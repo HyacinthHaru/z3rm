@@ -259,7 +259,6 @@ fn main() {
     let fs = Arc::new(RealFs::new(None, background_executor.clone()));
 
     app.run(move |cx| {
-        // §16.1 基础初始化
         cx.set_global(db::AppDatabase::new());
         release_channel::init(app_version.clone(), cx);
         settings::init(cx);
@@ -271,11 +270,9 @@ fn main() {
         load_user_themes_in_background(fs.clone(), cx);
         watch_themes(fs.clone(), cx);
 
-        // §16.1 Crash handler 异步初始化
         if let Some(crash_handler) = crash_handler {
             cx.spawn(async move |_| {
                 let _client = crash_handler.await;
-                // Crash handler client stored; unused in slim mode
                 drop(_client);
             })
             .detach();
@@ -296,15 +293,15 @@ fn main() {
             // 4. 注册窗口关闭回调: detach session (daemon 继续运行)
             let domain_for_close = domain.clone();
             cx.update(|cx| {
-                let _ = cx.on_window_closed(move |_, _| {
+                let _ = cx.on_window_closed(move |app, _window_id| {
                     let d = domain_for_close.clone();
-                    tokio::spawn(async move {
+                    app.spawn(async move |_| {
                         if let Err(e) = d.detach().await {
                             tracing::warn!(error = %e, "detach failed on window close");
                         } else {
                             tracing::info!("detached on window close");
                         }
-                    });
+                    }).detach();
                 });
             });
 
@@ -313,7 +310,7 @@ fn main() {
             let _window = cx.update(|cx| {
                 cx.open_window(
                     WindowOptions::default(),
-                    |_, cx| cx.new(|_| gpui::Empty),
+                    |_, cx| cx.new(|_| gpui::EmptyView),
                 )
             })?;
             cx.update(|cx| cx.activate(true));
