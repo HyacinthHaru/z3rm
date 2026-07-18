@@ -197,6 +197,17 @@ fn main() {
     #[cfg(unix)]
     util::prevent_root_execution();
 
+    // Auto-detect Wayland display if not set (common in tmux sessions)
+    if std::env::var("WAYLAND_DISPLAY").is_err() {
+        if let Ok(runtime_dir) = std::env::var("XDG_RUNTIME_DIR") {
+            let socket_path = std::path::PathBuf::from(&runtime_dir).join("wayland-0");
+            if socket_path.exists() {
+                // Safe: called before any threads are spawned
+                unsafe { std::env::set_var("WAYLAND_DISPLAY", "wayland-0") };
+            }
+        }
+    }
+
     ztracing::init();
 
     // §16.1 版本信息
