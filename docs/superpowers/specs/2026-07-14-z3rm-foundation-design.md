@@ -51,7 +51,7 @@ Forked from Zed. All editor/AI/collaboration features are removed. The retained 
 |---|---|---|
 | Upstream sync strategy | Hard fork + periodic cherry-pick | Destructive changes make merge untenable; GPUI updates are manually portable |
 | Migration approach | Progressive pruning of `zed` + `workspace` crate | Reuse window/settings/theme infrastructure; mark holes with `z3rm_todo` macro |
-| Project/git depth | Session-driven worktree (follows shell CWD via OSC 7) | No "open folder" concept — file tree sidebar shows the directory of the currently active terminal session's shell, switched on session focus change |
+| Project/git depth | Lightweight project (worktree + git status only) | Support file tree sidebar + diff view for CLI agent workflows |
 | Editor | Preserve slimmed read-only editor crate | Reuse tree-sitter syntax highlighting, line numbers, search, diff rendering |
 | Terminal state ownership | Server-canonical | mux_server owns PTY + alacritty emulator + grid; client renders grid only; no dual-parser divergence |
 | Multiplexer model | MuxDomain over Unix socket (local) or SSH tunnel (remote) | Single data path; same framed binary protocol for local and remote |
@@ -59,7 +59,7 @@ Forked from Zed. All editor/AI/collaboration features are removed. The retained 
 | Extension system | QuickJS (bundled), new terminal-oriented API | Reuse Zed extension project format; chrome implemented as plugins |
 | Daemon lifecycle | `keep_alive = true` by default | Matches tmux expectations; never silently kill PTYs |
 | Session persistence | Layout metadata only (no grid content to disk) | Grid lives in memory; crash = lose grid, keep layout + shells |
-| Platform priority | Windows + Linux first; macOS buildable only | ConPTY needs real Windows CI. Linux is primary development platform. macOS builds but no test runner available |
+| Platform priority | All platforms, Windows requires real CI runner (not Wine) | ConPTY cannot be tested via Wine; Wine only for compilation checks |
 | Licensing | Layered: inherited GPL-3.0-or-later, new crates Apache-2.0 | Preserve copyleft; own new work under permissive terms |
 
 ### 1.3 Competitive Research Summary
@@ -128,13 +128,13 @@ Zed's editor already has a `read_only` mode (used for preview buffers). The prun
 
 **Workspace / Project (pruned for terminal-first):**
 - `workspace` — preserve pane/tab/resize; delete editor/project/buffer coupling; default item = terminal
-- `project` — major prune: delete buffer/language registry/LSP/index/task; retain worktree (filesystem monitoring) + basic git status. **Worktree root follows the active terminal session's shell CWD** (from OSC 7), no separate "open folder" logic.
-- `worktree` — retained (`.gitignore` support reused). Root directory is dynamic: tracks the currently focused session's shell working directory. Switches on session/tab focus change.
+- `project` — major prune: delete buffer/language registry/LSP/index/task; retain worktree (filesystem monitoring) + basic git status
+- `worktree` — retained (`.gitignore` support reused)
 - `git`, `git_hosting_providers` — retained
 - `git_ui` — major prune: delete commit/diff editing; retain staged files list + diff viewer
 - `project_panel` — retained (file tree sidebar)
 - `recent_projects`, `file_finder`, `file_icons` — retained
-- `search` — retained but **must be reworked to ripgrep-on-worktree** (not Zed's buffer/multi-buffer-based search). Zed's content search depends on project's buffer model, which is being deleted. The search crate will be pruned to: filesystem search via `rg` (content) + worktree entries (filename). Search root follows the active session's CWD. This is a known `broken-ref` category hole during migration.
+- `search` — retained but **must be reworked to ripgrep-on-worktree** (not Zed's buffer/multi-buffer-based search). Zed's content search depends on project's buffer model, which is being deleted. The search crate will be pruned to: filesystem search via `rg` (content) + worktree entries (filename). This is a known `broken-ref` category hole during migration.
 
 **Settings / Theme (engine retained, schema rewritten):**
 - `settings`, `settings_macros` — engine retained
@@ -521,7 +521,7 @@ Delta chains are capped at $D_{max} = 16$. The 17th version forces materializati
 
 ### 4.7 File Monitoring and Circuit Breaker
 
-**Reuses worktree's existing file watcher** — no double-watching. Shadow snapshot subscribes to the same event stream that worktree already maintains, avoiding event ordering inconsistency. **Worktree root is dynamic**: follows the focused session's shell CWD (OSC 7), so shadow snapshot monitors whatever directory the user's shell is in.
+**Reuses worktree's existing file watcher** — no double-watching. Shadow snapshot subscribes to the same event stream that worktree already maintains, avoiding event ordering inconsistency.
 
 ```
 worktree event stream (single subscription)
@@ -688,7 +688,7 @@ Extensions declare capabilities in `extension.toml`. First install shows a permi
 
 Retain Zed's settings engine (`settings`, `settings_macros`) and settings UI (`settings_ui`, `settings_profile_selector`). Rewrite configuration schema (`settings_json`, `settings_content`) for terminal/mux/extension configuration.
 
-New schema covers: terminal config (font/shell/env), mux config (session/pane/keymap profiles), theme, extension config, shadow snapshot config. **CWD is not configurable** — it is driven by the shell's working directory (OSC 7).
+New schema covers: terminal config (font/shell/cwd/env), mux config (session/pane/keymap profiles), theme, extension config, shadow snapshot config.
 
 ## 7. Keymap Profiles
 
@@ -847,7 +847,7 @@ These terminal features are **Day 0**. Most already exist in the retained alacri
 - **Font ligatures and fallback chains** — GPUI already handles; no mux-specific work
 - **Emoji width and CJK wide character handling** — alacritty Unicode width tables; verify correctness in grid diff
 - **IME input** (critical — Chinese input) — GPUI input composition routed to server as synthetic PTY input via send_input
-- **Shell integration** (OSC 7 cwd, OSC 133 prompt markers) — server emulator parses OSC 7 to track shell CWD. **CWD drives the worktree root** for the file tree sidebar: when a session's shell changes directory, the worktree root updates to match.
+- **Shell integration** (OSC 7 cwd, OSC 133 prompt markers) — server emulator parses; cwd used for session metadata
 - **Title updates** (OSC 0/1/2) — server emulator parses; TabTitleChanged notification (§3.4)
 - **Pane zoom** — layout operation; server tracks zoomed pane; layout push to clients
 - **Synchronized updates** (DEC-2026) — already in §3.3 (BSU/ESU timeout)
@@ -970,7 +970,7 @@ All decisions below were resolved through structured grilling and are Day 0 bind
 - **Stale socket:** Connect timeout → do NOT delete socket → spawn new daemon → new daemon detects conflict → reports error or takes over.
 - **Idle resource:** Zero-pane daemon enters passive idle mode (minimal CPU/memory).
 - **keep_alive:** Default `true`. Daemon stays until explicit `z3rm-server kill`. Configurable `keep_alive_seconds` for auto-exit.
-- **One daemon, multiple sessions:** Each session has independent shell CWD (tracked via OSC 7). `--session <name>` attaches to existing or creates new in running daemon. The worktree root follows the focused session's CWD.
+- **One daemon, multiple sessions:** Each session has independent cwd/env. `--session <name>` attaches to existing or creates new in running daemon.
 - **Crash recovery:** Restore layout + shells at recorded cwd. Commands never auto-re-run.
 
 ### 16.2 Multi-Client
