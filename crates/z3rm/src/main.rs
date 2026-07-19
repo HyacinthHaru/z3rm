@@ -289,7 +289,7 @@ fn main() {
             .detach();
         }
 
-        // §16.1 daemon 自动启动 → 连接 → session → window
+        // §16.1 daemon 自动启动 → 连接 → session → pane → window
         cx.spawn(async move |cx| {
             // 1. 确保 daemon 运行并获取 MuxDomain
             let domain = Arc::new(daemon::ensure_daemon_running().await?);
@@ -297,8 +297,13 @@ fn main() {
             // 2. 创建/获取默认 session
             let session_id = daemon::ensure_default_session(&domain).await?;
 
-            // 3. attach 到 session
-            let _attach_resp = domain.attach(&session_id, mux::AttachMode::ReadOnly).await?;
+            // 2b. 确保 session 中有终端 pane
+            daemon::ensure_pane_in_session(&domain, &session_id).await?;
+
+            // 3. attach 到 session (Shared 模式允许输入)
+            let _attach_resp = domain
+                .attach(&session_id, mux::AttachMode::Shared)
+                .await?;
             tracing::info!(session_id = %session_id, "attached to session");
 
             // 4. 注册窗口关闭回调: detach session (daemon 继续运行)
@@ -316,11 +321,18 @@ fn main() {
                 });
             });
 
-            // 5. 创建窗口
+            // 5. 创建窗口 (设置初始尺寸)
             use gpui::AppContext as _;
+            let bounds = gpui::WindowBounds::Windowed(gpui::Bounds {
+                size: gpui::size(gpui::px(1440.), gpui::px(900.)),
+                origin: gpui::point(gpui::px(100.), gpui::px(100.)),
+            });
             let _window = cx.update(|cx| {
                 cx.open_window(
-                    WindowOptions::default(),
+                    gpui::WindowOptions {
+                        window_bounds: Some(bounds),
+                        ..Default::default()
+                    },
                     |_, cx| cx.new(|_| gpui::EmptyView),
                 )
             })?;

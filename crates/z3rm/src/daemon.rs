@@ -6,6 +6,7 @@ use std::process::Command;
 use std::time::Duration;
 
 use mux::MuxDomain;
+use mux_protocol::TerminalSize;
 
 // ============================================================================
 // §16.12 GPUI 通知 — daemon 连接丢失/错误提示
@@ -45,17 +46,13 @@ pub fn watch_daemon_connection(
     cx: &mut App,
 ) -> gpui::Task<()> {
     cx.spawn(async move |cx| {
-        // §16.12 定期检查 daemon socket 是否存在
         let socket_path = default_socket_path();
         loop {
-            tokio::time::sleep(Duration::from_secs(30)).await;
+            smol::Timer::after(Duration::from_secs(30)).await;
 
-            // §16.12 检测 socket 是否仍然存在
             if !socket_path.exists() {
-                // §16.12 连接丢失, 显示通知并尝试重连
                 cx.update(|cx| show_daemon_connection_lost(cx));
 
-                // §16.12 尝试重新连接 daemon
                 match ensure_daemon_running().await {
                     Ok(_) => {
                         tracing::info!("reconnected to daemon");
@@ -81,30 +78,19 @@ pub fn default_socket_path() -> PathBuf {
     .join("mux.sock")
 }
 
-/// 确保 mux_server daemon 正在运行，返回已连接的 MuxDomain。
-///
-/// 流程 (§16.1):
-/// 1. 尝试连接默认 socket
-/// 2. 连接失败 → 启动 z3rm-server --daemonize
-/// 3. 等待 socket 就绪 (最多 5s)
-/// 4. 再次连接，返回 MuxDomain
 pub async fn ensure_daemon_running() -> Result<MuxDomain> {
     let socket_path = default_socket_path();
 
-    // §16.1 Step 1: 先尝试连接，daemon 可能已经在运行
     if let Ok(domain) = mux::connect_local(&socket_path).await {
         tracing::info!("connected to existing daemon");
         return Ok(domain);
     }
 
-    // §16.1 Step 2: 连接失败，启动 daemon
     tracing::info!("daemon not running, spawning...");
     spawn_daemon()?;
 
-    // §16.1 Step 3: 等待 socket 就绪
     wait_for_socket(&socket_path, Duration::from_secs(5)).await?;
 
-    // §16.1 Step 4: 再次连接
     let domain = mux::connect_local(&socket_path)
         .await
         .context("failed to connect to daemon after spawn")?;
@@ -114,40 +100,41 @@ pub async fn ensure_daemon_running() -> Result<MuxDomain> {
 
 /// 启动 z3rm-server daemon 进程 (§16.1)
 fn spawn_daemon() -> Result<()> {
-    // 优先使用 z3rm-server 命令；如果找不到则尝试 z3rm --server
-    let result = Command::new("z3rm-server")
+    // 从可执行文件同目录查找 z3rm-server (dev build 支持)
+    let server_in_same_dir = std::env::current_exe()
+        .ok()
+        .and_then(|exe| exe.parent().map(|p| p.join("z3rm-server")));
+
+    let binary_name = if let Some(ref path) = server_in_same_dir {
+        if path.exists() {
+            path.to_string_lossy().into_owned()
+        } else {
+            "z3rm-server".to_string()
+        }
+    } else {
+        "z3rm-server".to_string()
+    };
+
+    let result = Command::new(&binary_name)
         .arg("--daemonize")
         .spawn();
 
     match result {
         Ok(_) => {
-            tracing::info!("spawned z3rm-server --daemonize");
+            tracing::info!(binary = %binary_name, "spawned daemon");
             Ok(())
         }
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-            // 回退: 尝试 z3rm --server
-            let result = Command::new("z3rm")
-                .arg("--server")
-                .arg("--daemonize")
-                .spawn();
-            match result {
-                Ok(_) => {
-                    tracing::info!("spawned z3rm --server --daemonize");
-                    Ok(())
-                }
-                Err(e2) => {
-                    Err(anyhow::anyhow!(
-                        "cannot spawn daemon: z3rm-server not found ({e}), z3rm --server failed ({e2})"
-                    ))
-                }
-            }
+            Err(anyhow::anyhow!(
+                "z3rm-server not found. Build it with `cargo build -p mux_server` \
+                 and ensure it is in PATH or next to the z3rm executable"
+            ))
         }
         Err(e) => {
-            Err(anyhow::anyhow!("failed to spawn z3rm-server: {e}"))
+            Err(anyhow::anyhow!("failed to spawn daemon: {e}"))
         }
     }
 }
-
 /// 轮询等待 socket 文件就绪 (§16.1)
 async fn wait_for_socket(socket_path: &Path, timeout: Duration) -> Result<()> {
     let start = std::time::Instant::now();
@@ -171,7 +158,7 @@ async fn wait_for_socket(socket_path: &Path, timeout: Duration) -> Result<()> {
             return Ok(());
         }
 
-        tokio::time::sleep(poll_interval).await;
+        smol::Timer::after(poll_interval).await;
     }
 }
 
@@ -191,4 +178,30 @@ pub async fn ensure_default_session(domain: &MuxDomain) -> Result<String> {
         tracing::info!(session_id = %session_id, "using existing session");
         Ok(session_id)
     }
+}
+/// 如果 session 没有 pane，创建默认终端 (§16.1)
+pub async fn ensure_pane_in_session(domain: &MuxDomain, session_id: &str) -> Result<()> {
+    // Attach to get snapshot (Shared mode to allow reading)
+    let attach_resp = domain.attach(session_id, mux::AttachMode::Shared).await?;
+    let snapshot = attach_resp.snapshot.context("no snapshot in attach response")?;
+
+    // Check if any tab has panes
+    let has_panes = snapshot.tabs.iter().any(|tab| !tab.panes.is_empty());
+    if has_panes {
+        // Detach since we just needed to check
+        domain.detach().await?;
+        return Ok(());
+    }
+    // No panes — spawn a terminal in the first tab
+    let tab_id = snapshot.tabs.first().map(|t| &t.id);
+    let fallback = String::from("default");
+    let tab_id = tab_id.unwrap_or(&fallback);
+
+    let home = dirs::home_dir().unwrap_or_else(|| PathBuf::from("/tmp"));
+    let size = TerminalSize { cols: 120, rows: 40 };
+    let pane_id = domain
+        .spawn_pane(session_id, tab_id, size, None, Some(&home))
+        .await?;
+    tracing::info!(pane_id = %pane_id, "spawned default terminal pane");
+    Ok(())
 }
