@@ -15,3 +15,7 @@ quote = { workspace = true }
 syn = { workspace = true, features = ["full"] }
 inventory = "0.3"
 z3rm_macros_types = { path = "../z3rm_macros_types" }
+
+[dev-dependencies]
+z3rm_macros_types = { path = "../z3rm_macros_types" }
+inventory = "0.3"
