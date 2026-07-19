@@ -98,21 +98,25 @@ impl ServerClipboard {
     pub fn set_clipboard(
         &self,
         entry: ClipboardEntry,
-        notification_tx: &mpsc::UnboundedSender<mux_protocol::proto::Notification>,
+        notification_tx: &mpsc::UnboundedSender<mux_protocol::Envelope>,
     ) {
         {
             let mut current = self.current.write();
             *current = Some(entry);
         }
-        // 推送 ClipboardChanged 通知到所有客户端 (§16.6)
-        let notification = mux_protocol::proto::Notification {
+        // §16.6 推送 ClipboardChanged 通知到所有客户端
+        let notification = mux_protocol::Notification {
             event: Some(
-                mux_protocol::proto::notification::Event::ClipboardChanged(
-                    mux_protocol::proto::ClipboardChanged {},
+                mux_protocol::notification::Event::ClipboardChanged(
+                    mux_protocol::ClipboardChanged {},
                 ),
             ),
         };
-        let _ = notification_tx.send(notification);
+        let envelope = mux_protocol::Envelope {
+            version: Some(mux_protocol::PROTOCOL_VERSION.clone()),
+            payload: Some(mux_protocol::envelope::Payload::Notification(notification)),
+        };
+        let _ = notification_tx.send(envelope);
         tracing::debug!("clipboard updated");
     }
 
@@ -127,7 +131,7 @@ impl ServerClipboard {
         &self,
         base64_data: &str,
         origin_host: String,
-        notification_tx: &mpsc::UnboundedSender<mux_protocol::proto::Notification>,
+        notification_tx: &mpsc::UnboundedSender<mux_protocol::Envelope>,
     ) -> anyhow::Result<()> {
         // §16.6 OSC 52 内容经过 base64 编码
         let data = base64::engine::general_purpose::STANDARD.decode(base64_data)?;
@@ -386,9 +390,14 @@ mod tests {
         // 确认收到通知
         let notification = rx.try_recv();
         assert!(notification.is_ok());
+        let envelope = notification.unwrap();
+        let notif = match envelope.payload {
+            Some(mux_protocol::envelope::Payload::Notification(n)) => Some(n),
+            _ => None,
+        };
         assert!(matches!(
-            notification.unwrap().event,
-            Some(mux_protocol::proto::notification::Event::ClipboardChanged(_))
+            notif.and_then(|n| n.event),
+            Some(mux_protocol::notification::Event::ClipboardChanged(_))
         ));
 
         // 第二次更新

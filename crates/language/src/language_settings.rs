@@ -712,36 +712,36 @@ impl settings::Settings for AllLanguageSettings {
         let all_languages = &content.project.all_languages;
 
         fn load_from_content(settings: LanguageSettingsContent) -> LanguageSettings {
-            let inlay_hints = settings.inlay_hints.unwrap();
-            let completions = settings.completions.unwrap();
-            let prettier = settings.prettier.unwrap();
-            let indent_guides = settings.indent_guides.unwrap();
-            let tasks = settings.tasks.unwrap();
-            let whitespace_map = settings.whitespace_map.unwrap();
+            let inlay_hints = settings.inlay_hints.unwrap_or_default();
+            let completions = settings.completions.unwrap_or_default();
+            let prettier = settings.prettier.unwrap_or_default();
+            let indent_guides = settings.indent_guides.unwrap_or_default();
+            let tasks = settings.tasks.unwrap_or_default();
+            let whitespace_map = settings.whitespace_map.unwrap_or_default();
 
             LanguageSettings {
-                tab_size: settings.tab_size.unwrap(),
-                hard_tabs: settings.hard_tabs.unwrap(),
-                soft_wrap: settings.soft_wrap.unwrap(),
-                preferred_line_length: settings.preferred_line_length.unwrap(),
-                show_wrap_guides: settings.show_wrap_guides.unwrap(),
-                wrap_guides: settings.wrap_guides.unwrap(),
+                tab_size: settings.tab_size.unwrap_or(NonZeroU32::new(4).unwrap()),
+                hard_tabs: settings.hard_tabs.unwrap_or_default(),
+                soft_wrap: settings.soft_wrap.unwrap_or_default(),
+                preferred_line_length: settings.preferred_line_length.unwrap_or_default(),
+                show_wrap_guides: settings.show_wrap_guides.unwrap_or_default(),
+                wrap_guides: settings.wrap_guides.unwrap_or_default(),
                 indent_guides: IndentGuideSettings {
-                    enabled: indent_guides.enabled.unwrap(),
-                    line_width: indent_guides.line_width.unwrap(),
-                    active_line_width: indent_guides.active_line_width.unwrap(),
-                    coloring: indent_guides.coloring.unwrap(),
-                    background_coloring: indent_guides.background_coloring.unwrap(),
+                    enabled: indent_guides.enabled.unwrap_or_default(),
+                    line_width: indent_guides.line_width.unwrap_or_default(),
+                    active_line_width: indent_guides.active_line_width.unwrap_or_default(),
+                    coloring: indent_guides.coloring.unwrap_or_default(),
+                    background_coloring: indent_guides.background_coloring.unwrap_or_default(),
                 },
-                format_on_save: settings.format_on_save.unwrap(),
+                format_on_save: settings.format_on_save.unwrap_or_default(),
                 remove_trailing_whitespace_on_save: settings
                     .remove_trailing_whitespace_on_save
-                    .unwrap(),
-                ensure_final_newline_on_save: settings.ensure_final_newline_on_save.unwrap(),
-                line_ending: settings.line_ending.unwrap(),
-                formatter: settings.formatter.unwrap(),
+                    .unwrap_or_default(),
+                ensure_final_newline_on_save: settings.ensure_final_newline_on_save.unwrap_or_default(),
+                line_ending: settings.line_ending.unwrap_or_default(),
+                formatter: settings.formatter.unwrap_or_default(),
                 prettier: PrettierSettings {
-                    allowed: prettier.allowed.unwrap(),
+                    allowed: prettier.allowed.unwrap_or_default(),
                     parser: prettier.parser.filter(|parser| !parser.is_empty()),
                     plugins: prettier.plugins.unwrap_or_default().into_iter().collect(),
                     options: match prettier.options.unwrap_or_default() {
@@ -749,63 +749,63 @@ impl settings::Settings for AllLanguageSettings {
                         _ => Default::default(),
                     },
                 },
-                jsx_tag_auto_close: settings.jsx_tag_auto_close.unwrap().enabled.unwrap(),
-                enable_language_server: settings.enable_language_server.unwrap(),
-                language_servers: settings.language_servers.unwrap(),
-                semantic_tokens: settings.semantic_tokens.unwrap(),
-                document_folding_ranges: settings.document_folding_ranges.unwrap(),
-                document_symbols: settings.document_symbols.unwrap(),
-                allow_rewrap: settings.allow_rewrap.unwrap(),
-                show_edit_predictions: settings.show_edit_predictions.unwrap(),
-                edit_predictions_disabled_in: settings.edit_predictions_disabled_in.unwrap(),
-                show_whitespaces: settings.show_whitespaces.unwrap(),
+                jsx_tag_auto_close: settings.jsx_tag_auto_close.unwrap_or_default().enabled.unwrap_or_default(),
+                enable_language_server: settings.enable_language_server.unwrap_or_default(),
+                language_servers: settings.language_servers.unwrap_or_default(),
+                semantic_tokens: settings.semantic_tokens.unwrap_or_default(),
+                document_folding_ranges: settings.document_folding_ranges.unwrap_or_default(),
+                document_symbols: settings.document_symbols.unwrap_or_default(),
+                allow_rewrap: settings.allow_rewrap.unwrap_or_default(),
+                show_edit_predictions: settings.show_edit_predictions.unwrap_or_default(),
+                edit_predictions_disabled_in: settings.edit_predictions_disabled_in.unwrap_or_default(),
+                show_whitespaces: settings.show_whitespaces.unwrap_or_default(),
                 whitespace_map: WhitespaceMap {
-                    space: SharedString::new(whitespace_map.space.unwrap().to_string()),
-                    tab: SharedString::new(whitespace_map.tab.unwrap().to_string()),
+                    space: SharedString::new(whitespace_map.space.unwrap_or_default().to_string()),
+                    tab: SharedString::new(whitespace_map.tab.unwrap_or_default().to_string()),
                 },
-                extend_comment_on_newline: settings.extend_comment_on_newline.unwrap(),
-                extend_list_on_newline: settings.extend_list_on_newline.unwrap(),
-                indent_list_on_tab: settings.indent_list_on_tab.unwrap(),
+                extend_comment_on_newline: settings.extend_comment_on_newline.unwrap_or_default(),
+                extend_list_on_newline: settings.extend_list_on_newline.unwrap_or_default(),
+                indent_list_on_tab: settings.indent_list_on_tab.unwrap_or_default(),
                 inlay_hints: InlayHintSettings {
-                    enabled: inlay_hints.enabled.unwrap(),
-                    show_value_hints: inlay_hints.show_value_hints.unwrap(),
-                    show_type_hints: inlay_hints.show_type_hints.unwrap(),
-                    show_parameter_hints: inlay_hints.show_parameter_hints.unwrap(),
-                    show_other_hints: inlay_hints.show_other_hints.unwrap(),
-                    show_background: inlay_hints.show_background.unwrap(),
-                    edit_debounce_ms: inlay_hints.edit_debounce_ms.unwrap() as u64,
-                    scroll_debounce_ms: inlay_hints.scroll_debounce_ms.unwrap() as u64,
+                    enabled: inlay_hints.enabled.unwrap_or_default(),
+                    show_value_hints: inlay_hints.show_value_hints.unwrap_or_default(),
+                    show_type_hints: inlay_hints.show_type_hints.unwrap_or_default(),
+                    show_parameter_hints: inlay_hints.show_parameter_hints.unwrap_or_default(),
+                    show_other_hints: inlay_hints.show_other_hints.unwrap_or_default(),
+                    show_background: inlay_hints.show_background.unwrap_or_default(),
+                    edit_debounce_ms: inlay_hints.edit_debounce_ms.unwrap_or_default() as u64,
+                    scroll_debounce_ms: inlay_hints.scroll_debounce_ms.unwrap_or_default() as u64,
                     toggle_on_modifiers_press: inlay_hints
                         .toggle_on_modifiers_press
                         .map(|m| m.into_gpui()),
                 },
-                use_autoclose: settings.use_autoclose.unwrap(),
-                use_auto_surround: settings.use_auto_surround.unwrap(),
-                use_on_type_format: settings.use_on_type_format.unwrap(),
-                auto_indent: settings.auto_indent.unwrap(),
-                auto_indent_on_paste: settings.auto_indent_on_paste.unwrap(),
+                use_autoclose: settings.use_autoclose.unwrap_or_default(),
+                use_auto_surround: settings.use_auto_surround.unwrap_or_default(),
+                use_on_type_format: settings.use_on_type_format.unwrap_or_default(),
+                auto_indent: settings.auto_indent.unwrap_or_default(),
+                auto_indent_on_paste: settings.auto_indent_on_paste.unwrap_or_default(),
                 always_treat_brackets_as_autoclosed: settings
                     .always_treat_brackets_as_autoclosed
-                    .unwrap(),
-                code_actions_on_format: settings.code_actions_on_format.unwrap(),
-                linked_edits: settings.linked_edits.unwrap(),
+                    .unwrap_or_default(),
+                code_actions_on_format: settings.code_actions_on_format.unwrap_or_default(),
+                linked_edits: settings.linked_edits.unwrap_or_default(),
                 tasks: LanguageTaskSettings {
                     variables: tasks.variables.unwrap_or_default(),
-                    enabled: tasks.enabled.unwrap(),
-                    prefer_lsp: tasks.prefer_lsp.unwrap(),
+                    enabled: tasks.enabled.unwrap_or_default(),
+                    prefer_lsp: tasks.prefer_lsp.unwrap_or_default(),
                 },
-                show_completions_on_input: settings.show_completions_on_input.unwrap(),
-                show_completion_documentation: settings.show_completion_documentation.unwrap(),
-                colorize_brackets: settings.colorize_brackets.unwrap(),
+                show_completions_on_input: settings.show_completions_on_input.unwrap_or_default(),
+                show_completion_documentation: settings.show_completion_documentation.unwrap_or_default(),
+                colorize_brackets: settings.colorize_brackets.unwrap_or_default(),
                 completions: CompletionSettings {
-                    words: completions.words.unwrap(),
-                    words_min_length: completions.words_min_length.unwrap() as usize,
-                    lsp: completions.lsp.unwrap(),
-                    lsp_fetch_timeout_ms: completions.lsp_fetch_timeout_ms.unwrap() as u64,
-                    lsp_insert_mode: completions.lsp_insert_mode.unwrap(),
+                    words: completions.words.unwrap_or_default(),
+                    words_min_length: completions.words_min_length.unwrap_or_default() as usize,
+                    lsp: completions.lsp.unwrap_or_default(),
+                    lsp_fetch_timeout_ms: completions.lsp_fetch_timeout_ms.unwrap_or_default() as u64,
+                    lsp_insert_mode: completions.lsp_insert_mode.unwrap_or_default(),
                 },
-                debuggers: settings.debuggers.unwrap(),
-                word_diff_enabled: settings.word_diff_enabled.unwrap(),
+                debuggers: settings.debuggers.unwrap_or_default(),
+                word_diff_enabled: settings.word_diff_enabled.unwrap_or_default(),
             }
         }
 
@@ -826,17 +826,13 @@ impl settings::Settings for AllLanguageSettings {
             .as_ref()
             .and_then(|ep| ep.provider);
 
-        let edit_predictions = all_languages.edit_predictions.clone().unwrap();
-        let edit_predictions_mode = edit_predictions.mode.unwrap();
+        let edit_predictions = all_languages.edit_predictions.clone().unwrap_or_default();
+        let edit_predictions_mode = edit_predictions.mode.unwrap_or_default();
 
         let disabled_globs: HashSet<&String> = edit_predictions
-            .disabled_globs
-            .as_ref()
-            .unwrap()
-            .iter()
-            .collect();
+            .disabled_globs.as_ref().map(|v| v.iter().collect()).unwrap_or_default();
 
-        let copilot = edit_predictions.copilot.unwrap();
+        let copilot = edit_predictions.copilot.unwrap_or_default();
         let copilot_settings = CopilotSettings {
             proxy: copilot.proxy,
             proxy_no_verify: copilot.proxy_no_verify,
@@ -844,24 +840,24 @@ impl settings::Settings for AllLanguageSettings {
             enable_next_edit_suggestions: copilot.enable_next_edit_suggestions,
         };
 
-        let codestral = edit_predictions.codestral.unwrap();
+        let codestral = edit_predictions.codestral.unwrap_or_default();
         let codestral_settings = CodestralSettings {
             model: codestral.model,
             max_tokens: codestral.max_tokens,
             api_url: codestral.api_url,
         };
 
-        let ollama = edit_predictions.ollama.unwrap();
+        let ollama = edit_predictions.ollama.unwrap_or_default();
         let ollama_settings = ollama
             .model
             .filter(|model| !model.is_empty())
             .map(|model| OpenAiCompatibleEditPredictionSettings {
                 model: model,
-                max_output_tokens: ollama.max_output_tokens.unwrap(),
-                api_url: ollama.api_url.unwrap().into(),
-                prompt_format: ollama.prompt_format.unwrap().into(),
+                max_output_tokens: ollama.max_output_tokens.unwrap_or_default(),
+                api_url: ollama.api_url.unwrap_or_default().into(),
+                prompt_format: ollama.prompt_format.unwrap_or_default().into(),
             });
-        let openai_compatible_settings = edit_predictions.open_ai_compatible_api.unwrap();
+        let openai_compatible_settings = edit_predictions.open_ai_compatible_api.unwrap_or_default();
         let openai_compatible_settings = openai_compatible_settings
             .model
             .filter(|model| !model.is_empty())
@@ -874,7 +870,7 @@ impl settings::Settings for AllLanguageSettings {
                 model,
                 max_output_tokens: 0,
                 api_url: api_url.into(),
-                prompt_format: openai_compatible_settings.prompt_format.unwrap().into(),
+                prompt_format: openai_compatible_settings.prompt_format.unwrap_or_default().into(),
             });
 
         // 文件类型映射: 当前设置结构为 Vec<LanguageFileTypeContent>,
@@ -952,7 +948,7 @@ mod tests {
                         let expanded_glob_str = shellexpand::tilde(glob_str).into_owned();
                         DisabledGlob {
                             matcher: globset::Glob::new(&expanded_glob_str)
-                                .unwrap()
+                                .expect("Invalid glob pattern in settings")
                                 .compile_matcher(),
                             is_absolute: Path::new(&expanded_glob_str).is_absolute(),
                         }

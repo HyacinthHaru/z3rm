@@ -5,6 +5,7 @@ use settings_macros::{MergeFrom, with_fallible_options};
 /// 影子快照设置 (spec §16 Plan 16)
 #[with_fallible_options]
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize, JsonSchema, MergeFrom)]
+#[serde(default)]
 pub struct ShadowSnapshotSettingsContent {
     /// Whether shadow snapshots are enabled. Default: true
     pub enabled: bool,

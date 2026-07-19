@@ -35,8 +35,8 @@ component.workspace = true
 db.workspace = true
 dirs.workspace = true
 futures-lite.workspace = true
-fs.workspace = true
 futures.workspace = true
+fs = { workspace = true, features = ["test-support"] }
 git.workspace = true
 gpui.workspace = true
 mux_protocol.workspace = true
@@ -74,7 +74,6 @@ windows.workspace = true
 
 [dev-dependencies]
 db = { workspace = true, features = ["test-support"] }
-fs = { workspace = true, features = ["test-support"] }
 gpui = { workspace = true, features = ["test-support"] }
 project = { workspace = true, features = ["test-support"] }
 remote = { workspace = true, features = ["test-support"] }

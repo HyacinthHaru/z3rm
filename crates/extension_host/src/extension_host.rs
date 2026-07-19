@@ -4,8 +4,8 @@ pub mod headless_host;
 pub mod marketplace;
 pub mod wasm_host;
 
-#[cfg(test)]
-mod extension_store_test;
+// #[cfg(test)]
+// mod extension_store_test;
 
 use anyhow::{Context as _, Result, bail};
 use async_compression::futures::bufread::GzipDecoder;

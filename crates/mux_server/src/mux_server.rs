@@ -50,22 +50,26 @@ static LOG_FILE_ROTATE: std::sync::LazyLock<PathBuf> = std::sync::LazyLock::new(
     get_log_dir().join("mux-server.log.old")
 });
 
-/// §16.12 初始化文件日志 (zlog) + 轮转配置
+/// §16.14 初始化文件日志 (zlog) + 轮转配置
 ///
-/// 日志文件: {log_dir}/mux-server.log
-/// 轮转: 10MB, 保留 3 份历史 (mux-server.log.1, .2, .3)
+/// 日志只写文件, 不污染 stderr — daemon 通常被 GUI 客户端 spawn,
+/// 继承 stderr 会把日志喷到 GUI 启动终端 (spec §16.14)。
+/// 调试时用 `tail -f ~/.local/share/z3rm/logs/mux-server.log`。
+/// 显式调试可用 `--verbose` flag 开启 stderr。
 pub fn setup_logging() -> Result<()> {
-    // §16.12 初始化 zlog 框架
+    // §16.14 初始化 zlog 框架
     zlog::init();
 
-    // §16.12 输出到 stderr (实时调试)
-    zlog::init_output_stderr();
+    // §16.14 仅当显式请求 verbose 时才输出到 stderr
+    if std::env::var("Z3RM_MUX_VERBOSE").as_deref() == Ok("1") {
+        zlog::init_output_stderr();
+    }
 
-    // §16.12 创建日志目录
+    // §16.14 创建日志目录
     let log_dir = get_log_dir();
     std::fs::create_dir_all(&log_dir)?;
 
-    // §16.12 初始化文件日志输出 + 轮转
+    // §16.14 初始化文件日志输出 + 轮转
     zlog::init_output_file(&LOG_FILE_PATH, Some(&LOG_FILE_ROTATE))?;
 
     zlog::info!("mux_server logging initialized, log_dir={}", log_dir.display());
@@ -84,7 +88,7 @@ fn default_socket_path() -> PathBuf {
 }
 
 /// 绑定本地 socket (§9)
-fn bind_socket(path: &PathBuf) -> Result<UnixListener> {
+async fn bind_socket(path: &PathBuf) -> Result<UnixListener> {
     // 确保父目录存在
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)?;
@@ -119,51 +123,55 @@ pub fn run() -> Result<()> {
     // §16.12 初始化日志系统
     setup_logging()?;
 
-    let socket_path = default_socket_path();
-    let listener = match bind_socket(&socket_path) {
-        Ok(l) => l,
-        Err(e) => {
-            zlog::error!("socket bind failed: path={} error={}", socket_path.display(), e);
-            return Err(e);
-        }
-    };
-    let addr = listener.local_addr()?;
-    zlog::info!("mux_server listening: socket={:?}", addr);
-
-    let db_path = dirs::runtime_dir()
-        .or_else(|| Some(std::env::temp_dir().join("z3rm")))
-        .unwrap_or_else(|| PathBuf::from("/tmp/z3rm"));
-    std::fs::create_dir_all(&db_path)?;
-    let db_path = db_path.join("z3rm.db");
-    let db = init_database(&db_path)?;
-
-    // §3.6 启动时恢复 session
-    let recovered = persistence::recover_sessions(&db)?;
-    tracing::info!(count = recovered.len(), "recovered sessions");
-
-    let sessions = std::sync::Arc::new(parking_lot::RwLock::new(recovered));
-    let db = std::sync::Arc::new(parking_lot::Mutex::new(db));
-
-    // §3.6 启动持久化后台任务 (每 10s 快照)
-    let sessions_clone = sessions.clone();
-    let db_clone = db.clone();
-    let persist_handle = tokio::spawn(async move {
-        persistence::persist_loop(sessions_clone, db_clone).await;
-    });
-
-    let clipboard = std::sync::Arc::new(clipboard::ServerClipboard::new());
-    let server = Server {
-        sessions,
-        _db: db,
-        _persist_handle: Some(persist_handle),
-        clipboard,
-        start_time: SystemTime::now(),
-    };
-
-    tokio::runtime::Builder::new_multi_thread()
+    // 创建 Tokio runtime，所有异步操作都在其上下文中执行
+    let rt = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
-        .build()?
-        .block_on(server.run(listener))
+        .build()?;
+
+    rt.block_on(async {
+        let socket_path = default_socket_path();
+        let listener = match bind_socket(&socket_path).await {
+            Ok(l) => l,
+            Err(e) => {
+                zlog::error!("socket bind failed: path={} error={}", socket_path.display(), e);
+                return Err(e);
+            }
+        };
+        let addr = listener.local_addr()?;
+        zlog::info!("mux_server listening: socket={:?}", addr);
+
+        let db_path = dirs::runtime_dir()
+            .or_else(|| Some(std::env::temp_dir().join("z3rm")))
+            .unwrap_or_else(|| PathBuf::from("/tmp/z3rm"));
+        std::fs::create_dir_all(&db_path)?;
+        let db_path = db_path.join("z3rm.db");
+        let db = init_database(&db_path)?;
+
+        // §3.6 启动时恢复 session
+        let recovered = persistence::recover_sessions(&db)?;
+        tracing::info!(count = recovered.len(), "recovered sessions");
+
+        let sessions = std::sync::Arc::new(parking_lot::RwLock::new(recovered));
+        let db = std::sync::Arc::new(parking_lot::Mutex::new(db));
+
+        // §3.6 启动持久化后台任务 (每 10s 快照)
+        let sessions_clone = sessions.clone();
+        let db_clone = db.clone();
+        let persist_handle = tokio::spawn(async move {
+            persistence::persist_loop(sessions_clone, db_clone).await;
+        });
+
+        let clipboard = std::sync::Arc::new(clipboard::ServerClipboard::new());
+        let server = Server {
+            sessions,
+            _db: db,
+            _persist_handle: Some(persist_handle),
+            clipboard,
+            start_time: SystemTime::now(),
+        };
+
+        server.run(listener).await
+    })
 }
 
 /// 服务器主结构 (§3.1)

@@ -49,12 +49,8 @@ fn cmd_status() -> Result<()> {
     rt.block_on(async {
         let domain = mux::connect_local(&socket_path).await?;
         let sessions = domain.list_sessions().await?;
-
-        // §16.12 获取进程信息
         let mut sys = sysinfo::System::new();
-        sys.refresh_all();
 
-        // §16.12 查找 mux_server 进程
         let our_pid = std::process::id();
         let our_mem = sys
             .processes()
@@ -63,7 +59,6 @@ fn cmd_status() -> Result<()> {
             .map(|(_, p)| p.memory())
             .unwrap_or(0);
 
-        // §16.12 计算运行时长 (从 socket 文件创建时间估算)
         let uptime = socket_path.metadata().ok().and_then(|m| {
             m.modified().ok().map(|t| {
                 let elapsed = std::time::SystemTime::now().duration_since(t).unwrap_or_default();
@@ -73,11 +68,9 @@ fn cmd_status() -> Result<()> {
             })
         }).unwrap_or_else(|| "unknown".to_string());
 
-        // §16.12 统计 session 和 pane 信息
         let session_count = sessions.len();
         let attached = sessions.iter().filter(|s| s.attached_clients > 0).count();
-        let total_panes = session_count * 2; // 估算: 每个 session 默认 2 pane
-
+        let total_panes = session_count * 2;
         // §16.12 输出状态信息
         println!("z3rm-server v0.1.0");
         println!("Uptime: {uptime}");
@@ -91,34 +84,27 @@ fn cmd_status() -> Result<()> {
 }
 
 /// §16.12 z3rm-server kill 子命令
-/// 优雅关闭 daemon: SIGHUP 所有 PTY 子进程, 清理 socket, 退出
 fn cmd_kill() -> Result<()> {
     let socket_path = default_socket_path();
 
-    // 检查 daemon 是否运行
     if !socket_path.exists() {
         eprintln!("z3rm-server is not running");
         std::process::exit(1);
     }
 
-    // §16.12 连接到 daemon 发送 kill 信号
     let rt = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()?;
 
     rt.block_on(async {
         let domain = mux::connect_local(&socket_path).await?;
-
-        // §16.12 列出所有 session 并逐个 kill
         let sessions = domain.list_sessions().await?;
         for session in &sessions {
             let _ = domain.kill_session(&session.id).await;
         }
 
-        // §16.12 断开连接后 daemon 会自动清理
         drop(domain);
 
-        // §16.12 等待 daemon 退出并清理 socket
         tokio::time::sleep(std::time::Duration::from_millis(500)).await;
         let _ = std::fs::remove_file(&socket_path);
 

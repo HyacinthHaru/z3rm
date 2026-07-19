@@ -91,6 +91,7 @@ pub enum HideMouseMode {
 /// 终端/多路复用器/UI chrome 设置结构体 (spec §16 Plan 16)
 #[with_fallible_options]
 #[derive(Debug, PartialEq, Default, Clone, Serialize, Deserialize, JsonSchema, MergeFrom)]
+#[serde(default)]
 pub struct SettingsContent {
     #[serde(flatten)]
     pub project: ProjectSettingsContent,
@@ -161,6 +162,7 @@ pub struct SettingsContent {
 /// 诊断设置内容 (spec §16 Plan 16)
 #[with_fallible_options]
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize, JsonSchema, MergeFrom)]
+#[serde(default)]
 pub struct DiagnosticsSettingsContent {
     /// 是否在状态栏显示诊断按钮
     pub button: bool,
@@ -181,6 +183,7 @@ pub enum FileFinderWidthContent {
 /// 文件查找器设置 (spec §16 Plan 16)
 #[with_fallible_options]
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize, JsonSchema, MergeFrom)]
+#[serde(default)]
 pub struct FileFinderSettingsContent {
     pub file_icons: bool,
     pub modal_max_width: Option<FileFinderWidthContent>,
@@ -190,6 +193,7 @@ pub struct FileFinderSettingsContent {
 /// 远程连接设置 (spec §16 Plan 16)
 #[with_fallible_options]
 #[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq, JsonSchema, MergeFrom)]
+#[serde(default)]
 pub struct RemoteSettingsContent {
     /// 远程服务器路径
     pub remote_server_path: Option<String>,
@@ -201,6 +205,7 @@ pub struct RemoteSettingsContent {
 /// 工具遥测设置
 #[with_fallible_options]
 #[derive(Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema, Debug, MergeFrom)]
+#[serde(default)]
 pub struct TelemetrySettingsContent {
     /// 是否收集诊断事件
     pub diagnostics: bool,
@@ -371,6 +376,7 @@ pub enum BaseKeymapContent {
 
 /// 兼容占位类型: SaturatingBool (spec §16 Plan 16)
 #[derive(Debug, Default, Copy, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[serde(default)]
 pub struct SaturatingBool(pub bool);
 
 impl std::fmt::Display for SaturatingBool {
@@ -413,6 +419,7 @@ pub struct ExtensionsSettingsContent {
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize, JsonSchema, MergeFrom)]
+#[serde(default)]
 pub struct LanguageToSettingsMap {
     pub settings: HashMap<String, LanguageSettingsContent>,
     pub defaults: LanguageSettingsContent,
@@ -422,6 +429,7 @@ pub struct LanguageToSettingsMap {
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize, JsonSchema, MergeFrom)]
+#[serde(default)]
 pub struct LanguageSettingsContent {
     // 兼容占位字段 - Option<T> 保持下游 unwrap() 调用 (spec §16 Plan 16)
     pub tab_size: Option<NonZeroU32>,

@@ -424,7 +424,7 @@ mod tests {
     #[test]
     fn test_runtime_creation() -> Result<()> {
         let runtime = QuickJsRuntime::with_defaults()?;
-        let ctx = runtime.create_context();
+        let ctx = runtime.create_context()?;
 
         // 验证 Context 可执行基本 JS
         let result: i32 = ctx.with(|ctx| ctx.eval("1 + 2"))?;
@@ -436,7 +436,7 @@ mod tests {
     fn test_memory_limit() -> Result<()> {
         // 创建内存受限的 Runtime (1MB)
         let runtime = QuickJsRuntime::new(1, CPU_FUEL_BUDGET_MS)?;
-        let ctx = runtime.create_context();
+        let ctx = runtime.create_context()?;
 
         // 尝试分配大量内存 → 应触发内存限制
         let result = ctx.with(|ctx| {
@@ -571,8 +571,8 @@ mod tests {
         let runtime = QuickJsRuntime::with_defaults()?;
 
         // 同一 Runtime 可创建多个 Context
-        let ctx1 = runtime.create_context();
-        let ctx2 = runtime.create_context();
+        let ctx1 = runtime.create_context()?;
+        let ctx2 = runtime.create_context()?;
 
         let r1: i32 = ctx1.with(|ctx| ctx.eval("42"))?;
         let r2: i32 = ctx2.with(|ctx| ctx.eval("99"))?;

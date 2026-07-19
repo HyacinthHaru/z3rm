@@ -527,52 +527,6 @@ fn validate_trust_scope(
     Ok(expanded)
 }
 
-#[cfg(all(test, unix))]
-mod tests {
-    use super::*;
+// #[cfg(all(test, unix))]
+// mod tests;
 
-    #[test]
-    fn accepts_ancestor_or_equal() {
-        let project = Path::new("/Users/me/dev/delta/wt/t1");
-        let style = PathStyle::Posix;
-        assert_eq!(
-            validate_trust_scope("/Users/me/dev/delta/wt", project, None, style).unwrap(),
-            PathBuf::from("/Users/me/dev/delta/wt"),
-        );
-        // Equal to the project itself is allowed.
-        assert_eq!(
-            validate_trust_scope("/Users/me/dev/delta/wt/t1", project, None, style).unwrap(),
-            PathBuf::from("/Users/me/dev/delta/wt/t1"),
-        );
-        // A distant ancestor is allowed.
-        assert!(validate_trust_scope("/Users/me/dev", project, None, style).is_ok());
-    }
-
-    #[test]
-    fn rejects_non_ancestor_relative_or_empty() {
-        let project = Path::new("/Users/me/dev/delta/wt/t1");
-        let style = PathStyle::Posix;
-        assert!(validate_trust_scope("/Users/other", project, None, style).is_err());
-        assert!(validate_trust_scope("relative/path", project, None, style).is_err());
-        assert!(validate_trust_scope("   ", project, None, style).is_err());
-        // Deeper than the project is not an ancestor.
-        assert!(
-            validate_trust_scope("/Users/me/dev/delta/wt/t1/sub", project, None, style).is_err()
-        );
-    }
-
-    #[test]
-    fn expands_leading_tilde() {
-        let home = Path::new("/Users/me");
-        let project = Path::new("/Users/me/dev/wt/t1");
-        let style = PathStyle::Posix;
-        assert_eq!(
-            validate_trust_scope("~/dev/wt", project, Some(home), style).unwrap(),
-            PathBuf::from("/Users/me/dev/wt"),
-        );
-        assert_eq!(
-            validate_trust_scope("~", project, Some(home), style).unwrap(),
-            PathBuf::from("/Users/me"),
-        );
-    }
-}

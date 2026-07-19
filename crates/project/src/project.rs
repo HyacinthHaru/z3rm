@@ -274,6 +274,21 @@ impl Project {
         })
     }
 
+    #[cfg(any(test, feature = "test-support"))]
+    pub async fn test(
+        fs: Arc<dyn Fs>,
+        worktree_paths: &[PathBuf],
+        cx: &mut App,
+    ) -> Entity<Self> {
+        Self::local(
+            Arc::new(LanguageRegistry::new(cx.background_executor().clone())),
+            fs,
+            None,
+            worktree_paths.to_vec(),
+            cx,
+        )
+    }
+
     /// Stub: remote project creation (spec §8.2 M2)
     pub fn remote(
         _session: Arc<dyn remote::RemoteConnection>,

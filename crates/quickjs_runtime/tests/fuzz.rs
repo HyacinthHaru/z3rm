@@ -188,15 +188,15 @@ fn test_rapid_io_calls() {
 /// §5.2 QuickJsRuntime 创建与默认配置
 #[test]
 fn test_quickjs_runtime_creation() {
-    let runtime = QuickJsRuntime::new(64, 50).unwrap();
+    let runtime = QuickJsRuntime::new(64, 50).expect("runtime init");
     let _ctx = runtime.create_context();
 }
 
 /// §5.2 QuickJsRuntime 执行简单 JS
 #[test]
 fn test_quickjs_runtime_eval() {
-    let runtime = QuickJsRuntime::new(64, 50).unwrap();
-    let ctx = runtime.create_context();
+    let runtime = QuickJsRuntime::new(64, 50).expect("runtime init");
+    let ctx = runtime.create_context().expect("context creation");
 
     let result: Result<i32, anyhow::Error> = ctx.with(|ctx| {
         let value: i32 = ctx.eval("1 + 2")?;

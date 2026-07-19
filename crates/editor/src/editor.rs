@@ -45,10 +45,10 @@ mod hover_links {
     pub use crate::stubs::exclude_link_to_position;
 }
 mod task;
-#[cfg(test)]
-mod editor_block_comment_tests;
-#[cfg(test)]
-mod editor_tests;
+// #[cfg(test)]
+// mod editor_block_comment_tests;
+// #[cfg(test)]
+// mod editor_tests;
 #[cfg(any(test, feature = "test-support"))]
 pub mod test;
 

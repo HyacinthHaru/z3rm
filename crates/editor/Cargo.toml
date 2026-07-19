@@ -15,6 +15,7 @@ doctest = false
 [features]
 test-support = [
     "text/test-support",
+    "fs/test-support",
     "language/test-support",
     "gpui/test-support",
     "multi_buffer/test-support",

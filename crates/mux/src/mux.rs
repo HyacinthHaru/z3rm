@@ -7,13 +7,13 @@
 //! 请求/响应关联通过 request_id（§9）。
 
 use anyhow::Result;
+use async_channel::unbounded;
 use std::collections::HashMap;
 use std::io::{Read, Write};
 use std::path::Path;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use interprocess::local_socket::{GenericFilePath, ToFsName};
-use tokio::sync::{mpsc, oneshot};
 
 // §9 从 mux_protocol 导入所有 protobuf 类型。
 use mux_protocol::{
@@ -26,12 +26,16 @@ use mux_protocol::{
 };
 
 // §16.6 SSH 远程连接模块（Plan 19）。
+#[cfg(feature = "ssh")]
 mod ssh;
+#[cfg(feature = "ssh")]
 mod remote_install;
 mod sync;
 
-// §16.6 导出 SSH 连接入口和同步函数。
+#[cfg(feature = "ssh")]
 pub use ssh::{connect_ssh, SshConnectionOptions, SshSession};
+#[cfg(feature = "ssh")]
+pub use remote_install::{ensure_remote_server, auto_install_server};
 pub use sync::sync_extensions_to_remote;
 
 // §9 公共类型导出
@@ -43,28 +47,17 @@ pub use mux_protocol::attach_request::AttachMode;
 /// Mux 客户端域：连接到 mux_server，发送 RPC 请求，接收通知。
 pub struct MuxDomain {
     inner: Arc<parking_lot::RwLock<DomainInner>>,
-    /// §9 后台 I/O 任务的 handle。
-    _io_handle: tokio::task::JoinHandle<()>,
-    /// §9 响应路由任务的 handle。
-    _routing_handle: tokio::task::JoinHandle<()>,
-    /// §3.3 窗口 ID (多窗口支持，Plan 32)
+    /// §9 窗口 ID (多窗口支持，Plan 32)
     pub window_id: String,
 }
-
-/// §9 内部状态：请求 ID 计数器、待处理请求、通知通道、写通道。
+/// §9 内部状态：请求 ID 计数器、待处理请求、订阅者列表、写通道。
 struct DomainInner {
-    /// §9 下一个请求 ID。
     next_request_id: AtomicU64,
-    /// §9 待处理请求映射：request_id → oneshot sender。
-    pending_requests: HashMap<u64, oneshot::Sender<Response>>,
-    /// §9 通知发送端（TODO: subscribe 使用 broadcast channel）。
-    #[allow(dead_code)]
-    notification_tx: mpsc::Sender<Notification>,
-    /// §9 写通道：send_request 通过此通道发送帧数据给 I/O 任务。
+    pending_requests: HashMap<u64, async_channel::Sender<Response>>,
+    /// §9 通知订阅者列表。subscribe() 添加新 sender, 路由器 fan-out 到所有。
+    subscribers: Arc<parking_lot::Mutex<Vec<async_channel::Sender<Notification>>>>,
     write_tx: std::sync::mpsc::Sender<Vec<u8>>,
 }
-
-// ============================================================================
 // §9 MuxTransport: 传输层枚举
 // ============================================================================
 
@@ -76,19 +69,20 @@ pub enum MuxTransport {
 // ============================================================================
 // §9 connect_local: 建立本地 socket 连接
 // ============================================================================
-
 /// §9 连接到本地 mux_server Unix socket。
-///
-/// 默认 socket 路径为 `$XDG_RUNTIME_DIR/z3rm/mux.sock` 或 `/tmp/z3rm-mux.sock`。
 pub async fn connect_local(socket_path: impl AsRef<Path>) -> Result<MuxDomain> {
-    // §9 使用 ToFsName trait 将路径转换为 local socket Name。
-    let name = socket_path
-        .as_ref()
-        .to_fs_name::<GenericFilePath>()
-        .map_err(|e| anyhow::anyhow!(e))?;
-    let stream = interprocess::local_socket::traits::Stream::connect(name)
-        .map_err(|e| anyhow::anyhow!(e))?;
-    MuxDomain::connect_with_stream(stream).await
+    let path = socket_path.as_ref().to_path_buf();
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::Builder::new()
+        .name("mux-connect".into())
+        .spawn(move || {
+            let result = std::os::unix::net::UnixStream::connect(&path)
+                .map_err(|e| anyhow::anyhow!(e));
+            let _ = tx.send(result);
+        })
+        .map_err(|e| anyhow::anyhow!("failed to spawn connect thread: {}", e))?;
+    let stream = rx.recv().map_err(|e| anyhow::anyhow!("recv error: {}", e))??;
+    MuxDomain::connect_with_unix_stream(stream)
 }
 
 // ============================================================================
@@ -96,83 +90,60 @@ pub async fn connect_local(socket_path: impl AsRef<Path>) -> Result<MuxDomain> {
 // ============================================================================
 
 impl MuxDomain {
-    /// §9 使用已有 stream 建立连接并启动后台 I/O 任务。
-    pub async fn connect_with_stream(
+    pub fn connect_with_stream(
         stream: interprocess::local_socket::Stream,
     ) -> Result<Self> {
-        // §9 创建通知通道（容量 256）。
-        let (notification_tx, _notification_rx) = mpsc::channel(256);
-        // §9 创建写通道（std sync mpsc，用于 blocking I/O 线程消费）。
         let (write_tx, write_rx) = std::sync::mpsc::channel();
-        // §9 创建响应通道（I/O 任务 → 路由任务）。
-        let (response_tx, response_rx) = mpsc::unbounded_channel();
 
-        // §9 启动后台 I/O 任务。
-        let io_handle =
-            Self::spawn_io_loop(stream, write_rx, response_tx, notification_tx.clone())?;
+        let subscribers: Arc<parking_lot::Mutex<Vec<async_channel::Sender<Notification>>>> =
+            Arc::new(parking_lot::Mutex::new(Vec::new()));
 
         let inner = Arc::new(parking_lot::RwLock::new(DomainInner {
             next_request_id: AtomicU64::new(1),
             pending_requests: HashMap::new(),
-            notification_tx,
+            subscribers: subscribers.clone(),
             write_tx,
         }));
 
-        // §9 启动响应路由任务。
-        let routing_inner = inner.clone();
-        let routing_handle = tokio::spawn(Self::response_router(routing_inner, response_rx));
+        let io_inner = inner.clone();
+        let io_subscribers = subscribers.clone();
+        std::thread::Builder::new()
+            .name("mux-io".into())
+            .spawn(move || {
+                Self::io_and_router_loop(stream, write_rx, io_inner, io_subscribers);
+            })
+            .map_err(|e| anyhow::anyhow!("failed to spawn mux I/O thread: {}", e))?;
 
-        // §3.3 生成窗口 ID (多窗口支持，Plan 32)
         let window_id = format!("win-{}", std::process::id());
 
         Ok(MuxDomain {
             inner,
-            _io_handle: io_handle,
-            _routing_handle: routing_handle,
             window_id,
         })
     }
 
-    /// §9 使用指定传输层创建连接（占位实现，本地 socket 优先）。
     pub async fn connect(_transport: MuxTransport) -> Result<Self> {
         Err(anyhow::anyhow!(
             "connect() with MuxTransport not yet supported; use connect_local()"
         ))
     }
 
-    /// §9 启动后台 I/O 任务：读取帧、解析、分发响应/通知；消费写通道并写入。
-    fn spawn_io_loop(
-        stream: interprocess::local_socket::Stream,
+    fn io_and_router_loop<S: std::io::Read + std::io::Write + Send + 'static>(
+        mut stream: S,
         write_rx: std::sync::mpsc::Receiver<Vec<u8>>,
-        response_tx: mpsc::UnboundedSender<Response>,
-        notification_tx: mpsc::Sender<Notification>,
-    ) -> Result<tokio::task::JoinHandle<()>> {
-        let handle = tokio::task::spawn_blocking(move || {
-            Self::io_loop(stream, write_rx, response_tx, notification_tx)
-        });
-        Ok(handle)
-    }
-
-    /// §9 I/O 循环：读取响应帧 + 消费写通道 + 分发通知。
-    fn io_loop(
-        mut stream: interprocess::local_socket::Stream,
-        write_rx: std::sync::mpsc::Receiver<Vec<u8>>,
-        response_tx: mpsc::UnboundedSender<Response>,
-        notification_tx: mpsc::Sender<Notification>,
+        inner: Arc<parking_lot::RwLock<DomainInner>>,
+        subscribers: Arc<parking_lot::Mutex<Vec<async_channel::Sender<Notification>>>>,
     ) {
         let mut buf = Vec::new();
 
         loop {
-            // §9 轮询写通道（非阻塞）。
+            // §9 轮询写通道（非阻塞）
             loop {
                 match write_rx.try_recv() {
                     Ok(framed) => {
-                        match stream.write_all(&framed) {
-                            Ok(_) => {}
-                            Err(e) => {
-                                tracing::error!(error = %e, "socket write error");
-                                return;
-                            }
+                        if stream.write_all(&framed).is_err() {
+                            tracing::error!("socket write error");
+                            return;
                         }
                     }
                     Err(std::sync::mpsc::TryRecvError::Empty) => break,
@@ -180,8 +151,8 @@ impl MuxDomain {
                 }
             }
 
-            // §9 读取下一帧。
-            match Self::read_next_frame(&mut stream, &mut buf) {
+            // §9 读取下一帧
+            match Self::read_next_frame_generic(&mut stream, &mut buf) {
                 Ok(Some(framed)) => {
                     let envelope = match mux_protocol::unframe(&framed) {
                         Ok((env, _)) => env,
@@ -193,15 +164,16 @@ impl MuxDomain {
 
                     match envelope.payload {
                         Some(EnvelopePayload::Response(resp)) => {
-                            if response_tx.send(resp).is_err() {
-                                tracing::warn!("response channel closed");
-                                break;
+                            let sender = inner.write().pending_requests.remove(&resp.request_id);
+                            if let Some(tx) = sender {
+                                let _ = tx.try_send(resp);
                             }
                         }
                         Some(EnvelopePayload::Notification(notif)) => {
-                            if notification_tx.blocking_send(notif).is_err() {
-                                tracing::warn!("notification channel closed");
-                                break;
+                            let mut subs = subscribers.lock();
+                            subs.retain(|tx| !tx.is_closed());
+                            for tx in subs.iter() {
+                                let _ = tx.try_send(notif.clone());
                             }
                         }
                         Some(EnvelopePayload::Request(_)) => {
@@ -223,6 +195,81 @@ impl MuxDomain {
         }
     }
 
+    /// Connect using std UnixStream (avoids interprocess connection issues)
+    pub fn connect_with_unix_stream(mut stream: std::os::unix::net::UnixStream) -> Result<Self> {
+        // Set non-blocking mode so read() doesn't block the I/O thread
+        stream.set_nonblocking(true).map_err(|e| anyhow::anyhow!(e))?;
+        let (write_tx, write_rx) = std::sync::mpsc::channel();
+
+        let subscribers: Arc<parking_lot::Mutex<Vec<async_channel::Sender<Notification>>>> =
+            Arc::new(parking_lot::Mutex::new(Vec::new()));
+
+        let inner = Arc::new(parking_lot::RwLock::new(DomainInner {
+            next_request_id: AtomicU64::new(1),
+            pending_requests: HashMap::new(),
+            subscribers: subscribers.clone(),
+            write_tx,
+        }));
+
+        let io_inner = inner.clone();
+        let io_subscribers = subscribers.clone();
+        std::thread::Builder::new()
+            .name("mux-io".into())
+            .spawn(move || {
+                Self::io_and_router_loop(stream, write_rx, io_inner, io_subscribers);
+            })
+            .map_err(|e| anyhow::anyhow!("failed to spawn mux I/O thread: {}", e))?;
+
+        let window_id = format!("win-{}", std::process::id());
+
+        Ok(MuxDomain {
+            inner,
+            window_id,
+        })
+    }
+
+    /// Generic frame reader for any Read+Write stream
+    fn read_next_frame_generic<S: std::io::Read + std::io::Write>(
+        stream: &mut S,
+        buf: &mut Vec<u8>,
+    ) -> std::io::Result<Option<Vec<u8>>> {
+        let (frame_len, header_len) = match Self::try_parse_frame_header(buf) {
+            Some(ok) => ok,
+            None => {
+                let mut read_buf = [0u8; 256];
+                match stream.read(&mut read_buf) {
+                    Ok(0) => return Ok(None),
+                    Ok(n) => buf.extend_from_slice(&read_buf[..n]),
+                    Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => return Ok(None),
+                    Err(e) => return Err(e),
+                }
+                match Self::try_parse_frame_header(buf) {
+                    Some(ok) => ok,
+                    None => return Ok(None),
+                }
+            }
+        };
+        let frame_len = frame_len as usize;
+        let header_len = header_len as usize;
+        let total_len = header_len + frame_len;
+        if buf.len() < total_len {
+            loop {
+                let mut read_buf = [0u8; 256];
+                match stream.read(&mut read_buf) {
+                    Ok(0) => return Ok(None),
+                    Ok(n) => buf.extend_from_slice(&read_buf[..n]),
+                    Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => return Ok(None),
+                    Err(e) => return Err(e),
+                }
+                if buf.len() >= total_len {
+                    break;
+                }
+            }
+        }
+
+        let frame = buf.drain(0..total_len).collect();
+        Ok(Some(frame))
+    }
     /// §9 读取下一帧数据。
     fn read_next_frame(
         stream: &mut interprocess::local_socket::Stream,
@@ -283,32 +330,6 @@ impl MuxDomain {
         None
     }
 
-    /// §9 响应路由任务：从 response_rx 读取响应，路由到对应的 oneshot sender。
-    async fn response_router(
-        inner: Arc<parking_lot::RwLock<DomainInner>>,
-        mut response_rx: mpsc::UnboundedReceiver<Response>,
-    ) {
-        while let Some(resp) = response_rx.recv().await {
-            // §9 查找对应的 oneshot sender。
-            let sender = {
-                let mut d = inner.write();
-                d.pending_requests.remove(&resp.request_id)
-            };
-
-            // §9 路由到等待中的请求。
-            match sender {
-                Some(tx) => {
-                    let _ = tx.send(resp);
-                }
-                None => {
-                    tracing::trace!(
-                        request_id = resp.request_id,
-                        "no pending request for response"
-                    );
-                }
-            }
-        }
-    }
 
     /// §9 分配新的 request_id（§16.6 公开供扩展安装使用）。
     pub fn next_request_id(&self) -> u64 {
@@ -318,16 +339,13 @@ impl MuxDomain {
     /// §9 发送请求并等待响应（§16.6 公开供扩展安装使用）。
     pub async fn send_request(&self, body: RequestBody) -> Result<Response> {
         let request_id = self.next_request_id();
+        let (tx, rx) = async_channel::bounded(1);
 
-        let (tx, rx) = oneshot::channel();
-
-        // §9 注册待处理请求。
         {
             let mut inner = self.inner.write();
             inner.pending_requests.insert(request_id, tx);
         }
 
-        // §9 构建 Request 消息并编码为帧。
         let request = Request {
             request_id,
             body: Some(body),
@@ -338,27 +356,33 @@ impl MuxDomain {
         };
         let framed = frame(&envelope)?;
 
-        // §9 通过写通道发送帧数据给 I/O 任务。
         self.inner
             .read()
             .write_tx
             .send(framed)
             .map_err(|e| anyhow::anyhow!("write channel error: {}", e))?;
 
-        // §9 等待 oneshot 响应。
-        let resp =
-            tokio::time::timeout(std::time::Duration::from_secs(30), rx)
-                .await
-                .map_err(|_| anyhow::anyhow!("request timeout"))?
-                .map_err(|_| anyhow::anyhow!("request cancelled"))?;
-
-        // §9 检查错误。
+        // §9 等待响应 (30s 超时，轮询实现)
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+        let resp = loop {
+            match rx.try_recv() {
+                Ok(resp) => break resp,
+                Err(async_channel::TryRecvError::Closed) => {
+                    return Err(anyhow::anyhow!("connection closed"));
+                }
+                Err(async_channel::TryRecvError::Empty) => {
+                    if std::time::Instant::now() >= deadline {
+                        return Err(anyhow::anyhow!("request timeout"));
+                    }
+                    std::thread::sleep(std::time::Duration::from_millis(10));
+                }
+            }
+        };
         if let Some(ResponseBody::Error(err)) = &resp.body {
             if !err.is_empty() {
                 return Err(anyhow::anyhow!("mux server error: {}", err));
             }
         }
-
         Ok(resp)
     }
 
@@ -613,11 +637,9 @@ impl MuxDomain {
     // §9 订阅通知（§9）
     // ========================================================================
 
-    /// §9 获取通知通道接收端。
-    pub fn subscribe(&self) -> mpsc::Receiver<Notification> {
-        // §9 TODO: 使用 broadcast channel 实现多订阅者。
-        let (tx, rx) = mpsc::channel(256);
-        drop(tx);
+    pub fn subscribe(&self) -> async_channel::Receiver<Notification> {
+        let (tx, rx) = async_channel::bounded(256);
+        self.inner.read().subscribers.lock().push(tx);
         rx
     }
 }

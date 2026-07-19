@@ -5,6 +5,7 @@ use settings_macros::{MergeFrom, with_fallible_options};
 /// UI chrome workspace settings (spec §16 Plan 16)
 #[with_fallible_options]
 #[derive(Clone, Debug, PartialEq, Default, Serialize, Deserialize, JsonSchema, MergeFrom)]
+#[serde(default)]
 pub struct WorkspaceSettingsContent {
     /// What draws window decorations/titlebar. Default: client
     pub window_decorations: WindowDecorations,
@@ -51,6 +52,7 @@ pub enum TextRenderingMode {
 /// Whether the focused panel follows the mouse location.
 #[with_fallible_options]
 #[derive(Copy, Clone, PartialEq, Debug, Default, Serialize, Deserialize, JsonSchema, MergeFrom)]
+#[serde(default)]
 pub struct FocusFollowsMouse {
     /// Whether focus follows the mouse. Default: false
     pub enabled: bool,
@@ -70,6 +72,7 @@ pub enum OnLastWindowClosed {
 /// Tab settings for terminal panes (spec §16 Plan 16)
 #[with_fallible_options]
 #[derive(Clone, Default, Debug, PartialEq, Serialize, Deserialize, JsonSchema, MergeFrom)]
+#[serde(default)]
 pub struct TabBarSettingsContent {
     /// Whether to show the middle click to close tab behavior. Default: true
     pub middle_click_to_close: bool,
@@ -102,6 +105,7 @@ pub enum ShowCloseButton {
 /// Status bar settings (spec §16 Plan 16)
 #[with_fallible_options]
 #[derive(Clone, Default, Serialize, Deserialize, JsonSchema, MergeFrom, Debug, PartialEq, Eq)]
+#[serde(default)]
 pub struct StatusBarSettingsContent {
     /// Whether to show the stack size on the status bar. Default: false
     pub stack_size: bool,

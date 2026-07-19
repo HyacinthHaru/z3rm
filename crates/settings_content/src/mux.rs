@@ -5,6 +5,7 @@ use settings_macros::{MergeFrom, with_fallible_options};
 /// 多路复用器设置 (spec §16 Plan 16)
 #[with_fallible_options]
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize, JsonSchema, MergeFrom)]
+#[serde(default)]
 pub struct MuxSettingsContent {
     /// Unix socket path for the mux server.
     pub socket_path: Option<String>,

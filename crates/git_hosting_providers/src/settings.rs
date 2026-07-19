@@ -69,7 +69,7 @@ impl Settings for GitHostingProviderSettings {
                 .project
                 .git_hosting_providers
                 .clone()
-                .unwrap()
+                .unwrap_or_default()
                 .into(),
         }
     }

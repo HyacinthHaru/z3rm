@@ -80,20 +80,29 @@ pub fn default_socket_path() -> PathBuf {
 
 pub async fn ensure_daemon_running() -> Result<MuxDomain> {
     let socket_path = default_socket_path();
-
-    if let Ok(domain) = mux::connect_local(&socket_path).await {
-        tracing::info!("connected to existing daemon");
-        return Ok(domain);
+    eprintln!("[z3rm] Attempting connect to {}", socket_path.display());
+    match mux::connect_local(&socket_path).await {
+        Ok(domain) => {
+            eprintln!("[z3rm] Connected to existing daemon");
+            tracing::info!("connected to existing daemon");
+            return Ok(domain);
+        }
+        Err(e) => {
+            eprintln!("[z3rm] Connection failed: {}", e);
+        }
     }
+    eprintln!("[z3rm] Spawning daemon...");
 
     tracing::info!("daemon not running, spawning...");
     spawn_daemon()?;
 
     wait_for_socket(&socket_path, Duration::from_secs(5)).await?;
+    eprintln!("[z3rm] Socket ready, connecting...");
 
     let domain = mux::connect_local(&socket_path)
         .await
         .context("failed to connect to daemon after spawn")?;
+    eprintln!("[z3rm] Connected to daemon after spawn");
     tracing::info!("connected to daemon after spawn");
     Ok(domain)
 }
@@ -114,11 +123,11 @@ fn spawn_daemon() -> Result<()> {
     } else {
         "z3rm-server".to_string()
     };
-
     let result = Command::new(&binary_name)
         .arg("--daemonize")
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
         .spawn();
-
     match result {
         Ok(_) => {
             tracing::info!(binary = %binary_name, "spawned daemon");
@@ -135,10 +144,11 @@ fn spawn_daemon() -> Result<()> {
         }
     }
 }
-/// 轮询等待 socket 文件就绪 (§16.1)
+/// 轮询等待 socket 就绪（验证 daemon 实际可连接）§16.1
 async fn wait_for_socket(socket_path: &Path, timeout: Duration) -> Result<()> {
     let start = std::time::Instant::now();
-    let poll_interval = Duration::from_millis(50);
+    let poll_interval = Duration::from_millis(100);
+    let path = socket_path.to_path_buf();
 
     loop {
         if start.elapsed() > timeout {
@@ -149,16 +159,28 @@ async fn wait_for_socket(socket_path: &Path, timeout: Duration) -> Result<()> {
             ));
         }
 
-        if socket_path.exists() {
+        // 尝试实际连接来验证 daemon 正在监听
+        let p = path.clone();
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::Builder::new()
+            .name("mux-sock-check".into())
+            .spawn(move || {
+                let result = std::os::unix::net::UnixStream::connect(&p);
+                let _ = tx.send(result);
+            })
+            .ok();
+        let result = rx.recv()?;
+        if result.is_ok() {
             tracing::info!(
-                "daemon socket ready at {} after {:?}",
+                "daemon socket ready and connected at {} after {:?}",
                 socket_path.display(),
                 start.elapsed()
             );
             return Ok(());
         }
 
-        smol::Timer::after(poll_interval).await;
+        // Sleep without blocking GPUI (use thread sleep in async context)
+        std::thread::sleep(poll_interval);
     }
 }
 
@@ -204,4 +226,27 @@ pub async fn ensure_pane_in_session(domain: &MuxDomain, session_id: &str) -> Res
         .await?;
     tracing::info!(pane_id = %pane_id, "spawned default terminal pane");
     Ok(())
+}
+
+/// 获取 session 的第一个 pane id (用于创建 MuxPaneView)。
+pub async fn get_first_pane_id(domain: &MuxDomain) -> Result<Option<String>> {
+    let sessions = domain.list_sessions().await?;
+    let session = sessions.first().context("no sessions")?;
+    let session_id = &session.id;
+    
+    // Attach to get snapshot
+    let attach_resp = domain.attach(session_id, mux::AttachMode::Shared).await?;
+    let snapshot = attach_resp.snapshot.context("no snapshot")?;
+    
+    // Find first pane
+    let pane_id = snapshot.tabs.iter()
+        .flat_map(|t| &t.panes)
+        .map(|p| &p.id)
+        .next()
+        .cloned();
+    
+    // Detach since we just needed to read
+    let _ = domain.detach().await;
+    
+    Ok(pane_id)
 }

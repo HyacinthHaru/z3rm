@@ -18,11 +18,13 @@ doctest = false
 [dependencies]
 anyhow.workspace = true
 async-recursion.workspace = true
+futures.workspace = true
 collections.workspace = true
 db.workspace = true
 dirs.workspace = true
 editor.workspace = true
-futures.workspace = true
+mux.workspace = true
+mux_protocol.workspace = true
 gpui.workspace = true
 itertools.workspace = true
 language.workspace = true

@@ -38,6 +38,10 @@ pub fn check_permission(role: ClientRole, required: ClientRole) -> bool {
 }
 
 /// 处理单个客户端连接 (§9)
+///
+/// 单一 outbound mpsc channel 同时承载 Response 和 Notification:
+/// 写循环 (write_handle) 消费 channel, 把 Envelope framed 写回 socket。
+/// 这样所有写操作都在同一个 tokio task 内串行化, 避免并发 write 冲突。
 pub async fn handle_connection(
     stream: UnixStream,
     sessions: Arc<parking_lot::RwLock<Vec<crate::session::Session>>>,
@@ -46,34 +50,38 @@ pub async fn handle_connection(
 ) -> anyhow::Result<()> {
     let (reader, writer) = tokio::io::split(stream);
 
-    let (notification_tx, mut notification_rx) =
-        mpsc::unbounded_channel::<Notification>();
+    // §9 outbound channel: Response 或 Notification 都走这个
+    let (outbound_tx, mut outbound_rx) =
+        mpsc::unbounded_channel::<Envelope>();
 
     // §3.3 客户端角色: 初始为 None, attach 后设置 (Plan 33)
     let client_role: Arc<parking_lot::Mutex<Option<ClientRole>>> =
         Arc::new(parking_lot::Mutex::new(None));
 
-    let read_handle = tokio::spawn(async move {
-        let mut reader = reader;
-        loop {
-            let envelope = read_envelope(&mut reader).await?;
-            dispatch_envelope(&envelope, &sessions, &notification_tx, &db, &clipboard, &client_role).await?;
-        }
-        #[allow(unreachable_code)]
-        Ok::<_, anyhow::Error>(())
-    });
+    let read_handle = {
+        let outbound_tx = outbound_tx.clone();
+        tokio::spawn(async move {
+            let mut reader = reader;
+            loop {
+                let envelope = read_envelope(&mut reader).await?;
+                dispatch_envelope(&envelope, &sessions, &outbound_tx, &db, &clipboard, &client_role).await?;
+            }
+            #[allow(unreachable_code)]
+            Ok::<_, anyhow::Error>(())
+        })
+    };
 
-    // §9 通知推送循环: 向客户端推送 Notification
+    // §9 写循环: 消费 outbound channel, framed 写回客户端
     let write_handle = tokio::spawn(async move {
         let mut writer = writer;
-        while let Some(notification) = notification_rx.recv().await {
-            let envelope = Envelope {
-                version: Some(mux_protocol::PROTOCOL_VERSION.clone()),
-                payload: Some(EnvelopePayload::Notification(notification)),
-            };
+        while let Some(envelope) = outbound_rx.recv().await {
             if let Ok(framed) = mux_protocol::frame(&envelope) {
-                writer.write_all(&framed).await?;
-                writer.flush().await?;
+                if writer.write_all(&framed).await.is_err() {
+                    break;
+                }
+                if writer.flush().await.is_err() {
+                    break;
+                }
             }
         }
         Ok::<_, anyhow::Error>(())
@@ -104,8 +112,8 @@ async fn read_envelope(
     let mut data = vec![0u8; len as usize];
     reader.read_exact(&mut data).await?;
 
-    // 解码 Envelope
-    let envelope = Envelope::decode_length_delimited(&data[..])?;
+    // 解码 Envelope (varint 前缀已读取, 用 decode 而非 decode_length_delimited)
+    let envelope = Envelope::decode(&data[..])?;
     Ok(envelope)
 }
 
@@ -113,7 +121,7 @@ async fn read_envelope(
 async fn dispatch_envelope(
     envelope: &Envelope,
     sessions: &Arc<parking_lot::RwLock<Vec<crate::session::Session>>>,
-    notification_tx: &mpsc::UnboundedSender<Notification>,
+    outbound_tx: &mpsc::UnboundedSender<Envelope>,
     _db: &Arc<parking_lot::Mutex<Connection>>,
     clipboard: &Arc<crate::clipboard::ServerClipboard>,
     client_role: &Arc<parking_lot::Mutex<Option<ClientRole>>>,
@@ -126,8 +134,11 @@ async fn dispatch_envelope(
     match payload {
         EnvelopePayload::Request(req) => {
             let request_id = req.request_id;
-            let response = dispatch_request(req, sessions, notification_tx, clipboard, client_role).await?;
-            send_response(response, request_id).await?;
+            // dispatch_request 内部会把 Response 通过 outbound_tx 发回,
+            // 也可能向 outbound_tx push Notification (用于 attach 等)
+            dispatch_request(req, sessions, outbound_tx, clipboard, client_role).await?;
+            // request_id 仅用于日志, 实际 response 已经在 dispatch_request 内发出
+            let _ = request_id;
         }
         EnvelopePayload::Response(_) => {
             tracing::warn!("unexpected Response from client");
@@ -139,23 +150,24 @@ async fn dispatch_envelope(
 
     Ok(())
 }
-/// §9 分发请求到具体处理器
+/// §9 分发请求到具体处理器, 通过 outbound_tx 把 Response 写回客户端。
 async fn dispatch_request(
     req: &Request,
     sessions: &Arc<parking_lot::RwLock<Vec<crate::session::Session>>>,
-    notification_tx: &mpsc::UnboundedSender<Notification>,
+    outbound_tx: &mpsc::UnboundedSender<Envelope>,
     clipboard: &Arc<crate::clipboard::ServerClipboard>,
     client_role: &Arc<parking_lot::Mutex<Option<ClientRole>>>,
-) -> anyhow::Result<Response> {
+) -> anyhow::Result<()> {
     let request_id = req.request_id;
 
     let body = match &req.body {
         Some(b) => b,
         None => {
-            return Ok(Response {
+            send_response(outbound_tx, Response {
                 request_id,
                 body: Some(ResponseBody::Error("empty request body".to_string())),
-            });
+            })?;
+            return Ok(());
         }
     };
 
@@ -166,7 +178,7 @@ async fn dispatch_request(
         // §3.3 无权限要求的操作
         RequestBody::CreateSession(r) => handle_create_session(r, sessions).await?,
         RequestBody::ListSessions(_) => handle_list_sessions(sessions).await?,
-        RequestBody::Attach(r) => handle_attach(r, sessions, client_role).await?,
+        RequestBody::Attach(r) => handle_attach(r, sessions, client_role, outbound_tx).await?,
         RequestBody::Detach(_) => handle_detach(sessions).await?,
         RequestBody::FetchGridUpdate(r) => handle_fetch_grid_update(r, sessions).await?,
         RequestBody::FetchScrollback(r) => handle_fetch_scrollback(r, sessions).await?,
@@ -197,7 +209,7 @@ async fn dispatch_request(
         }
         RequestBody::NewWindow(r) => {
             if check_permission(role, ClientRole::Admin) {
-                handle_new_window(r, sessions, notification_tx).await?
+                handle_new_window(r, sessions, outbound_tx).await?
             } else {
                 ResponseBody::Error("permission denied: admin required".to_string())
             }
@@ -206,28 +218,28 @@ async fn dispatch_request(
         // §3.3 需要 ReadWrite 的 pane 操作 (Plan 33)
         RequestBody::SpawnPane(r) => {
             if check_permission(role, ClientRole::ReadWrite) {
-                handle_spawn_pane(r, sessions).await?
+                handle_spawn_pane(r, sessions, outbound_tx).await?
             } else {
                 ResponseBody::Error("permission denied: read-write required".to_string())
             }
         }
         RequestBody::SplitPane(r) => {
             if check_permission(role, ClientRole::ReadWrite) {
-                handle_split_pane(r, sessions).await?
+                handle_split_pane(r, sessions, outbound_tx).await?
             } else {
                 ResponseBody::Error("permission denied: read-write required".to_string())
             }
         }
         RequestBody::ClosePane(r) => {
             if check_permission(role, ClientRole::ReadWrite) {
-                handle_close_pane(r, sessions).await?
+                handle_close_pane(r, sessions, outbound_tx).await?
             } else {
                 ResponseBody::Error("permission denied: read-write required".to_string())
             }
         }
         RequestBody::FocusPane(r) => {
             if check_permission(role, ClientRole::ReadWrite) {
-                handle_focus_pane(r, sessions).await?
+                handle_focus_pane(r, sessions, outbound_tx).await?
             } else {
                 ResponseBody::Error("permission denied: read-write required".to_string())
             }
@@ -243,21 +255,21 @@ async fn dispatch_request(
         // §3.3 需要 ReadWrite 的输入操作 (Plan 33)
         RequestBody::SendInput(r) => {
             if check_permission(role, ClientRole::ReadWrite) {
-                handle_send_input(r, sessions, clipboard, notification_tx).await?
+                handle_send_input(r, sessions, clipboard, outbound_tx).await?
             } else {
                 ResponseBody::Error("permission denied: read-write required".to_string())
             }
         }
         RequestBody::Paste(r) => {
             if check_permission(role, ClientRole::ReadWrite) {
-                handle_paste(r, sessions, clipboard, notification_tx).await?
+                handle_paste(r, sessions).await?
             } else {
                 ResponseBody::Error("permission denied: read-write required".to_string())
             }
         }
         RequestBody::SetClipboard(r) => {
             if check_permission(role, ClientRole::ReadWrite) {
-                handle_set_clipboard(r, clipboard, notification_tx).await?
+                handle_set_clipboard(r, clipboard, outbound_tx).await?
             } else {
                 ResponseBody::Error("permission denied: read-write required".to_string())
             }
@@ -276,13 +288,39 @@ async fn dispatch_request(
         RequestBody::StatFile(_) => ResponseBody::Error("stat_file not implemented yet".to_string()),
     };
 
-    Ok(Response {
+    // §9 把 Response 通过 outbound channel 写回客户端
+    send_response(outbound_tx, Response {
         request_id,
         body: Some(resp_body),
-    })
+    })?;
+
+    Ok(())
 }
 
-/// §3.10 创建会话
+/// §9 通过 outbound channel 把 Response 封装成 Envelope 发回客户端。
+fn send_response(
+    outbound_tx: &mpsc::UnboundedSender<Envelope>,
+    response: Response,
+) -> anyhow::Result<()> {
+    let envelope = Envelope {
+        version: Some(mux_protocol::PROTOCOL_VERSION.clone()),
+        payload: Some(EnvelopePayload::Response(response)),
+    };
+    outbound_tx.send(envelope).map_err(|_| anyhow::anyhow!("client disconnected"))
+}
+
+
+/// §9 通过 outbound channel 把 Notification 封装成 Envelope 推送。
+fn send_notification_envelope(
+    outbound_tx: &mpsc::UnboundedSender<Envelope>,
+    notification: Notification,
+) -> Result<(), mpsc::error::SendError<Envelope>> {
+    let envelope = Envelope {
+        version: Some(mux_protocol::PROTOCOL_VERSION.clone()),
+        payload: Some(EnvelopePayload::Notification(notification)),
+    };
+    outbound_tx.send(envelope)
+}
 async fn handle_create_session(
     req: &CreateSessionRequest,
     sessions: &Arc<parking_lot::RwLock<Vec<crate::session::Session>>>,
@@ -338,12 +376,12 @@ async fn handle_kill_session(
     }
     Ok(ResponseBody::Error(String::new()))
 }
-
-/// §3.10 连接会话
+/// §3.10 连接会话 — 把客户端的 outbound_tx 注册为所有 pane 的 subscriber
 async fn handle_attach(
     req: &AttachRequest,
     sessions: &Arc<parking_lot::RwLock<Vec<crate::session::Session>>>,
     client_role: &Arc<parking_lot::Mutex<Option<ClientRole>>>,
+    outbound_tx: &mpsc::UnboundedSender<Envelope>,
 ) -> anyhow::Result<ResponseBody> {
     let mut sessions_w = sessions.write();
     let session = sessions_w
@@ -351,7 +389,6 @@ async fn handle_attach(
         .find(|s| s.id == req.session_id)
         .ok_or_else(|| anyhow::anyhow!("session not found: {}", req.session_id))?;
 
-    // §16.12 记录客户端 attach 事件
     zlog::info!("client attached: session={} mode={:?}", req.session_id, req.mode);
 
     // §3.3 解析客户端身份 (Plan 33)
@@ -365,14 +402,11 @@ async fn handle_attach(
         format!("client-{}", std::process::id())
     };
 
-    // §3.3 从 ClientIdentity 提取角色 (Plan 33)
     let role = if let Some(identity) = &req.identity {
         proto_role_to_client_role(identity.role)
     } else {
-        ClientRole::ReadWrite // 无 identity 时默认 ReadWrite
+        ClientRole::ReadWrite
     };
-
-    // §3.3 将角色写入连接级状态 (Plan 33)
     *client_role.lock() = Some(role);
 
     let mode = match req.mode {
@@ -384,9 +418,33 @@ async fn handle_attach(
     };
     session.add_attached_client(client_id, mode, role);
 
-    // §3.3 将窗口 ID 注册到会话 (Plan 32)
     if !req.window_id.is_empty() {
         session.add_window(req.window_id.clone());
+    }
+
+    // §3.4 把该连接的 outbound_tx 注册为 session 内所有 pane 的 subscriber。
+    // 后续 PTY output → bump generation → broadcast PaneDirty → 此连接收到。
+    // 我们用一个 helper channel 把 Notification 包成 Envelope 转发到 outbound。
+    let notification_forward_tx = outbound_tx.clone();
+    let panes = session.panes.clone();
+    let panes_r = panes.read();
+    for (_id, pane) in panes_r.iter() {
+        // 创建一个内层 channel, 把 Notification 转成 Envelope 转发
+        let (inner_tx, mut inner_rx) = mpsc::unbounded_channel::<Notification>();
+        pane.add_subscriber(inner_tx);
+        // forward task: 把 inner Notification 包成 Envelope 发到 outbound
+        let forward_tx = notification_forward_tx.clone();
+        tokio::spawn(async move {
+            while let Some(notif) = inner_rx.recv().await {
+                let envelope = Envelope {
+                    version: Some(mux_protocol::PROTOCOL_VERSION.clone()),
+                    payload: Some(EnvelopePayload::Notification(notif)),
+                };
+                if forward_tx.send(envelope).is_err() {
+                    break;
+                }
+            }
+        });
     }
 
     Ok(ResponseBody::Attach(AttachResponse {
@@ -411,7 +469,7 @@ async fn handle_detach(
 async fn handle_new_window(
     req: &NewWindowRequest,
     sessions: &Arc<parking_lot::RwLock<Vec<crate::session::Session>>>,
-    notification_tx: &mpsc::UnboundedSender<Notification>,
+    outbound_tx: &mpsc::UnboundedSender<Envelope>,
 ) -> anyhow::Result<ResponseBody> {
     let mut sessions_w = sessions.write();
     let session = sessions_w
@@ -443,7 +501,7 @@ async fn handle_new_window(
             ),
         ),
     };
-    let _ = notification_tx.send(notify);
+    let _ = send_notification_envelope(outbound_tx, notify);
 
     // §3.3 返回新窗口信息与会话快照
     Ok(ResponseBody::NewWindow(NewWindowResponse {
@@ -458,21 +516,102 @@ async fn handle_new_window(
     }))
 }
 
-/// §3.10 创建 pane
+/// §3.10 创建 pane — 真正 spawn PTY + alacritty Term (server-canonical)
 async fn handle_spawn_pane(
-    _req: &SpawnPaneRequest,
-    _sessions: &Arc<parking_lot::RwLock<Vec<crate::session::Session>>>,
+    req: &SpawnPaneRequest,
+    sessions: &Arc<parking_lot::RwLock<Vec<crate::session::Session>>>,
+    outbound_tx: &mpsc::UnboundedSender<Envelope>,
 ) -> anyhow::Result<ResponseBody> {
     let pane_id = nanoid::nanoid!();
-    // §16.12 记录 pane 创建事件
-    zlog::info!("pane spawned: id={}", pane_id);
+
+    // §3.1 转换 ShellCommand → pane::ShellCommand
+    let shell_cmd = req.command.as_ref().map(|c| crate::pane::ShellCommand {
+        program: c.program.clone(),
+        args: c.args.clone(),
+        env: c.env.iter().map(|(k, v)| (k.clone(), v.clone())).collect(),
+    });
+
+    // §3.10 解析 cwd (空则用 session.cwd)
+    let cwd = {
+        let sessions_r = sessions.read();
+        sessions_r
+            .iter()
+            .find(|s| s.id == req.session_id)
+            .map(|s| s.cwd.clone())
+            .unwrap_or_default()
+    };
+    let cwd = req.cwd.clone().unwrap_or(cwd);
+
+    // §3.1 解析 size
+    let (cols, rows) = req
+        .size
+        .as_ref()
+        .map(|s| (s.cols, s.rows))
+        .unwrap_or((80, 24));
+
+    // §3.1 spawn PTY + alacritty Term
+    let pane = crate::pane::Pane::spawn(
+        pane_id.clone(),
+        cwd,
+        cols,
+        rows,
+        shell_cmd,
+    )?;
+
+    // §3.10 把 pane 加入 session 的 panes registry
+    {
+        let mut sessions_w = sessions.write();
+        if let Some(session) = sessions_w.iter_mut().find(|s| s.id == req.session_id) {
+            session.panes.write().insert(pane_id.clone(), pane);
+            session.set_focused_pane(pane_id.clone());
+        }
+    }
+
+    // §3.4 把该连接的 outbound_tx 注册为新 pane 的 subscriber
+    // (其他已 attach 的连接也需要注册 — TODO: session-level subscriber list)
+    {
+        let sessions_r = sessions.read();
+        if let Some(session) = sessions_r.iter().find(|s| s.id == req.session_id) {
+            let panes = session.panes.clone();
+            if let Some(pane) = panes.read().get(&pane_id) {
+                let (inner_tx, mut inner_rx) = mpsc::unbounded_channel::<Notification>();
+                pane.add_subscriber(inner_tx);
+                let forward_tx = outbound_tx.clone();
+                tokio::spawn(async move {
+                    while let Some(notif) = inner_rx.recv().await {
+                        let envelope = Envelope {
+                            version: Some(mux_protocol::PROTOCOL_VERSION.clone()),
+                            payload: Some(EnvelopePayload::Notification(notif)),
+                        };
+                        if forward_tx.send(envelope).is_err() {
+                            break;
+                        }
+                    }
+                });
+            }
+        }
+    }
+
+    zlog::info!("pane spawned: id={} session={}", pane_id, req.session_id);
+
+    // §3.4 推送 PaneAdded 通知
+    let notify = Notification {
+        event: Some(mux_protocol::notification::Event::PaneAdded(
+            mux_protocol::PaneAdded {
+                pane_id: pane_id.clone(),
+                tab_id: req.tab_id.clone(),
+            },
+        )),
+    };
+    let _ = send_notification_envelope(outbound_tx, notify);
+
     Ok(ResponseBody::PaneId(pane_id))
 }
-
-/// §3.10 分割 pane
+/// §3.10 分割 pane — split layout + spawn new pane with parent's cwd
 async fn handle_split_pane(
     req: &SplitPaneRequest,
     sessions: &Arc<parking_lot::RwLock<Vec<crate::session::Session>>>,
+    outbound_tx: &mpsc::UnboundedSender<Envelope>,
 ) -> anyhow::Result<ResponseBody> {
     let direction = match req.direction {
         1 => crate::layout::SplitDirection::LeftRight,
@@ -487,6 +626,51 @@ async fn handle_split_pane(
             session
                 .layout
                 .split(&req.pane_id, new_pane_id.clone(), direction)?;
+
+            // §3.10 spawn 新 pane, 继承 parent pane 的 cwd
+            let parent_cwd = session.panes.read().get(&req.pane_id).map(|p| p.cwd.clone()).unwrap_or_default();
+            let parent_cols = session.panes.read().get(&req.pane_id).map(|p| p.get_cols()).unwrap_or(80);
+            let parent_rows = session.panes.read().get(&req.pane_id).map(|p| p.get_rows()).unwrap_or(24);
+
+            let pane = crate::pane::Pane::spawn(
+                new_pane_id.clone(),
+                parent_cwd,
+                parent_cols,
+                parent_rows,
+                None,
+            )?;
+            session.panes.write().insert(new_pane_id.clone(), pane);
+            session.set_focused_pane(new_pane_id.clone());
+
+            // §3.4 给新 pane 注册当前连接的 subscriber
+            let pane_ref = session.panes.read().get(&new_pane_id).cloned();
+            if let Some(pane) = pane_ref {
+                let (inner_tx, mut inner_rx) = mpsc::unbounded_channel::<Notification>();
+                pane.add_subscriber(inner_tx);
+                let forward_tx = outbound_tx.clone();
+                tokio::spawn(async move {
+                    while let Some(notif) = inner_rx.recv().await {
+                        let envelope = Envelope {
+                            version: Some(mux_protocol::PROTOCOL_VERSION.clone()),
+                            payload: Some(EnvelopePayload::Notification(notif)),
+                        };
+                        if forward_tx.send(envelope).is_err() {
+                            break;
+                        }
+                    }
+                });
+            }
+
+            // §3.4 PaneAdded 通知
+            let notify = Notification {
+                event: Some(mux_protocol::notification::Event::PaneAdded(
+                    mux_protocol::PaneAdded {
+                        pane_id: new_pane_id.clone(),
+                        tab_id: String::new(),
+                    },
+                )),
+            };
+            let _ = send_notification_envelope(outbound_tx, notify);
         }
     }
 
@@ -497,13 +681,31 @@ async fn handle_split_pane(
 async fn handle_close_pane(
     req: &ClosePaneRequest,
     sessions: &Arc<parking_lot::RwLock<Vec<crate::session::Session>>>,
+    outbound_tx: &mpsc::UnboundedSender<Envelope>,
 ) -> anyhow::Result<ResponseBody> {
     let mut sessions_w = sessions.write();
     for session in sessions_w.iter_mut() {
         if let Err(e) = session.layout.remove_pane(&req.pane_id) {
             tracing::error!(error = ?e, pane_id = %req.pane_id, "failed to remove pane from layout");
         }
+        // §3.10 从 panes registry 移除 (drop 触发 child kill)
+        let mut panes = session.panes.write();
+        if panes.remove(&req.pane_id).is_some() {
+            zlog::info!("pane closed: id={}", req.pane_id);
+        }
     }
+
+    // §3.4 推送 PaneRemoved 通知
+    let notify = Notification {
+        event: Some(mux_protocol::notification::Event::PaneRemoved(
+            mux_protocol::PaneRemoved {
+                pane_id: req.pane_id.clone(),
+                exit_code: 0,
+            },
+        )),
+    };
+    let _ = send_notification_envelope(outbound_tx, notify);
+
     Ok(ResponseBody::Error(String::new()))
 }
 
@@ -511,6 +713,7 @@ async fn handle_close_pane(
 async fn handle_focus_pane(
     req: &FocusPaneRequest,
     sessions: &Arc<parking_lot::RwLock<Vec<crate::session::Session>>>,
+    _outbound_tx: &mpsc::UnboundedSender<Envelope>,
 ) -> anyhow::Result<ResponseBody> {
     let mut sessions_w = sessions.write();
     for session in sessions_w.iter_mut() {
@@ -521,7 +724,7 @@ async fn handle_focus_pane(
     Ok(ResponseBody::Error(String::new()))
 }
 
-/// §3.10 调整 pane 尺寸
+/// §3.10 调整 pane 尺寸 — 真正调用 pane.resize (PTY TIOCSWINSZ + alacritty)
 async fn handle_resize_pane(
     req: &ResizePaneRequest,
     sessions: &Arc<parking_lot::RwLock<Vec<crate::session::Session>>>,
@@ -529,8 +732,8 @@ async fn handle_resize_pane(
     let sessions_r = sessions.read();
     for session in sessions_r.iter() {
         let panes = session.panes.clone();
-        if let Some(_pane) = panes.read().get(&req.pane_id) {
-            // §3.10 ResizePaneRequest: 通知 pane resize
+        if let Some(pane) = panes.read().get(&req.pane_id) {
+            pane.resize(req.cols, req.rows);
         }
     }
     Ok(ResponseBody::Error(String::new()))
@@ -541,7 +744,7 @@ async fn handle_send_input(
     req: &SendInputRequest,
     sessions: &Arc<parking_lot::RwLock<Vec<crate::session::Session>>>,
     clipboard: &Arc<crate::clipboard::ServerClipboard>,
-    notification_tx: &mpsc::UnboundedSender<Notification>,
+    outbound_tx: &mpsc::UnboundedSender<Envelope>,
 ) -> anyhow::Result<ResponseBody> {
     // §16.6 解析 OSC 52 序列: ESC ] 52 ; c ; <base64> BEL/ST
     let mut osc52_parser = crate::clipboard::Osc52Parser::new();
@@ -549,7 +752,7 @@ async fn handle_send_input(
         // §16.6 OSC 52 触发剪贴板更新并通知所有客户端
         let origin_host = std::env::var("HOSTNAME")
             .unwrap_or_else(|_| "z3rm-server".to_string());
-        clipboard.set_from_osc52(&base64_content, origin_host, notification_tx)?;
+        clipboard.set_from_osc52(&base64_content, origin_host, outbound_tx)?;
         // OSC 52 序列已被消费, 不转发到 PTY
         return Ok(ResponseBody::Error(String::new()));
     }
@@ -592,23 +795,16 @@ async fn handle_send_input(
     Ok(ResponseBody::Error(String::new()))
 }
 
-/// §3.10 粘贴文本 + §16.6 bracketed paste 包裹
+/// §3.10 粘贴文本 — 调用 pane.paste (内部处理 bracketed paste markers)
 async fn handle_paste(
     req: &PasteRequest,
     sessions: &Arc<parking_lot::RwLock<Vec<crate::session::Session>>>,
-    _clipboard: &Arc<crate::clipboard::ServerClipboard>,
-    _notification_tx: &mpsc::UnboundedSender<Notification>,
 ) -> anyhow::Result<ResponseBody> {
     let sessions_r = sessions.read();
     for session in sessions_r.iter() {
         let panes = session.panes.clone();
         if let Some(pane) = panes.read().get(&req.pane_id) {
-            // §16.6 如果 bracketed paste 模式激活, 包裹内容
-            let text = crate::clipboard::wrap_bracketed_paste(
-                &req.text,
-                pane.is_bracketed_paste_active(),
-            );
-            pane.paste(&text)?;
+            pane.paste(&req.text)?;
         }
     }
     Ok(ResponseBody::Error(String::new()))
@@ -618,7 +814,7 @@ async fn handle_paste(
 async fn handle_set_clipboard(
     req: &SetClipboardRequest,
     clipboard: &Arc<crate::clipboard::ServerClipboard>,
-    notification_tx: &mpsc::UnboundedSender<Notification>,
+    outbound_tx: &mpsc::UnboundedSender<Envelope>,
 ) -> anyhow::Result<ResponseBody> {
     // §16.6 从 proto 消息转换并设置剪贴板
     let entry = match &req.entry {
@@ -627,7 +823,7 @@ async fn handle_set_clipboard(
             return Ok(ResponseBody::Error("empty clipboard entry".to_string()));
         }
     };
-    clipboard.set_clipboard(entry, notification_tx);
+    clipboard.set_clipboard(entry, outbound_tx);
     Ok(ResponseBody::Error(String::new()))
 }
 
@@ -844,8 +1040,3 @@ async fn handle_fetch_grid_update(
     Ok(ResponseBody::Error("pane not found".to_string()))
 }
 
-/// §9 发送响应回客户端 (stub)
-async fn send_response(_response: Response, _request_id: u64) -> anyhow::Result<()> {
-    // §9: 实际实现中通过 writer 发送
-    Ok(())
-}

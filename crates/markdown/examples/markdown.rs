@@ -40,14 +40,13 @@ pub fn main() {
         cx.set_global(store);
         cx.bind_keys([KeyBinding::new("cmd-c", markdown::Copy, None)]);
 
-        let node_runtime = NodeRuntime::unavailable();
         theme_settings::init(LoadThemes::JustBase, cx);
 
         let fs = fs::FakeFs::new(cx.background_executor().clone());
         let language_registry = LanguageRegistry::new(cx.background_executor().clone());
         language_registry.set_theme(cx.theme().clone());
         let language_registry = Arc::new(language_registry);
-        languages::init(language_registry.clone(), fs, node_runtime, cx);
+        languages::init(language_registry.clone(), fs, cx);
         Assets.load_fonts(cx).unwrap();
 
         cx.activate(true);

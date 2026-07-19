@@ -14,7 +14,7 @@ use assets::Assets;
 use crashes::InitCrashHandler;
 use fs::{Fs, RealFs};
 use futures::StreamExt as _;
-use gpui::{App, Application, TaskExt, WindowOptions};
+use gpui::{App, Application, TaskExt};
 use gpui_platform;
 use parking_lot::Mutex;
 use release_channel::{AppCommitSha, AppVersion, ReleaseChannel};
@@ -291,19 +291,27 @@ fn main() {
 
         // §16.1 daemon 自动启动 → 连接 → session → pane → window
         cx.spawn(async move |cx| {
+            eprintln!("[z3rm] Starting daemon connection flow");
             // 1. 确保 daemon 运行并获取 MuxDomain
             let domain = Arc::new(daemon::ensure_daemon_running().await?);
+            eprintln!("[z3rm] Daemon connected");
 
             // 2. 创建/获取默认 session
+            eprintln!("[z3rm] Creating default session");
             let session_id = daemon::ensure_default_session(&domain).await?;
+            eprintln!("[z3rm] Session created: {}", session_id);
 
             // 2b. 确保 session 中有终端 pane
+            eprintln!("[z3rm] Ensuring pane in session");
             daemon::ensure_pane_in_session(&domain, &session_id).await?;
+            eprintln!("[z3rm] Pane ensured");
 
             // 3. attach 到 session (Shared 模式允许输入)
+            eprintln!("[z3rm] Attaching to session");
             let _attach_resp = domain
                 .attach(&session_id, mux::AttachMode::Shared)
                 .await?;
+            eprintln!("[z3rm] Attached to session");
             tracing::info!(session_id = %session_id, "attached to session");
 
             // 4. 注册窗口关闭回调: detach session (daemon 继续运行)
@@ -321,21 +329,33 @@ fn main() {
                 });
             });
 
-            // 5. 创建窗口 (设置初始尺寸)
+            // 5. 获取第一个 pane id (用于创建 MuxPaneView)
+            eprintln!("[z3rm] Getting first pane id");
+            let pane_id = daemon::get_first_pane_id(&domain).await?
+                .unwrap_or_else(|| "default".to_string());
+            eprintln!("[z3rm] Pane id: {}", pane_id);
+
+            // 6. 创建窗口
+            eprintln!("[z3rm] Creating window");
             use gpui::AppContext as _;
-            let bounds = gpui::WindowBounds::Windowed(gpui::Bounds {
-                size: gpui::size(gpui::px(1440.), gpui::px(900.)),
-                origin: gpui::point(gpui::px(100.), gpui::px(100.)),
-            });
             let _window = cx.update(|cx| {
+                let domain_for_window = domain.clone();
+                let pane_id = pane_id.clone();
                 cx.open_window(
-                    gpui::WindowOptions {
-                        window_bounds: Some(bounds),
-                        ..Default::default()
+                    Default::default(),
+                    |window, cx| {
+                        cx.new(|cx| {
+                            terminal_view::mux_pane::MuxPaneView::new(
+                                pane_id.clone(),
+                                domain_for_window.clone(),
+                                window,
+                                cx,
+                            )
+                        })
                     },
-                    |_, cx| cx.new(|_| gpui::EmptyView),
                 )
             })?;
+            eprintln!("[z3rm] Window created");
             cx.update(|cx| cx.activate(true));
 
             anyhow::Ok(())

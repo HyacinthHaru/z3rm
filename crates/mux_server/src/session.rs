@@ -27,8 +27,8 @@ pub struct Session {
     pub focused_tab: Option<String>,
     /// 已附加的客户端列表
     pub attached_clients: Arc<parking_lot::RwLock<Vec<AttachedClient>>>,
-    /// Pane 注册表: pane_id → Pane
-    pub panes: Arc<parking_lot::RwLock<HashMap<String, Pane>>>,
+    /// Pane 注册表: pane_id → Arc<Pane> (Arc 因为 PTY read 线程 + 多订阅者持有)
+    pub panes: Arc<parking_lot::RwLock<HashMap<String, std::sync::Arc<crate::pane::Pane>>>>,
     /// §16.9 会话级同步滚动状态
     pub sync_scrollback: Arc<parking_lot::RwLock<SyncScrollbackState>>,
     /// §3.3 已连接的窗口 ID 列表 (多窗口支持，Plan 32)

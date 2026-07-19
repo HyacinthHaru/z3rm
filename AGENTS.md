@@ -159,6 +159,7 @@ z3rm is migrating from a Zed fork. Migration holes are marked explicitly and fix
   - `stub` — a placeholder implementation that needs real logic.
   - `disabled-feature` — functionality temporarily disabled during migration.
 * **Feature flag behavior.** Without the `z3rm-migration` feature, `#[z3rm_todo]` expands to `compile_error!`. With `--features z3rm-migration` it registers the hole and compilation succeeds.（来源：spec §8.1）
+* **配置跟随结构。** 修改 `SettingsContent` 或任何配置结构体后，必须重写对应的默认配置文件（如 `default.json`）以匹配新结构，而不是逐个修补缺失字段。
 * **Two-pass discipline.** Pass 1 scans and marks holes; Pass 2 fixes them. Verify milestones with `cargo check --features z3rm-migration`.（来源：spec §8.2）
 * **`.rs.old` files must never be committed.** They are local temporary artifacts. Git history is the official backup; delete `.rs.old` files before any commit.（来源：spec §8.2）
 

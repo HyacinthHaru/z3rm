@@ -275,18 +275,13 @@ impl LogViewer {
         let log_path_load = log_path.clone();
         let filters_clone_for_load = filters.clone();
         cx.spawn(async move |_, cx| {
-            let entries = tokio::task::spawn_blocking({
-                let p = log_path_load.clone();
-                move || read_log_file_sync(&p)
-            })
-            .await
-            .unwrap_or_default();
-            let file_size = tokio::task::spawn_blocking({
-                let p = log_path_load.clone();
-                move || get_file_size_sync(&p)
-            })
-            .await
-            .unwrap_or_default();
+            let log_path_entries = log_path_load.clone();
+            let entries = cx.background_spawn(async move {
+                read_log_file_sync(&log_path_entries)
+            }).await;
+            let file_size = cx.background_spawn(async move {
+                get_file_size_sync(&log_path_load)
+            }).await;
             last_file_size_load.store(file_size, Ordering::Relaxed);
 
             if let Err(e) = viewer.update(cx, |this, cx| {
@@ -307,14 +302,12 @@ impl LogViewer {
         let refresh_task = cx.spawn(async move |this, cx| {
             let refresh_interval = Duration::from_secs(2);
             loop {
-                tokio::time::sleep(refresh_interval).await;
+                smol::Timer::after(refresh_interval).await;
                 let last_size = last_file_size_refresh.load(Ordering::Relaxed);
                 let log_path_copy = log_path_refresh.clone();
-                let new_entries = tokio::task::spawn_blocking({
-                    move || read_new_lines_sync(&log_path_copy, last_size)
-                })
-                .await
-                .unwrap_or_default();
+                let new_entries = cx.background_spawn(async move {
+                    read_new_lines_sync(&log_path_copy, last_size)
+                }).await;
                 if let Some((entries, new_size)) = new_entries {
                     this.update(cx, |this, cx| {
                         let was_at_bottom = this.is_scrolled_to_bottom();

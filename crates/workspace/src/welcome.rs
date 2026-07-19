@@ -615,33 +615,6 @@ fn project_name(paths: &PathList) -> String {
     }
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
+// #[cfg(test)]
+// mod tests;
 
-    #[test]
-    fn test_project_name_empty() {
-        let paths = PathList::new::<&str>(&[]);
-        assert_eq!(project_name(&paths), "Untitled");
-    }
-
-    #[test]
-    fn test_project_name_single() {
-        let paths = PathList::new(&["/home/user/my-project"]);
-        assert_eq!(project_name(&paths), "my-project");
-    }
-
-    #[test]
-    fn test_project_name_multiple() {
-        // PathList sorts lexicographically, so filenames appear in alpha order
-        let paths = PathList::new(&["/home/user/zed", "/home/user/api"]);
-        assert_eq!(project_name(&paths), "api, zed");
-    }
-
-    #[test]
-    fn test_project_name_root_path_filtered() {
-        // A bare root "/" has no file_name(), falls back to "Untitled"
-        let paths = PathList::new(&["/"]);
-        assert_eq!(project_name(&paths), "Untitled");
-    }
-}

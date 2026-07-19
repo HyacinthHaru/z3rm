@@ -115,6 +115,7 @@ impl JsonSchema for FontFeaturesContent {
 
 #[with_fallible_options]
 #[derive(Clone, PartialEq, Debug, Default, Serialize, Deserialize, JsonSchema, MergeFrom)]
+#[serde(default)]
 pub struct ThemeSettingsContent {
     /// The default font size for text in the UI.
     pub ui_font_size: Option<FontSize>,

@@ -147,10 +147,10 @@ fn test_session_attach_detach() {
         "/home/user".to_string(),
     );
 
-    session.add_attached_client("client-1".to_string(), crate::session::AttachMode::Shared);
+    session.add_attached_client("client-1".to_string(), crate::session::AttachMode::Shared, crate::session::ClientRole::ReadWrite);
     assert_eq!(session.attached_client_count(), 1);
 
-    session.add_attached_client("client-2".to_string(), crate::session::AttachMode::ReadOnly);
+    session.add_attached_client("client-2".to_string(), crate::session::AttachMode::ReadOnly, crate::session::ClientRole::ReadOnly);
     assert_eq!(session.attached_client_count(), 2);
 
     session.remove_attached_client("client-1");
@@ -192,11 +192,12 @@ fn test_session_add_tab() {
 fn test_pane_creation() {
     let pane = crate::pane::Pane::spawn(
         "pane-1".to_string(),
-        "/home/user".to_string(),
+        std::env::temp_dir().to_string_lossy().to_string(),
         80,
         24,
         None,
-    );
+    )
+    .expect("spawn pane");
 
     assert_eq!(pane.id, "pane-1");
     assert_eq!(pane.get_generation(), 0);
@@ -207,19 +208,19 @@ fn test_pane_creation() {
 }
 
 /// §3.10 Pane: resize
-#[test]
 fn test_pane_resize() {
-    let mut pane = crate::pane::Pane::spawn(
+    let pane = crate::pane::Pane::spawn(
         "pane-1".to_string(),
-        "/home/user".to_string(),
+        std::env::temp_dir().to_string_lossy().to_string(),
         80,
         24,
         None,
-    );
+    )
+    .expect("spawn pane");
 
     pane.resize(100, 30);
-    assert_eq!(pane.cols, 100);
-    assert_eq!(pane.rows, 30);
+    assert_eq!(pane.get_cols(), 100);
+    assert_eq!(pane.get_rows(), 30);
 }
 
 /// §3.10 Pane: title
@@ -227,11 +228,12 @@ fn test_pane_resize() {
 fn test_pane_title() {
     let pane = crate::pane::Pane::spawn(
         "pane-1".to_string(),
-        "/home/user".to_string(),
+        std::env::temp_dir().to_string_lossy().to_string(),
         80,
         24,
         None,
-    );
+    )
+    .expect("spawn pane");
 
     pane.set_title("my-title".to_string());
     assert_eq!(pane.get_title(), "my-title");
@@ -347,11 +349,12 @@ fn test_scrollback_search() {
 fn test_pane_scrollback() {
     let pane = crate::pane::Pane::spawn(
         "pane-1".to_string(),
-        "/home/user".to_string(),
+        std::env::temp_dir().to_string_lossy().to_string(),
         80,
         24,
         None,
-    );
+    )
+    .expect("spawn pane");
 
     // §16.9 初始版本
     let initial_version = pane.get_scrollback_version();

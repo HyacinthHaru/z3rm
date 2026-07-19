@@ -10,6 +10,7 @@ use std::path::PathBuf;
 /// 保留项目索引、排除路径等基本设置。
 #[with_fallible_options]
 #[derive(Debug, PartialEq, Clone, Default, Serialize, Deserialize, JsonSchema, MergeFrom)]
+#[serde(default)]
 pub struct ProjectSettingsContent {
     /// Linked directories to index for file searching.
     pub linked_projects: Option<HashMap<PathBuf, LinkedProjectSettings>>,
