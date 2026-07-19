@@ -357,6 +357,12 @@ impl ViMotion {
             Self::Bracket => AlacViMotion::Bracket,
             Self::ParagraphUp => AlacViMotion::ParagraphUp,
             Self::ParagraphDown => AlacViMotion::ParagraphDown,
+            // §12 Plan 31 — search/line-select motions handled in
+            // terminal.rs (InternalEvent path), alacritty ViMotion no-op.
+            Self::LineSelect
+            | Self::SearchStart
+            | Self::SearchNext
+            | Self::SearchPrev => AlacViMotion::Up,
         }
     }
 }

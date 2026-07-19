@@ -8,11 +8,11 @@ path = "src/visual_test_runner.rs"
 required-features = [ "visual-tests"]
 
 [package]
-description = "The fast, collaborative code editor."
+description = "High-performance GPU-rendered terminal with built-in multiplexer."
 name = "z3rm"
 version = "1.12.0"
 license = "GPL-3.0-or-later"
-authors = [ "Zed Team <hi@zed.dev>"]
+authors = ["z3rm contributors"]
 default-run = "z3rm"
 
 [lints]

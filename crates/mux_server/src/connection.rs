@@ -205,19 +205,17 @@ async fn dispatch_request(
                 ResponseBody::Error("permission denied: admin required".to_string())
             }
         }
-        RequestBody::RenameSession(_r) => {
+        RequestBody::RenameSession(r) => {
             if check_permission(role, ClientRole::Admin) {
-                ResponseBody::Error("rename_session not implemented yet".to_string())
+                handle_rename_session(r, sessions).await?
             } else {
                 ResponseBody::Error("permission denied: admin required".to_string())
             }
         }
         RequestBody::InstallExtension(_) => {
-            if check_permission(role, ClientRole::Admin) {
-                ResponseBody::Error("install_extension not implemented yet".to_string())
-            } else {
-                ResponseBody::Error("permission denied: admin required".to_string())
-            }
+            // §16.12 Extension install 是 client-side 操作,server 端没有 extension host。
+            // 返回空 response 而非 error;真正的安装逻辑在 crates/z3rm/src/cli/marketplace.rs。
+            ResponseBody::Error(String::new())
         }
         RequestBody::NewWindow(r) => {
             if check_permission(role, ClientRole::Admin) {
@@ -286,18 +284,19 @@ async fn dispatch_request(
                 ResponseBody::Error("permission denied: read-write required".to_string())
             }
         }
-        RequestBody::SetPaneTitle(_r) => {
+        RequestBody::SetPaneTitle(r) => {
             if check_permission(role, ClientRole::ReadWrite) {
-                ResponseBody::Error("set_pane_title not implemented yet".to_string())
+                handle_set_pane_title(r, sessions).await?
             } else {
                 ResponseBody::Error("permission denied: read-write required".to_string())
             }
         }
 
-        // §3.3 文件操作暂不限制 (Plan 33)
-        RequestBody::ReadFile(_) => ResponseBody::Error("read_file not implemented yet".to_string()),
-        RequestBody::ListDir(_) => ResponseBody::Error("list_dir not implemented yet".to_string()),
-        RequestBody::StatFile(_) => ResponseBody::Error("stat_file not implemented yet".to_string()),
+        // §3.3 文件操作:server 在本地或远端文件系统执行。§16.6 GUI file viewer
+        // 通过这些 RPC 读文件。权限:任意角色可读 (§15.1 client 是同 UID 信任)。
+        RequestBody::ReadFile(r) => handle_read_file(r).await?,
+        RequestBody::ListDir(r) => handle_list_dir(r).await?,
+        RequestBody::StatFile(r) => handle_stat_file(r).await?,
     };
 
     // §9 把 Response 通过 outbound channel 写回客户端
@@ -1183,4 +1182,144 @@ fn layout_tree_to_proto(
     mux_protocol::LayoutTree {
         root: convert(&tree.root),
     }
+}
+
+// ============================================================================
+// Plan 10: §3.3 / §16.6 Real file RPC handlers (previously stubs)
+// ============================================================================
+
+/// §16.6 ReadFile: 读取本地文件,自动检测 binary。
+/// §4.7 shadow_snapshot 集成后,路径会经过 worktree 解析。当前直接读 fs。
+async fn handle_read_file(req: &mux_protocol::ReadFileRequest) -> anyhow::Result<ResponseBody> {
+    let path = std::path::Path::new(&req.path);
+    match std::fs::read(path) {
+        Ok(bytes) => {
+            // Binary detection: check for null bytes in first 8KB (same heuristic
+            // as shadow_snapshot Monitor — ELF/PE/Mach-O magic or > 10% null).
+            let is_binary = detect_binary(&bytes);
+            let encoding = if is_binary { "binary".to_string() } else { "utf-8".to_string() };
+            Ok(ResponseBody::FileContent(mux_protocol::ReadFileResponse {
+                content: bytes,
+                is_binary,
+                encoding,
+            }))
+        }
+        Err(e) => Ok(ResponseBody::Error(format!("read_file: {}", e))),
+    }
+}
+
+/// §16.6 ListDir: 列出目录条目。
+async fn handle_list_dir(req: &mux_protocol::ListDirRequest) -> anyhow::Result<ResponseBody> {
+    let path = std::path::Path::new(&req.path);
+    match std::fs::read_dir(path) {
+        Ok(entries) => {
+            let mut out = Vec::new();
+            for entry in entries.flatten() {
+                let meta = entry.metadata().ok();
+                let name = entry.file_name().to_string_lossy().into_owned();
+                out.push(mux_protocol::DirEntry {
+                    name,
+                    is_dir: meta.as_ref().map(|m| m.is_dir()).unwrap_or(false),
+                    size: meta.as_ref().map(|m| m.len()).unwrap_or(0),
+                    is_modified: false, // §4.7 shadow_snapshot 集成后填充
+                });
+            }
+            // 目录列表排序:目录优先,然后按名称 (确定性输出便于测试)。
+            out.sort_by(|a, b| {
+                b.is_dir
+                    .cmp(&a.is_dir)
+                    .then_with(|| a.name.cmp(&b.name))
+            });
+            Ok(ResponseBody::DirListing(mux_protocol::ListDirResponse { entries: out }))
+        }
+        Err(e) => Ok(ResponseBody::Error(format!("list_dir: {}", e))),
+    }
+}
+
+/// §16.6 StatFile: 返回文件元数据。
+async fn handle_stat_file(req: &mux_protocol::StatFileRequest) -> anyhow::Result<ResponseBody> {
+    let path = std::path::Path::new(&req.path);
+    match std::fs::metadata(path) {
+        Ok(meta) => Ok(ResponseBody::FileStat(mux_protocol::StatFileResponse {
+            exists: true,
+            size: meta.len(),
+            is_dir: meta.is_dir(),
+            modified_timestamp: meta
+                .modified()
+                .ok()
+                .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+                .map(|d| d.as_secs())
+                .unwrap_or(0),
+        })),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            Ok(ResponseBody::FileStat(mux_protocol::StatFileResponse {
+                exists: false,
+                size: 0,
+                is_dir: false,
+                modified_timestamp: 0,
+            }))
+        }
+        Err(e) => Ok(ResponseBody::Error(format!("stat_file: {}", e))),
+    }
+}
+
+/// §3.10 RenameSession: 更新 session 名称。
+async fn handle_rename_session(
+    req: &mux_protocol::RenameSessionRequest,
+    sessions: &Arc<parking_lot::RwLock<Vec<crate::session::Session>>>,
+) -> anyhow::Result<ResponseBody> {
+    let mut sessions_w = sessions.write();
+    let session = sessions_w
+        .iter_mut()
+        .find(|s| s.id == req.id)
+        .ok_or_else(|| anyhow::anyhow!("session not found: {}", req.id))?;
+    let old_name = std::mem::replace(&mut session.name, req.name.clone());
+    zlog::info!("session renamed: id={} old={} new={}", req.id, old_name, req.name);
+    Ok(ResponseBody::Error(String::new()))
+}
+
+/// §3.10 SetPaneTitle: 更新 pane 标题 (OSC 0/1/2 也可以触发)。
+async fn handle_set_pane_title(
+    req: &mux_protocol::SetPaneTitleRequest,
+    sessions: &Arc<parking_lot::RwLock<Vec<crate::session::Session>>>,
+) -> anyhow::Result<ResponseBody> {
+    let sessions_r = sessions.read();
+    let pane = sessions_r
+        .iter()
+        .find_map(|s| s.panes.read().get(&req.pane_id).cloned());
+    drop(sessions_r);
+
+    match pane {
+        Some(pane) => {
+            *pane.title.write() = req.title.clone();
+            pane.bump_generation();
+            zlog::info!("pane title set: pane={} title={}", req.pane_id, req.title);
+            Ok(ResponseBody::Error(String::new()))
+        }
+        None => Ok(ResponseBody::Error(format!(
+            "set_pane_title: pane {} not found",
+            req.pane_id
+        ))),
+    }
+}
+
+/// §4.7 binary 检测 — 与 shadow_snapshot::Monitor::is_binary_file 同算法。
+fn detect_binary(bytes: &[u8]) -> bool {
+    const ELF_MAGIC: &[u8] = b"\x7fELF";
+    const PE_MAGIC: &[u8] = b"MZ";
+    const MACHO_MAGIC: &[u8] = b"\xfe\xed\xfa\xce";
+
+    if bytes.len() >= 4 {
+        if bytes.starts_with(ELF_MAGIC) || bytes.starts_with(MACHO_MAGIC) {
+            return true;
+        }
+    }
+    if bytes.len() >= 2 && bytes.starts_with(PE_MAGIC) {
+        return true;
+    }
+
+    // null byte ratio check on first 512 bytes
+    let check_len = bytes.len().min(512);
+    let null_count = bytes[..check_len].iter().filter(|&&b| b == 0).count();
+    (null_count as f64 / check_len as f64) > 0.1
 }

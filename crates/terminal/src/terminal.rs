@@ -143,6 +143,10 @@ enum ViMotion {
     Bracket,
     ParagraphUp,
     ParagraphDown,
+    LineSelect,
+    SearchStart,
+    SearchNext,
+    SearchPrev,
 }
 
 #[derive(Clone, Debug)]
@@ -2239,6 +2243,25 @@ impl Terminal {
             "i" => {
                 self.scroll_to_bottom();
                 self.toggle_vi_mode();
+            }
+
+            "v" => {
+                let point = self.last_content.cursor.point;
+                let selection_type = SelectionType::Simple;
+                let side = SelectionSide::Right;
+                let selection = Selection::new(selection_type, point, side);
+                self.events
+                    .push_back(InternalEvent::SetSelection(Some(selection)));
+            }
+
+            "V" => {
+                // §12 Plan 31 — Line selection mode (linewise visual select)
+                let point = self.last_content.cursor.point;
+                let selection_type = SelectionType::Lines;
+                let side = SelectionSide::Left;
+                let selection = Selection::new(selection_type, point, side);
+                self.events
+                    .push_back(InternalEvent::SetSelection(Some(selection)));
             }
             _ => {}
         }

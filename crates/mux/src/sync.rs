@@ -104,7 +104,7 @@ pub fn scan_extensions_dir(base_dir: &Path) -> Result<Vec<ExtensionInfo>> {
 pub fn default_extensions_dir() -> PathBuf {
     dirs::config_dir()
         .unwrap_or_else(|| PathBuf::from("~"))
-        .join("zerm")
+        .join("z3rm")
         .join("extensions")
 }
 

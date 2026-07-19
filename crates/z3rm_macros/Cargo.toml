@@ -9,6 +9,13 @@ license = "Apache-2.0"
 path = "src/z3rm_macros.rs"
 proc-macro = true
 
+[[bin]]
+name = "count_todos"
+path = "src/bin/count_todos.rs"
+
+[features]
+z3rm-migration = []
+
 [dependencies]
 proc-macro2 = { workspace = true }
 quote = { workspace = true }

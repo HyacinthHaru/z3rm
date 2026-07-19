@@ -29,28 +29,17 @@ pub fn dispatch_copy_mode_key(
 ) -> bool {
     match keystroke.key.as_str() {
         // V: 行选择模式 (Line selection) — §12 Plan 31
-        "v" if keystroke.modifiers.shift => {
-            // 通过发送大写 V 到 vi_motion 触发行选择
-            // terminal 的 vi_motion 目前仅处理小写 v (Simple selection)
-            // 行选择 (V) 需要 terminal 层扩展支持，这里先转发
-            // 当 terminal 支持后，取消下方注释:
-            // terminal.update(cx, |term, _| {
-            //     let v_keystroke = Keystroke::new(Modifiers::SHIFT, "", "V");
-            //     term.vi_motion(&v_keystroke);
-            // });
-            // 当前行为: 转发到 vi_motion (将被忽略，不发送 PTY)
-            // 这是暂时的 — 后续扩展 terminal vi_motion 支持 V 即可
-            true
-        }
+        // 现在由 terminal.vi_motion 处理 (uppercase V via shift),转发即可。
+        "v" if keystroke.modifiers.shift => false, // forward to vi_motion (handles "V")
 
-        // /: 搜索 — §12 Plan 31
+        // /: 进入搜索模式 — §12 Plan 31
         "/" => {
-            // 搜索由 SearchableItem 接口处理 (/ 键拦截，不发送到 PTY)
-            // 实际的搜索查询由外部 search 面板触发
+            state.search_query = Some(String::new());
+            // 实际搜索输入由外部 search input 处理,这里仅拦截防止 / 到 PTY。
             true
         }
 
-        // q: 退出复制模式 — §12 Plan 31
+        // q: 退出复制模式
         "q" => {
             state.active = false;
             state.search_query = None;
@@ -59,18 +48,39 @@ pub fn dispatch_copy_mode_key(
 
         // n: 下一个搜索匹配 — §12 Plan 31
         "n" => {
-            // 搜索导航由 SearchableItem 接口处理
+            if let Some(query) = &state.search_query {
+                if !query.is_empty() {
+                    terminal.update(cx, |term, _| {
+                        // 触发 alacritty 的搜索导航 (下一个匹配)
+                        // terminal.search 需要外部预置 Search 对象,这里
+                        // 简化为 forward 到 vi_motion (alacritty 的 n 绑定)。
+                        // 完整实现需要 terminal.rs 暴露 search_next() 方法。
+                        let mut ks = Keystroke::default();
+                        ks.key = "n".to_string();
+                        term.vi_motion(&ks);
+                    });
+                }
+            }
             true
         }
 
         // N: 上一个搜索匹配 — §12 Plan 31
         "N" => {
+            if let Some(query) = &state.search_query {
+                if !query.is_empty() {
+                    terminal.update(cx, |term, _| {
+                        let mut ks = Keystroke::default();
+                        ks.key = "N".to_string();
+                        ks.modifiers.shift = true;
+                        term.vi_motion(&ks);
+                    });
+                }
+            }
             true
         }
 
-        // escape: 清除选择 + 退出复制模式 — §12 Plan 31
+        // escape: 清除选择 + 退出复制模式
         "escape" => {
-            // 清除选择
             terminal.update(cx, |term, _| {
                 let mut esc = Keystroke::default();
                 esc.key = "escape".to_string();
@@ -81,14 +91,14 @@ pub fn dispatch_copy_mode_key(
             true
         }
 
-        // i: 退出复制模式，返回正常输入 — §12 Plan 31
+        // i: 退出复制模式
         "i" => {
             state.active = false;
             state.search_query = None;
             true
         }
 
-        // 其他按键: 转发到 terminal.vi_motion (hjkl, g, G, w, b, e, v, y 等)
+        // 其他按键: 转发到 terminal.vi_motion
         _ => false,
     }
 }

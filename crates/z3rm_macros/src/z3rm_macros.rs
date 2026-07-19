@@ -1,13 +1,17 @@
-// z3rm_todo 属性宏
-// 来源: spec §8.1 — 迁移完成前不允许 cargo build 通过
-// 机制: 宏始终展开为 inventory::submit!，build script 统计剩余洞数
-// "修好一个洞" = "删掉这个 #[z3rm_todo] 属性"
+// z3rm_todo 属性宏 (spec §8.1)
+//
+// "Fixing a hole" = "deleting the #[z3rm_todo] attribute from that code"
+//
+// The macro emits BOTH branches as cfg-gated tokens. The USER crate's
+// feature flag (z3rm-migration in their Cargo.toml) controls which
+// branch survives cfg evaluation at the use site:
+//   - feature OFF (default): compile_error! fires, build blocked
+//   - feature ON: inventory registration, build proceeds
 
 use proc_macro::TokenStream;
 use quote::quote;
 use syn::{parse::Parse, parse::ParseStream, LitStr, Token};
 
-/// 宏参数解析: category (必需), description (可选)
 struct Z3rmTodoArgs {
     category: LitStr,
     description: Option<LitStr>,
@@ -22,48 +26,41 @@ impl Parse for Z3rmTodoArgs {
         } else {
             None
         };
-        Ok(Z3rmTodoArgs {
-            category,
-            description,
-        })
+        Ok(Z3rmTodoArgs { category, description })
     }
 }
 
-/// 标记迁移洞的位置。
-///
-/// 用法: `#[z3rm_todo("removed-crate", "workspace 不再依赖 project::worktree")]`
-///
-/// 宏始终展开为 inventory::submit! 注册一个 Z3rmTodo 条目。
-/// build script (count_todos 二进制) 收集所有条目并报告数量。
-/// 当所有洞都被修复（属性被删除），编译通过。
-/// 标记迁移洞的位置。
-///
-/// 用法: `#[z3rm_todo("removed-crate", "workspace 不再依赖 project::worktree")]`
-///
-/// 宏始终展开为 inventory::submit! 注册一个 Z3rmTodo 条目。
-/// build script (count_todos 二进制) 收集所有条目并报告数量。
-/// 当所有洞都被修复(属性被删除),编译通过。
-///
-/// §8.1 file/line 必须是宏**使用**处的位置 (caller site),不是宏定义处。
-/// 旧实现用 file!()/line!() 在宏展开时解析到宏 crate 自己的源文件,
-/// 所有洞的 file/line 都相同,失去定位价值。改用 proc_macro::Span::call_site。
+/// 标记迁移洞。用法:
+/// ```ignore
+/// #[z3rm_todo("removed-crate", "workspace 不再依赖 project::worktree")]
+/// fn some_function() { ... }
+/// ```
 #[proc_macro_attribute]
 pub fn z3rm_todo(attrs: TokenStream, item: TokenStream) -> TokenStream {
     let args: Z3rmTodoArgs = syn::parse_macro_input!(attrs as Z3rmTodoArgs);
     let item: proc_macro2::TokenStream = item.into();
     let category = args.category.value();
-    let description = args
-        .description
-        .map(|description| description.value())
-        .unwrap_or_default();
+    let description = args.description.map(|d| d.value()).unwrap_or_default();
 
-    // §8.1 用 call_site() 拿 caller 的 Span,file!()/line!() 才会展开成
-    // 宏使用处的真实位置。注意 stable Rust 上 Span::call_site().source_file()
-    // 还不稳定,但 file!() / line!() macros 内部用 Span,所以只要在
-    // expanded quote! 里用 file!() / line!(),它们就会自动绑定到 call_site。
-    // 关键:让 file!() / line!() 出现在 macro_rules! / quote! 展开结果中,
-    // 且在该 quote! 调用点上有 call_site 的 hygiene。
+    // Build the compile_error message as a single string literal.
+    let blocker_msg = if description.is_empty() {
+        format!(
+            "z3rm migration hole ({}): delete this #[z3rm_todo] attribute to resolve",
+            category
+        )
+    } else {
+        format!(
+            "z3rm migration hole ({}): {} — delete this #[z3rm_todo] attribute to resolve",
+            category, description
+        )
+    };
+    let blocker_lit = syn::LitStr::new(&blocker_msg, proc_macro2::Span::call_site());
+
+    // Emit both branches with cfg gates. The user crate's Cargo.toml
+    // z3rm-migration feature controls which one survives at compile time.
     let expanded = quote! {
+        // When z3rm-migration is ON: register the hole to inventory for counting.
+        #[cfg(feature = "z3rm-migration")]
         inventory::submit! {
             z3rm_macros_types::Z3rmTodo {
                 category: #category,
@@ -72,6 +69,13 @@ pub fn z3rm_todo(attrs: TokenStream, item: TokenStream) -> TokenStream {
                 line: line!(),
             }
         }
+
+        // When z3rm-migration is OFF (default): block compilation.
+        #[cfg(not(feature = "z3rm-migration"))]
+        compile_error!(#blocker_lit);
+
+        // The item is always emitted — the cfg gates only affect the
+        // inventory/compile_error wrappers above, not the item itself.
         #item
     };
 
