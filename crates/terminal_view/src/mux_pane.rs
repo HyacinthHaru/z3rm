@@ -153,23 +153,7 @@ impl MuxPaneView {
 
     /// §3.3 Apply GridDiff to snapshot.cells (row-major flat array).
     fn apply_diff(&mut self, diff: &GridDiff) {
-        let cols = self.snapshot.cols as usize;
-        let rows = self.snapshot.rows as usize;
-        for row_change in &diff.rows {
-            let row_idx = row_change.row as usize;
-            if row_idx >= rows {
-                continue;
-            }
-            for (col_idx, cell) in row_change.cells.iter().enumerate() {
-                if col_idx >= cols {
-                    break;
-                }
-                let flat = row_idx * cols + col_idx;
-                if flat < self.snapshot.cells.len() {
-                    self.snapshot.cells[flat] = cell.clone();
-                }
-            }
-        }
+        apply_diff_to_snapshot(&mut self.snapshot, diff);
     }
 
     /// §3.10 keystroke → terminal bytes → send_input.
@@ -289,6 +273,58 @@ fn keystroke_to_bytes(keystroke: &Keystroke) -> Vec<u8> {
     }
     bytes.extend_from_slice(esc_seq);
     bytes
+}
+
+/// §3.3 把 GridDiff 应用到 FullGridSnapshot。
+///
+/// 抽出为自由函数,便于单元测试覆盖 (无需 GPUI Context)。
+/// spec §3.3 row-major flat array;越界行/列静默丢弃。
+pub fn apply_diff_to_snapshot(snapshot: &mut FullGridSnapshot, diff: &GridDiff) {
+    let cols = snapshot.cols as usize;
+    let rows = snapshot.rows as usize;
+    for row_change in &diff.rows {
+        let row_idx = row_change.row as usize;
+        if row_idx >= rows {
+            continue;
+        }
+        for (col_idx, cell) in row_change.cells.iter().enumerate() {
+            if col_idx >= cols {
+                break;
+            }
+            let flat = row_idx * cols + col_idx;
+            if flat < snapshot.cells.len() {
+                snapshot.cells[flat] = cell.clone();
+            }
+        }
+    }
+}
+
+/// §3.3 把 FullGridSnapshot 渲染成纯文本 (MuxPaneView::render 的数据契约)。
+///
+/// 输出格式:每行 cols 个字符,行间以 \n 分隔。空 cell 用空格占位。
+/// 测试和外部调用方可用此函数验证 fetch_grid_update 的内容是否符合预期。
+pub fn snapshot_to_text(snapshot: &FullGridSnapshot) -> String {
+    let cols = snapshot.cols as usize;
+    let rows = snapshot.rows as usize;
+    if cols == 0 || rows == 0 {
+        return String::new();
+    }
+    let mut buf = String::with_capacity(cols * rows + rows);
+    for row in 0..rows {
+        for col in 0..cols {
+            let flat = row * cols + col;
+            let ch = snapshot
+                .cells
+                .get(flat)
+                .and_then(|c| c.char.chars().next())
+                .unwrap_or(' ');
+            buf.push(ch);
+        }
+        if row + 1 < rows {
+            buf.push('\n');
+        }
+    }
+    buf
 }
 
 impl Focusable for MuxPaneView {

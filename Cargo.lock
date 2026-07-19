@@ -7602,6 +7602,7 @@ dependencies = [
  "smol 1.3.0",
  "tar",
  "tempfile",
+ "terminal_view",
  "tokio",
  "tracing",
  "which 6.0.3",

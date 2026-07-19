@@ -37,3 +37,4 @@ interprocess = { workspace = true, features = ["tokio"] }
 serde_json = "1.0"
 tokio = { workspace = true, features = ["full"] }
 mux_protocol = { workspace = true }
+terminal_view = { workspace = true }
