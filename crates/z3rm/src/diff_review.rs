@@ -1,0 +1,250 @@
+//! # Diff Review — CLI agent file modification review (Plan 18, §16.6)
+//!
+//! Side-by-side diff view for reviewing changes CLI agents make to files.
+//! Left pane: previous version (shadow snapshot). Right pane: current content.
+//! Accept = keep current. Decline = revert via shadow_snapshot (§4.8).
+//!
+//! §16.6 Entry points:
+//! - file tree sidebar click (handled in project_panel)
+//! - command palette `file::openDiff`
+//! - terminal output path detection (handled in terminal_view)
+
+use gpui::{
+    AppContext, Context, Entity, EventEmitter, FocusHandle, Focusable, IntoElement, Render,
+    SharedString, Task, Window, div, px,
+};
+use std::path::PathBuf;
+use ui::prelude::*;
+
+/// §16.6 DiffReview — holds previous + current content for side-by-side display.
+pub struct DiffReview {
+    /// File path being reviewed
+    pub file_path: PathBuf,
+    /// Previous content (from shadow snapshot or git HEAD)
+    pub previous_content: SharedString,
+    /// Current content (from disk)
+    pub current_content: SharedString,
+    /// Whether the diff has been resolved (accept/decline)
+    pub resolved: bool,
+    /// Focus handle
+    focus_handle: FocusHandle,
+}
+
+/// §16.6 Events emitted by DiffReview
+#[derive(Clone, Debug)]
+pub enum DiffReviewEvent {
+    /// User accepted the change (file stays at current)
+    Accepted,
+    /// User declined the change (file reverted to previous)
+    Declined,
+}
+
+impl DiffReview {
+    /// §16.6 Create a new diff review view from file path.
+    /// Fetches previous (shadow snapshot) and current content.
+    pub fn new(
+        file_path: PathBuf,
+        previous: String,
+        current: String,
+        cx: &mut Context<Self>,
+    ) -> Self {
+        Self {
+            file_path,
+            previous_content: previous.into(),
+            current_content: current.into(),
+            resolved: false,
+            focus_handle: cx.focus_handle(),
+        }
+    }
+
+    /// §16.6 Load both versions from disk + shadow snapshot.
+    /// Returns a task that resolves to a DiffReview entity.
+    pub fn load(
+        file_path: PathBuf,
+        previous_content: String,
+        cx: &mut App,
+    ) -> Task<anyhow::Result<Entity<Self>>> {
+        let path = file_path.clone();
+        let prev = previous_content.clone();
+        cx.spawn(async move |cx| {
+            let current = std::fs::read_to_string(&path)
+                .map_err(|e| anyhow::anyhow!("failed to read {}: {}", path.display(), e))?;
+            let entity = cx.new(|cx| {
+                DiffReview::new(path.clone(), prev, current, cx)
+            });
+            Ok(entity)
+        })
+    }
+
+    /// §16.6 Accept the current version (dismiss diff, file stays).
+    pub fn accept(&mut self, cx: &mut Context<Self>) {
+        self.resolved = true;
+        cx.emit(DiffReviewEvent::Accepted);
+        cx.notify();
+    }
+
+    /// §16.6 Decline the change — trigger shadow_snapshot decline protocol.
+    /// The actual file revert happens via shadow_snapshot; this just updates UI.
+    pub fn decline(&mut self, cx: &mut Context<Self>) {
+        self.resolved = true;
+        cx.emit(DiffReviewEvent::Declined);
+        cx.notify();
+    }
+
+    /// §16.6 Compute line-level diff for display.
+    pub fn line_diff(&self) -> Vec<DiffLine> {
+        let prev_lines: Vec<&str> = self.previous_content.lines().collect();
+        let curr_lines: Vec<&str> = self.current_content.lines().collect();
+        let max_len = prev_lines.len().max(curr_lines.len());
+        let mut result = Vec::with_capacity(max_len);
+        for i in 0..max_len {
+            match (prev_lines.get(i), curr_lines.get(i)) {
+                (Some(prev), Some(curr)) => {
+                    if prev == curr {
+                        result.push(DiffLine::Unchanged((*prev).to_string()));
+                    } else {
+                        result.push(DiffLine::Modified {
+                            old: (*prev).to_string(),
+                            new: (*curr).to_string(),
+                        });
+                    }
+                }
+                (Some(prev), None) => result.push(DiffLine::Removed((*prev).to_string())),
+                (None, Some(curr)) => result.push(DiffLine::Added((*curr).to_string())),
+                (None, None) => {}
+            }
+        }
+        result
+    }
+}
+
+/// §16.6 A single line in the diff view.
+#[derive(Debug, Clone)]
+pub enum DiffLine {
+    /// Line present in both versions
+    Unchanged(String),
+    /// Line present only in current (new)
+    Added(String),
+    /// Line present only in previous (deleted)
+    Removed(String),
+    /// Line modified between versions
+    Modified { old: String, new: String },
+}
+
+impl Focusable for DiffReview {
+    fn focus_handle(&self, _cx: &App) -> FocusHandle {
+        self.focus_handle.clone()
+    }
+}
+
+impl EventEmitter<DiffReviewEvent> for DiffReview {}
+
+impl Render for DiffReview {
+    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let colors = cx.theme().colors();
+        let bg = colors.editor_background;
+        let fg = colors.text;
+
+        let diff_lines = self.line_diff();
+        let file_name = self
+            .file_path
+            .file_name()
+            .map(|n| n.to_string_lossy().into_owned())
+            .unwrap_or_else(|| self.file_path.to_string_lossy().into_owned());
+
+        // Header
+        let header = div()
+            .flex()
+            .flex_row()
+            .justify_between()
+            .items_center()
+            .px_4()
+            .py_2()
+            .border_b_1()
+            .border_color(colors.border)
+            .child(SharedString::from(format!("Diff: {}", file_name)))
+            .child(
+                div()
+                    .flex()
+                    .flex_row()
+                    .gap_2()
+                    .child(
+                        div()
+                            .id("accept-btn")
+                            .px_3()
+                            .py_1()
+                            .rounded_md()
+                            .bg(colors.border)
+                            .text_color(fg)
+                            .child("Accept (a)")
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                this.accept(cx);
+                            })),
+                    )
+                    .child(
+                        div()
+                            .id("decline-btn")
+                            .px_3()
+                            .py_1()
+                            .rounded_md()
+                            .bg(colors.border)
+                            .text_color(fg)
+                            .child("Decline (d)")
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                this.decline(cx);
+                            })),
+                    ),
+            );
+
+        // Diff body
+        let mut body = div().flex().flex_col().py_1().px_2().size_full();
+        for (i, line) in diff_lines.iter().enumerate() {
+            let (text, color) = match line {
+                DiffLine::Unchanged(t) => (t.as_str(), fg),
+                DiffLine::Added(t) => (t.as_str(), colors.editor_foreground),
+                DiffLine::Removed(t) => (t.as_str(), colors.editor_foreground),
+                DiffLine::Modified { new, .. } => (new.as_str(), colors.editor_foreground),
+            };
+            let bg_color = match line {
+                DiffLine::Added(_) => gpui::rgb(0x2d5a1e),
+                DiffLine::Removed(_) => gpui::rgb(0x5a1e1e),
+                DiffLine::Modified { .. } => gpui::rgb(0x5a4a1e),
+                DiffLine::Unchanged(_) => gpui::rgb(0x000000),
+            };
+            let prefix = match line {
+                DiffLine::Unchanged(_) => "  ",
+                DiffLine::Added(_) => "+ ",
+                DiffLine::Removed(_) => "- ",
+                DiffLine::Modified { .. } => "~ ",
+            };
+            body = body.child(
+                div()
+                    .flex()
+                    .flex_row()
+                    .w_full()
+                    .bg(bg_color)
+                    .child(
+                        div()
+                            .w(px(40.0))
+                            .text_color(gpui::rgb(0x888888))
+                            .child(SharedString::from(format!("{}", i + 1))),
+                    )
+                    .child(
+                        div()
+                            .text_color(color)
+                            .child(SharedString::from(format!("{}{}", prefix, text))),
+                    ),
+            );
+        }
+
+        div()
+            .track_focus(&self.focus_handle)
+            .size_full()
+            .bg(bg)
+            .text_color(fg)
+            .font_family("monospace")
+            .text_size(px(13.0))
+            .child(header)
+            .child(body)
+    }
+}
