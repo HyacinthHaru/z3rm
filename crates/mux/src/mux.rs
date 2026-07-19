@@ -7,13 +7,10 @@
 //! 请求/响应关联通过 request_id（§9）。
 
 use anyhow::Result;
-use async_channel::unbounded;
 use std::collections::HashMap;
-use std::io::{Read, Write};
 use std::path::Path;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
-use interprocess::local_socket::{GenericFilePath, ToFsName};
 
 // §9 从 mux_protocol 导入所有 protobuf 类型。
 use mux_protocol::{
@@ -196,8 +193,9 @@ impl MuxDomain {
     }
 
     /// Connect using std UnixStream (avoids interprocess connection issues)
-    pub fn connect_with_unix_stream(mut stream: std::os::unix::net::UnixStream) -> Result<Self> {
-        // Set non-blocking mode so read() doesn't block the I/O thread
+    pub fn connect_with_unix_stream(stream: std::os::unix::net::UnixStream) -> Result<Self> {
+        // §9 Set non-blocking mode so read() doesn't block the I/O thread.
+        // set_nonblocking takes &self so we don't need mut.
         stream.set_nonblocking(true).map_err(|e| anyhow::anyhow!(e))?;
         let (write_tx, write_rx) = std::sync::mpsc::channel();
 
@@ -268,48 +266,6 @@ impl MuxDomain {
         }
 
         let frame = buf.drain(0..total_len).collect();
-        Ok(Some(frame))
-    }
-    /// §9 读取下一帧数据。
-    fn read_next_frame(
-        stream: &mut interprocess::local_socket::Stream,
-        buf: &mut Vec<u8>,
-    ) -> std::io::Result<Option<Vec<u8>>> {
-        let (frame_len, header_len) = match Self::try_parse_frame_header(buf) {
-            Some(ok) => ok,
-            None => {
-                let mut read_buf = [0u8; 256];
-                match stream.read(&mut read_buf) {
-                    Ok(0) => return Ok(None),
-                    Ok(n) => buf.extend_from_slice(&read_buf[..n]),
-                    Err(e) => return Err(e),
-                }
-                match Self::try_parse_frame_header(buf) {
-                    Some(ok) => ok,
-                    None => return Ok(None),
-                }
-            }
-        };
-
-        let total_needed = header_len + frame_len as usize;
-        if buf.len() < total_needed {
-            let mut read_buf = [0u8; 4096];
-            while buf.len() < total_needed {
-                match stream.read(&mut read_buf) {
-                    Ok(0) => {
-                        return Err(std::io::Error::new(
-                            std::io::ErrorKind::UnexpectedEof,
-                            "connection closed",
-                        ))
-                    }
-                    Ok(n) => buf.extend_from_slice(&read_buf[..n]),
-                    Err(e) => return Err(e),
-                }
-            }
-        }
-
-        let frame = buf[header_len..header_len + frame_len as usize].to_vec();
-        buf.drain(..total_needed);
         Ok(Some(frame))
     }
 

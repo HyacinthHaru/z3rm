@@ -160,7 +160,9 @@ fn test_property_ancestor_table_correctness() {
 
     proptest!(
         ProptestConfig::with_cases(10),
-        |(depth in 1..15)| {
+        |(depth in 2..15)| {
+            // §4.4 depth=1 只有根节点,parent=None,ancestors 正确为空。
+            // 本测试验证的是 depth >= 2 (有祖先链) 的情况。
             let tree = VersionTree::new();
             let path_hash = random_hash();
             let content_hash = random_hash();
@@ -182,7 +184,7 @@ fn test_property_ancestor_table_correctness() {
             }
 
             let node = tree.get_node(vid).expect("最终节点不存在");
-            assert!(!node.ancestors.is_empty(), "祖先表不应为空");
+            assert!(!node.ancestors.is_empty(), "depth={} 时祖先表不应为空", depth);
             assert_eq!(node.ancestors[0], node.parent_id.unwrap(), "直接祖先不匹配");
         }
     );

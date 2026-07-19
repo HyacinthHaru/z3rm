@@ -172,8 +172,18 @@ async fn dispatch_request(
     };
 
     // §3.3 客户端角色:未 attach 时默认 Admin。
-    // 本地 socket 的 0600 权限已实现 user-level 隔离 (§9),
-    // 未显式声明 role 的本地连接按 Admin 处理;Attach 可降级。
+    //
+    // **fail-open 假设** (此处显式记录,新增 transport 时必须重新评估):
+    //   - 本地 Unix socket 走 §9 的 0600 ACL,已保证 user-level 隔离
+    //   - 当前唯一的 transport 就是 Local;SSH 走 SSH-forwarded Unix socket,
+    //     同样落到本机 socket 权限模型
+    //   - 因此本地连接 = 同 UID 信任 = Admin
+    //
+    // **风险**:如果未来加入网络 transport (mTLS、UDP resilient §25),
+    // 0600 ACL 不再适用,此默认会变成提权漏洞。届时必须改为:
+    //   - 默认 ReadOnly (fail-closed)
+    //   - 显式 identity 才能提权到 Admin
+    //   - 或按 transport 类型分支默认角色
     let role = client_role.lock().unwrap_or(ClientRole::Admin);
 
     let resp_body = match body {
@@ -685,6 +695,21 @@ async fn handle_split_pane(
             session.panes.write().insert(new_pane_id.clone(), pane);
             session.set_focused_pane(new_pane_id.clone());
 
+            // §3.3 / §16.9 把新 pane 加到包含 parent 的 tab。
+            // 之前漏了这步,导致 attach 快照的 tab.panes 不含 split 出来的新 pane,
+            // status 命令和依赖 attach snapshot 的客户端都看不到它。
+            let parent_tab_id = session
+                .tabs
+                .iter()
+                .find(|(_, t)| t.pane_ids.contains(&req.pane_id))
+                .map(|(id, _)| id.clone());
+            if let Some(tab_id) = parent_tab_id {
+                if let Some(tab) = session.tabs.get_mut(&tab_id) {
+                    if !tab.pane_ids.contains(&new_pane_id) {
+                        tab.pane_ids.push(new_pane_id.clone());
+                    }
+                }
+            }
             // §3.4 给新 pane 注册当前连接的 subscriber
             let pane_ref = session.panes.read().get(&new_pane_id).cloned();
             if let Some(pane) = pane_ref {

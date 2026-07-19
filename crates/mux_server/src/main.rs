@@ -33,18 +33,16 @@ fn default_socket_path() -> PathBuf {
     .join("mux.sock")
 }
 
-/// §16.12 z3rm-server status 子命令
-/// 连接到 daemon 并显示运行状态信息
+/// §16.14 z3rm-server status 子命令
+/// 连接到 daemon,枚举所有 session 的 pane,显示真实统计 + daemon 内存。
 fn cmd_status() -> Result<()> {
     let socket_path = default_socket_path();
 
-    // 检查 daemon 是否运行
     if !socket_path.exists() {
         eprintln!("z3rm-server is not running (socket not found: {})", socket_path.display());
         std::process::exit(1);
     }
 
-    // §16.12 连接到 daemon 获取状态
     let rt = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()?;
@@ -52,14 +50,30 @@ fn cmd_status() -> Result<()> {
     rt.block_on(async {
         let domain = mux::connect_local(&socket_path).await?;
         let sessions = domain.list_sessions().await?;
-        let mut sys = sysinfo::System::new();
 
-        let our_pid = std::process::id();
-        let our_mem = sys
-            .processes()
-            .iter()
-            .find(|(pid, _)| **pid == sysinfo::Pid::from(our_pid as usize))
-            .map(|(_, p)| p.memory())
+        // §16.14 真实 pane 数量:attach 每个 session,数 tabs[].panes[]。
+        // 旧实现是 session_count * 2 编的数字,严重误导诊断。
+        let mut total_panes: usize = 0;
+        for s in &sessions {
+            if let Ok(attach) = domain.attach(&s.id, mux::AttachMode::ReadOnly).await {
+                if let Some(snap) = &attach.snapshot {
+                    for tab in &snap.tabs {
+                        total_panes += tab.panes.len();
+                    }
+                }
+            }
+        }
+
+        // §16.14 daemon 内存:从 PID 文件读取 daemon PID,再用 sysinfo 查。
+        // 旧实现查的是 status 命令自己的 PID,永远是几 MB (status 进程本身)。
+        let pid_path = socket_path.with_extension("pid");
+        let daemon_pid = std::fs::read_to_string(&pid_path)
+            .ok()
+            .and_then(|s| s.trim().parse::<usize>().ok());
+        let mut sys = sysinfo::System::new();
+        sys.refresh_processes(sysinfo::ProcessesToUpdate::All, true);
+        let daemon_mem = daemon_pid
+            .and_then(|pid| sys.process(sysinfo::Pid::from(pid)).map(|p| p.memory()))
             .unwrap_or(0);
 
         let uptime = socket_path.metadata().ok().and_then(|m| {
@@ -73,14 +87,15 @@ fn cmd_status() -> Result<()> {
 
         let session_count = sessions.len();
         let attached = sessions.iter().filter(|s| s.attached_clients > 0).count();
-        let total_panes = session_count * 2;
-        // §16.12 输出状态信息
         println!("z3rm-server v0.1.0");
         println!("Uptime: {uptime}");
         println!("Sessions: {session_count} ({attached} attached)");
         println!("Panes: {total_panes}");
-        println!("Memory: {} MB", our_mem / 1024 / 1024);
+        println!("Memory: {} MB", daemon_mem / 1024 / 1024);
         println!("Socket: {}", socket_path.display());
+        if let Some(pid) = daemon_pid {
+            println!("PID: {pid}");
+        }
 
         Ok::<_, anyhow::Error>(())
     })

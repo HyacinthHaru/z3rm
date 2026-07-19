@@ -455,3 +455,66 @@ async fn e2e_generation_advances_on_pty_output() -> Result<()> {
     domain.kill_session(&session_id).await?;
     Ok(())
 }
+
+/// §15.4 / §16.9 split 出来的 pane 必须出现在 attach 快照的 tab.panes 里。
+///
+/// 这个测试专门捕获一类 bug:server 把新 pane 加到 `session.panes` 平铺 map,
+/// 但忘了同步加到 `session.tabs[*].pane_ids`。结果:fetch_grid_update(pane_id)
+/// 能拿到 grid,但 attach snapshot 不含该 pane,status 命令和 GUI 看不到它。
+#[tokio::test(flavor = "multi_thread")]
+async fn e2e_split_pane_visible_in_attach_snapshot() -> Result<()> {
+    let server = TestServer::spawn()?;
+    let domain = server.connect().await?;
+
+    let session_id = domain
+        .create_session("e2e-split-snapshot", &PathBuf::from("/"))
+        .await?;
+    let attach = domain.attach(&session_id, AttachMode::Shared).await?;
+    let tab_id = attach.snapshot.as_ref().unwrap().tabs[0].id.clone();
+
+    let pane1 = domain
+        .spawn_pane(
+            &session_id,
+            &tab_id,
+            proto::TerminalSize { cols: 40, rows: 5 },
+            Some(proto::ShellCommand {
+                program: "/bin/cat".into(),
+                args: vec![],
+                env: HashMap::new(),
+            }),
+            Some(&PathBuf::from("/")),
+        )
+        .await?;
+
+    let pane2 = domain
+        .split_pane(&pane1, SplitDirection::LeftRight)
+        .await?;
+
+    // 重新 attach 拿权威快照
+    let reattach = domain.attach(&session_id, AttachMode::ReadOnly).await?;
+    let snap = reattach
+        .snapshot
+        .as_ref()
+        .context("reattach snapshot missing")?;
+
+    // 验证两个 pane 都在某个 tab 的 pane_ids 里
+    let all_panes: Vec<String> = snap
+        .tabs
+        .iter()
+        .flat_map(|t| t.panes.iter().map(|p| p.id.clone()))
+        .collect();
+    assert!(
+        all_panes.contains(&pane1),
+        "pane1 must be in attach snapshot: {:?}",
+        all_panes
+    );
+    assert!(
+        all_panes.contains(&pane2),
+        "pane2 (split result) must be in attach snapshot: {:?}. \
+         If missing, handle_split_pane forgot to update tab.pane_ids.",
+        all_panes
+    );
+
+    domain.kill_session(&session_id).await?;
+    Ok(())
+}

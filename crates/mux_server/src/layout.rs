@@ -170,11 +170,14 @@ impl LayoutTree {
                 }
 
                 if removed {
-                    // 如果只剩一个子节点, 扁平化
+                    // 如果只剩一个子节点, 扁平化。
+                    // 注意:扁平化是"我替换我自己",不是"我被父节点删除"。
+                    // 返回 false 让父节点保留我 (而不是再删一遍),
+                    // 否则会把整个塌缩后的子树错误地丢弃。
                     if children.len() == 1 {
                         let child = children.remove(0);
                         *node = child;
-                        return Ok(true);
+                        return Ok(false);
                     }
                     Self::normalize_ratios(ratios);
                 }
@@ -278,13 +281,15 @@ impl LayoutTree {
         }
     }
 
-    /// §3.7 序列化布局树为 tmux 风格的校验和格式
+    /// §3.7 序列化布局树为 tmux 风格的校验和格式。
+    ///
+    /// 输出格式: 每个节点一行,行尾 `\n`,最后追加一行 checksum,文件以 `\n` 结尾。
+    /// 这样持久化到文件时符合 POSIX 文本文件约定,也便于 round-trip 解析。
     pub fn serialize(&self) -> anyhow::Result<String> {
         let mut buf = String::new();
         self.serialize_node(&self.root, &mut buf)?;
-        // 添加校验和
         let checksum = Self::compute_checksum(&buf);
-        Ok(format!("{}\n{}", buf, checksum))
+        Ok(format!("{}{}\n", buf, checksum))
     }
 
     fn serialize_node(&self, node: &LayoutNode, buf: &mut String) -> anyhow::Result<()> {

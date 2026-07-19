@@ -92,16 +92,14 @@ fn default_socket_path() -> PathBuf {
     .join("mux.sock")
 }
 
-/// 绑定本地 socket (§9)
+/// 绑定本地 socket (§9) + 写 PID 文件供 status 命令查询 daemon 内存。
 async fn bind_socket(path: &PathBuf) -> Result<UnixListener> {
-    // 确保父目录存在
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)?;
     }
     // 删除可能存在的旧 socket
     let _ = std::fs::remove_file(path);
 
-    // 创建 socket 文件
     let listener = UnixListener::bind(path)?;
 
     // 设置 0600 权限 (§9)
@@ -110,6 +108,13 @@ async fn bind_socket(path: &PathBuf) -> Result<UnixListener> {
         use std::os::unix::fs::PermissionsExt;
         let perms = std::fs::Permissions::from_mode(0o600);
         std::fs::set_permissions(path, perms)?;
+    }
+
+    // §16.14 写 PID 文件到 socket 同目录 (mux.pid),status 命令读它
+    // 查询 daemon 真实内存。失败不致命 (诊断功能降级)。
+    let pid_path = path.with_extension("pid");
+    if let Err(e) = std::fs::write(&pid_path, std::process::id().to_string()) {
+        zlog::warn!("failed to write pid file at {}: {}", pid_path.display(), e);
     }
 
     Ok(listener)
@@ -145,14 +150,20 @@ pub fn run() -> Result<()> {
         let addr = listener.local_addr()?;
         zlog::info!("mux_server listening: socket={:?}", addr);
 
+        // §16.1 DB 路径与 socket 路径对齐,都在 $XDG_RUNTIME_DIR/z3rm/ 下。
+        // 之前实现把 DB 放在 runtime_dir 根目录 (如 /run/user/1000/z3rm.db),
+        // 与 socket (/run/user/1000/z3rm/mux.sock) 不一致,导致清理 / 删除时
+        // 容易遗漏 DB,出现"幽灵 session"被持久化恢复。
         let db_path = if let Ok(p) = std::env::var("Z3RM_MUX_DB") {
             PathBuf::from(p)
         } else {
-            let dir = dirs::runtime_dir()
-                .or_else(|| Some(std::env::temp_dir().join("z3rm")))
-                .unwrap_or_else(|| PathBuf::from("/tmp/z3rm"));
-            std::fs::create_dir_all(&dir)?;
-            dir.join("z3rm.db")
+            // 复用 socket 父目录,保证两者在同一处
+            let parent = socket_path
+                .parent()
+                .map(PathBuf::from)
+                .unwrap_or_else(|| PathBuf::from("/tmp"));
+            std::fs::create_dir_all(&parent)?;
+            parent.join("mux.db")
         };
         let db = init_database(&db_path)?;
 
