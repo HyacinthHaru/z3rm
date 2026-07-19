@@ -1,7 +1,10 @@
-//! # End-to-End 集成测试
+//! # Protocol compile-time check
 //!
-//! §3.10 完整会话生命周期测试: 守护进程启动 → 创建会话 → 创建 Pane →
-//! 输入/输出 → 分割 → 焦点切换 → 断开/重连 → 关闭会话 → 清理。
+//! 这不是端到端集成测试。它只验证 mux_protocol 类型可以构造、字段名匹配,
+//! 以及 frame/unframe 序列化往返正确。真正的 e2e 测试在 crates/mux/tests/e2e.rs。
+//!
+//! 保留这个文件作为 protobuf schema 回归测试:proto 字段重命名或类型
+//! 变化会让本测试编译失败,提前捕获。
 
 use anyhow::Result;
 

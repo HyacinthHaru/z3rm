@@ -77,7 +77,12 @@ pub fn setup_logging() -> Result<()> {
 }
 
 /// 默认 socket 路径: $XDG_RUNTIME_DIR/z3rm/mux.sock (§16.1)
+///
+/// 测试与多实例场景可用 Z3RM_MUX_SOCKET 环境变量覆盖。
 fn default_socket_path() -> PathBuf {
+    if let Ok(p) = std::env::var("Z3RM_MUX_SOCKET") {
+        return PathBuf::from(p);
+    }
     if let Ok(runtime_dir) = std::env::var("XDG_RUNTIME_DIR") {
         PathBuf::from(runtime_dir)
     } else {
@@ -140,11 +145,15 @@ pub fn run() -> Result<()> {
         let addr = listener.local_addr()?;
         zlog::info!("mux_server listening: socket={:?}", addr);
 
-        let db_path = dirs::runtime_dir()
-            .or_else(|| Some(std::env::temp_dir().join("z3rm")))
-            .unwrap_or_else(|| PathBuf::from("/tmp/z3rm"));
-        std::fs::create_dir_all(&db_path)?;
-        let db_path = db_path.join("z3rm.db");
+        let db_path = if let Ok(p) = std::env::var("Z3RM_MUX_DB") {
+            PathBuf::from(p)
+        } else {
+            let dir = dirs::runtime_dir()
+                .or_else(|| Some(std::env::temp_dir().join("z3rm")))
+                .unwrap_or_else(|| PathBuf::from("/tmp/z3rm"));
+            std::fs::create_dir_all(&dir)?;
+            dir.join("z3rm.db")
+        };
         let db = init_database(&db_path)?;
 
         // §3.6 启动时恢复 session

@@ -1,6 +1,8 @@
-//! # 网络故障注入测试
+//! # Socket byte-stream framing tests
 //!
-//! §9 模拟数据包丢失、延迟、分区 → 验证客户端重连、服务端 detach、reattach 恢复。
+//! 这些测试只覆盖 mux_protocol frame/unframe 在原始 socket 字节流上的行为
+//! (部分帧、TCP/Unix socket 字节边界切片)。它们**不**起 mux_server 子进程,
+//! 因此不是端到端测试。真正的 e2e 在 crates/mux/tests/e2e.rs。
 
 use anyhow::Result;
 use std::time::Duration;
@@ -164,12 +166,15 @@ async fn test_reconnect_after_disconnect() -> Result<()> {
 // §9 帧完整性测试
 // ============================================================
 
-/// §9 损坏帧处理：验证 unframe 对损坏数据的处理
+/// §9 损坏帧处理:验证 unframe 对长度前缀无效或 payload 不完整的数据报错。
+/// 长度前缀 0 + trailing bytes 是合法 protobuf (空消息 + 未消费尾部),
+/// 所以用真正不完整的长度前缀来测:声明 len=10 但只给 2 字节 payload。
 #[test]
 fn test_corrupted_frame_handling() {
-    let corrupted = vec![0x00, 0x01, 0x02, 0xFF];
-    let result = mux_protocol::unframe(&corrupted);
-    assert!(result.is_err(), "损坏帧应返回解码错误");
+    // varint(10) = 0x0A,后跟 2 字节 payload (期望 10) -> underflow
+    let truncated = vec![0x0A, 0x01, 0x02];
+    let result = mux_protocol::unframe(&truncated);
+    assert!(result.is_err(), "声明长度超过实际 payload 应返回解码错误");
 }
 
 /// §9 截断帧处理

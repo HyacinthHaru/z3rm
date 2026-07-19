@@ -1,7 +1,7 @@
 //! # mux domain compile tests
 //!
 //! 编译时测试：验证 MuxDomain API 签名、类型兼容性、proto 类型使用。
-//! 集成测试在 mux_server 可用后编写。
+//! 真正的 e2e 测试在 crates/mux/tests/e2e.rs。
 
 use mux::{MuxDomain, MuxNotification, MuxTransport};
 use mux_protocol::*;

@@ -64,6 +64,17 @@ impl LayoutTree {
         }
     }
 
+    /// 根节点是否是空 placeholder (session 创建时初始状态)
+    pub fn is_empty_root(&self) -> bool {
+        matches!(
+            self.root,
+            LayoutNode::Pane {
+                id: ref i,
+                pane_id: ref p,
+            } if i.is_empty() && p.is_empty()
+        )
+    }
+
     /// 分割已有 pane (§3.10 SplitPaneRequest)
     pub fn split(
         &mut self,

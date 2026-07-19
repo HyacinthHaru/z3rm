@@ -171,8 +171,10 @@ async fn dispatch_request(
         }
     };
 
-    // §3.3 获取当前客户端角色，未 attach 时默认为 ReadOnly (Plan 33)
-    let role = client_role.lock().unwrap_or(ClientRole::ReadOnly);
+    // §3.3 客户端角色:未 attach 时默认 Admin。
+    // 本地 socket 的 0600 权限已实现 user-level 隔离 (§9),
+    // 未显式声明 role 的本地连接按 Admin 处理;Attach 可降级。
+    let role = client_role.lock().unwrap_or(ClientRole::Admin);
 
     let resp_body = match body {
         // §3.3 无权限要求的操作
@@ -326,7 +328,14 @@ async fn handle_create_session(
     sessions: &Arc<parking_lot::RwLock<Vec<crate::session::Session>>>,
 ) -> anyhow::Result<ResponseBody> {
     let id = nanoid::nanoid!();
-    let session = crate::session::Session::new(id.clone(), req.name.clone(), req.cwd.clone());
+    let mut session = crate::session::Session::new(id.clone(), req.name.clone(), req.cwd.clone());
+
+    // §16.6 spec 要求:每个新 session 自动创建一个 default tab,
+    // 否则客户端 spawn_pane 时没有 tab_id 可用。
+    let default_tab_id = "tab-0".to_string();
+    session.add_tab(default_tab_id.clone(), req.name.clone());
+    session.focused_tab = Some(default_tab_id);
+
     sessions.write().push(session);
 
     // §16.12 记录 session 创建事件
@@ -402,10 +411,13 @@ async fn handle_attach(
         format!("client-{}", std::process::id())
     };
 
+    // §3.3 角色解析:identity 显式声明时以其为准;否则保留既有角色
+    // (本地 socket 默认 Admin,见 dispatch_request)。这避免本地连接
+    // 在 attach 后被静默降权,无法执行 create/kill session。
     let role = if let Some(identity) = &req.identity {
         proto_role_to_client_role(identity.role)
     } else {
-        ClientRole::ReadWrite
+        client_role.lock().unwrap_or(ClientRole::Admin)
     };
     *client_role.lock() = Some(role);
 
@@ -447,13 +459,29 @@ async fn handle_attach(
         });
     }
 
+    // §15.4 权威快照:tabs / layout / focused 必须反映 server 真实状态。
+    // 旧实现写死 tabs: Vec::new() 是严重违反 spec §15.4 的 bug。
+    let tabs_proto: Vec<mux_protocol::TabInfo> = session
+        .tabs
+        .values()
+        .map(|t| mux_protocol::TabInfo {
+            id: t.id.clone(),
+            title: t.title.clone(),
+            panes: t
+                .pane_ids
+                .iter()
+                .filter_map(|pid| pane_info_for(session, pid))
+                .collect(),
+        })
+        .collect();
+
     Ok(ResponseBody::Attach(AttachResponse {
         snapshot: Some(SessionSnapshot {
             session_id: session.id.clone(),
             focused_pane_id: session.focused_pane.clone().unwrap_or_default(),
             focused_tab_id: session.focused_tab.clone().unwrap_or_default(),
-            tabs: Vec::new(),
-            layout: Some(LayoutTree { root: None }),
+            tabs: tabs_proto,
+            layout: Some(layout_tree_to_proto(&session.layout)),
         }),
     }))
 }
@@ -471,17 +499,16 @@ async fn handle_new_window(
     sessions: &Arc<parking_lot::RwLock<Vec<crate::session::Session>>>,
     outbound_tx: &mpsc::UnboundedSender<Envelope>,
 ) -> anyhow::Result<ResponseBody> {
+    // §3.3 生成新窗口 ID
+    let window_id = format!("win-{}-{}", std::process::id(), nanoid::nanoid!());
+
     let mut sessions_w = sessions.write();
     let session = sessions_w
         .iter_mut()
         .find(|s| s.id == req.session_id)
         .ok_or_else(|| anyhow::anyhow!("session not found: {}", req.session_id))?;
-
-    // §3.3 生成新窗口 ID
-    let window_id = format!("win-{}", nanoid::nanoid!());
-
-    // §3.3 将窗口添加到会话
     session.add_window(window_id.clone());
+    drop(sessions_w);
 
     // §16.12 记录新窗口创建事件
     zlog::info!(
@@ -503,16 +530,10 @@ async fn handle_new_window(
     };
     let _ = send_notification_envelope(outbound_tx, notify);
 
-    // §3.3 返回新窗口信息与会话快照
+    // §3.3 返回新窗口信息 (无 snapshot — 客户端应另行 attach)
     Ok(ResponseBody::NewWindow(NewWindowResponse {
         window_id,
-        snapshot: Some(SessionSnapshot {
-            session_id: session.id.clone(),
-            focused_pane_id: session.focused_pane.clone().unwrap_or_default(),
-            focused_tab_id: session.focused_tab.clone().unwrap_or_default(),
-            tabs: Vec::new(),
-            layout: Some(LayoutTree { root: None }),
-        }),
+        snapshot: None,
     }))
 }
 
@@ -558,12 +579,34 @@ async fn handle_spawn_pane(
         shell_cmd,
     )?;
 
-    // §3.10 把 pane 加入 session 的 panes registry
+    // §3.10 把 pane 加入 session 的 panes registry、tab 列表、layout 树。
+    // §15.4 attach 返回的权威快照必须反映这些登记。
     {
         let mut sessions_w = sessions.write();
         if let Some(session) = sessions_w.iter_mut().find(|s| s.id == req.session_id) {
             session.panes.write().insert(pane_id.clone(), pane);
             session.set_focused_pane(pane_id.clone());
+
+            // §3.3 / §16.9 把 pane 注册到指定 tab。Tab 不存在则按 id 创建,
+            // 防止客户端传入尚未创建的 tab_id 时静默丢弃 pane。
+            let tab = session.tabs.entry(req.tab_id.clone()).or_insert_with(|| {
+                crate::session::Tab {
+                    id: req.tab_id.clone(),
+                    title: String::new(),
+                    pane_ids: Vec::new(),
+                }
+            });
+            if !tab.pane_ids.contains(&pane_id) {
+                tab.pane_ids.push(pane_id.clone());
+            }
+
+            // §3.7 在 layout 中登记 pane:第一个 pane 成根,后续通过 split 接入。
+            if session.layout.is_empty_root() {
+                session.layout = crate::layout::LayoutTree::with_pane(
+                    format!("node-{}", pane_id),
+                    pane_id.clone(),
+                );
+            }
         }
     }
 
@@ -1040,3 +1083,79 @@ async fn handle_fetch_grid_update(
     Ok(ResponseBody::Error("pane not found".to_string()))
 }
 
+
+// ============================================================================
+// §15.4 Attach snapshot helpers
+// ============================================================================
+
+/// §15.4 把 session.panes 中的 pane 元数据转成 proto PaneInfo。
+fn pane_info_for(
+    session: &crate::session::Session,
+    pane_id: &str,
+) -> Option<mux_protocol::PaneInfo> {
+    let panes = session.panes.read();
+    let pane = panes.get(pane_id)?;
+    Some(mux_protocol::PaneInfo {
+        id: pane.id.clone(),
+        cwd: pane.cwd.clone(),
+        title: pane.title.read().clone(),
+        command: pane.command.clone().unwrap_or_default(),
+        generation: pane.generation.load(std::sync::atomic::Ordering::Relaxed),
+        size: Some(mux_protocol::TerminalSize {
+            cols: pane.cols.load(std::sync::atomic::Ordering::Relaxed) as u32,
+            rows: pane.rows.load(std::sync::atomic::Ordering::Relaxed) as u32,
+        }),
+        is_alive: pane.alive.load(std::sync::atomic::Ordering::Relaxed),
+    })
+}
+
+/// §15.4 / §16.9 把内部 LayoutTree 转成 proto LayoutTree。
+/// 空根 (session 初始状态) 转 `root: None`。
+fn layout_tree_to_proto(
+    tree: &crate::layout::LayoutTree,
+) -> mux_protocol::LayoutTree {
+    use crate::layout::{LayoutNode, SplitDirection};
+    use mux_protocol::proto::layout_node::Node;
+    use mux_protocol::proto::split_node::SplitDirection as ProtoDir;
+    use mux_protocol::proto::{LayoutNode as ProtoNode, PaneLeaf, SplitNode};
+
+    fn convert(node: &LayoutNode) -> Option<ProtoNode> {
+        let proto_node = match node {
+            LayoutNode::Pane { id, pane_id } if id.is_empty() && pane_id.is_empty() => {
+                return None;
+            }
+            LayoutNode::Pane { id, pane_id } => ProtoNode {
+                id: id.clone(),
+                node: Some(Node::Pane(PaneLeaf {
+                    pane_id: pane_id.clone(),
+                })),
+            },
+            LayoutNode::Split {
+                id,
+                direction,
+                children,
+                ratios,
+            } => {
+                let proto_children: Vec<ProtoNode> =
+                    children.iter().filter_map(convert).collect();
+                let proto_dir = match direction {
+                    SplitDirection::LeftRight => ProtoDir::LeftRight,
+                    SplitDirection::TopBottom => ProtoDir::TopBottom,
+                } as i32;
+                ProtoNode {
+                    id: id.clone(),
+                    node: Some(Node::Split(SplitNode {
+                        direction: proto_dir,
+                        children: proto_children,
+                        ratios: ratios.clone(),
+                    })),
+                }
+            }
+        };
+        Some(proto_node)
+    }
+
+    mux_protocol::LayoutTree {
+        root: convert(&tree.root),
+    }
+}
