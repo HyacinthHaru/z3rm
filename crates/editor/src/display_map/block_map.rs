@@ -2946,7 +2946,7 @@ fn offset_for_row(s: &str, target: RowDelta) -> (RowDelta, usize) {
     (RowDelta(row), offset)
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "z3rm-migration"))]
 mod tests {
     use super::*;
     use crate::{

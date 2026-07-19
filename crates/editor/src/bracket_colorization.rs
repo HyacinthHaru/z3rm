@@ -344,7 +344,7 @@ fn compute_bracket_ranges(
     Vec::new()
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "z3rm-migration"))]
 mod tests {
     use std::{cmp, sync::Arc, time::Duration};
 

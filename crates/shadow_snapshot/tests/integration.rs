@@ -16,19 +16,16 @@ use shadow_snapshot::{
     DeltaRef, PathHash, SnapshotTrigger, VersionTree, Wal, WalEntry, StorageEngine,
 };
 use std::path::PathBuf;
+use std::sync::Arc;
 use tempfile::TempDir;
 
 /// §4 集成测试用的临时引擎堆栈。
 ///
-/// 注意:shadow_snapshot 当前 API 有设计缺陷 —— BlobStore::new 消费
-/// StorageEngine (move 语义),所以同一进程内不能同时持有 StorageEngine
-/// 和 BlobStore。下面的测试用临时 workaround:为每个需要 BlobStore 的
-/// 测试单独 open 第二个 StorageEngine,绕过 API 限制。这是测试层的妥协,
-/// 真正的修复应该在 shadow_snapshot crate 里提供 high-level engine。
+/// §4.5 StorageEngine 用 Arc 共享,BlobStore 和测试同时持有同一份。
 struct EngineStack {
     _tmp: TempDir,
     wal: Wal,
-    storage: StorageEngine,
+    storage: Arc<StorageEngine>,
     tree: VersionTree,
     db_path: PathBuf,
     blob_dir: PathBuf,
@@ -43,7 +40,7 @@ impl EngineStack {
         std::fs::create_dir_all(&blob_dir)?;
 
         let wal = Wal::open(&wal_path).context("open WAL")?;
-        let storage = StorageEngine::open(&db_path).context("open storage")?;
+        let storage = Arc::new(StorageEngine::open(&db_path).context("open storage")?);
         let tree = VersionTree::new();
 
         Ok(Self {
@@ -62,22 +59,20 @@ fn path_hash(p: &str) -> PathHash {
     blake3::hash(p.as_bytes()).into()
 }
 
-/// §4 API 设计缺陷暴露:BlobStore::new 消费 StorageEngine,所以为了
-/// 同时持有 storage 和 blobs,必须再 open 一次 (WAL 模式下 SQLite 允许)。
-/// 这条 helper 是测试层 workaround,生产代码需要 high-level engine 修复。
-fn open_second_blob_store(stack: &EngineStack) -> Result<shadow_snapshot::BlobStore> {
-    let second_engine = StorageEngine::open(&stack.db_path)
-        .context("reopen StorageEngine for BlobStore (API workaround)")?;
-    Ok(shadow_snapshot::BlobStore::new(second_engine, stack.blob_dir.clone()))
+/// §4.5 BlobStore 共享 Arc<StorageEngine>。
+fn open_blob_store(stack: &EngineStack) -> Result<shadow_snapshot::BlobStore> {
+    Ok(shadow_snapshot::BlobStore::new(
+        stack.storage.clone(),
+        stack.blob_dir.clone(),
+    ))
 }
-
 #[test]
 fn integration_record_first_file_version() -> Result<()> {
     let stack = EngineStack::open()?;
 
     // §4.5 步骤 1: 内容寻址存储
     let content = b"hello world";
-    let content_hash = open_second_blob_store(&stack)?.put(content).context("blob put")?;
+    let content_hash = open_blob_store(&stack)?.put(content).context("blob put")?;
 
     // §4.5 步骤 2: 分配 SeqNo,append WAL,fsync
     let seq_no: u64 = 1;
@@ -134,7 +129,7 @@ fn integration_record_first_file_version() -> Result<()> {
     assert_eq!(tree_head, Some(version_id));
 
     // 验证:blob 内容能寻回
-    let recovered = open_second_blob_store(&stack)?.get(&content_hash).context("blob get")?;
+    let recovered = open_blob_store(&stack)?.get(&content_hash).context("blob get")?;
     assert_eq!(recovered, content);
 
     Ok(())
@@ -147,7 +142,7 @@ fn integration_delta_chain_grows() -> Result<()> {
 
     // 版本 1: full snapshot
     let v1_content = b"line1\nline2\nline3\n";
-    let v1_hash = open_second_blob_store(&stack)?.put(v1_content)?;
+    let v1_hash = open_blob_store(&stack)?.put(v1_content)?;
     let ph = path_hash("doc.md");
     let seq1: u64 = 1;
     let ts1 = std::time::SystemTime::now()
@@ -170,7 +165,7 @@ fn integration_delta_chain_grows() -> Result<()> {
 
     // 版本 2: delta。DeltaRef 包含 SHA-256(parent || child) 和压缩大小。
     let v2_content = b"line1\nline2\nline3\nline4\n";
-    let v2_hash = open_second_blob_store(&stack)?.put(v2_content)?;
+    let v2_hash = open_blob_store(&stack)?.put(v2_content)?;
     let mut delta_hasher = sha2::Sha256::new();
     use sha2::Digest;
     delta_hasher.update(v1_content);
@@ -179,7 +174,7 @@ fn integration_delta_chain_grows() -> Result<()> {
     // delta blob 是压缩后的差量。测试里用原始字节作占位,验证 chain 长度即可。
     let delta_blob = b"DELTA_PLACEHOLDER";
     let compressed_size = delta_blob.len() as u64;
-    let delta_content_hash = open_second_blob_store(&stack)?.put(delta_blob)?;
+    let delta_content_hash = open_blob_store(&stack)?.put(delta_blob)?;
     let _ = delta_key;
     let _ = delta_content_hash;
 
@@ -225,7 +220,7 @@ fn integration_wal_replay_recovers_committed_entries() -> Result<()> {
     // 写三个连续 entries
     for seq in 1..=3u64 {
         let content = format!("version-{}", seq);
-        let hash = open_second_blob_store(&stack)?.put(content.as_bytes())?;
+        let hash = open_blob_store(&stack)?.put(content.as_bytes())?;
         let entry = WalEntry {
             seq_no: seq,
             path_hash: ph,
@@ -279,6 +274,114 @@ fn integration_wal_checkpoint_clears_log() -> Result<()> {
         after.len(),
         0,
         "replay after checkpoint should be empty"
+    );
+
+    Ok(())
+}
+
+/// §4.6 reconstruct 必须能从 full snapshot + delta chain 重建目标版本内容。
+///
+/// 这个测试钉死 DeltaReplay::reconstruct 的契约:base content + 应用
+/// delta list = target content。之前 reconstruct 是 stub (返回空 Rope),
+/// 此测试会失败直到实现正确。
+#[test]
+fn integration_reconstruct_replays_delta_chain() -> Result<()> {
+    use shadow_snapshot::{
+        DeltaOp, DeltaReplay, DeltaRef, VersionNode,
+        deserialize_delta_ops, serialize_delta_ops,
+    };
+    use std::collections::HashMap;
+    use std::sync::Arc;
+
+    // 模拟 3 个版本的链: v1 (full) → v2 (delta insert) → v3 (delta delete)
+    let v1_content = b"hello\nworld\n";
+    let v2_content = b"hello\nworld\nmore\n";
+    let v3_content = b"hello\nworld\n"; // 删了 "more\n"
+
+    let v1_hash = blake3::hash(v1_content).into();
+    let delta_v1_to_v2 = vec![DeltaOp::Insert {
+        offset: v1_content.len(),
+        text: Arc::new(rope::Rope::from("more\n")),
+    }];
+    let delta_v2_to_v3 = vec![DeltaOp::Delete {
+        offset: v1_content.len(),
+        delete_len: 5,
+    }];
+
+    // 序列化 deltas,放到模拟 blob store (HashMap<hash, bytes>)
+    let delta_v1_to_v2_bytes = serialize_delta_ops(&delta_v1_to_v2);
+    let delta_v2_to_v3_bytes = serialize_delta_ops(&delta_v2_to_v3);
+    let delta_v1_to_v2_hash: [u8; 32] = blake3::hash(&delta_v1_to_v2_bytes).into();
+    let delta_v2_to_v3_hash: [u8; 32] = blake3::hash(&delta_v2_to_v3_bytes).into();
+    let delta_v1_to_v2_size = delta_v1_to_v2_bytes.len() as u64;
+    let delta_v2_to_v3_size = delta_v2_to_v3_bytes.len() as u64;
+
+    let mut blobs: HashMap<[u8; 32], Vec<u8>> = HashMap::new();
+    blobs.insert(v1_hash, v1_content.to_vec());
+    blobs.insert(delta_v1_to_v2_hash, delta_v1_to_v2_bytes);
+    blobs.insert(delta_v2_to_v3_hash, delta_v2_to_v3_bytes);
+
+    // 构造模拟 VersionNode 链
+    use smallvec::SmallVec;
+    let v1 = Arc::new(VersionNode {
+        version_id: 1,
+        path_hash: [0u8; 32],
+        seq_no: 1,
+        timestamp_ns: 0,
+        parent_id: None,
+        ancestors: SmallVec::new(),
+        full_content: Some(v1_hash),
+        delta: None,
+        delta_depth: 0,
+        trigger: shadow_snapshot::SnapshotTrigger::Write,
+    });
+    let v2 = Arc::new(VersionNode {
+        version_id: 2,
+        parent_id: Some(1),
+        full_content: None,
+        delta: Some(DeltaRef {
+            hash: delta_v1_to_v2_hash,
+            compressed_size: delta_v1_to_v2_size,
+        }),
+        delta_depth: 1,
+        ..(*v1).clone()
+    });
+    let v3 = Arc::new(VersionNode {
+        version_id: 3,
+        parent_id: Some(2),
+        delta: Some(DeltaRef {
+            hash: delta_v2_to_v3_hash,
+            compressed_size: delta_v2_to_v3_size,
+        }),
+        delta_depth: 2,
+        ..(*v2).clone()
+    });
+
+    let nodes: HashMap<u64, Arc<VersionNode>> =
+        [(1, v1), (2, v2), (3, v3)].into_iter().collect();
+
+    // 重建 v2:应该是 v1 + insert "more\n"
+    let reconstructed_v2 = DeltaReplay::reconstruct(
+        nodes.get(&2).unwrap(),
+        |id| nodes.get(&id).cloned(),
+        |hash| blobs.get(hash).cloned(),
+    )
+    .expect("reconstruct v2 must succeed");
+    assert_eq!(
+        reconstructed_v2.to_string(),
+        std::str::from_utf8(v2_content).unwrap()
+    );
+
+    // 重建 v3:应该是 v2 - "more\n" = v1
+    let reconstructed_v3 = DeltaReplay::reconstruct(
+        nodes.get(&3).unwrap(),
+        |id| nodes.get(&id).cloned(),
+        |hash| blobs.get(hash).cloned(),
+    )
+    .expect("reconstruct v3 must succeed");
+    assert_eq!(
+        reconstructed_v3.to_string(),
+        std::str::from_utf8(v3_content).unwrap()
     );
 
     Ok(())

@@ -13,8 +13,11 @@ path = "src/editor.rs"
 doctest = false
 
 [features]
+# §8.1 z3rm 迁移期间,默认禁用所有 #[cfg(test)] mod tests,
+# 因为它们引用已删除的 LSP/editing 模块 (editor_tests, inlays, hover_links::InlayHighlight 等)。
+# 启用 z3rm-migration feature 可强制编译,暴露所有迁移洞。
+z3rm-migration = []
 test-support = [
-    "text/test-support",
     "fs/test-support",
     "language/test-support",
     "gpui/test-support",

@@ -241,10 +241,15 @@ impl RemoteConnectionModal {
                 (options.distro_name.clone(), None, true, false)
             }
             RemoteConnectionOptions::Docker(options) => (options.name.clone(), None, false, true),
+            // §8.1 Mock variant 仅在 remote crate 的 test-support feature 启用时存在。
+            // remote_connection 自己的 cfg(test) 与 remote 的 feature 启用不同步,
+            // 所以用 unconditional wildcard 兜底,Mock 走默认路径 (空 connection_string)。
             #[cfg(any(test, feature = "test-support"))]
             RemoteConnectionOptions::Mock(options) => {
                 (format!("mock-{}", options.id), None, false, false)
             }
+            #[cfg(not(any(test, feature = "test-support")))]
+            _ => (String::new(), None, false, false),
         };
         Self {
             prompt: cx.new(|cx| {

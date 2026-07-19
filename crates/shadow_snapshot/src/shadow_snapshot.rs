@@ -14,7 +14,7 @@ mod storage;
 mod version_tree;
 mod wal;
 
-pub use delta_chain::{DeltaOp, DeltaReplay, D_MAX};
+pub use delta_chain::{serialize_delta_ops, deserialize_delta_ops, DeltaOp, DeltaReplay, D_MAX};
 pub use decline::DeclineProtocol;
 pub use lca::{compute_lca, build_ancestor_table};
 pub use memtable::{MemTable, PathChange};

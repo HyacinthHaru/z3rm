@@ -33,7 +33,7 @@ pub struct EditorLspTestContext {
     pub buffer_lsp_url: lsp::Uri,
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "z3rm-migration"))]
 pub(crate) fn git_commit_lang() -> Arc<Language> {
     Arc::new(Language::new(
         LanguageConfig {

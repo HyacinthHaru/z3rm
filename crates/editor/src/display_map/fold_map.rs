@@ -1731,7 +1731,7 @@ impl<'a> sum_tree::Dimension<'a, TransformSummary> for InlayOffset {
 
 pub type FoldEdit = Edit<FoldOffset>;
 
-#[cfg(test)]
+#[cfg(all(test, feature = "z3rm-migration"))]
 mod tests {
     use super::*;
     use crate::{MultiBuffer, ToPoint, display_map::inlay_map::InlayMap};

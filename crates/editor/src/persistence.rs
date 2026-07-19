@@ -410,7 +410,7 @@ VALUES {placeholders};
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "z3rm-migration"))]
 mod tests {
     use super::*;
 

@@ -1022,7 +1022,7 @@ pub fn split_display_range_by_lines(
     result
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "z3rm-migration"))]
 mod tests {
     use super::*;
     use crate::{

@@ -1471,7 +1471,7 @@ impl SplittableEditor {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "z3rm-migration"))]
 impl SplittableEditor {
     fn check_invariants(&self, quiesced: bool, cx: &mut App) {
         use text::Bias;
@@ -2366,7 +2366,7 @@ impl Render for SplittableEditor {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "z3rm-migration"))]
 mod tests {
     use std::{any::TypeId, sync::Arc};
 

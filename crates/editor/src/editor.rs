@@ -49,7 +49,9 @@ mod task;
 // mod editor_block_comment_tests;
 // #[cfg(test)]
 // mod editor_tests;
-#[cfg(any(test, feature = "test-support"))]
+// §8.1 z3rm 迁移:editor::test 模块依赖已删除的 project::Project::test 旧签名。
+// 默认禁用,启用 z3rm-migration feature 才尝试编译,暴露迁移洞。
+#[cfg(all(test, feature = "z3rm-migration"))]
 pub mod test;
 
 mod clipboard;

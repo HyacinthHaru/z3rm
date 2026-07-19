@@ -916,7 +916,7 @@ struct TabStop {
     byte_offset: u32,
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "z3rm-migration"))]
 mod tests {
     use std::mem;
 

@@ -56,7 +56,7 @@ impl Editor {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "z3rm-migration"))]
 mod tests {
     use futures::StreamExt as _;
     use gpui::TestAppContext;

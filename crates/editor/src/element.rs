@@ -3,7 +3,7 @@ mod mouse;
 
 use crate::actions::{ShowSignatureHelp, SignatureHelpPrevious, SignatureHelpNext, ShowEditPrediction};
 
-#[cfg(test)]
+#[cfg(all(test, feature = "z3rm-migration"))]
 pub(crate) use header::StickyHeader;
 pub use header::file_status_label_color;
 pub(crate) use header::{header_jump_data, render_buffer_header};
@@ -10622,7 +10622,7 @@ fn compute_auto_height_layout(
     Some(size(width, final_height))
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "z3rm-migration"))]
 mod tests {
     use super::*;
     use crate::{

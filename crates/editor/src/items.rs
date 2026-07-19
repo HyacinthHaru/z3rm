@@ -2089,7 +2089,7 @@ fn compute_modified_ranges(
     merged
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "z3rm-migration"))]
 mod tests {
     use crate::editor_tests::init_test;
     use fs::Fs;

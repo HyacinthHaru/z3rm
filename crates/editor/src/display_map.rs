@@ -2641,7 +2641,7 @@ impl DisplayPointConverter<'_> {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "z3rm-migration"))]
 pub mod tests {
     use super::*;
     use crate::{

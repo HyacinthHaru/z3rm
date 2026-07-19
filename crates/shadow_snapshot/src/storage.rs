@@ -7,6 +7,7 @@
 use std::fs::{self, File};
 use std::io::Write;
 use std::path::Path;
+use std::sync::Arc;
 
 use anyhow::{Context, Result};
 use rusqlite::{Connection, params, OptionalExtension};
@@ -61,7 +62,7 @@ CREATE TABLE IF NOT EXISTS gc_queue (
 );
 "#;
 
-/// StorageEngine：SQLite 版本节点存储
+/// StorageEngine:SQLite 版本节点存储。
 pub struct StorageEngine {
     conn: Connection,
 }
@@ -169,16 +170,21 @@ impl StorageEngine {
 ///
 /// 小对象 (< 4KB) 内联存 SQLite，大对象存磁盘分片目录。
 /// Zstd 压缩 + 引用计数。
+/// BlobStore:content-addressed 对象存储。
+///
+/// §4.5 持有 Arc<StorageEngine> 而非 StorageEngine by value,这样调用方
+/// 可以同时持有 StorageEngine (调 write_node) 和 BlobStore (调 put/get)。
+/// 旧 by-value 设计强迫二选一,严重限制 high-level engine 实现。
 pub struct BlobStore {
-    engine: StorageEngine,
+    engine: Arc<StorageEngine>,
     blob_dir: std::path::PathBuf,
 }
 
 impl BlobStore {
-    /// 创建 BlobStore
-    pub fn new(engine: StorageEngine, blob_dir: impl Into<std::path::PathBuf>) -> Self {
+    /// 创建 BlobStore,与调用方共享 StorageEngine。
+    pub fn new(engine: impl Into<Arc<StorageEngine>>, blob_dir: impl Into<std::path::PathBuf>) -> Self {
         Self {
-            engine,
+            engine: engine.into(),
             blob_dir: blob_dir.into(),
         }
     }

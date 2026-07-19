@@ -493,6 +493,8 @@ impl TitleBar {
             }
             #[cfg(any(test, feature = "test-support"))]
             RemoteConnectionOptions::Mock(_) => (None, "Mock Remote Project", IconName::Server),
+            #[cfg(not(any(test, feature = "test-support")))]
+            _ => (None, "Remote Project", IconName::Server),
         };
 
         let nickname = nickname.unwrap_or_else(|| host.clone());

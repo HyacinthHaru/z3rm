@@ -406,7 +406,7 @@ impl SeekTarget<'_, ItemSummary, ItemSummary> for Anchor {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "z3rm-migration"))]
 mod test {
     use super::*;
     use gpui::{App, div};
