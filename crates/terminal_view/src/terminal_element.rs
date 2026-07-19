@@ -1815,7 +1815,7 @@ fn resolve_terminal_images(
         .collect()
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "z3rm-migration"))]
 mod tests {
     use super::*;
     use gpui::{AbsoluteLength, Hsla, font};

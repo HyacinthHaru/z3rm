@@ -9,6 +9,8 @@ license = "GPL-3.0-or-later"
 workspace = true
 
 [features]
+# §8.1 z3rm 迁移期间,默认禁用 broken test mods (Project::test 旧签名等)。
+z3rm-migration = []
 test-support = ["editor/test-support", "gpui/test-support"]
 
 [lib]

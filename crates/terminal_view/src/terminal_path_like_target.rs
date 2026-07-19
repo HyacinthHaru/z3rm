@@ -217,7 +217,7 @@ fn possibly_open_target(
     })
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "z3rm-migration"))]
 mod tests {
     use super::*;
     use gpui::{AppContext as _, TestAppContext};

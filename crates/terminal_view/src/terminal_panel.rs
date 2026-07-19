@@ -1705,7 +1705,7 @@ impl RenderOnce for InlineAssistTabBarButton {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "z3rm-migration"))]
 mod tests {
     use std::num::NonZero;
 

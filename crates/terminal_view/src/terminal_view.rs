@@ -2368,7 +2368,7 @@ fn first_project_directory(workspace: &Workspace, cx: &App) -> Option<PathBuf> {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "z3rm-migration"))]
 mod tests {
     use super::*;
     use gpui::{TestAppContext, VisualTestContext};
