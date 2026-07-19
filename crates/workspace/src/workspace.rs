@@ -1287,6 +1287,12 @@ pub struct Workspace {
     active_worktree_creation: ActiveWorktreeCreation,
     deferred_save_items: Vec<Box<dyn WeakItemHandle>>,
     // §15.1 / §16.9 服务端布局树 (server-side layout tree)
+    //
+    // !!! §16.9 迁移缺口 (Plan 15):当前 server_layout 只被存储,
+    // 从未在渲染或 split/resize 决策中被读取。center: PaneGroup 仍是
+    // 几何权威,违反 spec §16.9 "client workspace holds no layout
+    // calculation logic"。完整迁移需要 PaneGroup 从 server_layout 派生,
+    // 且所有 split/resize 操作通过 mux RPC 走,而不是本地 PaneGroup::split。
     server_layout: Option<crate::layout_projection::LayoutTree>,
     // §16.9 tabbar 样式: top 或 stacked (运行时可切换)
     tabbar_style: crate::layout_projection::TabBarStyle,
