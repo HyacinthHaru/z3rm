@@ -7,6 +7,7 @@ mod input;
 mod cli;
 mod log_viewer;
 pub mod diff_review;
+pub mod chrome;
 
 use std::sync::Arc;
 

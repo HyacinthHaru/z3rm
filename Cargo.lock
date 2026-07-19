@@ -11875,6 +11875,7 @@ dependencies = [
  "anyhow",
  "blake3",
  "lru",
+ "notify 6.1.1",
  "parking_lot",
  "proptest",
  "proptest-derive",

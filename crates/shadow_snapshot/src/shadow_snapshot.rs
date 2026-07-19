@@ -13,6 +13,7 @@ mod quota;
 mod storage;
 mod version_tree;
 mod wal;
+mod engine;
 
 pub use delta_chain::{serialize_delta_ops, deserialize_delta_ops, DeltaOp, DeltaReplay, D_MAX};
 pub use decline::DeclineProtocol;
@@ -25,3 +26,4 @@ pub use version_tree::{
     ContentHash, DeltaRef, PathHash, SeqNo, VersionId, VersionNode, VersionTree,
 };
 pub use wal::{Wal, WalEntry};
+pub use engine::ShadowSnapshotEngine;

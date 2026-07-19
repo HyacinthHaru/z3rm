@@ -8,7 +8,9 @@ use std::collections::HashMap;
 use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
+use std::sync::{mpsc, Arc};
 
+use notify::Watcher;
 use parking_lot::Mutex;
 
 use crate::version_tree::SnapshotTrigger;
@@ -73,6 +75,13 @@ pub struct Monitor {
     /// 事件回调
     on_event: Box<dyn Fn(FileEvent) -> SnapshotTrigger + Send + Sync>,
 }
+
+// Safety: Monitor fields are Send+Sync safe:
+// - IgnoreFilter: PathBuf + Mutex<Vec<String>>
+// - circuit_breaker: Mutex<CircuitBreaker>
+// - on_event: Box<dyn Fn(...) + Send + Sync>
+unsafe impl Send for Monitor {}
+unsafe impl Sync for Monitor {}
 
 impl Monitor {
     /// 创建监控器
@@ -161,6 +170,67 @@ impl Monitor {
     /// 添加自定义忽略模式
     pub fn add_ignore_pattern(&self, pattern: &str) {
         self.ignore_filter.add_pattern(pattern);
+    }
+    /// Start watching a directory using the notify crate.
+    ///
+    /// Returns a handle that can be dropped to stop watching.
+    /// The watcher runs on a background thread and dispatches
+    /// filtered events through this monitor's pipeline.
+    pub fn watch_directory(self: &Arc<Self>, root: PathBuf) -> std::io::Result<WatchHandle> {
+        let (tx, rx) = mpsc::channel();
+
+        let mut watcher = notify::recommended_watcher(move |res: notify::Result<notify::Event>| {
+            if let Ok(event) = res {
+                let _ = tx.send(event);
+            }
+        })
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
+
+        watcher
+            .watch(&root, notify::RecursiveMode::Recursive)
+            .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
+
+        // Clone Arc<Self> into the background thread. The thread processes
+        // events through this monitor's ignore-filter + circuit-breaker pipeline.
+        let monitor = self.clone();
+        std::thread::Builder::new()
+            .name("fs-watcher".into())
+            .spawn(move || {
+                for event in rx.iter() {
+                    for path in event.paths {
+                        let kind = match event.kind {
+                            notify::EventKind::Create(_) => EventKind::Created,
+                            notify::EventKind::Modify(_) => EventKind::Modified,
+                            notify::EventKind::Remove(_) => EventKind::Deleted,
+                            notify::EventKind::Any => EventKind::Modified,
+                            _ => continue,
+                        };
+                        let file_event = FileEvent {
+                            path,
+                            kind,
+                            timestamp: Instant::now(),
+                        };
+                        let _ = monitor.handle_event(file_event);
+                    }
+                }
+            })
+            .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
+
+        Ok(WatchHandle { watcher: Some(watcher) })
+    }
+}
+
+/// Handle returned by `Monitor::watch_directory`. Drop to stop watching.
+pub struct WatchHandle {
+    watcher: Option<notify::RecommendedWatcher>,
+}
+
+impl Drop for WatchHandle {
+    fn drop(&mut self) {
+        // notify::RecommendedWatcher stops watching on Drop.
+        // Dropping the watcher also closes the channel sender,
+        // which causes the background thread to exit.
+        drop(self.watcher.take());
     }
 }
 

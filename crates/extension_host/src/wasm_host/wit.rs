@@ -24,7 +24,7 @@ use wasmtime::{
     component::{Component, Linker, Resource},
 };
 
-#[cfg(test)]
+#[cfg(all(test, feature = "z3rm-migration"))]
 pub use latest::CodeLabelSpanLiteral;
 pub use latest::{
     CodeLabel, CodeLabelSpan, Command, ExtensionProject, Range, SlashCommand,

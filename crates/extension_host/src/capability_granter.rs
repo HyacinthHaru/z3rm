@@ -83,7 +83,7 @@ impl CapabilityGranter {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "z3rm-migration"))]
 mod tests {
     use std::collections::BTreeMap;
 

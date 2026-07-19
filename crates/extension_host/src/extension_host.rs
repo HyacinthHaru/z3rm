@@ -3,6 +3,8 @@ pub mod extension_settings;
 pub mod headless_host;
 pub mod marketplace;
 pub mod wasm_host;
+pub mod api;
+pub mod vdom_bridge;
 
 // #[cfg(test)]
 // mod extension_store_test;

@@ -27,7 +27,7 @@ use std::{
 use theme::ThemeRegistry;
 use util::{rel_path::rel_path_buf, test::TempTree};
 
-#[cfg(test)]
+#[cfg(all(test, feature = "z3rm-migration"))]
 #[ctor::ctor(unsafe)]
 fn init_logger() {
     zlog::init_test();

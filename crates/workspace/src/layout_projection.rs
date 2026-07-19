@@ -218,11 +218,8 @@ impl LayoutTree {
 // §15.1 布局渲染 — 将 LayoutTree 渲染为 GPUI 元素
 // ============================================================================
 
-/// §15.1 布局渲染器: 将 LayoutTree 与 pane 实体映射, 计算 GPUI 元素位置
-///
-/// 注意: 此模块提供布局投影 (bounds 计算) 和渲染框架。
-/// 实际 pane 渲染由 workspace 的 PaneGroup/PaneAxis 完成。
-/// 当 server-driven layout 完全就绪后, workspace 将直接调用此模块渲染。
+/// §15.1 布局渲染器:将 LayoutTree 与 pane 实体映射,计算 GPUI 元素位置。
+/// `render_layout` 自由函数是 §16.9 的实际入口。
 pub struct LayoutRenderer;
 
 impl LayoutRenderer {
@@ -237,6 +234,24 @@ impl LayoutRenderer {
             splitter_width,
         })
     }
+}
+
+/// §16.9 布局渲染入口: 将 LayoutTree 投影为 pane bounds 列表。
+///
+/// 接收服务端布局树和 pane 实体映射, 根据树中 ratio 计算每个 pane
+/// 在给定区域内的 Bounds。返回扁平的 (pane_id, Bounds) 列表供 GPUI 渲染。
+///
+/// 替代 PaneGroup 的 flexbox 布局计算 (spec §16.9)。
+pub fn render_layout(
+    tree: &LayoutTree,
+    bounds: Bounds<Pixels>,
+) -> Vec<(String, Bounds<Pixels>)> {
+    let splitter_width = gpui::px(2.0);
+    let projection = tree.project(ProjectionConfig {
+        available_bounds: bounds,
+        splitter_width,
+    });
+    projection.pane_bounds.into_iter().collect()
 }
 
 // ============================================================================

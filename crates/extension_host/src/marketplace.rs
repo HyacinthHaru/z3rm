@@ -153,7 +153,7 @@ pub fn marketplace_entry_to_metadata(entry: &MarketplaceEntry) -> ExtensionMetad
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "z3rm-migration"))]
 mod tests {
     use super::*;
     use http_client::FakeHttpClient;

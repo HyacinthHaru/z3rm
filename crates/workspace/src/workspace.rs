@@ -1288,11 +1288,10 @@ pub struct Workspace {
     deferred_save_items: Vec<Box<dyn WeakItemHandle>>,
     // §15.1 / §16.9 服务端布局树 (server-side layout tree)
     //
-    // !!! §16.9 迁移缺口 (Plan 15):当前 server_layout 只被存储,
-    // 从未在渲染或 split/resize 决策中被读取。center: PaneGroup 仍是
-    // 几何权威,违反 spec §16.9 "client workspace holds no layout
-    // calculation logic"。完整迁移需要 PaneGroup 从 server_layout 派生,
-    // 且所有 split/resize 操作通过 mux RPC 走,而不是本地 PaneGroup::split。
+    // §16.9 Plan 15: 布局树由 mux_server 维护, client workspace 通过
+    // `render_layout` 投影为 pane bounds。split 操作通过 `domain.split_pane()`
+    // RPC 转发到 server。收到 `SessionLayoutChanged` 通知后调用 `domain.attach()`
+    // 获取最新快照并更新此字段。PaneGroup 仍作为 fallback 渲染使用。
     server_layout: Option<crate::layout_projection::LayoutTree>,
     // §16.9 tabbar 样式: top 或 stacked (运行时可切换)
     tabbar_style: crate::layout_projection::TabBarStyle,
@@ -6484,43 +6483,62 @@ impl Workspace {
     // §15.1 / §16.9 布局交互 RPC 转发 — 将用户操作转发到 mux_server
     // ========================================================================
 
-    /// §16.9 转发分割请求到 server
+    /// §16.9 转发分割请求到 server — 调用 domain.split_pane() RPC
     pub async fn rpc_split_pane(
         &self,
-        mux: &mux::MuxDomain,
+        domain: &mux::MuxDomain,
         pane_id: &str,
         direction: mux_protocol::split_node::SplitDirection,
     ) -> anyhow::Result<String> {
-        mux.split_pane(pane_id, direction).await
+        domain.split_pane(pane_id, direction).await
     }
 
     /// §16.9 转发关闭请求到 server
     pub async fn rpc_close_pane(
         &self,
-        mux: &mux::MuxDomain,
+        domain: &mux::MuxDomain,
         pane_id: &str,
     ) -> anyhow::Result<()> {
-        mux.close_pane(pane_id).await
+        domain.close_pane(pane_id).await
     }
 
     /// §16.9 转发聚焦请求到 server
     pub async fn rpc_focus_pane(
         &self,
-        mux: &mux::MuxDomain,
+        domain: &mux::MuxDomain,
         pane_id: &str,
     ) -> anyhow::Result<()> {
-        mux.focus_pane(pane_id).await
+        domain.focus_pane(pane_id).await
     }
 
     /// §16.9 转发调整大小请求到 server
     pub async fn rpc_resize_pane(
         &self,
-        mux: &mux::MuxDomain,
+        domain: &mux::MuxDomain,
         pane_id: &str,
         cols: u32,
         rows: u32,
     ) -> anyhow::Result<()> {
-        mux.resize_pane(pane_id, cols, rows).await
+        domain.resize_pane(pane_id, cols, rows).await
+    }
+
+    /// §16.9 处理 SessionLayoutChanged 通知: 从 server 获取最新布局快照
+    /// 并更新本地 server_layout, 触发重绘。
+    pub async fn handle_session_layout_changed(
+        &mut self,
+        domain: &mux::MuxDomain,
+        session_id: &str,
+    ) -> anyhow::Result<()> {
+        let attach_resp = domain
+            .attach(session_id, mux::AttachMode::Shared)
+            .await?;
+        if let Some(snapshot) = &attach_resp.snapshot {
+            if let Some(layout) = &snapshot.layout {
+                self.server_layout =
+                    Some(crate::layout_projection::LayoutTree::from_proto(layout));
+            }
+        }
+        Ok(())
     }
 
     #[cfg(any(test, feature = "test-support"))]
