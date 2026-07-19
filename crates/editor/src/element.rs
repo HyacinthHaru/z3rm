@@ -3,7 +3,7 @@ mod mouse;
 
 use crate::actions::{ShowSignatureHelp, SignatureHelpPrevious, SignatureHelpNext, ShowEditPrediction};
 
-#[cfg(all(test, feature = "z3rm-migration"))]
+#[cfg(test)]
 pub(crate) use header::StickyHeader;
 pub use header::file_status_label_color;
 pub(crate) use header::{header_jump_data, render_buffer_header};
