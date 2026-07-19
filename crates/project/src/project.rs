@@ -731,3 +731,63 @@ impl<'a> fuzzy_nucleo::PathMatchCandidateSet<'a> for PathMatchCandidateSet {
         self.snapshot.path_style()
     }
 }
+
+// §2.1 ProjectPath 基本不变量测试 — 这些不依赖 LSP/buffer,裁剪后必须仍能跑。
+#[cfg(test)]
+mod z3rm_path_tests {
+    use super::*;
+
+    #[test]
+    fn root_path_has_empty_path() {
+        let p = ProjectPath::root_path(WorktreeId::from_proto(0));
+        assert!(p.path.is_empty(), "root path should be empty");
+    }
+
+    #[test]
+    fn starts_with_same_worktree_and_prefix_path() {
+        let wid = WorktreeId::from_proto(1);
+        let root = ProjectPath::root_path(wid);
+        let child = ProjectPath {
+            worktree_id: wid,
+            path: RelPath::new(
+                std::path::Path::new("src/foo.rs"),
+                util::paths::PathStyle::Posix,
+            )
+            .unwrap()
+            .into_owned()
+            .into(),
+        };
+        assert!(child.starts_with(&root), "child should start_with root");
+        assert!(!root.starts_with(&child), "root should not start_with child");
+    }
+
+    #[test]
+    fn starts_with_different_worktree_is_false() {
+        let w1 = WorktreeId::from_proto(1);
+        let w2 = WorktreeId::from_proto(2);
+        let p1 = ProjectPath::root_path(w1);
+        let p2 = ProjectPath::root_path(w2);
+        assert!(
+            !p1.starts_with(&p2),
+            "different worktree should not start_with"
+        );
+    }
+
+    #[test]
+    fn proto_round_trip_preserves_worktree_id_and_path() {
+        let wid = WorktreeId::from_proto(42);
+        let original = ProjectPath {
+            worktree_id: wid,
+            path: RelPath::new(
+                std::path::Path::new("a/b.rs"),
+                util::paths::PathStyle::Posix,
+            )
+            .unwrap()
+            .into_owned()
+            .into(),
+        };
+        let proto = original.to_proto();
+        let recovered = ProjectPath::from_proto(proto).expect("round trip");
+        assert_eq!(original, recovered);
+    }
+}

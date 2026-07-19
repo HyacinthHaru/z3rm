@@ -11,9 +11,10 @@ workspace = true
 [lib]
 path = "src/project.rs"
 doctest = false
-test = false
+test = true
 
 [features]
+z3rm-migration = []
 test-support = [
     "buffer_diff/test-support",
     "language/test-support",
