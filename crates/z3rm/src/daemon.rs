@@ -68,7 +68,11 @@ pub fn watch_daemon_connection(
 }
 
 /// 默认 socket 路径: $XDG_RUNTIME_DIR/z3rm/mux.sock 或 /tmp/z3rm/mux.sock (§16.1)
+/// 测试与多实例场景可用 Z3RM_MUX_SOCKET 环境变量覆盖。
 pub fn default_socket_path() -> PathBuf {
+    if let Ok(p) = std::env::var("Z3RM_MUX_SOCKET") {
+        return PathBuf::from(p);
+    }
     if let Ok(runtime_dir) = std::env::var("XDG_RUNTIME_DIR") {
         PathBuf::from(runtime_dir)
     } else {

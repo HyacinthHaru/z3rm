@@ -232,6 +232,27 @@ pub async fn run_cli_command(cmd: CliCommand) -> Result<()> {
                 .create_session(&name, &cwd)
                 .await
                 .context("failed to create session")?;
+
+            // §3.10 tmux 语义:new -s 自动创建一个 window + 一个 pane,
+            // 否则后续 send-keys / capture-pane 没有 target 可用。
+            let snapshot = domain.attach(&id, mux::AttachMode::Shared).await?;
+            let tab_id = snapshot
+                .snapshot
+                .as_ref()
+                .and_then(|s| s.tabs.first())
+                .map(|t| t.id.clone())
+                .unwrap_or_else(|| "tab-0".to_string());
+            let _pane_id = domain
+                .spawn_pane(
+                    &id,
+                    &tab_id,
+                    mux_protocol::proto::TerminalSize { cols: 80, rows: 24 },
+                    None,
+                    Some(&cwd),
+                )
+                .await
+                .context("failed to spawn default pane")?;
+
             println!("created session {} ({})", name, id);
         }
 
