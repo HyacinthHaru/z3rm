@@ -306,7 +306,6 @@ fn main() {
             eprintln!("[z3rm] Ensuring pane in session");
             daemon::ensure_pane_in_session(&domain, &session_id).await?;
             eprintln!("[z3rm] Pane ensured");
-
             // 3. attach 到 session (Shared 模式允许输入)
             eprintln!("[z3rm] Attaching to session");
             let _attach_resp = domain
@@ -315,6 +314,24 @@ fn main() {
             eprintln!("[z3rm] Attached to session");
             tracing::info!(session_id = %session_id, "attached to session");
 
+            // §16.9 / §3.4 后台订阅 MuxDomain 通知。
+            // 具体处理 (PaneAdded → 创建 MuxPaneView / SessionLayoutChanged → 重建
+            // 布局) 由后续 Phase 2 工作完成；当前先保持订阅,保证
+            // PaneDirty/PaneAdded 等高频通知不会丢失。
+            let domain_for_notify = domain.clone();
+            cx.background_executor()
+                .spawn(async move {
+                    let mut rx = domain_for_notify.subscribe();
+                    while let Ok(notif) = rx.recv().await {
+                        if let Some(mux_protocol::notification::Event::SessionLayoutChanged(
+                            _slc,
+                        )) = notif.event.as_ref()
+                        {
+                            tracing::debug!("SessionLayoutChanged received");
+                        }
+                    }
+                })
+                .detach();
             // 4. 注册窗口关闭回调: detach session (daemon 继续运行)
             let domain_for_close = domain.clone();
             cx.update(|cx| {
