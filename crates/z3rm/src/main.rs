@@ -324,36 +324,24 @@ fn main() {
             Arc::new(git::GitHostingProviderRegistry::new());
         git::GitHostingProviderRegistry::set_global(git_hosting_provider_registry, cx);
 
-        // Workspace 全局 actions, pane/titlebar/action system
         workspace::init(app_state.clone(), cx);
-        // Editor (read-only viewer + diff rendering per spec §2.1)
         editor::init(cx);
-        // UI panels & tooling
         command_palette::init(cx);
         file_finder::init(cx);
         tab_switcher::init(cx);
         project_panel::init(cx);
-        project_symbols::init(cx);
         search::init(cx);
-        go_to_line::init(cx);
         title_bar::init(cx);
-        diagnostics::init(cx);
-        // Terminal/extension/settings UI
-        // Terminal/settings UI (§5.2 extension_host is QuickJS in z3rm, not yet wired;
-        // skipping extensions_ui/extension::init which require the legacy Node-based host)
         terminal_view::init(cx);
         settings_ui::init(cx);
         settings_profile_selector::init(cx);
-        // Selectors / editors
         theme_selector::init(cx);
         language_selector::init(cx);
         keymap_editor::init(cx);
         line_ending_selector::init(cx);
-        // Git
         git_hosting_providers::init(cx);
         git_ui::init(cx);
         recent_projects::init(cx);
-        // Misc
         which_key::init(cx);
         zlog_settings::init(cx);
 
@@ -392,7 +380,7 @@ fn main() {
             // window close = detach
             let domain_for_close = domain.clone();
             cx.update(|cx| {
-                let _ = cx.on_window_closed(move |app, _window_id| {
+                cx.on_window_closed(move |app, _window_id| {
                     let d = domain_for_close.clone();
                     app.spawn(async move |_| {
                         if let Err(e) = d.detach().await {
@@ -400,7 +388,8 @@ fn main() {
                         }
                     })
                     .detach();
-                });
+                })
+                .detach();
             });
 
             // 获取 pane id
