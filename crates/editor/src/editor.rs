@@ -9821,22 +9821,52 @@ impl Editor {
     pub fn clear_runnables(&mut self, _for_buffer: Option<BufferId>) {}
 
     /// Stub: compose_completion
-    pub fn compose_completion<A, B, C, R>(&mut self, _a0: A, _a1: B, _a2: C) -> R { unimplemented!() }
+    pub fn compose_completion<A, B, C, R>(&mut self, _a0: A, _a1: B, _a2: C) -> R
+    where
+        R: Default,
+    {
+        R::default()
+    }
 
     /// Stub: confirm_code_action
-    pub fn confirm_code_action<A, B, C, R>(&mut self, _a0: A, _a1: B, _a2: C) -> R { unimplemented!() }
+    pub fn confirm_code_action<A, B, C, R>(&mut self, _a0: A, _a1: B, _a2: C) -> R
+    where
+        R: Default,
+    {
+        R::default()
+    }
 
     /// Stub: confirm_completion
-    pub fn confirm_completion<A, B, C, R>(&mut self, _a0: A, _a1: B, _a2: C) -> R { unimplemented!() }
+    pub fn confirm_completion<A, B, C, R>(&mut self, _a0: A, _a1: B, _a2: C) -> R
+    where
+        R: Default,
+    {
+        R::default()
+    }
 
     /// Stub: confirm_completion_insert
-    pub fn confirm_completion_insert<A, B, C, R>(&mut self, _a0: A, _a1: B, _a2: C) -> R { unimplemented!() }
+    pub fn confirm_completion_insert<A, B, C, R>(&mut self, _a0: A, _a1: B, _a2: C) -> R
+    where
+        R: Default,
+    {
+        R::default()
+    }
 
     /// Stub: confirm_completion_replace
-    pub fn confirm_completion_replace<A, B, C, R>(&mut self, _a0: A, _a1: B, _a2: C) -> R { unimplemented!() }
+    pub fn confirm_completion_replace<A, B, C, R>(&mut self, _a0: A, _a1: B, _a2: C) -> R
+    where
+        R: Default,
+    {
+        R::default()
+    }
 
     /// Stub: discard_edit_prediction
-    pub fn discard_edit_prediction<A, B, R>(&mut self, _a0: A, _a1: B) -> R { unimplemented!() }
+    pub fn discard_edit_prediction<A, B, R>(&mut self, _a0: A, _a1: B) -> R
+    where
+        R: Default,
+    {
+        R::default()
+    }
 
     /// Stub: dismiss_diagnostics
     pub fn dismiss_diagnostics(&mut self, _cx: &mut Context<Self>) {}
@@ -9849,14 +9879,20 @@ impl Editor {
     /// Stub: handle_input
     pub fn handle_input(&mut self, _text: &str, _window: &mut Window, _cx: &mut Context<Self>) {}
 
-    /// Stub: has_active_diagnostic_group
-    pub fn has_active_diagnostic_group<R>(&mut self) -> R {
-        unimplemented!()
+    /// §2.1 spec: diagnostics module pruned. Always returns default (false).
+    pub fn has_active_diagnostic_group<R>(&mut self) -> R
+    where
+        R: Default,
+    {
+        R::default()
     }
 
-    /// Stub: has_available_code_actions_for_selection
-    pub fn has_available_code_actions_for_selection<R>(&mut self) -> R {
-        unimplemented!()
+    /// §2.1 spec: code_actions module deleted. Always returns false (no actions).
+    pub fn has_available_code_actions_for_selection<R>(&self) -> R
+    where
+        R: Default,
+    {
+        R::default()
     }
 
     /// Stub: invalidate_autoclose_regions
@@ -9878,23 +9914,71 @@ impl Editor {
     pub fn refresh_inline_diagnostics(&mut self, _a0: bool, _a1: &mut Window, _a2: &mut Context<Self>) {}
 
     /// Stub: render_edit_prediction_cursor_popover
-    pub fn render_edit_prediction_cursor_popover<A, B, C, D, E, F, R>(&mut self, _a0: A, _a1: B, _a2: C, _a3: D, _a4: E, _a5: F) -> R {
-        unimplemented!()
+    pub fn render_edit_prediction_cursor_popover<A, B, C, D, E, F, R>(
+        &mut self,
+        _a0: A,
+        _a1: B,
+        _a2: C,
+        _a3: D,
+        _a4: E,
+        _a5: F,
+    ) -> R
+    where
+        R: Default,
+    {
+        R::default()
     }
 
-    /// Stub: render_edit_prediction_popover
-    pub fn render_edit_prediction_popover<A, B, C, D, E, F, G, H, I, J, K, L, M, N, O, P, R>(&mut self, _a0: A, _a1: B, _a2: C, _a3: D, _a4: E, _a5: F, _a6: G, _a7: H, _a8: I, _a9: J, _a10: K, _a11: L, _a12: M, _a13: N, _a14: O, _a15: P) -> R {
-        unimplemented!()
+    /// §2.1 spec: edit_prediction module deleted (AI inline predictions).
+    /// Render path still references this; return empty until element.rs
+    /// is pruned to remove the call site.
+    pub fn render_edit_prediction_popover(
+        &mut self,
+        _a0: &gpui::Bounds<gpui::Pixels>,
+        _a1: gpui::Point<gpui::Pixels>,
+        _a2: gpui::Pixels,
+        _a3: &EditorSnapshot,
+        _a4: core::ops::Range<DisplayRow>,
+        _a5: f64,
+        _a6: f64,
+        _a7: &Vec<LineWithInvisibles>,
+        _a8: gpui::Pixels,
+        _a9: gpui::Point<f64>,
+        _a10: gpui::Point<f64>,
+        _a11: Option<DisplayPoint>,
+        _a12: gpui::Pixels,
+        _a13: &EditorStyle,
+        _a14: (),
+        _a15: (),
+    ) -> (Option<gpui::AnyElement>, gpui::Point<gpui::Pixels>) {
+        (None, gpui::Point::default())
     }
 
-    /// Stub: render_inline_code_actions
-    pub fn render_inline_code_actions<A, B, C, D, R>(&mut self, _a0: A, _a1: B, _a2: C, _a3: D) -> R {
-        unimplemented!()
+    /// §2.1 spec: code_actions module deleted (LSP editing UI).
+    /// Render path in element.rs still references this; return None.
+    pub fn render_inline_code_actions(
+        &mut self,
+        _icon_size: ui::IconSize,
+        _row: DisplayRow,
+        _active: bool,
+        _cx: &mut Context<Self>,
+    ) -> gpui::AnyElement {
+        div().into_any_element()
     }
 
     /// Stub: render_run_indicator
-    pub fn render_run_indicator<A, B, C, D, E, R>(&self, _a0: A, _a1: B, _a2: C, _a3: D, _a4: E) -> R {
-        unimplemented!()
+    pub fn render_run_indicator<A, B, C, D, E, R>(
+        &self,
+        _a0: A,
+        _a1: B,
+        _a2: C,
+        _a3: D,
+        _a4: E,
+    ) -> R
+    where
+        R: From<gpui::AnyElement>,
+    {
+        div().into_any_element().into()
     }
 
     /// Stub: resolve_visible_code_lenses
@@ -9918,7 +10002,12 @@ impl Editor {
     pub fn toggle_code_lens(&mut self, _inline: bool, _window: &mut Window, _cx: &mut Context<Self>) {}
 
     /// Stub: trigger_completion_on_input
-    pub fn trigger_completion_on_input<A, B, C, D, R>(&mut self, _a0: A, _a1: B, _a2: C, _a3: D) -> R { unimplemented!() }
+    pub fn trigger_completion_on_input<A, B, C, D, R>(&mut self, _a0: A, _a1: B, _a2: C, _a3: D) -> R
+    where
+        R: Default,
+    {
+        R::default()
+    }
 
     /// Stub: update_diagnostics_state
     pub fn update_diagnostics_state(&mut self, _window: &mut Window, _cx: &mut Context<Self>) {}
@@ -9994,13 +10083,19 @@ impl Editor {
     pub fn unwrap_syntax_node(&mut self, _action: &UnwrapSyntaxNode, _window: &mut Window, _cx: &mut Context<Self>) {}
 
     /// Stub: active_diagnostic_group_id
-    pub fn active_diagnostic_group_id<R>(&self) -> R {
-        unimplemented!()
+    pub fn active_diagnostic_group_id<R>(&self) -> R
+    where
+        R: Default,
+    {
+        R::default()
     }
 
     /// Stub: edit_prediction_cursor_popover_height
-    pub fn edit_prediction_cursor_popover_height<R>(&self) -> R {
-        unimplemented!()
+    pub fn edit_prediction_cursor_popover_height<R>(&self) -> R
+    where
+        R: Default,
+    {
+        R::default()
     }
 
     /// Stub: edit_prediction_preview_is_active
@@ -10009,13 +10104,19 @@ impl Editor {
     }
 
     /// Stub: edit_prediction_visible_in_cursor_popover
-    pub fn edit_prediction_visible_in_cursor_popover<A, R>(&self, _a0: A) -> R {
-        unimplemented!()
+    pub fn edit_prediction_visible_in_cursor_popover<A, R>(&self, _a0: A) -> R
+    where
+        R: Default,
+    {
+        R::default()
     }
 
     /// Stub: inline_diagnostics_enabled
-    pub fn inline_diagnostics_enabled<R>(&self) -> R {
-        unimplemented!()
+    pub fn inline_diagnostics_enabled<R>(&self) -> R
+    where
+        R: Default,
+    {
+        R::default()
     }
 
     // --- Stub methods for deleted diagnostic features (spec §8.2 M2) ---
@@ -10446,7 +10547,9 @@ impl SemanticsProvider for Project {
         position: text::Anchor,
         cx: &mut App,
     ) -> Option<Task<Option<Vec<project::Hover>>>> {
-        unimplemented!("stub: SemanticsProvider::hover")
+        // §2.1 spec: LSP integration deleted. All semantic queries return None / empty.
+        let _ = (buffer, position, cx);
+        None
     }
 
     fn inline_values(
@@ -10455,7 +10558,7 @@ impl SemanticsProvider for Project {
         _range: Range<text::Anchor>,
         _cx: &mut App,
     ) -> Option<Task<anyhow::Result<Vec<InlayHint>>>> {
-        unimplemented!("stub: SemanticsProvider::inline_values")
+        None
     }
 
     fn applicable_inlay_chunks(
@@ -10464,12 +10567,10 @@ impl SemanticsProvider for Project {
         _ranges: &[Range<text::Anchor>],
         _cx: &mut App,
     ) -> Vec<Range<BufferRow>> {
-        unimplemented!("stub: SemanticsProvider::applicable_inlay_chunks")
+        Vec::new()
     }
 
-    fn invalidate_inlay_hints(&self, _for_buffers: &HashSet<BufferId>, _cx: &mut App) {
-        unimplemented!("stub: SemanticsProvider::invalidate_inlay_hints")
-    }
+    fn invalidate_inlay_hints(&self, _for_buffers: &HashSet<BufferId>, _cx: &mut App) {}
 
     fn inlay_hints(
         &self,
@@ -10479,7 +10580,7 @@ impl SemanticsProvider for Project {
         _known_chunks: Option<(clock::Global, HashSet<Range<BufferRow>>)>,
         _cx: &mut App,
     ) -> Option<HashMap<Range<BufferRow>, Task<Result<CacheInlayHints>>>> {
-        unimplemented!("stub: SemanticsProvider::inlay_hints")
+        None
     }
 
     fn semantic_tokens(
@@ -10488,15 +10589,15 @@ impl SemanticsProvider for Project {
         _refresh: Option<RefreshForServer>,
         _cx: &mut App,
     ) -> Option<Shared<Task<std::result::Result<BufferSemanticTokens, Arc<anyhow::Error>>>>> {
-        unimplemented!("stub: SemanticsProvider::semantic_tokens")
+        None
     }
 
     fn supports_inlay_hints(&self, _buffer: &Entity<Buffer>, _cx: &mut App) -> bool {
-        unimplemented!("stub: SemanticsProvider::supports_inlay_hints")
+        false
     }
 
     fn supports_semantic_tokens(&self, _buffer: &Entity<Buffer>, _cx: &mut App) -> bool {
-        unimplemented!("stub: SemanticsProvider::supports_semantic_tokens")
+        false
     }
 
     fn document_highlights(
@@ -10505,7 +10606,7 @@ impl SemanticsProvider for Project {
         _position: text::Anchor,
         _cx: &mut App,
     ) -> Option<Task<Result<Vec<DocumentHighlight>>>> {
-        unimplemented!("stub: SemanticsProvider::document_highlights")
+        None
     }
 
     fn definitions(
@@ -10515,7 +10616,7 @@ impl SemanticsProvider for Project {
         _kind: GotoDefinitionKind,
         _cx: &mut App,
     ) -> Option<Task<Result<Option<Vec<LocationLink>>>>> {
-        unimplemented!("stub: SemanticsProvider::definitions")
+        None
     }
 
     fn range_for_rename(
@@ -10524,7 +10625,7 @@ impl SemanticsProvider for Project {
         _position: text::Anchor,
         _cx: &mut App,
     ) -> Task<Result<Option<Range<text::Anchor>>>> {
-        unimplemented!("stub: SemanticsProvider::range_for_rename")
+        Task::ready(Ok(None))
     }
 
     fn perform_rename(
@@ -10534,7 +10635,7 @@ impl SemanticsProvider for Project {
         _new_name: String,
         _cx: &mut App,
     ) -> Option<Task<Result<ProjectTransaction>>> {
-        unimplemented!("stub: SemanticsProvider::perform_rename")
+        None
     }
 }
 
