@@ -337,21 +337,18 @@ fn main() {
             eprintln!("[z3rm] Pane id: {}", pane_id);
 
             // 6. §2.1 创建窗口 + Workspace + MultiWorkspace.
-            // 保留 Zed 的 Workspace/Pane/PaneGroup/TabBar/status bar.
-            // MuxPaneView 实现 workspace::Item, 作为 active pane 的 item 注入.
+            // empty worktree: terminal 本身就是内容,不需要 file tree.
             eprintln!("[z3rm] Creating window with Workspace + PaneGroup");
             let pane_id_for_window = pane_id.clone();
             let domain_for_window = domain.clone();
             use gpui::AppContext as _;
             let _window = cx.update(|cx| {
-                // §2.1 AppState 持有 shared services (languages/fs/session).
+                // AppState
                 let languages = Arc::new(language::LanguageRegistry::new(
                     cx.background_executor().clone(),
                 ));
-                let fs_for_state: Arc<dyn fs::Fs> = fs.clone();
                 let kv_store = db::kvp::KeyValueStore::global(cx);
                 let new_session_id = db::uuid::Uuid::new_v4().to_string();
-                // Session::new 是 async; 用 tokio runtime 同步等待 (同 CLI 模式).
                 let rt = tokio::runtime::Builder::new_current_thread()
                     .enable_all()
                     .build()
@@ -363,10 +360,9 @@ fn main() {
                     cx.new(|inner_cx| session::AppSession::new(new_session, inner_cx));
                 let app_state = Arc::new(workspace::AppState {
                     languages: languages.clone(),
-                    fs: fs_for_state,
+                    fs: fs.clone() as Arc<dyn fs::Fs>,
                     build_window_options: |_, _| Default::default(),
                     session: session_entity,
-                    // §2.1: 编辑 + 协作 + node_runtime 已删除, 留 () stub.
                     client: Arc::new(()),
                     node_runtime: (),
                     user_store: (),
@@ -375,28 +371,13 @@ fn main() {
 
                 use project::Project;
                 use workspace::{MultiWorkspace, Workspace, ItemHandle};
-                let result = cx.open_window(
+                // 空 worktree — terminal 全屏,不投影 file tree
+                let project = Project::local(languages, fs.clone() as Arc<dyn fs::Fs>, None, vec![], cx);
+                let _window = cx.open_window(
                     Default::default(),
                     |window, cx| {
-                        // §2.1 worktree 用 home 根, 让 file finder / sidebar /
-                        // 标题栏可以锚定.
-                        let cwd = dirs::home_dir()
-                            .unwrap_or_else(|| std::path::PathBuf::from("."));
-                        let project = Project::local(
-                            languages,
-                            fs.clone() as Arc<dyn fs::Fs>,
-                            None,
-                            vec![cwd],
-                            cx,
-                        );
                         let workspace = cx.new(|cx| {
-                            Workspace::new(
-                                None,
-                                project,
-                                app_state,
-                                window,
-                                cx,
-                            )
+                            Workspace::new(None, project, app_state, window, cx)
                         });
                         let active_pane = workspace.read(cx).active_pane().clone();
                         let mux_pane_handle: Box<dyn ItemHandle> = Box::new(
@@ -409,6 +390,8 @@ fn main() {
                                 )
                             }),
                         );
+                        // §16.9 plan: 此处未来会改用 server layout 投影,
+                        // 暂保留 PaneGroup 本地 add_item
                         workspace.update(cx, |workspace, cx| {
                             workspace.add_item(
                                 active_pane,
@@ -420,14 +403,11 @@ fn main() {
                                 cx,
                             );
                         });
-                        // §2.1 MultiWorkspace 是窗口顶层 Render view, 提供 sidebar.
                         cx.new(|cx| MultiWorkspace::new(workspace, window, cx))
                     },
                 );
-                anyhow::Ok(result)
-            })??;
-            eprintln!("[z3rm] Window created");
-            cx.update(|cx| cx.activate(true));
+                _window
+            })?;
 
             anyhow::Ok(())
         })
