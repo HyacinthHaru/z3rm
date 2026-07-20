@@ -4214,7 +4214,8 @@ fn update_settings_file(
             SettingsStore::global(cx).update_settings_file(<dyn fs::Fs>::global(cx), update);
             Ok(())
         }
-        SettingsUiFile::Server(_) => unimplemented!(),
+        // §2.1 spec: LSP server settings file path removed; no-op.
+        SettingsUiFile::Server(_) => Ok(()),
     }
 }
 

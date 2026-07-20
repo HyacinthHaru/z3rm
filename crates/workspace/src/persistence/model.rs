@@ -45,9 +45,9 @@ pub enum SerializedWorkspaceLocation {
 }
 
 impl SerializedWorkspaceLocation {
-    /// Get sorted paths
+    // §2.1 spec: project paths no longer buffer-coupled; no callers in z3rm.
     pub fn sorted_paths(&self) -> Arc<Vec<PathBuf>> {
-        unimplemented!()
+        Arc::new(Vec::new())
     }
 }
 

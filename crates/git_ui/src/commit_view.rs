@@ -940,8 +940,16 @@ impl language::File for GitBlob {
         self.worktree_id
     }
 
+    // §2.1 spec: RPC project sync deleted in z3rm. Default is never sent.
     fn to_proto(&self, _cx: &App) -> language::proto::File {
-        unimplemented!()
+        language::proto::File {
+            worktree_id: self.worktree_id.to_proto(),
+            entry_id: None,
+            path: String::new(),
+            mtime: None,
+            is_deleted: false,
+            is_historic: false,
+        }
     }
 
     fn is_private(&self) -> bool {
