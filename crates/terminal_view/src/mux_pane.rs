@@ -9,9 +9,9 @@
 //
 // This is the most direct implementation of spec §3.1 "client never parses PTY bytes".
 
-use gpui::{
-    App, AppContext, Context, EventEmitter, FocusHandle, Focusable, FontWeight, KeyDownEvent,
-    Keystroke, Pixels, Render, SharedString, Task, Window, div, px,
+ use gpui::{
+    App, AppContext, Context, Entity, EventEmitter, FocusHandle, Focusable, FontWeight,
+    KeyDownEvent, Keystroke, Pixels, Render, SharedString, Task, Window, div, px,
 };
 use mux::MuxDomain;
 use mux_protocol::{
@@ -20,6 +20,12 @@ use mux_protocol::{
 };
 use std::sync::Arc;
 use ui::prelude::*;
+
+use workspace::{
+    item::{Item, ItemBufferKind, TabContentParams, TabTooltipContent},
+    ItemHandle, Pane, ToolbarItemLocation, Workspace,
+};
+use project::{Project, ProjectPath};
 
 /// §3.3 MuxPaneView — GPUI view for a mux_server pane.
 pub struct MuxPaneView {
@@ -368,4 +374,53 @@ impl Render for MuxPaneView {
             }))
             .child(text_content)
     }
+}
+
+impl Item for MuxPaneView {
+    type Event = MuxPaneEvent;
+
+    fn tab_content_text(&self, _detail: usize, _cx: &App) -> SharedString {
+        self.title()
+    }
+
+    fn suggested_filename(&self, _cx: &App) -> SharedString {
+        self.title()
+    }
+
+    fn tab_tooltip_text(&self, _cx: &App) -> Option<SharedString> {
+        Some(self.title())
+    }
+
+    fn tab_tooltip_content(&self, cx: &App) -> Option<TabTooltipContent> {
+        self.tab_tooltip_text(cx).map(TabTooltipContent::Text)
+    }
+
+    fn buffer_kind(&self, _cx: &App) -> ItemBufferKind {
+        ItemBufferKind::None
+    }
+
+    fn can_split(&self) -> bool {
+        true
+    }
+
+    fn clone_on_split(
+        &self,
+        _workspace_id: Option<workspace::WorkspaceId>,
+        _window: &mut Window,
+        _cx: &mut Context<Self>,
+    ) -> Task<Option<Entity<Self>>>
+    where
+        Self: Sized,
+    {
+        Task::ready(None)
+    }
+
+    fn is_dirty(&self, _cx: &App) -> bool {
+        false
+    }
+
+    fn breadcrumb_location(&self, _cx: &App) -> ToolbarItemLocation {
+        ToolbarItemLocation::Hidden
+    }
+
 }
