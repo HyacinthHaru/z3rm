@@ -323,6 +323,9 @@ impl From<settings::LineIndicatorFormat> for LineIndicatorFormat {
 
 impl Settings for LineIndicatorFormat {
     fn from_settings(content: &settings::SettingsContent) -> Self {
-        content.line_indicator_format.unwrap().into()
+        content
+            .line_indicator_format
+            .unwrap_or(settings::LineIndicatorFormat::Short)
+            .into()
     }
 }

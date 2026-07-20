@@ -316,8 +316,18 @@ fn main() {
             app_state
         };
         // §2.1 Backport all Zed UI chrome ::init calls (not in spec remove-list).
+        // §2.1 Globals required by chrome ::init calls.
+        // Fs and GitHostingProviderRegistry must exist before any git/git_ui
+        // panel queries them via cx.global::<>().
+        <dyn fs::Fs>::set_global(fs.clone(), cx);
+        let git_hosting_provider_registry =
+            Arc::new(git::GitHostingProviderRegistry::new());
+        git::GitHostingProviderRegistry::set_global(git_hosting_provider_registry, cx);
+
         // Workspace 全局 actions, pane/titlebar/action system
         workspace::init(app_state.clone(), cx);
+        // Editor (read-only viewer + diff rendering per spec §2.1)
+        editor::init(cx);
         // UI panels & tooling
         command_palette::init(cx);
         file_finder::init(cx);
@@ -326,7 +336,26 @@ fn main() {
         project_symbols::init(cx);
         search::init(cx);
         go_to_line::init(cx);
+        title_bar::init(cx);
         diagnostics::init(cx);
+        // Terminal/extension/settings UI
+        // Terminal/settings UI (§5.2 extension_host is QuickJS in z3rm, not yet wired;
+        // skipping extensions_ui/extension::init which require the legacy Node-based host)
+        terminal_view::init(cx);
+        settings_ui::init(cx);
+        settings_profile_selector::init(cx);
+        // Selectors / editors
+        theme_selector::init(cx);
+        language_selector::init(cx);
+        keymap_editor::init(cx);
+        line_ending_selector::init(cx);
+        // Git
+        git_hosting_providers::init(cx);
+        git_ui::init(cx);
+        recent_projects::init(cx);
+        // Misc
+        which_key::init(cx);
+        zlog_settings::init(cx);
 
         // §16.1 daemon 自动启动 → 连接 → session → pane → 窗口
         cx.spawn(async move |cx| {
