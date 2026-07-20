@@ -15,7 +15,7 @@ use assets::Assets;
 use crashes::InitCrashHandler;
 use fs::{Fs, RealFs};
 use futures::StreamExt as _;
-use gpui::{App, Application, TaskExt};
+use gpui::{App, AppContext as _, Application, Entity, TaskExt};
 use gpui_platform;
 use parking_lot::Mutex;
 use release_channel::{AppCommitSha, AppVersion, ReleaseChannel};
@@ -290,141 +290,137 @@ fn main() {
             .detach();
         }
 
-        // §16.1 daemon 自动启动 → 连接 → session → pane → window
+        // §16.1 / §2.1 创建 AppState (同步,在 app.run 内，让所有 ::init 可调用)
+        let kv_store = db::kvp::KeyValueStore::global(cx);
+        let session_id = db::uuid::Uuid::new_v4().to_string();
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("tokio runtime for session init");
+        let session = rt.block_on(session::Session::new(session_id, kv_store));
+        let app_state = {
+            let es: Entity<session::AppSession> = cx.new(|cx| session::AppSession::new(session, cx));
+            let languages = Arc::new(language::LanguageRegistry::new(
+                cx.background_executor().clone(),
+            ));
+            let app_state = Arc::new(workspace::AppState {
+                languages,
+                fs: fs.clone() as Arc<dyn fs::Fs>,
+                build_window_options: |_, _| Default::default(),
+                session: es,
+                client: Arc::new(()),
+                node_runtime: (),
+                user_store: (),
+            });
+            workspace::AppState::set_global(app_state.clone(), cx);
+            app_state
+        };
+        // §2.1 Backport all Zed UI chrome ::init calls (not in spec remove-list).
+        // Workspace 全局 actions, pane/titlebar/action system
+        workspace::init(app_state.clone(), cx);
+        // UI panels & tooling
+        command_palette::init(cx);
+        file_finder::init(cx);
+        tab_switcher::init(cx);
+        project_panel::init(cx);
+        project_symbols::init(cx);
+        search::init(cx);
+        go_to_line::init(cx);
+        diagnostics::init(cx);
+
+        // §16.1 daemon 自动启动 → 连接 → session → pane → 窗口
         cx.spawn(async move |cx| {
             eprintln!("[z3rm] Starting daemon connection flow");
-            // 1. 确保 daemon 运行并获取 MuxDomain
             let domain = Arc::new(daemon::ensure_daemon_running().await?);
             eprintln!("[z3rm] Daemon connected");
 
-            // 2. 创建/获取默认 session
-            eprintln!("[z3rm] Creating default session");
             let session_id = daemon::ensure_default_session(&domain).await?;
-            eprintln!("[z3rm] Session created: {}", session_id);
+            eprintln!("[z3rm] Session: {}", session_id);
 
-            // 2b. 确保 session 中有终端 pane
-            eprintln!("[z3rm] Ensuring pane in session");
             daemon::ensure_pane_in_session(&domain, &session_id).await?;
             eprintln!("[z3rm] Pane ensured");
-            // 3. attach 到 session (Shared 模式允许输入)
-            eprintln!("[z3rm] Attaching to session");
+
             let _attach_resp = domain
                 .attach(&session_id, mux::AttachMode::Shared)
                 .await?;
             eprintln!("[z3rm] Attached to session");
-            tracing::info!(session_id = %session_id, "attached to session");
 
-            // §16.9 / §3.4 后台订阅 MuxDomain 通知。
-            // 具体处理 (PaneAdded → 创建 MuxPaneView / SessionLayoutChanged → 重建
-            // 布局) 由后续 Phase 2 工作完成；当前先保持订阅,保证
-            // PaneDirty/PaneAdded 等高频通知不会丢失。
+            // notification subscriber
             let domain_for_notify = domain.clone();
             cx.background_executor()
                 .spawn(async move {
                     let mut rx = domain_for_notify.subscribe();
                     while let Ok(notif) = rx.recv().await {
-                        if let Some(mux_protocol::notification::Event::SessionLayoutChanged(
-                            _slc,
-                        )) = notif.event.as_ref()
+                        if let Some(mux_protocol::notification::Event::SessionLayoutChanged(_)) =
+                            notif.event.as_ref()
                         {
                             tracing::debug!("SessionLayoutChanged received");
                         }
                     }
                 })
                 .detach();
-            // 4. 注册窗口关闭回调: detach session (daemon 继续运行)
+
+            // window close = detach
             let domain_for_close = domain.clone();
             cx.update(|cx| {
                 let _ = cx.on_window_closed(move |app, _window_id| {
                     let d = domain_for_close.clone();
                     app.spawn(async move |_| {
                         if let Err(e) = d.detach().await {
-                            tracing::warn!(error = %e, "detach failed on window close");
-                        } else {
-                            tracing::info!("detached on window close");
+                            tracing::warn!(error = %e, "detach failed");
                         }
-                    }).detach();
+                    })
+                    .detach();
                 });
             });
 
-            // 5. 获取第一个 pane id (用于创建 MuxPaneView)
-            eprintln!("[z3rm] Getting first pane id");
-            let pane_id = daemon::get_first_pane_id(&domain).await?
+            // 获取 pane id
+            let pane_id = daemon::get_first_pane_id(&domain)
+                .await?
                 .unwrap_or_else(|| "default".to_string());
             eprintln!("[z3rm] Pane id: {}", pane_id);
 
-            // 6. §2.1 创建窗口 + Workspace + MultiWorkspace.
-            // empty worktree: terminal 本身就是内容,不需要 file tree.
-            eprintln!("[z3rm] Creating window with Workspace + PaneGroup");
-            let pane_id_for_window = pane_id.clone();
-            let domain_for_window = domain.clone();
-            use gpui::AppContext as _;
+            // §2.1 用 cx.open_window 创建窗口（env有 Context<MultiWorkspace> 可调用 .new）
+            eprintln!("[z3rm] Creating window via cx.open_window");
+            let p_id = pane_id.clone();
+            let dom = domain.clone();
             let _window = cx.update(|cx| {
-                // AppState
-                let languages = Arc::new(language::LanguageRegistry::new(
-                    cx.background_executor().clone(),
-                ));
-                let kv_store = db::kvp::KeyValueStore::global(cx);
-                let new_session_id = db::uuid::Uuid::new_v4().to_string();
-                let rt = tokio::runtime::Builder::new_current_thread()
-                    .enable_all()
-                    .build()
-                    .context("tokio runtime for session init")?;
-                let new_session = rt.block_on(
-                    session::Session::new(new_session_id.clone(), kv_store),
-                );
-                let session_entity =
-                    cx.new(|inner_cx| session::AppSession::new(new_session, inner_cx));
-                let app_state = Arc::new(workspace::AppState {
-                    languages: languages.clone(),
-                    fs: fs.clone() as Arc<dyn fs::Fs>,
-                    build_window_options: |_, _| Default::default(),
-                    session: session_entity,
-                    client: Arc::new(()),
-                    node_runtime: (),
-                    user_store: (),
-                });
-                workspace::AppState::set_global(app_state.clone(), cx);
-
-                use project::Project;
-                use workspace::{MultiWorkspace, Workspace, ItemHandle};
-                // 空 worktree — terminal 全屏,不投影 file tree
-                let project = Project::local(languages, fs.clone() as Arc<dyn fs::Fs>, None, vec![], cx);
-                let _window = cx.open_window(
-                    Default::default(),
-                    |window, cx| {
-                        let workspace = cx.new(|cx| {
-                            Workspace::new(None, project, app_state, window, cx)
-                        });
-                        let active_pane = workspace.read(cx).active_pane().clone();
-                        let mux_pane_handle: Box<dyn ItemHandle> = Box::new(
-                            cx.new(|cx| {
-                                terminal_view::mux_pane::MuxPaneView::new(
-                                    pane_id_for_window.clone(),
-                                    domain_for_window.clone(),
-                                    window,
-                                    cx,
-                                )
-                            }),
+                let result = cx.open_window(Default::default(), |window, cx| {
+                    let workspace = cx.new(|cx| {
+                        // 使用全局 AppState
+                        use workspace::AppState;
+                        let app_state = AppState::global(cx);
+                        use project::Project;
+                        let project = Project::local(
+                            app_state.languages.clone(),
+                            app_state.fs.clone(),
+                            None,
+                            vec![],
+                            cx,
                         );
-                        // §16.9 plan: 此处未来会改用 server layout 投影,
-                        // 暂保留 PaneGroup 本地 add_item
-                        workspace.update(cx, |workspace, cx| {
-                            workspace.add_item(
-                                active_pane,
-                                mux_pane_handle,
-                                None,
-                                true,
-                                true,
+                        workspace::Workspace::new(None, project, app_state, window, cx)
+                    });
+                    let active_pane = workspace.read(cx).active_pane().clone();
+                    use workspace::ItemHandle;
+                    let item: Box<dyn ItemHandle> = Box::new(
+                        cx.new(|cx| {
+                            terminal_view::mux_pane::MuxPaneView::new(
+                                p_id.clone(),
+                                dom.clone(),
                                 window,
                                 cx,
-                            );
-                        });
-                        cx.new(|cx| MultiWorkspace::new(workspace, window, cx))
-                    },
-                );
-                _window
-            })?;
+                            )
+                        }),
+                    );
+                    workspace.update(cx, |workspace, cx| {
+                        workspace.add_item(active_pane, item, None, true, true, window, cx);
+                    });
+                    cx.new(|cx| workspace::MultiWorkspace::new(workspace, window, cx))
+                });
+                anyhow::Ok(result)
+            })
+            ??;
+            eprintln!("[z3rm] Window created Ok");
 
             anyhow::Ok(())
         })
