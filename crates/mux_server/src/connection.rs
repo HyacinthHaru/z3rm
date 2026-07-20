@@ -738,10 +738,18 @@ async fn handle_split_pane(
                 )),
             };
             let _ = send_notification_envelope(outbound_tx, notify);
+
+            // §16.9 broadcast updated layout tree.
+            broadcast_layout_changed(
+                sessions,
+                &session.id,
+                outbound_tx,
+            );
+            return Ok(ResponseBody::PaneId(new_pane_id));
         }
     }
 
-    Ok(ResponseBody::PaneId(new_pane_id))
+    Ok(ResponseBody::Error("pane not found".into()))
 }
 
 /// §3.10 关闭 pane
@@ -762,6 +770,18 @@ async fn handle_close_pane(
         }
     }
 
+    // §16.9 broadcast updated layout to the requesting client.
+    let session_id = sessions_w
+        .iter()
+        .find(|s| s.layout.pane_ids().is_empty().then_some(true).unwrap_or(false)
+            || s.panes.read().contains_key(&req.pane_id))
+        .map(|s| s.id.clone())
+        .or_else(|| sessions_w.first().map(|s| s.id.clone()));
+    drop(sessions_w);
+    if let Some(sid) = session_id {
+        broadcast_layout_changed(sessions, &sid, outbound_tx);
+    }
+
     // §3.4 推送 PaneRemoved 通知
     let notify = Notification {
         event: Some(mux_protocol::notification::Event::PaneRemoved(
@@ -780,13 +800,18 @@ async fn handle_close_pane(
 async fn handle_focus_pane(
     req: &FocusPaneRequest,
     sessions: &Arc<parking_lot::RwLock<Vec<crate::session::Session>>>,
-    _outbound_tx: &mpsc::UnboundedSender<Envelope>,
+    outbound_tx: &mpsc::UnboundedSender<Envelope>,
 ) -> anyhow::Result<ResponseBody> {
     let mut sessions_w = sessions.write();
+    let mut matched_session_id: Option<String> = None;
     for session in sessions_w.iter_mut() {
         if session.layout.root.find_pane(&req.pane_id).is_some() {
             session.set_focused_pane(req.pane_id.clone());
+            matched_session_id = Some(session.id.clone());
         }
+    }
+    if let Some(sid) = matched_session_id {
+        broadcast_layout_changed(sessions, &sid, outbound_tx);
     }
     Ok(ResponseBody::Error(String::new()))
 }
@@ -1182,6 +1207,38 @@ fn layout_tree_to_proto(
     mux_protocol::LayoutTree {
         root: convert(&tree.root),
     }
+}
+
+/// §16.9 / §3.4 把当前会话的 layout 变更广播给单个连接。
+/// 
+/// 调用方在 split/close/resize/focus 后调用此函数,通知客户端刷新 layout。
+/// 当前每个连接只看到自己 outbound_tx;真实多客户端广播需要 session 级
+/// subscriber registry (Plan 10 后续工作),此函数先保证单连接流程跑通。
+fn broadcast_layout_changed(
+    sessions: &Arc<parking_lot::RwLock<Vec<crate::session::Session>>>,
+    session_id: &str,
+    outbound_tx: &mpsc::UnboundedSender<Envelope>,
+) {
+    let layout_proto = {
+        let sessions_r = sessions.read();
+        sessions_r
+            .iter()
+            .find(|s| s.id == session_id)
+            .map(|s| layout_tree_to_proto(&s.layout))
+    };
+    let Some(layout) = layout_proto else {
+        return;
+    };
+    let notify = Notification {
+        event: Some(mux_protocol::notification::Event::SessionLayoutChanged(
+            mux_protocol::SessionLayoutChanged { layout: Some(layout) },
+        )),
+    };
+    let envelope = Envelope {
+        version: Some(mux_protocol::PROTOCOL_VERSION.clone()),
+        payload: Some(EnvelopePayload::Notification(notify)),
+    };
+    let _ = outbound_tx.send(envelope);
 }
 
 // ============================================================================
