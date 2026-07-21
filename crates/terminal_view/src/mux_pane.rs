@@ -9,10 +9,10 @@
 //
 // This is the most direct implementation of spec §3.1 "client never parses PTY bytes".
 
-use tracing;
- use gpui::{
+use gpui::{
     App, AppContext, Context, Entity, EventEmitter, FocusHandle, Focusable, FontWeight,
-    KeyDownEvent, Keystroke, Pixels, Render, SharedString, Task, Window, div, px,
+    KeyDownEvent, Keystroke, MouseDownEvent, MouseMoveEvent, MouseUpEvent, Pixels, Render,
+    ScrollWheelEvent, SharedString, Task, Window, div, px, rgb,
 };
 use mux::MuxDomain;
 use mux_protocol::{
@@ -27,6 +27,13 @@ use workspace::{
     ItemHandle, Pane, ToolbarItemLocation, Workspace,
 };
 use project::{Project, ProjectPath};
+
+/// §12 / §16.4 Selection anchor/head in grid coordinates.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct SelectionPoint {
+    row: usize,
+    col: usize,
+}
 
 /// §3.3 MuxPaneView — GPUI view for a mux_server pane.
 pub struct MuxPaneView {
@@ -44,6 +51,16 @@ pub struct MuxPaneView {
     focus_handle: FocusHandle,
     /// §3.4 notification subscription task
     notification_task: Option<Task<()>>,
+    /// §12 mouse selection anchor
+    selection_anchor: Option<SelectionPoint>,
+    /// §12 mouse selection head (current drag position)
+    selection_head: Option<SelectionPoint>,
+    /// §12 whether a mouse drag is in progress
+    is_selecting: bool,
+    /// §16.4 scrollback offset (0 = bottom, N = N lines up)
+    scrollback_offset: usize,
+    /// §12 copy mode active
+    copy_mode: bool,
 }
 
 /// §3.3 View events (for workspace to subscribe)
@@ -82,6 +99,11 @@ impl MuxPaneView {
             fetch_in_flight: false,
             focus_handle,
             notification_task: None,
+            selection_anchor: None,
+            selection_head: None,
+            is_selecting: false,
+            scrollback_offset: 0,
+            copy_mode: false,
         };
         view.start_notification_listener(cx);
         view.schedule_fetch(cx);
@@ -214,6 +236,83 @@ impl MuxPaneView {
                 let _ = domain.resize_pane(&pane_id, cols, rows).await;
             })
             .detach();
+    }
+
+    /// §12 Convert mouse position to grid coordinates.
+    fn mouse_to_grid(&self, position: gpui::Point<Pixels>, char_width: Pixels, line_height: Pixels) -> Option<SelectionPoint> {
+        let cw = f32::from(char_width);
+        let lh = f32::from(line_height);
+        if cw <= 0.0 || lh <= 0.0 {
+            return None;
+        }
+        let col = (f32::from(position.x) / cw).max(0.0) as usize;
+        let row = (f32::from(position.y) / lh).max(0.0) as usize;
+        let cols = self.snapshot.cols as usize;
+        let rows = self.snapshot.rows as usize;
+        if col < cols && row < rows {
+            Some(SelectionPoint { row, col })
+        } else {
+            None
+        }
+    }
+
+    /// §12 Get selected text as a string.
+    pub fn selected_text(&self) -> Option<String> {
+        let anchor = self.selection_anchor?;
+        let head = self.selection_head?;
+        let (start, end) = if (anchor.row, anchor.col) <= (head.row, head.col) {
+            (anchor, head)
+        } else {
+            (head, anchor)
+        };
+        let cols = self.snapshot.cols as usize;
+        let mut text = String::new();
+        for row in start.row..=end.row {
+            let col_start = if row == start.row { start.col } else { 0 };
+            let col_end = if row == end.row { end.col } else { cols.saturating_sub(1) };
+            for col in col_start..=col_end {
+                let flat = row * cols + col;
+                if let Some(cell) = self.snapshot.cells.get(flat) {
+                    text.push(cell.char.chars().next().unwrap_or(' '));
+                }
+            }
+            if row < end.row {
+                text.push('\n');
+            }
+        }
+        Some(text)
+    }
+
+    /// §12 Check if a cell is within the current selection.
+    fn is_cell_selected(&self, row: usize, col: usize) -> bool {
+        let (Some(anchor), Some(head)) = (self.selection_anchor, self.selection_head) else {
+            return false;
+        };
+        let (start, end) = if (anchor.row, anchor.col) <= (head.row, head.col) {
+            (anchor, head)
+        } else {
+            (head, anchor)
+        };
+        if row < start.row || row > end.row {
+            return false;
+        }
+        if row == start.row && row == end.row {
+            return col >= start.col && col <= end.col;
+        }
+        if row == start.row {
+            return col >= start.col;
+        }
+        if row == end.row {
+            return col <= end.col;
+        }
+        true
+    }
+
+    /// §12 Clear selection.
+    fn clear_selection(&mut self) {
+        self.selection_anchor = None;
+        self.selection_head = None;
+        self.is_selecting = false;
     }
 }
 
@@ -353,35 +452,158 @@ impl EventEmitter<MuxPaneEvent> for MuxPaneView {}
 impl Render for MuxPaneView {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl gpui::IntoElement {
         let colors = cx.theme().colors();
-        let bg = colors.editor_background;
-        let fg = colors.text;
+        let default_bg = colors.editor_background;
+        let default_fg = colors.text;
+        let selection_bg = colors.element_selection_background;
+        let cursor_color = colors.icon_accent;
 
         let cols = self.snapshot.cols as usize;
         let rows = self.snapshot.rows as usize;
-        let mut text_buf = String::with_capacity(cols * rows);
+        let char_width = px(8.4);
+        let line_height = px(18.0);
+
+        let cursor_visible = self
+            .snapshot
+            .cursor
+            .as_ref()
+            .map(|c| c.visible)
+            .unwrap_or(false);
+        let cursor_col = self.snapshot.cursor.as_ref().map(|c| c.col as usize).unwrap_or(0);
+        let cursor_row = self.snapshot.cursor.as_ref().map(|c| c.row as usize).unwrap_or(0);
+
+        let mut row_elements = Vec::with_capacity(rows);
         for row in 0..rows {
+            let mut col_elements = Vec::with_capacity(cols);
             for col in 0..cols {
                 let flat = row * cols + col;
-                let ch = self.snapshot.cells[flat].char.chars().next().unwrap_or(' ');
-                text_buf.push(ch);
+                let cell = self.snapshot.cells.get(flat);
+
+                let ch = cell
+                    .and_then(|c| c.char.chars().next())
+                    .unwrap_or(' ');
+                let is_selected = self.is_cell_selected(row, col);
+                let is_cursor = cursor_visible && row == cursor_row && col == cursor_col;
+
+                let (cell_fg, cell_bg) = if is_cursor {
+                    (default_bg, cursor_color)
+                } else if is_selected {
+                    (default_fg, selection_bg)
+                } else {
+                    let fg = cell
+                        .map(|c| {
+                            if c.foreground != 0 {
+                                rgb(c.foreground).into()
+                            } else {
+                                default_fg
+                            }
+                        })
+                        .unwrap_or(default_fg);
+                    let bg = cell
+                        .map(|c| {
+                            if c.background != 0 {
+                                rgb(c.background).into()
+                            } else {
+                                default_bg
+                            }
+                        })
+                        .unwrap_or(default_bg);
+                    (fg, bg)
+                };
+
+                let style = cell.and_then(|c| c.style.as_ref());
+                let is_bold = style.map(|s| s.bold).unwrap_or(false);
+                let is_italic = style.map(|s| s.italic).unwrap_or(false);
+                let is_underline = style.map(|s| s.underline).unwrap_or(false);
+
+                let mut cell_div = div()
+                    .w(char_width)
+                    .h(line_height)
+                    .bg(cell_bg)
+                    .text_color(cell_fg)
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .overflow_hidden();
+
+                if is_bold {
+                    cell_div = cell_div.font_weight(FontWeight::BOLD);
+                }
+                if is_italic {
+                    cell_div = cell_div.italic();
+                }
+                if is_underline {
+                    cell_div = cell_div.underline();
+                }
+
+                let ch_str: SharedString = ch.to_string().into();
+                col_elements.push(cell_div.child(ch_str));
             }
-            if row + 1 < rows {
-                text_buf.push('\n');
-            }
+
+            row_elements.push(
+                div()
+                    .flex()
+                    .flex_row()
+                    .children(col_elements),
+            );
         }
-        let text_content: SharedString = text_buf.into();
 
         div()
             .track_focus(&self.focus_handle)
             .size_full()
-            .bg(bg)
-            .text_color(fg)
+            .bg(default_bg)
             .font_family("monospace")
             .text_size(px(14.0))
+            .overflow_hidden()
             .on_key_down(cx.listener(|this, event: &KeyDownEvent, _window, cx| {
                 this.dispatch_keystroke(&event.keystroke, cx);
             }))
-            .child(text_content)
+            .on_mouse_down(gpui::MouseButton::Left, cx.listener(|this, event: &MouseDownEvent, _window, cx| {
+                let cw = px(8.4);
+                let lh = px(18.0);
+                let point = this.mouse_to_grid(
+                    gpui::Point { x: event.position.x, y: event.position.y },
+                    cw,
+                    lh,
+                );
+                if let Some(grid_point) = point {
+                    this.selection_anchor = Some(grid_point);
+                    this.selection_head = Some(grid_point);
+                    this.is_selecting = true;
+                }
+                cx.notify();
+            }))
+            .on_mouse_move(cx.listener(|this, event: &MouseMoveEvent, _window, cx| {
+                let cw = px(8.4);
+                let lh = px(18.0);
+                if this.is_selecting {
+                    let point = this.mouse_to_grid(
+                        gpui::Point { x: event.position.x, y: event.position.y },
+                        cw,
+                        lh,
+                    );
+                    if let Some(grid_point) = point {
+                        this.selection_head = Some(grid_point);
+                        cx.notify();
+                    }
+                }
+            }))
+            .on_mouse_up(gpui::MouseButton::Left, cx.listener(|this, _event: &MouseUpEvent, _window, cx| {
+                this.is_selecting = false;
+                cx.notify();
+            }))
+            .on_scroll_wheel(cx.listener(|this, event: &ScrollWheelEvent, _window, cx| {
+                let lh = px(18.0);
+                let delta = event.delta.pixel_delta(px(20.0));
+                let dy = f32::from(delta.y);
+                let lines = (dy / f32::from(lh)).abs() as usize;
+                if dy > 0.0 {
+                    this.scrollback_offset = this.scrollback_offset.saturating_add(lines);
+                } else {
+                    this.scrollback_offset = this.scrollback_offset.saturating_sub(lines);
+                }
+                cx.notify();
+            }))
+            .children(row_elements)
     }
 }
 
@@ -431,5 +653,4 @@ impl Item for MuxPaneView {
     fn breadcrumb_location(&self, _cx: &App) -> ToolbarItemLocation {
         ToolbarItemLocation::Hidden
     }
-
 }

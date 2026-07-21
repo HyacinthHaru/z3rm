@@ -1,0 +1,11 @@
+[extension]
+name = "z3rm-which-key"
+version = "0.1.0"
+
+[capabilities]
+workspace = true
+
+[resources]
+memory_limit_mb = 64
+cpu_budget_ms = 50
+io_rate_limit = 100

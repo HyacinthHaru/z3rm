@@ -1,0 +1,13 @@
+[extension]
+name = "z3rm-status-bar"
+version = "0.1.0"
+
+[capabilities]
+terminal = true
+mux = true
+workspace = true
+
+[resources]
+memory_limit_mb = 64
+cpu_budget_ms = 50
+io_rate_limit = 100

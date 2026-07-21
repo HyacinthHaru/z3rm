@@ -19,7 +19,7 @@ use mux_protocol::{
     split_node::SplitDirection, envelope::Payload as EnvelopePayload,
     frame, Envelope, Notification, PROTOCOL_VERSION,
     Request, Response, SessionInfo, TerminalSize, FetchGridUpdateResponse,
-    FetchScrollbackResponse, AttachResponse, ShellCommand,
+    FetchScrollbackResponse, AttachResponse, ShellCommand, ShellIntegrationResponse,
 };
 
 // §16.6 SSH 远程连接模块（Plan 19）。
@@ -645,6 +645,32 @@ impl MuxDomain {
         let req = RequestBody::Detach(mux_protocol::DetachRequest {});
         let _resp = self.send_request(req).await?;
         Ok(())
+    }
+
+    // ========================================================================
+    // §3.3 Pane Zoom / Shell Integration
+    // ========================================================================
+
+    /// §3.3 设置 Pane zoom 状态。
+    pub async fn zoom_pane(&self, pane: &str, zoom: bool) -> Result<()> {
+        let req = RequestBody::ZoomPane(mux_protocol::ZoomPaneRequest {
+            pane_id: pane.to_string(),
+            zoom,
+        });
+        let _resp = self.send_request(req).await?;
+        Ok(())
+    }
+
+    /// §3.3 查询 Pane 的 shell integration 状态 (cwd + prompt marker)。
+    pub async fn get_shell_integration(&self, pane: &str) -> Result<ShellIntegrationResponse> {
+        let req = RequestBody::ShellIntegration(mux_protocol::ShellIntegrationRequest {
+            pane_id: pane.to_string(),
+        });
+        let resp = self.send_request(req).await?;
+        match resp.body {
+            Some(ResponseBody::ShellIntegration(si)) => Ok(si),
+            _ => Err(anyhow::anyhow!("unexpected response type for get_shell_integration")),
+        }
     }
 
     // ========================================================================

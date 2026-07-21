@@ -297,6 +297,18 @@ async fn dispatch_request(
         RequestBody::ReadFile(r) => handle_read_file(r).await?,
         RequestBody::ListDir(r) => handle_list_dir(r).await?,
         RequestBody::StatFile(r) => handle_stat_file(r).await?,
+
+        // §3.3 Pane zoom 和 shell integration
+        RequestBody::ZoomPane(r) => {
+            if check_permission(role, ClientRole::ReadWrite) {
+                handle_zoom_pane(r, sessions, outbound_tx).await?
+            } else {
+                ResponseBody::Error("permission denied: read-write required".to_string())
+            }
+        }
+        RequestBody::ShellIntegration(r) => {
+            handle_shell_integration(r, sessions).await?
+        }
     };
 
     // §9 把 Response 通过 outbound channel 写回客户端
@@ -680,7 +692,7 @@ async fn handle_split_pane(
                 .split(&req.pane_id, new_pane_id.clone(), direction)?;
 
             // §3.10 spawn 新 pane, 继承 parent pane 的 cwd
-            let parent_cwd = session.panes.read().get(&req.pane_id).map(|p| p.cwd.clone()).unwrap_or_default();
+            let parent_cwd = session.panes.read().get(&req.pane_id).map(|p| p.get_cwd()).unwrap_or_default();
             let parent_cols = session.panes.read().get(&req.pane_id).map(|p| p.get_cols()).unwrap_or(80);
             let parent_rows = session.panes.read().get(&req.pane_id).map(|p| p.get_rows()).unwrap_or(24);
 
@@ -1146,7 +1158,7 @@ fn pane_info_for(
     let pane = panes.get(pane_id)?;
     Some(mux_protocol::PaneInfo {
         id: pane.id.clone(),
-        cwd: pane.cwd.clone(),
+        cwd: pane.get_cwd(),
         title: pane.title.read().clone(),
         command: pane.command.clone().unwrap_or_default(),
         generation: pane.generation.load(std::sync::atomic::Ordering::Relaxed),
@@ -1358,6 +1370,81 @@ async fn handle_set_pane_title(
             req.pane_id
         ))),
     }
+}
+
+/// §3.3 ZoomPane: 切换 pane zoom 状态, bump generation, 通知客户端。
+async fn handle_zoom_pane(
+    req: &mux_protocol::ZoomPaneRequest,
+    sessions: &Arc<parking_lot::RwLock<Vec<crate::session::Session>>>,
+    outbound_tx: &mpsc::UnboundedSender<Envelope>,
+) -> anyhow::Result<ResponseBody> {
+    let mut matched_session_id: Option<String> = None;
+    let mut pane_found = false;
+
+    {
+        let sessions_r = sessions.read();
+        for session in sessions_r.iter() {
+            if let Some(pane) = session.panes.read().get(&req.pane_id) {
+                pane.set_zoomed(req.zoom);
+                pane.bump_generation();
+                matched_session_id = Some(session.id.clone());
+                pane_found = true;
+                break;
+            }
+        }
+    }
+
+    if !pane_found {
+        return Ok(ResponseBody::Error(format!(
+            "zoom_pane: pane {} not found",
+            req.pane_id
+        )));
+    }
+
+    // 广播 PaneZoomed 通知
+    let notify = Notification {
+        event: Some(mux_protocol::notification::Event::PaneZoomed(
+            mux_protocol::PaneZoomed {
+                pane_id: req.pane_id.clone(),
+                zoomed: req.zoom,
+            },
+        )),
+    };
+    let envelope = Envelope {
+        version: Some(mux_protocol::PROTOCOL_VERSION.clone()),
+        payload: Some(EnvelopePayload::Notification(notify)),
+    };
+    let _ = outbound_tx.send(envelope);
+
+    // zoom 影响 layout 可见性, 同步广播 layout 变更
+    if let Some(sid) = matched_session_id {
+        broadcast_layout_changed(sessions, &sid, outbound_tx);
+    }
+
+    zlog::info!("pane zoom: pane={} zoomed={}", req.pane_id, req.zoom);
+    Ok(ResponseBody::ZoomPane(mux_protocol::ZoomPaneResponse {}))
+}
+
+/// §3.3 ShellIntegration: 查询 pane 的 cwd 和 prompt marker 信息。
+async fn handle_shell_integration(
+    req: &mux_protocol::ShellIntegrationRequest,
+    sessions: &Arc<parking_lot::RwLock<Vec<crate::session::Session>>>,
+) -> anyhow::Result<ResponseBody> {
+    let sessions_r = sessions.read();
+    for session in sessions_r.iter() {
+        if let Some(pane) = session.panes.read().get(&req.pane_id) {
+            return Ok(ResponseBody::ShellIntegration(
+                mux_protocol::ShellIntegrationResponse {
+                    cwd: pane.get_cwd(),
+                    prompt_marker: pane.get_prompt_marker(),
+                },
+            ));
+        }
+    }
+    Ok(ResponseBody::Error(format!(
+        "shell_integration: pane {} not found",
+        req.pane_id
+    )))
 }
 
 /// §4.7 binary 检测 — 与 shadow_snapshot::Monitor::is_binary_file 同算法。

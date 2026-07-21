@@ -1051,7 +1051,7 @@ mod linux {
                 .map(|d| d.join("z3rm/mux.sock"))
                 .unwrap_or_else(|| PathBuf::from("/tmp/z3rm-mux.sock"));
 
-            let mux = mux::connect_local(&socket_path).await?;
+            let mux = mux::connect_local(Some(socket_path.as_path())).await?;
 
             // §3.3 列出会话，查找目标会话
             let sessions = mux.list_sessions().await?;

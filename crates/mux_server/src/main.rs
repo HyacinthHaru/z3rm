@@ -48,7 +48,7 @@ fn cmd_status() -> Result<()> {
         .build()?;
 
     rt.block_on(async {
-        let domain = mux::connect_local(&socket_path).await?;
+        let domain = mux::connect_local(Some(socket_path.as_path())).await?;
         let sessions = domain.list_sessions().await?;
 
         // §16.14 真实 pane 数量:attach 每个 session,数 tabs[].panes[]。
@@ -115,7 +115,7 @@ fn cmd_kill() -> Result<()> {
         .build()?;
 
     rt.block_on(async {
-        let domain = mux::connect_local(&socket_path).await?;
+        let domain = mux::connect_local(Some(socket_path.as_path())).await?;
         let sessions = domain.list_sessions().await?;
         for session in &sessions {
             let _ = domain.kill_session(&session.id).await;

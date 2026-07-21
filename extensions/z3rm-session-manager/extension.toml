@@ -1,0 +1,11 @@
+[extension]
+name = "z3rm-session-manager"
+version = "0.1.0"
+
+[capabilities]
+mux = true
+
+[resources]
+memory_limit_mb = 64
+cpu_budget_ms = 50
+io_rate_limit = 100

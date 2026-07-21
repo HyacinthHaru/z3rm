@@ -466,6 +466,8 @@ message Notification {
         SyncScrollbackNotification sync_scrollback = 9;
         WindowAdded window_added = 10;
         WindowRemoved window_removed = 11;
+        ShellIntegrationChanged shell_integration_changed = 12;
+        PaneZoomed pane_zoomed = 13;
     }
 }
 
@@ -517,6 +519,41 @@ message WindowRemoved {
     string session_id = 2;
 }
 
+// §3.3 Shell integration 变更通知 (OSC 7/133)
+message ShellIntegrationChanged {
+    string cwd = 1;
+}
+
+// §3.3 Pane zoom 状态变更通知
+message PaneZoomed {
+    string pane_id = 1;
+    bool zoomed = 2;
+}
+
+
+// === Pane Zoom ===
+
+// §3.3 Pane zoom 请求。
+message ZoomPaneRequest {
+    string pane_id = 1;
+    bool zoom = 2;
+}
+
+// §3.3 Pane zoom 响应。
+message ZoomPaneResponse {}
+
+// === Shell Integration (OSC 7/133) ===
+
+// §3.3 查询 pane 的 shell integration 状态。
+message ShellIntegrationRequest {
+    string pane_id = 1;
+}
+
+// §3.3 Shell integration 状态响应。
+message ShellIntegrationResponse {
+    string cwd = 1;
+    uint32 prompt_marker = 2;
+}
 // === Request/Response envelope ===
 
 // §9 请求信封：携带 request_id 与具体请求体。
@@ -547,6 +584,8 @@ message Request {
         InstallExtensionRequest install_extension = 23;
         SearchScrollbackRequest search_scrollback = 24;
         NewWindowRequest new_window = 25;
+        ZoomPaneRequest zoom_pane = 26;
+        ShellIntegrationRequest shell_integration = 27;
     }
 }
 
@@ -568,5 +607,7 @@ message Response {
         InstallExtensionResponse extension_installed = 13;
         SearchScrollbackResponse search_scrollback = 14;
         NewWindowResponse new_window = 15;
+        ZoomPaneResponse zoom_pane = 16;
+        ShellIntegrationResponse shell_integration = 17;
     }
 }

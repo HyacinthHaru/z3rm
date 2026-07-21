@@ -5,6 +5,7 @@ pub mod terminal_panel;
 mod terminal_path_like_target;
 pub mod terminal_scrollbar;
 pub mod mux_pane;
+pub mod file_viewer;
 
 use editor::{
     Editor, EditorSettings, actions::SelectAll, blink_manager::BlinkManager,
@@ -121,12 +122,24 @@ pub struct EnterCopyMode;
 pub struct ExitCopyMode;
 
 pub fn init(cx: &mut App) {
-    terminal_panel::init(cx);
-
-    register_serializable_item::<TerminalView>(cx);
-
+    // §3.1 server-canonical: old local-PTY TerminalView/TerminalPanel removed.
+    // Only file_viewer and mux_pane paths remain.
     cx.observe_new(|workspace: &mut Workspace, _window, _cx| {
-        workspace.register_action(TerminalView::deploy);
+        // §16.6 file viewer: open a file read-only from command palette
+        workspace.register_action(
+            |workspace, action: &file_viewer::OpenFile, window, cx| {
+                let path = PathBuf::from(&action.path);
+                let abs_path = if path.is_absolute() {
+                    path
+                } else if let Some(worktree) = workspace.project().read(cx).worktrees(cx).next()
+                {
+                    worktree.read(cx).abs_path().join(&path)
+                } else {
+                    path
+                };
+                file_viewer::open_file_in_viewer(workspace, abs_path, window, cx);
+            },
+        );
     })
     .detach();
 }

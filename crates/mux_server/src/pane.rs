@@ -25,7 +25,7 @@ use tokio::sync::mpsc;
 /// §3.1 真正拥有 alacritty Term + PTY pair 的 Pane (server-canonical)。
 pub struct Pane {
     pub id: String,
-    pub cwd: String,
+    pub cwd: Arc<parking_lot::RwLock<String>>,
     pub title: Arc<parking_lot::RwLock<String>>,
     pub command: Option<String>,
     /// §3.1 alacritty 终端实例 (server-canonical, 真实 VT 解析)。
@@ -38,6 +38,10 @@ pub struct Pane {
     pub cols: AtomicU64,
     pub rows: AtomicU64,
     pub bracketed_paste_mode: AtomicBool,
+    /// §3.3 Pane zoom 状态 (zoomed = 最大化, 隐藏其他 pane)。
+    pub zoomed: AtomicBool,
+    /// §3.3 OSC 133 prompt marker 计数器。
+    pub prompt_marker: AtomicU64,
     pub scrollback_buffer: Arc<parking_lot::RwLock<ScrollbackBuffer>>,
     pub scrollback_version: Arc<parking_lot::RwLock<ScrollbackVersion>>,
     /// §3.1 PTY master (用于 resize / reader clone)。
@@ -147,7 +151,7 @@ impl Pane {
 
         let pane = Arc::new(Pane {
             id: id.clone(),
-            cwd,
+            cwd: Arc::new(parking_lot::RwLock::new(cwd)),
             title: Arc::new(parking_lot::RwLock::new(String::new())),
             command: command_str,
             term: Arc::new(parking_lot::Mutex::new(term)),
@@ -157,6 +161,8 @@ impl Pane {
             cols: AtomicU64::new(cols as u64),
             rows: AtomicU64::new(rows as u64),
             bracketed_paste_mode: AtomicBool::new(false),
+            zoomed: AtomicBool::new(false),
+            prompt_marker: AtomicU64::new(0),
             scrollback_buffer: Arc::new(parking_lot::RwLock::new(ScrollbackBuffer::new(10_000))),
             scrollback_version: Arc::new(parking_lot::RwLock::new(ScrollbackVersion::new())),
             pty_master: Arc::new(Mutex::new(pair.master)),
@@ -229,6 +235,10 @@ impl Pane {
         // §3.3 收集 dirty 行 + 处理事件
         let dirty_rows = self.collect_dirty_rows();
         self.handle_pending_events();
+
+        // §3.3 解析 OSC 7 (cwd) / OSC 133 (prompt markers) — 在 alacritty
+        // 处理之外独立扫描, 因为 alacritty EventListener 不暴露 OSC 事件。
+        self.parse_osc_sequences(bytes);
 
         if !dirty_rows.is_empty() {
             // §3.3 生成 diff
@@ -482,6 +492,161 @@ impl Pane {
             self.scrollback_version.write().bump();
         }
     }
+
+    /// §3.3 设置 pane zoom 状态。
+    pub fn set_zoomed(&self, zoomed: bool) {
+        self.zoomed.store(zoomed, Ordering::SeqCst);
+    }
+
+    /// §3.3 获取 pane zoom 状态。
+    pub fn is_zoomed(&self) -> bool {
+        self.zoomed.load(Ordering::SeqCst)
+    }
+
+    /// §3.3 获取当前 cwd (可能已被 OSC 7 更新)。
+    pub fn get_cwd(&self) -> String {
+        self.cwd.read().clone()
+    }
+
+    /// §3.3 获取 prompt marker 计数。
+    pub fn get_prompt_marker(&self) -> u32 {
+        self.prompt_marker.load(Ordering::SeqCst) as u32
+    }
+
+    /// §3.3 扫描 PTY 输出中的 OSC 7 / OSC 133 序列。
+    ///
+    /// OSC 7: `ESC ] 7 ; file://HOST/PATH ST` — shell 报告当前工作目录。
+    /// OSC 133: `ESC ] 133 ; MARKER ST` — 语义 prompt 标记 (A=prompt start,
+    ///   B=command start, C=output start, D=command end)。
+    ///
+    /// ST (String Terminator) 可以是 BEL (0x07) 或 ESC \ (0x1b 0x5c)。
+    fn parse_osc_sequences(&self, bytes: &[u8]) {
+        let mut i = 0;
+        while i + 3 < bytes.len() {
+            // 寻找 OSC 引入: ESC ]
+            if bytes[i] != 0x1b || bytes[i + 1] != b']' {
+                i += 1;
+                continue;
+            }
+            i += 2;
+
+            // 解析 OSC 编号
+            let num_start = i;
+            while i < bytes.len() && bytes[i].is_ascii_digit() {
+                i += 1;
+            }
+            if i == num_start || i >= bytes.len() {
+                continue;
+            }
+            let osc_num: u32 = match std::str::from_utf8(&bytes[num_start..i]) {
+                Ok(s) => s.parse().unwrap_or(u32::MAX),
+                Err(_) => u32::MAX,
+            };
+
+            // OSC 7: 期望 ';' 后跟 URI
+            if osc_num == 7 {
+                if i < bytes.len() && bytes[i] == b';' {
+                    i += 1;
+                    let payload_start = i;
+                    let payload_end = self.find_osc_terminator(bytes, i);
+                    if let Some(end) = payload_end {
+                        if let Ok(uri) = std::str::from_utf8(&bytes[payload_start..end]) {
+                            self.handle_osc7_cwd(uri);
+                        }
+                        i = end;
+                    }
+                }
+                continue;
+            }
+
+            // OSC 133: 期望 ';' 后跟 marker 字符
+            if osc_num == 133 {
+                if i < bytes.len() && bytes[i] == b';' {
+                    i += 1;
+                    if i < bytes.len() {
+                        self.handle_osc133_marker(bytes[i]);
+                    }
+                }
+                continue;
+            }
+        }
+    }
+
+    /// 从 `start` 位置寻找 OSC 终止符 (BEL 或 ESC \), 返回 payload 结束位置。
+    fn find_osc_terminator(&self, bytes: &[u8], start: usize) -> Option<usize> {
+        let mut i = start;
+        while i < bytes.len() {
+            if bytes[i] == 0x07 {
+                return Some(i);
+            }
+            if bytes[i] == 0x1b && i + 1 < bytes.len() && bytes[i + 1] == 0x5c {
+                return Some(i);
+            }
+            i += 1;
+        }
+        None
+    }
+
+    /// §3.3 处理 OSC 7 URI: 提取 file:// 路径, 更新 pane cwd。
+    fn handle_osc7_cwd(&self, uri: &str) {
+        // file://hostname/path → /path
+        let path = if let Some(rest) = uri.strip_prefix("file://") {
+            // 跳过 hostname (到第一个 '/')
+            match rest.find('/') {
+                Some(slash) => &rest[slash..],
+                None => rest,
+            }
+        } else {
+            uri
+        };
+
+        if path.is_empty() {
+            return;
+        }
+
+        // 百分号解码 (e.g. %20 → space)
+        let decoded = percent_decode(path);
+        let old = self.cwd.read().clone();
+        if decoded != old {
+            *self.cwd.write() = decoded;
+            // 广播 ShellIntegrationChanged 到所有订阅者
+            self.broadcast_shell_integration_changed();
+        }
+    }
+
+    /// §3.3 处理 OSC 133 marker: 递增 prompt marker 计数。
+    fn handle_osc133_marker(&self, marker: u8) {
+        // A = prompt start, B = command start, C = output start, D = command end
+        if matches!(marker, b'A' | b'B' | b'C' | b'D') {
+            self.prompt_marker.fetch_add(1, Ordering::SeqCst);
+        }
+    }
+
+    /// §3.3 广播 ShellIntegrationChanged 到所有订阅者。
+    fn broadcast_shell_integration_changed(&self) {
+        let notif = MuxNotification {
+            event: Some(mux_protocol::notification::Event::ShellIntegrationChanged(
+                mux_protocol::ShellIntegrationChanged {
+                    cwd: self.get_cwd(),
+                },
+            )),
+        };
+        let subs = self.subscribers.read().clone();
+        let mut dead = Vec::new();
+        for (i, tx) in subs.iter().enumerate() {
+            if tx.send(notif.clone()).is_err() {
+                dead.push(i);
+            }
+        }
+        if !dead.is_empty() {
+            let mut live = self.subscribers.write();
+            for i in dead.into_iter().rev() {
+                if i < live.len() {
+                    live.remove(i);
+                }
+            }
+        }
+    }
 }
 
 impl Drop for Pane {
@@ -493,4 +658,25 @@ impl Drop for Pane {
             let _ = killer.kill();
         }
     }
+}
+
+/// §3.3 简单百分号解码 (OSC 7 URI 路径)。
+fn percent_decode(s: &str) -> String {
+    let bytes = s.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'%' && i + 2 < bytes.len() {
+            let hi = (bytes[i + 1] as char).to_digit(16);
+            let lo = (bytes[i + 2] as char).to_digit(16);
+            if let (Some(h), Some(l)) = (hi, lo) {
+                out.push((h * 16 + l) as u8);
+                i += 3;
+                continue;
+            }
+        }
+        out.push(bytes[i]);
+        i += 1;
+    }
+    String::from_utf8_lossy(&out).into_owned()
 }
