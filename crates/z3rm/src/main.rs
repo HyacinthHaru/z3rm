@@ -7,6 +7,7 @@ mod input;
 mod cli;
 mod log_viewer;
 pub mod diff_review;
+mod quickjs_extensions;
 
 use std::sync::Arc;
 
@@ -334,6 +335,8 @@ fn main() {
         search::init(cx);
         title_bar::init(cx);
         terminal_view::init(cx);
+        // §5.2 QuickJS extension system — loads JS extensions on background thread
+        quickjs_extensions::init_extensions(cx);
         settings_ui::init(cx);
         settings_profile_selector::init(cx);
         theme_selector::init(cx);

@@ -84,6 +84,9 @@ workspace = true
 [dependencies.extension_host]
 workspace = true
 
+[dependencies.quickjs_runtime]
+workspace = true
+
 [dependencies.extensions_ui]
 workspace = true
 

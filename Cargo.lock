@@ -17148,6 +17148,7 @@ dependencies = [
  "project_panel",
  "project_symbols",
  "proto",
+ "quickjs_runtime",
  "rayon",
  "recent_projects",
  "release_channel",

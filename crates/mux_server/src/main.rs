@@ -11,7 +11,7 @@ fn main() -> Result<()> {
     // §16.12 解析 CLI 子命令
     match args.get(1).map(String::as_str) {
         Some("status") => cmd_status(),
-        Some("kill") => cmd_kill(),
+        Some("kill") => cmd_kill(&args[2..]),
         _ => {
             // 默认行为: 运行 daemon
             run()
@@ -101,8 +101,14 @@ fn cmd_status() -> Result<()> {
     })
 }
 
-/// §16.12 z3rm-server kill 子命令
-fn cmd_kill() -> Result<()> {
+/// §3.5 z3rm-server kill 子命令
+///
+/// - `z3rm-server kill` → 终止整个 daemon (kill 全部 session + 移除 socket)
+/// - `z3rm-server kill --session <id>` → 仅结束指定 session,daemon 继续运行
+///
+/// §3.5 keep_alive 默认 true: session 全部结束后 daemon 仍存活,
+/// 由 keep_alive_seconds 空闲计时自动退出。
+fn cmd_kill(args: &[String]) -> Result<()> {
     let socket_path = default_socket_path();
 
     if !socket_path.exists() {
@@ -110,23 +116,59 @@ fn cmd_kill() -> Result<()> {
         std::process::exit(1);
     }
 
+    // §3.5 解析 --session <id>:仅结束该 session。
+    // 形态: `kill --session <id>` / `kill --session=<id>`。
+    let session_id = parse_session_flag(args);
+
     let rt = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()?;
 
     rt.block_on(async {
         let domain = mux::connect_local(Some(socket_path.as_path())).await?;
-        let sessions = domain.list_sessions().await?;
-        for session in &sessions {
-            let _ = domain.kill_session(&session.id).await;
+
+        if let Some(id) = &session_id {
+            // §3.5 z3rm-server kill --session <id>:发送 KillSession RPC,daemon 继续运行。
+            domain.kill_session(id).await?;
+            println!("session {id} killed successfully");
+        } else {
+            // §3.5 z3rm-server kill:结束所有 session 并关闭 daemon。
+            let sessions = domain.list_sessions().await?;
+            for session in &sessions {
+                let _ = domain.kill_session(&session.id).await;
+            }
+
+            drop(domain);
+
+            tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+            let _ = std::fs::remove_file(&socket_path);
+
+            println!("z3rm-server killed successfully");
         }
 
-        drop(domain);
-
-        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
-        let _ = std::fs::remove_file(&socket_path);
-
-        println!("z3rm-server killed successfully");
         Ok::<_, anyhow::Error>(())
     })
+}
+
+/// §3.5 解析 `--session <id>` / `--session=<id>` flag。
+///
+/// 返回 None 表示未提供 --session (kill 整个 daemon)。
+/// 提供了但缺少值时报错退出 (而非 panic)。
+fn parse_session_flag(args: &[String]) -> Option<String> {
+    let mut iter = args.iter();
+    while let Some(arg) = iter.next() {
+        if let Some(val) = arg.strip_prefix("--session=") {
+            return Some(val.to_string());
+        }
+        if arg == "--session" {
+            match iter.next() {
+                Some(v) if !v.is_empty() => return Some(v.clone()),
+                _ => {
+                    eprintln!("error: --session requires a value");
+                    std::process::exit(2);
+                }
+            }
+        }
+    }
+    None
 }

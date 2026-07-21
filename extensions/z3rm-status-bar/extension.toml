@@ -2,6 +2,9 @@
 name = "z3rm-status-bar"
 version = "0.1.0"
 
+[runtime]
+side = "client"
+
 [capabilities]
 terminal = true
 mux = true

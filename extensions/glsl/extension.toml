@@ -6,6 +6,9 @@ schema_version = 1
 authors = ["Mikayla Maki <mikayla@zed.dev>"]
 repository = "https://github.com/zed-industries/zed"
 
+[runtime]
+side = "client"
+
 [language_servers.glsl_analyzer]
 name = "GLSL Analyzer LSP"
 language = "GLSL"

@@ -3,8 +3,12 @@
 
 use anyhow::Result;
 use sqlez::connection::Connection;
+use std::future::Future;
 use std::path::PathBuf;
+use std::pin::Pin;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::SystemTime;
+use tokio::time::Duration;
 use interprocess::local_socket::tokio::Listener as LocalSocketListener;
 
 pub mod connection;
@@ -199,12 +203,27 @@ pub fn run() -> Result<()> {
         });
 
         let clipboard = std::sync::Arc::new(clipboard::ServerClipboard::new());
+
+        // §3.5 keep_alive_seconds: auto-exit after N seconds of zero active connections.
+        // Default 0 = disabled (keep alive forever). Configurable via Z3RM_KEEP_ALIVE_SECONDS.
+        let keep_alive_seconds: u64 = std::env::var("Z3RM_KEEP_ALIVE_SECONDS")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(0);
+        if keep_alive_seconds > 0 {
+            zlog::info!("keep_alive enabled: idle_timeout={}s", keep_alive_seconds);
+        }
         let server = Server {
             sessions,
             _db: db,
             _persist_handle: Some(persist_handle),
             clipboard,
             start_time: SystemTime::now(),
+            // §3.5 keep_alive: idle timeout in seconds. 0 = disabled (keep alive forever).
+            // Read from Z3RM_KEEP_ALIVE_SECONDS env var.
+            keep_alive_seconds,
+            // §3.5 active connection counter — drives the idle-shutdown timer.
+            active_connections: std::sync::Arc::new(AtomicUsize::new(0)),
         };
 
         server.run(listener).await
@@ -223,35 +242,109 @@ pub struct Server {
     clipboard: std::sync::Arc<clipboard::ServerClipboard>,
     // §16.12 启动时间 (用于 status 计算运行时长)
     start_time: SystemTime,
+    // §3.5 keep_alive: idle timeout in seconds (0 = disabled, keep alive forever)
+    keep_alive_seconds: u64,
+    // §3.5 active connection counter — drives the idle-shutdown timer
+    active_connections: std::sync::Arc<AtomicUsize>,
 }
 
 impl Server {
     async fn run(self, listener: LocalSocketListener) -> Result<()> {
         use interprocess::local_socket::tokio::prelude::*;
+
+        // §3.5 keep_alive: when active_connections is 0 and keep_alive_seconds > 0,
+        // the daemon exits after keep_alive_seconds of idleness. A mpsc channel lets
+        // spawned connection tasks notify the accept loop when they finish, so the
+        // loop can re-evaluate the idle timer without polling.
+        let (done_tx, mut done_rx) = tokio::sync::mpsc::unbounded_channel::<()>();
+
+        // The idle deadline, if a timer is currently armed. `None` means no timer
+        // is running (either because a connection is active or keep_alive is disabled).
+        let mut idle_deadline: Option<tokio::time::Instant> = None;
+
         loop {
-            let stream = match listener.accept().await {
-                Ok(s) => s,
-                Err(e) => {
-                    zlog::error!("accept failed: {}", e);
-                    continue;
-                }
-            };
-            zlog::info!("client connected");
+            // (Re-)arm the idle timer when the connection count transitions to zero.
+            let current = self.active_connections.load(Ordering::SeqCst);
+            if current == 0 && self.keep_alive_seconds > 0 && idle_deadline.is_none() {
+                idle_deadline = Some(tokio::time::Instant::now() + Duration::from_secs(self.keep_alive_seconds));
+            }
+            // Cancel the timer when connections become non-zero.
+            if current > 0 {
+                idle_deadline = None;
+            }
 
-            let sessions = self.sessions.clone();
-            let db = self._db.clone();
-            let clipboard = self.clipboard.clone();
+            tokio::select! {
+                // New client connection arrives — cancel any pending idle timer.
+                accept_result = listener.accept() => {
+                    let stream = match accept_result {
+                        Ok(s) => s,
+                        Err(e) => {
+                            zlog::error!("accept failed: {}", e);
+                            // Keep the loop alive on transient accept errors.
+                            continue;
+                        }
+                    };
+                    // New connection cancels the idle timer.
+                    idle_deadline = None;
+                    let prev = self.active_connections.fetch_add(1, Ordering::SeqCst);
+                    zlog::info!("client connected (active={})", prev + 1);
 
-            tokio::spawn(async move {
-                match connection::handle_connection(stream, sessions, db, clipboard).await {
-                    Ok(()) => {
-                        zlog::info!("client disconnected");
-                    }
-                    Err(e) => {
-                        zlog::error!("connection error: {}", e);
-                    }
+                    let sessions = self.sessions.clone();
+                    let db = self._db.clone();
+                    let clipboard = self.clipboard.clone();
+                    let counter = self.active_connections.clone();
+                    let done_tx = done_tx.clone();
+
+                    tokio::spawn(async move {
+                        match connection::handle_connection(stream, sessions, db, clipboard).await {
+                            Ok(()) => {
+                                zlog::info!("client disconnected");
+                            }
+                            Err(e) => {
+                                zlog::error!("connection error: {}", e);
+                            }
+                        }
+                        // §3.5 decrement counter and notify the accept loop so it
+                        // can re-evaluate the idle timer.
+                        let remaining = counter.fetch_sub(1, Ordering::SeqCst) - 1;
+                        let _ = done_tx.send(());
+                        zlog::info!("active connections={}", remaining);
+                    });
                 }
-            });
+
+                // Notify that a connection task finished — re-evaluate the idle timer.
+                _ = done_rx.recv() => {
+                    // Loop will re-arm idle_deadline if connections dropped to 0.
+                }
+
+                // Idle timer expired — graceful shutdown.
+                _ = idle_sleep(idle_deadline) => {
+                    tracing::info!(
+                        idle_seconds = self.keep_alive_seconds,
+                        "daemon idle for {}s, shutting down",
+                        self.keep_alive_seconds
+                    );
+                    return Ok(());
+                }
+            }
         }
+    }
+}
+
+/// §3.5 Returns a boxed future that resolves at the idle deadline.
+///
+/// If no deadline is armed (`None`), returns a future that never resolves,
+/// so it stays dormant inside `tokio::select!` until a connection event
+/// wins the race. This avoids the need for conditional branching inside
+/// the select! — the branch is always present but inert when disabled.
+fn idle_sleep(deadline: Option<tokio::time::Instant>) -> Pin<Box<dyn Future<Output = ()> + Send>> {
+    match deadline {
+        // Never resolves — far-future deadline keeps the select! branch inert.
+        None => Box::pin(tokio::time::sleep_until(
+            tokio::time::Instant::now() + Duration::from_secs(u64::MAX / 2),
+        )),
+        Some(d) => Box::pin(async move {
+            tokio::time::sleep_until(d).await;
+        }),
     }
 }

@@ -2,6 +2,9 @@
 name = "z3rm-layout-manager"
 version = "0.1.0"
 
+[runtime]
+side = "both"
+
 [capabilities]
 workspace = true
 mux = true
