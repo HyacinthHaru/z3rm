@@ -109,13 +109,13 @@ async fn test_stateless_roaming() {
     let server = UdpServer::bind(server_addr, key)
         .await
         .expect("bind failed");
-    let bound_addr = server.local_addr();
+    let bound_addr = server.local_addr().unwrap();
 
     // §16.6 客户端连接并发送第一条消息。
     let mut client = UdpClient::connect(bound_addr, key)
         .await
         .expect("client connect failed");
-    let client_port = client.local_addr().port();
+    let client_port = client.local_addr().unwrap().port();
 
     client
         .send(b"hello from client")
@@ -150,7 +150,7 @@ async fn test_udp_send_recv() {
     let server = UdpServer::bind(server_addr, key)
         .await
         .expect("bind failed");
-    let bound_addr = server.local_addr();
+    let bound_addr = server.local_addr().unwrap();
 
     // §16.6 客户端连接。
     let mut client = UdpClient::connect(bound_addr, key)

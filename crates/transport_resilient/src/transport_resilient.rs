@@ -88,7 +88,7 @@ impl UdpResilientTransport {
     }
 
     /// §16.6 获取本地地址。
-    pub fn local_addr(&self) -> std::net::SocketAddr {
+    pub fn local_addr(&self) -> std::io::Result<std::net::SocketAddr> {
         self.inner.local_addr()
     }
 }

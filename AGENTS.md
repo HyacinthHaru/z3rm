@@ -235,6 +235,7 @@ Release Notes:
 渲染链：`open_window` → `MultiWorkspace::render` → `.child(workspace)` → `Workspace::render` → `render_center` → `PaneGroup::render` → `Member::Pane` → `AnyView::from(pane)` → `Pane::render` → `item.to_any_view()` → `MuxPaneView::render`
 
 * **逐层加 `eprintln!` 定位断点。** 在每一层的 render 方法入口加 `eprintln!`，确认哪一层没有被调用。
+* **`BottomDockLayout` 默认值必须是 `Full`。** `Stacked` 分支的 Workspace render 只渲染 bottom dock，完全遗漏 `render_center`（中心 pane group），导致整个终端区域不渲染。迁移 stub 类型时，必须检查每个枚举变体在 render 中的分支是否完整。（来源：实际排查 2026-07）
 * **`gpui::Empty` 陷阱。** 搜索所有返回 `gpui::Empty` 的 render 方法——它们会在特定条件下静默吞掉整个子树。关键位置：
   - `pane.rs:render_tab_bar` — `workspace.upgrade().is_none()` 时返回 Empty（tabbar 消失）
   - `pane.rs:Render` — `project.upgrade().is_none()` 时返回空 div（整个 pane 消失）
@@ -253,3 +254,5 @@ Release Notes:
 * **`connect_local` 签名是 `Option<&Path>`。** 所有调用方必须用 `Some(path.as_path())` 或 `None`。
 * **`fetch_grid_update(since=0)` 必须返回 `FullSnapshot`。** 初始 generation 为 0 时，`since == current == 0` 不能返回 `NoChange`，否则客户端永远收不到初始网格。
 * **`let _ = domain.send_input(...)` 会静默丢弃按键。** 传输失败时用户无感知。至少用 `.log_err()` 或通知 UI 层。
+
+* **§3.1 in-place render-path 例外。** 客户端可以订阅 `PaneOutputChunk` PTY 字节流作为补充通知通道，驱动 `fetch_grid_update` 拉取渲染状态。字节流不改变 grid-diff 渲染路径，仅作为额外的 dirty 信号。spec §3.1 例外条款授权此优化（来源：spec §3.1, 行204）。

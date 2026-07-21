@@ -280,6 +280,8 @@ impl Pane {
             let mut processor =
                 Processor::<alacritty_terminal::vte::ansi::StdSyncHandler>::new();
             processor.advance(&mut *term, bytes);
+            // §3.1 In-place render-path: broadcast raw PTY bytes to clients.
+            self.broadcast_pane_output(bytes);
             let after = (
                 term.grid().cursor.point,
                 term.cursor_style(),
@@ -364,6 +366,30 @@ impl Pane {
 
     /// §3.3 / §3.4 向所有订阅者推送 PaneDirty (at-most-once, 丢失无害)。
     /// 关闭的订阅者会被自动清理。
+    fn broadcast_pane_output(&self, bytes: &[u8]) {
+        let notif = MuxNotification {
+            event: Some(mux_protocol::notification::Event::PaneOutput(
+                mux_protocol::PaneOutputChunk {
+                    pane_id: self.id.clone(),
+                    data: bytes.to_vec(),
+                },
+            )),
+        };
+        let subs = self.subscribers.read().clone();
+        let mut dead = Vec::new();
+        for (i, tx) in subs.iter().enumerate() {
+            if tx.send(notif.clone()).is_err() {
+                dead.push(i);
+            }
+        }
+        if !dead.is_empty() {
+            let mut live = self.subscribers.write();
+            for i in dead.into_iter().rev() {
+                if i < live.len() { live.remove(i); }
+            }
+        }
+    }
+
     fn broadcast_pane_dirty(&self) {
         let notif = MuxNotification {
             event: Some(mux_protocol::notification::Event::PaneDirty(

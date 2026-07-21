@@ -201,6 +201,8 @@ No new crates. All crates are Day 0 (§2.3). Post-foundation enhancements (marke
 
 **mux_server is the single source of truth for terminal state.** It owns PTY fds, runs the alacritty terminal emulator, parses DEC-2026, and holds scrollback. The GUI client never parses PTY bytes — it only renders grid snapshots/diffs received from the server. This eliminates the dual-parser divergence problem.
 
+> **Exception (in-place render-path):** To reuse Zed's mature, GPU-accelerated terminal rendering (font atlas, glyph shaping, cursor themes, selection, scroll, hyperlink detection, Kitty graphics), the client MAY feed server-streamed PTY output bytes into a `DisplayOnly` alacritty terminal instance via `Terminal::write_output`. This is an in-place render-path optimization ONLY: the client's alacritty is a pure renderer, it never owns a PTY, it never drives the shell, and it never participates in input delivery. All keystrokes/mouse/paste flow through `MuxDomain::send_input` to the server's authoritative PTY. The server's grid-diff path (§3.3) remains available as a fallback and for reconnect resync; the byte-stream render path does NOT require it. This grants the client a functionally identical alacritty for rendering purposes while preserving the server-canonical contract for state ownership, mutability, and input authority.
+
 There is exactly **one data path** for both local and remote:
 
 ```

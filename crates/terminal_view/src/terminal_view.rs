@@ -6,6 +6,8 @@ mod terminal_path_like_target;
 pub mod terminal_scrollbar;
 pub mod mux_pane;
 pub mod file_viewer;
+pub mod diff_view;
+pub mod settings_pane;
 
 use editor::{
     Editor, EditorSettings, actions::SelectAll, blink_manager::BlinkManager,

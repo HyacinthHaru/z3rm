@@ -1,69 +1,37 @@
 // §3.1 / §15.1 MuxPaneView — server-canonical terminal panel renderer.
 //
-// Unlike Zed's TerminalView, this view holds no local PTY or alacritty Term.
-// It is a thin client of mux_server:
-//   - Fetches FullGridSnapshot/GridDiff via MuxDomain::fetch_grid_update
-//   - Renders cells + cursor directly in GPUI
-//   - Sends input via MuxDomain::send_input / paste
-//   - Listens to PaneDirty notifications to trigger fetch + repaint
+// Architecture (§3.1 in-place render-path exception):
+//   - DisplayOnly Terminal receives PTY bytes via write_output (primary render path)
+//   - TerminalElement provides GPU-accelerated batched text rendering
+//   - Keyboard input goes through MuxDomain::send_input (never local PTY)
+//   - fetch_grid_update serves as recovery path on reconnect (§15.12)
 //
-// This is the most direct implementation of spec §3.1 "client never parses PTY bytes".
+// The client's alacritty instance is a pure renderer — it never owns a PTY.
 
+use std::sync::Arc;
 use gpui::{
-    App, AppContext, Context, Entity, EventEmitter, FocusHandle, Focusable, FontWeight,
-    KeyDownEvent, Keystroke, MouseDownEvent, MouseMoveEvent, MouseUpEvent, Pixels, Render,
-    ScrollWheelEvent, SharedString, Task, Window, div, px, rgb,
+    App, AppContext, Context, Entity, EventEmitter, FocusHandle, Focusable,
+    InteractiveElement, KeyDownEvent, Keystroke, ParentElement, Render, SharedString,
+    StatefulInteractiveElement, Styled, Task, WeakEntity, Window, div,
 };
 use mux::MuxDomain;
 use mux_protocol::{
     fetch_grid_update_response::Update as FetchUpdate, notification::Event as NotifEvent,
-    Cell as MuxCell, CursorState, FullGridSnapshot, GridDiff, Notification,
+    FullGridSnapshot, GridDiff, Notification, RowChange,
 };
-use std::sync::Arc;
-use ui::prelude::*;
+use project::Project;
+use settings::Settings;
+use terminal::{Terminal, TerminalBounds, TerminalBuilder, terminal_settings::TerminalSettings};
+use theme::ActiveTheme;
+use util::paths::PathStyle;
+
+use crate::terminal_element::TerminalElement;
+use crate::{TerminalMode, TerminalView};
 
 use workspace::{
-    item::{Item, ItemBufferKind, TabContentParams, TabTooltipContent},
-    ItemHandle, Pane, ToolbarItemLocation, Workspace,
+    item::{Item, ItemBufferKind, TabTooltipContent},
+    ItemHandle, ToolbarItemLocation, Workspace,
 };
-use project::{Project, ProjectPath};
-
-/// §12 / §16.4 Selection anchor/head in grid coordinates.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-struct SelectionPoint {
-    row: usize,
-    col: usize,
-}
-
-/// §3.3 MuxPaneView — GPUI view for a mux_server pane.
-pub struct MuxPaneView {
-    /// §3.10 server-assigned pane id
-    pub pane_id: String,
-    /// §3.10 MuxDomain client (shared Arc)
-    pub domain: Arc<MuxDomain>,
-    /// §3.3 current grid snapshot (fetched from server)
-    snapshot: FullGridSnapshot,
-    /// §3.3 client's known latest generation
-    generation: u64,
-    /// §3.3 fetch dedup flag
-    fetch_in_flight: bool,
-    /// GPUI focus handle
-    focus_handle: FocusHandle,
-    /// §3.4 notification subscription task
-    notification_task: Option<Task<()>>,
-    /// §12 mouse selection anchor
-    selection_anchor: Option<SelectionPoint>,
-    /// §12 mouse selection head (current drag position)
-    selection_head: Option<SelectionPoint>,
-    /// §12 whether a mouse drag is in progress
-    is_selecting: bool,
-    /// §16.4 scrollback offset (0 = bottom, N = N lines up)
-    scrollback_offset: usize,
-    /// §12 copy mode active
-    copy_mode: bool,
-    /// §15.7 zoom state (client-side toggle tracker)
-    zoomed: bool,
-}
 
 /// §3.3 View events (for workspace to subscribe)
 #[derive(Clone, Debug)]
@@ -72,48 +40,123 @@ pub enum MuxPaneEvent {
     CloseRequested,
 }
 
+/// §3.3 MuxPaneView — GPUI view for a mux_server pane.
+/// Wraps a DisplayOnly Terminal + TerminalView for GPU-accelerated rendering.
+pub struct MuxPaneView {
+    /// §3.10 server-assigned pane id
+    pub pane_id: String,
+    /// §3.10 MuxDomain client (shared Arc)
+    pub domain: Arc<MuxDomain>,
+    /// §3.1 exception: DisplayOnly terminal that receives PTY bytes via write_output
+    terminal: Entity<Terminal>,
+    /// TerminalView entity for TerminalElement state access (scroll, IME, mode)
+    terminal_view: Entity<TerminalView>,
+    /// Weak reference to workspace for TerminalElement
+    workspace: WeakEntity<Workspace>,
+    /// GPUI focus handle — tracked by TerminalElement, receives keyboard events
+    focus_handle: FocusHandle,
+    /// §3.4 notification subscription task
+    notification_task: Option<Task<()>>,
+    /// §3.3 client's known latest generation (for fetch_grid_update recovery)
+    generation: u64,
+    /// §3.3 fetch dedup flag
+    fetch_in_flight: bool,
+    /// §3.3 current grid snapshot (recovery path for reconnect)
+    snapshot: FullGridSnapshot,
+    /// §15.7 zoom state
+    zoomed: bool,
+}
+
 impl MuxPaneView {
-    /// §3.3 Create view. Immediately triggers fetch_grid_update(0).
+    /// §3.3 Create view with DisplayOnly Terminal + TerminalView.
+    /// PaneOutputChunk bytes feed Terminal::write_output; keyboard goes to MuxDomain.
     pub fn new(
         pane_id: String,
         domain: Arc<MuxDomain>,
-        _window: &mut Window,
+        workspace: WeakEntity<Workspace>,
+        project: WeakEntity<Project>,
+        window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Self {
         let focus_handle = cx.focus_handle();
 
+        // §3.1 exception: create DisplayOnly terminal (no PTY ownership)
+        let settings = TerminalSettings::get_global(cx);
+        let cursor_shape = settings.cursor_shape;
+        let alternate_scroll = settings.alternate_scroll;
+        let background_executor = cx.background_executor().clone();
+        let window_id = window.window_handle().window_id().as_u64();
+
+        let terminal = cx.new(|cx| {
+            TerminalBuilder::new_display_only_with_bounds(
+                cursor_shape,
+                alternate_scroll,
+                None, // default scroll history
+                window_id,
+                &background_executor,
+                PathStyle::local(),
+                // Initial bounds: 80×24 cells at standard monospace metrics.
+                // TerminalElement resizes on first prepaint with real font metrics.
+                TerminalBounds::new(
+                    gpui::px(18.0),  // line_height
+                    gpui::px(8.4),   // cell_width
+                    gpui::Bounds {
+                        origin: gpui::Point::default(),
+                        size: gpui::Size {
+                            width: gpui::px(8.4 * 80.0),
+                            height: gpui::px(18.0 * 24.0),
+                        },
+                    },
+                ),
+            )
+            .subscribe(cx)
+        });
+
+        // TerminalView provides state for TerminalElement (scroll, mode, IME)
+        let terminal_view = cx.new(|cx| {
+            TerminalView::new(
+                terminal.clone(),
+                workspace.clone(),
+                None,
+                project,
+                window,
+                cx,
+            )
+        });
+
+        let snapshot = FullGridSnapshot {
+            cols: 80,
+            rows: 24,
+            cells: vec![mux_protocol::Cell::default(); 80 * 24],
+            cursor: Some(mux_protocol::CursorState {
+                col: 0,
+                row: 0,
+                style: 1,
+                visible: true,
+            }),
+            alternate_screen: false,
+        };
+
         let mut view = Self {
             pane_id: pane_id.clone(),
             domain: domain.clone(),
-            snapshot: FullGridSnapshot {
-                cols: 80,
-                rows: 24,
-                cells: vec![MuxCell::default(); 80 * 24],
-                cursor: Some(CursorState {
-                    col: 0,
-                    row: 0,
-                    style: 1, // BLOCK
-                    visible: true,
-                }),
-                alternate_screen: false,
-            },
-            generation: 0,
-            fetch_in_flight: false,
+            terminal,
+            terminal_view,
+            workspace,
             focus_handle,
             notification_task: None,
-            selection_anchor: None,
-            selection_head: None,
-            is_selecting: false,
-            scrollback_offset: 0,
-            copy_mode: false,
+            generation: 0,
+            fetch_in_flight: false,
+            snapshot,
             zoomed: false,
         };
         view.start_notification_listener(cx);
+        view.subscribe_pane_output(cx);
         view.schedule_fetch(cx);
         view
     }
 
-    /// §3.4 Subscribe to PaneDirty / PaneRemoved, trigger fetch + repaint.
+    /// §3.4 Listen for PaneOutput (byte stream), PaneDirty, PaneRemoved notifications.
     fn start_notification_listener(&mut self, cx: &mut Context<Self>) {
         let pane_id = self.pane_id.clone();
         let rx = self.domain.subscribe();
@@ -123,6 +166,18 @@ impl MuxPaneView {
             while let Ok(notif) = rx.recv().await {
                 let Some(event) = notif.event else { continue };
                 match event {
+                    // §3.1 exception: primary render path — feed bytes to DisplayOnly terminal
+                    NotifEvent::PaneOutput(chunk) if chunk.pane_id == pane_id => {
+                        let data = chunk.data;
+                        if weak.update(cx, |view, cx| {
+                            view.terminal.update(cx, |terminal, cx| {
+                                terminal.write_output(&data, cx);
+                            });
+                        }).is_err() {
+                            break; // view dropped
+                        }
+                    }
+                    // §3.3 grid-diff path: trigger fetch for state reconciliation
                     NotifEvent::PaneDirty(dirty) if dirty.pane_id == pane_id => {
                         let _ = weak.update(cx, |view, cx| view.schedule_fetch(cx));
                     }
@@ -140,7 +195,20 @@ impl MuxPaneView {
         self.notification_task = Some(task);
     }
 
-    /// §3.3 Schedule a fetch_grid_update. fetch_in_flight prevents concurrent fetches.
+    /// §3.1 exception: subscribe to PTY byte stream from server.
+    fn subscribe_pane_output(&self, cx: &mut Context<Self>) {
+        let domain = self.domain.clone();
+        let pane_id = self.pane_id.clone();
+        cx.background_executor()
+            .spawn(async move {
+                if let Err(e) = domain.subscribe_pane_output(&pane_id).await {
+                    tracing::error!(pane_id = %pane_id, error = %e, "subscribe_pane_output failed");
+                }
+            })
+            .detach();
+    }
+
+    /// §3.3 Schedule a fetch_grid_update (recovery path for reconnect §15.12).
     fn schedule_fetch(&mut self, cx: &mut Context<Self>) {
         if self.fetch_in_flight {
             return;
@@ -161,42 +229,58 @@ impl MuxPaneView {
                         view.apply_fetch_update(resp, cx);
                     }
                     Err(e) => {
-                        tracing::error!(pane_id = %pane_id, error = %e, "fetch_grid_update failed: MuxPane grid unavailable");
+                        tracing::error!(pane_id = %pane_id, error = %e, "fetch_grid_update failed");
                     }
                 }
             }) {
-                Ok(()) => {},
-                Err(_) => tracing::warn!("MuxPane observer: weak update failed after fetch"),
+                Ok(()) => {}
+                Err(_) => tracing::warn!("MuxPaneView dropped after fetch"),
             }
         })
         .detach();
     }
 
-    /// §3.3 Apply fetch response + notify GPUI to repaint.
+    /// §3.3 / §15.12 Apply fetch response. On FullSnapshot, write content to DisplayOnly terminal.
     fn apply_fetch_update(
         &mut self,
         resp: mux_protocol::FetchGridUpdateResponse,
         cx: &mut Context<Self>,
     ) {
+        let prev_generation = self.generation;
         self.generation = resp.to_generation;
         match resp.update {
             Some(FetchUpdate::FullSnapshot(full)) => {
                 self.snapshot = full;
+                // §15.12 reconnect recovery: only write to terminal if generation went
+                // backwards (indicates reconnect) or this is the initial fetch (gen 0).
+                // During normal operation, PaneOutput byte stream is the render path —
+                // writing snapshot here would cause double-rendered characters.
+                if prev_generation == 0 || resp.to_generation < prev_generation {
+                    self.write_snapshot_to_terminal(cx);
+                }
             }
             Some(FetchUpdate::Diff(diff)) => {
-                self.apply_diff(&diff);
+                apply_diff_to_snapshot(&mut self.snapshot, &diff);
             }
             None => {}
         }
         cx.notify();
     }
 
-    /// §3.3 Apply GridDiff to snapshot.cells (row-major flat array).
-    fn apply_diff(&mut self, diff: &GridDiff) {
-        apply_diff_to_snapshot(&mut self.snapshot, diff);
+    /// §15.12 Write current snapshot content to DisplayOnly terminal for recovery.
+    fn write_snapshot_to_terminal(&mut self, cx: &mut Context<Self>) {
+        let text = snapshot_to_text(&self.snapshot);
+        let bytes = text.into_bytes();
+        // Clear screen + write snapshot (ANSI: ESC[2J ESC[H = clear + home)
+        let mut clear_and_write = Vec::with_capacity(bytes.len() + 8);
+        clear_and_write.extend_from_slice(b"\x1b[2J\x1b[H");
+        clear_and_write.extend_from_slice(&bytes);
+        self.terminal.update(cx, |terminal, cx| {
+            terminal.write_output(&clear_and_write, cx);
+        });
     }
 
-    /// §3.10 keystroke → terminal bytes → send_input.
+    /// §3.10 keystroke → terminal bytes → send_input via MuxDomain.
     fn dispatch_keystroke(&mut self, keystroke: &Keystroke, cx: &mut Context<Self>) {
         let bytes = keystroke_to_bytes(keystroke);
         if bytes.is_empty() {
@@ -206,116 +290,29 @@ impl MuxPaneView {
         let pane_id = self.pane_id.clone();
         cx.background_executor()
             .spawn(async move {
-                let _ = domain.send_input(&pane_id, &bytes).await;
+                if let Err(e) = domain.send_input(&pane_id, &bytes).await {
+                    tracing::error!(pane_id = %pane_id, error = %e, "send_input failed");
+                }
             })
             .detach();
     }
 
-    /// §3.3 Current snapshot title (for tabbar).
-    pub fn title(&self) -> SharedString {
-        if self.snapshot.cells.is_empty() {
-            "terminal".into()
-        } else {
-            let cols = self.snapshot.cols as usize;
-            let first_line: String = self.snapshot.cells[..cols]
-                .iter()
-                .map(|c| c.char.chars().next().unwrap_or(' '))
-                .collect();
-            let trimmed = first_line.trim();
-            if trimmed.is_empty() {
-                "terminal".into()
-            } else {
-                trimmed.to_string().into()
-            }
-        }
+    /// §3.3 Current terminal title (for tabbar). Uses terminal's parsed title from escape sequences.
+    pub fn title(&self, cx: &App) -> SharedString {
+        self.terminal.read(cx).title(true).into()
     }
 
-    /// §3.10 resize — notify server, server bumps generation + pushes new diff.
+    /// §3.10 resize — notify server of new dimensions.
     pub fn resize(&mut self, cols: u32, rows: u32, cx: &mut Context<Self>) {
         let domain = self.domain.clone();
         let pane_id = self.pane_id.clone();
         cx.background_executor()
             .spawn(async move {
-                let _ = domain.resize_pane(&pane_id, cols, rows).await;
+                if let Err(e) = domain.resize_pane(&pane_id, cols, rows).await {
+                    tracing::error!(error = %e, "resize_pane failed");
+                }
             })
             .detach();
-    }
-
-    /// §12 Convert mouse position to grid coordinates.
-    fn mouse_to_grid(&self, position: gpui::Point<Pixels>, char_width: Pixels, line_height: Pixels) -> Option<SelectionPoint> {
-        let cw = f32::from(char_width);
-        let lh = f32::from(line_height);
-        if cw <= 0.0 || lh <= 0.0 {
-            return None;
-        }
-        let col = (f32::from(position.x) / cw).max(0.0) as usize;
-        let row = (f32::from(position.y) / lh).max(0.0) as usize;
-        let cols = self.snapshot.cols as usize;
-        let rows = self.snapshot.rows as usize;
-        if col < cols && row < rows {
-            Some(SelectionPoint { row, col })
-        } else {
-            None
-        }
-    }
-
-    /// §12 Get selected text as a string.
-    pub fn selected_text(&self) -> Option<String> {
-        let anchor = self.selection_anchor?;
-        let head = self.selection_head?;
-        let (start, end) = if (anchor.row, anchor.col) <= (head.row, head.col) {
-            (anchor, head)
-        } else {
-            (head, anchor)
-        };
-        let cols = self.snapshot.cols as usize;
-        let mut text = String::new();
-        for row in start.row..=end.row {
-            let col_start = if row == start.row { start.col } else { 0 };
-            let col_end = if row == end.row { end.col } else { cols.saturating_sub(1) };
-            for col in col_start..=col_end {
-                let flat = row * cols + col;
-                if let Some(cell) = self.snapshot.cells.get(flat) {
-                    text.push(cell.char.chars().next().unwrap_or(' '));
-                }
-            }
-            if row < end.row {
-                text.push('\n');
-            }
-        }
-        Some(text)
-    }
-
-    /// §12 Check if a cell is within the current selection.
-    fn is_cell_selected(&self, row: usize, col: usize) -> bool {
-        let (Some(anchor), Some(head)) = (self.selection_anchor, self.selection_head) else {
-            return false;
-        };
-        let (start, end) = if (anchor.row, anchor.col) <= (head.row, head.col) {
-            (anchor, head)
-        } else {
-            (head, anchor)
-        };
-        if row < start.row || row > end.row {
-            return false;
-        }
-        if row == start.row && row == end.row {
-            return col >= start.col && col <= end.col;
-        }
-        if row == start.row {
-            return col >= start.col;
-        }
-        if row == end.row {
-            return col <= end.col;
-        }
-        true
-    }
-
-    /// §12 Clear selection.
-    fn clear_selection(&mut self) {
-        self.selection_anchor = None;
-        self.selection_head = None;
-        self.is_selecting = false;
     }
 
     /// §15.7 Whether this pane is currently zoomed.
@@ -336,11 +333,16 @@ impl MuxPaneView {
             })
             .detach();
     }
+
+    /// Access the underlying terminal entity (for tests/inspection).
+    pub fn terminal(&self) -> &Entity<Terminal> {
+        &self.terminal
+    }
 }
 
 /// §3.1 keystroke → terminal byte sequence (xterm standard).
 /// Handles Ctrl-letter, Alt (ESC prefix), arrow keys, function keys.
-fn keystroke_to_bytes(keystroke: &Keystroke) -> Vec<u8> {
+pub fn keystroke_to_bytes(keystroke: &Keystroke) -> Vec<u8> {
     let ctrl = keystroke.modifiers.control;
     let alt = keystroke.modifiers.alt;
     let mut bytes = Vec::new();
@@ -412,22 +414,21 @@ fn keystroke_to_bytes(keystroke: &Keystroke) -> Vec<u8> {
 }
 
 /// §3.3 把 GridDiff 应用到 FullGridSnapshot。
-///
-/// 抽出为自由函数,便于单元测试覆盖 (无需 GPUI Context)。
-/// spec §3.3 row-major flat array;越界行/列静默丢弃。
+/// RowChange.cells 按位置替换整行 (index = column)。
+/// spec §3.3 row-major flat array; 越界行/列静默丢弃。
 pub fn apply_diff_to_snapshot(snapshot: &mut FullGridSnapshot, diff: &GridDiff) {
     let cols = snapshot.cols as usize;
     let rows = snapshot.rows as usize;
     for row_change in &diff.rows {
-        let row_idx = row_change.row as usize;
-        if row_idx >= rows {
+        let row = row_change.row as usize;
+        if row >= rows {
             continue;
         }
-        for (col_idx, cell) in row_change.cells.iter().enumerate() {
-            if col_idx >= cols {
+        for (col, cell) in row_change.cells.iter().enumerate() {
+            if col >= cols {
                 break;
             }
-            let flat = row_idx * cols + col_idx;
+            let flat = row * cols + col;
             if flat < snapshot.cells.len() {
                 snapshot.cells[flat] = cell.clone();
             }
@@ -435,17 +436,12 @@ pub fn apply_diff_to_snapshot(snapshot: &mut FullGridSnapshot, diff: &GridDiff) 
     }
 }
 
-/// §3.3 把 FullGridSnapshot 渲染成纯文本 (MuxPaneView::render 的数据契约)。
-///
-/// 输出格式:每行 cols 个字符,行间以 \n 分隔。空 cell 用空格占位。
-/// 测试和外部调用方可用此函数验证 fetch_grid_update 的内容是否符合预期。
+/// §3.3 把 FullGridSnapshot 渲染成纯文本。
+/// 输出格式: 每行 cols 个字符, 行间以 \n 分隔。空 cell 用空格占位。
 pub fn snapshot_to_text(snapshot: &FullGridSnapshot) -> String {
     let cols = snapshot.cols as usize;
     let rows = snapshot.rows as usize;
-    if cols == 0 || rows == 0 {
-        return String::new();
-    }
-    let mut buf = String::with_capacity(cols * rows + rows);
+    let mut text = String::with_capacity(cols * rows + rows);
     for row in 0..rows {
         for col in 0..cols {
             let flat = row * cols + col;
@@ -454,13 +450,13 @@ pub fn snapshot_to_text(snapshot: &FullGridSnapshot) -> String {
                 .get(flat)
                 .and_then(|c| c.char.chars().next())
                 .unwrap_or(' ');
-            buf.push(ch);
+            text.push(ch);
         }
-        if row + 1 < rows {
-            buf.push('\n');
+        if row < rows - 1 {
+            text.push('\n');
         }
     }
-    buf
+    text
 }
 
 impl Focusable for MuxPaneView {
@@ -472,181 +468,54 @@ impl Focusable for MuxPaneView {
 impl EventEmitter<MuxPaneEvent> for MuxPaneView {}
 
 impl Render for MuxPaneView {
-    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl gpui::IntoElement {
-        // §3.3 Per-repaint poll: fetch_in_flight prevents concurrent fetches,
-        // so this catches up on dropped PaneDirty notifications.
-        self.schedule_fetch(cx);
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl gpui::IntoElement {
         let colors = cx.theme().colors();
-        let default_bg = colors.editor_background;
-        let default_fg = colors.text;
-        let selection_bg = colors.element_selection_background;
-        let cursor_color = colors.icon_accent;
-
-        let cols = self.snapshot.cols as usize;
-        let rows = self.snapshot.rows as usize;
-        let char_width = px(8.4);
-        let line_height = px(18.0);
-
-        let cursor_visible = self
-            .snapshot
-            .cursor
-            .as_ref()
-            .map(|c| c.visible)
-            .unwrap_or(false);
-        let cursor_col = self.snapshot.cursor.as_ref().map(|c| c.col as usize).unwrap_or(0);
-        let cursor_row = self.snapshot.cursor.as_ref().map(|c| c.row as usize).unwrap_or(0);
-
-        let mut row_elements = Vec::with_capacity(rows);
-        for row in 0..rows {
-            let mut col_elements = Vec::with_capacity(cols);
-            for col in 0..cols {
-                let flat = row * cols + col;
-                let cell = self.snapshot.cells.get(flat);
-
-                let ch = cell
-                    .and_then(|c| c.char.chars().next())
-                    .unwrap_or(' ');
-                let is_selected = self.is_cell_selected(row, col);
-                let is_cursor = cursor_visible && row == cursor_row && col == cursor_col;
-
-                let (cell_fg, cell_bg) = if is_cursor {
-                    (default_bg, cursor_color)
-                } else if is_selected {
-                    (default_fg, selection_bg)
-                } else {
-                    let fg = cell
-                        .map(|c| {
-                            if c.foreground != 0 {
-                                rgb(c.foreground).into()
-                            } else {
-                                default_fg
-                            }
-                        })
-                        .unwrap_or(default_fg);
-                    let bg = cell
-                        .map(|c| {
-                            if c.background != 0 {
-                                rgb(c.background).into()
-                            } else {
-                                default_bg
-                            }
-                        })
-                        .unwrap_or(default_bg);
-                    (fg, bg)
-                };
-
-                let style = cell.and_then(|c| c.style.as_ref());
-                let is_bold = style.map(|s| s.bold).unwrap_or(false);
-                let is_italic = style.map(|s| s.italic).unwrap_or(false);
-                let is_underline = style.map(|s| s.underline).unwrap_or(false);
-
-                let mut cell_div = div()
-                    .w(char_width)
-                    .h(line_height)
-                    .bg(cell_bg)
-                    .text_color(cell_fg)
-                    .flex()
-                    .items_center()
-                    .justify_center()
-                    .overflow_hidden();
-
-                if is_bold {
-                    cell_div = cell_div.font_weight(FontWeight::BOLD);
-                }
-                if is_italic {
-                    cell_div = cell_div.italic();
-                }
-                if is_underline {
-                    cell_div = cell_div.underline();
-                }
-
-                let ch_str: SharedString = ch.to_string().into();
-                col_elements.push(cell_div.child(ch_str));
-            }
-
-            row_elements.push(
-                div()
-                    .flex()
-                    .flex_row()
-                    .children(col_elements),
-            );
-        }
+        let focused = self.focus_handle.is_focused(window);
+        let terminal_handle = self.terminal.clone();
+        let terminal_view_handle = self.terminal_view.clone();
 
         div()
-            .track_focus(&self.focus_handle)
             .size_full()
-            .bg(default_bg)
-            .border_2()
-            .border_color(gpui::red())
-            .font_family("monospace")
-            .text_size(px(14.0))
-            .overflow_hidden()
+            .id("mux-pane-root")
+            .track_focus(&self.focus_handle)
+            .bg(colors.editor_background)
+            .child(
+                div()
+                    .size_full()
+                    .id("mux-terminal-container")
+                    .bg(colors.editor_background)
+                    .child(TerminalElement::new(
+                        terminal_handle,
+                        terminal_view_handle,
+                        self.workspace.clone(),
+                        self.focus_handle.clone(),
+                        focused,
+                        true, // cursor_visible
+                        None, // block_below_cursor
+                        TerminalMode::Standalone,
+                    )),
+            )
+            // §3.1 keyboard input → MuxDomain::send_input (DisplayOnly terminal drops input)
             .on_key_down(cx.listener(|this, event: &KeyDownEvent, _window, cx| {
                 this.dispatch_keystroke(&event.keystroke, cx);
+                cx.stop_propagation();
             }))
-            .on_mouse_down(gpui::MouseButton::Left, cx.listener(|this, event: &MouseDownEvent, _window, cx| {
-                let cw = px(8.4);
-                let lh = px(18.0);
-                let point = this.mouse_to_grid(
-                    gpui::Point { x: event.position.x, y: event.position.y },
-                    cw,
-                    lh,
-                );
-                if let Some(grid_point) = point {
-                    this.selection_anchor = Some(grid_point);
-                    this.selection_head = Some(grid_point);
-                    this.is_selecting = true;
-                }
-                cx.notify();
-            }))
-            .on_mouse_move(cx.listener(|this, event: &MouseMoveEvent, _window, cx| {
-                let cw = px(8.4);
-                let lh = px(18.0);
-                if this.is_selecting {
-                    let point = this.mouse_to_grid(
-                        gpui::Point { x: event.position.x, y: event.position.y },
-                        cw,
-                        lh,
-                    );
-                    if let Some(grid_point) = point {
-                        this.selection_head = Some(grid_point);
-                        cx.notify();
-                    }
-                }
-            }))
-            .on_mouse_up(gpui::MouseButton::Left, cx.listener(|this, _event: &MouseUpEvent, _window, cx| {
-                this.is_selecting = false;
-                cx.notify();
-            }))
-            .on_scroll_wheel(cx.listener(|this, event: &ScrollWheelEvent, _window, cx| {
-                let lh = px(18.0);
-                let delta = event.delta.pixel_delta(px(20.0));
-                let dy = f32::from(delta.y);
-                let lines = (dy / f32::from(lh)).abs() as usize;
-                if dy > 0.0 {
-                    this.scrollback_offset = this.scrollback_offset.saturating_add(lines);
-                } else {
-                    this.scrollback_offset = this.scrollback_offset.saturating_sub(lines);
-                }
-                cx.notify();
-            }))
-            .children(row_elements)
     }
 }
 
 impl Item for MuxPaneView {
     type Event = MuxPaneEvent;
 
-    fn tab_content_text(&self, _detail: usize, _cx: &App) -> SharedString {
-        self.title()
+    fn tab_content_text(&self, _detail: usize, cx: &App) -> SharedString {
+        self.terminal.read(cx).title(true).into()
     }
 
-    fn suggested_filename(&self, _cx: &App) -> SharedString {
-        self.title()
+    fn suggested_filename(&self, cx: &App) -> SharedString {
+        self.terminal.read(cx).title(true).into()
     }
 
-    fn tab_tooltip_text(&self, _cx: &App) -> Option<SharedString> {
-        Some(self.title())
+    fn tab_tooltip_text(&self, cx: &App) -> Option<SharedString> {
+        Some(self.terminal.read(cx).title(true).into())
     }
 
     fn tab_tooltip_content(&self, cx: &App) -> Option<TabTooltipContent> {
@@ -679,5 +548,110 @@ impl Item for MuxPaneView {
 
     fn breadcrumb_location(&self, _cx: &App) -> ToolbarItemLocation {
         ToolbarItemLocation::Hidden
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use mux_protocol::{Cell, CellStyle};
+
+    #[test]
+    fn test_keystroke_to_bytes_ctrl_c() {
+        let keystroke = Keystroke {
+            modifiers: gpui::Modifiers {
+                control: true,
+                ..Default::default()
+            },
+            key: "c".to_string(),
+            key_char: Some("c".to_string()),
+        };
+        assert_eq!(keystroke_to_bytes(&keystroke), vec![0x03]);
+    }
+
+    #[test]
+    fn test_keystroke_to_bytes_enter() {
+        let keystroke = Keystroke {
+            modifiers: Default::default(),
+            key: "enter".to_string(),
+            key_char: None,
+        };
+        assert_eq!(keystroke_to_bytes(&keystroke), vec![b'\r']);
+    }
+
+    #[test]
+    fn test_keystroke_to_bytes_arrow_up() {
+        let keystroke = Keystroke {
+            modifiers: Default::default(),
+            key: "up".to_string(),
+            key_char: None,
+        };
+        assert_eq!(keystroke_to_bytes(&keystroke), b"\x1b[A".to_vec());
+    }
+
+    #[test]
+    fn test_keystroke_to_bytes_alt_a() {
+        let keystroke = Keystroke {
+            modifiers: gpui::Modifiers {
+                alt: true,
+                ..Default::default()
+            },
+            key: "a".to_string(),
+            key_char: Some("a".to_string()),
+        };
+        assert_eq!(keystroke_to_bytes(&keystroke), vec![0x1B, b'a']);
+    }
+
+    #[test]
+    fn test_apply_diff_to_snapshot() {
+        let mut snapshot = FullGridSnapshot {
+            cols: 3,
+            rows: 2,
+            cells: vec![Cell::default(); 6],
+            cursor: None,
+            alternate_screen: false,
+        };
+        let diff = GridDiff {
+            rows: vec![RowChange {
+                row: 0,
+                cells: vec![
+                    Cell { char: "a".to_string(), ..Default::default() },
+                    Cell { char: "X".to_string(), ..Default::default() },
+                    Cell { char: "c".to_string(), ..Default::default() },
+                ],
+            }],
+        };
+        apply_diff_to_snapshot(&mut snapshot, &diff);
+        assert_eq!(snapshot.cells[0].char, "a");
+        assert_eq!(snapshot.cells[1].char, "X");
+        assert_eq!(snapshot.cells[2].char, "c");
+        // Out-of-bounds row is silently ignored
+        let diff_oob = GridDiff {
+            rows: vec![RowChange {
+                row: 99,
+                cells: vec![Cell { char: "Z".to_string(), ..Default::default() }],
+            }],
+        };
+        apply_diff_to_snapshot(&mut snapshot, &diff_oob);
+        assert_eq!(snapshot.cells.len(), 6);
+    }
+
+    #[test]
+    fn test_snapshot_to_text() {
+        let snapshot = FullGridSnapshot {
+            cols: 3,
+            rows: 2,
+            cells: vec![
+                Cell { char: "a".to_string(), ..Default::default() },
+                Cell { char: "b".to_string(), ..Default::default() },
+                Cell { char: "c".to_string(), ..Default::default() },
+                Cell { char: "d".to_string(), ..Default::default() },
+                Cell { char: "e".to_string(), ..Default::default() },
+                Cell { char: " ".to_string(), ..Default::default() },
+            ],
+            cursor: None,
+            alternate_screen: false,
+        };
+        assert_eq!(snapshot_to_text(&snapshot), "abc\nde ");
     }
 }

@@ -123,7 +123,9 @@ pub fn pack_extension(source_dir: &Path) -> Result<Vec<u8>> {
         let path = entry.path();
         if path.is_file() {
             let mut file = std::fs::File::open(&path)?;
-            let name = path.file_name().unwrap().to_string_lossy().to_string();
+            let name = path.file_name()
+                .ok_or_else(|| anyhow!("path has no file name: {}", path.display()))?
+                .to_string_lossy().to_string();
             archive.append_file(&name, &mut file)?;
         }
     }

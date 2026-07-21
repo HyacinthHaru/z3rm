@@ -90,8 +90,8 @@ impl UdpServer {
     }
 
     /// §16.6 获取本地绑定地址。
-    pub fn local_addr(&self) -> SocketAddr {
-        self.socket.local_addr().unwrap()
+    pub fn local_addr(&self) -> std::io::Result<SocketAddr> {
+        self.socket.local_addr()
     }
 
     /// §16.6 获取 RTT 估计器引用。
@@ -186,7 +186,7 @@ impl UdpClient {
     }
 
     /// §16.6 获取本地绑定地址。
-    pub fn local_addr(&self) -> SocketAddr {
-        self.socket.local_addr().unwrap()
+    pub fn local_addr(&self) -> std::io::Result<SocketAddr> {
+        self.socket.local_addr()
     }
 }

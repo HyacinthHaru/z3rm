@@ -58,10 +58,13 @@ struct DomainInner {
 // §9 MuxTransport: 传输层枚举
 // ============================================================================
 
-/// §9 传输层：本地 Unix socket。
+/// §3.2 传输层枚举：本地 Unix socket 或 SSH 隧道。
 pub enum MuxTransport {
-    /// §9 本地 Unix socket 连接。
+    /// §3.2 本地 Unix socket 连接。
     Local,
+    /// §3.2 SSH 隧道连接 (远程 mux_server)。
+    #[cfg(feature = "ssh")]
+    Ssh(SshSession),
 }
 // ============================================================================
 // §9 connect_local: 建立本地 socket 连接
@@ -671,6 +674,16 @@ impl MuxDomain {
             Some(ResponseBody::ShellIntegration(si)) => Ok(si),
             _ => Err(anyhow::anyhow!("unexpected response type for get_shell_integration")),
         }
+    }
+
+    /// §3.1 In-place render-path: 订阅 Pane 的 PTY 输出字节流。
+    /// 返回空响应确认订阅成功；实际字节通过 subscribe() 通知通道以 PaneOutputChunk 推送。
+    pub async fn subscribe_pane_output(&self, pane: &str) -> Result<()> {
+        let req = RequestBody::SubscribePaneOutput(mux_protocol::SubscribePaneOutputRequest {
+            pane_id: pane.to_string(),
+        });
+        let _resp = self.send_request(req).await?;
+        Ok(())
     }
 
     // ========================================================================

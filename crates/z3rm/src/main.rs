@@ -387,6 +387,12 @@ fn main() {
                 }
             });
 
+            // §3.8/§15.12 Start daemon connection watcher for automatic reconnect/recovery.
+            let domain_for_watch = domain.clone();
+            cx.update(|cx| {
+                daemon::watch_daemon_connection(domain_for_watch, cx).detach();
+            });
+
             // §1.1 spec: terminal 是默认 center pane item.
             // 任何新 Workspace 如果 active pane 为空, 自动 spawn terminal pane。
             // 覆盖 bootstrap / workspace::Open / NewWindow / restore 全部路径。
@@ -409,14 +415,18 @@ fn main() {
                             window.spawn(cx, async move |cx| {
                                 match domain.split_pane(&pane_id, mux_protocol::split_node::SplitDirection::LeftRight).await {
                                     Ok(new_pane_id) => {
-                                        let _ = window_handle.update(cx, |_, window, cx| {
-                                            let _ = weak_workspace.update(cx, |workspace, cx| {
+                                        if let Err(e) = window_handle.update(cx, |_, window, cx| {
+                                            if let Err(e) = weak_workspace.update(cx, |workspace, cx| {
                                                 let item: Box<dyn workspace::ItemHandle> = Box::new(cx.new(|cx| {
-                                                    terminal_view::mux_pane::MuxPaneView::new(new_pane_id, domain, window, cx)
+                                                    terminal_view::mux_pane::MuxPaneView::new(new_pane_id, domain, workspace.weak_handle(), workspace.project().downgrade(), window, cx)
                                                 }));
                                                 workspace.split_item(workspace::SplitDirection::Right, item, window, cx);
-                                            });
-                                        });
+                                            }) {
+                                                tracing::debug!(error = %e, "workspace dropped during mux_pane::SplitRight handler");
+                                            }
+                                        }) {
+                                            tracing::debug!(error = %e, "window dropped during mux_pane::SplitRight handler");
+                                        }
                                     }
                                     Err(e) => tracing::error!(error = %e, "mux_pane::SplitRight failed"),
                                 }
@@ -432,14 +442,18 @@ fn main() {
                             window.spawn(cx, async move |cx| {
                                 match domain.split_pane(&pane_id, mux_protocol::split_node::SplitDirection::TopBottom).await {
                                     Ok(new_pane_id) => {
-                                        let _ = window_handle.update(cx, |_, window, cx| {
-                                            let _ = weak_workspace.update(cx, |workspace, cx| {
+                                        if let Err(e) = window_handle.update(cx, |_, window, cx| {
+                                            if let Err(e) = weak_workspace.update(cx, |workspace, cx| {
                                                 let item: Box<dyn workspace::ItemHandle> = Box::new(cx.new(|cx| {
-                                                    terminal_view::mux_pane::MuxPaneView::new(new_pane_id, domain, window, cx)
+                                                    terminal_view::mux_pane::MuxPaneView::new(new_pane_id, domain, workspace.weak_handle(), workspace.project().downgrade(), window, cx)
                                                 }));
                                                 workspace.split_item(workspace::SplitDirection::Down, item, window, cx);
-                                            });
-                                        });
+                                            }) {
+                                                tracing::debug!(error = %e, "workspace dropped during mux_pane::SplitDown handler");
+                                            }
+                                        }) {
+                                            tracing::debug!(error = %e, "window dropped during mux_pane::SplitDown handler");
+                                        }
                                     }
                                     Err(e) => tracing::error!(error = %e, "mux_pane::SplitDown failed"),
                                 }
@@ -485,15 +499,19 @@ fn main() {
                                     .unwrap_or(0));
                                 match domain.spawn_pane(&session_id, &tab_id, size, None, None).await {
                                     Ok(new_pane_id) => {
-                                        let _ = window_handle.update(cx, |_, window, cx| {
-                                            let _ = weak_workspace.update(cx, |workspace, cx| {
+                                        if let Err(e) = window_handle.update(cx, |_, window, cx| {
+                                            if let Err(e) = weak_workspace.update(cx, |workspace, cx| {
                                                 let pane = workspace.active_pane().clone();
                                                 let item: Box<dyn workspace::ItemHandle> = Box::new(cx.new(|cx| {
-                                                    terminal_view::mux_pane::MuxPaneView::new(new_pane_id, domain, window, cx)
+                                                    terminal_view::mux_pane::MuxPaneView::new(new_pane_id, domain, workspace.weak_handle(), workspace.project().downgrade(), window, cx)
                                                 }));
                                                 workspace.add_item(pane, item, None, true, true, window, cx);
-                                            });
-                                        });
+                                            }) {
+                                                tracing::debug!(error = %e, "workspace dropped during mux_pane::NewTab handler");
+                                            }
+                                        }) {
+                                            tracing::debug!(error = %e, "window dropped during mux_pane::NewTab handler");
+                                        }
                                     }
                                     Err(e) => tracing::error!(error = %e, "mux_pane::NewTab: spawn_pane failed"),
                                 }
@@ -522,6 +540,8 @@ fn main() {
                                 terminal_view::mux_pane::MuxPaneView::new(
                                     pane_id,
                                     domain_clone,
+                                    workspace.weak_handle(),
+                                    workspace.project().downgrade(),
                                     window,
                                     cx,
                                 )
@@ -562,19 +582,23 @@ fn main() {
                                 daemon::get_first_pane_id(&domain).await.ok().flatten().unwrap_or_else(|| "default".to_string())
                             }
                         };
-                        let _ = window_handle.update(cx, |_, window, cx| {
-                            let _ = weak_workspace.update(cx, |workspace, cx| {
+                        if let Err(e) = window_handle.update(cx, |_, window, cx| {
+                            if let Err(e) = weak_workspace.update(cx, |workspace, cx| {
                                 use workspace::ItemHandle;
                                 workspace.active_pane().update(cx, |pane, _| {
                                     pane.set_should_display_welcome_page(false);
                                 });
                                 let item: Box<dyn ItemHandle> = Box::new(cx.new(|cx| {
-                                    terminal_view::mux_pane::MuxPaneView::new(pane_id, domain, window, cx)
+                                    terminal_view::mux_pane::MuxPaneView::new(pane_id, domain, workspace.weak_handle(), workspace.project().downgrade(), window, cx)
                                 }));
                                 let pane = workspace.active_pane().clone();
                                 workspace.add_item(pane, item, None, true, true, window, cx);
-                            });
-                        });
+                            }) {
+                                tracing::debug!(error = %e, "workspace dropped during pane auto-spawn observer");
+                            }
+                        }) {
+                            tracing::debug!(error = %e, "window dropped during pane auto-spawn observer");
+                        }
                     })
                     .detach();
                 })
@@ -636,6 +660,8 @@ fn main() {
                                 terminal_view::mux_pane::MuxPaneView::new(
                                     pane_id,
                                     domain_clone,
+                                    workspace.weak_handle(),
+                                    workspace.project().downgrade(),
                                     window,
                                     cx,
                                 )

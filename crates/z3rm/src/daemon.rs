@@ -138,6 +138,7 @@ fn spawn_daemon() -> Result<()> {
         .arg("--daemonize")
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null())
+        .envs(std::env::vars())  // inherit parent environment including $SHELL
         .spawn();
     match result {
         Ok(_) => {
@@ -257,7 +258,9 @@ pub async fn get_first_pane_id(domain: &MuxDomain) -> Result<Option<String>> {
         .cloned();
     
     // Detach since we just needed to read
-    let _ = domain.detach().await;
+    if let Err(e) = domain.detach().await {
+        tracing::error!(error = %e, "detach failed during get_first_pane_id");
+    }
     
     Ok(pane_id)
 }

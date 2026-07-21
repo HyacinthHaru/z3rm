@@ -1082,6 +1082,7 @@ impl AppState {
             client: Arc::new(()),
             node_runtime: (),
             user_store: (),
+            mux_domain: None,
         })
     }
 
@@ -6559,6 +6560,7 @@ impl Workspace {
             build_window_options: |_, _| Default::default(),
             node_runtime: (),
             session,
+            mux_domain: None,
         });
         let workspace = Self::new(Default::default(), project, app_state, window, cx);
         workspace

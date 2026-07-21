@@ -336,6 +336,11 @@ async fn dispatch_request(
         RequestBody::ShellIntegration(r) => {
             handle_shell_integration(r, sessions).await?
         }
+        RequestBody::SubscribePaneOutput(_) => {
+            // §3.1 In-place render-path: 订阅已由 pane.subscribe 自动注册;
+            // 此请求仅确认订阅成功。实际数据通过 PaneOutputChunk 通知推送。
+            ResponseBody::SubscribePaneOutput(mux_protocol::SubscribePaneOutputResponse {})
+        }
     };
 
     // §9 把 Response 通过 outbound channel 写回客户端
@@ -777,13 +782,15 @@ async fn handle_split_pane(
                 )),
             };
             let _ = send_notification_envelope(outbound_tx, notify);
-
-            // §16.9 broadcast updated layout tree.
-            broadcast_layout_changed(
-                sessions,
-                &session.id,
-                outbound_tx,
-            );
+            // §16.9 broadcast updated layout tree (inline to avoid RwLock deadlock:
+            // broadcast_layout_changed would re-acquire sessions.read() while we hold write()).
+            let layout_proto = layout_tree_to_proto(&session.layout);
+            let layout_notify = Notification {
+                event: Some(mux_protocol::notification::Event::SessionLayoutChanged(
+                    mux_protocol::SessionLayoutChanged { layout: Some(layout_proto) },
+                )),
+            };
+            let _ = send_notification_envelope(outbound_tx, layout_notify);
             return Ok(ResponseBody::PaneId(new_pane_id));
         }
     }
@@ -849,6 +856,7 @@ async fn handle_focus_pane(
             matched_session_id = Some(session.id.clone());
         }
     }
+    drop(sessions_w);
     if let Some(sid) = matched_session_id {
         broadcast_layout_changed(sessions, &sid, outbound_tx);
     }
