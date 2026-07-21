@@ -229,7 +229,6 @@ impl PaneGroup {
         window: &mut Window,
         cx: &mut App,
     ) -> impl IntoElement {
-        eprintln!("[PaneGroup] render called");
         self.root.render(0, zoomed, render_cx, window, cx).element
     }
 
@@ -415,7 +414,6 @@ impl Member {
     ) -> PaneRenderResult {
         match self {
             Member::Pane(pane) => {
-                eprintln!("[Member::Pane] render called");
                 if zoomed == Some(&pane.downgrade().into()) {
                     return PaneRenderResult {
                         element: div().into_any(),

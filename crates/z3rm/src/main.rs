@@ -499,7 +499,6 @@ fn main() {
                                 }
                             }).detach();
                         });
-                    eprintln!("[z3rm] observe_new<Workspace> fired");
                     if workspace.active_pane().read(cx).items().next().is_some() {
                         return;
                     }
@@ -611,40 +610,28 @@ fn main() {
                 .detach();
             });
 
-            eprintln!("[z3rm] Creating window via cx.open_window");
-            let domain_for_window = domain.clone();
-            let snapshot_for_window = snapshot_pane_ids.clone();
-            let app_state_for_window = app_state.clone();
-            let result = cx.open_window(Default::default(), {
-                move |window, cx| {
-                    use project::Project;
-                    let workspace = cx.new(|cx| {
-                        let project = Project::local(
-                            app_state_for_window.languages.clone(),
-                            app_state_for_window.fs.clone(),
-                            None,
-                            vec![],
-                            cx,
-                        );
-                        let mut workspace = workspace::Workspace::new(
-                            None,
-                            project,
-                            app_state_for_window.clone(),
-                            window,
-                            cx,
-                        );
-                        // §15.12 Inject MuxPaneViews during workspace construction (Zed init pattern).
+            eprintln!("[z3rm] Creating window via Workspace::new_local");
+            let domain_for_init = domain.clone();
+            let snapshot_for_init = snapshot_pane_ids.clone();
+            let open_result = cx.update(|cx| {
+                workspace::Workspace::new_local(
+                    vec![],
+                    app_state.clone(),
+                    None,
+                    None,
+                    Some(Box::new(move |workspace: &mut workspace::Workspace, window, cx| {
+                        // §15.12 Inject MuxPaneViews during workspace construction.
                         let pane = workspace.active_pane().clone();
                         pane.update(cx, |pane, _| {
                             pane.set_should_display_welcome_page(false);
                         });
-                        let pane_ids = if !snapshot_for_window.is_empty() {
-                            snapshot_for_window.clone()
+                        let pane_ids = if !snapshot_for_init.is_empty() {
+                            snapshot_for_init.clone()
                         } else {
                             vec!["default".to_string()]
                         };
                         for (index, pane_id) in pane_ids.into_iter().enumerate() {
-                            let domain_clone = domain_for_window.clone();
+                            let domain_clone = domain_for_init.clone();
                             let item: Box<dyn workspace::ItemHandle> = Box::new(cx.new(|cx| {
                                 terminal_view::mux_pane::MuxPaneView::new(
                                     pane_id,
@@ -653,16 +640,14 @@ fn main() {
                                     cx,
                                 )
                             }));
-                            eprintln!("[z3rm] init inject: adding MuxPaneView {} to workspace", index);
                             workspace.add_item(pane.clone(), item, None, index == 0, true, window, cx);
                         }
-                        workspace
-                    });
-                    cx.new(|cx| workspace::MultiWorkspace::new(workspace, window, cx))
-                }
-            });
-            result?;
-            eprintln!("[z3rm] Window created Ok");
+                    })),
+                    workspace::OpenMode::default(),
+                    cx,
+                )
+            }).await?;
+            eprintln!("[z3rm] Window created Ok: {:?}", open_result.window);
 
             anyhow::Ok(())
         })

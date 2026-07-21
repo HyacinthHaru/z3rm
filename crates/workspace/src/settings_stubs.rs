@@ -118,9 +118,9 @@ impl AutosaveSetting {
 #[derive(Copy, Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum BottomDockLayout {
-    #[default]
     Stacked,
     SideBySide,
+    #[default]
     Full,
     Contained,
     RightAligned,

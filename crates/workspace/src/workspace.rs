@@ -6921,7 +6921,6 @@ impl Workspace {
         window: &mut Window,
         cx: &mut App,
     ) -> impl IntoElement {
-        eprintln!("[Workspace] render_center called");
         div()
             .id("editor-region")
             .role(gpui::Role::Main)
@@ -7482,7 +7481,6 @@ impl Render for DraggedDock {
 
 impl Render for Workspace {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        eprintln!("[Workspace] RENDER called");
         static FIRST_PAINT: AtomicBool = AtomicBool::new(true);
         if FIRST_PAINT.swap(false, std::sync::atomic::Ordering::Relaxed) {
             log::info!("Rendered first frame");

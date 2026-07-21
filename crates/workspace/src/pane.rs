@@ -4326,7 +4326,6 @@ impl Render for Pane {
                     .on_drag_move::<DraggedSelection>(cx.listener(Self::handle_drag_move))
                     .on_drag_move::<ExternalPaths>(cx.listener(Self::handle_drag_move))
                     .map(|div| {
-                        eprintln!("[Pane] render: active_item={}, items={}", self.active_item().is_some(), self.items.len());
                         if let Some(item) = self.active_item() {
                             div.id("pane_placeholder")
                                 .v_flex()
