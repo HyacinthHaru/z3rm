@@ -65,6 +65,8 @@ pub struct MuxPaneView {
     snapshot: FullGridSnapshot,
     /// §15.7 zoom state
     zoomed: bool,
+    /// §3.10 last resize dimensions sent to server (cols, rows)
+    last_sent_size: (u32, u32),
 }
 
 impl MuxPaneView {
@@ -149,6 +151,7 @@ impl MuxPaneView {
             fetch_in_flight: false,
             snapshot,
             zoomed: false,
+            last_sent_size: (80, 24),
         };
         view.start_notification_listener(cx);
         view.subscribe_pane_output(cx);
@@ -469,6 +472,17 @@ impl EventEmitter<MuxPaneEvent> for MuxPaneView {}
 
 impl Render for MuxPaneView {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl gpui::IntoElement {
+        // §3.10 resize forwarding: detect terminal dimension changes and notify server.
+        // TerminalElement resizes the DisplayOnly terminal during prepaint; we check
+        // the resulting grid size and forward to mux_server so the PTY matches.
+        let bounds = self.terminal.read(cx).last_content().terminal_bounds;
+        let cols = bounds.num_columns() as u32;
+        let rows = bounds.num_lines() as u32;
+        if cols > 0 && rows > 0 && (cols, rows) != self.last_sent_size {
+            self.last_sent_size = (cols, rows);
+            self.resize(cols, rows, cx);
+        }
+
         let colors = cx.theme().colors();
         let focused = self.focus_handle.is_focused(window);
         let terminal_handle = self.terminal.clone();
