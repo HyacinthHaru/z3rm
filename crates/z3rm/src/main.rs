@@ -357,11 +357,21 @@ fn main() {
 
             daemon::ensure_pane_in_session(&domain, &session_id).await?;
             eprintln!("[z3rm] Pane ensured");
-
-            let _attach_resp = domain
+            let attach_resp = domain
                 .attach(&session_id, mux::AttachMode::Shared)
                 .await?;
-            eprintln!("[z3rm] Attached to session");
+            // §15.12 Extract all pane IDs from authoritative snapshot
+            let snapshot_pane_ids: Vec<String> = attach_resp
+                .snapshot
+                .as_ref()
+                .map(|s| {
+                    s.tabs
+                        .iter()
+                        .flat_map(|t| t.panes.iter().map(|p| p.id.clone()))
+                        .collect()
+                })
+                .unwrap_or_default();
+            eprintln!("[z3rm] Attached to session ({} panes in snapshot)", snapshot_pane_ids.len());
 
             // §3.2 把 domain 注入 AppState. AppState 是 Arc<AppState>,
             // 替换整个 Arc 让后续代码 (含未来的 workspace::Open 路径) 能拿到。
@@ -382,6 +392,7 @@ fn main() {
             // 覆盖 bootstrap / workspace::Open / NewWindow / restore 全部路径。
             let domain_for_observer = domain.clone();
             let session_for_observer = session_id.clone();
+            let snapshot_panes_for_observer = snapshot_pane_ids.clone();
             cx.update(|cx| {
                 cx.observe_new::<workspace::Workspace>(move |workspace, window, cx| {
                     let Some(window) = window else { return };
@@ -393,6 +404,7 @@ fn main() {
                     let session_id = session_for_observer.clone();
                     let weak_workspace = workspace.weak_handle();
                     let window_handle = window.window_handle();
+                    let snapshot_panes = snapshot_panes_for_observer.clone();
                     let worktree_cwd = workspace
                         .project()
                         .read(cx)
@@ -401,58 +413,52 @@ fn main() {
                         .and_then(|worktree| {
                             worktree.read(cx).as_local().map(|w| w.abs_path().to_path_buf())
                         });
-                        tracing::info!("observe_new Workspace: injecting MuxPaneView for session {}", session_for_observer);
+                    tracing::info!("observe_new Workspace: injecting MuxPaneViews for session {}", session_for_observer);
                     window.spawn(cx, async move |cx| {
-                        // §3.10 spawn pane with cwd from worktree (Open Folder path).
-                        let pane_id = match worktree_cwd.as_ref() {
-                            Some(cwd) => {
-                                let size = mux_protocol::TerminalSize {
-                                    cols: 80,
-                                    rows: 24,
-                                };
-                                match domain
-                                    .spawn_pane(
-                                        &session_id,
-                                        "main",
-                                        size,
-                                        None,
-                                        Some(cwd.as_path()),
-                                    )
-                                    .await
-                                {
-                                    Ok(id) => id,
-                                    Err(e) => {
-                                        tracing::warn!(error = %e, pane_id_fallback = "will_retry_first_pane", "spawn_pane with cwd failed");
-                                        daemon::get_first_pane_id(&domain)
-                                            .await
-                                            .ok()
-                                            .flatten()
-                                            .unwrap_or_else(|| "default".to_string())
+                        // §15.12 Render all panes from authoritative snapshot.
+                        // If snapshot has panes, use them; otherwise spawn a new one.
+                        let pane_ids: Vec<String> = if !snapshot_panes.is_empty() {
+                            snapshot_panes
+                        } else {
+                            let pane_id = match worktree_cwd.as_ref() {
+                                Some(cwd) => {
+                                    let size = mux_protocol::TerminalSize { cols: 80, rows: 24 };
+                                    match domain.spawn_pane(&session_id, "main", size, None, Some(cwd.as_path())).await {
+                                        Ok(id) => id,
+                                        Err(e) => {
+                                            tracing::warn!(error = %e, "spawn_pane with cwd failed");
+                                            daemon::get_first_pane_id(&domain).await.ok().flatten().unwrap_or_else(|| "default".to_string())
+                                        }
                                     }
                                 }
-                            }
-                            None => {
-                                daemon::get_first_pane_id(&domain)
-                                    .await
-                                    .ok()
-                                    .flatten()
-                                    .unwrap_or_else(|| "default".to_string())
-                            }
+                                None => {
+                                    daemon::get_first_pane_id(&domain).await.ok().flatten().unwrap_or_else(|| "default".to_string())
+                                }
+                            };
+                            vec![pane_id]
                         };
                         let _ = window_handle.update(cx, |_, window, cx| {
                             let _ = weak_workspace.update(cx, |workspace, cx| {
-                                let pane = workspace.active_pane().clone();
                                 use workspace::ItemHandle;
-                                let item: Box<dyn ItemHandle> = Box::new(cx.new(|cx| {
-                                    terminal_view::mux_pane::MuxPaneView::new(
-                                        pane_id,
-                                        domain,
-                                        window,
-                                        cx,
-                                    )
-                                }));
-                                tracing::info!("MuxPane observer: adding item to pane (pane_id set above)");
-                                workspace.add_item(pane, item, None, true, true, window, cx);
+                                for (index, pane_id) in pane_ids.into_iter().enumerate() {
+                                    let pane = if index == 0 {
+                                        workspace.active_pane().clone()
+                                    } else {
+                                        // §16.9 Additional panes: split right from active
+                                        workspace.active_pane().clone()
+                                    };
+                                    let domain_clone = domain.clone();
+                                    let item: Box<dyn ItemHandle> = Box::new(cx.new(|cx| {
+                                        terminal_view::mux_pane::MuxPaneView::new(
+                                            pane_id,
+                                            domain_clone,
+                                            window,
+                                            cx,
+                                        )
+                                    }));
+                                    tracing::info!("MuxPane observer: adding pane {} to workspace", index);
+                                    workspace.add_item(pane, item, None, index == 0, true, window, cx);
+                                }
                             });
                         });
                     })

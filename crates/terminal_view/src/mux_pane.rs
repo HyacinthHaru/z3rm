@@ -61,6 +61,8 @@ pub struct MuxPaneView {
     scrollback_offset: usize,
     /// §12 copy mode active
     copy_mode: bool,
+    /// §15.7 zoom state (client-side toggle tracker)
+    zoomed: bool,
 }
 
 /// §3.3 View events (for workspace to subscribe)
@@ -104,6 +106,7 @@ impl MuxPaneView {
             is_selecting: false,
             scrollback_offset: 0,
             copy_mode: false,
+            zoomed: false,
         };
         view.start_notification_listener(cx);
         view.schedule_fetch(cx);
@@ -313,6 +316,25 @@ impl MuxPaneView {
         self.selection_anchor = None;
         self.selection_head = None;
         self.is_selecting = false;
+    }
+
+    /// §15.7 Whether this pane is currently zoomed.
+    pub fn is_zoomed(&self) -> bool {
+        self.zoomed
+    }
+
+    /// §15.7 Set zoom state and notify server.
+    pub fn set_zoomed(&mut self, zoomed: bool, cx: &mut Context<Self>) {
+        self.zoomed = zoomed;
+        let domain = self.domain.clone();
+        let pane_id = self.pane_id.clone();
+        cx.background_executor()
+            .spawn(async move {
+                if let Err(e) = domain.zoom_pane(&pane_id, zoomed).await {
+                    tracing::error!(error = %e, "zoom_pane failed");
+                }
+            })
+            .detach();
     }
 }
 
