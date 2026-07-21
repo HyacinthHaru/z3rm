@@ -215,7 +215,7 @@ impl Drop for TestServer {
 #[tokio::test(flavor = "multi_thread")]
 async fn fetch_grid_update_then_render_contains_input() -> Result<()> {
     let server = TestServer::spawn()?;
-    let domain = Arc::new(mux::connect_local(&server.socket_path).await?);
+    let domain = Arc::new(mux::connect_local(Some(server.socket_path.as_path())).await?);
 
     let session = domain
         .create_session("render-test", &PathBuf::from("/"))

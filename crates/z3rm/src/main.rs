@@ -499,6 +499,7 @@ fn main() {
                                 }
                             }).detach();
                         });
+                    eprintln!("[z3rm] observe_new<Workspace> fired");
                     if workspace.active_pane().read(cx).items().next().is_some() {
                         return;
                     }
@@ -506,9 +507,11 @@ fn main() {
                     let Some(domain) = state.mux_domain.clone() else { return };
                     let snapshot_panes = snapshot_panes_for_observer.clone();
                     tracing::info!("observe_new Workspace: injecting {} MuxPaneViews", snapshot_panes.len());
+                    eprintln!("[z3rm] observer: {} snapshot panes", snapshot_panes.len());
 
                     // §15.12 Sync path: snapshot has panes → add them directly.
                     if !snapshot_panes.is_empty() {
+                        eprintln!("[z3rm] SYNC PATH: adding {} panes", snapshot_panes.len());
                         use workspace::ItemHandle;
                         // Disable welcome page since we're adding real content.
                         workspace.active_pane().update(cx, |pane, _| {
@@ -527,6 +530,7 @@ fn main() {
                             let pane = workspace.active_pane().clone();
                             tracing::info!("MuxPane observer: adding pane {} synchronously", index);
                             workspace.add_item(pane, item, None, index == 0, true, window, cx);
+                            eprintln!("[z3rm] add_item called for pane {}, items now={}", index, workspace.active_pane().read(cx).items().count());
                         }
                         return;
                     }
@@ -611,6 +615,9 @@ fn main() {
             cx.update(|cx| {
                 let result = cx.open_window(Default::default(), |window, cx| {
                     use project::Project;
+                    let domain_for_window = domain.clone();
+                    let snapshot_for_window = snapshot_pane_ids.clone();
+                    let session_for_window = session_id.clone();
                     let workspace = cx.new(|cx| {
                         let project = Project::local(
                             app_state.languages.clone(),
@@ -620,6 +627,31 @@ fn main() {
                             cx,
                         );
                         workspace::Workspace::new(None, project, app_state, window, cx)
+                    });
+                    // §15.12 Directly inject MuxPaneView into the workspace.
+                    workspace.update(cx, |workspace, cx| {
+                        let pane = workspace.active_pane().clone();
+                        pane.update(cx, |pane, _| {
+                            pane.set_should_display_welcome_page(false);
+                        });
+                        let pane_ids = if !snapshot_for_window.is_empty() {
+                            snapshot_for_window.clone()
+                        } else {
+                            vec!["default".to_string()]
+                        };
+                        for (index, pane_id) in pane_ids.into_iter().enumerate() {
+                            let domain_clone = domain_for_window.clone();
+                            let item: Box<dyn workspace::ItemHandle> = Box::new(cx.new(|cx| {
+                                terminal_view::mux_pane::MuxPaneView::new(
+                                    pane_id,
+                                    domain_clone,
+                                    window,
+                                    cx,
+                                )
+                            }));
+                            eprintln!("[z3rm] DIRECT inject: adding MuxPaneView {} to workspace", index);
+                            workspace.add_item(pane.clone(), item, None, index == 0, true, window, cx);
+                        }
                     });
                     cx.new(|cx| workspace::MultiWorkspace::new(workspace, window, cx))
                 });

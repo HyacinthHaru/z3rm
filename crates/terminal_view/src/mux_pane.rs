@@ -576,6 +576,8 @@ impl Render for MuxPaneView {
             .track_focus(&self.focus_handle)
             .size_full()
             .bg(default_bg)
+            .border_2()
+            .border_color(gpui::red())
             .font_family("monospace")
             .text_size(px(14.0))
             .overflow_hidden()

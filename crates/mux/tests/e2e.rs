@@ -88,7 +88,7 @@ impl TestServer {
     }
 
     async fn connect(&self) -> Result<MuxDomain> {
-        mux::connect_local(&self.socket_path)
+        mux::connect_local(Some(self.socket_path.as_path()))
             .await
             .context("connect_local failed")
     }
