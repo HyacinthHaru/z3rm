@@ -396,15 +396,145 @@ fn main() {
             cx.update(|cx| {
                 cx.observe_new::<workspace::Workspace>(move |workspace, window, cx| {
                     let Some(window) = window else { return };
+
+                    // §15.7 Register mux_pane action handlers on every workspace.
+                    workspace
+                        .register_action(|workspace, _: &settings::mux_actions::SplitRight, window, cx| {
+                            let Some(state) = workspace::AppState::try_global(cx) else { return };
+                            let Some(domain) = state.mux_domain.clone() else { return };
+                            let Some(mux_view) = workspace.active_item_as::<terminal_view::mux_pane::MuxPaneView>(cx) else { return };
+                            let pane_id = mux_view.read(cx).pane_id.clone();
+                            let weak_workspace = workspace.weak_handle();
+                            let window_handle = window.window_handle();
+                            window.spawn(cx, async move |cx| {
+                                match domain.split_pane(&pane_id, mux_protocol::split_node::SplitDirection::LeftRight).await {
+                                    Ok(new_pane_id) => {
+                                        let _ = window_handle.update(cx, |_, window, cx| {
+                                            let _ = weak_workspace.update(cx, |workspace, cx| {
+                                                let item: Box<dyn workspace::ItemHandle> = Box::new(cx.new(|cx| {
+                                                    terminal_view::mux_pane::MuxPaneView::new(new_pane_id, domain, window, cx)
+                                                }));
+                                                workspace.split_item(workspace::SplitDirection::Right, item, window, cx);
+                                            });
+                                        });
+                                    }
+                                    Err(e) => tracing::error!(error = %e, "mux_pane::SplitRight failed"),
+                                }
+                            }).detach();
+                        })
+                        .register_action(|workspace, _: &settings::mux_actions::SplitDown, window, cx| {
+                            let Some(state) = workspace::AppState::try_global(cx) else { return };
+                            let Some(domain) = state.mux_domain.clone() else { return };
+                            let Some(mux_view) = workspace.active_item_as::<terminal_view::mux_pane::MuxPaneView>(cx) else { return };
+                            let pane_id = mux_view.read(cx).pane_id.clone();
+                            let weak_workspace = workspace.weak_handle();
+                            let window_handle = window.window_handle();
+                            window.spawn(cx, async move |cx| {
+                                match domain.split_pane(&pane_id, mux_protocol::split_node::SplitDirection::TopBottom).await {
+                                    Ok(new_pane_id) => {
+                                        let _ = window_handle.update(cx, |_, window, cx| {
+                                            let _ = weak_workspace.update(cx, |workspace, cx| {
+                                                let item: Box<dyn workspace::ItemHandle> = Box::new(cx.new(|cx| {
+                                                    terminal_view::mux_pane::MuxPaneView::new(new_pane_id, domain, window, cx)
+                                                }));
+                                                workspace.split_item(workspace::SplitDirection::Down, item, window, cx);
+                                            });
+                                        });
+                                    }
+                                    Err(e) => tracing::error!(error = %e, "mux_pane::SplitDown failed"),
+                                }
+                            }).detach();
+                        })
+                        .register_action(|workspace, _: &settings::mux_actions::CloseTab, window, cx| {
+                            let Some(state) = workspace::AppState::try_global(cx) else { return };
+                            let Some(domain) = state.mux_domain.clone() else { return };
+                            let Some(mux_view) = workspace.active_item_as::<terminal_view::mux_pane::MuxPaneView>(cx) else { return };
+                            let pane_id = mux_view.read(cx).pane_id.clone();
+                            // Close server-side pane first, then remove the workspace item.
+                            cx.background_executor().spawn(async move {
+                                if let Err(e) = domain.close_pane(&pane_id).await {
+                                    tracing::error!(error = %e, "mux_pane::CloseTab: close_pane failed");
+                                }
+                            }).detach();
+                            workspace.active_pane().update(cx, |pane, cx| {
+                                pane.close_active_item(&workspace::CloseActiveItem::default(), window, cx)
+                                    .detach_and_log_err(cx);
+                            });
+                        })
+                        .register_action(|workspace, _: &settings::mux_actions::ZoomToggle, _window, cx| {
+                            let Some(mux_view) = workspace.active_item_as::<terminal_view::mux_pane::MuxPaneView>(cx) else { return };
+                            let new_zoom = !mux_view.read(cx).is_zoomed();
+                            mux_view.update(cx, |view, cx| view.set_zoomed(new_zoom, cx));
+                        })
+                        .register_action(|workspace, _: &settings::mux_actions::NewTab, window, cx| {
+                            let Some(state) = workspace::AppState::try_global(cx) else { return };
+                            let Some(domain) = state.mux_domain.clone() else { return };
+                            let weak_workspace = workspace.weak_handle();
+                            let window_handle = window.window_handle();
+                            window.spawn(cx, async move |cx| {
+                                // Resolve the active session, then spawn a pane in a fresh tab.
+                                let session_id = match domain.list_sessions().await {
+                                    Ok(sessions) => sessions.first().map(|s| s.id.clone()),
+                                    Err(e) => { tracing::error!(error = %e, "list_sessions failed"); None }
+                                };
+                                let Some(session_id) = session_id else { return };
+                                let size = mux_protocol::TerminalSize { cols: 80, rows: 24 };
+                                let tab_id = format!("tab-{}", std::time::SystemTime::now()
+                                    .duration_since(std::time::UNIX_EPOCH)
+                                    .map(|d| d.as_millis())
+                                    .unwrap_or(0));
+                                match domain.spawn_pane(&session_id, &tab_id, size, None, None).await {
+                                    Ok(new_pane_id) => {
+                                        let _ = window_handle.update(cx, |_, window, cx| {
+                                            let _ = weak_workspace.update(cx, |workspace, cx| {
+                                                let pane = workspace.active_pane().clone();
+                                                let item: Box<dyn workspace::ItemHandle> = Box::new(cx.new(|cx| {
+                                                    terminal_view::mux_pane::MuxPaneView::new(new_pane_id, domain, window, cx)
+                                                }));
+                                                workspace.add_item(pane, item, None, true, true, window, cx);
+                                            });
+                                        });
+                                    }
+                                    Err(e) => tracing::error!(error = %e, "mux_pane::NewTab: spawn_pane failed"),
+                                }
+                            }).detach();
+                        });
                     if workspace.active_pane().read(cx).items().next().is_some() {
                         return;
                     }
                     let Some(state) = workspace::AppState::try_global(cx) else { return };
                     let Some(domain) = state.mux_domain.clone() else { return };
+                    let snapshot_panes = snapshot_panes_for_observer.clone();
+                    tracing::info!("observe_new Workspace: injecting {} MuxPaneViews", snapshot_panes.len());
+
+                    // §15.12 Sync path: snapshot has panes → add them directly.
+                    if !snapshot_panes.is_empty() {
+                        use workspace::ItemHandle;
+                        // Disable welcome page since we're adding real content.
+                        workspace.active_pane().update(cx, |pane, _| {
+                            pane.set_should_display_welcome_page(false);
+                        });
+                        for (index, pane_id) in snapshot_panes.into_iter().enumerate() {
+                            let domain_clone = domain.clone();
+                            let item: Box<dyn ItemHandle> = Box::new(cx.new(|cx| {
+                                terminal_view::mux_pane::MuxPaneView::new(
+                                    pane_id,
+                                    domain_clone,
+                                    window,
+                                    cx,
+                                )
+                            }));
+                            let pane = workspace.active_pane().clone();
+                            tracing::info!("MuxPane observer: adding pane {} synchronously", index);
+                            workspace.add_item(pane, item, None, index == 0, true, window, cx);
+                        }
+                        return;
+                    }
+
+                    // Async path: no snapshot panes → spawn a new one.
                     let session_id = session_for_observer.clone();
                     let weak_workspace = workspace.weak_handle();
                     let window_handle = window.window_handle();
-                    let snapshot_panes = snapshot_panes_for_observer.clone();
                     let worktree_cwd = workspace
                         .project()
                         .read(cx)
@@ -413,52 +543,33 @@ fn main() {
                         .and_then(|worktree| {
                             worktree.read(cx).as_local().map(|w| w.abs_path().to_path_buf())
                         });
-                    tracing::info!("observe_new Workspace: injecting MuxPaneViews for session {}", session_for_observer);
                     window.spawn(cx, async move |cx| {
-                        // §15.12 Render all panes from authoritative snapshot.
-                        // If snapshot has panes, use them; otherwise spawn a new one.
-                        let pane_ids: Vec<String> = if !snapshot_panes.is_empty() {
-                            snapshot_panes
-                        } else {
-                            let pane_id = match worktree_cwd.as_ref() {
-                                Some(cwd) => {
-                                    let size = mux_protocol::TerminalSize { cols: 80, rows: 24 };
-                                    match domain.spawn_pane(&session_id, "main", size, None, Some(cwd.as_path())).await {
-                                        Ok(id) => id,
-                                        Err(e) => {
-                                            tracing::warn!(error = %e, "spawn_pane with cwd failed");
-                                            daemon::get_first_pane_id(&domain).await.ok().flatten().unwrap_or_else(|| "default".to_string())
-                                        }
+                        let pane_id = match worktree_cwd.as_ref() {
+                            Some(cwd) => {
+                                let size = mux_protocol::TerminalSize { cols: 80, rows: 24 };
+                                match domain.spawn_pane(&session_id, "main", size, None, Some(cwd.as_path())).await {
+                                    Ok(id) => id,
+                                    Err(e) => {
+                                        tracing::warn!(error = %e, "spawn_pane with cwd failed");
+                                        daemon::get_first_pane_id(&domain).await.ok().flatten().unwrap_or_else(|| "default".to_string())
                                     }
                                 }
-                                None => {
-                                    daemon::get_first_pane_id(&domain).await.ok().flatten().unwrap_or_else(|| "default".to_string())
-                                }
-                            };
-                            vec![pane_id]
+                            }
+                            None => {
+                                daemon::get_first_pane_id(&domain).await.ok().flatten().unwrap_or_else(|| "default".to_string())
+                            }
                         };
                         let _ = window_handle.update(cx, |_, window, cx| {
                             let _ = weak_workspace.update(cx, |workspace, cx| {
                                 use workspace::ItemHandle;
-                                for (index, pane_id) in pane_ids.into_iter().enumerate() {
-                                    let pane = if index == 0 {
-                                        workspace.active_pane().clone()
-                                    } else {
-                                        // §16.9 Additional panes: split right from active
-                                        workspace.active_pane().clone()
-                                    };
-                                    let domain_clone = domain.clone();
-                                    let item: Box<dyn ItemHandle> = Box::new(cx.new(|cx| {
-                                        terminal_view::mux_pane::MuxPaneView::new(
-                                            pane_id,
-                                            domain_clone,
-                                            window,
-                                            cx,
-                                        )
-                                    }));
-                                    tracing::info!("MuxPane observer: adding pane {} to workspace", index);
-                                    workspace.add_item(pane, item, None, index == 0, true, window, cx);
-                                }
+                                workspace.active_pane().update(cx, |pane, _| {
+                                    pane.set_should_display_welcome_page(false);
+                                });
+                                let item: Box<dyn ItemHandle> = Box::new(cx.new(|cx| {
+                                    terminal_view::mux_pane::MuxPaneView::new(pane_id, domain, window, cx)
+                                }));
+                                let pane = workspace.active_pane().clone();
+                                workspace.add_item(pane, item, None, true, true, window, cx);
                             });
                         });
                     })

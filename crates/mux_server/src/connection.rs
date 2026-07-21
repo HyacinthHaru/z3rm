@@ -62,14 +62,32 @@ pub async fn handle_connection(
         let outbound_tx = outbound_tx.clone();
         tokio::spawn(async move {
             let mut reader = reader;
+            let mut first = true;
             loop {
                 let envelope = read_envelope(&mut reader).await?;
+                // §3.10 协议版本协商: 首个 Envelope 的 version 必须与 server 匹配,
+                // 否则回一个 error 并关闭连接, 避免跨 major 版本误解析。
+                if first {
+                    first = false;
+                    if !version_compatible(&envelope.version) {
+                        let _ = send_response(&outbound_tx, Response {
+                            request_id: 0,
+                            body: Some(ResponseBody::Error("protocol version mismatch".to_string())),
+                        });
+                        anyhow::bail!("protocol version mismatch");
+                    }
+                }
                 dispatch_envelope(&envelope, &sessions, &outbound_tx, &db, &clipboard, &client_role).await?;
             }
             #[allow(unreachable_code)]
             Ok::<_, anyhow::Error>(())
         })
     };
+
+    // 丢弃原始 sender, 让 outbound channel 仅由 read_handle 的 clone 持有。
+    // 这样 read_handle 退出 (版本不符 / 客户端断开) 时 channel 关闭, 写循环把已排队
+    // 的 error 刷出后随之结束, 连接真正关闭; 否则残留 sender 会让写循环永远阻塞。
+    drop(outbound_tx);
 
     // §9 写循环: 消费 outbound channel, framed 写回客户端
     let write_handle = tokio::spawn(async move {
@@ -89,6 +107,15 @@ pub async fn handle_connection(
 
     let _ = tokio::join!(read_handle, write_handle);
     Ok(())
+}
+
+/// §3.10 协议版本协商: major 必须一致 (major = 破坏性变更, minor = 兼容新增)。
+/// 缺失 version 视为不兼容。
+fn version_compatible(version: &Option<ProtocolVersion>) -> bool {
+    match version {
+        Some(v) => v.major == mux_protocol::PROTOCOL_VERSION.major,
+        None => false,
+    }
 }
 
 /// §9 从 socket 读取长度前缀帧, 解码 Envelope

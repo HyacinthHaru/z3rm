@@ -101,12 +101,12 @@ fn test_layout_resize_pane() {
 #[test]
 fn test_layout_serialize() {
     let tree = LayoutTree::with_pane("root".to_string(), "pane-1".to_string());
-    let serialized = tree.serialize().expect("serialize failed");
+    let serialized = tree.serialize(80, 24).expect("serialize failed");
 
-    assert!(serialized.contains("P:root:pane-1"));
-    let lines: Vec<&str> = serialized.lines().collect();
-    assert!(lines.len() >= 2);
-    let _checksum: u32 = lines.last().unwrap().parse().expect("checksum should be a number");
+    // tmux 风格: <checksum>,WxH,xoff,yoff,paneid
+    assert!(serialized.ends_with(",80x24,0,0,pane-1"));
+    let (checksum, _body) = serialized.split_once(',').expect("checksum prefix");
+    let _checksum: u32 = checksum.parse().expect("checksum should be a number");
 }
 
 /// §3.10 Layout tree: collect pane IDs

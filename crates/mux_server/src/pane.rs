@@ -21,6 +21,9 @@ use std::io::{Read, Write};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 use tokio::sync::mpsc;
+use crate::coalescing::AdaptiveCoalescer;
+use crate::dec2026::Dec2026Parser;
+use std::time::{Duration, Instant};
 
 /// §3.1 真正拥有 alacritty Term + PTY pair 的 Pane (server-canonical)。
 pub struct Pane {
@@ -79,6 +82,18 @@ pub struct ShellCommand {
     pub program: String,
     pub args: Vec<String>,
     pub env: HashMap<String, String>,
+}
+
+/// §3.3 PTY read-loop 本地状态: DEC-2026 同步延迟 + coalescing 通知节流。
+/// 仅在单一 PTY read 线程内顺序访问, 无需同步原语。
+#[derive(Default)]
+struct ReadLoopState {
+    /// 上次 PaneDirty 广播时间 (coalescing 节流基准)
+    last_notify: Option<Instant>,
+    /// BSU..ESU 同步窗口内累积了尚未发布的变更
+    pending_sync: bool,
+    /// 有被 coalescing 推迟、待窗口到期补发的 PaneDirty
+    pending_notify: bool,
 }
 
 impl Pane {
@@ -193,6 +208,10 @@ impl Pane {
             .name(format!("pty-read-{}", self.id))
             .spawn(move || {
                 let mut buf = [0u8; 8192];
+                // §3.3 DEC-2026 解析器 + 自适应合并器 + 节流状态 (本线程独占)。
+                let mut dec = Dec2026Parser::new();
+                let mut coalescer = AdaptiveCoalescer::new();
+                let mut rl_state = ReadLoopState::default();
                 loop {
                     let Some(pane) = pane_weak.upgrade() else {
                         // Pane 已 drop, 退出线程
@@ -206,7 +225,7 @@ impl Pane {
                             return;
                         }
                         Ok(n) => {
-                            pane.process_pty_bytes(&buf[..n]);
+                            pane.process_pty_bytes(&buf[..n], &mut dec, &mut coalescer, &mut rl_state);
                         }
                         Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {
                             continue;
@@ -223,36 +242,123 @@ impl Pane {
             .ok();
     }
 
-    /// §3.1 喂 PTY 字节给 alacritty Term, 处理事件, 计算 diff, bump generation。
-    fn process_pty_bytes(self: &Arc<Self>, bytes: &[u8]) {
-        // §3.1 喂字节给 alacritty (它会调用 Handler 方法更新 grid)
-        {
-            let mut term = self.term.lock();
-            let mut processor = Processor::<alacritty_terminal::vte::ansi::StdSyncHandler>::new();
-            processor.advance(&mut *term, bytes);
-        }
+    /// §3.1 / §3.3 喂 PTY 字节给 alacritty Term, 处理事件, 计算 diff, bump generation。
+    ///
+    /// §3.3 DEC-2026: BSU..ESU 同步窗口内的 generation bump 推迟到 ESU (或 100ms
+    /// timeout) 再统一发布, 避免把同步更新的中间态推给客户端。
+    /// §3.3 adaptive coalescing: 按吞吐调整 PaneDirty 广播间隔 (0/2/16ms)。
+    /// §15.4 除 dirty 行外, cursor 样式 / 备用屏切换 / 滚动偏移 / title 变化也 bump。
+    fn process_pty_bytes(
+        self: &Arc<Self>,
+        bytes: &[u8],
+        dec: &mut Dec2026Parser,
+        coalescer: &mut AdaptiveCoalescer,
+        state: &mut ReadLoopState,
+    ) {
+        // §3.3 DEC-2026: 检测 BSU/ESU 边界; force_flush = unpaired BSU 超过 100ms。
+        let was_in_sync = dec.is_in_sync();
+        let force_flush = dec.parse(bytes);
+        let in_sync = dec.is_in_sync();
+        let esu_received = was_in_sync && !in_sync;
 
-        // §3.3 收集 dirty 行 + 处理事件
+        // §3.3 adaptive coalescer: 登记一次输出, 取当前批处理窗口。
+        let delay = coalescer.on_output();
+
+        // §3.3 若有被 coalescing 推迟的 PaneDirty 且窗口已到期, 先补发。
+        self.flush_pending_notify(state, delay);
+
+        // §3.1 喂字节给 alacritty; 同时捕获 render 状态 (cursor / alt-screen / scroll)
+        // 的变化 —— 它们可能不产生 dirty cell, 但仍影响渲染 (§15.4)。
+        let render_changed = {
+            let mut term = self.term.lock();
+            let before = (
+                term.grid().cursor.point,
+                term.cursor_style(),
+                term.grid().display_offset(),
+                term.mode().contains(TermMode::ALT_SCREEN),
+            );
+            let mut processor =
+                Processor::<alacritty_terminal::vte::ansi::StdSyncHandler>::new();
+            processor.advance(&mut *term, bytes);
+            let after = (
+                term.grid().cursor.point,
+                term.cursor_style(),
+                term.grid().display_offset(),
+                term.mode().contains(TermMode::ALT_SCREEN),
+            );
+            before != after
+        };
+
+        // §3.3 收集 dirty 行 + 消费事件 (title 变化由返回值报告, §15.4)。
         let dirty_rows = self.collect_dirty_rows();
-        self.handle_pending_events();
+        let title_changed = self.handle_pending_events();
 
         // §3.3 解析 OSC 7 (cwd) / OSC 133 (prompt markers) — 在 alacritty
         // 处理之外独立扫描, 因为 alacritty EventListener 不暴露 OSC 事件。
         self.parse_osc_sequences(bytes);
 
-        if !dirty_rows.is_empty() {
-            // §3.3 生成 diff
-            let diff = {
-                let term = self.term.lock();
-                diff_from_dirty(&*term, &dirty_rows)
-            };
+        let has_change = !dirty_rows.is_empty() || render_changed || title_changed;
 
-            // §3.3 bump generation → push 到 ring
-            let new_gen = self.generation.fetch_add(1, Ordering::SeqCst) + 1;
-            self.grid_diff_ring.write().push(new_gen, diff);
+        if has_change {
+            // §3.3 DEC-2026: 同步窗口内推迟 bump, 等 ESU / timeout 再发布。
+            if in_sync && !esu_received && !force_flush {
+                state.pending_sync = true;
+                return;
+            }
+            // ESU / timeout / 普通输出 → 发布 generation bump + 合并通知。
+            let forced = esu_received || force_flush;
+            self.emit_generation(dirty_rows, forced, delay, state);
+            state.pending_sync = false;
+        } else if state.pending_sync && (esu_received || force_flush || !in_sync) {
+            // 同步窗口结束但本批没有新行 —— 仍要发布之前累积的变更。
+            self.emit_generation(Vec::new(), true, delay, state);
+            state.pending_sync = false;
+        }
+    }
 
-            // §3.3 fan-out PaneDirty 到所有订阅者 (at-most-once)
+    /// §15.4 / §3.3 Bump generation, push diff 到 ring, 并按 coalescing 窗口决定广播。
+    ///
+    /// `dirty_rows` 为空时 push 空 diff —— generation 仍要前进, 客户端据此重新拉取
+    /// (cursor / title 等非行级变更通过 snapshot 反映)。
+    fn emit_generation(
+        self: &Arc<Self>,
+        dirty_rows: Vec<usize>,
+        force_broadcast: bool,
+        delay: Duration,
+        state: &mut ReadLoopState,
+    ) {
+        let diff = {
+            let term = self.term.lock();
+            diff_from_dirty(&*term, &dirty_rows)
+        };
+        let new_gen = self.generation.fetch_add(1, Ordering::SeqCst) + 1;
+        self.grid_diff_ring.write().push(new_gen, diff);
+
+        // §3.3 coalescing: 高吞吐 (delay=0) 或窗口已到期 → 立即广播; 否则推迟,
+        // 把多次小更新合并成一次 PaneDirty。强制刷新 (ESU / timeout) 总是立即广播。
+        let now = Instant::now();
+        let window_elapsed = state
+            .last_notify
+            .map_or(true, |t| now.duration_since(t) >= delay);
+        if force_broadcast || delay.is_zero() || window_elapsed {
             self.broadcast_pane_dirty();
+            state.last_notify = Some(now);
+            state.pending_notify = false;
+        } else {
+            state.pending_notify = true;
+        }
+    }
+
+    /// §3.3 补发被 coalescing 推迟、且窗口已到期的 PaneDirty。
+    fn flush_pending_notify(&self, state: &mut ReadLoopState, delay: Duration) {
+        if !state.pending_notify {
+            return;
+        }
+        let now = Instant::now();
+        if state.last_notify.map_or(true, |t| now.duration_since(t) >= delay) {
+            self.broadcast_pane_dirty();
+            state.last_notify = Some(now);
+            state.pending_notify = false;
         }
     }
 
@@ -312,15 +418,19 @@ impl Pane {
     }
 
     /// §3.3 处理 alacritty 通过 EventListener push 的事件。
-    fn handle_pending_events(&self) {
+    /// 返回是否发生 title 变化 (OSC 0/1/2) —— 供 §15.4 bump generation。
+    fn handle_pending_events(&self) -> bool {
         let events: Vec<AlacEvent> = self.events.lock().drain(..).collect();
+        let mut title_changed = false;
         for event in events {
             match event {
                 AlacEvent::Title(title) => {
                     *self.title.write() = title;
+                    title_changed = true;
                 }
                 AlacEvent::ResetTitle => {
                     *self.title.write() = String::new();
+                    title_changed = true;
                 }
                 AlacEvent::Bell => {
                     // TODO: fan-out Bell notification to clients
@@ -338,6 +448,7 @@ impl Pane {
                 _ => {}
             }
         }
+        title_changed
     }
 
     pub fn get_generation(&self) -> u64 {

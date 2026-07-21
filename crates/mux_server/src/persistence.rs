@@ -34,6 +34,9 @@ CREATE TABLE IF NOT EXISTS layout_nodes (
 
 /// §3.6 初始化数据库表
 pub fn init_tables(conn: &Connection) -> anyhow::Result<()> {
+    // §3.6 WAL mode: 后台 persist_loop 每 10s 写入, 不能阻塞 RPC 线程的并发读 (spec §3.6)。
+    let mut wal = Statement::prepare(conn, "PRAGMA journal_mode=WAL;")?;
+    wal.exec()?;
     let mut stmt = Statement::prepare(conn, SCHEMA_SQL)?;
     stmt.exec()?;
     let mut stmt2 = Statement::prepare(conn, LAYOUT_NODES_SQL)?;
@@ -73,8 +76,18 @@ fn snapshot_sessions(
                       VALUES (?, ?, ?, ?, ?)";
 
     for session in &*sessions_r {
-        // §3.7 序列化 layout tree
-        let layout_snapshot = session.layout.serialize().unwrap_or_default();
+        // §3.7 序列化 layout tree (tmux 风格绝对 cell 计数)。
+        // container 尺寸取自任一 constituent pane —— session 不单独记录窗口尺寸;
+        // ratios 决定相对切分, 绝对值只影响 WxH 数字, 结构 round-trip 不受影响。
+        let (cols, rows) = {
+            let panes = session.panes.read();
+            panes
+                .values()
+                .next()
+                .map(|p| (p.get_cols(), p.get_rows()))
+                .unwrap_or((80, 24))
+        };
+        let layout_snapshot = session.layout.serialize(cols, rows).unwrap_or_default();
 
         let mut stmt = Statement::prepare(&*conn, upsert_sql)?;
         stmt.bind(&session.id, 1)?;

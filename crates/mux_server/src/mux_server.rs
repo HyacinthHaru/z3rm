@@ -105,6 +105,17 @@ fn default_socket_name() -> interprocess::local_socket::Name<'static> {
     }
 }
 
+/// §16.1 Unix socket 文件系统路径 (绑定后设置 0600 权限用)。
+/// 与 default_socket_name 同源: 优先 $Z3RM_MUX_SOCKET, 否则 $XDG_RUNTIME_DIR/z3rm/mux.sock。
+#[cfg(unix)]
+fn unix_socket_path() -> Option<std::path::PathBuf> {
+    if let Ok(p) = std::env::var("Z3RM_MUX_SOCKET") {
+        return Some(std::path::PathBuf::from(p));
+    }
+    let runtime_dir = std::env::var("XDG_RUNTIME_DIR").unwrap_or_else(|_| "/tmp".to_string());
+    Some(std::path::PathBuf::from(runtime_dir).join("z3rm").join("mux.sock"))
+}
+
 async fn bind_socket(name: &interprocess::local_socket::Name<'_>) -> Result<LocalSocketListener> {
     use interprocess::local_socket::tokio::prelude::*;
     let listener = LocalSocketListener::from_options(
@@ -140,6 +151,15 @@ pub fn run() -> Result<()> {
                 return Err(e);
             }
         };
+
+        // §16.1 socket 权限 0600: 仅同 UID 可连接 —— §9 fail-open 角色模型的安全前提。
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            if let Some(socket_path) = unix_socket_path() {
+                std::fs::set_permissions(&socket_path, std::fs::Permissions::from_mode(0o600))?;
+            }
+        }
         zlog::info!("mux_server listening");
 
         // §16.1 DB 路径: Unix 下复用 socket 父目录; Windows 下用 %LOCALAPPDATA%/z3rm
