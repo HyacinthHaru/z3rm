@@ -376,6 +376,88 @@ fn main() {
                     workspace::AppState::set_global(next, cx);
                 }
             });
+
+            // §1.1 spec: terminal 是默认 center pane item.
+            // 任何新 Workspace 如果 active pane 为空, 自动 spawn terminal pane。
+            // 覆盖 bootstrap / workspace::Open / NewWindow / restore 全部路径。
+            let domain_for_observer = domain.clone();
+            let session_for_observer = session_id.clone();
+            cx.update(|cx| {
+                cx.observe_new::<workspace::Workspace>(move |workspace, window, cx| {
+                    let Some(window) = window else { return };
+                    if workspace.active_pane().read(cx).items().next().is_some() {
+                        return;
+                    }
+                    let Some(state) = workspace::AppState::try_global(cx) else { return };
+                    let Some(domain) = state.mux_domain.clone() else { return };
+                    let session_id = session_for_observer.clone();
+                    let weak_workspace = workspace.weak_handle();
+                    let window_handle = window.window_handle();
+                    let worktree_cwd = workspace
+                        .project()
+                        .read(cx)
+                        .worktrees(cx)
+                        .next()
+                        .and_then(|worktree| {
+                            worktree.read(cx).as_local().map(|w| w.abs_path().to_path_buf())
+                        });
+                    window.spawn(cx, async move |cx| {
+                        // §3.10 spawn pane with cwd from worktree (Open Folder path).
+                        let pane_id = match worktree_cwd.as_ref() {
+                            Some(cwd) => {
+                                let size = mux_protocol::TerminalSize {
+                                    cols: 80,
+                                    rows: 24,
+                                };
+                                match domain
+                                    .spawn_pane(
+                                        &session_id,
+                                        "main",
+                                        size,
+                                        None,
+                                        Some(cwd.as_path()),
+                                    )
+                                    .await
+                                {
+                                    Ok(id) => id,
+                                    Err(e) => {
+                                        tracing::warn!(error = %e, "spawn_pane with cwd failed");
+                                        daemon::get_first_pane_id(&domain)
+                                            .await
+                                            .ok()
+                                            .flatten()
+                                            .unwrap_or_else(|| "default".to_string())
+                                    }
+                                }
+                            }
+                            None => {
+                                daemon::get_first_pane_id(&domain)
+                                    .await
+                                    .ok()
+                                    .flatten()
+                                    .unwrap_or_else(|| "default".to_string())
+                            }
+                        };
+                        let _ = window_handle.update(cx, |_, window, cx| {
+                            let _ = weak_workspace.update(cx, |workspace, cx| {
+                                let pane = workspace.active_pane().clone();
+                                use workspace::ItemHandle;
+                                let item: Box<dyn ItemHandle> = Box::new(cx.new(|cx| {
+                                    terminal_view::mux_pane::MuxPaneView::new(
+                                        pane_id,
+                                        domain,
+                                        window,
+                                        cx,
+                                    )
+                                }));
+                                workspace.add_item(pane, item, None, true, true, window, cx);
+                            });
+                        });
+                    })
+                    .detach();
+                })
+                .detach();
+            });
             // notification subscriber
             let domain_for_notify = domain.clone();
             cx.background_executor()
@@ -406,23 +488,11 @@ fn main() {
                 .detach();
             });
 
-            // 获取 pane id
-            let pane_id = daemon::get_first_pane_id(&domain)
-                .await?
-                .unwrap_or_else(|| "default".to_string());
-            eprintln!("[z3rm] Pane id: {}", pane_id);
-
-            // §2.1 用 cx.open_window 创建窗口（env有 Context<MultiWorkspace> 可调用 .new）
             eprintln!("[z3rm] Creating window via cx.open_window");
-            let p_id = pane_id.clone();
-            let dom = domain.clone();
-            let _window = cx.update(|cx| {
+            cx.update(|cx| {
                 let result = cx.open_window(Default::default(), |window, cx| {
+                    use project::Project;
                     let workspace = cx.new(|cx| {
-                        // 使用全局 AppState
-                        use workspace::AppState;
-                        let app_state = AppState::global(cx);
-                        use project::Project;
                         let project = Project::local(
                             app_state.languages.clone(),
                             app_state.fs.clone(),
@@ -431,21 +501,6 @@ fn main() {
                             cx,
                         );
                         workspace::Workspace::new(None, project, app_state, window, cx)
-                    });
-                    let active_pane = workspace.read(cx).active_pane().clone();
-                    use workspace::ItemHandle;
-                    let item: Box<dyn ItemHandle> = Box::new(
-                        cx.new(|cx| {
-                            terminal_view::mux_pane::MuxPaneView::new(
-                                p_id.clone(),
-                                dom.clone(),
-                                window,
-                                cx,
-                            )
-                        }),
-                    );
-                    workspace.update(cx, |workspace, cx| {
-                        workspace.add_item(active_pane, item, None, true, true, window, cx);
                     });
                     cx.new(|cx| workspace::MultiWorkspace::new(workspace, window, cx))
                 });
