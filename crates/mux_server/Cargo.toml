@@ -18,7 +18,7 @@ mux = { workspace = true }
 alacritty_terminal = { workspace = true }
 portable-pty = { workspace = true }
 sqlez = { workspace = true }
-interprocess = "2"
+interprocess = { version = "2", features = ["tokio"] }
 tokio = { workspace = true, features = ["full"] }
 prost = { workspace = true }
 anyhow = { workspace = true }

@@ -83,12 +83,11 @@ pub fn default_socket_path() -> PathBuf {
 }
 
 pub async fn ensure_daemon_running() -> Result<MuxDomain> {
-    let socket_path = default_socket_path();
-    eprintln!("[z3rm] Attempting connect to {}", socket_path.display());
-    match mux::connect_local(&socket_path).await {
+    // §3.2 先尝试连接默认路径; 失败则 spawn daemon 再重试。
+    eprintln!("[z3rm] Attempting connect to default socket");
+    match mux::connect_local(None).await {
         Ok(domain) => {
             eprintln!("[z3rm] Connected to existing daemon");
-            tracing::info!("connected to existing daemon");
             return Ok(domain);
         }
         Err(e) => {
@@ -96,28 +95,36 @@ pub async fn ensure_daemon_running() -> Result<MuxDomain> {
         }
     }
     eprintln!("[z3rm] Spawning daemon...");
-
     tracing::info!("daemon not running, spawning...");
     spawn_daemon()?;
 
-    wait_for_socket(&socket_path, Duration::from_secs(5)).await?;
-    eprintln!("[z3rm] Socket ready, connecting...");
+    // §16.1 等待 socket 就绪后再尝试连接（避免 connect 轮询时 socket 未 bind 完成）
+    wait_for_socket(&default_socket_path(), Duration::from_secs(5)).await?;
 
-    let domain = mux::connect_local(&socket_path)
-        .await
-        .context("failed to connect to daemon after spawn")?;
-    eprintln!("[z3rm] Connected to daemon after spawn");
-    tracing::info!("connected to daemon after spawn");
-    Ok(domain)
+    // 现在尝试连接已就绪的 daemon
+    match mux::connect_local(None).await {
+        Ok(domain) => {
+            eprintln!("[z3rm] Connected to daemon after spawn");
+            return Ok(domain);
+        }
+        Err(e) => {
+            anyhow::bail!("daemon socket ready but connection failed: {}", e);
+        }
+    }
 }
 
 /// 启动 z3rm-server daemon 进程 (§16.1)
+/// 先清理 stale socket（旧 daemon 已死但文件残留），避免新 daemon bind "Address already in use"。
 fn spawn_daemon() -> Result<()> {
+    let socket_path = default_socket_path();
+    if socket_path.exists() {
+        tracing::info!(path = %socket_path.display(), "removing stale socket before spawn");
+        let _ = std::fs::remove_file(&socket_path);
+    }
     // 从可执行文件同目录查找 z3rm-server (dev build 支持)
     let server_in_same_dir = std::env::current_exe()
         .ok()
         .and_then(|exe| exe.parent().map(|p| p.join("z3rm-server")));
-
     let binary_name = if let Some(ref path) = server_in_same_dir {
         if path.exists() {
             path.to_string_lossy().into_owned()

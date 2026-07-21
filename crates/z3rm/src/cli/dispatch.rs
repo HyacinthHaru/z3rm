@@ -196,8 +196,7 @@ async fn get_first_tab_id(domain: &MuxDomain, session_id: &str) -> Result<String
 /// 来源: spec §3.10
 pub async fn run_cli_command(cmd: CliCommand) -> Result<()> {
     // 连接到 daemon
-    let socket_path = crate::daemon::default_socket_path();
-    let domain = mux::connect_local(&socket_path)
+    let domain = mux::connect_local(None)
         .await
         .context("failed to connect to mux_server. Is the daemon running?")?;
 

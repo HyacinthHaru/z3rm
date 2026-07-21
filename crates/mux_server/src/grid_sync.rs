@@ -317,6 +317,13 @@ impl GridDiffRing {
     /// §3.3 fetch_grid_update: 根据 since_generation 返回 diff 或全量快照
     pub fn fetch_update(&self, since_generation: u64, pane: &crate::pane::Pane) -> GridUpdate {
         let current = pane.get_generation();
+        // §3.3 since == 0 means initial full snapshot — must return full grid, not NoChange
+        if since_generation == 0 {
+            return GridUpdate::FullSnapshot {
+                to_generation: current,
+                snapshot: pane.get_full_snapshot(),
+            };
+        }
         if since_generation == current {
             return GridUpdate::NoChange(current);
         }

@@ -10,7 +10,7 @@ use mux_protocol::proto::*;
 use sqlez::connection::Connection;
 use std::sync::Arc;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::net::UnixStream;
+use interprocess::local_socket::tokio::Stream as LocalSocketStream;
 use tokio::sync::mpsc;
 
 // §3.3 客户端角色 (Plan 33)
@@ -43,7 +43,7 @@ pub fn check_permission(role: ClientRole, required: ClientRole) -> bool {
 /// 写循环 (write_handle) 消费 channel, 把 Envelope framed 写回 socket。
 /// 这样所有写操作都在同一个 tokio task 内串行化, 避免并发 write 冲突。
 pub async fn handle_connection(
-    stream: UnixStream,
+    stream: LocalSocketStream,
     sessions: Arc<parking_lot::RwLock<Vec<crate::session::Session>>>,
     db: Arc<parking_lot::Mutex<Connection>>,
     clipboard: Arc<crate::clipboard::ServerClipboard>,
@@ -93,7 +93,7 @@ pub async fn handle_connection(
 
 /// §9 从 socket 读取长度前缀帧, 解码 Envelope
 async fn read_envelope(
-    reader: &mut tokio::io::ReadHalf<UnixStream>,
+    reader: &mut tokio::io::ReadHalf<LocalSocketStream>,
 ) -> anyhow::Result<Envelope> {
     // 读取 varint 长度前缀 (§9)
     let mut len: u64 = 0;

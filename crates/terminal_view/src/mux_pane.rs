@@ -99,16 +99,22 @@ impl MuxPaneView {
                 match event {
                     NotifEvent::PaneDirty(dirty) if dirty.pane_id == pane_id => {
                         let _ = weak.update(cx, |view, cx| view.schedule_fetch(cx));
-                    }
+                        Err(e) => {
+                        tracing::error!(pane_id = %pane_id, error = %e, "fetch_grid_update failed");
+                    },
                     NotifEvent::PaneRemoved(removed) if removed.pane_id == pane_id => {
                         let _ = weak.update(cx, |view, cx| {
                             view.notification_task = None;
                             cx.emit(MuxPaneEvent::CloseRequested);
                         });
                         break;
-                    }
+                        Err(e) => {
+                        tracing::error!(pane_id = %pane_id, error = %e, "fetch_grid_update failed");
+                    },
                     _ => {}
-                }
+                    Err(e) => {
+                        tracing::error!(pane_id = %pane_id, error = %e, "fetch_grid_update failed");
+                    },
             }
         });
         self.notification_task = Some(task);
@@ -128,12 +134,20 @@ impl MuxPaneView {
 
         cx.spawn(async move |_, cx| {
             let result = domain.fetch_grid_update(&pane_id, since).await;
-            let _ = weak.update(cx, |view, cx| {
+            match weak.update(cx, |view, cx| {
                 view.fetch_in_flight = false;
-                if let Ok(resp) = result {
-                    view.apply_fetch_update(resp, cx);
+                match result {
+                    Ok(resp) => {
+                        view.apply_fetch_update(resp, cx);
+                    }
+                    Err(e) => {
+                        tracing::error!(pane_id = %pane_id, error = %e, "fetch_grid_update failed: MuxPane grid unavailable");
+                    }
                 }
-            });
+            }) {
+                Ok(()) => {},
+                Err(_) => tracing::warn!("MuxPane observer: weak update failed after fetch"),
+            }
         })
         .detach();
     }
@@ -240,7 +254,9 @@ fn keystroke_to_bytes(keystroke: &Keystroke) -> Vec<u8> {
             if let Some(b) = ctrl_byte {
                 if alt {
                     bytes.push(0x1B);
-                }
+                    Err(e) => {
+                        tracing::error!(pane_id = %pane_id, error = %e, "fetch_grid_update failed");
+                    },
                 bytes.push(b);
                 return bytes;
             }

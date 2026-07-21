@@ -5,7 +5,7 @@ use anyhow::Result;
 use sqlez::connection::Connection;
 use std::path::PathBuf;
 use std::time::SystemTime;
-use tokio::net::UnixListener;
+use interprocess::local_socket::tokio::Listener as LocalSocketListener;
 
 pub mod connection;
 pub mod clipboard;
@@ -76,47 +76,40 @@ pub fn setup_logging() -> Result<()> {
     Ok(())
 }
 
-/// 默认 socket 路径: $XDG_RUNTIME_DIR/z3rm/mux.sock (§16.1)
-///
-/// 测试与多实例场景可用 Z3RM_MUX_SOCKET 环境变量覆盖。
-fn default_socket_path() -> PathBuf {
+/// 默认 socket 路径: $XDG_RUNTIME_DIR/z3rm/mux.sock (Unix §16.1)
+/// 或 \\.\pipe\z3rm-mux (Windows)
+fn default_socket_name() -> interprocess::local_socket::Name<'static> {
+    use interprocess::local_socket::{prelude::*, GenericFilePath, GenericNamespaced};
     if let Ok(p) = std::env::var("Z3RM_MUX_SOCKET") {
-        return PathBuf::from(p);
+        return p
+            .to_fs_name::<GenericFilePath>()
+            .expect("invalid socket path");
     }
-    if let Ok(runtime_dir) = std::env::var("XDG_RUNTIME_DIR") {
-        PathBuf::from(runtime_dir)
-    } else {
-        PathBuf::from("/tmp")
-    }
-    .join("z3rm")
-    .join("mux.sock")
-}
-
-/// 绑定本地 socket (§9) + 写 PID 文件供 status 命令查询 daemon 内存。
-async fn bind_socket(path: &PathBuf) -> Result<UnixListener> {
-    if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent)?;
-    }
-    // 删除可能存在的旧 socket
-    let _ = std::fs::remove_file(path);
-
-    let listener = UnixListener::bind(path)?;
-
-    // 设置 0600 权限 (§9)
     #[cfg(unix)]
     {
-        use std::os::unix::fs::PermissionsExt;
-        let perms = std::fs::Permissions::from_mode(0o600);
-        std::fs::set_permissions(path, perms)?;
+        let runtime_dir = std::env::var("XDG_RUNTIME_DIR").unwrap_or_else(|_| "/tmp".to_string());
+        let path = std::path::PathBuf::from(runtime_dir).join("z3rm").join("mux.sock");
+        if let Some(parent) = path.parent() {
+            let _ = std::fs::create_dir_all(parent);
+        }
+        path.to_string_lossy()
+            .to_string()
+            .to_fs_name::<GenericFilePath>()
+            .expect("invalid socket path")
     }
-
-    // §16.14 写 PID 文件到 socket 同目录 (mux.pid),status 命令读它
-    // 查询 daemon 真实内存。失败不致命 (诊断功能降级)。
-    let pid_path = path.with_extension("pid");
-    if let Err(e) = std::fs::write(&pid_path, std::process::id().to_string()) {
-        zlog::warn!("failed to write pid file at {}: {}", pid_path.display(), e);
+    #[cfg(windows)]
+    {
+        r"\\.\pipe\z3rm-mux"
+            .to_ns_name::<GenericNamespaced>()
+            .expect("invalid pipe name")
     }
+}
 
+async fn bind_socket(name: &interprocess::local_socket::Name<'_>) -> Result<LocalSocketListener> {
+    use interprocess::local_socket::tokio::prelude::*;
+    let listener = LocalSocketListener::from_options(
+        interprocess::local_socket::ListenerOptions::new().name(name.borrow()),
+    )?;
     Ok(listener)
 }
 
@@ -139,42 +132,46 @@ pub fn run() -> Result<()> {
         .build()?;
 
     rt.block_on(async {
-        let socket_path = default_socket_path();
-        let listener = match bind_socket(&socket_path).await {
+        let socket_name = default_socket_name();
+        let listener = match bind_socket(&socket_name).await {
             Ok(l) => l,
             Err(e) => {
-                zlog::error!("socket bind failed: path={} error={}", socket_path.display(), e);
+                zlog::error!("socket bind failed: error={}", e);
                 return Err(e);
             }
         };
-        let addr = listener.local_addr()?;
-        zlog::info!("mux_server listening: socket={:?}", addr);
+        zlog::info!("mux_server listening");
 
-        // §16.1 DB 路径与 socket 路径对齐,都在 $XDG_RUNTIME_DIR/z3rm/ 下。
-        // 之前实现把 DB 放在 runtime_dir 根目录 (如 /run/user/1000/z3rm.db),
-        // 与 socket (/run/user/1000/z3rm/mux.sock) 不一致,导致清理 / 删除时
-        // 容易遗漏 DB,出现"幽灵 session"被持久化恢复。
+        // §16.1 DB 路径: Unix 下复用 socket 父目录; Windows 下用 %LOCALAPPDATA%/z3rm
         let db_path = if let Ok(p) = std::env::var("Z3RM_MUX_DB") {
             PathBuf::from(p)
         } else {
-            // 复用 socket 父目录,保证两者在同一处
-            let parent = socket_path
-                .parent()
-                .map(PathBuf::from)
-                .unwrap_or_else(|| PathBuf::from("/tmp"));
-            std::fs::create_dir_all(&parent)?;
-            parent.join("mux.db")
+            #[cfg(unix)]
+            {
+                let runtime_dir =
+                    std::env::var("XDG_RUNTIME_DIR").unwrap_or_else(|_| "/tmp".to_string());
+                let parent = PathBuf::from(runtime_dir).join("z3rm");
+                let _ = std::fs::create_dir_all(&parent);
+                parent.join("mux.db")
+            }
+            #[cfg(windows)]
+            {
+                let base = dirs::data_local_dir().unwrap_or_else(|| {
+                    PathBuf::from(std::env::var("TEMP").unwrap_or_else(|_| "C:/Temp".to_string()))
+                });
+                let dir = base.join("z3rm");
+                let _ = std::fs::create_dir_all(&dir);
+                dir.join("mux.db")
+            }
         };
         let db = init_database(&db_path)?;
 
-        // §3.6 启动时恢复 session
         let recovered = persistence::recover_sessions(&db)?;
         tracing::info!(count = recovered.len(), "recovered sessions");
 
         let sessions = std::sync::Arc::new(parking_lot::RwLock::new(recovered));
         let db = std::sync::Arc::new(parking_lot::Mutex::new(db));
 
-        // §3.6 启动持久化后台任务 (每 10s 快照)
         let sessions_clone = sessions.clone();
         let db_clone = db.clone();
         let persist_handle = tokio::spawn(async move {
@@ -209,12 +206,16 @@ pub struct Server {
 }
 
 impl Server {
-    /// §3.5 keep_alive=true: 守护进程保持运行直到显式关闭
-    /// §9 监听连接并处理请求
-    async fn run(self, listener: UnixListener) -> Result<()> {
+    async fn run(self, listener: LocalSocketListener) -> Result<()> {
+        use interprocess::local_socket::tokio::prelude::*;
         loop {
-            let (stream, addr) = listener.accept().await?;
-            // §16.12 记录客户端连接事件
+            let stream = match listener.accept().await {
+                Ok(s) => s,
+                Err(e) => {
+                    zlog::error!("accept failed: {}", e);
+                    continue;
+                }
+            };
             zlog::info!("client connected");
 
             let sessions = self.sessions.clone();
@@ -224,11 +225,9 @@ impl Server {
             tokio::spawn(async move {
                 match connection::handle_connection(stream, sessions, db, clipboard).await {
                     Ok(()) => {
-                        // §16.12 记录客户端断开
                         zlog::info!("client disconnected");
                     }
                     Err(e) => {
-                        // §16.12 记录连接错误
                         zlog::error!("connection error: {}", e);
                     }
                 }

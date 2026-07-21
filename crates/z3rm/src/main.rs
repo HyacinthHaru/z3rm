@@ -401,6 +401,7 @@ fn main() {
                         .and_then(|worktree| {
                             worktree.read(cx).as_local().map(|w| w.abs_path().to_path_buf())
                         });
+                        tracing::info!("observe_new Workspace: injecting MuxPaneView for session {}", session_for_observer);
                     window.spawn(cx, async move |cx| {
                         // §3.10 spawn pane with cwd from worktree (Open Folder path).
                         let pane_id = match worktree_cwd.as_ref() {
@@ -421,7 +422,7 @@ fn main() {
                                 {
                                     Ok(id) => id,
                                     Err(e) => {
-                                        tracing::warn!(error = %e, "spawn_pane with cwd failed");
+                                        tracing::warn!(error = %e, pane_id_fallback = "will_retry_first_pane", "spawn_pane with cwd failed");
                                         daemon::get_first_pane_id(&domain)
                                             .await
                                             .ok()
@@ -450,6 +451,7 @@ fn main() {
                                         cx,
                                     )
                                 }));
+                                tracing::info!("MuxPane observer: adding item to pane (pane_id set above)");
                                 workspace.add_item(pane, item, None, true, true, window, cx);
                             });
                         });

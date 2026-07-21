@@ -66,20 +66,83 @@ pub enum MuxTransport {
 // ============================================================================
 // §9 connect_local: 建立本地 socket 连接
 // ============================================================================
-/// §9 连接到本地 mux_server Unix socket。
-pub async fn connect_local(socket_path: impl AsRef<Path>) -> Result<MuxDomain> {
-    let path = socket_path.as_ref().to_path_buf();
-    let (tx, rx) = std::sync::mpsc::channel();
-    std::thread::Builder::new()
-        .name("mux-connect".into())
-        .spawn(move || {
-            let result = std::os::unix::net::UnixStream::connect(&path)
-                .map_err(|e| anyhow::anyhow!(e));
-            let _ = tx.send(result);
-        })
-        .map_err(|e| anyhow::anyhow!("failed to spawn connect thread: {}", e))?;
-    let stream = rx.recv().map_err(|e| anyhow::anyhow!("recv error: {}", e))??;
-    MuxDomain::connect_with_unix_stream(stream)
+/// §9 连接到本地 mux_server。
+/// Unix: 通过 std Unix domain socket (非阻塞 I/O)。
+/// Windows: TODO named pipe transport (§3.2 spec; not yet wired)。
+pub async fn connect_local(socket_path: Option<&Path>) -> Result<MuxDomain> {
+    let path = match socket_path {
+        Some(p) => p.to_path_buf(),
+        None => default_socket_path(),
+    };
+    // §3.2 连接失败时检查是否 stale socket（os error 111），如是则清理并重试一次。
+    let try_connect = || -> Option<Result<MuxDomain>> {
+        let p = path.clone();
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::Builder::new()
+            .name("mux-connect".into())
+            .spawn(move || {
+                #[cfg(unix)]
+                let result = {
+                    use std::os::unix::net::UnixStream;
+                    match UnixStream::connect(&p) {
+                        Ok(stream) => {
+                            if let Err(e) = stream.set_nonblocking(true) {
+                                Err(anyhow::anyhow!(e))
+                            } else {
+                                MuxDomain::connect_with_blocking_stream(stream)
+                            }
+                        }
+                        Err(e) => Err(anyhow::anyhow!(e)),
+                    }
+                };
+                #[cfg(not(unix))]
+                let result: Result<MuxDomain> = Err(anyhow::anyhow!(
+                    "Windows named-pipe transport not yet implemented (spec §3.2)"
+                ));
+                let _ = tx.send(result);
+            })
+            .ok()?;
+        rx.recv().ok().map(|r| r.and_then(|d: MuxDomain| Ok(d)))
+    };
+    if let Some(result) = try_connect() {
+        match result {
+            Ok(domain) => return Ok(domain),
+            Err(e) => {
+                let msg = format!("{}", e);
+                if msg.contains("111") || msg.contains("Connection refused") {
+                    tracing::warn!(path = %path.display(), "stale socket (111), cleaning and retrying");
+                    let _ = std::fs::remove_file(&path);
+                    if let Some(retry) = try_connect() {
+                        return retry;
+                    }
+                    return Err(anyhow::anyhow!(
+                        "connect_local retry failed after cleaning stale socket at {}",
+                        path.display()
+                    ));
+                }
+                return Err(anyhow::anyhow!("stale connect failed: {}", msg));
+            }
+        }
+    }
+    anyhow::bail!("connect_local: failed to spawn connection thread to {}", path.display())
+}
+
+
+/// §16.1 默认 socket 路径 (与 mux_server 对齐)。
+fn default_socket_path() -> std::path::PathBuf {
+    if let Ok(p) = std::env::var("Z3RM_MUX_SOCKET") {
+        return std::path::PathBuf::from(p);
+    }
+    #[cfg(unix)]
+    {
+        let runtime_dir =
+            std::env::var("XDG_RUNTIME_DIR").unwrap_or_else(|_| "/tmp".to_string());
+        std::path::PathBuf::from(runtime_dir).join("z3rm").join("mux.sock")
+    }
+    #[cfg(not(unix))]
+    {
+        std::path::PathBuf::from(r"\\.\pipe\z3rm-mux")
+    }
 }
 
 // ============================================================================
@@ -113,6 +176,34 @@ impl MuxDomain {
 
         let window_id = format!("win-{}", std::process::id());
 
+        Ok(MuxDomain {
+            inner,
+            window_id,
+        })
+    }
+
+    /// Connect using any blocking Read+Write stream (e.g., UnixStream with non-blocking set).
+    pub fn connect_with_blocking_stream<S: std::io::Read + std::io::Write + Send + 'static>(
+        stream: S,
+    ) -> Result<Self> {
+        let (write_tx, write_rx) = std::sync::mpsc::channel();
+        let subscribers: Arc<parking_lot::Mutex<Vec<async_channel::Sender<Notification>>>> =
+            Arc::new(parking_lot::Mutex::new(Vec::new()));
+        let inner = Arc::new(parking_lot::RwLock::new(DomainInner {
+            next_request_id: AtomicU64::new(1),
+            pending_requests: HashMap::new(),
+            subscribers: subscribers.clone(),
+            write_tx,
+        }));
+        let io_inner = inner.clone();
+        let io_subscribers = subscribers.clone();
+        std::thread::Builder::new()
+            .name("mux-io".into())
+            .spawn(move || {
+                Self::io_and_router_loop(stream, write_rx, io_inner, io_subscribers);
+            })
+            .map_err(|e| anyhow::anyhow!("failed to spawn mux I/O thread: {}", e))?;
+        let window_id = format!("win-{}", std::process::id());
         Ok(MuxDomain {
             inner,
             window_id,
@@ -192,39 +283,6 @@ impl MuxDomain {
         }
     }
 
-    /// Connect using std UnixStream (avoids interprocess connection issues)
-    pub fn connect_with_unix_stream(stream: std::os::unix::net::UnixStream) -> Result<Self> {
-        // §9 Set non-blocking mode so read() doesn't block the I/O thread.
-        // set_nonblocking takes &self so we don't need mut.
-        stream.set_nonblocking(true).map_err(|e| anyhow::anyhow!(e))?;
-        let (write_tx, write_rx) = std::sync::mpsc::channel();
-
-        let subscribers: Arc<parking_lot::Mutex<Vec<async_channel::Sender<Notification>>>> =
-            Arc::new(parking_lot::Mutex::new(Vec::new()));
-
-        let inner = Arc::new(parking_lot::RwLock::new(DomainInner {
-            next_request_id: AtomicU64::new(1),
-            pending_requests: HashMap::new(),
-            subscribers: subscribers.clone(),
-            write_tx,
-        }));
-
-        let io_inner = inner.clone();
-        let io_subscribers = subscribers.clone();
-        std::thread::Builder::new()
-            .name("mux-io".into())
-            .spawn(move || {
-                Self::io_and_router_loop(stream, write_rx, io_inner, io_subscribers);
-            })
-            .map_err(|e| anyhow::anyhow!("failed to spawn mux I/O thread: {}", e))?;
-
-        let window_id = format!("win-{}", std::process::id());
-
-        Ok(MuxDomain {
-            inner,
-            window_id,
-        })
-    }
 
     /// Generic frame reader for any Read+Write stream
     fn read_next_frame_generic<S: std::io::Read + std::io::Write>(
