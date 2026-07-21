@@ -612,24 +612,28 @@ fn main() {
             });
 
             eprintln!("[z3rm] Creating window via cx.open_window");
-            cx.update(|cx| {
-                let result = cx.open_window(Default::default(), |window, cx| {
+            let domain_for_window = domain.clone();
+            let snapshot_for_window = snapshot_pane_ids.clone();
+            let app_state_for_window = app_state.clone();
+            let result = cx.open_window(Default::default(), {
+                move |window, cx| {
                     use project::Project;
-                    let domain_for_window = domain.clone();
-                    let snapshot_for_window = snapshot_pane_ids.clone();
-                    let session_for_window = session_id.clone();
                     let workspace = cx.new(|cx| {
                         let project = Project::local(
-                            app_state.languages.clone(),
-                            app_state.fs.clone(),
+                            app_state_for_window.languages.clone(),
+                            app_state_for_window.fs.clone(),
                             None,
                             vec![],
                             cx,
                         );
-                        workspace::Workspace::new(None, project, app_state, window, cx)
-                    });
-                    // §15.12 Directly inject MuxPaneView into the workspace.
-                    workspace.update(cx, |workspace, cx| {
+                        let mut workspace = workspace::Workspace::new(
+                            None,
+                            project,
+                            app_state_for_window.clone(),
+                            window,
+                            cx,
+                        );
+                        // §15.12 Inject MuxPaneViews during workspace construction (Zed init pattern).
                         let pane = workspace.active_pane().clone();
                         pane.update(cx, |pane, _| {
                             pane.set_should_display_welcome_page(false);
@@ -649,15 +653,15 @@ fn main() {
                                     cx,
                                 )
                             }));
-                            eprintln!("[z3rm] DIRECT inject: adding MuxPaneView {} to workspace", index);
+                            eprintln!("[z3rm] init inject: adding MuxPaneView {} to workspace", index);
                             workspace.add_item(pane.clone(), item, None, index == 0, true, window, cx);
                         }
+                        workspace
                     });
                     cx.new(|cx| workspace::MultiWorkspace::new(workspace, window, cx))
-                });
-                anyhow::Ok(result)
-            })
-            ??;
+                }
+            });
+            result?;
             eprintln!("[z3rm] Window created Ok");
 
             anyhow::Ok(())

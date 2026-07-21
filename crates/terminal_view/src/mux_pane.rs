@@ -473,6 +473,7 @@ impl EventEmitter<MuxPaneEvent> for MuxPaneView {}
 
 impl Render for MuxPaneView {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl gpui::IntoElement {
+        eprintln!("[MuxPaneView] RENDER called, cols={} rows={}", self.snapshot.cols, self.snapshot.rows);
         // §3.3 Per-repaint poll: fetch_in_flight prevents concurrent fetches,
         // so this catches up on dropped PaneDirty notifications.
         self.schedule_fetch(cx);

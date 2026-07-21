@@ -208,3 +208,48 @@ Release Notes:
 
 - N/A
 ```
+
+# GPUI rendering debug guide
+
+排查 GPUI 渲染问题时的关键要点和方法。
+
+## 窗口创建必须遵循 Zed 模式
+
+* **必须用 `MultiWorkspace` 做窗口根视图。** `Workspace` 不能作为 `open_window` 的根视图——它的 render 依赖 `MultiWorkspace` 提供的上下文（`Workspace::for_window` 通过 `window.root::<MultiWorkspace>()` 查找）。直接用 `Workspace` 做根视图会导致 render 被调用但内部子组件（PaneGroup、Pane、items）不渲染。
+* **Items 必须在 `cx.new(|cx| Workspace::new(...))` 闭包内添加。** 不能在 workspace 创建后通过 `workspace.update(cx, ...)` 添加——此时 workspace 的渲染树已经构建完毕，后添加的 items 不会触发正确的渲染链。正确模式（参考 `Workspace::new_local`）：
+  ```rust
+  let window = cx.open_window(options, move |window, cx| {
+      let workspace = cx.new(|cx| {
+          let mut workspace = Workspace::new(id, project, app_state, window, cx);
+          // 在构造期间添加 items（init 回调模式）
+          workspace.add_item(pane, item, None, true, true, window, cx);
+          workspace
+      });
+      cx.new(|cx| MultiWorkspace::new(workspace, window, cx))
+  });
+  ```
+* **`open_window` 回调返回 `Entity<MultiWorkspace>`，不是 `Entity<Workspace>`。**
+
+## 渲染链排查方法
+
+渲染链：`open_window` → `MultiWorkspace::render` → `.child(workspace)` → `Workspace::render` → `render_center` → `PaneGroup::render` → `Member::Pane` → `AnyView::from(pane)` → `Pane::render` → `item.to_any_view()` → `MuxPaneView::render`
+
+* **逐层加 `eprintln!` 定位断点。** 在每一层的 render 方法入口加 `eprintln!`，确认哪一层没有被调用。
+* **`gpui::Empty` 陷阱。** 搜索所有返回 `gpui::Empty` 的 render 方法——它们会在特定条件下静默吞掉整个子树。关键位置：
+  - `pane.rs:render_tab_bar` — `workspace.upgrade().is_none()` 时返回 Empty（tabbar 消失）
+  - `pane.rs:Render` — `project.upgrade().is_none()` 时返回空 div（整个 pane 消失）
+* **`set_should_display_welcome_page(false)` 必须在添加 items 前调用。** `Workspace::new` 默认设为 true；welcome page 在 pane 无 items 时渲染，会遮挡终端。
+
+## GPUI 类型陷阱
+
+* **`Pixels(pub(crate) f32)`** — `.0` 字段是 crate-private。用 `f32::from(pixels)` 做算术。
+* **`gpui::rgb(hex)` 返回 `Rgba`，不是 `Hsla`。** `text_color()` 和 `bg()` 接受 `impl Into<Hsla>`。需要 `rgb(hex).into()` 转换。
+* **`ThemeColors` 字段名不直观。** 选择背景色是 `element_selection_background`（不是 `selection_background`）；没有 `cursor` 字段。
+* **`cx.listener()` 闭包必须是 `'static`。** 不能捕获局部变量引用。在闭包内部定义常量：`let cw = px(8.4);`
+* **`log::info!` vs `eprintln!`。** `log` crate 的输出可能被 tracing bridge 吞掉。排查时用 `eprintln!` 确保输出到 stderr。
+
+## Mux 协议陷阱
+
+* **`connect_local` 签名是 `Option<&Path>`。** 所有调用方必须用 `Some(path.as_path())` 或 `None`。
+* **`fetch_grid_update(since=0)` 必须返回 `FullSnapshot`。** 初始 generation 为 0 时，`since == current == 0` 不能返回 `NoChange`，否则客户端永远收不到初始网格。
+* **`let _ = domain.send_input(...)` 会静默丢弃按键。** 传输失败时用户无感知。至少用 `.log_err()` 或通知 UI 层。
