@@ -311,6 +311,7 @@ fn main() {
                 client: Arc::new(()),
                 node_runtime: (),
                 user_store: (),
+                mux_domain: None,
             });
             workspace::AppState::set_global(app_state.clone(), cx);
             app_state
@@ -362,6 +363,19 @@ fn main() {
                 .await?;
             eprintln!("[z3rm] Attached to session");
 
+            // §3.2 把 domain 注入 AppState. AppState 是 Arc<AppState>,
+            // 替换整个 Arc 让后续代码 (含未来的 workspace::Open 路径) 能拿到。
+            let domain_for_state = domain.clone();
+            cx.update(|cx| {
+                let updated = workspace::AppState::try_global(cx).map(|state| {
+                    let mut next = state.as_ref().clone();
+                    next.mux_domain = Some(domain_for_state.clone());
+                    Arc::new(next)
+                });
+                if let Some(next) = updated {
+                    workspace::AppState::set_global(next, cx);
+                }
+            });
             // notification subscriber
             let domain_for_notify = domain.clone();
             cx.background_executor()

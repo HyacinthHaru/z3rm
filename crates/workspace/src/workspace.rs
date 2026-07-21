@@ -1016,6 +1016,7 @@ pub fn register_serializable_item<I: SerializableItem>(cx: &mut App) {
         .insert(TypeId::of::<I>(), descriptor);
 }
 
+#[derive(Clone)]
 pub struct AppState {
     pub languages: Arc<LanguageRegistry>,
     pub fs: Arc<dyn fs::Fs>,
@@ -1027,6 +1028,8 @@ pub struct AppState {
     pub node_runtime: (),
     /// Stub: user_store (crates removed)
     pub user_store: (),
+    /// §3.2 client-side MuxDomain; None until daemon is up.
+    pub mux_domain: Option<Arc<mux::MuxDomain>>,
 }
 
 struct GlobalAppState(Arc<AppState>);
