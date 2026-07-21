@@ -369,11 +369,7 @@ pub async fn connect_ssh(target: &str) -> anyhow::Result<(super::MuxDomain, SshS
     tokio::time::sleep(Duration::from_secs(1)).await;
 
     // §16.6 步骤 5：转发远程 socket 到本地。
-    let remote_socket = "/tmp/z3rm-mux.sock";
-    let (local_socket, _shutdown) = session.forward_socket(remote_socket).await?;
-
-    let rt_handle = tokio::runtime::Handle::current();
-    let domain = super::connect_local(&local_socket, rt_handle).await
+    let domain = super::connect_local(Some(&local_socket)).await
         .context("通过转发的 socket 连接 mux_server 失败")?;
 
     tracing::info!(
@@ -394,7 +390,7 @@ fn shell_escape(s: &str) -> String {
         matches!(c, ' ' | '\'' | '"' | '\\' | '$' | '`' | '!' | '#' | '&' | '|' | ';' | '(' | ')' | '<' | '>' | '*' | '?' | '[' | ']' | '~')
     });
     if needs_escape {
-        let escaped = s.replace('\'', "'\\''");
+        let escaped = s.replace('\'', "'\\\''");
         format!("'{escaped}'")
     } else {
         s.to_string()
