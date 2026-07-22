@@ -7635,6 +7635,7 @@ dependencies = [
  "prost",
  "regex",
  "serde",
+ "shadow_snapshot",
  "sqlez",
  "sysinfo 0.37.2",
  "tempfile",

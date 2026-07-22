@@ -27,3 +27,4 @@ pub use version_tree::{
 };
 pub use wal::{Wal, WalEntry};
 pub use engine::ShadowSnapshotEngine;
+pub use monitor::{EventKind, FileEvent, Monitor, WatchHandle};

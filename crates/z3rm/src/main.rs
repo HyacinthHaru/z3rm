@@ -8,6 +8,7 @@ mod cli;
 mod log_viewer;
 pub mod diff_review;
 mod quickjs_extensions;
+mod extension_status_bar;
 
 use std::sync::Arc;
 
@@ -405,6 +406,12 @@ fn main() {
             cx.update(|cx| {
                 cx.observe_new::<workspace::Workspace>(move |workspace, window, cx| {
                     let Some(window) = window else { return };
+
+                    // §5.5 Add extension status bar (renders QuickJS extension VDOM)
+                    let ext_status = cx.new(|_cx| extension_status_bar::ExtensionStatusBar::new());
+                    workspace.status_bar().update(cx, |sb, cx| {
+                        sb.add_right_item(ext_status, window, cx);
+                    });
 
                     // §15.7 Register mux_pane action handlers on every workspace.
                     workspace

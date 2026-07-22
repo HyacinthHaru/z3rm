@@ -33,6 +33,11 @@ pub struct Session {
     pub sync_scrollback: Arc<parking_lot::RwLock<SyncScrollbackState>>,
     /// §3.3 已连接的窗口 ID 列表 (多窗口支持，Plan 32)
     pub connected_windows: Arc<parking_lot::RwLock<Vec<String>>>,
+    /// §4 Shadow snapshot watcher handle: cwd file changes → snapshot engine.
+    /// `None` means this session has no live watcher (cwd unusable / recovered /
+    /// test session). Arc so it survives Session derive(Clone) clones; the last
+    /// clone dropped stops the watcher + recorder (see snapshot::SnapshotWatch).
+    pub snapshot_watch: Option<std::sync::Arc<crate::snapshot::SnapshotWatch>>,
 }
 
 /// 标签页 (§3.10 TabInfo)
@@ -115,6 +120,7 @@ impl Session {
             panes: Arc::new(parking_lot::RwLock::new(HashMap::new())),
             sync_scrollback: Arc::new(parking_lot::RwLock::new(SyncScrollbackState::default())),
             connected_windows: Arc::new(parking_lot::RwLock::new(Vec::new())),
+            snapshot_watch: None,
         }
     }
 

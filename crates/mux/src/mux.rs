@@ -70,14 +70,14 @@ pub enum MuxTransport {
 // §9 connect_local: 建立本地 socket 连接
 // ============================================================================
 /// §9 连接到本地 mux_server。
-/// Unix: 通过 std Unix domain socket (非阻塞 I/O)。
-/// Windows: TODO named pipe transport (§3.2 spec; not yet wired)。
+/// §15.3 使用 interprocess crate 的 local socket 抽象:
+/// Unix → Unix domain socket, Windows → named pipe。
 pub async fn connect_local(socket_path: Option<&Path>) -> Result<MuxDomain> {
     let path = match socket_path {
         Some(p) => p.to_path_buf(),
         None => default_socket_path(),
     };
-    // §3.2 连接失败时检查是否 stale socket（os error 111），如是则清理并重试一次。
+    // §3.2 / §15.3 跨平台连接: Unix 用 UnixStream (non-blocking), Windows 用 interprocess named pipe。
     let try_connect = || -> Option<Result<MuxDomain>> {
         let p = path.clone();
         let (tx, rx) = std::sync::mpsc::channel();
@@ -98,20 +98,30 @@ pub async fn connect_local(socket_path: Option<&Path>) -> Result<MuxDomain> {
                         Err(e) => Err(anyhow::anyhow!(e)),
                     }
                 };
-                #[cfg(not(unix))]
-                let result: Result<MuxDomain> = Err(anyhow::anyhow!(
-                    "Windows named-pipe transport not yet implemented (spec §3.2)"
-                ));
+                #[cfg(windows)]
+                let result = {
+                    use interprocess::local_socket::{prelude::*, GenericNamespaced, Stream as LocalSocketStream};
+                    // Windows named pipe: \\.\pipe\z3rm-mux
+                    let pipe_name = p.to_string_lossy().to_string();
+                    let name = pipe_name
+                        .to_ns_name::<GenericNamespaced>()
+                        .map_err(|e| anyhow::anyhow!("invalid pipe name: {}", e))?;
+                    match LocalSocketStream::connect(name) {
+                        Ok(stream) => MuxDomain::connect_with_stream(stream),
+                        Err(e) => Err(anyhow::anyhow!(e)),
+                    }
+                };
                 let _ = tx.send(result);
             })
             .ok()?;
-        rx.recv().ok().map(|r| r.and_then(|d: MuxDomain| Ok(d)))
+        rx.recv().ok().map(|r: Result<MuxDomain>| r.and_then(|d| Ok(d)))
     };
     if let Some(result) = try_connect() {
         match result {
             Ok(domain) => return Ok(domain),
             Err(e) => {
                 let msg = format!("{}", e);
+                #[cfg(unix)]
                 if msg.contains("111") || msg.contains("Connection refused") {
                     tracing::warn!(path = %path.display(), "stale socket (111), cleaning and retrying");
                     let _ = std::fs::remove_file(&path);
@@ -123,7 +133,7 @@ pub async fn connect_local(socket_path: Option<&Path>) -> Result<MuxDomain> {
                         path.display()
                     ));
                 }
-                return Err(anyhow::anyhow!("stale connect failed: {}", msg));
+                return Err(anyhow::anyhow!("connect failed: {}", msg));
             }
         }
     }

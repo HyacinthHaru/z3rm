@@ -84,6 +84,64 @@ pub fn vdom_to_text(node: &VDomNode, depth: usize) -> String {
     out
 }
 
+
+/// §5.4 Convert a VDOM tree into a GPUI element tree.
+///
+/// Maps VDOM node types to GPUI elements:
+/// - "div" → flex container div
+/// - "span" → inline text div
+/// - "button" → clickable div
+/// - Text children → SharedString labels
+///
+/// Style properties are mapped to GPUI style methods where possible.
+pub fn vdom_to_element(node: &VDomNode) -> gpui::AnyElement {
+    use gpui::{div, px, IntoElement, ParentElement, SharedString, Styled};
+
+    let mut element = div();
+
+    // Apply flex layout styles from VDOM
+    if let Some(direction) = node.style.get("flexDirection") {
+        match direction.as_str() {
+            "row" => { element = element.flex_row(); }
+            "column" => { element = element.flex_col(); }
+            _ => {}
+        }
+    } else {
+        // Default: div is flex container
+        element = element.flex();
+    }
+
+    if let Some(gap) = node.style.get("gap") {
+        if let Some(px_val) = gap.strip_suffix("px") {
+            if let Ok(val) = px_val.trim().parse::<f32>() {
+                element = element.gap(px(val));
+            }
+        }
+    }
+
+    if let Some(justify) = node.style.get("justifyContent") {
+        match justify.as_str() {
+            "space-between" => { element = element.justify_between(); }
+            "center" => { element = element.justify_center(); }
+            _ => {}
+        }
+    }
+
+    // Add children
+    for child in &node.children {
+        match child {
+            VDomChild::Text(text) => {
+                let label: SharedString = text.clone().into();
+                element = element.child(label);
+            }
+            VDomChild::Node(child_node) => {
+                element = element.child(vdom_to_element(child_node));
+            }
+        }
+    }
+
+    element.into_any_element()
+}
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -1,0 +1,42 @@
+# REUSE.toml — SPDX licensing declarations for z3rm
+# Spec §10: Per-crate layered licensing.
+# GPUI framework crates: Apache-2.0
+# Retained Zed crates: GPL-3.0-or-later
+# New foundation crates: Apache-2.0
+
+version = 1
+
+# New foundation crates (Apache-2.0)
+[[annotations]]
+path = ["crates/z3rm/**", "crates/mux/**", "crates/mux_server/**", "crates/mux_protocol/**", "crates/shadow_snapshot/**", "crates/quickjs_runtime/**", "crates/transport_resilient/**", "crates/z3rm_macros/**", "crates/z3rm_macros_types/**"]
+precedence = "aggregate"
+SPDX-FileCopyrightText = "2026 z3rm contributors"
+SPDX-License-Identifier = "Apache-2.0"
+
+# GPUI framework crates (Apache-2.0, inherited from Zed)
+[[annotations]]
+path = ["crates/gpui/**", "crates/gpui_macos/**", "crates/gpui_linux/**", "crates/gpui_windows/**", "crates/gpui_platform/**", "crates/gpui_wgpu/**", "crates/gpui_web/**", "crates/gpui_shared_string/**", "crates/gpui_macros/**", "crates/gpui_util/**", "crates/gpui_tokio/**"]
+precedence = "aggregate"
+SPDX-FileCopyrightText = "2022-2026 Zed Industries, Inc."
+SPDX-License-Identifier = "Apache-2.0"
+
+# Retained Zed crates (GPL-3.0-or-later)
+[[annotations]]
+path = ["crates/terminal/**", "crates/terminal_view/**", "crates/editor/**", "crates/workspace/**", "crates/project/**", "crates/settings/**", "crates/theme/**"]
+precedence = "aggregate"
+SPDX-FileCopyrightText = "2022-2026 Zed Industries, Inc."
+SPDX-License-Identifier = "GPL-3.0-or-later"
+
+# Documentation and assets
+[[annotations]]
+path = ["docs/**", "assets/**", "extensions/**"]
+precedence = "aggregate"
+SPDX-FileCopyrightText = "2026 z3rm contributors"
+SPDX-License-Identifier = "Apache-2.0"
+
+# Build and config files
+[[annotations]]
+path = ["Cargo.toml", "Cargo.lock", "rust-toolchain.toml", ".github/**", "script/**"]
+precedence = "aggregate"
+SPDX-FileCopyrightText = "2026 z3rm contributors"
+SPDX-License-Identifier = "Apache-2.0"

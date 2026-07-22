@@ -190,7 +190,6 @@ impl Pane {
         // §3.1 启动 PTY read loop — 后台线程持续读取 PTY 输出, 喂给 alacritty,
         // 计算 dirty diff, bump generation。线程持有弱引用, pane drop 时自动结束。
         pane.clone().start_pty_read_loop(reader);
-
         Ok(pane)
     }
 

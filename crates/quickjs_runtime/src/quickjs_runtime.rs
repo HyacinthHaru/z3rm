@@ -345,17 +345,37 @@ impl ExtensionRunner {
     }
 
     fn do_load(&self, _extension_id: &str, source: &str) -> Result<()> {
-        // Day 0 stub: 创建 runtime + context, 执行源码
-        // 完整实现见 Plan 14 Task 3 (extension_host 重写)
         let runtime =
             QuickJsRuntime::new(self.memory_limit_mb, self.cpu_budget_ms).context("创建 Runtime 失败")?;
         let ctx = runtime.create_context()?;
 
         ctx.with(|ctx| {
-            // 执行扩展源码
-            let _result: rquickjs::Value = ctx.eval(source)?;
+            // §5.2: Strip ES module `export` keyword — QuickJS eval runs scripts, not modules.
+            let script_source = source.replace("export function", "function")
+                .replace("export const", "const")
+                .replace("export default", "const __default =");
 
-            // Day 0: 暂不调用 activate，等待 extension_host 实现
+            // Execute extension source to define activate() in globals
+            let _: rquickjs::Value = ctx.eval(script_source.as_str())?;
+
+            // §5.2/§5.3: Create context object and call activate() entirely in JS
+            // to avoid rquickjs Value lifetime issues with Rust closures.
+            let call_activate: &str = r#"
+                (function() {
+                    if (typeof activate !== 'function') return null;
+                    var __vdom_result = null;
+                    var context = {
+                        render: function(vdom) { __vdom_result = vdom; return vdom; },
+                        on: function(event, handler) { /* event registration */ },
+                        emit: function(event, data) { /* event emission */ },
+                        capabilities: { terminal: true, mux: true, workspace: true }
+                    };
+                    activate(context);
+                    return __vdom_result;
+                })()
+            "#;
+            let _result: rquickjs::Value = ctx.eval(call_activate)?;
+
             Ok(())
         })
     }

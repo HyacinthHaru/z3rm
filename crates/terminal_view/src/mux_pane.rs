@@ -10,7 +10,7 @@
 
 use std::sync::Arc;
 use gpui::{
-    App, AppContext, Context, Entity, EventEmitter, FocusHandle, Focusable,
+    App, AppContext, AsyncApp, Context, Entity, EventEmitter, FocusHandle, Focusable,
     InteractiveElement, KeyDownEvent, Keystroke, ParentElement, Render, SharedString,
     StatefulInteractiveElement, Styled, Task, WeakEntity, Window, div,
 };
@@ -160,29 +160,45 @@ impl MuxPaneView {
     }
 
     /// §3.4 Listen for PaneOutput (byte stream), PaneDirty, PaneRemoved notifications.
+    /// §3.1 exception: PaneOutput bytes are fed directly to the DisplayOnly terminal.
+    /// §3.3 adaptive coalescing: batch PaneOutput data and flush once per frame
+    /// to avoid excessive entity updates and repaints under high throughput.
+    /// §3.4 Listen for PaneOutput (byte stream), PaneDirty, PaneRemoved notifications.
+    /// §3.1 exception: PaneOutput bytes are fed directly to the DisplayOnly terminal.
+    /// After each batch flush, cx.notify() triggers MuxPaneView repaint so the
+    /// TerminalElement reads fresh terminal data on the next frame.
+    /// §3.3 debounce: PaneDirty → schedule_fetch is throttled to once per 16ms
+    /// (60fps). PaneOutput is the primary render path; PaneDirty only covers
+    /// non-bytes changes (cursor, title, alt-screen) that fetch_grid_update provides.
     fn start_notification_listener(&mut self, cx: &mut Context<Self>) {
         let pane_id = self.pane_id.clone();
         let rx = self.domain.subscribe();
         let weak = cx.entity().downgrade();
 
         let task = cx.spawn(async move |_, cx| {
+            let mut pending_output: Vec<u8> = Vec::new();
+            let mut pending_dirty = false;
+            let mut flush_handle: Option<Task<()>> = None;
+
             while let Ok(notif) = rx.recv().await {
                 let Some(event) = notif.event else { continue };
                 match event {
-                    // §3.1 exception: primary render path — feed bytes to DisplayOnly terminal
+                    // §3.1 exception: primary render path — accumulate bytes, flush per frame
                     NotifEvent::PaneOutput(chunk) if chunk.pane_id == pane_id => {
-                        let data = chunk.data;
-                        if weak.update(cx, |view, cx| {
-                            view.terminal.update(cx, |terminal, cx| {
-                                terminal.write_output(&data, cx);
-                            });
-                        }).is_err() {
-                            break; // view dropped
+                        pending_output.extend_from_slice(&chunk.data);
+                        // Flush immediately if buffer is large (>64KB)
+                        if pending_output.len() > 65536 {
+                            Self::do_write_output(&weak, &mut pending_output, &mut flush_handle, cx).await;
+                        } else if flush_handle.is_none() {
+                            Self::schedule_flush(&weak, &mut pending_output, &mut flush_handle, &mut pending_dirty, cx);
                         }
                     }
-                    // §3.3 grid-diff path: trigger fetch for state reconciliation
+                    // §3.3 grid-diff path: debounce to once per frame
                     NotifEvent::PaneDirty(dirty) if dirty.pane_id == pane_id => {
-                        let _ = weak.update(cx, |view, cx| view.schedule_fetch(cx));
+                        pending_dirty = true;
+                        if flush_handle.is_none() {
+                            Self::schedule_flush(&weak, &mut pending_output, &mut flush_handle, &mut pending_dirty, cx);
+                        }
                     }
                     NotifEvent::PaneRemoved(removed) if removed.pane_id == pane_id => {
                         let _ = weak.update(cx, |view, cx| {
@@ -196,6 +212,65 @@ impl MuxPaneView {
             }
         });
         self.notification_task = Some(task);
+    }
+
+    /// §3.3 Deferred flush: wait ~8ms (half-frame) to batch data, then flush.
+    /// Called only when flush_handle is None (at most one pending at a time).
+    fn schedule_flush(
+        weak: &WeakEntity<Self>,
+        pending_output: &mut Vec<u8>,
+        flush_handle: &mut Option<Task<()>>,
+        pending_dirty: &mut bool,
+        cx: &mut AsyncApp,
+    ) {
+        // Take the data into a local variable before spawning so we have it
+        // at closure capture time without borrowing pending_output.
+        let has_output = !pending_output.is_empty();
+        let has_dirty = *pending_dirty;
+        let data = std::mem::take(pending_output);
+        *pending_dirty = false;
+        let weak2 = weak.clone();
+
+        *flush_handle = Some(cx.spawn(async move |cx| {
+            cx.background_executor().timer(std::time::Duration::from_millis(8)).await;
+            if !data.is_empty() {
+                let _ = weak2.update(cx, |view, cx| {
+                    view.terminal.update(cx, |terminal, cx| {
+                        terminal.write_output(&data, cx);
+                    });
+                    // Trigger repaint on MuxPaneView so TerminalElement reads
+                    // fresh terminal data next frame.
+                    cx.notify();
+                });
+            } else if has_dirty {
+                // No output bytes but dirty flag set — nothing visible changed,
+                // schedule a fetch for the next frame anyway (catches cursor/style changes).
+                let _ = weak2.update(cx, |view, cx| {
+                    view.schedule_fetch(cx);
+                });
+            }
+        }));
+    }
+
+    /// §3.3 Synchronous flush: write output and trigger repaint immediately.
+    async fn do_write_output(
+        weak: &WeakEntity<Self>,
+        pending_output: &mut Vec<u8>,
+        flush_handle: &mut Option<Task<()>>,
+        cx: &mut AsyncApp,
+    ) {
+        if let Some(handle) = flush_handle.take() {
+            handle.detach();
+        }
+        let data = std::mem::take(pending_output);
+        if !data.is_empty() {
+            let _ = weak.update(cx, |view, cx| {
+                view.terminal.update(cx, |terminal, cx| {
+                    terminal.write_output(&data, cx);
+                });
+                cx.notify();
+            });
+        }
     }
 
     /// §3.1 exception: subscribe to PTY byte stream from server.
@@ -274,10 +349,18 @@ impl MuxPaneView {
     fn write_snapshot_to_terminal(&mut self, cx: &mut Context<Self>) {
         let text = snapshot_to_text(&self.snapshot);
         let bytes = text.into_bytes();
-        // Clear screen + write snapshot (ANSI: ESC[2J ESC[H = clear + home)
-        let mut clear_and_write = Vec::with_capacity(bytes.len() + 8);
+        // Clear screen + write snapshot + position cursor (ANSI: ESC[2J ESC[H = clear + home)
+        let mut clear_and_write = Vec::with_capacity(bytes.len() + 32);
         clear_and_write.extend_from_slice(b"\x1b[2J\x1b[H");
         clear_and_write.extend_from_slice(&bytes);
+        // §3.3 Position cursor at snapshot's recorded cursor location.
+        // ANSI CSI row;col H is 1-based.
+        if let Some(cursor) = &self.snapshot.cursor {
+            let row = cursor.row + 1; // 1-based
+            let col = cursor.col + 1; // 1-based
+            let cursor_pos = format!("\x1b[{};{}H", row, col);
+            clear_and_write.extend_from_slice(cursor_pos.as_bytes());
+        }
         self.terminal.update(cx, |terminal, cx| {
             terminal.write_output(&clear_and_write, cx);
         });

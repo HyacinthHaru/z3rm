@@ -389,6 +389,38 @@ async fn handle_create_session(
     session.add_tab(default_tab_id.clone(), req.name.clone());
     session.focused_tab = Some(default_tab_id);
 
+    // §4 Wire shadow_snapshot: start the Monitor + recorder on a blocking
+    // thread so the async task is not stalled by inotify setup / SQLite open.
+    // The session is registered immediately; the snapshot watch is attached
+    // when the background task completes.
+    let snapshot_id = id.clone();
+    let snapshot_cwd = req.cwd.clone();
+    let sessions_for_snapshot = sessions.clone();
+    let log_id = snapshot_id.clone();
+    let log_cwd = snapshot_cwd.clone();
+    tokio::spawn(async move {
+        let result = tokio::task::spawn_blocking(move || {
+            crate::snapshot::start(&snapshot_id, &snapshot_cwd)
+        }).await;
+        match result {
+            Ok(Ok(Some(watch))) => {
+                let mut sessions_w = sessions_for_snapshot.write();
+                if let Some(s) = sessions_w.iter_mut().find(|s| s.id == log_id) {
+                    s.snapshot_watch = Some(watch);
+                }
+            }
+            Ok(Ok(None)) => {
+                zlog::info!("shadow snapshot not armed: session={} cwd={}", log_id, log_cwd);
+            }
+            Ok(Err(error)) => {
+                zlog::warn!("shadow snapshot start failed: session={} cwd={} error={}", log_id, log_cwd, error);
+            }
+            Err(join_error) => {
+                zlog::warn!("shadow snapshot task panicked: session={} error={}", log_id, join_error);
+            }
+        }
+    });
+
     sessions.write().push(session);
 
     // §16.12 记录 session 创建事件
@@ -430,6 +462,14 @@ async fn handle_kill_session(
     let mut sessions_w = sessions.write();
     let idx = sessions_w.iter().position(|s| s.id == req.id);
     if let Some(idx) = idx {
+        // §4 Stop this session's shadow-snapshot watcher before dropping the
+        // session so watching/recording teardown is deterministic (its Drop would
+        // also stop it, but explicit stop logs the event and orders the join).
+        if let Some(sess) = sessions_w.get(idx) {
+            if let Some(watch) = sess.snapshot_watch.as_ref() {
+                watch.stop();
+            }
+        }
         sessions_w.remove(idx);
         // §16.12 记录 session 销毁事件
         zlog::info!("session killed: id={}", req.id);

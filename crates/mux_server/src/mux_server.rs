@@ -19,6 +19,7 @@ pub mod dec2026;
 pub mod layout;
 pub mod pane;
 pub mod persistence;
+pub mod snapshot;
 
 #[cfg(test)]
 mod tests;
@@ -128,6 +129,39 @@ async fn bind_socket(name: &interprocess::local_socket::Name<'_>) -> Result<Loca
     Ok(listener)
 }
 
+/// §3.2 Try to bind, falling back to stale socket cleanup.
+///
+/// On Unix, if  fails and a socket file exists, try connecting to it.
+/// If the connection fails (stale socket), remove the socket file and retry.
+/// On Windows, named pipes are ephemeral (server disappears = pipe gone),
+/// so stale cleanup is unnecessary.
+pub async fn bind_or_cleanup(name: &interprocess::local_socket::Name<'_>) -> Result<LocalSocketListener> {
+    match bind_socket(name).await {
+        Ok(listener) => Ok(listener),
+        Err(e) => {
+            #[cfg(unix)]
+            if let Some(socket_path) = unix_socket_path() {
+                if socket_path.exists() {
+                    use std::os::unix::net::UnixStream;
+                    match UnixStream::connect(&socket_path) {
+                        Ok(_) => {
+                            // Active server exists — return original error
+                            return Err(e);
+                        }
+                        Err(_) => {
+                            // Stale socket — remove and retry
+                            zlog::warn!("stale socket detected, cleaning: {:?}", socket_path);
+                            let _ = std::fs::remove_file(&socket_path);
+                            return bind_socket(name).await;
+                        }
+                    }
+                }
+            }
+            Err(e)
+        }
+    }
+}
+
 /// §3.6 初始化数据库连接
 fn init_database(db_path: &PathBuf) -> Result<Connection> {
     let db = Connection::open_file(db_path.to_str().unwrap_or("file::memory:?mode=memory"));
@@ -148,7 +182,7 @@ pub fn run() -> Result<()> {
 
     rt.block_on(async {
         let socket_name = default_socket_name();
-        let listener = match bind_socket(&socket_name).await {
+        let listener = match bind_or_cleanup(&socket_name).await {
             Ok(l) => l,
             Err(e) => {
                 zlog::error!("socket bind failed: error={}", e);
@@ -341,7 +375,7 @@ fn idle_sleep(deadline: Option<tokio::time::Instant>) -> Pin<Box<dyn Future<Outp
     match deadline {
         // Never resolves — far-future deadline keeps the select! branch inert.
         None => Box::pin(tokio::time::sleep_until(
-            tokio::time::Instant::now() + Duration::from_secs(u64::MAX / 2),
+            tokio::time::Instant::now() + Duration::from_secs(86400 * 365 * 10),
         )),
         Some(d) => Box::pin(async move {
             tokio::time::sleep_until(d).await;

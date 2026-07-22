@@ -30,6 +30,7 @@ impl TestServer {
     fn spawn() -> Result<Self> {
         let tmp = TempDir::new()?;
         let socket_path = tmp.path().join("mux.sock");
+        let db_path = tmp.path().join("mux.db");
 
         let server_bin = std::env::var("Z3RM_SERVER_BIN").ok().unwrap_or_else(|| {
             let manifest = std::env::var("CARGO_MANIFEST_DIR")
@@ -48,12 +49,12 @@ impl TestServer {
         let child = std::process::Command::new(&server_bin)
             .arg("--daemonize")
             .env("Z3RM_MUX_SOCKET", &socket_path)
+            .env("Z3RM_MUX_DB", &db_path)
             .env("SHELL", "/bin/sh")
             .stdout(std::process::Stdio::null())
             .stderr(std::process::Stdio::null())
             .spawn()
             .with_context(|| format!("failed to spawn {server_bin}"))?;
-
         // Wait for socket
         let deadline = Instant::now() + Duration::from_secs(10);
         while !socket_path.exists() {
