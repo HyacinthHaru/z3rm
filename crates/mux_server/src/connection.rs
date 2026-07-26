@@ -58,9 +58,18 @@ pub async fn handle_connection(
     // §3.3 客户端角色: 初始为 None, attach 后设置 (Plan 33)
     let client_role: Arc<parking_lot::Mutex<Option<ClientRole>>> =
         Arc::new(parking_lot::Mutex::new(None));
+    // Per-connection client identity — never process-wide alone.
+    let connection_client_id: Arc<parking_lot::Mutex<Option<String>>> =
+        Arc::new(parking_lot::Mutex::new(None));
 
     let read_handle = {
         let outbound_tx = outbound_tx.clone();
+        let sessions = sessions.clone();
+        let db = db.clone();
+        let clipboard = clipboard.clone();
+        let client_role = client_role.clone();
+        let connection_client_id = connection_client_id.clone();
+        let shutdown_state = shutdown_state.clone();
         tokio::spawn(async move {
             let mut reader = reader;
             let mut first = true;
@@ -78,7 +87,17 @@ pub async fn handle_connection(
                         anyhow::bail!("protocol version mismatch");
                     }
                 }
-                dispatch_envelope(&envelope, &sessions, &outbound_tx, &db, &clipboard, &client_role, &shutdown_state).await?;
+                dispatch_envelope(
+                    &envelope,
+                    &sessions,
+                    &outbound_tx,
+                    &db,
+                    &clipboard,
+                    &client_role,
+                    &connection_client_id,
+                    &shutdown_state,
+                )
+                .await?;
             }
             #[allow(unreachable_code)]
             Ok::<_, anyhow::Error>(())
@@ -107,6 +126,14 @@ pub async fn handle_connection(
     });
 
     let _ = tokio::join!(read_handle, write_handle);
+    // §3.10 On EOF, remove this connection from every session so attached_clients
+    // does not leak after CLI one-shots or GUI exit.
+    if let Some(client_id) = connection_client_id.lock().clone() {
+        let mut sessions_w = sessions.write();
+        for session in sessions_w.iter_mut() {
+            session.remove_attached_client(&client_id);
+        }
+    }
     Ok(())
 }
 
@@ -153,6 +180,7 @@ async fn dispatch_envelope(
     _db: &Arc<parking_lot::Mutex<Connection>>,
     clipboard: &Arc<crate::clipboard::ServerClipboard>,
     client_role: &Arc<parking_lot::Mutex<Option<ClientRole>>>,
+    connection_client_id: &Arc<parking_lot::Mutex<Option<String>>>,
     shutdown_state: &Arc<crate::ShutdownState>,
 ) -> anyhow::Result<()> {
     let payload = match &envelope.payload {
@@ -165,7 +193,7 @@ async fn dispatch_envelope(
             let request_id = req.request_id;
             // dispatch_request 内部会把 Response 通过 outbound_tx 发回,
             // 也可能向 outbound_tx push Notification (用于 attach 等)
-            dispatch_request(req, sessions, outbound_tx, clipboard, client_role, shutdown_state).await?;
+            dispatch_request(req, sessions, outbound_tx, clipboard, client_role, connection_client_id, shutdown_state).await?;
             // request_id 仅用于日志, 实际 response 已经在 dispatch_request 内发出
             let _ = request_id;
         }
@@ -186,6 +214,7 @@ async fn dispatch_request(
     outbound_tx: &mpsc::UnboundedSender<Envelope>,
     clipboard: &Arc<crate::clipboard::ServerClipboard>,
     client_role: &Arc<parking_lot::Mutex<Option<ClientRole>>>,
+    connection_client_id: &Arc<parking_lot::Mutex<Option<String>>>,
     shutdown_state: &Arc<crate::ShutdownState>,
 ) -> anyhow::Result<()> {
     let request_id = req.request_id;
@@ -220,8 +249,8 @@ async fn dispatch_request(
         // §3.3 无权限要求的操作
         RequestBody::CreateSession(r) => handle_create_session(r, sessions).await?,
         RequestBody::ListSessions(_) => handle_list_sessions(sessions).await?,
-        RequestBody::Attach(r) => handle_attach(r, sessions, client_role, outbound_tx).await?,
-        RequestBody::Detach(_) => handle_detach(sessions).await?,
+        RequestBody::Attach(r) => handle_attach(r, sessions, client_role, connection_client_id, outbound_tx).await?,
+        RequestBody::Detach(_) => handle_detach(sessions, connection_client_id).await?,
         RequestBody::FetchGridUpdate(r) => handle_fetch_grid_update(r, sessions).await?,
         RequestBody::FetchScrollback(r) => handle_fetch_scrollback(r, sessions).await?,
         RequestBody::SearchScrollback(r) => handle_search_scrollback(r, sessions).await?,
@@ -507,6 +536,7 @@ async fn handle_attach(
     req: &AttachRequest,
     sessions: &Arc<parking_lot::RwLock<Vec<crate::session::Session>>>,
     client_role: &Arc<parking_lot::Mutex<Option<ClientRole>>>,
+    connection_client_id: &Arc<parking_lot::Mutex<Option<String>>>,
     outbound_tx: &mpsc::UnboundedSender<Envelope>,
 ) -> anyhow::Result<ResponseBody> {
     let mut sessions_w = sessions.write();
@@ -517,15 +547,25 @@ async fn handle_attach(
 
     zlog::info!("client attached: session={} mode={:?}", req.session_id, req.mode);
 
-    // §3.3 解析客户端身份 (Plan 33)
-    let client_id = if let Some(identity) = &req.identity {
-        if !identity.client_id.is_empty() {
-            identity.client_id.clone()
+    // Prefer an already-assigned per-connection id so re-attach is idempotent
+    // for this socket. Mint a connection-scoped id (never process-wide alone).
+    let client_id = {
+        let mut stored = connection_client_id.lock();
+        if let Some(existing) = stored.as_ref() {
+            existing.clone()
         } else {
-            format!("client-{}", std::process::id())
+            let minted = if let Some(identity) = &req.identity {
+                if !identity.client_id.is_empty() {
+                    format!("{}-{}", identity.client_id, nanoid::nanoid!(8))
+                } else {
+                    format!("client-{}-{}", std::process::id(), nanoid::nanoid!(8))
+                }
+            } else {
+                format!("client-{}-{}", std::process::id(), nanoid::nanoid!(8))
+            };
+            *stored = Some(minted.clone());
+            minted
         }
-    } else {
-        format!("client-{}", std::process::id())
     };
 
     // §3.3 角色解析:identity 显式声明时以其为准;否则保留既有角色
@@ -545,6 +585,11 @@ async fn handle_attach(
         3 => crate::session::AttachMode::ReadOnly,
         _ => crate::session::AttachMode::Shared,
     };
+    // Idempotent attach for this connection; Steal clears other clients.
+    session.remove_attached_client(&client_id);
+    if mode == crate::session::AttachMode::Steal {
+        session.attached_clients.write().clear();
+    }
     session.add_attached_client(client_id, mode, role);
 
     if !req.window_id.is_empty() {
@@ -603,10 +648,17 @@ async fn handle_attach(
     }))
 }
 
-/// §3.10 断开连接
+/// §3.10 断开连接 — remove this connection's client registration.
 async fn handle_detach(
-    _sessions: &Arc<parking_lot::RwLock<Vec<crate::session::Session>>>,
+    sessions: &Arc<parking_lot::RwLock<Vec<crate::session::Session>>>,
+    connection_client_id: &Arc<parking_lot::Mutex<Option<String>>>,
 ) -> anyhow::Result<ResponseBody> {
+    if let Some(client_id) = connection_client_id.lock().clone() {
+        let mut sessions_w = sessions.write();
+        for session in sessions_w.iter_mut() {
+            session.remove_attached_client(&client_id);
+        }
+    }
     Ok(ResponseBody::Error(String::new()))
 }
 
