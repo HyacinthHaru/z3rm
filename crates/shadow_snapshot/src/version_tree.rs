@@ -30,8 +30,10 @@ pub enum SnapshotTrigger {
     Close,
     /// 防抖计时器触发
     Debounce,
-    /// Decline 协议触发
+    /// Decline 协议触发：WAL 意图，标记一次还原操作的开始
     Decline,
+    /// Decline 完成标记：文件已写回并 fsync，recovery 据此跳过已完成条目
+    DeclineDone,
     /// 文件删除事件
     Delete,
 }
@@ -136,6 +138,73 @@ impl VersionTree {
             let mut heads = self.heads.write();
             heads.insert(path_hash, node.version_id);
         }
+    }
+
+    /// 从持久化节点重建内存版本树（重启恢复）。
+    ///
+    /// 与 `add_node` 不同，这里直接重建 rather than append：不触达 orphan 标记、
+    /// 不按旧 HEAD 语义改链。调用方应按 version_id 升序传入节点，保证父节点先于
+    /// 子节点入树，使 ancestor 跳表能正确构建。HEAD 取每个 path 下 seq_no 最大
+    /// 的节点。`next_version_id` 设为已存最大 version_id + 1。
+    pub fn rebuild_from_nodes(
+        &self,
+        nodes: Vec<VersionNode>,
+        max_version_id: VersionId,
+    ) {
+        let mut next_id = self.next_id.lock();
+        *next_id = max_version_id.saturating_add(1).max(1);
+        drop(next_id);
+
+        let mut heads: HashMap<PathHash, (SeqNo, VersionId)> = HashMap::new();
+
+        // 先插入所有节点（构建顺序按 version_id 升序），重算 ancestor 表。
+        let mut nodes_map = self.nodes.write();
+        for mut node in nodes {
+            // 重算 ancestor 跳表；build_ancestor_table 读取已插入的父节点。
+            node.ancestors = self.build_ancestor_table_locked(&nodes_map, node.version_id, node.parent_id);
+            let path = node.path_hash;
+            let seq = node.seq_no;
+            let vid = node.version_id;
+            heads
+                .entry(path)
+                .and_modify(|(max_seq, max_vid)| {
+                    if seq > *max_seq {
+                        *max_seq = seq;
+                        *max_vid = vid;
+                    }
+                })
+                .or_insert((seq, vid));
+            nodes_map.insert(node.version_id, Arc::new(node));
+        }
+        drop(nodes_map);
+
+        let mut head_map = self.heads.write();
+        for (path, (_, vid)) in heads {
+            head_map.insert(path, vid);
+        }
+    }
+
+    /// 在已持有 `nodes` 写锁的前提下构建 ancestor 跳表（重建专用）。
+    fn build_ancestor_table_locked(
+        &self,
+        nodes: &HashMap<VersionId, Arc<VersionNode>>,
+        _version_id: VersionId,
+        parent_id: Option<VersionId>,
+    ) -> SmallVec<[VersionId; 16]> {
+        let mut table: SmallVec<[VersionId; 16]> = SmallVec::new();
+        if let Some(parent) = parent_id {
+            table.push(parent);
+            if let Some(parent_node) = nodes.get(&parent) {
+                for k in 1..16 {
+                    if k - 1 < parent_node.ancestors.len() {
+                        table.push(parent_node.ancestors[k - 1]);
+                    } else {
+                        break;
+                    }
+                }
+            }
+        }
+        table
     }
 
     /// 前进 HEAD：为新版本创建节点并设为当前 HEAD
@@ -278,6 +347,48 @@ impl VersionTree {
     pub fn iter_heads(&self) -> HashMap<PathHash, VersionId> {
         let heads = self.heads.read();
         heads.clone()
+    }
+
+    /// 删除一个节点：从 nodes、heads、orphans 中移除。
+    ///
+    /// 由 GC 在确认该节点不在任何 HEAD 的重建链上、且其 delta children
+    /// 已提升为 full 之后调用。不会级联删除子节点——调用方负责先提升依赖者。
+    pub fn remove_node(&self, version_id: VersionId) {
+        let mut nodes = self.nodes.write();
+        if let Some(node) = nodes.remove(&version_id) {
+            drop(nodes);
+            // 若它是某 path 的 HEAD，则把该 path 的 HEAD 清空；
+            // 调用方在删 HEAD 前必须保证已无依赖者（GC 流程保证）。
+            let mut heads = self.heads.write();
+            if heads.get(&node.path_hash) == Some(&version_id) {
+                heads.remove(&node.path_hash);
+            }
+            drop(heads);
+            let mut orphans = self.orphans.write();
+            orphans.remove(&version_id);
+        }
+    }
+
+    /// 把一个 delta-only 节点就地提升为 full snapshot。
+    ///
+    /// GC 在删除其 full base 之前调用：先 materialize 出 child 内容，
+    /// 存为新 full blob，再把节点改写为 full（清 delta、delta_depth=0），
+    /// 父链和 ancestors 不变。返回旧 delta 引用供调用方 unref。
+    pub fn promote_to_full(
+        &self,
+        version_id: VersionId,
+        new_full_hash: ContentHash,
+    ) -> Option<DeltaRef> {
+        let mut nodes = self.nodes.write();
+        let node = nodes.get(&version_id)?.clone();
+        let old_delta = node.delta.clone();
+        // Arc 没有 DerefMut；用可变克隆重建节点再换回 map。
+        let mut updated = (*node).clone();
+        updated.full_content = Some(new_full_hash);
+        updated.delta = None;
+        updated.delta_depth = 0;
+        nodes.insert(version_id, Arc::new(updated));
+        old_delta
     }
 }
 

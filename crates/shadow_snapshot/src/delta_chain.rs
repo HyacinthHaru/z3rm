@@ -74,10 +74,12 @@ impl DeltaReplay {
         get_blob: impl Fn(&[u8; 32]) -> Option<Vec<u8>>,
     ) -> Option<Rope> {
         // 收集从 target 回溯到最近 full snapshot 的路径 (不含 base)。
+        // 最多走 D_MAX+1 步:按契约 delta 深度 ≤ D_MAX,因此至多 D_MAX 个 delta
+        // 跳后再取到 full base(共 D_MAX+1 次 get_node)。多余则视为链断裂。
         let mut path: Vec<Arc<VersionNode>> = Vec::new();
         let mut current_id = target.version_id;
         let mut base_content: Option<Vec<u8>> = None;
-        for _ in 0..D_MAX {
+        for _ in 0..=D_MAX {
             let node = get_node(current_id)?;
             if let Some(full_hash) = &node.full_content {
                 base_content = get_blob(full_hash);

@@ -35,6 +35,247 @@ const URL_PREFIX: [&'static str; 5] = ["z3rm://", "http://", "https://", "file:/
 
 struct Detect;
 
+/// Clean-cutover mux forwarder (CliAuditRevived P0).
+///
+/// The installed `bin/z3rm` is the editor wrapper (`crates/cli`); the mux CLI
+/// surface (`ls`, `send-keys`, `capture-pane`, …) lives in `crates/z3rm`, the
+/// binary installed alongside it as `libexec/z3rm` / `Contents/MacOS/z3rm`.
+/// When the wrapper is invoked with a known mux subcommand as the first
+/// argument, it forwards the matching `argv[1..]` (with the wrapper-only
+/// `--z3rm <path>` override consumed and stripped) to that sibling binary and
+/// exits with the child's status — before any clap parsing or path-open IPC.
+///
+/// This is a *routing table*, not a parser: the command set is the only thing
+/// duplicated, and only by name. All flag parsing / validation stays in
+/// `crates/z3rm/src/cli.rs` (single parser). Aliases accepted by the mux binary
+/// (`list-sessions` → `ls`, `kill-session`/`kill` → mux kill) are included so
+/// the wrapper never drops a subcommand the real CLI would accept.
+mod mux_forward {
+    use std::ffi::{OsStr, OsString};
+    use std::process::Command;
+
+    use crate::InstalledApp;
+    use anyhow::{Context as _, Result};
+
+    /// Subcommand names owned by `crates/z3rm/src/cli.rs`. Membership here
+    /// only decides whether to forward; all flag parsing / validation stays
+    /// in that single parser. Aliases accepted by the mux binary
+    /// (`list-sessions` → `ls`, `kill-session`/`kill` → mux kill) are included
+    /// so the wrapper never drops a subcommand the real CLI would accept.
+    pub(super) const MUX_SUBCOMMANDS: &[&str] = &[
+        "ls",
+        "list-sessions",
+        "new",
+        "kill",
+        "kill-session",
+        "kill-server",
+        "attach",
+        "detach",
+        "split-window",
+        "send-keys",
+        "capture-pane",
+        "list-panes",
+        "select-pane",
+        "kill-pane",
+        "resize-pane",
+        "new-window",
+        "rename-window",
+        "help",
+    ];
+
+    /// True iff `first` names a mux subcommand this wrapper must forward.
+    pub(super) fn is_mux_subcommand(first: &OsStr) -> bool {
+        first
+            .to_str()
+            .is_some_and(|s| MUX_SUBCOMMANDS.contains(&s))
+    }
+
+    /// Replaces this process with the sibling mux binary, forwarding `args`
+    /// (which is `argv[1..]`) verbatim. Inherits stdio so the mux CLI owns all
+    /// output, then exits with the child's status.
+    pub(super) fn exec(sibling: &std::path::Path, args: &[OsString]) -> ! {
+        let status = match Command::new(sibling).args(args).status() {
+            Ok(status) => status,
+            Err(error) => {
+                eprintln!(
+                    "error: failed to forward to mux binary {}: {error:#}",
+                    sibling.display()
+                );
+                std::process::exit(1);
+            }
+        };
+        // Propagate the child's exit status. Code → same code; signal death →
+        // 128+signum, the portable shell convention (no libc dependency).
+        match status.code() {
+            Some(code) => std::process::exit(code),
+            None => {
+                #[cfg(unix)]
+                {
+                    use std::os::unix::process::ExitStatusExt as _;
+                    if let Some(signal) = status.signal() {
+                        std::process::exit(128 + signal);
+                    }
+                }
+                std::process::exit(1);
+            }
+        }
+    }
+
+    /// Top-level entry: if `argv[1]` is a known mux subcommand, resolve the
+    /// sibling `z3rm` binary and exec it with `argv[1..]` (minus the
+    /// wrapper-only `--z3rm <path>` override, which is consumed here for
+    /// sibling resolution and is not something the mux CLI parses). Returns
+    /// `Ok(())` only when no forward happened.
+    pub(super) fn try_forward() -> Result<()> {
+        let args: Vec<OsString> = std::env::args_os().skip(1).collect();
+        let Some(first) = args.first() else {
+            return Ok(());
+        };
+        if !is_mux_subcommand(first) {
+            return Ok(());
+        }
+
+        let override_path = override_z3rm(&args);
+        let forwarded = strip_z3rm(&args);
+        let app = crate::Detect::detect(override_path.as_deref()).context("Bundle detection")?;
+        let sibling = app.path();
+        exec(&sibling, &forwarded);
+    }
+
+    /// Returns `argv[1..]` with the wrapper-only `--z3rm <path>` pairs removed,
+    /// so the sibling receives only the mux subcommand and its real arguments.
+    fn strip_z3rm(args: &[OsString]) -> Vec<OsString> {
+        let mut out = Vec::with_capacity(args.len());
+        let mut iter = args.iter();
+        while let Some(arg) = iter.next() {
+            if arg == "--z3rm" {
+                // Drop the flag and its value pair.
+                iter.next();
+            } else {
+                out.push(arg.clone());
+            }
+        }
+        out
+    }
+
+    /// Looks for a `--z3rm <path>` pair so the forward respects the same
+    /// custom-editor override as editor launch. Returns the first match.
+    fn override_z3rm(args: &[OsString]) -> Option<std::path::PathBuf> {
+        let mut iter = args.iter();
+        while let Some(arg) = iter.next() {
+            if arg == "--z3rm" {
+                if let Some(value) = iter.next() {
+                    return Some(std::path::PathBuf::from(value));
+                }
+            }
+        }
+        None
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+        use std::ffi::OsString;
+
+        #[test]
+        fn forwards_known_mux_subcommands() {
+            for name in [
+                "ls",
+                "list-sessions",
+                "new",
+                "kill",
+                "kill-session",
+                "kill-server",
+                "attach",
+                "detach",
+                "split-window",
+                "send-keys",
+                "capture-pane",
+                "list-panes",
+                "select-pane",
+                "kill-pane",
+                "resize-pane",
+                "new-window",
+                "rename-window",
+                "help",
+            ] {
+                assert!(
+                    is_mux_subcommand(&OsString::from(name)),
+                    "{name:?} should forward"
+                );
+            }
+        }
+
+        #[test]
+        fn does_not_forward_editor_flags_or_paths() {
+            for name in ["--foreground", "--version", "--help", "--z3rm", "-n", "new-window-foo", "lsx"]
+            {
+                assert!(
+                    !is_mux_subcommand(&OsString::from(name)),
+                    "{name:?} must not forward (clap/editor path owns it)"
+                );
+            }
+        }
+
+        #[test]
+        fn override_z3rm_finds_path_value() {
+            let args: Vec<OsString> = vec![
+                "send-keys".into(),
+                "--z3rm".into(),
+                "/opt/z3rm/z3rm".into(),
+                "Enter".into(),
+            ];
+            assert_eq!(
+                override_z3rm(&args),
+                Some(std::path::PathBuf::from("/opt/z3rm/z3rm"))
+            );
+        }
+
+        #[test]
+        fn override_z3rm_absent_returns_none() {
+            let args: Vec<OsString> = vec!["ls".into()];
+            assert_eq!(override_z3rm(&args), None);
+        }
+
+        #[test]
+        fn strip_z3rm_removes_override_pair_forwarding_real_args_only() {
+            let args: Vec<OsString> = vec![
+                "send-keys".into(),
+                "--z3rm".into(),
+                "/opt/z3rm/z3rm".into(),
+                "-t".into(),
+                "my-session".into(),
+                "Enter".into(),
+            ];
+            assert_eq!(
+                strip_z3rm(&args),
+                vec![
+                    OsString::from("send-keys"),
+                    OsString::from("-t"),
+                    OsString::from("my-session"),
+                    OsString::from("Enter"),
+                ]
+            );
+        }
+
+        #[test]
+        fn strip_z3rm_with_no_override_is_identity() {
+            let args: Vec<OsString> = vec!["ls".into(), "-t".into(), "s".into()];
+            assert_eq!(strip_z3rm(&args), args);
+        }
+
+        #[test]
+        fn strip_z3rm_drops_dangling_flag_without_value() {
+            // A trailing --z3rm with no value should not corrupt forwarding:
+            // the flag alone is dropped (override resolution found no value).
+            let args: Vec<OsString> = vec!["ls".into(), "--z3rm".into()];
+            assert_eq!(strip_z3rm(&args), vec![OsString::from("ls")]);
+        }
+    }
+}
+
+
+
 trait InstalledApp {
     fn zed_version_string(&self) -> String;
     fn launch(&self, ipc_url: String, user_data_dir: Option<&str>) -> anyhow::Result<()>;
@@ -517,6 +758,13 @@ fn run() -> Result<()> {
         askpass::main_from_args(&socket, std::env::args().skip(1));
         return Ok(());
     }
+
+    // Clean cutover: forward known mux subcommands (`ls`, `send-keys`,
+    // `capture-pane`, …) to the sibling `libexec/z3rm` before clap parsing —
+    // clap would otherwise reject them as unknown subcommands. The mux CLI
+    // owns all parsing; this wrapper only routes on the command name and
+    // re-execs verbatim. (CliAuditRevived P0)
+    mux_forward::try_forward()?;
 
     let args = Args::parse();
 

@@ -146,13 +146,14 @@ impl Wal {
             w.write_all(&delta.hash)?;
             w.write_all(&delta.compressed_size.to_le_bytes())?;
         }
-        // trigger (u8: 0=Write, 1=Close, 2=Debounce, 3=Decline, 4=Delete)
+        // trigger (u8: 0=Write, 1=Close, 2=Debounce, 3=Decline, 4=Delete, 5=DeclineDone)
         w.write_all(&[match entry.trigger {
             SnapshotTrigger::Write => 0,
             SnapshotTrigger::Close => 1,
             SnapshotTrigger::Debounce => 2,
             SnapshotTrigger::Decline => 3,
             SnapshotTrigger::Delete => 4,
+            SnapshotTrigger::DeclineDone => 5,
         }])?;
 
         Ok(())
@@ -210,6 +211,7 @@ impl Wal {
             2 => SnapshotTrigger::Debounce,
             3 => SnapshotTrigger::Decline,
             4 => SnapshotTrigger::Delete,
+            5 => SnapshotTrigger::DeclineDone,
             _ => SnapshotTrigger::Write,
         };
 
@@ -292,6 +294,7 @@ mod tests {
             SnapshotTrigger::Close,
             SnapshotTrigger::Debounce,
             SnapshotTrigger::Decline,
+            SnapshotTrigger::DeclineDone,
             SnapshotTrigger::Delete,
         ];
 
@@ -309,7 +312,7 @@ mod tests {
         wal.commit().unwrap();
 
         let entries = wal.replay().unwrap();
-        assert_eq!(entries.len(), 5);
+        assert_eq!(entries.len(), 6);
         for (i, entry) in entries.iter().enumerate() {
             assert_eq!(entry.trigger, triggers[i]);
         }

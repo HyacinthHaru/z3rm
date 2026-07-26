@@ -13,7 +13,7 @@ use anyhow::{Context, Result};
 use rusqlite::{Connection, params, OptionalExtension};
 use sha2::{Sha256, Digest};
 
-use crate::version_tree::{ContentHash, PathHash, SeqNo, SnapshotTrigger, VersionId};
+use crate::version_tree::{ContentHash, DeltaRef, PathHash, SeqNo, SnapshotTrigger, VersionId, VersionNode};
 
 /// 小 blob 阈值：小于此值内联到 SQLite
 const INLINE_THRESHOLD: u64 = 4096;
@@ -94,6 +94,7 @@ impl StorageEngine {
             SnapshotTrigger::Close => "Close",
             SnapshotTrigger::Debounce => "Debounce",
             SnapshotTrigger::Decline => "Decline",
+            SnapshotTrigger::DeclineDone => "DeclineDone",
             SnapshotTrigger::Delete => "Delete",
         };
 
@@ -153,6 +154,133 @@ impl StorageEngine {
         Ok(ids)
     }
 
+    /// 重启时从 SQLite 加载所有持久化版本节点，并返回全局 max_seq_no / max_version_id。
+    ///
+    /// 调用方据此重建内存 VersionTree 与 ID 分配器，保证跨重启的 SeqNo / version_id
+    /// 单调性：新写入的 ID 一定大于所有已持久化 ID。ancestors 跳表由 VersionTree 在
+    /// 重建时按 parent 链重算（SQLite 不持久化跳表，避免 GC 改链后失效）。
+    pub fn load_nodes(&self) -> Result<LoadedNodes> {
+        let mut stmt = self.conn.prepare(
+            "SELECT version_id, path_hash, seq_no, parent_id, full_content_hash,
+                    delta_hash, delta_depth, trigger, timestamp_ns
+             FROM version_nodes ORDER BY version_id",
+        )?;
+        let mut rows = stmt.query([])?;
+
+        let mut nodes: Vec<VersionNode> = Vec::new();
+        let mut max_seq_no: SeqNo = 0;
+        let mut max_version_id: VersionId = 0;
+
+        while let Some(row) = rows.next()? {
+            let version_id = row.get::<_, i64>(0)? as VersionId;
+            let mut path_hash = [0u8; 32];
+            let path_blob: Vec<u8> = row.get(1)?;
+            if path_blob.len() != 32 {
+                anyhow::bail!("corrupt path_hash (len {}) for version_id {}", path_blob.len(), version_id);
+            }
+            path_hash.copy_from_slice(&path_blob);
+
+            let seq_no = row.get::<_, i64>(2)? as SeqNo;
+            let parent_id: Option<VersionId> = row
+                .get::<_, Option<i64>>(3)?
+                .map(|v| v as VersionId);
+
+            let full_content_hash: Option<ContentHash> = match row.get::<_, Option<Vec<u8>>>(4)? {
+                Some(blob) if blob.len() == 32 => {
+                    let mut h = [0u8; 32];
+                    h.copy_from_slice(&blob);
+                    Some(h)
+                }
+                Some(_) => anyhow::bail!("corrupt full_content_hash for version_id {}", version_id),
+                None => None,
+            };
+
+            let delta_hash: Option<ContentHash> = match row.get::<_, Option<Vec<u8>>>(5)? {
+                Some(blob) if blob.len() == 32 => {
+                    let mut h = [0u8; 32];
+                    h.copy_from_slice(&blob);
+                    Some(h)
+                }
+                Some(_) => anyhow::bail!("corrupt delta_hash for version_id {}", version_id),
+                None => None,
+            };
+
+            let delta_depth: u8 = row.get::<_, i32>(6)?.clamp(0, 255) as u8;
+            let trigger_str: String = row.get(7)?;
+            let trigger = parse_trigger(&trigger_str).ok_or_else(|| {
+                anyhow::anyhow!("corrupt trigger {:?} for version_id {}", trigger_str, version_id)
+            })?;
+            let timestamp_ns: u128 = row.get::<_, i64>(8)? as u128;
+
+            let delta = delta_hash.map(|hash| {
+                // delta.compressed_size 用于配额估算；持久层不存它，重建阶段记 0，
+                // run_gc 会用 node_blob_sizes 从 blob_refs 读真实大小。
+                DeltaRef { hash, compressed_size: 0 }
+            });
+
+            nodes.push(VersionNode {
+                version_id,
+                path_hash,
+                seq_no,
+                timestamp_ns,
+                parent_id,
+                ancestors: smallvec::smallvec![],
+                full_content: full_content_hash,
+                delta,
+                delta_depth,
+                trigger,
+            });
+
+            max_seq_no = max_seq_no.max(seq_no);
+            max_version_id = max_version_id.max(version_id);
+        }
+
+        Ok(LoadedNodes {
+            nodes,
+            max_seq_no,
+            max_version_id,
+        })
+    }
+    /// 查询 blob 引用表中的总保留字节数（ref_count > 0 的 size 之和）。
+    /// 用于 QuotaManager 计算实际已占用的存储空间。
+    pub fn total_blob_bytes(&self) -> anyhow::Result<u64> {
+        let total: i64 = self.conn.query_row(
+            "SELECT COALESCE(SUM(size), 0) FROM blob_refs WHERE ref_count > 0",
+            [],
+            |row| row.get(0),
+        )?;
+        Ok(total as u64)
+    }
+
+    /// 获取版本节点 blob 对应的实际大小（full 或 delta）。
+    pub fn node_blob_sizes(
+        &self,
+        content_hash: &[u8; 32],
+        delta_hash: Option<&[u8; 32]>,
+    ) -> anyhow::Result<(u64, u64)> {
+        let content_size: i64 = self
+            .conn
+            .query_row(
+                "SELECT COALESCE(SUM(size), 0) FROM blob_refs
+                 WHERE content_hash = ?1 AND ref_count > 0",
+                rusqlite::params![&content_hash[..]],
+                |row| row.get(0),
+            )?;
+        let delta_size: i64 = match delta_hash {
+            Some(hash) => self
+                .conn
+                .query_row(
+                    "SELECT COALESCE(SUM(size), 0) FROM blob_refs
+                     WHERE content_hash = ?1 AND ref_count > 0",
+                    rusqlite::params![&hash[..]],
+                    |row| row.get(0),
+                )?,
+            None => 0,
+        };
+        Ok((content_size as u64, delta_size as u64))
+    }
+
+
     /// 删除版本节点
     pub fn delete_node(&self, version_id: VersionId) -> Result<()> {
         self.conn
@@ -164,6 +292,29 @@ impl StorageEngine {
     pub fn connection(&self) -> &Connection {
         &self.conn
     }
+}
+
+/// `StorageEngine::load_nodes` 的返回值。
+pub struct LoadedNodes {
+    /// 全部持久化节点，按 version_id 升序。
+    pub nodes: Vec<VersionNode>,
+    /// 已持久化的最大 SeqNo（空库时为 0）。
+    pub max_seq_no: SeqNo,
+    /// 已持久化的最大 VersionId（空库时为 0）。
+    pub max_version_id: VersionId,
+}
+
+/// 把 SQLite 中的 trigger 字符串还原为 `SnapshotTrigger`。
+fn parse_trigger(s: &str) -> Option<SnapshotTrigger> {
+    Some(match s {
+        "Write" => SnapshotTrigger::Write,
+        "Close" => SnapshotTrigger::Close,
+        "Debounce" => SnapshotTrigger::Debounce,
+        "Decline" => SnapshotTrigger::Decline,
+        "DeclineDone" => SnapshotTrigger::DeclineDone,
+        "Delete" => SnapshotTrigger::Delete,
+        _ => return None,
+    })
 }
 
 /// BlobStore：content-addressed 对象存储

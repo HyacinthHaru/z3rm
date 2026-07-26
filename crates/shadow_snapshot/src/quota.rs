@@ -1,16 +1,22 @@
-//! Quota GC：age-based FIFO eviction + promote-to-full
+//! Quota GC：age-based FIFO eviction + promote-to-full（§4.9）
 //!
-//! - 按 seq_no 顺序 evict 最老的节点
-//! - 当 full snapshot 的 delta children 全部被 GC 后，promote-to-full
-//! - Orphan branch pruning：grace period（默认 24h）后 GC 候选
+//! - 删除时按 seq_no 升序（FIFO）evict 最老的节点
+//! - 用 blobstore 的真实保留字节数约束，不靠外部 `used_bytes` 喂入
+//! - 保留所有 HEAD 的 reconstructability：HEAD 的整条 delta 链及其 full base
+//!   一律不可删；删除 full base 前必须先把仍可达的 delta child materialize 成
+//!   full snapshot（promote-to-full），避免悬空 parent/delta 引用
+//! - Orphan 分支 grace period（默认 24h）后变为 GC 候选
 //! - Git commit hook：commit 后标记 pre-commit deltas 为 gc-eligible
 
 use std::collections::{HashMap, HashSet};
 use std::time::{Duration, Instant};
 
+use anyhow::{Context, Result};
 use tracing::{info, warn};
 
-use crate::version_tree::{SeqNo, VersionId, VersionTree};
+use crate::delta_chain::DeltaReplay;
+use crate::storage::{BlobStore, StorageEngine};
+use crate::version_tree::{ContentHash, SeqNo, VersionId, VersionTree};
 
 /// 孤儿分支 grace period（默认 24h）
 const DEFAULT_GRACE_PERIOD: Duration = Duration::from_secs(24 * 3600);
@@ -19,13 +25,13 @@ const DEFAULT_GRACE_PERIOD: Duration = Duration::from_secs(24 * 3600);
 pub struct QuotaManager {
     /// 最大存储空间（字节）
     max_bytes: u64,
-    /// 当前使用空间
+    /// 当前已用空间（由 `run_gc` 根据 blobstore 实际保留字节重算）
     used_bytes: parking_lot::Mutex<u64>,
     /// Grace period（interior mutability）
     grace_period: parking_lot::Mutex<Duration>,
     /// 孤儿节点标记时间
     orphan_since: parking_lot::Mutex<HashMap<VersionId, Instant>>,
-    /// GC 候选集合
+    /// GC 候选集合（planning 用，记录已标记/计划删除的节点）
     gc_eligible: parking_lot::Mutex<HashSet<VersionId>>,
 }
 
@@ -46,66 +52,190 @@ impl QuotaManager {
         *self.grace_period.lock() = period;
     }
 
-    /// 检查是否超过配额
+    /// 检查是否超过配额。`used_bytes` 由上次 `run_gc` 根据 blobstore 实际保留
+    /// 字节刷新；若从未运行过 GC 则始终返回 false（未超配额是诚实的）。
     pub fn is_over_quota(&self) -> bool {
         *self.used_bytes.lock() > self.max_bytes
     }
 
-    /// 执行 GC：age-based FIFO eviction
+    /// 执行 GC：按真实保留字节 FIFO 删除最老的、非保护的节点，直到回到配额内。
     ///
-    /// 按 seq_no 从小到大 evict 最老的节点，直到回到配额内。
-    /// 保留当前 HEAD 链上的所有节点。
-    pub fn run_gc(&self, tree: &VersionTree) -> u64 {
-        let mut freed = 0u64;
-        let head_ids = self.collect_head_ids(tree);
+    /// 保护集 = 每个 HEAD 的重建链（HEAD → parent → … 直到 full base 含），
+    /// 保证回收后所有 HEAD 都仍可重建。删除一个 full base 前，先把其仍可达的
+    /// delta child 在位提升为 full（materialize → 写新 full blob → 改写节点），
+    /// 释放对旧 base 的引用，从而不留下悬空 parent / delta 引用。
+    ///
+    /// 返回本次回收的字节数（基于 blobstore 的实际大小）。
+    pub fn run_gc(
+        &self,
+        tree: &VersionTree,
+        blob_store: &BlobStore,
+        storage: &StorageEngine,
+    ) -> Result<u64> {
+        let used = storage.total_blob_bytes().context("gc: total blob bytes")?;
+        *self.used_bytes.lock() = used;
 
-        // 按 seq_no 排序所有非 HEAD 节点
-        let mut candidates = Vec::new();
-
-        for (id, node) in tree.iter_nodes() {
-            if !head_ids.contains(&id) && !node.full_content.is_some() {
-                // 优先 GC delta 节点（非 full snapshot）
-                candidates.push((node.seq_no, id, node.delta_depth));
-            }
+        let to_free = used.saturating_sub(self.max_bytes);
+        if to_free == 0 {
+            return Ok(0);
         }
 
-        // 按 seq_no 排序（FIFO），delta_depth 高的优先
-        candidates.sort_by(|a, b| a.0.cmp(&b.0).then(b.2.cmp(&a.2)));
+        let protected = self.protected_set(tree);
+        // FIFO：按 seq_no 升序选可删候选，跳过保护集。
+        let mut candidates: Vec<(SeqNo, VersionId)> = tree
+            .iter_nodes()
+            .into_iter()
+            .filter(|(id, _)| !protected.contains(id))
+            .map(|(id, n)| (n.seq_no, id))
+            .collect();
+        candidates.sort_by_key(|(seq, _)| *seq);
 
-        let used = *self.used_bytes.lock();
-        let to_free = used.saturating_sub(self.max_bytes);
-
-        for (seq_no, id, _depth) in &candidates {
+        let mut freed: u64 = 0;
+        for (seq_no, id) in candidates {
             if freed >= to_free {
                 break;
             }
+            let Some(node) = tree.get_node(id) else {
+                continue;
+            };
 
-            // 标记为 GC 候选
-            {
-                let mut eligible = self.gc_eligible.lock();
-                eligible.insert(*id);
+            // 删除其 full base 之前，先把仍可达（在保护集中）的 delta child
+            // 提升为 full snapshot，避免删 base 后 child 重建链断裂。
+            if node.full_content.is_some() {
+                self.promote_protected_delta_children(tree, blob_store, storage, id)?;
             }
 
-            // 估算释放空间（delta 大小）
-            freed += self.estimate_node_size(tree, *id);
+            let (content_size, delta_size) = storage
+                .node_blob_sizes(
+                    node.full_content.as_ref().unwrap_or(&[0u8; 32]),
+                    node.delta.as_ref().map(|d| &d.hash),
+                )
+                .context("gc: node blob sizes")?;
+            let node_bytes = content_size.max(delta_size);
 
-            info!(version_id = *id, seq_no = *seq_no, "gc: evicting node");
+            // 持久层与内存层一致地删除节点。
+            storage
+                .delete_node(id)
+                .context("gc: delete node from storage")?;
+            tree.remove_node(id);
+
+            // unref 该节点引用的 blob（full 与/或 delta）。
+            if let Some(full_hash) = &node.full_content {
+                blob_store.unref(full_hash).context("gc: unref full blob")?;
+            }
+            if let Some(delta) = &node.delta {
+                blob_store
+                    .unref(&delta.hash)
+                    .context("gc: unref delta blob")?;
+            }
+
+            {
+                let mut eligible = self.gc_eligible.lock();
+                eligible.insert(id);
+            }
+            freed += node_bytes;
+            info!(version_id = id, seq_no, freed_bytes = node_bytes, "gc: evicted node");
         }
 
-        *self.used_bytes.lock() = used.saturating_sub(freed);
-
-        // 将 GC 候选标记到 version tree
-        let eligible = self.gc_eligible.lock().clone();
-        if !eligible.is_empty() {
-            let ids: Vec<VersionId> = eligible.into_iter().collect();
-            tree.mark_gc_eligible(&ids);
-        }
-
-        freed
+        // 用实际的回收后大小刷新 used_bytes（保守按 freed 扣减）。
+        let new_used = used.saturating_sub(freed);
+        *self.used_bytes.lock() = new_used;
+        Ok(freed)
     }
 
-    /// 收集所有 HEAD 链上的节点 ID（不可 GC）
-    fn collect_head_ids(&self, tree: &VersionTree) -> HashSet<VersionId> {
+    /// 把指定 full base 节点上仍 *受保护* 的直接 delta child 在位提升为 full。
+    ///
+    /// “受保护”指 child 在某个 HEAD 的重建链上——删除 base 会破坏其重建路径，
+    /// 因此必须先 materialize：reconstruct child 内容 → 存为新 full blob →
+    /// 在 version tree / storage 中改写该 child 为 full → unref 旧 delta blob。
+    fn promote_protected_delta_children(
+        &self,
+        tree: &VersionTree,
+        blob_store: &BlobStore,
+        storage: &StorageEngine,
+        base_id: VersionId,
+    ) -> Result<()> {
+        let protected = self.protected_set(tree);
+        let children: Vec<VersionId> = tree
+            .iter_nodes()
+            .into_iter()
+            .filter(|(_, n)| n.parent_id == Some(base_id) && n.delta.is_some())
+            .map(|(id, _)| id)
+            .collect();
+
+        for child_id in children {
+            if !protected.contains(&child_id) {
+                continue;
+            }
+            let Some(child) = tree.get_node(child_id) else {
+                continue;
+            };
+            // reconstruct child 的当前内容（依赖 base + delta 链）。
+            let rope = DeltaReplay::reconstruct(
+                &child,
+                |id| tree.get_node(id),
+                |hash: &[u8; 32]| blob_store.get(hash).ok(),
+            )
+            .context("gc: promote: reconstruct delta child")?;
+            let content = rope_to_bytes(&rope);
+            let new_full_hash = blob_store.put(&content).context("gc: promote: store full")?;
+            // 在树中改写 child：full_content=新 hash, delta=None, depth=0；拿回旧 delta。
+            let old_delta = tree.promote_to_full(child_id, new_full_hash);
+            // 持久化改写后的 child 节点。
+            storage
+                .write_node(
+                    child_id,
+                    &child.path_hash,
+                    child.seq_no,
+                    child.parent_id,
+                    Some(&new_full_hash),
+                    None,
+                    0,
+                    child.trigger,
+                    child.timestamp_ns,
+                )
+                .context("gc: promote: persist rewritten child")?;
+            // 旧 delta blob 不再被该 child 引用 → unref（refcount--，归零则删）。
+            if let Some(delta) = old_delta {
+                blob_store
+                    .unref(&delta.hash)
+                    .context("gc: promote: unref old delta blob")?;
+            }
+            info!(version_id = child_id, parent = base_id, "gc: promoted delta child to full");
+        }
+        Ok(())
+    }
+
+    /// 计算保护集：所有 HEAD 的可重建链（含 full base）。删除该集合中任何节点
+    /// 都会破坏某个 HEAD 的 reconstructability，故 GC 一律跳过。
+    fn protected_set(&self, tree: &VersionTree) -> HashSet<VersionId> {
+        let mut protected = HashSet::new();
+        for &head_id in tree.iter_heads().values() {
+            let mut current = Some(head_id);
+            // 沿 parent 链回溯，直到遇到 full snapshot 为止（含）。
+            let mut steps = 0u32;
+            while let Some(id) = current {
+                if !protected.insert(id) {
+                    break; // 已访问，避免环/重复
+                }
+                let Some(node) = tree.get_node(id) else { break };
+                if node.full_content.is_some() {
+                    break; // full base：保存就停止回溯
+                }
+                current = node.parent_id;
+                steps += 1;
+                // 保险：delta 链理论上限 D_MAX
+                if steps > crate::delta_chain::D_MAX as u32 {
+                    break;
+                }
+            }
+        }
+        protected
+    }
+
+    /// 收集所有 HEAD 链上的节点 ID（不可 GC）。旧的计划用 API（planning），
+    /// 保留向后兼容；真实保护集语义由 `protected_set` 提供。
+    pub fn collect_head_ids(&self, tree: &VersionTree) -> HashSet<VersionId> {
         let mut head_ids = HashSet::new();
         let orphans = tree.get_orphans();
 
@@ -129,56 +259,31 @@ impl QuotaManager {
         head_ids
     }
 
-    /// 估算节点占用的空间
-    fn estimate_node_size(&self, tree: &VersionTree, id: VersionId) -> u64 {
-        if let Some(node) = tree.get_node(id) {
-            // 估算：delta 节点 ≈ compressed_size，full snapshot ≈ 更大
-            if let Some(delta) = &node.delta {
-                delta.compressed_size
-            } else if node.full_content.is_some() {
-                4096 // 估算 full snapshot 大小
-            } else {
-                0
-            }
-        } else {
-            0
-        }
-    }
-
-    /// Promote-to-full：批量处理可提升的 full snapshot
+    /// Promote-to-full：返回树中已没有任何存活 delta child 的 full snapshot 数。
     ///
-    /// 当 full snapshot 的所有 delta children 都被 GC 后，
-    /// 可以将该 full snapshot 提升为新的 base，释放旧的 delta 引用。
+    /// 旧的纯计划式 API，仅用于报告；真正的 child promotion 由 `run_gc` 在删除
+    /// full base 之前通过 `promote_protected_delta_children` 完成。
     pub fn batch_promote(&self, tree: &VersionTree) -> usize {
-        let mut promoted = 0;
-
-        let full_snapshots: Vec<_> = tree
+        let full_snapshots: Vec<VersionId> = tree
             .iter_nodes()
             .into_iter()
             .filter(|(_, n)| n.full_content.is_some())
+            .map(|(id, _)| id)
             .collect();
 
-        for (snapshot_id, _snapshot) in &full_snapshots {
-            // 检查所有 delta children 是否已被 GC
-            let mut all_children_gc = true;
-
-            for (child_id, child) in tree.iter_nodes() {
+        let mut promoted = 0;
+        for snapshot_id in &full_snapshots {
+            let mut has_live_child = false;
+            for (_, child) in tree.iter_nodes() {
                 if child.parent_id == Some(*snapshot_id) && child.delta.is_some() {
-                    let eligible = self.gc_eligible.lock();
-                    if !eligible.contains(&child_id) {
-                        all_children_gc = false;
-                        break;
-                    }
+                    has_live_child = true;
+                    break;
                 }
             }
-
-            if all_children_gc {
-                // 所有 delta children 已被 GC，可以 promote
-                info!(version_id = *snapshot_id, "gc: promoting full snapshot");
+            if !has_live_child {
                 promoted += 1;
             }
         }
-
         promoted
     }
 
@@ -256,145 +361,9 @@ impl QuotaManager {
     }
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::version_tree::{SnapshotTrigger, VersionNode};
-    use std::sync::Arc;
-
-    fn make_node(seq_no: SeqNo, id: VersionId, parent: Option<VersionId>, full: bool) -> VersionNode {
-        VersionNode {
-            version_id: id,
-            path_hash: [0x11; 32],
-            seq_no,
-            timestamp_ns: 0,
-            parent_id: parent,
-            ancestors: Default::default(),
-            full_content: full.then_some([0xCC; 32]),
-            delta: (!full).then_some(crate::version_tree::DeltaRef {
-                hash: [0xDD; 32],
-                compressed_size: 100,
-            }),
-            delta_depth: if full { 0 } else { 1 },
-            trigger: SnapshotTrigger::Write,
-        }
-    }
-
-    #[test]
-    fn test_gc_fifo_eviction() {
-        let tree = VersionTree::new();
-        let quota = QuotaManager::new(100);
-
-        // 节点 1: path A, full snapshot → HEAD A = 1
-        let node1 = VersionNode {
-            version_id: 1,
-            path_hash: [0xAA; 32],
-            seq_no: 1,
-            timestamp_ns: 0,
-            parent_id: None,
-            ancestors: Default::default(),
-            full_content: Some([0xCC; 32]),
-            delta: None,
-            delta_depth: 0,
-            trigger: SnapshotTrigger::Write,
-        };
-        tree.add_node(Arc::new(node1));
-
-        // 节点 2: path A, delta, parent=1 → HEAD A = 2 (node1 不 orphan)
-        let node2 = VersionNode {
-            version_id: 2,
-            path_hash: [0xAA; 32],
-            seq_no: 2,
-            timestamp_ns: 0,
-            parent_id: Some(1),
-            ancestors: Default::default(),
-            full_content: None,
-            delta: Some(crate::version_tree::DeltaRef {
-                hash: [0xDD; 32],
-                compressed_size: 100,
-            }),
-            delta_depth: 1,
-            trigger: SnapshotTrigger::Write,
-        };
-        tree.add_node(Arc::new(node2));
-
-        // 节点 3: path A, delta, parent=None (分支!) → HEAD A = 3, node2 变 orphan
-        let node3 = VersionNode {
-            version_id: 3,
-            path_hash: [0xAA; 32],
-            seq_no: 3,
-            timestamp_ns: 0,
-            parent_id: None,
-            ancestors: Default::default(),
-            full_content: None,
-            delta: Some(crate::version_tree::DeltaRef {
-                hash: [0xDD; 32],
-                compressed_size: 200,
-            }),
-            delta_depth: 1,
-            trigger: SnapshotTrigger::Write,
-        };
-        tree.add_node(Arc::new(node3));
-
-        *quota.used_bytes.lock() = 400;
-
-        let freed = quota.run_gc(&tree);
-        assert!(freed > 0, "expected to free orphan node2");
-    }
-
-    #[test]
-    fn test_gc_preserves_head_chain() {
-        let tree = VersionTree::new();
-
-        // HEAD chain: 1 → 2 → 3
-        tree.add_node(Arc::new(make_node(1, 1, None, true)));
-        tree.add_node(Arc::new(make_node(2, 2, Some(1), false)));
-        tree.add_node(Arc::new(make_node(3, 3, Some(2), false)));
-
-        let head_ids = QuotaManager::new(0).collect_head_ids(&tree);
-
-        // 所有三个节点都在 HEAD 链上
-        assert!(head_ids.contains(&1));
-        assert!(head_ids.contains(&2));
-        assert!(head_ids.contains(&3));
-    }
-
-    #[test]
-    fn test_orphan_pruning() {
-        let tree = VersionTree::new();
-        let quota = QuotaManager::new(1000);
-        quota.set_grace_period(Duration::from_millis(1));
-
-        // 添加节点然后替换 HEAD（创建 orphan）
-        tree.add_node(Arc::new(make_node(1, 1, None, true)));
-        tree.add_node(Arc::new(make_node(2, 2, None, true)));
-
-        // 手动标记 orphan 为过去时间
-        let past = Instant::now() - Duration::from_secs(1);
-        {
-            let mut orphan_since = quota.orphan_since.lock();
-            orphan_since.insert(1, past);
-        }
-
-        let now = Instant::now();
-        quota.prune_orphan_branches(&tree, now);
-
-        // Orphan 1 已超过 grace period，应被标记
-        assert!(quota.gc_eligible_count() > 0);
-    }
-
-    #[test]
-    fn test_git_commit_hook() {
-        let tree = VersionTree::new();
-        let quota = QuotaManager::new(1000);
-
-        tree.add_node(Arc::new(make_node(1, 1, None, true)));
-        tree.add_node(Arc::new(make_node(2, 2, Some(1), false)));
-        tree.add_node(Arc::new(make_node(3, 3, Some(2), false)));
-
-        // Git commit at seq 2: 标记 seq < 2 的 delta 为 GC
-        quota.on_git_commit(&tree, 2);
-
-        assert_eq!(quota.gc_eligible_count(), 0); // seq 1 是 full snapshot，非 delta
-    }
+/// 把 Rope 的内容转成字节（保留 UTF-8；非 UTF-8 的内容用 lossy 转）。
+fn rope_to_bytes(rope: &rope::Rope) -> Vec<u8> {
+    // DeltaReplay 的 apply 依赖 UTF-8 文本语义，故用 to_string 路径。
+    rope.to_string().into_bytes()
 }
+

@@ -386,3 +386,265 @@ fn integration_reconstruct_replays_delta_chain() -> Result<()> {
 
     Ok(())
 }
+
+// ============================================================
+// §4.5 / §4.4  durability: restart monotonicity + WAL-before-write recovery
+//
+// 这组测试驱动 ShadowSnapshotEngine 真实堆栈,钉死两个契约:
+//   1. 重启后 SeqNo / VersionId 严格单调,且已持久化版本可重建。
+//   2. 崩溃发生在 WAL commit 之后、SQLite write_node 之前时,`open`
+//      的 WAL 回放把缺失的节点补回内存树与 SQLite。
+// ============================================================
+
+/// 打开一个位于同一临时目录的 ShadowSnapshotEngine,并暴露各路径供
+/// “直接写 WAL”的崩溃注入使用。
+fn open_engine(dir: &tempfile::TempDir) -> Result<(
+    shadow_snapshot::ShadowSnapshotEngine,
+    std::path::PathBuf,
+    std::path::PathBuf,
+    std::path::PathBuf,
+)> {
+    let db_path = dir.path().join("shadow.db");
+    let wal_path = dir.path().join("wal.bin");
+    let blob_dir = dir.path().join("blobs");
+    std::fs::create_dir_all(&blob_dir)?;
+    let engine = shadow_snapshot::ShadowSnapshotEngine::open(&db_path, &wal_path, &blob_dir)?;
+    Ok((engine, db_path, wal_path, blob_dir))
+}
+
+/// 重启单调性 + 状态重建。
+///
+/// 记录两个版本后重启,验证:
+///  - 内存树从 SQLite 重建,list_versions 返回两条记录;
+///  - query_version 对每个版本返回正确内容;
+///  - 下一笔 record_change 的 seq_no 严格高于重启前最大 seq_no。
+#[test]
+fn integration_restart_preserves_monotonicity_and_rebuilds_tree() -> Result<()> {
+    let dir = tempfile::tempdir().context("temp dir")?;
+
+    {
+        let (engine, _, _, _) = open_engine(&dir)?;
+        let v1 = engine.record_change(std::path::Path::new("doc.md"), b"alpha\n")?;
+        let v2 = engine.record_change(std::path::Path::new("doc.md"), b"alpha\nbeta\n")?;
+        // 第二个版本走 delta 路径:父存在且 depth+1 <= 16。
+        let node = engine
+            .get_version_node(v2)
+            .expect("test helper invariant");
+        assert_eq!(node.delta_depth, 1, "second change should be a delta");
+        assert!(node.full_content.is_none(), "delta node has no full content");
+        let _ = v1;
+    } // engine dropped; blobs + db + wal persist on disk.
+
+    let (engine, _, _, _) = open_engine(&dir)?;
+    let versions = engine.list_versions(std::path::Path::new("doc.md"))?;
+    assert_eq!(versions.len(), 2, "reopened engine must rebuild both persisted versions");
+    let last_seq_before = versions.iter().map(|(_, s, _)| *s).max().unwrap();
+
+    // 内容必须能从重建的树 + blob store 查回。
+    let c1 = engine.query_version(versions[0].0)?.expect("v1 content");
+    assert_eq!(c1, b"alpha\n");
+    let c2 = engine.query_version(versions[1].0)?.expect("v2 content");
+    assert_eq!(c2, b"alpha\nbeta\n");
+
+    // 重启后下一笔写入的 seq_no 必须严格高于重启前最大值。
+    let fresh = engine.list_versions(std::path::Path::new("doc.md"))?;
+    let _v3 = engine.record_change(std::path::Path::new("doc.md"), b"alpha\nbeta\ngamma\n")?;
+    let after = engine.list_versions(std::path::Path::new("doc.md"))?;
+    let new_max_seq = after.iter().map(|(_, s, _)| *s).max().unwrap();
+    assert!(
+        new_max_seq > last_seq_before,
+        "seq_no must stay strictly monotonic across restart ({} > {})",
+        new_max_seq,
+        last_seq_before,
+    );
+    // version id 也必须唯一且可重建:总版本数现在应为 3。
+    assert_eq!(after.len(), 3);
+    assert_eq!(fresh.len() + 1, after.len());
+
+    Ok(())
+}
+
+/// WAL-before-write 恢复:模拟崩溃在 WAL commit 之后、SQLite write_node 之前。
+///
+/// v1 通过 record_change 完整落盘(SQLite+WAL)。随后直接往 WAL 追加一条
+/// seq_no 更高的 Write 条目并 fsync,但**不**写 SQLite 节点行——复刻崩溃
+/// 在 `wal.commit()` 之后、`storage.write_node` 之前那一瞬。重开引擎后,
+/// `open` 的 WAL 回放应补回内存树 + SQLite,query_version 能取回内容,且
+/// 后续 seq_no 推进到该条目之上。
+#[test]
+fn integration_wal_before_write_recovers_unpersisted_node() -> Result<()> {
+    let dir = tempfile::tempdir().context("temp dir")?;
+    let wal_path = dir.path().join("wal.bin");
+
+    let v1 = {
+        let (engine, _, _, _) = open_engine(&dir)?;
+        engine.record_change(std::path::Path::new("note.txt"), b"hello\n")
+    }?;
+
+    // 直接打开同一 WAL 文件,注入“已 commit 但未持久化节点”的条目。
+    // parent_id = v1,内容是一笔 delta(父存在且 depth+1 = 1 <= 16)。
+    // 但为了证明回放重建任意形态,这里注入纯全快照条目:content_ref 有值,
+    // delta_ref = None,触发 open 的 full-snapshot 回放分支。
+    let ph = path_hash("note.txt");
+    let v2_content = b"hello\nworld\n";
+    {
+        let blob = shadow_snapshot::BlobStore::new(
+            // StorageEngine 重新打开以共享同一 SQLite 文件。
+            std::sync::Arc::new(StorageEngine::open(dir.path().join("shadow.db"))?),
+            dir.path().join("blobs"),
+        );
+        let content_hash = blob.put(v2_content)?;
+        let wal = Wal::open(&wal_path)?;
+        let entry = WalEntry {
+            seq_no: 10_000, // 显著高于 v1 的 seq_no,使其落在 “> max_seq_no” 回放窗口。
+            path_hash: ph,
+            parent_id: Some(v1),
+            content_ref: Some(content_hash),
+            delta_ref: None,
+            trigger: SnapshotTrigger::Write,
+        };
+        wal.append(&entry)?;
+        wal.commit()?;
+        // 故意不写 storage node:模拟崩溃。
+    }
+
+    let (engine, _, _, _) = open_engine(&dir)?;
+    let versions = engine.list_versions(std::path::Path::new("note.txt"))?;
+    assert_eq!(
+        versions.len(),
+        2,
+        "WAL replay must reconstruct the node missing from SQLite",
+    );
+    let recovered = versions
+        .iter()
+        .find(|(_, s, _)| *s == 10_000)
+        .expect("replayed seq_no 10000 node must be present");
+    let content = engine.query_version(recovered.0)?.expect("recovered content");
+    assert_eq!(content, v2_content);
+
+    // 下一次写入必须高于回放后的最大 seq_no(10000),不能复用。
+    let _v3 = engine.record_change(std::path::Path::new("note.txt"), b"hello\nworld!\n")?;
+    let after = engine.list_versions(std::path::Path::new("note.txt"))?;
+    let max_seq = after.iter().map(|(_, s, _)| *s).max().unwrap();
+    assert!(max_seq > 10_000, "seq_no allocator must advance past replayed max");
+
+    Ok(())
+}
+
+/// delta 生成契约:连续变更逐层增深;第 D_MAX+1 次强制全快照重置为 0。
+#[test]
+fn integration_delta_generation_grows_then_forces_full() -> Result<()> {
+    let dir = tempfile::tempdir().context("temp dir")?;
+    let (engine, _, _, _) = open_engine(&dir)?;
+
+    let path = std::path::Path::new("log.txt");
+    // v1: full snapshot, depth 0
+    let _v1 = engine.record_change(path, b"line0")?;
+    // v2..v17: each a delta, depth 1..16
+    let mut last_id = 0u64;
+    for i in 1..=16 {
+        let content = format!("line{}", i);
+        let id = engine.record_change(path, content.as_bytes())?;
+        let node = engine.get_version_node(id).expect("node present");
+        assert_eq!(
+            node.delta_depth, i,
+            "version {} should have delta_depth {}",
+            i, i,
+        );
+        assert!(node.delta.is_some(), "versions 2..17 should be deltas");
+        last_id = id;
+    }
+    // v18: would push depth to 17 > D_MAX → forced full snapshot, depth 0.
+    let id = engine.record_change(path, b"line17")?;
+    let node = engine.get_version_node(id).expect("node present");
+    assert_eq!(node.delta_depth, 0, "17th delta forces full snapshot, depth resets to 0");
+    assert!(node.full_content.is_some(), "forced node is a full snapshot");
+    assert!(node.delta.is_none(), "forced node has no delta ref");
+    // 全链可重建:每个版本 query 都返回其原始内容。
+    for i in 0..=17 {
+        let expected = format!("line{}", i).into_bytes();
+        let versions = engine.list_versions(path)?;
+        let vid = versions[i].0;
+        assert_eq!(engine.query_version(vid)?.unwrap(), expected, "content of version {}", i);
+    }
+    let _ = last_id;
+    Ok(())
+}
+
+/// delta-shape 节点的 WAL 回放:崩溃发生在一条 delta 写入的 WAL commit
+/// 之后、SQLite write_node 之前。`open` 必须把这条 `content_ref = None`、
+/// `delta_ref = Some(...)` 的条目重建为 delta 节点(而非错误地建成 full 节点),
+/// depth 沿父链恢复,内容可重建。
+#[test]
+fn integration_wal_replay_rebuilds_delta_node_shape() -> Result<()> {
+    use shadow_snapshot::{serialize_delta_ops, DeltaOp, BlobStore};
+    use std::sync::Arc as StdArc;
+
+    let dir = tempfile::tempdir().context("temp dir")?;
+    let db_path = dir.path().join("shadow.db");
+    let wal_path = dir.path().join("wal.bin");
+    let blob_dir = dir.path().join("blobs");
+    std::fs::create_dir_all(&blob_dir)?;
+
+    let parent_id = {
+        let (engine, _, _, _) = open_engine(&dir)?;
+        engine.record_change(std::path::Path::new("delta.txt"), b"base line\n")
+    }?;
+
+    // 构造一条 delta 写入:parent = v1(full),把 生产 delta 的逻辑手动复刻,
+    // 只把 delta blob 落盘 + WAL 条目 fsync,故意不写 SQLite 节点行。
+    let ph = path_hash("delta.txt");
+    let new_content = b"base line\nedits\n";
+    let storage = StdArc::new(StorageEngine::open(&db_path)?);
+    let blob_store = BlobStore::new(storage.clone(), blob_dir.clone());
+
+    // delta = Insert "edits\n" at end, transforming "base line\n" -> "base line\nedits\n".
+    let parent_bytes = b"base line\n";
+    let ops = vec![DeltaOp::Insert {
+        offset: parent_bytes.len(),
+        text: StdArc::new(rope::Rope::from("edits\n")),
+    }];
+    let delta_bytes = serialize_delta_ops(&ops);
+    let delta_hash = blob_store.put(&delta_bytes)?;
+    let compressed_size = delta_bytes.len() as u64;
+
+    {
+        let wal = Wal::open(&wal_path)?;
+        let entry = WalEntry {
+            seq_no: 5_000,
+            path_hash: ph,
+            parent_id: Some(parent_id),
+            content_ref: None, // delta 写入:无 full content blob
+            delta_ref: Some(DeltaRef {
+                hash: delta_hash,
+                compressed_size,
+            }),
+            trigger: SnapshotTrigger::Write,
+        };
+        wal.append(&entry)?;
+        wal.commit()?;
+        // 崩溃:不写 SQLite 节点行。
+    }
+
+    let (engine, _, _, _) = open_engine(&dir)?;
+    let versions = engine.list_versions(std::path::Path::new("delta.txt"))?;
+    assert_eq!(versions.len(), 2, "WAL replay must reconstruct the unpersisted delta node");
+
+    let replayed = versions
+        .iter()
+        .find(|(_, s, _)| *s == 5_000)
+        .expect("replayed delta entry seq 5000");
+    let node = engine
+        .get_version_node(replayed.0)
+        .expect("replayed node in tree");
+    // 关键断言:回放必须重建为 delta 形态,而不是 full。
+    assert_eq!(node.delta_depth, 1, "replayed node takes parent.depth + 1");
+    assert!(node.full_content.is_none(), "replayed delta node has no full blob");
+    assert!(node.delta.is_some(), "replayed node carries the delta ref");
+
+    // delta 节点必须可重建为正确内容。
+    let content = engine.query_version(replayed.0)?.expect("reconstructed content");
+    assert_eq!(content, new_content);
+
+    Ok(())
+}
