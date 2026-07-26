@@ -53,13 +53,22 @@ cargo run -p z3rm
 
 ### CLI
 
-The CLI provides tmux-compatible commands for multiplexer control.
+The packaged `bin/z3rm` is the `cli` wrapper. Mux subcommands (`ls`, `new`,
+`attach`, `send-keys`, `capture-pane`, …) are forwarded to the real `z3rm`
+binary (`libexec/z3rm` in packages, or `target/debug/z3rm` in development).
+Prefer running the main binary during development so you exercise the same
+parser the daemon GUI uses:
 
 ```sh
-cargo run -p cli -- ls                 # List sessions
-cargo run -p cli -- new -s mysession   # Create named session
-cargo run -p cli -- kill-session -t id # Kill session
-cargo run -p cli -- split-window -d h  # Split horizontally
+cargo run -p z3rm -- ls
+cargo run -p z3rm -- new -s mysession
+cargo run -p z3rm -- kill-session -t mysession
+cargo run -p z3rm -- split-window -t mysession -h
+cargo run -p z3rm -- send-keys -t mysession Enter
+cargo run -p z3rm -- capture-pane -t mysession -p -e
+
+# Packaged/wrapper path (forwards the same argv after detecting mux verbs):
+cargo run -p cli -- ls
 ```
 
 ## Project Structure

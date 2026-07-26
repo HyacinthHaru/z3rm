@@ -52,7 +52,7 @@ z3rm is a terminal multiplexer forked from the Zed editor, built around a **serv
 |---------|------|-------|
 | `z3rm` (GUI) | GPUI application, window management, extension host | `z3rm` |
 | `z3rm-server` (daemon) | PTY management, terminal emulation, session persistence | `mux_server` |
-| `z3rm` CLI | Command dispatch (attach, kill, status) | `cli` |
+| `z3rm` CLI | Mux control surface (`ls`/`send-keys`/`capture-pane`/…) plus editor open-path; wrapper forwards mux verbs to the main binary | `z3rm` + `cli` |
 
 **Daemon lifecycle** (§16.1):
 1. GUI client calls `ensure_daemon_running()` → spawns `z3rm-server` if socket absent.

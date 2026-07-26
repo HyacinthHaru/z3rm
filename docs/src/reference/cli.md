@@ -1,258 +1,108 @@
 ---
 title: CLI Reference
-description: "Reference for Zed's command-line interface (CLI), including opening files and directories, integrating with tools, and controlling Zed from scripts."
+description: "Reference for z3rm's command-line interface, including tmux-compatible mux control and editor open-path usage."
 ---
 
 # CLI Reference
 
-Use Z3rm's command-line interface (CLI) to open files and directories, integrate with other tools, and control Zed from scripts.
+z3rm exposes one public `z3rm` entry point with two roles:
 
-## Installation
+1. **Mux control** (tmux-compatible) — `ls`, `new`, `attach`, `send-keys`, `capture-pane`, …
+2. **Editor open-path** — open files/directories in the GUI
 
-**macOS:** Run the {#action cli::InstallCliBinary} command from the command palette ({#kb command_palette::Toggle}) to install the `zed` CLI to `/usr/local/bin/zed`.
+## Packaged vs development binary
 
-**Linux:** The CLI is included with Z3rm packages. The binary name is `z3rm`.
+| Build | Binary | Behavior |
+|---|---|---|
+| Development | `cargo run -p z3rm -- <cmd>` | Full mux parser in `crates/z3rm` |
+| Packaged | `bin/z3rm` (`crates/cli` wrapper) | Forwards known mux subcommands to `libexec/z3rm` (or platform equivalent) with identical argv and exit status; remaining args use the editor open-path IPC path |
 
-**Windows:** The CLI is included with Z3rm. Add Z3rm's installation directory to your PATH, or use the full path to `z3rm.exe`.
+Do **not** document `cargo run -p cli -- ls` as the primary mux entry: that only works because the wrapper forwards to the real binary.
 
-## Usage
-
-```sh
-zed [OPTIONS] [PATHS]...
-```
-
-## Opening Files and Directories
-
-Open a file:
+## Mux commands (§3.10)
 
 ```sh
-zed myfile.txt
+z3rm ls
+z3rm new -s <name> [-c <cwd>]
+z3rm kill-session -t <target>
+z3rm kill-server
+z3rm attach [-t <target>] [--ssh ssh://user@host[:port]]
+z3rm detach
+z3rm split-window [-t <pane>] [-h|-v] [-c <command>]
+z3rm send-keys [-t <pane>] <keys...>
+z3rm capture-pane [-t <pane>] [-p] [-S <lines>] [-e]
+z3rm list-panes [-t <session>]
+z3rm select-pane [-t <pane>]
+z3rm kill-pane [-t <pane>]
+z3rm resize-pane [-t <pane>] [-x <cols>] [-y <rows>]
+z3rm new-window [-t <session>]
+z3rm rename-window [-t <pane>] <title>
+z3rm help
 ```
 
-Open a directory as a workspace:
+### Targets
+
+- Omitted pane target → `$Z3RM_PANE` / `$Z3RM_PANE_ID`, else focused pane in `$Z3RM_SESSION`
+- `session` → focused pane of that session
+- `session:W.P` → tab/pane indexes
+- `%N` → global flattened pane index
+
+### Environment in panes
+
+Spawned shells receive:
+
+- `Z3RM_PANE` / `Z3RM_PANE_ID` — current pane id
+- `Z3RM_SESSION` — owning session id
+- `TERM=xterm-256color`, `COLORTERM=truecolor`
+
+### capture-pane
+
+- `-p` print to stdout
+- `-S -N` include the newest N scrollback lines before the visible grid
+- `-e` preserve cell styles as SGR (classic 16-color when near palette, else truecolor)
+
+### send-keys
+
+Shared `mux_protocol::parse_key` names: `Enter`, `Tab`, `Escape`, `BSpace`, arrows, `C-c`, `M-x`, `F1`–`F12`, and literal UTF-8.
+
+### Exit classes
+
+| Code | Meaning |
+|---|---|
+| 0 | Success / help |
+| 2 | Parse error |
+| 1 | Connection / RPC / runtime error |
+
+## Editor open-path options
+
+When the first argument is **not** a mux subcommand, the wrapper/editor path accepts:
 
 ```sh
-zed ~/projects/myproject
+z3rm [OPTIONS] [PATHS]...
 ```
 
-Open multiple files or directories:
+Common options (wrapper):
+
+- `-w`, `--wait` — wait for files to close
+- `-n`, `--new` — new workspace window
+- `-a`, `--add` — add to focused workspace
+- `-r`, `--reuse` — reuse existing window
+
+Open a file at a line/column:
 
 ```sh
-zed file1.txt file2.txt ~/projects/myproject
+z3rm myfile.txt:42
+z3rm myfile.txt:42:10
 ```
 
-Open a file at a specific line and column:
+## Debugging accessibility
 
-```sh
-zed myfile.txt:42        # Open at line 42
-zed myfile.txt:42:10     # Open at line 42, column 10
-```
+With AccessKit enabled (default; disable with `Z3RM_A11Y=0`):
 
-## Options
+- Action `z3rm_debug::DumpAccessibilityTree` writes the last frame AccessKit tree to `$Z3RM_A11Y_DUMP_PATH` or `/tmp/z3rm-a11y-tree.json`.
 
-### `-w`, `--wait`
+## Related
 
-Wait for all opened files to be closed before the CLI exits. When opening a directory, waits until the window is closed.
-
-This is useful for integrating Zed with tools that expect an editor to block until editing is complete (e.g., `git commit`):
-
-```sh
-export EDITOR="zed --wait"
-git commit  # Opens Zed and waits for you to close the commit message file
-```
-
-### `-n`, `--new`
-
-Open paths in a new workspace window, even if the paths are already open in an existing window:
-
-```sh
-zed -n ~/projects/myproject
-```
-
-### `-a`, `--add`
-
-Add paths to the currently focused workspace instead of opening a new window. When multiple workspace windows are open, files open in the focused window:
-
-```sh
-zed -a newfile.txt
-```
-
-### `-r`, `--reuse`
-
-Reuse an existing window, replacing its current workspace with the new paths:
-
-```sh
-zed -r ~/projects/different-project
-```
-
-By default (without `-n`, `-a`, or `-r`), directories open in the current window's sidebar. You can change this default with the `cli_default_open_behavior` setting. See [Windows & Projects](../windows-and-projects.md) for more details.
-
-### `--diff <OLD_PATH> <NEW_PATH>`
-
-Open a diff view comparing two files. Can be specified multiple times:
-
-```sh
-zed --diff file1.txt file2.txt
-zed --diff old.rs new.rs --diff old2.rs new2.rs
-```
-
-### `--foreground`
-
-Run Zed in the foreground, keeping the terminal attached. Useful for debugging:
-
-```sh
-zed --foreground
-```
-
-### `--user-data-dir <DIR>`
-
-Use a custom directory for all user data (database, extensions, logs) instead of the default location:
-
-```sh
-zed --user-data-dir ~/.zed-custom
-```
-
-Default locations:
-
-- **macOS:** `~/Library/Application Support/Zed`
-- **Linux:** `$XDG_DATA_HOME/zed` (typically `~/.local/share/zed`)
-- **Windows:** `%LOCALAPPDATA%\Zed`
-
-### `-v`, `--version`
-
-Print Zed's version and exit:
-
-```sh
-zed --version
-```
-
-### `--completions <SHELL>`
-
-Generate shell completions for the `zed` CLI:
-
-#### Bash
-
-Add to `~/.bashrc`:
-
-```bash
-eval "$(zed --completions bash)"
-```
-
-#### Elvish
-
-Add to `~/.config/elvish/rc.elv`:
-
-```elvish
-set edit:completion:arg-completer[zed] = { |@args|
-    eval (zed --completions elvish | slurp)
-    $edit:completion:arg-completer[zed] $@args
-}
-```
-
-#### Fish
-
-Add to `~/.config/fish/config.fish`:
-
-```fish
-zed --completions fish | source
-```
-
-#### Nushell
-
-Add to `~/.config/nushell/config.nu`:
-
-```nu
-mkdir ($nu.data-dir | path join "vendor/autoload")
-^zed --completions nushell | save --force ($nu.data-dir | path join "vendor/autoload/zed.nu")
-```
-
-#### Powershell
-
-Add to `$PROFILE`:
-
-```powershell
-(&zed --completions powershell) | Out-String | Invoke-Expression
-```
-
-#### Zsh
-
-Add to `~/.zshrc`:
-
-```zsh
-eval "$(zed --completions zsh)"
-```
-
-### `--uninstall`
-
-Uninstall Z3rm and remove all related files (macOS and Linux only):
-
-```sh
-z3rm --uninstall
-```
-
-### `--z3rm <PATH>`
-
-Specify a custom path to the Z3rm application or binary:
-
-```sh
-z3rm --z3rm /path/to/Z3rm.app myfile.txt
-```
-
-## Reading from Standard Input
-
-Read content from stdin by passing `-` as the path:
-
-```sh
-echo "Hello, World!" | zed -
-cat myfile.txt | zed -
-ps aux | zed -
-```
-
-This creates a temporary file with the stdin content and opens it in Zed.
-
-## URL Handling
-
-The CLI can open `z3rm://`, `file://`, and `ssh://` URLs:
-
-```sh
-zed z3rm://settings
-zed file:///Users/whatever/.zshrc
-zed ssh://me@example.com/abs/path
-zed ssh://me@example.com:/abs/path
-zed ssh://me@example.com/~/project
-zed ssh://me@example.com:~/project
-```
-
-## Using Zed as Your Default Editor
-
-Set Zed as your default editor for Git and other tools:
-
-```sh
-export EDITOR="zed --wait"
-export VISUAL="zed --wait"
-```
-
-Add these lines to your shell configuration file (e.g., `~/.bashrc`, `~/.zshrc`).
-
-## macOS: Switching Release Channels
-
-On macOS, you can launch a specific release channel by passing the channel name as the first argument:
-
-```sh
-zed --stable myfile.txt
-zed --preview myfile.txt
-zed --nightly myfile.txt
-```
-
-## WSL Integration (Windows)
-
-On Windows, the CLI supports opening paths from WSL distributions. This is handled automatically when launching Zed from within WSL.
-
-## Exit Codes
-
-| Code | Meaning                           |
-| ---- | --------------------------------- |
-| `0`  | Success                           |
-| `1`  | Error (details printed to stderr) |
-
-When using `--wait`, the exit code reflects whether the files were saved before closing.
+- Architecture: `docs/architecture/overview.md`, `docs/architecture/mux-design.md`
+- Spec: `docs/superpowers/specs/2026-07-14-z3rm-foundation-design.md` §3.10
+- Plan: `docs/superpowers/plans/2026-07-14-plan-27-cli-control-interface.md`
