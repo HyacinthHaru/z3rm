@@ -19,9 +19,15 @@ use mux_protocol::{
     fetch_grid_update_response::Update as FetchUpdate, notification::Event as NotifEvent,
     FullGridSnapshot, GridDiff, Notification, RowChange,
 };
+use mux_protocol::input::{
+    handle_key_event, is_full_screen_active, KeyDispatchContext, KeyDispatchResult, PaneModes,
+    PrefixAction, PrefixModeConfig, PrefixModeMachine,
+};
 use project::Project;
 use settings::Settings;
-use terminal::{Terminal, TerminalBounds, TerminalBuilder, terminal_settings::TerminalSettings};
+use terminal::{
+    Modes, Terminal, TerminalBounds, TerminalBuilder, terminal_settings::TerminalSettings,
+};
 use theme::ActiveTheme;
 use util::paths::PathStyle;
 
@@ -67,7 +73,8 @@ pub struct MuxPaneView {
     zoomed: bool,
     /// §3.10 last resize dimensions sent to server (cols, rows)
     last_sent_size: (u32, u32),
-    prefix_mode: bool,
+    /// §16.5 / §16.7 Shared prefix-mode state machine (live input router).
+    prefix_machine: PrefixModeMachine,
     prefix_timeout_task: Option<gpui::Task<()>>,
 }
 
@@ -154,7 +161,7 @@ impl MuxPaneView {
             snapshot,
             zoomed: false,
             last_sent_size: (80, 24),
-            prefix_mode: false,
+            prefix_machine: PrefixModeMachine::new(PrefixModeConfig::default()),
             prefix_timeout_task: None,
         };
         view.start_notification_listener(cx);
@@ -392,9 +399,64 @@ impl MuxPaneView {
         });
     }
 
-    /// §3.10 keystroke → terminal bytes → send_input via MuxDomain.
+    /// §3.10 / §16.7 keystroke → priority chain → MuxDomain::send_input.
     fn dispatch_keystroke(&mut self, keystroke: &Keystroke, cx: &mut Context<Self>) {
         let bytes = keystroke_to_bytes(keystroke);
+        if bytes.is_empty() {
+            return;
+        }
+
+        let mode = self.terminal.read(cx).last_content().mode;
+        let pane_modes = PaneModes {
+            alt_screen: mode.contains(Modes::ALT_SCREEN),
+            bracketed_paste: mode.contains(Modes::BRACKETED_PASTE),
+            mouse_tracking: mode.intersects(Modes::MOUSE_MODE),
+            any_decset: mode.intersects(
+                Modes::APP_CURSOR
+                    | Modes::APP_KEYPAD
+                    | Modes::FOCUS_IN_OUT
+                    | Modes::ALTERNATE_SCROLL
+                    | Modes::SGR_MOUSE
+                    | Modes::UTF8_MOUSE,
+            ),
+        };
+        self.prefix_machine
+            .set_full_screen_passthrough(is_full_screen_active(&pane_modes));
+
+        let ime_composing = self.terminal_view.read(cx).is_ime_composing();
+        let copy_mode = self.terminal.read(cx).vi_mode_enabled();
+
+        let mut ctx_dispatch = KeyDispatchContext {
+            ime_composing,
+            // Extension shortcuts are consumed by the GPUI keymap before raw key_down.
+            extension_shortcut: None,
+            prefix_mode_machine: self.prefix_machine.clone(),
+            pane_modes,
+            agent_cli_mode: false,
+            copy_mode,
+        };
+
+        // Prefix key entry is owned by EnterPrefixMode action; raw path sees unbound keys.
+        let result = handle_key_event(&bytes, false, false, &mut ctx_dispatch);
+        self.prefix_machine = ctx_dispatch.prefix_mode_machine;
+
+        match result {
+            KeyDispatchResult::RouteToIme
+            | KeyDispatchResult::ExecuteExtensionAction(_)
+            | KeyDispatchResult::ExecutePrefixCommand
+            | KeyDispatchResult::Passthrough
+            | KeyDispatchResult::RouteToCopyMode => {}
+            KeyDispatchResult::RouteToAgentCli => {
+                self.send_bytes_to_pty(bytes, cx);
+            }
+            KeyDispatchResult::SendLiteral { bytes: send_bytes }
+            | KeyDispatchResult::SendToPty { bytes: send_bytes } => {
+                self.send_bytes_to_pty(send_bytes, cx);
+            }
+        }
+    }
+
+    fn send_bytes_to_pty(&self, bytes: Vec<u8>, cx: &mut Context<Self>) {
         if bytes.is_empty() {
             return;
         }
@@ -450,42 +512,58 @@ impl MuxPaneView {
         &self.terminal
     }
 
-    /// §16.5 Enter prefix mode: subsequent keystroke is interpreted as a prefix
-    /// chord and dispatched to the bound keymap action rather than sent to PTY.
-    /// `timeout_ms` caps how long the pane waits for the next keystroke.
+    /// §16.5 Enter prefix mode via the shared PrefixModeMachine.
     pub fn enter_prefix_mode(&mut self, timeout_ms: u64, cx: &mut Context<Self>) {
-        self.prefix_mode = true;
-        cx.notify();
-        let timeout = std::time::Duration::from_millis(if timeout_ms == 0 { 500 } else { timeout_ms });
-        let task = cx.spawn(async move |this, cx| {
-            cx.background_executor().timer(timeout).await;
-            let _ = this.update(cx, |view, cx| {
-                if view.prefix_mode {
-                    view.prefix_mode = false;
-                    view.prefix_timeout_task = None;
-                    cx.notify();
-                }
-            });
+        let mode = self.terminal.read(cx).last_content().mode;
+        let fullscreen = is_full_screen_active(&PaneModes {
+            alt_screen: mode.contains(Modes::ALT_SCREEN),
+            bracketed_paste: mode.contains(Modes::BRACKETED_PASTE),
+            mouse_tracking: mode.intersects(Modes::MOUSE_MODE),
+            any_decset: false,
         });
-        // Replacing an in-flight timeout aborts the previous wait.
-        self.prefix_timeout_task = Some(task);
+        let config = PrefixModeConfig {
+            timeout_ms: if timeout_ms == 0 { 500 } else { timeout_ms },
+            full_screen_passthrough: fullscreen,
+        };
+        // Keep machine config; on_prefix_key uses full_screen_passthrough.
+        self.prefix_machine = PrefixModeMachine::new(config);
+        match self.prefix_machine.on_prefix_key() {
+            PrefixAction::EnterPrefixMode => {
+                cx.notify();
+                let timeout = std::time::Duration::from_millis(
+                    if timeout_ms == 0 { 500 } else { timeout_ms },
+                );
+                let task = cx.spawn(async move |this, cx| {
+                    cx.background_executor().timer(timeout).await;
+                    let _ = this.update(cx, |view, cx| {
+                        if view.prefix_machine.is_prefix_wait() {
+                            view.prefix_machine.on_timeout();
+                            view.prefix_timeout_task = None;
+                            cx.notify();
+                        }
+                    });
+                });
+                self.prefix_timeout_task = Some(task);
+            }
+            PrefixAction::Passthrough => {
+                // Fullscreen: chord key is not intercepted (caller may SendLiteral).
+            }
+            _ => {}
+        }
     }
 
-    /// §16.5 Send a literal keystroke to the PTY, bypassing prefix-mode
-    /// interpretation and copy/paste interception. Used by double-tap escape.
+    /// §16.5 Send a literal keystroke to the PTY (double-tap escape).
     pub fn send_literal(&mut self, keystroke: &str, cx: &mut Context<Self>) {
-        let domain = self.domain.clone();
-        let pane_id = self.pane_id.clone();
-        let bytes = keystroke.as_bytes().to_vec();
-        cx.background_executor()
-            .spawn(async move {
-                if let Err(error) = domain.send_input(&pane_id, &bytes).await {
-                    tracing::error!(pane_id = %pane_id, error = %error, "send_literal failed");
-                }
-            })
-            .detach();
-        self.prefix_mode = false;
+        self.send_bytes_to_pty(keystroke.as_bytes().to_vec(), cx);
+        if self.prefix_machine.is_prefix_wait() {
+            self.prefix_machine.on_timeout();
+        }
         self.prefix_timeout_task = None;
+        cx.notify();
+    }
+
+    fn is_prefix_mode(&self) -> bool {
+        self.prefix_machine.is_prefix_wait()
     }
 }
 
@@ -633,16 +711,12 @@ impl Render for MuxPaneView {
 
         let mut dispatch_context = gpui::KeyContext::new_with_defaults();
         dispatch_context.add("Terminal");
-        if self.prefix_mode {
+        if self.is_prefix_mode() {
             dispatch_context.add("PrefixMode");
         }
 
-        // §16.4 a11y: root exposes Role::Terminal + title label so assistive
-        // tech announces the pane. Remaining gap: the grid cells (text rows,
-        // cursor) are not yet in the tree — TerminalElement implements Element
-        // without a11y_role/a11y_synthetic_children, so line text is invisible
-        // to screen readers. A synthetic-children render of Role::TextRun nodes
-        // is the next step and is intentionally deferred (large redesign).
+        // §16.4 a11y: root exposes Role::Terminal + title label. TerminalElement
+        // synthesizes Role::TextRun children per visible line for screen readers.
 
         div()
             .size_full()
@@ -668,20 +742,24 @@ impl Render for MuxPaneView {
                         TerminalMode::Standalone,
                     )),
             )
-            // §3.1 keyboard input → MuxDomain::send_input (DisplayOnly terminal drops input)
+            // §16.7 keyboard → shared input router → MuxDomain::send_input
             .on_key_down(cx.listener(|this, event: &KeyDownEvent, _window, cx| {
-                if this.prefix_mode {
-                    this.prefix_mode = false;
+                if this.is_prefix_mode() {
+                    // Drop the timeout; machine stays in PrefixWait so handle_key_event
+                    // can still resolve the chord. GPUI keymap may also match PrefixMode.
                     if let Some(task) = this.prefix_timeout_task.take() {
                         task.detach();
                     }
+                    this.dispatch_keystroke(&event.keystroke, cx);
                     cx.notify();
-                    // Let the keymap dispatch the prefix chord action; fall through
-                    // to PTY delivery only if no binding consumed it.
+                    cx.stop_propagation();
                     return;
                 }
+                let ime = this.terminal_view.read(cx).is_ime_composing();
                 this.dispatch_keystroke(&event.keystroke, cx);
-                cx.stop_propagation();
+                if !ime {
+                    cx.stop_propagation();
+                }
             }))
     }
 }

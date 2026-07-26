@@ -175,6 +175,20 @@ impl ScrollbackBuffer {
         }
     }
 
+    /// §16.11 Hot-reload scrollback capacity from server settings.
+    /// Shrinks by dropping the oldest rows first (FIFO).
+    pub fn set_capacity(&mut self, capacity: usize) {
+        self.capacity = capacity;
+        if self.rows.len() > self.capacity {
+            let drop_count = self.rows.len() - self.capacity;
+            self.rows.drain(0..drop_count);
+        }
+    }
+
+    pub fn capacity(&self) -> usize {
+        self.capacity
+    }
+
     /// 追加一行到缓冲区 (§16.9)
     pub fn push_row(&mut self, row: RowChange) {
         self.rows.push(row);

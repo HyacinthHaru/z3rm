@@ -59,8 +59,16 @@ pub struct Pane {
     /// §3.3 PaneDirty 订阅者: 每个连接的 notification_tx。
     /// PTY read loop bump generation 后 fan-out PaneDirty 到所有订阅者。
     subscribers: Arc<parking_lot::RwLock<Vec<mpsc::UnboundedSender<MuxNotification>>>>,
+    /// §3.4 所属 session id (供 spawn_with_session 设置, 普通 spawn 为 None)。
+    /// 强引用未持有 Session 因此不会出现循环, Session 删除后 Pane 实例随之 drop。
+    session_id: parking_lot::Mutex<Option<String>>,
+    /// §3.4 自然退出钩子: PTY EOF 或 alacritty Exit/ChildExit 事件被触发时
+    /// 调用一次。连接到 connection 层注册一个 closure, 该 closure 在自己的线程里
+    /// 走会话级 lifecycle fan-out 路径广播 PaneRemoved + 从 session.layout /
+    /// session.panes 中清理。该字段用 Mutex<Option<...>> 以支持一次性 take,
+    /// 避免 EOF 路径 + Exit 事件路径重复广播。
+    exit_hook: parking_lot::Mutex<Option<Arc<dyn Fn() + Send + Sync>>>,
 }
-
 /// §3.3 Pane 事件收集器 — alacritty `EventListener` 的实现。
 ///
 /// alacritty 在 VT 处理过程中通过 `event_proxy.send_event(...)` 通知 UI
@@ -194,13 +202,18 @@ impl Pane {
             bracketed_paste_mode: AtomicBool::new(false),
             zoomed: AtomicBool::new(false),
             prompt_marker: AtomicU64::new(0),
-            scrollback_buffer: Arc::new(parking_lot::RwLock::new(ScrollbackBuffer::new(10_000))),
+            scrollback_buffer: Arc::new(parking_lot::RwLock::new(ScrollbackBuffer::new(crate::server_settings::default_scrollback_lines()))),
             scrollback_version: Arc::new(parking_lot::RwLock::new(ScrollbackVersion::new())),
             pty_master: Arc::new(Mutex::new(pair.master)),
             pty_writer: Arc::new(Mutex::new(writer)),
             child: Arc::new(Mutex::new(Some(child))),
             events,
             subscribers: Arc::new(parking_lot::RwLock::new(Vec::new())),
+            // §3.4 spawn_with_session 携带的 session_id 让 PTY read loop 在自然退出
+            // 时能定位会话级 lifecycle 订阅者; 空字符串表示未连接会话, 等价于 None。
+            session_id: parking_lot::Mutex::new(
+                if session_id.is_empty() { None } else { Some(session_id) }),
+            exit_hook: parking_lot::Mutex::new(None),
         });
 
         // §3.1 启动 PTY read loop — 后台线程持续读取 PTY 输出, 喂给 alacritty,
@@ -232,6 +245,7 @@ impl Pane {
                     match reader.read(&mut buf) {
                         Ok(0) => {
                             pane.set_alive(false);
+                            pane.fire_exit_hook();
                             return;
                         }
                         Ok(count) => {
@@ -246,6 +260,7 @@ impl Pane {
                         Err(error) => {
                             tracing::error!(pane_id = %pane.id, error = %error, "PTY read failed");
                             pane.set_alive(false);
+                            pane.fire_exit_hook();
                             return;
                         }
                     }
@@ -484,7 +499,12 @@ impl Pane {
                     // §16.6 clipboard 通过 OSC 52 由 connection 层处理
                 }
                 AlacEvent::Exit | AlacEvent::ChildExit(_) => {
+                    // §3.4 自然退出: 标记 dead + 调用 connection 层注册的退出钩子
+                    // (例如清理 session.panes / session.layout 并 fan-out PaneRemoved)。
+                    // handle_pending_events 与 PTY read-loop Ok(0) 路径各自独立, 因此
+                    // fire_exit_hook 内部 take 以保证只执行一次。
                     self.set_alive(false);
+                    self.fire_exit_hook();
                 }
                 _ => {}
             }
@@ -496,7 +516,13 @@ impl Pane {
         self.generation.load(Ordering::SeqCst)
     }
 
+    /// §16.11 Apply hot-reloaded scrollback capacity to this pane.
+    pub fn set_scrollback_capacity(&self, capacity: usize) {
+        self.scrollback_buffer.write().set_capacity(capacity);
+    }
+
     pub fn bump_generation(&self) {
+
         self.generation.fetch_add(1, Ordering::SeqCst);
     }
 
@@ -579,6 +605,38 @@ impl Pane {
 
     pub fn set_alive(&self, alive: bool) {
         self.alive.store(alive, Ordering::SeqCst);
+    }
+
+    /// §3.4 关联该 pane 到所在 session。会话级 lifecycle 通知需要知道
+    /// 目标 session 才能 fan-out; spawn_with_session 已设置, 此处覆盖用于
+    /// "Pane::spawn 后由 connection 层延迟注入" 的回退路径。
+    pub fn set_session_id(&self, session_id: String) {
+        *self.session_id.lock() = Some(session_id);
+    }
+
+    /// §3.4 获取 pane 所属 session id (可能为 None 表示未关联会话)。
+    pub fn get_session_id(&self) -> Option<String> {
+        self.session_id.lock().clone()
+    }
+
+    /// §3.4 注册 PTY 自然退出钩子。由 connection 层在把 pane 加入 session
+    /// 之后调用; 闭包在 PTY EOF 或 alacritty Exit/ChildExit 时被触发,
+    /// 负责 session 级清理 (从 layout / panes 移除) 以及 PaneRemoved fan-out。
+    ///
+    /// 仅设置一次: 重复注册会覆盖前一个钩子, 避免多个连接给同一 pane 重复注册。
+    pub fn set_exit_hook(&self, hook: Arc<dyn Fn() + Send + Sync>) {
+        *self.exit_hook.lock() = Some(hook);
+    }
+
+    /// §3.4 触发并清空 PTY 退出钩子 (一次性)。
+    ///
+    /// 由 PTY read-loop Ok(0) / Err 路径与 alacritty Exit / ChildExit 路径共享;
+    /// take 保证只执行一次, 防止两份清理代码同时跑导致重复 PaneRemoved 广播。
+    pub fn fire_exit_hook(&self) {
+        let hook = self.exit_hook.lock().take();
+        if let Some(hook) = hook {
+            hook();
+        }
     }
 
     pub fn set_title(&self, title: String) {

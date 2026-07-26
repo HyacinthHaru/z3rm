@@ -12,6 +12,8 @@ use tokio::time::Duration;
 use interprocess::local_socket::tokio::Listener as LocalSocketListener;
 
 pub mod connection;
+mod server_settings;
+
 pub mod clipboard;
 pub mod grid_sync;
 pub mod coalescing;
@@ -244,12 +246,10 @@ pub fn run() -> Result<()> {
 
         let clipboard = std::sync::Arc::new(clipboard::ServerClipboard::new());
 
-        // §3.5 keep_alive_seconds: auto-exit after N seconds of zero active connections.
-        // Default 0 = disabled (keep alive forever). Configurable via Z3RM_KEEP_ALIVE_SECONDS.
-        let keep_alive_seconds: u64 = std::env::var("Z3RM_KEEP_ALIVE_SECONDS")
-            .ok()
-            .and_then(|v| v.parse().ok())
-            .unwrap_or(0);
+        // §3.5 / §16.11 keep_alive + scrollback from ServerSettings (env + server.json).
+        let server_settings = crate::server_settings::ServerSettings::load();
+        let keep_alive_seconds = server_settings.keep_alive_seconds();
+
         if keep_alive_seconds > 0 {
             zlog::info!("keep_alive enabled: idle_timeout={}s", keep_alive_seconds);
         }
@@ -262,6 +262,7 @@ pub fn run() -> Result<()> {
             // §3.5 keep_alive: idle timeout in seconds. 0 = disabled (keep alive forever).
             // Read from Z3RM_KEEP_ALIVE_SECONDS env var.
             keep_alive_seconds,
+            server_settings: server_settings.clone(),
             // §3.5 active connection counter — drives the idle-shutdown timer.
             active_connections: std::sync::Arc::new(AtomicUsize::new(0)),
         };
@@ -284,12 +285,20 @@ pub struct Server {
     start_time: SystemTime,
     // §3.5 keep_alive: idle timeout in seconds (0 = disabled, keep alive forever)
     keep_alive_seconds: u64,
+    // §16.11 Shared server settings (env + server.json); hot-reloaded.
+    server_settings: std::sync::Arc<crate::server_settings::ServerSettings>,
     // §3.5 active connection counter — drives the idle-shutdown timer
     active_connections: std::sync::Arc<AtomicUsize>,
 }
 
 impl Server {
     async fn run(self, listener: LocalSocketListener) -> Result<()> {
+        // §16.11 Hot-reload server.json → scrollback capacity on live panes.
+        crate::server_settings::spawn_hot_reload(
+            self.server_settings.clone(),
+            self.sessions.clone(),
+        );
+
         use interprocess::local_socket::tokio::prelude::*;
 
         // §3.5 keep_alive: when active_connections is 0 and keep_alive_seconds > 0,

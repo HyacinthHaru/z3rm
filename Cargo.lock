@@ -7636,6 +7636,7 @@ dependencies = [
  "prost",
  "regex",
  "serde",
+ "serde_json",
  "shadow_snapshot",
  "sqlez",
  "sysinfo 0.37.2",
@@ -13008,6 +13009,7 @@ dependencies = [
 name = "terminal_view"
 version = "0.1.0"
 dependencies = [
+ "accesskit",
  "anyhow",
  "async-channel 2.5.0",
  "async-recursion",
@@ -17160,6 +17162,7 @@ dependencies = [
  "rope",
  "sandbox",
  "search",
+ "serde_json",
  "session",
  "settings",
  "settings_profile_selector",

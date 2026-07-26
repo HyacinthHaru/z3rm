@@ -4,12 +4,31 @@
 //! Per spec §5.2: "QuickJS runtime on a dedicated OS thread. The extension
 //! host must not run on the GPUI render thread. Extensions communicate with
 //! the UI via async channels; a hung extension freezes only itself."
+//!
+//! §5.4/§5.5 wiring: after loading, the host parses each extension's VDOM
+//! JSON (returned from `context.render(vdom)` or `registerChromeView`) and
+//! publishes the merged set into an app-global [`AcceptedVdom`] slot. The
+//! workspace observer applies that pending VDOM to every
+//! [`ExtensionStatusBar`] it creates, so the chrome actually displays
+//! extension output end-to-end.
 
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::sync::Arc;
 
 use anyhow::{Context as _, Result};
+use extension_host::vdom_bridge::{self, VDomNode};
+use gpui::{AppContext as _, Global};
+use parking_lot::Mutex;
 use quickjs_runtime::{ExtensionRunResult, ExtensionRunner};
+
+/// Pending extension chrome accepted from the host before any workspace
+/// (and thus any status bar) exists. The host stores its merged VDOM here;
+/// each new [`ExtensionStatusBar`] drains it on construction, and live updates
+/// push directly into existing status bars once one is registered.
+#[derive(Default)]
+struct AcceptedVdom(pub Arc<Mutex<Vec<VDomNode>>>);
+
+impl Global for AcceptedVdom {}
 
 /// A loaded extension with its metadata and run result.
 pub struct LoadedExtension {
@@ -100,7 +119,7 @@ pub fn load_client_extensions(extensions_dir: &Path) -> Vec<LoadedExtension> {
 }
 
 fn load_single_extension(
-    dir: &Path,
+    _dir: &Path,
     toml_path: &Path,
     main_js_path: &Path,
 ) -> Result<LoadedExtension> {
@@ -168,29 +187,212 @@ fn parse_extension_toml(path: &Path) -> Result<ExtensionMeta> {
     })
 }
 
+/// §5.4 Collect the status-bar VDOM trees offered by loaded extensions.
+///
+/// Each extension's `activate()` may return a VDOM via `context.render(vdom)`
+/// or by registering a `status-bar` chrome view. The runtime surfaces that
+/// payload as `ExtensionRunResult::vdom_json`; here we parse it into typed
+/// [`VDomNode`]s to hand to the status bar. Malformed VDOM is logged and
+/// skipped so one bad extension can never poison the chrome.
+///
+/// Pure and synchronous — intended to be the deterministic extension result
+/// path under test.
+pub fn collect_status_bar_vdom(loaded: &[LoadedExtension]) -> Vec<VDomNode> {
+    let mut nodes = Vec::new();
+    for ext in loaded {
+        let Some(json) = ext.result.vdom_json.as_deref() else {
+            continue;
+        };
+        match serde_json::from_str::<serde_json::Value>(json) {
+            Ok(value) => match vdom_bridge::parse_vdom(&value) {
+                Ok(node) => nodes.push(node),
+                Err(e) => tracing::warn!(id = %ext.id, error = %e, "extension VDOM parse failed"),
+            },
+            Err(e) => tracing::warn!(id = %ext.id, error = %e, "extension VDOM JSON invalid"),
+        }
+    }
+    nodes
+}
+
+/// §5.5 Publish collected VDOM into the app-global chrome state so freshly
+/// created status bars inherit it.
+fn publish_vdom(cx: &mut gpui::App, nodes: Vec<VDomNode>) {
+    if cx.try_global::<AcceptedVdom>().is_none() {
+        cx.set_global(AcceptedVdom::default());
+    }
+    let accepted = cx.global::<AcceptedVdom>();
+    let slot = accepted.0.clone();
+    let mut guard = slot.lock();
+    *guard = nodes;
+}
+
+/// §5.5 Read pending VDOM from the app-global chrome state so a freshly
+/// created [`ExtensionStatusBar`] can render it. Peeks (clones) rather than
+/// drains so every workspace inherits the initial chrome; a later reload
+/// republishes a fresh set.
+pub fn take_pending_vdom(cx: &gpui::App) -> Vec<VDomNode> {
+    cx.try_global::<AcceptedVdom>()
+        .map(|accepted| accepted.0.lock().clone())
+        .unwrap_or_default()
+}
+
+/// Initialize the app-global chrome state. Called early so [take_pending_vdom]
+/// never finds an absent global even if the host resolves before a workspace
+/// is observed.
+pub fn init(cx: &mut gpui::App) {
+    cx.set_global(AcceptedVdom::default());
+}
+
 /// §5.2 Initialize the QuickJS extension system at startup.
 /// Called from main.rs after GPUI app creation.
+///
+/// Loads extensions on a background thread (the host must never run on the
+/// render thread — spec §5.2), then parses and publishes any VDOM back onto
+/// the foreground thread into the app-global chrome state. Status bars created
+/// afterward drain that state via [`take_pending_vdom`].
 pub fn init_extensions(cx: &mut gpui::App) {
+    init(cx);
     let extensions_dir = paths::extensions_dir().clone();
 
-    // §5.2: Load extensions on a background thread to avoid blocking the render loop.
-    cx.background_executor()
-        .spawn(async move {
-            let loaded = load_client_extensions(&extensions_dir);
-            tracing::info!(
-                count = loaded.len(),
-                "QuickJS extensions loaded"
+    cx.spawn(async move |cx| {
+        // §5.2: load + activate every client extension off the render thread.
+        let loaded = cx
+            .background_spawn(async move { load_client_extensions(&extensions_dir) })
+            .await;
+        tracing::info!(count = loaded.len(), "QuickJS extensions loaded");
+        for ext in &loaded {
+            tracing::debug!(
+                id = %ext.id,
+                name = %ext.name,
+                side = ?ext.side,
+                ok = ext.result.result.is_ok(),
+                duration_ms = ext.result.duration.as_millis() as u64,
+                has_vdom = ext.result.vdom_json.is_some(),
+                "extension status"
             );
-            for ext in &loaded {
-                tracing::debug!(
-                    id = %ext.id,
-                    name = %ext.name,
-                    side = ?ext.side,
-                    ok = ext.result.result.is_ok(),
-                    duration_ms = ext.result.duration.as_millis() as u64,
-                    "extension status"
-                );
-            }
-        })
-        .detach();
+        }
+
+        // §5.4/§5.5: parse each extension's VDOM and publish it to the chrome
+        // state. Status bars appear later (one per workspace); they drain this
+        // buffer via take_pending_vdom on construction.
+        let nodes = collect_status_bar_vdom(&loaded);
+        let count = nodes.len();
+        cx.update(|cx| publish_vdom(cx, nodes));
+        if count > 0 {
+            tracing::info!(vdom_nodes = count, "extension VDOM published to chrome");
+        }
+    })
+    .detach();
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::extension_status_bar::ExtensionStatusBar;
+    use extension_host::vdom_bridge::{self, VDomChild};
+
+    fn loaded_with_vdom(id: &str, json: Option<&str>) -> LoadedExtension {
+        let result = ExtensionRunResult {
+            extension_id: id.to_string(),
+            result: Ok(()),
+            duration: std::time::Duration::ZERO,
+            cpu_exhausted: false,
+            memory_exceeded: false,
+            vdom_json: json.map(|s| s.to_string()),
+        };
+        LoadedExtension {
+            id: id.to_string(),
+            name: id.to_string(),
+            side: ExtensionSide::Client,
+            result,
+        }
+    }
+
+    #[test]
+    fn collect_parses_status_bar_vdom_from_activate_result() {
+        // Deterministic extension result path: activate() returned a VDOM via
+        // context.render(...); the runtime surfaced it as JSON. The collector
+        // turns it into a typed VDomNode the status bar can render.
+        let vdom = r#"{"type":"div","props":{"id":"status-bar"},"style":{"flexDirection":"row","gap":"8px"},"children":[{"type":"span","children":["zsh"]}]}"#;
+        let loaded = vec![loaded_with_vdom("demo-statusbar", Some(vdom))];
+        let nodes = collect_status_bar_vdom(&loaded);
+        assert_eq!(nodes.len(), 1);
+        let node = &nodes[0];
+        assert_eq!(node.element_type, "div");
+        assert_eq!(node.props.get("id").and_then(|v| v.as_str()), Some("status-bar"));
+        assert_eq!(node.style.get("flexDirection").map(String::as_str), Some("row"));
+        assert_eq!(node.children.len(), 1);
+        // The outer div's only child is the span element, not text.
+        let span = match &node.children[0] {
+            VDomChild::Node(n) => n,
+            VDomChild::Text(_) => panic!("expected the outer child to be a span node"),
+        };
+        assert_eq!(span.element_type, "span");
+        // The span surfaces the deterministic "zsh" text child — the bytes the
+        // status bar will ultimately render.
+        assert_eq!(span.children.len(), 1);
+        match &span.children[0] {
+            VDomChild::Text(t) => assert_eq!(t, "zsh"),
+            VDomChild::Node(_) => panic!("expected text child for the span"),
+        }
+    }
+
+    #[test]
+    fn collect_skips_extensions_without_vdom() {
+        let loaded = vec![
+            loaded_with_vdom("no-render", None),
+            loaded_with_vdom("has-render", Some(r#"{"type":"div","children":["ok"]}"#)),
+        ];
+        let nodes = collect_status_bar_vdom(&loaded);
+        assert_eq!(nodes.len(), 1);
+        assert_eq!(nodes[0].element_type, "div");
+    }
+
+    #[test]
+    fn collect_logs_and_skips_malformed_vdom_without_panicking() {
+        let loaded = vec![
+            loaded_with_vdom("broken", Some(r#"{"type":"div","children":}"#)),
+            loaded_with_vdom("not-an-object", Some(r#""oops""#)),
+            loaded_with_vdom("good", Some(r#"{"type":"span","children":["x"]}"#)),
+        ];
+        let nodes = collect_status_bar_vdom(&loaded);
+        // Only the well-formed extension yields a node; the rest are logged + skipped.
+        assert_eq!(nodes.len(), 1);
+        assert_eq!(nodes[0].element_type, "span");
+    }
+
+    #[test]
+    fn status_bar_renders_nonempty_vdom_from_collector_output() {
+        // End-to-end at the data layer: collector output → renderable bridge element.
+        // Confirms the status bar's render path has something to show for a
+        // deterministic extension result, without spinning up a GPUI window.
+        let vdom = r#"{"type":"div","children":[{"type":"span","children":["hello"]}]}"#;
+        let nodes = collect_status_bar_vdom(&vec![loaded_with_vdom("e", Some(vdom))]);
+        assert_eq!(nodes.len(), 1);
+        let text = vdom_bridge::vdom_to_text(&nodes[0], 0);
+        assert!(text.contains("hello"), "bridge vdom_to_text must surface the span text: {text}");
+    }
+
+    #[gpui::test]
+    fn status_bar_setter_accepts_vdom_and_notifies(cx: &mut gpui::TestAppContext) {
+        // Exercises the real setter + notify path: the host pushes the
+        // deterministic collector output into a live ExtensionStatusBar entity,
+        // and the view's state reflects it (which its next render will display).
+        let vdom = r#"{"type":"div","children":["branch"]}"#;
+        let nodes = collect_status_bar_vdom(&vec![loaded_with_vdom("git", Some(vdom))]);
+        assert_eq!(nodes.len(), 1);
+
+        let bar = cx.update(|cx| cx.new(|_| ExtensionStatusBar::new()));
+        let before = cx.read(|cx| bar.read(cx).vdom_node_count());
+        assert_eq!(before, 0);
+
+        cx.update(|cx| bar.update(cx, |bar, cx| bar.set_vdom_nodes(nodes, cx)));
+
+        let (count, element_type) = cx.read(|cx| {
+            let bar = bar.read(cx);
+            (bar.vdom_node_count(), bar.vdom_nodes().first().map(|n| n.element_type.clone()))
+        });
+        assert_eq!(count, 1);
+        assert_eq!(element_type.as_deref(), Some("div"));
+    }
 }

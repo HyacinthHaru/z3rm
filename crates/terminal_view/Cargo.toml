@@ -19,6 +19,7 @@ doctest = false
 
 [dependencies]
 anyhow.workspace = true
+accesskit.workspace = true
 async-channel = "2.3"
 async-recursion.workspace = true
 futures.workspace = true

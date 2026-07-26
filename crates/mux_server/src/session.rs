@@ -5,6 +5,8 @@ use crate::layout::LayoutTree;
 use crate::pane::Pane;
 use std::collections::HashMap;
 use std::sync::Arc;
+use mux_protocol::proto::envelope::Payload as EnvelopePayload;
+use mux_protocol::{Envelope, Notification};
 
 /// 会话状态 (§3.2)
 #[derive(Clone)]
@@ -33,6 +35,13 @@ pub struct Session {
     pub sync_scrollback: Arc<parking_lot::RwLock<SyncScrollbackState>>,
     /// §3.3 已连接的窗口 ID 列表 (多窗口支持，Plan 32)
     pub connected_windows: Arc<parking_lot::RwLock<Vec<String>>>,
+    /// §3.4 会话级 lifecycle 通知订阅者: client_id → 该连接的 outbound channel。
+    /// 承载 PaneAdded / PaneRemoved / SessionLayoutChanged (§3.4 at-least-once 路径)。
+    /// 与 `attached_clients` 分离: attached_clients 是 §3.10 客户端状态 (role / mode),
+    /// lifecycle_subscribers 是 §3.4 通知投递通道, 必须在 attach 时注册、断连时退订,
+    /// 否则单连接广播会漏掉其他 attached 客户端。
+    pub lifecycle_subscribers:
+        Arc<parking_lot::RwLock<HashMap<String, tokio::sync::mpsc::UnboundedSender<Envelope>>>>,
     /// §4 Shadow snapshot watcher handle: cwd file changes → snapshot engine.
     /// `None` means this session has no live watcher (cwd unusable / recovered /
     /// test session). Arc so it survives Session derive(Clone) clones; the last
@@ -120,6 +129,7 @@ impl Session {
             panes: Arc::new(parking_lot::RwLock::new(HashMap::new())),
             sync_scrollback: Arc::new(parking_lot::RwLock::new(SyncScrollbackState::default())),
             connected_windows: Arc::new(parking_lot::RwLock::new(Vec::new())),
+            lifecycle_subscribers: Arc::new(parking_lot::RwLock::new(HashMap::new())),
             snapshot_watch: None,
         }
     }
@@ -154,6 +164,57 @@ impl Session {
         let clients = self.attached_clients.clone();
         let mut clients_w = clients.write();
         clients_w.retain(|c| c.client_id != client_id);
+    }
+
+    /// §3.4 注册 lifecycle 订阅者: attach 时把该连接的 outbound channel 加入会话级注册表。
+    /// 同一 client_id 重复 attach (幂等 / steal) 时直接替换旧的 sender, 旧的 outbound
+    /// channel 因无引用而关闭——旧连接若仍存活, 其读循环会在下次发信失败时退出。
+    /// 因此统计 attached_client_count 时不会因为残留 sender 而偏高。
+    pub fn add_lifecycle_subscriber(
+        &self,
+        client_id: String,
+        outbound_tx: tokio::sync::mpsc::UnboundedSender<Envelope>,
+    ) {
+        self.lifecycle_subscribers.write().insert(client_id, outbound_tx);
+    }
+
+    /// §3.4 退订 lifecycle 通知: detach / 断连 / steal 清场时调用。
+    /// 移除该 client_id 对应的 outbound sender; 通道关闭由连接层写循环检测到。
+    pub fn remove_lifecycle_subscriber(&self, client_id: &str) {
+        self.lifecycle_subscribers.write().remove(client_id);
+    }
+
+    /// §3.4 清空 lifecycle 订阅 (steal 抢占踢出所有旧客户端时调用)。
+    /// 返回被踢出的 client_id 列表, 由调用方决定是否额外断开连接的 transport。
+    pub fn clear_lifecycle_subscribers(&self) -> Vec<String> {
+        let mut subs = self.lifecycle_subscribers.write();
+        let kicked: Vec<String> = subs.keys().cloned().collect();
+        subs.clear();
+        kicked
+    }
+
+    /// §3.4 向所有 attached 连接 fan-out 一条 lifecycle 通知 (at-least-once)。
+    ///
+    /// 与 pane 维度 lossy 的 PaneDirty / PaneOutput 路径不同: lifecycle 通知
+    /// (PaneAdded / PaneRemoved / SessionLayoutChanged) 必须保证送达每个
+    /// attached 客户端, 不只是发起方——这正是 §3.4 multi-client semantics 的核心。
+    ///
+    /// outbound channel 是 tokio::mpsc::unbounded, 因此不会因 subscriber 慢而丢弃
+    /// (会背压到整个连接的内存), closed channel 的 send 失败时立即清理对应订阅。
+    pub fn broadcast_lifecycle(&self, notification: Notification) {
+        let envelope = Envelope {
+            version: Some(mux_protocol::PROTOCOL_VERSION.clone()),
+            payload: Some(EnvelopePayload::Notification(notification)),
+        };
+        let mut subs = self.lifecycle_subscribers.write();
+        subs.retain(|_client_id, tx| {
+            if tx.send(envelope.clone()).is_ok() {
+                true
+            } else {
+                // §3.4 连接断开或写循环退出: 清理该 subscription, 不再尝试投递。
+                false
+            }
+        });
     }
 
     /// 附加客户端数量 (§3.10 SessionInfo.attached_clients)

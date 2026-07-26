@@ -4,10 +4,12 @@ use gpui::{
     Element, ElementId, Entity, FocusHandle, Font, FontFeatures, FontStyle, FontWeight,
     GlobalElementId, HighlightStyle, Hitbox, Hsla, InputHandler, InteractiveElement, Interactivity,
     IntoElement, LayoutId, Length, ModifiersChangedEvent, MouseButton, MouseMoveEvent, Pixels,
-    Point as GpuiPoint, StatefulInteractiveElement, StrikethroughStyle, Styled, TextRun, TextStyle,
-    UTF16Selection, UnderlineStyle, WeakEntity, WhiteSpace, Window, div, fill, point, px, relative,
-    size,
+    Point as GpuiPoint, Role, Stateful, StatefulInteractiveElement, StrikethroughStyle, Styled,
+    TextRun, TextStyle, UTF16Selection, UnderlineStyle, WeakEntity, WhiteSpace, Window, div, fill,
+    point, px, relative, size, A11ySubtreeBuilder,
 };
+use accesskit;
+
 use itertools::Itertools;
 use language::CursorShape as EditorCursorShape;
 use settings::Settings;
@@ -358,7 +360,11 @@ impl TerminalElement {
         cursor_visible: bool,
         block_below_cursor: Option<Rc<BlockProperties>>,
         mode: TerminalMode,
-    ) -> TerminalElement {
+    ) -> Stateful<TerminalElement> {
+        // A stable id is required for the element to participate in the
+        // accessibility tree (Element::a11y_role / a11y_synthetic_children
+        // are only consulted for elements with an id). The id is unique within
+        // its parent wrapper (mux_pane / terminal_view render one element each).
         TerminalElement {
             terminal,
             terminal_view,
@@ -370,6 +376,7 @@ impl TerminalElement {
             mode,
             interactivity: Default::default(),
         }
+        .id("terminal-element")
         .track_focus(&focus)
     }
 
@@ -871,6 +878,39 @@ impl Element for TerminalElement {
 
     fn source_location(&self) -> Option<&'static core::panic::Location<'static>> {
         None
+    }
+
+    /// Expose TerminalElement to the accessibility tree as the live terminal
+    /// surface. The labelled Terminal node that announces the pane lives on
+    /// the wrapper (mux_pane / terminal_view root); this element is its single
+    /// content child and supplies the readable line text via
+    /// [`Element::a11y_synthetic_children`].
+    fn a11y_role(&self) -> Option<accesskit::Role> {
+        Some(Role::Terminal)
+    }
+
+    fn write_a11y_info(&self, node: &mut accesskit::Node) {
+        // Stable, translatable-ish label so the surface is not nameless. The
+        // pane title is announced by the parent; this only names the content.
+        node.set_label("terminal output".to_string());
+    }
+
+    /// Synthesize one [`Role::TextRun`] node per visible terminal line, derived
+    /// from the same `batched_text_runs` the element paints. Runs already flush
+    /// at line boundaries (see [`TerminalElement::layout_grid`]), so grouping by
+    /// `start_point.line` reconstructs the on-screen rows. Each line is chunked
+    /// to fit AccessKit's `u8`-indexed `word_starts` (max 255 chars/run) and
+    /// supplies per-run `character_lengths` / `word_starts` so platform text
+    /// patterns (caret tracking, review, typed-character echo) work.
+    ///
+    /// Synthetic ids key off the parent node id + a `(line, chunk)` key, so
+    /// stable frame-to-frame while the pane layout is stable.
+    fn a11y_synthetic_children(
+        &mut self,
+        prepaint: &mut Self::PrepaintState,
+        builder: &mut A11ySubtreeBuilder,
+    ) {
+        push_terminal_line_text_runs(builder, &prepaint.batched_text_runs);
     }
 
     fn request_layout(
@@ -1676,6 +1716,137 @@ pub fn is_blank(cell: &Cell) -> bool {
     }
 
     true
+}
+
+// ---- Accessibility: synthetic line text runs --------------------------------
+
+/// AccessKit's `word_starts` is `u8`-indexed, so a single text run cannot
+/// exceed this many characters. Longer lines are split into multiple runs
+/// (mirroring `settings_ui::input_field`).
+const MAX_CHARS_PER_A11Y_RUN: usize = 255;
+
+/// A line reconstructed from `batched_text_runs` for accessibility purposes.
+/// `text` is the concatenation of every run on `line`, trailing blanks
+/// right-trimmed so screen readers do not announce a wall of spaces.
+struct A11yTerminalLine {
+    line: i32,
+    text: String,
+}
+
+/// Group the element's painted [`BatchedTextRun`]s into per-line strings,
+/// ordered by screen row. `batched_text_runs` flush at line boundaries, so
+/// every run belongs to exactly one line.
+fn collect_terminal_lines(runs: &[BatchedTextRun]) -> Vec<A11yTerminalLine> {
+    use std::collections::BTreeMap;
+    let mut by_line: BTreeMap<i32, String> = BTreeMap::new();
+    for run in runs {
+        by_line
+            .entry(run.start_point.line)
+            .or_default()
+            .push_str(&run.text);
+    }
+    by_line
+        .into_iter()
+        .map(|(line, mut text)| {
+            // Trailing whitespace carries no semantic content and triggers
+            // verbose "space space space …" announcements on some platforms.
+            let trimmed = text.trim_end_matches(' ');
+            // Keep an emptied line as an empty run so the row structure and
+            // line counts remain intact (AT can still report blank lines).
+            if trimmed.is_empty() {
+                text.clear();
+            } else if trimmed.len() < text.len() {
+                text.truncate(trimmed.len());
+            }
+            A11yTerminalLine { line, text }
+        })
+        .collect()
+}
+
+/// `true` for the "word" character class AccessKit expects for `word_starts`.
+/// Matches the input_field convention (`[A-Za-z0-9_]`).
+fn is_word_char(c: char) -> bool {
+    c.is_alphanumeric() || c == '_'
+}
+
+/// Build per-line `Role::TextRun` synthetic nodes without the
+/// [`A11ySubtreeBuilder`], so the line/text-run assembly can be unit-tested
+/// against arbitrary painted runs (mirroring `settings_ui::input_field`).
+///
+/// `synthetic_id` maps `(line, chunk_index)` to a stable [`accesskit::NodeId`];
+/// in production this is `A11ySubtreeBuilder::synthetic_node_id`.
+fn build_terminal_line_runs(
+    runs: &[BatchedTextRun],
+    synthetic_id: impl Fn(u64, u64) -> accesskit::NodeId,
+) -> Vec<(accesskit::NodeId, accesskit::Node)> {
+    let mut out = Vec::new();
+    for line in collect_terminal_lines(runs) {
+        let chars: Vec<char> = line.text.chars().collect();
+        let total = chars.len();
+        let num_chunks = total.div_ceil(MAX_CHARS_PER_A11Y_RUN).max(1);
+
+        // Word boundaries, retained as character offsets into the whole line.
+        let mut word_starts: Vec<usize> = Vec::new();
+        let mut was_word = false;
+        for (ix, c) in chars.iter().enumerate() {
+            let is_word = is_word_char(*c);
+            if is_word && !was_word {
+                word_starts.push(ix);
+            }
+            was_word = is_word;
+        }
+
+        for chunk_index in 0..num_chunks {
+            let char_start = chunk_index * MAX_CHARS_PER_A11Y_RUN;
+            let char_end = (char_start + MAX_CHARS_PER_A11Y_RUN).min(total);
+            let chunk: String = chars[char_start..char_end].iter().collect();
+
+            let mut node = accesskit::Node::new(accesskit::Role::TextRun);
+            node.set_text_direction(accesskit::TextDirection::LeftToRight);
+            node.set_value(chunk);
+            node.set_character_lengths(
+                chars[char_start..char_end]
+                    .iter()
+                    .map(|c| c.len_utf8() as u8)
+                    .collect::<Vec<u8>>(),
+            );
+            node.set_word_starts(
+                word_starts
+                    .iter()
+                    .filter(|&&ws| ws >= char_start && ws < char_end)
+                    .map(|&ws| (ws - char_start) as u8)
+                    .collect::<Vec<u8>>(),
+            );
+            // Stable id per (line, chunk): the line is the primary key and the
+            // chunk index distinguishes splits for very long lines.
+            let node_id = synthetic_id(line.line as u64, chunk_index as u64);
+            if chunk_index > 0 {
+                node.set_previous_on_line(synthetic_id(line.line as u64, (chunk_index - 1) as u64));
+            }
+            if chunk_index + 1 < num_chunks {
+                node.set_next_on_line(synthetic_id(line.line as u64, (chunk_index + 1) as u64));
+            }
+            out.push((node_id, node));
+        }
+    }
+    out
+}
+
+/// Push per-line `Role::TextRun` synthetic children onto `builder`, derived
+/// from the same `batched_text_runs` the element paints. Each run carries
+/// `value`, `character_lengths` and `word_starts` so platform text patterns
+/// can drive caret/review. Synthetic ids key off the parent node id + a
+/// `(line, chunk)` key, so they are stable frame-to-frame.
+fn push_terminal_line_text_runs(
+    builder: &mut A11ySubtreeBuilder,
+    runs: &[BatchedTextRun],
+) {
+    let runs = build_terminal_line_runs(runs, |line, chunk| {
+        builder.synthetic_node_id((line, chunk))
+    });
+    for (id, node) in runs {
+        builder.push_child(id, node);
+    }
 }
 
 fn to_highlighted_range_lines(
@@ -2563,5 +2734,147 @@ mod tests {
         // Negative: lines -7, -6, -5, -4
         assert_eq!(negative_filtered.first().unwrap().point.line, -7);
         assert_eq!(negative_filtered.last().unwrap().point.line, -4);
+    }
+
+    // ---- Accessibility: synthetic terminal line text runs ------------------
+
+    /// Build a [`BatchedTextRun`] with a stable default style for testing.
+    fn a11y_run(line: i32, text: &str) -> BatchedTextRun {
+        BatchedTextRun {
+            start_point: LayoutPoint::new(line, 0),
+            text: text.into(),
+            cell_count: text.chars().count(),
+            style: TextRun {
+                len: text.len(),
+                font: font("Helvetica"),
+                color: Hsla::red(),
+                ..Default::default()
+            },
+            font_size: AbsoluteLength::Pixels(px(14.)),
+        }
+    }
+
+    /// A synthetic id function for tests: encodes `(line << 16) | chunk` so
+    /// ids are deterministic and unique. Mirrors how a real
+    /// `A11ySubtreeBuilder::synthetic_node_id` derives ids from a key.
+    fn fake_id(line: u64, chunk: u64) -> accesskit::NodeId {
+        accesskit::NodeId((line << 16) | chunk)
+    }
+
+    /// `value` on a TextRun node is what screen readers announce. The synthetic
+    /// runs must expose exactly the visible line text — one node per row — so
+    /// review commands read the terminal surface.
+    #[test]
+    fn a11y_synthetic_runs_expose_visible_line_text() {
+        let runs = vec![
+            a11y_run(0, "hello "),
+            a11y_run(0, "world"),
+            a11y_run(1, "git status"),
+            // A fully-blank row must still produce a (empty) run so row counts
+            // are preserved and AT can report the blank line.
+            a11y_run(2, "        "),
+        ];
+        let nodes = build_terminal_line_runs(&runs, fake_id);
+        let values: Vec<&str> = nodes.iter().filter_map(|(_, n)| n.value()).collect();
+        assert_eq!(
+            values,
+            vec!["hello world", "git status", ""],
+            "each visible line becomes one TextRun, trailing blanks trimmed",
+        );
+        for (_, node) in &nodes {
+            assert_eq!(node.role(), accesskit::Role::TextRun);
+        }
+    }
+
+    /// Runs on the same painted line are concatenated in order, regardless of
+    /// how [`layout_grid`] batched them by style. Without this, a recolored
+    /// word would split a single terminal row into multiple a11y nodes and
+    /// screen readers would announce "hello _world_" as separate fragments.
+    #[test]
+    fn a11y_concatenates_multicolored_runs_on_same_line() {
+        let runs = vec![
+            a11y_run(3, "foo"),
+            a11y_run(3, "-"),
+            a11y_run(3, "bar"),
+            a11y_run(4, "baz"),
+        ];
+        let nodes = build_terminal_line_runs(&runs, fake_id);
+        let values: Vec<String> = nodes
+            .iter()
+            .map(|(_, n)| n.value().unwrap_or_default().to_string())
+            .collect();
+        assert_eq!(values, vec!["foo-bar", "baz"]);
+        // Three runs on line 3 collapse to a single TextRun node.
+        assert_eq!(nodes.iter().filter(|(_, n)| n.value() == Some("foo-bar")).count(), 1);
+    }
+
+    /// A single line longer than [`MAX_CHARS_PER_A11Y_RUN`] characters must
+    /// split into chunks — AccessKit's `word_starts` is `u8`-indexed, so a run
+    /// with more than 255 chars would silently corrupt word boundaries. The
+    /// chunks must carry `previous_on_line` / `next_on_line` so review can walk
+    /// the line as one logical run.
+    #[test]
+    fn a11y_long_line_splits_across_chunks_with_line_links() {
+        let long: String = "a".repeat(MAX_CHARS_PER_A11Y_RUN * 2 + 7);
+        let runs = vec![a11y_run(0, &long)];
+        let nodes = build_terminal_line_runs(&runs, fake_id);
+
+        // 2*255 + 7 chars ⇒ ceil(517 / 255) = 3 chunks.
+        assert_eq!(nodes.len(), 3);
+        let total: usize = nodes
+            .iter()
+            .map(|(_, n)| n.value().map(str::len).unwrap_or(0))
+            .sum();
+        assert_eq!(total, long.len(), "chunk values concatenate back to the line");
+
+        // Chunk 0 has `next_on_line`, chunk 2 has `previous_on_line`, chunk 1
+        // has both. The middle chunk must not be orphaned: it links both ways.
+        let has_next = |i: usize| {
+            nodes[i].1.next_on_line().is_some()
+        };
+        let has_prev = |i: usize| nodes[i].1.previous_on_line().is_some();
+        assert!(has_next(0) && !has_prev(0), "first chunk links forward only");
+        assert!(has_next(1) && has_prev(1), "middle chunk links both ways");
+        assert!(!has_next(2) && has_prev(2), "last chunk links backward only");
+
+        // Chunks link to the neighbouring chunks' ids.
+        assert_eq!(
+            nodes[0].1.next_on_line(),
+            Some(fake_id(0, 1)),
+        );
+        assert_eq!(
+            nodes[2].1.previous_on_line(),
+            Some(fake_id(0, 1)),
+        );
+    }
+
+    /// `character_lengths` and `word_starts` are the inputs the platform text
+    /// pattern uses for caret navigation and by-word review. A multi-byte
+    /// glyph (é = 2 UTF-8 bytes) and two words ("foo bar") must yield the
+    /// expected layouts: one length per char, a word boundary at "bar".
+    #[test]
+    fn a11y_run_carries_character_lengths_and_word_starts() {
+        let runs = vec![a11y_run(0, "café bar")]; // c a f é [space] b a r
+        let nodes = build_terminal_line_runs(&runs, fake_id);
+        assert_eq!(nodes.len(), 1);
+        let node = &nodes[0].1;
+        assert_eq!(node.character_lengths(), &[1u8, 1, 1, 2, 1, 1, 1, 1][..]);
+        // Words: "café" (start 0), "bar" (start 5). é is alphanumeric ⇒ part
+        // of "café".
+        assert_eq!(node.word_starts(), &[0u8, 5][..]);
+    }
+
+    /// Trailing-blank rows, and rows that are entirely whitespace, must not
+    /// collapse screen-reader "wall of spaces". The blank row keeps an empty
+    /// value (so the row count is stable) instead of retaining the spaces.
+    #[test]
+    fn a11y_trailing_blanks_are_trimmed_not_announced() {
+        let runs = vec![
+            a11y_run(0, "done.   "), // trailing spaces within a non-empty line
+            a11y_run(1, "   "), // entirely blank row
+        ];
+        let nodes = build_terminal_line_runs(&runs, fake_id);
+        let values: Vec<&str> = nodes.iter().map(|(_, n)| n.value().unwrap_or_default()).collect();
+        assert_eq!(values, vec!["done.", ""]);
     }
 }

@@ -538,8 +538,15 @@ fn main() {
                 cx.observe_new::<workspace::Workspace>(move |workspace, window, cx| {
                     let Some(window) = window else { return };
 
-                    // §5.5 Add extension status bar (renders QuickJS extension VDOM)
+                    // §5.5 Add extension status bar (renders QuickJS extension VDOM).
+                    // Apply any VDOM the host already published (init_extensions runs
+                    // at startup and may resolve before the first workspace is observed).
+                    let pending = quickjs_extensions::take_pending_vdom(cx);
                     let ext_status = cx.new(|_| extension_status_bar::ExtensionStatusBar::new());
+                    if !pending.is_empty() {
+                        let pending_for_update = pending.clone();
+                        ext_status.update(cx, |bar, cx| bar.set_vdom_nodes(pending_for_update, cx));
+                    }
                     workspace.status_bar().update(cx, |sb, cx| {
                         sb.add_right_item(ext_status, window, cx);
                     });

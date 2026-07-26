@@ -295,6 +295,10 @@ pub struct ExtensionRunResult {
     pub cpu_exhausted: bool,
     /// 内存是否超限
     pub memory_exceeded: bool,
+    /// §5.4 VDOM JSON 字符串: 扩展在 `activate()` 中通过 `context.render(vdom)`
+    /// 或 `registerChromeView('status-bar', view)` 注入的 VDOM。`None` 表示扩展未
+    /// 提供可渲染的 VDOM。
+    pub vdom_json: Option<String>,
 }
 
 /// 扩展加载器: 在独立线程中加载并执行扩展
@@ -324,6 +328,8 @@ impl ExtensionRunner {
     /// 2. 注入资源限制 (CPU fuel, 内存, IO)
     /// 3. 在专用线程中执行扩展源码
     /// 4. 调用 `activate(context)`
+    /// 5. 若扩展调用 `context.render(vdom)` 或注册了 `status-bar` chrome view,
+    ///    抓取该 VDOM 并以 JSON 字符串形式返回 (spec §5.4)。
     pub fn load_extension(
         &self,
         extension_id: &str,
@@ -331,9 +337,12 @@ impl ExtensionRunner {
         _activate_fn: &str,
     ) -> ExtensionRunResult {
         let start = Instant::now();
-        let result = self.do_load(extension_id, source);
+        let (result, vdom_json) = match self.do_load(extension_id, source) {
+            Ok(vdom) => (Ok(()), vdom),
+            Err(e) => (Err(e), None),
+        };
         let duration = start.elapsed();
-        let cpu_exhausted = result.as_ref().is_err();
+        let cpu_exhausted = result.is_err();
 
         ExtensionRunResult {
             extension_id: extension_id.to_string(),
@@ -341,10 +350,17 @@ impl ExtensionRunner {
             duration,
             cpu_exhausted,
             memory_exceeded: false,
+            vdom_json,
         }
     }
 
-    fn do_load(&self, _extension_id: &str, source: &str) -> Result<()> {
+    /// 内部加载逻辑;返回 `(Result<()> 的错误结果, Optional<VDOM-JSON String>)`。
+    /// 在主调用线程上执行 (调用方负责后续派发到后台执行器)。
+    fn do_load(
+        &self,
+        _extension_id: &str,
+        source: &str,
+    ) -> Result<Option<String>> {
         let runtime =
             QuickJsRuntime::new(self.memory_limit_mb, self.cpu_budget_ms).context("创建 Runtime 失败")?;
         let ctx = runtime.create_context()?;
@@ -358,25 +374,50 @@ impl ExtensionRunner {
             // Execute extension source to define activate() in globals
             let _: rquickjs::Value = ctx.eval(script_source.as_str())?;
 
-            // §5.2/§5.3: Create context object and call activate() entirely in JS
-            // to avoid rquickjs Value lifetime issues with Rust closures.
+            // §5.2/§5.3/§5.4: 配置 chrome context:
+            // - registerChromeView(name, view) 保存视图对象(支持 `view.render()` 调用)
+            // - render(vdom) 立即返回的 VDOM 优先于已注册的 chrome view
+            // - 返回值为 JSON 字符串 (rquickjs 0.6 Value::get::<String> 要求 here-string
+            //   形式以避免所有权/lifetime 跨线程问题)
             let call_activate: &str = r#"
                 (function() {
-                    if (typeof activate !== 'function') return null;
                     var __vdom_result = null;
+                    var __chrome_views = {};
                     var context = {
-                        render: function(vdom) { __vdom_result = vdom; return vdom; },
+                        render: function(vdom) {
+                            __vdom_result = vdom;
+                            return vdom;
+                        },
+                        registerChromeView: function(name, view) {
+                            __chrome_views[name] = view;
+                            return view;
+                        },
                         on: function(event, handler) { /* event registration */ },
                         emit: function(event, data) { /* event emission */ },
                         capabilities: { terminal: true, mux: true, workspace: true }
                     };
+                    if (typeof activate !== 'function') return null;
                     activate(context);
-                    return __vdom_result;
+                    if (__vdom_result !== null) {
+                        return JSON.stringify(__vdom_result);
+                    }
+                    var view = __chrome_views['status-bar'];
+                    if (view && typeof view.render === 'function') {
+                        try {
+                            return JSON.stringify(view.render());
+                        } catch (e) {
+                            return null;
+                        }
+                    }
+                    return null;
                 })()
             "#;
-            let _result: rquickjs::Value = ctx.eval(call_activate)?;
-
-            Ok(())
+            let captured: rquickjs::Value = ctx.eval(call_activate)?;
+            let vdom_json = match captured.get::<String>() {
+                Ok(s) if !s.is_empty() => Some(s),
+                _ => None,
+            };
+            Ok(vdom_json)
         })
     }
 }

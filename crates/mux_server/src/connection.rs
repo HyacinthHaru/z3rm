@@ -132,6 +132,7 @@ pub async fn handle_connection(
         let mut sessions_w = sessions.write();
         for session in sessions_w.iter_mut() {
             session.remove_attached_client(&client_id);
+            session.remove_lifecycle_subscriber(&client_id);
         }
     }
     Ok(())
@@ -322,7 +323,7 @@ async fn dispatch_request(
         }
         RequestBody::ClosePane(r) => {
             if check_permission(role, ClientRole::ReadWrite) {
-                handle_close_pane(r, sessions, outbound_tx).await?
+                handle_close_pane(r, sessions, outbound_tx, connection_client_id).await?
             } else {
                 ResponseBody::Error("permission denied: read-write required".to_string())
             }
@@ -345,7 +346,7 @@ async fn dispatch_request(
         // §3.3 需要 ReadWrite 的输入操作 (Plan 33)
         RequestBody::SendInput(r) => {
             if check_permission(role, ClientRole::ReadWrite) {
-                handle_send_input(r, sessions, clipboard, outbound_tx).await?
+                handle_send_input(r, sessions, clipboard, outbound_tx, connection_client_id).await?
             } else {
                 ResponseBody::Error("permission denied: read-write required".to_string())
             }
@@ -585,16 +586,26 @@ async fn handle_attach(
         3 => crate::session::AttachMode::ReadOnly,
         _ => crate::session::AttachMode::Shared,
     };
-    // Idempotent attach for this connection; Steal clears other clients.
+    // Idempotent attach for this connection; Steal clears other clients'
+    // §3.10 attached_clients AND §3.4 lifecycle_subscribers so the kicker
+    // is the only remaining receiver of PaneAdded/PaneRemoved/SessionLayoutChanged.
     session.remove_attached_client(&client_id);
     if mode == crate::session::AttachMode::Steal {
         session.attached_clients.write().clear();
+        session.clear_lifecycle_subscribers();
     }
-    session.add_attached_client(client_id, mode, role);
+    session.add_attached_client(client_id.clone(), mode, role);
 
     if !req.window_id.is_empty() {
         session.add_window(req.window_id.clone());
     }
+
+    // §3.4 Register this connection's outbound channel as a session-level
+    // lifecycle subscriber. lifecycle_subscribers is keyed by client_id and
+    // held by the session; the connection's outbound_tx is closed when its
+    // read/write loop exits, after which broadcast_lifecycle prunes it.
+    // Re-attach of the same client_id replaces the prior sender idempotently.
+    session.add_lifecycle_subscriber(client_id, outbound_tx.clone());
 
     // §3.4 把该连接的 outbound_tx 注册为 session 内所有 pane 的 subscriber。
     // 后续 PTY output → bump generation → broadcast PaneDirty → 此连接收到。
@@ -657,6 +668,7 @@ async fn handle_detach(
         let mut sessions_w = sessions.write();
         for session in sessions_w.iter_mut() {
             session.remove_attached_client(&client_id);
+            session.remove_lifecycle_subscriber(&client_id);
         }
     }
     Ok(ResponseBody::Error(String::new()))
@@ -740,8 +752,11 @@ async fn handle_spawn_pane(
         .unwrap_or((80, 24));
 
     // §3.1 spawn PTY + alacritty Term
-    let pane = crate::pane::Pane::spawn(
+    // §3.4 spawn_with_session 注入 session_id, 让 PTY read loop 在自然退出时
+    // 能定位所在会话并 fan-out PaneRemoved。
+    let pane = crate::pane::Pane::spawn_with_session(
         pane_id.clone(),
+        req.session_id.clone(),
         cwd,
         cols,
         rows,
@@ -806,17 +821,20 @@ async fn handle_spawn_pane(
 
     zlog::info!("pane spawned: id={} session={}", pane_id, req.session_id);
 
-    // §3.4 推送 PaneAdded 通知
-    let notify = Notification {
-        event: Some(mux_protocol::notification::Event::PaneAdded(
-            mux_protocol::PaneAdded {
-                pane_id: pane_id.clone(),
-                tab_id: req.tab_id.clone(),
-            },
-        )),
-    };
-    send_notification_envelope(outbound_tx, notify)
-        .map_err(|_| anyhow::anyhow!("client disconnected after pane spawn"))?;
+    // §3.4 Install natural-exit hook before fan-out so a fast-exiting shell
+    // still produces PaneRemoved for every attached client.
+    {
+        let sessions_r = sessions.read();
+        if let Some(session) = sessions_r.iter().find(|s| s.id == req.session_id) {
+            if let Some(pane) = session.panes.read().get(&pane_id) {
+                install_pane_exit_hook(pane, sessions, req.session_id.clone(), pane_id.clone());
+            }
+        }
+    }
+
+    // §3.4 fan-out PaneAdded 到所有 attached 客户端 (session 级 lifecycle 路径,
+    // at-least-once: 每个 attached 连接的 outbound channel 都收一份, 不只是发起方)。
+    broadcast_pane_added(sessions, &req.session_id, &pane_id, &req.tab_id);
 
     Ok(ResponseBody::PaneId(pane_id))
 }
@@ -885,6 +903,8 @@ async fn handle_split_pane(
                 .iter()
                 .find(|(_, tab)| tab.pane_ids.contains(&req.pane_id))
                 .map(|(id, _)| id.clone());
+            let parent_tab_id_for_broadcast =
+                parent_tab_id.clone().unwrap_or_default();
             if let Some(tab_id) = parent_tab_id {
                 if let Some(tab) = session.tabs.get_mut(&tab_id) {
                     if !tab.pane_ids.contains(&new_pane_id) {
@@ -910,27 +930,31 @@ async fn handle_split_pane(
                     }
                 });
             }
-
-            let pane_added = Notification {
-                event: Some(mux_protocol::notification::Event::PaneAdded(
-                    mux_protocol::PaneAdded {
-                        pane_id: new_pane_id.clone(),
-                        tab_id: String::new(),
-                    },
-                )),
-            };
-            send_notification_envelope(outbound_tx, pane_added)
-                .map_err(|_| anyhow::anyhow!("client disconnected during split"))?;
-            let layout_proto = layout_tree_to_proto(&session.layout);
-            let layout_changed = Notification {
-                event: Some(mux_protocol::notification::Event::SessionLayoutChanged(
-                    mux_protocol::SessionLayoutChanged {
-                        layout: Some(layout_proto),
-                    },
-                )),
-            };
-            send_notification_envelope(outbound_tx, layout_changed)
-                .map_err(|_| anyhow::anyhow!("client disconnected during split"))?;
+            // §3.4 fan-out PaneAdded + 更新后 layout 到所有 attached 客户端。
+            // 写入 session 在 scopes 结束 (sessions_w 被 drop) 后释放,
+            // 由 lifecycle helper 重新获取读锁单次发送, 避免嵌套写锁的死锁。
+            let session_id_for_broadcast = session.id.clone();
+            drop(sessions_w);
+            {
+                let sessions_r = sessions.read();
+                if let Some(session) = sessions_r.iter().find(|s| s.id == session_id_for_broadcast) {
+                    if let Some(pane) = session.panes.read().get(&new_pane_id) {
+                        install_pane_exit_hook(
+                            pane,
+                            sessions,
+                            session_id_for_broadcast.clone(),
+                            new_pane_id.clone(),
+                        );
+                    }
+                }
+            }
+            broadcast_pane_added(
+                sessions,
+                &session_id_for_broadcast,
+                &new_pane_id,
+                &parent_tab_id_for_broadcast,
+            );
+            broadcast_layout_changed(sessions, &session_id_for_broadcast);
             return Ok(ResponseBody::PaneId(new_pane_id));
         }
     }
@@ -942,43 +966,37 @@ async fn handle_split_pane(
 async fn handle_close_pane(
     req: &ClosePaneRequest,
     sessions: &Arc<parking_lot::RwLock<Vec<crate::session::Session>>>,
-    outbound_tx: &mpsc::UnboundedSender<Envelope>,
+    _outbound_tx: &mpsc::UnboundedSender<Envelope>,
+    connection_client_id: &Arc<parking_lot::Mutex<Option<String>>>,
 ) -> anyhow::Result<ResponseBody> {
-    let mut sessions_w = sessions.write();
-    for session in sessions_w.iter_mut() {
-        if let Err(e) = session.layout.remove_pane(&req.pane_id) {
-            tracing::error!(error = ?e, pane_id = %req.pane_id, "failed to remove pane from layout");
-        }
-        // §3.10 从 panes registry 移除 (drop 触发 child kill)
-        let mut panes = session.panes.write();
-        if panes.remove(&req.pane_id).is_some() {
-            zlog::info!("pane closed: id={}", req.pane_id);
-        }
+    if !client_still_attached(sessions, connection_client_id) {
+        anyhow::bail!("client not attached (kicked or detached)");
     }
 
-    // §16.9 broadcast updated layout to the requesting client.
-    let session_id = sessions_w
-        .iter()
-        .find(|s| s.layout.pane_ids().is_empty().then_some(true).unwrap_or(false)
-            || s.panes.read().contains_key(&req.pane_id))
-        .map(|s| s.id.clone())
-        .or_else(|| sessions_w.first().map(|s| s.id.clone()));
-    drop(sessions_w);
+    let mut removed = false;
+    let mut session_id = None;
+    {
+        let mut sessions_w = sessions.write();
+        for session in sessions_w.iter_mut() {
+            let had = session.panes.write().remove(&req.pane_id).is_some();
+            if had {
+                removed = true;
+                session_id = Some(session.id.clone());
+                if let Err(e) = session.layout.remove_pane(&req.pane_id) {
+                    tracing::error!(error = ?e, pane_id = %req.pane_id, "failed to remove pane from layout");
+                }
+                zlog::info!("pane closed: id={}", req.pane_id);
+                break;
+            }
+        }
+    }
+    if !removed {
+        anyhow::bail!("pane not found: {}", req.pane_id);
+    }
     if let Some(sid) = session_id {
-        broadcast_layout_changed(sessions, &sid, outbound_tx);
+        broadcast_layout_changed(sessions, &sid);
+        broadcast_pane_removed(sessions, &sid, &req.pane_id, 0);
     }
-
-    // §3.4 推送 PaneRemoved 通知
-    let notify = Notification {
-        event: Some(mux_protocol::notification::Event::PaneRemoved(
-            mux_protocol::PaneRemoved {
-                pane_id: req.pane_id.clone(),
-                exit_code: 0,
-            },
-        )),
-    };
-    let _ = send_notification_envelope(outbound_tx, notify);
-
     Ok(ResponseBody::Error(String::new()))
 }
 
@@ -998,11 +1016,11 @@ async fn handle_focus_pane(
     }
     drop(sessions_w);
     if let Some(sid) = matched_session_id {
-        broadcast_layout_changed(sessions, &sid, outbound_tx);
+        // §3.4 SessionLayoutChanged 走会话级 lifecycle fan-out, 送达所有 attached 客户端。
+        broadcast_layout_changed(sessions, &sid);
     }
     Ok(ResponseBody::Error(String::new()))
 }
-
 /// §3.10 调整 pane 尺寸 — 真正调用 pane.resize (PTY TIOCSWINSZ + alacritty)
 async fn handle_resize_pane(
     req: &ResizePaneRequest,
@@ -1024,7 +1042,12 @@ async fn handle_send_input(
     sessions: &Arc<parking_lot::RwLock<Vec<crate::session::Session>>>,
     clipboard: &Arc<crate::clipboard::ServerClipboard>,
     outbound_tx: &mpsc::UnboundedSender<Envelope>,
+    connection_client_id: &Arc<parking_lot::Mutex<Option<String>>>,
 ) -> anyhow::Result<ResponseBody> {
+    if !client_still_attached(sessions, connection_client_id) {
+        anyhow::bail!("client not attached (kicked or detached)");
+    }
+
     // §16.6 解析 OSC 52 序列: ESC ] 52 ; c ; <base64> BEL/ST
     let mut osc52_parser = crate::clipboard::Osc52Parser::new();
     if let Some(base64_content) = osc52_parser.feed(&req.data) {
@@ -1396,15 +1419,83 @@ fn layout_tree_to_proto(
     }
 }
 
-/// §16.9 / §3.4 把当前会话的 layout 变更广播给单个连接。
-/// 
-/// 调用方在 split/close/resize/focus 后调用此函数,通知客户端刷新 layout。
-/// 当前每个连接只看到自己 outbound_tx;真实多客户端广播需要 session 级
-/// subscriber registry (Plan 10 后续工作),此函数先保证单连接流程跑通。
+/// §3.4 lifecycle 广播 helper: 对 `session_id` 会话内所有已注册 lifecycle 订阅者
+/// (每个 attached 连接的 outbound channel) 投递一条 Notification (at-least-once)。
+///
+/// 该路径与 pane 维度 lossy 的 PaneOutput/PaneDirty 完全分离:
+/// - lifecycle 通知 (PaneAdded / PaneRemoved / SessionLayoutChanged) 必须
+///   送达每一个 attached 客户端, 不只是发起操作的连接;
+/// - PaneDirty 是 best-effort 的刷新触发器, 一次丢失无害 (下次 generation bump
+///   会再发, 客户端 fetch_grid_update 也会自驱 reconcile)。
+///
+/// outbound channel 是 tokio::mpsc::unbounded, 因此 subscriber 慢不会丢通知
+/// (会背压到该连接的写循环), closed channel 的 send 失败时立即清理对应订阅,
+/// 避免泄漏 disconnected 客户端。
+fn broadcast_lifecycle_in_session(
+    sessions: &Arc<parking_lot::RwLock<Vec<crate::session::Session>>>,
+    session_id: &str,
+    notif: Notification,
+) {
+    let sessions_r = sessions.read();
+    let Some(session) = sessions_r.iter().find(|s| s.id == session_id) else {
+        return;
+    };
+    session.broadcast_lifecycle(notif);
+}
+
+/// §16.9 / §3.4 把当前会话的 layout 变更 fan-out 到所有 attached 连接。
+///
+/// 调用方在 split/close/focus/zoom 后调用此函数; 通知进入会话级 lifecycle 路径
+/// 而非仅发起方的 outbound_tx, 因此多个 attached 客户端都会收到 layout 刷新。
+
+/// §3.4 When a pane's shell exits, remove it from the session and fan-out PaneRemoved.
+fn install_pane_exit_hook(
+    pane: &std::sync::Arc<crate::pane::Pane>,
+    sessions: &Arc<parking_lot::RwLock<Vec<crate::session::Session>>>,
+    session_id: String,
+    pane_id: String,
+) {
+    let sessions = sessions.clone();
+    let hook = std::sync::Arc::new(move || {
+        {
+            let mut sessions_w = sessions.write();
+            if let Some(session) = sessions_w.iter_mut().find(|s| s.id == session_id) {
+                let _ = session.layout.remove_pane(&pane_id);
+                session.panes.write().remove(&pane_id);
+            }
+        }
+        broadcast_pane_removed(&sessions, &session_id, &pane_id, 0);
+        broadcast_layout_changed(&sessions, &session_id);
+    });
+    pane.set_exit_hook(hook);
+}
+
+
+fn client_still_attached(
+    sessions: &Arc<parking_lot::RwLock<Vec<crate::session::Session>>>,
+    connection_client_id: &Arc<parking_lot::Mutex<Option<String>>>,
+) -> bool {
+    let Some(client_id) = connection_client_id.lock().clone() else {
+        // Pre-attach local socket: allow (create_session etc.).
+        return true;
+    };
+    let sessions_r = sessions.read();
+    for session in sessions_r.iter() {
+        if session
+            .attached_clients
+            .read()
+            .iter()
+            .any(|c| c.client_id == client_id)
+        {
+            return true;
+        }
+    }
+    false
+}
+
 fn broadcast_layout_changed(
     sessions: &Arc<parking_lot::RwLock<Vec<crate::session::Session>>>,
     session_id: &str,
-    outbound_tx: &mpsc::UnboundedSender<Envelope>,
 ) {
     let layout_proto = {
         let sessions_r = sessions.read();
@@ -1421,11 +1512,43 @@ fn broadcast_layout_changed(
             mux_protocol::SessionLayoutChanged { layout: Some(layout) },
         )),
     };
-    let envelope = Envelope {
-        version: Some(mux_protocol::PROTOCOL_VERSION.clone()),
-        payload: Some(EnvelopePayload::Notification(notify)),
+    broadcast_lifecycle_in_session(sessions, session_id, notify);
+}
+
+/// §3.4 fan-out PaneAdded 到该会话所有 attached 连接 (split / spawn 后调用)。
+fn broadcast_pane_added(
+    sessions: &Arc<parking_lot::RwLock<Vec<crate::session::Session>>>,
+    session_id: &str,
+    pane_id: &str,
+    tab_id: &str,
+) {
+    let notify = Notification {
+        event: Some(mux_protocol::notification::Event::PaneAdded(
+            mux_protocol::PaneAdded {
+                pane_id: pane_id.to_string(),
+                tab_id: tab_id.to_string(),
+            },
+        )),
     };
-    let _ = outbound_tx.send(envelope);
+    broadcast_lifecycle_in_session(sessions, session_id, notify);
+}
+
+/// §3.4 fan-out PaneRemoved 到该会话所有 attached 连接 (close / 自然退出后调用)。
+fn broadcast_pane_removed(
+    sessions: &Arc<parking_lot::RwLock<Vec<crate::session::Session>>>,
+    session_id: &str,
+    pane_id: &str,
+    exit_code: i32,
+) {
+    let notify = Notification {
+        event: Some(mux_protocol::notification::Event::PaneRemoved(
+            mux_protocol::PaneRemoved {
+                pane_id: pane_id.to_string(),
+                exit_code,
+            },
+        )),
+    };
+    broadcast_lifecycle_in_session(sessions, session_id, notify);
 }
 
 // ============================================================================
@@ -1576,25 +1699,23 @@ async fn handle_zoom_pane(
         )));
     }
 
-    // 广播 PaneZoomed 通知
-    let notify = Notification {
-        event: Some(mux_protocol::notification::Event::PaneZoomed(
-            mux_protocol::PaneZoomed {
-                pane_id: req.pane_id.clone(),
-                zoomed: req.zoom,
-            },
-        )),
-    };
-    let envelope = Envelope {
-        version: Some(mux_protocol::PROTOCOL_VERSION.clone()),
-        payload: Some(EnvelopePayload::Notification(notify)),
-    };
-    let _ = outbound_tx.send(envelope);
-
-    // zoom 影响 layout 可见性, 同步广播 layout 变更
-    if let Some(sid) = matched_session_id {
-        broadcast_layout_changed(sessions, &sid, outbound_tx);
+    // §3.4 zoom 影响 layout 可见性; PaneZoomed + SessionLayoutChanged 都属于
+    // lifecycle 事件范畴, 走会话级 lifecycle fan-out 路径送达所有 attached 客户端。
+    let session_id = matched_session_id.expect("pane_found implies matched session");
+    {
+        let sessions_r = sessions.read();
+        if let Some(session) = sessions_r.iter().find(|s| s.id == session_id) {
+            session.broadcast_lifecycle(Notification {
+                event: Some(mux_protocol::notification::Event::PaneZoomed(
+                    mux_protocol::PaneZoomed {
+                        pane_id: req.pane_id.clone(),
+                        zoomed: req.zoom,
+                    },
+                )),
+            });
+        }
     }
+    broadcast_layout_changed(sessions, &session_id);
 
     zlog::info!("pane zoom: pane={} zoomed={}", req.pane_id, req.zoom);
     Ok(ResponseBody::ZoomPane(mux_protocol::ZoomPaneResponse {}))

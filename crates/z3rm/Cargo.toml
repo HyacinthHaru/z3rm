@@ -254,6 +254,9 @@ workspace = true
 [dependencies.settings_ui]
 workspace = true
 
+[dependencies.serde_json]
+workspace = true
+
 [dependencies.shellexpand]
 workspace = true
 

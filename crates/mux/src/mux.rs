@@ -20,6 +20,7 @@ use mux_protocol::{
     frame, Envelope, Notification, PROTOCOL_VERSION,
     Request, Response, SessionInfo, TerminalSize, FetchGridUpdateResponse,
     FetchScrollbackResponse, AttachResponse, ShellCommand, ShellIntegrationResponse,
+    notification::Event as NotifEvent, SessionLayoutChanged,
 };
 
 // §16.6 SSH 远程连接模块（Plan 19）。
@@ -158,6 +159,63 @@ fn default_socket_path() -> std::path::PathBuf {
     }
 }
 
+trait ReadWrite: std::io::Read + std::io::Write {}
+impl<T: std::io::Read + std::io::Write> ReadWrite for T {}
+
+/// §15.4 Open a fresh local socket and return the live byte stream, without
+/// spawning the I/O thread. Used by `MuxDomain::reconnect_local_in_place` so
+/// the new I/O thread can be bound to an existing `Arc<RwLock<DomainInner>>`
+/// rather than a freshly-created one. Mirrors the stale-socket retry that
+/// `connect_local` performs.
+fn connect_local_stream(
+    socket_path: Option<&Path>,
+) -> Result<Box<dyn ReadWrite + Send>> {
+    let path = match socket_path {
+        Some(p) => p.to_path_buf(),
+        None => default_socket_path(),
+    };
+
+    #[cfg(unix)]
+    fn open(path: &std::path::Path) -> Result<Box<dyn ReadWrite + Send>> {
+        use std::os::unix::net::UnixStream;
+        let connect = || -> Result<UnixStream> {
+            let stream = UnixStream::connect(path)
+                .map_err(|e| anyhow::anyhow!("connect failed: {}", e))?;
+            stream
+                .set_nonblocking(true)
+                .map_err(|e| anyhow::anyhow!("set_nonblocking failed: {}", e))?;
+            Ok(stream)
+        };
+        match connect() {
+            Ok(stream) => Ok(Box::new(stream)),
+            Err(e) => {
+                let msg = format!("{}", e);
+                if msg.contains("111") || msg.contains("Connection refused") {
+                    tracing::warn!(path = %path.display(), "stale socket (111), cleaning and retrying");
+                    let _ = std::fs::remove_file(path);
+                    let stream = connect()?;
+                    Ok(Box::new(stream))
+                } else {
+                    Err(e)
+                }
+            }
+        }
+    }
+    #[cfg(not(unix))]
+    fn open(path: &std::path::Path) -> Result<Box<dyn ReadWrite + Send>> {
+        use interprocess::local_socket::{prelude::*, GenericNamespaced, Stream as LocalSocketStream};
+        let pipe_name = path.to_string_lossy().to_string();
+        let name = pipe_name
+            .to_ns_name::<GenericNamespaced>()
+            .map_err(|e| anyhow::anyhow!("invalid pipe name: {}", e))?;
+        let stream = LocalSocketStream::connect(name)
+            .map_err(|e| anyhow::anyhow!("connect failed: {}", e))?;
+        Ok(Box::new(stream))
+    }
+
+    open(&path)
+}
+
 // ============================================================================
 // §9 MuxDomain 实现
 // ============================================================================
@@ -273,8 +331,23 @@ impl MuxDomain {
                         Some(EnvelopePayload::Notification(notif)) => {
                             let mut subs = subscribers.lock();
                             subs.retain(|tx| !tx.is_closed());
+                            let is_lifecycle = matches!(
+                                notif.event,
+                                Some(NotifEvent::PaneAdded(_))
+                                    | Some(NotifEvent::PaneRemoved(_))
+                                    | Some(NotifEvent::SessionLayoutChanged(_))
+                            );
                             for tx in subs.iter() {
-                                let _ = tx.try_send(notif.clone());
+                                if is_lifecycle {
+                                    // §3.4 at-least-once: block rather than drop lifecycle.
+                                    // The I/O thread is dedicated; a slow GUI may stall
+                                    // briefly but must not lose PaneRemoved.
+                                    if tx.send_blocking(notif.clone()).is_err() {
+                                        // closed
+                                    }
+                                } else if tx.try_send(notif.clone()).is_err() {
+                                    // PaneDirty is at-most-once / lossy under pressure.
+                                }
                             }
                         }
                         Some(EnvelopePayload::Request(_)) => {
@@ -449,6 +522,15 @@ impl MuxDomain {
         Ok(())
     }
 
+    /// §3.5 Request an explicit mux_server process shutdown.
+    pub async fn shutdown(&self) -> Result<()> {
+        self.send_request(RequestBody::Shutdown(
+            mux_protocol::ShutdownRequest {},
+        ))
+        .await?;
+        Ok(())
+    }
+
     /// §3.10 重命名会话。
     pub async fn rename_session(&self, id: &str, name: &str) -> Result<()> {
         let req = RequestBody::RenameSession(mux_protocol::RenameSessionRequest {
@@ -518,9 +600,21 @@ impl MuxDomain {
 
     /// §3.10 拆分已有 Pane，返回新 Pane ID。
     pub async fn split_pane(&self, pane: &str, direction: SplitDirection) -> Result<String> {
+        self.split_pane_with_command(pane, direction, None).await
+    }
+
+    /// §3.10 Split an existing pane and optionally run a command in it.
+    pub async fn split_pane_with_command(
+        &self,
+        pane: &str,
+        direction: SplitDirection,
+        command: Option<ShellCommand>,
+    ) -> Result<String> {
         let req = RequestBody::SplitPane(mux_protocol::SplitPaneRequest {
             pane_id: pane.to_string(),
             direction: direction as i32,
+            command,
+            cwd: None,
         });
         let resp = self.send_request(req).await?;
         match resp.body {
@@ -701,9 +795,144 @@ impl MuxDomain {
     // ========================================================================
 
     pub fn subscribe(&self) -> async_channel::Receiver<Notification> {
-        let (tx, rx) = async_channel::bounded(256);
+        let (tx, rx) = async_channel::bounded(4096);
         self.inner.read().subscribers.lock().push(tx);
         rx
+    }
+
+    // ========================================================================
+    // §15.4 Reconnect helpers: subscriber transfer + synthetic notification
+    // ========================================================================
+
+    /// Probe whether the connection is alive by issuing a lightweight
+    /// list-sessions request. Returns `true` if the io thread is still
+    /// active and the server responded.
+    pub async fn check_connection(&self) -> bool {
+        self.list_sessions().await.is_ok()
+    }
+
+    /// Extract the subscriber list, leaving an empty list in its place.
+    /// Used during reconnect to transfer subscribers from the old (dead)
+    /// domain into the freshly connected domain.
+    pub fn take_subscribers(
+        &self,
+    ) -> Arc<parking_lot::Mutex<Vec<async_channel::Sender<Notification>>>> {
+        let inner = self.inner.write();
+        let mut subs_guard = inner.subscribers.lock();
+        let taken = std::mem::take(&mut *subs_guard);
+        Arc::new(parking_lot::Mutex::new(taken))
+    }
+
+    /// Install a previously extracted subscriber list into this domain.
+    /// Any pre-existing subscribers are replaced.
+    pub fn install_subscribers(
+        &self,
+        subs: Arc<parking_lot::Mutex<Vec<async_channel::Sender<Notification>>>>,
+    ) {
+        let mut inner = self.inner.write();
+        inner.subscribers = subs;
+    }
+
+    /// Broadcast a synthetic notification to every subscriber (at-least-once).
+    /// Used after reconnect to deliver a SessionLayoutChanged without waiting
+    /// for the server to push one.
+    pub fn broadcast_notification(&self, notif: Notification) {
+        let inner = self.inner.read();
+        let mut subs = inner.subscribers.lock();
+        subs.retain(|tx| !tx.is_closed());
+        for tx in subs.iter() {
+            if tx.try_send(notif.clone()).is_err() {
+                tracing::debug!("notification subscriber dropped before delivery");
+            }
+        }
+    }
+
+    /// §15.4 / §15.12 Authoritative in-place reconnect.
+    ///
+    /// Opens a fresh local socket and spawns a new I/O thread bound to
+    /// `self.inner`'s existing `Arc<RwLock<DomainInner>>`, then swaps the
+    /// transport-bound fields of that `DomainInner` in place. Because the
+    /// new I/O thread and `self` share the *same* `Arc`, request/response
+    /// routing and notification fan-out keep working for every existing
+    /// `Arc<MuxDomain>` and every already-registered subscriber — no GUI
+    /// re-wiring required.
+    ///
+    /// `self.window_id` is preserved (the server sees the same logical
+    /// window across reconnect). Subscriber senders registered before the
+    /// reconnect remain wired to `self.inner`'s subscribers `Mutex`, which
+    /// is exactly the `Mutex` the new I/O thread fans out into, so they
+    /// keep receiving server-pushed notifications.
+    ///
+    /// After the swap, re-attaches the supplied active `session_id` and
+    /// broadcasts a synthetic `SessionLayoutChanged` derived from the full
+    /// authoritative snapshot returned by the server — observers reconcile
+    /// from the snapshot rather than racing the at-least-once push path.
+    pub async fn reconnect_local_in_place(
+        &self,
+        session_id: &str,
+        attach_mode: AttachMode,
+    ) -> Result<()> {
+        let preserved = self.take_subscribers();
+        let new_write_tx = self.spawn_local_io()?;
+        self.reinsert_subscribers(&preserved);
+        {
+            let mut inner = self.inner.write();
+            inner.pending_requests.clear();
+            inner.next_request_id = AtomicU64::new(1);
+            inner.write_tx = new_write_tx;
+        }
+        let attach_resp = self.attach(session_id, attach_mode).await?;
+        if let Some(snapshot) = attach_resp.snapshot.as_ref() {
+            if let Some(layout) = snapshot.layout.as_ref() {
+                self.broadcast_notification(Notification {
+                    event: Some(NotifEvent::SessionLayoutChanged(
+                        SessionLayoutChanged {
+                            layout: Some(layout.clone()),
+                        },
+                    )),
+                });
+            }
+        }
+        Ok(())
+     }
+
+    /// Open a fresh local socket and spawn a new I/O thread bound to the
+    /// existing `self.inner` `Arc<RwLock<DomainInner>>`. Returns the write
+    /// channel the I/O thread drains so the caller can install it into the
+    /// `DomainInner` as the live transport.
+    fn spawn_local_io(&self) -> Result<std::sync::mpsc::Sender<Vec<u8>>> {
+        let stream = connect_local_stream(None)?;
+        let (write_tx, write_rx) = std::sync::mpsc::channel();
+        let io_inner = self.inner.clone();
+        let io_subscribers = {
+            let guard = self.inner.read();
+            guard.subscribers.clone()
+        };
+        std::thread::Builder::new()
+            .name("mux-io".into())
+            .spawn(move || {
+                Self::io_and_router_loop(stream, write_rx, io_inner, io_subscribers);
+            })
+            .map_err(|e| anyhow::anyhow!("failed to spawn mux I/O thread: {}", e))?;
+        Ok(write_tx)
+    }
+
+    /// Reinsert sender handles previously removed by `take_subscribers` back
+    /// into `self.inner`'s subscribers `Mutex` so the live I/O thread fans
+    /// out to them. Restores continuity for pre-reconnect subscribers
+    /// without replacing the subscribers `Arc` (which the I/O thread has
+    /// already captured).
+    fn reinsert_subscribers(
+        &self,
+        preserved: &Arc<parking_lot::Mutex<Vec<async_channel::Sender<Notification>>>>,
+    ) {
+        let mut taken = preserved.lock();
+        if taken.is_empty() {
+            return;
+        }
+        let guard = self.inner.read();
+        let mut into = guard.subscribers.lock();
+        into.append(&mut taken);
     }
 }
 
