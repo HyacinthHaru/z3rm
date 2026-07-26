@@ -7612,6 +7612,7 @@ dependencies = [
 name = "mux_protocol"
 version = "0.1.0"
 dependencies = [
+ "anyhow",
  "prost",
  "prost-build",
  "prost-types",
@@ -13008,6 +13009,7 @@ name = "terminal_view"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "async-channel 2.5.0",
  "async-recursion",
  "collections",
  "db",

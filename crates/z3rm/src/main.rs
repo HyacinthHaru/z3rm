@@ -36,10 +36,12 @@ static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
 
 fn build_application() -> Application {
     let platform = gpui_platform::current_platform(false);
-    if std::env::var("Z3RM_EXPERIMENTAL_A11Y").as_deref() == Ok("1") {
-        Application::with_platform(platform)
-    } else {
+    // §16.4 Accessibility is on by default (AccessKit). Set Z3RM_A11Y=0 to
+    // force-disable for diagnosis of platform integration issues.
+    if std::env::var("Z3RM_A11Y").as_deref() == Ok("0") {
         Application::new_inaccessible(platform)
+    } else {
+        Application::with_platform(platform)
     }
 }
 

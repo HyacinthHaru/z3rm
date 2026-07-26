@@ -511,7 +511,7 @@ impl Pane {
     /// §3.10 Paste — 向 PTY 写入文本 (可选 bracketed paste markers)。
     pub fn paste(&self, text: &str) -> anyhow::Result<()> {
         if self.is_bracketed_paste_active() {
-            let bracketed = format!("\x1b[2004{}\x1b[2014", text);
+            let bracketed = format!("\x1b[200~{}\x1b[201~", text);
             self.write_input(bracketed.as_bytes())
         } else {
             self.write_input(text.as_bytes())

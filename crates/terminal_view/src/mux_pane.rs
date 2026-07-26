@@ -11,7 +11,7 @@
 use std::sync::Arc;
 use gpui::{
     App, AppContext, AsyncApp, Context, Entity, EventEmitter, FocusHandle, Focusable,
-    InteractiveElement, KeyDownEvent, Keystroke, ParentElement, Render, SharedString,
+    InteractiveElement, KeyDownEvent, Keystroke, ParentElement, Render, Role, SharedString,
     StatefulInteractiveElement, Styled, Task, WeakEntity, Window, div,
 };
 use mux::MuxDomain;
@@ -179,100 +179,122 @@ impl MuxPaneView {
         let rx = self.domain.subscribe();
         let weak = cx.entity().downgrade();
 
+        // Coalescing loop: accumulate small PaneOutput/PaneDirty signals, then
+        // flush after an 8ms quiet window (or immediately above 64KiB). Unlike
+        // the prior Task-latch design, this loop always re-arms after each flush
+        // because there is no cross-scope Option that stays Some forever.
         let task = cx.spawn(async move |_, cx| {
             let mut pending_output: Vec<u8> = Vec::new();
             let mut pending_dirty = false;
-            let mut flush_handle: Option<Task<()>> = None;
 
-            while let Ok(notif) = rx.recv().await {
-                let Some(event) = notif.event else { continue };
-                match event {
-                    // §3.1 exception: primary render path — accumulate bytes, flush per frame
-                    NotifEvent::PaneOutput(chunk) if chunk.pane_id == pane_id => {
-                        pending_output.extend_from_slice(&chunk.data);
-                        // Flush immediately if buffer is large (>64KB)
-                        if pending_output.len() > 65536 {
-                            Self::do_write_output(&weak, &mut pending_output, &mut flush_handle, cx).await;
-                        } else if flush_handle.is_none() {
-                            Self::schedule_flush(&weak, &mut pending_output, &mut flush_handle, &mut pending_dirty, cx);
+            loop {
+                // Block for the next notification when idle; otherwise drain
+                // whatever is already queued without waiting.
+                let notif = if pending_output.is_empty() && !pending_dirty {
+                    match rx.recv().await {
+                        Ok(n) => n,
+                        Err(_) => break,
+                    }
+                } else {
+                    match rx.try_recv() {
+                        Ok(n) => n,
+                        Err(err) if err.to_string().contains("empty") || format!("{err:?}").contains("Empty") => {
+                            // Quiet window: batch for ~half a frame, then flush.
+                            if pending_output.len() <= 65536 {
+                                cx.background_executor()
+                                    .timer(std::time::Duration::from_millis(8))
+                                    .await;
+                                // Drain anything that arrived during the wait.
+                                while let Ok(n) = rx.try_recv() {
+                                    if !Self::accumulate_notification(
+                                        &pane_id,
+                                        n,
+                                        &mut pending_output,
+                                        &mut pending_dirty,
+                                        &weak,
+                                        cx,
+                                    ) {
+                                        return;
+                                    }
+                                }
+                            }
+                            Self::flush_pending(&weak, &mut pending_output, &mut pending_dirty, cx)
+                                .await;
+                            continue;
                         }
+                        Err(_) => break,
                     }
-                    // §3.3 grid-diff path: debounce to once per frame
-                    NotifEvent::PaneDirty(dirty) if dirty.pane_id == pane_id => {
-                        pending_dirty = true;
-                        if flush_handle.is_none() {
-                            Self::schedule_flush(&weak, &mut pending_output, &mut flush_handle, &mut pending_dirty, cx);
-                        }
-                    }
-                    NotifEvent::PaneRemoved(removed) if removed.pane_id == pane_id => {
-                        let _ = weak.update(cx, |view, cx| {
-                            view.notification_task = None;
-                            cx.emit(MuxPaneEvent::CloseRequested);
-                        });
-                        break;
-                    }
-                    _ => {}
+                };
+
+                if !Self::accumulate_notification(
+                    &pane_id,
+                    notif,
+                    &mut pending_output,
+                    &mut pending_dirty,
+                    &weak,
+                    cx,
+                ) {
+                    break;
+                }
+
+                if pending_output.len() > 65536 {
+                    Self::flush_pending(&weak, &mut pending_output, &mut pending_dirty, cx).await;
                 }
             }
         });
         self.notification_task = Some(task);
     }
 
-    /// §3.3 Deferred flush: wait ~8ms (half-frame) to batch data, then flush.
-    /// Called only when flush_handle is None (at most one pending at a time).
-    fn schedule_flush(
+    /// Returns false when the pane was removed and the listener should exit.
+    fn accumulate_notification(
+        pane_id: &str,
+        notif: mux_protocol::Notification,
+        pending_output: &mut Vec<u8>,
+        pending_dirty: &mut bool,
+        weak: &WeakEntity<Self>,
+        cx: &mut AsyncApp,
+    ) -> bool {
+        let Some(event) = notif.event else {
+            return true;
+        };
+        match event {
+            NotifEvent::PaneOutput(chunk) if chunk.pane_id == pane_id => {
+                pending_output.extend_from_slice(&chunk.data);
+                true
+            }
+            NotifEvent::PaneDirty(dirty) if dirty.pane_id == pane_id => {
+                *pending_dirty = true;
+                true
+            }
+            NotifEvent::PaneRemoved(removed) if removed.pane_id == pane_id => {
+                let _ = weak.update(cx, |view, cx| {
+                    view.notification_task = None;
+                    cx.emit(MuxPaneEvent::CloseRequested);
+                });
+                false
+            }
+            _ => true,
+        }
+    }
+
+    async fn flush_pending(
         weak: &WeakEntity<Self>,
         pending_output: &mut Vec<u8>,
-        flush_handle: &mut Option<Task<()>>,
         pending_dirty: &mut bool,
         cx: &mut AsyncApp,
     ) {
-        // Take the data into a local variable before spawning so we have it
-        // at closure capture time without borrowing pending_output.
-        let has_output = !pending_output.is_empty();
-        let has_dirty = *pending_dirty;
         let data = std::mem::take(pending_output);
-        *pending_dirty = false;
-        let weak2 = weak.clone();
-
-        *flush_handle = Some(cx.spawn(async move |cx| {
-            cx.background_executor().timer(std::time::Duration::from_millis(8)).await;
-            if !data.is_empty() {
-                let _ = weak2.update(cx, |view, cx| {
-                    view.terminal.update(cx, |terminal, cx| {
-                        terminal.write_output(&data, cx);
-                    });
-                    // Trigger repaint on MuxPaneView so TerminalElement reads
-                    // fresh terminal data next frame.
-                    cx.notify();
-                });
-            } else if has_dirty {
-                // No output bytes but dirty flag set — nothing visible changed,
-                // schedule a fetch for the next frame anyway (catches cursor/style changes).
-                let _ = weak2.update(cx, |view, cx| {
-                    view.schedule_fetch(cx);
-                });
-            }
-        }));
-    }
-
-    /// §3.3 Synchronous flush: write output and trigger repaint immediately.
-    async fn do_write_output(
-        weak: &WeakEntity<Self>,
-        pending_output: &mut Vec<u8>,
-        flush_handle: &mut Option<Task<()>>,
-        cx: &mut AsyncApp,
-    ) {
-        if let Some(handle) = flush_handle.take() {
-            handle.detach();
-        }
-        let data = std::mem::take(pending_output);
+        let dirty = std::mem::take(pending_dirty);
         if !data.is_empty() {
             let _ = weak.update(cx, |view, cx| {
                 view.terminal.update(cx, |terminal, cx| {
                     terminal.write_output(&data, cx);
                 });
                 cx.notify();
+            });
+        } else if dirty {
+            let _ = weak.update(cx, |view, cx| {
+                view.schedule_fetch(cx);
             });
         }
     }
@@ -615,10 +637,19 @@ impl Render for MuxPaneView {
             dispatch_context.add("PrefixMode");
         }
 
+        // §16.4 a11y: root exposes Role::Terminal + title label so assistive
+        // tech announces the pane. Remaining gap: the grid cells (text rows,
+        // cursor) are not yet in the tree — TerminalElement implements Element
+        // without a11y_role/a11y_synthetic_children, so line text is invisible
+        // to screen readers. A synthetic-children render of Role::TextRun nodes
+        // is the next step and is intentionally deferred (large redesign).
+
         div()
             .size_full()
             .id("mux-pane-root")
             .track_focus(&self.focus_handle)
+            .role(Role::Terminal)
+            .aria_label(self.terminal.read(cx).title(true))
             .key_context(dispatch_context)
             .bg(colors.editor_background)
             .child(

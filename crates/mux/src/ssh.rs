@@ -8,9 +8,7 @@ use anyhow::{Context, Result, anyhow};
 use std::path::PathBuf;
 use std::process::Stdio;
 use std::time::Duration;
-use tokio::io::AsyncReadExt;
 use tokio::process::Command;
-use tokio::sync::oneshot;
 
 // ============================================================================
 // §16.6 SSH 连接选项
@@ -132,13 +130,26 @@ impl SshConnectionOptions {
 // ============================================================================
 
 /// §16.6 SSH 会话：管理 ControlMaster 连接和 socket 转发。
+///
+/// 拥有 ControlMaster 临时目录与 forward 转发子进程及其本地 socket 目录，
+/// Drop 时一并清理，避免进程与 socket 泄漏。
 pub struct SshSession {
     /// §16.6 连接选项。
     options: SshConnectionOptions,
+    /// §16.6 Control socket 目录，须随会话存活以保留 control socket 文件。
+    /// 该字段从不被读取，仅靠其 Drop 删除目录，故标注 dead_code。
+    #[allow(dead_code)]
+    control_dir: Option<tempfile::TempDir>,
     /// §16.6 Control socket 路径（用于复用连接）。
     control_path: PathBuf,
     /// §16.6 SSH 主进程。
     master_process: Option<tokio::process::Child>,
+    /// §16.6 forward 转发本地 socket 目录，须随会话存活以保留 socket 文件。
+    /// 该字段从不被读取，仅靠其 Drop 删除目录，故标注 dead_code。
+    #[allow(dead_code)]
+    forward_dir: Option<tempfile::TempDir>,
+    /// §16.6 forward 转发 ssh 子进程，Drop 时一并终止。
+    forward_process: Option<tokio::process::Child>,
 }
 
 impl SshSession {
@@ -149,9 +160,9 @@ impl SshSession {
     pub async fn connect(options: SshConnectionOptions) -> Result<Self> {
         let destination = options.destination();
 
-        // §16.6 创建临时 Control socket 目录。
-        let temp_dir = tempfile::tempdir().with_context(|| "创建临时目录失败")?;
-        let control_path = temp_dir.path().join("ssh_control");
+        // §16.6 创建临时 Control socket 目录，由 SshSession 持有以保留 socket 文件。
+        let control_dir = tempfile::tempdir().with_context(|| "创建临时目录失败")?;
+        let control_path = control_dir.path().join("ssh_control");
 
         // §16.6 启动 SSH ControlMaster 进程。
         let ssh_args = options.build_ssh_args();
@@ -164,35 +175,66 @@ impl SshSession {
             .arg("-o")
             .arg(control_str)
             .arg(&destination)
-            .stdout(Stdio::piped())
+            .stdout(Stdio::null())
             .stderr(Stdio::piped());
 
         let mut child = cmd
             .spawn()
             .context("启动 SSH 进程失败，请确认系统已安装 OpenSSH")?;
 
-        // §16.6 等待连接建立（读取 stdout 直到连接完成）。
+        // §16.6 ControlMaster 就绪判断：不依赖 stdout EOF（ssh -N 下 stdout 不会关闭），
+        // 改为轮询 control socket 是否出现。同时检查 ssh 是否已提前退出（连接失败）。
+        // stderr 留在 child 中以便失败时读取，并向调用者报告可诊断错误。
         let connect_timeout = Duration::from_secs(options.connect_timeout as u64);
-        let mut stdout = child.stdout.take().expect("stdout should be piped");
-
-        tokio::time::timeout(connect_timeout, async {
-            // §16.6 SSH ControlMaster 连接成功后 stdout 关闭。
-            let mut buf = [0u8; 1024];
+        let ready = tokio::time::timeout(connect_timeout, async {
             loop {
-                match stdout.read(&mut buf).await {
-                    Ok(0) => break, // §16.6 连接建立完成
-                    Ok(n) => {
-                        tracing::debug!(data = ?&buf[..n], "ssh master output");
+                // §16.6 ssh 提前退出说明连接失败：读取 stderr 后返回明确错误。
+                match child.try_wait() {
+                    Ok(Some(status)) => {
+                        let stderr_msg = match child.stderr.as_mut() {
+                            Some(s) => {
+                                use tokio::io::AsyncReadExt;
+                                let mut buf = vec![0u8; 4096];
+                                match s.read(&mut buf).await {
+                                    Ok(n) => String::from_utf8_lossy(&buf[..n]).to_string(),
+                                    Err(_) => String::new(),
+                                }
+                            }
+                            None => String::new(),
+                        };
+                        return Err(anyhow!(
+                            "SSH ControlMaster 退出，连接失败: status={} stderr={}",
+                            status,
+                            stderr_msg.trim()
+                        ));
                     }
-                    Err(e) => {
-                        tracing::warn!(error = %e, "ssh master read error");
-                        break;
-                    }
+                    Ok(None) => {}     // §16.6 进程仍在运行，继续等待 socket 出现。
+                    Err(e) => return Err(anyhow!("检查 SSH 进程状态失败: {e}")),
                 }
+                if control_path.exists() {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(100)).await;
             }
+            Ok(())
         })
-        .await
-        .context("SSH 连接超时")?;
+        .await;
+        match ready {
+            Ok(Ok(())) => {}
+            Ok(Err(e)) => {
+                // §16.6 失败路径：尽力终止已 spawn 的 ControlMaster，不静默吞错。
+                if let Err(kill_err) = child.start_kill() {
+                    tracing::warn!(error = %kill_err, "失败清理时终止 SSH ControlMaster 失败");
+                }
+                return Err(e);
+            }
+            Err(_) => {
+                if let Err(kill_err) = child.start_kill() {
+                    tracing::warn!(error = %kill_err, "超时清理时终止 SSH ControlMaster 失败");
+                }
+                return Err(anyhow!("SSH ControlMaster 连接超时: {}", destination));
+            }
+        }
 
         tracing::info!(
             destination = %destination,
@@ -202,8 +244,11 @@ impl SshSession {
 
         Ok(Self {
             options,
+            control_dir: Some(control_dir),
             control_path,
             master_process: Some(child),
+            forward_dir: None,
+            forward_process: None,
         })
     }
 
@@ -264,23 +309,25 @@ impl SshSession {
         Ok(())
     }
 
-    /// §16.6 通过 SSH 建立 socket 转发，返回本地 Unix socket 路径。
+    /// §16.6 通过 SSH 建立 socket 转发，将本地 Unix socket 转发到远程 socket。
     ///
-    /// 在远程执行 `socat` 或 `ssh -L` 将远程 Unix socket 转发到本地。
+    /// 转发子进程及其本地 socket 临时目录由本会话拥有，随 `SshSession` Drop 一并清理。
+    /// 返回本地 socket 路径供后续连接。多次调用会替换上一次的转发资源。
     pub async fn forward_socket(
-        &self,
+        &mut self,
         remote_socket: &str,
-    ) -> Result<(PathBuf, oneshot::Sender<()>)> {
+    ) -> Result<PathBuf> {
+        // §16.6 先清理上一次的转发资源（若有），避免遗留进程与 socket。
+        self.take_forward();
+
         let destination = self.options.destination();
         let ssh_args = self.options.build_ssh_args();
 
-        // §16.6 创建本地临时 Unix socket。
-        let temp_dir = tempfile::tempdir().with_context(|| "创建临时目录失败")?;
-        let local_socket_path = temp_dir.path().join("mux.sock");
+        // §16.6 创建本地临时 Unix socket 目录，由 SshSession 持有以保留 socket 文件。
+        let forward_dir = tempfile::tempdir().with_context(|| "创建临时目录失败")?;
+        let local_socket_path = forward_dir.path().join("mux.sock");
 
-        // §16.6 通过 SSH 通道转发 socket。
-        // 使用 ssh -L 将远程 socket 映射到本地 socket。
-        // 命令: ssh -L /tmp/local.sock:/tmp/remote.sock user@host sleep 999999
+        // §16.6 通过 SSH 控制通道转发 socket：ssh -L local:remote 复用 ControlMaster。
         let mut cmd = Command::new("ssh");
         let control_str = format!("ControlPath={}", self.control_path.display());
         let forward_str = format!(
@@ -295,30 +342,37 @@ impl SshSession {
             .arg(forward_str)
             .arg(&destination)
             .arg("sleep")
-            .arg("999999") // §16.6 保持转发进程存活
+            .arg("999999") // §16.6 保持转发进程存活，由 Drop 终止。
             .stdout(Stdio::null())
             .stderr(Stdio::null());
 
         let child = cmd.spawn().context("SSH socket 转发启动失败")?;
 
-        // §16.6 等待 socket 就绪（短暂延迟让 ssh 设置完成）。
-        tokio::time::sleep(Duration::from_millis(500)).await;
+        // §16.6 等待本地 socket 就绪：轮询文件出现，而非固定延迟，避免假就绪。
+        let forward_timeout = Duration::from_secs(5);
+        let ready = tokio::time::timeout(forward_timeout, async {
+            loop {
+                if local_socket_path.exists() {
+                    break;
+                }
+                // §16.6 转发进程提前退出说明失败。
+                // 注意：child 已被存入 session 前无法 here 检查，故仅依赖 socket 出现。
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+        })
+        .await;
+        if ready.is_err() {
+            // §16.6 未就绪：立即终止已 spawn 的转发进程并清理临时目录。
+            let mut leaked = child;
+            if let Err(kill_err) = leaked.start_kill() {
+                tracing::warn!(error = %kill_err, "超时清理时终止 SSH forward 子进程失败");
+            }
+            return Err(anyhow!("SSH socket 转发等待本地 socket 超时"));
+        }
 
-        // §16.6 创建关闭信号通道。
-        let (shutdown_tx, shutdown_rx) = oneshot::channel();
-
-        // §16.6 后台任务：监听关闭信号后终止转发进程。
-        let forward_pid = child.id();
-        tokio::spawn(async move {
-            let _ = shutdown_rx.await;
-            tracing::info!(
-                pid = ?forward_pid,
-                "SSH socket 转发关闭"
-            );
-        });
-
-        // §16.6 防止 child 被 drop 时终止。
-        std::mem::forget(child);
+        // §16.6 资源所有权移交会话。
+        self.forward_dir = Some(forward_dir);
+        self.forward_process = Some(child);
 
         tracing::info!(
             local = %local_socket_path.display(),
@@ -326,16 +380,35 @@ impl SshSession {
             "SSH socket 转发建立"
         );
 
-        Ok((local_socket_path, shutdown_tx))
+        Ok(local_socket_path)
+    }
+
+    /// §16.6 取出并清理 forward 转发资源（终止子进程、丢弃临时目录）。
+    ///
+    /// 供 Drop 与 `forward_socket` 重置时复用。不静默吞错：kill 失败记录 tracing 警告。
+    fn take_forward(&mut self) {
+        if let Some(mut child) = self.forward_process.take() {
+            // §16.6 Drop 不能 async，使用 start_kill 发送 SIGTERM。
+            if let Err(e) = child.start_kill() {
+                tracing::warn!(error = %e, "终止 SSH forward 子进程失败");
+            }
+        }
+        // §16.6 丢弃 forward_dir 会删除本地 socket 目录。
+        self.forward_dir = None;
     }
 }
 
 impl Drop for SshSession {
     fn drop(&mut self) {
+        // §16.6 先终止 forward 转发子进程与本地 socket 目录。
+        self.take_forward();
+        // §16.6 再终止 SSH ControlMaster 主进程。Drop 不能 async，用 start_kill 发送 SIGTERM。
         if let Some(mut child) = self.master_process.take() {
-            // §16.6 优雅关闭 SSH ControlMaster（Drop 不能 async，使用 start_kill）。
-            let _ = child.start_kill();
+            if let Err(e) = child.start_kill() {
+                tracing::warn!(error = %e, "终止 SSH ControlMaster 子进程失败");
+            }
         }
+        // §16.6 control_dir 在结构体析构时一并删除其临时目录。
     }
 }
 
@@ -352,9 +425,8 @@ pub async fn connect_ssh(target: &str) -> anyhow::Result<(super::MuxDomain, SshS
     // §16.6 步骤 1：解析连接选项。
     let options = SshConnectionOptions::from_uri(target)
         .with_context(|| format!("解析 SSH URI 失败: {}", target))?;
-
     // §16.6 步骤 2：建立 SSH 会话（ControlMaster）。
-    let session = SshSession::connect(options).await?;
+    let mut session = SshSession::connect(options).await?;
 
     // §16.6 步骤 3：探测/安装远程服务器。
     let server_path = ensure_remote_server(&session).await?;
@@ -367,6 +439,17 @@ pub async fn connect_ssh(target: &str) -> anyhow::Result<(super::MuxDomain, SshS
 
     // §16.6 等待服务器启动。
     tokio::time::sleep(Duration::from_secs(1)).await;
+
+    let remote_socket = session
+        .exec("printf '%s' \"${XDG_RUNTIME_DIR:-/tmp}/z3rm/mux.sock\"")
+        .await
+        .context("解析远程 mux socket 路径失败")?;
+    let remote_socket = remote_socket.trim();
+    anyhow::ensure!(!remote_socket.is_empty(), "远程 mux socket 路径为空");
+    let local_socket = session
+        .forward_socket(remote_socket)
+        .await
+        .context("建立远程 mux socket 转发失败")?;
 
     // §16.6 步骤 5：转发远程 socket 到本地。
     let domain = super::connect_local(Some(&local_socket)).await
@@ -524,5 +607,132 @@ mod tests {
     #[test]
     fn test_shell_escape_empty() {
         assert_eq!(shell_escape(""), "''".to_string());
+    }
+
+    // §16.6 这些测试验证 SshSession 对 control_dir / forward_dir / forward 进程的
+    // 所有权与 Drop 清理行为，不依赖真实 ssh 二进制（CI 沙箱中常不可用）。
+
+    /// 构造一个持有指定临时目录与子进程的 SshSession，便于测试 Drop 行为。
+    fn fake_session(
+        control_dir: Option<tempfile::TempDir>,
+        master: Option<tokio::process::Child>,
+        forward_dir: Option<tempfile::TempDir>,
+        forward: Option<tokio::process::Child>,
+    ) -> SshSession {
+        let options = SshConnectionOptions {
+            host: "test".to_string(),
+            username: None,
+            port: None,
+            identity_file: None,
+            extra_args: Vec::new(),
+            connect_timeout: 30,
+        };
+        let control_path = control_dir
+            .as_ref()
+            .map(|d| d.path().join("ssh_control"))
+            .unwrap_or_default();
+        SshSession {
+            options,
+            control_dir,
+            control_path,
+            master_process: master,
+            forward_dir,
+            forward_process: forward,
+        }
+    }
+
+    /// 启动一个长寿命子进程并返回 (child, pid)，用于验证 Drop 是否终止它。
+    fn long_sleep_child() -> (tokio::process::Child, u32) {
+        let child = tokio::process::Command::new("sleep")
+            .arg("9999")
+            .spawn()
+            .expect("spawn sleep");
+        let pid = child.id().expect("pid");
+        (child, pid)
+    }
+
+    /// 进程是否仍存活：`kill -0 pid` 成功表示存在。
+    fn process_alive(pid: u32) -> bool {
+        std::process::Command::new("kill")
+            .arg("-0")
+            .arg(pid.to_string())
+            .output()
+            .map(|o| o.status.success())
+            .unwrap_or(false)
+    }
+
+    #[tokio::test]
+    async fn test_control_dir_lives_with_session() {
+        let control_dir = tempfile::tempdir().expect("tempdir");
+        let dir_path = control_dir.path().to_path_buf();
+        let session = fake_session(Some(control_dir), None, None, None);
+        assert!(dir_path.exists(), "control 目录在 session 存活时应存在");
+        drop(session);
+        assert!(!dir_path.exists(), "control 目录在 session drop 后应被删除");
+    }
+
+    #[tokio::test]
+    async fn test_forward_dir_lives_with_session() {
+        let forward_dir = tempfile::tempdir().expect("tempdir");
+        let dir_path = forward_dir.path().to_path_buf();
+        let session = fake_session(None, None, Some(forward_dir), None);
+        assert!(dir_path.exists(), "forward 目录在 session 存活时应存在");
+        drop(session);
+        assert!(!dir_path.exists(), "forward 目录在 session drop 后应被删除");
+    }
+
+    #[tokio::test]
+    async fn test_take_forward_clears_fields() {
+        let forward_dir = tempfile::tempdir().expect("tempdir");
+        let dir_path = forward_dir.path().to_path_buf();
+        let (forward_child, _pid) = long_sleep_child();
+        let mut session = fake_session(None, None, Some(forward_dir), Some(forward_child));
+        session.take_forward();
+        assert!(session.forward_process.is_none(), "take_forward 后 forward_process 应为 None");
+        assert!(session.forward_dir.is_none(), "take_forward 后 forward_dir 应为 None");
+        assert!(!dir_path.exists(), "take_forward 后本地 socket 目录应被删除");
+    }
+
+    /// Drop 必须终止 forward 子进程，而非 mem::forget。
+    #[tokio::test]
+    async fn test_drop_kills_forward_process() {
+        let (forward_child, pid) = long_sleep_child();
+        assert!(process_alive(pid), "forward 子进程刚启动时应存活");
+        let session = fake_session(None, None, None, Some(forward_child));
+        drop(session);
+        // §16.6 start_kill 异步投递信号，轮询确认终止。
+        for _ in 0..100 {
+            if !process_alive(pid) {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        panic!("forward 子进程在 session drop 后未被终止");
+    }
+
+    /// Drop 必须终止 master 子进程。
+    #[tokio::test]
+    async fn test_drop_kills_master_process() {
+        let (master_child, pid) = long_sleep_child();
+        assert!(process_alive(pid), "master 子进程刚启动时应存活");
+        let session = fake_session(None, Some(master_child), None, None);
+        drop(session);
+        for _ in 0..100 {
+            if !process_alive(pid) {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        panic!("master 子进程在 session drop 后未被终止");
+    }
+
+    /// 重复 take_forward 不应 panic 且不应泄漏。
+    #[tokio::test]
+    async fn test_take_forward_idempotent() {
+        let mut session = fake_session(None, None, None, None);
+        session.take_forward();
+        session.take_forward();
+        assert!(session.forward_process.is_none());
+        assert!(session.forward_dir.is_none());
     }
 }
