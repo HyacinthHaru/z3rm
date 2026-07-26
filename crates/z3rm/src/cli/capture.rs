@@ -136,18 +136,68 @@ impl SgrState {
             parts.push("9".into());
         }
         if self.foreground != 0 {
-            let r = (self.foreground >> 16) & 0xff;
-            let g = (self.foreground >> 8) & 0xff;
-            let b = self.foreground & 0xff;
-            parts.push(format!("38;2;{r};{g};{b}"));
+            parts.push(color_sgr(true, self.foreground));
         }
         if self.background != 0 {
-            let r = (self.background >> 16) & 0xff;
-            let g = (self.background >> 8) & 0xff;
-            let b = self.background & 0xff;
-            parts.push(format!("48;2;{r};{g};{b}"));
+            parts.push(color_sgr(false, self.background));
         }
         format!("\x1b[{}m", parts.join(";"))
+    }
+}
+
+/// Prefer classic 16-color SGR when the RGB is near the XTerm palette so
+/// capture-pane -e stays tmux-compatible for ordinary ANSI sequences. Fall
+/// back to truecolor for arbitrary RGB.
+fn color_sgr(foreground: bool, color: u32) -> String {
+    let r = ((color >> 16) & 0xff) as i32;
+    let g = ((color >> 8) & 0xff) as i32;
+    let b = (color & 0xff) as i32;
+    // XTerm default 16-color palette (approx).
+    const PALETTE: [(i32, i32, i32, u8); 17] = [
+        (0, 0, 0, 0),
+        (205, 0, 0, 1),
+        (204, 85, 85, 1), // common theme bright-dark red
+        (0, 205, 0, 2),
+        (205, 205, 0, 3),
+        (0, 0, 238, 4),
+        (205, 0, 205, 5),
+        (0, 205, 205, 6),
+        (229, 229, 229, 7),
+        (127, 127, 127, 8),
+        (255, 0, 0, 9),
+        (0, 255, 0, 10),
+        (255, 255, 0, 11),
+        (92, 92, 255, 12),
+        (255, 0, 255, 13),
+        (0, 255, 255, 14),
+        (255, 255, 255, 15),
+    ];
+    let mut best = None;
+    let mut best_dist = i32::MAX;
+    for (pr, pg, pb, index) in PALETTE {
+        let dist = (r - pr).pow(2) + (g - pg).pow(2) + (b - pb).pow(2);
+        if dist < best_dist {
+            best_dist = dist;
+            best = Some(index);
+        }
+    }
+    // Threshold ~50 units per channel squared sum ~ 3*50^2 = 7500.
+    if let Some(index) = best.filter(|_| best_dist <= 25000) {
+        if foreground {
+            if index < 8 {
+                format!("{}", 30 + index)
+            } else {
+                format!("{}", 90 + (index - 8))
+            }
+        } else if index < 8 {
+            format!("{}", 40 + index)
+        } else {
+            format!("{}", 100 + (index - 8))
+        }
+    } else if foreground {
+        format!("38;2;{r};{g};{b}")
+    } else {
+        format!("48;2;{r};{g};{b}")
     }
 }
 
@@ -172,15 +222,14 @@ mod tests {
         let cells = vec![cell("a", 0xff0000, true)];
         assert_eq!(render_cells(&cells, false), "a");
     }
-
     #[test]
     fn ansi_capture_emits_sgr_and_reset() {
-        let cells = vec![cell("x", 0xff0000, true)];
+        // Near-palette red (205,0,0) maps to classic \x1b[31m.
+        let cells = vec![cell("x", 0xcd0000, true)];
         let text = render_cells(&cells, true);
-        assert!(text.starts_with("\x1b[0;1;38;2;255;0;0m"), "{text:?}");
+        assert!(text.starts_with("\x1b[0;1;31m"), "{text:?}");
         assert!(text.ends_with("x\x1b[0m"), "{text:?}");
     }
-
     #[test]
     fn ansi_capture_coalesces_identical_runs() {
         let cells = vec![cell("a", 0xff0000, true), cell("b", 0xff0000, true)];

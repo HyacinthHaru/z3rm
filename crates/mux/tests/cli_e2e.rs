@@ -205,6 +205,46 @@ fn cli_send_keys_and_capture_pane_roundtrip() -> Result<()> {
 }
 
 #[test]
+fn cli_capture_pane_escape_flag_preserves_ansi() -> Result<()> {
+    let env = CliEnv::spawn()?;
+    env.run(&["new", "-s", "ansi-capture"])?;
+    std::thread::sleep(Duration::from_millis(300));
+
+    let (code, _, stderr) = env.run(&[
+        "send-keys",
+        "-t",
+        "ansi-capture",
+        "printf",
+        " ",
+        "'\\033[31mANSI_MARKER\\033[0m'",
+        "Enter",
+    ])?;
+    assert_eq!(code, 0, "send-keys should succeed; stderr={stderr}");
+    std::thread::sleep(Duration::from_millis(700));
+
+    let (code, plain, stderr) = env.run(&["capture-pane", "-t", "ansi-capture", "-p"])?;
+    assert_eq!(code, 0, "plain capture failed: {stderr}");
+    assert!(plain.contains("ANSI_MARKER"), "plain capture: {plain:?}");
+    assert!(!plain.contains("\u{1b}["), "plain capture leaked ANSI: {plain:?}");
+
+    let (code, escaped, stderr) = env.run(&[
+        "capture-pane",
+        "-t",
+        "ansi-capture",
+        "-p",
+        "-e",
+    ])?;
+    assert_eq!(code, 0, "escaped capture failed: {stderr}");
+    assert!(
+        escaped.contains("\u{1b}[31m") || escaped.contains(";31m") || escaped.contains("\u{1b}[0;31m"),
+        "escaped capture should include red SGR, got: {escaped:?}"
+    );
+    assert!(escaped.contains("\u{1b}[0m"), "escaped capture: {escaped:?}");
+
+    Ok(())
+}
+
+#[test]
 fn cli_split_window_creates_new_pane() -> Result<()> {
     let env = CliEnv::spawn()?;
     env.run(&["new", "-s", "split-test"])?;
