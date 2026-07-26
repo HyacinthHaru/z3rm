@@ -45,6 +45,9 @@ fn build_application() -> Application {
     }
 }
 
+gpui::actions!(z3rm_debug, [DumpAccessibilityTree]);
+
+
 fn focus_mux_pane_index(
     workspace: &mut workspace::Workspace,
     index: u8,
@@ -774,6 +777,33 @@ fn main() {
                                     tracing::error!(error = %e, "mux::KillServer failed");
                                 }
                             }).detach();
+                        })
+                        .register_action(|_workspace, _: &DumpAccessibilityTree, window, _cx| {
+                            // Debug-only: dump the last frame's AccessKit tree for
+                            // AT-SPI/screenshot automation. Writes under
+                            // $Z3RM_A11Y_DUMP_PATH or /tmp/z3rm-a11y-tree.json.
+                            match window.debug_a11y_tree_json() {
+                                Some(json) => {
+                                    let path = std::env::var("Z3RM_A11Y_DUMP_PATH").unwrap_or_else(
+                                        |_| "/tmp/z3rm-a11y-tree.json".to_string(),
+                                    );
+                                    match std::fs::write(&path, &json) {
+                                        Ok(()) => {
+                                            tracing::info!(%path, bytes = json.len(), "dumped a11y tree");
+                                            eprintln!("a11y tree dumped to {path} ({} bytes)", json.len());
+                                        }
+                                        Err(error) => {
+                                            tracing::error!(%path, error = %error, "failed to write a11y dump");
+                                            eprintln!("error writing a11y dump to {path}: {error}");
+                                        }
+                                    }
+                                }
+                                None => {
+                                    eprintln!(
+                                        "a11y tree unavailable (AccessKit inactive or no frame yet; check Z3RM_A11Y)"
+                                    );
+                                }
+                            }
                         });
                     if workspace.active_pane().read(cx).items().next().is_some() {
                         return;
