@@ -47,6 +47,7 @@ pub async fn handle_connection(
     sessions: Arc<parking_lot::RwLock<Vec<crate::session::Session>>>,
     db: Arc<parking_lot::Mutex<Connection>>,
     clipboard: Arc<crate::clipboard::ServerClipboard>,
+    shutdown_state: Arc<crate::ShutdownState>,
 ) -> anyhow::Result<()> {
     let (reader, writer) = tokio::io::split(stream);
 
@@ -77,7 +78,7 @@ pub async fn handle_connection(
                         anyhow::bail!("protocol version mismatch");
                     }
                 }
-                dispatch_envelope(&envelope, &sessions, &outbound_tx, &db, &clipboard, &client_role).await?;
+                dispatch_envelope(&envelope, &sessions, &outbound_tx, &db, &clipboard, &client_role, &shutdown_state).await?;
             }
             #[allow(unreachable_code)]
             Ok::<_, anyhow::Error>(())
@@ -152,6 +153,7 @@ async fn dispatch_envelope(
     _db: &Arc<parking_lot::Mutex<Connection>>,
     clipboard: &Arc<crate::clipboard::ServerClipboard>,
     client_role: &Arc<parking_lot::Mutex<Option<ClientRole>>>,
+    shutdown_state: &Arc<crate::ShutdownState>,
 ) -> anyhow::Result<()> {
     let payload = match &envelope.payload {
         Some(p) => p,
@@ -163,7 +165,7 @@ async fn dispatch_envelope(
             let request_id = req.request_id;
             // dispatch_request 内部会把 Response 通过 outbound_tx 发回,
             // 也可能向 outbound_tx push Notification (用于 attach 等)
-            dispatch_request(req, sessions, outbound_tx, clipboard, client_role).await?;
+            dispatch_request(req, sessions, outbound_tx, clipboard, client_role, shutdown_state).await?;
             // request_id 仅用于日志, 实际 response 已经在 dispatch_request 内发出
             let _ = request_id;
         }
@@ -184,6 +186,7 @@ async fn dispatch_request(
     outbound_tx: &mpsc::UnboundedSender<Envelope>,
     clipboard: &Arc<crate::clipboard::ServerClipboard>,
     client_role: &Arc<parking_lot::Mutex<Option<ClientRole>>>,
+    shutdown_state: &Arc<crate::ShutdownState>,
 ) -> anyhow::Result<()> {
     let request_id = req.request_id;
 
@@ -222,6 +225,27 @@ async fn dispatch_request(
         RequestBody::FetchGridUpdate(r) => handle_fetch_grid_update(r, sessions).await?,
         RequestBody::FetchScrollback(r) => handle_fetch_scrollback(r, sessions).await?,
         RequestBody::SearchScrollback(r) => handle_search_scrollback(r, sessions).await?,
+        RequestBody::Shutdown(_) => {
+            if check_permission(role, ClientRole::Admin) {
+                send_response(
+                    outbound_tx,
+                    Response {
+                        request_id,
+                        body: Some(ResponseBody::Error(String::new())),
+                    },
+                )?;
+                shutdown_state
+                    .requested
+                    .store(true, std::sync::atomic::Ordering::SeqCst);
+                shutdown_state
+                    .ack_request_id
+                    .store(request_id, std::sync::atomic::Ordering::SeqCst);
+                shutdown_state.acked.notify_one();
+                tracing::info!(request_id, "mux shutdown acknowledged");
+                return Ok(());
+            }
+            ResponseBody::Error("permission denied: admin required".to_string())
+        }
         RequestBody::GetClipboard(_) => handle_get_clipboard(clipboard).await?,
 
         // §3.3 Admin-only 操作 (Plan 33)
@@ -739,11 +763,13 @@ async fn handle_spawn_pane(
             },
         )),
     };
-    let _ = send_notification_envelope(outbound_tx, notify);
+    send_notification_envelope(outbound_tx, notify)
+        .map_err(|_| anyhow::anyhow!("client disconnected after pane spawn"))?;
 
     Ok(ResponseBody::PaneId(pane_id))
 }
-/// §3.10 分割 pane — split layout + spawn new pane with parent's cwd
+
+/// §3.10 Split an existing pane and optionally run a command in the new pane.
 async fn handle_split_pane(
     req: &SplitPaneRequest,
     sessions: &Arc<parking_lot::RwLock<Vec<crate::session::Session>>>,
@@ -763,28 +789,49 @@ async fn handle_split_pane(
                 .layout
                 .split(&req.pane_id, new_pane_id.clone(), direction)?;
 
-            // §3.10 spawn 新 pane, 继承 parent pane 的 cwd
-            let parent_cwd = session.panes.read().get(&req.pane_id).map(|p| p.get_cwd()).unwrap_or_default();
-            let parent_cols = session.panes.read().get(&req.pane_id).map(|p| p.get_cols()).unwrap_or(80);
-            let parent_rows = session.panes.read().get(&req.pane_id).map(|p| p.get_rows()).unwrap_or(24);
+            let parent_cwd = session
+                .panes
+                .read()
+                .get(&req.pane_id)
+                .map(|pane| pane.get_cwd())
+                .unwrap_or_default();
+            let parent_cols = session
+                .panes
+                .read()
+                .get(&req.pane_id)
+                .map(|pane| pane.get_cols())
+                .unwrap_or(80);
+            let parent_rows = session
+                .panes
+                .read()
+                .get(&req.pane_id)
+                .map(|pane| pane.get_rows())
+                .unwrap_or(24);
+            let cwd = req
+                .cwd
+                .clone()
+                .filter(|cwd| !cwd.is_empty())
+                .unwrap_or(parent_cwd);
+            let command = req.command.as_ref().map(|command| crate::pane::ShellCommand {
+                program: command.program.clone(),
+                args: command.args.clone(),
+                env: command.env.clone().into_iter().collect(),
+            });
 
             let pane = crate::pane::Pane::spawn(
                 new_pane_id.clone(),
-                parent_cwd,
+                cwd,
                 parent_cols,
                 parent_rows,
-                None,
+                command,
             )?;
             session.panes.write().insert(new_pane_id.clone(), pane);
             session.set_focused_pane(new_pane_id.clone());
 
-            // §3.3 / §16.9 把新 pane 加到包含 parent 的 tab。
-            // 之前漏了这步,导致 attach 快照的 tab.panes 不含 split 出来的新 pane,
-            // status 命令和依赖 attach snapshot 的客户端都看不到它。
             let parent_tab_id = session
                 .tabs
                 .iter()
-                .find(|(_, t)| t.pane_ids.contains(&req.pane_id))
+                .find(|(_, tab)| tab.pane_ids.contains(&req.pane_id))
                 .map(|(id, _)| id.clone());
             if let Some(tab_id) = parent_tab_id {
                 if let Some(tab) = session.tabs.get_mut(&tab_id) {
@@ -793,7 +840,7 @@ async fn handle_split_pane(
                     }
                 }
             }
-            // §3.4 给新 pane 注册当前连接的 subscriber
+
             let pane_ref = session.panes.read().get(&new_pane_id).cloned();
             if let Some(pane) = pane_ref {
                 let (inner_tx, mut inner_rx) = mpsc::unbounded_channel::<Notification>();
@@ -812,8 +859,7 @@ async fn handle_split_pane(
                 });
             }
 
-            // §3.4 PaneAdded 通知
-            let notify = Notification {
+            let pane_added = Notification {
                 event: Some(mux_protocol::notification::Event::PaneAdded(
                     mux_protocol::PaneAdded {
                         pane_id: new_pane_id.clone(),
@@ -821,16 +867,18 @@ async fn handle_split_pane(
                     },
                 )),
             };
-            let _ = send_notification_envelope(outbound_tx, notify);
-            // §16.9 broadcast updated layout tree (inline to avoid RwLock deadlock:
-            // broadcast_layout_changed would re-acquire sessions.read() while we hold write()).
+            send_notification_envelope(outbound_tx, pane_added)
+                .map_err(|_| anyhow::anyhow!("client disconnected during split"))?;
             let layout_proto = layout_tree_to_proto(&session.layout);
-            let layout_notify = Notification {
+            let layout_changed = Notification {
                 event: Some(mux_protocol::notification::Event::SessionLayoutChanged(
-                    mux_protocol::SessionLayoutChanged { layout: Some(layout_proto) },
+                    mux_protocol::SessionLayoutChanged {
+                        layout: Some(layout_proto),
+                    },
                 )),
             };
-            let _ = send_notification_envelope(outbound_tx, layout_notify);
+            send_notification_envelope(outbound_tx, layout_changed)
+                .map_err(|_| anyhow::anyhow!("client disconnected during split"))?;
             return Ok(ResponseBody::PaneId(new_pane_id));
         }
     }
@@ -912,12 +960,12 @@ async fn handle_resize_pane(
     for session in sessions_r.iter() {
         let panes = session.panes.clone();
         if let Some(pane) = panes.read().get(&req.pane_id) {
-            pane.resize(req.cols, req.rows);
+            pane.resize(req.cols, req.rows)?;
+            return Ok(ResponseBody::Error(String::new()));
         }
     }
-    Ok(ResponseBody::Error(String::new()))
+    Ok(ResponseBody::Error("pane not found".to_string()))
 }
-
 /// §3.10 发送输入 + §16.6 OSC 52 剪贴板拦截
 async fn handle_send_input(
     req: &SendInputRequest,

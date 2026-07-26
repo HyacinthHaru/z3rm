@@ -6,7 +6,7 @@
   {
     "context": "Terminal",
     "bindings": {
-      "ctrl-a": ["mux::enterPrefixMode", { "timeout": 500 }],
+      "ctrl-a": ["mux::EnterPrefixMode", { "timeout_ms": 500 }],
 
       // §12 复制模式 (Plan 31)
       "ctrl-shift-;": "terminal::EnterCopyMode"
@@ -17,42 +17,41 @@
     "context": "Terminal && PrefixMode",
     "bindings": {
       // Tab (window) management
-      "c": "pane::newTab",
-      "k": "pane::closeTab",
-      "n": "pane::nextTab",
-      "p": "pane::prevTab",
+      "c": "mux_pane::NewTab",
+      "k": "mux_pane::CloseTab",
+      "n": "mux_pane::NextTab",
+      "p": "mux_pane::PrevTab",
 
       // Pane splitting
-      "S": "pane::splitRight",
-      "s": "pane::splitDown",
+      "S": "mux_pane::SplitRight",
+      "s": "mux_pane::SplitDown",
 
       // Pane navigation (directional)
-      "left": "pane::focusLeft",
-      "right": "pane::focusRight",
-      "up": "pane::focusUp",
-      "down": "pane::focusDown",
-      "tab": "pane::focusNextPane",
+      "left": "mux_pane::FocusLeft",
+      "right": "mux_pane::FocusRight",
+      "up": "mux_pane::FocusUp",
+      "down": "mux_pane::FocusDown",
+      "tab": "mux_pane::FocusNextPane",
 
-      // Pane switching by number
-      "0": "pane::focusPane0",
-      "1": "pane::focusPane1",
-      "2": "pane::focusPane2",
-      "3": "pane::focusPane3",
-      "4": "pane::focusPane4",
-      "5": "pane::focusPane5",
-      "6": "pane::focusPane6",
-      "7": "pane::focusPane7",
-      "8": "pane::focusPane8",
-      "9": "pane::focusPane9",
+      // Pane switching by number (0-8; FocusPane9 is not a registered action)
+      "0": "mux_pane::FocusPane0",
+      "1": "mux_pane::FocusPane1",
+      "2": "mux_pane::FocusPane2",
+      "3": "mux_pane::FocusPane3",
+      "4": "mux_pane::FocusPane4",
+      "5": "mux_pane::FocusPane5",
+      "6": "mux_pane::FocusPane6",
+      "7": "mux_pane::FocusPane7",
+      "8": "mux_pane::FocusPane8",
 
       // Pane zoom (fullscreen toggle)
-      "F": "pane::zoomToggle",
+      "F": "mux_pane::ZoomToggle",
 
       // Mux session
-      "d": "mux::detach",
+      "d": "mux::Detach",
 
       // Send literal Ctrl-a to PTY (double-tap escape)
-      "ctrl-a": "terminal::sendLiteral Ctrl-a"
+      "ctrl-a": ["terminal::SendLiteral", { "keystroke": "Ctrl-a" }]
     }
   }
 ]

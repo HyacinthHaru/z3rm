@@ -5,9 +5,9 @@ use anyhow::{Context, Result};
 use std::path::PathBuf;
 
 use mux::MuxDomain;
-use mux_protocol::proto::split_node::SplitDirection;
+use mux_protocol::proto::{split_node::SplitDirection, ShellCommand};
 
-use super::keys::parse_key;
+use super::keys::parse_keys;
 use super::target::Target;
 
 /// CLI 控制命令枚举
@@ -23,9 +23,13 @@ pub enum CliCommand {
     },
     /// `z3rm kill -t <target>` — 终止 session
     KillSession { target: String },
+    /// `z3rm kill-server` — 优雅关闭 mux_server (结束所有 session 并退出)
+    KillServer,
     /// `z3rm attach -t <target>` — 连接到 session (打开 GUI)
     Attach { target: Option<String> },
     /// `z3rm detach` — 断开当前 client
+    /// `z3rm attach --ssh <ssh://uri>` — 通过 SSH 隧道连接到远程 mux_server
+    Ssh { target: String },
     Detach,
     /// `z3rm split-window -t <target> [-h|-v]` — 分割 pane
     SplitWindow {
@@ -66,43 +70,78 @@ pub enum CliCommand {
     },
 }
 
+fn current_pane_from_env() -> Option<String> {
+    std::env::var("Z3RM_PANE")
+        .ok()
+        .filter(|pane| !pane.is_empty())
+        .or_else(|| std::env::var("Z3RM_PANE_ID").ok().filter(|pane| !pane.is_empty()))
+}
+
+fn current_session_from_env() -> Option<String> {
+    std::env::var("Z3RM_SESSION")
+        .ok()
+        .filter(|session| !session.is_empty())
+}
+
+async fn resolve_named_session_id(domain: &MuxDomain, name: &str) -> Result<String> {
+    let sessions = domain.list_sessions().await?;
+    let session = sessions
+        .iter()
+        .find(|session| session.id == name || session.name == name)
+        .ok_or_else(|| anyhow::anyhow!("session '{}' not found", name))?;
+    Ok(session.id.clone())
+}
+
+
+
+/// §3.10 Empty pane id 是错误: `unwrap_or_default()` 把空字符串变成合法目标,
+/// 后续 send-keys / capture-pane 等在 daemon 端才发现失败。
+/// 这里提前暴露错误, 用户即时看到。
+fn ensure_non_empty_pane_id(pane_id: String, context: &str) -> Result<String> {
+    if pane_id.is_empty() {
+        anyhow::bail!("no focused pane in {context}");
+    }
+    Ok(pane_id)
+}
+
 /// 解析 target, 从 snapshot 中找到对应的 pane ID
 async fn resolve_pane_id(
     domain: &MuxDomain,
     target: &Target,
-    default_session: &str,
 ) -> Result<String> {
     match target {
         Target::Current => {
-            // 使用第一个 session 的 focused pane
-            let sessions = domain.list_sessions().await?;
-            if sessions.is_empty() {
-                return Err(anyhow::anyhow!("no active sessions"));
+            if let Some(pane_id) = current_pane_from_env() {
+                return ensure_non_empty_pane_id(pane_id, "current");
             }
-            let session_id = &sessions[0].id;
-            let snapshot = domain
-                .attach(session_id, mux::AttachMode::ReadOnly)
-                .await?;
-            Ok(snapshot
+
+            let session_id = if let Some(session_id) = current_session_from_env() {
+                resolve_named_session_id(domain, &session_id).await?
+            } else {
+                let sessions = domain.list_sessions().await?;
+                sessions
+                    .first()
+                    .map(|session| session.id.clone())
+                    .ok_or_else(|| anyhow::anyhow!("no active sessions"))?
+            };
+
+            let snapshot = domain.attach(&session_id, mux::AttachMode::ReadOnly).await?;
+            let pane_id = snapshot
                 .snapshot
                 .as_ref()
                 .map(|s| s.focused_pane_id.clone())
-                .unwrap_or_default())
+                .unwrap_or_default();
+            ensure_non_empty_pane_id(pane_id, "current session")
         }
         Target::Session(name) => {
-            let sessions = domain.list_sessions().await?;
-            let session = sessions
-                .iter()
-                .find(|s| s.id == *name || s.name == *name)
-                .ok_or_else(|| anyhow::anyhow!("session '{}' not found", name))?;
-            let snapshot = domain
-                .attach(&session.id, mux::AttachMode::ReadOnly)
-                .await?;
-            Ok(snapshot
+            let session_id = resolve_named_session_id(domain, name).await?;
+            let snapshot = domain.attach(&session_id, mux::AttachMode::ReadOnly).await?;
+            let pane_id = snapshot
                 .snapshot
                 .as_ref()
                 .map(|s| s.focused_pane_id.clone())
-                .unwrap_or_default())
+                .unwrap_or_default();
+            ensure_non_empty_pane_id(pane_id, &format!("session '{}'", name))
         }
         Target::PaneInSession {
             session,
@@ -133,21 +172,29 @@ async fn resolve_pane_id(
                 session
             ))
         }
-        Target::PaneByIndex(_idx) => {
-            // 使用第一个 session 的 focused pane
+        Target::PaneByIndex(idx) => {
+            // §3.10 tmux-style %N: global pane index across sessions (tabs flattened).
             let sessions = domain.list_sessions().await?;
             if sessions.is_empty() {
                 return Err(anyhow::anyhow!("no active sessions"));
             }
-            let session_id = &sessions[0].id;
-            let snapshot = domain
-                .attach(session_id, mux::AttachMode::ReadOnly)
-                .await?;
-            Ok(snapshot
-                .snapshot
-                .as_ref()
-                .map(|s| s.focused_pane_id.clone())
-                .unwrap_or_default())
+            let mut global_index = 0u32;
+            for session in &sessions {
+                let snapshot = domain
+                    .attach(&session.id, mux::AttachMode::ReadOnly)
+                    .await?;
+                if let Some(snap) = &snapshot.snapshot {
+                    for tab in &snap.tabs {
+                        for pane_info in &tab.panes {
+                            if global_index == *idx {
+                                return Ok(pane_info.id.clone());
+                            }
+                            global_index += 1;
+                        }
+                    }
+                }
+            }
+            Err(anyhow::anyhow!("pane %{} not found", idx))
         }
     }
 }
@@ -159,54 +206,48 @@ async fn resolve_session_id(
     default_session: &str,
 ) -> Result<String> {
     match target {
-        Target::Current | Target::PaneByIndex(_) => Ok(default_session.to_string()),
-        Target::Session(name) => {
-            let sessions = domain.list_sessions().await?;
-            let session = sessions
-                .iter()
-                .find(|s| s.id == *name || s.name == *name)
-                .ok_or_else(|| anyhow::anyhow!("session '{}' not found", name))?;
-            Ok(session.id.clone())
+        Target::Current | Target::PaneByIndex(_) => {
+            if let Some(session_id) = current_session_from_env() {
+                resolve_named_session_id(domain, &session_id).await
+            } else {
+                Ok(default_session.to_string())
+            }
         }
-        Target::PaneInSession { session, .. } => {
-            let sessions = domain.list_sessions().await?;
-            let session_info = sessions
-                .iter()
-                .find(|s| s.id == *session || s.name == *session)
-                .ok_or_else(|| anyhow::anyhow!("session '{}' not found", session))?;
-            Ok(session_info.id.clone())
-        }
+        Target::Session(name) => resolve_named_session_id(domain, name).await,
+        Target::PaneInSession { session, .. } => resolve_named_session_id(domain, session).await,
     }
 }
 
-/// 获取 session 的第一个 tab ID
-async fn get_first_tab_id(domain: &MuxDomain, session_id: &str) -> Result<String> {
-    let snapshot = domain
-        .attach(session_id, mux::AttachMode::ReadOnly)
-        .await?;
-    if let Some(snap) = &snapshot.snapshot {
-        if let Some(tab) = snap.tabs.first() {
-            return Ok(tab.id.clone());
-        }
-    }
-    Err(anyhow::anyhow!("no tabs in session '{}'", session_id))
-}
 
 /// 执行 CLI 命令。
 /// 来源: spec §3.10
 pub async fn run_cli_command(cmd: CliCommand) -> Result<()> {
+    // §16.6 SSH 远程连接不经过本地 daemon，直接建立 SSH 隧道后返回。
+    if let CliCommand::Ssh { target } = cmd {
+        let (_domain, _session) = mux::connect_ssh(&target)
+            .await
+            .context("failed to connect via SSH. Ensure the remote host has an OpenSSH client and is reachable.")?;
+        eprintln!("connected to remote mux_server via SSH ({})", target);
+        return Ok(());
+    }
+
     // 连接到 daemon
     let domain = mux::connect_local(None)
         .await
         .context("failed to connect to mux_server. Is the daemon running?")?;
-
-    // 获取默认 session (第一个)
+    // 获取默认 session (第一个)；失败传播, 不再静默退回空串。
     let default_session = {
-        let sessions = domain.list_sessions().await.unwrap_or_default();
+        let sessions = domain
+            .list_sessions()
+            .await
+            .context("failed to list sessions when resolving default")?;
         sessions.first().map(|s| s.id.clone()).unwrap_or_default()
     };
 
     match cmd {
+        CliCommand::Ssh { .. } => {
+            // Already handled above (early return before connect_local).
+        }
         CliCommand::ListSessions => {
             let sessions = domain
                 .list_sessions()
@@ -223,10 +264,14 @@ pub async fn run_cli_command(cmd: CliCommand) -> Result<()> {
                 }
             }
         }
-
         CliCommand::NewSession { name, cwd } => {
             let name = name.unwrap_or_else(|| format!("session-{}", std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_secs()));
-            let cwd = cwd.unwrap_or_else(|| PathBuf::from("/"));
+            // §3.10 cwd 缺省时使用当前进程的当前目录，错误向上传播。
+            let cwd = match cwd {
+                Some(cwd) => cwd,
+                None => std::env::current_dir()
+                    .context("failed to resolve current working directory for new session")?,
+            };
             let id = domain
                 .create_session(&name, &cwd)
                 .await
@@ -268,8 +313,16 @@ pub async fn run_cli_command(cmd: CliCommand) -> Result<()> {
             println!("killed session {}", session.name);
         }
 
+        CliCommand::KillServer => {
+            domain
+                .shutdown()
+                .await
+                .context("failed to shut down mux_server")?;
+            println!("mux_server shut down");
+        }
+
         CliCommand::Attach { target } => {
-            let target = super::target::parse_target(&target);
+            let target = super::target::parse_target(&target).context("invalid target")?;
             let session_id = resolve_session_id(&domain, &target, &default_session).await?;
             domain
                 .attach(&session_id, mux::AttachMode::Shared)
@@ -286,32 +339,35 @@ pub async fn run_cli_command(cmd: CliCommand) -> Result<()> {
         CliCommand::SplitWindow {
             target,
             horizontal,
-            command: _,
+            command,
         } => {
-            let target = super::target::parse_target(&target);
-            let pane_id = resolve_pane_id(&domain, &target, &default_session).await?;
+            let target = super::target::parse_target(&target).context("invalid target")?;
+            let pane_id = resolve_pane_id(&domain, &target).await?;
             let direction = if horizontal {
                 SplitDirection::LeftRight
             } else {
                 SplitDirection::TopBottom
             };
+            let command = command.map(|command| ShellCommand {
+                program: std::env::var("SHELL").unwrap_or_else(|_| "/bin/sh".to_string()),
+                args: vec!["-lc".to_string(), command],
+                env: Default::default(),
+            });
             let new_pane = domain
-                .split_pane(&pane_id, direction)
+                .split_pane_with_command(&pane_id, direction, command)
                 .await
                 .context("failed to split pane")?;
             println!("split pane: new pane {}", new_pane);
         }
 
         CliCommand::SendKeys { target, keys } => {
-            let target = super::target::parse_target(&target);
-            let pane_id = resolve_pane_id(&domain, &target, &default_session).await?;
-            for key in &keys {
-                let bytes = parse_key(key);
-                domain
-                    .send_input(&pane_id, &bytes)
-                    .await
-                    .context("failed to send input")?;
-            }
+            let target = super::target::parse_target(&target).context("invalid target")?;
+            let pane_id = resolve_pane_id(&domain, &target).await?;
+            let bytes = parse_keys(&keys);
+            domain
+                .send_input(&pane_id, &bytes)
+                .await
+                .context("failed to send input")?;
         }
 
         CliCommand::CapturePane {
@@ -320,8 +376,8 @@ pub async fn run_cli_command(cmd: CliCommand) -> Result<()> {
             scrollback,
             escape,
         } => {
-            let target = super::target::parse_target(&target);
-            let pane_id = resolve_pane_id(&domain, &target, &default_session).await?;
+            let target = super::target::parse_target(&target).context("invalid target")?;
+            let pane_id = resolve_pane_id(&domain, &target).await?;
             let text = super::capture::capture_pane(
                 &domain,
                 &pane_id,
@@ -338,32 +394,34 @@ pub async fn run_cli_command(cmd: CliCommand) -> Result<()> {
         }
 
         CliCommand::ListPanes { target } => {
-            let target = super::target::parse_target(&target);
+            let target = super::target::parse_target(&target).context("invalid target")?;
             let session_id = resolve_session_id(&domain, &target, &default_session).await?;
             let snapshot = domain
                 .attach(&session_id, mux::AttachMode::ReadOnly)
                 .await?;
             if let Some(snap) = &snapshot.snapshot {
+                let mut pane_index = 0usize;
                 for tab in &snap.tabs {
-                    for (j, pane) in tab.panes.iter().enumerate() {
+                    for pane in &tab.panes {
                         let focused = snap.focused_pane_id == pane.id;
                         let marker = if focused { "*" } else { " " };
                         println!(
-                            "{}%d: {} {} ({}x{})",
+                            "{}%{}: {} ({}x{})",
                             marker,
-                            j,
+                            pane_index,
                             pane.title,
                             pane.size.as_ref().map(|s| s.cols).unwrap_or(0),
                             pane.size.as_ref().map(|s| s.rows).unwrap_or(0),
                         );
+                        pane_index += 1;
                     }
                 }
             }
         }
 
         CliCommand::SelectPane { target } => {
-            let target = super::target::parse_target(&target);
-            let pane_id = resolve_pane_id(&domain, &target, &default_session).await?;
+            let target = super::target::parse_target(&target).context("invalid target")?;
+            let pane_id = resolve_pane_id(&domain, &target).await?;
             domain
                 .focus_pane(&pane_id)
                 .await
@@ -372,8 +430,8 @@ pub async fn run_cli_command(cmd: CliCommand) -> Result<()> {
         }
 
         CliCommand::KillPane { target } => {
-            let target = super::target::parse_target(&target);
-            let pane_id = resolve_pane_id(&domain, &target, &default_session).await?;
+            let target = super::target::parse_target(&target).context("invalid target")?;
+            let pane_id = resolve_pane_id(&domain, &target).await?;
             domain
                 .close_pane(&pane_id)
                 .await
@@ -386,10 +444,32 @@ pub async fn run_cli_command(cmd: CliCommand) -> Result<()> {
             width,
             height,
         } => {
-            let target = super::target::parse_target(&target);
-            let pane_id = resolve_pane_id(&domain, &target, &default_session).await?;
-            let cols = width.map(|w| w as u32).unwrap_or(80);
-            let rows = height.map(|h| h as u32).unwrap_or(24);
+            let target = super::target::parse_target(&target).context("invalid target")?;
+            let pane_id = resolve_pane_id(&domain, &target).await?;
+
+            // §3.10 Preserve unspecified axis from current pane size (do not wipe to 80x24).
+            let (current_cols, current_rows) = {
+                let sessions = domain.list_sessions().await?;
+                let mut found = (80u32, 24u32);
+                for session in &sessions {
+                    if let Ok(attach) = domain.attach(&session.id, mux::AttachMode::ReadOnly).await {
+                        if let Some(snap) = &attach.snapshot {
+                            for tab in &snap.tabs {
+                                if let Some(pane) = tab.panes.iter().find(|p| p.id == pane_id) {
+                                    found = (
+                                        pane.size.as_ref().map(|s| s.cols).unwrap_or(80),
+                                        pane.size.as_ref().map(|s| s.rows).unwrap_or(24),
+                                    );
+                                }
+                            }
+                        }
+                    }
+                }
+                found
+            };
+
+            let cols = width.map(|w| w as u32).unwrap_or(current_cols);
+            let rows = height.map(|h| h as u32).unwrap_or(current_rows);
             domain
                 .resize_pane(&pane_id, cols, rows)
                 .await
@@ -398,7 +478,7 @@ pub async fn run_cli_command(cmd: CliCommand) -> Result<()> {
         }
 
         CliCommand::NewWindow { target } => {
-            let target = super::target::parse_target(&target);
+            let target = super::target::parse_target(&target).context("invalid target")?;
             let session_id = resolve_session_id(&domain, &target, &default_session).await?;
 
             // 创建新 tab (通过 spawn_pane 隐式创建)
@@ -412,8 +492,8 @@ pub async fn run_cli_command(cmd: CliCommand) -> Result<()> {
         }
 
         CliCommand::RenameWindow { target, title } => {
-            let target = super::target::parse_target(&target);
-            let pane_id = resolve_pane_id(&domain, &target, &default_session).await?;
+            let target = super::target::parse_target(&target).context("invalid target")?;
+            let pane_id = resolve_pane_id(&domain, &target).await?;
             domain
                 .set_pane_title(&pane_id, &title)
                 .await
@@ -423,4 +503,28 @@ pub async fn run_cli_command(cmd: CliCommand) -> Result<()> {
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::Mutex;
+
+    static ENV_LOCK: Mutex<()> = Mutex::new(());
+
+    #[test]
+    fn current_pane_from_env_prefers_explicit_pane() {
+        let _guard = ENV_LOCK.lock().expect("env lock poisoned");
+        unsafe {
+            std::env::set_var("Z3RM_PANE", "pane-from-env");
+            std::env::set_var("Z3RM_SESSION", "session-from-env");
+        }
+
+        assert_eq!(current_pane_from_env().as_deref(), Some("pane-from-env"));
+
+        unsafe {
+            std::env::remove_var("Z3RM_PANE");
+            std::env::remove_var("Z3RM_SESSION");
+        }
+    }
 }

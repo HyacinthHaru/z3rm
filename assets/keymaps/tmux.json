@@ -6,7 +6,7 @@
   {
     "context": "Terminal",
     "bindings": {
-      "ctrl-b": ["mux::enterPrefixMode", { "timeout": 500 }]
+      "ctrl-b": ["mux::EnterPrefixMode", { "timeout_ms": 500 }]
     }
   },
   // Prefix mode: after Ctrl-b, the next key is matched here
@@ -14,36 +14,36 @@
     "context": "Terminal && PrefixMode",
     "bindings": {
       // Tab management
-      "c": "pane::newTab",
-      "n": "pane::nextTab",
-      "p": "pane::prevTab",
+      "c": "mux_pane::NewTab",
+      "n": "mux_pane::NextTab",
+      "p": "mux_pane::PrevTab",
 
       // Pane splitting
-      "%": "pane::splitRight",
-      "\"": "pane::splitDown",
+      "%": "mux_pane::SplitRight",
+      "\"": "mux_pane::SplitDown",
 
       // Pane navigation (directional)
-      "left": "pane::focusLeft",
-      "right": "pane::focusRight",
-      "up": "pane::focusUp",
-      "down": "pane::focusDown",
+      "left": "mux_pane::FocusLeft",
+      "right": "mux_pane::FocusRight",
+      "up": "mux_pane::FocusUp",
+      "down": "mux_pane::FocusDown",
 
       // Pane navigation (numbered)
-      "0": "pane::focusPane0",
-      "1": "pane::focusPane1",
-      "2": "pane::focusPane2",
-      "3": "pane::focusPane3",
-      "4": "pane::focusPane4",
-      "5": "pane::focusPane5",
-      "6": "pane::focusPane6",
-      "7": "pane::focusPane7",
-      "8": "pane::focusPane8",
+      "0": "mux_pane::FocusPane0",
+      "1": "mux_pane::FocusPane1",
+      "2": "mux_pane::FocusPane2",
+      "3": "mux_pane::FocusPane3",
+      "4": "mux_pane::FocusPane4",
+      "5": "mux_pane::FocusPane5",
+      "6": "mux_pane::FocusPane6",
+      "7": "mux_pane::FocusPane7",
+      "8": "mux_pane::FocusPane8",
 
       // Mux session
-      "d": "mux::detach",
+      "d": "mux::Detach",
 
       // Send literal Ctrl-b to PTY (double-tap escape)
-      "ctrl-b": "terminal::sendLiteral Ctrl-b"
+      "ctrl-b": ["terminal::SendLiteral", { "keystroke": "Ctrl-b" }]
     }
   }
 ]

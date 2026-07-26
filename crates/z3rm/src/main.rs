@@ -3,10 +3,8 @@
 
 mod daemon;
 mod zed;
-mod input;
 mod cli;
 mod log_viewer;
-pub mod diff_review;
 mod quickjs_extensions;
 mod extension_status_bar;
 
@@ -17,7 +15,7 @@ use assets::Assets;
 use crashes::InitCrashHandler;
 use fs::{Fs, RealFs};
 use futures::StreamExt as _;
-use gpui::{App, AppContext as _, Application, Entity, TaskExt};
+use gpui::{App, AppContext as _, Application, Context, Entity, Focusable, Global, TaskExt, Window};
 use gpui_platform;
 use parking_lot::Mutex;
 use release_channel::{AppCommitSha, AppVersion, ReleaseChannel};
@@ -42,6 +40,69 @@ fn build_application() -> Application {
         Application::with_platform(platform)
     } else {
         Application::new_inaccessible(platform)
+    }
+}
+
+fn focus_mux_pane_index(
+    workspace: &mut workspace::Workspace,
+    index: u8,
+    window: &mut Window,
+    cx: &mut Context<workspace::Workspace>,
+) {
+    if let Some(pane) = workspace.panes().get(index as usize).cloned() {
+        window.focus(&pane.focus_handle(cx), cx);
+    }
+}
+
+#[derive(Clone, Debug, settings::RegisterSetting)]
+struct MuxSettings {
+    keymap_profile: String,
+}
+
+impl settings::Settings for MuxSettings {
+    fn from_settings(content: &settings::SettingsContent) -> Self {
+        let mux = content.mux.clone().unwrap_or_default();
+        Self {
+            keymap_profile: mux.keymap_profile.unwrap_or_else(|| "default".to_string()),
+        }
+    }
+}
+
+struct ActiveMuxKeymapProfile(String);
+
+impl Global for ActiveMuxKeymapProfile {}
+
+fn bind_startup_keymaps(cx: &mut App) {
+    match settings::KeymapFile::load_asset_allow_partial_failure(settings::DEFAULT_KEYMAP_PATH, cx) {
+        Ok(key_bindings) => cx.bind_keys(key_bindings),
+        Err(error) => tracing::error!(error = %error, "failed to load default keymap"),
+    }
+    bind_configured_mux_keymap_profile(cx);
+    cx.observe_global::<settings::SettingsStore>(|cx| {
+        bind_configured_mux_keymap_profile(cx);
+    })
+    .detach();
+}
+
+fn bind_configured_mux_keymap_profile(cx: &mut App) {
+    let profile = <MuxSettings as settings::Settings>::get_global(cx)
+        .keymap_profile
+        .clone();
+    if cx
+        .try_global::<ActiveMuxKeymapProfile>()
+        .is_some_and(|active| active.0 == profile)
+    {
+        return;
+    }
+    let path = settings::mux_keymap_profile_path(&profile);
+    // Built-in mux profiles reject partial failures (see settings::load_mux_keymap_profile),
+    // so a broken profile never leaves half-applied bindings.
+    match settings::load_mux_keymap_profile(&profile, cx) {
+        Ok(key_bindings) => {
+            cx.bind_keys(key_bindings);
+            cx.set_global(ActiveMuxKeymapProfile(profile));
+        }
+        Err(error) => tracing::error!(profile, path, error = %error, "failed to load mux keymap profile"),
     }
 }
 
@@ -175,27 +236,73 @@ fn main() {
     // §16.1 沙盒与权限检查
     sandbox::run_sandbox_launcher_if_invoked();
 
-    // §3.10 CLI 子命令处理: 如果是 CLI 命令, 执行后直接退出
-    if let Some(cmd) = cli::parse_cli_args() {
-        let rt = tokio::runtime::Runtime::new()
-            .expect("failed to create tokio runtime for CLI");
-        if let Err(e) = rt.block_on(async { cli::run_cli_command(cmd).await }) {
-            eprintln!("error: {}", e);
-            std::process::exit(1);
+    // §3.10 `attach` is the only mux CLI command that opens a GUI. The CLI
+    // process still returns immediately: it launches a fresh GUI process with
+    // the target carried in environment variables, prints confirmation, and exits.
+    let attach_target = if std::env::var_os("Z3RM_GUI_ATTACH").is_some() {
+        std::env::var("Z3RM_ATTACH_TARGET").ok()
+    } else {
+        let args: Vec<String> = std::env::args().collect();
+        if let Some(cli::LaunchIntent::Gui { target }) = cli::parse_launch_intent_from(&args) {
+            let executable = std::env::current_exe().unwrap_or_else(|error| {
+                eprintln!("error: failed to locate z3rm executable: {error}");
+                std::process::exit(1);
+            });
+            let mut command = std::process::Command::new(executable);
+            command
+                .env("Z3RM_GUI_ATTACH", "1")
+                .stdin(std::process::Stdio::null())
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null());
+            if let Some(target) = &target {
+                command.env("Z3RM_ATTACH_TARGET", target);
+            }
+            command.spawn().unwrap_or_else(|error| {
+                eprintln!("error: failed to launch z3rm GUI: {error}");
+                std::process::exit(1);
+            });
+            eprintln!(
+                "z3rm: attached to session '{}' in GUI window",
+                target.as_deref().unwrap_or("default")
+            );
+            std::process::exit(0);
         }
-        std::process::exit(0);
-    }
 
-    // §16.11 扩展市场 CLI 命令处理
-    if let Ok(Some(ext_args)) = cli::marketplace::parse_extension_args() {
-        let rt = tokio::runtime::Runtime::new()
-            .expect("failed to create tokio runtime for extension CLI");
-        if let Err(e) = rt.block_on(async { cli::marketplace::run_extension_command(ext_args).await }) {
-            eprintln!("error: {}", e);
-            std::process::exit(1);
+        let cli_cmd = match cli::parse_cli_args_from(&args) {
+            Ok(cmd) => cmd,
+            Err(error) if error == cli::HELP_REQUESTED => {
+                print!("{}", cli::format_usage());
+                std::process::exit(0);
+            }
+            Err(error) => {
+                eprintln!("error: {error}");
+                std::process::exit(2);
+            }
+        };
+        if let Some(cmd) = cli_cmd {
+            let runtime = tokio::runtime::Runtime::new()
+                .expect("failed to create tokio runtime for CLI");
+            if let Err(error) = runtime.block_on(async { cli::run_cli_command(cmd).await }) {
+                eprintln!("error: {error}");
+                std::process::exit(1);
+            }
+            std::process::exit(0);
         }
-        std::process::exit(0);
-    }
+
+        if let Ok(Some(extension_args)) = cli::marketplace::parse_extension_args() {
+            let runtime = tokio::runtime::Runtime::new()
+                .expect("failed to create tokio runtime for extension CLI");
+            if let Err(error) = runtime.block_on(async {
+                cli::marketplace::run_extension_command(extension_args).await
+            }) {
+                eprintln!("error: {error}");
+                std::process::exit(1);
+            }
+            std::process::exit(0);
+        }
+        None
+    };
+
 
     #[cfg(unix)]
     util::prevent_root_execution();
@@ -278,6 +385,7 @@ fn main() {
         settings::init(cx);
         theme_settings::init(theme::LoadThemes::All(Box::new(Assets)), cx);
         zed_init(cx);
+        bind_startup_keymaps(cx);
         watch_settings_files(fs.clone(), cx);
 
         load_embedded_fonts(cx);
@@ -356,7 +464,13 @@ fn main() {
             let domain = Arc::new(daemon::ensure_daemon_running().await?);
             eprintln!("[z3rm] Daemon connected");
 
-            let session_id = daemon::ensure_default_session(&domain).await?;
+            // §3.10 GUI attach target: 命令行 `attach [-t target]` 把目标 session
+            // 携带过来, 优先解析；target 为空时退回到默认 session。
+            let session_id = daemon::ensure_target_session(
+                &domain,
+                attach_target.as_deref(),
+            )
+            .await?;
             eprintln!("[z3rm] Session: {}", session_id);
 
             daemon::ensure_pane_in_session(&domain, &session_id).await?;
@@ -364,17 +478,25 @@ fn main() {
             let attach_resp = domain
                 .attach(&session_id, mux::AttachMode::Shared)
                 .await?;
-            // §15.12 Extract all pane IDs from authoritative snapshot
-            let snapshot_pane_ids: Vec<String> = attach_resp
+            // §15.12 / §15.4 Authoritative snapshot: layout tree + pane IDs.
+            let snapshot_layout: Option<workspace::layout_projection::LayoutTree> = attach_resp
                 .snapshot
                 .as_ref()
-                .map(|s| {
-                    s.tabs
-                        .iter()
-                        .flat_map(|t| t.panes.iter().map(|p| p.id.clone()))
-                        .collect()
-                })
-                .unwrap_or_default();
+                .and_then(|s| s.layout.as_ref())
+                .map(workspace::layout_projection::LayoutTree::from_proto);
+            let snapshot_pane_ids: Vec<String> = match &snapshot_layout {
+                Some(layout) => layout.pane_ids(),
+                None => attach_resp
+                    .snapshot
+                    .as_ref()
+                    .map(|s| {
+                        s.tabs
+                            .iter()
+                            .flat_map(|t| t.panes.iter().map(|p| p.id.clone()))
+                            .collect()
+                    })
+                    .unwrap_or_default(),
+            };
             eprintln!("[z3rm] Attached to session ({} panes in snapshot)", snapshot_pane_ids.len());
 
             // §3.2 把 domain 注入 AppState. AppState 是 Arc<AppState>,
@@ -391,24 +513,28 @@ fn main() {
                 }
             });
 
-            // §3.8/§15.12 Start daemon connection watcher for automatic reconnect/recovery.
+            // §3.8/§15.12 Start daemon connection watcher for automatic
+            // authoritative reconnect. Pass the active session_id so the
+            // watcher can reattach and broadcast a synthetic layout
+            // notification after the swap.
             let domain_for_watch = domain.clone();
+            let session_for_watch = session_id.clone();
             cx.update(|cx| {
-                daemon::watch_daemon_connection(domain_for_watch, cx).detach();
+                daemon::watch_daemon_connection(domain_for_watch, session_for_watch, cx).detach();
             });
 
             // §1.1 spec: terminal 是默认 center pane item.
             // 任何新 Workspace 如果 active pane 为空, 自动 spawn terminal pane。
             // 覆盖 bootstrap / workspace::Open / NewWindow / restore 全部路径。
-            let domain_for_observer = domain.clone();
             let session_for_observer = session_id.clone();
             let snapshot_panes_for_observer = snapshot_pane_ids.clone();
+            let snapshot_layout_for_observer = snapshot_layout.clone();
             cx.update(|cx| {
                 cx.observe_new::<workspace::Workspace>(move |workspace, window, cx| {
                     let Some(window) = window else { return };
 
                     // §5.5 Add extension status bar (renders QuickJS extension VDOM)
-                    let ext_status = cx.new(|_cx| extension_status_bar::ExtensionStatusBar::new());
+                    let ext_status = cx.new(|_| extension_status_bar::ExtensionStatusBar::new());
                     workspace.status_bar().update(cx, |sb, cx| {
                         sb.add_right_item(ext_status, window, cx);
                     });
@@ -469,6 +595,87 @@ fn main() {
                                 }
                             }).detach();
                         })
+                        .register_action(|workspace, _: &settings::mux_actions::FocusLeft, window, cx| {
+                            workspace.activate_pane_in_direction(workspace::SplitDirection::Left, window, cx);
+                        })
+                        .register_action(|workspace, _: &settings::mux_actions::FocusRight, window, cx| {
+                            workspace.activate_pane_in_direction(workspace::SplitDirection::Right, window, cx);
+                        })
+                        .register_action(|workspace, _: &settings::mux_actions::FocusUp, window, cx| {
+                            workspace.activate_pane_in_direction(workspace::SplitDirection::Up, window, cx);
+                        })
+                        .register_action(|workspace, _: &settings::mux_actions::NextTab, window, cx| {
+                            workspace.active_pane().update(cx, |pane, cx| {
+                                pane.activate_next_item(&workspace::pane::ActivateNextItem::default(), window, cx);
+                            });
+                        })
+                        .register_action(|workspace, _: &settings::mux_actions::PrevTab, window, cx| {
+                            workspace.active_pane().update(cx, |pane, cx| {
+                                pane.activate_previous_item(&workspace::pane::ActivatePreviousItem::default(), window, cx);
+                            });
+                        })
+                        .register_action(|workspace, action: &settings::mux_actions::FocusPaneIndex, window, cx| {
+                            focus_mux_pane_index(workspace, action.index, window, cx);
+                        })
+                        .register_action(|workspace, _: &settings::mux_actions::FocusPane0, window, cx| {
+                            focus_mux_pane_index(workspace, 0, window, cx);
+                        })
+                        .register_action(|workspace, _: &settings::mux_actions::FocusPane1, window, cx| {
+                            focus_mux_pane_index(workspace, 1, window, cx);
+                        })
+                        .register_action(|workspace, _: &settings::mux_actions::FocusPane2, window, cx| {
+                            focus_mux_pane_index(workspace, 2, window, cx);
+                        })
+                        .register_action(|workspace, _: &settings::mux_actions::FocusPane3, window, cx| {
+                            focus_mux_pane_index(workspace, 3, window, cx);
+                        })
+                        .register_action(|workspace, _: &settings::mux_actions::FocusPane4, window, cx| {
+                            focus_mux_pane_index(workspace, 4, window, cx);
+                        })
+                        .register_action(|workspace, _: &settings::mux_actions::FocusPane5, window, cx| {
+                            focus_mux_pane_index(workspace, 5, window, cx);
+                        })
+                        .register_action(|workspace, _: &settings::mux_actions::FocusPane6, window, cx| {
+                            focus_mux_pane_index(workspace, 6, window, cx);
+                        })
+                        .register_action(|workspace, _: &settings::mux_actions::FocusPane7, window, cx| {
+                            focus_mux_pane_index(workspace, 7, window, cx);
+                        })
+                        .register_action(|workspace, _: &settings::mux_actions::FocusPane8, window, cx| {
+                            focus_mux_pane_index(workspace, 8, window, cx);
+                        })
+                        .register_action(|workspace, action: &settings::mux_actions::EnterPrefixMode, _window, cx| {
+                            let Some(mux_view) = workspace.active_item_as::<terminal_view::mux_pane::MuxPaneView>(cx) else { return };
+                            mux_view.update(cx, |view, cx| view.enter_prefix_mode(action.timeout_ms, cx));
+                        })
+                        .register_action(|workspace, action: &settings::mux_actions::SendLiteral, _window, cx| {
+                            let Some(mux_view) = workspace.active_item_as::<terminal_view::mux_pane::MuxPaneView>(cx) else { return };
+                            mux_view.update(cx, |view, cx| view.send_literal(&action.keystroke, cx));
+                        })
+                        .register_action(|workspace, _: &settings::mux_actions::FocusDown, window, cx| {
+                            workspace.activate_pane_in_direction(workspace::SplitDirection::Down, window, cx);
+                        })
+                        .register_action(|workspace, _: &settings::mux_actions::FocusNextPane, window, cx| {
+                            workspace.activate_next_pane(window, cx);
+                        })
+                        .register_action(|workspace, _: &settings::mux_actions::FocusPrevPane, window, cx| {
+                            workspace.activate_previous_pane(window, cx);
+                        })
+                        .register_action(|workspace, _: &settings::mux_actions::ResizeLeft, window, cx| {
+                            workspace.resize_pane(gpui::Axis::Horizontal, gpui::px(-50.0), window, cx);
+                        })
+                        .register_action(|workspace, _: &settings::mux_actions::ResizeRight, window, cx| {
+                            workspace.resize_pane(gpui::Axis::Horizontal, gpui::px(50.0), window, cx);
+                        })
+                        .register_action(|workspace, _: &settings::mux_actions::ResizeUp, window, cx| {
+                            workspace.resize_pane(gpui::Axis::Vertical, gpui::px(-50.0), window, cx);
+                        })
+                        .register_action(|workspace, _: &settings::mux_actions::ResizeDown, window, cx| {
+                            workspace.resize_pane(gpui::Axis::Vertical, gpui::px(50.0), window, cx);
+                        })
+                        .register_action(|workspace, _: &settings::mux_actions::ResizeEqual, _window, cx| {
+                            workspace.reset_pane_sizes(cx);
+                        })
                         .register_action(|workspace, _: &settings::mux_actions::CloseTab, window, cx| {
                             let Some(state) = workspace::AppState::try_global(cx) else { return };
                             let Some(domain) = state.mux_domain.clone() else { return };
@@ -485,10 +692,15 @@ fn main() {
                                     .detach_and_log_err(cx);
                             });
                         })
-                        .register_action(|workspace, _: &settings::mux_actions::ZoomToggle, _window, cx| {
+                        .register_action(|workspace, _: &settings::mux_actions::ZoomToggle, window, cx| {
                             let Some(mux_view) = workspace.active_item_as::<terminal_view::mux_pane::MuxPaneView>(cx) else { return };
                             let new_zoom = !mux_view.read(cx).is_zoomed();
+                            // Updates the view's zoom state and notifies the server
+                            // (zoom_pane RPC is fire-and-forget; errors logged in set_zoomed).
                             mux_view.update(cx, |view, cx| view.set_zoomed(new_zoom, cx));
+                            // Reflect the zoom into the workspace's zoomed view.
+                            let pane = workspace.active_pane().clone();
+                            workspace.set_pane_zoomed(pane, new_zoom, window, cx);
                         })
                         .register_action(|workspace, _: &settings::mux_actions::NewTab, window, cx| {
                             let Some(state) = workspace::AppState::try_global(cx) else { return };
@@ -526,40 +738,94 @@ fn main() {
                                     Err(e) => tracing::error!(error = %e, "mux_pane::NewTab: spawn_pane failed"),
                                 }
                             }).detach();
+                        })
+                        .register_action(|_workspace, _: &settings::mux_actions::Detach, _window, cx| {
+                            let Some(state) = workspace::AppState::try_global(cx) else { return };
+                            let Some(domain) = state.mux_domain.clone() else { return };
+                            cx.background_executor().spawn(async move {
+                                if let Err(e) = domain.detach().await {
+                                    tracing::error!(error = %e, "mux::Detach failed");
+                                }
+                            }).detach();
+                        })
+                        .register_action(|_workspace, _: &settings::mux_actions::KillSession, _window, cx| {
+                            let Some(state) = workspace::AppState::try_global(cx) else { return };
+                            let Some(domain) = state.mux_domain.clone() else { return };
+                            cx.background_executor().spawn(async move {
+                                // Resolve the first session as the kill target.
+                                let session_id = match domain.list_sessions().await {
+                                    Ok(sessions) => sessions.first().map(|s| s.id.clone()),
+                                    Err(e) => { tracing::error!(error = %e, "KillSession: list_sessions failed"); None }
+                                };
+                                if let Some(session_id) = session_id {
+                                    if let Err(e) = domain.kill_session(&session_id).await {
+                                        tracing::error!(error = %e, "mux::KillSession failed");
+                                    }
+                                }
+                            }).detach();
+                        })
+                        .register_action(|_workspace, _: &settings::mux_actions::KillServer, _window, cx| {
+                            let Some(state) = workspace::AppState::try_global(cx) else { return };
+                            let Some(domain) = state.mux_domain.clone() else { return };
+                            cx.background_executor().spawn(async move {
+                                if let Err(e) = domain.shutdown().await {
+                                    tracing::error!(error = %e, "mux::KillServer failed");
+                                }
+                            }).detach();
                         });
                     if workspace.active_pane().read(cx).items().next().is_some() {
                         return;
                     }
                     let Some(state) = workspace::AppState::try_global(cx) else { return };
                     let Some(domain) = state.mux_domain.clone() else { return };
+                    let snapshot_layout_for_observer = snapshot_layout_for_observer.clone();
                     let snapshot_panes = snapshot_panes_for_observer.clone();
                     tracing::info!("observe_new Workspace: injecting {} MuxPaneViews", snapshot_panes.len());
-                    eprintln!("[z3rm] observer: {} snapshot panes", snapshot_panes.len());
 
-                    // §15.12 Sync path: snapshot has panes → add them directly.
+                    // §15.12 Sync path: snapshot has panes → project the authoritative layout.
                     if !snapshot_panes.is_empty() {
-                        eprintln!("[z3rm] SYNC PATH: adding {} panes", snapshot_panes.len());
-                        use workspace::ItemHandle;
-                        // Disable welcome page since we're adding real content.
-                        workspace.active_pane().update(cx, |pane, _| {
-                            pane.set_should_display_welcome_page(false);
-                        });
-                        for (index, pane_id) in snapshot_panes.into_iter().enumerate() {
-                            let domain_clone = domain.clone();
-                            let item: Box<dyn ItemHandle> = Box::new(cx.new(|cx| {
-                                terminal_view::mux_pane::MuxPaneView::new(
-                                    pane_id,
-                                    domain_clone,
-                                    workspace.weak_handle(),
-                                    workspace.project().downgrade(),
+                        match &snapshot_layout_for_observer {
+                            Some(layout) => {
+                                workspace.apply_initial_layout(
+                                    layout,
+                                    |workspace, window, cx| workspace.add_pane_for_layout(window, cx),
+                                    |workspace, pane, pane_id, window, cx| {
+                                        let item: Box<dyn workspace::ItemHandle> = Box::new(cx.new(|cx| {
+                                            terminal_view::mux_pane::MuxPaneView::new(
+                                                pane_id,
+                                                domain.clone(),
+                                                workspace.weak_handle(),
+                                                workspace.project().downgrade(),
+                                                window,
+                                                cx,
+                                            )
+                                        }));
+                                        workspace.add_item(pane.clone(), item, None, true, true, window, cx);
+                                    },
                                     window,
                                     cx,
-                                )
-                            }));
-                            let pane = workspace.active_pane().clone();
-                            tracing::info!("MuxPane observer: adding pane {} synchronously", index);
-                            workspace.add_item(pane, item, None, index == 0, true, window, cx);
-                            eprintln!("[z3rm] add_item called for pane {}, items now={}", index, workspace.active_pane().read(cx).items().count());
+                                );
+                            }
+                            None => {
+                                // No layout tree in snapshot: tabs in the default pane.
+                                workspace.active_pane().update(cx, |pane, _| {
+                                    pane.set_should_display_welcome_page(false);
+                                });
+                                for (index, pane_id) in snapshot_panes.into_iter().enumerate() {
+                                    let item: Box<dyn workspace::ItemHandle> = Box::new(cx.new(|cx| {
+                                        terminal_view::mux_pane::MuxPaneView::new(
+                                            pane_id,
+                                            domain.clone(),
+                                            workspace.weak_handle(),
+                                            workspace.project().downgrade(),
+                                            window,
+                                            cx,
+                                        )
+                                    }));
+                                    let pane = workspace.active_pane().clone();
+                                    workspace.add_item(pane, item, None, index == 0, true, window, cx);
+                                }
+                            }
                         }
                         return;
                     }
@@ -614,20 +880,6 @@ fn main() {
                 })
                 .detach();
             });
-            // notification subscriber
-            let domain_for_notify = domain.clone();
-            cx.background_executor()
-                .spawn(async move {
-                    let mut rx = domain_for_notify.subscribe();
-                    while let Ok(notif) = rx.recv().await {
-                        if let Some(mux_protocol::notification::Event::SessionLayoutChanged(_)) =
-                            notif.event.as_ref()
-                        {
-                            tracing::debug!("SessionLayoutChanged received");
-                        }
-                    }
-                })
-                .detach();
 
             // window close = detach
             let domain_for_close = domain.clone();
@@ -647,6 +899,7 @@ fn main() {
             eprintln!("[z3rm] Creating window via Workspace::new_local");
             let domain_for_init = domain.clone();
             let snapshot_for_init = snapshot_pane_ids.clone();
+            let layout_for_init = snapshot_layout.clone();
             let open_result = cx.update(|cx| {
                 workspace::Workspace::new_local(
                     vec![],
@@ -654,29 +907,55 @@ fn main() {
                     None,
                     None,
                     Some(Box::new(move |workspace: &mut workspace::Workspace, window, cx| {
-                        // §15.12 Inject MuxPaneViews during workspace construction.
-                        let pane = workspace.active_pane().clone();
-                        pane.update(cx, |pane, _| {
-                            pane.set_should_display_welcome_page(false);
-                        });
-                        let pane_ids = if !snapshot_for_init.is_empty() {
-                            snapshot_for_init.clone()
-                        } else {
-                            vec!["default".to_string()]
-                        };
-                        for (index, pane_id) in pane_ids.into_iter().enumerate() {
-                            let domain_clone = domain_for_init.clone();
-                            let item: Box<dyn workspace::ItemHandle> = Box::new(cx.new(|cx| {
-                                terminal_view::mux_pane::MuxPaneView::new(
-                                    pane_id,
-                                    domain_clone,
-                                    workspace.weak_handle(),
-                                    workspace.project().downgrade(),
+                        // §15.4 / §15.12 Project the authoritative server layout during
+                        // construction: one GPUI pane per server pane.
+                        match &layout_for_init {
+                            Some(layout) => {
+                                workspace.apply_initial_layout(
+                                    layout,
+                                    |workspace, window, cx| workspace.add_pane_for_layout(window, cx),
+                                    |workspace, pane, pane_id, window, cx| {
+                                        let item: Box<dyn workspace::ItemHandle> = Box::new(cx.new(|cx| {
+                                            terminal_view::mux_pane::MuxPaneView::new(
+                                                pane_id,
+                                                domain_for_init.clone(),
+                                                workspace.weak_handle(),
+                                                workspace.project().downgrade(),
+                                                window,
+                                                cx,
+                                            )
+                                        }));
+                                        workspace.add_item(pane.clone(), item, None, true, true, window, cx);
+                                    },
                                     window,
                                     cx,
-                                )
-                            }));
-                            workspace.add_item(pane.clone(), item, None, index == 0, true, window, cx);
+                                );
+                            }
+                            None => {
+                                // No layout tree: single default pane with all views as tabs.
+                                let pane = workspace.active_pane().clone();
+                                pane.update(cx, |pane, _| {
+                                    pane.set_should_display_welcome_page(false);
+                                });
+                                let pane_ids = if !snapshot_for_init.is_empty() {
+                                    snapshot_for_init.clone()
+                                } else {
+                                    vec!["default".to_string()]
+                                };
+                                for (index, pane_id) in pane_ids.into_iter().enumerate() {
+                                    let item: Box<dyn workspace::ItemHandle> = Box::new(cx.new(|cx| {
+                                        terminal_view::mux_pane::MuxPaneView::new(
+                                            pane_id,
+                                            domain_for_init.clone(),
+                                            workspace.weak_handle(),
+                                            workspace.project().downgrade(),
+                                            window,
+                                            cx,
+                                        )
+                                    }));
+                                    workspace.add_item(pane.clone(), item, None, index == 0, true, window, cx);
+                                }
+                            }
                         }
                     })),
                     workspace::OpenMode::default(),
@@ -685,8 +964,108 @@ fn main() {
             }).await?;
             eprintln!("[z3rm] Window created Ok: {:?}", open_result.window);
 
+            // §15.4 / §15.12 Authoritative reconcile: every SessionLayoutChanged carries
+            // the server's layout tree; project it into the window's workspace.
+            let domain_for_notify = domain.clone();
+            let window_handle: gpui::AnyWindowHandle = open_result.window.into();
+            cx.spawn(async move |cx| {
+                let rx = domain_for_notify.subscribe();
+                while let Ok(notif) = rx.recv().await {
+                    let Some(mux_protocol::notification::Event::SessionLayoutChanged(layout_change)) =
+                        notif.event
+                    else {
+                        continue;
+                    };
+                    let Some(proto_layout) = layout_change.layout else {
+                        continue;
+                    };
+                    let layout = workspace::layout_projection::LayoutTree::from_proto(&proto_layout);
+                    if let Err(e) = cx.update_window(window_handle, |_, window, cx| {
+                        let Some(multi_workspace) = window.root::<workspace::MultiWorkspace>().flatten() else {
+                            return;
+                        };
+                        let Some(workspace) = multi_workspace.read(cx).workspaces().next().cloned() else {
+                            return;
+                        };
+                        workspace.update(cx, |workspace, cx| {
+                            let mut existing: std::collections::HashMap<String, Entity<workspace::Pane>> =
+                                std::collections::HashMap::default();
+                            for pane in workspace.panes() {
+                                for item in pane.read(cx).items() {
+                                    if let Ok(view) =
+                                        item.to_any_view().downcast::<terminal_view::mux_pane::MuxPaneView>()
+                                    {
+                                        let pane_id = view.read(cx).pane_id.clone();
+                                        existing.entry(pane_id).or_insert_with(|| pane.clone());
+                                    }
+                                }
+                            }
+                            workspace.apply_layout_snapshot(
+                                &layout,
+                                existing,
+                                |workspace, window, cx| workspace.add_pane_for_layout(window, cx),
+                                |workspace, pane, pane_id, window, cx| {
+                                    let item: Box<dyn workspace::ItemHandle> = Box::new(cx.new(|cx| {
+                                        terminal_view::mux_pane::MuxPaneView::new(
+                                            pane_id,
+                                            domain_for_notify.clone(),
+                                            workspace.weak_handle(),
+                                            workspace.project().downgrade(),
+                                            window,
+                                            cx,
+                                        )
+                                    }));
+                                    workspace.add_item(pane.clone(), item, None, true, true, window, cx);
+                                },
+                                window,
+                                cx,
+                            );
+                        });
+                    }) {
+                        tracing::debug!(error = %e, "app context closed during SessionLayoutChanged reconcile");
+                        break;
+                    }
+                }
+            })
+            .detach();
+
             anyhow::Ok(())
         })
         .detach_and_log_err(cx);
     });
+}
+
+#[cfg(test)]
+mod tests {
+    use gpui::App;
+    use settings::{KeymapFile, KeymapFileLoadResult};
+
+    #[gpui::test]
+    fn mux_keymap_profiles_load(cx: &mut App) {
+        for profile in settings::MUX_KEYMAP_PROFILE_NAMES {
+            let content = settings::mux_keymap_profile_content(profile);
+            match KeymapFile::load(content.as_ref(), cx) {
+                KeymapFileLoadResult::Success { key_bindings } => {
+                    assert!(!key_bindings.is_empty(), "{profile} profile has no bindings");
+                }
+                KeymapFileLoadResult::SomeFailedToLoad { error_message, .. } => {
+                    panic!("mux profile {profile} failed to load: {error_message}");
+                }
+                KeymapFileLoadResult::JsonParseFailure { error } => {
+                    panic!("mux profile {profile} has invalid JSON: {error}");
+                }
+            }
+        }
+    }
+
+    #[gpui::test]
+    fn startup_keymaps_bind_default_and_mux_profile(cx: &mut App) {
+        settings::init(cx);
+        super::bind_startup_keymaps(cx);
+        assert_eq!(
+            cx.try_global::<super::ActiveMuxKeymapProfile>()
+                .map(|profile| profile.0.as_str()),
+            Some("default")
+        );
+    }
 }

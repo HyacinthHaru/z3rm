@@ -10,143 +10,190 @@ pub mod target;
 pub use dispatch::CliCommand;
 pub use dispatch::run_cli_command;
 
-use clap::{ArgAction, Parser, Subcommand};
 use std::path::PathBuf;
 
-/// z3rm CLI — tmux 兼容的会话控制工具 (§3.10)
-#[derive(Parser, Debug)]
-#[command(name = "z3rm", about = "tmux-compatible session control", disable_version_flag = true)]
-struct Cli {
-    #[command(subcommand)]
-    command: CliSubcommand,
+/// z3rm 启动意图 — GUI 模式 vs RPC 模式。
+///
+/// `z3rm attach [-t target]`（不带 `--ssh`）不再走 RPC attach 然后 exit(0)，
+/// 而是标记为 GUI 启动意图：main.rs 不会在此处 `exit(0)`，而把目标 session 名字
+/// /ID 推入进程环境，进入与 GUI 启动相同的 daemon 流程。`attach --ssh` 必须保持
+/// 原行为（建立 SSH 隧道后退出），不属于 GUI 意图。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum LaunchIntent {
+    /// Launch GUI and attach the requested session.
+    /// `target` 是原始 target 字符串（如 `"dev"`、`"dev:0.1"`），由运行时解析；
+    /// `None` 表示 "默认/最近使用的 session"。
+    Gui { target: Option<String> },
 }
 
-#[derive(Subcommand, Debug)]
-enum CliSubcommand {
-    /// 列出所有 session
-    Ls,
-    /// 创建新 session
-    New {
-        /// Session 名称
-        #[arg(short, long)]
-        s: Option<String>,
-        /// 工作目录
-        #[arg(short = 'c', long)]
-        cwd: Option<PathBuf>,
-    },
-    /// 终止 session
-    Kill {
-        /// 目标 session
-        #[arg(short, long, default_value = None)]
-        t: Option<String>,
-    },
-    /// 连接到 session (打印确认信息后立即退出)
-    Attach {
-        /// 目标 session
-        #[arg(short, long, default_value = None)]
-        t: Option<String>,
-    },
-    /// 断开当前 client
-    Detach,
-    /// 分割 pane
-    SplitWindow {
-        /// 目标 pane
-        #[arg(short, long, default_value = None)]
-        t: Option<String>,
-        /// 水平分割 (左右)
-        #[arg(short = 'h', long, action = ArgAction::SetTrue)]
-        horizontal: bool,
-        /// 垂直分割 (上下) — 默认
-        #[arg(short = 'v', long, action = ArgAction::SetTrue)]
-        vertical: bool,
-        /// 在新 pane 中执行的命令
-        #[arg(long)]
-        command: Option<String>,
-    },
-    /// 发送输入到 pane
-    SendKeys {
-        /// 目标 pane
-        #[arg(short, long, default_value = None)]
-        t: Option<String>,
-        /// 按键名 (tmux 风格: Enter, C-c, Up, M-x, 或字面文本)
-        keys: Vec<String>,
-    },
-    /// 捕获 pane 内容
-    CapturePane {
-        /// 目标 pane
-        #[arg(short, long, default_value = None)]
-        t: Option<String>,
-        /// 直接输出到 stdout (无额外换行)
-        #[arg(short, long, action = ArgAction::SetTrue)]
-        print: bool,
-        /// 包含 scrollback (负值 = 行数)
-        #[arg(short = 'S', long, value_parser = parse_i32)]
-        scrollback: Option<i32>,
-        /// 保留 ANSI 转义码
-        #[arg(short = 'e', long, action = ArgAction::SetTrue)]
-        escape: bool,
-    },
-    /// 列出 session 中的 pane
-    ListPanes {
-        /// 目标 session
-        #[arg(short, long, default_value = None)]
-        t: Option<String>,
-    },
-    /// 聚焦 pane
-    SelectPane {
-        /// 目标 pane
-        #[arg(short, long, default_value = None)]
-        t: Option<String>,
-    },
-    /// 关闭 pane
-    KillPane {
-        /// 目标 pane
-        #[arg(short, long, default_value = None)]
-        t: Option<String>,
-    },
-    /// 调整 pane 大小
-    ResizePane {
-        /// 目标 pane
-        #[arg(short, long, default_value = None)]
-        t: Option<String>,
-        /// 宽度 (列数)
-        #[arg(short = 'x', long)]
-        width: Option<u16>,
-        /// 高度 (行数)
-        #[arg(short = 'y', long)]
-        height: Option<u16>,
-    },
-    /// 创建新 tab (tmux 的 new-window)
-    NewWindow {
-        /// 目标 session
-        #[arg(short, long, default_value = None)]
-        t: Option<String>,
-    },
-    /// 设置 pane 标题 (tmux 的 rename-window)
-    RenameWindow {
-        /// 目标 pane
-        #[arg(short, long, default_value = None)]
-        t: Option<String>,
-        /// 新标题
-        title: String,
-    },
-}
-
-fn parse_i32(s: &str) -> Result<i32, String> {
-    s.parse().map_err(|e| format!("invalid integer '{}': {}", s, e))
-}
-
-/// 解析命令行参数, 返回 CLI 命令或 None (表示 GUI 模式)
-pub fn parse_cli_args() -> Option<CliCommand> {
-    let args: Vec<String> = std::env::args().collect();
-    if args.len() <= 1 {
+/// 询问 `argv` 是否表达 GUI 启动意图。
+/// 目前仅识别 `attach [-t target]`；`attach --ssh ...` 仍走 CLI 短路。
+pub fn parse_launch_intent_from(args: &[String]) -> Option<LaunchIntent> {
+    if args.len() < 2 || args[1] != "attach" {
         return None;
     }
+    let rest = &args[2..];
+    let mut target: Option<String> = None;
+    let mut i = 0;
+    while i < rest.len() {
+        match rest[i].as_str() {
+            "-t" | "--target" => {
+                if i + 1 >= rest.len() {
+                    // `attach -t` 缺值交给 CLI 解析层报错；GUI 意图跳过。
+                    return None;
+                }
+                target = Some(rest[i + 1].clone());
+                i += 2;
+            }
+            "--ssh" => return None,
+            _ => i += 1,
+        }
+    }
+    Some(LaunchIntent::Gui { target })
+}
+
+pub fn parse_launch_intent() -> Option<LaunchIntent> {
+    parse_launch_intent_from(&std::env::args().collect::<Vec<_>>())
+}
+
+/// 解析命令行参数，返回 CLI 命令或 None (表示 GUI/extension 模式)。
+pub fn parse_cli_args() -> Result<Option<CliCommand>, String> {
+    let args: Vec<String> = std::env::args().collect();
+    parse_cli_args_from(&args)
+}
+
+/// Sentinel error message returned when `--help` or `help` is requested.
+/// The main function uses this URL-constant to distinguish a help request
+/// from a real parse error and writes usage to stdout + exit(0).
+pub const HELP_REQUESTED: &str = "usage: z3rm <command> [args]";
+
+/// Return the full usage summary (spec §3.10 command table).
+pub fn format_usage() -> String {
+    format!(
+        "usage: z3rm <command> [args]\n\
+\n\
+commands (spec §3.10):\n\
+    ls                              list all sessions\n\
+    new -s <name> [-c <cwd>]         create a new session\n\
+    kill -t <target>                 terminate a session\n\
+    kill-server                      gracefully shut down mux_server\n\
+    attach [-t <target>]             attach to a session (opens GUI)\n\
+    attach --ssh <ssh://uri>         connect via SSH tunnel to remote mux_server
+    detach                           detach the current client\n\
+    split-window [-t <target>] [-h|-v] [-c <command>]\n\
+                                     split the active pane\n\
+    send-keys -t <target> <keys...>  send input to a pane\n\
+    capture-pane [-t <target>] [-p] [-S <-N>] [-e]\n\
+                                     capture pane contents\n\
+    list-panes [-t <session>]        list panes in a session\n\
+    select-pane -t <target>          focus a pane\n\
+    kill-pane -t <target>            close a pane\n\
+    resize-pane [-t <target>] -x <W> -y <H>\n\
+                                     resize a pane\n\
+    new-window [-t <session>]         create a new tab\n\
+    rename-window -t <target> <title> set the pane title\n\
+\n\
+aliases: list-sessions = ls, kill-session = kill\n\
+run 'z3rm extension --help' for marketplace commands\n"
+    )
+}
+
+
+pub fn parse_cli_args_from(args: &[String]) -> Result<Option<CliCommand>, String> {
+    if args.len() <= 1 {
+        return Ok(None);
+    }
+
+    if args[1] == "extension" {
+        return Ok(None);
+    }
+
+    // --help / help: return a sentinel error that main.rs detects and exits 0
+    if args[1] == "--help" || args[1] == "help" {
+        return Err(HELP_REQUESTED.to_string());
+    }
+
+    let mut normalized = args.to_vec();
+    match normalized[1].as_str() {
+        "list-sessions" => normalized[1] = "ls".to_string(),
+        "kill-session" => normalized[1] = "kill".to_string(),
+        _ => {}
+    }
+
+    match normalized[1].as_str() {
+        "kill" if !has_option_value(&normalized[2..], "-t", "--target") => {
+            return Err("kill requires -t <target>".to_string());
+        }
+        "send-keys" if send_keys_payload_is_empty(&normalized[2..]) => {
+            return Err("send-keys requires at least one key".to_string());
+        }
+        "rename-window" if rename_window_title(&normalized[2..]).is_none() => {
+            return Err("rename-window requires a title".to_string());
+        }
+        command if is_mux_cli_command(command) => {}
+        command => return Err(format!("unknown CLI command: {command}")),
+    }
+    parse_cli_args_lossy(&normalized)
+}
+
+fn has_option_value(args: &[String], short: &str, long: &str) -> bool {
+    args.windows(2)
+        .any(|window| (window[0] == short || window[0] == long) && !window[1].starts_with('-'))
+}
+
+fn send_keys_payload_is_empty(args: &[String]) -> bool {
+    let mut i = 0;
+    while i < args.len() {
+        match args[i].as_str() {
+            "-t" | "--target" => i += 2,
+            _ => return false,
+        }
+    }
+    true
+}
+
+fn rename_window_title(args: &[String]) -> Option<&str> {
+    let mut i = 0;
+    while i < args.len() {
+        match args[i].as_str() {
+            "-t" | "--target" => i += 2,
+            _ => return Some(&args[i]),
+        }
+    }
+    None
+}
+
+fn is_mux_cli_command(command: &str) -> bool {
+    matches!(
+        command,
+        "ls"
+            | "new"
+            | "kill"
+            | "kill-server"
+            | "attach"
+            | "detach"
+            | "split-window"
+            | "send-keys"
+            | "capture-pane"
+            | "list-panes"
+            | "select-pane"
+            | "kill-pane"
+            | "resize-pane"
+            | "new-window"
+            | "rename-window"
+    )
+}
+
+fn parse_cli_args_lossy(args: &[String]) -> Result<Option<CliCommand>, String> {
+    if args.len() <= 1 {
+        return Ok(None);
+    }
+
 
     // 第一个参数是程序名, 第二个是子命令
     let subcommand = &args[1];
     match subcommand.as_str() {
-        "ls" => Some(CliCommand::ListSessions),
+        "ls" => Ok(Some(CliCommand::ListSessions)),
 
         "new" => {
             let mut name = None;
@@ -167,7 +214,7 @@ pub fn parse_cli_args() -> Option<CliCommand> {
                     _ => {}
                 }
             }
-            Some(CliCommand::NewSession { name, cwd })
+            Ok(Some(CliCommand::NewSession { name, cwd }))
         }
 
         "kill" => {
@@ -184,16 +231,16 @@ pub fn parse_cli_args() -> Option<CliCommand> {
                 }
             }
             match target {
-                Some(t) => Some(CliCommand::KillSession { target: t }),
-                None => {
-                    eprintln!("error: kill requires -t <target>");
-                    None
-                }
+                Some(t) => Ok(Some(CliCommand::KillSession { target: t })),
+                None => Err("kill requires -t <target>".to_string()),
             }
         }
 
+        "kill-server" => Ok(Some(CliCommand::KillServer)),
+
         "attach" => {
             let mut target = None;
+            let mut ssh_uri = None;
             let rest = &args[2..];
             for i in 0..rest.len() {
                 match rest[i].as_str() {
@@ -202,13 +249,22 @@ pub fn parse_cli_args() -> Option<CliCommand> {
                             target = Some(rest[i + 1].clone());
                         }
                     }
+                    "--ssh" => {
+                        if i + 1 < rest.len() {
+                            ssh_uri = Some(rest[i + 1].clone());
+                        }
+                    }
                     _ => {}
                 }
             }
-            Some(CliCommand::Attach { target })
+            if let Some(uri) = ssh_uri {
+                Ok(Some(CliCommand::Ssh { target: uri }))
+            } else {
+                Ok(Some(CliCommand::Attach { target }))
+            }
         }
 
-        "detach" => Some(CliCommand::Detach),
+        "detach" => Ok(Some(CliCommand::Detach)),
 
         "split-window" => {
             let mut target = None;
@@ -232,11 +288,11 @@ pub fn parse_cli_args() -> Option<CliCommand> {
                     _ => {}
                 }
             }
-            Some(CliCommand::SplitWindow {
+            Ok(Some(CliCommand::SplitWindow {
                 target,
                 horizontal,
                 command,
-            })
+            }))
         }
 
         "send-keys" => {
@@ -261,10 +317,9 @@ pub fn parse_cli_args() -> Option<CliCommand> {
                 }
             }
             if keys.is_empty() {
-                eprintln!("error: send-keys requires at least one key");
-                None
+                Err("send-keys requires at least one key".to_string())
             } else {
-                Some(CliCommand::SendKeys { target, keys })
+                Ok(Some(CliCommand::SendKeys { target, keys }))
             }
         }
 
@@ -291,9 +346,9 @@ pub fn parse_cli_args() -> Option<CliCommand> {
                     }
                     "-S" | "--scrollback" => {
                         if i + 1 < rest.len() {
-                            if let Ok(n) = rest[i + 1].parse::<i32>() {
-                                scrollback = Some(n);
-                            }
+                            let n = rest[i + 1].parse::<i32>()
+                                .map_err(|_| format!("invalid integer for -S: '{}'", rest[i + 1]))?;
+                            scrollback = Some(n);
                             i += 2;
                         } else {
                             i += 1;
@@ -308,12 +363,12 @@ pub fn parse_cli_args() -> Option<CliCommand> {
                     }
                 }
             }
-            Some(CliCommand::CapturePane {
+            Ok(Some(CliCommand::CapturePane {
                 target,
                 print,
                 scrollback,
                 escape,
-            })
+            }))
         }
 
         "list-panes" => {
@@ -329,7 +384,7 @@ pub fn parse_cli_args() -> Option<CliCommand> {
                     _ => {}
                 }
             }
-            Some(CliCommand::ListPanes { target })
+            Ok(Some(CliCommand::ListPanes { target }))
         }
 
         "select-pane" => {
@@ -345,7 +400,7 @@ pub fn parse_cli_args() -> Option<CliCommand> {
                     _ => {}
                 }
             }
-            Some(CliCommand::SelectPane { target })
+            Ok(Some(CliCommand::SelectPane { target }))
         }
 
         "kill-pane" => {
@@ -361,7 +416,7 @@ pub fn parse_cli_args() -> Option<CliCommand> {
                     _ => {}
                 }
             }
-            Some(CliCommand::KillPane { target })
+            Ok(Some(CliCommand::KillPane { target }))
         }
 
         "resize-pane" => {
@@ -382,9 +437,9 @@ pub fn parse_cli_args() -> Option<CliCommand> {
                     }
                     "-x" | "--width" => {
                         if i + 1 < rest.len() {
-                            if let Ok(n) = rest[i + 1].parse::<u16>() {
-                                width = Some(n);
-                            }
+                            let n = rest[i + 1].parse::<u16>()
+                                .map_err(|_| format!("invalid integer for -x: '{}'", rest[i + 1]))?;
+                            width = Some(n);
                             i += 2;
                         } else {
                             i += 1;
@@ -392,9 +447,9 @@ pub fn parse_cli_args() -> Option<CliCommand> {
                     }
                     "-y" | "--height" => {
                         if i + 1 < rest.len() {
-                            if let Ok(n) = rest[i + 1].parse::<u16>() {
-                                height = Some(n);
-                            }
+                            let n = rest[i + 1].parse::<u16>()
+                                .map_err(|_| format!("invalid integer for -y: '{}'", rest[i + 1]))?;
+                            height = Some(n);
                             i += 2;
                         } else {
                             i += 1;
@@ -405,11 +460,11 @@ pub fn parse_cli_args() -> Option<CliCommand> {
                     }
                 }
             }
-            Some(CliCommand::ResizePane {
+            Ok(Some(CliCommand::ResizePane {
                 target,
                 width,
                 height,
-            })
+            }))
         }
 
         "new-window" => {
@@ -425,7 +480,7 @@ pub fn parse_cli_args() -> Option<CliCommand> {
                     _ => {}
                 }
             }
-            Some(CliCommand::NewWindow { target })
+            Ok(Some(CliCommand::NewWindow { target }))
         }
 
         "rename-window" => {
@@ -451,12 +506,210 @@ pub fn parse_cli_args() -> Option<CliCommand> {
             let title = if i < rest.len() {
                 rest[i].clone()
             } else {
-                eprintln!("error: rename-window requires a title");
-                return None;
+                return Err("rename-window requires a title".to_string());
             };
-            Some(CliCommand::RenameWindow { target, title })
+            Ok(Some(CliCommand::RenameWindow { target, title }))
         }
 
-        _ => None,
+        _ => unreachable!(),
+    }
+}
+
+mod tests {
+    use super::*;
+
+    fn args(parts: &[&str]) -> Vec<String> {
+        std::iter::once("z3rm".to_string())
+            .chain(parts.iter().map(|part| (*part).to_string()))
+            .collect()
+    }
+
+    #[test]
+    fn list_sessions_alias_is_accepted() {
+        let parsed = parse_cli_args_from(&args(&["list-sessions"])).expect("parse");
+        assert!(matches!(parsed, Some(CliCommand::ListSessions)));
+    }
+
+    #[test]
+    fn kill_session_alias_is_accepted() {
+        let parsed = parse_cli_args_from(&args(&["kill-session", "-t", "dev"])).expect("parse");
+        match parsed {
+            Some(CliCommand::KillSession { target }) => assert_eq!(target, "dev"),
+            other => panic!("unexpected parse result: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn kill_without_target_is_parse_error() {
+        let err = parse_cli_args_from(&args(&["kill"]))
+            .expect_err("kill without -t must be a parse error, not GUI mode");
+        assert!(err.contains("kill requires"), "{err}");
+    }
+
+    #[test]
+    fn send_keys_without_keys_is_parse_error() {
+        let err = parse_cli_args_from(&args(&["send-keys", "-t", "dev"]))
+            .expect_err("send-keys without keys must be a parse error");
+        assert!(err.contains("send-keys requires"), "{err}");
+    }
+
+    #[test]
+    fn capture_pane_bad_scrollback_returns_error() {
+        let err = parse_cli_args_from(&args(&["capture-pane", "-S", "abc"]))
+            .expect_err("-S with non-integer must be a parse error");
+        assert!(err.contains("-S"), "error should name the flag: {err}");
+        assert!(err.contains("abc"), "error should show bad value: {err}");
+    }
+
+    #[test]
+    fn resize_pane_bad_width_returns_error() {
+        let err = parse_cli_args_from(&args(&["resize-pane", "-x", "abc"]))
+            .expect_err("-x with non-integer must be a parse error");
+        assert!(err.contains("-x"), "error should name the flag: {err}");
+    }
+
+    #[test]
+    fn resize_pane_bad_height_returns_error() {
+        let err = parse_cli_args_from(&args(&["resize-pane", "-y", "xyz"]))
+            .expect_err("-y with non-integer must be a parse error");
+        assert!(err.contains("-y"), "error should name the flag: {err}");
+    }
+
+    #[test]
+    fn help_flag_emits_usage() {
+        let err = parse_cli_args_from(&args(&["--help"]))
+            .expect_err("--help must be a handled case");
+        assert!(err.contains("usage"), "help should contain usage: {err}");
+    }
+
+    #[test]
+    fn launch_intent_attach_with_target_is_gui_intent() {
+        let intent = parse_launch_intent_from(&args(&["attach", "-t", "dev"]));
+        assert_eq!(
+            intent,
+            Some(LaunchIntent::Gui { target: Some("dev".into()) })
+        );
+    }
+
+    #[test]
+    fn launch_intent_attach_without_target_is_gui_intent() {
+        let intent = parse_launch_intent_from(&args(&["attach"]));
+        assert_eq!(intent, Some(LaunchIntent::Gui { target: None }));
+    }
+
+    #[test]
+    fn launch_intent_attach_ssh_is_not_gui_intent() {
+        // attach --ssh 必须保留 CLI 短路逻辑，不应被当作 GUI 意图拦截。
+        let intent = parse_launch_intent_from(&args(&["attach", "--ssh", "ssh://host"]));
+        assert_eq!(intent, None);
+    }
+
+    #[test]
+    fn launch_intent_non_attach_args_return_none() {
+        // 其他命令不属于 GUI 启动意图（继续走 CLI 短路或 GUI 模式）。
+        assert_eq!(parse_launch_intent_from(&args(&["ls"])), None);
+        assert_eq!(parse_launch_intent_from(&args(&["new", "-s", "x"])), None);
+        assert_eq!(parse_launch_intent_from(&args(&[])), None);
+        assert_eq!(parse_launch_intent_from(&args(&["--help"])), None);
+    }
+
+    #[test]
+    fn launch_intent_missing_target_value_returns_none() {
+        // `attach -t <empty>` 让 CLI 解析层报错；GUI 意图侧不抢先消费。
+        assert_eq!(parse_launch_intent_from(&args(&["attach", "-t"])), None);
+    }
+
+    #[test]
+    fn launch_intent_accepts_long_target_flag() {
+        let intent = parse_launch_intent_from(&args(&["attach", "--target", "dev:0.1"]));
+        assert_eq!(
+            intent,
+            Some(LaunchIntent::Gui { target: Some("dev:0.1".into()) })
+        );
+    }
+
+    #[test]
+    fn attach_cli_command_still_parses_alongside_launch_intent() {
+        // parse_cli_args 必须仍能识别 attach（CLI 模式测试不回归）。
+        let parsed = parse_cli_args_from(&args(&["attach", "-t", "dev"]))
+            .expect("attach should still be a recognized CLI command");
+        if let Some(CliCommand::Attach { target }) = &parsed {
+            assert_eq!(target.as_deref(), Some("dev"));
+        } else {
+            panic!("unexpected parse result: {parsed:?}");
+        }
+    }
+
+    #[test]
+    fn help_subcommand_emits_usage() {
+        let err = parse_cli_args_from(&args(&["help"]))
+            .expect_err("help subcommand must be a handled case");
+        assert!(err.contains("usage"), "help should contain usage: {err}");
+    }
+
+    #[test]
+    fn new_session_without_cwd_yields_none_for_dispatch_to_default() {
+        // §3.10 当 -c / --cwd 没传时, 解析器必须保留 cwd=None,
+        // 让 dispatch 层使用 std::env::current_dir() 作为工作目录。
+        let parsed = parse_cli_args_from(&args(&["new", "-s", "dev"]))
+            .expect("new should be a recognized CLI command");
+        match parsed {
+            Some(CliCommand::NewSession { name, cwd }) => {
+                assert_eq!(name.as_deref(), Some("dev"));
+                assert!(cwd.is_none(), "cwd must be None when -c is absent");
+            }
+            other => panic!("unexpected parse result: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn new_session_with_cwd_preserves_explicit_cwd() {
+        // §3.10 -c 必须保留, 让 dispatch 直接使用, 不再去 current_dir 推算。
+        let parsed = parse_cli_args_from(&args(&["new", "-s", "dev", "-c", "/tmp/work"]))
+            .expect("parse");
+        match parsed {
+            Some(CliCommand::NewSession { name, cwd }) => {
+                assert_eq!(name.as_deref(), Some("dev"));
+                let cwd = cwd.expect("cwd should be Some when -c passed");
+                assert_eq!(cwd.to_string_lossy(), "/tmp/work");
+            }
+            other => panic!("unexpected parse result: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn new_session_accepts_long_cwd_flag() {
+        let parsed =
+            parse_cli_args_from(&args(&["new", "--session-name", "dev", "--cwd", "/var"]))
+                .expect("parse");
+        if let Some(CliCommand::NewSession { name, cwd }) = &parsed {
+            assert_eq!(name.as_deref(), Some("dev"));
+            let cwd = cwd.as_ref().expect("cwd should be Some when --cwd passed");
+            assert_eq!(cwd.to_string_lossy(), "/var");
+        } else {
+            panic!("unexpected parse result: {parsed:?}");
+        }
+    }
+
+    #[test]
+    fn attach_intent_parses_alongside_cwd_default_preserved() {
+        // §3.10 attach 携带 target 时, CLI 仍能诚实地被解析为 CliCommand::Attach,
+        // GUI 启动侧另行消费 (parse_launch_intent_from) 决定走 GUI 路径。
+        // 这里验证两个解析路径不会互相干扰: LaunchIntent 拿到 target,
+        // parse_cli_args_from 也能拿到相同 target。
+        let args_vec = args(&["attach", "-t", "dev"]);
+        let intent = parse_launch_intent_from(&args_vec);
+        let parsed = parse_cli_args_from(&args_vec).expect("parse");
+        assert_eq!(intent, Some(LaunchIntent::Gui { target: Some("dev".into()) }));
+        if let Some(CliCommand::Attach { target }) = &parsed {
+            assert_eq!(target.as_deref(), Some("dev"));
+        } else {
+            panic!("unexpected parse result: {parsed:?}");
+        }
+    }
+
+        let err = parse_cli_args_from(&args(&["help"]))
+            .expect_err("help subcommand must be a handled case");
+        assert!(err.contains("usage"), "help should contain usage: {err}");
     }
 }

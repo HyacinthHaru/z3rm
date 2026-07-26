@@ -132,17 +132,8 @@ fn cmd_kill(args: &[String]) -> Result<()> {
             domain.kill_session(id).await?;
             println!("session {id} killed successfully");
         } else {
-            // §3.5 z3rm-server kill:结束所有 session 并关闭 daemon。
-            let sessions = domain.list_sessions().await?;
-            for session in &sessions {
-                let _ = domain.kill_session(&session.id).await;
-            }
-
-            drop(domain);
-
-            tokio::time::sleep(std::time::Duration::from_millis(500)).await;
-            let _ = std::fs::remove_file(&socket_path);
-
+            // §3.5 z3rm-server kill: request an acknowledged process shutdown.
+            domain.shutdown().await?;
             println!("z3rm-server killed successfully");
         }
 

@@ -171,6 +171,12 @@ fn init_database(db_path: &PathBuf) -> Result<Connection> {
 }
 
 /// 启动守护进程 (§3.1)
+pub struct ShutdownState {
+    pub requested: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    pub ack_request_id: std::sync::Arc<std::sync::atomic::AtomicU64>,
+    pub acked: std::sync::Arc<tokio::sync::Notify>,
+}
+
 pub fn run() -> Result<()> {
     // §16.12 初始化日志系统
     setup_logging()?;
@@ -292,6 +298,12 @@ impl Server {
         // loop can re-evaluate the idle timer without polling.
         let (done_tx, mut done_rx) = tokio::sync::mpsc::unbounded_channel::<()>();
 
+        let shutdown_state = std::sync::Arc::new(ShutdownState {
+            requested: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            ack_request_id: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            acked: std::sync::Arc::new(tokio::sync::Notify::new()),
+        });
+
         // The idle deadline, if a timer is currently armed. `None` means no timer
         // is running (either because a connection is active or keep_alive is disabled).
         let mut idle_deadline: Option<tokio::time::Instant> = None;
@@ -328,9 +340,10 @@ impl Server {
                     let clipboard = self.clipboard.clone();
                     let counter = self.active_connections.clone();
                     let done_tx = done_tx.clone();
+                    let shutdown_state = shutdown_state.clone();
 
                     tokio::spawn(async move {
-                        match connection::handle_connection(stream, sessions, db, clipboard).await {
+                        match connection::handle_connection(stream, sessions, db, clipboard, shutdown_state).await {
                             Ok(()) => {
                                 zlog::info!("client disconnected");
                             }
@@ -349,6 +362,12 @@ impl Server {
                 // Notify that a connection task finished — re-evaluate the idle timer.
                 _ = done_rx.recv() => {
                     // Loop will re-arm idle_deadline if connections dropped to 0.
+                }
+
+                // §3.5 Explicit Shutdown RPC acknowledged and flushed by a connection.
+                _ = shutdown_state.acked.notified() => {
+                    tracing::info!("explicit mux shutdown acknowledged, terminating");
+                    return Ok(());
                 }
 
                 // Idle timer expired — graceful shutdown.

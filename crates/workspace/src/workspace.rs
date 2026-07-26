@@ -6471,16 +6471,234 @@ impl Workspace {
         self.server_layout.as_ref()
     }
 
-    /// §15.1 接收服务端 LayoutTree (从 mux_protocol proto 转换)
-    pub fn apply_layout_snapshot(
+    /// §15.1 Create a workspace pane for mux layout projection.
+    pub fn add_pane_for_layout(
         &mut self,
-        proto_tree: &mux_protocol::LayoutTree,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Entity<Pane> {
+        let pane = self.add_pane(window, cx);
+        pane.update(cx, |pane, _| {
+            pane.set_should_display_welcome_page(false);
+        });
+        pane
+    }
+
+    /// §15.7 Reflect zoom state into the workspace zoomed view.
+    pub fn set_pane_zoomed(
+        &mut self,
+        pane: Entity<Pane>,
+        zoomed: bool,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let layout = crate::layout_projection::LayoutTree::from_proto(proto_tree);
-        self.server_layout = Some(layout);
+        pane.update(cx, |pane, cx| pane.set_zoomed(zoomed, cx));
+        if zoomed {
+            self.zoomed = Some(pane.downgrade().into());
+            self.zoomed_position = None;
+            if pane.read(cx).has_focus(window, cx) {
+                window.focus(&pane.focus_handle(cx), cx);
+            }
+        } else if self
+            .zoomed
+            .as_ref()
+            .and_then(|view| view.upgrade())
+            .is_some_and(|view| view.entity_id() == pane.entity_id())
+        {
+            self.zoomed = None;
+            self.zoomed_position = None;
+        }
+        cx.emit(Event::ZoomChanged);
         cx.notify();
+    }
+
+    /// §15.1 Project an authoritative layout tree into the center PaneGroup.
+    ///
+    /// `create_pane` builds a new Pane entity; `add_item` attaches a mux pane view
+    /// identified by server pane_id. Existing views are not reused on first attach.
+    pub fn apply_initial_layout(
+        &mut self,
+        layout: &crate::layout_projection::LayoutTree,
+        mut create_pane: impl FnMut(&mut Workspace, &mut Window, &mut Context<Self>) -> Entity<Pane>,
+        mut add_item: impl FnMut(
+            &mut Workspace,
+            &Entity<Pane>,
+            String,
+            &mut Window,
+            &mut Context<Self>,
+        ),
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.server_layout = Some(layout.clone());
+        let mut existing = std::collections::HashMap::default();
+        self.reconcile_layout_tree(
+            layout,
+            &mut existing,
+            &mut create_pane,
+            &mut add_item,
+            window,
+            cx,
+        );
+    }
+
+    /// §15.4 / §15.12 Reconcile a layout push against existing pane views.
+    ///
+    /// Reuses Entity<Pane> for pane_ids already present in `existing`, creates
+    /// only the delta, removes zombies, and rebuilds the center tree to match
+    /// the authoritative nested directions/ratios.
+    pub fn apply_layout_snapshot(
+        &mut self,
+        layout: &crate::layout_projection::LayoutTree,
+        mut existing: std::collections::HashMap<String, Entity<Pane>>,
+        mut create_pane: impl FnMut(&mut Workspace, &mut Window, &mut Context<Self>) -> Entity<Pane>,
+        mut add_item: impl FnMut(
+            &mut Workspace,
+            &Entity<Pane>,
+            String,
+            &mut Window,
+            &mut Context<Self>,
+        ),
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.server_layout = Some(layout.clone());
+        self.reconcile_layout_tree(
+            layout,
+            &mut existing,
+            &mut create_pane,
+            &mut add_item,
+            window,
+            cx,
+        );
+    }
+
+    fn reconcile_layout_tree(
+        &mut self,
+        layout: &crate::layout_projection::LayoutTree,
+        existing: &mut std::collections::HashMap<String, Entity<Pane>>,
+        create_pane: &mut dyn FnMut(&mut Workspace, &mut Window, &mut Context<Self>) -> Entity<Pane>,
+        add_item: &mut dyn FnMut(
+            &mut Workspace,
+            &Entity<Pane>,
+            String,
+            &mut Window,
+            &mut Context<Self>,
+        ),
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let mut used: std::collections::HashSet<gpui::EntityId> =
+            std::collections::HashSet::default();
+        let (root, focus_pane) = self.reconcile_layout_node(
+            &layout.root,
+            existing,
+            &mut used,
+            create_pane,
+            add_item,
+            window,
+            cx,
+        );
+
+        // Drop panes that are no longer present in the authoritative tree.
+        let stale: Vec<Entity<Pane>> = self
+            .panes
+            .iter()
+            .filter(|pane| !used.contains(&pane.entity_id()))
+            .cloned()
+            .collect();
+        for pane in stale {
+            self.remove_pane(pane, focus_pane.clone(), window, cx);
+        }
+
+        self.center = PaneGroup::with_root(root);
+        self.center.set_is_center(true);
+        if let Some(focus_pane) = focus_pane {
+            self.active_pane = focus_pane.clone();
+            self.last_active_center_pane = Some(focus_pane.downgrade());
+            window.focus(&focus_pane.focus_handle(cx), cx);
+        }
+        cx.notify();
+    }
+
+    fn reconcile_layout_node(
+        &mut self,
+        node: &crate::layout_projection::LayoutNode,
+        existing: &mut std::collections::HashMap<String, Entity<Pane>>,
+        used: &mut std::collections::HashSet<gpui::EntityId>,
+        create_pane: &mut dyn FnMut(&mut Workspace, &mut Window, &mut Context<Self>) -> Entity<Pane>,
+        add_item: &mut dyn FnMut(
+            &mut Workspace,
+            &Entity<Pane>,
+            String,
+            &mut Window,
+            &mut Context<Self>,
+        ),
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> (Member, Option<Entity<Pane>>) {
+        use crate::layout_projection::{LayoutNode, SplitDirection as LayoutSplit};
+
+        match node {
+            LayoutNode::Pane { pane_id, .. } => {
+                let pane = if let Some(pane) = existing.remove(pane_id) {
+                    pane
+                } else {
+                    let pane = create_pane(self, window, cx);
+                    add_item(self, &pane, pane_id.clone(), window, cx);
+                    pane
+                };
+                used.insert(pane.entity_id());
+                (Member::Pane(pane.clone()), Some(pane))
+            }
+            LayoutNode::Split {
+                direction,
+                children,
+                ratios,
+                ..
+            } => {
+                let mut members = Vec::with_capacity(children.len());
+                let mut focus = None;
+                for child in children {
+                    let (member, child_focus) = self.reconcile_layout_node(
+                        child,
+                        existing,
+                        used,
+                        create_pane,
+                        add_item,
+                        window,
+                        cx,
+                    );
+                    if focus.is_none() {
+                        focus = child_focus;
+                    }
+                    members.push(member);
+                }
+                if members.is_empty() {
+                    let pane = create_pane(self, window, cx);
+                    used.insert(pane.entity_id());
+                    return (Member::Pane(pane.clone()), Some(pane));
+                }
+                let axis = match direction {
+                    LayoutSplit::LeftRight => gpui::Axis::Horizontal,
+                    LayoutSplit::TopBottom => gpui::Axis::Vertical,
+                };
+                let flexes = if ratios.len() == members.len() && ratios.iter().all(|r| r.is_finite() && *r > 0.0) {
+                    let sum: f32 = ratios.iter().sum();
+                    if sum > 0.0 {
+                        Some(ratios.iter().map(|r| r / sum * members.len() as f32).collect())
+                    } else {
+                        None
+                    }
+                } else {
+                    None
+                };
+                (
+                    Member::Axis(PaneAxis::load(axis, members, flexes)),
+                    focus,
+                )
+            }
+        }
     }
 
     // ========================================================================

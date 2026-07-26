@@ -5,24 +5,24 @@
     "context": "Terminal",
     "bindings": {
       // Tab management
-      "ctrl-shift-t": "pane::newTab",
-      "ctrl-shift-w": "pane::closeTab",
+      "ctrl-shift-t": "mux_pane::NewTab",
+      "ctrl-shift-w": "mux_pane::CloseTab",
 
       // Pane splitting
-      "ctrl-shift-%": "pane::splitRight",
-      "ctrl-shift-\"": "pane::splitDown",
+      "ctrl-shift-%": "mux_pane::SplitRight",
+      "ctrl-shift-\"": "mux_pane::SplitDown",
 
       // Pane navigation
-      "ctrl-shift-left": "pane::focusLeft",
-      "ctrl-shift-right": "pane::focusRight",
-      "ctrl-shift-up": "pane::focusUp",
-      "ctrl-shift-down": "pane::focusDown",
+      "ctrl-shift-left": "mux_pane::FocusLeft",
+      "ctrl-shift-right": "mux_pane::FocusRight",
+      "ctrl-shift-up": "mux_pane::FocusUp",
+      "ctrl-shift-down": "mux_pane::FocusDown",
 
       // Mux session
-      "ctrl-shift-d": "mux::detach",
+      "ctrl-shift-d": "mux::Detach",
 
       // Pane zoom
-      "ctrl-shift-z": "pane::zoomToggle",
+      "ctrl-shift-z": "mux_pane::ZoomToggle",
 
       // §12 复制模式 (Plan 31)
       "ctrl-shift-;": "terminal::EnterCopyMode",

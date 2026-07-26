@@ -218,7 +218,7 @@ fn test_pane_resize() {
     )
     .expect("spawn pane");
 
-    pane.resize(100, 30);
+    pane.resize(100, 30).expect("resize pane");
     assert_eq!(pane.get_cols(), 100);
     assert_eq!(pane.get_rows(), 30);
 }

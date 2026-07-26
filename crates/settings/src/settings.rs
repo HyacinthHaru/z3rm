@@ -209,6 +209,22 @@ pub fn mux_keymap_profile_content(profile: &str) -> Cow<'static, str> {
     asset_str::<SettingsAssets>(path)
 }
 
+/// §16.7 加载指定 mux keymap profile 的全部绑定。
+///
+/// Built-in profiles must reject partial failures rather than silently retaining
+/// broken bindings: a single bad binding is treated as a hard error so the profile
+/// cannot be switched to a half-applied state. This mirrors the strict behaviour of
+/// [`KeymapFile::load_asset`] and never uses the partial-failure path.
+pub fn load_mux_keymap_profile(
+    profile: &str,
+    cx: &gpui::App,
+) -> anyhow::Result<Vec<gpui::KeyBinding>> {
+    let path = mux_keymap_profile_path(profile);
+    // Built-in assets are not user-editable, so any per-binding failure is a bug
+    // in the bundled profile rather than a user typo and must surface as an error.
+    KeymapFile::load_asset(path, None, cx)
+}
+
 
 /// Specific keybinding overrides. Loaded after the base keymap so they win over
 /// conflicting base-keymap (and default `Editor`) bindings for the same chords,

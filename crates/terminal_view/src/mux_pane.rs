@@ -67,6 +67,8 @@ pub struct MuxPaneView {
     zoomed: bool,
     /// §3.10 last resize dimensions sent to server (cols, rows)
     last_sent_size: (u32, u32),
+    prefix_mode: bool,
+    prefix_timeout_task: Option<gpui::Task<()>>,
 }
 
 impl MuxPaneView {
@@ -152,6 +154,8 @@ impl MuxPaneView {
             snapshot,
             zoomed: false,
             last_sent_size: (80, 24),
+            prefix_mode: false,
+            prefix_timeout_task: None,
         };
         view.start_notification_listener(cx);
         view.subscribe_pane_output(cx);
@@ -420,9 +424,46 @@ impl MuxPaneView {
             .detach();
     }
 
-    /// Access the underlying terminal entity (for tests/inspection).
     pub fn terminal(&self) -> &Entity<Terminal> {
         &self.terminal
+    }
+
+    /// §16.5 Enter prefix mode: subsequent keystroke is interpreted as a prefix
+    /// chord and dispatched to the bound keymap action rather than sent to PTY.
+    /// `timeout_ms` caps how long the pane waits for the next keystroke.
+    pub fn enter_prefix_mode(&mut self, timeout_ms: u64, cx: &mut Context<Self>) {
+        self.prefix_mode = true;
+        cx.notify();
+        let timeout = std::time::Duration::from_millis(if timeout_ms == 0 { 500 } else { timeout_ms });
+        let task = cx.spawn(async move |this, cx| {
+            cx.background_executor().timer(timeout).await;
+            let _ = this.update(cx, |view, cx| {
+                if view.prefix_mode {
+                    view.prefix_mode = false;
+                    view.prefix_timeout_task = None;
+                    cx.notify();
+                }
+            });
+        });
+        // Replacing an in-flight timeout aborts the previous wait.
+        self.prefix_timeout_task = Some(task);
+    }
+
+    /// §16.5 Send a literal keystroke to the PTY, bypassing prefix-mode
+    /// interpretation and copy/paste interception. Used by double-tap escape.
+    pub fn send_literal(&mut self, keystroke: &str, cx: &mut Context<Self>) {
+        let domain = self.domain.clone();
+        let pane_id = self.pane_id.clone();
+        let bytes = keystroke.as_bytes().to_vec();
+        cx.background_executor()
+            .spawn(async move {
+                if let Err(error) = domain.send_input(&pane_id, &bytes).await {
+                    tracing::error!(pane_id = %pane_id, error = %error, "send_literal failed");
+                }
+            })
+            .detach();
+        self.prefix_mode = false;
+        self.prefix_timeout_task = None;
     }
 }
 
@@ -555,9 +596,6 @@ impl EventEmitter<MuxPaneEvent> for MuxPaneView {}
 
 impl Render for MuxPaneView {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl gpui::IntoElement {
-        // §3.10 resize forwarding: detect terminal dimension changes and notify server.
-        // TerminalElement resizes the DisplayOnly terminal during prepaint; we check
-        // the resulting grid size and forward to mux_server so the PTY matches.
         let bounds = self.terminal.read(cx).last_content().terminal_bounds;
         let cols = bounds.num_columns() as u32;
         let rows = bounds.num_lines() as u32;
@@ -571,10 +609,17 @@ impl Render for MuxPaneView {
         let terminal_handle = self.terminal.clone();
         let terminal_view_handle = self.terminal_view.clone();
 
+        let mut dispatch_context = gpui::KeyContext::new_with_defaults();
+        dispatch_context.add("Terminal");
+        if self.prefix_mode {
+            dispatch_context.add("PrefixMode");
+        }
+
         div()
             .size_full()
             .id("mux-pane-root")
             .track_focus(&self.focus_handle)
+            .key_context(dispatch_context)
             .bg(colors.editor_background)
             .child(
                 div()
@@ -594,6 +639,16 @@ impl Render for MuxPaneView {
             )
             // §3.1 keyboard input → MuxDomain::send_input (DisplayOnly terminal drops input)
             .on_key_down(cx.listener(|this, event: &KeyDownEvent, _window, cx| {
+                if this.prefix_mode {
+                    this.prefix_mode = false;
+                    if let Some(task) = this.prefix_timeout_task.take() {
+                        task.detach();
+                    }
+                    cx.notify();
+                    // Let the keymap dispatch the prefix chord action; fall through
+                    // to PTY delivery only if no binding consumed it.
+                    return;
+                }
                 this.dispatch_keystroke(&event.keystroke, cx);
                 cx.stop_propagation();
             }))
@@ -639,12 +694,11 @@ impl Item for MuxPaneView {
         Task::ready(None)
     }
 
-    fn is_dirty(&self, _cx: &App) -> bool {
-        false
-    }
-
-    fn breadcrumb_location(&self, _cx: &App) -> ToolbarItemLocation {
-        ToolbarItemLocation::Hidden
+    fn to_item_events(event: &MuxPaneEvent, f: &mut dyn FnMut(workspace::item::ItemEvent)) {
+        match event {
+            MuxPaneEvent::CloseRequested => f(workspace::item::ItemEvent::CloseItem),
+            MuxPaneEvent::TitleChanged => f(workspace::item::ItemEvent::UpdateTab),
+        }
     }
 }
 

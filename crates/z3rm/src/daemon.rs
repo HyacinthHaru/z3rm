@@ -12,7 +12,7 @@ use mux_protocol::TerminalSize;
 // §16.12 GPUI 通知 — daemon 连接丢失/错误提示
 // ============================================================================
 
-use gpui::{App, SharedString, Task};
+use gpui::{App, SharedString};
 use ui::{Icon, IconName};
 
 /// §16.12 显示 "daemon 连接丢失" 通知 (warning toast)
@@ -39,28 +39,52 @@ pub fn show_daemon_error(cx: &mut App, error: impl Into<SharedString>) {
     });
 }
 
-/// §16.12 daemon 连接监视器: 后台检测连接状态并自动重连。
-/// 当 MuxDomain 连接丢失时自动重连并显示 toast 通知。
+/// §16.12 / §15.12 daemon 连接监视器 — 后台检测连接状态并在丢失时做权威
+/// 重连 (§15.4 in-place swap)。会话 ID 由调用方持有, 重连期间原 `Arc<MuxDomain>`
+/// 被原地换上新传输/inner, 保留 `window_id` 与所有通知订阅者, 并主动广播
+/// 一条 `SessionLayoutChanged` 触发下游快照重对账。
 pub fn watch_daemon_connection(
-    _domain: std::sync::Arc<MuxDomain>,
+    domain: std::sync::Arc<MuxDomain>,
+    session_id: String,
     cx: &mut App,
 ) -> gpui::Task<()> {
     cx.spawn(async move |cx| {
-        let socket_path = default_socket_path();
+        const INITIAL_BACKOFF: Duration = Duration::from_millis(500);
+        const MAX_BACKOFF: Duration = Duration::from_secs(30);
+        let mut backoff = INITIAL_BACKOFF;
         loop {
-            smol::Timer::after(Duration::from_secs(30)).await;
+            cx.background_executor().timer(backoff).await;
 
-            if !socket_path.exists() {
-                cx.update(|cx| show_daemon_connection_lost(cx));
+            // §15.4 Probe the live connection (issues a real RPC), not just
+            // socket presence — a stale socket file can outlive a dead daemon.
+            if domain.check_connection().await {
+                backoff = INITIAL_BACKOFF;
+                continue;
+            }
 
-                match ensure_daemon_running().await {
-                    Ok(_) => {
-                        tracing::info!("reconnected to daemon");
-                    }
-                    Err(reconnect_err) => {
-                        let msg = format!("Failed to reconnect to daemon: {reconnect_err}");
-                        cx.update(|cx| show_daemon_error(cx, msg));
-                    }
+            // §16.12 Connection lost: surface it and escalate. Spawn-then-
+            // reconnect is a fallback for the case where the daemon process
+            // itself died. Successful reconnect uses the same exponential
+            // back-off envelope below.
+            cx.update(|cx| show_daemon_connection_lost(cx));
+            if let Err(spawn_err) = ensure_daemon_running().await {
+                tracing::warn!(error = %spawn_err, "ensure_daemon_running failed before reconnect");
+            }
+
+            match domain
+                .reconnect_local_in_place(&session_id, mux::AttachMode::Shared)
+                .await
+            {
+                Ok(_) => {
+                    tracing::info!(session_id = %session_id, "reconnected to daemon in place");
+                    cx.update(|cx| show_daemon_error(cx, "Mux reconnected"));
+                    backoff = INITIAL_BACKOFF;
+                }
+                Err(reconnect_err) => {
+                    let msg = format!("Failed to reconnect to mux: {reconnect_err}");
+                    tracing::warn!(error = %reconnect_err, "reconnect attempt failed");
+                    cx.update(|cx| show_daemon_error(cx, msg));
+                    backoff = (backoff * 2).min(MAX_BACKOFF);
                 }
             }
         }
@@ -211,6 +235,46 @@ pub async fn ensure_default_session(domain: &MuxDomain) -> Result<String> {
         let session_id = sessions[0].id.clone();
         tracing::info!(session_id = %session_id, "using existing session");
         Ok(session_id)
+    }
+}
+
+/// 解析 GUI 启动附带的 target session 并返回 session ID。
+///
+/// §3.10 `z3rm attach [-t target]` 启动 GUI 时携带 target：
+/// - `Some(name_or_id)` -> 按 id 或 name 查找现有 session；找不到则报错。
+/// - `None` -> 退回 `ensure_default_session` 的语义（创建或复用默认 session）。
+///
+/// 错误必须传播（不静默丢弃 `list_sessions` / 解析失败）。
+pub async fn ensure_target_session(
+    domain: &MuxDomain,
+    target: Option<&str>,
+) -> Result<String> {
+    match target {
+        None => ensure_default_session(domain).await,
+        Some(raw) => {
+            if raw.is_empty() {
+                anyhow::bail!("attach target must not be empty");
+            }
+            let filtered: String = raw
+                .chars()
+                .filter(|ch| !ch.is_whitespace())
+                .collect();
+            if filtered.is_empty() {
+                anyhow::bail!("attach target must not be empty");
+            }
+            let sessions = domain.list_sessions().await?;
+            let session = sessions
+                .iter()
+                .find(|session| session.id == filtered || session.name == filtered)
+                .ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "session '{}' not found (existing: {:?})",
+                        filtered,
+                        sessions.iter().map(|s| &s.name).collect::<Vec<_>>()
+                    )
+                })?;
+            Ok(session.id.clone())
+        }
     }
 }
 /// 如果 session 没有 pane，创建默认终端 (§16.1)

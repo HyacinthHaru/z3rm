@@ -8,6 +8,7 @@ use crate::grid_sync::{
     self, diff_from_dirty, snapshot_from_term, GridDiff, GridDiffRing, FullGridSnapshot,
     ScrollbackBuffer, ScrollbackVersion,
 };
+use anyhow::Context as _;
 use alacritty_terminal::event::{Event as AlacEvent, EventListener};
 use alacritty_terminal::grid::Dimensions as _;
 use alacritty_terminal::term::test::TermSize;
@@ -107,6 +108,17 @@ impl Pane {
         rows: u32,
         command: Option<ShellCommand>,
     ) -> anyhow::Result<Arc<Self>> {
+        Self::spawn_with_session(id, String::new(), cwd, cols, rows, command)
+    }
+
+    pub fn spawn_with_session(
+        id: String,
+        session_id: String,
+        cwd: String,
+        cols: u32,
+        rows: u32,
+        command: Option<ShellCommand>,
+    ) -> anyhow::Result<Arc<Self>> {
         let events = Arc::new(parking_lot::Mutex::new(Vec::new()));
         let listener = PaneEventListener { events: events.clone() };
 
@@ -151,6 +163,10 @@ impl Pane {
         cmd.env("TERM", "xterm-256color");
         cmd.env("COLORTERM", "truecolor");
         cmd.env("Z3RM_PANE_ID", &id);
+        cmd.env("Z3RM_PANE", &id);
+        if !session_id.is_empty() {
+            cmd.env("Z3RM_SESSION", &session_id);
+        }
 
         // §3.1 spawn 子进程
         let child = pair.slave.spawn_command(cmd)?;
@@ -200,45 +216,45 @@ impl Pane {
     /// Bump generation 后由 connection 层 fan-out PaneDirty 通知到所有 client。
     fn start_pty_read_loop(self: Arc<Self>, mut reader: Box<dyn Read + Send>) {
         let pane_weak = Arc::downgrade(&self);
-        // 持有 strong ref 直到线程启动, 防止 race
-        let pane_strong = self.clone();
 
-        std::thread::Builder::new()
+        if let Err(error) = std::thread::Builder::new()
             .name(format!("pty-read-{}", self.id))
             .spawn(move || {
                 let mut buf = [0u8; 8192];
-                // §3.3 DEC-2026 解析器 + 自适应合并器 + 节流状态 (本线程独占)。
                 let mut dec = Dec2026Parser::new();
                 let mut coalescer = AdaptiveCoalescer::new();
                 let mut rl_state = ReadLoopState::default();
                 loop {
                     let Some(pane) = pane_weak.upgrade() else {
-                        // Pane 已 drop, 退出线程
                         return;
                     };
 
                     match reader.read(&mut buf) {
                         Ok(0) => {
-                            // EOF — 子进程关闭了 stdout, 标记 pane dead
                             pane.set_alive(false);
                             return;
                         }
-                        Ok(n) => {
-                            pane.process_pty_bytes(&buf[..n], &mut dec, &mut coalescer, &mut rl_state);
+                        Ok(count) => {
+                            pane.process_pty_bytes(
+                                &buf[..count],
+                                &mut dec,
+                                &mut coalescer,
+                                &mut rl_state,
+                            );
                         }
-                        Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {
-                            continue;
-                        }
-                        Err(_) => {
+                        Err(error) if error.kind() == std::io::ErrorKind::Interrupted => {}
+                        Err(error) => {
+                            tracing::error!(pane_id = %pane.id, error = %error, "PTY read failed");
                             pane.set_alive(false);
                             return;
                         }
                     }
                 }
-                #[allow(unreachable_code)]
-                drop(pane_strong);
             })
-            .ok();
+        {
+            tracing::error!(pane_id = %self.id, error = %error, "failed to spawn PTY reader");
+            self.set_alive(false);
+        }
     }
 
     /// §3.1 / §3.3 喂 PTY 字节给 alacritty Term, 处理事件, 计算 diff, bump generation。
@@ -516,14 +532,13 @@ impl Pane {
     }
 
     /// §3.10 Resize — 改 PTY winsize + resize alacritty Term + bump generation。
-    pub fn resize(&self, cols: u32, rows: u32) {
-        // §3.1 通知 PTY TIOCSWINSZ
-        let _ = self.pty_master.lock().resize(PtySize {
-            rows: rows as u16,
-            cols: cols as u16,
+    pub fn resize(&self, cols: u32, rows: u32) -> anyhow::Result<()> {
+        self.pty_master.lock().resize(PtySize {
+            rows: rows.try_into().context("pane row count exceeds PTY limit")?,
+            cols: cols.try_into().context("pane column count exceeds PTY limit")?,
             pixel_width: 0,
             pixel_height: 0,
-        });
+        })?;
 
         // §3.1 resize alacritty Term
         {
@@ -545,6 +560,7 @@ impl Pane {
         };
         let new_gen = self.generation.fetch_add(1, Ordering::SeqCst) + 1;
         self.grid_diff_ring.write().push(new_gen, diff);
+        Ok(())
     }
 
     /// §3.3 获取当前 cols。
