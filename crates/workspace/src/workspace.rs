@@ -782,22 +782,6 @@ pub fn init(app_state: Arc<AppState>, cx: &mut App) {
                 true,
                 cx,
             );
-        })
-        .on_action(|_: &OpenDiff, cx: &mut App| {
-            // §16.5 打开 diff review：选择文件 → 对比当前版本与 shadow snapshot 前一个版本
-            // TODO: 集成 shadow_snapshot 获取前一版本内容并打开 diff 视图
-            let app_state = AppState::global(cx);
-            prompt_and_open_paths(
-                app_state,
-                PathPromptOptions {
-                    files: true,
-                    directories: false,
-                    multiple: false,
-                    prompt: Some("Select file for diff review".into()),
-                },
-                true,
-                cx,
-            );
         });
 }
 
@@ -6519,6 +6503,7 @@ impl Workspace {
     pub fn apply_initial_layout(
         &mut self,
         layout: &crate::layout_projection::LayoutTree,
+        focused_pane_id: Option<&str>,
         mut create_pane: impl FnMut(&mut Workspace, &mut Window, &mut Context<Self>) -> Entity<Pane>,
         mut add_item: impl FnMut(
             &mut Workspace,
@@ -6534,6 +6519,7 @@ impl Workspace {
         let mut existing = std::collections::HashMap::default();
         self.reconcile_layout_tree(
             layout,
+            focused_pane_id,
             &mut existing,
             &mut create_pane,
             &mut add_item,
@@ -6550,6 +6536,7 @@ impl Workspace {
     pub fn apply_layout_snapshot(
         &mut self,
         layout: &crate::layout_projection::LayoutTree,
+        focused_pane_id: Option<&str>,
         mut existing: std::collections::HashMap<String, Entity<Pane>>,
         mut create_pane: impl FnMut(&mut Workspace, &mut Window, &mut Context<Self>) -> Entity<Pane>,
         mut add_item: impl FnMut(
@@ -6565,6 +6552,7 @@ impl Workspace {
         self.server_layout = Some(layout.clone());
         self.reconcile_layout_tree(
             layout,
+            focused_pane_id,
             &mut existing,
             &mut create_pane,
             &mut add_item,
@@ -6576,6 +6564,7 @@ impl Workspace {
     fn reconcile_layout_tree(
         &mut self,
         layout: &crate::layout_projection::LayoutTree,
+        focused_pane_id: Option<&str>,
         existing: &mut std::collections::HashMap<String, Entity<Pane>>,
         create_pane: &mut dyn FnMut(&mut Workspace, &mut Window, &mut Context<Self>) -> Entity<Pane>,
         add_item: &mut dyn FnMut(
@@ -6590,10 +6579,13 @@ impl Workspace {
     ) {
         let mut used: std::collections::HashSet<gpui::EntityId> =
             std::collections::HashSet::default();
-        let (root, focus_pane) = self.reconcile_layout_node(
+        let mut pane_id_map: std::collections::HashMap<String, Entity<Pane>> =
+            std::collections::HashMap::default();
+        let (root, dfs_focus) = self.reconcile_layout_node(
             &layout.root,
             existing,
             &mut used,
+            &mut pane_id_map,
             create_pane,
             add_item,
             window,
@@ -6607,12 +6599,20 @@ impl Workspace {
             .filter(|pane| !used.contains(&pane.entity_id()))
             .cloned()
             .collect();
+        let fallback_focus = dfs_focus.clone();
         for pane in stale {
-            self.remove_pane(pane, focus_pane.clone(), window, cx);
+            self.remove_pane(pane, fallback_focus.clone(), window, cx);
         }
 
         self.center = PaneGroup::with_root(root);
         self.center.set_is_center(true);
+
+        // §15.4 prefer the authoritative focused pane over the DFS-first leaf.
+        // Build a pane_id → Entity<Pane> map from items in the used panes,
+        let focus_pane = focused_pane_id
+            .and_then(|target_id| pane_id_map.get(target_id).cloned())
+            .or(dfs_focus);
+
         if let Some(focus_pane) = focus_pane {
             self.active_pane = focus_pane.clone();
             self.last_active_center_pane = Some(focus_pane.downgrade());
@@ -6626,6 +6626,7 @@ impl Workspace {
         node: &crate::layout_projection::LayoutNode,
         existing: &mut std::collections::HashMap<String, Entity<Pane>>,
         used: &mut std::collections::HashSet<gpui::EntityId>,
+        pane_id_map: &mut std::collections::HashMap<String, Entity<Pane>>,
         create_pane: &mut dyn FnMut(&mut Workspace, &mut Window, &mut Context<Self>) -> Entity<Pane>,
         add_item: &mut dyn FnMut(
             &mut Workspace,
@@ -6649,6 +6650,7 @@ impl Workspace {
                     pane
                 };
                 used.insert(pane.entity_id());
+                pane_id_map.insert(pane_id.clone(), pane.clone());
                 (Member::Pane(pane.clone()), Some(pane))
             }
             LayoutNode::Split {
@@ -6664,6 +6666,7 @@ impl Workspace {
                         child,
                         existing,
                         used,
+                        pane_id_map,
                         create_pane,
                         add_item,
                         window,

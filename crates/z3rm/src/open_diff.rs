@@ -62,16 +62,11 @@ pub fn init(cx: &mut App) {
                  using on-disk content as fallback — diff will show no changes"
             );
             // Build DiffReview from loaded content and add to the active workspace pane.
-            let entity = match cx.update(|cx| DiffReview::load(path.clone(), previous.clone(), cx)) {
-                Ok(task) => match task.await {
-                    Ok(e) => e,
-                    Err(error) => {
-                        tracing::error!(path = %path.display(), error = %error, "DiffReview::load failed");
-                        return;
-                    }
-                },
+            let task = cx.update(|cx| DiffReview::load(path.clone(), previous.clone(), cx));
+            let entity = match task.await {
+                Ok(e) => e,
                 Err(error) => {
-                    tracing::error!(path = %path.display(), error = %error, "DiffReview::load cx.update failed");
+                    tracing::error!(path = %path.display(), error = %error, "DiffReview::load failed");
                     return;
                 }
             };

@@ -536,6 +536,13 @@ fn main() {
                 .as_ref()
                 .and_then(|s| s.layout.as_ref())
                 .map(workspace::layout_projection::LayoutTree::from_proto);
+            let snapshot_focused_pane: Option<String> = attach_resp
+                .snapshot
+                .as_ref()
+                .and_then(|s| {
+                    let id = s.focused_pane_id.clone();
+                    if id.is_empty() { None } else { Some(id) }
+                });
             let snapshot_pane_ids: Vec<String> = match &snapshot_layout {
                 Some(layout) => layout.pane_ids(),
                 None => attach_resp
@@ -579,8 +586,9 @@ fn main() {
             // 任何新 Workspace 如果 active pane 为空, 自动 spawn terminal pane。
             // 覆盖 bootstrap / workspace::Open / NewWindow / restore 全部路径。
             let session_for_observer = session_id.clone();
-            let snapshot_panes_for_observer = snapshot_pane_ids.clone();
             let snapshot_layout_for_observer = snapshot_layout.clone();
+            let snapshot_panes_for_observer = snapshot_pane_ids.clone();
+            let snapshot_focused_for_observer = snapshot_focused_pane.clone();
             cx.update(|cx| {
                 cx.observe_new::<workspace::Workspace>(move |workspace, window, cx| {
                     let Some(window) = window else { return };
@@ -874,6 +882,7 @@ fn main() {
                             Some(layout) => {
                                 workspace.apply_initial_layout(
                                     layout,
+                                    snapshot_focused_for_observer.as_deref(),
                                     |workspace, window, cx| workspace.add_pane_for_layout(window, cx),
                                     |workspace, pane, pane_id, window, cx| {
                                         let item: Box<dyn workspace::ItemHandle> = Box::new(cx.new(|cx| {
@@ -986,6 +995,7 @@ fn main() {
             let domain_for_init = domain.clone();
             let snapshot_for_init = snapshot_pane_ids.clone();
             let layout_for_init = snapshot_layout.clone();
+            let focused_for_init = snapshot_focused_pane.clone();
             let open_result = cx.update(|cx| {
                 workspace::Workspace::new_local(
                     vec![],
@@ -999,6 +1009,7 @@ fn main() {
                             Some(layout) => {
                                 workspace.apply_initial_layout(
                                     layout,
+                                    focused_for_init.as_deref(),
                                     |workspace, window, cx| workspace.add_pane_for_layout(window, cx),
                                     |workspace, pane, pane_id, window, cx| {
                                         let item: Box<dyn workspace::ItemHandle> = Box::new(cx.new(|cx| {
@@ -1088,6 +1099,7 @@ fn main() {
                             }
                             workspace.apply_layout_snapshot(
                                 &layout,
+                                None,
                                 existing,
                                 |workspace, window, cx| workspace.add_pane_for_layout(window, cx),
                                 |workspace, pane, pane_id, window, cx| {
