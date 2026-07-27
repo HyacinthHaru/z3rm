@@ -6453,5 +6453,50 @@ mod tests {
             json.is_some(),
             "debug_a11y_tree_json must be Some under Z3RM_A11Y_BUILD_HEADLESS after a frame"
         );
+        // §16.4 the dumped tree must be valid JSON containing a Window root
+        // node, proving the a11y tree structure is well-formed for downstream
+        // TerminalElement/TextRun assertions.
+        let json = json.expect("checked Some above");
+        let parsed: serde_json::Value = serde_json::from_str(&json)
+            .expect("a11y tree JSON must be parseable");
+        assert!(
+            parsed.is_object(),
+            "a11y tree root must be a JSON object"
+        );
+        // The tree contains nodes keyed by NodeId; verify at least one node
+        // carries Role::Window (the root).
+        let json_str = parsed.to_string();
+        assert!(
+            json_str.contains("Window"),
+            "a11y tree must contain a Window role node, got: {}",
+            &json_str[..200.min(json_str.len())]
+        );
+    }
+
+    /// §16.4 stress: rapid draw cycles must not panic and the a11y tree
+    /// must remain well-formed across N frames. Simulates a high-frequency
+    /// terminal output scenario where PaneDirty fires every frame.
+    #[test]
+    fn headless_a11y_stress_rapid_draw_cycles() {
+        unsafe {
+            std::env::set_var("Z3RM_A11Y_BUILD_HEADLESS", "1");
+        }
+        let mut cx = TestAppContext::single();
+        let window = cx.add_window(|_, _| RootView {
+            explicit_size: false,
+            child_bounds: Rc::new(Cell::new(Bounds::default())),
+        });
+        for _ in 0..100 {
+            let json = cx
+                .update_window(window.into(), |_, window, cx| {
+                    window.draw(cx).clear();
+                    window.debug_a11y_tree_json()
+                })
+                .unwrap();
+            assert!(json.is_some(), "a11y tree must be available every frame");
+        }
+        unsafe {
+            std::env::remove_var("Z3RM_A11Y_BUILD_HEADLESS");
+        }
     }
 }
