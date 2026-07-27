@@ -144,11 +144,36 @@ pub fn start(session_id: &str, cwd: &str) -> Result<Option<Arc<SnapshotWatch>>> 
     // !Send: it must never cross threads. Only Send types (path_rx, init_tx)
     // move into the closure.
     let recorder_session_id = session_id.to_string();
+    let root_for_recorder = root.to_path_buf();
     let recorder = std::thread::Builder::new()
         .name(format!("shadow-snap-{}", session_id))
         .spawn(move || {
+            let root = root_for_recorder;
             let engine = match shadow_snapshot::ShadowSnapshotEngine::open(&db_path, &wal_path, &blob_dir) {
                 Ok(engine) => {
+                    // §4.8: complete any Decline intents that crashed mid-restore.
+                    // Resolve path_hash by hashing every file under the session cwd
+                    // (no persistent reverse index yet; walk is bounded to one tree).
+                    let path_index = build_path_hash_index(&root);
+                    match engine.recover_incomplete_restores(|path_hash| {
+                        path_index.get(path_hash).cloned()
+                    }) {
+                        Ok(n) if n > 0 => {
+                            zlog::info!(
+                                "shadow decline recovery: session={} completed={}",
+                                recorder_session_id,
+                                n,
+                            );
+                        }
+                        Ok(_) => {}
+                        Err(error) => {
+                            zlog::warn!(
+                                "shadow decline recovery failed: session={} error={}",
+                                recorder_session_id,
+                                error,
+                            );
+                        }
+                    }
                     // Engine opened fine; tell the caller and enter the loop.
                     // A send failure means the caller gave up — just exit.
                     let _ = init_tx.send(Ok(()));
@@ -242,6 +267,22 @@ pub fn start(session_id: &str, cwd: &str) -> Result<Option<Arc<SnapshotWatch>>> 
             recorder: Mutex::new(Some(recorder)),
         }),
     })))
+}
+
+
+/// Build path_hash → PathBuf index for decline recovery by walking the session cwd.
+/// Matches `shadow_snapshot::compute_path_hash` (blake3 of path.to_string_lossy).
+fn build_path_hash_index(root: &Path) -> std::collections::HashMap<[u8; 32], PathBuf> {
+    let mut index = std::collections::HashMap::new();
+    for entry in walkdir::WalkDir::new(root).follow_links(false).into_iter().filter_map(|e| e.ok()) {
+        if !entry.file_type().is_file() {
+            continue;
+        }
+        let path = entry.into_path();
+        let hash = shadow_snapshot::compute_path_hash(&path);
+        index.insert(hash, path);
+    }
+    index
 }
 
 /// Map a filesystem event kind to the snapshot trigger reason it represents.

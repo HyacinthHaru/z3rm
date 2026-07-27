@@ -6,49 +6,49 @@
     "context": "Terminal",
     "bindings": {
       // Tab management
-      "alt-shift-t": "pane::newTab",
-      "alt-shift-q": "pane::closeTab",
-      "alt-shift-n": "pane::nextTab",
-      "alt-shift-p": "pane::prevTab",
+      "alt-shift-t": "mux_pane::NewTab",
+      "alt-shift-q": "mux_pane::CloseTab",
+      "alt-shift-n": "mux_pane::NextTab",
+      "alt-shift-p": "mux_pane::PrevTab",
 
       // Pane splitting (wezterm uses Alt+Shift+D for horizontal, Alt+Shift+K for vertical)
-      "alt-shift-d": "pane::splitRight",
-      "alt-shift-k": "pane::splitDown",
+      "alt-shift-d": "mux_pane::SplitRight",
+      "alt-shift-k": "mux_pane::SplitDown",
 
       // Pane navigation (wezterm directional)
-      "alt-shift-left": "pane::focusLeft",
-      "alt-shift-right": "pane::focusRight",
-      "alt-shift-up": "pane::focusUp",
-      "alt-shift-down": "pane::focusDown",
+      "alt-shift-left": "mux_pane::FocusLeft",
+      "alt-shift-right": "mux_pane::FocusRight",
+      "alt-shift-up": "mux_pane::FocusUp",
+      "alt-shift-down": "mux_pane::FocusDown",
 
       // Pane navigation (wezterm hjkl)
-      "alt-h": "pane::focusLeft",
-      "alt-j": "pane::focusDown",
-      "alt-k": "pane::focusUp",
-      "alt-l": "pane::focusRight",
+      "alt-h": "mux_pane::FocusLeft",
+      "alt-j": "mux_pane::FocusDown",
+      "alt-k": "mux_pane::FocusUp",
+      "alt-l": "mux_pane::FocusRight",
 
       // Pane switching by number (wezterm style)
-      "alt-1": "pane::focusPane0",
-      "alt-2": "pane::focusPane1",
-      "alt-3": "pane::focusPane2",
-      "alt-4": "pane::focusPane3",
-      "alt-5": "pane::focusPane4",
-      "alt-6": "pane::focusPane5",
-      "alt-7": "pane::focusPane6",
-      "alt-8": "pane::focusPane7",
-      "alt-9": "pane::focusPane8",
+      "alt-1": "mux_pane::FocusPane0",
+      "alt-2": "mux_pane::FocusPane1",
+      "alt-3": "mux_pane::FocusPane2",
+      "alt-4": "mux_pane::FocusPane3",
+      "alt-5": "mux_pane::FocusPane4",
+      "alt-6": "mux_pane::FocusPane5",
+      "alt-7": "mux_pane::FocusPane6",
+      "alt-8": "mux_pane::FocusPane7",
+      "alt-9": "mux_pane::FocusPane8",
 
       // Pane zoom
-      "alt-z": "pane::zoomToggle",
+      "alt-z": "mux_pane::ZoomToggle",
 
       // Pane resizing (wezterm style)
-      "alt-shift-left": "pane::resizeLeft",
-      "alt-shift-right": "pane::resizeRight",
-      "alt-shift-up": "pane::resizeUp",
-      "alt-shift-down": "pane::resizeDown",
+      "alt-shift-left": "mux_pane::ResizeLeft",
+      "alt-shift-right": "mux_pane::ResizeRight",
+      "alt-shift-up": "mux_pane::ResizeUp",
+      "alt-shift-down": "mux_pane::ResizeDown",
 
       // Mux session
-      "alt-shift-d": "mux::detach",
+      "alt-shift-d": "mux::Detach",
 
       // §12 复制模式 (Plan 31)
       "ctrl-shift-;": "terminal::EnterCopyMode"

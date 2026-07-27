@@ -6,7 +6,7 @@
   {
     "context": "Terminal",
     "bindings": {
-      "ctrl-w": ["mux::enterPrefixMode", { "timeout_ms": 500 }],
+      "ctrl-w": ["mux::EnterPrefixMode", { "timeout_ms": 500 }],
 
       // §12 复制模式 (Plan 31)
       "ctrl-shift-;": "terminal::EnterCopyMode"
@@ -17,43 +17,43 @@
     "context": "Terminal && PrefixMode",
     "bindings": {
       // Pane navigation (vim hjkl)
-      "h": "pane::focusLeft",
-      "j": "pane::focusDown",
-      "k": "pane::focusUp",
-      "l": "pane::focusRight",
+      "h": "mux_pane::FocusLeft",
+      "j": "mux_pane::FocusDown",
+      "k": "mux_pane::FocusUp",
+      "l": "mux_pane::FocusRight",
 
       // Pane splitting (vim-style)
-      "_": "pane::splitDown",
-      "|": "pane::splitRight",
+      "_": "mux_pane::SplitDown",
+      "|": "mux_pane::SplitRight",
 
       // Pane management
-      "n": "pane::newTab",
-      "c": "pane::closeTab",
-      "z": "pane::zoomToggle",
-      "=": "pane::resizeEqual",
-      "x": "pane::closeTab",
+      "n": "mux_pane::NewTab",
+      "c": "mux_pane::CloseTab",
+      "z": "mux_pane::ZoomToggle",
+      "=": "mux_pane::ResizeEqual",
+      "x": "mux_pane::CloseTab",
 
       // Tab navigation
-      "gt": "pane::nextTab",
-      "gb": "pane::prevTab",
+      "gt": "mux_pane::NextTab",
+      "gb": "mux_pane::PrevTab",
 
       // Pane switching by number
-      "1": "pane::focusPane0",
-      "2": "pane::focusPane1",
-      "3": "pane::focusPane2",
-      "4": "pane::focusPane3",
-      "5": "pane::focusPane4",
-      "6": "pane::focusPane5",
-      "7": "pane::focusPane6",
-      "8": "pane::focusPane7",
-      "9": "pane::focusPane8",
+      "1": "mux_pane::FocusPane0",
+      "2": "mux_pane::FocusPane1",
+      "3": "mux_pane::FocusPane2",
+      "4": "mux_pane::FocusPane3",
+      "5": "mux_pane::FocusPane4",
+      "6": "mux_pane::FocusPane5",
+      "7": "mux_pane::FocusPane6",
+      "8": "mux_pane::FocusPane7",
+      "9": "mux_pane::FocusPane8",
 
       // Mux session
-      "d": "mux::detach",
+      "d": "mux::Detach",
 
       // Pane ordering
-      "w": "pane::focusNextPane",
-      "W": "pane::focusPrevPane",
+      "w": "mux_pane::FocusNextPane",
+      "W": "mux_pane::FocusPrevPane",
 
       // Send literal Ctrl-w to PTY (double-tap escape)
       "ctrl-w": "terminal::sendKeystroke Ctrl-w"

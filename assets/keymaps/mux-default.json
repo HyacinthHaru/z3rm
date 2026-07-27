@@ -5,45 +5,45 @@
     "context": "Terminal",
     "bindings": {
       // Tab management
-      "ctrl-shift-t": "pane::newTab",
-      "ctrl-shift-w": "pane::closeTab",
-      "ctrl-shift-n": "pane::nextTab",
-      "ctrl-shift-p": "pane::prevTab",
+      "ctrl-shift-t": "mux_pane::NewTab",
+      "ctrl-shift-w": "mux_pane::CloseTab",
+      "ctrl-shift-n": "mux_pane::NextTab",
+      "ctrl-shift-p": "mux_pane::PrevTab",
 
       // Pane splitting
-      "ctrl-shift-%": "pane::splitRight",
-      "ctrl-shift-_": "pane::splitDown",
+      "ctrl-shift-%": "mux_pane::SplitRight",
+      "ctrl-shift-_": "mux_pane::SplitDown",
 
       // Pane navigation
-      "ctrl-shift-left": "pane::focusLeft",
-      "ctrl-shift-right": "pane::focusRight",
-      "ctrl-shift-up": "pane::focusUp",
-      "ctrl-shift-down": "pane::focusDown",
+      "ctrl-shift-left": "mux_pane::FocusLeft",
+      "ctrl-shift-right": "mux_pane::FocusRight",
+      "ctrl-shift-up": "mux_pane::FocusUp",
+      "ctrl-shift-down": "mux_pane::FocusDown",
 
       // Mux session
-      "ctrl-shift-d": "mux::detach",
+      "ctrl-shift-d": "mux::Detach",
 
       // Pane zoom
-      "ctrl-shift-z": "pane::zoomToggle",
+      "ctrl-shift-z": "mux_pane::ZoomToggle",
 
       // Pane resizing
-      "ctrl-shift-h": "pane::resizeLeft",
-      "ctrl-shift-l": "pane::resizeRight",
-      "ctrl-shift-k": "pane::resizeUp",
-      "ctrl-shift-j": "pane::resizeDown",
+      "ctrl-shift-h": "mux_pane::ResizeLeft",
+      "ctrl-shift-l": "mux_pane::ResizeRight",
+      "ctrl-shift-k": "mux_pane::ResizeUp",
+      "ctrl-shift-j": "mux_pane::ResizeDown",
 
       // Pane switching by number (1-9)
-      "ctrl-shift-1": "pane::focusPane0",
-      "ctrl-shift-2": "pane::focusPane1",
-      "ctrl-shift-3": "pane::focusPane2",
-      "ctrl-shift-4": "pane::focusPane3",
-      "ctrl-shift-5": "pane::focusPane4",
-      "ctrl-shift-6": "pane::focusPane5",
-      "ctrl-shift-7": "pane::focusPane6",
-      "ctrl-shift-9": "pane::focusPane8",
+      "ctrl-shift-1": "mux_pane::FocusPane0",
+      "ctrl-shift-2": "mux_pane::FocusPane1",
+      "ctrl-shift-3": "mux_pane::FocusPane2",
+      "ctrl-shift-4": "mux_pane::FocusPane3",
+      "ctrl-shift-5": "mux_pane::FocusPane4",
+      "ctrl-shift-6": "mux_pane::FocusPane5",
+      "ctrl-shift-7": "mux_pane::FocusPane6",
+      "ctrl-shift-9": "mux_pane::FocusPane8",
 
       // §12 复制模式 (Plan 31)
-      "ctrl-shift-;": "terminal::EnterCopyMode",
+      "ctrl-shift-;": "terminal::EnterCopyMode"
     }
   }
 ]

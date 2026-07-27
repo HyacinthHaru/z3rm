@@ -21,7 +21,7 @@ use crate::version_tree::{
 use crate::wal::{Wal, WalEntry};
 
 /// Compute a Blake3 hash of a file path for use as `PathHash`.
-fn compute_path_hash(path: &Path) -> PathHash {
+pub fn compute_path_hash(path: &Path) -> PathHash {
     let mut hasher = Blake3Hasher::new();
     hasher.update(path.to_string_lossy().as_bytes());
     hasher.finalize().into()
