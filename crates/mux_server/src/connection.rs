@@ -313,14 +313,14 @@ async fn dispatch_request(
         // §3.3 需要 ReadWrite 的 pane 操作 (Plan 33)
         RequestBody::SpawnPane(r) => {
             if check_permission(role, ClientRole::ReadWrite) {
-                handle_spawn_pane(r, sessions, outbound_tx, server_settings).await?
+                handle_spawn_pane(r, sessions, outbound_tx, server_settings, clipboard).await?
             } else {
                 ResponseBody::Error("permission denied: read-write required".to_string())
             }
         }
         RequestBody::SplitPane(r) => {
             if check_permission(role, ClientRole::ReadWrite) {
-                handle_split_pane(r, sessions, outbound_tx, server_settings).await?
+                handle_split_pane(r, sessions, outbound_tx, server_settings, clipboard).await?
             } else {
                 ResponseBody::Error("permission denied: read-write required".to_string())
             }
@@ -364,7 +364,7 @@ async fn dispatch_request(
         }
         RequestBody::SetClipboard(r) => {
             if check_permission(role, ClientRole::ReadWrite) {
-                handle_set_clipboard(r, clipboard, outbound_tx).await?
+                handle_set_clipboard(r, sessions, clipboard).await?
             } else {
                 ResponseBody::Error("permission denied: read-write required".to_string())
             }
@@ -685,6 +685,62 @@ async fn handle_detach(
 }
 
 /// §3.3 在现有会话中创建新窗口 (Plan 32)
+
+/// §3.4 Register `pane` with every currently attached client's outbound channel
+/// so PaneDirty / PaneOutput fan out to the whole session, not only the spawner.
+
+/// §16.6 Install emulator ClipboardStore → ServerClipboard fan-out for a pane.
+fn install_pane_clipboard_hook(
+    pane: &std::sync::Arc<crate::pane::Pane>,
+    sessions: &Arc<parking_lot::RwLock<Vec<crate::session::Session>>>,
+    clipboard: &Arc<crate::clipboard::ServerClipboard>,
+) {
+    let sessions = Arc::clone(sessions);
+    let clipboard = Arc::clone(clipboard);
+    pane.set_clipboard_hook(Box::new(move |data: String| {
+        let entry = crate::clipboard::ClipboardEntry {
+            content_type: crate::clipboard::ClipboardContentType::Text,
+            data: data.into_bytes(),
+            origin_host: std::env::var("HOSTNAME").unwrap_or_else(|_| "z3rm-server".into()),
+        };
+        let mut txs = Vec::new();
+        for session in sessions.read().iter() {
+            for tx in session.lifecycle_subscribers.read().values() {
+                txs.push(tx.clone());
+            }
+        }
+        clipboard.set_clipboard(entry, &txs);
+    }));
+}
+
+fn register_pane_with_session_subscribers(
+    session: &crate::session::Session,
+    pane: &std::sync::Arc<crate::pane::Pane>,
+) {
+    let subs: Vec<_> = session
+        .lifecycle_subscribers
+        .read()
+        .values()
+        .cloned()
+        .collect();
+    for outbound_tx in subs {
+        let (inner_tx, mut inner_rx) = mpsc::unbounded_channel::<Notification>();
+        pane.add_subscriber(inner_tx);
+        let forward_tx = outbound_tx;
+        tokio::spawn(async move {
+            while let Some(notif) = inner_rx.recv().await {
+                let envelope = Envelope {
+                    version: Some(mux_protocol::PROTOCOL_VERSION.clone()),
+                    payload: Some(EnvelopePayload::Notification(notif)),
+                };
+                if forward_tx.send(envelope).is_err() {
+                    break;
+                }
+            }
+        });
+    }
+}
+
 async fn handle_new_window(
     req: &NewWindowRequest,
     sessions: &Arc<parking_lot::RwLock<Vec<crate::session::Session>>>,
@@ -734,6 +790,7 @@ async fn handle_spawn_pane(
     sessions: &Arc<parking_lot::RwLock<Vec<crate::session::Session>>>,
     outbound_tx: &mpsc::UnboundedSender<Envelope>,
     server_settings: &Arc<crate::server_settings::ServerSettings>,
+    clipboard: &Arc<crate::clipboard::ServerClipboard>,
 ) -> anyhow::Result<ResponseBody> {
     let pane_id = nanoid::nanoid!();
 
@@ -811,27 +868,14 @@ async fn handle_spawn_pane(
         }
     }
 
-    // §3.4 把该连接的 outbound_tx 注册为新 pane 的 subscriber
-    // (其他已 attach 的连接也需要注册 — TODO: session-level subscriber list)
+    // §3.4 Register the new pane with every attached client's outbound so
+    // PaneDirty/PaneOutput reach the whole session (not only the spawner).
     {
         let sessions_r = sessions.read();
         if let Some(session) = sessions_r.iter().find(|s| s.id == req.session_id) {
-            let panes = session.panes.clone();
-            if let Some(pane) = panes.read().get(&pane_id) {
-                let (inner_tx, mut inner_rx) = mpsc::unbounded_channel::<Notification>();
-                pane.add_subscriber(inner_tx);
-                let forward_tx = outbound_tx.clone();
-                tokio::spawn(async move {
-                    while let Some(notif) = inner_rx.recv().await {
-                        let envelope = Envelope {
-                            version: Some(mux_protocol::PROTOCOL_VERSION.clone()),
-                            payload: Some(EnvelopePayload::Notification(notif)),
-                        };
-                        if forward_tx.send(envelope).is_err() {
-                            break;
-                        }
-                    }
-                });
+            if let Some(pane) = session.panes.read().get(&pane_id) {
+                register_pane_with_session_subscribers(session, pane);
+                install_pane_clipboard_hook(pane, sessions, clipboard);
             }
         }
     }
@@ -862,6 +906,7 @@ async fn handle_split_pane(
     sessions: &Arc<parking_lot::RwLock<Vec<crate::session::Session>>>,
     outbound_tx: &mpsc::UnboundedSender<Envelope>,
     server_settings: &Arc<crate::server_settings::ServerSettings>,
+    clipboard: &Arc<crate::clipboard::ServerClipboard>,
 ) -> anyhow::Result<ResponseBody> {
     let direction = match req.direction {
         1 => crate::layout::SplitDirection::LeftRight,
@@ -907,10 +952,7 @@ async fn handle_split_pane(
             });
             let pane = crate::pane::Pane::spawn_with_session(
                 new_pane_id.clone(),
-                // §3.10 split-pane panes are not bound to a session up front;
-                // an empty session_id mirrors the old Pane::spawn behavior
-                // (PTY read loop fan-out uses None).
-                String::new(),
+                session.id.clone(),
                 cwd,
                 parent_cols,
                 parent_rows,
@@ -938,20 +980,10 @@ async fn handle_split_pane(
 
             let pane_ref = session.panes.read().get(&new_pane_id).cloned();
             if let Some(pane) = pane_ref {
-                let (inner_tx, mut inner_rx) = mpsc::unbounded_channel::<Notification>();
-                pane.add_subscriber(inner_tx);
-                let forward_tx = outbound_tx.clone();
-                tokio::spawn(async move {
-                    while let Some(notif) = inner_rx.recv().await {
-                        let envelope = Envelope {
-                            version: Some(mux_protocol::PROTOCOL_VERSION.clone()),
-                            payload: Some(EnvelopePayload::Notification(notif)),
-                        };
-                        if forward_tx.send(envelope).is_err() {
-                            break;
-                        }
-                    }
-                });
+                // Bind split pane to this session so exit hooks / env resolve.
+                pane.set_session_id(session.id.clone());
+                register_pane_with_session_subscribers(session, &pane);
+                install_pane_clipboard_hook(&pane, sessions, clipboard);
             }
             // §3.4 fan-out PaneAdded + 更新后 layout 到所有 attached 客户端。
             // 写入 session 在 scopes 结束 (sessions_w 被 drop) 后释放,
@@ -1081,7 +1113,15 @@ async fn handle_send_input(
         // §16.6 OSC 52 触发剪贴板更新并通知所有客户端
         let origin_host = std::env::var("HOSTNAME")
             .unwrap_or_else(|_| "z3rm-server".to_string());
-        clipboard.set_from_osc52(&base64_content, origin_host, outbound_tx)?;
+        {
+            let mut txs = Vec::new();
+            for session in sessions.read().iter() {
+                for tx in session.lifecycle_subscribers.read().values() {
+                    txs.push(tx.clone());
+                }
+            }
+            clipboard.set_from_osc52(&base64_content, origin_host, &txs)?;
+        }
         // OSC 52 序列已被消费, 不转发到 PTY
         return Ok(ResponseBody::Error(String::new()));
     }
@@ -1142,8 +1182,8 @@ async fn handle_paste(
 /// §16.6 设置剪贴板
 async fn handle_set_clipboard(
     req: &SetClipboardRequest,
+    sessions: &Arc<parking_lot::RwLock<Vec<crate::session::Session>>>,
     clipboard: &Arc<crate::clipboard::ServerClipboard>,
-    outbound_tx: &mpsc::UnboundedSender<Envelope>,
 ) -> anyhow::Result<ResponseBody> {
     // §16.6 从 proto 消息转换并设置剪贴板
     let entry = match &req.entry {
@@ -1152,7 +1192,14 @@ async fn handle_set_clipboard(
             return Ok(ResponseBody::Error("empty clipboard entry".to_string()));
         }
     };
-    clipboard.set_clipboard(entry, outbound_tx);
+    // Fan-out ClipboardChanged to every attached client's lifecycle channel.
+    let mut txs = Vec::new();
+    for session in sessions.read().iter() {
+        for tx in session.lifecycle_subscribers.read().values() {
+            txs.push(tx.clone());
+        }
+    }
+    clipboard.set_clipboard(entry, &txs);
     Ok(ResponseBody::Error(String::new()))
 }
 

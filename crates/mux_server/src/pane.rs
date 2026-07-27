@@ -68,6 +68,8 @@ pub struct Pane {
     /// session.panes 中清理。该字段用 Mutex<Option<...>> 以支持一次性 take,
     /// 避免 EOF 路径 + Exit 事件路径重复广播。
     exit_hook: parking_lot::Mutex<Option<Arc<dyn Fn() + Send + Sync>>>,
+    /// §16.6 Optional hook for ClipboardStore events from the emulator.
+    clipboard_hook: parking_lot::Mutex<Option<Box<dyn Fn(String) + Send>>>,
 }
 /// §3.3 Pane 事件收集器 — alacritty `EventListener` 的实现。
 ///
@@ -238,6 +240,7 @@ impl Pane {
             session_id: parking_lot::Mutex::new(
                 if session_id.is_empty() { None } else { Some(session_id) }),
             exit_hook: parking_lot::Mutex::new(None),
+            clipboard_hook: parking_lot::Mutex::new(None),
         });
 
         // §3.1 启动 PTY read loop — 后台线程持续读取 PTY 输出, 喂给 alacritty,
@@ -562,8 +565,15 @@ impl Pane {
                     // §3.1 alacritty 请求写 PTY (e.g. color query response)
                     let _ = self.pty_writer.lock().write_all(text.as_bytes());
                 }
-                AlacEvent::ClipboardStore(_, _) | AlacEvent::ClipboardLoad(_, _) => {
-                    // §16.6 clipboard 通过 OSC 52 由 connection 层处理
+                AlacEvent::ClipboardStore(_clipboard_type, data) => {
+                    // §16.6 Shell OSC 52 / emulator ClipboardStore → server clipboard.
+                    if let Some(hook) = self.clipboard_hook.lock().as_ref() {
+                        hook(data);
+                    }
+                }
+                AlacEvent::ClipboardLoad(_, _) => {
+                    // Load requests are answered by the client; server holds authority
+                    // for store only in the Day-0 path.
                 }
                 AlacEvent::Exit | AlacEvent::ChildExit(_) => {
                     // §3.4 自然退出: 标记 dead + 调用 connection 层注册的退出钩子
@@ -701,6 +711,12 @@ impl Pane {
     /// "Pane::spawn 后由 connection 层延迟注入" 的回退路径。
     pub fn set_session_id(&self, session_id: String) {
         *self.session_id.lock() = Some(session_id);
+    }
+
+    /// §16.6 Install a hook invoked when the emulator stores clipboard content
+    /// (OSC 52 / ClipboardStore). Replaces any previous hook.
+    pub fn set_clipboard_hook(&self, hook: Box<dyn Fn(String) + Send>) {
+        *self.clipboard_hook.lock() = Some(hook);
     }
 
     /// §3.4 获取 pane 所属 session id (可能为 None 表示未关联会话)。

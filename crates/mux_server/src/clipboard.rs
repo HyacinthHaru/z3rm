@@ -98,13 +98,13 @@ impl ServerClipboard {
     pub fn set_clipboard(
         &self,
         entry: ClipboardEntry,
-        notification_tx: &mpsc::UnboundedSender<mux_protocol::Envelope>,
+        notification_txs: &[mpsc::UnboundedSender<mux_protocol::Envelope>],
     ) {
         {
             let mut current = self.current.write();
             *current = Some(entry);
         }
-        // §16.6 推送 ClipboardChanged 通知到所有客户端
+        // §16.6 推送 ClipboardChanged 到所有会话客户端 (at-least-once fan-out)。
         let notification = mux_protocol::Notification {
             event: Some(
                 mux_protocol::notification::Event::ClipboardChanged(
@@ -116,8 +116,10 @@ impl ServerClipboard {
             version: Some(mux_protocol::PROTOCOL_VERSION.clone()),
             payload: Some(mux_protocol::envelope::Payload::Notification(notification)),
         };
-        let _ = notification_tx.send(envelope);
-        tracing::debug!("clipboard updated");
+        for tx in notification_txs {
+            let _ = tx.send(envelope.clone());
+        }
+        tracing::debug!(clients = notification_txs.len(), "clipboard updated");
     }
 
     /// §16.6 获取当前剪贴板内容
@@ -131,7 +133,7 @@ impl ServerClipboard {
         &self,
         base64_data: &str,
         origin_host: String,
-        notification_tx: &mpsc::UnboundedSender<mux_protocol::Envelope>,
+        notification_txs: &[mpsc::UnboundedSender<mux_protocol::Envelope>],
     ) -> anyhow::Result<()> {
         // §16.6 OSC 52 内容经过 base64 编码
         let data = base64::engine::general_purpose::STANDARD.decode(base64_data)?;
@@ -140,7 +142,7 @@ impl ServerClipboard {
             data,
             origin_host,
         };
-        self.set_clipboard(entry, notification_tx);
+        self.set_clipboard(entry, notification_txs);
         Ok(())
     }
 }
@@ -364,7 +366,7 @@ mod tests {
 
         clipboard.set_clipboard(
             ClipboardEntry::text("hello", "test-host".to_string()),
-            &tx,
+            &[tx],
         );
 
         let entry = clipboard.get_clipboard();
@@ -385,7 +387,7 @@ mod tests {
         // 初始状态无通知
         clipboard.set_clipboard(
             ClipboardEntry::text("first", "host1".to_string()),
-            &tx,
+            &[tx.clone()],
         );
         // 确认收到通知
         let notification = rx.try_recv();
@@ -403,7 +405,7 @@ mod tests {
         // 第二次更新
         clipboard.set_clipboard(
             ClipboardEntry::text("second", "host2".to_string()),
-            &tx,
+            &[tx],
         );
         let notification = rx.try_recv();
         assert!(notification.is_ok());
