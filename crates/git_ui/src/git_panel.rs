@@ -3511,7 +3511,7 @@ impl GitPanel {
 
             self.project
                 .read(cx)
-                .git_config(path, args)
+                .git_config(path, args, cx)
                 .detach_and_log_err(cx);
         }
     }

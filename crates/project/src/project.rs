@@ -630,44 +630,59 @@ impl Project {
             .update(cx, |store, cx| store.create_worktree(abs_path, visible, cx))
     }
 
-    /// Stub: stage_hunks
+    /// §16.6 Delegate git stage/unstage to GitStore.
     pub fn stage_hunks(
         &mut self,
-        _buffer: gpui::Entity<language::Buffer>,
-        _unstaged_diff: gpui::Entity<buffer_diff::BufferDiff>,
-        _worktree_ranges: Vec<std::ops::Range<language::Anchor>>,
-        _cx: &mut Context<Self>,
+        buffer: gpui::Entity<language::Buffer>,
+        unstaged_diff: gpui::Entity<buffer_diff::BufferDiff>,
+        worktree_ranges: Vec<std::ops::Range<language::Anchor>>,
+        cx: &mut Context<Self>,
     ) -> Task<anyhow::Result<()>> {
-        Task::ready(Err(anyhow::anyhow!("stub: stage_hunks")))
+        let git_store = self.git_store.clone();
+        cx.spawn(async move |_, cx| {
+            git_store.update(cx, |store, cx| {
+                store.stage_hunks(buffer, unstaged_diff, worktree_ranges, cx)
+            })?;
+            Ok(())
+        })
     }
 
-    /// Stub: unstage_staged_hunks
+    /// §16.6 Delegate git unstage to GitStore.
     pub fn unstage_staged_hunks(
         &mut self,
-        _staged_diff: gpui::Entity<buffer_diff::BufferDiff>,
-        _index_ranges: Vec<std::ops::Range<language::Anchor>>,
-        _cx: &mut Context<Self>,
+        staged_diff: gpui::Entity<buffer_diff::BufferDiff>,
+        index_ranges: Vec<std::ops::Range<language::Anchor>>,
+        cx: &mut Context<Self>,
     ) -> Task<anyhow::Result<()>> {
-        Task::ready(Err(anyhow::anyhow!("stub: unstage_staged_hunks")))
+        let git_store = self.git_store.clone();
+        cx.spawn(async move |_, cx| {
+            git_store.update(cx, |store, cx| {
+                store.unstage_staged_hunks(staged_diff, index_ranges, cx)
+            })?;
+            Ok(())
+        })
     }
 
-    /// Stub: git_init
+    /// §16.6 Delegate git_init to GitStore.
     pub fn git_init(
         &self,
-        _path: Arc<std::path::Path>,
-        _fallback_branch_name: String,
-        _cx: &mut gpui::Context<Self>,
+        path: Arc<std::path::Path>,
+        fallback_branch_name: String,
+        cx: &mut gpui::Context<Self>,
     ) -> Task<anyhow::Result<()>> {
-        Task::ready(Err(anyhow::anyhow!("stub: git_init")))
+        self.git_store.read(cx).git_init(path, fallback_branch_name, cx)
     }
 
-    /// Stub: git_config
+    /// §16.6 Delegate git_config to GitStore. Returns the raw stdout string
+    /// rather than a parsed HashMap; callers that need key-value parsing
+    /// should parse the `-z` delimited output.
     pub fn git_config(
         &self,
-        _path: Arc<std::path::Path>,
-        _args: Vec<String>,
-    ) -> Task<anyhow::Result<std::collections::HashMap<String, String>>> {
-        Task::ready(Err(anyhow::anyhow!("stub: git_config")))
+        path: Arc<std::path::Path>,
+        args: Vec<String>,
+        cx: &mut gpui::Context<Self>,
+    ) -> Task<anyhow::Result<String>> {
+        self.git_store.read(cx).git_config(path, args, cx)
     }
 }
 
