@@ -379,22 +379,82 @@ impl ExtensionRunner {
             // - render(vdom) 立即返回的 VDOM 优先于已注册的 chrome view
             // - 返回值为 JSON 字符串 (rquickjs 0.6 Value::get::<String> 要求 here-string
             //   形式以避免所有权/lifetime 跨线程问题)
+            // §5.1/§5.4 Day-0 context: real chrome APIs plus non-throwing mux /
+            // commands / keymaps stubs so built-in extensions can activate and
+            // return VDOM without requiring a live host bridge yet.
             let call_activate: &str = r#"
                 (function() {
                     var __vdom_result = null;
                     var __chrome_views = {};
+                    var __commands = {};
+                    var __event_handlers = {};
+                    function safeCall(fn) {
+                        try { return fn(); } catch (e) { return undefined; }
+                    }
                     var context = {
                         render: function(vdom) {
                             __vdom_result = vdom;
                             return vdom;
                         },
                         registerChromeView: function(name, view) {
+                            if (view && typeof view.invalidate !== 'function') {
+                                view.invalidate = function() {
+                                    // Host re-render hook; no-op until chrome bridge polls.
+                                };
+                            }
                             __chrome_views[name] = view;
                             return view;
                         },
-                        on: function(event, handler) { /* event registration */ },
-                        emit: function(event, data) { /* event emission */ },
-                        capabilities: { terminal: true, mux: true, workspace: true }
+                        on: function(event, handler) {
+                            if (!__event_handlers[event]) __event_handlers[event] = [];
+                            __event_handlers[event].push(handler);
+                        },
+                        emit: function(event, data) {
+                            var handlers = __event_handlers[event] || [];
+                            for (var i = 0; i < handlers.length; i++) {
+                                try { handlers[i](data); } catch (e) {}
+                            }
+                        },
+                        capabilities: { terminal: true, mux: true, workspace: true },
+                        // §5.1 mux surface used by built-ins (status-bar, session-manager).
+                        // listSessions returns [] until a host bridge injects live data;
+                        // subscribe stores handlers so later emit/host push can fire them.
+                        mux: {
+                            listSessions: function() { return []; },
+                            subscribe: function(event, handler) {
+                                if (!__event_handlers['mux:' + event]) {
+                                    __event_handlers['mux:' + event] = [];
+                                }
+                                __event_handlers['mux:' + event].push(handler);
+                                return function unsubscribe() {
+                                    var list = __event_handlers['mux:' + event] || [];
+                                    var idx = list.indexOf(handler);
+                                    if (idx >= 0) list.splice(idx, 1);
+                                };
+                            },
+                            focusPane: function(_paneId) { return false; },
+                            createSession: function(_name) { return null; },
+                            killSession: function(_id) { return false; },
+                            attach: function(_id) { return false; },
+                            detach: function() { return false; }
+                        },
+                        commands: {
+                            register: function(name, handler) {
+                                __commands[name] = handler;
+                                return true;
+                            },
+                            execute: function(name, args) {
+                                var handler = __commands[name];
+                                if (typeof handler === 'function') {
+                                    return safeCall(function() { return handler(args); });
+                                }
+                                return undefined;
+                            }
+                        },
+                        keymaps: {
+                            bind: function(_chord, _command) { return true; },
+                            unbind: function(_chord) { return true; }
+                        }
                     };
                     if (typeof activate !== 'function') return null;
                     activate(context);
@@ -407,6 +467,19 @@ impl ExtensionRunner {
                             return JSON.stringify(view.render());
                         } catch (e) {
                             return null;
+                        }
+                    }
+                    // Prefer any registered chrome view that can render.
+                    var names = Object.keys(__chrome_views);
+                    for (var i = 0; i < names.length; i++) {
+                        var candidate = __chrome_views[names[i]];
+                        if (candidate && typeof candidate.render === 'function') {
+                            try {
+                                var rendered = candidate.render();
+                                if (rendered !== null && rendered !== undefined) {
+                                    return JSON.stringify(rendered);
+                                }
+                            } catch (e) {}
                         }
                     }
                     return null;
@@ -640,6 +713,43 @@ mod tests {
 
         // 两个 Context 独立
         assert_ne!(r1, r2);
+        Ok(())
+    }
+
+    #[test]
+    fn test_builtin_status_bar_activates_with_mux_context() -> Result<()> {
+        // Built-in extensions call context.mux.subscribe / registerChromeView.
+        // Day-0 host must not throw; activate should return status-bar VDOM.
+        let runner = ExtensionRunner::with_defaults();
+        let source = r#"
+            function activate(context) {
+                var state = { sessionName: 'demo', paneTitle: 'shell' };
+                var view = {
+                    render: function() {
+                        return {
+                            type: 'div',
+                            props: { id: 'status-bar' },
+                            children: [
+                                { type: 'span', children: [state.sessionName] },
+                                { type: 'span', children: [state.paneTitle] }
+                            ]
+                        };
+                    }
+                };
+                context.mux.subscribe('pane:focus', function(pane) {
+                    state.paneTitle = pane.title || '';
+                });
+                context.commands.register('noop', function() { return true; });
+                context.keymaps.bind('ctrl-x', 'noop');
+                context.registerChromeView('status-bar', view);
+            }
+            function deactivate() {}
+        "#;
+        let result = runner.load_extension("z3rm-status-bar-like", source, "activate");
+        assert!(result.result.is_ok(), "activate must succeed: {:?}", result.result);
+        let vdom = result.vdom_json.expect("status-bar VDOM must be captured");
+        assert!(vdom.contains("status-bar"), "vdom={vdom}");
+        assert!(vdom.contains("demo"), "vdom={vdom}");
         Ok(())
     }
 
