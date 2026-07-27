@@ -60,7 +60,13 @@ pub struct LayoutTree {
 impl LayoutTree {
     /// 从 mux_protocol 的 proto LayoutTree 转换
     pub fn from_proto(tree: &mux_protocol::LayoutTree) -> Self {
-        let root_node = tree.root.as_ref().expect("LayoutTree root must be present");
+        // §15.4 the server serializes an empty session's root as None; treat
+        // that as an empty single-pane tree rather than panicking (AGENTS.md).
+        let Some(root_node) = tree.root.as_ref() else {
+            return Self {
+                root: LayoutNode::Pane { id: String::new(), pane_id: String::new() },
+            };
+        };
         Self {
             root: Self::node_from_proto(root_node),
         }
@@ -168,7 +174,17 @@ impl LayoutTree {
                 ..
             } => {
                 let axis = direction.to_axis();
-                let total_ratio: f32 = ratios.iter().sum();
+                // §15.4 guard against mismatched/empty ratios from a malformed
+                // or forward-compatible layout payload: fall back to equal
+                // weights instead of indexing out of bounds or dividing by 0.
+                let equal_ratios = vec![1.0_f32; children.len()];
+                let safe_ratios = if ratios.len() == children.len() && !ratios.is_empty() {
+                    ratios.as_slice()
+                } else {
+                    equal_ratios.as_slice()
+                };
+                let total_ratio: f32 = safe_ratios.iter().sum();
+                let total_ratio = if total_ratio <= 0.0 { children.len() as f32 } else { total_ratio };
 
                 // §15.1 计算每个子节点的 bounds (考虑分割条宽度)
                 let num_children = children.len() as f32;
@@ -186,7 +202,7 @@ impl LayoutTree {
                 };
 
                 for (i, child) in children.iter().enumerate() {
-                    let child_size = (ratios[i] / total_ratio) * usable_size;
+                    let child_size = (safe_ratios[i] / total_ratio) * usable_size;
                     let child_bounds = if axis == Axis::Horizontal {
                         Bounds {
                             origin: point(current_offset, bounds.origin.y),
