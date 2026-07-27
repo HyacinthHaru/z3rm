@@ -7656,11 +7656,16 @@ impl Focusable for Workspace {
 impl Workspace {
     pub fn open_resolved_path(
         &mut self,
-        _path: project::ResolvedPath,
-        _window: &mut Window,
-        _cx: &mut App,
+        path: project::ResolvedPath,
+        window: &mut Window,
+        cx: &mut Context<Self>,
     ) -> Task<anyhow::Result<gpui::AnyView>> {
-        Task::ready(Err(anyhow::anyhow!("stub: open_resolved_path")))
+        let abs_path = path.path;
+        let task = self.open_abs_path(abs_path, OpenOptions::default(), window, cx);
+        cx.foreground_executor().spawn(async move {
+            let item = task.await?;
+            Ok(item.to_any_view())
+        })
     }
 
     /// 返回当前工作区的 project group key
