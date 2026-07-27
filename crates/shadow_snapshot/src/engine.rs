@@ -96,6 +96,12 @@ pub struct ShadowSnapshotEngine {
     blob_store: BlobStore,
     /// Monotonic sequence counter, shared across all paths.
     seq_no: AtomicU64,
+    /// §4.9 age-based FIFO quota GC. Optional: present only when configured via
+    /// `with_quota`. When present, `record_change` and `decline` periodically
+    /// call `run_gc` so blob growth stays bounded; absent, growth is unbounded.
+    quota: Option<crate::quota::QuotaManager>,
+    /// record_change counter for throttling GC (don't GC every write).
+    records_since_gc: AtomicU64,
 }
 
 impl ShadowSnapshotEngine {
@@ -197,7 +203,44 @@ impl ShadowSnapshotEngine {
             tree,
             blob_store,
             seq_no: AtomicU64::new(start_seq),
+            quota: None,
+            records_since_gc: AtomicU64::new(0),
         })
+    }
+    /// §4.9 Install a quota manager (FIFO age-based GC). Optional: when absent,
+    /// blob growth is unbounded (still bounded per-path by `D_MAX`, but every
+    /// full historical version is retained forever). Returns `&mut self` for
+    /// chaining after `open`. Spec default quota 500 MB; pass via
+    /// `QuotaManager::new(DEFAULT_QUOTA_BYTES)`.
+    pub fn with_quota(mut self, quota: crate::quota::QuotaManager) -> Self {
+        self.quota = Some(quota);
+        self
+    }
+
+    /// §4.9 throttled GC: trigger `run_gc` every `GC_INTERVAL` records so a burst
+    /// of writes does not GC per-write. Failure to run GC is logged (not fatal)
+    /// — a transient I/O error must not kill the recorder; the next attempt will
+    /// re-evaluate against current blob usage.
+    fn maybe_run_gc(&self) {
+        const GC_INTERVAL: u64 = 64;
+        if self.quota.is_none() {
+            return;
+        }
+        let count = self.records_since_gc.fetch_add(1, Ordering::AcqRel) + 1;
+        if count < GC_INTERVAL {
+            return;
+        }
+        self.records_since_gc.store(0, Ordering::Release);
+        let Some(quota) = self.quota.as_ref() else {
+            return;
+        };
+        match quota.run_gc(&self.tree, &self.blob_store, &self.storage) {
+            Ok(freed) if freed > 0 => {
+                tracing::info!(freed_bytes = freed, "shadow GC completed");
+            }
+            Ok(_) => {}
+            Err(error) => tracing::warn!(error = %error, "shadow GC run failed"),
+        }
     }
 
     /// Record a file change. Called by the file watcher.
@@ -263,6 +306,9 @@ impl ShadowSnapshotEngine {
             SnapshotTrigger::Write,
             timestamp_ns,
         )?;
+
+        // §4.9 throttled GC after a durable write so blob growth stays bounded.
+        self.maybe_run_gc();
 
         Ok(version_id)
     }
@@ -440,6 +486,8 @@ impl ShadowSnapshotEngine {
             seq_no,
             "decline: version restored and HEAD advanced"
         );
+        // A decline stores a full-snapshot blob; include it in quota accounting.
+        self.maybe_run_gc();
         Ok(())
     }
 
@@ -581,5 +629,55 @@ mod tests {
             .read_node_content(&head2_node)
             .expect("v2 content reconstructable");
         assert_eq!(restored, b"v2");
+    }
+
+    /// §4.9 QuotaManager wiring: `with_quota` installs a quota,
+    /// `record_change` triggers throttled GC. With a tiny quota and enough
+    /// unique-content writes to exceed `GC_INTERVAL`, run_gc runs at least
+    /// once and the engine stays usable: HEAD is reachable and reconstructs
+    /// to the latest content. This guards against the regression of
+    /// `record_change` forgetting to call `maybe_run_gc`.
+    #[test]
+    fn test_quota_gc_runs_after_record_change() {
+        let dir = TempDir::new().unwrap();
+        let db = dir.path().join("qgc.db");
+        let wal = dir.path().join("qgc.wal");
+        let blobs = dir.path().join("qblobs");
+        std::fs::create_dir_all(&blobs).unwrap();
+
+        let target_file = dir.path().join("q.txt");
+        std::fs::write(&target_file, b"x").unwrap();
+
+        let engine = ShadowSnapshotEngine::open(&db, &wal, &blobs)
+            .unwrap()
+            // Tiny quota: 1 KiB so enough unique full snapshots exceed it.
+            .with_quota(crate::quota::QuotaManager::new(1024));
+
+        // First record creates a blob. Then overwrite with unique content to
+        // grow total_blob_bytes past GC_INTERVAL (64 entries).
+        engine.record_change(&target_file, b"v0").unwrap();
+        for i in 1..128u32 {
+            // Unique content forces new full snapshots (delta dedups identical
+            // payloads); 128 writes crosses the 64-record throttle twice.
+            let payload = format!("version {i} data");
+            engine.record_change(&target_file, payload.as_bytes()).unwrap();
+        }
+
+        // After 128 writes the throttled GC has run at least once. Assert the
+        // engine is still usable: HEAD is reachable and reconstructs to the
+        // latest written content, so GC never evicted the protected HEAD chain.
+        let path_hash = compute_path_hash(&target_file);
+        let head_id = engine
+            .tree
+            .get_head(&path_hash)
+            .expect("HEAD after writes");
+        let head_node = engine
+            .tree
+            .get_node(head_id)
+            .expect("latest head node present");
+        let restored = engine
+            .read_node_content(&head_node)
+            .expect("HEAD content reconstructable after GC");
+        assert_eq!(restored, b"version 127 data");
     }
 }

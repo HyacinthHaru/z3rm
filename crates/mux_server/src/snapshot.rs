@@ -149,7 +149,13 @@ pub fn start(session_id: &str, cwd: &str) -> Result<Option<Arc<SnapshotWatch>>> 
         .name(format!("shadow-snap-{}", session_id))
         .spawn(move || {
             let root = root_for_recorder;
-            let engine = match shadow_snapshot::ShadowSnapshotEngine::open(&db_path, &wal_path, &blob_dir) {
+            let engine = match shadow_snapshot::ShadowSnapshotEngine::open(&db_path, &wal_path, &blob_dir)
+                // §4.9 age-based FIFO GC: cap shadow blob growth at 500MB so a
+                // long-running session cannot fill the disk. `with_quota` is
+                // optional; absent, growth stays bounded per-path by `D_MAX`
+                // but accumulates full base versions forever.
+                .map(|e| e.with_quota(shadow_snapshot::QuotaManager::new(500 * 1024 * 1024)))
+            {
                 Ok(engine) => {
                     // §4.8: complete any Decline intents that crashed mid-restore.
                     // Resolve path_hash by hashing every file under the session cwd
