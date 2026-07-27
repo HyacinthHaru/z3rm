@@ -43,7 +43,7 @@
       "d": "mux::Detach",
 
       // Send literal Ctrl-b to PTY (double-tap escape)
-      "ctrl-b": ["terminal::SendLiteral", { "keystroke": "Ctrl-b" }]
+      "ctrl-b": ["terminal::SendLiteral", { "keystroke": "C-b" }]
     }
   }
 ]

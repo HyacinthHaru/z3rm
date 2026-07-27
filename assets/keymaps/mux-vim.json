@@ -56,7 +56,7 @@
       "W": "mux_pane::FocusPrevPane",
 
       // Send literal Ctrl-w to PTY (double-tap escape)
-      "ctrl-w": "terminal::sendKeystroke Ctrl-w"
+      "ctrl-w": ["terminal::SendLiteral", { "keystroke": "C-w" }]
     }
   }
 ]
