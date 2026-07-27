@@ -127,6 +127,22 @@ pub fn vdom_to_element(node: &VDomNode) -> gpui::AnyElement {
         }
     }
 
+    // §5.4 core styles: color (text), background, fontSize, padding. Each is
+    // best-effort: an unparseable value is skipped (parse helpers return None),
+    // so a malformed style never breaks the whole chrome render.
+    if let Some(color) = node.style.get("color").and_then(|v| parse_color(v)) {
+        element = element.text_color(color);
+    }
+    if let Some(bg) = node.style.get("background").and_then(|v| parse_color(v)) {
+        element = element.bg(bg);
+    }
+    if let Some(size) = node.style.get("fontSize").and_then(|v| parse_px(v)) {
+        element = element.text_size(px(size));
+    }
+    if let Some(pad) = node.style.get("padding").and_then(|v| parse_px(v)) {
+        element = element.px(px(pad));
+    }
+
     // Add children
     for child in &node.children {
         match child {
@@ -141,6 +157,24 @@ pub fn vdom_to_element(node: &VDomNode) -> gpui::AnyElement {
     }
 
     element.into_any_element()
+}
+
+/// §5.4 parse a CSS hex color (`#rrggbb`) into an `Hsla`. Returns None for
+/// unparseable values so the bridge can skip the style rather than panic.
+pub fn parse_color(value: &str) -> Option<gpui::Hsla> {
+    let hex = value.strip_prefix('#')?;
+    if hex.len() != 6 {
+        return None;
+    }
+    let parsed = u32::from_str_radix(hex, 16).ok()?;
+    Some(gpui::rgb(parsed).into())
+}
+
+/// §5.4 parse a CSS pixel length (`Npx`) into an f32. Returns None for
+/// non-numeric or non-px values.
+pub fn parse_px(value: &str) -> Option<f32> {
+    let num = value.strip_suffix("px")?.trim();
+    num.parse::<f32>().ok()
 }
 #[cfg(test)]
 mod tests {
@@ -161,6 +195,19 @@ mod tests {
             VDomChild::Text(t) => assert_eq!(t, "hello"),
             _ => panic!("expected text child"),
         }
+    }
+
+    #[test]
+    fn parse_color_and_px_helpers_round_trip_core_styles() {
+        // §5.4 the bridge must turn CSS-like style strings into GPUI values.
+        // These helpers are the pure primitives vdom_to_element uses; without
+        // them, color/background/fontSize/padding are silently ignored.
+        assert_eq!(parse_color("#ff0000"), Some(gpui::rgb(0xff0000).into()));
+        assert_eq!(parse_color("#000000"), Some(gpui::rgb(0x000000).into()));
+        assert_eq!(parse_color("not-a-color"), None);
+        assert_eq!(parse_px("14px"), Some(14.0));
+        assert_eq!(parse_px("4px"), Some(4.0));
+        assert_eq!(parse_px("nope"), None);
     }
 
     #[test]
