@@ -595,6 +595,19 @@ async fn handle_attach(
     // is the only remaining receiver of PaneAdded/PaneRemoved/SessionLayoutChanged.
     session.remove_attached_client(&client_id);
     if mode == crate::session::AttachMode::Steal {
+        // §3.4 BEFORE clearing subscribers, broadcast an empty
+        // SessionLayoutChanged to every soon-to-be-kicked client so they
+        // reconcile to zero panes instead of retaining zombie panes. Losing
+        // this is the §3.4 failure mode: a kicked client never learns it was
+        // kicked and keeps rendering stale panes.
+        let kick_notification = Notification {
+            event: Some(mux_protocol::notification::Event::SessionLayoutChanged(
+                mux_protocol::SessionLayoutChanged {
+                    layout: Some(mux_protocol::LayoutTree { root: None }),
+                },
+            )),
+        };
+        session.broadcast_lifecycle(kick_notification);
         session.attached_clients.write().clear();
         session.clear_lifecycle_subscribers();
     }
