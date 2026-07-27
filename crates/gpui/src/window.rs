@@ -1370,7 +1370,9 @@ impl Window {
         }
 
         let accessibility_force_disabled = cx.accessibility_force_disabled;
-        let a11y_active_flag = Arc::new(AtomicBool::new(false));
+        let a11y_active_flag = Arc::new(AtomicBool::new(
+            std::env::var("Z3RM_A11Y_FORCE").is_ok(),
+        ));
 
         #[cfg(not(target_family = "wasm"))]
         if !accessibility_force_disabled {

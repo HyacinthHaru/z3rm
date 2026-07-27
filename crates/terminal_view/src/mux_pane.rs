@@ -827,14 +827,14 @@ impl Render for MuxPaneView {
             dispatch_context.add("PrefixMode");
         }
 
-        // §16.4 a11y: root exposes Role::Terminal + title label. TerminalElement
-        // synthesizes Role::TextRun children per visible line for screen readers.
+        // §16.4 a11y: the TerminalElement child exposes Role::Terminal + TextRun
+        // synthetic children per visible line. The root div stays role-less to
+        // avoid a nested duplicate Terminal role in the a11y tree.
 
         div()
             .size_full()
             .id("mux-pane-root")
             .track_focus(&self.focus_handle)
-            .role(Role::Terminal)
             .aria_label(self.terminal.read(cx).title(true))
             .key_context(dispatch_context)
             .bg(colors.editor_background)
