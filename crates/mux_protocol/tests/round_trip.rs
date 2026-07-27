@@ -115,3 +115,48 @@ fn test_attach_request_with_identity() {
     assert_eq!(identity.client_id, "client-abc");
     assert_eq!(identity.role, proto::ClientRole::ReadOnly as i32);
 }
+
+// §9 验证 PaneTitleChanged Notification round-trip。
+#[test]
+fn test_pane_title_changed_notification() {
+    let env = Envelope {
+        version: Some(PROTOCOL_VERSION),
+        payload: Some(proto::envelope::Payload::Notification(Notification {
+            event: Some(proto::notification::Event::PaneTitleChanged(
+                PaneTitleChanged {
+                    pane_id: "p1".into(),
+                    title: "my title".into(),
+                },
+            )),
+        })),
+    };
+
+    let framed = frame(&env).unwrap();
+    let (decoded, consumed) = unframe(&framed).unwrap();
+    assert_eq!(consumed, framed.len());
+    assert!(matches!(
+        decoded.payload,
+        Some(proto::envelope::Payload::Notification(_))
+    ));
+}
+
+// §9 验证 PaneBell Notification round-trip。
+#[test]
+fn test_pane_bell_notification() {
+    let env = Envelope {
+        version: Some(PROTOCOL_VERSION),
+        payload: Some(proto::envelope::Payload::Notification(Notification {
+            event: Some(proto::notification::Event::PaneBell(PaneBell {
+                pane_id: "p1".into(),
+            })),
+        })),
+    };
+
+    let framed = frame(&env).unwrap();
+    let (decoded, consumed) = unframe(&framed).unwrap();
+    assert_eq!(consumed, framed.len());
+    assert!(matches!(
+        decoded.payload,
+        Some(proto::envelope::Payload::Notification(_))
+    ));
+}

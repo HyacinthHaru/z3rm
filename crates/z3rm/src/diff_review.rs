@@ -13,8 +13,13 @@ use gpui::{
     AppContext, Context, Entity, EventEmitter, FocusHandle, Focusable, IntoElement, Render,
     SharedString, Task, Window, div, px,
 };
+use std::any::TypeId;
 use std::path::PathBuf;
 use ui::prelude::*;
+use workspace::{
+    item::{Item, ItemEvent, TabContentParams},
+    ToolbarItemLocation,
+};
 
 /// §16.6 DiffReview — holds previous + current content for side-by-side display.
 pub struct DiffReview {
@@ -26,6 +31,8 @@ pub struct DiffReview {
     pub current_content: SharedString,
     /// Whether the diff has been resolved (accept/decline)
     pub resolved: bool,
+    /// Tab title for the workspace item ("Diff: <file_name>")
+    title: SharedString,
     /// Focus handle
     focus_handle: FocusHandle,
 }
@@ -48,17 +55,28 @@ impl DiffReview {
         current: String,
         cx: &mut Context<Self>,
     ) -> Self {
+        let file_name = file_path
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or("file")
+            .to_string();
+        let title = SharedString::from(format!("Diff: {}", file_name));
         Self {
             file_path,
             previous_content: previous.into(),
             current_content: current.into(),
             resolved: false,
+            title,
             focus_handle: cx.focus_handle(),
         }
     }
 
     /// §16.6 Load both versions from disk + shadow snapshot.
-    /// Returns a task that resolves to a DiffReview entity.
+    /// Caller supplies `previous_content` (real shadow-snapshot version when
+    /// the Decline/ListVersions RPC is available, otherwise on-disk current
+    /// content as a fallback — see `open_diff::init`). The current content is
+    /// read from disk inside the spawned task. Returns a DiffReview entity
+    /// ready to be added to a workspace pane via `add_item`.
     pub fn load(
         file_path: PathBuf,
         previous_content: String,
@@ -67,8 +85,12 @@ impl DiffReview {
         let path = file_path.clone();
         let prev = previous_content.clone();
         cx.spawn(async move |cx| {
-            let current = std::fs::read_to_string(&path)
-                .map_err(|e| anyhow::anyhow!("failed to read {}: {}", path.display(), e))?;
+            let current = smol::unblock({
+                let path = path.clone();
+                move || std::fs::read_to_string(&path)
+            })
+            .await
+            .map_err(|e| anyhow::anyhow!("failed to read {}: {}", path.display(), e))?;
             let entity = cx.new(|cx| {
                 DiffReview::new(path.clone(), prev, current, cx)
             });
@@ -138,6 +160,8 @@ impl Focusable for DiffReview {
 }
 
 impl EventEmitter<DiffReviewEvent> for DiffReview {}
+
+impl EventEmitter<ItemEvent> for DiffReview {}
 
 impl Render for DiffReview {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
@@ -246,5 +270,76 @@ impl Render for DiffReview {
             .text_size(px(13.0))
             .child(header)
             .child(body)
+    }
+}
+
+impl Item for DiffReview {
+    type Event = ItemEvent;
+
+    fn tab_content(&self, params: TabContentParams, _window: &Window, _cx: &App) -> gpui::AnyElement {
+        gpui::div()
+            .child(gpui::SharedString::from(
+                self.title.as_ref(),
+            ))
+            .into_any()
+    }
+
+    fn tab_content_text(&self, _detail: usize, _cx: &App) -> SharedString {
+        self.title.clone()
+    }
+
+    fn telemetry_event_text(&self) -> Option<&'static str> {
+        None
+    }
+
+    fn is_dirty(&self, _: &App) -> bool {
+        false
+    }
+
+    fn capability(&self, _: &App) -> language::Capability {
+        language::Capability::ReadOnly
+    }
+
+    fn act_as_type<'a>(
+        &'a self,
+        type_id: TypeId,
+        self_handle: &'a Entity<Self>,
+        _: &'a App,
+    ) -> Option<gpui::AnyEntity> {
+        if TypeId::of::<Self>() == type_id {
+            Some(self_handle.clone().into())
+        } else {
+            None
+        }
+    }
+
+    fn breadcrumb_location(&self, _: &App) -> ToolbarItemLocation {
+        ToolbarItemLocation::PrimaryLeft
+    }
+
+    fn breadcrumbs(
+        &self,
+        _cx: &App,
+    ) -> Option<(Vec<workspace::item::HighlightedText>, Option<gpui::Font>)> {
+        use workspace::item::HighlightedText;
+        Some((
+            vec![HighlightedText {
+                text: self.title.clone(),
+                highlights: Vec::new(),
+            }],
+            None,
+        ))
+    }
+
+    fn to_item_events(_event: &ItemEvent, f: &mut dyn std::ops::FnMut(ItemEvent)) {
+        f(*_event)
+    }
+
+    fn can_split(&self) -> bool {
+        false
+    }
+
+    fn tab_tooltip_text(&self, _: &App) -> Option<SharedString> {
+        Some(self.title.clone())
     }
 }

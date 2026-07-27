@@ -514,6 +514,30 @@ impl Pane {
         }
     }
 
+    /// §15.13 / §3.4 向所有订阅者推送 PaneBell (fan-out to subscribers).
+    fn broadcast_pane_bell(&self) {
+        let notif = MuxNotification {
+            event: Some(mux_protocol::notification::Event::PaneBell(
+                mux_protocol::PaneBell { pane_id: self.id.clone() },
+            )),
+        };
+        let subs = self.subscribers.read().clone();
+        let mut dead = Vec::new();
+        for (i, tx) in subs.iter().enumerate() {
+            if tx.send(notif.clone()).is_err() {
+                dead.push(i);
+            }
+        }
+        if !dead.is_empty() {
+            let mut live = self.subscribers.write();
+            for i in dead.into_iter().rev() {
+                if i < live.len() {
+                    live.remove(i);
+                }
+            }
+        }
+    }
+
     /// §3.4 订阅 PaneDirty / PaneRemoved 通知。
     /// 返回的 sender 由连接层持有, drop 时关闭 channel,
     /// broadcast_pane_dirty 下次调用会检测到并清理。
@@ -559,11 +583,16 @@ impl Pane {
                     title_changed = true;
                 }
                 AlacEvent::Bell => {
-                    // TODO: fan-out Bell notification to clients
+                    // §15.13 bell affects render: bump generation so clients
+                    // fetch the updated grid, then fan-out Bell notification.
+                    self.bump_generation();
+                    self.broadcast_pane_bell();
                 }
                 AlacEvent::PtyWrite(text) => {
                     // §3.1 alacritty 请求写 PTY (e.g. color query response)
-                    let _ = self.pty_writer.lock().write_all(text.as_bytes());
+                    if let Err(e) = self.pty_writer.lock().write_all(text.as_bytes()) {
+                        tracing::warn!(error = %e, "pty_writer write_all failed");
+                    }
                 }
                 AlacEvent::ClipboardStore(_clipboard_type, data) => {
                     // §16.6 Shell OSC 52 / emulator ClipboardStore → server clipboard.

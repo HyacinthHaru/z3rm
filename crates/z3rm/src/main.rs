@@ -7,6 +7,7 @@ mod cli;
 mod log_viewer;
 mod quickjs_extensions;
 mod extension_status_bar;
+mod diff_review;
 mod open_diff;
 
 use std::sync::Arc;

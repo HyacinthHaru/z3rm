@@ -1725,15 +1725,40 @@ async fn handle_set_pane_title(
     sessions: &Arc<parking_lot::RwLock<Vec<crate::session::Session>>>,
 ) -> anyhow::Result<ResponseBody> {
     let sessions_r = sessions.read();
-    let pane = sessions_r
-        .iter()
-        .find_map(|s| s.panes.read().get(&req.pane_id).cloned());
+    let mut matched_session_id: Option<String> = None;
+    let mut matched_pane: Option<std::sync::Arc<crate::pane::Pane>> = None;
+    for session in sessions_r.iter() {
+        if let Some(pane) = session.panes.read().get(&req.pane_id).cloned() {
+            matched_session_id = Some(session.id.clone());
+            matched_pane = Some(pane);
+            break;
+        }
+    }
     drop(sessions_r);
 
-    match pane {
+    match matched_pane {
         Some(pane) => {
             *pane.title.write() = req.title.clone();
             pane.bump_generation();
+            // §3.4 / §3.3 broadcast PaneTitleChanged so every attached client
+            // learns the title string (PaneDirty only carries pane_id).
+            // broadcast_lifecycle_in_session looks up the session by id.
+            if let Some(session_id) = matched_session_id {
+                broadcast_lifecycle_in_session(
+                    sessions,
+                    &session_id,
+                    Notification {
+                        event: Some(
+                            mux_protocol::notification::Event::PaneTitleChanged(
+                                mux_protocol::PaneTitleChanged {
+                                    pane_id: req.pane_id.clone(),
+                                    title: req.title.clone(),
+                                },
+                            ),
+                        ),
+                    },
+                );
+            }
             zlog::info!("pane title set: pane={} title={}", req.pane_id, req.title);
             Ok(ResponseBody::Error(String::new()))
         }

@@ -487,6 +487,8 @@ message Notification {
         ShellIntegrationChanged shell_integration_changed = 12;
         PaneZoomed pane_zoomed = 13;
         PaneOutputChunk pane_output = 14;
+        PaneTitleChanged pane_title_changed = 15;
+        PaneBell pane_bell = 16;
     }
 }
 
@@ -547,6 +549,15 @@ message ShellIntegrationChanged {
 message PaneZoomed {
     string pane_id = 1;
     bool zoomed = 2;
+}
+// §9 / §3.4 Pane 标题变更通知 (OSC 0/1/2 或 SetPaneTitle 触发)。
+message PaneTitleChanged {
+    string pane_id = 1;
+    string title = 2;
+}
+// §9 / §15.13 Pane 终端铃声通知 (终端 BEL 字符, §15.13 BSU timeout 100ms)。
+message PaneBell {
+    string pane_id = 1;
 }
 
 

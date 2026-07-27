@@ -311,6 +311,24 @@ impl MuxPaneView {
                 });
                 false
             }
+            NotifEvent::PaneTitleChanged(changed) if changed.pane_id == pane_id => {
+                let _ = weak.update(cx, |view, cx| {
+                    // §3.4 Set terminal title via OSC 2 escape sequence.
+                    view.terminal.update(cx, |t, cx| {
+                        t.write_output(
+                            format!("\x1b]2;{}\x07", changed.title).as_bytes(),
+                            cx,
+                        );
+                    });
+                    cx.emit(MuxPaneEvent::TitleChanged);
+                });
+                true
+            }
+            NotifEvent::PaneBell(bell) if bell.pane_id == pane_id => {
+                // §15.13 Bell notification — treat like dirty to trigger re-render.
+                *pending_dirty = true;
+                true
+            }
             _ => true,
         }
     }
@@ -403,6 +421,16 @@ impl MuxPaneView {
             }
             Some(FetchUpdate::Diff(diff)) => {
                 apply_diff_to_snapshot(&mut self.snapshot, &diff);
+                // §16.6 / StubSweep3 #7: Write changed rows to the DisplayOnly
+                // Terminal so the rendered view reflects the diff, not just the
+                // cached snapshot. A full snapshot rewrite via
+                // write_snapshot_to_terminal is the simplest/safest approach:
+                // performing per-row ANSI rewrites for arbitrary GridDiff
+                // contents (partial rows, cursor changes) would require careful
+                // per-cell position tracking and risks visual artifacts. A full
+                // rewrite always produces a correct display, and GridDiff
+                // payloads are small (delta frames during reconnect recovery).
+                self.write_snapshot_to_terminal(cx);
             }
             None => {}
         }
