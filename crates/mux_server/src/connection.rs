@@ -47,6 +47,7 @@ pub async fn handle_connection(
     sessions: Arc<parking_lot::RwLock<Vec<crate::session::Session>>>,
     db: Arc<parking_lot::Mutex<Connection>>,
     clipboard: Arc<crate::clipboard::ServerClipboard>,
+    server_settings: Arc<crate::server_settings::ServerSettings>,
     shutdown_state: Arc<crate::ShutdownState>,
 ) -> anyhow::Result<()> {
     let (reader, writer) = tokio::io::split(stream);
@@ -61,12 +62,12 @@ pub async fn handle_connection(
     // Per-connection client identity — never process-wide alone.
     let connection_client_id: Arc<parking_lot::Mutex<Option<String>>> =
         Arc::new(parking_lot::Mutex::new(None));
-
     let read_handle = {
         let outbound_tx = outbound_tx.clone();
         let sessions = sessions.clone();
         let db = db.clone();
         let clipboard = clipboard.clone();
+        let server_settings = server_settings.clone();
         let client_role = client_role.clone();
         let connection_client_id = connection_client_id.clone();
         let shutdown_state = shutdown_state.clone();
@@ -93,6 +94,7 @@ pub async fn handle_connection(
                     &outbound_tx,
                     &db,
                     &clipboard,
+                    &server_settings,
                     &client_role,
                     &connection_client_id,
                     &shutdown_state,
@@ -180,6 +182,7 @@ async fn dispatch_envelope(
     outbound_tx: &mpsc::UnboundedSender<Envelope>,
     _db: &Arc<parking_lot::Mutex<Connection>>,
     clipboard: &Arc<crate::clipboard::ServerClipboard>,
+    server_settings: &Arc<crate::server_settings::ServerSettings>,
     client_role: &Arc<parking_lot::Mutex<Option<ClientRole>>>,
     connection_client_id: &Arc<parking_lot::Mutex<Option<String>>>,
     shutdown_state: &Arc<crate::ShutdownState>,
@@ -194,7 +197,7 @@ async fn dispatch_envelope(
             let request_id = req.request_id;
             // dispatch_request 内部会把 Response 通过 outbound_tx 发回,
             // 也可能向 outbound_tx push Notification (用于 attach 等)
-            dispatch_request(req, sessions, outbound_tx, clipboard, client_role, connection_client_id, shutdown_state).await?;
+            dispatch_request(req, sessions, outbound_tx, clipboard, server_settings, client_role, connection_client_id, shutdown_state).await?;
             // request_id 仅用于日志, 实际 response 已经在 dispatch_request 内发出
             let _ = request_id;
         }
@@ -214,6 +217,7 @@ async fn dispatch_request(
     sessions: &Arc<parking_lot::RwLock<Vec<crate::session::Session>>>,
     outbound_tx: &mpsc::UnboundedSender<Envelope>,
     clipboard: &Arc<crate::clipboard::ServerClipboard>,
+    server_settings: &Arc<crate::server_settings::ServerSettings>,
     client_role: &Arc<parking_lot::Mutex<Option<ClientRole>>>,
     connection_client_id: &Arc<parking_lot::Mutex<Option<String>>>,
     shutdown_state: &Arc<crate::ShutdownState>,
@@ -309,14 +313,14 @@ async fn dispatch_request(
         // §3.3 需要 ReadWrite 的 pane 操作 (Plan 33)
         RequestBody::SpawnPane(r) => {
             if check_permission(role, ClientRole::ReadWrite) {
-                handle_spawn_pane(r, sessions, outbound_tx).await?
+                handle_spawn_pane(r, sessions, outbound_tx, server_settings).await?
             } else {
                 ResponseBody::Error("permission denied: read-write required".to_string())
             }
         }
         RequestBody::SplitPane(r) => {
             if check_permission(role, ClientRole::ReadWrite) {
-                handle_split_pane(r, sessions, outbound_tx).await?
+                handle_split_pane(r, sessions, outbound_tx, server_settings).await?
             } else {
                 ResponseBody::Error("permission denied: read-write required".to_string())
             }
@@ -723,6 +727,7 @@ async fn handle_spawn_pane(
     req: &SpawnPaneRequest,
     sessions: &Arc<parking_lot::RwLock<Vec<crate::session::Session>>>,
     outbound_tx: &mpsc::UnboundedSender<Envelope>,
+    server_settings: &Arc<crate::server_settings::ServerSettings>,
 ) -> anyhow::Result<ResponseBody> {
     let pane_id = nanoid::nanoid!();
 
@@ -751,6 +756,11 @@ async fn handle_spawn_pane(
         .map(|s| (s.cols, s.rows))
         .unwrap_or((80, 24));
 
+    // §16.11 scrollback capacity comes from the live ServerSettings (env +
+    // server.json, hot-reloaded) so a daemon-wide change takes effect for the
+    // next spawned pane without a restart.
+    let scrollback_lines = server_settings.scrollback_lines();
+
     // §3.1 spawn PTY + alacritty Term
     // §3.4 spawn_with_session 注入 session_id, 让 PTY read loop 在自然退出时
     // 能定位所在会话并 fan-out PaneRemoved。
@@ -761,6 +771,7 @@ async fn handle_spawn_pane(
         cols,
         rows,
         shell_cmd,
+        scrollback_lines,
     )?;
 
     // §3.10 把 pane 加入 session 的 panes registry、tab 列表、layout 树。
@@ -844,6 +855,7 @@ async fn handle_split_pane(
     req: &SplitPaneRequest,
     sessions: &Arc<parking_lot::RwLock<Vec<crate::session::Session>>>,
     outbound_tx: &mpsc::UnboundedSender<Envelope>,
+    server_settings: &Arc<crate::server_settings::ServerSettings>,
 ) -> anyhow::Result<ResponseBody> {
     let direction = match req.direction {
         1 => crate::layout::SplitDirection::LeftRight,
@@ -887,13 +899,18 @@ async fn handle_split_pane(
                 args: command.args.clone(),
                 env: command.env.clone().into_iter().collect(),
             });
-
-            let pane = crate::pane::Pane::spawn(
+            let pane = crate::pane::Pane::spawn_with_session(
                 new_pane_id.clone(),
+                // §3.10 split-pane panes are not bound to a session up front;
+                // an empty session_id mirrors the old Pane::spawn behavior
+                // (PTY read loop fan-out uses None).
+                String::new(),
                 cwd,
                 parent_cols,
                 parent_rows,
                 command,
+                // §16.11 honor live ServerSettings scrollback (env + server.json).
+                server_settings.scrollback_lines(),
             )?;
             session.panes.write().insert(new_pane_id.clone(), pane);
             session.set_focused_pane(new_pane_id.clone());
@@ -970,7 +987,9 @@ async fn handle_close_pane(
     connection_client_id: &Arc<parking_lot::Mutex<Option<String>>>,
 ) -> anyhow::Result<ResponseBody> {
     if !client_still_attached(sessions, connection_client_id) {
-        anyhow::bail!("client not attached (kicked or detached)");
+        return Ok(ResponseBody::Error(
+            "client not attached (kicked or detached)".to_string(),
+        ));
     }
 
     let mut removed = false;
@@ -991,7 +1010,7 @@ async fn handle_close_pane(
         }
     }
     if !removed {
-        anyhow::bail!("pane not found: {}", req.pane_id);
+        return Ok(ResponseBody::Error(format!("pane not found: {}", req.pane_id)));
     }
     if let Some(sid) = session_id {
         broadcast_layout_changed(sessions, &sid);
@@ -1045,7 +1064,9 @@ async fn handle_send_input(
     connection_client_id: &Arc<parking_lot::Mutex<Option<String>>>,
 ) -> anyhow::Result<ResponseBody> {
     if !client_still_attached(sessions, connection_client_id) {
-        anyhow::bail!("client not attached (kicked or detached)");
+        return Ok(ResponseBody::Error(
+            "client not attached (kicked or detached)".to_string(),
+        ));
     }
 
     // §16.6 解析 OSC 52 序列: ESC ] 52 ; c ; <base64> BEL/ST

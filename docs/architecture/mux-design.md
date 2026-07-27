@@ -140,6 +140,46 @@ struct Pane {
 ### Persistence
 SQLite stores sessions, tabs, layout tree (`SplitNode` × `PaneLeaf`), pane metadata. On startup: `load_sessions_from_db()` → restore sessions, re-spawn PTYs. Layout: recursive horizontal/vertical `SplitNode` with ratios.
 
+### Server Settings — `server.json` (§16.11)
+
+The mux_server daemon reads a small JSON config so operators can tune
+scrollback capacity and the idle-shutdown timer without recompiling.
+
+**Sources** (highest wins at load time):
+
+1. Environment — `Z3RM_SCROLLBACK_LINES`, `Z3RM_KEEP_ALIVE_SECONDS`.
+2. File — `$Z3RM_SERVER_SETTINGS` (explicit override) or the default
+   `$XDG_CONFIG_HOME/z3rm/server.json` (or `~/.config/z3rm/server.json`).
+
+**Schema** (`crates/mux_server/src/server_settings.rs`):
+
+```json
+{
+  "keep_alive_seconds": 0,
+  "scrollback_lines": 10000,
+  "max_scroll_history_lines": 10000
+}
+```
+
+| Key | Type | Default | Notes |
+|---|---|---|---|
+| `keep_alive_seconds` | `u64` | `0` (disabled) | Idle daemon shutdown delay; `0` = keep alive forever. Read once at boot and on the next idle cycle when the file changes. |
+| `scrollback_lines` | `u64` (≤ `100_000`) | `10_000` | Backlog rows per pane. Capped at 100k. Existing live panes shrink (FIFO drop) on shrink; new panes honor it immediately. |
+| `max_scroll_history_lines` | `u64` (≤ `100_000`) | — | Alias for `scrollback_lines` (matches `terminal.max_scroll_history_lines` from the client settings schema). `scrollback_lines` wins when both are set. |
+
+**Hot reload**: a background task polls the resolved file path every 2s
+(`ServerSettings::spawn_hot_reload`). On file change it parses the JSON,
+swaps the value into the live `Arc<ServerSettings>` atomics, and applies the
+new scrollback capacity to every pane currently in `sessions` via
+`Pane::set_scrollback_capacity`. `keep_alive_seconds` is re-read on the
+next idle cycle.
+
+**Wiring**: new panes receive their capacity from
+`ServerSettings::scrollback_lines()` (which already incorporates env + JSON)
+threaded through `handle_connection` → `handle_spawn_pane` /
+`handle_split_pane` into `Pane::spawn_with_session`. `Pane::spawn` (used by
+unit tests) falls back to the env-only `default_scrollback_lines()` since no
+live settings handle is in scope.
 ## Protocol Summary (mux_protocol §9, §3.10)
 
 | Category | Messages |

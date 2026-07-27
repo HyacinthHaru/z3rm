@@ -267,7 +267,9 @@ impl Project {
             };
 
             for worktree_path in worktrees {
-                project.add_local_worktree(worktree_path, true, cx);
+                project
+                    .add_local_worktree(worktree_path, true, cx)
+                    .detach_and_log_err(cx);
             }
 
             project
@@ -552,14 +554,20 @@ impl Project {
         gpui::Task::ready(Err(anyhow::anyhow!("stub: try_windows_path_to_wsl")))
     }
 
-    /// Stub: find_or_create_worktree
+    /// §8.2 Delegate to WorktreeStore::find_or_create_worktree.
     pub fn find_or_create_worktree(
         &mut self,
-        _abs_path: &std::path::Path,
-        _visible: bool,
-        _cx: &mut Context<Self>,
+        abs_path: &std::path::Path,
+        visible: bool,
+        cx: &mut Context<Self>,
     ) -> gpui::Task<anyhow::Result<gpui::Entity<Worktree>>> {
-        gpui::Task::ready(Err(anyhow::anyhow!("stub: find_or_create_worktree")))
+        let task = self
+            .worktree_store
+            .update(cx, |store, cx| store.find_or_create_worktree(abs_path, visible, cx));
+        cx.spawn(async move |_, _| {
+            let (worktree, _rel) = task.await?;
+            Ok(worktree)
+        })
     }
 
     /// Stub: is_read_only
@@ -572,24 +580,45 @@ impl Project {
         gpui::Task::ready(())
     }
 
-    /// Stub: delete_file
+    /// Delete a project path via its worktree entry.
     pub fn delete_file(
         &mut self,
-        _path: ProjectPath,
-        _force: bool,
-        _cx: &mut Context<Self>,
+        path: ProjectPath,
+        trash: bool,
+        cx: &mut Context<Self>,
     ) -> Task<anyhow::Result<()>> {
-        Task::ready(Err(anyhow::anyhow!("stub: delete_file")))
+        let Some(worktree) = self.worktree_for_id(path.worktree_id, cx) else {
+            return Task::ready(Err(anyhow::anyhow!("worktree not found for path")));
+        };
+        let entry_id = worktree
+            .read(cx)
+            .entry_for_path(path.path.as_ref())
+            .map(|e| e.id);
+        let Some(entry_id) = entry_id else {
+            return Task::ready(Err(anyhow::anyhow!("entry not found for path")));
+        };
+        let task = worktree.update(cx, |worktree, cx| {
+            worktree.delete_entry(entry_id, trash, cx)
+        });
+        match task {
+            Some(task) => cx.spawn(async move |_, _| {
+                task.await?;
+                Ok(())
+            }),
+            None => Task::ready(Err(anyhow::anyhow!("delete_entry unavailable"))),
+        }
     }
 
-    /// Stub: create_worktree
+
     pub fn create_worktree(
         &mut self,
-        _abs_path: impl Into<std::path::PathBuf>,
-        _visible: bool,
-        _cx: &mut Context<Self>,
+        abs_path: impl Into<std::path::PathBuf>,
+        visible: bool,
+        cx: &mut Context<Self>,
     ) -> Task<anyhow::Result<gpui::Entity<Worktree>>> {
-        Task::ready(Err(anyhow::anyhow!("stub: create_worktree")))
+        let abs_path = abs_path.into();
+        self.worktree_store
+            .update(cx, |store, cx| store.create_worktree(abs_path, visible, cx))
     }
 
     /// Stub: stage_hunks

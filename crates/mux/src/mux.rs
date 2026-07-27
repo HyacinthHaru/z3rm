@@ -10,6 +10,7 @@ use anyhow::Result;
 use std::collections::HashMap;
 use std::path::Path;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::Duration;
 use std::sync::Arc;
 
 // §9 从 mux_protocol 导入所有 protobuf 类型。
@@ -295,18 +296,23 @@ impl MuxDomain {
     ) {
         let mut buf = Vec::new();
 
-        loop {
+        let mut exit = false;
+        'outer: loop {
             // §9 轮询写通道（非阻塞）
             loop {
                 match write_rx.try_recv() {
                     Ok(framed) => {
                         if stream.write_all(&framed).is_err() {
                             tracing::error!("socket write error");
-                            return;
+                            exit = true;
+                            break 'outer;
                         }
                     }
                     Err(std::sync::mpsc::TryRecvError::Empty) => break,
-                    Err(std::sync::mpsc::TryRecvError::Disconnected) => return,
+                    Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                        exit = true;
+                        break 'outer;
+                    }
                 }
             }
 
@@ -317,7 +323,8 @@ impl MuxDomain {
                         Ok((env, _)) => env,
                         Err(e) => {
                             tracing::error!(error = %e, "failed to decode envelope");
-                            break;
+                            exit = true;
+                            break 'outer;
                         }
                     };
 
@@ -363,9 +370,22 @@ impl MuxDomain {
                 }
                 Err(e) => {
                     tracing::error!(error = %e, "socket read error");
-                    break;
+                    exit = true;
+                    break 'outer;
                 }
             }
+        }
+        let _ = exit;
+        // §9 传输断开: 清空所有 pending_requests 的 sender, 让等待中的
+        // send_request 调用 rx.recv() 立即收到 Closed -> 快速返回
+        // "connection closed" 而非干等 15s 超时。这是 steal / 断连后写
+        let pending: Vec<async_channel::Sender<Response>> = {
+            let mut inner = inner.write();
+            inner.pending_requests.drain().map(|(_, tx)| tx).collect()
+        };
+        for tx in pending {
+            // 关闭 sender; 对端 recv() 返回 RecvError::Closed。
+            drop(tx);
         }
     }
 
@@ -462,28 +482,29 @@ impl MuxDomain {
             .send(framed)
             .map_err(|e| anyhow::anyhow!("write channel error: {}", e))?;
 
-        // §9 等待响应 (30s 超时，轮询实现)
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
-        let resp = loop {
-            match rx.try_recv() {
-                Ok(resp) => break resp,
-                Err(async_channel::TryRecvError::Closed) => {
-                    return Err(anyhow::anyhow!("connection closed"));
-                }
-                Err(async_channel::TryRecvError::Empty) => {
-                    if std::time::Instant::now() >= deadline {
-                        return Err(anyhow::anyhow!("request timeout"));
+        // §9 等待响应: 异步 await, 不阻塞 executor worker 线程。
+        // 15s 上限: 足够慢 SSH 隧道往返, 又能在真正 hang 时快速失败。
+        // I/O 线程退出时会清空 pending_requests, 此时 recv() 立刻返回
+        // Closed -> 调用方无需等待 15s 即可拿到 "connection closed" 错误。
+        match tokio::time::timeout(Duration::from_secs(15), rx.recv()).await {
+            Ok(Ok(resp)) => {
+                if let Some(ResponseBody::Error(err)) = &resp.body {
+                    if !err.is_empty() {
+                        self.inner.write().pending_requests.remove(&request_id);
+                        return Err(anyhow::anyhow!("mux server error: {}", err));
                     }
-                    std::thread::sleep(std::time::Duration::from_millis(10));
                 }
+                Ok(resp)
             }
-        };
-        if let Some(ResponseBody::Error(err)) = &resp.body {
-            if !err.is_empty() {
-                return Err(anyhow::anyhow!("mux server error: {}", err));
+            Ok(Err(_)) => {
+                self.inner.write().pending_requests.remove(&request_id);
+                Err(anyhow::anyhow!("connection closed"))
+            }
+            Err(_) => {
+                self.inner.write().pending_requests.remove(&request_id);
+                Err(anyhow::anyhow!("request timeout"))
             }
         }
-        Ok(resp)
     }
 
     // ========================================================================
@@ -624,12 +645,17 @@ impl MuxDomain {
     }
 
     /// §3.10 关闭 Pane。
-    pub async fn close_pane(&self, pane: &str) -> Result<()> {
+        pub async fn close_pane(&self, pane: &str) -> Result<()> {
         let req = RequestBody::ClosePane(mux_protocol::ClosePaneRequest {
             pane_id: pane.to_string(),
         });
-        let _resp = self.send_request(req).await?;
-        Ok(())
+        let resp = self.send_request(req).await?;
+        match resp.body {
+            Some(ResponseBody::Error(msg)) if !msg.is_empty() => {
+                Err(anyhow::anyhow!(msg))
+            }
+            _ => Ok(()),
+        }
     }
 
     /// §3.10 聚焦 Pane。
@@ -672,8 +698,13 @@ impl MuxDomain {
             pane_id: pane.to_string(),
             data: bytes.to_vec(),
         });
-        let _resp = self.send_request(req).await?;
-        Ok(())
+        let resp = self.send_request(req).await?;
+        match resp.body {
+            Some(ResponseBody::Error(msg)) if !msg.is_empty() => {
+                Err(anyhow::anyhow!(msg))
+            }
+            _ => Ok(()),
+        }
     }
 
     /// §3.10 向 Pane 粘贴文本。

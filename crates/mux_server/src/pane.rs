@@ -109,6 +109,12 @@ impl Pane {
     /// §3.10 创建新 pane: spawn PTY + alacritty Term + 启动 read loop。
     ///
     /// 返回 Arc 因为 PTY read 线程持有弱引用, pane drop 时自动结束。
+    ///
+    /// Scrollback capacity comes from `ServerSettings::scrollback_lines()` via
+    /// the connection layer so new panes honor a live `server.json` value, not
+    /// just the `Z3RM_SCROLLBACK_LINES` env snapshot at boot. This `spawn` entry
+    /// point (used by tests and `Pane::spawn_with_session` fallbacks) falls back
+    /// to `default_scrollback_lines()` when no live settings are threaded in.
     pub fn spawn(
         id: String,
         cwd: String,
@@ -116,9 +122,24 @@ impl Pane {
         rows: u32,
         command: Option<ShellCommand>,
     ) -> anyhow::Result<Arc<Self>> {
-        Self::spawn_with_session(id, String::new(), cwd, cols, rows, command)
+        Self::spawn_with_session(
+            id,
+            String::new(),
+            cwd,
+            cols,
+            rows,
+            command,
+            crate::server_settings::default_scrollback_lines(),
+        )
     }
 
+    /// §3.10 / §16.11 Create a pane bound to a session.
+    ///
+    /// `scrollback_lines` is the live capacity from `ServerSettings` (env +
+    /// `server.json`, hot-reloaded); the caller in `connection.rs` forwards
+    /// `settings.scrollback_lines()`. Passing it explicitly (rather than
+    /// re-reading the env here) is what lets a daemon-wide capacity change take
+    /// effect for every subsequently spawned pane without a restart.
     pub fn spawn_with_session(
         id: String,
         session_id: String,
@@ -126,6 +147,7 @@ impl Pane {
         cols: u32,
         rows: u32,
         command: Option<ShellCommand>,
+        scrollback_lines: usize,
     ) -> anyhow::Result<Arc<Self>> {
         let events = Arc::new(parking_lot::Mutex::new(Vec::new()));
         let listener = PaneEventListener { events: events.clone() };
@@ -202,7 +224,7 @@ impl Pane {
             bracketed_paste_mode: AtomicBool::new(false),
             zoomed: AtomicBool::new(false),
             prompt_marker: AtomicU64::new(0),
-            scrollback_buffer: Arc::new(parking_lot::RwLock::new(ScrollbackBuffer::new(crate::server_settings::default_scrollback_lines()))),
+            scrollback_buffer: Arc::new(parking_lot::RwLock::new(ScrollbackBuffer::new(scrollback_lines))),
             scrollback_version: Arc::new(parking_lot::RwLock::new(ScrollbackVersion::new())),
             pty_master: Arc::new(Mutex::new(pair.master)),
             pty_writer: Arc::new(Mutex::new(writer)),

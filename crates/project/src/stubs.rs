@@ -804,26 +804,50 @@ impl Repository {
 impl Project {
     pub fn open_buffer_by_id(
         &mut self,
-        _id: text::BufferId,
-        _cx: &mut gpui::Context<Self>,
+        id: text::BufferId,
+        cx: &mut gpui::Context<Self>,
     ) -> Task<anyhow::Result<Entity<language::Buffer>>> {
-        Task::ready(Err(anyhow::anyhow!("stub: open_buffer_by_id")))
+        Task::ready(self.buffer_store.read(cx).get_existing(id))
     }
 
     pub fn open_local_buffer(
         &mut self,
-        _path: &std::path::Path,
-        _cx: &mut gpui::Context<Self>,
+        path: &std::path::Path,
+        cx: &mut gpui::Context<Self>,
     ) -> Task<anyhow::Result<Entity<language::Buffer>>> {
-        Task::ready(Err(anyhow::anyhow!("stub: open_local_buffer")))
+        let Some(project_path) = self
+            .worktree_store
+            .read(cx)
+            .project_path_for_absolute_path(path, cx)
+        else {
+            return Task::ready(Err(anyhow::anyhow!(
+                "path is not in a project worktree: {}",
+                path.display()
+            )));
+        };
+        self.buffer_store
+            .update(cx, |store, cx| store.open_buffer(project_path, cx))
     }
 
     pub fn open_path(
         &mut self,
-        _path: ProjectPath,
-        _cx: &mut gpui::Context<Self>,
+        path: ProjectPath,
+        cx: &mut gpui::Context<Self>,
     ) -> Task<anyhow::Result<(Entity<worktree::Worktree>, Entity<language::Buffer>)>> {
-        Task::ready(Err(anyhow::anyhow!("stub: open_path")))
+        let Some(worktree) = self
+            .worktree_store
+            .read(cx)
+            .worktree_for_id(path.worktree_id, cx)
+        else {
+            return Task::ready(Err(anyhow::anyhow!(
+                "unknown worktree {}",
+                path.worktree_id
+            )));
+        };
+        let buffer_task = self
+            .buffer_store
+            .update(cx, |store, cx| store.open_buffer(path, cx));
+        cx.spawn(async move |_, _| Ok((worktree, buffer_task.await?)))
     }
 
     pub fn open_local_buffer_via_lsp(
@@ -837,18 +861,20 @@ impl Project {
 
     pub fn find_project_path(
         &self,
-        _full_path: &std::path::Path,
-        _cx: &gpui::App,
+        full_path: &std::path::Path,
+        cx: &gpui::App,
     ) -> Option<ProjectPath> {
-        None
+        self.worktree_store
+            .read(cx)
+            .project_path_for_absolute_path(full_path, cx)
     }
 
     pub fn find_worktree(
         &mut self,
-        _abs_path: &std::path::Path,
-        _cx: &mut gpui::Context<Self>,
+        abs_path: &std::path::Path,
+        cx: &mut gpui::Context<Self>,
     ) -> Option<(Entity<Worktree>, Arc<RelPath>)> {
-        None
+        self.worktree_store.read(cx).find_worktree(abs_path, cx)
     }
 
     /// 存根: 解析绝对文件路径 (来源: spec §8.2 M3)
@@ -862,19 +888,32 @@ impl Project {
 
     pub fn save_buffers(
         &mut self,
-        _buffers: collections::HashSet<Entity<language::Buffer>>,
-        _cx: &mut gpui::Context<Self>,
+        buffers: collections::HashSet<Entity<language::Buffer>>,
+        cx: &mut gpui::Context<Self>,
     ) -> Task<anyhow::Result<()>> {
-        Task::ready(Ok(()))
+        let tasks: Vec<_> = buffers
+            .into_iter()
+            .map(|buffer| {
+                self.buffer_store
+                    .update(cx, |store, cx| store.save_buffer(buffer, cx))
+            })
+            .collect();
+        cx.spawn(async move |_, _| {
+            for task in tasks {
+                task.await?;
+            }
+            Ok(())
+        })
     }
 
     pub fn save_buffer_as(
         &mut self,
-        _buffer: Entity<language::Buffer>,
-        _path: ProjectPath,
-        _cx: &mut gpui::Context<Self>,
+        buffer: Entity<language::Buffer>,
+        path: ProjectPath,
+        cx: &mut gpui::Context<Self>,
     ) -> Task<anyhow::Result<()>> {
-        Task::ready(Ok(()))
+        self.buffer_store
+            .update(cx, |store, cx| store.save_buffer_as(buffer, path, cx))
     }
 
     pub fn reload_buffers(
@@ -1074,8 +1113,12 @@ impl Project {
         Task::ready(Ok(Vec::new()))
     }
 
-    pub fn visible_worktrees(&self, _cx: &gpui::App) -> impl Iterator<Item = Entity<Worktree>> {
-        std::iter::empty::<Entity<Worktree>>()
+    pub fn visible_worktrees(&self, cx: &gpui::App) -> impl Iterator<Item = Entity<Worktree>> {
+        self.worktree_store
+            .read(cx)
+            .visible_worktrees(cx)
+            .collect::<Vec<_>>()
+            .into_iter()
     }
 
     // --- Stub methods for deleted diagnostic/remote features (spec §8.2 M2) ---
@@ -1127,37 +1170,44 @@ impl Project {
         Task::ready(Ok(()))
     }
 
-    pub fn repositories(&self, _cx: &App) -> Vec<Entity<crate::git_store::Repository>> {
-        Vec::new()
+    pub fn repositories(&self, cx: &App) -> Vec<Entity<crate::git_store::Repository>> {
+        self.git_store
+            .read(cx)
+            .repositories()
+            .values()
+            .cloned()
+            .collect()
     }
 
-    pub fn active_repository(&self, _cx: &App) -> Option<Entity<crate::git_store::Repository>> {
-        None
+    pub fn active_repository(&self, cx: &App) -> Option<Entity<crate::git_store::Repository>> {
+        self.git_store.read(cx).active_repository()
     }
 
     pub fn save_buffer(
         &mut self,
-        _buffer: Entity<language::Buffer>,
-        _cx: &mut gpui::Context<Self>,
+        buffer: Entity<language::Buffer>,
+        cx: &mut gpui::Context<Self>,
     ) -> Task<anyhow::Result<()>> {
-        Task::ready(Ok(()))
+        self.buffer_store
+            .update(cx, |store, cx| store.save_buffer(buffer, cx))
     }
 
     pub fn get_open_buffer(
         &self,
-        _file: &ProjectPath,
-        _cx: &App,
+        file: &ProjectPath,
+        cx: &App,
     ) -> Option<Entity<language::Buffer>> {
-        None
+        self.buffer_store.read(cx).get_by_path(file)
     }
 
     pub fn create_buffer(
         &mut self,
-        _language: Option<Arc<language::Language>>,
-        _is_empty: bool,
-        _cx: &mut gpui::Context<Self>,
+        language: Option<Arc<language::Language>>,
+        project_searchable: bool,
+        cx: &mut gpui::Context<Self>,
     ) -> gpui::Task<anyhow::Result<Entity<language::Buffer>>> {
-        gpui::Task::ready(Err(anyhow::anyhow!("stub: create_buffer")))
+        self.buffer_store
+            .update(cx, |store, cx| store.create_buffer(language, project_searchable, cx))
     }
 
     /// 返回搜索历史可变引用
@@ -1319,10 +1369,10 @@ impl Project {
     /// 获取 buffer (stub)
     pub fn buffer_for_id(
         &mut self,
-        _buffer_id: text::BufferId,
-        _cx: &mut gpui::Context<Self>,
+        buffer_id: text::BufferId,
+        cx: &mut gpui::Context<Self>,
     ) -> Option<gpui::Entity<language::Buffer>> {
-        None
+        self.buffer_store.read(cx).get(buffer_id)
     }
 
     /// 获取脏 buffers (stub)
