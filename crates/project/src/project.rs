@@ -133,6 +133,12 @@ pub struct Project {
     environment: Entity<ProjectEnvironment>,
     settings_observer: Entity<SettingsObserver>,
     toolchain_store: Option<Entity<ToolchainStore>>,
+    /// Inert store entities for removed features (task/debugger/bookmarks/breakpoints).
+    /// Created once at construction so callers get a valid handle instead of a panic.
+    task_store_entity: Entity<crate::task_store::TaskStore>,
+    dap_store_entity: Entity<stubs::DapStore>,
+    bookmark_store_entity: Entity<stubs::bookmark_store::BookmarkStore>,
+    breakpoint_store_entity: Entity<stubs::debugger::breakpoint_store::BreakpointStore>,
     last_worktree_paths: WorktreePaths,
 }
 
@@ -263,6 +269,10 @@ impl Project {
                 environment,
                 settings_observer: project_settings,
                 toolchain_store: None,
+            task_store_entity: cx.new(|_| crate::task_store::TaskStore::default()),
+            dap_store_entity: cx.new(|_| stubs::DapStore::default()),
+            bookmark_store_entity: cx.new(|_| stubs::bookmark_store::BookmarkStore::default()),
+            breakpoint_store_entity: cx.new(|_| stubs::debugger::breakpoint_store::BreakpointStore::default()),
                 last_worktree_paths: WorktreePaths::default(),
             };
 
@@ -680,7 +690,7 @@ impl Project {
         &self,
         path: Arc<std::path::Path>,
         args: Vec<String>,
-        cx: &mut gpui::Context<Self>,
+        cx: &gpui::App,
     ) -> Task<anyhow::Result<String>> {
         self.git_store.read(cx).git_config(path, args, cx)
     }

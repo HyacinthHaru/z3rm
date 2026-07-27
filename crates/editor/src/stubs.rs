@@ -138,7 +138,7 @@ pub trait ProjectLspStoreExt {
 
 impl ProjectLspStoreExt for Project {
     fn lsp_store(&self) -> Entity<Project> {
-        unimplemented!("LspStore stub")
+        panic!("LSP store not available: LSP support removed during migration")
     }
 }
 

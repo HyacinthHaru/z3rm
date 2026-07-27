@@ -1066,19 +1066,19 @@ impl Project {
     }
 
     pub fn task_store(&self) -> Entity<crate::task_store::TaskStore> {
-        unimplemented!("stub: task_store")
+        self.task_store_entity.clone()
     }
 
     pub fn dap_store(&self) -> Entity<DapStore> {
-        unimplemented!("stub: dap_store")
+        self.dap_store_entity.clone()
     }
 
     pub fn bookmark_store(&self) -> Entity<BookmarkStore> {
-        unimplemented!("stub: bookmark_store")
+        self.bookmark_store_entity.clone()
     }
 
     pub fn breakpoint_store(&self) -> Entity<BreakpointStore> {
-        unimplemented!("stub: breakpoint_store")
+        self.breakpoint_store_entity.clone()
     }
 
     pub fn active_debug_session(
