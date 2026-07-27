@@ -805,7 +805,7 @@ impl settings::Settings for AllLanguageSettings {
                     lsp_insert_mode: completions.lsp_insert_mode.unwrap_or_default(),
                 },
                 debuggers: settings.debuggers.unwrap_or_default(),
-                word_diff_enabled: settings.word_diff_enabled.unwrap_or_default(),
+                word_diff_enabled: settings.word_diff_enabled.unwrap_or(true),
             }
         }
 

@@ -3303,15 +3303,15 @@ pub async fn copy_recursive<'a>(
                     anyhow::bail!("{target_item:?} already exists");
                 }
             }
-            let _ = fs
-                .remove_dir(
-                    &target_item,
-                    RemoveOptions {
-                        recursive: true,
-                        ignore_if_not_exists: true,
-                    },
-                )
-                .await;
+            fs.remove_dir(
+                &target_item,
+                RemoveOptions {
+                    recursive: true,
+                    ignore_if_not_exists: true,
+                },
+            )
+            .await
+            .with_context(|| format!("failed to clear copy target {target_item:?}"))?;
             fs.create_dir(&target_item).await?;
         } else {
             fs.copy_file(&item, &target_item, options).await?;
@@ -3391,17 +3391,24 @@ async fn file_id(path: impl AsRef<Path>) -> Result<u64> {
 }
 
 #[cfg(target_os = "windows")]
-fn atomic_replace<P: AsRef<Path>>(
-    replaced_file: P,
-    replacement_file: P,
-) -> windows::core::Result<()> {
+fn atomic_replace<P: AsRef<Path>>(replaced_file: P, replacement_file: P) -> Result<()> {
     use windows::{
         Win32::Storage::FileSystem::{REPLACE_FILE_FLAGS, ReplaceFileW},
         core::HSTRING,
     };
 
-    // If the file does not exist, create it.
-    let _ = std::fs::File::create_new(replaced_file.as_ref());
+    match std::fs::File::create_new(replaced_file.as_ref()) {
+        Ok(_) => {}
+        Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {}
+        Err(error) => {
+            return Err(error).with_context(|| {
+                format!(
+                    "failed to create atomic-write destination {:?}",
+                    replaced_file.as_ref()
+                )
+            });
+        }
+    }
 
     unsafe {
         ReplaceFileW(
@@ -3413,4 +3420,6 @@ fn atomic_replace<P: AsRef<Path>>(
             None,
         )
     }
+    .map_err(anyhow::Error::from)
+    .with_context(|| format!("failed to atomically replace {:?}", replaced_file.as_ref()))
 }

@@ -6,6 +6,12 @@
   "excluded_paths": ["node_modules", ".git"],
   "scan_symlinks": "local_only",
 
+  "all_languages": {
+    "defaults": {
+      "word_diff_enabled": true
+    }
+  },
+
   // === 扩展设置 (ExtensionSettingsContent - flattened) ===
   "extension": {
     "directory": "~/.config/z3rm/extensions",

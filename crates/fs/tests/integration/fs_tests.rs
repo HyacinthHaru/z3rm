@@ -432,6 +432,50 @@ async fn test_copy_recursive_with_ignoring(executor: BackgroundExecutor) {
 }
 
 #[gpui::test]
+async fn test_copy_recursive_propagates_target_removal_error(executor: BackgroundExecutor) {
+    let fs = FakeFs::new(executor);
+    fs.insert_tree(
+        path!("/source"),
+        json!({
+            "nested": {
+                "file": "new"
+            }
+        }),
+    )
+    .await;
+    fs.insert_tree(
+        path!("/target"),
+        json!({
+            "nested": {
+                "file": "old"
+            }
+        }),
+    )
+    .await;
+    fs.set_remove_dir_error(path!("/target"), "permission denied".into());
+
+    let error = copy_recursive(
+        fs.as_ref(),
+        Path::new(path!("/source")),
+        Path::new(path!("/target")),
+        CopyOptions {
+            overwrite: true,
+            ..Default::default()
+        },
+    )
+    .await
+    .expect_err("failed target removal must abort the copy");
+
+    assert!(error.to_string().contains("failed to clear copy target"));
+    assert_eq!(
+        fs.load(Path::new(path!("/target/nested/file")))
+            .await
+            .expect("old target file should remain"),
+        "old"
+    );
+}
+
+#[gpui::test]
 async fn test_realfs_atomic_write(executor: BackgroundExecutor) {
     // With the file handle still open, the file should be replaced
     // https://github.com/zed-industries/zed/issues/30054

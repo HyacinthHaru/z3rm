@@ -15,7 +15,7 @@ use sum_tree::SumTree;
 use text::{
     Anchor, Bias, BufferId, Edit, OffsetRangeExt, Patch, Point, ToOffset as _, ToPoint as _,
 };
-use util::{ResultExt, debug_panic};
+use util::ResultExt;
 
 pub const MAX_WORD_DIFF_LINE_COUNT: usize = 5;
 
@@ -25,6 +25,7 @@ pub struct BufferDiff {
     diff_snapshot: Option<BufferDiffSnapshot>,
     secondary_diff: Option<Entity<BufferDiff>>,
     buffer_snapshot: text::BufferSnapshot,
+    base_text_update_generation: u64,
 }
 
 #[derive(Clone)]
@@ -1564,8 +1565,9 @@ impl BufferDiff {
             buffer_id: buffer.remote_id(),
             base_text_buffer: base_text,
             diff_snapshot: None,
-            buffer_snapshot: buffer.clone(),
             secondary_diff: None,
+            buffer_snapshot: buffer.clone(),
+            base_text_update_generation: 0,
         }
     }
 
@@ -1578,8 +1580,9 @@ impl BufferDiff {
             buffer_id: buffer.remote_id(),
             base_text_buffer,
             diff_snapshot: None,
-            buffer_snapshot: buffer.clone(),
             secondary_diff: None,
+            buffer_snapshot: buffer.clone(),
+            base_text_update_generation: 0,
         }
     }
 
@@ -1615,8 +1618,9 @@ impl BufferDiff {
             buffer_id: buffer.remote_id(),
             base_text_buffer: base_text,
             diff_snapshot: Some(diff_snapshot),
-            buffer_snapshot: buffer.clone(),
             secondary_diff: None,
+            buffer_snapshot: buffer.clone(),
+            base_text_update_generation: 0,
         }
     }
 
@@ -2148,6 +2152,8 @@ impl BufferDiff {
         buffer: text::BufferSnapshot,
         cx: &mut Context<Self>,
     ) -> Task<()> {
+        self.base_text_update_generation = self.base_text_update_generation.wrapping_add(1);
+        let update_generation = self.base_text_update_generation;
         cx.spawn(async move |this, cx| {
             let base_text_exists = base_text.is_some();
             let base_text = base_text.unwrap_or_default();
@@ -2164,9 +2170,10 @@ impl BufferDiff {
             let base_text_diff = base_text_diff.await;
             let Some(edited_base_text) = this
                 .update(cx, |this, cx| {
-                    if this.base_text_buffer.read(cx).version() != base_text_diff.base_version {
-                        log::warn!("dropping concurrent diff update");
-                        debug_panic!("incorrect concurrent call to set_base_text");
+                    if this.base_text_update_generation != update_generation
+                        || this.base_text_buffer.read(cx).version() != base_text_diff.base_version
+                    {
+                        log::debug!("dropping stale diff update");
                         return None;
                     }
                     let edited_base_text =
@@ -2199,9 +2206,10 @@ impl BufferDiff {
             };
             let state = state.await;
             this.update(cx, |this, cx| {
-                if &this.base_text_buffer.read(cx).version() != edited_base_text.base_version() {
-                    log::warn!("dropping concurrent diff update");
-                    debug_panic!("incorrect concurrent call to set_base_text");
+                if this.base_text_update_generation != update_generation
+                    || &this.base_text_buffer.read(cx).version() != edited_base_text.base_version()
+                {
+                    log::debug!("dropping stale diff update");
                     return;
                 }
 
@@ -4311,5 +4319,30 @@ mod tests {
         let snapshot = diff.update(cx, |diff, cx| diff.snapshot(cx));
         snapshot.buffer_point_to_base_text_range(Point::new(0, 0), &buffer_snapshot);
         snapshot.buffer_point_to_base_text_range(Point::new(1, 0), &buffer_snapshot);
+    }
+
+    #[gpui::test]
+    async fn test_overlapping_set_base_text_keeps_latest_update(cx: &mut TestAppContext) {
+        let buffer = Buffer::new(
+            ReplicaId::LOCAL,
+            BufferId::new(1).expect("valid test buffer id"),
+            "current\n".to_string(),
+        );
+        let buffer_snapshot = buffer.snapshot();
+        let diff = cx.new(|cx| BufferDiff::new(&buffer_snapshot, None, None, cx));
+
+        let first = diff.update(cx, |diff, cx| {
+            diff.set_base_text(Some(Arc::from("old\n")), buffer_snapshot.clone(), cx)
+        });
+        let second = diff.update(cx, |diff, cx| {
+            diff.set_base_text(Some(Arc::from("new\n")), buffer_snapshot.clone(), cx)
+        });
+
+        first.await;
+        second.await;
+        cx.run_until_parked();
+
+        let base_text = diff.read_with(cx, |diff, cx| diff.base_text(cx).text());
+        assert_eq!(base_text, "new\n");
     }
 }
