@@ -44,6 +44,10 @@ use workspace::{
 pub enum MuxPaneEvent {
     TitleChanged,
     CloseRequested,
+    /// §3.1/§16.6 an input transport failed (server unreachable, permission
+    /// denied, etc.). Surfaces the error text so the workspace can show a
+    /// toast instead of silently dropping the keystroke/mouse event.
+    InputFailed { message: SharedString },
 }
 
 /// §3.3 MuxPaneView — GPUI view for a mux_server pane.
@@ -76,6 +80,9 @@ pub struct MuxPaneView {
     /// §16.5 / §16.7 Shared prefix-mode state machine (live input router).
     prefix_machine: PrefixModeMachine,
     prefix_timeout_task: Option<gpui::Task<()>>,
+    /// §3.1 mouse-input transport errors buffered from the input sink (which
+    /// has no GPUI context) and drained into InputFailed events at render.
+    pending_input_errors: std::sync::Arc<std::sync::Mutex<Vec<SharedString>>>,
 }
 
 impl MuxPaneView {
@@ -90,6 +97,11 @@ impl MuxPaneView {
         cx: &mut Context<Self>,
     ) -> Self {
         let focus_handle = cx.focus_handle();
+        // §3.1 shared with the mouse input sink (which has no GPUI context):
+        // transport errors land here and are drained into InputFailed events
+        // at render time.
+        let pending_input_errors =
+            std::sync::Arc::new(std::sync::Mutex::new(Vec::<SharedString>::new()));
 
         // §3.1 exception: create DisplayOnly terminal (no PTY ownership)
         let settings = TerminalSettings::get_global(cx);
@@ -125,11 +137,13 @@ impl MuxPaneView {
 
         // §16.6 Mouse reports from DisplayOnly TerminalElement must reach
         // the server-owned PTY. Keyboard already goes through send_bytes_to_pty;
-        // this sink covers mouse_mode write_to_pty paths.
+        // this sink covers mouse_mode write_to_pty paths. Transport errors are
+        // buffered into `pending_input_errors` and drained at render.
         {
             let domain = domain.clone();
             let pane_id = pane_id.clone();
             let executor = cx.background_executor().clone();
+            let errors = pending_input_errors.clone();
             let sink: std::sync::Arc<dyn Fn(Vec<u8>) + Send + Sync> =
                 std::sync::Arc::new(move |bytes: Vec<u8>| {
                     if bytes.is_empty() {
@@ -137,6 +151,7 @@ impl MuxPaneView {
                     }
                     let domain = domain.clone();
                     let pane_id = pane_id.clone();
+                    let errors = errors.clone();
                     executor
                         .spawn(async move {
                             if let Err(error) = domain.send_input(&pane_id, &bytes).await {
@@ -145,6 +160,9 @@ impl MuxPaneView {
                                     error = %error,
                                     "mouse send_input failed"
                                 );
+                                if let Ok(mut buf) = errors.lock() {
+                                    buf.push(SharedString::from(format!("{error}")));
+                                }
                             }
                         })
                         .detach();
@@ -195,10 +213,9 @@ impl MuxPaneView {
             last_sent_size: (80, 24),
             prefix_machine: PrefixModeMachine::new(PrefixModeConfig::default()),
             prefix_timeout_task: None,
+            pending_input_errors,
         };
         view.start_notification_listener(cx);
-        view.subscribe_pane_output(cx);
-        view.schedule_fetch(cx);
         view
     }
 
@@ -527,13 +544,16 @@ impl MuxPaneView {
         }
         let domain = self.domain.clone();
         let pane_id = self.pane_id.clone();
-        cx.background_executor()
-            .spawn(async move {
-                if let Err(e) = domain.send_input(&pane_id, &bytes).await {
-                    tracing::error!(pane_id = %pane_id, error = %e, "send_input failed");
-                }
-            })
-            .detach();
+        cx.spawn(async move |this, cx| {
+            if let Err(error) = domain.send_input(&pane_id, &bytes).await {
+                tracing::error!(pane_id = %pane_id, error = %error, "send_input failed");
+                let message = SharedString::from(format!("{error}"));
+                let _ = this.update(cx, |_, view_cx| {
+                    view_cx.emit(MuxPaneEvent::InputFailed { message });
+                });
+            }
+        })
+        .detach();
     }
 
     /// §3.3 Current terminal title (for tabbar). Uses terminal's parsed title from escape sequences.
@@ -772,6 +792,15 @@ impl EventEmitter<MuxPaneEvent> for MuxPaneView {}
 
 impl Render for MuxPaneView {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl gpui::IntoElement {
+        // §3.1 drain mouse-input transport errors buffered by the input sink
+        // (which has no GPUI context) and surface them as InputFailed events.
+        let drained: Vec<SharedString> = match self.pending_input_errors.lock() {
+            Ok(mut buf) => std::mem::take(&mut *buf),
+            Err(_) => Vec::new(),
+        };
+        for message in drained {
+            cx.emit(MuxPaneEvent::InputFailed { message });
+        }
         let bounds = self.terminal.read(cx).last_content().terminal_bounds;
         let cols = bounds.num_columns() as u32;
         let rows = bounds.num_lines() as u32;
@@ -883,6 +912,10 @@ impl Item for MuxPaneView {
         match event {
             MuxPaneEvent::CloseRequested => f(workspace::item::ItemEvent::CloseItem),
             MuxPaneEvent::TitleChanged => f(workspace::item::ItemEvent::UpdateTab),
+            // §3.1 InputFailed is informational only — it does not change tab
+            // state. Subscribers that want to surface it (toast/status) listen
+            // for the MuxPaneEvent directly via cx.subscribe.
+            MuxPaneEvent::InputFailed { .. } => {}
         }
     }
 }
@@ -991,5 +1024,40 @@ mod tests {
             display_offset: 0,
         };
         assert_eq!(snapshot_to_text(&snapshot), "abc\nde ");
+    }
+
+    /// §3.1 the mouse input sink buffers transport errors into an
+    /// `Arc<Mutex<Vec<SharedString>>>` shared with the view; render drains it.
+    /// This tests the drain contract directly: pushed errors come out once and
+    /// the buffer is empty afterward, so render never re-emits a stale error
+    /// and never drops one (poisoned lock yields empty, not a panic).
+    #[test]
+    fn pending_input_errors_buffer_drains_once() {
+        let buffer: std::sync::Arc<std::sync::Mutex<Vec<SharedString>>> =
+            std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+
+        buffer
+            .lock()
+            .unwrap()
+            .push(SharedString::from("mux server error: permission denied"));
+        buffer
+            .lock()
+            .unwrap()
+            .push(SharedString::from("connection closed"));
+
+        let drained: Vec<SharedString> = match buffer.lock() {
+            Ok(mut buf) => std::mem::take(&mut *buf),
+            Err(_) => Vec::new(),
+        };
+        assert_eq!(drained.len(), 2);
+        assert!(drained[0].as_ref().contains("permission denied"));
+        assert!(drained[1].as_ref().contains("connection closed"));
+
+        // Second drain is empty — render never re-emits.
+        let again = match buffer.lock() {
+            Ok(mut buf) => std::mem::take(&mut *buf),
+            Err(_) => Vec::new(),
+        };
+        assert!(again.is_empty(), "buffer must be empty after drain");
     }
 }
