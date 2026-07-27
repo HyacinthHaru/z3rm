@@ -20,7 +20,8 @@ pub async fn capture_pane(
 ) -> Result<String> {
     let mut output = String::new();
 
-    // 负值 -N：取 scrollback 尾部最新 N 行（不是最旧 N 行）。
+    // 负值 -N：取 scrollback 尾部最新 N 行（不是最旧 N 行），
+    // 与 tmux `capture-pane -S -N -p` 语义一致 (仅 scrollback，不再追加当前视图)。
     if let Some(n) = scrollback_lines.filter(|n| *n < 0) {
         let count = n.unsigned_abs();
         let scrollback = domain
@@ -33,6 +34,7 @@ pub async fn capture_pane(
             output.push_str(&render_cells(&row.cells, preserve_ansi));
             output.push('\n');
         }
+        return Ok(output);
     }
 
     let grid = domain
