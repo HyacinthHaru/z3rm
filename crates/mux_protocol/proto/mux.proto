@@ -124,6 +124,7 @@ message PaneInfo {
     uint64 generation = 5;  // current grid generation
     TerminalSize size = 6;
     bool is_alive = 7;
+    bool zoomed = 8;  // §15.4 pane zoom state for snapshot restore
 }
 
 // §3.3 / §3.10 终端尺寸。

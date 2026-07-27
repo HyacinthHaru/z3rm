@@ -1455,6 +1455,7 @@ fn pane_info_for(
             rows: pane.rows.load(std::sync::atomic::Ordering::Relaxed) as u32,
         }),
         is_alive: pane.alive.load(std::sync::atomic::Ordering::Relaxed),
+        zoomed: pane.is_zoomed(),
     })
 }
 
