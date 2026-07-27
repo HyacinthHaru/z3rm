@@ -7,6 +7,7 @@ mod cli;
 mod log_viewer;
 mod quickjs_extensions;
 mod extension_status_bar;
+mod open_diff;
 
 use std::sync::Arc;
 
@@ -441,6 +442,7 @@ fn main() {
         git::GitHostingProviderRegistry::set_global(git_hosting_provider_registry, cx);
 
         workspace::init(app_state.clone(), cx);
+        open_diff::init(cx);
         editor::init(cx);
         command_palette::init(cx);
         file_finder::init(cx);
