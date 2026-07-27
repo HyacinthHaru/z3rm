@@ -584,8 +584,19 @@ impl MuxPaneView {
     }
 
     /// §16.5 Send a literal keystroke to the PTY (double-tap escape).
+    /// `keystroke` is a tmux-style name (`C-b`, `Enter`, …) from the keymap.
     pub fn send_literal(&mut self, keystroke: &str, cx: &mut Context<Self>) {
-        self.send_bytes_to_pty(keystroke.as_bytes().to_vec(), cx);
+        let bytes = mux_protocol::parse_key(keystroke);
+        if bytes.is_empty() {
+            // Fall back to raw UTF-8 only for single printable characters.
+            if keystroke.chars().count() == 1 {
+                self.send_bytes_to_pty(keystroke.as_bytes().to_vec(), cx);
+            } else {
+                tracing::warn!(%keystroke, "send_literal: unparseable keystroke");
+            }
+        } else {
+            self.send_bytes_to_pty(bytes, cx);
+        }
         if self.prefix_machine.is_prefix_wait() {
             self.prefix_machine.on_timeout();
         }

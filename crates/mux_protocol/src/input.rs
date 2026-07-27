@@ -442,7 +442,14 @@ pub fn handle_key_event(
                     bytes: key_bytes.to_vec(),
                 }
             }
-            PrefixAction::Passthrough => return KeyDispatchResult::Passthrough,
+            // §16.7 unmatched key after prefix: exit prefix mode and send the
+            // key to the PTY (tmux parity). Passthrough here means "to PTY",
+            // not "drop the keystroke".
+            PrefixAction::Passthrough => {
+                return KeyDispatchResult::SendToPty {
+                    bytes: key_bytes.to_vec(),
+                };
+            }
             PrefixAction::EnterPrefixMode => {} // 不会在此分支触发
         }
     }
@@ -766,7 +773,12 @@ mod tests {
 
         // 不匹配的键 → 透传
         let result = handle_key_event(b"x", false, false, &mut ctx);
-        assert_eq!(result, KeyDispatchResult::Passthrough);
+        assert_eq!(
+            result,
+            KeyDispatchResult::SendToPty {
+                bytes: b"x".to_vec()
+            }
+        );
     }
 
     #[test]

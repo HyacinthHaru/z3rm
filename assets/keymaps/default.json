@@ -25,7 +25,7 @@
       "ctrl-shift-z": "mux_pane::ZoomToggle",
 
       // §12 复制模式 (Plan 31)
-      "ctrl-shift-;": "terminal::EnterCopyMode",
+      "ctrl-shift-;": "terminal::EnterCopyMode"
     }
   }
 ]
