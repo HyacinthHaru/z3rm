@@ -97,7 +97,7 @@ fn default_socket_name() -> interprocess::local_socket::Name<'static> {
         let runtime_dir = std::env::var("XDG_RUNTIME_DIR").unwrap_or_else(|_| "/tmp".to_string());
         let path = std::path::PathBuf::from(runtime_dir).join("z3rm").join("mux.sock");
         if let Some(parent) = path.parent() {
-            let _ = std::fs::create_dir_all(parent);
+            if let Err(e) = std::fs::create_dir_all(parent) { tracing::warn!(error = %e, "create_dir_all failed"); }
         }
         path.to_string_lossy()
             .to_string()
@@ -153,7 +153,7 @@ pub async fn bind_or_cleanup(name: &interprocess::local_socket::Name<'_>) -> Res
                         Err(_) => {
                             // Stale socket — remove and retry
                             zlog::warn!("stale socket detected, cleaning: {:?}", socket_path);
-                            let _ = std::fs::remove_file(&socket_path);
+                            if let Err(e) = std::fs::remove_file(&socket_path) { tracing::warn!(error = %e, "remove stale socket failed"); }
                             return bind_socket(name).await;
                         }
                     }
@@ -217,7 +217,7 @@ pub fn run() -> Result<()> {
                 let runtime_dir =
                     std::env::var("XDG_RUNTIME_DIR").unwrap_or_else(|_| "/tmp".to_string());
                 let parent = PathBuf::from(runtime_dir).join("z3rm");
-                let _ = std::fs::create_dir_all(&parent);
+                if let Err(e) = std::fs::create_dir_all(&parent) { tracing::warn!(error = %e, "create_dir_all failed"); }
                 parent.join("mux.db")
             }
             #[cfg(windows)]
@@ -226,7 +226,7 @@ pub fn run() -> Result<()> {
                     PathBuf::from(std::env::var("TEMP").unwrap_or_else(|_| "C:/Temp".to_string()))
                 });
                 let dir = base.join("z3rm");
-                let _ = std::fs::create_dir_all(&dir);
+                if let Err(e) = std::fs::create_dir_all(&dir) { tracing::warn!(error = %e, "create_dir_all failed"); }
                 dir.join("mux.db")
             }
         };

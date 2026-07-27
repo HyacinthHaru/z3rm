@@ -130,7 +130,7 @@ pub async fn connect_local(socket_path: Option<&Path>) -> Result<MuxDomain> {
                 #[cfg(unix)]
                 if msg.contains("111") || msg.contains("Connection refused") {
                     tracing::warn!(path = %path.display(), "stale socket (111), cleaning and retrying");
-                    let _ = std::fs::remove_file(&path);
+                    if let Err(e) = std::fs::remove_file(&path) { tracing::warn!(error = %e, "remove_file failed"); }
                     if let Some(retry) = try_connect() {
                         return retry;
                     }
@@ -197,7 +197,7 @@ fn connect_local_stream(
                 let msg = format!("{}", e);
                 if msg.contains("111") || msg.contains("Connection refused") {
                     tracing::warn!(path = %path.display(), "stale socket (111), cleaning and retrying");
-                    let _ = std::fs::remove_file(path);
+                    if let Err(e) = std::fs::remove_file(path) { tracing::warn!(error = %e, "remove_file failed"); }
                     let stream = connect()?;
                     Ok(Box::new(stream))
                 } else {

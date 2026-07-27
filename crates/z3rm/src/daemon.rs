@@ -143,7 +143,7 @@ fn spawn_daemon() -> Result<()> {
     let socket_path = default_socket_path();
     if socket_path.exists() {
         tracing::info!(path = %socket_path.display(), "removing stale socket before spawn");
-        let _ = std::fs::remove_file(&socket_path);
+        if let Err(e) = std::fs::remove_file(&socket_path) { tracing::warn!(error = %e, "stale socket removal failed"); }
     }
     // 从可执行文件同目录查找 z3rm-server (dev build 支持)
     let server_in_same_dir = std::env::current_exe()
