@@ -347,12 +347,15 @@ impl Server {
                     let sessions = self.sessions.clone();
                     let db = self._db.clone();
                     let clipboard = self.clipboard.clone();
+                    // §16.11 thread the live ServerSettings handle so new panes
+                    // honor env + server.json scrollback (hot-reloaded) at spawn.
+                    let server_settings = self.server_settings.clone();
                     let counter = self.active_connections.clone();
                     let done_tx = done_tx.clone();
                     let shutdown_state = shutdown_state.clone();
 
                     tokio::spawn(async move {
-                        match connection::handle_connection(stream, sessions, db, clipboard, shutdown_state).await {
+                        match connection::handle_connection(stream, sessions, db, clipboard, server_settings, shutdown_state).await {
                             Ok(()) => {
                                 zlog::info!("client disconnected");
                             }

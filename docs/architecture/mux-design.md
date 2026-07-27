@@ -151,7 +151,7 @@ scrollback capacity and the idle-shutdown timer without recompiling.
 2. File — `$Z3RM_SERVER_SETTINGS` (explicit override) or the default
    `$XDG_CONFIG_HOME/z3rm/server.json` (or `~/.config/z3rm/server.json`).
 
-**Schema** (`crates/mux_server/src/server_settings.rs`):
+**Schema** (`crates/mux_server/src/server_settings.rs`); a copy-to-`server.json` sample lives at `crates/mux_server/server.example.json`:
 
 ```json
 {
@@ -180,6 +180,7 @@ threaded through `handle_connection` → `handle_spawn_pane` /
 `handle_split_pane` into `Pane::spawn_with_session`. `Pane::spawn` (used by
 unit tests) falls back to the env-only `default_scrollback_lines()` since no
 live settings handle is in scope.
+
 ## Protocol Summary (mux_protocol §9, §3.10)
 
 | Category | Messages |

@@ -233,4 +233,31 @@ mod tests {
         assert_eq!(parsed.keep_alive_seconds, Some(12));
         assert_eq!(parsed.scrollback_lines, Some(1234));
     }
+
+    /// §16.11 The shipped reference sample
+    /// (`crates/mux_server/server.example.json`) must parse through the
+    /// production deserializer and carry the documented default values. This
+    /// guards the "default server.json sample" against schema drift.
+    #[test]
+    fn example_file_parses_with_defaults() {
+        let sample = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("server.example.json");
+        let parsed = read_file(&sample)
+            .unwrap_or_else(|| panic!("parse {}: failed", sample.display()));
+        assert_eq!(parsed.keep_alive_seconds, Some(0));
+        assert_eq!(parsed.scrollback_lines, Some(10_000));
+        assert_eq!(parsed.max_scroll_history_lines, Some(10_000));
+
+        // Applying the sample to a fresh ServerSettings must yield the same
+        // live scrollback the default boot path produces (10_000), proving a
+        // daemon pointed at the sample behaves identically to the env default.
+        let settings = ServerSettings {
+            keep_alive_seconds: AtomicU64::new(999),
+            scrollback_lines: AtomicU64::new(999),
+            settings_path: None,
+        };
+        settings.apply_file(&parsed);
+        assert_eq!(settings.keep_alive_seconds(), 0);
+        assert_eq!(settings.scrollback_lines(), 10_000);
+    }
 }

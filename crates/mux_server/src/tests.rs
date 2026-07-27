@@ -382,6 +382,47 @@ fn test_pane_scrollback() {
     assert_eq!(lines.len(), 1);
     assert_eq!(lines[0].cells[0].character, "Hello");
 }
+    // §16.9 Pane: capacity honored from spawn_with_session parameter
+    //
+    // The connection layer threads `ServerSettings::scrollback_lines()` (env +
+    // server.json, hot-reloaded) into spawn_with_session. The pane's buffer
+    // capacity MUST equal that threaded value, not the env-only
+    // `default_scrollback_lines()` snapshot. We exercise two non-default
+    // capacities here — well above and below the 10k DEFAULT — to make sure
+    // neither the env path nor the default path leaked into spawn_with_session.
+#[test]
+fn test_pane_scrollback_capacity_uses_threaded_value() {
+    let cwd = std::env::temp_dir().to_string_lossy().to_string();
+
+    let small = crate::pane::Pane::spawn_with_session(
+        "pane-small".to_string(),
+        "sess-small".to_string(),
+        cwd.clone(),
+        80,
+        24,
+        None,
+        42,
+    )
+    .expect("spawn pane with small scrollback");
+    assert_eq!(
+        small.scrollback_buffer.read().capacity(),
+        42,
+        "spawn_with_session must use the threaded scrollback value (got {})",
+        small.scrollback_buffer.read().capacity()
+    );
+
+    let large = crate::pane::Pane::spawn_with_session(
+        "pane-large".to_string(),
+        "sess-large".to_string(),
+        cwd,
+        80,
+        24,
+        None,
+        87_654,
+    )
+    .expect("spawn pane with large scrollback");
+    assert_eq!(large.scrollback_buffer.read().capacity(), 87_654);
+}
 
 /// §16.9 Session: sync scrollback
 #[test]

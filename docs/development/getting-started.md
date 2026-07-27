@@ -45,6 +45,33 @@ The headless mux server owns all PTYs and terminal state. It auto-starts on clie
 cargo run -p mux_server
 ```
 
+### Server configuration (z3rm-server)
+
+The daemon reads scrollback capacity and its idle-shutdown timer from a
+small JSON file so you don't need env vars in the launcher:
+
+```sh
+mkdir -p "${XDG_CONFIG_HOME:-$HOME/.config}/z3rm"
+cat > "${XDG_CONFIG_HOME:-$HOME/.config}/z3rm/server.json" <<'EOF'
+{
+  "keep_alive_seconds": 0,
+  "scrollback_lines": 10000
+}
+EOF
+```
+
+| Key | Default | Affects |
+|---|---|---|
+| `keep_alive_seconds` | `0` (off) | Idle daemon shutdown delay. `0` = keep alive forever. |
+| `scrollback_lines` | `10000` | Backlog rows per pane (capped at 100_000). |
+| `max_scroll_history_lines` | — | Alias for `scrollback_lines`. |
+
+Override the file path with `Z3RM_SERVER_SETTINGS`, or set
+`Z3RM_SCROLLBACK_LINES` / `Z3RM_KEEP_ALIVE_SECONDS` to skip the file. Values
+reload live every couple of seconds (drop-in edit `server.json` and the running
+daemon applies the new scrollback to existing panes; new panes pick it up at
+spawn). See `docs/architecture/mux-design.md`.
+
 ### GUI client (z3rm)
 
 ```sh
