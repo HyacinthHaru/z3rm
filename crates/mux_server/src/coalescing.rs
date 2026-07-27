@@ -7,6 +7,7 @@
 //!
 //! 设计: 每个 pane 维护自己的合并器实例，根据最近输出频率自适应调整延迟。
 
+use std::collections::HashMap;
 use std::time::{Duration, Instant};
 
 /// 自适应合并器: 根据最近输出频率动态调整批处理延迟。
@@ -136,5 +137,111 @@ mod tests {
         // 窗口重置后，延迟回到 16ms
         coalescer.on_output();
         assert_eq!(coalescer.delay(), Duration::from_millis(16));
+    }
+}
+
+/// §4.7 Filesystem path debounce: coalesce repeated writes to the same path
+/// within a 500ms window into a single snapshot, so a noisy editor saving a
+/// file many times per second does not produce one version per save.
+///
+/// The recorder calls `note` on every watcher event and `flush_due` on a timer
+/// to release paths that have been quiet for `DEBOUNCE_WINDOW`. While a path
+/// is being debounced, `note` updates the latest trigger/content hint, so the
+/// released event always reflects the most recent fs state.
+pub struct PathDebouncer {
+    pending: HashMap<std::path::PathBuf, (shadow_snapshot::SnapshotTrigger, Instant)>,
+}
+
+/// §4.7 debounce window for filesystem snapshotting.
+const DEBOUNCE_WINDOW: Duration = Duration::from_millis(500);
+
+impl PathDebouncer {
+    pub fn new() -> Self {
+        Self { pending: HashMap::new() }
+    }
+
+    /// Record that `path` changed with `trigger` at `now`. If the path is
+    /// already pending, the trigger is refreshed to the latest event so the
+    /// eventual flush reflects the newest observable state.
+    pub fn note(
+        &mut self,
+        path: std::path::PathBuf,
+        trigger: shadow_snapshot::SnapshotTrigger,
+        now: Instant,
+    ) {
+        self.pending.insert(path, (trigger, now));
+    }
+
+    /// Return and remove paths that have been idle for ≥ `DEBOUNCE_WINDOW`.
+    /// A path still receiving events stays pending until it quiets down.
+    pub fn flush_due(&mut self, now: Instant) -> Vec<(std::path::PathBuf, shadow_snapshot::SnapshotTrigger)> {
+        let mut released = Vec::new();
+        self.pending.retain(|path, (trigger, last)| {
+            if now.duration_since(*last) >= DEBOUNCE_WINDOW {
+                released.push((path.clone(), *trigger));
+                false
+            } else {
+                true
+            }
+        });
+        released
+    }
+
+    /// Number of paths currently being debounced.
+    pub fn pending_count(&self) -> usize {
+        self.pending.len()
+    }
+}
+
+#[cfg(test)]
+mod path_debouncer_tests {
+    use super::*;
+
+    #[test]
+    fn coalesces_bursts_within_window() {
+        use shadow_snapshot::SnapshotTrigger;
+        use std::path::PathBuf;
+
+        let mut debouncer = PathDebouncer::new();
+        let path = PathBuf::from("/tmp/burst.txt");
+        let t0 = Instant::now();
+
+        // §4.7 a burst of 5 writes within the window collapses to one pending entry.
+        for i in 0..5 {
+            debouncer.note(path.clone(), SnapshotTrigger::Write, t0 + Duration::from_millis(i));
+        }
+        assert_eq!(debouncer.pending_count(), 1, "burst must coalesce");
+
+        // Nothing flushes before the 500ms window elapses.
+        assert!(debouncer.flush_due(t0 + Duration::from_millis(400)).is_empty());
+
+        // After 500ms quiet, exactly one flush occurs carrying the latest trigger.
+        let flushed = debouncer.flush_due(t0 + Duration::from_millis(550));
+        assert_eq!(flushed.len(), 1);
+        assert_eq!(flushed[0].0, path);
+        assert_eq!(flushed[0].1, SnapshotTrigger::Write);
+        assert_eq!(debouncer.pending_count(), 0);
+    }
+
+    #[test]
+    fn keeps_path_pending_until_quiet() {
+        use shadow_snapshot::SnapshotTrigger;
+        use std::path::PathBuf;
+
+        let mut debouncer = PathDebouncer::new();
+        let path = PathBuf::from("/tmp/chatty.txt");
+        let t0 = Instant::now();
+
+        // Writes at 0, 200, 400ms — the path never goes 500ms quiet.
+        debouncer.note(path.clone(), SnapshotTrigger::Write, t0);
+        assert!(debouncer.flush_due(t0 + Duration::from_millis(450)).is_empty());
+        debouncer.note(path.clone(), SnapshotTrigger::Write, t0 + Duration::from_millis(200));
+        debouncer.note(path.clone(), SnapshotTrigger::Write, t0 + Duration::from_millis(400));
+        assert!(debouncer.flush_due(t0 + Duration::from_millis(600)).is_empty(),
+            "still within window of last note at 400ms (200ms < 500ms)");
+
+        // Quiet for 500ms after the last note → flush.
+        let flushed = debouncer.flush_due(t0 + Duration::from_millis(901));
+        assert_eq!(flushed.len(), 1);
     }
 }

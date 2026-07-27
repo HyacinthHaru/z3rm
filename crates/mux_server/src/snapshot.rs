@@ -47,7 +47,7 @@ struct WatchInner {
     watch_handle: Mutex<Option<WatchHandle>>,
     /// Feed of changed paths from watcher thread → recorder thread.
     /// Dropping this sender makes the recorder's recv loop exit.
-    path_sender: Mutex<Option<mpsc::Sender<PathBuf>>>,
+    path_sender: Mutex<Option<mpsc::Sender<(PathBuf, shadow_snapshot::SnapshotTrigger)>>>,
     /// Recorder thread handle, joined on stop/drop.
     recorder: Mutex<Option<std::thread::JoinHandle<()>>>,
 }
@@ -135,7 +135,9 @@ pub fn start(session_id: &str, cwd: &str) -> Result<Option<Arc<SnapshotWatch>>> 
         .with_context(|| format!("shadow blob dir create: {}", blob_dir.display()))?;
 
     // Channel: watcher thread (inside Monitor) → recorder thread (owns engine).
-    let (path_tx, path_rx) = mpsc::channel::<PathBuf>();
+    // Carries the trigger so the recorder can route Delete vs Write without
+    // re-deriving it from the path (a delete leaves no file to inspect).
+    let (path_tx, path_rx) = mpsc::channel::<(PathBuf, shadow_snapshot::SnapshotTrigger)>();
     // Channel: recorder reports engine-open result back to us before looping.
     let (init_tx, init_rx) = mpsc::channel::<Result<()>>();
 
@@ -192,33 +194,26 @@ pub fn start(session_id: &str, cwd: &str) -> Result<Option<Arc<SnapshotWatch>>> 
                 }
             };
 
-            // Single-writer loop: the only synthetic SeqNo source is the engine
-            // itself (fetch_add on its atomic), and every record_change runs
-            // here, satisfying spec §4.3/§4.5 ordering.
-            for path in path_rx.iter() {
-                // Read current content; transient read errors (file deleted
-                // mid-write, permission race) are logged and skipped rather
-                // than killing the recorder — a bad snapshot for one file
-                // must not halt versioning for the rest of the worktree.
-                match std::fs::read(&path) {
-                    Ok(content) => {
-                        if let Err(error) = engine.record_change(&path, &content) {
-                        zlog::warn!(
-                            "shadow snapshot record failed: session={} path={} error={}",
-                            recorder_session_id,
-                            path.display(),
-                            error,
-                        );
-                        }
+            // §4.7 single-writer loop with 500ms path debounce. Events are
+            // coalesced per-path so a chatty editor saving many times per
+            // second produces one version per quiet period, not one per save.
+            // `recv_timeout` wakes the loop to flush due paths even when the
+            // watcher is silent, satisfying the debounce window without a
+            // second timer thread.
+            use crate::coalescing::PathDebouncer;
+            let mut debouncer = PathDebouncer::new();
+            // Poll just under the window so flush latency stays close to 500ms.
+            let poll = std::time::Duration::from_millis(100);
+            loop {
+                match path_rx.recv_timeout(poll) {
+                    Ok((path, trigger)) => {
+                        debouncer.note(path, trigger, std::time::Instant::now());
                     }
-                    Err(error) => {
-                        zlog::warn!(
-                            "shadow snapshot read failed: session={} path={} error={}",
-                            recorder_session_id,
-                            path.display(),
-                            error,
-                        );
-                    }
+                    Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
+                    Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break,
+                }
+                for (path, trigger) in debouncer.flush_due(std::time::Instant::now()) {
+                    route_record_event(&engine, &path, trigger);
                 }
             }
         })
@@ -239,8 +234,11 @@ pub fn start(session_id: &str, cwd: &str) -> Result<Option<Arc<SnapshotWatch>>> 
         let path_tx = path_tx.clone();
         let session_id = session_id.to_string();
         move |event: FileEvent| -> SnapshotTrigger {
-            let _ = path_tx.send(event.path);
-            event_to_trigger(event.kind, &session_id)
+            // §4.4 send the path together with its trigger so the recorder can
+            // route Delete vs Write without re-reading the (now-absent) file.
+            let trigger = event_to_trigger(event.kind, &session_id);
+            let _ = path_tx.send((event.path, trigger));
+            trigger
         }
     };
 
@@ -301,6 +299,48 @@ fn event_to_trigger(kind: EventKind, _session_id: &str) -> SnapshotTrigger {
     }
 }
 
+/// §4.4 Route one filesystem event to the matching engine API.
+///
+/// Delete events are tombstoned via `record_delete`; every other trigger is
+/// a content change read from disk and recorded via `record_change`. Failures
+/// are logged, not fatal — a transient I/O error must not halt versioning for
+/// the rest of the worktree. Extracted from the recorder loop so the routing
+/// decision is unit-testable without a live fs watcher.
+fn route_record_event(
+    engine: &shadow_snapshot::ShadowSnapshotEngine,
+    path: &Path,
+    trigger: shadow_snapshot::SnapshotTrigger,
+) {
+    if trigger == shadow_snapshot::SnapshotTrigger::Delete {
+        if let Err(error) = engine.record_delete(path) {
+            zlog::warn!(
+                "shadow snapshot delete failed: path={} error={}",
+                path.display(),
+                error,
+            );
+        }
+        return;
+    }
+    match std::fs::read(path) {
+        Ok(content) => {
+            if let Err(error) = engine.record_change(path, &content) {
+                zlog::warn!(
+                    "shadow snapshot record failed: path={} error={}",
+                    path.display(),
+                    error,
+                );
+            }
+        }
+        Err(error) => {
+            zlog::warn!(
+                "shadow snapshot read failed: path={} error={}",
+                path.display(),
+                error,
+            );
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -311,6 +351,34 @@ mod tests {
         assert_eq!(event_to_trigger(EventKind::Modified, "s"), SnapshotTrigger::Write);
         assert_eq!(event_to_trigger(EventKind::Renamed, "s"), SnapshotTrigger::Write);
         assert_eq!(event_to_trigger(EventKind::Deleted, "s"), SnapshotTrigger::Delete);
+    }
+
+    /// §4.4 a delete event must reach `record_delete`, not `record_change`.
+    /// Spins a real in-process engine (no fs watcher) and routes one Delete
+    /// event through the same function the recorder loop uses, then asserts
+    /// the resulting HEAD node carries `trigger=Delete`.
+    #[test]
+    fn route_record_event_versions_delete_as_tombstone() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("route.db");
+        let wal = dir.path().join("route.wal");
+        let blobs = dir.path().join("routeblobs");
+        std::fs::create_dir_all(&blobs).unwrap();
+
+        let engine = shadow_snapshot::ShadowSnapshotEngine::open(&db, &wal, &blobs).unwrap();
+        let target_file = dir.path().join("victim.txt");
+        let _ = engine.record_change(&target_file, b"alive").unwrap();
+
+        route_record_event(&engine, &target_file, shadow_snapshot::SnapshotTrigger::Delete);
+
+        let versions = engine.list_versions(&target_file).unwrap();
+        let last = versions.last().expect("a node after delete");
+        assert_eq!(
+            last.2,
+            shadow_snapshot::SnapshotTrigger::Delete,
+            "delete must be versioned with trigger=Delete, got {:?}",
+            last.2
+        );
     }
 
     #[test]

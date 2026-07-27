@@ -244,13 +244,42 @@ pub struct IgnoreFilter {
 
 impl IgnoreFilter {
     fn new(worktree_root: impl Into<PathBuf>) -> Self {
+        let root = worktree_root.into();
         let mut patterns = Vec::new();
         for p in DEFAULT_IGNORE {
             patterns.push(p.to_string());
         }
+        // §4.7 honor project ignore files. `.z3rmignore` overrides; `.gitignore`
+        // is the conventional project ignore set. Both are best-effort: a
+        // missing/unreadable file is silently skipped (logged at debug).
+        Self::load_ignore_file(&root, ".z3rmignore", &mut patterns);
+        Self::load_ignore_file(&root, ".gitignore", &mut patterns);
         Self {
-            worktree_root: worktree_root.into(),
+            worktree_root: root,
             patterns: Mutex::new(patterns),
+        }
+    }
+
+    /// Read a gitignore-style ignore file from `root/<name>` and append each
+    /// non-comment, non-empty line as a pattern. I/O errors are debug-logged
+    /// and skipped — a missing file is the common case, not an error.
+    fn load_ignore_file(root: &Path, name: &str, patterns: &mut Vec<String>) {
+        let path = root.join(name);
+        match std::fs::read_to_string(&path) {
+            Ok(content) => {
+                for line in content.lines() {
+                    let trimmed = line.trim();
+                    if trimmed.is_empty() || trimmed.starts_with('#') {
+                        continue;
+                    }
+                    patterns.push(trimmed.to_string());
+                }
+                tracing::debug!(file = name, "loaded project ignore file");
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => {
+                tracing::debug!(file = name, error = %error, "skip unreadable ignore file");
+            }
         }
     }
 
@@ -377,6 +406,29 @@ mod tests {
         assert!(filter.should_ignore(&PathBuf::from("/tmp/test/node_modules/pkg/index.js")));
         assert!(filter.should_ignore(&PathBuf::from("/tmp/test/main.pyc")));
         assert!(!filter.should_ignore(&PathBuf::from("/tmp/test/src/main.rs")));
+    }
+
+    #[test]
+    fn test_ignore_filter_loads_project_ignore_files() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join(".z3rmignore"),
+            "# z3rm-specific\nprivate-cache/\n*.secret\n",
+        )
+        .unwrap();
+        std::fs::write(
+            dir.path().join(".gitignore"),
+            "# project-wide\ngenerated/\n*.bak\n",
+        )
+        .unwrap();
+
+        let filter = IgnoreFilter::new(dir.path());
+
+        assert!(filter.should_ignore(&dir.path().join("private-cache/data.bin")));
+        assert!(filter.should_ignore(&dir.path().join("token.secret")));
+        assert!(filter.should_ignore(&dir.path().join("generated/output.rs")));
+        assert!(filter.should_ignore(&dir.path().join("notes.bak")));
+        assert!(!filter.should_ignore(&dir.path().join("src/main.rs")));
     }
 
     #[test]

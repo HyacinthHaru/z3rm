@@ -313,6 +313,56 @@ impl ShadowSnapshotEngine {
         Ok(version_id)
     }
 
+    /// §4.4 Record a file deletion as a tombstone node: `trigger=Delete`,
+    /// no content_ref, no delta_ref, depth 0. The watcher routes fs remove
+    /// events here so history shows the file was removed at this SeqNo. A
+    /// later recreate parents on the tombstone as a fresh full snapshot.
+    pub fn record_delete(&self, path: &Path) -> Result<VersionId> {
+        let path_hash = compute_path_hash(path);
+        let seq_no = self.seq_no.fetch_add(1, Ordering::AcqRel) as SeqNo;
+        let timestamp_ns = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0);
+        let parent_id = self.tree.get_head(&path_hash);
+
+        let entry = WalEntry {
+            seq_no,
+            path_hash,
+            parent_id,
+            content_ref: None,
+            delta_ref: None,
+            trigger: SnapshotTrigger::Delete,
+        };
+        self.wal.append(&entry)?;
+        self.wal.commit()?;
+
+        let version_id = self.tree.advance_head(
+            path_hash,
+            seq_no,
+            timestamp_ns,
+            parent_id,
+            None,
+            None,
+            0u8,
+            SnapshotTrigger::Delete,
+        );
+        self.storage.write_node(
+            version_id,
+            &path_hash,
+            seq_no,
+            parent_id,
+            None,
+            None,
+            0u8,
+            SnapshotTrigger::Delete,
+            timestamp_ns,
+        )?;
+
+        self.maybe_run_gc();
+        Ok(version_id)
+    }
+
     /// Decide whether the next version is a delta or a full snapshot, and store
     /// the corresponding blob into the blob store.
     ///
@@ -679,5 +729,46 @@ mod tests {
             .read_node_content(&head_node)
             .expect("HEAD content reconstructable after GC");
         assert_eq!(restored, b"version 127 data");
+    }
+
+    /// §4.4 a file deletion must be versioned as a node with
+    /// `trigger=Delete` rather than silently dropped or recorded as Write.
+    /// The watcher routes fs delete events here; without this, restored
+    /// history would not show that the file was removed at that SeqNo.
+    #[test]
+    fn test_record_delete_emits_delete_trigger_node() {
+        let dir = TempDir::new().unwrap();
+        let db = dir.path().join("del.db");
+        let wal = dir.path().join("del.wal");
+        let blobs = dir.path().join("delblobs");
+        std::fs::create_dir_all(&blobs).unwrap();
+
+        let target_file = dir.path().join("deleted.txt");
+        let engine = ShadowSnapshotEngine::open(&db, &wal, &blobs).unwrap();
+        let _v0 = engine.record_change(&target_file, b"present").unwrap();
+
+        engine.record_delete(&target_file).expect("record_delete succeeds");
+
+        let after = engine.list_versions(&target_file).unwrap();
+        let last = after.last().expect("a node exists after deletion");
+        assert_eq!(
+            last.2,
+            SnapshotTrigger::Delete,
+            "delete must be versioned with trigger=Delete"
+        );
+
+        // HEAD must point at the Delete node so subsequent writes parent on the
+        // tombstone (a recreate is a fresh full snapshot, not a delta over the
+        // pre-delete content).
+        let path_hash = compute_path_hash(&target_file);
+        let head_id = engine
+            .tree
+            .get_head(&path_hash)
+            .expect("HEAD defined after delete");
+        let head_node = engine
+            .tree
+            .get_node(head_id)
+            .expect("delete head node present");
+        assert_eq!(head_node.trigger, SnapshotTrigger::Delete);
     }
 }
