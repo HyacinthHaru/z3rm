@@ -82,5 +82,5 @@
   "vim_mode": false,
 
   // === 行号指示器格式 ===
-  "line_indicator_format": "short",
+  "line_indicator_format": "short"
 }
