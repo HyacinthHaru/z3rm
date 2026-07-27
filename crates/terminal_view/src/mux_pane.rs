@@ -177,6 +177,7 @@ impl MuxPaneView {
                 visible: true,
             }),
             alternate_screen: false,
+            display_offset: 0,
         };
 
         let mut view = Self {
@@ -453,8 +454,13 @@ impl MuxPaneView {
             let cursor_pos = format!("\x1b[{};{}H", row, col);
             clear_and_write.extend_from_slice(cursor_pos.as_bytes());
         }
+        // §15.12 Restore the server-authoritative scroll position after the
+        // snapshot text/cursor are written. u32 → usize is lossless on every
+        // target (usize is at least 32 bits); clamping happens in the Terminal.
+        let display_offset = self.snapshot.display_offset as usize;
         self.terminal.update(cx, |terminal, cx| {
             terminal.write_output(&clear_and_write, cx);
+            terminal.scroll_to_display_offset(display_offset);
         });
     }
 
@@ -940,6 +946,7 @@ mod tests {
             cells: vec![Cell::default(); 6],
             cursor: None,
             alternate_screen: false,
+            display_offset: 0,
         };
         let diff = GridDiff {
             rows: vec![RowChange {
@@ -981,6 +988,7 @@ mod tests {
             ],
             cursor: None,
             alternate_screen: false,
+            display_offset: 0,
         };
         assert_eq!(snapshot_to_text(&snapshot), "abc\nde ");
     }

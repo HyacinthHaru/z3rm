@@ -60,6 +60,7 @@ fn test_grid_update_response() {
             visible: true,
         }),
         alternate_screen: false,
+        display_offset: 0,
     };
     let update2 = FetchGridUpdateResponse {
         from_generation: 100,

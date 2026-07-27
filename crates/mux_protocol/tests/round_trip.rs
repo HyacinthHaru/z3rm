@@ -67,6 +67,7 @@ fn test_full_snapshot_serialization() {
             visible: true,
         }),
         alternate_screen: false,
+        display_offset: 42,
     };
 
     let mut buf = Vec::new();
@@ -75,6 +76,8 @@ fn test_full_snapshot_serialization() {
     assert_eq!(decoded.cols, 80);
     assert_eq!(decoded.rows, 24);
     assert_eq!(decoded.cells.len(), 80 * 24);
+    // §15.12 display_offset (field 6) survives encode/decode as a nonzero value.
+    assert_eq!(decoded.display_offset, 42);
 }
 
 // §3.3 验证 ClientIdentity 编码/解码 (Plan 33)

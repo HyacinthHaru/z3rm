@@ -37,6 +37,7 @@ fn snapshot_to_text_empty_grid() {
         cells: vec![],
         cursor: None,
         alternate_screen: false,
+        display_offset: 0,
     };
     assert_eq!(snapshot_to_text(&snap), "");
 }
@@ -49,6 +50,7 @@ fn snapshot_to_text_single_row() {
         cells: vec![cell('h'), cell('e'), cell('l'), cell('l'), cell('o')],
         cursor: None,
         alternate_screen: false,
+        display_offset: 0,
     };
     assert_eq!(snapshot_to_text(&snap), "hello");
 }
@@ -66,6 +68,7 @@ fn snapshot_to_text_multi_row_no_trailing_newline() {
         ],
         cursor: None,
         alternate_screen: false,
+        display_offset: 0,
     };
     assert_eq!(snapshot_to_text(&snap), "ab\ncd\nef");
 }
@@ -79,6 +82,7 @@ fn snapshot_to_text_missing_cells_filled_with_space() {
         cells: vec![cell('x')], // 只有 1 cell,期望 6
         cursor: None,
         alternate_screen: false,
+        display_offset: 0,
     };
     let text = snapshot_to_text(&snap);
     assert_eq!(text, "x  \n   ");
@@ -92,6 +96,7 @@ fn apply_diff_overwrites_cells_in_row() {
         cells: vec![cell('a'); 6],
         cursor: None,
         alternate_screen: false,
+        display_offset: 0,
     };
     let diff = GridDiff {
         rows: vec![RowChange {
@@ -112,6 +117,7 @@ fn apply_diff_truncates_overlong_row() {
         cells: vec![cell('a'); 2],
         cursor: None,
         alternate_screen: false,
+        display_offset: 0,
     };
     let diff = GridDiff {
         rows: vec![RowChange {
@@ -132,6 +138,7 @@ fn apply_diff_skips_out_of_bounds_row() {
         cells: vec![cell('a'); 2],
         cursor: None,
         alternate_screen: false,
+        display_offset: 0,
     };
     let diff = GridDiff {
         rows: vec![RowChange {

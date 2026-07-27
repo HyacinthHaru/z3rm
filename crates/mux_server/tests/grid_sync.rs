@@ -286,3 +286,59 @@ fn test_scrollback_version_counter_match() {
     // 不同 counter → 不匹配
     assert!(v1.counter != v3.counter, "不同 counter 不应匹配");
 }
+
+// ============================================================
+// §15.12 FullGridSnapshot.display_offset 服务端捕获
+// ============================================================
+
+/// §15.12 `snapshot_from_term` 必须捕获 alacritty grid 的真实 display_offset,
+/// 而非固定 0。构造带滚动历史的真实 Term, 滚动后断言快照值与 grid 一致。
+#[test]
+fn test_snapshot_from_term_captures_display_offset() {
+    use alacritty_terminal::event::VoidListener;
+    use alacritty_terminal::grid::{Dimensions as _, Scroll as AlacScroll};
+    use alacritty_terminal::term::test::TermSize;
+    use alacritty_terminal::term::{Config as TermConfig, Term};
+    use alacritty_terminal::vte::ansi::Processor;
+
+    // 20 列 × 5 行视口, 允许 100 行历史。
+    let size = TermSize::new(20, 5);
+    let config = TermConfig {
+        scrolling_history: 100,
+        ..TermConfig::default()
+    };
+    let mut term: Term<VoidListener> = Term::new(config, &size, VoidListener);
+
+    // 喂 30 行 (远多于 5 行视口) → 产生滚动历史。
+    let mut processor = Processor::<alacritty_terminal::vte::ansi::StdSyncHandler>::new();
+    let mut bytes = Vec::new();
+    for index in 0..30u32 {
+        bytes.extend_from_slice(format!("line {}\r\n", index).as_bytes());
+    }
+    processor.advance(&mut term, &bytes);
+
+    let history = term.history_size();
+    assert!(
+        history > 0,
+        "前置条件: 写入超过视口的行后必须产生滚动历史, got history={}",
+        history
+    );
+
+    // 滚到顶部 → grid display_offset == history_size (> 0)。
+    term.scroll_display(AlacScroll::Top);
+    let grid_offset = term.grid().display_offset();
+    assert!(
+        grid_offset > 0,
+        "前置条件: 滚动后 grid display_offset 必须非零"
+    );
+
+    let snapshot = snapshot_from_term(&term);
+    assert_eq!(
+        snapshot.display_offset, grid_offset,
+        "snapshot_from_term 必须携带服务端 grid 的 display_offset"
+    );
+    assert!(
+        snapshot.display_offset > 0,
+        "捕获的 display_offset 必须是非零滚动位置"
+    );
+}

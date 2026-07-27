@@ -719,6 +719,8 @@ enum InternalEvent {
     Clear,
     // FocusNextMatch,
     Scroll(Scroll),
+    // §15.12 absolute display-offset restore (reconnect recovery)
+    ScrollToDisplayOffset(usize),
     ScrollToPoint(Point),
     SetSelection(Option<Selection>),
     UpdateSelection(GpuiPoint<Pixels>),
@@ -1686,6 +1688,34 @@ impl Terminal {
                     }
                 }
             }
+            InternalEvent::ScrollToDisplayOffset(offset) => {
+                // §15.12 Resolve an absolute offset against the live grid,
+                // clamped to history. Computed as a relative Delta at flush
+                // time (term lock held) so it stays correct after prior output.
+                let current = display_offset(term);
+                let history = total_lines(term).saturating_sub(screen_lines(term));
+                let target = (*offset).min(history);
+                let delta = target as i32 - current as i32;
+                if delta != 0 {
+                    let scroll = Scroll::Delta(delta);
+                    trace!("Scrolling to display offset: target={target}, delta={delta}");
+                    scroll_display(term, scroll);
+                    self.refresh_hovered_word(window);
+
+                    if self.vi_mode_enabled {
+                        update_vi_cursor_for_scroll(term, scroll);
+                        if let Some(selection_head) = update_selection_to_vi_cursor(term) {
+                            #[cfg(any(target_os = "linux", target_os = "freebsd"))]
+                            if let Some(selection_text) = selection_text(term) {
+                                cx.write_to_primary(ClipboardItem::new_string(selection_text));
+                            }
+
+                            self.selection_head = Some(selection_head);
+                            cx.emit(Event::SelectionsChanged)
+                        }
+                    }
+                }
+            }
             InternalEvent::SetSelection(selection) => {
                 trace!("Setting selection: selection={selection:?}");
                 set_term_selection(term, selection.as_ref());
@@ -1978,6 +2008,17 @@ impl Terminal {
 
     pub fn scroll_to_bottom(&mut self) {
         self.events.push_back(InternalEvent::Scroll(Scroll::Bottom));
+    }
+
+    /// §15.12 Scroll to an absolute display offset, clamped to scrollback history.
+    ///
+    /// Used by reconnect recovery to restore the server-authoritative scroll
+    /// position carried in a `FullGridSnapshot`. The delta is resolved against
+    /// the live `display_offset` when the event is flushed in `sync`, so it stays
+    /// correct even if prior output shifted the grid.
+    pub fn scroll_to_display_offset(&mut self, offset: usize) {
+        self.events
+            .push_back(InternalEvent::ScrollToDisplayOffset(offset));
     }
 
     pub fn scrolled_to_top(&self) -> bool {
@@ -4537,6 +4578,76 @@ mod tests {
             text.starts_with("world"),
             "Bare CR should allow overwriting: got '{}'",
             text
+        );
+    }
+
+    /// §15.12 Reconnect recovery: `scroll_to_display_offset` must drive the
+    /// embedded Terminal's real scroll position so that, after `sync`,
+    /// `last_content().display_offset` equals the restored nonzero offset.
+    #[gpui::test]
+    async fn test_scroll_to_display_offset_restores_scroll_position(
+        cx: &mut TestAppContext,
+    ) {
+        cx.update(|cx| {
+            let settings_store = settings::SettingsStore::test(cx);
+            cx.set_global(settings_store);
+        });
+        let cx = cx.add_empty_window();
+        let terminal = cx.new(|cx| {
+            TerminalBuilder::new_display_only(
+                SettingsCursorShape::default(),
+                AlternateScroll::On,
+                Some(10_000),
+                0,
+                cx.background_executor(),
+                PathStyle::local(),
+            )
+            .subscribe(cx)
+        });
+
+        // Write far more lines than the viewport to materialize scrollback.
+        cx.update(|window, cx| {
+            terminal.update(cx, |terminal, cx| {
+                let mut bytes = Vec::new();
+                for index in 0..300u32 {
+                    bytes.extend_from_slice(format!("line {}\r\n", index).as_bytes());
+                }
+                terminal.write_output(&bytes, cx);
+            });
+        });
+
+        // Flush the write and confirm scrollback history exists. history is
+        // total_lines - visible screen rows.
+        let history_size = cx.update(|window, cx| {
+            terminal.update(cx, |terminal, cx| {
+                terminal.sync(window, cx);
+            });
+            let term = terminal.read(cx).term.lock_unfair();
+            crate::alacritty::total_lines(&term).saturating_sub(crate::alacritty::screen_lines(&term))
+        });
+        assert!(
+            history_size > 0,
+            "precondition: scrollback history must exist, got history={}",
+            history_size
+        );
+
+        // Pick a nonzero target strictly within history, then restore it.
+        let target_offset = (history_size / 2).max(1);
+        cx.update(|_window, cx| {
+            terminal.update(cx, |terminal, _cx| {
+                terminal.scroll_to_display_offset(target_offset);
+            });
+        });
+
+        let restored = cx.update(|window, cx| {
+            terminal.update(cx, |terminal, cx| {
+                terminal.sync(window, cx);
+                terminal.last_content.display_offset
+            })
+        });
+        assert_eq!(
+            restored, target_offset,
+            "last_content().display_offset must equal the restored nonzero offset"
         );
     }
 

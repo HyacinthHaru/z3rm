@@ -288,12 +288,16 @@ message CellStyle {
 }
 
 // §3.3 完整网格快照，用于重连或缓存失效。
+// §15.12 display_offset 携带服务端 alacritty grid 的 display_offset
+// (滚动到历史缓冲的行数), 重连时客户端据此恢复滚动位置。
 message FullGridSnapshot {
     uint32 cols = 1;
     uint32 rows = 2;
     repeated Cell cells = 3;  // flat row-major: cells[row * cols + col]
     CursorState cursor = 4;
     bool alternate_screen = 5;
+    // §15.12 服务端 grid display_offset (0 = 滚动到底部/最新行)。
+    uint32 display_offset = 6;
 }
 
 // §3.3 光标状态。

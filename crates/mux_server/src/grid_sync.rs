@@ -74,6 +74,8 @@ pub struct FullGridSnapshot {
     pub cursor: CursorState,
     /// 是否使用 alternate screen
     pub alternate_screen: bool,
+    /// §15.12 alacritty grid display_offset (滚动到历史缓冲的行数, 0 = 最新行)
+    pub display_offset: usize,
 }
 
 /// Grid diff ring (§3.3 默认 64 entries)
@@ -404,6 +406,7 @@ pub fn build_empty_snapshot(cols: u32, rows: u32) -> FullGridSnapshot {
             visible: true,
         },
         alternate_screen: false,
+        display_offset: 0,
     }
 }
 
@@ -544,6 +547,8 @@ pub fn snapshot_from_term<T: EventListener>(term: &Term<T>) -> FullGridSnapshot 
             visible: cursor_visible,
         },
         alternate_screen: alt,
+        // §15.12 携带服务端 grid 的滚动位置 (== term.grid().display_offset())。
+        display_offset: content.display_offset,
     }
 }
 

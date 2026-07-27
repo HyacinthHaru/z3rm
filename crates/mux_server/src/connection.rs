@@ -1401,6 +1401,9 @@ async fn handle_fetch_grid_update(
                                 visible: snapshot.cursor.visible,
                             }),
                             alternate_screen: snapshot.alternate_screen,
+                            // §15.12 usize → u32 (saturating; scrollback 远小于 u32::MAX)。
+                            display_offset: u32::try_from(snapshot.display_offset)
+                                .unwrap_or(u32::MAX),
                         },
                     )),
                 },
