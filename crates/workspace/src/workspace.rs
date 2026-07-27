@@ -6747,24 +6747,6 @@ impl Workspace {
         domain.resize_pane(pane_id, cols, rows).await
     }
 
-    /// §16.9 处理 SessionLayoutChanged 通知: 从 server 获取最新布局快照
-    /// 并更新本地 server_layout, 触发重绘。
-    pub async fn handle_session_layout_changed(
-        &mut self,
-        domain: &mux::MuxDomain,
-        session_id: &str,
-    ) -> anyhow::Result<()> {
-        let attach_resp = domain
-            .attach(session_id, mux::AttachMode::Shared)
-            .await?;
-        if let Some(snapshot) = &attach_resp.snapshot {
-            if let Some(layout) = &snapshot.layout {
-                self.server_layout =
-                    Some(crate::layout_projection::LayoutTree::from_proto(layout));
-            }
-        }
-        Ok(())
-    }
 
     #[cfg(any(test, feature = "test-support"))]
     pub fn test_new(project: Entity<Project>, window: &mut Window, cx: &mut Context<Self>) -> Self {

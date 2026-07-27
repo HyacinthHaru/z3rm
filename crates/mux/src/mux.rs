@@ -343,6 +343,9 @@ impl MuxDomain {
                                 Some(NotifEvent::PaneAdded(_))
                                     | Some(NotifEvent::PaneRemoved(_))
                                     | Some(NotifEvent::SessionLayoutChanged(_))
+                                    | Some(NotifEvent::PaneZoomed(_))
+                                    | Some(NotifEvent::PaneTitleChanged(_))
+                                    | Some(NotifEvent::PaneBell(_))
                             );
                             for tx in subs.iter() {
                                 if is_lifecycle {
