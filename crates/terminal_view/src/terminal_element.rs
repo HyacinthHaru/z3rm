@@ -2877,4 +2877,73 @@ mod tests {
         let values: Vec<&str> = nodes.iter().map(|(_, n)| n.value().unwrap_or_default()).collect();
         assert_eq!(values, vec!["done.", ""]);
     }
+
+    /// §16.4 / goal a11y stress: a full 80x24 terminal screen of mixed
+    /// content (colored output, blank lines, long lines, unicode) must
+    /// produce a bounded, correct set of TextRun nodes without panicking.
+    /// This exercises the a11y transformation under realistic load.
+    #[test]
+    fn a11y_stress_full_screen_mixed_content() {
+        let mut runs = Vec::new();
+        for line in 0..24i32 {
+            match line % 4 {
+                0 => {
+                    // Normal colored output — two style runs per line.
+                    runs.push(a11y_run(line, "\\x1b[32mPASS\\x1b[0m"));
+                    runs.push(a11y_run(line, "  test_module::case_"));
+                }
+                1 => {
+                    // Long line near the chunk boundary.
+                    let text = "x".repeat(MAX_CHARS_PER_A11Y_RUN + 10);
+                    runs.push(a11y_run(line, &text));
+                }
+                2 => {
+                    // Blank line.
+                    runs.push(a11y_run(line, ""));
+                }
+                _ => {
+                    // Unicode: multi-byte chars.
+                    runs.push(a11y_run(line, "日本語テスト"));
+                }
+            }
+        }
+
+        let nodes = build_terminal_line_runs(&runs, fake_id);
+
+        // 24 lines must produce at least 24 nodes (long line splits → more).
+        assert!(
+            nodes.len() >= 24,
+            "expected ≥24 nodes for 24 lines, got {}",
+            nodes.len()
+        );
+
+        // Node count must be bounded: each line produces at most
+        // ceil(len / MAX_CHARS_PER_A11Y_RUN) + 1 chunks.
+        let max_expected = 24 * 4;
+        assert!(
+            nodes.len() <= max_expected,
+            "node count {} exceeds reasonable bound {} for 24 lines",
+            nodes.len(),
+            max_expected
+        );
+
+        // All nodes are TextRun role.
+        for (_, node) in &nodes {
+            assert_eq!(node.role(), accesskit::Role::TextRun);
+        }
+
+        // PASS text must be present in the first non-blank line's value.
+        let first_value = nodes
+            .iter()
+            .filter_map(|(_, n)| n.value())
+            .find(|v| v.contains("PASS"));
+        assert!(first_value.is_some(), "PASS text must appear in a11y nodes");
+
+        // Unicode content must survive.
+        let has_unicode = nodes
+            .iter()
+            .filter_map(|(_, n)| n.value())
+            .any(|v| v.contains("日本"));
+        assert!(has_unicode, "unicode text must appear in a11y nodes");
+    }
 }
