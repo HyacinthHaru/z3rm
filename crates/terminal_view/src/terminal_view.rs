@@ -1543,6 +1543,10 @@ impl Render for TerminalView {
             .size_full()
             .relative()
             .track_focus(&self.focus_handle(cx))
+            // §16.4 a11y: outer div exposes Terminal role + title for non-mux
+            // terminal views; the child TerminalElement also carries Terminal.
+            .role(gpui::Role::Terminal)
+            .aria_label(self.terminal.read(cx).title(true))
             .key_context(self.dispatch_context(cx))
             .on_action(cx.listener(TerminalView::send_text))
             .on_action(cx.listener(TerminalView::send_keystroke))
