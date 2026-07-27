@@ -543,9 +543,25 @@ impl Pane {
         self.scrollback_buffer.write().set_capacity(capacity);
     }
 
+    /// §3.3 bump_generation — bump generation but also push a full-screen
+    /// diff and broadcast PaneDirty so the push/pull contract (§3.3) holds:
+    /// a render-affecting change (zoom, title) MUST wake every attached
+    /// client. The previous implementation only did `fetch_add`, so a
+    /// CLI/one-client title/zoom change left the gap that has to be picked
+    /// up next PTY byte. The full-screen diff aligns with §15.13 which
+    /// treats title as a generation-affecting change.
     pub fn bump_generation(&self) {
-
-        self.generation.fetch_add(1, Ordering::SeqCst);
+        let all_rows: Vec<usize> = {
+            let term = self.term.lock();
+            (0..term.screen_lines()).collect()
+        };
+        let diff = {
+            let term = self.term.lock();
+            diff_from_dirty(&*term, &all_rows)
+        };
+        let new_gen = self.generation.fetch_add(1, Ordering::SeqCst) + 1;
+        self.grid_diff_ring.write().push(new_gen, diff);
+        self.broadcast_pane_dirty();
     }
 
     /// §3.10 SendInput — 向 PTY 写入原始字节。
@@ -608,6 +624,12 @@ impl Pane {
         };
         let new_gen = self.generation.fetch_add(1, Ordering::SeqCst) + 1;
         self.grid_diff_ring.write().push(new_gen, diff);
+        // §3.3 / §15.13 resize is render-affecting: wake every attached
+        // client so it pulls the new full-screen grid. Otherwise the
+        // initiating client knows its local size but peers (and the
+        // initiator on a future reconnect path) never fetch until an
+        // unrelated PTY byte happens to bump+broadcast.
+        self.broadcast_pane_dirty();
         Ok(())
     }
 

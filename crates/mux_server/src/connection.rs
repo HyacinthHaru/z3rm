@@ -664,11 +664,17 @@ async fn handle_attach(
 }
 
 /// §3.10 断开连接 — remove this connection's client registration.
+///
+/// Voluntary detach clears `connection_client_id` so subsequent CLI RPCs
+/// (send-keys, capture-pane, …) treat the socket as pre-attach again —
+/// matching tmux, where a detached client can still drive panes by target.
+/// Steal kick leaves the id set without a session membership, so
+/// `client_still_attached` keeps failing writers in milliseconds.
 async fn handle_detach(
     sessions: &Arc<parking_lot::RwLock<Vec<crate::session::Session>>>,
     connection_client_id: &Arc<parking_lot::Mutex<Option<String>>>,
 ) -> anyhow::Result<ResponseBody> {
-    if let Some(client_id) = connection_client_id.lock().clone() {
+    if let Some(client_id) = connection_client_id.lock().take() {
         let mut sessions_w = sessions.write();
         for session in sessions_w.iter_mut() {
             session.remove_attached_client(&client_id);

@@ -266,10 +266,10 @@ fn watch_themes(fs: Arc<dyn Fs>, cx: &mut App) {
                     .is_some_and(|m| !m.is_dir)
                 {
                     let theme_registry = cx.update(|cx| ThemeRegistry::global(cx));
-                    if let Some(bytes) = fs.load_bytes(&event.path).await.log_err()
-                        && load_user_theme(&theme_registry, &bytes).log_err().is_some()
-                    {
-                        cx.update(theme_settings::reload_theme);
+                    if let Some(bytes) = fs.load_bytes(&event.path).await.log_err() {
+                        if load_user_theme(&theme_registry, &bytes).log_err().is_some() {
+                            cx.update(theme_settings::reload_theme);
+                        }
                     }
                 }
             }

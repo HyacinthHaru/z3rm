@@ -707,9 +707,4 @@ mod tests {
             panic!("unexpected parse result: {parsed:?}");
         }
     }
-
-        let err = parse_cli_args_from(&args(&["help"]))
-            .expect_err("help subcommand must be a handled case");
-        assert!(err.contains("usage"), "help should contain usage: {err}");
-    }
 }

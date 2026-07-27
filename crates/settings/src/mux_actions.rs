@@ -16,6 +16,16 @@ use serde::Deserialize;
 #[action(namespace = mux)]
 pub struct Detach;
 
+/// §16.7 关闭当前 mux session。
+#[derive(Clone, Debug, Default, Deserialize, JsonSchema, PartialEq, Action)]
+#[action(namespace = mux)]
+pub struct KillSession;
+
+/// §16.7 关闭整个 mux_server 进程。
+#[derive(Clone, Debug, Default, Deserialize, JsonSchema, PartialEq, Action)]
+#[action(namespace = mux)]
+pub struct KillServer;
+
 /// §16.7 进入 prefix 模式，等待下一个按键。
 /// timeout_ms 控制 prefix 模式超时时间（默认 500ms）。
 #[derive(Clone, Debug, Deserialize, JsonSchema, PartialEq, Action)]

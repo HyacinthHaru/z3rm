@@ -191,6 +191,10 @@ message ShellCommand {
 message SplitPaneRequest {
     string pane_id = 1;
     SplitNode.SplitDirection direction = 2;
+    // Optional command to run in the new pane (inherits parent when unset).
+    optional ShellCommand command = 3;
+    // Optional working directory for the new pane (inherits parent when unset).
+    optional string cwd = 4;
 }
 
 // §3.10 关闭 Pane。
@@ -569,6 +573,11 @@ message ShellIntegrationResponse {
     string cwd = 1;
     uint32 prompt_marker = 2;
 }
+
+// §3.5 Explicit process shutdown (admin-only). Empty body; server flushes
+// the response then exits the accept loop.
+message ShutdownRequest {}
+
 // === Request/Response envelope ===
 
 // §9 请求信封：携带 request_id 与具体请求体。
@@ -602,6 +611,7 @@ message Request {
         ZoomPaneRequest zoom_pane = 26;
         ShellIntegrationRequest shell_integration = 27;
         SubscribePaneOutputRequest subscribe_pane_output = 28;
+        ShutdownRequest shutdown = 29;
     }
 }
 

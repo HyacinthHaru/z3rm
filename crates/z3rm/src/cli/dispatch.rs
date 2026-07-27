@@ -2,6 +2,7 @@
 // 来源: spec §3.10
 
 use anyhow::{Context, Result};
+use std::time::Duration;
 use std::path::PathBuf;
 
 use mux::MuxDomain;
@@ -231,9 +232,10 @@ pub async fn run_cli_command(cmd: CliCommand) -> Result<()> {
         return Ok(());
     }
 
-    // 连接到 daemon
-    let domain = mux::connect_local(None)
+    // §3.10 CLI must never hang on a wedged daemon socket.
+    let domain = tokio::time::timeout(Duration::from_secs(5), mux::connect_local(None))
         .await
+        .context("mux_server not responding (connect timeout)")?
         .context("failed to connect to mux_server. Is the daemon running?")?;
     // 获取默认 session (第一个)；失败传播, 不再静默退回空串。
     let default_session = {
@@ -314,26 +316,33 @@ pub async fn run_cli_command(cmd: CliCommand) -> Result<()> {
         }
 
         CliCommand::KillServer => {
-            domain
-                .shutdown()
-                .await
-                .context("failed to shut down mux_server")?;
-            println!("mux_server shut down");
+            match tokio::time::timeout(Duration::from_secs(2), domain.shutdown()).await {
+                Ok(Ok(())) => println!("mux_server shut down"),
+                Ok(Err(error)) => {
+                    tracing::warn!(error = %error, "shutdown RPC failed; treating as already down");
+                    println!("mux_server already shut down");
+                }
+                Err(_) => println!("mux_server already shut down"),
+            }
         }
 
+        // §3.10 attach is handled by main as LaunchIntent::Gui (spawn GUI, exit).
+        // This arm is a safety net if reached programmatically: print only, no RPC.
         CliCommand::Attach { target } => {
-            let target = super::target::parse_target(&target).context("invalid target")?;
-            let session_id = resolve_session_id(&domain, &target, &default_session).await?;
-            domain
-                .attach(&session_id, mux::AttachMode::Shared)
-                .await
-                .context("failed to attach")?;
-            eprintln!("attached to session {}", session_id);
+            let label = target.as_deref().unwrap_or("default");
+            eprintln!("z3rm: attached to session '{}' in GUI window", label);
         }
 
         CliCommand::Detach => {
-            domain.detach().await.context("failed to detach")?;
-            eprintln!("detached");
+            // §3.10 never hang if the daemon is already gone.
+            match tokio::time::timeout(Duration::from_secs(2), domain.detach()).await {
+                Ok(Ok(())) => eprintln!("detached"),
+                Ok(Err(error)) => {
+                    tracing::warn!(error = %error, "detach RPC failed; treating as already detached");
+                    eprintln!("already detached");
+                }
+                Err(_) => eprintln!("already detached"),
+            }
         }
 
         CliCommand::SplitWindow {
@@ -341,7 +350,7 @@ pub async fn run_cli_command(cmd: CliCommand) -> Result<()> {
             horizontal,
             command,
         } => {
-            let target = super::target::parse_target(&target).context("invalid target")?;
+            let target = super::target::parse_target(&target);
             let pane_id = resolve_pane_id(&domain, &target).await?;
             let direction = if horizontal {
                 SplitDirection::LeftRight
@@ -361,7 +370,7 @@ pub async fn run_cli_command(cmd: CliCommand) -> Result<()> {
         }
 
         CliCommand::SendKeys { target, keys } => {
-            let target = super::target::parse_target(&target).context("invalid target")?;
+            let target = super::target::parse_target(&target);
             let pane_id = resolve_pane_id(&domain, &target).await?;
             let bytes = parse_keys(&keys);
             domain
@@ -376,7 +385,7 @@ pub async fn run_cli_command(cmd: CliCommand) -> Result<()> {
             scrollback,
             escape,
         } => {
-            let target = super::target::parse_target(&target).context("invalid target")?;
+            let target = super::target::parse_target(&target);
             let pane_id = resolve_pane_id(&domain, &target).await?;
             let text = super::capture::capture_pane(
                 &domain,
@@ -394,7 +403,7 @@ pub async fn run_cli_command(cmd: CliCommand) -> Result<()> {
         }
 
         CliCommand::ListPanes { target } => {
-            let target = super::target::parse_target(&target).context("invalid target")?;
+            let target = super::target::parse_target(&target);
             let session_id = resolve_session_id(&domain, &target, &default_session).await?;
             let snapshot = domain
                 .attach(&session_id, mux::AttachMode::ReadOnly)
@@ -420,7 +429,7 @@ pub async fn run_cli_command(cmd: CliCommand) -> Result<()> {
         }
 
         CliCommand::SelectPane { target } => {
-            let target = super::target::parse_target(&target).context("invalid target")?;
+            let target = super::target::parse_target(&target);
             let pane_id = resolve_pane_id(&domain, &target).await?;
             domain
                 .focus_pane(&pane_id)
@@ -430,7 +439,7 @@ pub async fn run_cli_command(cmd: CliCommand) -> Result<()> {
         }
 
         CliCommand::KillPane { target } => {
-            let target = super::target::parse_target(&target).context("invalid target")?;
+            let target = super::target::parse_target(&target);
             let pane_id = resolve_pane_id(&domain, &target).await?;
             domain
                 .close_pane(&pane_id)
@@ -444,7 +453,7 @@ pub async fn run_cli_command(cmd: CliCommand) -> Result<()> {
             width,
             height,
         } => {
-            let target = super::target::parse_target(&target).context("invalid target")?;
+            let target = super::target::parse_target(&target);
             let pane_id = resolve_pane_id(&domain, &target).await?;
 
             // §3.10 Preserve unspecified axis from current pane size (do not wipe to 80x24).
@@ -478,7 +487,7 @@ pub async fn run_cli_command(cmd: CliCommand) -> Result<()> {
         }
 
         CliCommand::NewWindow { target } => {
-            let target = super::target::parse_target(&target).context("invalid target")?;
+            let target = super::target::parse_target(&target);
             let session_id = resolve_session_id(&domain, &target, &default_session).await?;
 
             // 创建新 tab (通过 spawn_pane 隐式创建)
@@ -492,7 +501,7 @@ pub async fn run_cli_command(cmd: CliCommand) -> Result<()> {
         }
 
         CliCommand::RenameWindow { target, title } => {
-            let target = super::target::parse_target(&target).context("invalid target")?;
+            let target = super::target::parse_target(&target);
             let pane_id = resolve_pane_id(&domain, &target).await?;
             domain
                 .set_pane_title(&pane_id, &title)

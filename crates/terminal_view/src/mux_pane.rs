@@ -123,6 +123,37 @@ impl MuxPaneView {
             .subscribe(cx)
         });
 
+        // §16.6 Mouse reports from DisplayOnly TerminalElement must reach
+        // the server-owned PTY. Keyboard already goes through send_bytes_to_pty;
+        // this sink covers mouse_mode write_to_pty paths.
+        {
+            let domain = domain.clone();
+            let pane_id = pane_id.clone();
+            let executor = cx.background_executor().clone();
+            let sink: std::sync::Arc<dyn Fn(Vec<u8>) + Send + Sync> =
+                std::sync::Arc::new(move |bytes: Vec<u8>| {
+                    if bytes.is_empty() {
+                        return;
+                    }
+                    let domain = domain.clone();
+                    let pane_id = pane_id.clone();
+                    executor
+                        .spawn(async move {
+                            if let Err(error) = domain.send_input(&pane_id, &bytes).await {
+                                tracing::error!(
+                                    pane_id = %pane_id,
+                                    error = %error,
+                                    "mouse send_input failed"
+                                );
+                            }
+                        })
+                        .detach();
+                });
+            terminal.update(cx, |terminal, _cx| {
+                terminal.set_input_sink(Some(sink));
+            });
+        }
+
         // TerminalView provides state for TerminalElement (scroll, mode, IME)
         let terminal_view = cx.new(|cx| {
             TerminalView::new(

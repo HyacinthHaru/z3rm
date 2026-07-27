@@ -991,6 +991,7 @@ impl TerminalBuilder {
         let terminal = Terminal {
             task: None,
             terminal_type: TerminalType::DisplayOnly,
+            input_sink: None,
             subprocess: None,
             completion_tx: None,
             term,
@@ -1265,6 +1266,7 @@ impl TerminalBuilder {
             let terminal = Terminal {
                 task,
                 terminal_type,
+                input_sink: None,
                 subprocess,
                 completion_tx,
                 term,
@@ -1441,6 +1443,10 @@ enum TerminalType {
 
 pub struct Terminal {
     terminal_type: TerminalType,
+    /// Optional sink for DisplayOnly terminals that still need to emit
+    /// input bytes (mouse reports, focus events) to a remote mux PTY.
+    /// When set, `write_to_pty` forwards bytes here instead of no-opping.
+    input_sink: Option<std::sync::Arc<dyn Fn(Vec<u8>) + Send + Sync>>,
     /// Set for non-PTY terminals (see [`HeadlessTerminal`]); owns the spawned
     /// subprocess and the task pumping its output into the grid.
     subprocess: Option<SubprocessHandle>,
@@ -2021,7 +2027,22 @@ impl Terminal {
                 }
             }
             pty_tx.notify(input);
+            return;
         }
+        // §16.6 DisplayOnly mux panes: mouse reports / focus events must
+        // still reach the server-owned PTY via the registered input sink.
+        if let Some(sink) = &self.input_sink {
+            sink(input.into_owned());
+        }
+    }
+
+    /// Register a sink that receives bytes `write_to_pty` would otherwise
+    /// drop on DisplayOnly terminals (mux mouse reporting path).
+    pub fn set_input_sink(
+        &mut self,
+        sink: Option<std::sync::Arc<dyn Fn(Vec<u8>) + Send + Sync>>,
+    ) {
+        self.input_sink = sink;
     }
 
     pub fn input(&mut self, input: impl Into<Cow<'static, [u8]>>) {

@@ -175,6 +175,7 @@ workspace = true
 
 [dependencies.mux]
 workspace = true
+features = ["ssh"]
 [dependencies.mux_protocol]
 workspace = true
 
