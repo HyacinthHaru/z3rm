@@ -292,6 +292,18 @@ impl PlatformWindow for TestWindow {
 
     fn on_appearance_changed(&self, _callback: Box<dyn FnMut()>) {}
 
+
+    fn a11y_init(&self, callbacks: crate::A11yCallbacks) {
+        // §15.11 Headless a11y capture: by default TestWindow leaves the
+        // a11y active flag untouched (the real adapter is absent). When a
+        // process opts in via `Z3RM_A11Y_BUILD_HEADLESS`, immediately fire
+        // the activation callback so `active_flag` flips and the per-frame
+        // tree construction runs. The returned `TreeUpdate` is dropped: the
+        // in-memory builder keeps its own copy for `debug_a11y_tree_json`.
+        if std::env::var("Z3RM_A11Y_BUILD_HEADLESS").is_ok() {
+            let _ = (callbacks.activation)();
+        }
+    }
     fn draw(&self, scene: &Scene) {
         let scale_factor = self.scale_factor();
         let mut state = self.0.lock();

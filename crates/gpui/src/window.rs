@@ -6420,4 +6420,36 @@ mod tests {
 
         assert_eq!(child_bounds.get().size, size(px(300.), px(200.)));
     }
+
+    /// A TestWindow that has not hosted a real AccessKit adapter leaves the
+    /// per-frame a11y builder inactive, so `debug_a11y_tree_json` returns
+    /// None. Setting `Z3RM_A11Y_BUILD_HEADLESS` makes `TestWindow::a11y_init`
+    /// flip the active flag and pump the in-memory builder so the tree can be
+    /// dumped headlessly (§15.11 / `DumpAccessibilityTree` action).
+    #[test]
+    fn headless_a11y_env_var_activates_debug_tree() {
+        // SAFETY: testenv isolation — this test is the only toucher of the
+        // env var on its thread, and TestAppContext owns its own state.
+        unsafe {
+            std::env::set_var("Z3RM_A11Y_BUILD_HEADLESS", "1");
+        }
+        let mut cx = TestAppContext::single();
+        let window = cx.add_window(|_, _| RootView {
+            explicit_size: false,
+            child_bounds: Rc::new(Cell::new(Bounds::default())),
+        });
+        let json = cx
+            .update_window(window.into(), |_, window, cx| {
+                window.draw(cx).clear();
+                window.debug_a11y_tree_json()
+            })
+            .unwrap();
+        unsafe {
+            std::env::remove_var("Z3RM_A11Y_BUILD_HEADLESS");
+        }
+        assert!(
+            json.is_some(),
+            "debug_a11y_tree_json must be Some under Z3RM_A11Y_BUILD_HEADLESS after a frame"
+        );
+    }
 }
