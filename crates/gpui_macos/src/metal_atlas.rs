@@ -243,7 +243,7 @@ impl MetalAtlasTexture {
         match self.metal_texture.pixel_format() {
             A8Unorm | R8Unorm => 1,
             RGBA8Unorm | BGRA8Unorm => 4,
-            _ => unimplemented!(),
+            _ => unreachable!("atlas texture created with unsupported pixel format"),
         }
     }
 

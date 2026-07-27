@@ -243,9 +243,47 @@ fn runnable_ranges_from_grouped_matches(
         shared_captures,
     } = group_runnable_matches(captures, runnable_config, offset_range);
 
-    // LSP context_provider 已删除，分组 runnable 不再解析 (spec §8.2 M2)
-    let _ = (buffer, pattern_index, language, groups, shared_captures);
-    SmallVec::new()
+    let tags = runnable_tags_from_pattern(&runnable_config.query, pattern_index);
+    let buffer_id = buffer.remote_id();
+    groups
+        .into_iter()
+        .filter_map(|group| {
+            let captures = shared_captures.iter().chain(group.captures.iter());
+            let run_range = captures
+                .clone()
+                .find(|capture| capture.is_run())
+                .map(|capture| capture.range())?;
+            let full_range = captures
+                .clone()
+                .fold(group.range.clone(), |mut range, capture| {
+                    let capture_range = capture.range();
+                    range.start = range.start.min(capture_range.start);
+                    range.end = range.end.max(capture_range.end);
+                    range
+                });
+            let extra_captures = captures
+                .filter_map(|capture| {
+                    capture.name().map(|name| {
+                        (
+                            name.to_string(),
+                            buffer.text_for_range(capture.range()).collect::<String>(),
+                        )
+                    })
+                })
+                .collect();
+            Some(RunnableRange {
+                buffer_id,
+                run_range,
+                full_range,
+                runnable: Runnable {
+                    tags: tags.clone(),
+                    language: language.clone(),
+                    buffer: buffer_id,
+                },
+                extra_captures,
+            })
+        })
+        .collect()
 }
 
 fn runnable_range_from_captures(
@@ -461,14 +499,21 @@ mod tests {
     }
 
     #[gpui::test]
-    fn test_grouped_match_without_resolver_emits_nothing(cx: &mut TestAppContext) {
-        // `@run_item` is present but no resolver is registered on the language.
+    fn test_grouped_match_emits_one_runnable_per_item(cx: &mut TestAppContext) {
         let runnables = collect_runnables(cx, GROUPED_SOURCE, GROUPED_QUERY);
-        assert!(
-            runnables.is_empty(),
-            "grouped path with no resolver should emit nothing, got {}",
-            runnables.len()
-        );
+        assert_eq!(runnables.len(), 3);
+
+        let run_texts: Vec<&str> = runnables
+            .iter()
+            .map(|runnable| &GROUPED_SOURCE[runnable.run_range.clone()])
+            .collect();
+        assert_eq!(run_texts, vec!["alpha", "beta", "gamma"]);
+
+        let outer_names: Vec<&str> = runnables
+            .iter()
+            .filter_map(|runnable| runnable.extra_captures.get("_outer").map(String::as_str))
+            .collect();
+        assert_eq!(outer_names, vec!["outer", "outer", "outer"]);
     }
 
 
