@@ -48,6 +48,10 @@ pub struct MuxDomain {
     inner: Arc<parking_lot::RwLock<DomainInner>>,
     /// §9 窗口 ID (多窗口支持，Plan 32)
     pub window_id: String,
+    /// §15.7 Last session successfully attached by this domain. Used by native
+    /// KillSession keybindings so the GUI targets the attached session rather
+    /// than an arbitrary `list_sessions().first()`.
+    last_attached_session_id: parking_lot::RwLock<Option<String>>,
 }
 /// §9 内部状态：请求 ID 计数器、待处理请求、订阅者列表、写通道。
 struct DomainInner {
@@ -247,10 +251,10 @@ impl MuxDomain {
             .map_err(|e| anyhow::anyhow!("failed to spawn mux I/O thread: {}", e))?;
 
         let window_id = format!("win-{}", std::process::id());
-
         Ok(MuxDomain {
             inner,
             window_id,
+            last_attached_session_id: parking_lot::RwLock::new(None),
         })
     }
 
@@ -279,6 +283,7 @@ impl MuxDomain {
         Ok(MuxDomain {
             inner,
             window_id,
+            last_attached_session_id: parking_lot::RwLock::new(None),
         })
     }
 
@@ -776,9 +781,17 @@ impl MuxDomain {
         });
         let resp = self.send_request(req).await?;
         match resp.body {
-            Some(ResponseBody::Attach(resp)) => Ok(resp),
+            Some(ResponseBody::Attach(resp)) => {
+                *self.last_attached_session_id.write() = Some(session.to_string());
+                Ok(resp)
+            }
             _ => Err(anyhow::anyhow!("unexpected response type for attach")),
         }
+    }
+
+    /// §15.7 Session this domain last attached to, if any.
+    pub fn last_attached_session_id(&self) -> Option<String> {
+        self.last_attached_session_id.read().clone()
     }
 
     /// §3.10 断开连接。

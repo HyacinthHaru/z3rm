@@ -593,6 +593,13 @@ impl MuxPaneView {
             .detach();
     }
 
+    /// §15.4 Seed zoom from an authoritative snapshot without re-issuing the
+    /// zoom_pane RPC (server already owns the flag in PaneInfo.zoomed).
+    pub fn set_zoomed_from_snapshot(&mut self, zoomed: bool, cx: &mut Context<Self>) {
+        self.zoomed = zoomed;
+        cx.notify();
+    }
+
     pub fn terminal(&self) -> &Entity<Terminal> {
         &self.terminal
     }

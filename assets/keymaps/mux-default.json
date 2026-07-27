@@ -22,6 +22,9 @@
 
       // Mux session
       "ctrl-shift-d": "mux::Detach",
+      // §15.7 native kill without extension host (avoid ctrl-shift-k: ResizeUp)
+      "ctrl-alt-k": "mux::KillSession",
+      "ctrl-alt-q": "mux::KillServer",
 
       // Pane zoom
       "ctrl-shift-z": "mux_pane::ZoomToggle",

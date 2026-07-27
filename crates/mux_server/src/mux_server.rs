@@ -247,11 +247,13 @@ pub fn run() -> Result<()> {
         let clipboard = std::sync::Arc::new(clipboard::ServerClipboard::new());
 
         // §3.5 / §16.11 keep_alive + scrollback from ServerSettings (env + server.json).
+        // keep_alive_seconds is read live from the AtomicU64 on each idle re-arm
+        // so hot-reload of server.json takes effect on the next idle cycle.
         let server_settings = crate::server_settings::ServerSettings::load();
         let keep_alive_seconds = server_settings.keep_alive_seconds();
 
         if keep_alive_seconds > 0 {
-            zlog::info!("keep_alive enabled: idle_timeout={}s", keep_alive_seconds);
+            zlog::info!("keep_alive enabled: idle_timeout={}s (hot-reloadable)", keep_alive_seconds);
         }
         let server = Server {
             sessions,
@@ -259,9 +261,6 @@ pub fn run() -> Result<()> {
             _persist_handle: Some(persist_handle),
             clipboard,
             start_time: SystemTime::now(),
-            // §3.5 keep_alive: idle timeout in seconds. 0 = disabled (keep alive forever).
-            // Read from Z3RM_KEEP_ALIVE_SECONDS env var.
-            keep_alive_seconds,
             server_settings: server_settings.clone(),
             // §3.5 active connection counter — drives the idle-shutdown timer.
             active_connections: std::sync::Arc::new(AtomicUsize::new(0)),
@@ -283,14 +282,12 @@ pub struct Server {
     clipboard: std::sync::Arc<clipboard::ServerClipboard>,
     // §16.12 启动时间 (用于 status 计算运行时长)
     start_time: SystemTime,
-    // §3.5 keep_alive: idle timeout in seconds (0 = disabled, keep alive forever)
-    keep_alive_seconds: u64,
     // §16.11 Shared server settings (env + server.json); hot-reloaded.
+    // keep_alive_seconds is read live via AtomicU64 — not snapshotted at boot.
     server_settings: std::sync::Arc<crate::server_settings::ServerSettings>,
     // §3.5 active connection counter — drives the idle-shutdown timer
     active_connections: std::sync::Arc<AtomicUsize>,
 }
-
 impl Server {
     async fn run(self, listener: LocalSocketListener) -> Result<()> {
         // §16.11 Hot-reload server.json → scrollback capacity on live panes.
@@ -319,9 +316,11 @@ impl Server {
 
         loop {
             // (Re-)arm the idle timer when the connection count transitions to zero.
+            // Read keep_alive live so a hot-reloaded server.json value applies.
+            let keep_alive_seconds = self.server_settings.keep_alive_seconds();
             let current = self.active_connections.load(Ordering::SeqCst);
-            if current == 0 && self.keep_alive_seconds > 0 && idle_deadline.is_none() {
-                idle_deadline = Some(tokio::time::Instant::now() + Duration::from_secs(self.keep_alive_seconds));
+            if current == 0 && keep_alive_seconds > 0 && idle_deadline.is_none() {
+                idle_deadline = Some(tokio::time::Instant::now() + Duration::from_secs(keep_alive_seconds));
             }
             // Cancel the timer when connections become non-zero.
             if current > 0 {
@@ -329,7 +328,6 @@ impl Server {
             }
 
             tokio::select! {
-                // New client connection arrives — cancel any pending idle timer.
                 accept_result = listener.accept() => {
                     let stream = match accept_result {
                         Ok(s) => s,
@@ -384,10 +382,11 @@ impl Server {
 
                 // Idle timer expired — graceful shutdown.
                 _ = idle_sleep(idle_deadline) => {
+                    let keep_alive_seconds = self.server_settings.keep_alive_seconds();
                     tracing::info!(
-                        idle_seconds = self.keep_alive_seconds,
+                        idle_seconds = keep_alive_seconds,
                         "daemon idle for {}s, shutting down",
-                        self.keep_alive_seconds
+                        keep_alive_seconds
                     );
                     return Ok(());
                 }

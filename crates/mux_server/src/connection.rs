@@ -111,16 +111,41 @@ pub async fn handle_connection(
     // 的 error 刷出后随之结束, 连接真正关闭; 否则残留 sender 会让写循环永远阻塞。
     drop(outbound_tx);
 
-    // §9 写循环: 消费 outbound channel, framed 写回客户端
+    // §9 写循环: 消费 outbound channel, framed 写回客户端.
+    // §3.5 After a Shutdown ack response is flushed, notify the accept loop so
+    // the process exits only once the client has the acknowledgment on the wire.
     let write_handle = tokio::spawn(async move {
         let mut writer = writer;
         while let Some(envelope) = outbound_rx.recv().await {
+            let is_shutdown_ack = match &envelope.payload {
+                Some(EnvelopePayload::Response(resp))
+                    if shutdown_state
+                        .requested
+                        .load(std::sync::atomic::Ordering::SeqCst)
+                        && resp.request_id
+                            == shutdown_state
+                                .ack_request_id
+                                .load(std::sync::atomic::Ordering::SeqCst) =>
+                {
+                    true
+                }
+                _ => false,
+            };
             if let Ok(framed) = mux_protocol::frame(&envelope) {
                 if writer.write_all(&framed).await.is_err() {
                     break;
                 }
                 if writer.flush().await.is_err() {
                     break;
+                }
+                if is_shutdown_ack {
+                    tracing::info!(
+                        request_id = shutdown_state
+                            .ack_request_id
+                            .load(std::sync::atomic::Ordering::SeqCst),
+                        "mux shutdown ack flushed to client"
+                    );
+                    shutdown_state.acked.notify_one();
                 }
             }
         }
@@ -261,6 +286,15 @@ async fn dispatch_request(
         RequestBody::SearchScrollback(r) => handle_search_scrollback(r, sessions).await?,
         RequestBody::Shutdown(_) => {
             if check_permission(role, ClientRole::Admin) {
+                // §3.5 Mark shutdown + queue the ack response. The writer loop
+                // flushes that response and only then notifies the accept loop,
+                // so the client receives the ack before the process exits.
+                shutdown_state
+                    .requested
+                    .store(true, std::sync::atomic::Ordering::SeqCst);
+                shutdown_state
+                    .ack_request_id
+                    .store(request_id, std::sync::atomic::Ordering::SeqCst);
                 send_response(
                     outbound_tx,
                     Response {
@@ -268,14 +302,7 @@ async fn dispatch_request(
                         body: Some(ResponseBody::Error(String::new())),
                     },
                 )?;
-                shutdown_state
-                    .requested
-                    .store(true, std::sync::atomic::Ordering::SeqCst);
-                shutdown_state
-                    .ack_request_id
-                    .store(request_id, std::sync::atomic::Ordering::SeqCst);
-                shutdown_state.acked.notify_one();
-                tracing::info!(request_id, "mux shutdown acknowledged");
+                tracing::info!(request_id, "mux shutdown response queued for flush-ack");
                 return Ok(());
             }
             ResponseBody::Error("permission denied: admin required".to_string())

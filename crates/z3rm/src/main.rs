@@ -543,6 +543,16 @@ fn main() {
                     let id = s.focused_pane_id.clone();
                     if id.is_empty() { None } else { Some(id) }
                 });
+            let snapshot_zoomed: std::collections::HashMap<String, bool> = attach_resp
+                .snapshot
+                .as_ref()
+                .map(|s| {
+                    s.tabs
+                        .iter()
+                        .flat_map(|t| t.panes.iter().map(|p| (p.id.clone(), p.zoomed)))
+                        .collect()
+                })
+                .unwrap_or_default();
             let snapshot_pane_ids: Vec<String> = match &snapshot_layout {
                 Some(layout) => layout.pane_ids(),
                 None => attach_resp
@@ -589,6 +599,7 @@ fn main() {
             let snapshot_layout_for_observer = snapshot_layout.clone();
             let snapshot_panes_for_observer = snapshot_pane_ids.clone();
             let snapshot_focused_for_observer = snapshot_focused_pane.clone();
+            let snapshot_zoomed_for_observer = snapshot_zoomed.clone();
             cx.update(|cx| {
                 cx.observe_new::<workspace::Workspace>(move |workspace, window, cx| {
                     let Some(window) = window else { return };
@@ -819,15 +830,30 @@ fn main() {
                             let Some(state) = workspace::AppState::try_global(cx) else { return };
                             let Some(domain) = state.mux_domain.clone() else { return };
                             cx.background_executor().spawn(async move {
-                                // Resolve the first session as the kill target.
-                                let session_id = match domain.list_sessions().await {
-                                    Ok(sessions) => sessions.first().map(|s| s.id.clone()),
-                                    Err(e) => { tracing::error!(error = %e, "KillSession: list_sessions failed"); None }
+                                // §15.7 Prefer the session this domain last attached to.
+                                // Fall back to list_sessions only if attach never recorded one.
+                                let session_id = domain
+                                    .last_attached_session_id()
+                                    .or_else(|| {
+                                        // Blocking list is not available here; spawn already async.
+                                        None
+                                    });
+                                let session_id = match session_id {
+                                    Some(id) => Some(id),
+                                    None => match domain.list_sessions().await {
+                                        Ok(sessions) => sessions.first().map(|s| s.id.clone()),
+                                        Err(e) => {
+                                            tracing::error!(error = %e, "KillSession: list_sessions failed");
+                                            None
+                                        }
+                                    },
                                 };
                                 if let Some(session_id) = session_id {
                                     if let Err(e) = domain.kill_session(&session_id).await {
                                         tracing::error!(error = %e, "mux::KillSession failed");
                                     }
+                                } else {
+                                    tracing::warn!("KillSession: no attached or listed session");
                                 }
                             }).detach();
                         })
@@ -874,6 +900,7 @@ fn main() {
                     let Some(domain) = state.mux_domain.clone() else { return };
                     let snapshot_layout_for_observer = snapshot_layout_for_observer.clone();
                     let snapshot_panes = snapshot_panes_for_observer.clone();
+                    let zoomed_map = snapshot_zoomed_for_observer.clone();
                     tracing::info!("observe_new Workspace: injecting {} MuxPaneViews", snapshot_panes.len());
 
                     // §15.12 Sync path: snapshot has panes → project the authoritative layout.
@@ -900,6 +927,26 @@ fn main() {
                                     window,
                                     cx,
                                 );
+
+                                // §15.4 seed zoom from PaneInfo without re-RPC.
+                                // Two-pass: collect then mutate to avoid borrow conflicts.
+                                let mut panes_to_zoom: Vec<Entity<workspace::Pane>> = Vec::new();
+                                for pane in workspace.panes() {
+                                    for item in pane.read(cx).items() {
+                                        if let Ok(view) = item
+                                            .to_any_view()
+                                            .downcast::<terminal_view::mux_pane::MuxPaneView>()
+                                        {
+                                            let pane_id = view.read(cx).pane_id.clone();
+                                            if zoomed_map.get(&pane_id) == Some(&true) {
+                                                panes_to_zoom.push(pane.clone());
+                                            }
+                                        }
+                                    }
+                                }
+                                for pane in panes_to_zoom {
+                                    workspace.set_pane_zoomed(pane, true, window, cx);
+                                }
                             }
                             None => {
                                 // No layout tree in snapshot: tabs in the default pane.
@@ -996,6 +1043,7 @@ fn main() {
             let snapshot_for_init = snapshot_pane_ids.clone();
             let layout_for_init = snapshot_layout.clone();
             let focused_for_init = snapshot_focused_pane.clone();
+            let zoomed_for_init = snapshot_zoomed.clone();
             let open_result = cx.update(|cx| {
                 workspace::Workspace::new_local(
                     vec![],
@@ -1027,6 +1075,26 @@ fn main() {
                                     window,
                                     cx,
                                 );
+
+                                // §15.4 seed zoom from PaneInfo without re-RPC.
+                                // Two-pass: collect then mutate to avoid borrow conflicts.
+                                let mut panes_to_zoom: Vec<Entity<workspace::Pane>> = Vec::new();
+                                for pane in workspace.panes() {
+                                    for item in pane.read(cx).items() {
+                                        if let Ok(view) = item
+                                            .to_any_view()
+                                            .downcast::<terminal_view::mux_pane::MuxPaneView>()
+                                        {
+                                            let pane_id = view.read(cx).pane_id.clone();
+                                            if zoomed_for_init.get(&pane_id) == Some(&true) {
+                                                panes_to_zoom.push(pane.clone());
+                                            }
+                                        }
+                                    }
+                                }
+                                for pane in panes_to_zoom {
+                                    workspace.set_pane_zoomed(pane, true, window, cx);
+                                }
                             }
                             None => {
                                 // No layout tree: single default pane with all views as tabs.
