@@ -61,6 +61,20 @@ impl Dec2026Parser {
         false
     }
 
+    /// §3.3 Wall-clock check for unpaired BSU without waiting for more PTY bytes.
+    /// Call from the PTY read loop on poll timeout so a quiet terminal after BSU
+    /// still force-flushes within ~100ms.
+    pub fn check_timeout(&mut self) -> bool {
+        if let Some(bsu_time) = self.bsu_time {
+            if Instant::now().duration_since(bsu_time) > Duration::from_millis(100) {
+                self.in_sync = false;
+                self.bsu_time = None;
+                return true;
+            }
+        }
+        false
+    }
+
     /// 获取当前同步状态
     pub fn is_in_sync(&self) -> bool {
         self.in_sync

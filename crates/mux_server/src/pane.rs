@@ -204,6 +204,8 @@ impl Pane {
         // §3.1 获取 reader / writer
         let reader = pair.master.try_clone_reader()?;
         let writer = pair.master.take_writer()?;
+        // §3.3 raw fd for poll-based BSU timeout (None on platforms without it).
+        let master_raw_fd = pair.master.as_raw_fd().map(|fd| fd as i32);
 
         // slave 端已经不需要了 (drop 让 child 持有)
         drop(pair.slave);
@@ -240,7 +242,7 @@ impl Pane {
 
         // §3.1 启动 PTY read loop — 后台线程持续读取 PTY 输出, 喂给 alacritty,
         // 计算 dirty diff, bump generation。线程持有弱引用, pane drop 时自动结束。
-        pane.clone().start_pty_read_loop(reader);
+        pane.clone().start_pty_read_loop(reader, master_raw_fd);
         Ok(pane)
     }
 
@@ -249,7 +251,11 @@ impl Pane {
     /// 该线程持续从 PTY 读取字节, 喂给 alacritty Term, 然后从 dirty_lines
     /// 提取变更行, 生成 GridDiff, push 到 ring 并 bump generation。
     /// Bump generation 后由 connection 层 fan-out PaneDirty 通知到所有 client。
-    fn start_pty_read_loop(self: Arc<Self>, mut reader: Box<dyn Read + Send>) {
+    fn start_pty_read_loop(
+        self: Arc<Self>,
+        mut reader: Box<dyn Read + Send>,
+        master_raw_fd: Option<i32>,
+    ) {
         let pane_weak = Arc::downgrade(&self);
 
         if let Err(error) = std::thread::Builder::new()
@@ -264,6 +270,23 @@ impl Pane {
                         return;
                     };
 
+                    // §3.3: while BSU is open, poll the master fd so a quiet PTY
+                    // still hits the 100ms force-flush without waiting for more bytes.
+                    let poll_ms: i32 = if dec.is_in_sync() { 25 } else { 250 };
+                    let readable = match master_raw_fd {
+                        Some(fd) => poll_fd_readable(fd, poll_ms),
+                        None => true,
+                    };
+
+                    if !readable {
+                        if dec.check_timeout() {
+                            pane.force_flush_after_bsu_timeout(&mut coalescer, &mut rl_state);
+                        } else {
+                            pane.flush_pending_notify(&mut rl_state, coalescer.delay());
+                        }
+                        continue;
+                    }
+
                     match reader.read(&mut buf) {
                         Ok(0) => {
                             pane.set_alive(false);
@@ -277,8 +300,16 @@ impl Pane {
                                 &mut coalescer,
                                 &mut rl_state,
                             );
+                            if dec.check_timeout() {
+                                pane.force_flush_after_bsu_timeout(&mut coalescer, &mut rl_state);
+                            }
                         }
                         Err(error) if error.kind() == std::io::ErrorKind::Interrupted => {}
+                        Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                            if dec.check_timeout() {
+                                pane.force_flush_after_bsu_timeout(&mut coalescer, &mut rl_state);
+                            }
+                        }
                         Err(error) => {
                             tracing::error!(pane_id = %pane.id, error = %error, "PTY read failed");
                             pane.set_alive(false);
@@ -414,6 +445,20 @@ impl Pane {
             state.last_notify = Some(now);
             state.pending_notify = false;
         }
+    }
+
+    /// §3.3 Unpaired-BSU wall-clock timeout: publish any deferred sync window
+    /// generation bump without waiting for further PTY bytes.
+    fn force_flush_after_bsu_timeout(
+        self: &Arc<Self>,
+        coalescer: &mut AdaptiveCoalescer,
+        state: &mut ReadLoopState,
+    ) {
+        if state.pending_sync {
+            self.emit_generation(Vec::new(), true, Duration::ZERO, state);
+            state.pending_sync = false;
+        }
+        self.flush_pending_notify(state, coalescer.delay());
     }
 
     /// §3.3 / §3.4 向所有订阅者推送 PaneDirty (at-most-once, 丢失无害)。
@@ -933,4 +978,24 @@ fn percent_decode(s: &str) -> String {
         i += 1;
     }
     String::from_utf8_lossy(&out).into_owned()
+}
+
+/// §3.3 poll(2) the PTY master fd so the read loop can wake for BSU timeout
+/// without consuming bytes. Returns true if readable/error (caller should read),
+/// false on timeout. On non-unix, always true (blocking read path).
+#[cfg(unix)]
+fn poll_fd_readable(fd: i32, timeout_ms: i32) -> bool {
+    let mut pfd = libc::pollfd {
+        fd,
+        events: libc::POLLIN,
+        revents: 0,
+    };
+    // SAFETY: single pollfd, valid fd from portable-pty master.
+    let rc = unsafe { libc::poll(&mut pfd, 1, timeout_ms) };
+    rc > 0
+}
+
+#[cfg(not(unix))]
+fn poll_fd_readable(_fd: i32, _timeout_ms: i32) -> bool {
+    true
 }
