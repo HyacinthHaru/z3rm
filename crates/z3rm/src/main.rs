@@ -74,7 +74,14 @@ impl settings::Settings for MuxSettings {
     }
 }
 
-struct ActiveMuxKeymapProfile(String);
+/// Tracks the currently-active mux keymap profile plus its bindings so a
+/// profile switch can emit `Unbind` entries for the prior keystrokes before
+/// binding the new profile. Without this, switching profiles left the old
+/// profile's bindings live alongside the new ones (§16.7).
+struct ActiveMuxKeymapProfile {
+    profile: String,
+    bindings: Vec<gpui::KeyBinding>,
+}
 
 impl Global for ActiveMuxKeymapProfile {}
 
@@ -96,7 +103,7 @@ fn bind_configured_mux_keymap_profile(cx: &mut App) {
         .clone();
     if cx
         .try_global::<ActiveMuxKeymapProfile>()
-        .is_some_and(|active| active.0 == profile)
+        .is_some_and(|active| active.profile == profile)
     {
         return;
     }
@@ -105,8 +112,45 @@ fn bind_configured_mux_keymap_profile(cx: &mut App) {
     // so a broken profile never leaves half-applied bindings.
     match settings::load_mux_keymap_profile(&profile, cx) {
         Ok(key_bindings) => {
+            // §16.7 Profile switching must not stack bindings. Before binding
+            // the new profile, emit `Unbind` entries at the previous profile's
+            // keystrokes (naming the previous action) so the keymap drops them.
+            if let Some(prev) = cx.try_global::<ActiveMuxKeymapProfile>() {
+                let unbinds: Vec<gpui::KeyBinding> = prev
+                    .bindings
+                    .iter()
+                    .filter_map(|binding| {
+                        // No-action and Unbind markers have no action name to clear.
+                        if gpui::is_unbind(binding.action()) || gpui::is_no_action(binding.action()) {
+                            return None;
+                        }
+                        let keystrokes: Vec<String> = binding
+                            .keystrokes()
+                            .iter()
+                            .map(|k| k.to_string())
+                            .collect();
+                        if keystrokes.is_empty() {
+                            return None;
+                        }
+                        let action_name = binding.action().name().to_string();
+                        Some(gpui::KeyBinding::new(
+                            &keystrokes.join(" "),
+                            gpui::Unbind(action_name.into()),
+                            None,
+                        ))
+                    })
+                    .collect();
+                if !unbinds.is_empty() {
+                    cx.bind_keys(unbinds);
+                }
+            }
+            // Clone before consuming — `cx.bind_keys` needs an owned iterator.
+            let stored = key_bindings.clone();
             cx.bind_keys(key_bindings);
-            cx.set_global(ActiveMuxKeymapProfile(profile));
+            cx.set_global(ActiveMuxKeymapProfile {
+                profile,
+                bindings: stored,
+            });
         }
         Err(error) => tracing::error!(profile, path, error = %error, "failed to load mux keymap profile"),
     }
@@ -1079,7 +1123,7 @@ fn main() {
 #[cfg(test)]
 mod tests {
     use gpui::App;
-    use settings::{KeymapFile, KeymapFileLoadResult};
+    use settings::{KeymapFile, KeymapFileLoadResult, Settings as _};
 
     #[gpui::test]
     fn mux_keymap_profiles_load(cx: &mut App) {
@@ -1105,8 +1149,55 @@ mod tests {
         super::bind_startup_keymaps(cx);
         assert_eq!(
             cx.try_global::<super::ActiveMuxKeymapProfile>()
-                .map(|profile| profile.0.as_str()),
+                .map(|profile| profile.profile.as_str()),
             Some("default")
+        );
+    }
+
+    /// §16.7 Switching the mux keymap profile must not leave the previous
+    /// profile's bindings active. After switching from `default` to `tmux`,
+    /// the `ctrl-shift-t` chord (bound by default, absent from tmux) must be
+    /// unbound. This guards against the regressions where `bind_keys` only
+    /// appended and `Unbind` entries were never emitted for the prior profile.
+    #[gpui::test]
+    fn mux_profile_switch_unbinds_previous_keystrokes(cx: &mut App) {
+        settings::init(cx);
+        super::bind_startup_keymaps(cx);
+
+        // Use bindings_for_input with a Terminal context so disabled
+        // (NoAction/Unbind) bindings are honored by the keymap's resolution
+        // pass — all_bindings_for_input bypasses that pass and would always
+        // surface the raw bindings.
+        let mut ctx_stack = gpui::KeyContext::new_with_defaults();
+        ctx_stack.set("Terminal", "Terminal");
+        let keystroke = gpui::Keystroke::parse("ctrl-shift-d").unwrap();
+        let (before, _) = cx
+            .key_bindings()
+            .borrow()
+            .bindings_for_input(&[keystroke.clone()], &[ctx_stack.clone()]);
+        assert!(
+            before.iter().any(|b| b.action().name() == "mux::Detach"),
+            "default profile should bind ctrl-shift-d to mux::Detach, got actions: {:?}",
+            before.iter().map(|b| b.action().name()).collect::<Vec<_>>()
+        );
+
+        // Switch profile to tmux (which does not bind ctrl-shift-d).
+        super::MuxSettings::override_global(
+            super::MuxSettings { keymap_profile: "tmux".to_string() },
+            cx,
+        );
+        // override_global does not notify SettingsStore on its own; drive the
+        // rebind function directly so the test exercises the unbind path.
+        super::bind_configured_mux_keymap_profile(cx);
+
+        let (after, _) = cx
+            .key_bindings()
+            .borrow()
+            .bindings_for_input(&[keystroke], &[ctx_stack]);
+        assert!(
+            !after.iter().any(|b| b.action().name() == "mux::Detach"),
+            "tmux profile must not retain default's mux::Detach binding, still bound to: {:?}",
+            after.iter().map(|b| b.action().name()).collect::<Vec<_>>()
         );
     }
 }
