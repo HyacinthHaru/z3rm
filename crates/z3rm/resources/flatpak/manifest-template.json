@@ -42,7 +42,8 @@
         "envsubst < flatpak/z3rm.metainfo.xml.in > z3rm.metainfo.xml && install -Dm644 zed.metainfo.xml /app/share/metainfo/$APP_ID.metainfo.xml",
         "sed -i -e '/@release_info@/{r flatpak/release-info/$CHANNEL' -e 'd}' /app/share/metainfo/$APP_ID.metainfo.xml",
         "install -Dm755 bin/z3rm /app/bin/z3rm",
-        "install -Dm755 libexec/zed-editor /app/libexec/zed-editor",
+        "install -Dm755 libexec/z3rm /app/libexec/z3rm",
+        "install -Dm755 libexec/z3rm-server /app/libexec/z3rm-server",
         "install -Dm755 lib/* -t /app/lib"
       ],
       "sources": [

@@ -141,29 +141,4 @@ mod tests {
         assert!(diff.contains("+ x"), "should mark added line");
     }
 
-    fn unified_diff(previous: &str, current: &str) -> String {
-        let prev_lines: Vec<&str> = previous.lines().collect();
-        let curr_lines: Vec<&str> = current.lines().collect();
-        let mut out = String::new();
-        out.push_str("--- previous\n+++ current\n");
-        let max = prev_lines.len().max(curr_lines.len());
-        for i in 0..max {
-            match (prev_lines.get(i), curr_lines.get(i)) {
-                (Some(prev), Some(curr)) if prev == curr => {
-                    out.push_str(&format!(" {}\n", prev));
-                }
-                (Some(prev), Some(curr)) if prev != curr => {
-                    out.push_str(&format!("-{}\n+{}\n", prev, curr));
-                }
-                (Some(prev), None) => {
-                    out.push_str(&format!("-{}\n", prev));
-                }
-                (None, Some(curr)) => {
-                    out.push_str(&format!("+{}\n", curr));
-                }
-                (None, None) => {}
-            }
-        }
-        out
-    }
 }

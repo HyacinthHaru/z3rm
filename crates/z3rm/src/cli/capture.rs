@@ -18,10 +18,7 @@ pub async fn capture_pane(
     scrollback_lines: Option<i32>,
     preserve_ansi: bool,
 ) -> Result<String> {
-    let mut output = String::new();
-
-    // 负值 -N：取 scrollback 尾部最新 N 行（不是最旧 N 行），
-    // 与 tmux `capture-pane -S -N -p` 语义一致 (仅 scrollback，不再追加当前视图)。
+    let mut scrollback_rows = Vec::new();
     if let Some(n) = scrollback_lines.filter(|n| *n < 0) {
         let count = n.unsigned_abs();
         let scrollback = domain
@@ -30,11 +27,11 @@ pub async fn capture_pane(
             .context("failed to fetch scrollback")?;
         let total = scrollback.lines.len();
         let start = total.saturating_sub(count as usize);
-        for row in &scrollback.lines[start..] {
-            output.push_str(&render_cells(&row.cells, preserve_ansi));
-            output.push('\n');
-        }
-        return Ok(output);
+        scrollback_rows.extend(
+            scrollback.lines[start..]
+                .iter()
+                .map(|row| row.cells.clone()),
+        );
     }
 
     let grid = domain
@@ -42,15 +39,37 @@ pub async fn capture_pane(
         .await
         .context("failed to fetch grid update")?;
 
-    if let Some(update) = &grid.update {
+    let scrollback_row_slices = scrollback_rows
+        .iter()
+        .map(Vec::as_slice)
+        .collect::<Vec<_>>();
+    Ok(render_capture(
+        &scrollback_row_slices,
+        grid.update.as_ref(),
+        preserve_ansi,
+    ))
+}
+
+fn render_capture(
+    scrollback_rows: &[&[Cell]],
+    grid_update: Option<&GridUpdateKind>,
+    preserve_ansi: bool,
+) -> String {
+    let mut output = String::new();
+    for row in scrollback_rows {
+        output.push_str(&render_cells(row, preserve_ansi));
+        output.push('\n');
+    }
+
+    if let Some(update) = grid_update {
         match update {
             GridUpdateKind::FullSnapshot(snapshot) => {
                 for row in 0..snapshot.rows {
                     let mut row_cells = Vec::with_capacity(snapshot.cols as usize);
                     for col in 0..snapshot.cols {
                         let idx = (row * snapshot.cols + col) as usize;
-                        if idx < snapshot.cells.len() {
-                            row_cells.push(snapshot.cells[idx].clone());
+                        if let Some(cell) = snapshot.cells.get(idx) {
+                            row_cells.push(cell.clone());
                         }
                     }
                     output.push_str(&render_cells(&row_cells, preserve_ansi));
@@ -66,7 +85,7 @@ pub async fn capture_pane(
         }
     }
 
-    Ok(output)
+    output
 }
 
 fn render_cells(cells: &[Cell], preserve_ansi: bool) -> String {
@@ -238,5 +257,19 @@ mod tests {
         let text = render_cells(&cells, true);
         assert_eq!(text.matches("\x1b[").count(), 2, "one open SGR + one reset: {text:?}");
         assert!(text.contains("ab"));
+    }
+    #[test]
+    fn capture_with_scrollback_appends_visible_grid() {
+        let scrollback = vec![cell("h", 0, false)];
+        let visible = vec![cell("v", 0, false)];
+        let update = GridUpdateKind::FullSnapshot(mux_protocol::proto::FullGridSnapshot {
+            cols: 1,
+            rows: 1,
+            cells: visible,
+            ..Default::default()
+        });
+
+        let text = render_capture(&[scrollback.as_slice()], Some(&update), false);
+        assert_eq!(text, "h\nv\n");
     }
 }

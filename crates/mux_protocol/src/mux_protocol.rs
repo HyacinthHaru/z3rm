@@ -39,6 +39,168 @@ pub fn unframe(buf: &[u8]) -> Result<(Envelope, usize), prost::DecodeError> {
 }
 
 // ============================================================================
+// §9 长度前缀帧的边界保护 (wire hardening)
+// ============================================================================
+//
+// 客户端 (mux) 与服务端 (mux_server) 的帧读取器都从线上读取 varint 长度前缀,
+// 再据此分配缓冲区。若前缀由攻击者控制 (例如声明 len = u64::MAX), 读取器在
+// 分配前若不做边界检查, 会被诱导申请近 2^63 字节内存。
+//
+// 以下常量与函数是两端共享的唯一真相来源:
+// - MAX_VARINT_LEN:    varint(u64) 最多 10 字节, 超过即为 overlong/截断。
+// - MAX_FRAME_PAYLOAD: 单帧 payload (varint 之后的 protobuf 字节) 上限,
+//                      大于该值在分配前即被拒绝。
+//                      64 MiB 远大于任何合理的 Envelope (含回滚/文件块/pane
+//                      输出), 但又足以挡住攻击者构造的巨型前缀。
+//
+// 读者必须: 先严格校验前缀, 再用校验后的长度作为分配上限; 任何 EOF mid-frame
+// 或畸形前缀返回错误, 不得退化为 "无数据" 的成功语义。
+
+/// varint(u64) 的最大编码长度 (字节)。超过即 overlong 畸形前缀。
+pub const MAX_VARINT_LEN: usize = 10;
+
+/// §9 单帧 payload 长度上限 (64 MiB)。读取器在分配或扩容前据此拒绝越界前缀。
+pub const MAX_FRAME_PAYLOAD: usize = 64 * 1024 * 1024;
+
+/// §9 长度前缀帧的解析错误: overlong 前缀、溢出、或超过 payload 上限。
+///
+/// 读取器必须把它向上传播为错误, 不得静默当作 "无数据" 的成功返回。
+#[derive(Debug)]
+pub struct FrameLengthError(pub FrameLengthErrorKind);
+
+/// §9 帧长度错误类别。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FrameLengthErrorKind {
+    /// varint 前缀字节数超过 `MAX_VARINT_LEN` 仍未终止 (overlong 攻击)。
+    OverlongPrefix,
+    /// varint 编码的长度超过 `usize` 位数 (32-bit 平台上的 u64::MAX 等)。
+    LengthOverflow,
+    /// varint 编码的长度超过 `MAX_FRAME_PAYLOAD`。
+    PayloadTooLarge { len: usize },
+}
+
+impl std::fmt::Display for FrameLengthError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self.0 {
+            FrameLengthErrorKind::OverlongPrefix => {
+                write!(f, "frame length varint exceeds {} bytes", MAX_VARINT_LEN)
+            }
+            FrameLengthErrorKind::LengthOverflow => {
+                write!(f, "frame length prefix overflows usize")
+            }
+            FrameLengthErrorKind::PayloadTooLarge { len } => {
+                write!(
+                    f,
+                    "frame length {} exceeds max payload {}",
+                    len,
+                    MAX_FRAME_PAYLOAD
+                )
+            }
+        }
+    }
+}
+
+impl std::error::Error for FrameLengthError {}
+
+impl From<FrameLengthError> for std::io::Error {
+    fn from(e: FrameLengthError) -> Self {
+        std::io::Error::new(std::io::ErrorKind::InvalidData, e)
+    }
+}
+
+/// §9 校验从线上读出的 varint 长度, 返回可用于分配的 `usize`。
+///
+/// 在分配或扩容缓冲区之前调用, 统一拒绝:
+/// - 超过 `usize` 位数 (溢出);
+/// - 超过 `MAX_FRAME_PAYLOAD` (越界 payload)。
+///
+/// ```ignore
+/// let len = mux_protocol::check_frame_len(raw_len)?;
+/// let mut buf = vec![0u8; len];
+/// ```
+pub fn check_frame_len(len: u64) -> Result<usize, FrameLengthError> {
+    let len_usize = usize::try_from(len)
+        .map_err(|_| FrameLengthError(FrameLengthErrorKind::LengthOverflow))?;
+    if len_usize > MAX_FRAME_PAYLOAD {
+        return Err(FrameLengthError(FrameLengthErrorKind::PayloadTooLarge { len: len_usize }));
+    }
+    Ok(len_usize)
+}
+
+/// §9 从已缓冲的字节解析 varint 长度前缀。
+///
+/// 返回:
+/// - `Ok(Some((len, header_len)))`  前缀完整且合法, 已消费 `header_len` 字节;
+/// - `Ok(None)`                     已缓冲字节不足以判定 (调用方应继续读取);
+/// - `Err(OverlongPrefix)`          varint 持续未终止, 字节数已达
+///                                  `MAX_VARINT_LEN` (overlong 攻击)。
+///
+/// 本函数只做前缀终止与 overlong 校验, **不**校验长度上限 — 调用方在分配前
+/// 仍须用 `check_frame_len` 做溢出 / payload 上限检查, 以便错误类别精确。
+pub fn parse_len_prefix(buf: &[u8]) -> Result<Option<(u64, usize)>, FrameLengthError> {
+    let mut value: u64 = 0;
+    let mut shift: u32 = 0;
+    for (i, &byte) in buf.iter().enumerate() {
+        // shift 增长先于终止判断: 第 i 个字节贡献 bits [7i, 7i+7)。
+        // 当已处理满 MAX_VARINT_LEN 个字节仍未遇到终止位, 视为 overlong。
+        // 注意 protobuf 中完整的 u64 varint 恰为 10 字节, 但第 10 字节 (shift=63)
+        // 只允许低 1 位有效; 这里宽松地接受 "已终止" 的第 10 字节, 仅拒绝
+        // 第 10 字节仍带 continuation 的情形 (即真正 overlong)。
+        if byte & 0x80 == 0 {
+            if i + 1 == MAX_VARINT_LEN && byte > 1 {
+                return Err(FrameLengthError(FrameLengthErrorKind::LengthOverflow));
+            }
+            value |= (byte as u64) << shift;
+            return Ok(Some((value, i + 1)));
+        }
+        value |= ((byte & 0x7F) as u64) << shift;
+        shift += 7;
+        // 下一个字节会让 shift 达到或超过 7*MAX_VARINT_LEN, 必然 overlong。
+        if i + 1 >= MAX_VARINT_LEN {
+            return Err(FrameLengthError(FrameLengthErrorKind::OverlongPrefix));
+        }
+    }
+    Ok(None)
+}
+
+#[cfg(test)]
+mod frame_length_tests {
+    use super::*;
+
+    #[test]
+    fn parse_len_prefix_waits_for_incomplete_prefix() {
+        assert!(parse_len_prefix(&[0x80]).expect("parse prefix").is_none());
+    }
+
+    #[test]
+    fn parse_len_prefix_rejects_overlong_prefix() {
+        let bytes = [0x80; MAX_VARINT_LEN];
+        let error = parse_len_prefix(&bytes).expect_err("overlong prefix must fail");
+        assert_eq!(error.0, FrameLengthErrorKind::OverlongPrefix);
+    }
+
+    #[test]
+    fn parse_len_prefix_rejects_u64_overflow_prefix() {
+        let mut bytes = [0xff; MAX_VARINT_LEN];
+        bytes[MAX_VARINT_LEN - 1] = 0x02;
+        let error = parse_len_prefix(&bytes).expect_err("overflow prefix must fail");
+        assert_eq!(error.0, FrameLengthErrorKind::LengthOverflow);
+    }
+
+    #[test]
+    fn check_frame_len_rejects_oversized_payload() {
+        let error = check_frame_len((MAX_FRAME_PAYLOAD as u64) + 1)
+            .expect_err("oversized payload must fail");
+        assert_eq!(
+            error.0,
+            FrameLengthErrorKind::PayloadTooLarge {
+                len: MAX_FRAME_PAYLOAD + 1,
+            }
+        );
+    }
+}
+
+// ============================================================================
 // §3.10 tmux 兼容按键名解析 (CLI 协议契约)
 // ============================================================================
 //

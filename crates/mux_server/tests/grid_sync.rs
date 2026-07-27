@@ -248,6 +248,43 @@ fn test_scrollback_buffer_capacity() {
     assert!(buf.is_full());
 }
 
+#[test]
+fn scrollback_fetch_lines_rejects_out_of_range_and_zero_count() {
+    let mut buf = ScrollbackBuffer::new(10);
+    for row in 0..3u32 {
+        buf.push_row(RowChange {
+            row,
+            cells: vec![Cell::default()],
+        });
+    }
+
+    assert!(buf.fetch_lines(3, 1, 0).is_empty());
+    assert!(buf.fetch_lines(u32::MAX, 1, 0).is_empty());
+    assert!(buf.fetch_lines(1, 0, 0).is_empty());
+    assert!(buf.fetch_lines(1, 0, 1).is_empty());
+}
+
+#[test]
+fn scrollback_fetch_lines_handles_extreme_counts_without_panic() {
+    let mut buf = ScrollbackBuffer::new(10);
+    for row in 0..3u32 {
+        buf.push_row(RowChange {
+            row,
+            cells: vec![Cell::default()],
+        });
+    }
+
+    let upward = buf.fetch_lines(2, u32::MAX, 0);
+    assert_eq!(upward.len(), 3);
+    assert_eq!(upward[0].row, 0);
+    assert_eq!(upward[2].row, 2);
+
+    let downward = buf.fetch_lines(0, u32::MAX, 1);
+    assert_eq!(downward.len(), 3);
+    assert_eq!(downward[0].row, 0);
+    assert_eq!(downward[2].row, 2);
+}
+
 /// §16.9 ScrollbackVersion bump
 #[test]
 fn test_scrollback_version_bump() {

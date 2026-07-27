@@ -18,7 +18,7 @@ use mux_protocol::{
     attach_request::AttachMode as AttachMode_,
     request::Body as RequestBody, response::Body as ResponseBody,
     split_node::SplitDirection, envelope::Payload as EnvelopePayload,
-    frame, Envelope, Notification, PROTOCOL_VERSION,
+    frame, check_frame_len, parse_len_prefix, Envelope, Notification, PROTOCOL_VERSION,
     Request, Response, SessionInfo, TerminalSize, FetchGridUpdateResponse,
     FetchScrollbackResponse, AttachResponse, ShellCommand, ShellIntegrationResponse,
     notification::Event as NotifEvent, SessionLayoutChanged,
@@ -398,42 +398,46 @@ impl MuxDomain {
     }
 
 
-    /// Generic frame reader for any Read+Write stream
+    /// Generic frame reader for any Read+Write stream.
     fn read_next_frame_generic<S: std::io::Read + std::io::Write>(
         stream: &mut S,
         buf: &mut Vec<u8>,
     ) -> std::io::Result<Option<Vec<u8>>> {
-        let (frame_len, header_len) = match Self::try_parse_frame_header(buf) {
-            Some(ok) => ok,
-            None => {
-                let mut read_buf = [0u8; 256];
-                match stream.read(&mut read_buf) {
-                    Ok(0) => return Ok(None),
-                    Ok(n) => buf.extend_from_slice(&read_buf[..n]),
-                    Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => return Ok(None),
-                    Err(e) => return Err(e),
+        let (frame_len, header_len) = loop {
+            if let Some((len, header_len)) = Self::try_parse_frame_header(buf)? {
+                break (len, header_len);
+            }
+
+            let mut read_buf = [0u8; 256];
+            match stream.read(&mut read_buf) {
+                Ok(0) if buf.is_empty() => return Ok(None),
+                Ok(0) => {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::UnexpectedEof,
+                        "connection closed while reading frame header",
+                    ));
                 }
-                match Self::try_parse_frame_header(buf) {
-                    Some(ok) => ok,
-                    None => return Ok(None),
-                }
+                Ok(n) => buf.extend_from_slice(&read_buf[..n]),
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => return Ok(None),
+                Err(error) => return Err(error),
             }
         };
-        let frame_len = frame_len as usize;
-        let header_len = header_len as usize;
-        let total_len = header_len + frame_len;
-        if buf.len() < total_len {
-            loop {
-                let mut read_buf = [0u8; 256];
-                match stream.read(&mut read_buf) {
-                    Ok(0) => return Ok(None),
-                    Ok(n) => buf.extend_from_slice(&read_buf[..n]),
-                    Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => return Ok(None),
-                    Err(e) => return Err(e),
+
+        let total_len = header_len.checked_add(frame_len).ok_or_else(|| {
+            std::io::Error::new(std::io::ErrorKind::InvalidData, "frame length overflow")
+        })?;
+        while buf.len() < total_len {
+            let mut read_buf = [0u8; 256];
+            match stream.read(&mut read_buf) {
+                Ok(0) => {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::UnexpectedEof,
+                        "connection closed while reading frame payload",
+                    ));
                 }
-                if buf.len() >= total_len {
-                    break;
-                }
+                Ok(n) => buf.extend_from_slice(&read_buf[..n]),
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => return Ok(None),
+                Err(error) => return Err(error),
             }
         }
 
@@ -442,20 +446,12 @@ impl MuxDomain {
     }
 
     /// §9 尝试从缓冲区解析帧头（varint 长度前缀）。
-    fn try_parse_frame_header(buf: &[u8]) -> Option<(u32, usize)> {
-        let mut result: u32 = 0;
-        let mut shift = 0;
-        for (i, &byte) in buf.iter().enumerate() {
-            result |= ((byte & 0x7F) as u32) << shift;
-            shift += 7;
-            if byte & 0x80 == 0 {
-                return Some((result, i + 1));
-            }
-            if shift >= 35 {
-                return None;
-            }
-        }
-        None
+    fn try_parse_frame_header(buf: &[u8]) -> std::io::Result<Option<(usize, usize)>> {
+        let Some((len, header_len)) = parse_len_prefix(buf)? else {
+            return Ok(None);
+        };
+        let len = check_frame_len(len)?;
+        Ok(Some((len, header_len)))
     }
 
 
@@ -986,6 +982,60 @@ impl MuxDomain {
 // ============================================================================
 // §9 MuxNotification: 公共通知类型别名
 // ============================================================================
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::io::Cursor;
+
+    #[test]
+    fn frame_reader_rejects_oversized_prefix_before_payload_read() {
+        let mut prefix = Vec::new();
+        let mut length = (mux_protocol::MAX_FRAME_PAYLOAD as u64) + 1;
+        while length >= 0x80 {
+            prefix.push((length as u8 & 0x7f) | 0x80);
+            length >>= 7;
+        }
+        prefix.push(length as u8);
+
+        let mut stream = Cursor::new(Vec::new());
+        let error = MuxDomain::read_next_frame_generic(&mut stream, &mut prefix)
+            .expect_err("oversized frame prefix must fail");
+        assert_eq!(error.kind(), std::io::ErrorKind::InvalidData);
+    }
+
+    #[test]
+    fn frame_reader_rejects_overlong_prefix() {
+        let mut buffer = vec![0x80; mux_protocol::MAX_VARINT_LEN];
+        let mut stream = Cursor::new(Vec::new());
+
+        let error = MuxDomain::read_next_frame_generic(&mut stream, &mut buffer)
+            .expect_err("overlong frame prefix must fail");
+        assert_eq!(error.kind(), std::io::ErrorKind::InvalidData);
+    }
+
+    #[test]
+    fn frame_reader_reports_eof_during_payload() {
+        let mut buffer = vec![3, b'a'];
+        let mut stream = Cursor::new(Vec::new());
+
+        let error = MuxDomain::read_next_frame_generic(&mut stream, &mut buffer)
+            .expect_err("mid-payload eof must fail");
+        assert_eq!(error.kind(), std::io::ErrorKind::UnexpectedEof);
+    }
+
+    #[test]
+    fn frame_reader_drains_complete_frame() {
+        let mut buffer = vec![2, b'a', b'b', 1, b'c'];
+        let mut stream = Cursor::new(Vec::new());
+
+        let frame = MuxDomain::read_next_frame_generic(&mut stream, &mut buffer)
+            .expect("read frame")
+            .expect("complete frame");
+        assert_eq!(frame, vec![2, b'a', b'b']);
+        assert_eq!(buffer, vec![1, b'c']);
+    }
+}
 
 /// §9 通知类型别名。
 pub type MuxNotification = Notification;

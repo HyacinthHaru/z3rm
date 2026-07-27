@@ -143,11 +143,46 @@ impl LayoutTree {
             }
         }
     }
+
+    /// §3.10 从布局树移除一个 pane。
+    ///
+    /// 不变量: 移除后布局树必须仍然持有至少一个 pane, 绝不留下空根
+    /// (`Pane { id:"", pane_id:"" }` 哨兵)。因此:
+    /// - 根节点为 `Pane` 且匹配 `pane_id` → 这是唯一的 pane, 移除会清空
+    ///   布局 → 返回 `Err` (不修改原树)。
+    /// - 找不到 `pane_id` → 返回 `Err` (不修改原树)。
+    /// - 其余情形正常移除并扁平化, 失败路径原树完整恢复。
     pub fn remove_pane(&mut self, pane_id: &str) -> anyhow::Result<()> {
-        let mut old_root = std::mem::replace(&mut self.root, LayoutNode::Pane { id: String::new(), pane_id: String::new() });
-        Self::remove_from_node(&mut old_root, pane_id)?;
-        self.root = old_root;
-        Ok(())
+        // 先拦截 sole-root: 根是叶子且正是要删的 pane。此时没有兄弟可塌缩,
+        // 删除会留下空布局树 → 拒绝。原树未被触碰, 不变量保持。
+        if let LayoutNode::Pane { pane_id: pid, .. } = &self.root {
+            if pid == pane_id {
+                anyhow::bail!("cannot remove sole root pane: layout would be empty");
+            }
+        }
+
+        // 取出原树; 失败路径 (`?` 提前返回) 不会写回 self.root, 但我们已经在
+        // 上层替换成了哨兵, 必须在错误路径恢复。用显式作用域 + 始终恢复。
+        let mut old_root = std::mem::replace(
+            &mut self.root,
+            LayoutNode::Pane { id: String::new(), pane_id: String::new() },
+        );
+        match Self::remove_from_node(&mut old_root, pane_id) {
+            Ok(true) => {
+                self.root = old_root;
+                Ok(())
+            }
+            Ok(false) => {
+                // 没有找到该 pane: 恢复原树, 返回错误而非虚假成功。
+                self.root = old_root;
+                anyhow::bail!("pane not found in layout: {}", pane_id);
+            }
+            Err(e) => {
+                // 移除过程出错: 恢复原树, 向上传递错误。
+                self.root = old_root;
+                Err(e)
+            }
+        }
     }
 
     fn remove_from_node(node: &mut LayoutNode, pane_id: &str) -> anyhow::Result<bool> {

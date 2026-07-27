@@ -6,7 +6,7 @@ use prost::Message;
 use mux_protocol::proto::fetch_grid_update_response::Update as FetchGridUpdateResponseUpdate;
 use mux_protocol::proto::response::Body as ResponseBody;
 use mux_protocol::proto::envelope::Payload as EnvelopePayload;
-use mux_protocol::proto::*;
+use mux_protocol::{check_frame_len, proto::*, FrameLengthError, FrameLengthErrorKind, MAX_VARINT_LEN};
 use sqlez::connection::Connection;
 use std::sync::Arc;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -34,6 +34,13 @@ pub fn check_permission(role: ClientRole, required: ClientRole) -> bool {
         (ClientRole::ReadWrite, ClientRole::ReadOnly) => true,
         (ClientRole::ReadOnly, ClientRole::ReadOnly) => true,
         _ => false,
+    }
+}
+
+pub fn effective_attach_role(role: ClientRole, mode: crate::session::AttachMode) -> ClientRole {
+    match mode {
+        crate::session::AttachMode::ReadOnly => ClientRole::ReadOnly,
+        crate::session::AttachMode::Shared | crate::session::AttachMode::Steal => role,
     }
 }
 
@@ -178,26 +185,28 @@ fn version_compatible(version: &Option<ProtocolVersion>) -> bool {
 async fn read_envelope(
     reader: &mut tokio::io::ReadHalf<LocalSocketStream>,
 ) -> anyhow::Result<Envelope> {
-    // 读取 varint 长度前缀 (§9)
     let mut len: u64 = 0;
     let mut shift: u32 = 0;
 
-    loop {
+    for byte_index in 0..MAX_VARINT_LEN {
         let byte = reader.read_u8().await?;
-        len |= ((byte & 0x7F) as u64) << shift;
         if byte & 0x80 == 0 {
-            break;
+            len |= (byte as u64) << shift;
+            let len = check_frame_len(len)?;
+            let mut data = vec![0u8; len];
+            reader.read_exact(&mut data).await?;
+            let envelope = Envelope::decode(&data[..])?;
+            return Ok(envelope);
         }
+        len |= ((byte & 0x7F) as u64) << shift;
         shift += 7;
+        if byte_index + 1 >= MAX_VARINT_LEN {
+            return Err(FrameLengthError(FrameLengthErrorKind::OverlongPrefix).into());
+        }
     }
 
-    // 读取 payload 数据
-    let mut data = vec![0u8; len as usize];
-    reader.read_exact(&mut data).await?;
+    Err(FrameLengthError(FrameLengthErrorKind::OverlongPrefix).into())
 
-    // 解码 Envelope (varint 前缀已读取, 用 decode 而非 decode_length_delimited)
-    let envelope = Envelope::decode(&data[..])?;
-    Ok(envelope)
 }
 
 /// §9 分发 Envelope 到请求/通知处理器
@@ -600,15 +609,15 @@ async fn handle_attach(
         }
     };
 
-    // §3.3 角色解析:identity 显式声明时以其为准;否则保留既有角色
-    // (本地 socket 默认 Admin,见 dispatch_request)。这避免本地连接
-    // 在 attach 后被静默降权,无法执行 create/kill session。
-    let role = if let Some(identity) = &req.identity {
+    // §3.3 角色解析: identity 显式声明时以其为准;否则保留既有角色
+    // (本地 socket 默认 Admin,见 dispatch_request)。ReadOnly attach mode
+    // 是会话级写保护, 必须降权整个连接, 否则 attach -r 后续 SendInput
+    // 仍会按 Admin/ReadWrite 通过。
+    let requested_role = if let Some(identity) = &req.identity {
         proto_role_to_client_role(identity.role)
     } else {
         client_role.lock().unwrap_or(ClientRole::Admin)
     };
-    *client_role.lock() = Some(role);
 
     let mode = match req.mode {
         0 => crate::session::AttachMode::Shared,
@@ -617,6 +626,8 @@ async fn handle_attach(
         3 => crate::session::AttachMode::ReadOnly,
         _ => crate::session::AttachMode::Shared,
     };
+    let role = effective_attach_role(requested_role, mode);
+    *client_role.lock() = Some(role);
     // Idempotent attach for this connection; Steal clears other clients'
     // §3.10 attached_clients AND §3.4 lifecycle_subscribers so the kicker
     // is the only remaining receiver of PaneAdded/PaneRemoved/SessionLayoutChanged.

@@ -87,7 +87,7 @@ script/generate-licenses
 rustup target add $target_triple
 
 echo "Compiling z3rm binaries"
-cargo build ${build_flag} --package z3rm --package cli --target $target_triple
+cargo build ${build_flag} --package z3rm --package cli --package mux_server --target $target_triple
 # Build remote_server in separate invocation to prevent feature unification from other crates
 # from influencing dynamic libraries required by it.
 cargo build ${build_flag} --package remote_server --target $target_triple
@@ -204,6 +204,7 @@ function sign_app_binaries() {
         /usr/bin/codesign --deep --force --timestamp --options runtime --sign "$IDENTITY" "${app_path}/Contents/MacOS/cli" -v
         /usr/bin/codesign --deep --force --timestamp --options runtime --sign "$IDENTITY" "${app_path}/Contents/MacOS/git" -v
         /usr/bin/codesign --deep --force --timestamp --options runtime --entitlements crates/z3rm/resources/z3rm.entitlements --sign "$IDENTITY" "${app_path}/Contents/MacOS/z3rm" -v
+        /usr/bin/codesign --deep --force --timestamp --options runtime --entitlements crates/z3rm/resources/z3rm.entitlements --sign "$IDENTITY" "${app_path}/Contents/MacOS/z3rm-server" -v
         /usr/bin/codesign --force --timestamp --options runtime --entitlements crates/z3rm/resources/z3rm.entitlements --sign "$IDENTITY" "${app_path}" -v
     else
         echo "One or more of the following variables are missing: MACOS_CERTIFICATE, MACOS_CERTIFICATE_PASSWORD, APPLE_NOTARIZATION_KEY, APPLE_NOTARIZATION_KEY_ID, APPLE_NOTARIZATION_ISSUER_ID"
@@ -334,6 +335,7 @@ upload_debug_symbols
 
 cp target/${target_triple}/${target_dir}/z3rm "${app_path}/Contents/MacOS/z3rm"
 cp target/${target_triple}/${target_dir}/cli "${app_path}/Contents/MacOS/cli"
+cp target/${target_triple}/${target_dir}/z3rm-server "${app_path}/Contents/MacOS/z3rm-server"
 sign_app_binaries
 
 sign_binary "target/$target_triple/release/remote_server"

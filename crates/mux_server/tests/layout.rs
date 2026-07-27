@@ -127,6 +127,32 @@ fn test_close_pane_invariants() {
     check_ratios(&tree.root);
 }
 
+#[test]
+fn remove_sole_root_pane_errors_and_preserves_tree() {
+    let mut tree = LayoutTree::with_pane("n1".into(), "p1".into());
+
+    let error = tree
+        .remove_pane("p1")
+        .expect_err("sole root pane removal must fail");
+    assert!(error.to_string().contains("sole root pane"));
+    assert_eq!(tree.pane_ids(), vec!["p1".to_string()]);
+    assert!(!tree.is_empty_root());
+}
+
+#[test]
+fn remove_missing_pane_errors_and_preserves_tree() {
+    let mut tree = LayoutTree::with_pane("n1".into(), "p1".into());
+    tree.split("p1", "p2".into(), SplitDirection::LeftRight).unwrap();
+    let before = tree.serialize(80, 24).unwrap();
+
+    let error = tree
+        .remove_pane("missing")
+        .expect_err("missing pane removal must fail");
+    assert!(error.to_string().contains("pane not found"));
+    assert_eq!(tree.serialize(80, 24).unwrap(), before);
+}
+
+
 /// §3.10 Resize pane 后不变量
 #[test]
 fn test_resize_pane_invariants() {

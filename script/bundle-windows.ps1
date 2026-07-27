@@ -101,10 +101,11 @@ function GenerateLicenses {
 
 function BuildZedAndItsFriends {
     Write-Output "Building Z3rm and its friends, for channel: $channel"
-    # Build z3rm.exe, cli.exe and auto_update_helper.exe
-    cargo build --release --package z3rm --package cli --package auto_update_helper --target $target
+    # Build z3rm.exe, cli.exe, z3rm-server.exe and auto_update_helper.exe
+    cargo build --release --package z3rm --package cli --package mux_server --package auto_update_helper --target $target
     Copy-Item -Path ".\$CargoOutDir\z3rm.exe" -Destination "$innoDir\z3rm.exe" -Force
     Copy-Item -Path ".\$CargoOutDir\cli.exe" -Destination "$innoDir\cli.exe" -Force
+    Copy-Item -Path ".\$CargoOutDir\z3rm-server.exe" -Destination "$innoDir\z3rm-server.exe" -Force
     Copy-Item -Path ".\$CargoOutDir\auto_update_helper.exe" -Destination "$innoDir\auto_update_helper.exe" -Force
     # Build explorer_command_injector.dll
     switch ($channel) {

@@ -110,6 +110,24 @@ fn test_proto_role_mapping() {
     assert!(matches!(proto_role_to_client_role(99), ClientRole::ReadWrite));
 }
 
+#[test]
+fn test_readonly_attach_mode_downgrades_effective_role() {
+    use mux_server::connection::effective_attach_role;
+
+    assert_eq!(
+        effective_attach_role(ClientRole::Admin, AttachMode::ReadOnly),
+        ClientRole::ReadOnly
+    );
+    assert_eq!(
+        effective_attach_role(ClientRole::ReadWrite, AttachMode::ReadOnly),
+        ClientRole::ReadOnly
+    );
+    assert_eq!(
+        effective_attach_role(ClientRole::Admin, AttachMode::Shared),
+        ClientRole::Admin
+    );
+}
+
 // ============================================================
 // §3.3 权限矩阵测试
 // ============================================================

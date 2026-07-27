@@ -209,34 +209,41 @@ impl ScrollbackBuffer {
     /// from_line: 起始行号 (0 = 最早的历史行)
     /// count: 要获取的行数
     /// direction: 0 = 向上 (from_line 往旧方向), 1 = 向下 (from_line 往新方向)
+    ///
+    /// 全路径 panic-free: 对任意 u32 输入都不会 panic, 不会整数溢出。
+    /// - 缓冲区为空 / `from_line >= total` / `count == 0` → 空 Vec。
+    /// - 向上: 返回 `[start, from_line]` 共 count 行 (不足时从 0 开始)。
+    /// - 向下: 返回 `[from_line, end)` 共 min(count, 余量) 行。
     pub fn fetch_lines(&self, from_line: u32, count: u32, direction: u32) -> Vec<RowChange> {
-        if self.rows.is_empty() {
+        let total = self.rows.len();
+        if total == 0 || count == 0 {
+            return Vec::new();
+        }
+        // from_line 越界: 向上/向下都没有可返回的行。
+        if from_line as usize >= total {
             return Vec::new();
         }
 
-        let total = self.rows.len();
         let from = from_line as usize;
         let count = count as usize;
 
         match direction {
             0 => {
-                // §16.9 向上: 从 from_line 往旧方向 (行号减小)
-                let start = if from + 1 >= count { from + 1 - count } else { 0 };
-                self.rows[start..=from]
-                    .iter()
-                    .cloned()
-                    .collect()
+                // §16.9 向上: 返回 from_line 及之前共 count 行 (行号减小)。
+                // start = from - (count - 1), 下限 0。count >= 1 (上面已排除 0),
+                // saturating_sub 保证不溢出、不 panic。
+                let start = from.saturating_sub(count - 1);
+                self.rows[start..=from].iter().cloned().collect()
             }
             _ => {
-                // §16.9 向下: 从 from_line 往新方向 (行号增大)
-                let end = std::cmp::min(from + count, total);
-                if from >= total {
-                    return Vec::new();
-                }
-                self.rows[from..end]
-                    .iter()
-                    .cloned()
-                    .collect()
+                // §16.9 向下: 返回 [from, end)。end = min(from + count, total)。
+                // checked_add 防止 from + count 溢出 (虽然当前上限下不会溢出,
+                // 但对任意 u32 输入保持鲁棒)。
+                let end = from
+                    .checked_add(count)
+                    .map(|x| std::cmp::min(x, total))
+                    .unwrap_or(total);
+                self.rows[from..end].iter().cloned().collect()
             }
         }
     }

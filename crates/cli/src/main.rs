@@ -80,6 +80,7 @@ mod mux_forward {
         "resize-pane",
         "new-window",
         "rename-window",
+        "extension",
         "help",
     ];
 
@@ -197,6 +198,7 @@ mod mux_forward {
                 "resize-pane",
                 "new-window",
                 "rename-window",
+                "extension",
                 "help",
             ] {
                 assert!(
