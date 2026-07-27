@@ -357,9 +357,14 @@ impl ShadowSnapshotEngine {
 
     /// Decline (undo) to a specific version. Crash-safe per §4.8.
     ///
-    /// 用真实 decline 协议把文件内容还原到目标版本：目标内容先入 BlobStore，
+    /// 真实 decline 协议把文件内容还原到目标版本：目标内容先入 BlobStore，
     /// WAL 意图 fsync 后才写回文件并 fsync，最后写 DeclineDone 完成标记。
     /// 全快照目标直接从 blob 取内容；delta-only 目标用 delta 链重建。
+    ///
+    /// §4.8 branch C'：还原后，目标内容在 tree 中以 trigger=Decline 的
+    /// full-snapshot VersionNode 成为新的 HEAD。这样后续 record_change 的
+    /// parent 链以还原后的内容为基线，而不是还原前的写入链——避免 decline
+    /// 被“幽灵地”覆盖回旧状态。
     pub fn decline(&self, path: &Path, target_version: VersionId) -> Result<()> {
         use crate::decline::DeclineProtocol;
         use crate::delta_chain::DeltaReplay;
@@ -387,21 +392,53 @@ impl ShadowSnapshotEngine {
             rope.to_string().into_bytes()
         };
 
+        let path_hash = node.path_hash;
+        let parent_id = self.tree.get_head(&path_hash);
         let seq_no = self.seq_no.fetch_add(1, Ordering::AcqRel) as SeqNo;
         let protocol = DeclineProtocol::new(&self.wal, seq_no);
-        protocol.execute(
+        let content_hash = protocol.execute(
             &self.blob_store,
-            node.path_hash,
+            path_hash,
             Some(target_version),
             &target_content,
             path,
         )?;
 
+        // §4.8 branch C'：WAL DeclineDone 已 fsync，可以把还原后的内容作为
+        // full-snapshot node 持久化推进 HEAD。content_hash 来自 execute 内
+        // blob_store.put，与还原到磁盘的字节一致。
+        let timestamp_ns = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0);
+        let decline_version_id = self.tree.advance_head(
+            path_hash,
+            seq_no,
+            timestamp_ns,
+            parent_id,
+            Some(content_hash),
+            None,
+            0u8,
+            SnapshotTrigger::Decline,
+        );
+        self.storage.write_node(
+            decline_version_id,
+            &path_hash,
+            seq_no,
+            parent_id,
+            Some(&content_hash),
+            None,
+            0u8,
+            SnapshotTrigger::Decline,
+            timestamp_ns,
+        )?;
+
         tracing::info!(
             version_id = target_version,
+            decline_version_id,
             path = ?path,
             seq_no,
-            "decline: version restored"
+            "decline: version restored and HEAD advanced"
         );
         Ok(())
     }
@@ -458,5 +495,91 @@ impl ShadowSnapshotEngine {
         }
         tracing::info!(completed, total = pending.len(), "decline recovery finished");
         Ok(completed)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tempfile::TempDir;
+
+    /// Assert that `decline()` writes the restored file content to disk AND
+    /// advances the version tree HEAD to a new `trigger=Decline` full-snapshot
+    /// node, so a subsequent `record_change` uses the declined content as
+    /// parent. This is the §4.8 branch C' contract that prior to this fix
+    /// was missing — decline ran the protocol but left HEAD on the prior chain.
+    #[test]
+    fn test_decline_advances_head() {
+        let dir = TempDir::new().unwrap();
+        let db = dir.path().join("engine.db");
+        let wal = dir.path().join("engine.wal");
+        let blobs = dir.path().join("blobs");
+        std::fs::create_dir_all(&blobs).unwrap();
+
+        let target_file = dir.path().join("declined.txt");
+        // record_change does not touch the disk; it snapshots whatever bytes are
+        // passed in. The disk is only mutated by decline's restore_file.
+        std::fs::write(&target_file, b"v0").unwrap();
+        let engine = ShadowSnapshotEngine::open(&db, &wal, &blobs).unwrap();
+        let _v0 = engine.record_change(&target_file, b"v0").unwrap();
+        let _v1 = engine.record_change(&target_file, b"v1").unwrap();
+
+        // v0 is the first (full-snapshot) version; list_versions is seq-sorted.
+        let versions = engine.list_versions(&target_file).unwrap();
+        assert_eq!(versions.len(), 2, "expected v0+v1 versions before decline");
+        let v0 = versions[0].0;
+
+        // Disk still holds the initial v0 bytes (record_change never writes).
+        assert_eq!(std::fs::read(&target_file).unwrap(), b"v0");
+
+        // Decline back to v0: restore_file writes v0 content back to disk,
+        // and the new contract advances HEAD to a Decline full snapshot.
+        engine.decline(&target_file, v0).unwrap();
+
+        // File content on disk is now the declined version (v0), written by the
+        // protocol's restore_file step.
+        assert_eq!(std::fs::read(&target_file).unwrap(), b"v0");
+
+        // HEAD must be the new Decline trigger node — list_versions is seq-sorted,
+        // so the last entry is HEAD by SeqNo.
+        let after = engine.list_versions(&target_file).unwrap();
+        let last = after.last().expect("at least one version after decline");
+        assert_eq!(
+            last.2,
+            SnapshotTrigger::Decline,
+            "decline should be the HEAD trigger"
+        );
+
+        // tree.get_head(path_hash) must point to the new decline node and that
+        // node must be a full snapshot (content_ref set, no delta_ref).
+        let path_hash = compute_path_hash(&target_file);
+        let head_id = engine
+            .tree
+            .get_head(&path_hash)
+            .expect("HEAD defined after decline");
+        let head_node = engine
+            .tree
+            .get_node(head_id)
+            .expect("decline head node present");
+        assert_eq!(head_node.trigger, SnapshotTrigger::Decline);
+        assert!(
+            head_node.full_content.is_some(),
+            "decline node must be a full snapshot"
+        );
+        assert!(head_node.delta.is_none(), "decline node has no delta");
+
+        // A subsequent record_change must use the decline node as parent, so the
+        // delta chain reconstructs v2 from the declined v0 baseline, not from v1.
+        let _v2 = engine.record_change(&target_file, b"v2").unwrap();
+        let after2 = engine.list_versions(&target_file).unwrap();
+        let head2 = after2.last().expect("at least one version after v2");
+        let head2_node = engine
+            .tree
+            .get_node(head2.0)
+            .expect("v2 node present");
+        let restored = engine
+            .read_node_content(&head2_node)
+            .expect("v2 content reconstructable");
+        assert_eq!(restored, b"v2");
     }
 }
