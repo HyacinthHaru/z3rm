@@ -1,21 +1,10 @@
-//! §16.6 OpenDiff command palette entry — open a file as DiffView.
-//!
-//! Baseline: compare current disk content against an empty previous version
-//! (full file shown as additions). When shadow_snapshot previous content is
-//! available for the path, callers can pass it as `previous`.
-//!
-//! §16.6 / StubSweep3 #5: Now creates a `DiffReview` item (from
-//! `crate::diff_review::DiffReview`) instead of the generic `DiffView`, so the
-//! side-by-side Accept/Decline UI is reachable. The previous-version content
-//! currently falls back to the on-disk file content (identical = no diff
-//! highlights). When the Decline/ListVersions RPC from shadow_snapshot lands,
-//! wire `DiffReview::load` with the real historical version from the shadow
-//! engine — the helper already accepts `previous_content` from the caller.
+//! §16.6 OpenDiff command palette entry for reviewing a file against its
+//! previous shadow-snapshot version.
 
-use crate::diff_review::DiffReview;
-use std::sync::Arc;
-use gpui::{App, AppContext as _, PathPromptOptions};
+use crate::diff_review::{DiffReview, RestoreTarget};
 use anyhow::Context as _;
+use gpui::{App, PathPromptOptions};
+use std::sync::Arc;
 use workspace::ItemHandle;
 
 /// Register the OpenDiff action: pick a file, open DiffReview in active workspace.
@@ -41,14 +30,17 @@ pub fn init(cx: &mut App) {
                 return;
             };
 
-            let (previous, target_version_id, domain, session_id) =
+            let (previous, restore_target) =
                 match crate::open_diff::fetch_previous_version(&path, cx).await {
-                    Ok(result) => result,
+                    Ok((previous, version_id, domain, session_id)) => (
+                        previous,
+                        Some(RestoreTarget::new(domain, session_id, version_id)),
+                    ),
                     Err(error) => {
                         tracing::warn!(
                             path = %path.display(),
                             error = %error,
-                            "OpenDiff: shadow version fetch failed; using on-disk content as fallback"
+                            "OpenDiff: shadow version unavailable; opening read-only preview"
                         );
                         let fallback = match smol::unblock({
                             let path = path.clone();
@@ -62,32 +54,11 @@ pub fn init(cx: &mut App) {
                                 return;
                             }
                         };
-                        let domain_result = cx.update(|cx| {
-                            workspace::AppState::try_global(cx)
-                                .and_then(|state| state.mux_domain.clone())
-                        });
-                        let domain = match domain_result {
-                            Some(domain) => domain,
-                            None => {
-                                tracing::error!("OpenDiff: mux domain unavailable for fallback");
-                                return;
-                            }
-                        };
-                        let session_id = domain
-                            .last_attached_session_id()
-                            .unwrap_or_default();
-                        (fallback, 0, domain, session_id)
+                        (fallback, None)
                     }
                 };
             let task = cx.update(|cx| {
-                DiffReview::load(
-                    path.clone(),
-                    previous.clone(),
-                    domain,
-                    session_id,
-                    target_version_id,
-                    cx,
-                )
+                DiffReview::load(path.clone(), previous.clone(), restore_target, cx)
             });
             let entity = match task.await {
                 Ok(e) => e,
@@ -96,7 +67,7 @@ pub fn init(cx: &mut App) {
                     return;
                 }
             };
-            let _ = cx.update(|cx| {
+            cx.update(|cx| {
                 for window_handle in cx.windows() {
                     let opened = window_handle.update(cx, |_root, window, cx| {
                         let Some(Some(multi)) = window.root::<workspace::MultiWorkspace>() else {
@@ -127,24 +98,18 @@ pub fn init(cx: &mut App) {
     });
 }
 
-
 async fn fetch_previous_version(
     path: &std::path::Path,
     cx: &mut gpui::AsyncApp,
 ) -> anyhow::Result<(String, u64, Arc<mux::MuxDomain>, String)> {
     let domain = cx
-        .update(|cx| {
-            workspace::AppState::try_global(cx)
-                .and_then(|state| state.mux_domain.clone())
-        })
+        .update(|cx| workspace::AppState::try_global(cx).and_then(|state| state.mux_domain.clone()))
         .with_context(|| "mux domain not available")?;
     let session_id = domain
         .last_attached_session_id()
         .context("no session attached")?;
     let path_str = path.to_string_lossy().into_owned();
-    let versions_response = domain
-        .list_file_versions(&session_id, &path_str)
-        .await?;
+    let versions_response = domain.list_file_versions(&session_id, &path_str).await?;
     let versions = versions_response.versions;
     if versions.len() < 2 {
         anyhow::bail!("need at least 2 versions to diff, found {}", versions.len());
@@ -196,5 +161,4 @@ mod tests {
         assert!(diff.contains("- b"), "should mark removed line");
         assert!(diff.contains("+ x"), "should mark added line");
     }
-
 }

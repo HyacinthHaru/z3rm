@@ -7,12 +7,12 @@
 //! - 专用 OS 线程隔离
 
 use std::cell::Cell;
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::thread;
 use std::time::{Duration, Instant};
 
-use anyhow::{anyhow, Context as _, Result};
+use anyhow::{Context as _, Result, anyhow};
 use parking_lot::Mutex;
 use rquickjs::{Context, Runtime};
 
@@ -120,7 +120,10 @@ impl IoTokenBucket {
 
     /// 默认配置: 100 tokens/s, 容量 200
     pub fn default_config() -> Self {
-        Self::new(IO_TOKEN_BUCKET_DEFAULT_RATE, IO_TOKEN_BUCKET_DEFAULT_CAPACITY)
+        Self::new(
+            IO_TOKEN_BUCKET_DEFAULT_RATE,
+            IO_TOKEN_BUCKET_DEFAULT_CAPACITY,
+        )
     }
 
     /// 尝试获取 `count` 个令牌。成功返回 `true`。
@@ -255,8 +258,8 @@ impl QuickJsRuntime {
                 let tracker_clone = tracker.clone();
                 runtime.set_interrupt_handler(Some(Box::new(move || tracker_clone.check())));
 
-                let ctx = Context::full(&runtime)
-                    .map_err(|e| anyhow!("子线程创建 Context 失败: {e}"))?;
+                let ctx =
+                    Context::full(&runtime).map_err(|e| anyhow!("子线程创建 Context 失败: {e}"))?;
 
                 // 执行用户函数
                 ctx.with(f)
@@ -369,8 +372,8 @@ impl ExtensionRunner {
         source: &str,
         _activate_fn: &str,
     ) -> Result<LiveExtension> {
-        let runtime =
-            QuickJsRuntime::new(self.memory_limit_mb, self.cpu_budget_ms).context("创建 Runtime 失败")?;
+        let runtime = QuickJsRuntime::new(self.memory_limit_mb, self.cpu_budget_ms)
+            .context("创建 Runtime 失败")?;
         let ctx = runtime.create_context()?;
 
         ctx.with(|ctx| {
@@ -450,23 +453,23 @@ impl ExtensionRunner {
         })?;
 
         let _ = extension_id; // logged by caller
-        Ok(LiveExtension { _runtime: runtime, ctx })
+        Ok(LiveExtension {
+            _runtime: runtime,
+            ctx,
+        })
     }
 
     /// 内部加载逻辑;返回 `(Result<()> 的错误结果, Optional<VDOM-JSON String>)`。
     /// 在主调用线程上执行 (调用方负责后续派发到后台执行器)。
-    fn do_load(
-        &self,
-        _extension_id: &str,
-        source: &str,
-    ) -> Result<Option<String>> {
-        let runtime =
-            QuickJsRuntime::new(self.memory_limit_mb, self.cpu_budget_ms).context("创建 Runtime 失败")?;
+    fn do_load(&self, _extension_id: &str, source: &str) -> Result<Option<String>> {
+        let runtime = QuickJsRuntime::new(self.memory_limit_mb, self.cpu_budget_ms)
+            .context("创建 Runtime 失败")?;
         let ctx = runtime.create_context()?;
 
         ctx.with(|ctx| {
             // §5.2: Strip ES module `export` keyword — QuickJS eval runs scripts, not modules.
-            let script_source = source.replace("export function", "function")
+            let script_source = source
+                .replace("export function", "function")
                 .replace("export const", "const")
                 .replace("export default", "const __default =");
 
@@ -619,7 +622,8 @@ impl LiveExtension {
     /// next [`render_now`](Self::render_now) pulls a fresh VDOM.
     pub fn invalidate_registered_views(&self) {
         let _ = self.ctx.with(|ctx| {
-            let _: rquickjs::Value = ctx.eval(r#"
+            let _: rquickjs::Value = ctx.eval(
+                r#"
                 if (globalThis.__chrome_views) {
                     var names = Object.keys(globalThis.__chrome_views);
                     for (var i = 0; i < names.length; i++) {
@@ -629,7 +633,8 @@ impl LiveExtension {
                         }
                     }
                 }
-            "#)?;
+            "#,
+            )?;
             Ok::<_, anyhow::Error>(())
         });
     }
@@ -684,14 +689,22 @@ impl LiveExtension {
                 r#"(function() {{
                     var name = {name_str};
                     var payload = {payload};
-                    var key = name;
-                    var handlers = (globalThis.__z3rm_event_handlers || {{}})[key] || [];
-                    for (var i = 0; i < handlers.length; i++) {{
-                        try {{ handlers[i](payload); }} catch (e) {{}}
+                    var keys = [name];
+                    if (name.indexOf('mux:') !== 0) keys.push('mux:' + name);
+                    var registry = globalThis.__z3rm_event_handlers || {{}};
+                    for (var keyIndex = 0; keyIndex < keys.length; keyIndex++) {{
+                        var handlers = registry[keys[keyIndex]] || [];
+                        for (var i = 0; i < handlers.length; i++) {{
+                            try {{ handlers[i](payload); }} catch (e) {{}}
+                        }}
                     }}
                 }})()"#,
                 name_str = serde_json::to_string(&key)?,
-                payload = if payload.is_empty() { "null".to_string() } else { payload },
+                payload = if payload.is_empty() {
+                    "null".to_string()
+                } else {
+                    payload
+                },
             );
             let _: rquickjs::Value = ctx.eval(snippet)?;
             Ok::<_, anyhow::Error>(())
@@ -807,7 +820,6 @@ mod tests {
         assert!(check.check(), "超预算应中断");
     }
 
-
     #[test]
     fn test_io_token_bucket() {
         let bucket = Arc::new(IoTokenBucket::new(100.0, 200.0));
@@ -891,10 +903,7 @@ mod tests {
         );
 
         // 无限循环应被中断（CPU fuel 耗尽或内存超限）
-        assert!(
-            result.result.is_err(),
-            "无限循环应被资源限制终止"
-        );
+        assert!(result.result.is_err(), "无限循环应被资源限制终止");
     }
 
     #[test]
@@ -974,10 +983,45 @@ mod tests {
             function deactivate() {}
         "#;
         let result = runner.load_extension("z3rm-status-bar-like", source, "activate");
-        assert!(result.result.is_ok(), "activate must succeed: {:?}", result.result);
+        assert!(
+            result.result.is_ok(),
+            "activate must succeed: {:?}",
+            result.result
+        );
         let vdom = result.vdom_json.expect("status-bar VDOM must be captured");
         assert!(vdom.contains("status-bar"), "vdom={vdom}");
         assert!(vdom.contains("demo"), "vdom={vdom}");
+        Ok(())
+    }
+
+    #[test]
+    fn live_mux_event_updates_registered_view() -> Result<()> {
+        let runner = ExtensionRunner::with_defaults();
+        let source = r#"
+            function activate(context) {
+                var state = { paneTitle: 'shell' };
+                context.mux.subscribe('pane:focus', function(pane) {
+                    state.paneTitle = pane.title || '';
+                });
+                context.registerChromeView('status-bar', {
+                    render: function() {
+                        return { type: 'span', children: [state.paneTitle] };
+                    }
+                });
+            }
+        "#;
+
+        let extension = runner.load_live("event-test", source, "activate")?;
+        let initial = extension
+            .render_now()?
+            .context("registered view did not render")?;
+        assert!(initial.contains("shell"), "initial vdom={initial}");
+
+        extension.emit_event("pane:focus", r#"{"title":"editor"}"#)?;
+        let updated = extension
+            .render_now()?
+            .context("registered view did not render after event")?;
+        assert!(updated.contains("editor"), "updated vdom={updated}");
         Ok(())
     }
 

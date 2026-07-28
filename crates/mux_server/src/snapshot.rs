@@ -20,12 +20,12 @@
 //   recorder via an std::sync::mpsc channel; the recorder reads the file and
 //   calls engine.record_change on its own thread.
 use std::path::{Path, PathBuf};
-use std::sync::{mpsc, Arc};
 use std::sync::Mutex;
+use std::sync::{Arc, mpsc};
 
 use anyhow::{Context, Result};
-use zlog;  // external crate, not crate::zlog
 use shadow_snapshot::{EventKind, FileEvent, Monitor, SnapshotTrigger, WatchHandle};
+use zlog; // external crate, not crate::zlog
 
 #[derive(Debug, Clone)]
 pub struct FileVersion {
@@ -40,6 +40,7 @@ enum ShadowCommand {
         reply: mpsc::Sender<Result<Vec<FileVersion>>>,
     },
     GetVersion {
+        path: PathBuf,
         version_id: u64,
         reply: mpsc::Sender<Result<Option<Vec<u8>>>>,
     },
@@ -78,16 +79,36 @@ struct WatchInner {
 }
 
 fn stop_inner(inner: &WatchInner) {
-    if let Some(handle) = inner.watch_handle.lock().expect("watch mutex poisoned").take() {
+    if let Some(handle) = inner
+        .watch_handle
+        .lock()
+        .expect("watch mutex poisoned")
+        .take()
+    {
         drop(handle);
     }
-    if let Some(sender) = inner.path_sender.lock().expect("sender mutex poisoned").take() {
+    if let Some(sender) = inner
+        .path_sender
+        .lock()
+        .expect("sender mutex poisoned")
+        .take()
+    {
         drop(sender);
     }
-    if let Some(sender) = inner.command_sender.lock().expect("command mutex poisoned").take() {
+    if let Some(sender) = inner
+        .command_sender
+        .lock()
+        .expect("command mutex poisoned")
+        .take()
+    {
         drop(sender);
     }
-    if let Some(join) = inner.recorder.lock().expect("recorder mutex poisoned").take() {
+    if let Some(join) = inner
+        .recorder
+        .lock()
+        .expect("recorder mutex poisoned")
+        .take()
+    {
         if join.join().is_err() {
             zlog::warn!("shadow snapshot recorder thread panicked during shutdown");
         }
@@ -105,23 +126,41 @@ impl SnapshotWatch {
     pub fn list_versions(&self, path: PathBuf) -> Result<Vec<FileVersion>> {
         let (reply, response) = mpsc::channel();
         self.send_command(ShadowCommand::ListVersions { path, reply })?;
-        response.recv().context("shadow recorder stopped before listing versions")?
+        response
+            .recv()
+            .context("shadow recorder stopped before listing versions")?
     }
 
-    pub fn get_version(&self, version_id: u64) -> Result<Option<Vec<u8>>> {
+    pub fn get_version(&self, path: PathBuf, version_id: u64) -> Result<Option<Vec<u8>>> {
         let (reply, response) = mpsc::channel();
-        self.send_command(ShadowCommand::GetVersion { version_id, reply })?;
-        response.recv().context("shadow recorder stopped before reading version")?
+        self.send_command(ShadowCommand::GetVersion {
+            path,
+            version_id,
+            reply,
+        })?;
+        response
+            .recv()
+            .context("shadow recorder stopped before reading version")?
     }
 
     pub fn decline(&self, path: PathBuf, version_id: u64) -> Result<()> {
         let (reply, response) = mpsc::channel();
-        self.send_command(ShadowCommand::Decline { path, version_id, reply })?;
-        response.recv().context("shadow recorder stopped before restoring version")?
+        self.send_command(ShadowCommand::Decline {
+            path,
+            version_id,
+            reply,
+        })?;
+        response
+            .recv()
+            .context("shadow recorder stopped before restoring version")?
     }
 
     fn send_command(&self, command: ShadowCommand) -> Result<()> {
-        let sender = self.inner.command_sender.lock().expect("command mutex poisoned");
+        let sender = self
+            .inner
+            .command_sender
+            .lock()
+            .expect("command mutex poisoned");
         sender
             .as_ref()
             .context("shadow recorder is stopped")?
@@ -198,48 +237,49 @@ pub fn start(session_id: &str, cwd: &str) -> Result<Option<Arc<SnapshotWatch>>> 
         .name(format!("shadow-snap-{}", session_id))
         .spawn(move || {
             let root = root_for_recorder;
-            let engine = match shadow_snapshot::ShadowSnapshotEngine::open(&db_path, &wal_path, &blob_dir)
-                // §4.9 age-based FIFO GC: cap shadow blob growth at 500MB so a
-                // long-running session cannot fill the disk. `with_quota` is
-                // optional; absent, growth stays bounded per-path by `D_MAX`
-                // but accumulates full base versions forever.
-                .map(|e| e.with_quota(shadow_snapshot::QuotaManager::new(500 * 1024 * 1024)))
-            {
-                Ok(engine) => {
-                    // §4.8: complete any Decline intents that crashed mid-restore.
-                    // Resolve path_hash by hashing every file under the session cwd
-                    // (no persistent reverse index yet; walk is bounded to one tree).
-                    let path_index = build_path_hash_index(&root);
-                    match engine.recover_incomplete_restores(|path_hash| {
-                        path_index.get(path_hash).cloned()
-                    }) {
-                        Ok(n) if n > 0 => {
-                            zlog::info!(
-                                "shadow decline recovery: session={} completed={}",
-                                recorder_session_id,
-                                n,
-                            );
+            let engine =
+                match shadow_snapshot::ShadowSnapshotEngine::open(&db_path, &wal_path, &blob_dir)
+                    // §4.9 age-based FIFO GC: cap shadow blob growth at 500MB so a
+                    // long-running session cannot fill the disk. `with_quota` is
+                    // optional; absent, growth stays bounded per-path by `D_MAX`
+                    // but accumulates full base versions forever.
+                    .map(|e| e.with_quota(shadow_snapshot::QuotaManager::new(500 * 1024 * 1024)))
+                {
+                    Ok(engine) => {
+                        // §4.8: complete any Decline intents that crashed mid-restore.
+                        // Resolve path_hash by hashing every file under the session cwd
+                        // (no persistent reverse index yet; walk is bounded to one tree).
+                        let path_index = build_path_hash_index(&root);
+                        match engine.recover_incomplete_restores(|path_hash| {
+                            path_index.get(path_hash).cloned()
+                        }) {
+                            Ok(n) if n > 0 => {
+                                zlog::info!(
+                                    "shadow decline recovery: session={} completed={}",
+                                    recorder_session_id,
+                                    n,
+                                );
+                            }
+                            Ok(_) => {}
+                            Err(error) => {
+                                zlog::warn!(
+                                    "shadow decline recovery failed: session={} error={}",
+                                    recorder_session_id,
+                                    error,
+                                );
+                            }
                         }
-                        Ok(_) => {}
-                        Err(error) => {
-                            zlog::warn!(
-                                "shadow decline recovery failed: session={} error={}",
-                                recorder_session_id,
-                                error,
-                            );
-                        }
+                        // Engine opened fine; tell the caller and enter the loop.
+                        // A send failure means the caller gave up — just exit.
+                        let _ = init_tx.send(Ok(()));
+                        engine
                     }
-                    // Engine opened fine; tell the caller and enter the loop.
-                    // A send failure means the caller gave up — just exit.
-                    let _ = init_tx.send(Ok(()));
-                    engine
-                }
-                Err(error) => {
-                    // Surface the open failure; the caller surfaces it as Err.
-                    let _ = init_tx.send(Err(error));
-                    return;
-                }
-            };
+                    Err(error) => {
+                        // Surface the open failure; the caller surfaces it as Err.
+                        let _ = init_tx.send(Err(error));
+                        return;
+                    }
+                };
 
             // §4.7 single-writer loop with 500ms path debounce. Events are
             // coalesced per-path so a chatty editor saving many times per
@@ -319,7 +359,10 @@ pub fn start(session_id: &str, cwd: &str) -> Result<Option<Arc<SnapshotWatch>>> 
             drop(path_tx);
             let _ = recorder.join();
             return Err(error).with_context(|| {
-                format!("shadow snapshot watch_directory: session={} cwd={}", session_id, cwd)
+                format!(
+                    "shadow snapshot watch_directory: session={} cwd={}",
+                    session_id, cwd
+                )
             });
         }
     };
@@ -334,7 +377,6 @@ pub fn start(session_id: &str, cwd: &str) -> Result<Option<Arc<SnapshotWatch>>> 
         }),
     })))
 }
-
 
 fn handle_command(engine: &shadow_snapshot::ShadowSnapshotEngine, command: ShadowCommand) {
     match command {
@@ -353,8 +395,15 @@ fn handle_command(engine: &shadow_snapshot::ShadowSnapshotEngine, command: Shado
                 zlog::warn!("shadow list-versions requester disconnected");
             }
         }
-        ShadowCommand::GetVersion { version_id, reply } => {
-            if reply.send(engine.query_version(version_id)).is_err() {
+        ShadowCommand::GetVersion {
+            path,
+            version_id,
+            reply,
+        } => {
+            if reply
+                .send(engine.query_version_for_path(&path, version_id))
+                .is_err()
+            {
                 zlog::warn!("shadow get-version requester disconnected");
             }
         }
@@ -374,7 +423,11 @@ fn handle_command(engine: &shadow_snapshot::ShadowSnapshotEngine, command: Shado
 /// Matches `shadow_snapshot::compute_path_hash` (blake3 of path.to_string_lossy).
 fn build_path_hash_index(root: &Path) -> std::collections::HashMap<[u8; 32], PathBuf> {
     let mut index = std::collections::HashMap::new();
-    for entry in walkdir::WalkDir::new(root).follow_links(false).into_iter().filter_map(|e| e.ok()) {
+    for entry in walkdir::WalkDir::new(root)
+        .follow_links(false)
+        .into_iter()
+        .filter_map(|e| e.ok())
+    {
         if !entry.file_type().is_file() {
             continue;
         }
@@ -443,10 +496,22 @@ mod tests {
 
     #[test]
     fn trigger_mapping_covers_all_kinds() {
-        assert_eq!(event_to_trigger(EventKind::Created, "s"), SnapshotTrigger::Write);
-        assert_eq!(event_to_trigger(EventKind::Modified, "s"), SnapshotTrigger::Write);
-        assert_eq!(event_to_trigger(EventKind::Renamed, "s"), SnapshotTrigger::Write);
-        assert_eq!(event_to_trigger(EventKind::Deleted, "s"), SnapshotTrigger::Delete);
+        assert_eq!(
+            event_to_trigger(EventKind::Created, "s"),
+            SnapshotTrigger::Write
+        );
+        assert_eq!(
+            event_to_trigger(EventKind::Modified, "s"),
+            SnapshotTrigger::Write
+        );
+        assert_eq!(
+            event_to_trigger(EventKind::Renamed, "s"),
+            SnapshotTrigger::Write
+        );
+        assert_eq!(
+            event_to_trigger(EventKind::Deleted, "s"),
+            SnapshotTrigger::Delete
+        );
     }
 
     /// §4.4 a delete event must reach `record_delete`, not `record_change`.
@@ -465,7 +530,11 @@ mod tests {
         let target_file = dir.path().join("victim.txt");
         let _ = engine.record_change(&target_file, b"alive").unwrap();
 
-        route_record_event(&engine, &target_file, shadow_snapshot::SnapshotTrigger::Delete);
+        route_record_event(
+            &engine,
+            &target_file,
+            shadow_snapshot::SnapshotTrigger::Delete,
+        );
 
         let versions = engine.list_versions(&target_file).unwrap();
         let last = versions.last().expect("a node after delete");

@@ -5,15 +5,15 @@
 //! querying versions, declining to prior versions, and listing history.
 
 use std::path::Path;
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use anyhow::Result;
 use blake3::Hasher as Blake3Hasher;
 use rope::Rope;
 
-use crate::delta_chain::{serialize_delta_ops, DeltaOp, DeltaReplay, D_MAX};
+use crate::delta_chain::{D_MAX, DeltaOp, DeltaReplay, serialize_delta_ops};
 use crate::storage::{BlobStore, StorageEngine};
 use crate::version_tree::{
     ContentHash, DeltaRef, PathHash, SeqNo, SnapshotTrigger, VersionId, VersionTree,
@@ -58,9 +58,7 @@ fn rope_to_bytes(rope: &Rope) -> Vec<u8> {
 /// for correctness — only that replay reconstructs the bytes.
 fn compute_delta_ops(old: &[u8], new: &[u8]) -> Vec<DeltaOp> {
     let max_prefix = old.len().min(new.len());
-    let prefix = (0..max_prefix)
-        .take_while(|&i| old[i] == new[i])
-        .count();
+    let prefix = (0..max_prefix).take_while(|&i| old[i] == new[i]).count();
     let remaining_old = old.len().saturating_sub(prefix);
     let remaining_new = new.len().saturating_sub(prefix);
     let max_suffix = remaining_old.min(remaining_new);
@@ -152,13 +150,12 @@ impl ShadowSnapshotEngine {
             let (full_content, delta_ref, depth) = match entry.content_ref {
                 Some(full_hash) => (Some(full_hash), None, 0u8),
                 None => {
-                    let delta_ref = entry
-                        .delta_ref
-                        .clone()
-                        .ok_or_else(|| anyhow::anyhow!(
+                    let delta_ref = entry.delta_ref.clone().ok_or_else(|| {
+                        anyhow::anyhow!(
                             "WAL replay: entry seq {} has neither full nor delta ref",
                             entry.seq_no
-                        ))?;
+                        )
+                    })?;
                     let depth = entry
                         .parent_id
                         .and_then(|pid| tree.get_node(pid))
@@ -441,6 +438,21 @@ impl ShadowSnapshotEngine {
         self.read_node_content(&node).map(Some)
     }
 
+    pub fn query_version_for_path(
+        &self,
+        path: &Path,
+        version_id: VersionId,
+    ) -> Result<Option<Vec<u8>>> {
+        let Some(node) = self.tree.get_node(version_id) else {
+            return Ok(None);
+        };
+        anyhow::ensure!(
+            compute_path_hash(path) == node.path_hash,
+            "version {version_id} does not belong to requested path"
+        );
+        self.read_node_content(&node).map(Some)
+    }
+
     /// Return the in-memory node for a version, if present. Useful for
     /// inspecting snapshot shape (full vs delta, depth) in tests and for
     /// callers that need the chain metadata without materializing bytes.
@@ -465,9 +477,15 @@ impl ShadowSnapshotEngine {
         use crate::decline::DeclineProtocol;
         use crate::delta_chain::DeltaReplay;
 
-        let node = self.tree.get_node(target_version).ok_or_else(|| {
-            anyhow::anyhow!("version {} not found", target_version)
-        })?;
+        let node = self
+            .tree
+            .get_node(target_version)
+            .ok_or_else(|| anyhow::anyhow!("version {} not found", target_version))?;
+        let requested_path_hash = compute_path_hash(path);
+        anyhow::ensure!(
+            requested_path_hash == node.path_hash,
+            "decline path does not match version {target_version}"
+        );
 
         // 取回目标版本的原始字节。full 快照直接读 blob；
         // delta-only 节点走 delta 链重建。
@@ -542,10 +560,7 @@ impl ShadowSnapshotEngine {
     }
 
     /// List all versions of a file.
-    pub fn list_versions(
-        &self,
-        path: &Path,
-    ) -> Result<Vec<(VersionId, SeqNo, SnapshotTrigger)>> {
+    pub fn list_versions(&self, path: &Path) -> Result<Vec<(VersionId, SeqNo, SnapshotTrigger)>> {
         let path_hash = compute_path_hash(path);
 
         let nodes = self.tree.iter_nodes();
@@ -583,15 +598,14 @@ impl ShadowSnapshotEngine {
                 );
                 continue;
             };
-            DeclineProtocol::finish_restore(
-                &self.wal,
-                &self.blob_store,
-                entry,
-                &target_path,
-            )?;
+            DeclineProtocol::finish_restore(&self.wal, &self.blob_store, entry, &target_path)?;
             completed += 1;
         }
-        tracing::info!(completed, total = pending.len(), "decline recovery finished");
+        tracing::info!(
+            completed,
+            total = pending.len(),
+            "decline recovery finished"
+        );
         Ok(completed)
     }
 }
@@ -671,14 +685,50 @@ mod tests {
         let _v2 = engine.record_change(&target_file, b"v2").unwrap();
         let after2 = engine.list_versions(&target_file).unwrap();
         let head2 = after2.last().expect("at least one version after v2");
-        let head2_node = engine
-            .tree
-            .get_node(head2.0)
-            .expect("v2 node present");
+        let head2_node = engine.tree.get_node(head2.0).expect("v2 node present");
         let restored = engine
             .read_node_content(&head2_node)
             .expect("v2 content reconstructable");
         assert_eq!(restored, b"v2");
+    }
+
+    #[test]
+    fn decline_rejects_version_from_another_path() {
+        let directory = TempDir::new().unwrap();
+        let database = directory.path().join("binding.db");
+        let wal = directory.path().join("binding.wal");
+        let blobs = directory.path().join("binding-blobs");
+        std::fs::create_dir_all(&blobs).unwrap();
+        let source = directory.path().join("source.txt");
+        let destination = directory.path().join("destination.txt");
+        std::fs::write(&source, b"source-current").unwrap();
+        std::fs::write(&destination, b"destination-current").unwrap();
+        let engine = ShadowSnapshotEngine::open(&database, &wal, &blobs).unwrap();
+        let source_version = engine.record_change(&source, b"source-history").unwrap();
+
+        let error = engine
+            .decline(&destination, source_version)
+            .expect_err("a version must only restore its recorded path");
+
+        assert!(error.to_string().contains("path"), "error={error:#}");
+        assert_eq!(std::fs::read(&destination).unwrap(), b"destination-current");
+    }
+
+    #[test]
+    fn query_version_rejects_another_path() {
+        let directory = TempDir::new().unwrap();
+        let database = directory.path().join("query-binding.db");
+        let wal = directory.path().join("query-binding.wal");
+        let blobs = directory.path().join("query-binding-blobs");
+        std::fs::create_dir_all(&blobs).unwrap();
+        let source = directory.path().join("source.txt");
+        let other = directory.path().join("other.txt");
+        let engine = ShadowSnapshotEngine::open(&database, &wal, &blobs).unwrap();
+        let version = engine.record_change(&source, b"secret").unwrap();
+
+        let result = engine.query_version_for_path(&other, version);
+
+        assert!(result.is_err());
     }
 
     /// §4.9 QuotaManager wiring: `with_quota` installs a quota,
@@ -710,17 +760,16 @@ mod tests {
             // Unique content forces new full snapshots (delta dedups identical
             // payloads); 128 writes crosses the 64-record throttle twice.
             let payload = format!("version {i} data");
-            engine.record_change(&target_file, payload.as_bytes()).unwrap();
+            engine
+                .record_change(&target_file, payload.as_bytes())
+                .unwrap();
         }
 
         // After 128 writes the throttled GC has run at least once. Assert the
         // engine is still usable: HEAD is reachable and reconstructs to the
         // latest written content, so GC never evicted the protected HEAD chain.
         let path_hash = compute_path_hash(&target_file);
-        let head_id = engine
-            .tree
-            .get_head(&path_hash)
-            .expect("HEAD after writes");
+        let head_id = engine.tree.get_head(&path_hash).expect("HEAD after writes");
         let head_node = engine
             .tree
             .get_node(head_id)
@@ -747,7 +796,9 @@ mod tests {
         let engine = ShadowSnapshotEngine::open(&db, &wal, &blobs).unwrap();
         let _v0 = engine.record_change(&target_file, b"present").unwrap();
 
-        engine.record_delete(&target_file).expect("record_delete succeeds");
+        engine
+            .record_delete(&target_file)
+            .expect("record_delete succeeds");
 
         let after = engine.list_versions(&target_file).unwrap();
         let last = after.last().expect("a node exists after deletion");

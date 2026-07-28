@@ -9,33 +9,32 @@
 use anyhow::Result;
 use std::collections::HashMap;
 use std::path::Path;
+use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
-use std::sync::Arc;
 
 // §9 从 mux_protocol 导入所有 protobuf 类型。
 use mux_protocol::{
-    attach_request::AttachMode as AttachMode_,
-    request::Body as RequestBody, response::Body as ResponseBody,
-    split_node::SplitDirection, envelope::Payload as EnvelopePayload,
-    frame, check_frame_len, parse_len_prefix, Envelope, Notification, PROTOCOL_VERSION,
-    Request, Response, SessionInfo, TerminalSize, FetchGridUpdateResponse,
-    FetchScrollbackResponse, AttachResponse, ShellCommand, ShellIntegrationResponse,
-    ListFileVersionsResponse, GetFileVersionResponse, DeclineFileVersionResponse,
-    notification::Event as NotifEvent, SessionLayoutChanged,
+    AttachResponse, DeclineFileVersionResponse, Envelope, FetchGridUpdateResponse,
+    FetchScrollbackResponse, GetFileVersionResponse, ListFileVersionsResponse, Notification,
+    PROTOCOL_VERSION, Request, Response, SessionInfo, SessionLayoutChanged, ShellCommand,
+    ShellIntegrationResponse, TerminalSize, attach_request::AttachMode as AttachMode_,
+    check_frame_len, envelope::Payload as EnvelopePayload, frame,
+    notification::Event as NotifEvent, parse_len_prefix, request::Body as RequestBody,
+    response::Body as ResponseBody, split_node::SplitDirection,
 };
 
 // §16.6 SSH 远程连接模块（Plan 19）。
 #[cfg(feature = "ssh")]
-mod ssh;
-#[cfg(feature = "ssh")]
 mod remote_install;
+#[cfg(feature = "ssh")]
+mod ssh;
 mod sync;
 
 #[cfg(feature = "ssh")]
-pub use ssh::{connect_ssh, SshConnectionOptions, SshSession};
+pub use remote_install::{auto_install_server, ensure_remote_server};
 #[cfg(feature = "ssh")]
-pub use remote_install::{ensure_remote_server, auto_install_server};
+pub use ssh::{SshConnectionOptions, SshSession, connect_ssh};
 pub use sync::sync_extensions_to_remote;
 
 // §9 公共类型导出
@@ -107,7 +106,9 @@ pub async fn connect_local(socket_path: Option<&Path>) -> Result<MuxDomain> {
                 };
                 #[cfg(windows)]
                 let result = {
-                    use interprocess::local_socket::{prelude::*, GenericNamespaced, Stream as LocalSocketStream};
+                    use interprocess::local_socket::{
+                        GenericNamespaced, Stream as LocalSocketStream, prelude::*,
+                    };
                     // Windows named pipe: \\.\pipe\z3rm-mux
                     let pipe_name = p.to_string_lossy().to_string();
                     let name = pipe_name
@@ -121,7 +122,9 @@ pub async fn connect_local(socket_path: Option<&Path>) -> Result<MuxDomain> {
                 let _ = tx.send(result);
             })
             .ok()?;
-        rx.recv().ok().map(|r: Result<MuxDomain>| r.and_then(|d| Ok(d)))
+        rx.recv()
+            .ok()
+            .map(|r: Result<MuxDomain>| r.and_then(|d| Ok(d)))
     };
     if let Some(result) = try_connect() {
         match result {
@@ -131,7 +134,9 @@ pub async fn connect_local(socket_path: Option<&Path>) -> Result<MuxDomain> {
                 #[cfg(unix)]
                 if msg.contains("111") || msg.contains("Connection refused") {
                     tracing::warn!(path = %path.display(), "stale socket (111), cleaning and retrying");
-                    if let Err(e) = std::fs::remove_file(&path) { tracing::warn!(error = %e, "remove_file failed"); }
+                    if let Err(e) = std::fs::remove_file(&path) {
+                        tracing::warn!(error = %e, "remove_file failed");
+                    }
                     if let Some(retry) = try_connect() {
                         return retry;
                     }
@@ -144,9 +149,11 @@ pub async fn connect_local(socket_path: Option<&Path>) -> Result<MuxDomain> {
             }
         }
     }
-    anyhow::bail!("connect_local: failed to spawn connection thread to {}", path.display())
+    anyhow::bail!(
+        "connect_local: failed to spawn connection thread to {}",
+        path.display()
+    )
 }
-
 
 /// §16.1 默认 socket 路径 (与 mux_server 对齐)。
 fn default_socket_path() -> std::path::PathBuf {
@@ -155,9 +162,10 @@ fn default_socket_path() -> std::path::PathBuf {
     }
     #[cfg(unix)]
     {
-        let runtime_dir =
-            std::env::var("XDG_RUNTIME_DIR").unwrap_or_else(|_| "/tmp".to_string());
-        std::path::PathBuf::from(runtime_dir).join("z3rm").join("mux.sock")
+        let runtime_dir = std::env::var("XDG_RUNTIME_DIR").unwrap_or_else(|_| "/tmp".to_string());
+        std::path::PathBuf::from(runtime_dir)
+            .join("z3rm")
+            .join("mux.sock")
     }
     #[cfg(not(unix))]
     {
@@ -173,9 +181,7 @@ impl<T: std::io::Read + std::io::Write> ReadWrite for T {}
 /// the new I/O thread can be bound to an existing `Arc<RwLock<DomainInner>>`
 /// rather than a freshly-created one. Mirrors the stale-socket retry that
 /// `connect_local` performs.
-fn connect_local_stream(
-    socket_path: Option<&Path>,
-) -> Result<Box<dyn ReadWrite + Send>> {
+fn connect_local_stream(socket_path: Option<&Path>) -> Result<Box<dyn ReadWrite + Send>> {
     let path = match socket_path {
         Some(p) => p.to_path_buf(),
         None => default_socket_path(),
@@ -185,8 +191,8 @@ fn connect_local_stream(
     fn open(path: &std::path::Path) -> Result<Box<dyn ReadWrite + Send>> {
         use std::os::unix::net::UnixStream;
         let connect = || -> Result<UnixStream> {
-            let stream = UnixStream::connect(path)
-                .map_err(|e| anyhow::anyhow!("connect failed: {}", e))?;
+            let stream =
+                UnixStream::connect(path).map_err(|e| anyhow::anyhow!("connect failed: {}", e))?;
             stream
                 .set_nonblocking(true)
                 .map_err(|e| anyhow::anyhow!("set_nonblocking failed: {}", e))?;
@@ -198,7 +204,9 @@ fn connect_local_stream(
                 let msg = format!("{}", e);
                 if msg.contains("111") || msg.contains("Connection refused") {
                     tracing::warn!(path = %path.display(), "stale socket (111), cleaning and retrying");
-                    if let Err(e) = std::fs::remove_file(path) { tracing::warn!(error = %e, "remove_file failed"); }
+                    if let Err(e) = std::fs::remove_file(path) {
+                        tracing::warn!(error = %e, "remove_file failed");
+                    }
                     let stream = connect()?;
                     Ok(Box::new(stream))
                 } else {
@@ -209,7 +217,9 @@ fn connect_local_stream(
     }
     #[cfg(not(unix))]
     fn open(path: &std::path::Path) -> Result<Box<dyn ReadWrite + Send>> {
-        use interprocess::local_socket::{prelude::*, GenericNamespaced, Stream as LocalSocketStream};
+        use interprocess::local_socket::{
+            GenericNamespaced, Stream as LocalSocketStream, prelude::*,
+        };
         let pipe_name = path.to_string_lossy().to_string();
         let name = pipe_name
             .to_ns_name::<GenericNamespaced>()
@@ -227,9 +237,7 @@ fn connect_local_stream(
 // ============================================================================
 
 impl MuxDomain {
-    pub fn connect_with_stream(
-        stream: interprocess::local_socket::Stream,
-    ) -> Result<Self> {
+    pub fn connect_with_stream(stream: interprocess::local_socket::Stream) -> Result<Self> {
         let (write_tx, write_rx) = std::sync::mpsc::channel();
 
         let subscribers: Arc<parking_lot::Mutex<Vec<async_channel::Sender<Notification>>>> =
@@ -402,7 +410,6 @@ impl MuxDomain {
         }
     }
 
-
     /// Generic frame reader for any Read+Write stream.
     fn read_next_frame_generic<S: std::io::Read + std::io::Write>(
         stream: &mut S,
@@ -415,11 +422,10 @@ impl MuxDomain {
 
             let mut read_buf = [0u8; 256];
             match stream.read(&mut read_buf) {
-                Ok(0) if buf.is_empty() => return Ok(None),
                 Ok(0) => {
                     return Err(std::io::Error::new(
                         std::io::ErrorKind::UnexpectedEof,
-                        "connection closed while reading frame header",
+                        "connection closed before frame header",
                     ));
                 }
                 Ok(n) => buf.extend_from_slice(&read_buf[..n]),
@@ -459,10 +465,12 @@ impl MuxDomain {
         Ok(Some((len, header_len)))
     }
 
-
     /// §9 分配新的 request_id（§16.6 公开供扩展安装使用）。
     pub fn next_request_id(&self) -> u64 {
-        self.inner.read().next_request_id.fetch_add(1, Ordering::SeqCst)
+        self.inner
+            .read()
+            .next_request_id
+            .fetch_add(1, Ordering::SeqCst)
     }
 
     /// §9 发送请求并等待响应（§16.6 公开供扩展安装使用）。
@@ -526,7 +534,9 @@ impl MuxDomain {
         let resp = self.send_request(req).await?;
         match resp.body {
             Some(ResponseBody::Sessions(list)) => Ok(list.sessions),
-            _ => Err(anyhow::anyhow!("unexpected response type for list_sessions")),
+            _ => Err(anyhow::anyhow!(
+                "unexpected response type for list_sessions"
+            )),
         }
     }
 
@@ -539,25 +549,31 @@ impl MuxDomain {
         let resp = self.send_request(req).await?;
         match resp.body {
             Some(ResponseBody::Session(info)) => Ok(info.id),
-            _ => Err(anyhow::anyhow!("unexpected response type for create_session")),
+            _ => Err(anyhow::anyhow!(
+                "unexpected response type for create_session"
+            )),
+        }
+    }
+
+    fn empty_or_error_response(response: Response) -> Result<()> {
+        match response.body {
+            Some(ResponseBody::Error(message)) if !message.is_empty() => {
+                Err(anyhow::anyhow!(message))
+            }
+            _ => Ok(()),
         }
     }
 
     /// §3.10 结束指定会话。
     pub async fn kill_session(&self, id: &str) -> Result<()> {
-        let req = RequestBody::KillSession(mux_protocol::KillSessionRequest {
-            id: id.to_string(),
-        });
-        let _resp = self.send_request(req).await?;
-        Ok(())
+        let req = RequestBody::KillSession(mux_protocol::KillSessionRequest { id: id.to_string() });
+        Self::empty_or_error_response(self.send_request(req).await?)
     }
 
     /// §3.5 Request an explicit mux_server process shutdown.
     pub async fn shutdown(&self) -> Result<()> {
-        self.send_request(RequestBody::Shutdown(
-            mux_protocol::ShutdownRequest {},
-        ))
-        .await?;
+        self.send_request(RequestBody::Shutdown(mux_protocol::ShutdownRequest {}))
+            .await?;
         Ok(())
     }
 
@@ -567,8 +583,7 @@ impl MuxDomain {
             id: id.to_string(),
             name: name.to_string(),
         });
-        let _resp = self.send_request(req).await?;
-        Ok(())
+        Self::empty_or_error_response(self.send_request(req).await?)
     }
 
     // ========================================================================
@@ -598,7 +613,9 @@ impl MuxDomain {
         let resp = self.send_request(req).await?;
         match resp.body {
             Some(ResponseBody::NewWindow(r)) => Ok(r.window_id),
-            _ => Err(anyhow::anyhow!("unexpected response type for create_window")),
+            _ => Err(anyhow::anyhow!(
+                "unexpected response type for create_window"
+            )),
         }
     }
     // ========================================================================
@@ -654,17 +671,11 @@ impl MuxDomain {
     }
 
     /// §3.10 关闭 Pane。
-        pub async fn close_pane(&self, pane: &str) -> Result<()> {
+    pub async fn close_pane(&self, pane: &str) -> Result<()> {
         let req = RequestBody::ClosePane(mux_protocol::ClosePaneRequest {
             pane_id: pane.to_string(),
         });
-        let resp = self.send_request(req).await?;
-        match resp.body {
-            Some(ResponseBody::Error(msg)) if !msg.is_empty() => {
-                Err(anyhow::anyhow!(msg))
-            }
-            _ => Ok(()),
-        }
+        Self::empty_or_error_response(self.send_request(req).await?)
     }
 
     /// §3.10 聚焦 Pane。
@@ -672,8 +683,7 @@ impl MuxDomain {
         let req = RequestBody::FocusPane(mux_protocol::FocusPaneRequest {
             pane_id: pane.to_string(),
         });
-        let _resp = self.send_request(req).await?;
-        Ok(())
+        Self::empty_or_error_response(self.send_request(req).await?)
     }
 
     /// §3.10 调整 Pane 尺寸。
@@ -683,8 +693,7 @@ impl MuxDomain {
             cols,
             rows,
         });
-        let _resp = self.send_request(req).await?;
-        Ok(())
+        Self::empty_or_error_response(self.send_request(req).await?)
     }
 
     /// §3.10 设置 Pane 标题。
@@ -693,8 +702,7 @@ impl MuxDomain {
             pane_id: pane.to_string(),
             title: title.to_string(),
         });
-        let _resp = self.send_request(req).await?;
-        Ok(())
+        Self::empty_or_error_response(self.send_request(req).await?)
     }
 
     // ========================================================================
@@ -709,9 +717,7 @@ impl MuxDomain {
         });
         let resp = self.send_request(req).await?;
         match resp.body {
-            Some(ResponseBody::Error(msg)) if !msg.is_empty() => {
-                Err(anyhow::anyhow!(msg))
-            }
+            Some(ResponseBody::Error(msg)) if !msg.is_empty() => Err(anyhow::anyhow!(msg)),
             _ => Ok(()),
         }
     }
@@ -722,8 +728,7 @@ impl MuxDomain {
             pane_id: pane.to_string(),
             text: text.to_string(),
         });
-        let _resp = self.send_request(req).await?;
-        Ok(())
+        Self::empty_or_error_response(self.send_request(req).await?)
     }
 
     // ========================================================================
@@ -743,7 +748,9 @@ impl MuxDomain {
         let resp = self.send_request(req).await?;
         match resp.body {
             Some(ResponseBody::GridUpdate(update)) => Ok(update),
-            _ => Err(anyhow::anyhow!("unexpected response type for fetch_grid_update")),
+            _ => Err(anyhow::anyhow!(
+                "unexpected response type for fetch_grid_update"
+            )),
         }
     }
 
@@ -764,7 +771,9 @@ impl MuxDomain {
         let resp = self.send_request(req).await?;
         match resp.body {
             Some(ResponseBody::Scrollback(scrollback)) => Ok(scrollback),
-            _ => Err(anyhow::anyhow!("unexpected response type for fetch_scrollback")),
+            _ => Err(anyhow::anyhow!(
+                "unexpected response type for fetch_scrollback"
+            )),
         }
     }
 
@@ -824,7 +833,9 @@ impl MuxDomain {
         let resp = self.send_request(req).await?;
         match resp.body {
             Some(ResponseBody::ShellIntegration(si)) => Ok(si),
-            _ => Err(anyhow::anyhow!("unexpected response type for get_shell_integration")),
+            _ => Err(anyhow::anyhow!(
+                "unexpected response type for get_shell_integration"
+            )),
         }
     }
 
@@ -855,7 +866,9 @@ impl MuxDomain {
         let resp = self.send_request(req).await?;
         match resp.body {
             Some(ResponseBody::FileVersions(versions)) => Ok(versions),
-            _ => Err(anyhow::anyhow!("unexpected response type for list_file_versions")),
+            _ => Err(anyhow::anyhow!(
+                "unexpected response type for list_file_versions"
+            )),
         }
     }
 
@@ -874,7 +887,9 @@ impl MuxDomain {
         let resp = self.send_request(req).await?;
         match resp.body {
             Some(ResponseBody::FileVersionContent(content)) => Ok(content),
-            _ => Err(anyhow::anyhow!("unexpected response type for get_file_version")),
+            _ => Err(anyhow::anyhow!(
+                "unexpected response type for get_file_version"
+            )),
         }
     }
 
@@ -893,7 +908,9 @@ impl MuxDomain {
         let resp = self.send_request(req).await?;
         match resp.body {
             Some(ResponseBody::DeclineFileVersion(resp)) => Ok(resp),
-            _ => Err(anyhow::anyhow!("unexpected response type for decline_file_version")),
+            _ => Err(anyhow::anyhow!(
+                "unexpected response type for decline_file_version"
+            )),
         }
     }
 
@@ -992,16 +1009,14 @@ impl MuxDomain {
         if let Some(snapshot) = attach_resp.snapshot.as_ref() {
             if let Some(layout) = snapshot.layout.as_ref() {
                 self.broadcast_notification(Notification {
-                    event: Some(NotifEvent::SessionLayoutChanged(
-                        SessionLayoutChanged {
-                            layout: Some(layout.clone()),
-                        },
-                    )),
+                    event: Some(NotifEvent::SessionLayoutChanged(SessionLayoutChanged {
+                        layout: Some(layout.clone()),
+                    })),
                 });
             }
         }
         Ok(())
-     }
+    }
 
     /// Open a fresh local socket and spawn a new I/O thread bound to the
     /// existing `self.inner` `Arc<RwLock<DomainInner>>`. Returns the write
@@ -1076,6 +1091,16 @@ mod tests {
         let error = MuxDomain::read_next_frame_generic(&mut stream, &mut buffer)
             .expect_err("overlong frame prefix must fail");
         assert_eq!(error.kind(), std::io::ErrorKind::InvalidData);
+    }
+
+    #[test]
+    fn frame_reader_reports_eof_before_header() {
+        let mut buffer = Vec::new();
+        let mut stream = Cursor::new(Vec::new());
+
+        let error = MuxDomain::read_next_frame_generic(&mut stream, &mut buffer)
+            .expect_err("peer eof before a frame must fail");
+        assert_eq!(error.kind(), std::io::ErrorKind::UnexpectedEof);
     }
 
     #[test]

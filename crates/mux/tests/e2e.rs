@@ -121,11 +121,7 @@ async fn wait_for_grid_contains(
             }
         }
         if Instant::now() >= deadline {
-            let last = resp
-                .update
-                .as_ref()
-                .map(grid_text)
-                .unwrap_or_default();
+            let last = resp.update.as_ref().map(grid_text).unwrap_or_default();
             anyhow::bail!(
                 "timeout waiting for {:?} in pane {} grid. Last grid:\n{}",
                 needle,
@@ -301,7 +297,13 @@ async fn e2e_detach_reattach_preserves_state() -> Result<()> {
         .await?;
 
     client_a.send_input(&pane_id, b"persisted-marker\n").await?;
-    wait_for_grid_contains(&client_a, &pane_id, "persisted-marker", Duration::from_secs(5)).await?;
+    wait_for_grid_contains(
+        &client_a,
+        &pane_id,
+        "persisted-marker",
+        Duration::from_secs(5),
+    )
+    .await?;
 
     // 阶段 2:detach (client_a drop 模拟窗口关闭)
     client_a.detach().await?;
@@ -329,17 +331,18 @@ async fn e2e_detach_reattach_preserves_state() -> Result<()> {
         .find(|t| t.id == tab_id)
         .context("reattach snapshot missing original tab")?;
     assert!(
-        tab_b
-            .panes
-            .iter()
-            .any(|p| p.id == pane_id && p.is_alive),
+        tab_b.panes.iter().any(|p| p.id == pane_id && p.is_alive),
         "reattach snapshot must list original pane as alive"
     );
 
     // 阶段 4:fetch grid 应该仍然包含 "persisted-marker"
-    let grid =
-        wait_for_grid_contains(&client_b, &pane_id, "persisted-marker", Duration::from_secs(5))
-            .await?;
+    let grid = wait_for_grid_contains(
+        &client_b,
+        &pane_id,
+        "persisted-marker",
+        Duration::from_secs(5),
+    )
+    .await?;
     assert!(
         grid.contains("persisted-marker"),
         "reattached grid should contain persisted content, got:\n{}",
@@ -486,9 +489,7 @@ async fn e2e_split_pane_visible_in_attach_snapshot() -> Result<()> {
         )
         .await?;
 
-    let pane2 = domain
-        .split_pane(&pane1, SplitDirection::LeftRight)
-        .await?;
+    let pane2 = domain.split_pane(&pane1, SplitDirection::LeftRight).await?;
 
     // 重新 attach 拿权威快照
     let reattach = domain.attach(&session_id, AttachMode::ReadOnly).await?;
@@ -514,6 +515,23 @@ async fn e2e_split_pane_visible_in_attach_snapshot() -> Result<()> {
          If missing, handle_split_pane forgot to update tab.pane_ids.",
         all_panes
     );
+
+    domain.kill_session(&session_id).await?;
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn e2e_bogus_pane_mutations_return_errors() -> Result<()> {
+    let server = TestServer::spawn()?;
+    let domain = server.connect().await?;
+    let session_id = domain
+        .create_session("e2e-bogus-pane", &PathBuf::from("/"))
+        .await?;
+    domain.attach(&session_id, AttachMode::Shared).await?;
+
+    assert!(domain.send_input("missing-pane", b"x").await.is_err());
+    assert!(domain.paste("missing-pane", "x").await.is_err());
+    assert!(domain.focus_pane("missing-pane").await.is_err());
 
     domain.kill_session(&session_id).await?;
     Ok(())

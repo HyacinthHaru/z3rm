@@ -1,15 +1,15 @@
 // §16.1 Disable command line from opening on release mode
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
-mod daemon;
-mod zed;
 mod cli;
 mod cli_ipc;
-mod log_viewer;
-mod quickjs_extensions;
-mod extension_status_bar;
+mod daemon;
 mod diff_review;
+mod extension_status_bar;
+mod log_viewer;
 mod open_diff;
+mod quickjs_extensions;
+mod zed;
 
 use std::{path::Path, sync::Arc};
 
@@ -18,7 +18,9 @@ use assets::Assets;
 use crashes::InitCrashHandler;
 use fs::{Fs, RealFs};
 use futures::StreamExt as _;
-use gpui::{App, AppContext as _, Application, Context, Entity, Focusable, Global, TaskExt, Window};
+use gpui::{
+    App, AppContext as _, Application, Context, Entity, Focusable, Global, TaskExt, Window,
+};
 use gpui_platform;
 use parking_lot::Mutex;
 use release_channel::{AppCommitSha, AppVersion, ReleaseChannel};
@@ -31,7 +33,6 @@ use crate::zed::{init as zed_init, watch_settings_files};
 #[cfg(feature = "mimalloc")]
 #[global_allocator]
 static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
-
 
 // ============================================================================
 // §16.1 Application 构建
@@ -49,7 +50,6 @@ fn build_application() -> Application {
 }
 
 gpui::actions!(z3rm_debug, [DumpAccessibilityTree]);
-
 
 fn focus_mux_pane_index(
     workspace: &mut workspace::Workspace,
@@ -88,7 +88,8 @@ struct ActiveMuxKeymapProfile {
 impl Global for ActiveMuxKeymapProfile {}
 
 fn bind_startup_keymaps(cx: &mut App) {
-    match settings::KeymapFile::load_asset_allow_partial_failure(settings::DEFAULT_KEYMAP_PATH, cx) {
+    match settings::KeymapFile::load_asset_allow_partial_failure(settings::DEFAULT_KEYMAP_PATH, cx)
+    {
         Ok(key_bindings) => cx.bind_keys(key_bindings),
         Err(error) => tracing::error!(error = %error, "failed to load default keymap"),
     }
@@ -123,14 +124,12 @@ fn bind_configured_mux_keymap_profile(cx: &mut App) {
                     .iter()
                     .filter_map(|binding| {
                         // No-action and Unbind markers have no action name to clear.
-                        if gpui::is_unbind(binding.action()) || gpui::is_no_action(binding.action()) {
+                        if gpui::is_unbind(binding.action()) || gpui::is_no_action(binding.action())
+                        {
                             return None;
                         }
-                        let keystrokes: Vec<String> = binding
-                            .keystrokes()
-                            .iter()
-                            .map(|k| k.to_string())
-                            .collect();
+                        let keystrokes: Vec<String> =
+                            binding.keystrokes().iter().map(|k| k.to_string()).collect();
                         if keystrokes.is_empty() {
                             return None;
                         }
@@ -154,7 +153,9 @@ fn bind_configured_mux_keymap_profile(cx: &mut App) {
                 bindings: stored,
             });
         }
-        Err(error) => tracing::error!(profile, path, error = %error, "failed to load mux keymap profile"),
+        Err(error) => {
+            tracing::error!(profile, path, error = %error, "failed to load mux keymap profile")
+        }
     }
 }
 
@@ -354,8 +355,8 @@ fn main() {
             }
         };
         if let Some(cmd) = cli_cmd {
-            let runtime = tokio::runtime::Runtime::new()
-                .expect("failed to create tokio runtime for CLI");
+            let runtime =
+                tokio::runtime::Runtime::new().expect("failed to create tokio runtime for CLI");
             if let Err(error) = runtime.block_on(async { cli::run_cli_command(cmd).await }) {
                 eprintln!("error: {error}");
                 std::process::exit(1);
@@ -366,9 +367,9 @@ fn main() {
         if let Ok(Some(extension_args)) = cli::marketplace::parse_extension_args() {
             let runtime = tokio::runtime::Runtime::new()
                 .expect("failed to create tokio runtime for extension CLI");
-            if let Err(error) = runtime.block_on(async {
-                cli::marketplace::run_extension_command(extension_args).await
-            }) {
+            if let Err(error) = runtime
+                .block_on(async { cli::marketplace::run_extension_command(extension_args).await })
+            {
                 eprintln!("error: {error}");
                 std::process::exit(1);
             }
@@ -376,7 +377,6 @@ fn main() {
         }
         None
     };
-
 
     #[cfg(unix)]
     util::prevent_root_execution();
@@ -434,35 +434,38 @@ fn main() {
     let should_install_crash_handler = matches!(
         std::env::var("Z3RM_GENERATE_MINIDUMPS").as_deref(),
         Ok("true" | "1")
-    ) || *release_channel::RELEASE_CHANNEL != ReleaseChannel::Dev;
+    ) || *release_channel::RELEASE_CHANNEL
+        != ReleaseChannel::Dev;
 
     let crash_handler = if should_install_crash_handler {
-        Some(background_executor.spawn(crashes::init(
-            InitCrashHandler {
-                session_id: String::new(),
-                zed_version: format!(
-                    "{}.{}.{}",
-                    app_version.major, app_version.minor, app_version.patch
-                ),
-                binary: "z3rm".to_string(),
-                release_channel: release_channel::RELEASE_CHANNEL_NAME.clone(),
-                commit_sha: app_commit_sha
-                    .as_ref()
-                    .map(|sha| sha.full())
-                    .unwrap_or_else(|| "no sha".to_owned()),
-            },
-            {
-                let background_executor = background_executor.clone();
-                move |task| {
-                    background_executor.spawn(task).detach();
-                }
-            },
-            |pid| paths::temp_dir().join(format!("z3rm-crash-handler-{pid}")),
-            {
-                let background_executor = background_executor.clone();
-                move |duration| background_executor.timer(duration)
-            },
-        )))
+        Some(
+            background_executor.spawn(crashes::init(
+                InitCrashHandler {
+                    session_id: String::new(),
+                    zed_version: format!(
+                        "{}.{}.{}",
+                        app_version.major, app_version.minor, app_version.patch
+                    ),
+                    binary: "z3rm".to_string(),
+                    release_channel: release_channel::RELEASE_CHANNEL_NAME.clone(),
+                    commit_sha: app_commit_sha
+                        .as_ref()
+                        .map(|sha| sha.full())
+                        .unwrap_or_else(|| "no sha".to_owned()),
+                },
+                {
+                    let background_executor = background_executor.clone();
+                    move |task| {
+                        background_executor.spawn(task).detach();
+                    }
+                },
+                |pid| paths::temp_dir().join(format!("z3rm-crash-handler-{pid}")),
+                {
+                    let background_executor = background_executor.clone();
+                    move |duration| background_executor.timer(duration)
+                },
+            )),
+        )
     } else {
         crashes::force_backtrace();
         None
@@ -665,8 +668,11 @@ fn main() {
                         let pending_for_update = pending.clone();
                         ext_status.update(cx, |bar, cx| bar.set_vdom_nodes(pending_for_update, cx));
                     }
-                    if let Some(host) = cx.try_global::<quickjs_extensions::GlobalHostController>() {
-                        host.0.add_status_bar(ext_status.downgrade());
+                    let host = cx
+                        .try_global::<quickjs_extensions::GlobalHostController>()
+                        .map(|host| host.0.clone());
+                    if let Some(host) = host {
+                        host.update(cx, |host, _| host.add_status_bar(ext_status.downgrade()));
                     }
                     workspace.status_bar().update(cx, |sb, cx| {
                         sb.add_right_item(ext_status, window, cx);
@@ -1267,7 +1273,10 @@ mod tests {
             let content = settings::mux_keymap_profile_content(profile);
             match KeymapFile::load(content.as_ref(), cx) {
                 KeymapFileLoadResult::Success { key_bindings } => {
-                    assert!(!key_bindings.is_empty(), "{profile} profile has no bindings");
+                    assert!(
+                        !key_bindings.is_empty(),
+                        "{profile} profile has no bindings"
+                    );
                 }
                 KeymapFileLoadResult::SomeFailedToLoad { error_message, .. } => {
                     panic!("mux profile {profile} failed to load: {error_message}");
@@ -1319,7 +1328,9 @@ mod tests {
 
         // Switch profile to tmux (which does not bind ctrl-shift-d).
         super::MuxSettings::override_global(
-            super::MuxSettings { keymap_profile: "tmux".to_string() },
+            super::MuxSettings {
+                keymap_profile: "tmux".to_string(),
+            },
             cx,
         );
         // override_global does not notify SettingsStore on its own; drive the

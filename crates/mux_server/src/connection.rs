@@ -2,16 +2,18 @@
 // 每个客户端连接一个 tokio task, 处理请求并推送通知。
 
 use anyhow::Context as _;
-use mux_protocol::proto::request::Body as RequestBody;
-use prost::Message;
-use mux_protocol::proto::fetch_grid_update_response::Update as FetchGridUpdateResponseUpdate;
-use mux_protocol::proto::response::Body as ResponseBody;
+use interprocess::local_socket::tokio::Stream as LocalSocketStream;
 use mux_protocol::proto::envelope::Payload as EnvelopePayload;
-use mux_protocol::{check_frame_len, proto::*, FrameLengthError, FrameLengthErrorKind, MAX_VARINT_LEN};
+use mux_protocol::proto::fetch_grid_update_response::Update as FetchGridUpdateResponseUpdate;
+use mux_protocol::proto::request::Body as RequestBody;
+use mux_protocol::proto::response::Body as ResponseBody;
+use mux_protocol::{
+    FrameLengthError, FrameLengthErrorKind, MAX_VARINT_LEN, check_frame_len, proto::*,
+};
+use prost::Message;
 use sqlez::connection::Connection;
 use std::sync::Arc;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use interprocess::local_socket::tokio::Stream as LocalSocketStream;
 use tokio::sync::mpsc;
 
 // §3.3 客户端角色 (Plan 33)
@@ -31,8 +33,8 @@ pub fn proto_role_to_client_role(role: i32) -> ClientRole {
 pub fn check_permission(role: ClientRole, required: ClientRole) -> bool {
     match (role, required) {
         (ClientRole::Admin, _) => true,
-        (ClientRole::ReadWrite, ClientRole::ReadWrite) |
-        (ClientRole::ReadWrite, ClientRole::ReadOnly) => true,
+        (ClientRole::ReadWrite, ClientRole::ReadWrite)
+        | (ClientRole::ReadWrite, ClientRole::ReadOnly) => true,
         (ClientRole::ReadOnly, ClientRole::ReadOnly) => true,
         _ => false,
     }
@@ -61,8 +63,7 @@ pub async fn handle_connection(
     let (reader, writer) = tokio::io::split(stream);
 
     // §9 outbound channel: Response 或 Notification 都走这个
-    let (outbound_tx, mut outbound_rx) =
-        mpsc::unbounded_channel::<Envelope>();
+    let (outbound_tx, mut outbound_rx) = mpsc::unbounded_channel::<Envelope>();
 
     // §3.3 客户端角色: 初始为 None, attach 后设置 (Plan 33)
     let client_role: Arc<parking_lot::Mutex<Option<ClientRole>>> =
@@ -95,10 +96,15 @@ pub async fn handle_connection(
                 if first {
                     first = false;
                     if !version_compatible(&envelope.version) {
-                        let _ = send_response(&outbound_tx, Response {
-                            request_id: 0,
-                            body: Some(ResponseBody::Error("protocol version mismatch".to_string())),
-                        });
+                        let _ = send_response(
+                            &outbound_tx,
+                            Response {
+                                request_id: 0,
+                                body: Some(ResponseBody::Error(
+                                    "protocol version mismatch".to_string(),
+                                )),
+                            },
+                        );
                         anyhow::bail!("protocol version mismatch");
                     }
                 }
@@ -236,7 +242,6 @@ async fn read_envelope(
     }
 
     Err(FrameLengthError(FrameLengthErrorKind::OverlongPrefix).into())
-
 }
 
 /// §9 分发 Envelope 到请求/通知处理器
@@ -262,7 +267,18 @@ async fn dispatch_envelope(
             let request_id = req.request_id;
             // dispatch_request 内部会把 Response 通过 outbound_tx 发回,
             // 也可能向 outbound_tx push Notification (用于 attach 等)
-            dispatch_request(req, sessions, outbound_tx, clipboard, server_settings, client_role, connection_client_id, shutdown_state, &forward_tasks).await?;
+            dispatch_request(
+                req,
+                sessions,
+                outbound_tx,
+                clipboard,
+                server_settings,
+                client_role,
+                connection_client_id,
+                shutdown_state,
+                &forward_tasks,
+            )
+            .await?;
             // request_id 仅用于日志, 实际 response 已经在 dispatch_request 内发出
             let _ = request_id;
         }
@@ -293,10 +309,13 @@ async fn dispatch_request(
     let body = match &req.body {
         Some(b) => b,
         None => {
-            send_response(outbound_tx, Response {
-                request_id,
-                body: Some(ResponseBody::Error("empty request body".to_string())),
-            })?;
+            send_response(
+                outbound_tx,
+                Response {
+                    request_id,
+                    body: Some(ResponseBody::Error("empty request body".to_string())),
+                },
+            )?;
             return Ok(());
         }
     };
@@ -320,17 +339,27 @@ async fn dispatch_request(
         // §3.3 无权限要求的操作
         RequestBody::CreateSession(r) => handle_create_session(r, sessions).await?,
         RequestBody::ListSessions(_) => handle_list_sessions(sessions).await?,
-        RequestBody::Attach(r) => handle_attach(r, sessions, client_role, connection_client_id, outbound_tx, forward_tasks).await?,
-        RequestBody::Detach(_) => handle_detach(sessions, connection_client_id, forward_tasks).await?,
+        RequestBody::Attach(r) => {
+            handle_attach(
+                r,
+                sessions,
+                client_role,
+                connection_client_id,
+                outbound_tx,
+                forward_tasks,
+            )
+            .await?
+        }
+        RequestBody::Detach(_) => {
+            handle_detach(sessions, connection_client_id, forward_tasks).await?
+        }
         RequestBody::FetchGridUpdate(r) => handle_fetch_grid_update(r, sessions).await?,
         RequestBody::FetchScrollback(r) => handle_fetch_scrollback(r, sessions).await?,
         RequestBody::SearchScrollback(r) => handle_search_scrollback(r, sessions).await?,
         RequestBody::ListFileVersions(request) => {
             handle_list_file_versions(request, sessions).await?
         }
-        RequestBody::GetFileVersion(request) => {
-            handle_get_file_version(request, sessions).await?
-        }
+        RequestBody::GetFileVersion(request) => handle_get_file_version(request, sessions).await?,
         RequestBody::DeclineFileVersion(request) => {
             if check_permission(role, ClientRole::ReadWrite) {
                 handle_decline_file_version(request, sessions).await?
@@ -472,9 +501,7 @@ async fn dispatch_request(
                 ResponseBody::Error("permission denied: read-write required".to_string())
             }
         }
-        RequestBody::ShellIntegration(r) => {
-            handle_shell_integration(r, sessions).await?
-        }
+        RequestBody::ShellIntegration(r) => handle_shell_integration(r, sessions).await?,
         RequestBody::SubscribePaneOutput(_) => {
             // §3.1 In-place render-path: 订阅已由 pane.subscribe 自动注册;
             // 此请求仅确认订阅成功。实际数据通过 PaneOutputChunk 通知推送。
@@ -483,10 +510,13 @@ async fn dispatch_request(
     };
 
     // §9 把 Response 通过 outbound channel 写回客户端
-    send_response(outbound_tx, Response {
-        request_id,
-        body: Some(resp_body),
-    })?;
+    send_response(
+        outbound_tx,
+        Response {
+            request_id,
+            body: Some(resp_body),
+        },
+    )?;
 
     Ok(())
 }
@@ -500,9 +530,10 @@ fn send_response(
         version: Some(mux_protocol::PROTOCOL_VERSION.clone()),
         payload: Some(EnvelopePayload::Response(response)),
     };
-    outbound_tx.send(envelope).map_err(|_| anyhow::anyhow!("client disconnected"))
+    outbound_tx
+        .send(envelope)
+        .map_err(|_| anyhow::anyhow!("client disconnected"))
 }
-
 
 /// §9 通过 outbound channel 把 Notification 封装成 Envelope 推送。
 fn send_notification_envelope(
@@ -540,7 +571,8 @@ async fn handle_create_session(
     tokio::spawn(async move {
         let result = tokio::task::spawn_blocking(move || {
             crate::snapshot::start(&snapshot_id, &snapshot_cwd)
-        }).await;
+        })
+        .await;
         match result {
             Ok(Ok(Some(watch))) => {
                 let mut sessions_w = sessions_for_snapshot.write();
@@ -549,13 +581,26 @@ async fn handle_create_session(
                 }
             }
             Ok(Ok(None)) => {
-                zlog::info!("shadow snapshot not armed: session={} cwd={}", log_id, log_cwd);
+                zlog::info!(
+                    "shadow snapshot not armed: session={} cwd={}",
+                    log_id,
+                    log_cwd
+                );
             }
             Ok(Err(error)) => {
-                zlog::warn!("shadow snapshot start failed: session={} cwd={} error={}", log_id, log_cwd, error);
+                zlog::warn!(
+                    "shadow snapshot start failed: session={} cwd={} error={}",
+                    log_id,
+                    log_cwd,
+                    error
+                );
             }
             Err(join_error) => {
-                zlog::warn!("shadow snapshot task panicked: session={} error={}", log_id, join_error);
+                zlog::warn!(
+                    "shadow snapshot task panicked: session={} error={}",
+                    log_id,
+                    join_error
+                );
             }
         }
     });
@@ -563,7 +608,12 @@ async fn handle_create_session(
     sessions.write().push(session);
 
     // §16.12 记录 session 创建事件
-    zlog::info!("session created: id={} name={} cwd={}", id, req.name, req.cwd);
+    zlog::info!(
+        "session created: id={} name={} cwd={}",
+        id,
+        req.name,
+        req.cwd
+    );
 
     Ok(ResponseBody::Session(SessionInfo {
         id,
@@ -590,7 +640,9 @@ async fn handle_list_sessions(
         })
         .collect();
 
-    Ok(ResponseBody::Sessions(ListSessionsResponse { sessions: infos }))
+    Ok(ResponseBody::Sessions(ListSessionsResponse {
+        sessions: infos,
+    }))
 }
 
 /// §3.10 结束会话
@@ -598,24 +650,26 @@ async fn handle_kill_session(
     req: &KillSessionRequest,
     sessions: &Arc<parking_lot::RwLock<Vec<crate::session::Session>>>,
 ) -> anyhow::Result<ResponseBody> {
-    let mut sessions_w = sessions.write();
-    let idx = sessions_w.iter().position(|s| s.id == req.id);
-    if let Some(idx) = idx {
-        // §4 Stop this session's shadow-snapshot watcher before dropping the
-        // session so watching/recording teardown is deterministic (its Drop would
-        // also stop it, but explicit stop logs the event and orders the join).
-        if let Some(sess) = sessions_w.get(idx) {
-            if let Some(watch) = sess.snapshot_watch.as_ref() {
-                watch.stop();
-            }
+    if let Some(session) = take_session(sessions, &req.id) {
+        if let Some(watch) = session.snapshot_watch.as_ref() {
+            watch.stop();
         }
-        sessions_w.remove(idx);
-        // §16.12 记录 session 销毁事件
         zlog::info!("session killed: id={}", req.id);
     } else {
         zlog::warn!("kill session not found: id={}", req.id);
     }
     Ok(ResponseBody::Error(String::new()))
+}
+
+fn take_session(
+    sessions: &Arc<parking_lot::RwLock<Vec<crate::session::Session>>>,
+    session_id: &str,
+) -> Option<crate::session::Session> {
+    let mut sessions = sessions.write();
+    let index = sessions
+        .iter()
+        .position(|session| session.id == session_id)?;
+    Some(sessions.remove(index))
 }
 /// §3.10 连接会话 — 把客户端的 outbound_tx 注册为所有 pane 的 subscriber
 async fn handle_attach(
@@ -632,7 +686,11 @@ async fn handle_attach(
         .find(|s| s.id == req.session_id)
         .ok_or_else(|| anyhow::anyhow!("session not found: {}", req.session_id))?;
 
-    zlog::info!("client attached: session={} mode={:?}", req.session_id, req.mode);
+    zlog::info!(
+        "client attached: session={} mode={:?}",
+        req.session_id,
+        req.mode
+    );
 
     // Prefer an already-assigned per-connection id so re-attach is idempotent
     // for this socket. Mint a connection-scoped id (never process-wide alone).
@@ -871,14 +929,12 @@ async fn handle_new_window(
 
     // §3.3 广播 WindowAdded 通知到所有已连接窗口
     let notify = Notification {
-        event: Some(
-            mux_protocol::proto::notification::Event::WindowAdded(
-                mux_protocol::WindowAdded {
-                    window_id: window_id.clone(),
-                    session_id: req.session_id.clone(),
-                },
-            ),
-        ),
+        event: Some(mux_protocol::proto::notification::Event::WindowAdded(
+            mux_protocol::WindowAdded {
+                window_id: window_id.clone(),
+                session_id: req.session_id.clone(),
+            },
+        )),
     };
     let _ = send_notification_envelope(outbound_tx, notify);
 
@@ -952,13 +1008,15 @@ async fn handle_spawn_pane(
 
             // §3.3 / §16.9 把 pane 注册到指定 tab。Tab 不存在则按 id 创建,
             // 防止客户端传入尚未创建的 tab_id 时静默丢弃 pane。
-            let tab = session.tabs.entry(req.tab_id.clone()).or_insert_with(|| {
-                crate::session::Tab {
-                    id: req.tab_id.clone(),
-                    title: String::new(),
-                    pane_ids: Vec::new(),
-                }
-            });
+            let tab =
+                session
+                    .tabs
+                    .entry(req.tab_id.clone())
+                    .or_insert_with(|| crate::session::Tab {
+                        id: req.tab_id.clone(),
+                        title: String::new(),
+                        pane_ids: Vec::new(),
+                    });
             if !tab.pane_ids.contains(&pane_id) {
                 tab.pane_ids.push(pane_id.clone());
             }
@@ -1050,11 +1108,14 @@ async fn handle_split_pane(
                 .clone()
                 .filter(|cwd| !cwd.is_empty())
                 .unwrap_or(parent_cwd);
-            let command = req.command.as_ref().map(|command| crate::pane::ShellCommand {
-                program: command.program.clone(),
-                args: command.args.clone(),
-                env: command.env.clone().into_iter().collect(),
-            });
+            let command = req
+                .command
+                .as_ref()
+                .map(|command| crate::pane::ShellCommand {
+                    program: command.program.clone(),
+                    args: command.args.clone(),
+                    env: command.env.clone().into_iter().collect(),
+                });
             let pane = crate::pane::Pane::spawn_with_session(
                 new_pane_id.clone(),
                 session.id.clone(),
@@ -1073,8 +1134,7 @@ async fn handle_split_pane(
                 .iter()
                 .find(|(_, tab)| tab.pane_ids.contains(&req.pane_id))
                 .map(|(id, _)| id.clone());
-            let parent_tab_id_for_broadcast =
-                parent_tab_id.clone().unwrap_or_default();
+            let parent_tab_id_for_broadcast = parent_tab_id.clone().unwrap_or_default();
             if let Some(tab_id) = parent_tab_id {
                 if let Some(tab) = session.tabs.get_mut(&tab_id) {
                     if !tab.pane_ids.contains(&new_pane_id) {
@@ -1097,7 +1157,8 @@ async fn handle_split_pane(
             drop(sessions_w);
             {
                 let sessions_r = sessions.read();
-                if let Some(session) = sessions_r.iter().find(|s| s.id == session_id_for_broadcast) {
+                if let Some(session) = sessions_r.iter().find(|s| s.id == session_id_for_broadcast)
+                {
                     if let Some(pane) = session.panes.read().get(&new_pane_id) {
                         install_pane_exit_hook(
                             pane,
@@ -1153,7 +1214,10 @@ async fn handle_close_pane(
         }
     }
     if !removed {
-        return Ok(ResponseBody::Error(format!("pane not found: {}", req.pane_id)));
+        return Ok(ResponseBody::Error(format!(
+            "pane not found: {}",
+            req.pane_id
+        )));
     }
     if let Some(sid) = session_id {
         broadcast_layout_changed(sessions, &sid);
@@ -1166,21 +1230,34 @@ async fn handle_close_pane(
 async fn handle_focus_pane(
     req: &FocusPaneRequest,
     sessions: &Arc<parking_lot::RwLock<Vec<crate::session::Session>>>,
-    outbound_tx: &mpsc::UnboundedSender<Envelope>,
+    _outbound_tx: &mpsc::UnboundedSender<Envelope>,
 ) -> anyhow::Result<ResponseBody> {
-    let mut sessions_w = sessions.write();
-    let mut matched_session_id: Option<String> = None;
-    for session in sessions_w.iter_mut() {
-        if session.layout.root.find_pane(&req.pane_id).is_some() {
-            session.set_focused_pane(req.pane_id.clone());
-            matched_session_id = Some(session.id.clone());
-        }
-    }
-    drop(sessions_w);
-    if let Some(sid) = matched_session_id {
-        // §3.4 SessionLayoutChanged 走会话级 lifecycle fan-out, 送达所有 attached 客户端。
-        broadcast_layout_changed(sessions, &sid);
-    }
+    let session_id = {
+        let mut sessions = sessions.write();
+        let Some(session) = sessions
+            .iter_mut()
+            .find(|session| session.layout.root.find_pane(&req.pane_id).is_some())
+        else {
+            return Ok(ResponseBody::Error(format!(
+                "pane not found: {}",
+                req.pane_id
+            )));
+        };
+        session.set_focused_pane(req.pane_id.clone());
+        session.id.clone()
+    };
+    broadcast_lifecycle_in_session(
+        sessions,
+        &session_id,
+        Notification {
+            event: Some(mux_protocol::notification::Event::PaneFocused(
+                mux_protocol::PaneFocused {
+                    pane_id: req.pane_id.clone(),
+                },
+            )),
+        },
+    );
+    broadcast_layout_changed(sessions, &session_id);
     Ok(ResponseBody::Error(String::new()))
 }
 /// §3.10 调整 pane 尺寸 — 真正调用 pane.resize (PTY TIOCSWINSZ + alacritty)
@@ -1198,12 +1275,22 @@ async fn handle_resize_pane(
     }
     Ok(ResponseBody::Error("pane not found".to_string()))
 }
+fn find_pane(
+    sessions: &Arc<parking_lot::RwLock<Vec<crate::session::Session>>>,
+    pane_id: &str,
+) -> Option<Arc<crate::pane::Pane>> {
+    let sessions = sessions.read();
+    sessions
+        .iter()
+        .find_map(|session| session.panes.read().get(pane_id).cloned())
+}
+
 /// §3.10 发送输入 + §16.6 OSC 52 剪贴板拦截
 async fn handle_send_input(
     req: &SendInputRequest,
     sessions: &Arc<parking_lot::RwLock<Vec<crate::session::Session>>>,
     clipboard: &Arc<crate::clipboard::ServerClipboard>,
-    outbound_tx: &mpsc::UnboundedSender<Envelope>,
+    _outbound_tx: &mpsc::UnboundedSender<Envelope>,
     connection_client_id: &Arc<parking_lot::Mutex<Option<String>>>,
 ) -> anyhow::Result<ResponseBody> {
     if !client_still_attached(sessions, connection_client_id) {
@@ -1211,13 +1298,18 @@ async fn handle_send_input(
             "client not attached (kicked or detached)".to_string(),
         ));
     }
+    let Some(pane) = find_pane(sessions, &req.pane_id) else {
+        return Ok(ResponseBody::Error(format!(
+            "pane not found: {}",
+            req.pane_id
+        )));
+    };
 
     // §16.6 解析 OSC 52 序列: ESC ] 52 ; c ; <base64> BEL/ST
     let mut osc52_parser = crate::clipboard::Osc52Parser::new();
     if let Some(base64_content) = osc52_parser.feed(&req.data) {
         // §16.6 OSC 52 触发剪贴板更新并通知所有客户端
-        let origin_host = std::env::var("HOSTNAME")
-            .unwrap_or_else(|_| "z3rm-server".to_string());
+        let origin_host = std::env::var("HOSTNAME").unwrap_or_else(|_| "z3rm-server".to_string());
         {
             let mut txs = Vec::new();
             for session in sessions.read().iter() {
@@ -1237,35 +1329,17 @@ async fn handle_send_input(
     const BRACKETED_PASTE_DISABLE: &[u8] = &[0x1B, b'[', b'?', b'2', b'0', b'0', b'4', b'l'];
     if req.data == BRACKETED_PASTE_ENABLE {
         // §16.6 启用 bracketed paste
-        let sessions_r = sessions.read();
-        for session in sessions_r.iter() {
-            let panes = session.panes.clone();
-            if let Some(pane) = panes.read().get(&req.pane_id) {
-                pane.set_bracketed_paste_mode(true);
-            }
-        }
+        pane.set_bracketed_paste_mode(true);
         return Ok(ResponseBody::Error(String::new()));
     }
     if req.data == BRACKETED_PASTE_DISABLE {
         // §16.6 禁用 bracketed paste
-        let sessions_r = sessions.read();
-        for session in sessions_r.iter() {
-            let panes = session.panes.clone();
-            if let Some(pane) = panes.read().get(&req.pane_id) {
-                pane.set_bracketed_paste_mode(false);
-            }
-        }
+        pane.set_bracketed_paste_mode(false);
         return Ok(ResponseBody::Error(String::new()));
     }
 
     // §3.10 普通输入: 转发到 PTY
-    let sessions_r = sessions.read();
-    for session in sessions_r.iter() {
-        let panes = session.panes.clone();
-        if let Some(pane) = panes.read().get(&req.pane_id) {
-            pane.write_input(&req.data)?;
-        }
-    }
+    pane.write_input(&req.data)?;
     Ok(ResponseBody::Error(String::new()))
 }
 
@@ -1274,13 +1348,13 @@ async fn handle_paste(
     req: &PasteRequest,
     sessions: &Arc<parking_lot::RwLock<Vec<crate::session::Session>>>,
 ) -> anyhow::Result<ResponseBody> {
-    let sessions_r = sessions.read();
-    for session in sessions_r.iter() {
-        let panes = session.panes.clone();
-        if let Some(pane) = panes.read().get(&req.pane_id) {
-            pane.paste(&req.text)?;
-        }
-    }
+    let Some(pane) = find_pane(sessions, &req.pane_id) else {
+        return Ok(ResponseBody::Error(format!(
+            "pane not found: {}",
+            req.pane_id
+        )));
+    };
+    pane.paste(&req.text)?;
     Ok(ResponseBody::Error(String::new()))
 }
 
@@ -1320,15 +1394,14 @@ async fn handle_get_clipboard(
                 entry: Some(proto_entry),
             }))
         }
-        None => {
-            Ok(ResponseBody::Clipboard(GetClipboardResponse {
-                entry: Some(mux_protocol::proto::ClipboardEntry {
-                    content_type: mux_protocol::proto::clipboard_entry::ClipboardContentType::Text as i32,
-                    data: Vec::new(),
-                    origin_host: String::new(),
-                }),
-            }))
-        }
+        None => Ok(ResponseBody::Clipboard(GetClipboardResponse {
+            entry: Some(mux_protocol::proto::ClipboardEntry {
+                content_type: mux_protocol::proto::clipboard_entry::ClipboardContentType::Text
+                    as i32,
+                data: Vec::new(),
+                origin_host: String::new(),
+            }),
+        })),
     }
 }
 
@@ -1342,17 +1415,15 @@ async fn handle_fetch_scrollback(
     for session in sessions_r.iter() {
         let panes = session.panes.clone();
         if let Some(pane) = panes.read().get(&req.pane_id) {
-            let (lines, total, version) = pane.fetch_scrollback(
-                req.from_line,
-                req.direction,
-                req.count,
-            );
+            let (lines, total, version) =
+                pane.fetch_scrollback(req.from_line, req.direction, req.count);
             let resp = FetchScrollbackResponse {
                 lines: lines
                     .into_iter()
                     .map(|r| RowChange {
                         row: r.row,
-                        cells: r.cells
+                        cells: r
+                            .cells
                             .into_iter()
                             .map(|c| Cell {
                                 char: c.character,
@@ -1388,18 +1459,15 @@ async fn handle_search_scrollback(
     for session in sessions_r.iter() {
         let panes = session.panes.clone();
         if let Some(pane) = panes.read().get(&req.pane_id) {
-            let (matches, version) = pane.search_scrollback(
-                &req.regex,
-                req.from_line,
-                req.direction,
-                req.max_results,
-            );
+            let (matches, version) =
+                pane.search_scrollback(&req.regex, req.from_line, req.direction, req.max_results);
             let resp = SearchScrollbackResponse {
                 matches: matches
                     .into_iter()
                     .map(|(line_num, row)| SearchMatch {
                         line_number: line_num,
-                        context: row.cells
+                        context: row
+                            .cells
                             .into_iter()
                             .map(|c| Cell {
                                 char: c.character,
@@ -1442,14 +1510,16 @@ async fn handle_fetch_grid_update(
                 } => FetchGridUpdateResponse {
                     from_generation,
                     to_generation,
-                    update: Some(
-                        FetchGridUpdateResponseUpdate::Diff(GridDiff {
-                            rows: diff
-                                .rows
-                                .into_iter()
-                                .map(|r| RowChange {
-                                    row: r.row,
-                                    cells: r.cells.into_iter().map(|c| Cell {
+                    update: Some(FetchGridUpdateResponseUpdate::Diff(GridDiff {
+                        rows: diff
+                            .rows
+                            .into_iter()
+                            .map(|r| RowChange {
+                                row: r.row,
+                                cells: r
+                                    .cells
+                                    .into_iter()
+                                    .map(|c| Cell {
                                         char: c.character,
                                         style: Some(CellStyle {
                                             bold: c.style.bold,
@@ -1463,10 +1533,9 @@ async fn handle_fetch_grid_update(
                                         background: c.background,
                                     })
                                     .collect(),
-                                })
-                                .collect(),
-                        }),
-                    ),
+                            })
+                            .collect(),
+                    })),
                 },
                 crate::grid_sync::GridUpdate::FullSnapshot {
                     to_generation,
@@ -1524,7 +1593,6 @@ async fn handle_fetch_grid_update(
     Ok(ResponseBody::Error("pane not found".to_string()))
 }
 
-
 // ============================================================================
 // §15.4 Attach snapshot helpers
 // ============================================================================
@@ -1553,9 +1621,7 @@ fn pane_info_for(
 
 /// §15.4 / §16.9 把内部 LayoutTree 转成 proto LayoutTree。
 /// 空根 (session 初始状态) 转 `root: None`。
-fn layout_tree_to_proto(
-    tree: &crate::layout::LayoutTree,
-) -> mux_protocol::LayoutTree {
+fn layout_tree_to_proto(tree: &crate::layout::LayoutTree) -> mux_protocol::LayoutTree {
     use crate::layout::{LayoutNode, SplitDirection};
     use mux_protocol::proto::layout_node::Node;
     use mux_protocol::proto::split_node::SplitDirection as ProtoDir;
@@ -1578,8 +1644,7 @@ fn layout_tree_to_proto(
                 children,
                 ratios,
             } => {
-                let proto_children: Vec<ProtoNode> =
-                    children.iter().filter_map(convert).collect();
+                let proto_children: Vec<ProtoNode> = children.iter().filter_map(convert).collect();
                 let proto_dir = match direction {
                     SplitDirection::LeftRight => ProtoDir::LeftRight,
                     SplitDirection::TopBottom => ProtoDir::TopBottom,
@@ -1653,7 +1718,6 @@ fn install_pane_exit_hook(
     pane.set_exit_hook(hook);
 }
 
-
 fn client_still_attached(
     sessions: &Arc<parking_lot::RwLock<Vec<crate::session::Session>>>,
     connection_client_id: &Arc<parking_lot::Mutex<Option<String>>>,
@@ -1692,7 +1756,9 @@ fn broadcast_layout_changed(
     };
     let notify = Notification {
         event: Some(mux_protocol::notification::Event::SessionLayoutChanged(
-            mux_protocol::SessionLayoutChanged { layout: Some(layout) },
+            mux_protocol::SessionLayoutChanged {
+                layout: Some(layout),
+            },
         )),
     };
     broadcast_lifecycle_in_session(sessions, session_id, notify);
@@ -1734,34 +1800,87 @@ fn broadcast_pane_removed(
     broadcast_lifecycle_in_session(sessions, session_id, notify);
 }
 
+fn resolve_shadow_path(
+    root: &std::path::Path,
+    requested: &str,
+) -> anyhow::Result<std::path::PathBuf> {
+    use std::path::Component;
+
+    let canonical_root = root
+        .canonicalize()
+        .with_context(|| format!("canonicalizing shadow root: {}", root.display()))?;
+    let requested_path = std::path::Path::new(requested);
+    anyhow::ensure!(
+        !requested_path.as_os_str().is_empty(),
+        "shadow path is empty"
+    );
+    anyhow::ensure!(
+        !requested_path
+            .components()
+            .any(|component| matches!(component, Component::ParentDir)),
+        "shadow path may not contain parent traversal"
+    );
+
+    let candidate = if requested_path.is_absolute() {
+        requested_path.to_path_buf()
+    } else {
+        canonical_root.join(requested_path)
+    };
+
+    let mut existing_ancestor = candidate.as_path();
+    while !existing_ancestor.exists() {
+        existing_ancestor = existing_ancestor
+            .parent()
+            .context("shadow path has no existing ancestor")?;
+    }
+    let canonical_ancestor = existing_ancestor.canonicalize().with_context(|| {
+        format!(
+            "canonicalizing shadow path ancestor: {}",
+            existing_ancestor.display()
+        )
+    })?;
+    anyhow::ensure!(
+        canonical_ancestor.starts_with(&canonical_root),
+        "shadow path escapes session cwd"
+    );
+
+    let suffix = candidate
+        .strip_prefix(existing_ancestor)
+        .context("resolving shadow path suffix")?;
+    Ok(canonical_ancestor.join(suffix))
+}
+
 async fn handle_list_file_versions(
     request: &mux_protocol::ListFileVersionsRequest,
     sessions: &Arc<parking_lot::RwLock<Vec<crate::session::Session>>>,
 ) -> anyhow::Result<ResponseBody> {
-    let watch = snapshot_watch_for_session(sessions, &request.session_id)?;
-    let path = std::path::PathBuf::from(&request.path);
+    let (watch, root) = snapshot_context_for_session(sessions, &request.session_id)?;
+    let path = resolve_shadow_path(&root, &request.path)?;
     let versions = tokio::task::spawn_blocking(move || watch.list_versions(path))
         .await
         .context("joining shadow list-versions request")??;
-    Ok(ResponseBody::FileVersions(mux_protocol::ListFileVersionsResponse {
-        versions: versions
-            .into_iter()
-            .map(|version| mux_protocol::FileVersion {
-                version_id: version.version_id,
-                seq_no: version.seq_no,
-                trigger: format!("{:?}", version.trigger).to_ascii_lowercase(),
-            })
-            .collect(),
-    }))
+    Ok(ResponseBody::FileVersions(
+        mux_protocol::ListFileVersionsResponse {
+            versions: versions
+                .into_iter()
+                .map(|version| mux_protocol::FileVersion {
+                    version_id: version.version_id,
+                    seq_no: version.seq_no,
+                    trigger: format!("{:?}", version.trigger).to_ascii_lowercase(),
+                })
+                .collect(),
+        },
+    ))
 }
 
 async fn handle_get_file_version(
     request: &mux_protocol::GetFileVersionRequest,
     sessions: &Arc<parking_lot::RwLock<Vec<crate::session::Session>>>,
 ) -> anyhow::Result<ResponseBody> {
-    let watch = snapshot_watch_for_session(sessions, &request.session_id)?;
+    let (watch, root) = snapshot_context_for_session(sessions, &request.session_id)?;
+    let path = resolve_shadow_path(&root, &request.path)?;
     let version_id = request.version_id;
-    let content = tokio::task::spawn_blocking(move || watch.get_version(version_id))
+    let content = tokio::task::spawn_blocking(move || watch.get_version(path, version_id))
         .await
         .context("joining shadow get-version request")??
         .with_context(|| format!("shadow version not found: {version_id}"))?;
@@ -1774,8 +1893,8 @@ async fn handle_decline_file_version(
     request: &mux_protocol::DeclineFileVersionRequest,
     sessions: &Arc<parking_lot::RwLock<Vec<crate::session::Session>>>,
 ) -> anyhow::Result<ResponseBody> {
-    let watch = snapshot_watch_for_session(sessions, &request.session_id)?;
-    let path = std::path::PathBuf::from(&request.path);
+    let (watch, root) = snapshot_context_for_session(sessions, &request.session_id)?;
+    let path = resolve_shadow_path(&root, &request.path)?;
     let version_id = request.version_id;
     tokio::task::spawn_blocking(move || watch.decline(path, version_id))
         .await
@@ -1785,20 +1904,21 @@ async fn handle_decline_file_version(
     ))
 }
 
-fn snapshot_watch_for_session(
+fn snapshot_context_for_session(
     sessions: &Arc<parking_lot::RwLock<Vec<crate::session::Session>>>,
     session_id: &str,
-) -> anyhow::Result<Arc<crate::snapshot::SnapshotWatch>> {
-    sessions
-        .read()
+) -> anyhow::Result<(Arc<crate::snapshot::SnapshotWatch>, std::path::PathBuf)> {
+    let sessions = sessions.read();
+    let session = sessions
         .iter()
         .find(|session| session.id == session_id)
-        .with_context(|| format!("session not found: {session_id}"))?
+        .with_context(|| format!("session not found: {session_id}"))?;
+    let watch = session
         .snapshot_watch
         .clone()
-        .with_context(|| format!("shadow snapshot is not active for session: {session_id}"))
+        .with_context(|| format!("shadow snapshot is not active for session: {session_id}"))?;
+    Ok((watch, std::path::PathBuf::from(&session.cwd)))
 }
-
 
 // ============================================================================
 // Plan 10: §3.3 / §16.6 Real file RPC handlers (previously stubs)
@@ -1813,7 +1933,11 @@ async fn handle_read_file(req: &mux_protocol::ReadFileRequest) -> anyhow::Result
             // Binary detection: check for null bytes in first 8KB (same heuristic
             // as shadow_snapshot Monitor — ELF/PE/Mach-O magic or > 10% null).
             let is_binary = detect_binary(&bytes);
-            let encoding = if is_binary { "binary".to_string() } else { "utf-8".to_string() };
+            let encoding = if is_binary {
+                "binary".to_string()
+            } else {
+                "utf-8".to_string()
+            };
             Ok(ResponseBody::FileContent(mux_protocol::ReadFileResponse {
                 content: bytes,
                 is_binary,
@@ -1841,12 +1965,10 @@ async fn handle_list_dir(req: &mux_protocol::ListDirRequest) -> anyhow::Result<R
                 });
             }
             // 目录列表排序:目录优先,然后按名称 (确定性输出便于测试)。
-            out.sort_by(|a, b| {
-                b.is_dir
-                    .cmp(&a.is_dir)
-                    .then_with(|| a.name.cmp(&b.name))
-            });
-            Ok(ResponseBody::DirListing(mux_protocol::ListDirResponse { entries: out }))
+            out.sort_by(|a, b| b.is_dir.cmp(&a.is_dir).then_with(|| a.name.cmp(&b.name)));
+            Ok(ResponseBody::DirListing(mux_protocol::ListDirResponse {
+                entries: out,
+            }))
         }
         Err(e) => Ok(ResponseBody::Error(format!("list_dir: {}", e))),
     }
@@ -1890,7 +2012,12 @@ async fn handle_rename_session(
         .find(|s| s.id == req.id)
         .ok_or_else(|| anyhow::anyhow!("session not found: {}", req.id))?;
     let old_name = std::mem::replace(&mut session.name, req.name.clone());
-    zlog::info!("session renamed: id={} old={} new={}", req.id, old_name, req.name);
+    zlog::info!(
+        "session renamed: id={} old={} new={}",
+        req.id,
+        old_name,
+        req.name
+    );
     Ok(ResponseBody::Error(String::new()))
 }
 
@@ -1923,14 +2050,12 @@ async fn handle_set_pane_title(
                     sessions,
                     &session_id,
                     Notification {
-                        event: Some(
-                            mux_protocol::notification::Event::PaneTitleChanged(
-                                mux_protocol::PaneTitleChanged {
-                                    pane_id: req.pane_id.clone(),
-                                    title: req.title.clone(),
-                                },
-                            ),
-                        ),
+                        event: Some(mux_protocol::notification::Event::PaneTitleChanged(
+                            mux_protocol::PaneTitleChanged {
+                                pane_id: req.pane_id.clone(),
+                                title: req.title.clone(),
+                            },
+                        )),
                     },
                 );
             }
@@ -2036,4 +2161,56 @@ fn detect_binary(bytes: &[u8]) -> bool {
     let check_len = bytes.len().min(512);
     let null_count = bytes[..check_len].iter().filter(|&&b| b == 0).count();
     (null_count as f64 / check_len as f64) > 0.1
+}
+
+#[cfg(test)]
+mod connection_unit_tests {
+    use super::*;
+
+    #[test]
+    fn take_session_returns_removed_session() {
+        let sessions = Arc::new(parking_lot::RwLock::new(vec![
+            crate::session::Session::new(
+                "session-1".to_string(),
+                "one".to_string(),
+                "/tmp".to_string(),
+            ),
+        ]));
+
+        let removed = take_session(&sessions, "session-1");
+
+        assert_eq!(
+            removed.as_ref().map(|session| session.id.as_str()),
+            Some("session-1")
+        );
+        assert!(sessions.read().is_empty());
+    }
+
+    #[test]
+    fn shadow_path_rejects_parent_and_symlink_escape() {
+        let directory = tempfile::tempdir().expect("temp directory");
+        let root = directory.path().join("root");
+        let outside = directory.path().join("outside");
+        std::fs::create_dir_all(&root).expect("create root");
+        std::fs::create_dir_all(&outside).expect("create outside");
+
+        assert!(resolve_shadow_path(&root, "../outside/file.txt").is_err());
+
+        #[cfg(unix)]
+        {
+            std::os::unix::fs::symlink(&outside, root.join("escape")).expect("create symlink");
+            assert!(resolve_shadow_path(&root, "escape/file.txt").is_err());
+        }
+    }
+
+    #[test]
+    fn shadow_path_allows_missing_file_below_root() {
+        let directory = tempfile::tempdir().expect("temp directory");
+        let root = directory.path().join("root");
+        std::fs::create_dir_all(root.join("nested")).expect("create root");
+
+        let resolved = resolve_shadow_path(&root, "nested/deleted.txt").expect("resolve path");
+
+        assert_eq!(resolved, root.join("nested/deleted.txt"));
+    }
 }

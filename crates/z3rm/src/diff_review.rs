@@ -18,8 +18,8 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use ui::prelude::*;
 use workspace::{
-    item::{Item, ItemEvent, TabContentParams},
     ToolbarItemLocation,
+    item::{Item, ItemEvent, TabContentParams},
 };
 
 /// §16.6 DiffReview — holds previous + current content for side-by-side display.
@@ -36,11 +36,25 @@ pub struct DiffReview {
     title: SharedString,
     /// Focus handle
     focus_handle: FocusHandle,
-    domain: Arc<mux::MuxDomain>,
-    session_id: String,
-    target_version_id: u64,
+    restore_target: Option<RestoreTarget>,
     decline_pending: bool,
     decline_error: Option<SharedString>,
+}
+
+pub struct RestoreTarget {
+    domain: Arc<mux::MuxDomain>,
+    session_id: String,
+    version_id: u64,
+}
+
+impl RestoreTarget {
+    pub fn new(domain: Arc<mux::MuxDomain>, session_id: String, version_id: u64) -> Self {
+        Self {
+            domain,
+            session_id,
+            version_id,
+        }
+    }
 }
 
 /// §16.6 Events emitted by DiffReview
@@ -59,9 +73,7 @@ impl DiffReview {
         file_path: PathBuf,
         previous: String,
         current: String,
-        domain: Arc<mux::MuxDomain>,
-        session_id: String,
-        target_version_id: u64,
+        restore_target: Option<RestoreTarget>,
         cx: &mut Context<Self>,
     ) -> Self {
         let file_name = file_path
@@ -76,9 +88,7 @@ impl DiffReview {
             current_content: current.into(),
             resolved: false,
             title,
-            domain,
-            session_id,
-            target_version_id,
+            restore_target,
             decline_pending: false,
             decline_error: None,
             focus_handle: cx.focus_handle(),
@@ -94,9 +104,7 @@ impl DiffReview {
     pub fn load(
         file_path: PathBuf,
         previous_content: String,
-        domain: Arc<mux::MuxDomain>,
-        session_id: String,
-        target_version_id: u64,
+        restore_target: Option<RestoreTarget>,
         cx: &mut App,
     ) -> Task<anyhow::Result<Entity<Self>>> {
         let path = file_path.clone();
@@ -108,17 +116,8 @@ impl DiffReview {
             })
             .await
             .map_err(|e| anyhow::anyhow!("failed to read {}: {}", path.display(), e))?;
-            let entity = cx.new(|cx| {
-                DiffReview::new(
-                    path.clone(),
-                    prev,
-                    current,
-                    domain,
-                    session_id,
-                    target_version_id,
-                    cx,
-                )
-            });
+            let entity =
+                cx.new(|cx| DiffReview::new(path.clone(), prev, current, restore_target, cx));
             Ok(entity)
         })
     }
@@ -130,16 +129,23 @@ impl DiffReview {
         cx.notify();
     }
 
+    pub fn can_decline(&self) -> bool {
+        self.restore_target.is_some() && !self.resolved
+    }
+
     pub fn decline(&mut self, cx: &mut Context<Self>) {
-        if self.decline_pending || self.resolved {
+        if self.decline_pending || !self.can_decline() {
             return;
         }
+        let Some(restore_target) = self.restore_target.as_ref() else {
+            return;
+        };
         self.decline_pending = true;
         self.decline_error = None;
-        let domain = self.domain.clone();
-        let session_id = self.session_id.clone();
+        let domain = restore_target.domain.clone();
+        let session_id = restore_target.session_id.clone();
+        let version_id = restore_target.version_id;
         let path = self.file_path.to_string_lossy().into_owned();
-        let version_id = self.target_version_id;
         cx.spawn(async move |this, cx| {
             let result = domain
                 .decline_file_version(&session_id, &path, version_id)
@@ -257,7 +263,7 @@ impl Render for DiffReview {
                                 this.accept(cx);
                             })),
                     )
-                    .child(
+                    .child(if self.can_decline() {
                         div()
                             .id("decline-btn")
                             .px_3()
@@ -268,8 +274,17 @@ impl Render for DiffReview {
                             .child("Decline (d)")
                             .on_click(cx.listener(|this, _, _, cx| {
                                 this.decline(cx);
-                            })),
-                    ),
+                            }))
+                    } else {
+                        div()
+                            .id("decline-unavailable")
+                            .px_3()
+                            .py_1()
+                            .rounded_md()
+                            .bg(colors.border)
+                            .text_color(colors.text_muted)
+                            .child("No snapshot")
+                    }),
             );
 
         // Diff body
@@ -328,11 +343,14 @@ impl Render for DiffReview {
 impl Item for DiffReview {
     type Event = ItemEvent;
 
-    fn tab_content(&self, params: TabContentParams, _window: &Window, _cx: &App) -> gpui::AnyElement {
+    fn tab_content(
+        &self,
+        params: TabContentParams,
+        _window: &Window,
+        _cx: &App,
+    ) -> gpui::AnyElement {
         gpui::div()
-            .child(gpui::SharedString::from(
-                self.title.as_ref(),
-            ))
+            .child(gpui::SharedString::from(self.title.as_ref()))
             .into_any()
     }
 
@@ -393,5 +411,28 @@ impl Item for DiffReview {
 
     fn tab_tooltip_text(&self, _: &App) -> Option<SharedString> {
         Some(self.title.clone())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[gpui::test]
+    fn review_without_snapshot_cannot_decline(cx: &mut gpui::TestAppContext) {
+        let review = cx.new(|cx| {
+            DiffReview::new(
+                PathBuf::from("file.txt"),
+                "same".to_string(),
+                "same".to_string(),
+                None,
+                cx,
+            )
+        });
+
+        assert!(!cx.read(|cx| review.read(cx).can_decline()));
+        review.update(cx, |review, cx| review.decline(cx));
+        assert!(!cx.read(|cx| review.read(cx).decline_pending));
+        assert!(!cx.read(|cx| review.read(cx).resolved));
     }
 }

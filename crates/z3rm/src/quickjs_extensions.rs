@@ -47,11 +47,12 @@ pub enum ExtensionSide {
 }
 
 impl ExtensionSide {
-    fn from_str(s: &str) -> Self {
-        match s {
-            "server" => Self::Server,
-            "both" => Self::Both,
-            _ => Self::Client,
+    fn from_str(value: &str) -> Result<Self> {
+        match value {
+            "client" => Ok(Self::Client),
+            "server" => Ok(Self::Server),
+            "both" => Ok(Self::Both),
+            _ => anyhow::bail!("invalid extension runtime side: {value}"),
         }
     }
 }
@@ -63,6 +64,11 @@ struct ExtensionMeta {
     side: ExtensionSide,
     memory_limit_mb: usize,
     cpu_budget_ms: u64,
+}
+
+struct PreparedExtension {
+    meta: ExtensionMeta,
+    source: String,
 }
 
 /// §5.2 Scan the extensions directory and load all client-side JS extensions.
@@ -93,22 +99,20 @@ pub fn load_client_extensions(extensions_dir: &Path) -> Vec<LoadedExtension> {
             continue;
         }
 
-        match load_single_extension(&dir, &toml_path, &main_js_path) {
-            Ok(ext) => {
-                // §16.8: only load client-side or both-side extensions in the GUI
-                if ext.side != ExtensionSide::Server {
-                    if ext.result.result.is_ok() {
-                        tracing::info!(id = %ext.id, "extension loaded successfully");
-                    } else {
-                        tracing::warn!(
-                            id = %ext.id,
-                            error = ?ext.result.result,
-                            "extension loaded with errors"
-                        );
-                    }
-                    loaded.push(ext);
+        match load_single_extension(&toml_path, &main_js_path) {
+            Ok(Some(ext)) => {
+                if ext.result.result.is_ok() {
+                    tracing::info!(id = %ext.id, "extension loaded successfully");
+                } else {
+                    tracing::warn!(
+                        id = %ext.id,
+                        error = ?ext.result.result,
+                        "extension loaded with errors"
+                    );
                 }
+                loaded.push(ext);
             }
+            Ok(None) => {}
             Err(e) => {
                 tracing::warn!(dir = %dir.display(), error = %e, "failed to load extension");
             }
@@ -118,26 +122,33 @@ pub fn load_client_extensions(extensions_dir: &Path) -> Vec<LoadedExtension> {
     loaded
 }
 
-fn load_single_extension(
-    _dir: &Path,
+fn prepare_client_extension(
     toml_path: &Path,
     main_js_path: &Path,
-) -> Result<LoadedExtension> {
+) -> Result<Option<PreparedExtension>> {
     let meta = parse_extension_toml(toml_path)
         .with_context(|| format!("parsing {}", toml_path.display()))?;
-
+    if meta.side == ExtensionSide::Server {
+        return Ok(None);
+    }
     let source = std::fs::read_to_string(main_js_path)
         .with_context(|| format!("reading {}", main_js_path.display()))?;
+    Ok(Some(PreparedExtension { meta, source }))
+}
 
+fn load_single_extension(toml_path: &Path, main_js_path: &Path) -> Result<Option<LoadedExtension>> {
+    let Some(prepared) = prepare_client_extension(toml_path, main_js_path)? else {
+        return Ok(None);
+    };
+    let meta = prepared.meta;
     let runner = ExtensionRunner::new(meta.memory_limit_mb, meta.cpu_budget_ms);
-    let result = runner.load_extension(&meta.id, &source, "activate");
-
-    Ok(LoadedExtension {
+    let result = runner.load_extension(&meta.id, &prepared.source, "activate");
+    Ok(Some(LoadedExtension {
         id: meta.id,
         name: meta.name,
         side: meta.side,
         result,
-    })
+    }))
 }
 
 /// Parse extension.toml for metadata. Minimal TOML parsing (no serde dependency
@@ -146,7 +157,7 @@ fn parse_extension_toml(path: &Path) -> Result<ExtensionMeta> {
     let content = std::fs::read_to_string(path)?;
 
     let mut name = String::new();
-    let mut side = ExtensionSide::Client;
+    let mut side = None;
     let mut memory_limit_mb: usize = 64;
     let mut cpu_budget_ms: u64 = 50;
 
@@ -160,12 +171,12 @@ fn parse_extension_toml(path: &Path) -> Result<ExtensionMeta> {
             let value = value.trim().trim_matches('"');
             match key {
                 "name" => name = value.to_string(),
-                "side" => side = ExtensionSide::from_str(value),
+                "side" => side = Some(ExtensionSide::from_str(value)?),
                 "memory_limit_mb" => {
-                    memory_limit_mb = value.parse().unwrap_or(64);
+                    memory_limit_mb = value.parse().context("invalid memory_limit_mb")?;
                 }
                 "cpu_budget_ms" => {
-                    cpu_budget_ms = value.parse().unwrap_or(50);
+                    cpu_budget_ms = value.parse().context("invalid cpu_budget_ms")?;
                 }
                 _ => {}
             }
@@ -178,6 +189,7 @@ fn parse_extension_toml(path: &Path) -> Result<ExtensionMeta> {
         .map(|n| n.to_string_lossy().into_owned())
         .unwrap_or_else(|| "unknown".to_string());
 
+    let side = side.context("extension manifest missing [runtime] side")?;
     Ok(ExtensionMeta {
         id,
         name,
@@ -244,30 +256,15 @@ pub fn init(cx: &mut gpui::App) {
 }
 
 /// §5.2 Initialize the QuickJS extension system at startup.
-/// Called from main.rs after GPUI app creation.
-///
-/// Loads extensions on a background thread (the host must never run on the
-/// render thread — spec §5.2), then parses and publishes any VDOM back onto
-/// the foreground thread into the app-global chrome state. Status bars created
-/// afterward drain that state via [`take_pending_vdom`].
 pub fn init_extensions(cx: &mut gpui::App) {
     init(cx);
     let extensions_dir = paths::extensions_dir().clone();
-
-    cx.spawn(async move |cx| {
-        let loaded = cx
-            .background_spawn(async move { load_client_extensions(&extensions_dir) })
-            .await;
-        tracing::info!(count = loaded.len(), "QuickJS extensions loaded");
-
-        let nodes = collect_status_bar_vdom(&loaded);
-        let count = nodes.len();
-        cx.update(|cx| publish_vdom(cx, nodes));
-        if count > 0 {
-            tracing::info!(vdom_nodes = count, "extension VDOM published to chrome");
-        }
-    })
-    .detach();
+    let controller = cx.new(|cx| {
+        let mut controller = ExtensionHostController::new();
+        controller.start(&extensions_dir, cx);
+        controller
+    });
+    cx.set_global(GlobalHostController(controller));
 }
 
 // §5.2 Dedicated-thread extension host actor.
@@ -292,10 +289,11 @@ pub struct ExtensionHostController {
     command_sender: Option<std::sync::mpsc::Sender<HostCommand>>,
     host_thread: Option<std::thread::JoinHandle<()>>,
     render_tick: Option<gpui::Task<()>>,
-    status_bars: parking_lot::Mutex<Vec<gpui::WeakEntity<crate::extension_status_bar::ExtensionStatusBar>>>,
+    status_bars:
+        parking_lot::Mutex<Vec<gpui::WeakEntity<crate::extension_status_bar::ExtensionStatusBar>>>,
 }
 
-pub struct GlobalHostController(pub std::sync::Arc<ExtensionHostController>);
+pub struct GlobalHostController(pub gpui::Entity<ExtensionHostController>);
 impl gpui::Global for GlobalHostController {}
 
 impl ExtensionHostController {
@@ -307,75 +305,89 @@ impl ExtensionHostController {
             status_bars: parking_lot::Mutex::new(Vec::new()),
         }
     }
-    pub fn start(&mut self, extensions_dir: &Path, cx: &mut gpui::Context<Self>) {
-        let (command_tx, command_rx) = std::sync::mpsc::channel::<HostCommand>();
-        let dir = extensions_dir.to_path_buf();
 
-        let handle = std::thread::Builder::new()
+    pub fn start(&mut self, extensions_dir: &Path, cx: &mut gpui::Context<Self>) {
+        let (command_sender, command_receiver) = std::sync::mpsc::channel::<HostCommand>();
+        let extensions_dir = extensions_dir.to_path_buf();
+        let host_thread = std::thread::Builder::new()
             .name("quickjs-ext-host".into())
             .spawn(move || {
-
-                let runner = ExtensionRunner::with_defaults();
                 let mut live_extensions: Vec<quickjs_runtime::LiveExtension> = Vec::new();
-
-                let entries = match std::fs::read_dir(&dir) {
-                    Ok(e) => e,
-                    Err(_) => return,
+                let entries = match std::fs::read_dir(&extensions_dir) {
+                    Ok(entries) => entries,
+                    Err(error) => {
+                        tracing::warn!(path = %extensions_dir.display(), %error, "extensions directory not readable");
+                        return;
+                    }
                 };
-                for entry in entries.flatten() {
-                    let ext_dir = entry.path();
-                    if !ext_dir.is_dir() {
-                        continue;
-                    }
-                    let main_js = ext_dir.join("main.js");
-                    let toml = ext_dir.join("extension.toml");
-                    if !main_js.exists() || !toml.exists() {
-                        continue;
-                    }
-                    let source = match std::fs::read_to_string(&main_js) {
-                        Ok(s) => s,
-                        Err(_) => continue,
+
+                for entry in entries {
+                    let entry = match entry {
+                        Ok(entry) => entry,
+                        Err(error) => {
+                            tracing::warn!(%error, "failed to read extension directory entry");
+                            continue;
+                        }
                     };
-                    let id = ext_dir
-                        .file_name()
-                        .map(|n| n.to_string_lossy().into_owned())
-                        .unwrap_or_default();
-                    match runner.load_live(&id, &source, "activate") {
-                        Ok(live) => {
-                            tracing::info!(id = %id, "live extension loaded");
-                            live_extensions.push(live);
+                    let extension_dir = entry.path();
+                    if !extension_dir.is_dir() {
+                        continue;
+                    }
+                    let main_js = extension_dir.join("main.js");
+                    let manifest = extension_dir.join("extension.toml");
+                    if !main_js.exists() || !manifest.exists() {
+                        continue;
+                    }
+                    let prepared = match prepare_client_extension(&manifest, &main_js) {
+                        Ok(Some(prepared)) => prepared,
+                        Ok(None) => continue,
+                        Err(error) => {
+                            tracing::warn!(path = %extension_dir.display(), %error, "extension preparation failed");
+                            continue;
+                        }
+                    };
+                    let runner = ExtensionRunner::new(
+                        prepared.meta.memory_limit_mb,
+                        prepared.meta.cpu_budget_ms,
+                    );
+                    match runner.load_live(&prepared.meta.id, &prepared.source, "activate") {
+                        Ok(live_extension) => {
+                            tracing::info!(id = %prepared.meta.id, "live extension loaded");
+                            live_extensions.push(live_extension);
                         }
                         Err(error) => {
-                            tracing::warn!(id = %id, error = %error, "live extension load failed");
+                            tracing::warn!(id = %prepared.meta.id, %error, "live extension load failed");
                         }
                     }
                 }
 
                 loop {
-                    match command_rx.recv() {
+                    match command_receiver.recv() {
                         Ok(HostCommand::Render { reply }) => {
                             let mut nodes = Vec::new();
-                            for live in &live_extensions {
-                                match live.render_now() {
-                                    Ok(Some(json_str)) => {
-                                        if let Ok(value) = serde_json::from_str::<serde_json::Value>(&json_str) {
-                                            if let Ok(node) = vdom_bridge::parse_vdom(&value) {
-                                                nodes.push(node);
-                                            }
-                                        }
-                                    }
+                            for live_extension in &live_extensions {
+                                match live_extension.render_now() {
+                                    Ok(Some(json)) => match serde_json::from_str::<serde_json::Value>(&json) {
+                                        Ok(value) => match vdom_bridge::parse_vdom(&value) {
+                                            Ok(node) => nodes.push(node),
+                                            Err(error) => tracing::warn!(%error, "extension VDOM parse failed"),
+                                        },
+                                        Err(error) => tracing::warn!(%error, "extension VDOM JSON invalid"),
+                                    },
                                     Ok(None) => {}
                                     Err(error) => {
-                                        tracing::warn!(error = %error, "extension render failed");
+                                        tracing::warn!(%error, "extension render failed");
                                     }
                                 }
                             }
-                            let _ = reply.send(Ok(nodes));
+                            if reply.send(Ok(nodes)).is_err() {
+                                tracing::debug!("extension render requester disconnected");
+                            }
                         }
                         Ok(HostCommand::Emit { event, payload }) => {
-                            for live in &live_extensions {
-                                if let Err(error) = live.emit_event(&event, &payload) {
-                                    tracing::warn!(event = %event, error = %error, "extension emit failed");
+                            for live_extension in &live_extensions {
+                                if let Err(error) = live_extension.emit_event(&event, &payload) {
+                                    tracing::warn!(event = %event, %error, "extension emit failed");
                                 }
                             }
                         }
@@ -384,10 +396,15 @@ impl ExtensionHostController {
                 }
             });
 
-        if let Ok(handle) = handle {
-            self.command_sender = Some(command_tx);
-            self.host_thread = Some(handle);
-            self.start_render_tick(cx);
+        match host_thread {
+            Ok(host_thread) => {
+                self.command_sender = Some(command_sender);
+                self.host_thread = Some(host_thread);
+                self.start_render_tick(cx);
+            }
+            Err(error) => {
+                tracing::error!(%error, "failed to start QuickJS extension host");
+            }
         }
     }
 
@@ -397,26 +414,38 @@ impl ExtensionHostController {
         self.render_tick = Some(cx.spawn(async move |this, cx| {
             loop {
                 cx.background_executor().timer(timer_interval).await;
-
-                if let Some(sender) = &sender {
-                    let (reply, response) = std::sync::mpsc::channel();
-                    if sender.send(HostCommand::Render { reply }).is_err() {
-                        break;
-                    }
-                    match response.recv() {
-                        Ok(Ok(nodes)) => {
-                            let _ = this.update(cx, |this, cx| {
-                                for bar in this.status_bars.lock().iter() {
-                                    if let Some(bar) = bar.upgrade() {
-                                        bar.update(cx, |bar, cx| bar.set_vdom_nodes(nodes.clone(), cx));
-                                    }
+                let Some(sender) = sender.clone() else {
+                    break;
+                };
+                let render_result = cx
+                    .background_spawn(async move {
+                        let (reply, response) = std::sync::mpsc::channel();
+                        sender
+                            .send(HostCommand::Render { reply })
+                            .context("sending render request to QuickJS host")?;
+                        response
+                            .recv()
+                            .context("QuickJS host stopped before render response")?
+                    })
+                    .await;
+                match render_result {
+                    Ok(nodes) => {
+                        if let Err(error) = this.update(cx, |this, cx| {
+                            for status_bar in this.status_bars.lock().iter() {
+                                if let Some(status_bar) = status_bar.upgrade() {
+                                    status_bar.update(cx, |status_bar, cx| {
+                                        status_bar.set_vdom_nodes(nodes.clone(), cx)
+                                    });
                                 }
-                            });
+                            }
+                        }) {
+                            tracing::warn!(%error, "extension controller dropped during render update");
+                            break;
                         }
-                        Ok(Err(error)) => {
-                            tracing::warn!(error = %error, "extension host render error");
-                        }
-                        Err(_) => break,
+                    }
+                    Err(error) => {
+                        tracing::warn!(%error, "extension host render error");
+                        break;
                     }
                 }
             }
@@ -424,26 +453,35 @@ impl ExtensionHostController {
     }
 
     pub fn emit_event(&self, event: &str, payload: &str) {
-        if let Some(sender) = &self.command_sender {
-            let _ = sender.send(HostCommand::Emit {
+        if let Some(sender) = &self.command_sender
+            && let Err(error) = sender.send(HostCommand::Emit {
                 event: event.to_string(),
                 payload: payload.to_string(),
-            });
+            })
+        {
+            tracing::warn!(%error, "failed to send event to QuickJS host");
         }
     }
 
-    pub fn add_status_bar(&self, bar: gpui::WeakEntity<crate::extension_status_bar::ExtensionStatusBar>) {
-        self.status_bars.lock().push(bar);
+    pub fn add_status_bar(
+        &self,
+        status_bar: gpui::WeakEntity<crate::extension_status_bar::ExtensionStatusBar>,
+    ) {
+        self.status_bars.lock().push(status_bar);
     }
 }
 
 impl Drop for ExtensionHostController {
     fn drop(&mut self) {
-        if let Some(sender) = &self.command_sender {
-            let _ = sender.send(HostCommand::Shutdown);
+        if let Some(sender) = &self.command_sender
+            && let Err(error) = sender.send(HostCommand::Shutdown)
+        {
+            tracing::warn!(%error, "failed to stop QuickJS host");
         }
-        if let Some(handle) = self.host_thread.take() {
-            let _ = handle.join();
+        if let Some(handle) = self.host_thread.take()
+            && handle.join().is_err()
+        {
+            tracing::warn!("QuickJS host thread panicked during shutdown");
         }
     }
 }
@@ -471,6 +509,45 @@ mod tests {
         }
     }
 
+    fn temporary_extension_dir(name: &str) -> Result<std::path::PathBuf> {
+        let directory =
+            std::env::temp_dir().join(format!("z3rm-quickjs-{name}-{}", nanoid::nanoid!()));
+        std::fs::create_dir_all(&directory)?;
+        Ok(directory)
+    }
+
+    #[test]
+    fn server_extension_is_filtered_before_script_read() -> Result<()> {
+        let directory = temporary_extension_dir("server-side")?;
+        let manifest = directory.join("extension.toml");
+        std::fs::write(
+            &manifest,
+            "name = \"server extension\"\n[runtime]\nside = \"server\"\n",
+        )?;
+
+        let prepared = prepare_client_extension(&manifest, &directory.join("missing.js"))?;
+
+        assert!(prepared.is_none());
+        std::fs::remove_dir_all(directory)?;
+        Ok(())
+    }
+
+    #[test]
+    fn invalid_runtime_side_fails_closed() -> Result<()> {
+        let directory = temporary_extension_dir("invalid-side")?;
+        let manifest = directory.join("extension.toml");
+        std::fs::write(
+            &manifest,
+            "name = \"invalid extension\"\n[runtime]\nside = \"browser\"\n",
+        )?;
+
+        let result = parse_extension_toml(&manifest);
+
+        assert!(result.is_err());
+        std::fs::remove_dir_all(directory)?;
+        Ok(())
+    }
+
     #[test]
     fn collect_parses_status_bar_vdom_from_activate_result() {
         // Deterministic extension result path: activate() returned a VDOM via
@@ -482,8 +559,14 @@ mod tests {
         assert_eq!(nodes.len(), 1);
         let node = &nodes[0];
         assert_eq!(node.element_type, "div");
-        assert_eq!(node.props.get("id").and_then(|v| v.as_str()), Some("status-bar"));
-        assert_eq!(node.style.get("flexDirection").map(String::as_str), Some("row"));
+        assert_eq!(
+            node.props.get("id").and_then(|v| v.as_str()),
+            Some("status-bar")
+        );
+        assert_eq!(
+            node.style.get("flexDirection").map(String::as_str),
+            Some("row")
+        );
         assert_eq!(node.children.len(), 1);
         // The outer div's only child is the span element, not text.
         let span = match &node.children[0] {
@@ -533,7 +616,10 @@ mod tests {
         let nodes = collect_status_bar_vdom(&vec![loaded_with_vdom("e", Some(vdom))]);
         assert_eq!(nodes.len(), 1);
         let text = vdom_bridge::vdom_to_text(&nodes[0], 0);
-        assert!(text.contains("hello"), "bridge vdom_to_text must surface the span text: {text}");
+        assert!(
+            text.contains("hello"),
+            "bridge vdom_to_text must surface the span text: {text}"
+        );
     }
 
     #[gpui::test]
@@ -553,7 +639,10 @@ mod tests {
 
         let (count, element_type) = cx.read(|cx| {
             let bar = bar.read(cx);
-            (bar.vdom_node_count(), bar.vdom_nodes().first().map(|n| n.element_type.clone()))
+            (
+                bar.vdom_node_count(),
+                bar.vdom_nodes().first().map(|n| n.element_type.clone()),
+            )
         });
         assert_eq!(count, 1);
         assert_eq!(element_type.as_deref(), Some("div"));

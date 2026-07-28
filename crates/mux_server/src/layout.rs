@@ -83,7 +83,13 @@ impl LayoutTree {
         direction: SplitDirection,
     ) -> anyhow::Result<()> {
         let old_node_id = Self::find_pane_node_id(&self.root, pane_id)?;
-        let old_root = std::mem::replace(&mut self.root, LayoutNode::Pane { id: String::new(), pane_id: String::new() });
+        let old_root = std::mem::replace(
+            &mut self.root,
+            LayoutNode::Pane {
+                id: String::new(),
+                pane_id: String::new(),
+            },
+        );
         let mut root = old_root;
         Self::split_node(&mut root, &old_node_id, new_pane_id, direction)?;
         self.root = root;
@@ -132,15 +138,14 @@ impl LayoutTree {
             }
             LayoutNode::Split { children, .. } => {
                 for child in children.iter_mut() {
-                    if Self::split_node(child, old_node_id, new_pane_id.clone(), direction).is_ok() {
+                    if Self::split_node(child, old_node_id, new_pane_id.clone(), direction).is_ok()
+                    {
                         return Ok(());
                     }
                 }
                 Err(anyhow::anyhow!("node not found: {}", old_node_id))
             }
-            LayoutNode::Pane { .. } => {
-                Err(anyhow::anyhow!("node not found: {}", old_node_id))
-            }
+            LayoutNode::Pane { .. } => Err(anyhow::anyhow!("node not found: {}", old_node_id)),
         }
     }
 
@@ -165,7 +170,10 @@ impl LayoutTree {
         // 上层替换成了哨兵, 必须在错误路径恢复。用显式作用域 + 始终恢复。
         let mut old_root = std::mem::replace(
             &mut self.root,
-            LayoutNode::Pane { id: String::new(), pane_id: String::new() },
+            LayoutNode::Pane {
+                id: String::new(),
+                pane_id: String::new(),
+            },
         );
         match Self::remove_from_node(&mut old_root, pane_id) {
             Ok(true) => {
@@ -186,39 +194,40 @@ impl LayoutTree {
     }
 
     fn remove_from_node(node: &mut LayoutNode, pane_id: &str) -> anyhow::Result<bool> {
-        match node {
-            LayoutNode::Pane { pane_id: pid, .. } if pid == pane_id => Ok(true),
-            LayoutNode::Pane { .. } => Ok(false),
-            LayoutNode::Split {
-                children,
-                ratios,
-                ..
-            } => {
-                let mut removed = false;
-                for (i, child) in children.iter_mut().enumerate() {
-                    if Self::remove_from_node(child, pane_id)? {
-                        removed = true;
-                        children.remove(i);
-                        ratios.remove(i);
-                        break;
-                    }
-                }
+        let LayoutNode::Split {
+            children, ratios, ..
+        } = node
+        else {
+            return Ok(false);
+        };
 
-                if removed {
-                    // 如果只剩一个子节点, 扁平化。
-                    // 注意:扁平化是"我替换我自己",不是"我被父节点删除"。
-                    // 返回 false 让父节点保留我 (而不是再删一遍),
-                    // 否则会把整个塌缩后的子树错误地丢弃。
-                    if children.len() == 1 {
-                        let child = children.remove(0);
-                        *node = child;
-                        return Ok(false);
-                    }
-                    Self::normalize_ratios(ratios);
+        let direct_child_index = children.iter().position(|child| {
+            matches!(child, LayoutNode::Pane { pane_id: child_pane_id, .. } if child_pane_id == pane_id)
+        });
+        let removed = if let Some(index) = direct_child_index {
+            children.remove(index);
+            ratios.remove(index);
+            true
+        } else {
+            let mut removed = false;
+            for child in children.iter_mut() {
+                if Self::remove_from_node(child, pane_id)? {
+                    removed = true;
+                    break;
                 }
-                Ok(removed)
             }
+            removed
+        };
+
+        if !removed {
+            return Ok(false);
         }
+        if children.len() == 1 {
+            *node = children.remove(0);
+        } else {
+            Self::normalize_ratios(ratios);
+        }
+        Ok(true)
     }
 
     /// 归一化比例
@@ -241,7 +250,13 @@ impl LayoutTree {
         direction: SplitDirection,
         delta: f32,
     ) -> anyhow::Result<()> {
-        let old_root = std::mem::replace(&mut self.root, LayoutNode::Pane { id: String::new(), pane_id: String::new() });
+        let old_root = std::mem::replace(
+            &mut self.root,
+            LayoutNode::Pane {
+                id: String::new(),
+                pane_id: String::new(),
+            },
+        );
         let mut root = old_root;
         Self::resize_in_node(&mut root, pane_id, direction, delta)?;
         self.root = root;
@@ -292,9 +307,9 @@ impl LayoutTree {
     fn contains_pane(node: &LayoutNode, pane_id: &str) -> bool {
         match node {
             LayoutNode::Pane { pane_id: pid, .. } => pid == pane_id,
-            LayoutNode::Split { children, .. } => children
-                .iter()
-                .any(|c| Self::contains_pane(c, pane_id)),
+            LayoutNode::Split { children, .. } => {
+                children.iter().any(|c| Self::contains_pane(c, pane_id))
+            }
         }
     }
 
@@ -340,9 +355,10 @@ impl LayoutTree {
         height: u32,
     ) -> anyhow::Result<String> {
         match node {
-            LayoutNode::Pane { pane_id, .. } => {
-                Ok(format!("{}x{},{},{},{}", width, height, xoff, yoff, pane_id))
-            }
+            LayoutNode::Pane { pane_id, .. } => Ok(format!(
+                "{}x{},{},{},{}",
+                width, height, xoff, yoff, pane_id
+            )),
             LayoutNode::Split {
                 direction,
                 children,
@@ -443,16 +459,28 @@ impl LayoutTree {
         let bytes = s.as_bytes();
         let mut i = 0;
         let width = Self::scan_uint(bytes, &mut i)?;
-        anyhow::ensure!(i < bytes.len() && bytes[i] == b'x', "layout: expected 'x' in WxH");
+        anyhow::ensure!(
+            i < bytes.len() && bytes[i] == b'x',
+            "layout: expected 'x' in WxH"
+        );
         i += 1;
         let height = Self::scan_uint(bytes, &mut i)?;
-        anyhow::ensure!(i < bytes.len() && bytes[i] == b',', "layout: expected ',' after WxH");
+        anyhow::ensure!(
+            i < bytes.len() && bytes[i] == b',',
+            "layout: expected ',' after WxH"
+        );
         i += 1;
         let _xoff = Self::scan_uint(bytes, &mut i)?;
-        anyhow::ensure!(i < bytes.len() && bytes[i] == b',', "layout: expected ',' after xoff");
+        anyhow::ensure!(
+            i < bytes.len() && bytes[i] == b',',
+            "layout: expected ',' after xoff"
+        );
         i += 1;
         let _yoff = Self::scan_uint(bytes, &mut i)?;
-        anyhow::ensure!(i < bytes.len() && bytes[i] == b',', "layout: expected ',' after yoff");
+        anyhow::ensure!(
+            i < bytes.len() && bytes[i] == b',',
+            "layout: expected ',' after yoff"
+        );
         i += 1;
         // paneid 直到分隔符 (',' '}' ']') 或结尾; 分隔符均为 ASCII, 对 UTF-8 安全。
         let start = i;
@@ -498,12 +526,14 @@ impl LayoutTree {
 
         // 从绝对 cell 计数反推 ratios: child 主轴尺寸 / 容器主轴尺寸。
         let (total_w, total_h) = match direction {
-            SplitDirection::LeftRight => {
-                (widths.iter().sum::<u32>(), heights.iter().copied().max().unwrap_or(0))
-            }
-            SplitDirection::TopBottom => {
-                (widths.iter().copied().max().unwrap_or(0), heights.iter().sum::<u32>())
-            }
+            SplitDirection::LeftRight => (
+                widths.iter().sum::<u32>(),
+                heights.iter().copied().max().unwrap_or(0),
+            ),
+            SplitDirection::TopBottom => (
+                widths.iter().copied().max().unwrap_or(0),
+                heights.iter().sum::<u32>(),
+            ),
         };
         let denom = match direction {
             SplitDirection::LeftRight => total_w,
@@ -523,7 +553,12 @@ impl LayoutTree {
         };
         let id = Self::alloc_id(next_id, node_ids);
         Ok((
-            LayoutNode::Split { id, direction, children, ratios },
+            LayoutNode::Split {
+                id,
+                direction,
+                children,
+                ratios,
+            },
             total_w,
             total_h,
             rest,
