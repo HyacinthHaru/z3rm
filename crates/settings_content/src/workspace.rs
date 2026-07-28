@@ -74,6 +74,9 @@ pub enum OnLastWindowClosed {
 #[derive(Clone, Default, Debug, PartialEq, Serialize, Deserialize, JsonSchema, MergeFrom)]
 #[serde(default)]
 pub struct TabBarSettingsContent {
+    /// Whether to show the tab bar. Default: true
+    pub show: bool,
+
     /// Whether to show the middle click to close tab behavior. Default: true
     pub middle_click_to_close: bool,
 

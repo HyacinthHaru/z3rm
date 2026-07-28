@@ -1476,8 +1476,8 @@ impl settings::SettingsKey for VimModeSetting {
 }
 
 impl settings::Settings for VimModeSetting {
-    fn from_settings(_content: &settings::SettingsContent) -> Self {
-        Self::default()
+    fn from_settings(content: &settings::SettingsContent) -> Self {
+        Self(content.vim_mode.unwrap_or(false))
     }
 }
 

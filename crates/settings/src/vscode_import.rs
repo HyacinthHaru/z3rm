@@ -207,6 +207,7 @@ impl VsCodeSettings {
 
     fn tab_bar_settings_content(&self) -> TabBarSettingsContent {
         TabBarSettingsContent {
+            show: true,
             middle_click_to_close: true,
             mouse_scroll_to_switch: true,
             show_active_item: false,

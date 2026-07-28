@@ -89,7 +89,7 @@ impl Settings for TabBarSettings {
     fn from_settings(content: &settings::SettingsContent) -> Self {
         let tab_bar = content.tab_bar.clone().unwrap_or_default();
         TabBarSettings {
-            show: true, // Tab 栏默认显示
+            show: tab_bar.show,
             middle_click_to_close: tab_bar.middle_click_to_close,
             mouse_scroll_to_switch: tab_bar.mouse_scroll_to_switch,
             show_active_item: tab_bar.show_active_item,
