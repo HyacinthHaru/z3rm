@@ -195,6 +195,16 @@ fn session_shadow_dir(session_id: &str) -> PathBuf {
 /// `$LOCAL_DATA/z3rm/shadow/<session_id>/` so each session gets its own
 /// single-writer engine instance.
 pub fn start(session_id: &str, cwd: &str) -> Result<Option<Arc<SnapshotWatch>>> {
+    start_with(session_id, cwd, |monitor, root| {
+        monitor.watch_directory(root)
+    })
+}
+
+pub fn start_with(
+    session_id: &str,
+    cwd: &str,
+    watch: impl FnOnce(Arc<Monitor>, PathBuf) -> std::io::Result<shadow_snapshot::WatchHandle>,
+) -> Result<Option<Arc<SnapshotWatch>>> {
     let root = Path::new(cwd);
     // A usable watch root must be an existing directory. Recovered/test
     // sessions carry a cwd that is just a string (e.g. "/home/user"); starting
@@ -311,9 +321,7 @@ pub fn start(session_id: &str, cwd: &str) -> Result<Option<Arc<SnapshotWatch>>> 
                     route_record_event(&engine, &path, trigger);
                 }
 
-                if path_disconnected
-                    && matches!(command_rx.try_recv(), Err(mpsc::TryRecvError::Disconnected))
-                {
+                if path_disconnected {
                     break;
                 }
             }
@@ -344,7 +352,7 @@ pub fn start(session_id: &str, cwd: &str) -> Result<Option<Arc<SnapshotWatch>>> 
     };
 
     let monitor = Arc::new(Monitor::new(root.to_path_buf(), on_event));
-    let watch_handle = match monitor.watch_directory(root.to_path_buf()) {
+    let watch_handle = match watch(monitor.clone(), root.to_path_buf()) {
         Ok(handle) => {
             zlog::info!(
                 "shadow snapshot started: session={} cwd={}",
@@ -354,10 +362,14 @@ pub fn start(session_id: &str, cwd: &str) -> Result<Option<Arc<SnapshotWatch>>> 
             handle
         }
         Err(error) => {
-            // watch_directory failed — drop the recorder sender so the recorder
-            // thread exits, and surface the error to the caller.
+            // Drop the path sender AND the monitor (which holds a clone of
+            // path_tx inside its on_event closure) so path_rx sees Disconnected
+            // and the recorder thread exits before join.
             drop(path_tx);
-            let _ = recorder.join();
+            drop(monitor);
+            if recorder.join().is_err() {
+                zlog::warn!("shadow snapshot recorder panicked after watcher startup failed");
+            }
             return Err(error).with_context(|| {
                 format!(
                     "shadow snapshot watch_directory: session={} cwd={}",
@@ -554,5 +566,23 @@ mod tests {
             Ok(None) => {}
             other => panic!("expected Ok(None), got {:?}", other.map(|o| o.is_some())),
         }
+    }
+
+    #[test]
+    fn watch_directory_failure_joins_recorder_without_deadlock() {
+        let directory = tempfile::tempdir().expect("temp directory");
+        let cwd = directory.path().to_str().expect("utf-8 cwd").to_string();
+
+        let result = start_with("fail-watch-test", &cwd, |_monitor, _root| {
+            Err(std::io::Error::new(
+                std::io::ErrorKind::PermissionDenied,
+                "injected watcher failure",
+            ))
+        });
+
+        assert!(
+            result.is_err(),
+            "injected watch failure must surface as Err"
+        );
     }
 }
