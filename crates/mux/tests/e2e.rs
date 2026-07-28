@@ -96,8 +96,47 @@ impl TestServer {
 
 impl Drop for TestServer {
     fn drop(&mut self) {
-        let _ = self.child.kill();
-        let _ = self.child.wait();
+        if let Err(error) = self.child.kill() {
+            eprintln!("failed to kill e2e mux server: {error}");
+        }
+        if let Err(error) = self.child.wait() {
+            eprintln!("failed to reap e2e mux server: {error}");
+        }
+    }
+}
+
+/// 等待 pane grid 出现 `min_count` 次包含 `needle` 的内容,或超时失败。
+///
+/// mux_server 处理 PTY 输出 + 推送 PaneDirty + 客户端拉 grid 是异步的,
+/// 所以轮询 fetch_grid_update 直到看到目标出现次数满足,避免在第一次出现
+/// 就返回而后续输出尚未到达的竞态 (例如 cat 输入回显 + 输出回显需两次)。
+async fn wait_for_grid_contains_count(
+    domain: &MuxDomain,
+    pane_id: &str,
+    needle: &str,
+    min_count: usize,
+    timeout: Duration,
+) -> Result<String> {
+    let deadline = Instant::now() + timeout;
+    loop {
+        let resp = domain.fetch_grid_update(pane_id, 0).await?;
+        if let Some(update) = &resp.update {
+            let text = grid_text(update);
+            if text.matches(needle).count() >= min_count {
+                return Ok(text);
+            }
+        }
+        if Instant::now() >= deadline {
+            let last = resp.update.as_ref().map(grid_text).unwrap_or_default();
+            anyhow::bail!(
+                "timeout waiting for {:?} to occur {} times in pane {} grid. Last grid:\n{}",
+                needle,
+                min_count,
+                pane_id,
+                last
+            );
+        }
+        std::thread::sleep(Duration::from_millis(50));
     }
 }
 
@@ -111,26 +150,7 @@ async fn wait_for_grid_contains(
     needle: &str,
     timeout: Duration,
 ) -> Result<String> {
-    let deadline = Instant::now() + timeout;
-    loop {
-        let resp = domain.fetch_grid_update(pane_id, 0).await?;
-        if let Some(update) = &resp.update {
-            let text = grid_text(update);
-            if text.contains(needle) {
-                return Ok(text);
-            }
-        }
-        if Instant::now() >= deadline {
-            let last = resp.update.as_ref().map(grid_text).unwrap_or_default();
-            anyhow::bail!(
-                "timeout waiting for {:?} in pane {} grid. Last grid:\n{}",
-                needle,
-                pane_id,
-                last
-            );
-        }
-        std::thread::sleep(Duration::from_millis(50));
-    }
+    wait_for_grid_contains_count(domain, pane_id, needle, 1, timeout).await
 }
 
 /// 把 GridUpdate (Diff 或 FullSnapshot) 渲染成纯文本用于断言。
@@ -234,15 +254,17 @@ async fn e2e_full_session_lifecycle() -> Result<()> {
         .await
         .context("send_input failed")?;
 
-    // 7. fetch_grid_update 轮询直到看到 "hello-z3rm" (cat 回显两次:输入行 + 输出行)
+    // 7. fetch_grid_update 轮询直到看到 "hello-z3rm" 两次
+    // (cat 输入回显行 + cat 输出行)。等到两次都出现再断言,避免轮询在
+    // 第一次回显到达但第二次输出尚未到达时提前返回的竞态。
     let grid =
-        wait_for_grid_contains(&domain, &pane_id, "hello-z3rm", Duration::from_secs(5)).await?;
+        wait_for_grid_contains_count(&domain, &pane_id, "hello-z3rm", 2, Duration::from_secs(5))
+            .await?;
     assert!(
         grid.matches("hello-z3rm").count() >= 2,
         "expected cat to echo 'hello-z3rm' twice (typed + echoed), got:\n{}",
         grid
     );
-
     // 8. kill_session
     domain.kill_session(&session_id).await?;
 
@@ -364,7 +386,15 @@ async fn e2e_split_pane_creates_distinct_pane() -> Result<()> {
         .create_session("e2e-split", &PathBuf::from("/"))
         .await?;
     let attach = domain.attach(&session_id, AttachMode::Shared).await?;
-    let tab_id = attach.snapshot.as_ref().unwrap().tabs[0].id.clone();
+    let tab_id = attach
+        .snapshot
+        .as_ref()
+        .context("split attach snapshot missing")?
+        .tabs
+        .first()
+        .context("split attach snapshot has no tabs")?
+        .id
+        .clone();
 
     let pane1 = domain
         .spawn_pane(
@@ -423,7 +453,15 @@ async fn e2e_generation_advances_on_pty_output() -> Result<()> {
         .create_session("e2e-gen", &PathBuf::from("/"))
         .await?;
     let attach = domain.attach(&session_id, AttachMode::Shared).await?;
-    let tab_id = attach.snapshot.as_ref().unwrap().tabs[0].id.clone();
+    let tab_id = attach
+        .snapshot
+        .as_ref()
+        .context("generation attach snapshot missing")?
+        .tabs
+        .first()
+        .context("generation attach snapshot has no tabs")?
+        .id
+        .clone();
 
     let pane = domain
         .spawn_pane(
@@ -473,7 +511,15 @@ async fn e2e_split_pane_visible_in_attach_snapshot() -> Result<()> {
         .create_session("e2e-split-snapshot", &PathBuf::from("/"))
         .await?;
     let attach = domain.attach(&session_id, AttachMode::Shared).await?;
-    let tab_id = attach.snapshot.as_ref().unwrap().tabs[0].id.clone();
+    let tab_id = attach
+        .snapshot
+        .as_ref()
+        .context("split snapshot attach missing")?
+        .tabs
+        .first()
+        .context("split snapshot attach has no tabs")?
+        .id
+        .clone();
 
     let pane1 = domain
         .spawn_pane(
@@ -516,7 +562,11 @@ async fn e2e_split_pane_visible_in_attach_snapshot() -> Result<()> {
         all_panes
     );
 
-    domain.kill_session(&session_id).await?;
+    // This connection intentionally re-attached read-only, so it must not regain
+    // Admin authority merely for cleanup. Use a fresh local connection, whose
+    // pre-attach role is Admin, to remove the isolated test session.
+    let admin = server.connect().await?;
+    admin.kill_session(&session_id).await?;
     Ok(())
 }
 

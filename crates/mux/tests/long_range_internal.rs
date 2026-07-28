@@ -12,8 +12,8 @@
 use anyhow::{Context, Result};
 use mux::{AttachMode, MuxDomain};
 use mux_protocol::proto::{
-    self, fetch_grid_update_response::Update as FetchUpdate, split_node::SplitDirection,
-    TerminalSize,
+    self, TerminalSize, fetch_grid_update_response::Update as FetchUpdate,
+    split_node::SplitDirection,
 };
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -40,7 +40,8 @@ impl TestServer {
                 manifest.join("../../target/debug/z3rm-server"),
                 manifest.join("../../target/release/z3rm-server"),
             ];
-            candidates.iter()
+            candidates
+                .iter()
                 .find(|p| p.exists())
                 .map(|p| p.to_string_lossy().into_owned())
                 .unwrap_or_else(|| "z3rm-server".to_string())
@@ -66,14 +67,22 @@ impl TestServer {
         // Extra settle time
         std::thread::sleep(Duration::from_millis(200));
 
-        Ok(Self { child, socket_path, _tmp: tmp })
+        Ok(Self {
+            child,
+            socket_path,
+            _tmp: tmp,
+        })
     }
 }
 
 impl Drop for TestServer {
     fn drop(&mut self) {
-        let _ = self.child.kill();
-        let _ = self.child.wait();
+        if let Err(error) = self.child.kill() {
+            eprintln!("failed to kill long-range mux server: {error}");
+        }
+        if let Err(error) = self.child.wait() {
+            eprintln!("failed to reap long-range mux server: {error}");
+        }
     }
 }
 
@@ -82,12 +91,19 @@ async fn connect(server: &TestServer) -> Result<MuxDomain> {
 }
 
 /// Helper: wait for grid to contain expected text
-async fn wait_for_text(domain: &MuxDomain, pane_id: &str, expected: &str, timeout_ms: u64) -> Result<()> {
+async fn wait_for_text(
+    domain: &MuxDomain,
+    pane_id: &str,
+    expected: &str,
+    timeout_ms: u64,
+) -> Result<()> {
     let deadline = Instant::now() + Duration::from_millis(timeout_ms);
     loop {
         let resp = domain.fetch_grid_update(pane_id, 0).await?;
         if let Some(FetchUpdate::FullSnapshot(snapshot)) = resp.update {
-            let text: String = snapshot.cells.iter()
+            let text: String = snapshot
+                .cells
+                .iter()
                 .filter_map(|c| c.char.chars().next())
                 .collect();
             if text.contains(expected) {
@@ -120,14 +136,20 @@ async fn test_session_lifecycle_100_ops() -> Result<()> {
     let mut session_ids = Vec::new();
     for i in 0..10 {
         let name = format!("session-{i}");
-        let id = domain.create_session(&name, std::path::Path::new("/tmp")).await?;
+        let id = domain
+            .create_session(&name, std::path::Path::new("/tmp"))
+            .await?;
         session_ids.push(id);
     }
 
     // Ops 11-20: List sessions 10 times (verify count grows)
     for _ in 0..10 {
         let sessions = domain.list_sessions().await?;
-        assert!(sessions.len() >= 10, "expected >= 10 sessions, got {}", sessions.len());
+        assert!(
+            sessions.len() >= 10,
+            "expected >= 10 sessions, got {}",
+            sessions.len()
+        );
     }
 
     // Ops 21-30: Attach/detach each session
@@ -144,7 +166,9 @@ async fn test_session_lifecycle_100_ops() -> Result<()> {
     // Ops 41-50: Spawn pane in each session
     let mut pane_ids = Vec::new();
     for id in &session_ids {
-        let pane_id = domain.spawn_pane(id, "main", TerminalSize { cols: 80, rows: 24 }, None, None).await?;
+        let pane_id = domain
+            .spawn_pane(id, "main", TerminalSize { cols: 80, rows: 24 }, None, None)
+            .await?;
         pane_ids.push(pane_id);
     }
 
@@ -157,7 +181,10 @@ async fn test_session_lifecycle_100_ops() -> Result<()> {
     // Ops 61-70: Fetch grid from each pane
     for pane_id in &pane_ids {
         let resp = domain.fetch_grid_update(pane_id, 0).await?;
-        assert!(resp.update.is_some(), "pane {pane_id} should have grid data");
+        assert!(
+            resp.update.is_some(),
+            "pane {pane_id} should have grid data"
+        );
     }
 
     // Ops 71-80: Resize each pane
@@ -175,7 +202,11 @@ async fn test_session_lifecycle_100_ops() -> Result<()> {
     // Ops 91-100: Verify sessions are gone
     for _ in 0..10 {
         let sessions = domain.list_sessions().await?;
-        assert!(sessions.len() <= 1, "all user sessions should be killed, got {}", sessions.len());
+        assert!(
+            sessions.len() <= 1,
+            "all user sessions should be killed, got {}",
+            sessions.len()
+        );
     }
 
     Ok(())
@@ -189,8 +220,18 @@ async fn test_pane_split_zoom_focus_100_ops() -> Result<()> {
     let server = TestServer::spawn()?;
     let domain = connect(&server).await?;
 
-    let session_id = domain.create_session("split-test", std::path::Path::new("/tmp")).await?;
-    let root_pane = domain.spawn_pane(&session_id, "main", TerminalSize { cols: 80, rows: 24 }, None, None).await?;
+    let session_id = domain
+        .create_session("split-test", std::path::Path::new("/tmp"))
+        .await?;
+    let root_pane = domain
+        .spawn_pane(
+            &session_id,
+            "main",
+            TerminalSize { cols: 80, rows: 24 },
+            None,
+            None,
+        )
+        .await?;
 
     // Ops 1-20: Split pane 20 times (alternating directions)
     let mut panes = vec![root_pane.clone()];
@@ -200,7 +241,9 @@ async fn test_pane_split_zoom_focus_100_ops() -> Result<()> {
         } else {
             SplitDirection::TopBottom
         };
-        let new_pane = domain.split_pane(&panes[i % panes.len()], direction).await?;
+        let new_pane = domain
+            .split_pane(&panes[i % panes.len()], direction)
+            .await?;
         panes.push(new_pane);
     }
     assert_eq!(panes.len(), 21);
@@ -242,9 +285,29 @@ async fn test_input_stress_100_ops() -> Result<()> {
     let server = TestServer::spawn()?;
     let domain = connect(&server).await?;
 
-    let session_id = domain.create_session("input-test", std::path::Path::new("/tmp")).await?;
-    let pane_id = domain.spawn_pane(&session_id, "main", TerminalSize { cols: 80, rows: 24 }, None, None).await?;
-    tokio::time::sleep(Duration::from_millis(300)).await;
+    let session_id = domain
+        .create_session("input-test", std::path::Path::new("/tmp"))
+        .await?;
+    // Run a raw-mode byte sink so control bytes are tested as input data.
+    // Sending Ctrl-C/Ctrl-D to an interactive shell would intentionally signal
+    // or terminate it, which tests shell semantics rather than mux delivery.
+    let pane_id = domain
+        .spawn_pane(
+            &session_id,
+            "main",
+            TerminalSize { cols: 80, rows: 24 },
+            Some(proto::ShellCommand {
+                program: "/bin/sh".to_string(),
+                args: vec![
+                    "-c".to_string(),
+                    "stty raw -echo; printf 'input-ready\\r\\n'; cat >/dev/null".to_string(),
+                ],
+                env: Default::default(),
+            }),
+            None,
+        )
+        .await?;
+    wait_for_text(&domain, &pane_id, "input-ready", 5_000).await?;
 
     // Ops 1-26: Ctrl+A through Ctrl+Z
     for c in b'a'..=b'z' {
@@ -298,11 +361,13 @@ async fn test_input_stress_100_ops() -> Result<()> {
         domain.send_input(&pane_id, b"\x7f").await?; // backspace
     }
 
-    // Ops 97-106: Mixed sequences
-    domain.send_input(&pane_id, b"echo done\r").await?;
-    tokio::time::sleep(Duration::from_millis(500)).await;
+    // Ops 97-106: Mixed sequences. The raw sink remains alive after every
+    // control byte, proving the mux/PTY path delivered the entire sequence.
+    for _ in 0..10 {
+        domain.send_input(&pane_id, b"final-sequence").await?;
+    }
+    tokio::time::sleep(Duration::from_millis(100)).await;
 
-    // Verify pane still responsive
     let resp = domain.fetch_grid_update(&pane_id, 0).await?;
     assert!(resp.update.is_some());
 
@@ -318,8 +383,18 @@ async fn test_grid_sync_generation_100_ops() -> Result<()> {
     let server = TestServer::spawn()?;
     let domain = connect(&server).await?;
 
-    let session_id = domain.create_session("grid-test", std::path::Path::new("/tmp")).await?;
-    let pane_id = domain.spawn_pane(&session_id, "main", TerminalSize { cols: 80, rows: 24 }, None, None).await?;
+    let session_id = domain
+        .create_session("grid-test", std::path::Path::new("/tmp"))
+        .await?;
+    let pane_id = domain
+        .spawn_pane(
+            &session_id,
+            "main",
+            TerminalSize { cols: 80, rows: 24 },
+            None,
+            None,
+        )
+        .await?;
     tokio::time::sleep(Duration::from_millis(300)).await;
 
     let mut last_gen: u64 = 0;
@@ -331,8 +406,12 @@ async fn test_grid_sync_generation_100_ops() -> Result<()> {
         tokio::time::sleep(Duration::from_millis(20)).await;
 
         let resp = domain.fetch_grid_update(&pane_id, last_gen).await?;
-        assert!(resp.to_generation >= last_gen,
-            "generation should not decrease: {} < {}", resp.to_generation, last_gen);
+        assert!(
+            resp.to_generation >= last_gen,
+            "generation should not decrease: {} < {}",
+            resp.to_generation,
+            last_gen
+        );
 
         if resp.to_generation > last_gen {
             // Got new data — verify it's a valid update
@@ -354,7 +433,10 @@ async fn test_grid_sync_generation_100_ops() -> Result<()> {
     }
 
     // Final verification: generation must have increased significantly
-    assert!(last_gen > 50, "generation should have increased significantly, got {last_gen}");
+    assert!(
+        last_gen > 50,
+        "generation should have increased significantly, got {last_gen}"
+    );
 
     domain.kill_session(&session_id).await?;
     Ok(())
@@ -368,8 +450,18 @@ async fn test_resize_storm_100_ops() -> Result<()> {
     let server = TestServer::spawn()?;
     let domain = connect(&server).await?;
 
-    let session_id = domain.create_session("resize-test", std::path::Path::new("/tmp")).await?;
-    let pane_id = domain.spawn_pane(&session_id, "main", TerminalSize { cols: 80, rows: 24 }, None, None).await?;
+    let session_id = domain
+        .create_session("resize-test", std::path::Path::new("/tmp"))
+        .await?;
+    let pane_id = domain
+        .spawn_pane(
+            &session_id,
+            "main",
+            TerminalSize { cols: 80, rows: 24 },
+            None,
+            None,
+        )
+        .await?;
     tokio::time::sleep(Duration::from_millis(200)).await;
 
     // Ops 1-100: Resize with varying dimensions
@@ -404,7 +496,9 @@ async fn test_multi_session_concurrent_100_ops() -> Result<()> {
     // Ops 1-5: Create 5 sessions
     let mut sessions = Vec::new();
     for i in 0..5 {
-        let id = domain.create_session(&format!("multi-{i}"), std::path::Path::new("/tmp")).await?;
+        let id = domain
+            .create_session(&format!("multi-{i}"), std::path::Path::new("/tmp"))
+            .await?;
         sessions.push(id);
     }
 
@@ -412,7 +506,15 @@ async fn test_multi_session_concurrent_100_ops() -> Result<()> {
     let mut all_panes = Vec::new();
     for session_id in &sessions {
         for _ in 0..4 {
-            let pane_id = domain.spawn_pane(session_id, "main", TerminalSize { cols: 80, rows: 24 }, None, None).await?;
+            let pane_id = domain
+                .spawn_pane(
+                    session_id,
+                    "main",
+                    TerminalSize { cols: 80, rows: 24 },
+                    None,
+                    None,
+                )
+                .await?;
             all_panes.push(pane_id);
         }
     }
@@ -458,12 +560,26 @@ async fn test_notification_stream_100_ops() -> Result<()> {
     let domain = connect(&server).await?;
     let mut rx = domain.subscribe();
 
-    let session_id = domain.create_session("notif-test", std::path::Path::new("/tmp")).await?;
+    let session_id = domain
+        .create_session("notif-test", std::path::Path::new("/tmp"))
+        .await?;
+    // Server lifecycle and pane notifications are session-scoped. Merely
+    // subscribing on the client creates a local receiver; attach establishes
+    // the server-side lifecycle subscriber required by §3.4.
+    domain.attach(&session_id, AttachMode::Shared).await?;
 
     // Ops 1-50: Spawn panes (generates PaneAdded notifications)
     let mut panes = Vec::new();
     for _ in 0..50 {
-        let pane_id = domain.spawn_pane(&session_id, "main", TerminalSize { cols: 80, rows: 24 }, None, None).await?;
+        let pane_id = domain
+            .spawn_pane(
+                &session_id,
+                "main",
+                TerminalSize { cols: 80, rows: 24 },
+                None,
+                None,
+            )
+            .await?;
         panes.push(pane_id);
     }
 
@@ -481,7 +597,10 @@ async fn test_notification_stream_100_ops() -> Result<()> {
             break;
         }
     }
-    assert!(notif_count >= 50, "expected >= 50 notifications, got {notif_count}");
+    assert!(
+        notif_count >= 50,
+        "expected >= 50 notifications, got {notif_count}"
+    );
 
     domain.kill_session(&session_id).await?;
     Ok(())
@@ -496,11 +615,21 @@ async fn test_reconnect_recovery_100_ops() -> Result<()> {
 
     // Phase 1: Create state (ops 1-50)
     let domain1 = connect(&server).await?;
-    let session_id = domain1.create_session("reconnect-test", std::path::Path::new("/tmp")).await?;
+    let session_id = domain1
+        .create_session("reconnect-test", std::path::Path::new("/tmp"))
+        .await?;
 
     let mut panes = Vec::new();
     for i in 0..25 {
-        let pane_id = domain1.spawn_pane(&session_id, "main", TerminalSize { cols: 80, rows: 24 }, None, None).await?;
+        let pane_id = domain1
+            .spawn_pane(
+                &session_id,
+                "main",
+                TerminalSize { cols: 80, rows: 24 },
+                None,
+                None,
+            )
+            .await?;
         let cmd = format!("echo before-{i}\r");
         domain1.send_input(&pane_id, cmd.as_bytes()).await?;
         panes.push(pane_id);
@@ -518,7 +647,10 @@ async fn test_reconnect_recovery_100_ops() -> Result<()> {
     // Verify all panes still exist and have content
     for (i, pane_id) in panes.iter().enumerate() {
         let resp = domain2.fetch_grid_update(pane_id, 0).await?;
-        assert!(resp.update.is_some(), "pane {i} should have grid after reconnect");
+        assert!(
+            resp.update.is_some(),
+            "pane {i} should have grid after reconnect"
+        );
     }
 
     // Send more input after reconnect
@@ -546,8 +678,18 @@ async fn test_scrollback_fetch_100_ops() -> Result<()> {
     let server = TestServer::spawn()?;
     let domain = connect(&server).await?;
 
-    let session_id = domain.create_session("scroll-test", std::path::Path::new("/tmp")).await?;
-    let pane_id = domain.spawn_pane(&session_id, "main", TerminalSize { cols: 80, rows: 24 }, None, None).await?;
+    let session_id = domain
+        .create_session("scroll-test", std::path::Path::new("/tmp"))
+        .await?;
+    let pane_id = domain
+        .spawn_pane(
+            &session_id,
+            "main",
+            TerminalSize { cols: 80, rows: 24 },
+            None,
+            None,
+        )
+        .await?;
     tokio::time::sleep(Duration::from_millis(300)).await;
 
     // Ops 1-80: Generate scrollback by printing many lines
@@ -583,15 +725,28 @@ async fn test_protocol_mixed_ops_100() -> Result<()> {
     let mut sessions = Vec::new();
     for i in 0..10 {
         let name = format!("mixed-{i}");
-        let id = domain.create_session(&name, std::path::Path::new("/tmp")).await?;
+        let id = domain
+            .create_session(&name, std::path::Path::new("/tmp"))
+            .await?;
         sessions.push(id);
     }
 
     // Ops 11-30: Spawn + input + fetch in each session
     let mut panes = Vec::new();
     for session_id in &sessions {
-        let size = TerminalSize { cols: 120, rows: 40 };
-        let pane_id = domain.spawn_pane(session_id, "main", TerminalSize { cols: 80, rows: 24 }, None, None).await?;
+        let size = TerminalSize {
+            cols: 120,
+            rows: 40,
+        };
+        let pane_id = domain
+            .spawn_pane(
+                session_id,
+                "main",
+                TerminalSize { cols: 80, rows: 24 },
+                None,
+                None,
+            )
+            .await?;
         domain.send_input(&pane_id, b"echo mixed\r").await?;
         panes.push(pane_id);
     }
@@ -605,7 +760,9 @@ async fn test_protocol_mixed_ops_100() -> Result<()> {
 
     // Ops 51-60: Split each pane
     for pane_id in &panes {
-        domain.split_pane(pane_id, SplitDirection::LeftRight).await?;
+        domain
+            .split_pane(pane_id, SplitDirection::LeftRight)
+            .await?;
     }
 
     // Ops 61-70: Resize each pane
@@ -622,7 +779,9 @@ async fn test_protocol_mixed_ops_100() -> Result<()> {
 
     // Ops 81-90: Rename sessions
     for (i, session_id) in sessions.iter().enumerate() {
-        domain.rename_session(session_id, &format!("final-{i}")).await?;
+        domain
+            .rename_session(session_id, &format!("final-{i}"))
+            .await?;
     }
 
     // Ops 91-100: Kill all sessions

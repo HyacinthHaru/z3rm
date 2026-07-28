@@ -56,10 +56,72 @@ pub struct MuxDomain {
 /// §9 内部状态：请求 ID 计数器、待处理请求、订阅者列表、写通道。
 struct DomainInner {
     next_request_id: AtomicU64,
-    pending_requests: HashMap<u64, async_channel::Sender<Response>>,
+    pending_requests: HashMap<u64, PendingRequest>,
     /// §9 通知订阅者列表。subscribe() 添加新 sender, 路由器 fan-out 到所有。
     subscribers: Arc<parking_lot::Mutex<Vec<async_channel::Sender<Notification>>>>,
     write_tx: std::sync::mpsc::Sender<Vec<u8>>,
+    /// Monotonic transport epoch. Each I/O worker records the epoch it was
+    /// spawned with; reconnect increments it so a stale worker can no longer
+    /// fulfill or cancel requests registered against the new transport.
+    transport_epoch: AtomicU64,
+}
+
+/// A pending request remembers the transport epoch it was registered against,
+/// so the router only fulfills it with a response from the same epoch and a
+/// draining stale worker cannot close a sender owned by the new transport.
+struct PendingRequest {
+    sender: async_channel::Sender<Response>,
+    transport_epoch: u64,
+}
+
+struct PendingRequestGuard {
+    inner: Arc<parking_lot::RwLock<DomainInner>>,
+    request_id: u64,
+    transport_epoch: u64,
+}
+
+impl Drop for PendingRequestGuard {
+    fn drop(&mut self) {
+        let mut inner = self.inner.write();
+        let belongs_to_guard = inner
+            .pending_requests
+            .get(&self.request_id)
+            .is_some_and(|request| request.transport_epoch == self.transport_epoch);
+        if belongs_to_guard {
+            inner.pending_requests.remove(&self.request_id);
+        }
+    }
+}
+
+fn take_pending_response_sender(
+    inner: &mut DomainInner,
+    request_id: u64,
+    worker_epoch: u64,
+) -> Option<async_channel::Sender<Response>> {
+    let belongs_to_worker = inner
+        .pending_requests
+        .get(&request_id)
+        .is_some_and(|request| request.transport_epoch == worker_epoch);
+    belongs_to_worker
+        .then(|| inner.pending_requests.remove(&request_id))
+        .flatten()
+        .map(|request| request.sender)
+}
+
+fn drain_pending_requests_for_epoch(
+    inner: &mut DomainInner,
+    worker_epoch: u64,
+) -> Vec<async_channel::Sender<Response>> {
+    let pending = std::mem::take(&mut inner.pending_requests);
+    let mut worker_senders = Vec::new();
+    for (request_id, request) in pending {
+        if request.transport_epoch == worker_epoch {
+            worker_senders.push(request.sender);
+        } else {
+            inner.pending_requests.insert(request_id, request);
+        }
+    }
+    worker_senders
 }
 // §9 MuxTransport: 传输层枚举
 // ============================================================================
@@ -119,7 +181,9 @@ pub async fn connect_local(socket_path: Option<&Path>) -> Result<MuxDomain> {
                         Err(e) => Err(anyhow::anyhow!(e)),
                     }
                 };
-                let _ = tx.send(result);
+                if tx.send(result).is_err() {
+                    tracing::debug!("mux connect caller dropped before receiving result");
+                }
             })
             .ok()?;
         rx.recv()
@@ -248,14 +312,16 @@ impl MuxDomain {
             pending_requests: HashMap::new(),
             subscribers: subscribers.clone(),
             write_tx,
+            transport_epoch: AtomicU64::new(0),
         }));
 
         let io_inner = inner.clone();
         let io_subscribers = subscribers.clone();
+        let io_epoch = 0;
         std::thread::Builder::new()
             .name("mux-io".into())
             .spawn(move || {
-                Self::io_and_router_loop(stream, write_rx, io_inner, io_subscribers);
+                Self::io_and_router_loop(stream, write_rx, io_inner, io_subscribers, io_epoch);
             })
             .map_err(|e| anyhow::anyhow!("failed to spawn mux I/O thread: {}", e))?;
 
@@ -279,13 +345,15 @@ impl MuxDomain {
             pending_requests: HashMap::new(),
             subscribers: subscribers.clone(),
             write_tx,
+            transport_epoch: AtomicU64::new(0),
         }));
         let io_inner = inner.clone();
         let io_subscribers = subscribers.clone();
+        let io_epoch = 0;
         std::thread::Builder::new()
             .name("mux-io".into())
             .spawn(move || {
-                Self::io_and_router_loop(stream, write_rx, io_inner, io_subscribers);
+                Self::io_and_router_loop(stream, write_rx, io_inner, io_subscribers, io_epoch);
             })
             .map_err(|e| anyhow::anyhow!("failed to spawn mux I/O thread: {}", e))?;
         let window_id = format!("win-{}", std::process::id());
@@ -311,24 +379,25 @@ impl MuxDomain {
         write_rx: std::sync::mpsc::Receiver<Vec<u8>>,
         inner: Arc<parking_lot::RwLock<DomainInner>>,
         subscribers: Arc<parking_lot::Mutex<Vec<async_channel::Sender<Notification>>>>,
+        worker_epoch: u64,
     ) {
         let mut buf = Vec::new();
 
-        let mut exit = false;
         'outer: loop {
+            if inner.read().transport_epoch.load(Ordering::SeqCst) != worker_epoch {
+                break;
+            }
             // §9 轮询写通道（非阻塞）
             loop {
                 match write_rx.try_recv() {
                     Ok(framed) => {
                         if stream.write_all(&framed).is_err() {
                             tracing::error!("socket write error");
-                            exit = true;
                             break 'outer;
                         }
                     }
                     Err(std::sync::mpsc::TryRecvError::Empty) => break,
                     Err(std::sync::mpsc::TryRecvError::Disconnected) => {
-                        exit = true;
                         break 'outer;
                     }
                 }
@@ -341,16 +410,28 @@ impl MuxDomain {
                         Ok((env, _)) => env,
                         Err(e) => {
                             tracing::error!(error = %e, "failed to decode envelope");
-                            exit = true;
                             break 'outer;
                         }
                     };
+                    if inner.read().transport_epoch.load(Ordering::SeqCst) != worker_epoch {
+                        break 'outer;
+                    }
 
                     match envelope.payload {
                         Some(EnvelopePayload::Response(resp)) => {
-                            let sender = inner.write().pending_requests.remove(&resp.request_id);
-                            if let Some(tx) = sender {
-                                let _ = tx.try_send(resp);
+                            let request_id = resp.request_id;
+                            let sender = take_pending_response_sender(
+                                &mut inner.write(),
+                                resp.request_id,
+                                worker_epoch,
+                            );
+                            if let Some(sender) = sender
+                                && sender.try_send(resp).is_err()
+                            {
+                                tracing::debug!(
+                                    request_id,
+                                    "request future dropped before response delivery"
+                                );
                             }
                         }
                         Some(EnvelopePayload::Notification(notif)) => {
@@ -391,23 +472,14 @@ impl MuxDomain {
                 }
                 Err(e) => {
                     tracing::error!(error = %e, "socket read error");
-                    exit = true;
                     break 'outer;
                 }
             }
         }
-        let _ = exit;
-        // §9 传输断开: 清空所有 pending_requests 的 sender, 让等待中的
-        // send_request 调用 rx.recv() 立即收到 Closed -> 快速返回
-        // "connection closed" 而非干等 15s 超时。这是 steal / 断连后写
-        let pending: Vec<async_channel::Sender<Response>> = {
-            let mut inner = inner.write();
-            inner.pending_requests.drain().map(|(_, tx)| tx).collect()
-        };
-        for tx in pending {
-            // 关闭 sender; 对端 recv() 返回 RecvError::Closed。
-            drop(tx);
-        }
+        // Close only requests registered on this transport. A stale worker may
+        // exit after reconnect has already installed requests for a new epoch.
+        let pending = drain_pending_requests_for_epoch(&mut inner.write(), worker_epoch);
+        drop(pending);
     }
 
     /// Generic frame reader for any Read+Write stream.
@@ -473,16 +545,18 @@ impl MuxDomain {
             .fetch_add(1, Ordering::SeqCst)
     }
 
-    /// §9 发送请求并等待响应（§16.6 公开供扩展安装使用）。
+    /// Send a request and wait for its response.
     pub async fn send_request(&self, body: RequestBody) -> Result<Response> {
+        self.send_request_with_timeout(body, Duration::from_secs(15))
+            .await
+    }
+
+    async fn send_request_with_timeout(
+        &self,
+        body: RequestBody,
+        timeout: Duration,
+    ) -> Result<Response> {
         let request_id = self.next_request_id();
-        let (tx, rx) = async_channel::bounded(1);
-
-        {
-            let mut inner = self.inner.write();
-            inner.pending_requests.insert(request_id, tx);
-        }
-
         let request = Request {
             request_id,
             body: Some(body),
@@ -493,34 +567,46 @@ impl MuxDomain {
         };
         let framed = frame(&envelope)?;
 
-        self.inner
-            .read()
-            .write_tx
-            .send(framed)
-            .map_err(|e| anyhow::anyhow!("write channel error: {}", e))?;
+        let (tx, rx) = async_channel::bounded(1);
+        let (write_tx, transport_epoch) = {
+            let mut inner = self.inner.write();
+            let transport_epoch = inner.transport_epoch.load(Ordering::SeqCst);
+            inner.pending_requests.insert(
+                request_id,
+                PendingRequest {
+                    sender: tx,
+                    transport_epoch,
+                },
+            );
+            (inner.write_tx.clone(), transport_epoch)
+        };
+        let _pending_request = PendingRequestGuard {
+            inner: self.inner.clone(),
+            request_id,
+            transport_epoch,
+        };
 
-        // §9 等待响应: 异步 await, 不阻塞 executor worker 线程。
-        // 15s 上限: 足够慢 SSH 隧道往返, 又能在真正 hang 时快速失败。
-        // I/O 线程退出时会清空 pending_requests, 此时 recv() 立刻返回
-        // Closed -> 调用方无需等待 15s 即可拿到 "connection closed" 错误。
-        match tokio::time::timeout(Duration::from_secs(15), rx.recv()).await {
-            Ok(Ok(resp)) => {
-                if let Some(ResponseBody::Error(err)) = &resp.body {
-                    if !err.is_empty() {
-                        self.inner.write().pending_requests.remove(&request_id);
-                        return Err(anyhow::anyhow!("mux server error: {}", err));
-                    }
+        write_tx
+            .send(framed)
+            .map_err(|error| anyhow::anyhow!("write channel error: {}", error))?;
+        // This future is also polled by GPUI's executor, where no Tokio reactor
+        // exists, so the timeout must be executor-neutral.
+        let response = smol::future::or(async { Some(rx.recv().await) }, async {
+            smol::Timer::after(timeout).await;
+            None
+        })
+        .await;
+        match response {
+            Some(Ok(resp)) => {
+                if let Some(ResponseBody::Error(err)) = &resp.body
+                    && !err.is_empty()
+                {
+                    return Err(anyhow::anyhow!("mux server error: {}", err));
                 }
                 Ok(resp)
             }
-            Ok(Err(_)) => {
-                self.inner.write().pending_requests.remove(&request_id);
-                Err(anyhow::anyhow!("connection closed"))
-            }
-            Err(_) => {
-                self.inner.write().pending_requests.remove(&request_id);
-                Err(anyhow::anyhow!("request timeout"))
-            }
+            Some(Err(_)) => Err(anyhow::anyhow!("connection closed")),
+            None => Err(anyhow::anyhow!("request timeout")),
         }
     }
 
@@ -1011,65 +1097,49 @@ impl MuxDomain {
         session_id: &str,
         attach_mode: AttachMode,
     ) -> Result<()> {
-        let preserved = self.take_subscribers();
-        let new_write_tx = self.spawn_local_io()?;
-        self.reinsert_subscribers(&preserved);
-        {
+        let stream = connect_local_stream(None)?;
+        let (new_write_tx, new_write_rx) = std::sync::mpsc::channel();
+        let io_inner = self.inner.clone();
+
+        let old_pending = {
             let mut inner = self.inner.write();
-            inner.pending_requests.clear();
-            inner.next_request_id = AtomicU64::new(1);
+            let old_epoch = inner.transport_epoch.load(Ordering::SeqCst);
+            let new_epoch = old_epoch
+                .checked_add(1)
+                .ok_or_else(|| anyhow::anyhow!("mux transport epoch exhausted"))?;
+            let io_subscribers = inner.subscribers.clone();
+
+            std::thread::Builder::new()
+                .name("mux-io".into())
+                .spawn(move || {
+                    Self::io_and_router_loop(
+                        stream,
+                        new_write_rx,
+                        io_inner,
+                        io_subscribers,
+                        new_epoch,
+                    );
+                })
+                .map_err(|error| anyhow::anyhow!("failed to spawn mux I/O thread: {}", error))?;
+
+            let old_pending = drain_pending_requests_for_epoch(&mut inner, old_epoch);
             inner.write_tx = new_write_tx;
-        }
+            inner.transport_epoch.store(new_epoch, Ordering::SeqCst);
+            old_pending
+        };
+        drop(old_pending);
+
         let attach_resp = self.attach(session_id, attach_mode).await?;
-        if let Some(snapshot) = attach_resp.snapshot.as_ref() {
-            if let Some(layout) = snapshot.layout.as_ref() {
-                self.broadcast_notification(Notification {
-                    event: Some(NotifEvent::SessionLayoutChanged(SessionLayoutChanged {
-                        layout: Some(layout.clone()),
-                    })),
-                });
-            }
+        if let Some(snapshot) = attach_resp.snapshot.as_ref()
+            && let Some(layout) = snapshot.layout.as_ref()
+        {
+            self.broadcast_notification(Notification {
+                event: Some(NotifEvent::SessionLayoutChanged(SessionLayoutChanged {
+                    layout: Some(layout.clone()),
+                })),
+            });
         }
         Ok(())
-    }
-
-    /// Open a fresh local socket and spawn a new I/O thread bound to the
-    /// existing `self.inner` `Arc<RwLock<DomainInner>>`. Returns the write
-    /// channel the I/O thread drains so the caller can install it into the
-    /// `DomainInner` as the live transport.
-    fn spawn_local_io(&self) -> Result<std::sync::mpsc::Sender<Vec<u8>>> {
-        let stream = connect_local_stream(None)?;
-        let (write_tx, write_rx) = std::sync::mpsc::channel();
-        let io_inner = self.inner.clone();
-        let io_subscribers = {
-            let guard = self.inner.read();
-            guard.subscribers.clone()
-        };
-        std::thread::Builder::new()
-            .name("mux-io".into())
-            .spawn(move || {
-                Self::io_and_router_loop(stream, write_rx, io_inner, io_subscribers);
-            })
-            .map_err(|e| anyhow::anyhow!("failed to spawn mux I/O thread: {}", e))?;
-        Ok(write_tx)
-    }
-
-    /// Reinsert sender handles previously removed by `take_subscribers` back
-    /// into `self.inner`'s subscribers `Mutex` so the live I/O thread fans
-    /// out to them. Restores continuity for pre-reconnect subscribers
-    /// without replacing the subscribers `Arc` (which the I/O thread has
-    /// already captured).
-    fn reinsert_subscribers(
-        &self,
-        preserved: &Arc<parking_lot::Mutex<Vec<async_channel::Sender<Notification>>>>,
-    ) {
-        let mut taken = preserved.lock();
-        if taken.is_empty() {
-            return;
-        }
-        let guard = self.inner.read();
-        let mut into = guard.subscribers.lock();
-        into.append(&mut taken);
     }
 }
 
@@ -1080,6 +1150,96 @@ impl MuxDomain {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn unresponsive_domain() -> (MuxDomain, std::sync::mpsc::Receiver<Vec<u8>>) {
+        let (write_tx, write_rx) = std::sync::mpsc::channel();
+        let subscribers = Arc::new(parking_lot::Mutex::new(Vec::new()));
+        let domain = MuxDomain {
+            inner: Arc::new(parking_lot::RwLock::new(DomainInner {
+                next_request_id: AtomicU64::new(1),
+                pending_requests: HashMap::new(),
+                subscribers,
+                write_tx,
+                transport_epoch: AtomicU64::new(0),
+            })),
+            window_id: "test-window".to_string(),
+            last_attached_session_id: parking_lot::RwLock::new(None),
+        };
+        (domain, write_rx)
+    }
+
+    #[test]
+    fn request_timeout_does_not_require_tokio_runtime() {
+        let (domain, write_rx) = unresponsive_domain();
+
+        let error = smol::block_on(domain.send_request_with_timeout(
+            RequestBody::ListSessions(mux_protocol::ListSessionsRequest {}),
+            Duration::from_millis(10),
+        ))
+        .expect_err("an unresponsive server must time out");
+
+        assert!(error.to_string().contains("request timeout"));
+        assert!(write_rx.try_recv().is_ok(), "request must be written");
+        assert!(domain.inner.read().pending_requests.is_empty());
+    }
+
+    #[test]
+    fn cancelling_request_removes_pending_entry() {
+        let (domain, write_rx) = unresponsive_domain();
+
+        let completed = smol::block_on(smol::future::or(
+            async {
+                domain
+                    .send_request_with_timeout(
+                        RequestBody::ListSessions(mux_protocol::ListSessionsRequest {}),
+                        Duration::from_secs(60),
+                    )
+                    .await
+                    .is_ok()
+            },
+            async {
+                smol::Timer::after(Duration::from_millis(10)).await;
+                false
+            },
+        ));
+
+        assert!(!completed);
+        assert!(write_rx.try_recv().is_ok(), "request must be written");
+        assert!(domain.inner.read().pending_requests.is_empty());
+    }
+
+    #[test]
+    fn stale_transport_cannot_fulfill_or_cancel_new_request() {
+        let (domain, _write_rx) = unresponsive_domain();
+        let (old_sender, _old_receiver) = async_channel::bounded(1);
+        let (new_sender, new_receiver) = async_channel::bounded(1);
+        {
+            let mut inner = domain.inner.write();
+            inner.pending_requests.insert(
+                1,
+                PendingRequest {
+                    sender: old_sender,
+                    transport_epoch: 0,
+                },
+            );
+            inner.pending_requests.insert(
+                2,
+                PendingRequest {
+                    sender: new_sender,
+                    transport_epoch: 1,
+                },
+            );
+        }
+
+        assert!(take_pending_response_sender(&mut domain.inner.write(), 2, 0).is_none());
+        assert!(domain.inner.read().pending_requests.contains_key(&2));
+
+        let stale_requests = drain_pending_requests_for_epoch(&mut domain.inner.write(), 0);
+        drop(stale_requests);
+        assert!(!domain.inner.read().pending_requests.contains_key(&1));
+        assert!(domain.inner.read().pending_requests.contains_key(&2));
+        assert!(!new_receiver.is_closed());
+    }
     use std::io::Cursor;
 
     #[test]
