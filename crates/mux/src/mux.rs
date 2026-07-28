@@ -6,7 +6,7 @@
 //! 协议版本化（§3.10），基于长度前缀的二进制帧（§9），
 //! 请求/响应关联通过 request_id（§9）。
 
-use anyhow::Result;
+use anyhow::{Context as _, Result};
 use std::collections::HashMap;
 use std::path::Path;
 use std::sync::Arc;
@@ -140,83 +140,93 @@ pub enum MuxTransport {
 /// §9 连接到本地 mux_server。
 /// §15.3 使用 interprocess crate 的 local socket 抽象:
 /// Unix → Unix domain socket, Windows → named pipe。
+async fn run_blocking_operation<T>(
+    thread_name: &'static str,
+    operation: impl FnOnce() -> Result<T> + Send + 'static,
+) -> Result<T>
+where
+    T: Send + 'static,
+{
+    let (sender, receiver) = async_channel::bounded(1);
+    std::thread::Builder::new()
+        .name(thread_name.into())
+        .spawn(move || {
+            let result = operation();
+            if sender.send_blocking(result).is_err() {
+                tracing::debug!(
+                    thread_name,
+                    "blocking operation caller dropped before result"
+                );
+            }
+        })
+        .map_err(|error| anyhow::anyhow!("failed to spawn {thread_name} thread: {error}"))?;
+    receiver
+        .recv()
+        .await
+        .map_err(|_| anyhow::anyhow!("{thread_name} thread exited without returning a result"))?
+}
+
+fn connect_local_blocking(path: &Path) -> Result<MuxDomain> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::net::UnixStream;
+        let stream = UnixStream::connect(path)?;
+        stream.set_nonblocking(true)?;
+        MuxDomain::connect_with_blocking_stream(stream)
+    }
+    #[cfg(windows)]
+    {
+        use interprocess::local_socket::{
+            GenericNamespaced, Stream as LocalSocketStream, prelude::*,
+        };
+        let pipe_name = path.to_string_lossy().to_string();
+        let name = pipe_name
+            .to_ns_name::<GenericNamespaced>()
+            .map_err(|error| anyhow::anyhow!("invalid pipe name: {error}"))?;
+        let stream = LocalSocketStream::connect(name)
+            .map_err(|error| anyhow::anyhow!("connect failed: {error}"))?;
+        MuxDomain::connect_with_stream(stream)
+    }
+}
+
+async fn connect_local_once(path: &Path) -> Result<MuxDomain> {
+    let path = path.to_path_buf();
+    run_blocking_operation("mux-connect", move || connect_local_blocking(&path)).await
+}
+
 pub async fn connect_local(socket_path: Option<&Path>) -> Result<MuxDomain> {
-    let path = match socket_path {
-        Some(p) => p.to_path_buf(),
-        None => default_socket_path(),
-    };
-    // §3.2 / §15.3 跨平台连接: Unix 用 UnixStream (non-blocking), Windows 用 interprocess named pipe。
-    let try_connect = || -> Option<Result<MuxDomain>> {
-        let p = path.clone();
-        let (tx, rx) = std::sync::mpsc::channel();
-        std::thread::Builder::new()
-            .name("mux-connect".into())
-            .spawn(move || {
-                #[cfg(unix)]
-                let result = {
-                    use std::os::unix::net::UnixStream;
-                    match UnixStream::connect(&p) {
-                        Ok(stream) => {
-                            if let Err(e) = stream.set_nonblocking(true) {
-                                Err(anyhow::anyhow!(e))
-                            } else {
-                                MuxDomain::connect_with_blocking_stream(stream)
-                            }
-                        }
-                        Err(e) => Err(anyhow::anyhow!(e)),
+    let path = socket_path
+        .map(Path::to_path_buf)
+        .unwrap_or_else(default_socket_path);
+
+    match connect_local_once(&path).await {
+        Ok(domain) => Ok(domain),
+        Err(error) => {
+            let message = error.to_string();
+            #[cfg(unix)]
+            if message.contains("111") || message.contains("Connection refused") {
+                tracing::warn!(path = %path.display(), "stale socket, cleaning and retrying");
+                match std::fs::remove_file(&path) {
+                    Ok(()) => {}
+                    Err(remove_error) if remove_error.kind() == std::io::ErrorKind::NotFound => {}
+                    Err(remove_error) => {
+                        return Err(anyhow::anyhow!(
+                            "failed to remove stale mux socket at {}: {}",
+                            path.display(),
+                            remove_error
+                        ));
                     }
-                };
-                #[cfg(windows)]
-                let result = {
-                    use interprocess::local_socket::{
-                        GenericNamespaced, Stream as LocalSocketStream, prelude::*,
-                    };
-                    // Windows named pipe: \\.\pipe\z3rm-mux
-                    let pipe_name = p.to_string_lossy().to_string();
-                    let name = pipe_name
-                        .to_ns_name::<GenericNamespaced>()
-                        .map_err(|e| anyhow::anyhow!("invalid pipe name: {}", e))?;
-                    match LocalSocketStream::connect(name) {
-                        Ok(stream) => MuxDomain::connect_with_stream(stream),
-                        Err(e) => Err(anyhow::anyhow!(e)),
-                    }
-                };
-                if tx.send(result).is_err() {
-                    tracing::debug!("mux connect caller dropped before receiving result");
                 }
-            })
-            .ok()?;
-        rx.recv()
-            .ok()
-            .map(|r: Result<MuxDomain>| r.and_then(|d| Ok(d)))
-    };
-    if let Some(result) = try_connect() {
-        match result {
-            Ok(domain) => return Ok(domain),
-            Err(e) => {
-                let msg = format!("{}", e);
-                #[cfg(unix)]
-                if msg.contains("111") || msg.contains("Connection refused") {
-                    tracing::warn!(path = %path.display(), "stale socket (111), cleaning and retrying");
-                    if let Err(e) = std::fs::remove_file(&path) {
-                        tracing::warn!(error = %e, "remove_file failed");
-                    }
-                    if let Some(retry) = try_connect() {
-                        return retry;
-                    }
-                    return Err(anyhow::anyhow!(
+                return connect_local_once(&path).await.with_context(|| {
+                    format!(
                         "connect_local retry failed after cleaning stale socket at {}",
                         path.display()
-                    ));
-                }
-                return Err(anyhow::anyhow!("connect failed: {}", msg));
+                    )
+                });
             }
+            Err(anyhow::anyhow!("connect failed: {message}"))
         }
     }
-    anyhow::bail!(
-        "connect_local: failed to spawn connection thread to {}",
-        path.display()
-    )
 }
 
 /// §16.1 默认 socket 路径 (与 mux_server 对齐)。
@@ -1181,6 +1191,35 @@ mod tests {
         assert!(error.to_string().contains("request timeout"));
         assert!(write_rx.try_recv().is_ok(), "request must be written");
         assert!(domain.inner.read().pending_requests.is_empty());
+    }
+
+    #[test]
+    fn blocking_operation_does_not_stall_async_executor() {
+        let release = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let operation_release = release.clone();
+
+        let operation_completed_first = smol::block_on(smol::future::or(
+            async move {
+                run_blocking_operation("mux-test-blocking", move || {
+                    while !operation_release.load(Ordering::SeqCst) {
+                        std::thread::sleep(Duration::from_millis(1));
+                    }
+                    Ok(())
+                })
+                .await
+                .is_ok()
+            },
+            async move {
+                smol::Timer::after(Duration::from_millis(10)).await;
+                release.store(true, Ordering::SeqCst);
+                false
+            },
+        ));
+
+        assert!(
+            !operation_completed_first,
+            "executor timer must advance while blocking operation runs on its OS thread"
+        );
     }
 
     #[test]

@@ -146,19 +146,11 @@ pub async fn ensure_daemon_running() -> Result<MuxDomain> {
     tracing::info!("daemon not running, spawning...");
     spawn_daemon()?;
 
-    // §16.1 等待 socket 就绪后再尝试连接（避免 connect 轮询时 socket 未 bind 完成）
-    wait_for_socket(&default_socket_path(), Duration::from_secs(5)).await?;
-
-    // 现在尝试连接已就绪的 daemon
-    match mux::connect_local(None).await {
-        Ok(domain) => {
-            eprintln!("[z3rm] Connected to daemon after spawn");
-            return Ok(domain);
-        }
-        Err(e) => {
-            anyhow::bail!("daemon socket ready but connection failed: {}", e);
-        }
-    }
+    // §16.1 Poll until the daemon accepts a real protocol connection. The
+    // successful domain is returned directly, avoiding a throwaway I/O worker.
+    let domain = wait_for_socket(&default_socket_path(), Duration::from_secs(5)).await?;
+    eprintln!("[z3rm] Connected to daemon after spawn");
+    Ok(domain)
 }
 
 /// 启动 z3rm-server daemon 进程 (§16.1)
@@ -202,11 +194,12 @@ fn spawn_daemon() -> Result<()> {
         Err(e) => Err(anyhow::anyhow!("failed to spawn daemon: {e}")),
     }
 }
-/// 轮询等待 socket 就绪（验证 daemon 实际可连接）§16.1
-async fn wait_for_socket(socket_path: &Path, timeout: Duration) -> Result<()> {
+/// Poll until the daemon socket accepts a real protocol connection (§16.1).
+/// Connection attempts and delays are executor-neutral, so daemon cold start
+/// does not block GPUI's foreground executor.
+async fn wait_for_socket(socket_path: &Path, timeout: Duration) -> Result<MuxDomain> {
     let start = std::time::Instant::now();
     let poll_interval = Duration::from_millis(100);
-    let path = socket_path.to_path_buf();
 
     loop {
         if start.elapsed() > timeout {
@@ -217,28 +210,25 @@ async fn wait_for_socket(socket_path: &Path, timeout: Duration) -> Result<()> {
             ));
         }
 
-        // 尝试实际连接来验证 daemon 正在监听
-        let p = path.clone();
-        let (tx, rx) = std::sync::mpsc::channel();
-        std::thread::Builder::new()
-            .name("mux-sock-check".into())
-            .spawn(move || {
-                let result = std::os::unix::net::UnixStream::connect(&p);
-                let _ = tx.send(result);
-            })
-            .ok();
-        let result = rx.recv()?;
-        if result.is_ok() {
-            tracing::info!(
-                "daemon socket ready and connected at {} after {:?}",
-                socket_path.display(),
-                start.elapsed()
-            );
-            return Ok(());
+        match mux::connect_local(Some(socket_path)).await {
+            Ok(domain) => {
+                tracing::info!(
+                    path = %socket_path.display(),
+                    elapsed = ?start.elapsed(),
+                    "daemon socket ready and accepting connections"
+                );
+                return Ok(domain);
+            }
+            Err(error) => {
+                tracing::trace!(
+                    path = %socket_path.display(),
+                    %error,
+                    "daemon socket not ready yet"
+                );
+            }
         }
 
-        // Sleep without blocking GPUI (use thread sleep in async context)
-        std::thread::sleep(poll_interval);
+        smol::Timer::after(poll_interval).await;
     }
 }
 
