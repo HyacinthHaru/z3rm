@@ -10169,14 +10169,75 @@ impl Editor {
     /// Stub: delete_to_previous_word_start
     pub fn delete_to_previous_word_start(&mut self, _action: &DeleteToPreviousWordStart, _window: &mut Window, _cx: &mut Context<Self>) {}
 
-    /// Stub: newline
-    pub fn newline(&mut self, _: &Newline, _window: &mut Window, _cx: &mut Context<Self>) {}
+    pub fn newline(&mut self, _: &Newline, window: &mut Window, cx: &mut Context<Self>) {
+        self.insert("\n", window, cx);
+    }
 
-    /// Stub: newline_above
-    pub fn newline_above(&mut self, _: &NewlineAbove, _window: &mut Window, _cx: &mut Context<Self>) {}
+    pub fn newline_above(&mut self, _: &NewlineAbove, window: &mut Window, cx: &mut Context<Self>) {
+        if self.read_only(cx) {
+            return;
+        }
 
-    /// Stub: newline_below
-    pub fn newline_below(&mut self, _: &NewlineBelow, _window: &mut Window, _cx: &mut Context<Self>) {}
+        let snapshot = self.display_snapshot(cx);
+        let selections = self.selections.all::<MultiBufferOffset>(&snapshot);
+
+        self.transact(window, cx, |this, window, cx| {
+            let snapshot = this.display_snapshot(cx);
+            let mut edits = Vec::with_capacity(selections.len());
+            let mut new_cursors = Vec::with_capacity(selections.len());
+            let mut delta = 0isize;
+
+            for selection in selections {
+                let cursor = selection.head().0;
+                let display_point = MultiBufferOffset(cursor).to_display_point(&snapshot);
+                let line_start = DisplayPoint::new(display_point.row(), 0);
+                let insert_offset = line_start.to_offset(&snapshot, Bias::Left).0;
+                edits.push((MultiBufferOffset(insert_offset)..MultiBufferOffset(insert_offset), "\n".to_string()));
+
+                let adjusted = insert_offset.saturating_add_signed(delta) + 1;
+                new_cursors.push(MultiBufferOffset(adjusted)..MultiBufferOffset(adjusted));
+                delta += 1;
+            }
+
+            this.edit(edits, cx);
+            this.change_selections(SelectionEffects::no_scroll(), window, cx, |s| {
+                s.select_ranges(new_cursors)
+            });
+        });
+    }
+
+    pub fn newline_below(&mut self, _: &NewlineBelow, window: &mut Window, cx: &mut Context<Self>) {
+        if self.read_only(cx) {
+            return;
+        }
+
+        let snapshot = self.display_snapshot(cx);
+        let selections = self.selections.all::<MultiBufferOffset>(&snapshot);
+
+        self.transact(window, cx, |this, window, cx| {
+            let snapshot = this.display_snapshot(cx);
+            let mut edits = Vec::with_capacity(selections.len());
+            let mut new_cursors = Vec::with_capacity(selections.len());
+            let mut delta = 0isize;
+
+            for selection in selections {
+                let cursor = selection.head().0;
+                let display_point = MultiBufferOffset(cursor).to_display_point(&snapshot);
+                let next_line = DisplayPoint::new(display_point.row() + DisplayRow(1), 0);
+                let insert_offset = next_line.to_offset(&snapshot, Bias::Left).0;
+                edits.push((MultiBufferOffset(insert_offset)..MultiBufferOffset(insert_offset), "\n".to_string()));
+
+                let adjusted = insert_offset.saturating_add_signed(delta) + 1;
+                new_cursors.push(MultiBufferOffset(adjusted)..MultiBufferOffset(adjusted));
+                delta += 1;
+            }
+
+            this.edit(edits, cx);
+            this.change_selections(SelectionEffects::no_scroll(), window, cx, |s| {
+                s.select_ranges(new_cursors)
+            });
+        });
+    }
 
     /// Stub: observe_pending_input
     pub fn observe_pending_input(&mut self, _window: &mut Window, _cx: &mut Context<Self>) {
