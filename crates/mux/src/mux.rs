@@ -287,10 +287,14 @@ impl MuxDomain {
         })
     }
 
-    pub async fn connect(_transport: MuxTransport) -> Result<Self> {
-        Err(anyhow::anyhow!(
-            "connect() with MuxTransport not yet supported; use connect_local()"
-        ))
+    pub async fn connect(transport: MuxTransport) -> Result<Self> {
+        match transport {
+            MuxTransport::Local => connect_local(None).await,
+            #[cfg(feature = "ssh")]
+            MuxTransport::Ssh(_) => Err(anyhow::anyhow!(
+                "SSH transport requires connect_ssh() to manage the SshSession lifecycle"
+            )),
+        }
     }
 
     fn io_and_router_loop<S: std::io::Read + std::io::Write + Send + 'static>(

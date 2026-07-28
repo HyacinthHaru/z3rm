@@ -999,7 +999,9 @@ impl Drop for Pane {
         self.alive.store(false, Ordering::SeqCst);
         if let Some(child) = self.child.lock().take() {
             let mut killer = child.clone_killer();
-            let _ = killer.kill();
+            if let Err(error) = killer.kill() {
+                tracing::warn!(%error, "failed to kill child process during pane drop");
+            }
         }
     }
 }
