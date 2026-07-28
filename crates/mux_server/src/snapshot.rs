@@ -27,6 +27,29 @@ use anyhow::{Context, Result};
 use zlog;  // external crate, not crate::zlog
 use shadow_snapshot::{EventKind, FileEvent, Monitor, SnapshotTrigger, WatchHandle};
 
+#[derive(Debug, Clone)]
+pub struct FileVersion {
+    pub version_id: u64,
+    pub seq_no: u64,
+    pub trigger: SnapshotTrigger,
+}
+
+enum ShadowCommand {
+    ListVersions {
+        path: PathBuf,
+        reply: mpsc::Sender<Result<Vec<FileVersion>>>,
+    },
+    GetVersion {
+        version_id: u64,
+        reply: mpsc::Sender<Result<Option<Vec<u8>>>>,
+    },
+    Decline {
+        path: PathBuf,
+        version_id: u64,
+        reply: mpsc::Sender<Result<()>>,
+    },
+}
+
 /// Handle to one session's shadow-snapshot watcher + recorder.
 ///
 /// Cheaply shareable via [`Arc<SnapshotWatch>`] (the inner state is behind a
@@ -48,18 +71,12 @@ struct WatchInner {
     /// Feed of changed paths from watcher thread → recorder thread.
     /// Dropping this sender makes the recorder's recv loop exit.
     path_sender: Mutex<Option<mpsc::Sender<(PathBuf, shadow_snapshot::SnapshotTrigger)>>>,
+    /// Commands from RPC handlers into the single-writer recorder thread.
+    command_sender: Mutex<Option<mpsc::Sender<ShadowCommand>>>,
     /// Recorder thread handle, joined on stop/drop.
     recorder: Mutex<Option<std::thread::JoinHandle<()>>>,
 }
 
-/// Idempotently tear down the watcher + recorder for a session.
-///
-/// Order matters for a prompt, deadlock-free shutdown:
-///   1. Drop the WatchHandle → notify watcher thread sees the channel close
-///      and exits, releasing its clone of the path sender.
-///   2. Drop our path sender → rx.iter() in the recorder returns None.
-///   3. join() the recorder — guaranteed to have exited at step 2, so the
-///      join returns promptly without blocking Drop.
 fn stop_inner(inner: &WatchInner) {
     if let Some(handle) = inner.watch_handle.lock().expect("watch mutex poisoned").take() {
         drop(handle);
@@ -67,20 +84,49 @@ fn stop_inner(inner: &WatchInner) {
     if let Some(sender) = inner.path_sender.lock().expect("sender mutex poisoned").take() {
         drop(sender);
     }
+    if let Some(sender) = inner.command_sender.lock().expect("command mutex poisoned").take() {
+        drop(sender);
+    }
     if let Some(join) = inner.recorder.lock().expect("recorder mutex poisoned").take() {
-        // Recorder only blocks on path_rx.recv(); with all senders dropped it
-        // has already exited, so join completes immediately.
-        let _ = join.join();
+        if join.join().is_err() {
+            zlog::warn!("shadow snapshot recorder thread panicked during shutdown");
+        }
     }
 }
 impl SnapshotWatch {
-    /// Stop watching and recording for this session. Safe to call more than
-    /// once (subsequent calls are no-ops).
+    /// Stop watching and recording for this session. Safe to call more than once.
     pub fn stop(&self) {
         stop_inner(&self.inner);
         if !self.inner.session_id.is_empty() {
             zlog::info!("shadow snapshot stopped: session={}", self.inner.session_id);
         }
+    }
+
+    pub fn list_versions(&self, path: PathBuf) -> Result<Vec<FileVersion>> {
+        let (reply, response) = mpsc::channel();
+        self.send_command(ShadowCommand::ListVersions { path, reply })?;
+        response.recv().context("shadow recorder stopped before listing versions")?
+    }
+
+    pub fn get_version(&self, version_id: u64) -> Result<Option<Vec<u8>>> {
+        let (reply, response) = mpsc::channel();
+        self.send_command(ShadowCommand::GetVersion { version_id, reply })?;
+        response.recv().context("shadow recorder stopped before reading version")?
+    }
+
+    pub fn decline(&self, path: PathBuf, version_id: u64) -> Result<()> {
+        let (reply, response) = mpsc::channel();
+        self.send_command(ShadowCommand::Decline { path, version_id, reply })?;
+        response.recv().context("shadow recorder stopped before restoring version")?
+    }
+
+    fn send_command(&self, command: ShadowCommand) -> Result<()> {
+        let sender = self.inner.command_sender.lock().expect("command mutex poisoned");
+        sender
+            .as_ref()
+            .context("shadow recorder is stopped")?
+            .send(command)
+            .context("sending command to shadow recorder")
     }
 }
 
@@ -138,6 +184,7 @@ pub fn start(session_id: &str, cwd: &str) -> Result<Option<Arc<SnapshotWatch>>> 
     // Carries the trigger so the recorder can route Delete vs Write without
     // re-deriving it from the path (a delete leaves no file to inspect).
     let (path_tx, path_rx) = mpsc::channel::<(PathBuf, shadow_snapshot::SnapshotTrigger)>();
+    let (command_tx, command_rx) = mpsc::channel::<ShadowCommand>();
     // Channel: recorder reports engine-open result back to us before looping.
     let (init_tx, init_rx) = mpsc::channel::<Result<()>>();
 
@@ -204,16 +251,30 @@ pub fn start(session_id: &str, cwd: &str) -> Result<Option<Arc<SnapshotWatch>>> 
             let mut debouncer = PathDebouncer::new();
             // Poll just under the window so flush latency stays close to 500ms.
             let poll = std::time::Duration::from_millis(100);
+            let mut path_disconnected = false;
             loop {
                 match path_rx.recv_timeout(poll) {
                     Ok((path, trigger)) => {
                         debouncer.note(path, trigger, std::time::Instant::now());
                     }
                     Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
-                    Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break,
+                    Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+                        path_disconnected = true;
+                    }
                 }
+
+                while let Ok(command) = command_rx.try_recv() {
+                    handle_command(&engine, command);
+                }
+
                 for (path, trigger) in debouncer.flush_due(std::time::Instant::now()) {
                     route_record_event(&engine, &path, trigger);
+                }
+
+                if path_disconnected
+                    && matches!(command_rx.try_recv(), Err(mpsc::TryRecvError::Disconnected))
+                {
+                    break;
                 }
             }
         })
@@ -268,11 +329,46 @@ pub fn start(session_id: &str, cwd: &str) -> Result<Option<Arc<SnapshotWatch>>> 
             session_id: session_id.to_string(),
             watch_handle: Mutex::new(Some(watch_handle)),
             path_sender: Mutex::new(Some(path_tx)),
+            command_sender: Mutex::new(Some(command_tx)),
             recorder: Mutex::new(Some(recorder)),
         }),
     })))
 }
 
+
+fn handle_command(engine: &shadow_snapshot::ShadowSnapshotEngine, command: ShadowCommand) {
+    match command {
+        ShadowCommand::ListVersions { path, reply } => {
+            let result = engine.list_versions(&path).map(|versions| {
+                versions
+                    .into_iter()
+                    .map(|(version_id, seq_no, trigger)| FileVersion {
+                        version_id,
+                        seq_no,
+                        trigger,
+                    })
+                    .collect()
+            });
+            if reply.send(result).is_err() {
+                zlog::warn!("shadow list-versions requester disconnected");
+            }
+        }
+        ShadowCommand::GetVersion { version_id, reply } => {
+            if reply.send(engine.query_version(version_id)).is_err() {
+                zlog::warn!("shadow get-version requester disconnected");
+            }
+        }
+        ShadowCommand::Decline {
+            path,
+            version_id,
+            reply,
+        } => {
+            if reply.send(engine.decline(&path, version_id)).is_err() {
+                zlog::warn!("shadow decline requester disconnected");
+            }
+        }
+    }
+}
 
 /// Build path_hash → PathBuf index for decline recovery by walking the session cwd.
 /// Matches `shadow_snapshot::compute_path_hash` (blake3 of path.to_string_lossy).

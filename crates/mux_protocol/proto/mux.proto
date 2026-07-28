@@ -421,6 +421,50 @@ message StatFileResponse {
     uint64 modified_timestamp = 4;
 }
 
+// === Shadow File Versions (crash-safe filesystem versioning, §4) ===
+
+// §4.4 单个文件版本：版本 ID、单调递增的 SeqNo 与触发原因。
+message FileVersion {
+    uint64 version_id = 1;  // §4.5 稳定版本 ID
+    uint64 seq_no = 2;      // §4.4 单调递增序列号（绝不用 wall clock / mtime 排序）
+    string trigger = 3;     // 触发此版本的稳定字符串标识（例如 "edit"、"decline-undo"）
+}
+
+// §4 列出某会话内某路径的全部版本。
+message ListFileVersionsRequest {
+    string session_id = 1;
+    string path = 2;        // UTF-8 文件路径
+}
+
+// §4 版本列表响应。
+message ListFileVersionsResponse {
+    repeated FileVersion versions = 1;
+}
+
+// §4 获取指定版本的字节内容。
+message GetFileVersionRequest {
+    string session_id = 1;
+    string path = 2;        // UTF-8 文件路径
+    uint64 version_id = 3;  // §4.5 目标版本 ID
+}
+
+// §4 版本内容响应。
+message GetFileVersionResponse {
+    bytes content = 1;
+}
+
+// §4.8 拒绝（撤销）某版本，将文件回滚至前一版本。
+message DeclineFileVersionRequest {
+    string session_id = 1;
+    string path = 2;        // UTF-8 文件路径
+    uint64 version_id = 3;  // §4.5 要拒绝的版本 ID
+}
+
+// §4.8 拒绝版本响应：restored 表示是否成功回滚。
+message DeclineFileVersionResponse {
+    bool restored = 1;
+}
+
 // === Clipboard (server relay hub) ===
 
 // §16 剪贴板条目：内容类型 + 数据 + 来源主机。
@@ -628,6 +672,9 @@ message Request {
         ShellIntegrationRequest shell_integration = 27;
         SubscribePaneOutputRequest subscribe_pane_output = 28;
         ShutdownRequest shutdown = 29;
+        ListFileVersionsRequest list_file_versions = 30;  // §4 shadow snapshot
+        GetFileVersionRequest get_file_version = 31;       // §4 shadow snapshot
+        DeclineFileVersionRequest decline_file_version = 32;  // §4 shadow snapshot
     }
 }
 
@@ -652,5 +699,8 @@ message Response {
         ZoomPaneResponse zoom_pane = 16;
         ShellIntegrationResponse shell_integration = 17;
         SubscribePaneOutputResponse subscribe_pane_output = 18;
+        ListFileVersionsResponse file_versions = 19;          // §4 shadow snapshot
+        GetFileVersionResponse file_version_content = 20;     // §4 shadow snapshot
+        DeclineFileVersionResponse decline_file_version = 21; // §4 shadow snapshot
     }
 }

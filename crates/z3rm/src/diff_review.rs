@@ -15,6 +15,7 @@ use gpui::{
 };
 use std::any::TypeId;
 use std::path::PathBuf;
+use std::sync::Arc;
 use ui::prelude::*;
 use workspace::{
     item::{Item, ItemEvent, TabContentParams},
@@ -35,6 +36,11 @@ pub struct DiffReview {
     title: SharedString,
     /// Focus handle
     focus_handle: FocusHandle,
+    domain: Arc<mux::MuxDomain>,
+    session_id: String,
+    target_version_id: u64,
+    decline_pending: bool,
+    decline_error: Option<SharedString>,
 }
 
 /// §16.6 Events emitted by DiffReview
@@ -53,6 +59,9 @@ impl DiffReview {
         file_path: PathBuf,
         previous: String,
         current: String,
+        domain: Arc<mux::MuxDomain>,
+        session_id: String,
+        target_version_id: u64,
         cx: &mut Context<Self>,
     ) -> Self {
         let file_name = file_path
@@ -67,6 +76,11 @@ impl DiffReview {
             current_content: current.into(),
             resolved: false,
             title,
+            domain,
+            session_id,
+            target_version_id,
+            decline_pending: false,
+            decline_error: None,
             focus_handle: cx.focus_handle(),
         }
     }
@@ -80,6 +94,9 @@ impl DiffReview {
     pub fn load(
         file_path: PathBuf,
         previous_content: String,
+        domain: Arc<mux::MuxDomain>,
+        session_id: String,
+        target_version_id: u64,
         cx: &mut App,
     ) -> Task<anyhow::Result<Entity<Self>>> {
         let path = file_path.clone();
@@ -92,7 +109,15 @@ impl DiffReview {
             .await
             .map_err(|e| anyhow::anyhow!("failed to read {}: {}", path.display(), e))?;
             let entity = cx.new(|cx| {
-                DiffReview::new(path.clone(), prev, current, cx)
+                DiffReview::new(
+                    path.clone(),
+                    prev,
+                    current,
+                    domain,
+                    session_id,
+                    target_version_id,
+                    cx,
+                )
             });
             Ok(entity)
         })
@@ -105,11 +130,38 @@ impl DiffReview {
         cx.notify();
     }
 
-    /// §16.6 Decline the change — trigger shadow_snapshot decline protocol.
-    /// The actual file revert happens via shadow_snapshot; this just updates UI.
     pub fn decline(&mut self, cx: &mut Context<Self>) {
-        self.resolved = true;
-        cx.emit(DiffReviewEvent::Declined);
+        if self.decline_pending || self.resolved {
+            return;
+        }
+        self.decline_pending = true;
+        self.decline_error = None;
+        let domain = self.domain.clone();
+        let session_id = self.session_id.clone();
+        let path = self.file_path.to_string_lossy().into_owned();
+        let version_id = self.target_version_id;
+        cx.spawn(async move |this, cx| {
+            let result = domain
+                .decline_file_version(&session_id, &path, version_id)
+                .await;
+            this.update(cx, |this, cx| {
+                this.decline_pending = false;
+                match result {
+                    Ok(response) if response.restored => {
+                        this.resolved = true;
+                        cx.emit(DiffReviewEvent::Declined);
+                    }
+                    Ok(_) => {
+                        this.decline_error = Some("shadow restore was not confirmed".into());
+                    }
+                    Err(error) => {
+                        this.decline_error = Some(format!("Decline failed: {error:#}").into());
+                    }
+                }
+                cx.notify();
+            })
+        })
+        .detach();
         cx.notify();
     }
 

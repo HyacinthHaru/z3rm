@@ -21,6 +21,7 @@ use mux_protocol::{
     frame, check_frame_len, parse_len_prefix, Envelope, Notification, PROTOCOL_VERSION,
     Request, Response, SessionInfo, TerminalSize, FetchGridUpdateResponse,
     FetchScrollbackResponse, AttachResponse, ShellCommand, ShellIntegrationResponse,
+    ListFileVersionsResponse, GetFileVersionResponse, DeclineFileVersionResponse,
     notification::Event as NotifEvent, SessionLayoutChanged,
 };
 
@@ -835,6 +836,65 @@ impl MuxDomain {
         });
         let _resp = self.send_request(req).await?;
         Ok(())
+    }
+
+    // ========================================================================
+    // §4 Shadow File Versions（crash-safe 文件系统版本控制）
+    // ========================================================================
+
+    /// §4 列出指定会话内某路径的全部 shadow 版本。
+    pub async fn list_file_versions(
+        &self,
+        session_id: &str,
+        path: &str,
+    ) -> Result<ListFileVersionsResponse> {
+        let req = RequestBody::ListFileVersions(mux_protocol::ListFileVersionsRequest {
+            session_id: session_id.to_string(),
+            path: path.to_string(),
+        });
+        let resp = self.send_request(req).await?;
+        match resp.body {
+            Some(ResponseBody::FileVersions(versions)) => Ok(versions),
+            _ => Err(anyhow::anyhow!("unexpected response type for list_file_versions")),
+        }
+    }
+
+    /// §4 获取指定版本的文件字节内容。
+    pub async fn get_file_version(
+        &self,
+        session_id: &str,
+        path: &str,
+        version_id: u64,
+    ) -> Result<GetFileVersionResponse> {
+        let req = RequestBody::GetFileVersion(mux_protocol::GetFileVersionRequest {
+            session_id: session_id.to_string(),
+            path: path.to_string(),
+            version_id,
+        });
+        let resp = self.send_request(req).await?;
+        match resp.body {
+            Some(ResponseBody::FileVersionContent(content)) => Ok(content),
+            _ => Err(anyhow::anyhow!("unexpected response type for get_file_version")),
+        }
+    }
+
+    /// §4.8 拒绝（撤销）指定版本，将文件回滚至前一版本。
+    pub async fn decline_file_version(
+        &self,
+        session_id: &str,
+        path: &str,
+        version_id: u64,
+    ) -> Result<DeclineFileVersionResponse> {
+        let req = RequestBody::DeclineFileVersion(mux_protocol::DeclineFileVersionRequest {
+            session_id: session_id.to_string(),
+            path: path.to_string(),
+            version_id,
+        });
+        let resp = self.send_request(req).await?;
+        match resp.body {
+            Some(ResponseBody::DeclineFileVersion(resp)) => Ok(resp),
+            _ => Err(anyhow::anyhow!("unexpected response type for decline_file_version")),
+        }
     }
 
     // ========================================================================

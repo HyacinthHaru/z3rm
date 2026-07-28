@@ -163,3 +163,52 @@ fn test_pane_bell_notification() {
         Some(proto::envelope::Payload::Notification(_))
     ));
 }
+
+// §4 验证 FileVersion 消息直接编码/解码（version_id / seq_no / trigger）。
+#[test]
+fn test_file_version_round_trip() {
+    let version = FileVersion {
+        version_id: 42,
+        seq_no: 7,
+        trigger: "edit".to_string(),
+    };
+
+    let mut buf = Vec::new();
+    version.encode(&mut buf).unwrap();
+    let decoded = FileVersion::decode(buf.as_slice()).unwrap();
+    assert_eq!(decoded.version_id, 42);
+    assert_eq!(decoded.seq_no, 7);
+    assert_eq!(decoded.trigger, "edit");
+}
+
+// §4 验证 ListFileVersionsRequest 经由 Envelope frame/unframe 往返，
+// 且 Request/Response oneof 新字段（30-32 / 19-21）正确解码。
+#[test]
+fn test_shadow_file_version_envelope_round_trip() {
+    let env = Envelope {
+        version: Some(PROTOCOL_VERSION),
+        payload: Some(proto::envelope::Payload::Request(Request {
+            request_id: 99,
+            body: Some(proto::request::Body::ListFileVersions(
+                ListFileVersionsRequest {
+                    session_id: "s1".to_string(),
+                    path: "/tmp/notes.md".to_string(),
+                },
+            )),
+        })),
+    };
+
+    let framed = frame(&env).unwrap();
+    let (decoded, consumed) = unframe(&framed).unwrap();
+    assert_eq!(consumed, framed.len());
+
+    let req = match decoded.payload {
+        Some(proto::envelope::Payload::Request(Request {
+            body: Some(proto::request::Body::ListFileVersions(req)),
+            ..
+        })) => req,
+        _ => panic!("expected ListFileVersions request after round-trip"),
+    };
+    assert_eq!(req.session_id, "s1");
+    assert_eq!(req.path, "/tmp/notes.md");
+}

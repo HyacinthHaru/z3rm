@@ -1,6 +1,7 @@
 // §9 Connection 模块 — mux_protocol 消息分发、帧编码/解码、通知广播。
 // 每个客户端连接一个 tokio task, 处理请求并推送通知。
 
+use anyhow::Context as _;
 use mux_protocol::proto::request::Body as RequestBody;
 use prost::Message;
 use mux_protocol::proto::fetch_grid_update_response::Update as FetchGridUpdateResponseUpdate;
@@ -324,6 +325,19 @@ async fn dispatch_request(
         RequestBody::FetchGridUpdate(r) => handle_fetch_grid_update(r, sessions).await?,
         RequestBody::FetchScrollback(r) => handle_fetch_scrollback(r, sessions).await?,
         RequestBody::SearchScrollback(r) => handle_search_scrollback(r, sessions).await?,
+        RequestBody::ListFileVersions(request) => {
+            handle_list_file_versions(request, sessions).await?
+        }
+        RequestBody::GetFileVersion(request) => {
+            handle_get_file_version(request, sessions).await?
+        }
+        RequestBody::DeclineFileVersion(request) => {
+            if check_permission(role, ClientRole::ReadWrite) {
+                handle_decline_file_version(request, sessions).await?
+            } else {
+                ResponseBody::Error("permission denied: read-write required".to_string())
+            }
+        }
         RequestBody::Shutdown(_) => {
             if check_permission(role, ClientRole::Admin) {
                 // §3.5 Mark shutdown + queue the ack response. The writer loop
@@ -1719,6 +1733,72 @@ fn broadcast_pane_removed(
     };
     broadcast_lifecycle_in_session(sessions, session_id, notify);
 }
+
+async fn handle_list_file_versions(
+    request: &mux_protocol::ListFileVersionsRequest,
+    sessions: &Arc<parking_lot::RwLock<Vec<crate::session::Session>>>,
+) -> anyhow::Result<ResponseBody> {
+    let watch = snapshot_watch_for_session(sessions, &request.session_id)?;
+    let path = std::path::PathBuf::from(&request.path);
+    let versions = tokio::task::spawn_blocking(move || watch.list_versions(path))
+        .await
+        .context("joining shadow list-versions request")??;
+    Ok(ResponseBody::FileVersions(mux_protocol::ListFileVersionsResponse {
+        versions: versions
+            .into_iter()
+            .map(|version| mux_protocol::FileVersion {
+                version_id: version.version_id,
+                seq_no: version.seq_no,
+                trigger: format!("{:?}", version.trigger).to_ascii_lowercase(),
+            })
+            .collect(),
+    }))
+}
+
+async fn handle_get_file_version(
+    request: &mux_protocol::GetFileVersionRequest,
+    sessions: &Arc<parking_lot::RwLock<Vec<crate::session::Session>>>,
+) -> anyhow::Result<ResponseBody> {
+    let watch = snapshot_watch_for_session(sessions, &request.session_id)?;
+    let version_id = request.version_id;
+    let content = tokio::task::spawn_blocking(move || watch.get_version(version_id))
+        .await
+        .context("joining shadow get-version request")??
+        .with_context(|| format!("shadow version not found: {version_id}"))?;
+    Ok(ResponseBody::FileVersionContent(
+        mux_protocol::GetFileVersionResponse { content },
+    ))
+}
+
+async fn handle_decline_file_version(
+    request: &mux_protocol::DeclineFileVersionRequest,
+    sessions: &Arc<parking_lot::RwLock<Vec<crate::session::Session>>>,
+) -> anyhow::Result<ResponseBody> {
+    let watch = snapshot_watch_for_session(sessions, &request.session_id)?;
+    let path = std::path::PathBuf::from(&request.path);
+    let version_id = request.version_id;
+    tokio::task::spawn_blocking(move || watch.decline(path, version_id))
+        .await
+        .context("joining shadow decline request")??;
+    Ok(ResponseBody::DeclineFileVersion(
+        mux_protocol::DeclineFileVersionResponse { restored: true },
+    ))
+}
+
+fn snapshot_watch_for_session(
+    sessions: &Arc<parking_lot::RwLock<Vec<crate::session::Session>>>,
+    session_id: &str,
+) -> anyhow::Result<Arc<crate::snapshot::SnapshotWatch>> {
+    sessions
+        .read()
+        .iter()
+        .find(|session| session.id == session_id)
+        .with_context(|| format!("session not found: {session_id}"))?
+        .snapshot_watch
+        .clone()
+        .with_context(|| format!("shadow snapshot is not active for session: {session_id}"))
+}
+
 
 // ============================================================================
 // Plan 10: §3.3 / §16.6 Real file RPC handlers (previously stubs)
