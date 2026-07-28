@@ -1687,13 +1687,43 @@ impl Editor {
     // 以下为 stub 方法 — 对应已删除的编辑功能模块
     // =====================================================================
 
-    /// Stub: insert text at selection (编辑功能已删除)
     pub fn insert(
         &mut self,
-        _new_text: &str,
-        _window: &mut Window,
-        _cx: &mut Context<Self>,
+        new_text: &str,
+        window: &mut Window,
+        cx: &mut Context<Self>,
     ) {
+        if self.read_only(cx) {
+            return;
+        }
+
+        let display_snapshot = self.display_snapshot(cx);
+        let selections = self.selections.all::<MultiBufferOffset>(&display_snapshot);
+        if new_text.is_empty() && selections.iter().all(|selection| selection.start == selection.end) {
+            return;
+        }
+        let mut edits = Vec::with_capacity(selections.len());
+        let mut new_cursor_offsets = Vec::with_capacity(selections.len());
+        let mut accumulated_delta = 0isize;
+        let inserted_len = new_text.len() as isize;
+
+        for selection in selections {
+            let start = selection.start.0.min(selection.end.0);
+            let end = selection.start.0.max(selection.end.0);
+            edits.push((MultiBufferOffset(start)..MultiBufferOffset(end), new_text.to_string()));
+
+            let adjusted_start = start.saturating_add_signed(accumulated_delta);
+            let cursor = adjusted_start.saturating_add(new_text.len());
+            new_cursor_offsets.push(MultiBufferOffset(cursor)..MultiBufferOffset(cursor));
+
+            let replaced_len = end.saturating_sub(start) as isize;
+            accumulated_delta += inserted_len - replaced_len;
+        }
+
+        self.edit(edits, cx);
+        self.change_selections(SelectionEffects::no_scroll(), window, cx, |selections| {
+            selections.select_ranges(new_cursor_offsets)
+        });
     }
 
     /// Stub: visible_buffer_ranges (collaboration 模块已删除)
@@ -9876,8 +9906,9 @@ impl Editor {
         false
     }
 
-    /// Stub: handle_input
-    pub fn handle_input(&mut self, _text: &str, _window: &mut Window, _cx: &mut Context<Self>) {}
+    pub fn handle_input(&mut self, text: &str, window: &mut Window, cx: &mut Context<Self>) {
+        self.insert(text, window, cx);
+    }
 
     /// §2.1 spec: diagnostics module pruned. Always returns default (false).
     pub fn has_active_diagnostic_group<R>(&mut self) -> R

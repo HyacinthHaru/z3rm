@@ -58,7 +58,7 @@ pub fn init<F, S, C, P>(
     spawn: S,
     socket_path: P,
     wait_timer: C,
-) -> impl Future<Output = Arc<Client>> + use<F, C, S, P>
+) -> impl Future<Output = Option<Arc<Client>>> + use<F, C, S, P>
 where
     F: Future<Output = ()> + Send + Sync + 'static,
     C: (Fn(Duration) -> F) + Send + Sync + 'static,
@@ -76,7 +76,7 @@ async fn connect_and_keepalive<F, C, S, P>(
     socket_path: P,
     wait_timer: C,
     spawn: S,
-) -> Arc<Client>
+) -> Option<Arc<Client>>
 where
     F: Future<Output = ()> + Send + Sync + 'static,
     C: (Fn(Duration) -> F) + Send + Sync + 'static,
@@ -93,6 +93,10 @@ where
         if let Ok(client) = Client::with_name(SocketName::Path(&socket_path)) {
             info!("connected to crash handler process after {elapsed:?}");
             break client;
+        }
+        if elapsed >= CRASH_HANDLER_CONNECT_TIMEOUT {
+            log::warn!("timed out connecting to crash handler process after {elapsed:?}");
+            return None;
         }
         elapsed += retry_frequency;
         wait_timer(retry_frequency).await;
@@ -171,7 +175,7 @@ where
             }
         }
     }));
-    client
+    Some(client)
 }
 
 pub struct CrashServer {

@@ -4,13 +4,14 @@
 mod daemon;
 mod zed;
 mod cli;
+mod cli_ipc;
 mod log_viewer;
 mod quickjs_extensions;
 mod extension_status_bar;
 mod diff_review;
 mod open_diff;
 
-use std::sync::Arc;
+use std::{path::Path, sync::Arc};
 
 use anyhow::Context as _;
 use assets::Assets;
@@ -287,13 +288,35 @@ fn main() {
     // §16.1 沙盒与权限检查
     sandbox::run_sandbox_launcher_if_invoked();
 
+    let args: Vec<String> = std::env::args().collect();
+    if let Some(socket) = args
+        .windows(2)
+        .find_map(|pair| (pair[0] == "--crash-handler").then_some(pair[1].as_str()))
+    {
+        crashes::crash_server(Path::new(socket), paths::logs_dir().clone());
+        std::process::exit(0);
+    }
+
+    let startup_open_url = args
+        .iter()
+        .skip(1)
+        .find(|argument| cli_ipc::is_open_url(argument))
+        .cloned();
+    if let Some(data_dir) = args
+        .windows(2)
+        .find_map(|pair| (pair[0] == "--user-data-dir").then_some(pair[1].as_str()))
+    {
+        paths::set_custom_data_dir(data_dir);
+    }
+
     // §3.10 `attach` is the only mux CLI command that opens a GUI. The CLI
     // process still returns immediately: it launches a fresh GUI process with
     // the target carried in environment variables, prints confirmation, and exits.
     let attach_target = if std::env::var_os("Z3RM_GUI_ATTACH").is_some() {
         std::env::var("Z3RM_ATTACH_TARGET").ok()
+    } else if startup_open_url.is_some() {
+        None
     } else {
-        let args: Vec<String> = std::env::args().collect();
         if let Some(cli::LaunchIntent::Gui { target }) = cli::parse_launch_intent_from(&args) {
             let executable = std::env::current_exe().unwrap_or_else(|error| {
                 eprintln!("error: failed to locate z3rm executable: {error}");
@@ -387,7 +410,24 @@ fn main() {
             .unwrap_or("unknown"),
     );
 
+    let (open_url_sender, mut open_url_receiver) = cli_ipc::open_url_channel();
+    if let Some(url) = startup_open_url {
+        open_url_sender.send(url);
+    }
+
     let app = build_application().with_assets(Assets);
+    app.on_open_urls({
+        let open_url_sender = open_url_sender.clone();
+        move |urls| {
+            for url in urls {
+                open_url_sender.send(url);
+            }
+        }
+    });
+    #[cfg(any(target_os = "linux", target_os = "freebsd"))]
+    if let Err(error) = cli_ipc::listen_for_cli_connections(open_url_sender.clone()) {
+        tracing::warn!(error = %error, "failed to start installed-CLI listener");
+    }
     let background_executor = app.background_executor();
 
     // §16.1 Crash handler
@@ -477,6 +517,18 @@ fn main() {
             workspace::AppState::set_global(app_state.clone(), cx);
             app_state
         };
+
+        let app_state_for_cli = app_state.clone();
+        cx.spawn(async move |cx| {
+            while let Some(url) = open_url_receiver.next().await {
+                if let Err(error) =
+                    cli_ipc::handle_open_url(url, app_state_for_cli.clone(), cx).await
+                {
+                    tracing::error!(error = %error, "installed CLI request failed");
+                }
+            }
+        })
+        .detach();
         // §2.1 Backport all Zed UI chrome ::init calls (not in spec remove-list).
         // §2.1 Globals required by chrome ::init calls.
         // Fs and GitHostingProviderRegistry must exist before any git/git_ui
