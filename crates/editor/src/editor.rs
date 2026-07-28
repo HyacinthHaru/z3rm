@@ -4846,13 +4846,49 @@ impl Editor {
     /// Stub: autoindent (编辑功能已删除)
     pub fn autoindent(&mut self, _: &AutoIndent, _window: &mut Window, _cx: &mut Context<Self>) {}
 
-    /// Stub: delete_line (编辑功能已删除)
     pub fn delete_line(
         &mut self,
         _: &DeleteLine,
-        _window: &mut Window,
-        _cx: &mut Context<Self>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
     ) {
+        if self.read_only(cx) {
+            return;
+        }
+
+        let snapshot = self.display_snapshot(cx);
+        let selections = self.selections.all::<MultiBufferOffset>(&snapshot);
+
+        self.transact(window, cx, |this, window, cx| {
+            let snapshot = this.display_snapshot(cx);
+            let max_point = snapshot.max_point();
+            let max_offset = max_point.to_offset(&snapshot, Bias::Right).0;
+            let mut edits = Vec::with_capacity(selections.len());
+            let mut new_cursors = Vec::with_capacity(selections.len());
+            let mut delta = 0isize;
+
+            for selection in selections {
+                let cursor_display = selection.head().to_display_point(&snapshot);
+                let start_row = cursor_display.row();
+                let line_start = DisplayPoint::new(start_row, 0).to_offset(&snapshot, Bias::Left).0;
+                let next_line = DisplayPoint::new(start_row + DisplayRow(1), 0);
+                let end_offset = if next_line <= max_point {
+                    next_line.to_offset(&snapshot, Bias::Left).0
+                } else {
+                    max_offset
+                };
+
+                let adjusted = line_start.saturating_add_signed(delta);
+                new_cursors.push(MultiBufferOffset(adjusted)..MultiBufferOffset(adjusted));
+                edits.push((MultiBufferOffset(line_start)..MultiBufferOffset(end_offset), String::new()));
+                delta -= (end_offset - line_start) as isize;
+            }
+
+            this.edit(edits, cx);
+            this.change_selections(SelectionEffects::no_scroll(), window, cx, |s| {
+                s.select_ranges(new_cursors)
+            });
+        });
     }
 
     pub fn join_lines_impl(
@@ -10149,18 +10185,8 @@ impl Editor {
     /// Stub: set_max_diagnostics_severity
     pub fn set_max_diagnostics_severity(&mut self, _severity: DiagnosticSeverity, _cx: &mut Context<Self>) {}
 
-    /// Stub: should_open_signature_help_automatically
-    pub fn should_open_signature_help_automatically(&mut self, _position: &Anchor, _cx: &mut Context<Self>) -> bool {
-        false
-    }
-
-    /// Stub: show_signature_help_auto
-    pub fn show_signature_help_auto(&mut self, _window: &mut Window, _cx: &mut Context<Self>) {}
-
-    /// Stub: toggle_code_lens
     pub fn toggle_code_lens(&mut self, _inline: bool, _window: &mut Window, _cx: &mut Context<Self>) {}
 
-    /// Stub: trigger_completion_on_input
     pub fn trigger_completion_on_input<A, B, C, D, R>(&mut self, _a0: A, _a1: B, _a2: C, _a3: D) -> R
     where
         R: Default,
@@ -10168,8 +10194,148 @@ impl Editor {
         R::default()
     }
 
-    /// Stub: update_diagnostics_state
+    pub fn should_open_signature_help_automatically(&self, _old_cursor_position: impl ::core::clone::Clone, _cx: &mut Context<Self>) -> bool {
+        false
+    }
+
+    pub fn show_signature_help_auto(&mut self, _window: &mut Window, _cx: &mut Context<Self>) {}
+
     pub fn update_diagnostics_state(&mut self, _window: &mut Window, _cx: &mut Context<Self>) {}
+
+    /// Stub: should_open_signature_help_automatically
+    pub fn cut_to_end_of_line(&mut self, _action: &CutToEndOfLine, window: &mut Window, cx: &mut Context<Self>) {
+        self.delete_to_line_end(window, cx);
+    }
+
+    pub fn delete_to_beginning_of_line(&mut self, _action: &DeleteToBeginningOfLine, window: &mut Window, cx: &mut Context<Self>) {
+        if self.read_only(cx) { return; }
+        let snapshot = self.display_snapshot(cx);
+        let selections = self.selections.all::<MultiBufferOffset>(&snapshot);
+        self.transact(window, cx, |this, window, cx| {
+            let snapshot = this.display_snapshot(cx);
+            let mut edits = Vec::with_capacity(selections.len());
+            let mut new_cursors = Vec::with_capacity(selections.len());
+            let mut delta = 0isize;
+            for selection in selections {
+                let head_display = selection.head().to_display_point(&snapshot);
+                let line_start = DisplayPoint::new(head_display.row(), 0);
+                let start_off = line_start.to_offset(&snapshot, Bias::Left).0;
+                let end_off = selection.head().0;
+                let adjusted = start_off.saturating_add_signed(delta);
+                new_cursors.push(MultiBufferOffset(adjusted)..MultiBufferOffset(adjusted));
+                edits.push((MultiBufferOffset(start_off)..MultiBufferOffset(end_off), String::new()));
+                delta -= (end_off - start_off) as isize;
+            }
+            this.edit(edits, cx);
+            this.change_selections(SelectionEffects::no_scroll(), window, cx, |s| s.select_ranges(new_cursors));
+        });
+    }
+
+    pub fn delete_to_end_of_line(&mut self, _action: &DeleteToEndOfLine, window: &mut Window, cx: &mut Context<Self>) {
+        self.delete_to_line_end(window, cx);
+    }
+
+    fn delete_to_line_end(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.read_only(cx) { return; }
+        let snapshot = self.display_snapshot(cx);
+        let max_point = snapshot.max_point();
+        let selections = self.selections.all::<MultiBufferOffset>(&snapshot);
+        self.transact(window, cx, |this, window, cx| {
+            let snapshot = this.display_snapshot(cx);
+            let max_point = snapshot.max_point();
+            let mut edits = Vec::with_capacity(selections.len());
+            let mut new_cursors = Vec::with_capacity(selections.len());
+            let mut delta = 0isize;
+            for selection in selections {
+                let head_display = selection.head().to_display_point(&snapshot);
+                let line_end = snapshot.clip_point(DisplayPoint::new(head_display.row(), u32::MAX), Bias::Right);
+                let start_off = selection.head().0;
+                let end_off = if line_end < max_point {
+                    DisplayPoint::new(head_display.row() + DisplayRow(1), 0).to_offset(&snapshot, Bias::Left).0
+                } else {
+                    max_point.to_offset(&snapshot, Bias::Right).0
+                };
+                let adjusted = start_off.saturating_add_signed(delta);
+                new_cursors.push(MultiBufferOffset(adjusted)..MultiBufferOffset(adjusted));
+                edits.push((MultiBufferOffset(start_off)..MultiBufferOffset(end_off), String::new()));
+                delta -= (end_off - start_off) as isize;
+            }
+            this.edit(edits, cx);
+            this.change_selections(SelectionEffects::no_scroll(), window, cx, |s| s.select_ranges(new_cursors));
+        });
+    }
+
+    pub fn delete_to_next_subword_end(&mut self, _action: &DeleteToNextSubwordEnd, window: &mut Window, cx: &mut Context<Self>) {
+        self.delete_forward_to_word(window, cx, true);
+    }
+
+    pub fn delete_to_next_word_end(&mut self, _action: &DeleteToNextWordEnd, window: &mut Window, cx: &mut Context<Self>) {
+        self.delete_forward_to_word(window, cx, false);
+    }
+
+    pub fn delete_to_previous_subword_start(&mut self, _action: &DeleteToPreviousSubwordStart, window: &mut Window, cx: &mut Context<Self>) {
+        self.delete_backward_to_word(window, cx, true);
+    }
+
+    pub fn delete_to_previous_word_start(&mut self, _action: &DeleteToPreviousWordStart, window: &mut Window, cx: &mut Context<Self>) {
+        self.delete_backward_to_word(window, cx, false);
+    }
+
+    fn delete_backward_to_word(&mut self, window: &mut Window, cx: &mut Context<Self>, subword: bool) {
+        if self.read_only(cx) { return; }
+        let snapshot = self.display_snapshot(cx);
+        let selections = self.selections.all::<MultiBufferOffset>(&snapshot);
+        self.transact(window, cx, |this, window, cx| {
+            let snapshot = this.display_snapshot(cx);
+            let mut edits = Vec::with_capacity(selections.len());
+            let mut new_cursors = Vec::with_capacity(selections.len());
+            let mut delta = 0isize;
+            for selection in selections {
+                let head_display = selection.head().to_display_point(&snapshot);
+                let target = if subword {
+                    movement::previous_subword_start(&snapshot, head_display)
+                } else {
+                    movement::previous_word_start(&snapshot, head_display)
+                };
+                let start_off = target.to_offset(&snapshot, Bias::Left).0;
+                let end_off = selection.head().0;
+                let adjusted = start_off.saturating_add_signed(delta);
+                new_cursors.push(MultiBufferOffset(adjusted)..MultiBufferOffset(adjusted));
+                edits.push((MultiBufferOffset(start_off)..MultiBufferOffset(end_off), String::new()));
+                delta -= (end_off - start_off) as isize;
+            }
+            this.edit(edits, cx);
+            this.change_selections(SelectionEffects::no_scroll(), window, cx, |s| s.select_ranges(new_cursors));
+        });
+    }
+
+    fn delete_forward_to_word(&mut self, window: &mut Window, cx: &mut Context<Self>, subword: bool) {
+        if self.read_only(cx) { return; }
+        let snapshot = self.display_snapshot(cx);
+        let selections = self.selections.all::<MultiBufferOffset>(&snapshot);
+        self.transact(window, cx, |this, window, cx| {
+            let snapshot = this.display_snapshot(cx);
+            let mut edits = Vec::with_capacity(selections.len());
+            let mut new_cursors = Vec::with_capacity(selections.len());
+            let mut delta = 0isize;
+            for selection in selections {
+                let head_display = selection.head().to_display_point(&snapshot);
+                let target = if subword {
+                    movement::next_subword_end(&snapshot, head_display)
+                } else {
+                    movement::next_word_end(&snapshot, head_display)
+                };
+                let start_off = selection.head().0;
+                let end_off = target.to_offset(&snapshot, Bias::Right).0;
+                let adjusted = start_off.saturating_add_signed(delta);
+                new_cursors.push(MultiBufferOffset(adjusted)..MultiBufferOffset(adjusted));
+                edits.push((MultiBufferOffset(start_off)..MultiBufferOffset(end_off), String::new()));
+                delta -= (end_off - start_off) as isize;
+            }
+            this.edit(edits, cx);
+            this.change_selections(SelectionEffects::no_scroll(), window, cx, |s| s.select_ranges(new_cursors));
+        });
+    }
 
     /// Stub: update_edit_prediction_preview
     pub fn update_edit_prediction_preview(&mut self, _a0: &gpui::Modifiers, _window: &mut Window, _cx: &mut Context<Self>) {}
@@ -10186,26 +10352,6 @@ impl Editor {
     /// Stub: accept_next_word_edit_prediction
     pub fn accept_next_word_edit_prediction(&mut self, _action: &AcceptNextWordEditPrediction, _window: &mut Window, _cx: &mut Context<Self>) {}
 
-    /// Stub: cut_to_end_of_line
-    pub fn cut_to_end_of_line(&mut self, _action: &CutToEndOfLine, _window: &mut Window, _cx: &mut Context<Self>) {}
-
-    /// Stub: delete_to_beginning_of_line
-    pub fn delete_to_beginning_of_line(&mut self, _action: &DeleteToBeginningOfLine, _window: &mut Window, _cx: &mut Context<Self>) {}
-
-    /// Stub: delete_to_end_of_line
-    pub fn delete_to_end_of_line(&mut self, _action: &DeleteToEndOfLine, _window: &mut Window, _cx: &mut Context<Self>) {}
-
-    /// Stub: delete_to_next_subword_end
-    pub fn delete_to_next_subword_end(&mut self, _action: &DeleteToNextSubwordEnd, _window: &mut Window, _cx: &mut Context<Self>) {}
-
-    /// Stub: delete_to_next_word_end
-    pub fn delete_to_next_word_end(&mut self, _action: &DeleteToNextWordEnd, _window: &mut Window, _cx: &mut Context<Self>) {}
-
-    /// Stub: delete_to_previous_subword_start
-    pub fn delete_to_previous_subword_start(&mut self, _action: &DeleteToPreviousSubwordStart, _window: &mut Window, _cx: &mut Context<Self>) {}
-
-    /// Stub: delete_to_previous_word_start
-    pub fn delete_to_previous_word_start(&mut self, _action: &DeleteToPreviousWordStart, _window: &mut Window, _cx: &mut Context<Self>) {}
 
     pub fn newline(&mut self, _: &Newline, window: &mut Window, cx: &mut Context<Self>) {
         self.insert("\n", window, cx);
