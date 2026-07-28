@@ -496,13 +496,12 @@ impl Project {
         false
     }
 
-    /// Stub: project_path_git_status (git status 模块已简化)
     pub fn project_path_git_status(
         &self,
-        _path: &ProjectPath,
-        _cx: &App,
+        path: &ProjectPath,
+        cx: &App,
     ) -> Option<git::status::FileStatus> {
-        None
+        self.git_store.read(cx).project_path_git_status(path, cx)
     }
 
     pub fn set_language_for_buffer(
