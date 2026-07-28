@@ -2,6 +2,7 @@
 // 管理 PTY、alacritty 终端模拟、layout 引擎、session 持久化。
 
 use anyhow::Result;
+use interprocess::local_socket::tokio::Listener as LocalSocketListener;
 use sqlez::connection::Connection;
 use std::future::Future;
 use std::path::PathBuf;
@@ -9,24 +10,22 @@ use std::pin::Pin;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::SystemTime;
 use tokio::time::Duration;
-use interprocess::local_socket::tokio::Listener as LocalSocketListener;
 
 pub mod connection;
 mod server_settings;
 
 pub mod clipboard;
-pub mod grid_sync;
 pub mod coalescing;
 pub mod dec2026;
+pub mod grid_sync;
 pub mod layout;
 pub mod pane;
 pub mod persistence;
 pub mod snapshot;
 
+pub mod session;
 #[cfg(test)]
 mod tests;
-pub mod session;
-
 
 // ============================================================================
 // §16.12 日志系统 — 文件日志 + 轮转
@@ -48,14 +47,12 @@ pub(crate) fn get_log_dir() -> PathBuf {
 }
 
 /// §16.12 日志文件路径 (主文件)
-static LOG_FILE_PATH: std::sync::LazyLock<PathBuf> = std::sync::LazyLock::new(|| {
-    get_log_dir().join("mux-server.log")
-});
+static LOG_FILE_PATH: std::sync::LazyLock<PathBuf> =
+    std::sync::LazyLock::new(|| get_log_dir().join("mux-server.log"));
 
 /// §16.12 日志轮转路径 (旧文件)
-static LOG_FILE_ROTATE: std::sync::LazyLock<PathBuf> = std::sync::LazyLock::new(|| {
-    get_log_dir().join("mux-server.log.old")
-});
+static LOG_FILE_ROTATE: std::sync::LazyLock<PathBuf> =
+    std::sync::LazyLock::new(|| get_log_dir().join("mux-server.log.old"));
 
 /// §16.14 初始化文件日志 (zlog) + 轮转配置
 ///
@@ -79,14 +76,17 @@ pub fn setup_logging() -> Result<()> {
     // §16.14 初始化文件日志输出 + 轮转
     zlog::init_output_file(&LOG_FILE_PATH, Some(&LOG_FILE_ROTATE))?;
 
-    zlog::info!("mux_server logging initialized, log_dir={}", log_dir.display());
+    zlog::info!(
+        "mux_server logging initialized, log_dir={}",
+        log_dir.display()
+    );
     Ok(())
 }
 
 /// 默认 socket 路径: $XDG_RUNTIME_DIR/z3rm/mux.sock (Unix §16.1)
 /// 或 \\.\pipe\z3rm-mux (Windows)
 fn default_socket_name() -> interprocess::local_socket::Name<'static> {
-    use interprocess::local_socket::{prelude::*, GenericFilePath, GenericNamespaced};
+    use interprocess::local_socket::{GenericFilePath, GenericNamespaced, prelude::*};
     if let Ok(p) = std::env::var("Z3RM_MUX_SOCKET") {
         return p
             .to_fs_name::<GenericFilePath>()
@@ -95,9 +95,13 @@ fn default_socket_name() -> interprocess::local_socket::Name<'static> {
     #[cfg(unix)]
     {
         let runtime_dir = std::env::var("XDG_RUNTIME_DIR").unwrap_or_else(|_| "/tmp".to_string());
-        let path = std::path::PathBuf::from(runtime_dir).join("z3rm").join("mux.sock");
+        let path = std::path::PathBuf::from(runtime_dir)
+            .join("z3rm")
+            .join("mux.sock");
         if let Some(parent) = path.parent() {
-            if let Err(e) = std::fs::create_dir_all(parent) { tracing::warn!(error = %e, "create_dir_all failed"); }
+            if let Err(e) = std::fs::create_dir_all(parent) {
+                tracing::warn!(error = %e, "create_dir_all failed");
+            }
         }
         path.to_string_lossy()
             .to_string()
@@ -120,7 +124,11 @@ fn unix_socket_path() -> Option<std::path::PathBuf> {
         return Some(std::path::PathBuf::from(p));
     }
     let runtime_dir = std::env::var("XDG_RUNTIME_DIR").unwrap_or_else(|_| "/tmp".to_string());
-    Some(std::path::PathBuf::from(runtime_dir).join("z3rm").join("mux.sock"))
+    Some(
+        std::path::PathBuf::from(runtime_dir)
+            .join("z3rm")
+            .join("mux.sock"),
+    )
 }
 
 async fn bind_socket(name: &interprocess::local_socket::Name<'_>) -> Result<LocalSocketListener> {
@@ -137,7 +145,9 @@ async fn bind_socket(name: &interprocess::local_socket::Name<'_>) -> Result<Loca
 /// If the connection fails (stale socket), remove the socket file and retry.
 /// On Windows, named pipes are ephemeral (server disappears = pipe gone),
 /// so stale cleanup is unnecessary.
-pub async fn bind_or_cleanup(name: &interprocess::local_socket::Name<'_>) -> Result<LocalSocketListener> {
+pub async fn bind_or_cleanup(
+    name: &interprocess::local_socket::Name<'_>,
+) -> Result<LocalSocketListener> {
     match bind_socket(name).await {
         Ok(listener) => Ok(listener),
         Err(e) => {
@@ -153,7 +163,9 @@ pub async fn bind_or_cleanup(name: &interprocess::local_socket::Name<'_>) -> Res
                         Err(_) => {
                             // Stale socket — remove and retry
                             zlog::warn!("stale socket detected, cleaning: {:?}", socket_path);
-                            if let Err(e) = std::fs::remove_file(&socket_path) { tracing::warn!(error = %e, "remove stale socket failed"); }
+                            if let Err(e) = std::fs::remove_file(&socket_path) {
+                                tracing::warn!(error = %e, "remove stale socket failed");
+                            }
                             return bind_socket(name).await;
                         }
                     }
@@ -217,7 +229,9 @@ pub fn run() -> Result<()> {
                 let runtime_dir =
                     std::env::var("XDG_RUNTIME_DIR").unwrap_or_else(|_| "/tmp".to_string());
                 let parent = PathBuf::from(runtime_dir).join("z3rm");
-                if let Err(e) = std::fs::create_dir_all(&parent) { tracing::warn!(error = %e, "create_dir_all failed"); }
+                if let Err(e) = std::fs::create_dir_all(&parent) {
+                    tracing::warn!(error = %e, "create_dir_all failed");
+                }
                 parent.join("mux.db")
             }
             #[cfg(windows)]
@@ -226,7 +240,9 @@ pub fn run() -> Result<()> {
                     PathBuf::from(std::env::var("TEMP").unwrap_or_else(|_| "C:/Temp".to_string()))
                 });
                 let dir = base.join("z3rm");
-                if let Err(e) = std::fs::create_dir_all(&dir) { tracing::warn!(error = %e, "create_dir_all failed"); }
+                if let Err(e) = std::fs::create_dir_all(&dir) {
+                    tracing::warn!(error = %e, "create_dir_all failed");
+                }
                 dir.join("mux.db")
             }
         };
@@ -236,6 +252,55 @@ pub fn run() -> Result<()> {
         tracing::info!(count = recovered.len(), "recovered sessions");
 
         let sessions = std::sync::Arc::new(parking_lot::RwLock::new(recovered));
+        // §4 / §3.6 Re-arm shadow-snapshot watchers for recovered sessions.
+        // Each task mirrors handle_create_session: spawn_blocking → snapshot::start,
+        // then a brief write-lock to assign snapshot_watch if the session still exists.
+        let recovered_shadow_targets: Vec<(String, String)> = {
+            let sessions_r = sessions.read();
+            sessions_r
+                .iter()
+                .map(|s| (s.id.clone(), s.cwd.clone()))
+                .collect()
+        };
+        for (session_id, cwd) in recovered_shadow_targets {
+            let sessions_arc = sessions.clone();
+            tokio::spawn(async move {
+                let session_id_for_start = session_id.clone();
+                match tokio::task::spawn_blocking(move || {
+                    crate::snapshot::start(&session_id_for_start, &cwd)
+                })
+                .await
+                {
+                    Ok(Ok(Some(watch))) => {
+                        let mut sessions_w = sessions_arc.write();
+                        if let Some(session) = sessions_w.iter_mut().find(|s| s.id == session_id) {
+                            session.snapshot_watch = Some(watch);
+                            zlog::info!("shadow snapshot re-armed: session={}", session_id);
+                        }
+                    }
+                    Ok(Ok(None)) => {
+                        zlog::info!(
+                            "shadow snapshot not armed (recovered): session={}",
+                            session_id
+                        );
+                    }
+                    Ok(Err(error)) => {
+                        zlog::warn!(
+                            "shadow snapshot start failed (recovered): session={} error={}",
+                            session_id,
+                            error
+                        );
+                    }
+                    Err(error) => {
+                        zlog::warn!(
+                            "shadow snapshot task join failed (recovered): session={} error={}",
+                            session_id,
+                            error
+                        );
+                    }
+                }
+            });
+        }
         let db = std::sync::Arc::new(parking_lot::Mutex::new(db));
 
         let sessions_clone = sessions.clone();
@@ -253,7 +318,10 @@ pub fn run() -> Result<()> {
         let keep_alive_seconds = server_settings.keep_alive_seconds();
 
         if keep_alive_seconds > 0 {
-            zlog::info!("keep_alive enabled: idle_timeout={}s (hot-reloadable)", keep_alive_seconds);
+            zlog::info!(
+                "keep_alive enabled: idle_timeout={}s (hot-reloadable)",
+                keep_alive_seconds
+            );
         }
         let server = Server {
             sessions,
@@ -320,7 +388,8 @@ impl Server {
             let keep_alive_seconds = self.server_settings.keep_alive_seconds();
             let current = self.active_connections.load(Ordering::SeqCst);
             if current == 0 && keep_alive_seconds > 0 && idle_deadline.is_none() {
-                idle_deadline = Some(tokio::time::Instant::now() + Duration::from_secs(keep_alive_seconds));
+                idle_deadline =
+                    Some(tokio::time::Instant::now() + Duration::from_secs(keep_alive_seconds));
             }
             // Cancel the timer when connections become non-zero.
             if current > 0 {
