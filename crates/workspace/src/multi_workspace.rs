@@ -1197,7 +1197,7 @@ impl MultiWorkspace {
     pub fn find_or_create_workspace(
         &mut self,
         paths: PathList,
-        _connection_options: Option<remote::RemoteConnectionOptions>,
+        connection_options: Option<remote::RemoteConnectionOptions>,
         provisional_project_group_key: Option<ProjectGroupKey>,
         _connect_remote: impl FnOnce(
             remote::RemoteConnectionOptions,
@@ -1211,13 +1211,25 @@ impl MultiWorkspace {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Task<Result<Entity<Workspace>>> {
-        Task::ready(Err(anyhow::anyhow!("stub: find_or_create_workspace")))
+        if connection_options.is_some() {
+            return Task::ready(Err(anyhow::anyhow!("remote workspaces are not supported by this z3rm build")));
+        }
+
+        self.find_or_create_local_workspace(
+            paths,
+            provisional_project_group_key,
+            excluding,
+            init,
+            open_mode,
+            window,
+            cx,
+        )
     }
 
     pub fn find_or_create_workspace_with_source_workspace(
         &mut self,
         paths: PathList,
-        _connection_options: Option<remote::RemoteConnectionOptions>,
+        connection_options: Option<remote::RemoteConnectionOptions>,
         provisional_project_group_key: Option<ProjectGroupKey>,
         _connect_remote: impl FnOnce(
             remote::RemoteConnectionOptions,
@@ -1232,7 +1244,20 @@ impl MultiWorkspace {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Task<Result<Entity<Workspace>>> {
-        Task::ready(Err(anyhow::anyhow!("stub: find_or_create_workspace_with_source")))
+        if connection_options.is_some() {
+            return Task::ready(Err(anyhow::anyhow!("remote workspaces are not supported by this z3rm build")));
+        }
+
+        self.find_or_create_local_workspace_with_source_workspace(
+            paths,
+            provisional_project_group_key,
+            excluding,
+            init,
+            open_mode,
+            source_workspace,
+            window,
+            cx,
+        )
     }
 
     /// Finds an existing workspace in this multi-workspace whose paths match,
