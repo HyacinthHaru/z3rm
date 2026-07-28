@@ -2,11 +2,11 @@
 // 来源: spec §3.10
 
 use anyhow::{Context, Result};
-use std::time::Duration;
 use std::path::PathBuf;
+use std::time::Duration;
 
 use mux::MuxDomain;
-use mux_protocol::proto::{split_node::SplitDirection, ShellCommand};
+use mux_protocol::proto::{ShellCommand, split_node::SplitDirection};
 
 use super::keys::parse_keys;
 use super::target::Target;
@@ -23,14 +23,20 @@ pub enum CliCommand {
         cwd: Option<PathBuf>,
     },
     /// `z3rm kill -t <target>` — 终止 session
-    KillSession { target: String },
+    KillSession {
+        target: String,
+    },
     /// `z3rm kill-server` — 优雅关闭 mux_server (结束所有 session 并退出)
     KillServer,
     /// `z3rm attach -t <target>` — 连接到 session (打开 GUI)
-    Attach { target: Option<String> },
+    Attach {
+        target: Option<String>,
+    },
     /// `z3rm detach` — 断开当前 client
     /// `z3rm attach --ssh <ssh://uri>` — 通过 SSH 隧道连接到远程 mux_server
-    Ssh { target: String },
+    Ssh {
+        target: String,
+    },
     Detach,
     /// `z3rm split-window -t <target> [-h|-v]` — 分割 pane
     SplitWindow {
@@ -51,11 +57,17 @@ pub enum CliCommand {
         escape: bool,
     },
     /// `z3rm list-panes -t <target>` — 列出 session 中的 pane
-    ListPanes { target: Option<String> },
+    ListPanes {
+        target: Option<String>,
+    },
     /// `z3rm select-pane -t <target>` — 聚焦 pane
-    SelectPane { target: Option<String> },
+    SelectPane {
+        target: Option<String>,
+    },
     /// `z3rm kill-pane -t <target>` — 关闭 pane
-    KillPane { target: Option<String> },
+    KillPane {
+        target: Option<String>,
+    },
     /// `z3rm resize-pane -t <target> -x <W> -y <H>` — 调整 pane 大小
     ResizePane {
         target: Option<String>,
@@ -63,7 +75,9 @@ pub enum CliCommand {
         height: Option<u16>,
     },
     /// `z3rm new-window -t <target>` — 创建新 tab
-    NewWindow { target: Option<String> },
+    NewWindow {
+        target: Option<String>,
+    },
     /// `z3rm rename-window -t <target> <title>` — 设置 pane 标题
     RenameWindow {
         target: Option<String>,
@@ -75,7 +89,11 @@ fn current_pane_from_env() -> Option<String> {
     std::env::var("Z3RM_PANE")
         .ok()
         .filter(|pane| !pane.is_empty())
-        .or_else(|| std::env::var("Z3RM_PANE_ID").ok().filter(|pane| !pane.is_empty()))
+        .or_else(|| {
+            std::env::var("Z3RM_PANE_ID")
+                .ok()
+                .filter(|pane| !pane.is_empty())
+        })
 }
 
 fn current_session_from_env() -> Option<String> {
@@ -93,8 +111,6 @@ async fn resolve_named_session_id(domain: &MuxDomain, name: &str) -> Result<Stri
     Ok(session.id.clone())
 }
 
-
-
 /// §3.10 Empty pane id 是错误: `unwrap_or_default()` 把空字符串变成合法目标,
 /// 后续 send-keys / capture-pane 等在 daemon 端才发现失败。
 /// 这里提前暴露错误, 用户即时看到。
@@ -105,10 +121,26 @@ fn ensure_non_empty_pane_id(pane_id: String, context: &str) -> Result<String> {
     Ok(pane_id)
 }
 
+#[derive(Clone, Copy)]
+enum ResolveAccess {
+    ReadOnly,
+    ReadWrite,
+}
+
+impl ResolveAccess {
+    fn attach_mode(self) -> mux::AttachMode {
+        match self {
+            Self::ReadOnly => mux::AttachMode::ReadOnly,
+            Self::ReadWrite => mux::AttachMode::Shared,
+        }
+    }
+}
+
 /// 解析 target, 从 snapshot 中找到对应的 pane ID
 async fn resolve_pane_id(
     domain: &MuxDomain,
     target: &Target,
+    access: ResolveAccess,
 ) -> Result<String> {
     match target {
         Target::Current => {
@@ -126,7 +158,7 @@ async fn resolve_pane_id(
                     .ok_or_else(|| anyhow::anyhow!("no active sessions"))?
             };
 
-            let snapshot = domain.attach(&session_id, mux::AttachMode::ReadOnly).await?;
+            let snapshot = domain.attach(&session_id, access.attach_mode()).await?;
             let pane_id = snapshot
                 .snapshot
                 .as_ref()
@@ -136,7 +168,7 @@ async fn resolve_pane_id(
         }
         Target::Session(name) => {
             let session_id = resolve_named_session_id(domain, name).await?;
-            let snapshot = domain.attach(&session_id, mux::AttachMode::ReadOnly).await?;
+            let snapshot = domain.attach(&session_id, access.attach_mode()).await?;
             let pane_id = snapshot
                 .snapshot
                 .as_ref()
@@ -156,7 +188,7 @@ async fn resolve_pane_id(
                 .ok_or_else(|| anyhow::anyhow!("session '{}' not found", session))?;
 
             let snapshot = domain
-                .attach(&session_info.id, mux::AttachMode::ReadOnly)
+                .attach(&session_info.id, access.attach_mode())
                 .await?;
 
             if let Some(snap) = &snapshot.snapshot {
@@ -181,9 +213,7 @@ async fn resolve_pane_id(
             }
             let mut global_index = 0u32;
             for session in &sessions {
-                let snapshot = domain
-                    .attach(&session.id, mux::AttachMode::ReadOnly)
-                    .await?;
+                let snapshot = domain.attach(&session.id, access.attach_mode()).await?;
                 if let Some(snap) = &snapshot.snapshot {
                     for tab in &snap.tabs {
                         for pane_info in &tab.panes {
@@ -218,7 +248,6 @@ async fn resolve_session_id(
         Target::PaneInSession { session, .. } => resolve_named_session_id(domain, session).await,
     }
 }
-
 
 /// 执行 CLI 命令。
 /// 来源: spec §3.10
@@ -259,15 +288,20 @@ pub async fn run_cli_command(cmd: CliCommand) -> Result<()> {
                 println!("no sessions");
             } else {
                 for s in &sessions {
-                    println!(
-                        "{}: {} ({} clients)",
-                        s.name, s.id, s.attached_clients
-                    );
+                    println!("{}: {} ({} clients)", s.name, s.id, s.attached_clients);
                 }
             }
         }
         CliCommand::NewSession { name, cwd } => {
-            let name = name.unwrap_or_else(|| format!("session-{}", std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_secs()));
+            let name = name.unwrap_or_else(|| {
+                format!(
+                    "session-{}",
+                    std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .unwrap_or_default()
+                        .as_secs()
+                )
+            });
             // §3.10 cwd 缺省时使用当前进程的当前目录，错误向上传播。
             let cwd = match cwd {
                 Some(cwd) => cwd,
@@ -351,7 +385,7 @@ pub async fn run_cli_command(cmd: CliCommand) -> Result<()> {
             command,
         } => {
             let target = super::target::parse_target(&target);
-            let pane_id = resolve_pane_id(&domain, &target).await?;
+            let pane_id = resolve_pane_id(&domain, &target, ResolveAccess::ReadWrite).await?;
             let direction = if horizontal {
                 SplitDirection::LeftRight
             } else {
@@ -371,7 +405,7 @@ pub async fn run_cli_command(cmd: CliCommand) -> Result<()> {
 
         CliCommand::SendKeys { target, keys } => {
             let target = super::target::parse_target(&target);
-            let pane_id = resolve_pane_id(&domain, &target).await?;
+            let pane_id = resolve_pane_id(&domain, &target, ResolveAccess::ReadWrite).await?;
             let bytes = parse_keys(&keys);
             domain
                 .send_input(&pane_id, &bytes)
@@ -386,15 +420,10 @@ pub async fn run_cli_command(cmd: CliCommand) -> Result<()> {
             escape,
         } => {
             let target = super::target::parse_target(&target);
-            let pane_id = resolve_pane_id(&domain, &target).await?;
-            let text = super::capture::capture_pane(
-                &domain,
-                &pane_id,
-                scrollback,
-                escape,
-            )
-            .await
-            .context("failed to capture pane")?;
+            let pane_id = resolve_pane_id(&domain, &target, ResolveAccess::ReadOnly).await?;
+            let text = super::capture::capture_pane(&domain, &pane_id, scrollback, escape)
+                .await
+                .context("failed to capture pane")?;
             if print {
                 print!("{}", text);
             } else {
@@ -430,7 +459,7 @@ pub async fn run_cli_command(cmd: CliCommand) -> Result<()> {
 
         CliCommand::SelectPane { target } => {
             let target = super::target::parse_target(&target);
-            let pane_id = resolve_pane_id(&domain, &target).await?;
+            let pane_id = resolve_pane_id(&domain, &target, ResolveAccess::ReadWrite).await?;
             domain
                 .focus_pane(&pane_id)
                 .await
@@ -440,7 +469,7 @@ pub async fn run_cli_command(cmd: CliCommand) -> Result<()> {
 
         CliCommand::KillPane { target } => {
             let target = super::target::parse_target(&target);
-            let pane_id = resolve_pane_id(&domain, &target).await?;
+            let pane_id = resolve_pane_id(&domain, &target, ResolveAccess::ReadWrite).await?;
             domain
                 .close_pane(&pane_id)
                 .await
@@ -454,14 +483,14 @@ pub async fn run_cli_command(cmd: CliCommand) -> Result<()> {
             height,
         } => {
             let target = super::target::parse_target(&target);
-            let pane_id = resolve_pane_id(&domain, &target).await?;
+            let pane_id = resolve_pane_id(&domain, &target, ResolveAccess::ReadWrite).await?;
 
             // §3.10 Preserve unspecified axis from current pane size (do not wipe to 80x24).
             let (current_cols, current_rows) = {
                 let sessions = domain.list_sessions().await?;
                 let mut found = (80u32, 24u32);
                 for session in &sessions {
-                    if let Ok(attach) = domain.attach(&session.id, mux::AttachMode::ReadOnly).await {
+                    if let Ok(attach) = domain.attach(&session.id, mux::AttachMode::Shared).await {
                         if let Some(snap) = &attach.snapshot {
                             for tab in &snap.tabs {
                                 if let Some(pane) = tab.panes.iter().find(|p| p.id == pane_id) {
@@ -502,7 +531,7 @@ pub async fn run_cli_command(cmd: CliCommand) -> Result<()> {
 
         CliCommand::RenameWindow { target, title } => {
             let target = super::target::parse_target(&target);
-            let pane_id = resolve_pane_id(&domain, &target).await?;
+            let pane_id = resolve_pane_id(&domain, &target, ResolveAccess::ReadWrite).await?;
             domain
                 .set_pane_title(&pane_id, &title)
                 .await
