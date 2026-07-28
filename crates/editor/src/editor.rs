@@ -4684,11 +4684,97 @@ impl Editor {
     /// Stub: clear (编辑功能已删除)
     pub fn clear(&mut self, _window: &mut Window, _cx: &mut Context<Self>) {}
 
-    /// Stub: backspace (编辑功能已删除)
-    pub fn backspace(&mut self, _: &Backspace, _window: &mut Window, _cx: &mut Context<Self>) {}
+    pub fn backspace(&mut self, _: &Backspace, window: &mut Window, cx: &mut Context<Self>) {
+        if self.read_only(cx) {
+            return;
+        }
 
-    /// Stub: delete (编辑功能已删除)
-    pub fn delete(&mut self, _: &Delete, _window: &mut Window, _cx: &mut Context<Self>) {}
+        let display_snapshot = self.display_snapshot(cx);
+        let old_selections = self.selections.all::<MultiBufferOffset>(&display_snapshot);
+
+        self.transact(window, cx, |this, _window, cx| {
+            let snapshot = this.display_snapshot(cx);
+            let mut edits = Vec::with_capacity(old_selections.len());
+            let mut new_cursor_offsets = Vec::with_capacity(old_selections.len());
+            let mut accumulated_delta = 0isize;
+
+            for selection in old_selections {
+                let (start_off, end_off) = if selection.start == selection.end {
+                    let cursor = selection.head().0;
+                    if cursor == 0 {
+                        continue;
+                    }
+                    let cursor_display = MultiBufferOffset(cursor).to_display_point(&snapshot);
+                    let prev_display = snapshot.clip_point(
+                        DisplayPoint::new(cursor_display.row(), cursor_display.column().saturating_sub(1)),
+                        Bias::Left,
+                    );
+                    (prev_display.to_offset(&snapshot, Bias::Left).0, cursor)
+                } else {
+                    (selection.start.0, selection.end.0)
+                };
+                let start_off = MultiBufferOffset(start_off);
+                let end_off = MultiBufferOffset(end_off);
+
+                let adjusted = start_off.0.saturating_add_signed(accumulated_delta);
+                new_cursor_offsets.push(MultiBufferOffset(adjusted)..MultiBufferOffset(adjusted));
+                edits.push((start_off..end_off, String::new()));
+                accumulated_delta -= (end_off.0 - start_off.0) as isize;
+            }
+
+            this.edit(edits, cx);
+            this.change_selections(SelectionEffects::no_scroll(), _window, cx, |selections| {
+                selections.select_ranges(new_cursor_offsets)
+            });
+        });
+    }
+
+    pub fn delete(&mut self, _: &Delete, window: &mut Window, cx: &mut Context<Self>) {
+        if self.read_only(cx) {
+            return;
+        }
+
+        let display_snapshot = self.display_snapshot(cx);
+        let old_selections = self.selections.all::<MultiBufferOffset>(&display_snapshot);
+
+        self.transact(window, cx, |this, _window, cx| {
+            let snapshot = this.display_snapshot(cx);
+            let max_point = snapshot.max_point();
+            let max_offset = max_point.to_offset(&snapshot, Bias::Right).0;
+            let mut edits = Vec::with_capacity(old_selections.len());
+            let mut new_cursor_offsets = Vec::with_capacity(old_selections.len());
+            let mut accumulated_delta = 0isize;
+
+            for selection in old_selections {
+                let (start_off, end_off) = if selection.start == selection.end {
+                    let cursor = selection.head().0;
+                    if cursor >= max_offset {
+                        continue;
+                    }
+                    let cursor_display = MultiBufferOffset(cursor).to_display_point(&snapshot);
+                    let next_display = snapshot.clip_point(
+                        DisplayPoint::new(cursor_display.row(), cursor_display.column() + 1),
+                        Bias::Right,
+                    );
+                    (cursor, next_display.to_offset(&snapshot, Bias::Right).0)
+                } else {
+                    (selection.start.0, selection.end.0)
+                };
+                let start_off = MultiBufferOffset(start_off);
+                let end_off = MultiBufferOffset(end_off);
+
+                let adjusted = start_off.0.saturating_add_signed(accumulated_delta);
+                new_cursor_offsets.push(MultiBufferOffset(adjusted)..MultiBufferOffset(adjusted));
+                edits.push((start_off..end_off, String::new()));
+                accumulated_delta -= (end_off.0 - start_off.0) as isize;
+            }
+
+            this.edit(edits, cx);
+            this.change_selections(SelectionEffects::no_scroll(), _window, cx, |selections| {
+                selections.select_ranges(new_cursor_offsets)
+            });
+        });
+    }
 
     pub fn backtab(&mut self, _: &Backtab, window: &mut Window, cx: &mut Context<Self>) {
         if self.mode.is_single_line() {
