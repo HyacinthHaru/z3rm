@@ -6828,11 +6828,49 @@ impl Editor {
         }
     }
 
-    /// Stub: undo (编辑功能已删除)
-    pub fn undo(&mut self, _: &Undo, _window: &mut Window, _cx: &mut Context<Self>) {}
+    pub fn undo(&mut self, _: &Undo, window: &mut Window, cx: &mut Context<Self>) {
+        if self.read_only(cx) {
+            return;
+        }
 
-    /// Stub: redo (编辑功能已删除)
-    pub fn redo(&mut self, _: &Redo, _window: &mut Window, _cx: &mut Context<Self>) {}
+        if let Some(tx_id) = self.buffer.update(cx, |buffer, cx| buffer.undo(cx)) {
+            self.selection_history.mode = SelectionHistoryMode::Undoing;
+            if let Some(transaction) = self.selection_history.transaction(tx_id).cloned() {
+                let selections = transaction.undo.clone();
+                self.change_selections(
+                    SelectionEffects::scroll(Autoscroll::newest()),
+                    window,
+                    cx,
+                    |s| s.select_anchors(selections.to_vec()),
+                );
+            }
+            self.selection_history.mode = SelectionHistoryMode::Normal;
+            cx.notify();
+        }
+    }
+
+    pub fn redo(&mut self, _: &Redo, window: &mut Window, cx: &mut Context<Self>) {
+        if self.read_only(cx) {
+            return;
+        }
+
+        if let Some(tx_id) = self.buffer.update(cx, |buffer, cx| buffer.redo(cx)) {
+            self.selection_history.mode = SelectionHistoryMode::Redoing;
+            if let Some(transaction) = self.selection_history.transaction(tx_id) {
+                if let Some(redo_selections) = &transaction.redo {
+                    let selections = redo_selections.clone();
+                    self.change_selections(
+                        SelectionEffects::scroll(Autoscroll::newest()),
+                        window,
+                        cx,
+                        |s| s.select_anchors(selections.to_vec()),
+                    );
+                }
+            }
+            self.selection_history.mode = SelectionHistoryMode::Normal;
+            cx.notify();
+        }
+    }
 
     pub fn finalize_last_transaction(&mut self, cx: &mut Context<Self>) {
         self.buffer
