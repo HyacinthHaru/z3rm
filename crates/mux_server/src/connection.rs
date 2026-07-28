@@ -456,6 +456,13 @@ async fn dispatch_request(
                 ResponseBody::Error("permission denied: read-write required".to_string())
             }
         }
+        RequestBody::ResizeLayout(r) => {
+            if check_permission(role, ClientRole::ReadWrite) {
+                handle_resize_layout(r, sessions, outbound_tx).await?
+            } else {
+                ResponseBody::Error("permission denied: read-write required".to_string())
+            }
+        }
 
         // §3.3 需要 ReadWrite 的输入操作 (Plan 33)
         RequestBody::SendInput(r) => {
@@ -1274,6 +1281,52 @@ async fn handle_resize_pane(
         }
     }
     Ok(ResponseBody::Error("pane not found".to_string()))
+}
+
+/// §16.9 Resize the server-authoritative layout ratio of a pane.
+async fn handle_resize_layout(
+    req: &mux_protocol::ResizeLayoutRequest,
+    sessions: &Arc<parking_lot::RwLock<Vec<crate::session::Session>>>,
+    _outbound_tx: &mpsc::UnboundedSender<Envelope>,
+) -> anyhow::Result<ResponseBody> {
+    let direction = match req.direction {
+        1 => crate::layout::SplitDirection::LeftRight,
+        2 => crate::layout::SplitDirection::TopBottom,
+        _ => {
+            return Ok(ResponseBody::Error(format!(
+                "invalid split direction: {}",
+                req.direction
+            )));
+        }
+    };
+    let session_id = {
+        let mut sessions_w = sessions.write();
+        let Some(session) = sessions_w
+            .iter_mut()
+            .find(|s| s.layout.root.find_pane(&req.pane_id).is_some())
+        else {
+            return Ok(ResponseBody::Error(format!(
+                "pane not found: {}",
+                req.pane_id
+            )));
+        };
+        if let Err(error) = session
+            .layout
+            .resize_pane(&req.pane_id, direction, req.delta)
+        {
+            tracing::warn!(error = %error, pane_id = %req.pane_id, "layout resize_pane failed");
+            return Ok(ResponseBody::Error(format!("{error}")));
+        }
+        session.id.clone()
+    };
+    broadcast_layout_changed(sessions, &session_id);
+    zlog::info!(
+        "layout resized: pane={} direction={:?} delta={}",
+        req.pane_id,
+        direction,
+        req.delta
+    );
+    Ok(ResponseBody::Error(String::new()))
 }
 fn find_pane(
     sessions: &Arc<parking_lot::RwLock<Vec<crate::session::Session>>>,

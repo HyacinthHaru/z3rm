@@ -62,6 +62,28 @@ fn focus_mux_pane_index(
     }
 }
 
+/// §16.9 Forward a layout ratio resize to the server.
+fn forward_layout_resize(
+    cx: &mut gpui::App,
+    pane_id: String,
+    direction: mux_protocol::split_node::SplitDirection,
+    delta: f32,
+) {
+    let Some(state) = workspace::AppState::try_global(cx) else {
+        return;
+    };
+    let Some(domain) = state.mux_domain.clone() else {
+        return;
+    };
+    cx.background_executor()
+        .spawn(async move {
+            if let Err(error) = domain.resize_layout(&pane_id, direction, delta).await {
+                tracing::warn!(error = %error, "resize_layout RPC failed");
+            }
+        })
+        .detach();
+}
+
 #[derive(Clone, Debug, settings::RegisterSetting)]
 struct MuxSettings {
     keymap_profile: String,
@@ -791,26 +813,25 @@ fn main() {
                             let Some(mux_view) = workspace.active_item_as::<terminal_view::mux_pane::MuxPaneView>(cx) else { return };
                             mux_view.update(cx, |view, cx| view.send_literal(&action.keystroke, cx));
                         })
-                        .register_action(|workspace, _: &settings::mux_actions::FocusDown, window, cx| {
-                            workspace.activate_pane_in_direction(workspace::SplitDirection::Down, window, cx);
-                        })
-                        .register_action(|workspace, _: &settings::mux_actions::FocusNextPane, window, cx| {
-                            workspace.activate_next_pane(window, cx);
-                        })
-                        .register_action(|workspace, _: &settings::mux_actions::FocusPrevPane, window, cx| {
-                            workspace.activate_previous_pane(window, cx);
-                        })
                         .register_action(|workspace, _: &settings::mux_actions::ResizeLeft, window, cx| {
                             workspace.resize_pane(gpui::Axis::Horizontal, gpui::px(-50.0), window, cx);
+                            let pane_id = workspace.active_item_as::<terminal_view::mux_pane::MuxPaneView>(cx).map(|v| v.read(cx).pane_id.clone());
+                            if let Some(id) = pane_id { forward_layout_resize(cx, id, mux_protocol::split_node::SplitDirection::LeftRight, -0.05); }
                         })
                         .register_action(|workspace, _: &settings::mux_actions::ResizeRight, window, cx| {
                             workspace.resize_pane(gpui::Axis::Horizontal, gpui::px(50.0), window, cx);
+                            let pane_id = workspace.active_item_as::<terminal_view::mux_pane::MuxPaneView>(cx).map(|v| v.read(cx).pane_id.clone());
+                            if let Some(id) = pane_id { forward_layout_resize(cx, id, mux_protocol::split_node::SplitDirection::LeftRight, 0.05); }
                         })
                         .register_action(|workspace, _: &settings::mux_actions::ResizeUp, window, cx| {
                             workspace.resize_pane(gpui::Axis::Vertical, gpui::px(-50.0), window, cx);
+                            let pane_id = workspace.active_item_as::<terminal_view::mux_pane::MuxPaneView>(cx).map(|v| v.read(cx).pane_id.clone());
+                            if let Some(id) = pane_id { forward_layout_resize(cx, id, mux_protocol::split_node::SplitDirection::TopBottom, -0.05); }
                         })
                         .register_action(|workspace, _: &settings::mux_actions::ResizeDown, window, cx| {
                             workspace.resize_pane(gpui::Axis::Vertical, gpui::px(50.0), window, cx);
+                            let pane_id = workspace.active_item_as::<terminal_view::mux_pane::MuxPaneView>(cx).map(|v| v.read(cx).pane_id.clone());
+                            if let Some(id) = pane_id { forward_layout_resize(cx, id, mux_protocol::split_node::SplitDirection::TopBottom, 0.05); }
                         })
                         .register_action(|workspace, _: &settings::mux_actions::ResizeEqual, _window, cx| {
                             workspace.reset_pane_sizes(cx);

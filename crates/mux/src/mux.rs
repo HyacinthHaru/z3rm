@@ -696,6 +696,21 @@ impl MuxDomain {
         Self::empty_or_error_response(self.send_request(req).await?)
     }
 
+    /// §16.9 Adjust the server-authoritative layout ratio of a pane.
+    pub async fn resize_layout(
+        &self,
+        pane: &str,
+        direction: SplitDirection,
+        delta: f32,
+    ) -> Result<()> {
+        let req = RequestBody::ResizeLayout(mux_protocol::ResizeLayoutRequest {
+            pane_id: pane.to_string(),
+            direction: direction as i32,
+            delta,
+        });
+        Self::empty_or_error_response(self.send_request(req).await?)
+    }
+
     /// §3.10 设置 Pane 标题。
     pub async fn set_pane_title(&self, pane: &str, title: &str) -> Result<()> {
         let req = RequestBody::SetPaneTitle(mux_protocol::SetPaneTitleRequest {

@@ -220,6 +220,13 @@ message SetPaneTitleRequest {
     string title = 2;
 }
 
+// §16.9 Adjust the server-authoritative layout ratio of a pane.
+message ResizeLayoutRequest {
+    string pane_id = 1;
+    SplitNode.SplitDirection direction = 2;
+    float delta = 3;  // ratio delta (e.g. 0.05 = 5%)
+}
+
 // §3.10 调整 Pane 尺寸。
 message ResizePaneRequest {
     string pane_id = 1;
@@ -675,6 +682,7 @@ message Request {
         ListFileVersionsRequest list_file_versions = 30;  // §4 shadow snapshot
         GetFileVersionRequest get_file_version = 31;       // §4 shadow snapshot
         DeclineFileVersionRequest decline_file_version = 32;  // §4 shadow snapshot
+        ResizeLayoutRequest resize_layout = 33;  // §16.9 server-owned layout ratios
     }
 }
 
