@@ -514,13 +514,20 @@ impl Project {
     ) {
     }
 
-    /// Stub: open_buffer_for_symbol (symbol search 功能已删除)
     pub fn open_buffer_for_symbol(
         &self,
-        _symbol: &Symbol,
-        _cx: &mut Context<Self>,
+        symbol: &Symbol,
+        cx: &mut Context<Self>,
     ) -> Task<anyhow::Result<Entity<language::Buffer>>> {
-        Task::ready(Err(anyhow::anyhow!("stub: symbol search disabled")))
+        let Some(path) = symbol.path.clone() else {
+            return Task::ready(Err(anyhow::anyhow!(
+                "symbol {:?} has no project path",
+                symbol.name
+            )));
+        };
+
+        self.buffer_store
+            .update(cx, |store, cx| store.open_buffer(path, cx))
     }
 
     /// Stub: create_terminal_shell (task crate 已删除)
