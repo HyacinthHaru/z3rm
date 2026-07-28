@@ -35,7 +35,7 @@ use crate::terminal_element::TerminalElement;
 use crate::{TerminalMode, TerminalView};
 
 use workspace::{
-    ItemHandle, ToolbarItemLocation, Workspace,
+    ToolbarItemLocation, Workspace,
     item::{Item, ItemBufferKind, TabTooltipContent},
 };
 
@@ -218,6 +218,10 @@ impl MuxPaneView {
             pending_input_errors,
         };
         view.start_notification_listener(cx);
+        // Subscribe before the initial fetch so output produced while the request is
+        // in flight cannot fall into a fetch-before-subscribe race. A quiet pane
+        // emits no future notification, so construction itself must fetch generation 0.
+        view.schedule_fetch(cx);
         view
     }
 
@@ -377,7 +381,6 @@ impl MuxPaneView {
         resp: mux_protocol::FetchGridUpdateResponse,
         cx: &mut Context<Self>,
     ) {
-        let prev_generation = self.generation;
         self.generation = resp.to_generation;
         match resp.update {
             Some(FetchUpdate::FullSnapshot(full)) => {
@@ -881,7 +884,159 @@ impl Item for MuxPaneView {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use mux_protocol::{Cell, CellStyle};
+    use gpui::TestAppContext;
+    use mux_protocol::{
+        Cell, CellStyle, Envelope, FetchGridUpdateResponse, Request, Response,
+        envelope::Payload as EnvelopePayload, request::Body as RequestBody,
+        response::Body as ResponseBody,
+    };
+    use settings::SettingsStore;
+
+    #[cfg(unix)]
+    fn serve_initial_grid(mut stream: std::os::unix::net::UnixStream) -> Result<(), String> {
+        use std::io::{Read, Write};
+
+        stream
+            .set_read_timeout(Some(std::time::Duration::from_secs(5)))
+            .map_err(|error| format!("set mock mux read timeout: {error}"))?;
+
+        let mut prefix = Vec::with_capacity(mux_protocol::MAX_VARINT_LEN);
+        loop {
+            let mut byte = [0u8; 1];
+            stream
+                .read_exact(&mut byte)
+                .map_err(|error| format!("read initial grid request prefix: {error}"))?;
+            prefix.push(byte[0]);
+            if byte[0] & 0x80 == 0 {
+                break;
+            }
+            if prefix.len() == mux_protocol::MAX_VARINT_LEN {
+                return Err("initial grid request used an overlong frame prefix".to_string());
+            }
+        }
+
+        let (raw_len, prefix_len) = mux_protocol::parse_len_prefix(&prefix)
+            .map_err(|error| format!("parse initial grid request prefix: {error}"))?
+            .ok_or_else(|| "initial grid request prefix was incomplete".to_string())?;
+        let payload_len = mux_protocol::check_frame_len(raw_len)
+            .map_err(|error| format!("validate initial grid request length: {error}"))?;
+        let mut framed = prefix;
+        framed.resize(prefix_len + payload_len, 0);
+        stream
+            .read_exact(&mut framed[prefix_len..])
+            .map_err(|error| format!("read initial grid request payload: {error}"))?;
+
+        let (envelope, consumed) = mux_protocol::unframe(&framed)
+            .map_err(|error| format!("decode initial grid request: {error}"))?;
+        if consumed != framed.len() {
+            return Err(format!(
+                "initial grid request left {} trailing bytes",
+                framed.len() - consumed
+            ));
+        }
+        let request = match envelope.payload {
+            Some(EnvelopePayload::Request(request)) => request,
+            payload => {
+                return Err(format!(
+                    "expected initial request envelope, got {payload:?}"
+                ));
+            }
+        };
+        let fetch = match request.body {
+            Some(RequestBody::FetchGridUpdate(fetch)) => fetch,
+            body => return Err(format!("expected initial FetchGridUpdate, got {body:?}")),
+        };
+        if fetch.pane_id != "quiet-pane" || fetch.since_generation != 0 {
+            return Err(format!(
+                "unexpected initial fetch target/generation: {}@{}",
+                fetch.pane_id, fetch.since_generation
+            ));
+        }
+
+        let cells = ["q", "u", "i", "e", "t"]
+            .into_iter()
+            .map(|char| Cell {
+                char: char.to_string(),
+                ..Default::default()
+            })
+            .collect();
+        let response = Envelope {
+            version: Some(mux_protocol::PROTOCOL_VERSION),
+            payload: Some(EnvelopePayload::Response(Response {
+                request_id: request.request_id,
+                body: Some(ResponseBody::GridUpdate(FetchGridUpdateResponse {
+                    from_generation: 0,
+                    to_generation: 7,
+                    update: Some(FetchUpdate::FullSnapshot(FullGridSnapshot {
+                        cols: 5,
+                        rows: 1,
+                        cells,
+                        cursor: None,
+                        alternate_screen: false,
+                        display_offset: 0,
+                    })),
+                })),
+            })),
+        };
+        let response = mux_protocol::frame(&response)
+            .map_err(|error| format!("encode initial grid response: {error}"))?;
+        stream
+            .write_all(&response)
+            .map_err(|error| format!("write initial grid response: {error}"))?;
+        stream
+            .flush()
+            .map_err(|error| format!("flush initial grid response: {error}"))
+    }
+
+    #[cfg(unix)]
+    #[gpui::test]
+    async fn new_fetches_generation_zero_for_a_quiet_pane(cx: &mut TestAppContext) {
+        cx.executor().allow_parking();
+        cx.update(|cx| {
+            let settings_store = SettingsStore::test(cx);
+            cx.set_global(settings_store);
+            theme_settings::init(theme::LoadThemes::JustBase, cx);
+        });
+
+        let (client, server) = match std::os::unix::net::UnixStream::pair() {
+            Ok(pair) => pair,
+            Err(error) => panic!("create mock mux socket pair: {error}"),
+        };
+        if let Err(error) = client.set_nonblocking(true) {
+            panic!("set mock mux client nonblocking: {error}");
+        }
+        let domain = match MuxDomain::connect_with_blocking_stream(client) {
+            Ok(domain) => Arc::new(domain),
+            Err(error) => panic!("connect mock mux domain: {error}"),
+        };
+        let server_thread = std::thread::spawn(move || serve_initial_grid(server));
+
+        let (view, cx) = cx.add_window_view(|window, cx| {
+            MuxPaneView::new(
+                "quiet-pane".to_string(),
+                domain,
+                WeakEntity::new_invalid(),
+                WeakEntity::new_invalid(),
+                window,
+                cx,
+            )
+        });
+        let initial_grid_applied = view.condition::<MuxPaneEvent>(cx, |view, _cx| {
+            view.generation == 7 && !view.fetch_in_flight
+        });
+        match server_thread.join() {
+            Ok(Ok(())) => {}
+            Ok(Err(error)) => panic!("mock mux server failed: {error}"),
+            Err(_) => panic!("mock mux server panicked"),
+        }
+        initial_grid_applied.await;
+
+        view.read_with(cx, |view, _cx| {
+            assert_eq!(view.generation, 7);
+            assert!(!view.fetch_in_flight);
+            assert_eq!(snapshot_to_text(&view.snapshot), "quiet");
+        });
+    }
 
     #[test]
     fn test_keystroke_to_bytes_ctrl_c() {
