@@ -53,6 +53,8 @@ mod task;
 // 默认禁用,启用 z3rm-migration feature 才尝试编译,暴露迁移洞。
 #[cfg(all(test, feature = "z3rm-migration"))]
 pub mod test;
+#[cfg(test)]
+mod core_action_tests;
 
 mod clipboard;
 mod config;
@@ -1703,7 +1705,6 @@ impl Editor {
             return;
         }
 
-        self.finalize_last_transaction(cx);
         self.transact(window, cx, |this, window, cx| {
             let mut edits = Vec::with_capacity(selections.len());
             let mut new_cursor_offsets = Vec::with_capacity(selections.len());
