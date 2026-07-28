@@ -4,10 +4,10 @@
 use std::{ops::Range, path::PathBuf, sync::Arc};
 
 use collections::BTreeMap;
+use extension::ExtensionProvides;
+use fs::Fs;
 use gpui::{App, Entity, SharedString, Task};
 use serde::{Deserialize, Serialize};
-use fs::Fs;
-use extension::ExtensionProvides;
 use text::Anchor;
 use worktree::ProjectEntryId;
 
@@ -214,7 +214,6 @@ pub struct Symbol {
     pub path: Option<ProjectPath>,
 }
 
-
 // ---------------------------------------------------------------------------
 // Diagnostic summary stubs (spec §8.2 M2)
 // ---------------------------------------------------------------------------
@@ -250,7 +249,14 @@ pub mod bookmark_store {
         pub fn all_bookmark_locations(
             _store: Entity<BookmarkStore>,
             _cx: &mut gpui::AsyncApp,
-        ) -> Task<anyhow::Result<std::collections::HashMap<gpui::Entity<language::Buffer>, (Vec<std::ops::Range<text::Point>>)>>> {
+        ) -> Task<
+            anyhow::Result<
+                std::collections::HashMap<
+                    gpui::Entity<language::Buffer>,
+                    (Vec<std::ops::Range<text::Point>>),
+                >,
+            >,
+        > {
             Task::ready(Ok(std::collections::HashMap::new()))
         }
 
@@ -321,7 +327,13 @@ pub mod debugger {
 
         impl Breakpoint {
             pub fn new_standard() -> Self {
-                Self { state: BreakpointState::Enabled, condition: None, hit_condition: None, log_point: None, message: None }
+                Self {
+                    state: BreakpointState::Enabled,
+                    condition: None,
+                    hit_condition: None,
+                    log_point: None,
+                    message: None,
+                }
             }
 
             pub fn is_enabled(&self) -> bool {
@@ -348,7 +360,8 @@ pub mod debugger {
                 _range: Option<Range<Anchor>>,
                 _snapshot: &language::BufferSnapshot,
                 _cx: &App,
-            ) -> std::vec::IntoIter<(BreakpointWithPosition, Option<BreakpointSessionState>)> {
+            ) -> std::vec::IntoIter<(BreakpointWithPosition, Option<BreakpointSessionState>)>
+            {
                 Vec::new().into_iter()
             }
 
@@ -588,7 +601,6 @@ pub mod lsp_store {
         pub symbol: super::Symbol,
         pub path: ProjectPath,
     }
-
 }
 
 // ---------------------------------------------------------------------------
@@ -717,16 +729,17 @@ impl Telemetry {
 // ---------------------------------------------------------------------------
 
 use crate::{
-    bookmark_store::BookmarkStore,
-    debugger::breakpoint_store::BreakpointStore,
     Location, Project, ProjectPath, ProjectTransaction, Worktree, WorktreeId,
+    bookmark_store::BookmarkStore, debugger::breakpoint_store::BreakpointStore,
 };
 use git::blame::Blame;
 use lsp::LanguageServerId;
 use util::rel_path::RelPath;
 
 #[derive(Clone, Debug)]
-pub struct StackFrame { pub position: text::Point }
+pub struct StackFrame {
+    pub position: text::Point,
+}
 
 /// Stub for deleted remote::RemoteConnectionOptions (spec §8.2 M2)
 #[derive(Clone, Debug)]
@@ -784,12 +797,19 @@ impl Repository {
     }
 
     /// Stub: status_for_path
-    pub fn status_for_path(&self, _path: &git::repository::RepoPath) -> Option<crate::git_store::StatusEntry> {
+    pub fn status_for_path(
+        &self,
+        _path: &git::repository::RepoPath,
+    ) -> Option<crate::git_store::StatusEntry> {
         None
     }
 
     /// Stub: project_path_to_repo_path
-    pub fn project_path_to_repo_path(&self, _path: &ProjectPath, _cx: &gpui::App) -> Option<git::repository::RepoPath> {
+    pub fn project_path_to_repo_path(
+        &self,
+        _path: &ProjectPath,
+        _cx: &gpui::App,
+    ) -> Option<git::repository::RepoPath> {
         None
     }
 
@@ -961,7 +981,6 @@ impl Project {
         Task::ready(Ok(Vec::new()))
     }
 
-
     pub fn definitions(
         &mut self,
         _buffer: &Entity<language::Buffer>,
@@ -1088,10 +1107,7 @@ impl Project {
         None
     }
 
-    pub fn any_language_server_supports_inlay_hints(
-        &mut self,
-        _buffer: &language::Buffer,
-    ) -> bool {
+    pub fn any_language_server_supports_inlay_hints(&mut self, _buffer: &language::Buffer) -> bool {
         false
     }
 
@@ -1206,8 +1222,9 @@ impl Project {
         project_searchable: bool,
         cx: &mut gpui::Context<Self>,
     ) -> gpui::Task<anyhow::Result<Entity<language::Buffer>>> {
-        self.buffer_store
-            .update(cx, |store, cx| store.create_buffer(language, project_searchable, cx))
+        self.buffer_store.update(cx, |store, cx| {
+            store.create_buffer(language, project_searchable, cx)
+        })
     }
 
     /// 返回搜索历史可变引用
@@ -1250,18 +1267,12 @@ impl Project {
     }
 
     /// 当前活动项目目录
-    pub fn active_project_directory(
-        &self,
-        _cx: &App,
-    ) -> Option<std::path::PathBuf> {
+    pub fn active_project_directory(&self, _cx: &App) -> Option<std::path::PathBuf> {
         None
     }
 
     /// 当前活动项目目录 (const ref)
-    pub fn active_entry_directory(
-        &self,
-        _cx: &App,
-    ) -> Option<std::path::PathBuf> {
+    pub fn active_entry_directory(&self, _cx: &App) -> Option<std::path::PathBuf> {
         None
     }
 
@@ -1270,100 +1281,199 @@ impl Project {
         false
     }
 
-    /// 根据 entry_id 获取 ProjectPath
+    /// Resolve a `ProjectPath` for an entry by locating its owning worktree.
     pub fn path_for_entry(
         &self,
-        _entry_id: ProjectEntryId,
-        _cx: &App,
+        entry_id: ProjectEntryId,
+        cx: &App,
     ) -> Option<crate::ProjectPath> {
-        None
+        self.worktree_store
+            .read(cx)
+            .worktree_and_entry_for_id(entry_id, cx)
+            .map(|(worktree, entry)| crate::ProjectPath {
+                worktree_id: worktree.read(cx).id(),
+                path: entry.path.clone(),
+            })
     }
 
-    /// 根据 entry_id 获取 worktree_id
+    /// Resolve the owning worktree id for an entry.
     pub fn worktree_id_for_entry(
         &self,
-        _entry_id: ProjectEntryId,
-        _cx: &App,
+        entry_id: ProjectEntryId,
+        cx: &App,
     ) -> Option<worktree::WorktreeId> {
-        None
+        self.worktree_store
+            .read(cx)
+            .worktree_for_entry(entry_id, cx)
+            .map(|worktree| worktree.read(cx).id())
     }
 
-    /// 判断 entry 是否是 worktree root
-    pub fn entry_is_worktree_root(
-        &self,
-        _entry_id: ProjectEntryId,
-        _cx: &App,
-    ) -> bool {
-        false
+    /// Whether the given entry is the root of its worktree.
+    pub fn entry_is_worktree_root(&self, entry_id: ProjectEntryId, cx: &App) -> bool {
+        let Some(worktree) = self.worktree_store.read(cx).worktree_for_entry(entry_id, cx) else {
+            return false;
+        };
+        worktree
+            .read(cx)
+            .root_entry()
+            .is_some_and(|root| root.id == entry_id)
     }
 
-    /// 创建 entry (stub)
+    /// Create a file or directory entry in its worktree.
     pub fn create_entry(
         &mut self,
-        _path: crate::ProjectPath,
-        _is_dir: bool,
-        _cx: &mut gpui::Context<Self>,
+        path: crate::ProjectPath,
+        is_dir: bool,
+        cx: &mut gpui::Context<Self>,
     ) -> gpui::Task<anyhow::Result<worktree::CreatedEntry>> {
-        gpui::Task::ready(Err(anyhow::anyhow!("stub: create_entry")))
+        let Some(worktree) = self.worktree_for_id(path.worktree_id, cx) else {
+            return gpui::Task::ready(Err(anyhow::anyhow!(
+                "worktree {} not found",
+                path.worktree_id
+            )));
+        };
+        worktree.update(cx, |worktree, cx| {
+            worktree.create_entry(path.path, is_dir, None, cx)
+        })
     }
 
-    /// 重命名 entry (stub)
+    /// Rename an entry, supporting cross-worktree moves via `WorktreeStore`.
     pub fn rename_entry(
         &mut self,
-        _entry_id: ProjectEntryId,
-        _new_path: crate::ProjectPath,
-        _cx: &mut gpui::Context<Self>,
+        entry_id: ProjectEntryId,
+        new_path: crate::ProjectPath,
+        cx: &mut gpui::Context<Self>,
     ) -> gpui::Task<anyhow::Result<worktree::CreatedEntry>> {
-        gpui::Task::ready(Err(anyhow::anyhow!("stub: rename_entry")))
+        self.worktree_store.update(cx, |store, cx| {
+            store.rename_entry(entry_id, new_path, cx)
+        })
     }
 
-    /// 删除 entry (stub)
+    /// Delete an entry, returning the trashed entry when trashing.
+    ///
+    /// A missing worktree or entry yields `Err`, never a false success.
     pub fn delete_entry(
         &mut self,
-        _entry_id: ProjectEntryId,
-        _trash: bool,
-        _cx: &mut gpui::Context<Self>,
+        entry_id: ProjectEntryId,
+        trash: bool,
+        cx: &mut gpui::Context<Self>,
     ) -> gpui::Task<anyhow::Result<Option<fs::TrashedEntry>>> {
-        gpui::Task::ready(Ok(None))
+        let Some(worktree) = self.worktree_for_entry(entry_id, cx) else {
+            return gpui::Task::ready(Err(anyhow::anyhow!(
+                "no worktree for entry {:?}",
+                entry_id
+            )));
+        };
+        let task = worktree.update(cx, |worktree, cx| {
+            worktree.delete_entry(entry_id, trash, cx)
+        });
+        match task {
+            Some(task) => cx.spawn(async move |_, _| task.await),
+            None => gpui::Task::ready(Err(anyhow::anyhow!(
+                "no such entry {:?}",
+                entry_id
+            ))),
+        }
     }
 
-    /// 恢复 entry (stub)
+    /// Restore a trashed entry and refresh its path so the worktree observes it.
     pub fn restore_entry(
         &mut self,
-        _worktree_id: worktree::WorktreeId,
-        _trashed_entry: fs::TrashedEntry,
-        _cx: &mut gpui::Context<Self>,
+        worktree_id: worktree::WorktreeId,
+        trashed_entry: fs::TrashedEntry,
+        cx: &mut gpui::Context<Self>,
     ) -> gpui::Task<anyhow::Result<crate::ProjectPath>> {
-        gpui::Task::ready(Err(anyhow::anyhow!("stub: restore_entry")))
+        let Some(worktree) = self.worktree_for_id(worktree_id, cx) else {
+            return gpui::Task::ready(Err(anyhow::anyhow!(
+                "worktree {} not found",
+                worktree_id
+            )));
+        };
+        cx.spawn(async move |this, cx| {
+            let restored_path =
+                Worktree::restore_entry(trashed_entry, worktree.clone(), cx).await?;
+            let path: Arc<RelPath> = restored_path.into();
+            // Refresh the restored path so the worktree picks up the on-disk change.
+            let refresh = worktree.update(cx, |worktree, cx| match worktree {
+                Worktree::Local(local) => local.refresh_entry(path.clone(), None, cx),
+                Worktree::Remote(_) => Task::ready(Err(anyhow::anyhow!(
+                    "cannot refresh remote worktree after restore"
+                ))),
+            });
+            refresh.await?;
+            this.update(cx, |_, _| {
+                crate::ProjectPath {
+                    worktree_id,
+                    path: path.clone(),
+                }
+            })
+        })
     }
 
-    /// 复制 entry (stub)
+    /// Copy an entry to a new project path via `WorktreeStore::copy_entry`.
     pub fn copy_entry(
         &mut self,
-        _entry_id: ProjectEntryId,
-        _path: crate::ProjectPath,
-        _cx: &mut gpui::Context<Self>,
+        entry_id: ProjectEntryId,
+        path: crate::ProjectPath,
+        cx: &mut gpui::Context<Self>,
     ) -> gpui::Task<anyhow::Result<worktree::CreatedEntry>> {
-        gpui::Task::ready(Err(anyhow::anyhow!("stub: copy_entry")))
+        let worktree_store = self.worktree_store.clone();
+        let copy = self.worktree_store.update(cx, |store, cx| {
+            store.copy_entry(entry_id, path.clone(), cx)
+        });
+        cx.spawn(async move |_, cx| match copy.await? {
+            Some(entry) => Ok(worktree::CreatedEntry::Included(entry)),
+            None => {
+                let abs_path = worktree_store
+                    .read_with(cx, |store, cx| store.absolutize(&path, cx))
+                    .unwrap_or_default();
+                Ok(worktree::CreatedEntry::Excluded { abs_path })
+            }
+        })
     }
 
-    /// 展开 entry (stub)
+    /// Expand a single entry, detaching the underlying worktree task.
     pub fn expand_entry(
         &mut self,
-        _worktree_id: worktree::WorktreeId,
-        _entry_id: ProjectEntryId,
-        _cx: &mut gpui::Context<Self>,
+        worktree_id: worktree::WorktreeId,
+        entry_id: ProjectEntryId,
+        cx: &mut gpui::Context<Self>,
     ) {
+        let Some(worktree) = self.worktree_for_id(worktree_id, cx) else {
+            return;
+        };
+        let Some(task) = worktree.update(cx, |worktree, cx| {
+            worktree.expand_entry(entry_id, cx)
+        }) else {
+            return;
+        };
+        cx.spawn(async move |_, _| {
+            if let Err(err) = task.await {
+                log::error!("failed to expand entry {entry_id:?}: {err:?}");
+            }
+        })
+        .detach();
     }
 
-    /// 展开所有子目录 (stub)
+    /// Recursively expand an entry's descendants, emitting
+    /// `Event::ExpandedAllForEntry` when the scan completes.
     pub fn expand_all_for_entry(
         &mut self,
-        _worktree_id: worktree::WorktreeId,
-        _entry_id: ProjectEntryId,
-        _cx: &mut gpui::Context<Self>,
+        worktree_id: worktree::WorktreeId,
+        entry_id: ProjectEntryId,
+        cx: &mut gpui::Context<Self>,
     ) -> Option<gpui::Task<anyhow::Result<()>>> {
-        None
+        let worktree = self.worktree_for_id(worktree_id, cx)?;
+        let task = worktree.update(cx, |worktree, cx| {
+            worktree.expand_all_for_entry(entry_id, cx)
+        })?;
+        Some(cx.spawn(async move |this, cx| {
+            task.await?;
+            this.update(cx, |_, cx| {
+                cx.emit(crate::Event::ExpandedAllForEntry(worktree_id, entry_id));
+            })?;
+            Ok(())
+        }))
     }
 
     /// 获取 buffer (stub)
@@ -1376,10 +1486,7 @@ impl Project {
     }
 
     /// 获取脏 buffers (stub)
-    pub fn dirty_buffers(
-        &self,
-        _cx: &App,
-    ) -> impl Iterator<Item = crate::ProjectPath> {
+    pub fn dirty_buffers(&self, _cx: &App) -> impl Iterator<Item = crate::ProjectPath> {
         std::iter::empty()
     }
 
@@ -1547,7 +1654,11 @@ impl ShellBuilder {
     }
 
     /// 构建命令和参数 (no shell quoting)
-    pub fn build_no_quote(&self, command: Option<String>, _args: &[String]) -> (String, Vec<String>) {
+    pub fn build_no_quote(
+        &self,
+        command: Option<String>,
+        _args: &[String],
+    ) -> (String, Vec<String>) {
         let mut all_args = self.args.clone();
         if let Some(cmd) = command {
             if !cmd.is_empty() {
@@ -1625,3 +1736,202 @@ impl<T> Clone for SearchResults<T> {
 
 /// Stub: Search alias for SearchQuery (task crate 已删除)
 pub type Search = crate::search::SearchQuery;
+
+#[cfg(test)]
+mod stub_delegate_tests {
+    use super::*;
+    use crate::Project;
+    use fs::{FakeFs, Fs};
+    use gpui::TestAppContext;
+    use language::LanguageRegistry;
+    use serde_json::json;
+    use settings::SettingsStore;
+    use std::{path::Path, path::PathBuf, sync::Arc};
+    use util::rel_path::rel_path_buf;
+
+    fn init_test(cx: &mut TestAppContext) {
+        cx.update(|cx| {
+            let settings_store = SettingsStore::test(cx);
+            cx.set_global(settings_store);
+        });
+    }
+
+    async fn setup_project(
+        cx: &mut TestAppContext,
+    ) -> (Arc<FakeFs>, gpui::Entity<Project>, worktree::WorktreeId) {
+        let fs = FakeFs::new(cx.executor());
+        fs.insert_tree(Path::new("/project"), json!({ "dir": {} }))
+            .await;
+        // Build the Project synchronously (Project::test needs &mut App, which we
+        // obtain via cx.update), then add the worktree with an awaitable task.
+        let project = cx.update(|cx| {
+            Project::local(
+                Arc::new(language::LanguageRegistry::new(
+                    cx.background_executor().clone(),
+                )),
+                fs.clone(),
+                None,
+                Vec::new(),
+                cx,
+            )
+        });
+        let worktree = project
+            .update(cx, |p, cx| {
+                p.add_local_worktree(std::path::PathBuf::from("/project"), true, cx)
+            })
+            .await
+            .expect("worktree created");
+        cx.update(|cx| {
+            worktree
+                .read(cx)
+                .as_local()
+                .expect("local worktree")
+                .scan_complete()
+        })
+        .await;
+        let worktree_id = worktree.read_with(cx, |w, _| w.id());
+        (fs, project, worktree_id)
+    }
+
+    fn project_path(worktree_id: worktree::WorktreeId, rel: &str) -> ProjectPath {
+        ProjectPath {
+            worktree_id,
+            path: rel_path_buf(rel).into(),
+        }
+    }
+
+    #[gpui::test]
+    async fn test_entry_lookups(cx: &mut TestAppContext) {
+        init_test(cx);
+        let (_fs, project, worktree_id) = setup_project(cx).await;
+
+        let path = project_path(worktree_id, "dir/file.txt");
+        let created = project
+            .update(cx, |p, cx| p.create_entry(path.clone(), false, cx))
+            .await
+            .expect("create_entry");
+        let entry_id = match created {
+            worktree::CreatedEntry::Included(entry) => entry.id,
+            other => panic!("expected Included, got {other:?}"),
+        };
+
+        // path_for_entry resolves the same ProjectPath.
+        assert_eq!(
+            project.read_with(cx, |p, cx| p.path_for_entry(entry_id, cx)),
+            Some(path)
+        );
+
+        // worktree_id_for_entry resolves the owning worktree.
+        assert_eq!(
+            project.read_with(cx, |p, cx| p.worktree_id_for_entry(entry_id, cx)),
+            Some(worktree_id)
+        );
+
+        // A nested file is not the worktree root.
+        assert!(!project.read_with(cx, |p, cx| p.entry_is_worktree_root(entry_id, cx)));
+
+        // The root entry IS the root.
+        let root_id = project
+            .read_with(cx, |p, cx| {
+                p.worktrees(cx)
+                    .next()
+                    .and_then(|w| w.read(cx).root_entry().map(|e| e.id))
+            })
+            .expect("root entry");
+        assert!(project.read_with(cx, |p, cx| p.entry_is_worktree_root(root_id, cx)));
+
+        // Lookups for an unknown entry yield None/false.
+        assert_eq!(
+            project.read_with(cx, |p, cx| p.path_for_entry(ProjectEntryId::MAX, cx)),
+            None
+        );
+        assert_eq!(
+            project.read_with(cx, |p, cx| p.worktree_id_for_entry(ProjectEntryId::MAX, cx)),
+            None
+        );
+        assert!(
+            !project.read_with(cx, |p, cx| p.entry_is_worktree_root(ProjectEntryId::MAX, cx))
+        );
+    }
+
+    #[gpui::test]
+    async fn test_delete_missing_entry_returns_err(cx: &mut TestAppContext) {
+        init_test(cx);
+        let (_fs, project, _worktree_id) = setup_project(cx).await;
+
+        // Deleting a never-created entry MUST be Err, never the false Ok(None)
+        // success the old stub returned.
+        let result = project
+            .update(cx, |p, cx| p.delete_entry(ProjectEntryId::MAX, true, cx))
+            .await;
+        assert!(
+            result.is_err(),
+            "deleting a missing entry must return Err, got {result:?}"
+        );
+    }
+
+    #[gpui::test]
+    async fn test_create_rename_copy_delete_restore(cx: &mut TestAppContext) {
+        init_test(cx);
+        let (fs, project, worktree_id) = setup_project(cx).await;
+
+        // create
+        let src = project_path(worktree_id, "dir/a.txt");
+        let created = project
+            .update(cx, |p, cx| p.create_entry(src.clone(), false, cx))
+            .await
+            .expect("create_entry");
+        let entry_id = match created {
+            worktree::CreatedEntry::Included(e) => e.id,
+            other => panic!("expected Included, got {other:?}"),
+        };
+        assert!(fs.is_file(Path::new("/project/dir/a.txt")).await);
+
+        // rename a.txt -> b.txt
+        let renamed = project_path(worktree_id, "dir/b.txt");
+        project
+            .update(cx, |p, cx| p.rename_entry(entry_id, renamed.clone(), cx))
+            .await
+            .expect("rename_entry");
+        assert!(fs.is_file(Path::new("/project/dir/b.txt")).await);
+
+        // copy b.txt -> c.txt
+        let copied = project_path(worktree_id, "dir/c.txt");
+        let copy_result = project
+            .update(cx, |p, cx| p.copy_entry(entry_id, copied.clone(), cx))
+            .await
+            .expect("copy_entry");
+        assert!(matches!(copy_result, worktree::CreatedEntry::Included(_)));
+        assert!(fs.is_file(Path::new("/project/dir/c.txt")).await);
+
+        // delete (trash) the renamed entry, receiving a TrashedEntry.
+        let trashed = project
+            .update(cx, |p, cx| p.delete_entry(entry_id, true, cx))
+            .await
+            .expect("delete_entry")
+            .expect("trashed entry present after trash delete");
+        assert!(!fs.is_file(Path::new("/project/dir/b.txt")).await);
+
+        // restore recreates the file and returns its ProjectPath.
+        let restored = project
+            .update(cx, |p, cx| p.restore_entry(worktree_id, trashed, cx))
+            .await
+            .expect("restore_entry");
+        assert_eq!(restored.worktree_id, worktree_id);
+    }
+
+    #[gpui::test]
+    async fn test_create_entry_unknown_worktree_errors(cx: &mut TestAppContext) {
+        init_test(cx);
+        let (_fs, project, _worktree_id) = setup_project(cx).await;
+
+        // Creating in a non-existent worktree fails rather than silently no-op'ing.
+        let bogus = worktree::WorktreeId::from_proto(9999);
+        let result = project
+            .update(cx, |p, cx| {
+                p.create_entry(project_path(bogus, "x.txt"), false, cx)
+            })
+            .await;
+        assert!(result.is_err(), "create_entry in unknown worktree must error");
+    }
+}
