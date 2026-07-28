@@ -255,26 +255,11 @@ pub fn init_extensions(cx: &mut gpui::App) {
     let extensions_dir = paths::extensions_dir().clone();
 
     cx.spawn(async move |cx| {
-        // §5.2: load + activate every client extension off the render thread.
         let loaded = cx
             .background_spawn(async move { load_client_extensions(&extensions_dir) })
             .await;
         tracing::info!(count = loaded.len(), "QuickJS extensions loaded");
-        for ext in &loaded {
-            tracing::debug!(
-                id = %ext.id,
-                name = %ext.name,
-                side = ?ext.side,
-                ok = ext.result.result.is_ok(),
-                duration_ms = ext.result.duration.as_millis() as u64,
-                has_vdom = ext.result.vdom_json.is_some(),
-                "extension status"
-            );
-        }
 
-        // §5.4/§5.5: parse each extension's VDOM and publish it to the chrome
-        // state. Status bars appear later (one per workspace); they drain this
-        // buffer via take_pending_vdom on construction.
         let nodes = collect_status_bar_vdom(&loaded);
         let count = nodes.len();
         cx.update(|cx| publish_vdom(cx, nodes));
@@ -283,6 +268,184 @@ pub fn init_extensions(cx: &mut gpui::App) {
         }
     })
     .detach();
+}
+
+// §5.2 Dedicated-thread extension host actor.
+//
+// Owns LiveExtensions on a single std::thread, satisfying the §5.2
+// "dedicated OS thread" constraint. The host thread receives HostCommand
+// messages via mpsc and responds via oneshot. All QuickJS ctx.with calls
+// happen only on this thread.
+
+enum HostCommand {
+    Render {
+        reply: std::sync::mpsc::Sender<Result<Vec<VDomNode>>>,
+    },
+    Emit {
+        event: String,
+        payload: String,
+    },
+    Shutdown,
+}
+
+pub struct ExtensionHostController {
+    command_sender: Option<std::sync::mpsc::Sender<HostCommand>>,
+    host_thread: Option<std::thread::JoinHandle<()>>,
+    render_tick: Option<gpui::Task<()>>,
+    status_bars: parking_lot::Mutex<Vec<gpui::WeakEntity<crate::extension_status_bar::ExtensionStatusBar>>>,
+}
+
+pub struct GlobalHostController(pub std::sync::Arc<ExtensionHostController>);
+impl gpui::Global for GlobalHostController {}
+
+impl ExtensionHostController {
+    pub fn new() -> Self {
+        Self {
+            command_sender: None,
+            host_thread: None,
+            render_tick: None,
+            status_bars: parking_lot::Mutex::new(Vec::new()),
+        }
+    }
+    pub fn start(&mut self, extensions_dir: &Path, cx: &mut gpui::Context<Self>) {
+        let (command_tx, command_rx) = std::sync::mpsc::channel::<HostCommand>();
+        let dir = extensions_dir.to_path_buf();
+
+        let handle = std::thread::Builder::new()
+            .name("quickjs-ext-host".into())
+            .spawn(move || {
+
+                let runner = ExtensionRunner::with_defaults();
+                let mut live_extensions: Vec<quickjs_runtime::LiveExtension> = Vec::new();
+
+                let entries = match std::fs::read_dir(&dir) {
+                    Ok(e) => e,
+                    Err(_) => return,
+                };
+                for entry in entries.flatten() {
+                    let ext_dir = entry.path();
+                    if !ext_dir.is_dir() {
+                        continue;
+                    }
+                    let main_js = ext_dir.join("main.js");
+                    let toml = ext_dir.join("extension.toml");
+                    if !main_js.exists() || !toml.exists() {
+                        continue;
+                    }
+                    let source = match std::fs::read_to_string(&main_js) {
+                        Ok(s) => s,
+                        Err(_) => continue,
+                    };
+                    let id = ext_dir
+                        .file_name()
+                        .map(|n| n.to_string_lossy().into_owned())
+                        .unwrap_or_default();
+                    match runner.load_live(&id, &source, "activate") {
+                        Ok(live) => {
+                            tracing::info!(id = %id, "live extension loaded");
+                            live_extensions.push(live);
+                        }
+                        Err(error) => {
+                            tracing::warn!(id = %id, error = %error, "live extension load failed");
+                        }
+                    }
+                }
+
+                loop {
+                    match command_rx.recv() {
+                        Ok(HostCommand::Render { reply }) => {
+                            let mut nodes = Vec::new();
+                            for live in &live_extensions {
+                                match live.render_now() {
+                                    Ok(Some(json_str)) => {
+                                        if let Ok(value) = serde_json::from_str::<serde_json::Value>(&json_str) {
+                                            if let Ok(node) = vdom_bridge::parse_vdom(&value) {
+                                                nodes.push(node);
+                                            }
+                                        }
+                                    }
+                                    Ok(None) => {}
+                                    Err(error) => {
+                                        tracing::warn!(error = %error, "extension render failed");
+                                    }
+                                }
+                            }
+                            let _ = reply.send(Ok(nodes));
+                        }
+                        Ok(HostCommand::Emit { event, payload }) => {
+                            for live in &live_extensions {
+                                if let Err(error) = live.emit_event(&event, &payload) {
+                                    tracing::warn!(event = %event, error = %error, "extension emit failed");
+                                }
+                            }
+                        }
+                        Ok(HostCommand::Shutdown) | Err(_) => break,
+                    }
+                }
+            });
+
+        if let Ok(handle) = handle {
+            self.command_sender = Some(command_tx);
+            self.host_thread = Some(handle);
+            self.start_render_tick(cx);
+        }
+    }
+
+    fn start_render_tick(&mut self, cx: &mut gpui::Context<Self>) {
+        let sender = self.command_sender.clone();
+        let timer_interval = std::time::Duration::from_secs(1);
+        self.render_tick = Some(cx.spawn(async move |this, cx| {
+            loop {
+                cx.background_executor().timer(timer_interval).await;
+
+                if let Some(sender) = &sender {
+                    let (reply, response) = std::sync::mpsc::channel();
+                    if sender.send(HostCommand::Render { reply }).is_err() {
+                        break;
+                    }
+                    match response.recv() {
+                        Ok(Ok(nodes)) => {
+                            let _ = this.update(cx, |this, cx| {
+                                for bar in this.status_bars.lock().iter() {
+                                    if let Some(bar) = bar.upgrade() {
+                                        bar.update(cx, |bar, cx| bar.set_vdom_nodes(nodes.clone(), cx));
+                                    }
+                                }
+                            });
+                        }
+                        Ok(Err(error)) => {
+                            tracing::warn!(error = %error, "extension host render error");
+                        }
+                        Err(_) => break,
+                    }
+                }
+            }
+        }));
+    }
+
+    pub fn emit_event(&self, event: &str, payload: &str) {
+        if let Some(sender) = &self.command_sender {
+            let _ = sender.send(HostCommand::Emit {
+                event: event.to_string(),
+                payload: payload.to_string(),
+            });
+        }
+    }
+
+    pub fn add_status_bar(&self, bar: gpui::WeakEntity<crate::extension_status_bar::ExtensionStatusBar>) {
+        self.status_bars.lock().push(bar);
+    }
+}
+
+impl Drop for ExtensionHostController {
+    fn drop(&mut self) {
+        if let Some(sender) = &self.command_sender {
+            let _ = sender.send(HostCommand::Shutdown);
+        }
+        if let Some(handle) = self.host_thread.take() {
+            let _ = handle.join();
+        }
+    }
 }
 
 #[cfg(test)]

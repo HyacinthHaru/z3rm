@@ -665,6 +665,9 @@ fn main() {
                         let pending_for_update = pending.clone();
                         ext_status.update(cx, |bar, cx| bar.set_vdom_nodes(pending_for_update, cx));
                     }
+                    if let Some(host) = cx.try_global::<quickjs_extensions::GlobalHostController>() {
+                        host.0.add_status_bar(ext_status.downgrade());
+                    }
                     workspace.status_bar().update(cx, |sb, cx| {
                         sb.add_right_item(ext_status, window, cx);
                     });

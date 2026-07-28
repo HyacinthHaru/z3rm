@@ -386,8 +386,9 @@ impl ExtensionRunner {
                 (function() {
                     globalThis.__chrome_views = {};
                     globalThis.__z3rm_rerender = false;
+                    globalThis.__z3rm_event_handlers = {};
                     var __commands = {};
-                    var __event_handlers = {};
+                    var __event_handlers = globalThis.__z3rm_event_handlers;
                     function safeCall(fn) { try { return fn(); } catch (e) { return undefined; } }
                     var context = {
                         render: function(vdom) { return vdom; },
@@ -672,6 +673,28 @@ impl LiveExtension {
                 _ => None,
             };
             Ok(vdom_json)
+        })
+    }
+
+    pub fn emit_event(&self, event_name: &str, payload_json: &str) -> Result<()> {
+        let key = event_name.to_string();
+        let payload = payload_json.to_string();
+        self.ctx.with(|ctx| {
+            let snippet = format!(
+                r#"(function() {{
+                    var name = {name_str};
+                    var payload = {payload};
+                    var key = name;
+                    var handlers = (globalThis.__z3rm_event_handlers || {{}})[key] || [];
+                    for (var i = 0; i < handlers.length; i++) {{
+                        try {{ handlers[i](payload); }} catch (e) {{}}
+                    }}
+                }})()"#,
+                name_str = serde_json::to_string(&key)?,
+                payload = if payload.is_empty() { "null".to_string() } else { payload },
+            );
+            let _: rquickjs::Value = ctx.eval(snippet)?;
+            Ok::<_, anyhow::Error>(())
         })
     }
 }
