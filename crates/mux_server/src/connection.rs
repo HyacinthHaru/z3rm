@@ -69,6 +69,11 @@ pub async fn handle_connection(
     // Per-connection client identity — never process-wide alone.
     let connection_client_id: Arc<parking_lot::Mutex<Option<String>>> =
         Arc::new(parking_lot::Mutex::new(None));
+    // Per-connection forward task handles spawned in handle_attach.
+    // Tracked so they can be aborted on detach/EOF to prevent the
+    // outbound channel from never closing (P0 connection hang).
+    let forward_tasks: Arc<parking_lot::Mutex<Vec<tokio::task::JoinHandle<()>>>> =
+        Arc::new(parking_lot::Mutex::new(Vec::new()));
     let read_handle = {
         let outbound_tx = outbound_tx.clone();
         let sessions = sessions.clone();
@@ -78,6 +83,7 @@ pub async fn handle_connection(
         let client_role = client_role.clone();
         let connection_client_id = connection_client_id.clone();
         let shutdown_state = shutdown_state.clone();
+        let forward_tasks = forward_tasks.clone();
         tokio::spawn(async move {
             let mut reader = reader;
             let mut first = true;
@@ -105,6 +111,7 @@ pub async fn handle_connection(
                     &client_role,
                     &connection_client_id,
                     &shutdown_state,
+                    &forward_tasks,
                 )
                 .await?;
             }
@@ -159,16 +166,38 @@ pub async fn handle_connection(
         Ok::<_, anyhow::Error>(())
     });
 
-    let _ = tokio::join!(read_handle, write_handle);
+    // §3.10 read_handle exits on EOF or error, but write_handle blocks on
+    // outbound_rx.recv() which never closes because handle_attach clones
+    // outbound_tx into session-shared subscriber state. We cannot rely on
+    // tokio::join! — use select! so the writer terminates when the reader does.
+    let read_result = tokio::select! {
+        result = read_handle => result,
+        _ = write_handle => {
+            // Writer died (broken pipe). Still need to clean up subscribers.
+            return Ok(());
+        }
+    };
+
     // §3.10 On EOF, remove this connection from every session so attached_clients
-    // does not leak after CLI one-shots or GUI exit.
+    // and lifecycle_subscribers do not leak after CLI one-shots or GUI exit.
+    // This must happen BEFORE write_handle is dropped so the outbound_tx clones
+    // held by session state are released, allowing the write loop to drain and exit.
     if let Some(client_id) = connection_client_id.lock().clone() {
         let mut sessions_w = sessions.write();
         for session in sessions_w.iter_mut() {
             session.remove_attached_client(&client_id);
             session.remove_lifecycle_subscriber(&client_id);
         }
+        drop(sessions_w);
     }
+
+    // Abort forward tasks so their outbound_tx clones are dropped,
+    // allowing the write loop's outbound_rx to close and drain.
+    for handle in forward_tasks.lock().drain(..) {
+        handle.abort();
+    }
+
+    let _ = read_result;
     Ok(())
 }
 
@@ -220,6 +249,7 @@ async fn dispatch_envelope(
     client_role: &Arc<parking_lot::Mutex<Option<ClientRole>>>,
     connection_client_id: &Arc<parking_lot::Mutex<Option<String>>>,
     shutdown_state: &Arc<crate::ShutdownState>,
+    forward_tasks: &Arc<parking_lot::Mutex<Vec<tokio::task::JoinHandle<()>>>>,
 ) -> anyhow::Result<()> {
     let payload = match &envelope.payload {
         Some(p) => p,
@@ -231,7 +261,7 @@ async fn dispatch_envelope(
             let request_id = req.request_id;
             // dispatch_request 内部会把 Response 通过 outbound_tx 发回,
             // 也可能向 outbound_tx push Notification (用于 attach 等)
-            dispatch_request(req, sessions, outbound_tx, clipboard, server_settings, client_role, connection_client_id, shutdown_state).await?;
+            dispatch_request(req, sessions, outbound_tx, clipboard, server_settings, client_role, connection_client_id, shutdown_state, &forward_tasks).await?;
             // request_id 仅用于日志, 实际 response 已经在 dispatch_request 内发出
             let _ = request_id;
         }
@@ -255,6 +285,7 @@ async fn dispatch_request(
     client_role: &Arc<parking_lot::Mutex<Option<ClientRole>>>,
     connection_client_id: &Arc<parking_lot::Mutex<Option<String>>>,
     shutdown_state: &Arc<crate::ShutdownState>,
+    forward_tasks: &Arc<parking_lot::Mutex<Vec<tokio::task::JoinHandle<()>>>>,
 ) -> anyhow::Result<()> {
     let request_id = req.request_id;
 
@@ -288,8 +319,8 @@ async fn dispatch_request(
         // §3.3 无权限要求的操作
         RequestBody::CreateSession(r) => handle_create_session(r, sessions).await?,
         RequestBody::ListSessions(_) => handle_list_sessions(sessions).await?,
-        RequestBody::Attach(r) => handle_attach(r, sessions, client_role, connection_client_id, outbound_tx).await?,
-        RequestBody::Detach(_) => handle_detach(sessions, connection_client_id).await?,
+        RequestBody::Attach(r) => handle_attach(r, sessions, client_role, connection_client_id, outbound_tx, forward_tasks).await?,
+        RequestBody::Detach(_) => handle_detach(sessions, connection_client_id, forward_tasks).await?,
         RequestBody::FetchGridUpdate(r) => handle_fetch_grid_update(r, sessions).await?,
         RequestBody::FetchScrollback(r) => handle_fetch_scrollback(r, sessions).await?,
         RequestBody::SearchScrollback(r) => handle_search_scrollback(r, sessions).await?,
@@ -579,6 +610,7 @@ async fn handle_attach(
     client_role: &Arc<parking_lot::Mutex<Option<ClientRole>>>,
     connection_client_id: &Arc<parking_lot::Mutex<Option<String>>>,
     outbound_tx: &mpsc::UnboundedSender<Envelope>,
+    forward_tasks: &Arc<parking_lot::Mutex<Vec<tokio::task::JoinHandle<()>>>>,
 ) -> anyhow::Result<ResponseBody> {
     let mut sessions_w = sessions.write();
     let session = sessions_w
@@ -674,7 +706,7 @@ async fn handle_attach(
         pane.add_subscriber(inner_tx);
         // forward task: 把 inner Notification 包成 Envelope 发到 outbound
         let forward_tx = notification_forward_tx.clone();
-        tokio::spawn(async move {
+        let handle = tokio::spawn(async move {
             while let Some(notif) = inner_rx.recv().await {
                 let envelope = Envelope {
                     version: Some(mux_protocol::PROTOCOL_VERSION.clone()),
@@ -685,6 +717,7 @@ async fn handle_attach(
                 }
             }
         });
+        forward_tasks.lock().push(handle);
     }
 
     // §15.4 权威快照:tabs / layout / focused 必须反映 server 真实状态。
@@ -724,6 +757,7 @@ async fn handle_attach(
 async fn handle_detach(
     sessions: &Arc<parking_lot::RwLock<Vec<crate::session::Session>>>,
     connection_client_id: &Arc<parking_lot::Mutex<Option<String>>>,
+    forward_tasks: &Arc<parking_lot::Mutex<Vec<tokio::task::JoinHandle<()>>>>,
 ) -> anyhow::Result<ResponseBody> {
     if let Some(client_id) = connection_client_id.lock().take() {
         let mut sessions_w = sessions.write();
@@ -731,6 +765,12 @@ async fn handle_detach(
             session.remove_attached_client(&client_id);
             session.remove_lifecycle_subscriber(&client_id);
         }
+    }
+    // Abort all forward tasks so their outbound_tx clones are dropped,
+    // preventing stale PaneDirty/PaneOutput delivery and duplicate
+    // subscriber registration on re-attach.
+    for handle in forward_tasks.lock().drain(..) {
+        handle.abort();
     }
     Ok(ResponseBody::Error(String::new()))
 }
