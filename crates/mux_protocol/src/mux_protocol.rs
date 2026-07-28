@@ -235,8 +235,9 @@ pub fn parse_key(name: &str) -> Vec<u8> {
         "PageDown" => b"\x1b[6~".to_vec(),
         // C-c → Ctrl+C = 0x03
         s if s.starts_with("C-") && s.len() == 3 => {
-            let c = s.as_bytes()[2].to_ascii_lowercase();
-            vec![c.wrapping_sub(b'a').wrapping_add(1)]
+            // Ctrl+X: mask to control range (0x00–0x1F). This correctly
+            // handles C-[ (ESC), C-@ (NUL), C-/ (FS), C-\\ (FS), etc.
+            vec![s.as_bytes()[2] & 0x1f]
         }
         // M-x → Alt+X: ESC followed by x
         s if s.starts_with("M-") && s.len() == 3 => {
@@ -316,6 +317,16 @@ mod key_tests {
         // 大写也有效
         assert_eq!(parse_key("C-A"), vec![1]);
         assert_eq!(parse_key("C-Z"), vec![26]);
+    }
+
+    #[test]
+    fn parse_ctrl_punctuation() {
+        assert_eq!(parse_key("C-["), vec![0x1b]); // ESC
+        assert_eq!(parse_key("C-@"), vec![0x00]); // NUL
+        assert_eq!(parse_key("C-\\"), vec![0x1c]); // FS
+        assert_eq!(parse_key("C-]"), vec![0x1d]); // GS
+        assert_eq!(parse_key("C-^"), vec![0x1e]); // RS
+        assert_eq!(parse_key("C-_"), vec![0x1f]); // US
     }
 
     #[test]
