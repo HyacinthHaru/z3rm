@@ -27,7 +27,7 @@
       "ctrl-alt-q": "mux::KillServer",
 
       // §16.4 Debug a11y tree dump (requires Z3RM_A11Y_FORCE=1 or AT connected)
-      "ctrl-shift-a": "z3rm::DumpAccessibilityTree",
+      "ctrl-shift-a": "z3rm_debug::DumpAccessibilityTree",
 
       // Pane zoom
       "ctrl-shift-z": "mux_pane::ZoomToggle",
@@ -46,6 +46,7 @@
       "ctrl-shift-5": "mux_pane::FocusPane4",
       "ctrl-shift-6": "mux_pane::FocusPane5",
       "ctrl-shift-7": "mux_pane::FocusPane6",
+      "ctrl-shift-8": "mux_pane::FocusPane7",
       "ctrl-shift-9": "mux_pane::FocusPane8",
 
       // §12 复制模式 (Plan 31)

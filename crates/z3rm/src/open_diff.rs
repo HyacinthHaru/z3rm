@@ -123,32 +123,9 @@ async fn fetch_previous_version(
     Ok((previous, target.version_id, domain, session_id))
 }
 
-/// Compute a minimal unified-diff-like display between previous and current.
+/// Compute a unified diff between the previous and current contents.
 pub fn unified_diff(previous: &str, current: &str) -> String {
-    let prev_lines: Vec<&str> = previous.lines().collect();
-    let curr_lines: Vec<&str> = current.lines().collect();
-    let mut out = String::new();
-    out.push_str("--- previous\n+++ current\n");
-    let max = prev_lines.len().max(curr_lines.len());
-    for i in 0..max {
-        match (prev_lines.get(i), curr_lines.get(i)) {
-            (Some(prev), Some(curr)) => {
-                if prev == curr {
-                    out.push_str(&format!(" {}\n", prev));
-                } else {
-                    out.push_str(&format!("-{}\n+{}\n", prev, curr));
-                }
-            }
-            (Some(prev), None) => {
-                out.push_str(&format!("-{}\n", prev));
-            }
-            (None, Some(curr)) => {
-                out.push_str(&format!("+{}\n", curr));
-            }
-            (None, None) => {}
-        }
-    }
-    out
+    language::unified_diff(previous, current)
 }
 
 #[cfg(test)]
@@ -158,7 +135,17 @@ mod tests {
     #[test]
     fn unified_diff_marks_additions_and_removals() {
         let diff = unified_diff("a\nb\nc", "a\nx\nc");
-        assert!(diff.contains("- b"), "should mark removed line");
-        assert!(diff.contains("+ x"), "should mark added line");
+        assert!(diff.lines().any(|line| line == "-b"), "{diff}");
+        assert!(diff.lines().any(|line| line == "+x"), "{diff}");
+    }
+
+    #[test]
+    fn unified_diff_does_not_treat_an_insertion_as_trailing_replacements() {
+        let diff = unified_diff("a\nb\nc", "a\ninserted\nb\nc");
+        assert!(diff.lines().any(|line| line == "+inserted"), "{diff}");
+        assert!(
+            !diff.lines().any(|line| line == "-b" || line == "-c"),
+            "{diff}"
+        );
     }
 }

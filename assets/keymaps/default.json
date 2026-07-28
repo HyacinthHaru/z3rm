@@ -17,12 +17,36 @@
       "ctrl-shift-right": "mux_pane::FocusRight",
       "ctrl-shift-up": "mux_pane::FocusUp",
       "ctrl-shift-down": "mux_pane::FocusDown",
+      "ctrl-shift-n": "mux_pane::FocusNextPane",
+      "ctrl-shift-p": "mux_pane::FocusPrevPane",
+
+      // Pane switching by number (1-9)
+      "ctrl-shift-1": "mux_pane::FocusPane0",
+      "ctrl-shift-2": "mux_pane::FocusPane1",
+      "ctrl-shift-3": "mux_pane::FocusPane2",
+      "ctrl-shift-4": "mux_pane::FocusPane3",
+      "ctrl-shift-5": "mux_pane::FocusPane4",
+      "ctrl-shift-6": "mux_pane::FocusPane5",
+      "ctrl-shift-7": "mux_pane::FocusPane6",
+      "ctrl-shift-8": "mux_pane::FocusPane7",
+      "ctrl-shift-9": "mux_pane::FocusPane8",
 
       // Mux session
       "ctrl-shift-d": "mux::Detach",
+      "ctrl-alt-k": "mux::KillSession",
+      "ctrl-alt-q": "mux::KillServer",
+
+      // Pane resizing
+      "ctrl-shift-h": "mux_pane::ResizeLeft",
+      "ctrl-shift-l": "mux_pane::ResizeRight",
+      "ctrl-shift-k": "mux_pane::ResizeUp",
+      "ctrl-shift-j": "mux_pane::ResizeDown",
 
       // Pane zoom
       "ctrl-shift-z": "mux_pane::ZoomToggle",
+
+      // Debug accessibility tree
+      "ctrl-shift-a": "z3rm_debug::DumpAccessibilityTree",
 
       // §12 复制模式 (Plan 31)
       "ctrl-shift-;": "terminal::EnterCopyMode"

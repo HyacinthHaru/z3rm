@@ -18,9 +18,7 @@ use assets::Assets;
 use crashes::InitCrashHandler;
 use fs::{Fs, RealFs};
 use futures::StreamExt as _;
-use gpui::{
-    App, AppContext as _, Application, Context, Entity, Focusable, Global, TaskExt, Window,
-};
+use gpui::{App, AppContext as _, Application, Context, Entity, Global, TaskExt, Window};
 use gpui_platform;
 use parking_lot::Mutex;
 use release_channel::{AppCommitSha, AppVersion, ReleaseChannel};
@@ -51,6 +49,44 @@ fn build_application() -> Application {
 
 gpui::actions!(z3rm_debug, [DumpAccessibilityTree]);
 
+fn focus_mux_workspace_pane(
+    pane: Entity<workspace::Pane>,
+    window: &mut Window,
+    cx: &mut Context<workspace::Workspace>,
+) {
+    let Some(item) = pane.read(cx).active_item() else {
+        return;
+    };
+    let Ok(mux_view) = item
+        .to_any_view()
+        .downcast::<terminal_view::mux_pane::MuxPaneView>()
+    else {
+        return;
+    };
+    let pane_id = mux_view.read(cx).pane_id.clone();
+    let focus_handle = item.item_focus_handle(cx);
+    window.focus(&focus_handle, cx);
+
+    let Some(state) = workspace::AppState::try_global(cx) else {
+        return;
+    };
+    let Some(domain) = state.mux_domain.clone() else {
+        return;
+    };
+    cx.spawn(async move |_, cx| {
+        if let Err(error) = domain.focus_pane(&pane_id).await {
+            tracing::error!(pane_id, %error, "focus_pane RPC failed");
+            cx.update(|cx| {
+                daemon::show_daemon_error(
+                    cx,
+                    format!("Failed to focus mux pane {pane_id}: {error}"),
+                );
+            });
+        }
+    })
+    .detach();
+}
+
 fn focus_mux_pane_index(
     workspace: &mut workspace::Workspace,
     index: u8,
@@ -58,8 +94,40 @@ fn focus_mux_pane_index(
     cx: &mut Context<workspace::Workspace>,
 ) {
     if let Some(pane) = workspace.panes().get(index as usize).cloned() {
-        window.focus(&pane.focus_handle(cx), cx);
+        focus_mux_workspace_pane(pane, window, cx);
     }
+}
+
+fn cyclic_pane_index(current: usize, pane_count: usize, forward: bool) -> Option<usize> {
+    if pane_count == 0 || current >= pane_count {
+        return None;
+    }
+    Some(if forward {
+        (current + 1) % pane_count
+    } else if current == 0 {
+        pane_count - 1
+    } else {
+        current - 1
+    })
+}
+
+fn focus_adjacent_mux_pane(
+    workspace: &mut workspace::Workspace,
+    forward: bool,
+    window: &mut Window,
+    cx: &mut Context<workspace::Workspace>,
+) {
+    let panes = workspace.panes();
+    let Some(current) = panes
+        .iter()
+        .position(|pane| pane == workspace.active_pane())
+    else {
+        return;
+    };
+    let Some(index) = cyclic_pane_index(current, panes.len(), forward) else {
+        return;
+    };
+    focus_mux_workspace_pane(panes[index].clone(), window, cx);
 }
 
 /// §16.9 Forward a layout ratio resize to the server.
@@ -757,13 +825,30 @@ fn main() {
                             }).detach();
                         })
                         .register_action(|workspace, _: &settings::mux_actions::FocusLeft, window, cx| {
-                            workspace.activate_pane_in_direction(workspace::SplitDirection::Left, window, cx);
+                            if let Some(pane) = workspace.find_pane_in_direction(workspace::SplitDirection::Left, cx) {
+                                focus_mux_workspace_pane(pane, window, cx);
+                            }
                         })
                         .register_action(|workspace, _: &settings::mux_actions::FocusRight, window, cx| {
-                            workspace.activate_pane_in_direction(workspace::SplitDirection::Right, window, cx);
+                            if let Some(pane) = workspace.find_pane_in_direction(workspace::SplitDirection::Right, cx) {
+                                focus_mux_workspace_pane(pane, window, cx);
+                            }
                         })
                         .register_action(|workspace, _: &settings::mux_actions::FocusUp, window, cx| {
-                            workspace.activate_pane_in_direction(workspace::SplitDirection::Up, window, cx);
+                            if let Some(pane) = workspace.find_pane_in_direction(workspace::SplitDirection::Up, cx) {
+                                focus_mux_workspace_pane(pane, window, cx);
+                            }
+                        })
+                        .register_action(|workspace, _: &settings::mux_actions::FocusDown, window, cx| {
+                            if let Some(pane) = workspace.find_pane_in_direction(workspace::SplitDirection::Down, cx) {
+                                focus_mux_workspace_pane(pane, window, cx);
+                            }
+                        })
+                        .register_action(|workspace, _: &settings::mux_actions::FocusNextPane, window, cx| {
+                            focus_adjacent_mux_pane(workspace, true, window, cx);
+                        })
+                        .register_action(|workspace, _: &settings::mux_actions::FocusPrevPane, window, cx| {
+                            focus_adjacent_mux_pane(workspace, false, window, cx);
                         })
                         .register_action(|workspace, _: &settings::mux_actions::NextTab, window, cx| {
                             workspace.active_pane().update(cx, |pane, cx| {
@@ -1318,6 +1403,48 @@ mod tests {
                 .map(|profile| profile.profile.as_str()),
             Some("default")
         );
+    }
+
+    #[test]
+    fn cyclic_pane_navigation_wraps_both_directions() {
+        assert_eq!(super::cyclic_pane_index(0, 0, true), None);
+        assert_eq!(super::cyclic_pane_index(2, 2, true), None);
+        assert_eq!(super::cyclic_pane_index(0, 3, true), Some(1));
+        assert_eq!(super::cyclic_pane_index(2, 3, true), Some(0));
+        assert_eq!(super::cyclic_pane_index(0, 3, false), Some(2));
+        assert_eq!(super::cyclic_pane_index(2, 3, false), Some(1));
+    }
+
+    #[gpui::test]
+    fn default_profile_binds_all_native_focus_and_kill_actions(cx: &mut App) {
+        let content = settings::mux_keymap_profile_content("default");
+        let key_bindings = match KeymapFile::load(content.as_ref(), cx) {
+            KeymapFileLoadResult::Success { key_bindings } => key_bindings,
+            KeymapFileLoadResult::SomeFailedToLoad { error_message, .. } => {
+                panic!("default mux profile failed to load: {error_message}")
+            }
+            KeymapFileLoadResult::JsonParseFailure { error } => {
+                panic!("default mux profile has invalid JSON: {error}")
+            }
+        };
+        let action_names = key_bindings
+            .iter()
+            .map(|binding| binding.action().name())
+            .collect::<std::collections::HashSet<_>>();
+
+        for required in [
+            "mux_pane::FocusDown",
+            "mux_pane::FocusNextPane",
+            "mux_pane::FocusPrevPane",
+            "mux_pane::FocusPane7",
+            "mux::KillSession",
+            "mux::KillServer",
+        ] {
+            assert!(
+                action_names.contains(required),
+                "default profile is missing native action {required}"
+            );
+        }
     }
 
     /// §16.7 Switching the mux keymap profile must not leave the previous
