@@ -12062,21 +12062,33 @@ pub fn multibuffer_context_lines(cx: &App) -> u32 {
 impl gpui::EntityInputHandler for Editor {
     fn text_for_range(
         &mut self,
-        _range: std::ops::Range<usize>,
+        range: std::ops::Range<usize>,
         _adjusted_range: &mut Option<std::ops::Range<usize>>,
         _window: &mut Window,
-        _cx: &mut Context<Self>,
+        cx: &mut Context<Self>,
     ) -> Option<String> {
-        None
+        let snapshot = self.display_snapshot(cx);
+        let buffer_snapshot = snapshot.buffer_snapshot();
+        let start = MultiBufferOffsetUtf16(text::OffsetUtf16(range.start)).to_offset(buffer_snapshot);
+        let end = MultiBufferOffsetUtf16(text::OffsetUtf16(range.end)).to_offset(buffer_snapshot);
+        Some(buffer_snapshot.text_for_range(start..end).collect())
     }
 
     fn selected_text_range(
         &mut self,
         _ignore_disabled_input: bool,
         _window: &mut Window,
-        _cx: &mut Context<Self>,
+        cx: &mut Context<Self>,
     ) -> Option<gpui::UTF16Selection> {
-        None
+        let snapshot = self.display_snapshot(cx);
+        let buffer_snapshot = snapshot.buffer_snapshot();
+        let selection = self.selections.newest::<MultiBufferOffset>(&snapshot);
+        let start_utf16 = MultiBufferOffset(selection.start.0).to_offset_utf16(buffer_snapshot);
+        let end_utf16 = MultiBufferOffset(selection.end.0).to_offset_utf16(buffer_snapshot);
+        Some(gpui::UTF16Selection {
+            range: start_utf16.0 .0..end_utf16.0 .0,
+            reversed: selection.reversed,
+        })
     }
 
     fn marked_text_range(
@@ -12091,21 +12103,45 @@ impl gpui::EntityInputHandler for Editor {
 
     fn replace_text_in_range(
         &mut self,
-        _range: Option<std::ops::Range<usize>>,
-        _text: &str,
-        _window: &mut Window,
-        _cx: &mut Context<Self>,
+        range: Option<std::ops::Range<usize>>,
+        text: &str,
+        window: &mut Window,
+        cx: &mut Context<Self>,
     ) {
+        if self.read_only(cx) {
+            return;
+        }
+
+        if let Some(range) = range {
+            let snapshot = self.display_snapshot(cx);
+            let buffer_snapshot = snapshot.buffer_snapshot();
+            let start = MultiBufferOffsetUtf16(text::OffsetUtf16(range.start)).to_offset(buffer_snapshot);
+            let end = MultiBufferOffsetUtf16(text::OffsetUtf16(range.end)).to_offset(buffer_snapshot);
+
+            self.transact(window, cx, |this, window, cx| {
+                this.edit(
+                    vec![(start..end, text.to_string())],
+                    cx,
+                );
+                let cursor = MultiBufferOffset(start.0 + text.len());
+                this.change_selections(SelectionEffects::no_scroll(), window, cx, |selections| {
+                    selections.select_ranges(vec![cursor..cursor])
+                });
+            });
+        } else {
+            self.insert(text, window, cx);
+        }
     }
 
     fn replace_and_mark_text_in_range(
         &mut self,
-        _range: Option<std::ops::Range<usize>>,
-        _new_text: &str,
+        range: Option<std::ops::Range<usize>>,
+        new_text: &str,
         _new_selected_range: Option<std::ops::Range<usize>>,
-        _window: &mut Window,
-        _cx: &mut Context<Self>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
     ) {
+        self.replace_text_in_range(range, new_text, window, cx);
     }
 
     fn bounds_for_range(
