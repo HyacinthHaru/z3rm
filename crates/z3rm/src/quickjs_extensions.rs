@@ -417,6 +417,37 @@ impl ExtensionHostController {
                 let Some(sender) = sender.clone() else {
                     break;
                 };
+
+                // §5.4 Push live mux state before rendering so extensions
+                // render from authoritative session data, not stale cache.
+                let mux_domain = cx.update(|cx| {
+                    workspace::AppState::try_global(cx)
+                        .and_then(|state| state.mux_domain.clone())
+                });
+                if let Some(domain) = mux_domain {
+                    if let Ok(sessions) = domain.list_sessions().await {
+                        let json = sessions
+                            .into_iter()
+                            .map(|session| {
+                                serde_json::json!({
+                                    "id": session.id,
+                                    "name": session.name,
+                                    "cwd": session.cwd,
+                                    "attachedClients": session.attached_clients,
+                                })
+                            })
+                            .collect::<Vec<_>>();
+                        if let Err(error) = sender.send(HostCommand::Emit {
+                            event: "mux:sessions".to_string(),
+                            payload: serde_json::to_string(&json)
+                                .unwrap_or_else(|_| "[]".to_string()),
+                        }) {
+                            tracing::warn!(%error, "failed to push mux sessions to host");
+                            break;
+                        }
+                    }
+                }
+
                 let render_result = cx
                     .background_spawn(async move {
                         let (reply, response) = std::sync::mpsc::channel();

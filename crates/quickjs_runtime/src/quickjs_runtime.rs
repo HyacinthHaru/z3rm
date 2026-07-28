@@ -390,6 +390,7 @@ impl ExtensionRunner {
                     globalThis.__chrome_views = {};
                     globalThis.__z3rm_rerender = false;
                     globalThis.__z3rm_event_handlers = {};
+                    globalThis.__z3rm_mux_sessions = [];
                     var __commands = {};
                     var __event_handlers = globalThis.__z3rm_event_handlers;
                     function safeCall(fn) { try { return fn(); } catch (e) { return undefined; } }
@@ -414,7 +415,7 @@ impl ExtensionRunner {
                         },
                         capabilities: { terminal: true, mux: true, workspace: true },
                         mux: {
-                            listSessions: function() { return []; },
+                            listSessions: function() { return globalThis.__z3rm_mux_sessions; },
                             subscribe: function(event, handler) {
                                 var key = 'mux:' + event;
                                 if (!__event_handlers[key]) __event_handlers[key] = [];
@@ -444,6 +445,11 @@ impl ExtensionRunner {
                             unbind: function() { return true; }
                         }
                     };
+                    // Cache host-pushed mux session snapshots so listSessions()
+                    // returns live data without blocking on an async RPC.
+                    context.on('mux:sessions', function(sessions) {
+                        globalThis.__z3rm_mux_sessions = sessions || [];
+                    });
                     if (typeof activate === 'function') activate(context);
                     return null;
                 })()
