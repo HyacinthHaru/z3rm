@@ -15,9 +15,31 @@ use mux_protocol::TerminalSize;
 use gpui::{App, SharedString};
 use ui::{Icon, IconName};
 
+fn mount_status_toast(
+    toast: gpui::Entity<notifications::status_toast::StatusToast>,
+    cx: &mut gpui::App,
+) {
+    for window_handle in cx.windows() {
+        let mounted = window_handle.update(cx, |_root, window, cx| {
+            let Some(Some(multi)) = window.root::<workspace::MultiWorkspace>() else {
+                return false;
+            };
+            let workspace = multi.read(cx).workspace().clone();
+            workspace.update(cx, |workspace, cx| {
+                workspace.toggle_status_toast(toast.clone(), cx);
+            });
+            true
+        });
+        if matches!(mounted, Ok(true)) {
+            return;
+        }
+    }
+    tracing::warn!("no workspace available to mount daemon status toast");
+}
+
 /// §16.12 显示 "daemon 连接丢失" 通知 (warning toast)
 pub fn show_daemon_connection_lost(cx: &mut App) {
-    notifications::status_toast::StatusToast::new(
+    let toast = notifications::status_toast::StatusToast::new(
         "Connection to mux_server lost. Reconnecting...",
         cx,
         |toast, _| {
@@ -27,16 +49,18 @@ pub fn show_daemon_connection_lost(cx: &mut App) {
                 .dismiss_button(true)
         },
     );
+    mount_status_toast(toast, cx);
 }
 
 /// §16.12 显示 daemon 错误通知 (error toast)
 pub fn show_daemon_error(cx: &mut App, error: impl Into<SharedString>) {
-    notifications::status_toast::StatusToast::new(error, cx, |toast, _| {
+    let toast = notifications::status_toast::StatusToast::new(error, cx, |toast, _| {
         toast
             .icon(Icon::new(IconName::XCircle).color(ui::Color::Error))
             .auto_dismiss(false)
             .dismiss_button(true)
     });
+    mount_status_toast(toast, cx);
 }
 
 /// §16.12 / §15.12 daemon 连接监视器 — 后台检测连接状态并在丢失时做权威
@@ -143,7 +167,9 @@ fn spawn_daemon() -> Result<()> {
     let socket_path = default_socket_path();
     if socket_path.exists() {
         tracing::info!(path = %socket_path.display(), "removing stale socket before spawn");
-        if let Err(e) = std::fs::remove_file(&socket_path) { tracing::warn!(error = %e, "stale socket removal failed"); }
+        if let Err(e) = std::fs::remove_file(&socket_path) {
+            tracing::warn!(error = %e, "stale socket removal failed");
+        }
     }
     // 从可执行文件同目录查找 z3rm-server (dev build 支持)
     let server_in_same_dir = std::env::current_exe()
@@ -162,22 +188,18 @@ fn spawn_daemon() -> Result<()> {
         .arg("--daemonize")
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null())
-        .envs(std::env::vars())  // inherit parent environment including $SHELL
+        .envs(std::env::vars()) // inherit parent environment including $SHELL
         .spawn();
     match result {
         Ok(_) => {
             tracing::info!(binary = %binary_name, "spawned daemon");
             Ok(())
         }
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-            Err(anyhow::anyhow!(
-                "z3rm-server not found. Build it with `cargo build -p mux_server` \
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Err(anyhow::anyhow!(
+            "z3rm-server not found. Build it with `cargo build -p mux_server` \
                  and ensure it is in PATH or next to the z3rm executable"
-            ))
-        }
-        Err(e) => {
-            Err(anyhow::anyhow!("failed to spawn daemon: {e}"))
-        }
+        )),
+        Err(e) => Err(anyhow::anyhow!("failed to spawn daemon: {e}")),
     }
 }
 /// 轮询等待 socket 就绪（验证 daemon 实际可连接）§16.1
@@ -245,20 +267,14 @@ pub async fn ensure_default_session(domain: &MuxDomain) -> Result<String> {
 /// - `None` -> 退回 `ensure_default_session` 的语义（创建或复用默认 session）。
 ///
 /// 错误必须传播（不静默丢弃 `list_sessions` / 解析失败）。
-pub async fn ensure_target_session(
-    domain: &MuxDomain,
-    target: Option<&str>,
-) -> Result<String> {
+pub async fn ensure_target_session(domain: &MuxDomain, target: Option<&str>) -> Result<String> {
     match target {
         None => ensure_default_session(domain).await,
         Some(raw) => {
             if raw.is_empty() {
                 anyhow::bail!("attach target must not be empty");
             }
-            let filtered: String = raw
-                .chars()
-                .filter(|ch| !ch.is_whitespace())
-                .collect();
+            let filtered: String = raw.chars().filter(|ch| !ch.is_whitespace()).collect();
             if filtered.is_empty() {
                 anyhow::bail!("attach target must not be empty");
             }
@@ -281,7 +297,9 @@ pub async fn ensure_target_session(
 pub async fn ensure_pane_in_session(domain: &MuxDomain, session_id: &str) -> Result<()> {
     // Attach to get snapshot (Shared mode to allow reading)
     let attach_resp = domain.attach(session_id, mux::AttachMode::Shared).await?;
-    let snapshot = attach_resp.snapshot.context("no snapshot in attach response")?;
+    let snapshot = attach_resp
+        .snapshot
+        .context("no snapshot in attach response")?;
 
     // Check if any tab has panes
     let has_panes = snapshot.tabs.iter().any(|tab| !tab.panes.is_empty());
@@ -296,7 +314,10 @@ pub async fn ensure_pane_in_session(domain: &MuxDomain, session_id: &str) -> Res
     let tab_id = tab_id.unwrap_or(&fallback);
 
     let home = dirs::home_dir().unwrap_or_else(|| PathBuf::from("/tmp"));
-    let size = TerminalSize { cols: 120, rows: 40 };
+    let size = TerminalSize {
+        cols: 120,
+        rows: 40,
+    };
     let pane_id = domain
         .spawn_pane(session_id, tab_id, size, None, Some(&home))
         .await?;
@@ -309,22 +330,24 @@ pub async fn get_first_pane_id(domain: &MuxDomain) -> Result<Option<String>> {
     let sessions = domain.list_sessions().await?;
     let session = sessions.first().context("no sessions")?;
     let session_id = &session.id;
-    
+
     // Attach to get snapshot
     let attach_resp = domain.attach(session_id, mux::AttachMode::Shared).await?;
     let snapshot = attach_resp.snapshot.context("no snapshot")?;
-    
+
     // Find first pane
-    let pane_id = snapshot.tabs.iter()
+    let pane_id = snapshot
+        .tabs
+        .iter()
         .flat_map(|t| &t.panes)
         .map(|p| &p.id)
         .next()
         .cloned();
-    
+
     // Detach since we just needed to read
     if let Err(e) = domain.detach().await {
         tracing::error!(error = %e, "detach failed during get_first_pane_id");
     }
-    
+
     Ok(pane_id)
 }
