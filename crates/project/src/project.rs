@@ -505,13 +505,13 @@ impl Project {
         None
     }
 
-    /// Stub: set_language_for_buffer (language assignment 功能已删除)
     pub fn set_language_for_buffer(
         &mut self,
-        _buffer: &Entity<Buffer>,
-        _language: Arc<language::Language>,
-        _cx: &mut Context<Self>,
+        buffer: &Entity<Buffer>,
+        language: Arc<language::Language>,
+        cx: &mut Context<Self>,
     ) {
+        buffer.update(cx, |buffer, cx| buffer.set_language(Some(language), cx));
     }
 
     pub fn open_buffer_for_symbol(
