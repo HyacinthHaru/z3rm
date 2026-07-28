@@ -1702,27 +1702,31 @@ impl Editor {
         if new_text.is_empty() && selections.iter().all(|selection| selection.start == selection.end) {
             return;
         }
-        let mut edits = Vec::with_capacity(selections.len());
-        let mut new_cursor_offsets = Vec::with_capacity(selections.len());
-        let mut accumulated_delta = 0isize;
-        let inserted_len = new_text.len() as isize;
 
-        for selection in selections {
-            let start = selection.start.0.min(selection.end.0);
-            let end = selection.start.0.max(selection.end.0);
-            edits.push((MultiBufferOffset(start)..MultiBufferOffset(end), new_text.to_string()));
+        self.finalize_last_transaction(cx);
+        self.transact(window, cx, |this, window, cx| {
+            let mut edits = Vec::with_capacity(selections.len());
+            let mut new_cursor_offsets = Vec::with_capacity(selections.len());
+            let mut accumulated_delta = 0isize;
+            let inserted_len = new_text.len() as isize;
 
-            let adjusted_start = start.saturating_add_signed(accumulated_delta);
-            let cursor = adjusted_start.saturating_add(new_text.len());
-            new_cursor_offsets.push(MultiBufferOffset(cursor)..MultiBufferOffset(cursor));
+            for selection in selections {
+                let start = selection.start.0.min(selection.end.0);
+                let end = selection.start.0.max(selection.end.0);
+                edits.push((MultiBufferOffset(start)..MultiBufferOffset(end), new_text.to_string()));
 
-            let replaced_len = end.saturating_sub(start) as isize;
-            accumulated_delta += inserted_len - replaced_len;
-        }
+                let adjusted_start = start.saturating_add_signed(accumulated_delta);
+                let cursor = adjusted_start.saturating_add(new_text.len());
+                new_cursor_offsets.push(MultiBufferOffset(cursor)..MultiBufferOffset(cursor));
 
-        self.edit(edits, cx);
-        self.change_selections(SelectionEffects::no_scroll(), window, cx, |selections| {
-            selections.select_ranges(new_cursor_offsets)
+                let replaced_len = end.saturating_sub(start) as isize;
+                accumulated_delta += inserted_len - replaced_len;
+            }
+
+            this.edit(edits, cx);
+            this.change_selections(SelectionEffects::no_scroll(), window, cx, |selections| {
+                selections.select_ranges(new_cursor_offsets)
+            });
         });
     }
 
