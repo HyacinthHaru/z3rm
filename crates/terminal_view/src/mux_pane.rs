@@ -8,23 +8,23 @@
 //
 // The client's alacritty instance is a pure renderer — it never owns a PTY.
 
-use std::sync::Arc;
 use gpui::{
     App, AppContext, AsyncApp, Context, Entity, EventEmitter, FocusHandle, Focusable,
     InteractiveElement, KeyDownEvent, Keystroke, ParentElement, Render, Role, SharedString,
     StatefulInteractiveElement, Styled, Task, WeakEntity, Window, div,
 };
 use mux::MuxDomain;
-use mux_protocol::{
-    fetch_grid_update_response::Update as FetchUpdate, notification::Event as NotifEvent,
-    FullGridSnapshot, GridDiff, Notification, RowChange,
-};
 use mux_protocol::input::{
-    handle_key_event, is_full_screen_active, KeyDispatchContext, KeyDispatchResult, PaneModes,
-    PrefixAction, PrefixModeConfig, PrefixModeMachine,
+    KeyDispatchContext, KeyDispatchResult, PaneModes, PrefixAction, PrefixModeConfig,
+    PrefixModeMachine, handle_key_event, is_full_screen_active,
+};
+use mux_protocol::{
+    FullGridSnapshot, GridDiff, Notification, RowChange,
+    fetch_grid_update_response::Update as FetchUpdate, notification::Event as NotifEvent,
 };
 use project::Project;
 use settings::Settings;
+use std::sync::Arc;
 use terminal::{
     Modes, Terminal, TerminalBounds, TerminalBuilder, terminal_settings::TerminalSettings,
 };
@@ -35,8 +35,8 @@ use crate::terminal_element::TerminalElement;
 use crate::{TerminalMode, TerminalView};
 
 use workspace::{
-    item::{Item, ItemBufferKind, TabTooltipContent},
     ItemHandle, ToolbarItemLocation, Workspace,
+    item::{Item, ItemBufferKind, TabTooltipContent},
 };
 
 /// §3.3 View events (for workspace to subscribe)
@@ -47,7 +47,9 @@ pub enum MuxPaneEvent {
     /// §3.1/§16.6 an input transport failed (server unreachable, permission
     /// denied, etc.). Surfaces the error text so the workspace can show a
     /// toast instead of silently dropping the keystroke/mouse event.
-    InputFailed { message: SharedString },
+    InputFailed {
+        message: SharedString,
+    },
 }
 
 /// §3.3 MuxPaneView — GPUI view for a mux_server pane.
@@ -121,8 +123,8 @@ impl MuxPaneView {
                 // Initial bounds: 80×24 cells at standard monospace metrics.
                 // TerminalElement resizes on first prepaint with real font metrics.
                 TerminalBounds::new(
-                    gpui::px(18.0),  // line_height
-                    gpui::px(8.4),   // cell_width
+                    gpui::px(18.0), // line_height
+                    gpui::px(8.4),  // cell_width
                     gpui::Bounds {
                         origin: gpui::Point::default(),
                         size: gpui::Size {
@@ -235,18 +237,14 @@ impl MuxPaneView {
         let rx = self.domain.subscribe();
         let weak = cx.entity().downgrade();
 
-        // Coalescing loop: accumulate small PaneOutput/PaneDirty signals, then
-        // flush after an 8ms quiet window (or immediately above 64KiB). Unlike
-        // the prior Task-latch design, this loop always re-arms after each flush
-        // because there is no cross-scope Option that stays Some forever.
+        // §3.1 server-canonical render path: PaneOutput and PaneDirty are both
+        // dirty signals that trigger fetch_grid_update. PTY bytes are never
+        // fed to the client terminal — the server owns the sole emulator.
         let task = cx.spawn(async move |_, cx| {
-            let mut pending_output: Vec<u8> = Vec::new();
             let mut pending_dirty = false;
 
             loop {
-                // Block for the next notification when idle; otherwise drain
-                // whatever is already queued without waiting.
-                let notif = if pending_output.is_empty() && !pending_dirty {
+                let notif = if !pending_dirty {
                     match rx.recv().await {
                         Ok(n) => n,
                         Err(_) => break,
@@ -254,47 +252,33 @@ impl MuxPaneView {
                 } else {
                     match rx.try_recv() {
                         Ok(n) => n,
-                        Err(err) if err.to_string().contains("empty") || format!("{err:?}").contains("Empty") => {
-                            // Quiet window: batch for ~half a frame, then flush.
-                            if pending_output.len() <= 65536 {
-                                cx.background_executor()
-                                    .timer(std::time::Duration::from_millis(8))
-                                    .await;
-                                // Drain anything that arrived during the wait.
-                                while let Ok(n) = rx.try_recv() {
-                                    if !Self::accumulate_notification(
-                                        &pane_id,
-                                        n,
-                                        &mut pending_output,
-                                        &mut pending_dirty,
-                                        &weak,
-                                        cx,
-                                    ) {
-                                        return;
-                                    }
+                        Err(err)
+                            if err.to_string().contains("empty")
+                                || format!("{err:?}").contains("Empty") =>
+                        {
+                            cx.background_executor()
+                                .timer(std::time::Duration::from_millis(8))
+                                .await;
+                            while let Ok(n) = rx.try_recv() {
+                                if !Self::accumulate_notification(
+                                    &pane_id,
+                                    n,
+                                    &mut pending_dirty,
+                                    &weak,
+                                    cx,
+                                ) {
+                                    return;
                                 }
                             }
-                            Self::flush_pending(&weak, &mut pending_output, &mut pending_dirty, cx)
-                                .await;
+                            Self::flush_pending(&weak, &mut pending_dirty, cx).await;
                             continue;
                         }
                         Err(_) => break,
                     }
                 };
 
-                if !Self::accumulate_notification(
-                    &pane_id,
-                    notif,
-                    &mut pending_output,
-                    &mut pending_dirty,
-                    &weak,
-                    cx,
-                ) {
+                if !Self::accumulate_notification(&pane_id, notif, &mut pending_dirty, &weak, cx) {
                     break;
-                }
-
-                if pending_output.len() > 65536 {
-                    Self::flush_pending(&weak, &mut pending_output, &mut pending_dirty, cx).await;
                 }
             }
         });
@@ -305,7 +289,6 @@ impl MuxPaneView {
     fn accumulate_notification(
         pane_id: &str,
         notif: mux_protocol::Notification,
-        pending_output: &mut Vec<u8>,
         pending_dirty: &mut bool,
         weak: &WeakEntity<Self>,
         cx: &mut AsyncApp,
@@ -314,8 +297,9 @@ impl MuxPaneView {
             return true;
         };
         match event {
+            // §3.1: PaneOutput is a dirty signal only — bytes are never parsed.
             NotifEvent::PaneOutput(chunk) if chunk.pane_id == pane_id => {
-                pending_output.extend_from_slice(&chunk.data);
+                *pending_dirty = true;
                 true
             }
             NotifEvent::PaneDirty(dirty) if dirty.pane_id == pane_id => {
@@ -331,19 +315,14 @@ impl MuxPaneView {
             }
             NotifEvent::PaneTitleChanged(changed) if changed.pane_id == pane_id => {
                 let _ = weak.update(cx, |view, cx| {
-                    // §3.4 Set terminal title via OSC 2 escape sequence.
                     view.terminal.update(cx, |t, cx| {
-                        t.write_output(
-                            format!("\x1b]2;{}\x07", changed.title).as_bytes(),
-                            cx,
-                        );
+                        t.write_output(format!("\x1b]2;{}\x07", changed.title).as_bytes(), cx);
                     });
                     cx.emit(MuxPaneEvent::TitleChanged);
                 });
                 true
             }
             NotifEvent::PaneBell(bell) if bell.pane_id == pane_id => {
-                // §15.13 Bell notification — treat like dirty to trigger re-render.
                 *pending_dirty = true;
                 true
             }
@@ -351,39 +330,13 @@ impl MuxPaneView {
         }
     }
 
-    async fn flush_pending(
-        weak: &WeakEntity<Self>,
-        pending_output: &mut Vec<u8>,
-        pending_dirty: &mut bool,
-        cx: &mut AsyncApp,
-    ) {
-        let data = std::mem::take(pending_output);
+    async fn flush_pending(weak: &WeakEntity<Self>, pending_dirty: &mut bool, cx: &mut AsyncApp) {
         let dirty = std::mem::take(pending_dirty);
-        if !data.is_empty() {
-            let _ = weak.update(cx, |view, cx| {
-                view.terminal.update(cx, |terminal, cx| {
-                    terminal.write_output(&data, cx);
-                });
-                cx.notify();
-            });
-        } else if dirty {
+        if dirty {
             let _ = weak.update(cx, |view, cx| {
                 view.schedule_fetch(cx);
             });
         }
-    }
-
-    /// §3.1 exception: subscribe to PTY byte stream from server.
-    fn subscribe_pane_output(&self, cx: &mut Context<Self>) {
-        let domain = self.domain.clone();
-        let pane_id = self.pane_id.clone();
-        cx.background_executor()
-            .spawn(async move {
-                if let Err(e) = domain.subscribe_pane_output(&pane_id).await {
-                    tracing::error!(pane_id = %pane_id, error = %e, "subscribe_pane_output failed");
-                }
-            })
-            .detach();
     }
 
     /// §3.3 Schedule a fetch_grid_update (recovery path for reconnect §15.12).
@@ -429,13 +382,9 @@ impl MuxPaneView {
         match resp.update {
             Some(FetchUpdate::FullSnapshot(full)) => {
                 self.snapshot = full;
-                // §15.12 reconnect recovery: only write to terminal if generation went
-                // backwards (indicates reconnect) or this is the initial fetch (gen 0).
-                // During normal operation, PaneOutput byte stream is the render path —
-                // writing snapshot here would cause double-rendered characters.
-                if prev_generation == 0 || resp.to_generation < prev_generation {
-                    self.write_snapshot_to_terminal(cx);
-                }
+                // §3.1 server-canonical: structured grid is the sole render path.
+                // Always write to terminal — no byte stream fallback exists.
+                self.write_snapshot_to_terminal(cx);
             }
             Some(FetchUpdate::Diff(diff)) => {
                 apply_diff_to_snapshot(&mut self.snapshot, &diff);
@@ -622,9 +571,11 @@ impl MuxPaneView {
         match self.prefix_machine.on_prefix_key() {
             PrefixAction::EnterPrefixMode => {
                 cx.notify();
-                let timeout = std::time::Duration::from_millis(
-                    if timeout_ms == 0 { 500 } else { timeout_ms },
-                );
+                let timeout = std::time::Duration::from_millis(if timeout_ms == 0 {
+                    500
+                } else {
+                    timeout_ms
+                });
                 let task = cx.spawn(async move |this, cx| {
                     cx.background_executor().timer(timeout).await;
                     let _ = this.update(cx, |view, cx| {
@@ -992,9 +943,18 @@ mod tests {
             rows: vec![RowChange {
                 row: 0,
                 cells: vec![
-                    Cell { char: "a".to_string(), ..Default::default() },
-                    Cell { char: "X".to_string(), ..Default::default() },
-                    Cell { char: "c".to_string(), ..Default::default() },
+                    Cell {
+                        char: "a".to_string(),
+                        ..Default::default()
+                    },
+                    Cell {
+                        char: "X".to_string(),
+                        ..Default::default()
+                    },
+                    Cell {
+                        char: "c".to_string(),
+                        ..Default::default()
+                    },
                 ],
             }],
         };
@@ -1006,7 +966,10 @@ mod tests {
         let diff_oob = GridDiff {
             rows: vec![RowChange {
                 row: 99,
-                cells: vec![Cell { char: "Z".to_string(), ..Default::default() }],
+                cells: vec![Cell {
+                    char: "Z".to_string(),
+                    ..Default::default()
+                }],
             }],
         };
         apply_diff_to_snapshot(&mut snapshot, &diff_oob);
@@ -1019,12 +982,30 @@ mod tests {
             cols: 3,
             rows: 2,
             cells: vec![
-                Cell { char: "a".to_string(), ..Default::default() },
-                Cell { char: "b".to_string(), ..Default::default() },
-                Cell { char: "c".to_string(), ..Default::default() },
-                Cell { char: "d".to_string(), ..Default::default() },
-                Cell { char: "e".to_string(), ..Default::default() },
-                Cell { char: " ".to_string(), ..Default::default() },
+                Cell {
+                    char: "a".to_string(),
+                    ..Default::default()
+                },
+                Cell {
+                    char: "b".to_string(),
+                    ..Default::default()
+                },
+                Cell {
+                    char: "c".to_string(),
+                    ..Default::default()
+                },
+                Cell {
+                    char: "d".to_string(),
+                    ..Default::default()
+                },
+                Cell {
+                    char: "e".to_string(),
+                    ..Default::default()
+                },
+                Cell {
+                    char: " ".to_string(),
+                    ..Default::default()
+                },
             ],
             cursor: None,
             alternate_screen: false,
