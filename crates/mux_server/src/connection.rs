@@ -177,35 +177,62 @@ pub async fn handle_connection(
     // outbound_rx.recv() which never closes because handle_attach clones
     // outbound_tx into session-shared subscriber state. We cannot rely on
     // tokio::join! — use select! so the writer terminates when the reader does.
-    let read_result = tokio::select! {
-        result = read_handle => result,
-        _ = write_handle => {
-            // Writer died (broken pipe). Still need to clean up subscribers.
-            return Ok(());
-        }
-    };
+    wait_for_connection_tasks(read_handle, write_handle).await;
 
-    // §3.10 On EOF, remove this connection from every session so attached_clients
-    // and lifecycle_subscribers do not leak after CLI one-shots or GUI exit.
-    // This must happen BEFORE write_handle is dropped so the outbound_tx clones
-    // held by session state are released, allowing the write loop to drain and exit.
+    cleanup_connection_state(&sessions, &connection_client_id, &forward_tasks);
+    Ok(())
+}
+
+async fn wait_for_connection_tasks(
+    mut read_handle: tokio::task::JoinHandle<anyhow::Result<()>>,
+    mut write_handle: tokio::task::JoinHandle<anyhow::Result<()>>,
+) {
+    tokio::select! {
+        result = &mut read_handle => {
+            write_handle.abort();
+            if let Err(error) = write_handle.await
+                && !error.is_cancelled()
+            {
+                tracing::warn!(%error, "mux writer task failed during connection cleanup");
+            }
+            match result {
+                Ok(Err(error)) => tracing::debug!(%error, "mux reader stopped"),
+                Err(error) => tracing::warn!(%error, "mux reader task failed"),
+                Ok(Ok(())) => {}
+            }
+        }
+        result = &mut write_handle => {
+            read_handle.abort();
+            match read_handle.await {
+                Ok(Err(error)) => tracing::debug!(%error, "mux reader stopped during connection cleanup"),
+                Err(error) if !error.is_cancelled() => {
+                    tracing::warn!(%error, "mux reader task failed during connection cleanup");
+                }
+                Ok(Ok(())) | Err(_) => {}
+            }
+            if let Err(error) = result {
+                tracing::warn!(%error, "mux writer task failed");
+            }
+        }
+    }
+}
+
+fn cleanup_connection_state(
+    sessions: &Arc<parking_lot::RwLock<Vec<crate::session::Session>>>,
+    connection_client_id: &Arc<parking_lot::Mutex<Option<String>>>,
+    forward_tasks: &Arc<parking_lot::Mutex<Vec<tokio::task::JoinHandle<()>>>>,
+) {
     if let Some(client_id) = connection_client_id.lock().clone() {
-        let mut sessions_w = sessions.write();
-        for session in sessions_w.iter_mut() {
+        let mut sessions = sessions.write();
+        for session in sessions.iter_mut() {
             session.remove_attached_client(&client_id);
             session.remove_lifecycle_subscriber(&client_id);
         }
-        drop(sessions_w);
     }
 
-    // Abort forward tasks so their outbound_tx clones are dropped,
-    // allowing the write loop's outbound_rx to close and drain.
     for handle in forward_tasks.lock().drain(..) {
         handle.abort();
     }
-
-    let _ = read_result;
-    Ok(())
 }
 
 /// §3.10 协议版本协商: major 必须一致 (major = 破坏性变更, minor = 兼容新增)。
@@ -2215,6 +2242,78 @@ mod connection_unit_tests {
             Some("session-1")
         );
         assert!(sessions.read().is_empty());
+    }
+
+    #[tokio::test]
+    async fn connection_cleanup_removes_registration_and_aborts_forwarders() {
+        let mut session = crate::session::Session::new(
+            "session-1".to_string(),
+            "one".to_string(),
+            "/tmp".to_string(),
+        );
+        session.add_attached_client(
+            "client-1".to_string(),
+            crate::session::AttachMode::Shared,
+            ClientRole::ReadWrite,
+        );
+        let (subscriber, _notifications) = mpsc::unbounded_channel();
+        session.add_lifecycle_subscriber("client-1".to_string(), subscriber);
+        let sessions = Arc::new(parking_lot::RwLock::new(vec![session]));
+        let client_id = Arc::new(parking_lot::Mutex::new(Some("client-1".to_string())));
+        let forward_tasks = Arc::new(parking_lot::Mutex::new(vec![tokio::spawn(
+            std::future::pending::<()>(),
+        )]));
+
+        cleanup_connection_state(&sessions, &client_id, &forward_tasks);
+
+        let sessions = sessions.read();
+        assert_eq!(sessions[0].attached_client_count(), 0);
+        assert!(sessions[0].lifecycle_subscribers.read().is_empty());
+        assert!(forward_tasks.lock().is_empty());
+    }
+
+    struct DropSignal(Arc<std::sync::atomic::AtomicBool>);
+
+    impl Drop for DropSignal {
+        fn drop(&mut self) {
+            self.0.store(true, std::sync::atomic::Ordering::SeqCst);
+        }
+    }
+
+    #[tokio::test]
+    async fn writer_exit_cancels_reader_task() {
+        let reader_dropped = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let reader = tokio::spawn({
+            let guard = DropSignal(reader_dropped.clone());
+            async move {
+                let _guard = guard;
+                std::future::pending::<()>().await;
+                Ok(())
+            }
+        });
+        let writer = tokio::spawn(async { Ok(()) });
+
+        wait_for_connection_tasks(reader, writer).await;
+
+        assert!(reader_dropped.load(std::sync::atomic::Ordering::SeqCst));
+    }
+
+    #[tokio::test]
+    async fn reader_exit_cancels_writer_task() {
+        let writer_dropped = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let reader = tokio::spawn(async { Ok(()) });
+        let writer = tokio::spawn({
+            let guard = DropSignal(writer_dropped.clone());
+            async move {
+                let _guard = guard;
+                std::future::pending::<()>().await;
+                Ok(())
+            }
+        });
+
+        wait_for_connection_tasks(reader, writer).await;
+
+        assert!(writer_dropped.load(std::sync::atomic::Ordering::SeqCst));
     }
 
     #[test]
