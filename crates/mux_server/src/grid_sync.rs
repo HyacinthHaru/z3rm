@@ -19,63 +19,77 @@ pub struct RowChange {
     pub cells: Vec<Cell>,
 }
 
-/// 单元格 (§3.3 Cell)
 #[derive(Clone, Debug, Default)]
 pub struct Cell {
-    /// 字符
     pub character: String,
-    /// 样式标志
+    pub zerowidth: String,
     pub style: CellStyle,
-    /// 前景色 0xRRGGBB
     pub foreground: u32,
-    /// 背景色 0xRRGGBB
     pub background: u32,
+    pub hyperlink: Option<Hyperlink>,
 }
 
-/// 单元格样式 (§3.3 CellStyle)
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct Hyperlink {
+    pub id: String,
+    pub uri: String,
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum UnderlineStyle {
+    #[default]
+    None,
+    Single,
+    Double,
+    Curly,
+    Dotted,
+    Dashed,
+}
+
 #[derive(Clone, Copy, Debug, Default)]
 pub struct CellStyle {
     pub bold: bool,
     pub italic: bool,
-    pub underline: bool,
+    pub underline: UnderlineStyle,
+    pub underline_color: Option<u32>,
     pub strikethrough: bool,
     pub dim: bool,
     pub reverse: bool,
+    pub wide_char: bool,
+    pub wide_char_spacer: bool,
+    pub leading_wide_char_spacer: bool,
+    pub wrapline: bool,
+    pub hidden: bool,
 }
 
-/// 光标状态 (§3.3 CursorState)
 #[derive(Clone, Copy, Debug)]
 pub struct CursorState {
     pub col: u32,
     pub row: u32,
     pub style: CursorShape,
     pub visible: bool,
+    pub blinking: bool,
 }
 
-/// 光标形状 (§3.3)
 #[derive(Clone, Copy, Debug, Default)]
 pub enum CursorShape {
     #[default]
     Block,
     Bar,
     Underline,
+    HollowBlock,
+    Hidden,
 }
 
-/// 完整网格快照 (§3.3 FullGridSnapshot)
 #[derive(Clone, Debug)]
 pub struct FullGridSnapshot {
-    /// 列数
     pub cols: u32,
-    /// 行数
     pub rows: u32,
-    /// 扁平单元格数组 (row-major: cells[row * cols + col])
     pub cells: Vec<Cell>,
-    /// 光标状态
     pub cursor: CursorState,
-    /// 是否使用 alternate screen
     pub alternate_screen: bool,
-    /// §15.12 alacritty grid display_offset (滚动到历史缓冲的行数, 0 = 最新行)
     pub display_offset: usize,
+    pub modes: u32,
 }
 
 /// Grid diff ring (§3.3 默认 64 entries)
@@ -91,6 +105,8 @@ pub struct GridDiffRing {
 struct DiffEntry {
     generation: u64,
     diff: GridDiff,
+    /// Cursor/mode/offset/dimensions changed and cannot be represented by row diffs.
+    requires_full_snapshot: bool,
 }
 
 /// Grid 更新结果 (§3.3 FetchGridUpdateResponse)
@@ -329,39 +345,70 @@ impl GridDiffRing {
         }
     }
 
-    /// 推送新的 diff (§3.3)
+    /// Publish a generation fully represented by its changed rows.
     pub fn push(&mut self, generation: u64, diff: GridDiff) {
-        self.entries.push_back(DiffEntry { generation, diff });
+        self.push_entry(generation, diff, false);
+    }
+
+    /// Publish a generation that also changed state absent from `GridDiff`.
+    pub fn push_requiring_full_snapshot(&mut self, generation: u64, diff: GridDiff) {
+        self.push_entry(generation, diff, true);
+    }
+
+    fn push_entry(&mut self, generation: u64, diff: GridDiff, requires_full_snapshot: bool) {
+        self.entries.push_back(DiffEntry {
+            generation,
+            diff,
+            requires_full_snapshot,
+        });
         while self.entries.len() > self.capacity {
             self.entries.pop_front();
         }
     }
 
-    /// §3.3 fetch_grid_update: 根据 since_generation 返回 diff 或全量快照
-    pub fn fetch_update(&self, since_generation: u64, pane: &crate::pane::Pane) -> GridUpdate {
-        let current = pane.get_generation();
-        // §3.3 since == 0 means initial full snapshot — must return full grid, not NoChange
+    /// §3.3 fetch_grid_update: return merged rows only when every generation
+    /// since the client checkpoint is row-representable. Otherwise return the
+    /// current full snapshot so non-cell render state is never skipped.
+    pub fn fetch_update(
+        &self,
+        since_generation: u64,
+        current: u64,
+        full_snapshot: impl Fn() -> FullGridSnapshot,
+    ) -> GridUpdate {
         if since_generation == 0 {
             return GridUpdate::FullSnapshot {
                 to_generation: current,
-                snapshot: pane.get_full_snapshot(),
+                snapshot: full_snapshot(),
             };
         }
         if since_generation == current {
             return GridUpdate::NoChange(current);
         }
-
         if since_generation > current {
-            return GridUpdate::NoChange(current);
+            return GridUpdate::FullSnapshot {
+                to_generation: current,
+                snapshot: full_snapshot(),
+            };
         }
 
-        if let Some(oldest) = self.entries.front() {
-            if since_generation < oldest.generation {
-                return GridUpdate::FullSnapshot {
-                    to_generation: current,
-                    snapshot: pane.get_full_snapshot(),
-                };
-            }
+        if let Some(oldest) = self.entries.front()
+            && since_generation.saturating_add(1) < oldest.generation
+        {
+            return GridUpdate::FullSnapshot {
+                to_generation: current,
+                snapshot: full_snapshot(),
+            };
+        }
+
+        if self
+            .entries
+            .iter()
+            .any(|entry| entry.generation > since_generation && entry.requires_full_snapshot)
+        {
+            return GridUpdate::FullSnapshot {
+                to_generation: current,
+                snapshot: full_snapshot(),
+            };
         }
 
         let mut merged_diff = GridDiff::default();
@@ -371,9 +418,9 @@ impl GridDiffRing {
                     let pos = merged_diff
                         .rows
                         .iter()
-                        .position(|r| r.row == row_change.row);
-                    if let Some(idx) = pos {
-                        merged_diff.rows[idx].cells = row_change.cells.clone();
+                        .position(|row| row.row == row_change.row);
+                    if let Some(index) = pos {
+                        merged_diff.rows[index].cells = row_change.cells.clone();
                     } else {
                         merged_diff.rows.push(row_change.clone());
                     }
@@ -411,9 +458,11 @@ pub fn build_empty_snapshot(cols: u32, rows: u32) -> FullGridSnapshot {
             row: 0,
             style: CursorShape::Block,
             visible: true,
+            blinking: false,
         },
         alternate_screen: false,
         display_offset: 0,
+        modes: mux_protocol::terminal_mode::SHOW_CURSOR,
     }
 }
 
@@ -421,13 +470,15 @@ pub fn build_empty_snapshot(cols: u32, rows: u32) -> FullGridSnapshot {
 // §3.1 server-canonical: alacritty Term → z3rm grid 转换
 // ============================================================================
 //
-use alacritty_terminal::term::cell::{Cell as AlacCell, Flags};
-use alacritty_terminal::term::{Config as TermConfig, Term, TermMode};
-use alacritty_terminal::term::test::TermSize;
-use alacritty_terminal::index::{Column, Line, Point as AlacPoint};
 use alacritty_terminal::event::{EventListener, VoidListener};
 use alacritty_terminal::grid::Dimensions as _;
-use alacritty_terminal::vte::ansi::{Color as AlacColor, CursorShape as AlacCursorShape, NamedColor, Rgb};
+use alacritty_terminal::index::{Column, Line, Point as AlacPoint};
+use alacritty_terminal::term::cell::{Cell as AlacCell, Flags};
+use alacritty_terminal::term::test::TermSize;
+use alacritty_terminal::term::{Config as TermConfig, Term, TermMode};
+use alacritty_terminal::vte::ansi::{
+    Color as AlacColor, CursorShape as AlacCursorShape, NamedColor, Rgb,
+};
 
 /// §3.1 默认调色板 — 标准 xterm 256 色 + 默认 fg/bg。
 ///
@@ -455,35 +506,151 @@ impl Palette {
         }
         // 命名色 fallback 到 xterm 默认值 (16 色映射到 0..15)
         match named {
-            NamedColor::Black => Rgb { r: 0x00, g: 0x00, b: 0x00 },
-            NamedColor::Red => Rgb { r: 0xcc, g: 0x55, b: 0x55 },
-            NamedColor::Green => Rgb { r: 0x55, g: 0xcc, b: 0x55 },
-            NamedColor::Yellow => Rgb { r: 0xcd, g: 0xcd, b: 0x55 },
-            NamedColor::Blue => Rgb { r: 0x55, g: 0x55, b: 0xcc },
-            NamedColor::Magenta => Rgb { r: 0xcc, g: 0x55, b: 0xcc },
-            NamedColor::Cyan => Rgb { r: 0x55, g: 0xcc, b: 0xcc },
-            NamedColor::White => Rgb { r: 0xdd, g: 0xdd, b: 0xdd },
-            NamedColor::BrightBlack => Rgb { r: 0x77, g: 0x77, b: 0x77 },
-            NamedColor::BrightRed => Rgb { r: 0xff, g: 0x77, b: 0x77 },
-            NamedColor::BrightGreen => Rgb { r: 0x77, g: 0xff, b: 0x77 },
-            NamedColor::BrightYellow => Rgb { r: 0xff, g: 0xff, b: 0x77 },
-            NamedColor::BrightBlue => Rgb { r: 0x77, g: 0x77, b: 0xff },
-            NamedColor::BrightMagenta => Rgb { r: 0xff, g: 0x77, b: 0xff },
-            NamedColor::BrightCyan => Rgb { r: 0x77, g: 0xff, b: 0xff },
-            NamedColor::BrightWhite => Rgb { r: 0xff, g: 0xff, b: 0xff },
-            NamedColor::Foreground => Rgb { r: 0xdd, g: 0xdd, b: 0xdd },
-            NamedColor::Background => Rgb { r: 0x00, g: 0x00, b: 0x00 },
-            NamedColor::Cursor => Rgb { r: 0xdd, g: 0xdd, b: 0xdd },
-            NamedColor::DimBlack => Rgb { r: 0x55, g: 0x55, b: 0x55 },
-            NamedColor::DimRed => Rgb { r: 0x88, g: 0x44, b: 0x44 },
-            NamedColor::DimGreen => Rgb { r: 0x44, g: 0x88, b: 0x44 },
-            NamedColor::DimYellow => Rgb { r: 0x88, g: 0x88, b: 0x44 },
-            NamedColor::DimBlue => Rgb { r: 0x44, g: 0x44, b: 0x88 },
-            NamedColor::DimMagenta => Rgb { r: 0x88, g: 0x44, b: 0x88 },
-            NamedColor::DimCyan => Rgb { r: 0x44, g: 0x88, b: 0x88 },
-            NamedColor::DimWhite => Rgb { r: 0x88, g: 0x88, b: 0x88 },
-            NamedColor::BrightForeground => Rgb { r: 0xff, g: 0xff, b: 0xff },
-            NamedColor::DimForeground => Rgb { r: 0x88, g: 0x88, b: 0x88 },
+            NamedColor::Black => Rgb {
+                r: 0x00,
+                g: 0x00,
+                b: 0x00,
+            },
+            NamedColor::Red => Rgb {
+                r: 0xcc,
+                g: 0x55,
+                b: 0x55,
+            },
+            NamedColor::Green => Rgb {
+                r: 0x55,
+                g: 0xcc,
+                b: 0x55,
+            },
+            NamedColor::Yellow => Rgb {
+                r: 0xcd,
+                g: 0xcd,
+                b: 0x55,
+            },
+            NamedColor::Blue => Rgb {
+                r: 0x55,
+                g: 0x55,
+                b: 0xcc,
+            },
+            NamedColor::Magenta => Rgb {
+                r: 0xcc,
+                g: 0x55,
+                b: 0xcc,
+            },
+            NamedColor::Cyan => Rgb {
+                r: 0x55,
+                g: 0xcc,
+                b: 0xcc,
+            },
+            NamedColor::White => Rgb {
+                r: 0xdd,
+                g: 0xdd,
+                b: 0xdd,
+            },
+            NamedColor::BrightBlack => Rgb {
+                r: 0x77,
+                g: 0x77,
+                b: 0x77,
+            },
+            NamedColor::BrightRed => Rgb {
+                r: 0xff,
+                g: 0x77,
+                b: 0x77,
+            },
+            NamedColor::BrightGreen => Rgb {
+                r: 0x77,
+                g: 0xff,
+                b: 0x77,
+            },
+            NamedColor::BrightYellow => Rgb {
+                r: 0xff,
+                g: 0xff,
+                b: 0x77,
+            },
+            NamedColor::BrightBlue => Rgb {
+                r: 0x77,
+                g: 0x77,
+                b: 0xff,
+            },
+            NamedColor::BrightMagenta => Rgb {
+                r: 0xff,
+                g: 0x77,
+                b: 0xff,
+            },
+            NamedColor::BrightCyan => Rgb {
+                r: 0x77,
+                g: 0xff,
+                b: 0xff,
+            },
+            NamedColor::BrightWhite => Rgb {
+                r: 0xff,
+                g: 0xff,
+                b: 0xff,
+            },
+            NamedColor::Foreground => Rgb {
+                r: 0xdd,
+                g: 0xdd,
+                b: 0xdd,
+            },
+            NamedColor::Background => Rgb {
+                r: 0x00,
+                g: 0x00,
+                b: 0x00,
+            },
+            NamedColor::Cursor => Rgb {
+                r: 0xdd,
+                g: 0xdd,
+                b: 0xdd,
+            },
+            NamedColor::DimBlack => Rgb {
+                r: 0x55,
+                g: 0x55,
+                b: 0x55,
+            },
+            NamedColor::DimRed => Rgb {
+                r: 0x88,
+                g: 0x44,
+                b: 0x44,
+            },
+            NamedColor::DimGreen => Rgb {
+                r: 0x44,
+                g: 0x88,
+                b: 0x44,
+            },
+            NamedColor::DimYellow => Rgb {
+                r: 0x88,
+                g: 0x88,
+                b: 0x44,
+            },
+            NamedColor::DimBlue => Rgb {
+                r: 0x44,
+                g: 0x44,
+                b: 0x88,
+            },
+            NamedColor::DimMagenta => Rgb {
+                r: 0x88,
+                g: 0x44,
+                b: 0x88,
+            },
+            NamedColor::DimCyan => Rgb {
+                r: 0x44,
+                g: 0x88,
+                b: 0x88,
+            },
+            NamedColor::DimWhite => Rgb {
+                r: 0x88,
+                g: 0x88,
+                b: 0x88,
+            },
+            NamedColor::BrightForeground => Rgb {
+                r: 0xff,
+                g: 0xff,
+                b: 0xff,
+            },
+            NamedColor::DimForeground => Rgb {
+                r: 0x88,
+                g: 0x88,
+                b: 0x88,
+            },
         }
     }
 
@@ -496,13 +663,22 @@ impl Palette {
         // 0..15 与命名色一致
         if idx < 16 {
             let named = match idx {
-                0 => NamedColor::Black, 1 => NamedColor::Red, 2 => NamedColor::Green,
-                3 => NamedColor::Yellow, 4 => NamedColor::Blue, 5 => NamedColor::Magenta,
-                6 => NamedColor::Cyan, 7 => NamedColor::White,
-                8 => NamedColor::BrightBlack, 9 => NamedColor::BrightRed,
-                10 => NamedColor::BrightGreen, 11 => NamedColor::BrightYellow,
-                12 => NamedColor::BrightBlue, 13 => NamedColor::BrightMagenta,
-                14 => NamedColor::BrightCyan, _ => NamedColor::BrightWhite,
+                0 => NamedColor::Black,
+                1 => NamedColor::Red,
+                2 => NamedColor::Green,
+                3 => NamedColor::Yellow,
+                4 => NamedColor::Blue,
+                5 => NamedColor::Magenta,
+                6 => NamedColor::Cyan,
+                7 => NamedColor::White,
+                8 => NamedColor::BrightBlack,
+                9 => NamedColor::BrightRed,
+                10 => NamedColor::BrightGreen,
+                11 => NamedColor::BrightYellow,
+                12 => NamedColor::BrightBlue,
+                13 => NamedColor::BrightMagenta,
+                14 => NamedColor::BrightCyan,
+                _ => NamedColor::BrightWhite,
             };
             return Self::named(named, colors);
         }
@@ -513,7 +689,11 @@ impl Palette {
             let g = (i / 6) % 6;
             let b = i % 6;
             let cv = |v: u8| if v == 0 { 0 } else { v * 40 + 55 };
-            return Rgb { r: cv(r), g: cv(g), b: cv(b) };
+            return Rgb {
+                r: cv(r),
+                g: cv(g),
+                b: cv(b),
+            };
         }
         // 232..255 灰阶
         let i = idx - 232;
@@ -540,8 +720,7 @@ pub fn snapshot_from_term<T: EventListener>(term: &Term<T>) -> FullGridSnapshot 
 
     let alt = content.mode.contains(TermMode::ALT_SCREEN);
     let cursor = content.cursor;
-    let cursor_shape = cursor.shape;
-    let cursor_visible = cursor_shape != AlacCursorShape::Hidden;
+    let cursor_style = term.cursor_style();
 
     FullGridSnapshot {
         cols,
@@ -550,12 +729,14 @@ pub fn snapshot_from_term<T: EventListener>(term: &Term<T>) -> FullGridSnapshot 
         cursor: CursorState {
             col: cursor.point.column.0 as u32,
             row: cursor.point.line.0.max(0) as u32,
-            style: shape_from_alacritty(cursor_shape),
-            visible: cursor_visible,
+            style: shape_from_alacritty(cursor.shape),
+            visible: content.mode.contains(TermMode::SHOW_CURSOR)
+                && cursor.shape != AlacCursorShape::Hidden,
+            blinking: cursor_style.blinking,
         },
         alternate_screen: alt,
-        // §15.12 携带服务端 grid 的滚动位置 (== term.grid().display_offset())。
         display_offset: content.display_offset,
+        modes: modes_from_alacritty(content.mode),
     }
 }
 
@@ -580,44 +761,128 @@ pub fn diff_from_dirty<T: EventListener>(term: &Term<T>, dirty_rows: &[usize]) -
             let cell = &term.grid()[point];
             cells.push(cell_from_alacritty(cell, colors));
         }
-        rows.push(RowChange { row: row as u32, cells });
+        rows.push(RowChange {
+            row: row as u32,
+            cells,
+        });
     }
     GridDiff { rows }
 }
 
-fn cell_from_alacritty(
-    alac: &AlacCell,
-    colors: &alacritty_terminal::term::color::Colors,
-) -> Cell {
-    let mut fg = Palette::resolve(alac.fg, colors);
-    let mut bg = Palette::resolve(alac.bg, colors);
-    // INVERSE = 交换 fg/bg (与 alacritty 渲染行为一致)
-    if alac.flags.contains(Flags::INVERSE) {
-        std::mem::swap(&mut fg, &mut bg);
-    }
+fn cell_from_alacritty(alac: &AlacCell, colors: &alacritty_terminal::term::color::Colors) -> Cell {
+    let underline = if alac.flags.contains(Flags::DOUBLE_UNDERLINE) {
+        UnderlineStyle::Double
+    } else if alac.flags.contains(Flags::UNDERCURL) {
+        UnderlineStyle::Curly
+    } else if alac.flags.contains(Flags::DOTTED_UNDERLINE) {
+        UnderlineStyle::Dotted
+    } else if alac.flags.contains(Flags::DASHED_UNDERLINE) {
+        UnderlineStyle::Dashed
+    } else if alac.flags.contains(Flags::UNDERLINE) {
+        UnderlineStyle::Single
+    } else {
+        UnderlineStyle::None
+    };
     Cell {
         character: alac.c.to_string(),
+        zerowidth: alac.zerowidth().into_iter().flatten().collect::<String>(),
         style: CellStyle {
             bold: alac.flags.contains(Flags::BOLD),
             italic: alac.flags.contains(Flags::ITALIC),
-            underline: alac.flags.contains(Flags::UNDERLINE),
+            underline,
+            underline_color: alac
+                .underline_color()
+                .map(|color| Palette::resolve(color, colors)),
             strikethrough: alac.flags.contains(Flags::STRIKEOUT),
             dim: alac.flags.contains(Flags::DIM),
             reverse: alac.flags.contains(Flags::INVERSE),
+            wide_char: alac.flags.contains(Flags::WIDE_CHAR),
+            wide_char_spacer: alac.flags.contains(Flags::WIDE_CHAR_SPACER),
+            leading_wide_char_spacer: alac.flags.contains(Flags::LEADING_WIDE_CHAR_SPACER),
+            wrapline: alac.flags.contains(Flags::WRAPLINE),
+            hidden: alac.flags.contains(Flags::HIDDEN),
         },
-        foreground: fg,
-        background: bg,
+        foreground: Palette::resolve(alac.fg, colors),
+        background: Palette::resolve(alac.bg, colors),
+        hyperlink: alac.hyperlink().map(|hyperlink| Hyperlink {
+            id: hyperlink.id().to_string(),
+            uri: hyperlink.uri().to_string(),
+        }),
     }
 }
 
-fn shape_from_alacritty(s: AlacCursorShape) -> CursorShape {
-    match s {
-        AlacCursorShape::Block
-        | AlacCursorShape::HollowBlock => CursorShape::Block,
+fn shape_from_alacritty(shape: AlacCursorShape) -> CursorShape {
+    match shape {
+        AlacCursorShape::Block => CursorShape::Block,
         AlacCursorShape::Underline => CursorShape::Underline,
         AlacCursorShape::Beam => CursorShape::Bar,
-        AlacCursorShape::Hidden => CursorShape::Block,
+        AlacCursorShape::HollowBlock => CursorShape::HollowBlock,
+        AlacCursorShape::Hidden => CursorShape::Hidden,
     }
+}
+
+pub(crate) fn modes_from_alacritty(mode: TermMode) -> u32 {
+    let mut modes = 0;
+    for (source, target) in [
+        (
+            TermMode::APP_CURSOR,
+            mux_protocol::terminal_mode::APP_CURSOR,
+        ),
+        (
+            TermMode::APP_KEYPAD,
+            mux_protocol::terminal_mode::APP_KEYPAD,
+        ),
+        (
+            TermMode::SHOW_CURSOR,
+            mux_protocol::terminal_mode::SHOW_CURSOR,
+        ),
+        (TermMode::LINE_WRAP, mux_protocol::terminal_mode::LINE_WRAP),
+        (TermMode::ORIGIN, mux_protocol::terminal_mode::ORIGIN),
+        (TermMode::INSERT, mux_protocol::terminal_mode::INSERT),
+        (
+            TermMode::LINE_FEED_NEW_LINE,
+            mux_protocol::terminal_mode::LINE_FEED_NEW_LINE,
+        ),
+        (
+            TermMode::FOCUS_IN_OUT,
+            mux_protocol::terminal_mode::FOCUS_IN_OUT,
+        ),
+        (
+            TermMode::ALTERNATE_SCROLL,
+            mux_protocol::terminal_mode::ALTERNATE_SCROLL,
+        ),
+        (
+            TermMode::BRACKETED_PASTE,
+            mux_protocol::terminal_mode::BRACKETED_PASTE,
+        ),
+        (TermMode::SGR_MOUSE, mux_protocol::terminal_mode::SGR_MOUSE),
+        (
+            TermMode::UTF8_MOUSE,
+            mux_protocol::terminal_mode::UTF8_MOUSE,
+        ),
+        (
+            TermMode::ALT_SCREEN,
+            mux_protocol::terminal_mode::ALT_SCREEN,
+        ),
+        (
+            TermMode::MOUSE_REPORT_CLICK,
+            mux_protocol::terminal_mode::MOUSE_REPORT_CLICK,
+        ),
+        (
+            TermMode::MOUSE_DRAG,
+            mux_protocol::terminal_mode::MOUSE_DRAG,
+        ),
+        (
+            TermMode::MOUSE_MOTION,
+            mux_protocol::terminal_mode::MOUSE_MOTION,
+        ),
+        (TermMode::VI, mux_protocol::terminal_mode::VI),
+    ] {
+        if mode.contains(source) {
+            modes |= target;
+        }
+    }
+    modes
 }
 
 /// §3.3 创建带初始尺寸的真实 alacritty Term (用于 Pane::spawn)。

@@ -1,9 +1,9 @@
 mod mappings;
 
 mod alacritty;
+pub mod kitty_graphics;
 mod pty_info;
 pub mod terminal_settings;
-pub mod kitty_graphics;
 
 #[cfg(not(windows))]
 use anyhow::Context as _;
@@ -28,10 +28,10 @@ use futures::StreamExt;
 use pty_info::{ProcessIdGetter, PtyProcessInfo};
 use serde::{Deserialize, Serialize};
 use settings::Settings;
-use util::shell::{Shell, ShellKind};
 use terminal_settings::{AlternateScroll, CursorShape as SettingsCursorShape, TerminalSettings};
 use theme::{ActiveTheme, Theme};
 use urlencoding;
+use util::shell::{Shell, ShellKind};
 use util::{ResultExt as _, paths::PathStyle, truncate_and_trailoff};
 
 /// 终端任务隐藏策略 (stub: replaced deleted task::HideStrategy)
@@ -88,13 +88,14 @@ use crate::alacritty::current_child_signal_mask;
 use crate::alacritty::{
     AlacrittyCell, AlacrittyGridIterator, AlacrittyHyperlink, AlacrittySearch, AlacrittyTerm,
     AlacrittyTermConfig, AlacrittyTermLock, HyperlinkMatch, PtySender, RegexSearches,
-    append_text_to_term, apply_config, clear_saved_screen, content_text, display_offset,
-    display_only_term_config, find_from_terminal_point, full_content_range, last_non_empty_lines,
-    make_content, new_term, open_pty, pty_options, pty_term_config, resize, screen_lines,
-    scroll_display, scroll_to_point, search_matches, selection_text, set_default_cursor_style,
-    set_selection as set_term_selection, shrink_to_used, spawn_event_loop,
-    toggle_vi_mode as toggle_term_vi_mode, total_lines, update_selection as update_term_selection,
-    update_selection_to_vi_cursor, update_vi_cursor_for_scroll, vi_goto_point, vi_motion,
+    append_text_to_term, apply_config, apply_structured_snapshot, clear_saved_screen, content_text,
+    display_offset, display_only_term_config, find_from_terminal_point, full_content_range,
+    last_non_empty_lines, make_content, new_term, open_pty, pty_options, pty_term_config, resize,
+    screen_lines, scroll_display, scroll_to_point, search_matches, selection_text,
+    set_default_cursor_style, set_selection as set_term_selection, shrink_to_used,
+    spawn_event_loop, toggle_vi_mode as toggle_term_vi_mode, total_lines,
+    update_selection as update_term_selection, update_selection_to_vi_cursor,
+    update_vi_cursor_for_scroll, vi_goto_point, vi_motion,
 };
 use crate::mappings::colors::to_vte_rgb;
 use crate::mappings::keys::to_esc_str;
@@ -359,6 +360,88 @@ pub struct Cell {
     cell: AlacrittyCell,
 }
 
+/// A fully materialized terminal cell supplied by an authoritative external
+/// emulator. This deliberately lives in `terminal`, rather than depending on
+/// a transport crate, so display-only terminals can import structured state
+/// without reparsing ANSI text.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct StructuredTerminalCell {
+    pub character: char,
+    pub zerowidth: Vec<char>,
+    pub foreground: Rgb,
+    pub background: Rgb,
+    pub bold: bool,
+    pub italic: bool,
+    pub underline: StructuredUnderlineStyle,
+    pub underline_color: Option<Rgb>,
+    pub strikethrough: bool,
+    pub dim: bool,
+    pub reverse: bool,
+    pub wide_char: bool,
+    pub wide_char_spacer: bool,
+    pub leading_wide_char_spacer: bool,
+    pub wrapline: bool,
+    pub hidden: bool,
+    pub hyperlink: Option<Hyperlink>,
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum StructuredUnderlineStyle {
+    #[default]
+    None,
+    Single,
+    Double,
+    Curly,
+    Dotted,
+    Dashed,
+}
+
+impl Default for StructuredTerminalCell {
+    fn default() -> Self {
+        Self {
+            character: ' ',
+            zerowidth: Vec::new(),
+            foreground: Rgb {
+                r: 0xdd,
+                g: 0xdd,
+                b: 0xdd,
+            },
+            background: Rgb { r: 0, g: 0, b: 0 },
+            bold: false,
+            italic: false,
+            underline: StructuredUnderlineStyle::None,
+            underline_color: None,
+            strikethrough: false,
+            dim: false,
+            reverse: false,
+            wide_char: false,
+            wide_char_spacer: false,
+            leading_wide_char_spacer: false,
+            wrapline: false,
+            hidden: false,
+            hyperlink: None,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct StructuredTerminalCursor {
+    pub point: Point,
+    pub shape: CursorShape,
+    pub visible: bool,
+    pub blinking: bool,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct StructuredTerminalSnapshot {
+    pub cols: usize,
+    pub rows: usize,
+    pub cells: Vec<StructuredTerminalCell>,
+    pub cursor: Option<StructuredTerminalCursor>,
+    pub alternate_screen: bool,
+    pub modes: Modes,
+}
+
 pub struct RenderableCells<'a> {
     cells: AlacrittyGridIterator<'a>,
 }
@@ -421,6 +504,14 @@ impl Modes {
 
     pub fn remove(&mut self, other: Self) {
         self.0 &= !other.0;
+    }
+
+    pub const fn bits(self) -> u32 {
+        self.0
+    }
+
+    pub const fn from_bits_truncate(bits: u32) -> Self {
+        Self(bits & ((1 << 17) - 1))
     }
 }
 
@@ -907,6 +998,9 @@ impl Display for TerminalError {
 // https://github.com/alacritty/alacritty/blob/cb3a79dbf6472740daca8440d5166c1d4af5029e/extra/man/alacritty.5.scd?plain=1#L207-L213
 const DEFAULT_SCROLL_HISTORY_LINES: usize = 10_000;
 pub const MAX_SCROLL_HISTORY_LINES: usize = 100_000;
+const MAX_STRUCTURED_GRID_COLUMNS: usize = 4_096;
+const MAX_STRUCTURED_GRID_ROWS: usize = 4_096;
+const MAX_STRUCTURED_GRID_CELLS: usize = 1_048_576;
 static NEXT_INIT_COMMAND_STARTUP_MARKER_ID: AtomicU64 = AtomicU64::new(1);
 
 const INIT_COMMAND_STARTUP_MARKER_PREFIX: &str = "__zed_init_command_ready_";
@@ -1855,6 +1949,67 @@ impl Terminal {
         )
     }
 
+    /// Atomically replace a display-only terminal's active viewport from an
+    /// authoritative structured snapshot.
+    pub fn apply_structured_snapshot(
+        &mut self,
+        snapshot: &StructuredTerminalSnapshot,
+        cx: &mut Context<Self>,
+    ) -> Result<()> {
+        if !matches!(self.terminal_type, TerminalType::DisplayOnly) {
+            bail!("structured snapshots are only valid for display-only terminals");
+        }
+        if snapshot.cols == 0 || snapshot.rows == 0 {
+            bail!("structured snapshot dimensions must be nonzero");
+        }
+        if snapshot.cols > MAX_STRUCTURED_GRID_COLUMNS || snapshot.rows > MAX_STRUCTURED_GRID_ROWS {
+            bail!("structured snapshot dimensions exceed terminal limits");
+        }
+        let expected_cells = snapshot
+            .cols
+            .checked_mul(snapshot.rows)
+            .filter(|&cells| cells <= MAX_STRUCTURED_GRID_CELLS)
+            .ok_or_else(|| {
+                anyhow::anyhow!("structured snapshot cell count exceeds terminal limit")
+            })?;
+        if snapshot.cells.len() != expected_cells {
+            bail!(
+                "structured snapshot has {} cells, expected {} for {}x{}",
+                snapshot.cells.len(),
+                expected_cells,
+                snapshot.cols,
+                snapshot.rows
+            );
+        }
+
+        let mut bounds = self.last_content.terminal_bounds;
+        bounds.bounds.size.width = bounds.cell_width * snapshot.cols as f32;
+        bounds.bounds.size.height = bounds.line_height * snapshot.rows as f32;
+        if bounds.num_columns() != snapshot.cols || bounds.num_lines() != snapshot.rows {
+            bail!("structured snapshot dimensions cannot be represented by terminal bounds");
+        }
+        self.last_content.terminal_bounds = bounds;
+        let term = self.term.clone();
+        let mut term = term.lock_unfair();
+        apply_structured_snapshot(&mut term, snapshot, bounds);
+        term.selection = None;
+        self.last_content = make_content(&term, &self.last_content);
+        drop(term);
+
+        self.selection_head = None;
+        self.selection_phase = SelectionPhase::Ended;
+        self.last_mouse = None;
+        self.mouse_down_position = None;
+        self.mouse_down_hyperlink = None;
+        self.last_hyperlink_search_position = None;
+        self.last_content.last_hovered_word = None;
+        self.matches.clear();
+        cx.emit(Event::SelectionsChanged);
+        cx.emit(Event::NewNavigationTarget(None));
+        cx.emit(Event::Wakeup);
+        Ok(())
+    }
+
     fn update_selected_word(
         &mut self,
         prev_word: Option<HoveredWord>,
@@ -2079,10 +2234,7 @@ impl Terminal {
 
     /// Register a sink that receives bytes `write_to_pty` would otherwise
     /// drop on DisplayOnly terminals (mux mouse reporting path).
-    pub fn set_input_sink(
-        &mut self,
-        sink: Option<std::sync::Arc<dyn Fn(Vec<u8>) + Send + Sync>>,
-    ) {
+    pub fn set_input_sink(&mut self, sink: Option<std::sync::Arc<dyn Fn(Vec<u8>) + Send + Sync>>) {
         self.input_sink = sink;
     }
 
@@ -3069,7 +3221,10 @@ impl Terminal {
     /// 解析并加载 Kitty Graphics 协议数据
     ///
     /// §11.2 解析 Kitty Graphics DCS 序列并加载图像
-    pub fn parse_and_load_kitty_graphics(&mut self, payload: &str) -> Option<kitty_graphics::ImageId> {
+    pub fn parse_and_load_kitty_graphics(
+        &mut self,
+        payload: &str,
+    ) -> Option<kitty_graphics::ImageId> {
         if let Some((params, image)) = kitty_graphics::parse_kitty_graphics(payload) {
             match params.action {
                 kitty_graphics::ImageAction::Send => {
@@ -3078,7 +3233,8 @@ impl Terminal {
                 }
                 kitty_graphics::ImageAction::Delete => {
                     if params.identifier > 0 {
-                        self.image_cache.remove(kitty_graphics::ImageId(params.identifier as u64));
+                        self.image_cache
+                            .remove(kitty_graphics::ImageId(params.identifier as u64));
                     } else {
                         self.image_cache.clear();
                     }
@@ -3551,6 +3707,187 @@ mod tests {
             terminal.write_output(marker.as_bytes(), cx);
         });
         assert!(startup_rx.try_recv().is_ok());
+    }
+
+    #[gpui::test]
+    async fn display_only_structured_snapshot_preserves_render_state(cx: &mut TestAppContext) {
+        let terminal = cx.new(|cx| {
+            TerminalBuilder::new_display_only(
+                SettingsCursorShape::default(),
+                AlternateScroll::On,
+                None,
+                0,
+                cx.background_executor(),
+                PathStyle::local(),
+            )
+            .subscribe(cx)
+        });
+        let styled = StructuredTerminalCell {
+            character: 'A',
+            zerowidth: vec!['\u{301}'],
+            foreground: Rgb { r: 1, g: 2, b: 3 },
+            background: Rgb { r: 4, g: 5, b: 6 },
+            bold: true,
+            italic: true,
+            underline: StructuredUnderlineStyle::Curly,
+            underline_color: Some(Rgb { r: 7, g: 8, b: 9 }),
+            strikethrough: true,
+            dim: true,
+            reverse: true,
+            wide_char: true,
+            wrapline: true,
+            hyperlink: Some(Hyperlink::new(
+                Some("link-id"),
+                "https://example.com".to_string(),
+            )),
+            ..Default::default()
+        };
+        let alternate = StructuredTerminalSnapshot {
+            cols: 2,
+            rows: 1,
+            cells: vec![styled.clone(), StructuredTerminalCell::default()],
+            cursor: Some(StructuredTerminalCursor {
+                point: Point::new(0, 1),
+                shape: CursorShape::Underline,
+                visible: true,
+                blinking: true,
+            }),
+            alternate_screen: true,
+            modes: Modes::ALT_SCREEN | Modes::APP_CURSOR | Modes::BRACKETED_PASTE,
+        };
+
+        let applied = terminal.update(cx, |terminal, cx| {
+            terminal.apply_structured_snapshot(&alternate, cx)
+        });
+        if let Err(error) = applied {
+            panic!("apply alternate structured snapshot: {error}");
+        }
+        terminal.read_with(cx, |terminal, _cx| {
+            let content = terminal.last_content();
+            assert!(content.mode.contains(Modes::ALT_SCREEN));
+            assert_eq!(content.cursor.point, Point::new(0, 1));
+            assert_eq!(content.cursor.shape, CursorShape::Underline);
+            assert_eq!(content.terminal_bounds.num_columns(), 2);
+            assert_eq!(content.terminal_bounds.num_lines(), 1);
+            let cell = content
+                .cells
+                .iter()
+                .find(|cell| cell.point == Point::new(0, 0))
+                .unwrap_or_else(|| panic!("structured cell missing from render content"));
+            assert_eq!(cell.character(), 'A');
+            assert_eq!(cell.foreground(), Color::Spec(styled.foreground));
+            assert_eq!(cell.background(), Color::Spec(styled.background));
+            assert!(cell.is_bold());
+            assert!(cell.is_italic());
+            assert!(cell.has_underline());
+            assert!(cell.has_strikeout());
+            assert!(cell.is_dim());
+            assert!(cell.is_inverse());
+            assert_eq!(cell.zerowidth(), Some(['\u{301}'].as_slice()));
+            assert!(cell.has_undercurl());
+            assert_eq!(
+                cell.underline_color(),
+                Some(Color::Spec(Rgb { r: 7, g: 8, b: 9 }))
+            );
+            assert!(!cell.is_hidden());
+            let hyperlink = cell
+                .hyperlink()
+                .unwrap_or_else(|| panic!("structured hyperlink missing"));
+            assert_eq!(hyperlink.id(), Some("link-id"));
+            assert_eq!(hyperlink.uri(), "https://example.com");
+            assert!(content.mode.contains(Modes::APP_CURSOR));
+            assert!(content.mode.contains(Modes::BRACKETED_PASTE));
+        });
+
+        let primary_hidden = StructuredTerminalSnapshot {
+            cols: 1,
+            rows: 1,
+            cells: vec![StructuredTerminalCell {
+                character: 'P',
+                ..Default::default()
+            }],
+            cursor: Some(StructuredTerminalCursor {
+                point: Point::new(0, 0),
+                shape: CursorShape::Bar,
+                visible: false,
+                blinking: false,
+            }),
+            alternate_screen: false,
+            modes: Modes::NONE,
+        };
+        let applied = terminal.update(cx, |terminal, cx| {
+            terminal.apply_structured_snapshot(&primary_hidden, cx)
+        });
+        if let Err(error) = applied {
+            panic!("apply primary structured snapshot: {error}");
+        }
+        terminal.read_with(cx, |terminal, _cx| {
+            let content = terminal.last_content();
+            assert!(!content.mode.contains(Modes::ALT_SCREEN));
+            assert_eq!(content.cursor.shape, CursorShape::Hidden);
+            assert_eq!(content.cursor.point, Point::new(0, 0));
+            assert_eq!(content.cells[0].character(), 'P');
+        });
+    }
+
+    #[gpui::test]
+    async fn structured_snapshot_rejects_incomplete_grid_without_mutation(cx: &mut TestAppContext) {
+        let terminal = cx.new(|cx| {
+            TerminalBuilder::new_display_only(
+                SettingsCursorShape::default(),
+                AlternateScroll::On,
+                None,
+                0,
+                cx.background_executor(),
+                PathStyle::local(),
+            )
+            .subscribe(cx)
+        });
+        let before = terminal.read_with(cx, |terminal, _cx| terminal.get_content());
+        let malformed = StructuredTerminalSnapshot {
+            cols: 2,
+            rows: 1,
+            cells: vec![StructuredTerminalCell::default()],
+            cursor: None,
+            alternate_screen: false,
+            modes: Modes::NONE,
+        };
+        let result = terminal.update(cx, |terminal, cx| {
+            terminal.apply_structured_snapshot(&malformed, cx)
+        });
+        assert!(result.is_err());
+        let after = terminal.read_with(cx, |terminal, _cx| terminal.get_content());
+        assert_eq!(after, before);
+    }
+
+    #[gpui::test]
+    async fn structured_snapshot_rejects_oversized_grid_without_mutation(cx: &mut TestAppContext) {
+        let terminal = cx.new(|cx| {
+            TerminalBuilder::new_display_only(
+                SettingsCursorShape::default(),
+                AlternateScroll::On,
+                None,
+                0,
+                cx.background_executor(),
+                PathStyle::local(),
+            )
+            .subscribe(cx)
+        });
+        let before = terminal.read_with(cx, |terminal, _cx| terminal.get_content());
+        let oversized = StructuredTerminalSnapshot {
+            cols: 4_097,
+            rows: 1,
+            cells: vec![StructuredTerminalCell::default(); 4_097],
+            cursor: None,
+            alternate_screen: false,
+            modes: Modes::NONE,
+        };
+        let result = terminal.update(cx, |terminal, cx| {
+            terminal.apply_structured_snapshot(&oversized, cx)
+        });
+        assert!(result.is_err());
+        let after = terminal.read_with(cx, |terminal, _cx| terminal.get_content());
+        assert_eq!(after, before);
     }
 
     #[test]
@@ -4585,9 +4922,7 @@ mod tests {
     /// embedded Terminal's real scroll position so that, after `sync`,
     /// `last_content().display_offset` equals the restored nonzero offset.
     #[gpui::test]
-    async fn test_scroll_to_display_offset_restores_scroll_position(
-        cx: &mut TestAppContext,
-    ) {
+    async fn test_scroll_to_display_offset_restores_scroll_position(cx: &mut TestAppContext) {
         cx.update(|cx| {
             let settings_store = settings::SettingsStore::test(cx);
             cx.set_global(settings_store);
@@ -4623,7 +4958,8 @@ mod tests {
                 terminal.sync(window, cx);
             });
             let term = terminal.read(cx).term.lock_unfair();
-            crate::alacritty::total_lines(&term).saturating_sub(crate::alacritty::screen_lines(&term))
+            crate::alacritty::total_lines(&term)
+                .saturating_sub(crate::alacritty::screen_lines(&term))
         });
         assert!(
             history_size > 0,

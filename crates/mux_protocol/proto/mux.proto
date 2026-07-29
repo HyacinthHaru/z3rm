@@ -283,16 +283,43 @@ message Cell {
     CellStyle style = 2;
     uint32 foreground = 3;  // 0xRRGGBB
     uint32 background = 4;  // 0xRRGGBB
+    // Combining marks attached to the primary scalar in `char`.
+    string zerowidth = 5;
+    // OSC 8 metadata. Absent means the cell has no explicit hyperlink.
+    Hyperlink hyperlink = 6;
+}
+
+message Hyperlink {
+    string id = 1;
+    string uri = 2;
 }
 
 // §3.3 单元格样式标志。
 message CellStyle {
     bool bold = 1;
     bool italic = 2;
+    // Retained for protocol 1.0 clients. New clients prefer underline_style.
     bool underline = 3;
     bool strikethrough = 4;
     bool dim = 5;
     bool reverse = 6;
+    UnderlineStyle underline_style = 7;
+    optional uint32 underline_color = 8;  // 0xRRGGBB
+    bool wide_char = 9;
+    bool wide_char_spacer = 10;
+    bool leading_wide_char_spacer = 11;
+    bool wrapline = 12;
+    bool hidden = 13;
+
+    enum UnderlineStyle {
+        UNDERLINE_STYLE_UNSPECIFIED = 0;
+        NONE = 1;
+        SINGLE = 2;
+        DOUBLE = 3;
+        CURLY = 4;
+        DOTTED = 5;
+        DASHED = 6;
+    }
 }
 
 // §3.3 完整网格快照，用于重连或缓存失效。
@@ -306,6 +333,7 @@ message FullGridSnapshot {
     bool alternate_screen = 5;
     // §15.12 服务端 grid display_offset (0 = 滚动到底部/最新行)。
     uint32 display_offset = 6;
+    optional uint32 modes = 7;
 }
 
 // §3.3 光标状态。
@@ -314,12 +342,15 @@ message CursorState {
     uint32 row = 2;
     CursorStyle style = 3;
     bool visible = 4;
+    bool blinking = 5;
 
     enum CursorStyle {
         CURSOR_STYLE_UNSPECIFIED = 0;
         BLOCK = 1;
         BAR = 2;
         UNDERLINE = 3;
+        HOLLOW_BLOCK = 4;
+        HIDDEN = 5;
     }
 }
 

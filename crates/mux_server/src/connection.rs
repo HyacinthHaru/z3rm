@@ -1458,6 +1458,42 @@ async fn handle_get_clipboard(
     }
 }
 
+fn grid_cell_to_proto(cell: crate::grid_sync::Cell) -> Cell {
+    let underline_style = match cell.style.underline {
+        crate::grid_sync::UnderlineStyle::None => 1,
+        crate::grid_sync::UnderlineStyle::Single => 2,
+        crate::grid_sync::UnderlineStyle::Double => 3,
+        crate::grid_sync::UnderlineStyle::Curly => 4,
+        crate::grid_sync::UnderlineStyle::Dotted => 5,
+        crate::grid_sync::UnderlineStyle::Dashed => 6,
+    };
+    Cell {
+        char: cell.character,
+        style: Some(CellStyle {
+            bold: cell.style.bold,
+            italic: cell.style.italic,
+            underline: !matches!(cell.style.underline, crate::grid_sync::UnderlineStyle::None),
+            strikethrough: cell.style.strikethrough,
+            dim: cell.style.dim,
+            reverse: cell.style.reverse,
+            underline_style,
+            underline_color: cell.style.underline_color,
+            wide_char: cell.style.wide_char,
+            wide_char_spacer: cell.style.wide_char_spacer,
+            leading_wide_char_spacer: cell.style.leading_wide_char_spacer,
+            wrapline: cell.style.wrapline,
+            hidden: cell.style.hidden,
+        }),
+        foreground: cell.foreground,
+        background: cell.background,
+        zerowidth: cell.zerowidth,
+        hyperlink: cell.hyperlink.map(|hyperlink| mux_protocol::Hyperlink {
+            id: hyperlink.id,
+            uri: hyperlink.uri,
+        }),
+    }
+}
+
 /// §3.3 获取 grid 更新
 /// §16.9 获取回滚缓冲区历史行
 async fn handle_fetch_scrollback(
@@ -1475,23 +1511,7 @@ async fn handle_fetch_scrollback(
                     .into_iter()
                     .map(|r| RowChange {
                         row: r.row,
-                        cells: r
-                            .cells
-                            .into_iter()
-                            .map(|c| Cell {
-                                char: c.character,
-                                style: Some(CellStyle {
-                                    bold: c.style.bold,
-                                    italic: c.style.italic,
-                                    underline: c.style.underline,
-                                    strikethrough: c.style.strikethrough,
-                                    dim: c.style.dim,
-                                    reverse: c.style.reverse,
-                                }),
-                                foreground: c.foreground,
-                                background: c.background,
-                            })
-                            .collect(),
+                        cells: r.cells.into_iter().map(grid_cell_to_proto).collect(),
                     })
                     .collect(),
                 total_lines: total,
@@ -1519,23 +1539,7 @@ async fn handle_search_scrollback(
                     .into_iter()
                     .map(|(line_num, row)| SearchMatch {
                         line_number: line_num,
-                        context: row
-                            .cells
-                            .into_iter()
-                            .map(|c| Cell {
-                                char: c.character,
-                                style: Some(CellStyle {
-                                    bold: c.style.bold,
-                                    italic: c.style.italic,
-                                    underline: c.style.underline,
-                                    strikethrough: c.style.strikethrough,
-                                    dim: c.style.dim,
-                                    reverse: c.style.reverse,
-                                }),
-                                foreground: c.foreground,
-                                background: c.background,
-                            })
-                            .collect(),
+                        context: row.cells.into_iter().map(grid_cell_to_proto).collect(),
                     })
                     .collect(),
                 scrollback_version: version,
@@ -1569,23 +1573,7 @@ async fn handle_fetch_grid_update(
                             .into_iter()
                             .map(|r| RowChange {
                                 row: r.row,
-                                cells: r
-                                    .cells
-                                    .into_iter()
-                                    .map(|c| Cell {
-                                        char: c.character,
-                                        style: Some(CellStyle {
-                                            bold: c.style.bold,
-                                            italic: c.style.italic,
-                                            underline: c.style.underline,
-                                            strikethrough: c.style.strikethrough,
-                                            dim: c.style.dim,
-                                            reverse: c.style.reverse,
-                                        }),
-                                        foreground: c.foreground,
-                                        background: c.background,
-                                    })
-                                    .collect(),
+                                cells: r.cells.into_iter().map(grid_cell_to_proto).collect(),
                             })
                             .collect(),
                     })),
@@ -1600,23 +1588,7 @@ async fn handle_fetch_grid_update(
                         FullGridSnapshot {
                             cols: snapshot.cols,
                             rows: snapshot.rows,
-                            cells: snapshot
-                                .cells
-                                .into_iter()
-                                .map(|c| Cell {
-                                    char: c.character,
-                                    style: Some(CellStyle {
-                                        bold: c.style.bold,
-                                        italic: c.style.italic,
-                                        underline: c.style.underline,
-                                        strikethrough: c.style.strikethrough,
-                                        dim: c.style.dim,
-                                        reverse: c.style.reverse,
-                                    }),
-                                    foreground: c.foreground,
-                                    background: c.background,
-                                })
-                                .collect(),
+                            cells: snapshot.cells.into_iter().map(grid_cell_to_proto).collect(),
                             cursor: Some(CursorState {
                                 col: snapshot.cursor.col,
                                 row: snapshot.cursor.row,
@@ -1624,13 +1596,17 @@ async fn handle_fetch_grid_update(
                                     crate::grid_sync::CursorShape::Block => 1,
                                     crate::grid_sync::CursorShape::Bar => 2,
                                     crate::grid_sync::CursorShape::Underline => 3,
+                                    crate::grid_sync::CursorShape::HollowBlock => 4,
+                                    crate::grid_sync::CursorShape::Hidden => 5,
                                 },
                                 visible: snapshot.cursor.visible,
+                                blinking: snapshot.cursor.blinking,
                             }),
                             alternate_screen: snapshot.alternate_screen,
                             // §15.12 usize → u32 (saturating; scrollback 远小于 u32::MAX)。
                             display_offset: u32::try_from(snapshot.display_offset)
                                 .unwrap_or(u32::MAX),
+                            modes: Some(snapshot.modes),
                         },
                     )),
                 },

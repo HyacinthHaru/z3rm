@@ -24,7 +24,7 @@ use alacritty_terminal::{
     tty,
     vi_mode::{ViModeCursor, ViMotion as AlacViMotion},
     vte::ansi::{
-        ClearMode, CursorShape as AlacCursorShape, CursorStyle as AlacCursorStyle,
+        ClearMode, CursorShape as AlacCursorShape, CursorStyle as AlacCursorStyle, NamedMode,
         NamedPrivateMode, PrivateMode,
     },
 };
@@ -38,7 +38,8 @@ use windows::Win32::{Foundation::HANDLE, System::Threading::GetProcessId};
 use crate::{
     Cell, Color, Content, Cursor, CursorShape, Hyperlink, HyperlinkData, IndexedCell, Modes, Point,
     PtyEvent, Range, RenderableCells, Scroll, Search, Selection, SelectionRange, SelectionSide,
-    SelectionType, TerminalBackendEvent, TerminalBounds, ViMotion,
+    SelectionType, StructuredTerminalSnapshot, StructuredUnderlineStyle, TerminalBackendEvent,
+    TerminalBounds, ViMotion,
     pty_info::ProcessIdGetter,
     terminal_settings::{AlternateScroll, CursorShape as SettingsCursorShape},
 };
@@ -217,6 +218,148 @@ pub(super) fn resize(term: &mut AlacrittyTerm, bounds: TerminalBounds) {
     term.resize(bounds);
 }
 
+/// Replace the active display-only emulator viewport with a structured,
+/// externally authoritative snapshot. Cell attributes are written directly to
+/// Alacritty's grid so no information is lost through ANSI serialization.
+pub(super) fn apply_structured_snapshot(
+    term: &mut AlacrittyTerm,
+    snapshot: &StructuredTerminalSnapshot,
+    bounds: TerminalBounds,
+) {
+    resize(term, bounds);
+
+    let is_alternate = term.mode().contains(TermMode::ALT_SCREEN);
+    if is_alternate != snapshot.alternate_screen {
+        term.swap_alt();
+    }
+    apply_structured_modes(term, snapshot.modes);
+
+    term.grid_mut().reset();
+    for (index, source) in snapshot.cells.iter().enumerate() {
+        let row = index / snapshot.cols;
+        let col = index % snapshot.cols;
+        let mut flags = Flags::empty();
+        flags.set(Flags::BOLD, source.bold);
+        flags.set(Flags::ITALIC, source.italic);
+        flags.set(Flags::STRIKEOUT, source.strikethrough);
+        flags.set(Flags::DIM, source.dim);
+        flags.set(Flags::INVERSE, source.reverse);
+        flags.set(Flags::WIDE_CHAR, source.wide_char);
+        flags.set(Flags::WIDE_CHAR_SPACER, source.wide_char_spacer);
+        flags.set(
+            Flags::LEADING_WIDE_CHAR_SPACER,
+            source.leading_wide_char_spacer,
+        );
+        flags.set(Flags::WRAPLINE, source.wrapline);
+        flags.set(Flags::HIDDEN, source.hidden);
+        flags.insert(match source.underline {
+            StructuredUnderlineStyle::None => Flags::empty(),
+            StructuredUnderlineStyle::Single => Flags::UNDERLINE,
+            StructuredUnderlineStyle::Double => Flags::DOUBLE_UNDERLINE,
+            StructuredUnderlineStyle::Curly => Flags::UNDERCURL,
+            StructuredUnderlineStyle::Dotted => Flags::DOTTED_UNDERLINE,
+            StructuredUnderlineStyle::Dashed => Flags::DASHED_UNDERLINE,
+        });
+
+        let mut cell = AlacCell {
+            c: source.character,
+            fg: Color::Spec(source.foreground),
+            bg: Color::Spec(source.background),
+            flags,
+            extra: None,
+        };
+        for &character in &source.zerowidth {
+            cell.push_zerowidth(character);
+        }
+        cell.set_underline_color(source.underline_color.map(Color::Spec));
+        cell.set_hyperlink(source.hyperlink.clone().map(Into::into));
+        term.grid_mut()[Line(row as i32)][Column(col)] = cell;
+    }
+
+    let cursor = snapshot.cursor.unwrap_or(crate::StructuredTerminalCursor {
+        point: Point::new(0, 0),
+        shape: CursorShape::Hidden,
+        visible: false,
+        blinking: false,
+    });
+    let cursor_line = cursor
+        .point
+        .line
+        .clamp(0, snapshot.rows.saturating_sub(1) as i32);
+    let cursor_col = cursor.point.column.min(snapshot.cols.saturating_sub(1));
+    term.grid_mut().cursor.point = AlacPoint::new(Line(cursor_line), Column(cursor_col));
+
+    let shape = match cursor.shape {
+        CursorShape::Block => AlacCursorShape::Block,
+        CursorShape::Underline => AlacCursorShape::Underline,
+        CursorShape::Bar => AlacCursorShape::Beam,
+        CursorShape::HollowBlock => AlacCursorShape::HollowBlock,
+        CursorShape::Hidden => AlacCursorShape::Hidden,
+    };
+    term.set_cursor_style(Some(AlacCursorStyle {
+        shape,
+        blinking: cursor.blinking,
+    }));
+    if cursor.visible && cursor.shape != CursorShape::Hidden {
+        term.set_private_mode(NamedPrivateMode::ShowCursor.into());
+    } else {
+        term.unset_private_mode(NamedPrivateMode::ShowCursor.into());
+    }
+}
+
+fn apply_structured_modes(term: &mut AlacrittyTerm, modes: Modes) {
+    for (terminal_mode, private_mode) in [
+        (Modes::APP_CURSOR, NamedPrivateMode::CursorKeys),
+        (Modes::LINE_WRAP, NamedPrivateMode::LineWrap),
+        (Modes::ORIGIN, NamedPrivateMode::Origin),
+        (Modes::FOCUS_IN_OUT, NamedPrivateMode::ReportFocusInOut),
+        (Modes::ALTERNATE_SCROLL, NamedPrivateMode::AlternateScroll),
+        (Modes::BRACKETED_PASTE, NamedPrivateMode::BracketedPaste),
+        (Modes::SGR_MOUSE, NamedPrivateMode::SgrMouse),
+        (Modes::UTF8_MOUSE, NamedPrivateMode::Utf8Mouse),
+    ] {
+        if modes.contains(terminal_mode) {
+            term.set_private_mode(private_mode.into());
+        } else {
+            term.unset_private_mode(private_mode.into());
+        }
+    }
+
+    for private_mode in [
+        NamedPrivateMode::ReportMouseClicks,
+        NamedPrivateMode::ReportCellMouseMotion,
+        NamedPrivateMode::ReportAllMouseMotion,
+    ] {
+        term.unset_private_mode(private_mode.into());
+    }
+    if modes.contains(Modes::MOUSE_REPORT_CLICK) {
+        term.set_private_mode(NamedPrivateMode::ReportMouseClicks.into());
+    } else if modes.contains(Modes::MOUSE_DRAG) {
+        term.set_private_mode(NamedPrivateMode::ReportCellMouseMotion.into());
+    } else if modes.contains(Modes::MOUSE_MOTION) {
+        term.set_private_mode(NamedPrivateMode::ReportAllMouseMotion.into());
+    }
+
+    if modes.contains(Modes::APP_KEYPAD) {
+        term.set_keypad_application_mode();
+    } else {
+        term.unset_keypad_application_mode();
+    }
+    for (terminal_mode, public_mode) in [
+        (Modes::INSERT, NamedMode::Insert),
+        (Modes::LINE_FEED_NEW_LINE, NamedMode::LineFeedNewLine),
+    ] {
+        if modes.contains(terminal_mode) {
+            term.set_mode(public_mode.into());
+        } else {
+            term.unset_mode(public_mode.into());
+        }
+    }
+    if term.mode().contains(TermMode::VI) != modes.contains(Modes::VI) {
+        term.toggle_vi_mode();
+    }
+}
+
 pub(super) fn display_offset(term: &AlacrittyTerm) -> usize {
     term.grid().display_offset()
 }
@@ -359,10 +502,9 @@ impl ViMotion {
             Self::ParagraphDown => AlacViMotion::ParagraphDown,
             // §12 Plan 31 — search/line-select motions handled in
             // terminal.rs (InternalEvent path), alacritty ViMotion no-op.
-            Self::LineSelect
-            | Self::SearchStart
-            | Self::SearchNext
-            | Self::SearchPrev => AlacViMotion::Up,
+            Self::LineSelect | Self::SearchStart | Self::SearchNext | Self::SearchPrev => {
+                AlacViMotion::Up
+            }
         }
     }
 }
@@ -521,6 +663,16 @@ impl Cell {
     #[inline]
     pub fn has_undercurl(&self) -> bool {
         self.cell.flags.contains(Flags::UNDERCURL)
+    }
+
+    #[inline]
+    pub fn underline_color(&self) -> Option<Color> {
+        self.cell.underline_color()
+    }
+
+    #[inline]
+    pub fn is_hidden(&self) -> bool {
+        self.cell.flags.contains(Flags::HIDDEN)
     }
 
     #[inline]

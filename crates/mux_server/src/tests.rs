@@ -2,7 +2,7 @@
 // generation counter、session 生命周期等核心功能。
 
 use crate::grid_sync::{GridDiff, GridDiffRing, RowChange};
-use crate::layout::{LayoutTree, LayoutNode, SplitDirection};
+use crate::layout::{LayoutNode, LayoutTree, SplitDirection};
 use std::io::Write;
 
 /// §3.3 Grid diff ring: push + overflow
@@ -147,10 +147,18 @@ fn test_session_attach_detach() {
         "/home/user".to_string(),
     );
 
-    session.add_attached_client("client-1".to_string(), crate::session::AttachMode::Shared, crate::session::ClientRole::ReadWrite);
+    session.add_attached_client(
+        "client-1".to_string(),
+        crate::session::AttachMode::Shared,
+        crate::session::ClientRole::ReadWrite,
+    );
     assert_eq!(session.attached_client_count(), 1);
 
-    session.add_attached_client("client-2".to_string(), crate::session::AttachMode::ReadOnly, crate::session::ClientRole::ReadOnly);
+    session.add_attached_client(
+        "client-2".to_string(),
+        crate::session::AttachMode::ReadOnly,
+        crate::session::ClientRole::ReadOnly,
+    );
     assert_eq!(session.attached_client_count(), 2);
 
     session.remove_attached_client("client-1");
@@ -249,9 +257,7 @@ fn test_scrollback_push_and_fetch() {
             row: i,
             cells: vec![crate::grid_sync::Cell {
                 character: format!("Line {}", i),
-                style: Default::default(),
-                foreground: 0,
-                background: 0,
+                ..Default::default()
             }],
         });
     }
@@ -281,9 +287,7 @@ fn test_scrollback_capacity_overflow() {
             row: i,
             cells: vec![crate::grid_sync::Cell {
                 character: format!("Line {}", i),
-                style: Default::default(),
-                foreground: 0,
-                background: 0,
+                ..Default::default()
             }],
         });
     }
@@ -318,9 +322,7 @@ fn test_scrollback_search() {
             row: i,
             cells: vec![crate::grid_sync::Cell {
                 character: format!("Line {} test", i),
-                style: Default::default(),
-                foreground: 0,
-                background: 0,
+                ..Default::default()
             }],
         });
     }
@@ -371,9 +373,7 @@ fn test_pane_scrollback() {
         row: 0,
         cells: vec![crate::grid_sync::Cell {
             character: "Hello".to_string(),
-            style: Default::default(),
-            foreground: 0,
-            background: 0,
+            ..Default::default()
         }],
     });
 
@@ -382,14 +382,14 @@ fn test_pane_scrollback() {
     assert_eq!(lines.len(), 1);
     assert_eq!(lines[0].cells[0].character, "Hello");
 }
-    // §16.9 Pane: capacity honored from spawn_with_session parameter
-    //
-    // The connection layer threads `ServerSettings::scrollback_lines()` (env +
-    // server.json, hot-reloaded) into spawn_with_session. The pane's buffer
-    // capacity MUST equal that threaded value, not the env-only
-    // `default_scrollback_lines()` snapshot. We exercise two non-default
-    // capacities here — well above and below the 10k DEFAULT — to make sure
-    // neither the env path nor the default path leaked into spawn_with_session.
+// §16.9 Pane: capacity honored from spawn_with_session parameter
+//
+// The connection layer threads `ServerSettings::scrollback_lines()` (env +
+// server.json, hot-reloaded) into spawn_with_session. The pane's buffer
+// capacity MUST equal that threaded value, not the env-only
+// `default_scrollback_lines()` snapshot. We exercise two non-default
+// capacities here — well above and below the 10k DEFAULT — to make sure
+// neither the env path nor the default path leaked into spawn_with_session.
 #[test]
 fn test_pane_scrollback_capacity_uses_threaded_value() {
     let cwd = std::env::temp_dir().to_string_lossy().to_string();
@@ -616,7 +616,11 @@ fn test_session_broadcast_layout_change() {
 /// §3.3 测试新会话初始无窗口
 #[test]
 fn test_session_new_has_no_windows() {
-    let session = Session::new("sess-new".to_string(), "new".to_string(), "/tmp".to_string());
+    let session = Session::new(
+        "sess-new".to_string(),
+        "new".to_string(),
+        "/tmp".to_string(),
+    );
     assert_eq!(session.window_count(), 0);
     assert!(session.get_windows().is_empty());
 }

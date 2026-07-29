@@ -12,10 +12,20 @@ fn test_grid_diff_round_trip() {
                 char: "H".into(),
                 style: Some(CellStyle {
                     bold: true,
+                    underline: true,
+                    underline_style: proto::cell_style::UnderlineStyle::Curly as i32,
+                    underline_color: Some(0x123456),
+                    wide_char: true,
+                    wrapline: true,
                     ..Default::default()
                 }),
                 foreground: 0xFFFFFF,
                 background: 0x000000,
+                zerowidth: "\u{301}".into(),
+                hyperlink: Some(Hyperlink {
+                    id: "link-id".into(),
+                    uri: "https://example.com".into(),
+                }),
             }],
         }],
     };
@@ -25,6 +35,23 @@ fn test_grid_diff_round_trip() {
     let decoded = GridDiff::decode(buf.as_slice()).unwrap();
     assert_eq!(decoded.rows.len(), 1);
     assert_eq!(decoded.rows[0].row, 5);
+    let cell = &decoded.rows[0].cells[0];
+    assert_eq!(cell.zerowidth, "\u{301}");
+    assert_eq!(
+        cell.hyperlink.as_ref().map(|link| link.uri.as_str()),
+        Some("https://example.com")
+    );
+    let style = cell
+        .style
+        .as_ref()
+        .unwrap_or_else(|| panic!("cell style missing"));
+    assert_eq!(
+        style.underline_style,
+        proto::cell_style::UnderlineStyle::Curly as i32
+    );
+    assert_eq!(style.underline_color, Some(0x123456));
+    assert!(style.wide_char);
+    assert!(style.wrapline);
 }
 
 // §9 验证 Envelope 的 frame / unframe 往返。
@@ -54,20 +81,23 @@ fn test_full_snapshot_serialization() {
     let snap = FullGridSnapshot {
         cols: 80,
         rows: 24,
-        cells: vec![Cell {
-            char: " ".into(),
-            style: None,
-            foreground: 0,
-            background: 0,
-        }; 80 * 24],
+        cells: vec![
+            Cell {
+                char: " ".into(),
+                ..Default::default()
+            };
+            80 * 24
+        ],
         cursor: Some(CursorState {
             col: 0,
             row: 0,
-            style: proto::cursor_state::CursorStyle::Block as i32,
-            visible: true,
+            style: proto::cursor_state::CursorStyle::Hidden as i32,
+            visible: false,
+            blinking: true,
         }),
         alternate_screen: false,
         display_offset: 42,
+        modes: Some(terminal_mode::APP_CURSOR | terminal_mode::BRACKETED_PASTE),
     };
 
     let mut buf = Vec::new();
@@ -78,6 +108,16 @@ fn test_full_snapshot_serialization() {
     assert_eq!(decoded.cells.len(), 80 * 24);
     // §15.12 display_offset (field 6) survives encode/decode as a nonzero value.
     assert_eq!(decoded.display_offset, 42);
+    let cursor = decoded.cursor.unwrap_or_else(|| panic!("cursor missing"));
+    assert_eq!(
+        cursor.style,
+        proto::cursor_state::CursorStyle::Hidden as i32
+    );
+    assert!(cursor.blinking);
+    assert_eq!(
+        decoded.modes,
+        Some(terminal_mode::APP_CURSOR | terminal_mode::BRACKETED_PASTE)
+    );
 }
 
 // §3.3 验证 ClientIdentity 编码/解码 (Plan 33)

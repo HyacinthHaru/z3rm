@@ -10,7 +10,7 @@
 
 use gpui::{
     App, AppContext, AsyncApp, Context, Entity, EventEmitter, FocusHandle, Focusable,
-    InteractiveElement, KeyDownEvent, Keystroke, ParentElement, Render, Role, SharedString,
+    InteractiveElement, KeyDownEvent, Keystroke, ParentElement, Render, SharedString,
     StatefulInteractiveElement, Styled, Task, WeakEntity, Window, div,
 };
 use mux::MuxDomain;
@@ -19,14 +19,17 @@ use mux_protocol::input::{
     PrefixModeMachine, handle_key_event, is_full_screen_active,
 };
 use mux_protocol::{
-    FullGridSnapshot, GridDiff, Notification, RowChange,
-    fetch_grid_update_response::Update as FetchUpdate, notification::Event as NotifEvent,
+    FullGridSnapshot, GridDiff, fetch_grid_update_response::Update as FetchUpdate,
+    notification::Event as NotifEvent,
 };
 use project::Project;
 use settings::Settings;
 use std::sync::Arc;
 use terminal::{
-    Modes, Terminal, TerminalBounds, TerminalBuilder, terminal_settings::TerminalSettings,
+    CursorShape as TerminalCursorShape, Hyperlink as TerminalHyperlink, Modes, Rgb,
+    StructuredTerminalCell, StructuredTerminalCursor, StructuredTerminalSnapshot,
+    StructuredUnderlineStyle, Terminal, TerminalBounds, TerminalBuilder,
+    terminal_settings::TerminalSettings,
 };
 use theme::ActiveTheme;
 use util::paths::PathStyle;
@@ -35,7 +38,7 @@ use crate::terminal_element::TerminalElement;
 use crate::{TerminalMode, TerminalView};
 
 use workspace::{
-    ToolbarItemLocation, Workspace,
+    Workspace,
     item::{Item, ItemBufferKind, TabTooltipContent},
 };
 
@@ -73,6 +76,9 @@ pub struct MuxPaneView {
     generation: u64,
     /// §3.3 fetch dedup flag
     fetch_in_flight: bool,
+    /// A dirty signal arrived while a fetch was in flight. Completion must
+    /// immediately pull again so a newer server generation cannot be stranded.
+    fetch_pending: bool,
     /// §3.3 current grid snapshot (recovery path for reconnect)
     snapshot: FullGridSnapshot,
     /// §15.7 zoom state
@@ -195,9 +201,11 @@ impl MuxPaneView {
                 row: 0,
                 style: 1,
                 visible: true,
+                blinking: false,
             }),
             alternate_screen: false,
             display_offset: 0,
+            modes: None,
         };
 
         let mut view = Self {
@@ -210,6 +218,7 @@ impl MuxPaneView {
             notification_task: None,
             generation: 0,
             fetch_in_flight: false,
+            fetch_pending: false,
             snapshot,
             zoomed: false,
             last_sent_size: (80, 24),
@@ -346,9 +355,11 @@ impl MuxPaneView {
     /// §3.3 Schedule a fetch_grid_update (recovery path for reconnect §15.12).
     fn schedule_fetch(&mut self, cx: &mut Context<Self>) {
         if self.fetch_in_flight {
+            self.fetch_pending = true;
             return;
         }
         self.fetch_in_flight = true;
+        self.fetch_pending = false;
 
         let pane_id = self.pane_id.clone();
         let domain = self.domain.clone();
@@ -361,11 +372,26 @@ impl MuxPaneView {
                 view.fetch_in_flight = false;
                 match result {
                     Ok(resp) => {
-                        view.apply_fetch_update(resp, cx);
+                        if let Err(error) = view.apply_fetch_update(resp, cx) {
+                            tracing::error!(pane_id = %pane_id, error = %error, "apply grid update failed");
+                            cx.emit(MuxPaneEvent::InputFailed {
+                                message: SharedString::from(format!(
+                                    "failed to apply mux pane {pane_id} grid: {error}"
+                                )),
+                            });
+                        }
                     }
-                    Err(e) => {
-                        tracing::error!(pane_id = %pane_id, error = %e, "fetch_grid_update failed");
+                    Err(error) => {
+                        tracing::error!(pane_id = %pane_id, error = %error, "fetch_grid_update failed");
+                        cx.emit(MuxPaneEvent::InputFailed {
+                            message: SharedString::from(format!(
+                                "failed to fetch mux pane {pane_id} grid: {error}"
+                            )),
+                        });
                     }
+                }
+                if view.fetch_pending {
+                    view.schedule_fetch(cx);
                 }
             }) {
                 Ok(()) => {}
@@ -375,62 +401,48 @@ impl MuxPaneView {
         .detach();
     }
 
-    /// §3.3 / §15.12 Apply fetch response. On FullSnapshot, write content to DisplayOnly terminal.
+    /// §3.3 / §15.12 Apply a fetched update transactionally. The local
+    /// generation advances only after the structured grid was validated and
+    /// imported successfully, so a malformed response remains retryable.
     fn apply_fetch_update(
         &mut self,
         resp: mux_protocol::FetchGridUpdateResponse,
         cx: &mut Context<Self>,
-    ) {
-        self.generation = resp.to_generation;
+    ) -> anyhow::Result<()> {
+        validate_generation_envelope(self.generation, &resp)?;
+        let mut candidate = self.snapshot.clone();
         match resp.update {
-            Some(FetchUpdate::FullSnapshot(full)) => {
-                self.snapshot = full;
-                // §3.1 server-canonical: structured grid is the sole render path.
-                // Always write to terminal — no byte stream fallback exists.
-                self.write_snapshot_to_terminal(cx);
+            Some(FetchUpdate::FullSnapshot(full)) => candidate = full,
+            Some(FetchUpdate::Diff(diff)) => apply_diff_to_snapshot(&mut candidate, &diff)?,
+            None => {
+                self.generation = resp.to_generation;
+                cx.notify();
+                return Ok(());
             }
-            Some(FetchUpdate::Diff(diff)) => {
-                apply_diff_to_snapshot(&mut self.snapshot, &diff);
-                // §16.6 / StubSweep3 #7: Write changed rows to the DisplayOnly
-                // Terminal so the rendered view reflects the diff, not just the
-                // cached snapshot. A full snapshot rewrite via
-                // write_snapshot_to_terminal is the simplest/safest approach:
-                // performing per-row ANSI rewrites for arbitrary GridDiff
-                // contents (partial rows, cursor changes) would require careful
-                // per-cell position tracking and risks visual artifacts. A full
-                // rewrite always produces a correct display, and GridDiff
-                // payloads are small (delta frames during reconnect recovery).
-                self.write_snapshot_to_terminal(cx);
-            }
-            None => {}
         }
+
+        self.write_snapshot_to_terminal(&candidate, cx)?;
+        self.snapshot = candidate;
+        self.generation = resp.to_generation;
         cx.notify();
+        Ok(())
     }
 
-    /// §15.12 Write current snapshot content to DisplayOnly terminal for recovery.
-    fn write_snapshot_to_terminal(&mut self, cx: &mut Context<Self>) {
-        let text = snapshot_to_text(&self.snapshot);
-        let bytes = text.into_bytes();
-        // Clear screen + write snapshot + position cursor (ANSI: ESC[2J ESC[H = clear + home)
-        let mut clear_and_write = Vec::with_capacity(bytes.len() + 32);
-        clear_and_write.extend_from_slice(b"\x1b[2J\x1b[H");
-        clear_and_write.extend_from_slice(&bytes);
-        // §3.3 Position cursor at snapshot's recorded cursor location.
-        // ANSI CSI row;col H is 1-based.
-        if let Some(cursor) = &self.snapshot.cursor {
-            let row = cursor.row + 1; // 1-based
-            let col = cursor.col + 1; // 1-based
-            let cursor_pos = format!("\x1b[{};{}H", row, col);
-            clear_and_write.extend_from_slice(cursor_pos.as_bytes());
-        }
-        // §15.12 Restore the server-authoritative scroll position after the
-        // snapshot text/cursor are written. u32 → usize is lossless on every
-        // target (usize is at least 32 bits); clamping happens in the Terminal.
-        let display_offset = self.snapshot.display_offset as usize;
-        self.terminal.update(cx, |terminal, cx| {
-            terminal.write_output(&clear_and_write, cx);
-            terminal.scroll_to_display_offset(display_offset);
-        });
+    /// Import the server-owned viewport directly into the display-only
+    /// Alacritty grid. `display_offset` is not applied here: the current wire
+    /// snapshot contains only the already-selected server viewport, not enough
+    /// history to reconstruct a local scrollback buffer at that offset.
+    fn write_snapshot_to_terminal(
+        &mut self,
+        snapshot: &FullGridSnapshot,
+        cx: &mut Context<Self>,
+    ) -> anyhow::Result<()> {
+        let structured = structured_terminal_snapshot(snapshot)?;
+        self.terminal
+            .update(cx, |terminal, cx| {
+                terminal.apply_structured_snapshot(&structured, cx)
+            })
+            .map_err(|error| anyhow::anyhow!("structured terminal import failed: {error}"))
     }
 
     /// §3.10 / §16.7 keystroke → priority chain → MuxDomain::send_input.
@@ -697,27 +709,206 @@ pub fn keystroke_to_bytes(keystroke: &Keystroke) -> Vec<u8> {
     bytes
 }
 
-/// §3.3 把 GridDiff 应用到 FullGridSnapshot。
-/// RowChange.cells 按位置替换整行 (index = column)。
-/// spec §3.3 row-major flat array; 越界行/列静默丢弃。
-pub fn apply_diff_to_snapshot(snapshot: &mut FullGridSnapshot, diff: &GridDiff) {
+fn validate_generation_envelope(
+    current_generation: u64,
+    response: &mux_protocol::FetchGridUpdateResponse,
+) -> anyhow::Result<()> {
+    if response.to_generation < response.from_generation {
+        anyhow::bail!(
+            "mux grid generation regressed within response: {} -> {}",
+            response.from_generation,
+            response.to_generation
+        );
+    }
+    match &response.update {
+        Some(FetchUpdate::FullSnapshot(_)) => Ok(()),
+        Some(FetchUpdate::Diff(_)) if response.from_generation == current_generation => Ok(()),
+        Some(FetchUpdate::Diff(_)) => anyhow::bail!(
+            "mux grid diff starts at generation {}, client is at {}",
+            response.from_generation,
+            current_generation
+        ),
+        None if response.from_generation == current_generation
+            && response.to_generation == current_generation =>
+        {
+            Ok(())
+        }
+        None => anyhow::bail!(
+            "mux no-change response {} -> {} does not match client generation {}",
+            response.from_generation,
+            response.to_generation,
+            current_generation
+        ),
+    }
+}
+
+/// Convert the wire snapshot into the terminal crate's transport-neutral DTO.
+fn structured_terminal_snapshot(
+    snapshot: &FullGridSnapshot,
+) -> anyhow::Result<StructuredTerminalSnapshot> {
     let cols = snapshot.cols as usize;
     let rows = snapshot.rows as usize;
+    let expected_cells = mux_protocol::checked_grid_cell_count(cols, rows)
+        .map_err(|message| anyhow::anyhow!("invalid mux grid dimensions: {message}"))?;
+    if snapshot.cells.len() != expected_cells {
+        anyhow::bail!(
+            "mux grid has {} cells, expected {} for {}x{}",
+            snapshot.cells.len(),
+            expected_cells,
+            cols,
+            rows
+        );
+    }
+
+    let cells = snapshot
+        .cells
+        .iter()
+        .enumerate()
+        .map(|(index, cell)| {
+            let mut chars = cell.char.chars();
+            let character = chars
+                .next()
+                .ok_or_else(|| anyhow::anyhow!("mux grid cell {index} has no character"))?;
+            if chars.next().is_some() {
+                anyhow::bail!("mux grid cell {index} contains more than one Unicode scalar");
+            }
+            let style = cell.style.as_ref().cloned().unwrap_or_default();
+            let underline = match style.underline_style {
+                2 => StructuredUnderlineStyle::Single,
+                3 => StructuredUnderlineStyle::Double,
+                4 => StructuredUnderlineStyle::Curly,
+                5 => StructuredUnderlineStyle::Dotted,
+                6 => StructuredUnderlineStyle::Dashed,
+                _ if style.underline => StructuredUnderlineStyle::Single,
+                _ => StructuredUnderlineStyle::None,
+            };
+            let hyperlink = cell.hyperlink.as_ref().and_then(|hyperlink| {
+                (!hyperlink.uri.is_empty()).then(|| {
+                    TerminalHyperlink::new(
+                        (!hyperlink.id.is_empty()).then_some(hyperlink.id.as_str()),
+                        hyperlink.uri.clone(),
+                    )
+                })
+            });
+            Ok(StructuredTerminalCell {
+                character,
+                zerowidth: cell.zerowidth.chars().collect(),
+                foreground: rgb_from_u32(cell.foreground),
+                background: rgb_from_u32(cell.background),
+                bold: style.bold,
+                italic: style.italic,
+                underline,
+                underline_color: style.underline_color.map(rgb_from_u32),
+                strikethrough: style.strikethrough,
+                dim: style.dim,
+                reverse: style.reverse,
+                wide_char: style.wide_char,
+                wide_char_spacer: style.wide_char_spacer,
+                leading_wide_char_spacer: style.leading_wide_char_spacer,
+                wrapline: style.wrapline,
+                hidden: style.hidden,
+                hyperlink,
+            })
+        })
+        .collect::<anyhow::Result<Vec<_>>>()?;
+
+    let cursor = snapshot
+        .cursor
+        .as_ref()
+        .map(|cursor| {
+            if cursor.row as usize >= rows || cursor.col as usize >= cols {
+                anyhow::bail!(
+                    "mux cursor ({}, {}) is outside {}x{} grid",
+                    cursor.col,
+                    cursor.row,
+                    cols,
+                    rows
+                );
+            }
+            let shape = match cursor.style {
+                0 | 1 => TerminalCursorShape::Block,
+                2 => TerminalCursorShape::Bar,
+                3 => TerminalCursorShape::Underline,
+                4 => TerminalCursorShape::HollowBlock,
+                5 => TerminalCursorShape::Hidden,
+                _ => TerminalCursorShape::Block,
+            };
+            Ok(StructuredTerminalCursor {
+                point: terminal::Point::new(cursor.row as i32, cursor.col as usize),
+                shape,
+                visible: cursor.visible,
+                blinking: cursor.blinking,
+            })
+        })
+        .transpose()?;
+
+    let modes = snapshot
+        .modes
+        .map(Modes::from_bits_truncate)
+        .unwrap_or_else(|| {
+            if snapshot.alternate_screen {
+                Modes::ALT_SCREEN
+            } else {
+                Modes::NONE
+            }
+        });
+    Ok(StructuredTerminalSnapshot {
+        cols,
+        rows,
+        cells,
+        cursor,
+        alternate_screen: snapshot.alternate_screen,
+        modes,
+    })
+}
+
+fn rgb_from_u32(color: u32) -> Rgb {
+    Rgb {
+        r: ((color >> 16) & 0xff) as u8,
+        g: ((color >> 8) & 0xff) as u8,
+        b: (color & 0xff) as u8,
+    }
+}
+
+/// §3.3 Apply a row-complete GridDiff to the cached FullGridSnapshot.
+/// Every row is validated before mutation so malformed wire data cannot advance
+/// the client's generation or leave a partially updated cache.
+pub fn apply_diff_to_snapshot(
+    snapshot: &mut FullGridSnapshot,
+    diff: &GridDiff,
+) -> anyhow::Result<()> {
+    let cols = snapshot.cols as usize;
+    let rows = snapshot.rows as usize;
+    let expected_cells = cols
+        .checked_mul(rows)
+        .ok_or_else(|| anyhow::anyhow!("cached mux grid dimensions overflow"))?;
+    if snapshot.cells.len() != expected_cells {
+        anyhow::bail!(
+            "cached mux grid has {} cells, expected {expected_cells}",
+            snapshot.cells.len()
+        );
+    }
     for row_change in &diff.rows {
-        let row = row_change.row as usize;
-        if row >= rows {
-            continue;
+        if row_change.row as usize >= rows {
+            anyhow::bail!(
+                "mux grid diff row {} is outside {rows} rows",
+                row_change.row
+            );
         }
-        for (col, cell) in row_change.cells.iter().enumerate() {
-            if col >= cols {
-                break;
-            }
-            let flat = row * cols + col;
-            if flat < snapshot.cells.len() {
-                snapshot.cells[flat] = cell.clone();
-            }
+        if row_change.cells.len() != cols {
+            anyhow::bail!(
+                "mux grid diff row {} has {} cells, expected {cols}",
+                row_change.row,
+                row_change.cells.len()
+            );
         }
     }
+
+    for row_change in &diff.rows {
+        let row_start = row_change.row as usize * cols;
+        snapshot.cells[row_start..row_start + cols].clone_from_slice(&row_change.cells);
+    }
+    Ok(())
 }
 
 /// §3.3 把 FullGridSnapshot 渲染成纯文本。
@@ -886,7 +1077,7 @@ mod tests {
     use super::*;
     use gpui::TestAppContext;
     use mux_protocol::{
-        Cell, CellStyle, Envelope, FetchGridUpdateResponse, Request, Response,
+        Cell, CellStyle, Envelope, FetchGridUpdateResponse, Request, Response, RowChange,
         envelope::Payload as EnvelopePayload, request::Body as RequestBody,
         response::Body as ResponseBody,
     };
@@ -955,9 +1146,29 @@ mod tests {
 
         let cells = ["q", "u", "i", "e", "t"]
             .into_iter()
-            .map(|char| Cell {
+            .enumerate()
+            .map(|(index, char)| Cell {
                 char: char.to_string(),
-                ..Default::default()
+                style: (index == 0).then(|| CellStyle {
+                    bold: true,
+                    italic: true,
+                    underline: true,
+                    strikethrough: true,
+                    dim: true,
+                    reverse: true,
+                    underline_style: 4,
+                    underline_color: Some(0x070809),
+                    wide_char: true,
+                    wrapline: true,
+                    ..Default::default()
+                }),
+                foreground: if index == 0 { 0x010203 } else { 0xdddddd },
+                background: if index == 0 { 0x040506 } else { 0x000000 },
+                zerowidth: if index == 0 { "\u{301}" } else { "" }.to_string(),
+                hyperlink: (index == 0).then(|| mux_protocol::Hyperlink {
+                    id: "quiet-link".to_string(),
+                    uri: "https://example.com/quiet".to_string(),
+                }),
             })
             .collect();
         let response = Envelope {
@@ -971,9 +1182,20 @@ mod tests {
                         cols: 5,
                         rows: 1,
                         cells,
-                        cursor: None,
-                        alternate_screen: false,
+                        cursor: Some(mux_protocol::CursorState {
+                            col: 4,
+                            row: 0,
+                            style: 3,
+                            visible: true,
+                            blinking: true,
+                        }),
+                        alternate_screen: true,
                         display_offset: 0,
+                        modes: Some(
+                            mux_protocol::terminal_mode::ALT_SCREEN
+                                | mux_protocol::terminal_mode::APP_CURSOR
+                                | mux_protocol::terminal_mode::BRACKETED_PASTE,
+                        ),
                     })),
                 })),
             })),
@@ -986,6 +1208,180 @@ mod tests {
         stream
             .flush()
             .map_err(|error| format!("flush initial grid response: {error}"))
+    }
+
+    #[cfg(unix)]
+    fn read_test_envelope(
+        stream: &mut std::os::unix::net::UnixStream,
+        context: &str,
+    ) -> Result<Envelope, String> {
+        use std::io::Read;
+
+        let mut prefix = Vec::with_capacity(mux_protocol::MAX_VARINT_LEN);
+        loop {
+            let mut byte = [0u8; 1];
+            stream
+                .read_exact(&mut byte)
+                .map_err(|error| format!("read {context} prefix: {error}"))?;
+            prefix.push(byte[0]);
+            if byte[0] & 0x80 == 0 {
+                break;
+            }
+            if prefix.len() == mux_protocol::MAX_VARINT_LEN {
+                return Err(format!("{context} used an overlong frame prefix"));
+            }
+        }
+        let (raw_len, prefix_len) = mux_protocol::parse_len_prefix(&prefix)
+            .map_err(|error| format!("parse {context} prefix: {error}"))?
+            .ok_or_else(|| format!("{context} prefix was incomplete"))?;
+        let payload_len = mux_protocol::check_frame_len(raw_len)
+            .map_err(|error| format!("validate {context} length: {error}"))?;
+        let mut framed = prefix;
+        framed.resize(prefix_len + payload_len, 0);
+        stream
+            .read_exact(&mut framed[prefix_len..])
+            .map_err(|error| format!("read {context} payload: {error}"))?;
+        let (envelope, consumed) =
+            mux_protocol::unframe(&framed).map_err(|error| format!("decode {context}: {error}"))?;
+        if consumed != framed.len() {
+            return Err(format!(
+                "{context} left {} trailing bytes",
+                framed.len() - consumed
+            ));
+        }
+        Ok(envelope)
+    }
+
+    #[cfg(unix)]
+    fn write_test_envelope(
+        stream: &mut std::os::unix::net::UnixStream,
+        envelope: &Envelope,
+        context: &str,
+    ) -> Result<(), String> {
+        use std::io::Write;
+
+        let framed =
+            mux_protocol::frame(envelope).map_err(|error| format!("encode {context}: {error}"))?;
+        stream
+            .write_all(&framed)
+            .map_err(|error| format!("write {context}: {error}"))?;
+        stream
+            .flush()
+            .map_err(|error| format!("flush {context}: {error}"))
+    }
+
+    #[cfg(unix)]
+    fn grid_response(request_id: u64, from: u64, to: u64, cursor_row: u32) -> Envelope {
+        Envelope {
+            version: Some(mux_protocol::PROTOCOL_VERSION),
+            payload: Some(EnvelopePayload::Response(Response {
+                request_id,
+                body: Some(ResponseBody::GridUpdate(FetchGridUpdateResponse {
+                    from_generation: from,
+                    to_generation: to,
+                    update: Some(FetchUpdate::FullSnapshot(FullGridSnapshot {
+                        cols: 2,
+                        rows: 2,
+                        cells: vec![
+                            Cell {
+                                char: " ".to_string(),
+                                ..Cell::default()
+                            };
+                            4
+                        ],
+                        cursor: Some(mux_protocol::CursorState {
+                            col: 0,
+                            row: cursor_row,
+                            style: 1,
+                            visible: true,
+                            blinking: false,
+                        }),
+                        alternate_screen: false,
+                        display_offset: 0,
+                        modes: None,
+                    })),
+                })),
+            })),
+        }
+    }
+
+    #[cfg(unix)]
+    fn serve_dirty_during_fetch(
+        mut stream: std::os::unix::net::UnixStream,
+        first_fetch_received: async_channel::Sender<()>,
+        release_first_response: async_channel::Receiver<()>,
+    ) -> Result<(), String> {
+        stream
+            .set_read_timeout(Some(std::time::Duration::from_secs(5)))
+            .map_err(|error| format!("set race server read timeout: {error}"))?;
+
+        let first = read_test_envelope(&mut stream, "first grid request")?;
+        let first = match first.payload {
+            Some(EnvelopePayload::Request(request)) => request,
+            payload => return Err(format!("expected first request, got {payload:?}")),
+        };
+        let first_fetch = match first.body {
+            Some(RequestBody::FetchGridUpdate(fetch)) => fetch,
+            body => return Err(format!("expected first grid fetch, got {body:?}")),
+        };
+        if first_fetch.pane_id != "race-pane" || first_fetch.since_generation != 0 {
+            return Err(format!(
+                "unexpected first fetch: {}@{}",
+                first_fetch.pane_id, first_fetch.since_generation
+            ));
+        }
+
+        first_fetch_received
+            .send_blocking(())
+            .map_err(|error| format!("signal first grid fetch: {error}"))?;
+        release_first_response
+            .recv_blocking()
+            .map_err(|error| format!("wait to release first response: {error}"))?;
+        write_test_envelope(
+            &mut stream,
+            &grid_response(first.request_id, 0, 7, 0),
+            "first grid response",
+        )?;
+
+        let second = loop {
+            let envelope = read_test_envelope(&mut stream, "catch-up request")?;
+            let request = match envelope.payload {
+                Some(EnvelopePayload::Request(request)) => request,
+                payload => return Err(format!("expected catch-up request, got {payload:?}")),
+            };
+            match request.body {
+                Some(RequestBody::FetchGridUpdate(fetch)) => break (request.request_id, fetch),
+                Some(RequestBody::ResizePane(resize)) => {
+                    if resize.pane_id != "race-pane" || resize.cols != 2 || resize.rows != 2 {
+                        return Err(format!("unexpected resize during catch-up: {resize:?}"));
+                    }
+                    write_test_envelope(
+                        &mut stream,
+                        &Envelope {
+                            version: Some(mux_protocol::PROTOCOL_VERSION),
+                            payload: Some(EnvelopePayload::Response(Response {
+                                request_id: request.request_id,
+                                body: None,
+                            })),
+                        },
+                        "resize response",
+                    )?;
+                }
+                body => return Err(format!("expected catch-up grid fetch, got {body:?}")),
+            }
+        };
+        let (second_request_id, second_fetch) = second;
+        if second_fetch.pane_id != "race-pane" || second_fetch.since_generation != 7 {
+            return Err(format!(
+                "unexpected catch-up fetch: {}@{}",
+                second_fetch.pane_id, second_fetch.since_generation
+            ));
+        }
+        write_test_envelope(
+            &mut stream,
+            &grid_response(second_request_id, 7, 8, 1),
+            "catch-up grid response",
+        )
     }
 
     #[cfg(unix)]
@@ -1031,10 +1427,145 @@ mod tests {
         }
         initial_grid_applied.await;
 
-        view.read_with(cx, |view, _cx| {
+        view.read_with(cx, |view, cx| {
             assert_eq!(view.generation, 7);
             assert!(!view.fetch_in_flight);
             assert_eq!(snapshot_to_text(&view.snapshot), "quiet");
+
+            let content = view.terminal.read(cx).last_content();
+            assert!(content.mode.contains(Modes::ALT_SCREEN));
+            assert_eq!(content.cursor.point, terminal::Point::new(0, 4));
+            assert_eq!(content.cursor.shape, TerminalCursorShape::Underline);
+            let cell = content
+                .cells
+                .iter()
+                .find(|cell| cell.point == terminal::Point::new(0, 0))
+                .unwrap_or_else(|| panic!("structured q cell missing from terminal content"));
+            assert_eq!(cell.character(), 'q');
+            assert_eq!(
+                cell.foreground(),
+                terminal::Color::Spec(Rgb { r: 1, g: 2, b: 3 })
+            );
+            assert_eq!(
+                cell.background(),
+                terminal::Color::Spec(Rgb { r: 4, g: 5, b: 6 })
+            );
+            assert!(cell.is_bold());
+            assert!(cell.is_italic());
+            assert!(cell.has_underline());
+            assert!(cell.has_strikeout());
+            assert!(cell.is_dim());
+            assert!(cell.is_inverse());
+            assert_eq!(cell.zerowidth(), Some(['\u{301}'].as_slice()));
+            assert!(cell.has_undercurl());
+            let hyperlink = cell
+                .hyperlink()
+                .unwrap_or_else(|| panic!("mux hyperlink missing"));
+            assert_eq!(hyperlink.id(), Some("quiet-link"));
+            assert_eq!(hyperlink.uri(), "https://example.com/quiet");
+            assert!(content.mode.contains(Modes::APP_CURSOR));
+            assert!(content.mode.contains(Modes::BRACKETED_PASTE));
+        });
+    }
+
+    #[cfg(unix)]
+    #[gpui::test]
+    async fn dirty_during_fetch_triggers_cursor_catch_up(cx: &mut TestAppContext) {
+        cx.executor().allow_parking();
+        cx.update(|cx| {
+            let settings_store = SettingsStore::test(cx);
+            cx.set_global(settings_store);
+            theme_settings::init(theme::LoadThemes::JustBase, cx);
+        });
+
+        let (client, server) = match std::os::unix::net::UnixStream::pair() {
+            Ok(pair) => pair,
+            Err(error) => panic!("create fetch-race socket pair: {error}"),
+        };
+        if let Err(error) = client.set_nonblocking(true) {
+            panic!("set fetch-race client nonblocking: {error}");
+        }
+        let domain = match MuxDomain::connect_with_blocking_stream(client) {
+            Ok(domain) => Arc::new(domain),
+            Err(error) => panic!("connect fetch-race mux domain: {error}"),
+        };
+        let (first_fetch_received, first_fetch) = async_channel::bounded(1);
+        let (release_first_response, first_response_release) = async_channel::bounded(1);
+        let server_thread = std::thread::spawn(move || {
+            serve_dirty_during_fetch(server, first_fetch_received, first_response_release)
+        });
+
+        let (view, cx) = cx.add_window_view(|window, cx| {
+            MuxPaneView::new(
+                "race-pane".to_string(),
+                domain.clone(),
+                WeakEntity::new_invalid(),
+                WeakEntity::new_invalid(),
+                window,
+                cx,
+            )
+        });
+        let first_fetch_deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        loop {
+            while cx.executor().tick() {}
+            if first_fetch.try_recv().is_ok() {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < first_fetch_deadline,
+                "mock server did not receive the initial grid fetch"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+        domain.broadcast_notification(mux_protocol::Notification {
+            event: Some(NotifEvent::PaneDirty(mux_protocol::PaneDirty {
+                pane_id: "race-pane".to_string(),
+            })),
+        });
+        cx.run_until_parked();
+        cx.executor()
+            .advance_clock(std::time::Duration::from_millis(9));
+        cx.run_until_parked();
+        view.read_with(cx, |view, _cx| {
+            assert!(view.fetch_in_flight);
+            assert!(view.fetch_pending);
+        });
+        release_first_response
+            .send_blocking(())
+            .unwrap_or_else(|error| panic!("release first grid response: {error}"));
+        let catch_up_deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        let catch_up_state = loop {
+            while cx.executor().tick() {}
+            let state = view.read_with(cx, |view, _cx| {
+                (view.generation, view.fetch_in_flight, view.fetch_pending)
+            });
+            if state == (8, false, false) || std::time::Instant::now() >= catch_up_deadline {
+                break state;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        };
+        match server_thread.join() {
+            Ok(Ok(())) => {}
+            Ok(Err(error)) => panic!(
+                "fetch-race server failed while client was at generation={}, in_flight={}, pending={}: {error}",
+                catch_up_state.0, catch_up_state.1, catch_up_state.2,
+            ),
+            Err(_) => panic!("fetch-race server panicked"),
+        }
+        assert_eq!(
+            catch_up_state,
+            (8, false, false),
+            "grid catch-up did not settle"
+        );
+
+        view.read_with(cx, |view, cx| {
+            assert_eq!(view.generation, 8);
+            assert!(!view.fetch_in_flight);
+            assert!(!view.fetch_pending);
+            assert_eq!(
+                view.terminal.read(cx).last_content().cursor.point,
+                terminal::Point::new(1, 0)
+            );
         });
     }
 
@@ -1085,6 +1616,56 @@ mod tests {
     }
 
     #[test]
+    fn diff_generation_must_continue_from_client_checkpoint() {
+        let valid = FetchGridUpdateResponse {
+            from_generation: 5,
+            to_generation: 6,
+            update: Some(FetchUpdate::Diff(GridDiff::default())),
+        };
+        assert!(validate_generation_envelope(5, &valid).is_ok());
+
+        let stale = FetchGridUpdateResponse {
+            from_generation: 4,
+            ..valid.clone()
+        };
+        assert!(validate_generation_envelope(5, &stale).is_err());
+    }
+
+    #[test]
+    fn no_change_generation_must_equal_client_checkpoint() {
+        let valid = FetchGridUpdateResponse {
+            from_generation: 5,
+            to_generation: 5,
+            update: None,
+        };
+        assert!(validate_generation_envelope(5, &valid).is_ok());
+
+        let future = FetchGridUpdateResponse {
+            to_generation: 6,
+            ..valid
+        };
+        assert!(validate_generation_envelope(5, &future).is_err());
+    }
+
+    #[test]
+    fn full_snapshot_can_authoritatively_reset_generation() {
+        let reset = FetchGridUpdateResponse {
+            from_generation: 0,
+            to_generation: 3,
+            update: Some(FetchUpdate::FullSnapshot(FullGridSnapshot {
+                cols: 1,
+                rows: 1,
+                cells: vec![Cell::default()],
+                cursor: None,
+                alternate_screen: false,
+                display_offset: 0,
+                modes: None,
+            })),
+        };
+        assert!(validate_generation_envelope(99, &reset).is_ok());
+    }
+
+    #[test]
     fn test_apply_diff_to_snapshot() {
         let mut snapshot = FullGridSnapshot {
             cols: 3,
@@ -1093,6 +1674,7 @@ mod tests {
             cursor: None,
             alternate_screen: false,
             display_offset: 0,
+            modes: None,
         };
         let diff = GridDiff {
             rows: vec![RowChange {
@@ -1113,22 +1695,31 @@ mod tests {
                 ],
             }],
         };
-        apply_diff_to_snapshot(&mut snapshot, &diff);
+        if let Err(error) = apply_diff_to_snapshot(&mut snapshot, &diff) {
+            panic!("valid row diff failed: {error}");
+        }
         assert_eq!(snapshot.cells[0].char, "a");
         assert_eq!(snapshot.cells[1].char, "X");
         assert_eq!(snapshot.cells[2].char, "c");
-        // Out-of-bounds row is silently ignored
+
+        let before = snapshot.clone();
         let diff_oob = GridDiff {
             rows: vec![RowChange {
                 row: 99,
-                cells: vec![Cell {
-                    char: "Z".to_string(),
-                    ..Default::default()
-                }],
+                cells: vec![Cell::default(); 3],
             }],
         };
-        apply_diff_to_snapshot(&mut snapshot, &diff_oob);
-        assert_eq!(snapshot.cells.len(), 6);
+        assert!(apply_diff_to_snapshot(&mut snapshot, &diff_oob).is_err());
+        assert_eq!(snapshot.cells, before.cells);
+
+        let short_row = GridDiff {
+            rows: vec![RowChange {
+                row: 0,
+                cells: vec![Cell::default(); 2],
+            }],
+        };
+        assert!(apply_diff_to_snapshot(&mut snapshot, &short_row).is_err());
+        assert_eq!(snapshot.cells, before.cells);
     }
 
     #[test]
@@ -1165,6 +1756,7 @@ mod tests {
             cursor: None,
             alternate_screen: false,
             display_offset: 0,
+            modes: None,
         };
         assert_eq!(snapshot_to_text(&snapshot), "abc\nde ");
     }

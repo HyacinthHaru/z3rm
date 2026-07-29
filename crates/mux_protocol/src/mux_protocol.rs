@@ -16,10 +16,30 @@ pub mod input;
 pub use proto::*;
 
 // §3.10 当前协议版本：major 用于破坏性变更，minor 用于新增字段。
-pub const PROTOCOL_VERSION: proto::ProtocolVersion = proto::ProtocolVersion {
-    major: 1,
-    minor: 0,
-};
+pub const PROTOCOL_VERSION: proto::ProtocolVersion = proto::ProtocolVersion { major: 1, minor: 1 };
+
+/// Stable bits used by `FullGridSnapshot.modes`; these do not mirror any
+/// terminal emulator's private representation.
+pub mod terminal_mode {
+    pub const APP_CURSOR: u32 = 1 << 0;
+    pub const APP_KEYPAD: u32 = 1 << 1;
+    pub const SHOW_CURSOR: u32 = 1 << 2;
+    pub const LINE_WRAP: u32 = 1 << 3;
+    pub const ORIGIN: u32 = 1 << 4;
+    pub const INSERT: u32 = 1 << 5;
+    pub const LINE_FEED_NEW_LINE: u32 = 1 << 6;
+    pub const FOCUS_IN_OUT: u32 = 1 << 7;
+    pub const ALTERNATE_SCROLL: u32 = 1 << 8;
+    pub const BRACKETED_PASTE: u32 = 1 << 9;
+    pub const SGR_MOUSE: u32 = 1 << 10;
+    pub const UTF8_MOUSE: u32 = 1 << 11;
+    pub const ALT_SCREEN: u32 = 1 << 12;
+    pub const MOUSE_REPORT_CLICK: u32 = 1 << 13;
+    pub const MOUSE_DRAG: u32 = 1 << 14;
+    pub const MOUSE_MOTION: u32 = 1 << 15;
+    pub const VI: u32 = 1 << 16;
+    pub const KNOWN: u32 = (1 << 17) - 1;
+}
 
 // §9 将 Envelope 编码为长度前缀二进制帧：| varint len | protobuf bytes |。
 /// Frame a message as length-prefixed binary.
@@ -62,6 +82,24 @@ pub const MAX_VARINT_LEN: usize = 10;
 /// §9 单帧 payload 长度上限 (64 MiB)。读取器在分配或扩容前据此拒绝越界前缀。
 pub const MAX_FRAME_PAYLOAD: usize = 64 * 1024 * 1024;
 
+pub const MAX_GRID_COLUMNS: usize = 4_096;
+pub const MAX_GRID_ROWS: usize = 4_096;
+pub const MAX_GRID_CELLS: usize = 1_048_576;
+
+pub fn checked_grid_cell_count(cols: usize, rows: usize) -> Result<usize, &'static str> {
+    if cols == 0 || rows == 0 {
+        return Err("grid dimensions must be nonzero");
+    }
+    if cols > MAX_GRID_COLUMNS || rows > MAX_GRID_ROWS {
+        return Err("grid dimensions exceed protocol limits");
+    }
+    let cells = cols.checked_mul(rows).ok_or("grid dimensions overflow")?;
+    if cells > MAX_GRID_CELLS {
+        return Err("grid cell count exceeds protocol limit");
+    }
+    Ok(cells)
+}
+
 /// §9 长度前缀帧的解析错误: overlong 前缀、溢出、或超过 payload 上限。
 ///
 /// 读取器必须把它向上传播为错误, 不得静默当作 "无数据" 的成功返回。
@@ -92,8 +130,7 @@ impl std::fmt::Display for FrameLengthError {
                 write!(
                     f,
                     "frame length {} exceeds max payload {}",
-                    len,
-                    MAX_FRAME_PAYLOAD
+                    len, MAX_FRAME_PAYLOAD
                 )
             }
         }
@@ -119,10 +156,12 @@ impl From<FrameLengthError> for std::io::Error {
 /// let mut buf = vec![0u8; len];
 /// ```
 pub fn check_frame_len(len: u64) -> Result<usize, FrameLengthError> {
-    let len_usize = usize::try_from(len)
-        .map_err(|_| FrameLengthError(FrameLengthErrorKind::LengthOverflow))?;
+    let len_usize =
+        usize::try_from(len).map_err(|_| FrameLengthError(FrameLengthErrorKind::LengthOverflow))?;
     if len_usize > MAX_FRAME_PAYLOAD {
-        return Err(FrameLengthError(FrameLengthErrorKind::PayloadTooLarge { len: len_usize }));
+        return Err(FrameLengthError(FrameLengthErrorKind::PayloadTooLarge {
+            len: len_usize,
+        }));
     }
     Ok(len_usize)
 }
@@ -355,6 +394,18 @@ mod key_tests {
     }
 }
 
+#[cfg(test)]
+mod grid_limit_tests {
+    use super::*;
+
+    #[test]
+    fn decoded_grid_limits_reject_oversized_dimensions_and_products() {
+        assert_eq!(checked_grid_cell_count(80, 24), Ok(1_920));
+        assert!(checked_grid_cell_count(0, 24).is_err());
+        assert!(checked_grid_cell_count(MAX_GRID_COLUMNS + 1, 1).is_err());
+        assert!(checked_grid_cell_count(2_048, 2_048).is_err());
+    }
+}
 // ============================================================================
 // §3.10 tmux 风格目标 specifier 解析 (CLI 协议契约)
 // ============================================================================

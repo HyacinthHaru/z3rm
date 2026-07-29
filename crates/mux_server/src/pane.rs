@@ -8,7 +8,7 @@ use crate::coalescing::AdaptiveCoalescer;
 use crate::dec2026::Dec2026Parser;
 use crate::grid_sync::{
     self, FullGridSnapshot, GridDiff, GridDiffRing, ScrollbackBuffer, ScrollbackVersion,
-    diff_from_dirty, snapshot_from_term,
+    diff_from_dirty, modes_from_alacritty, snapshot_from_term,
 };
 use alacritty_terminal::event::{Event as AlacEvent, EventListener};
 use alacritty_terminal::grid::Dimensions as _;
@@ -167,13 +167,17 @@ impl Pane {
         command: Option<ShellCommand>,
         scrollback_lines: usize,
     ) -> anyhow::Result<Arc<Self>> {
+        let cols_usize = usize::try_from(cols).context("pane column count exceeds host limit")?;
+        let rows_usize = usize::try_from(rows).context("pane row count exceeds host limit")?;
+        mux_protocol::checked_grid_cell_count(cols_usize, rows_usize)
+            .map_err(|message| anyhow::anyhow!("invalid pane size {cols}x{rows}: {message}"))?;
         let events = Arc::new(parking_lot::Mutex::new(Vec::new()));
         let listener = PaneEventListener {
             events: events.clone(),
         };
 
         let term_config = TermConfig::default();
-        let size = TermSize::new(cols as usize, rows as usize);
+        let size = TermSize::new(cols_usize, rows_usize);
         let term = Term::new(term_config, &size, listener);
 
         // §3.1 打开 PTY pair
@@ -376,18 +380,16 @@ impl Pane {
             let before = (
                 term.grid().cursor.point,
                 term.cursor_style(),
-                term.mode().contains(TermMode::SHOW_CURSOR),
                 term.grid().display_offset(),
-                term.mode().contains(TermMode::ALT_SCREEN),
+                modes_from_alacritty(*term.mode()),
             );
             let mut processor = Processor::<alacritty_terminal::vte::ansi::StdSyncHandler>::new();
             processor.advance(&mut *term, bytes);
             let after = (
                 term.grid().cursor.point,
                 term.cursor_style(),
-                term.mode().contains(TermMode::SHOW_CURSOR),
                 term.grid().display_offset(),
-                term.mode().contains(TermMode::ALT_SCREEN),
+                modes_from_alacritty(*term.mode()),
             );
             before != after
         };
@@ -766,6 +768,10 @@ impl Pane {
 
     /// §3.10 Resize — 改 PTY winsize + resize alacritty Term + bump generation。
     pub fn resize(&self, cols: u32, rows: u32) -> anyhow::Result<()> {
+        let cols_usize = usize::try_from(cols).context("pane column count exceeds host limit")?;
+        let rows_usize = usize::try_from(rows).context("pane row count exceeds host limit")?;
+        mux_protocol::checked_grid_cell_count(cols_usize, rows_usize)
+            .map_err(|message| anyhow::anyhow!("invalid pane size {cols}x{rows}: {message}"))?;
         let commit = self.commit.lock();
         self.pty_master.lock().resize(PtySize {
             rows: rows
@@ -780,7 +786,7 @@ impl Pane {
 
         let diff = {
             let mut term = self.term.lock();
-            term.resize(TermSize::new(cols as usize, rows as usize));
+            term.resize(TermSize::new(cols_usize, rows_usize));
             let all_rows = (0..term.screen_lines()).collect::<Vec<_>>();
             diff_from_dirty(&*term, &all_rows)
         };
@@ -1174,6 +1180,68 @@ mod tests {
             Ok(notification) => panic!("expected PaneDirty, got {:?}", notification.event),
             Err(error) => panic!("receive reset-title PaneDirty notification: {error}"),
         }
+    }
+
+    #[test]
+    fn mode_only_output_publishes_full_generation() {
+        let pane = match Pane::spawn(
+            "mode-test-pane".to_string(),
+            std::env::temp_dir().to_string_lossy().to_string(),
+            20,
+            5,
+            Some(ShellCommand {
+                program: "/bin/cat".to_string(),
+                ..Default::default()
+            }),
+        ) {
+            Ok(pane) => pane,
+            Err(error) => panic!("spawn mode test pane: {error}"),
+        };
+        pane.collect_dirty_rows();
+        let mut dec = Dec2026Parser::new();
+        let mut coalescer = AdaptiveCoalescer::new();
+        let mut state = ReadLoopState::default();
+
+        pane.process_pty_bytes(b"baseline", &mut dec, &mut coalescer, &mut state);
+        assert_eq!(pane.get_generation(), 1);
+
+        pane.process_pty_bytes(b"\x1b[?1h\x1b[?2004h", &mut dec, &mut coalescer, &mut state);
+
+        assert_eq!(pane.get_generation(), 2);
+        match pane.fetch_grid_update(1) {
+            grid_sync::GridUpdate::FullSnapshot { snapshot, .. } => {
+                assert_ne!(snapshot.modes & mux_protocol::terminal_mode::APP_CURSOR, 0);
+                assert_ne!(
+                    snapshot.modes & mux_protocol::terminal_mode::BRACKETED_PASTE,
+                    0
+                );
+            }
+            update => panic!("expected mode-only full snapshot, got {update:?}"),
+        }
+    }
+
+    #[test]
+    fn oversized_grid_is_rejected_before_spawn_or_resize_mutation() {
+        let cwd = std::env::temp_dir().to_string_lossy().to_string();
+        assert!(Pane::spawn("oversized-spawn".to_string(), cwd.clone(), 4_097, 1, None).is_err());
+
+        let pane = match Pane::spawn(
+            "oversized-resize".to_string(),
+            cwd,
+            20,
+            5,
+            Some(ShellCommand {
+                program: "/bin/cat".to_string(),
+                ..Default::default()
+            }),
+        ) {
+            Ok(pane) => pane,
+            Err(error) => panic!("spawn resize limit pane: {error}"),
+        };
+        let generation = pane.get_generation();
+        assert!(pane.resize(4_097, 1).is_err());
+        assert_eq!((pane.get_cols(), pane.get_rows()), (20, 5));
+        assert_eq!(pane.get_generation(), generation);
     }
 }
 
