@@ -159,6 +159,7 @@ impl VersionTree {
 
         // 先插入所有节点（构建顺序按 version_id 升序），重算 ancestor 表。
         let mut nodes_map = self.nodes.write();
+        nodes_map.clear();
         for mut node in nodes {
             // 重算 ancestor 跳表；build_ancestor_table 读取已插入的父节点。
             node.ancestors = self.build_ancestor_table_locked(&nodes_map, node.version_id, node.parent_id);
@@ -179,9 +180,11 @@ impl VersionTree {
         drop(nodes_map);
 
         let mut head_map = self.heads.write();
-        for (path, (_, vid)) in heads {
-            head_map.insert(path, vid);
+        head_map.clear();
+        for (path, (_, version_id)) in heads {
+            head_map.insert(path, version_id);
         }
+        self.orphans.write().clear();
     }
 
     /// 在已持有 `nodes` 写锁的前提下构建 ancestor 跳表（重建专用）。

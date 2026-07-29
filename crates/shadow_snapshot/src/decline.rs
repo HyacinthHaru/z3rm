@@ -39,11 +39,10 @@ impl<'a> DeclineProtocol<'a> {
         Self { wal, seq_no }
     }
 
-    /// 执行完整的 decline 协议（§4.8，WAL-first）
-    ///
-    /// 返回目标内容的 SHA-256 哈希。失败的每一步都向上传播错误，
-    /// 调用方可据此向 UI 层反馈。
-    pub fn execute(
+    /// Restore the target file after durably recording the decline intent.
+    /// The caller must persist the corresponding version node before calling
+    /// `mark_done`; otherwise recovery must continue to treat this as pending.
+    pub fn prepare_restore(
         &self,
         blob_store: &BlobStore,
         path_hash: PathHash,
@@ -73,10 +72,7 @@ impl<'a> DeclineProtocol<'a> {
             "decline: intent appended and fsynced"
         );
 
-        // 步骤 3 + 4: 写回文件并标记完成。
         Self::restore_file(blob_store, &content_hash, target_path)?;
-        self.append_done(path_hash, content_hash)?;
-
         Ok(content_hash)
     }
 
@@ -127,8 +123,7 @@ impl<'a> DeclineProtocol<'a> {
         Ok(())
     }
 
-    /// 追加完成标记（DeclineDone）并 fsync。
-    fn append_done(&self, path_hash: PathHash, content_hash: ContentHash) -> Result<()> {
+    pub fn mark_done(&self, path_hash: PathHash, content_hash: ContentHash) -> Result<()> {
         let done = WalEntry {
             seq_no: self.seq_no,
             path_hash,
@@ -261,8 +256,9 @@ mod tests {
         let protocol = DeclineProtocol::new(&stack.wal, 1);
         let content = b"decline target content";
         let hash = protocol
-            .execute(&stack.blob_store, path_hash, None, content, &file_path)
+            .prepare_restore(&stack.blob_store, path_hash, None, content, &file_path)
             .unwrap();
+        protocol.mark_done(path_hash, hash).unwrap();
 
         // 文件已写回
         let written = std::fs::read(&file_path).unwrap();
@@ -469,7 +465,7 @@ mod tests {
         let new_content = b"new restored content";
         let protocol = DeclineProtocol::new(&stack.wal, 1);
         protocol
-            .execute(&stack.blob_store, [0x77; 32], None, new_content, &file_path)
+            .prepare_restore(&stack.blob_store, [0x77; 32], None, new_content, &file_path)
             .unwrap();
 
         let written = std::fs::read(&file_path).unwrap();

@@ -126,9 +126,9 @@ impl ShadowSnapshotEngine {
         tree.rebuild_from_nodes(loaded.nodes, loaded.max_version_id);
 
         // Rebuild durable WAL operations missing from SQLite. Write-like
-        // records restore their snapshot shape; Delete restores a tombstone.
-        // Decline/DeclineDone remain paired by recover_incomplete_restores,
-        // since resolving their file path requires the mux-owned path map.
+        // records restore their snapshot shape, Delete restores a tombstone,
+        // and Decline restores its full-snapshot version node. DeclineDone is
+        // only the completion marker; file replay still needs the mux path map.
         let mut replay_max_seq = loaded.max_seq_no;
         let wal_entries = wal.replay().map_err(|e| anyhow::anyhow!(e))?;
         for entry in wal_entries {
@@ -139,6 +139,7 @@ impl ShadowSnapshotEngine {
                     | SnapshotTrigger::Close
                     | SnapshotTrigger::Debounce
                     | SnapshotTrigger::Delete
+                    | SnapshotTrigger::Decline
             );
             if !produces_node || persisted_sequences.contains(&entry.seq_no) {
                 continue;
@@ -151,16 +152,32 @@ impl ShadowSnapshotEngine {
             // Rebuild the same node shape record_change would have persisted.
             // A WAL entry with content_ref is a full snapshot; one with delta_ref
             // is a delta node whose depth is parent.depth + 1 (parent is already
-            let (full_content, delta_ref, depth) = if entry.trigger == SnapshotTrigger::Delete {
-                if entry.content_ref.is_some() || entry.delta_ref.is_some() {
-                    return Err(anyhow::anyhow!(
-                        "WAL replay: delete entry seq {} contains snapshot content",
-                        entry.seq_no
-                    ));
+            let (full_content, delta_ref, depth) = match entry.trigger {
+                SnapshotTrigger::Delete => {
+                    if entry.content_ref.is_some() || entry.delta_ref.is_some() {
+                        return Err(anyhow::anyhow!(
+                            "WAL replay: delete entry seq {} contains snapshot content",
+                            entry.seq_no
+                        ));
+                    }
+                    (None, None, 0u8)
                 }
-                (None, None, 0u8)
-            } else {
-                match entry.content_ref {
+                SnapshotTrigger::Decline => {
+                    let content_hash = entry.content_ref.ok_or_else(|| {
+                        anyhow::anyhow!(
+                            "WAL replay: decline entry seq {} is missing content_ref",
+                            entry.seq_no
+                        )
+                    })?;
+                    if entry.delta_ref.is_some() {
+                        return Err(anyhow::anyhow!(
+                            "WAL replay: decline entry seq {} contains a delta",
+                            entry.seq_no
+                        ));
+                    }
+                    (Some(content_hash), None, 0u8)
+                }
+                _ => match entry.content_ref {
                     Some(full_hash) => (Some(full_hash), None, 0u8),
                     None => {
                         let delta_ref = entry.delta_ref.clone().ok_or_else(|| {
@@ -176,7 +193,7 @@ impl ShadowSnapshotEngine {
                             .unwrap_or(1);
                         (None, Some(delta_ref), depth)
                     }
-                }
+                },
             };
 
             // advance_head 用 WAL 记录的 parent_id,而非当前 tree HEAD:
@@ -203,6 +220,17 @@ impl ShadowSnapshotEngine {
                 timestamp_ns,
             )?;
         }
+        let mut replayed_nodes = tree.iter_nodes();
+        replayed_nodes.sort_unstable_by_key(|(version_id, _node)| *version_id);
+        let max_version_id = replayed_nodes
+            .last()
+            .map(|(version_id, _node)| *version_id)
+            .unwrap_or(0);
+        let rebuilt_nodes = replayed_nodes
+            .into_iter()
+            .map(|(_version_id, node)| node.as_ref().clone())
+            .collect();
+        tree.rebuild_from_nodes(rebuilt_nodes, max_version_id);
 
         // SeqNo 分配器从回放后的最大值 +1 起,保证跨重启严格单调。
         let start_seq = replay_max_seq.saturating_add(1).max(1);
@@ -523,17 +551,16 @@ impl ShadowSnapshotEngine {
         let parent_id = self.tree.get_head(&path_hash);
         let seq_no = self.seq_no.fetch_add(1, Ordering::AcqRel) as SeqNo;
         let protocol = DeclineProtocol::new(&self.wal, seq_no);
-        let content_hash = protocol.execute(
+        let content_hash = protocol.prepare_restore(
             &self.blob_store,
             path_hash,
-            Some(target_version),
+            parent_id,
             &target_content,
             path,
         )?;
 
-        // §4.8 branch C'：WAL DeclineDone 已 fsync，可以把还原后的内容作为
-        // full-snapshot node 持久化推进 HEAD。content_hash 来自 execute 内
-        // blob_store.put，与还原到磁盘的字节一致。
+        // The durable intent and the version node describe the same parent.
+        // DeclineDone is appended only after the node reaches SQLite.
         let timestamp_ns = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .map(|d| d.as_nanos())
@@ -559,6 +586,7 @@ impl ShadowSnapshotEngine {
             SnapshotTrigger::Decline,
             timestamp_ns,
         )?;
+        protocol.mark_done(path_hash, content_hash)?;
 
         tracing::info!(
             version_id = target_version,
@@ -692,6 +720,17 @@ mod tests {
             "decline node must be a full snapshot"
         );
         assert!(head_node.delta.is_none(), "decline node has no delta");
+        let wal_entries = engine.wal.replay().unwrap();
+        let decline_intent = wal_entries
+            .iter()
+            .find(|entry| entry.trigger == SnapshotTrigger::Decline)
+            .expect("decline intent exists");
+        assert_eq!(decline_intent.parent_id, head_node.parent_id);
+        let decline_done = wal_entries
+            .iter()
+            .find(|entry| entry.trigger == SnapshotTrigger::DeclineDone)
+            .expect("decline completion exists");
+        assert_eq!(decline_done.seq_no, decline_intent.seq_no);
 
         // A subsequent record_change must use the decline node as parent, so the
         // delta chain reconstructs v2 from the declined v0 baseline, not from v1.
@@ -920,5 +959,135 @@ mod tests {
         let new_versions = engine.list_versions(&new_path).unwrap();
         let new_sequence = new_versions.first().expect("new version exists").1;
         assert_eq!(new_sequence, 101);
+    }
+
+    #[test]
+    fn completed_wal_decline_recovers_missing_node() {
+        let directory = TempDir::new().unwrap();
+        let database = directory.path().join("decline-replay.db");
+        let wal_path = directory.path().join("decline-replay.wal");
+        let blobs = directory.path().join("decline-replay-blobs");
+        std::fs::create_dir_all(&blobs).unwrap();
+        let path = directory.path().join("declined.txt");
+        let path_hash = compute_path_hash(&path);
+
+        let storage = Arc::new(StorageEngine::open(&database).unwrap());
+        let blob_store = BlobStore::new(storage, blobs.clone());
+        let content_hash = blob_store.put(b"restored content").unwrap();
+        drop(blob_store);
+        let wal = Wal::open(&wal_path).unwrap();
+        for trigger in [SnapshotTrigger::Decline, SnapshotTrigger::DeclineDone] {
+            wal.append(&WalEntry {
+                seq_no: 42,
+                path_hash,
+                parent_id: None,
+                content_ref: Some(content_hash),
+                delta_ref: None,
+                trigger,
+            })
+            .unwrap();
+        }
+        wal.commit().unwrap();
+        drop(wal);
+
+        let engine = ShadowSnapshotEngine::open(&database, &wal_path, &blobs).unwrap();
+        let versions = engine.list_versions(&path).unwrap();
+        let version = versions.first().expect("decline node restored");
+        assert_eq!(version.1, 42);
+        assert_eq!(version.2, SnapshotTrigger::Decline);
+        assert_eq!(
+            engine.query_version(version.0).unwrap().unwrap(),
+            b"restored content"
+        );
+    }
+
+    #[test]
+    fn replaying_old_gap_preserves_newer_head_for_same_path() {
+        let directory = TempDir::new().unwrap();
+        let database = directory.path().join("head-order.db");
+        let wal_path = directory.path().join("head-order.wal");
+        let blobs = directory.path().join("head-order-blobs");
+        std::fs::create_dir_all(&blobs).unwrap();
+        let path = directory.path().join("same.txt");
+        let path_hash = compute_path_hash(&path);
+
+        let storage = StorageEngine::open(&database).unwrap();
+        storage
+            .write_node(
+                100,
+                &path_hash,
+                100,
+                None,
+                None,
+                None,
+                0,
+                SnapshotTrigger::Delete,
+                1,
+            )
+            .unwrap();
+        drop(storage);
+        let wal = Wal::open(&wal_path).unwrap();
+        wal.append(&WalEntry {
+            seq_no: 42,
+            path_hash,
+            parent_id: None,
+            content_ref: None,
+            delta_ref: None,
+            trigger: SnapshotTrigger::Delete,
+        })
+        .unwrap();
+        wal.commit().unwrap();
+        drop(wal);
+
+        let engine = ShadowSnapshotEngine::open(&database, &wal_path, &blobs).unwrap();
+        let head_id = engine.tree.get_head(&path_hash).expect("head exists");
+        let head = engine.tree.get_node(head_id).expect("head node exists");
+        assert_eq!(head.seq_no, 100);
+        assert!(!engine.tree.get_orphans().contains(&head_id));
+    }
+
+    #[test]
+    fn wal_gap_rebuild_preserves_persisted_ancestor_chain() {
+        let directory = TempDir::new().unwrap();
+        let database = directory.path().join("ancestor-replay.db");
+        let wal_path = directory.path().join("ancestor-replay.wal");
+        let blobs = directory.path().join("ancestor-replay-blobs");
+        std::fs::create_dir_all(&blobs).unwrap();
+        let chain_path = compute_path_hash(&directory.path().join("chain.txt"));
+        let gap_path = compute_path_hash(&directory.path().join("gap.txt"));
+
+        let storage = StorageEngine::open(&database).unwrap();
+        for (version_id, sequence, parent_id) in [(10, 10, None), (11, 11, Some(10))] {
+            storage
+                .write_node(
+                    version_id,
+                    &chain_path,
+                    sequence,
+                    parent_id,
+                    None,
+                    None,
+                    0,
+                    SnapshotTrigger::Delete,
+                    1,
+                )
+                .unwrap();
+        }
+        drop(storage);
+        let wal = Wal::open(&wal_path).unwrap();
+        wal.append(&WalEntry {
+            seq_no: 5,
+            path_hash: gap_path,
+            parent_id: None,
+            content_ref: None,
+            delta_ref: None,
+            trigger: SnapshotTrigger::Delete,
+        })
+        .unwrap();
+        wal.commit().unwrap();
+        drop(wal);
+
+        let engine = ShadowSnapshotEngine::open(&database, &wal_path, &blobs).unwrap();
+        let child = engine.tree.get_node(11).expect("child node exists");
+        assert_eq!(child.ancestors.first(), Some(&10));
     }
 }
