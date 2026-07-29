@@ -177,23 +177,37 @@ pub async fn handle_connection(
     // outbound_rx.recv() which never closes because handle_attach clones
     // outbound_tx into session-shared subscriber state. We cannot rely on
     // tokio::join! — use select! so the writer terminates when the reader does.
-    wait_for_connection_tasks(read_handle, write_handle).await;
-
-    cleanup_connection_state(&sessions, &connection_client_id, &forward_tasks);
+    wait_for_connection_tasks(read_handle, write_handle, || {
+        cleanup_connection_state(&sessions, &connection_client_id, &forward_tasks)
+    })
+    .await;
     Ok(())
 }
 
-async fn wait_for_connection_tasks(
+async fn wait_for_connection_tasks<Cleanup, CleanupFuture>(
     mut read_handle: tokio::task::JoinHandle<anyhow::Result<()>>,
     mut write_handle: tokio::task::JoinHandle<anyhow::Result<()>>,
-) {
+    cleanup: Cleanup,
+)
+where
+    Cleanup: FnOnce() -> CleanupFuture,
+    CleanupFuture: Future<Output = ()>,
+{
     tokio::select! {
         result = &mut read_handle => {
-            write_handle.abort();
-            if let Err(error) = write_handle.await
-                && !error.is_cancelled()
-            {
-                tracing::warn!(%error, "mux writer task failed during connection cleanup");
+            cleanup().await;
+            match tokio::time::timeout(std::time::Duration::from_secs(1), &mut write_handle).await {
+                Ok(Ok(Err(error))) => tracing::debug!(%error, "mux writer stopped"),
+                Ok(Err(error)) => tracing::warn!(%error, "mux writer task failed"),
+                Ok(Ok(Ok(()))) => {}
+                Err(_) => {
+                    write_handle.abort();
+                    if let Err(error) = write_handle.await
+                        && !error.is_cancelled()
+                    {
+                        tracing::warn!(%error, "mux writer task failed during connection cleanup");
+                    }
+                }
             }
             match result {
                 Ok(Err(error)) => tracing::debug!(%error, "mux reader stopped"),
@@ -210,6 +224,7 @@ async fn wait_for_connection_tasks(
                 }
                 Ok(Ok(())) | Err(_) => {}
             }
+            cleanup().await;
             if let Err(error) = result {
                 tracing::warn!(%error, "mux writer task failed");
             }
@@ -217,7 +232,7 @@ async fn wait_for_connection_tasks(
     }
 }
 
-fn cleanup_connection_state(
+async fn cleanup_connection_state(
     sessions: &Arc<parking_lot::RwLock<Vec<crate::session::Session>>>,
     connection_client_id: &Arc<parking_lot::Mutex<Option<String>>>,
     forward_tasks: &Arc<parking_lot::Mutex<Vec<tokio::task::JoinHandle<()>>>>,
@@ -230,8 +245,16 @@ fn cleanup_connection_state(
         }
     }
 
-    for handle in forward_tasks.lock().drain(..) {
+    let forward_tasks = forward_tasks.lock().drain(..).collect::<Vec<_>>();
+    for handle in &forward_tasks {
         handle.abort();
+    }
+    for handle in forward_tasks {
+        if let Err(error) = handle.await
+            && !error.is_cancelled()
+        {
+            tracing::warn!(%error, "mux forwarder task failed during connection cleanup");
+        }
     }
 }
 
@@ -2264,7 +2287,7 @@ mod connection_unit_tests {
             std::future::pending::<()>(),
         )]));
 
-        cleanup_connection_state(&sessions, &client_id, &forward_tasks);
+        cleanup_connection_state(&sessions, &client_id, &forward_tasks).await;
 
         let sessions = sessions.read();
         assert_eq!(sessions[0].attached_client_count(), 0);
@@ -2293,13 +2316,38 @@ mod connection_unit_tests {
         });
         let writer = tokio::spawn(async { Ok(()) });
 
-        wait_for_connection_tasks(reader, writer).await;
+        wait_for_connection_tasks(reader, writer, || async {}).await;
 
         assert!(reader_dropped.load(std::sync::atomic::Ordering::SeqCst));
     }
 
     #[tokio::test]
-    async fn reader_exit_cancels_writer_task() {
+    async fn reader_exit_drains_queued_writer_response() {
+        let response_written = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let (response_sender, response_receiver) = tokio::sync::oneshot::channel();
+        let reader = tokio::spawn(async move {
+            response_sender
+                .send(())
+                .map_err(|_| anyhow::anyhow!("writer dropped queued response"))?;
+            Ok(())
+        });
+        let writer = tokio::spawn({
+            let response_written = response_written.clone();
+            async move {
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+                response_receiver.await?;
+                response_written.store(true, std::sync::atomic::Ordering::SeqCst);
+                Ok(())
+            }
+        });
+
+        wait_for_connection_tasks(reader, writer, || async {}).await;
+
+        assert!(response_written.load(std::sync::atomic::Ordering::SeqCst));
+    }
+
+    #[tokio::test]
+    async fn reader_exit_bounds_stalled_writer_drain() {
         let writer_dropped = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let reader = tokio::spawn(async { Ok(()) });
         let writer = tokio::spawn({
@@ -2311,7 +2359,7 @@ mod connection_unit_tests {
             }
         });
 
-        wait_for_connection_tasks(reader, writer).await;
+        wait_for_connection_tasks(reader, writer, || async {}).await;
 
         assert!(writer_dropped.load(std::sync::atomic::Ordering::SeqCst));
     }
