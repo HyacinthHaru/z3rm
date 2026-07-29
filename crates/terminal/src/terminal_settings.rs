@@ -10,8 +10,8 @@ use settings::{
     TerminalDockPosition, TerminalLineHeight, VenvSettings, WorkingDirectory,
     merge_from::MergeFrom,
 };
-use util::shell::Shell;
 use theme_settings::FontFamilyName;
+use util::shell::Shell;
 
 #[derive(Copy, Clone, Debug, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
 pub struct Toolbar {
@@ -85,7 +85,9 @@ impl settings::Settings for TerminalSettings {
         project_content.merge_from_option(content.project.terminal.as_ref());
         TerminalSettings {
             shell: settings_shell_to_task_shell(project_content.shell.unwrap_or_default()),
-            working_directory: project_content.working_directory.unwrap_or_else(|| WorkingDirectory::CurrentFileDirectory),
+            working_directory: project_content
+                .working_directory
+                .unwrap_or_else(|| WorkingDirectory::CurrentFileDirectory),
             font_size: user_content.font_size.map(|s| s.into_gpui()),
             font_family: user_content.font_family,
             font_fallbacks: user_content.font_fallbacks.map(|fallbacks| {
@@ -101,14 +103,20 @@ impl settings::Settings for TerminalSettings {
             line_height: user_content.line_height.unwrap_or_default(),
             env: project_content.env.unwrap_or_default(),
             cursor_shape: user_content.cursor_shape.unwrap_or_default().into(),
-            blinking: user_content.blinking.unwrap_or_else(|| TerminalBlink::TerminalControlled),
-            alternate_scroll: user_content.alternate_scroll.unwrap_or_else(|| settings::AlternateScroll::On),
+            blinking: user_content
+                .blinking
+                .unwrap_or_else(|| TerminalBlink::TerminalControlled),
+            alternate_scroll: user_content
+                .alternate_scroll
+                .unwrap_or_else(|| settings::AlternateScroll::On),
             option_as_meta: user_content.option_as_meta.unwrap_or_default(),
             copy_on_select: user_content.copy_on_select.unwrap_or_default(),
             keep_selection_on_copy: user_content.keep_selection_on_copy.unwrap_or_default(),
             open_links_in_mouse_mode: user_content.open_links_in_mouse_mode.unwrap_or_default(),
             button: user_content.button.unwrap_or_default(),
-            dock: user_content.dock.unwrap_or_else(|| TerminalDockPosition::Bottom),
+            dock: user_content
+                .dock
+                .unwrap_or_else(|| TerminalDockPosition::Bottom),
             default_width: px(user_content.default_width.unwrap_or(640.0)),
             default_height: px(user_content.default_height.unwrap_or(320.0)),
             flexible: user_content.flexible.unwrap_or_default(),
@@ -116,10 +124,16 @@ impl settings::Settings for TerminalSettings {
             scroll_multiplier: user_content.scroll_multiplier.unwrap_or(1.0),
             max_scroll_history_lines: user_content.max_scroll_history_lines,
             toolbar: Toolbar {
-                breadcrumbs: user_content.toolbar.as_ref().map_or(true, |tb| tb.breadcrumbs.unwrap_or(true)),
+                breadcrumbs: user_content
+                    .toolbar
+                    .as_ref()
+                    .map_or(true, |tb| tb.breadcrumbs.unwrap_or(true)),
             },
             scrollbar: ScrollbarSettings {
-                show: user_content.scrollbar.as_ref().map_or(None, |sb| sb.show.clone()),
+                show: user_content
+                    .scrollbar
+                    .as_ref()
+                    .map_or(None, |sb| sb.show.clone()),
             },
             minimum_contrast: user_content.minimum_contrast.unwrap_or_default(),
             path_hyperlink_regexes: project_content
@@ -160,5 +174,22 @@ impl From<settings::CursorShapeContent> for CursorShape {
             settings::CursorShapeContent::Bar => CursorShape::Bar,
             settings::CursorShapeContent::Hollow => CursorShape::Hollow,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn embedded_defaults_enable_terminal_path_hyperlinks() {
+        let content: settings::SettingsContent =
+            settings::parse_json_with_comments(settings::default_settings().as_ref())
+                .unwrap_or_else(|error| panic!("parse embedded default settings: {error}"));
+        let terminal = <TerminalSettings as settings::Settings>::from_settings(&content);
+
+        assert!(terminal.open_links_in_mouse_mode);
+        assert!(!terminal.path_hyperlink_regexes.is_empty());
+        assert_eq!(terminal.path_hyperlink_timeout_ms, 1);
     }
 }

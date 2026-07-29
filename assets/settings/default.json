@@ -62,6 +62,62 @@
     "line_endings_button": false
   },
 
+  // === 终端设置 ===
+  "terminal": {
+    "shell": "system",
+    "working_directory": "current_project_directory",
+    "env": {},
+    "detect_venv": {
+      "on": {
+        "directories": [".env", "env", ".venv", "venv"],
+        "activate_script": "default",
+        "conda_manager": "auto"
+      }
+    },
+    "font_weight": 400,
+    "line_height": "standard",
+    "cursor_shape": "block",
+    "blinking": "terminal_controlled",
+    "alternate_scroll": "on",
+    "option_as_meta": false,
+    "copy_on_select": false,
+    "keep_selection_on_copy": true,
+    "open_links_in_mouse_mode": true,
+    "button": true,
+    "dock": "bottom",
+    "flexible": true,
+    "default_width": 640,
+    "default_height": 320,
+    "max_scroll_history_lines": 10000,
+    "scroll_multiplier": 1.0,
+    "toolbar": {
+      "breadcrumbs": false
+    },
+    "scrollbar": {
+      "show": null
+    },
+    "minimum_contrast": 45,
+    "path_hyperlink_regexes": [
+      "File \"(?<path>[^\"]+)\", line (?<line>[0-9]+)",
+      [
+        "(?x)",
+        "(?<path>",
+        "    (",
+        "        [^({\\[<\"'`\\ \\u2500-\\u257F]",
+        "        ([^\\ :(]|[:(][^0-9()\\ ])*",
+        "        [^()}\\]>\"'`.,;:\\ ]",
+        "    |",
+        "        [^(){}\\[\\]<>\"'`.,;:\\ \\u2500-\\u257F]",
+        "    )",
+        "    (:+[0-9]+(:[0-9]+)?|:?\\([0-9]+([,:]?[0-9]+)?\\))?",
+        ")"
+      ]
+    ],
+    "path_hyperlink_timeout_ms": 1,
+    "show_count_badge": false,
+    "bell": "off"
+  },
+
   // === 多路复用器设置 ===
   "mux": {
     "keep_alive": true,
