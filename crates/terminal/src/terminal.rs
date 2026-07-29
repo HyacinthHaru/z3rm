@@ -437,6 +437,10 @@ pub struct StructuredTerminalSnapshot {
     pub cols: usize,
     pub rows: usize,
     pub cells: Vec<StructuredTerminalCell>,
+    /// Flat row-major history cells, oldest row first.
+    pub history: Vec<StructuredTerminalCell>,
+    /// Number of history rows above the active screen selected for display.
+    pub display_offset: usize,
     pub cursor: Option<StructuredTerminalCursor>,
     pub alternate_screen: bool,
     pub modes: Modes,
@@ -1979,6 +1983,24 @@ impl Terminal {
                 expected_cells,
                 snapshot.cols,
                 snapshot.rows
+            );
+        }
+        if snapshot.history.len() % snapshot.cols != 0 {
+            bail!(
+                "structured snapshot history has {} cells, not complete {}-column rows",
+                snapshot.history.len(),
+                snapshot.cols
+            );
+        }
+        let history_rows = snapshot.history.len() / snapshot.cols;
+        if history_rows > MAX_SCROLL_HISTORY_LINES {
+            bail!("structured snapshot history exceeds terminal limits");
+        }
+        if snapshot.display_offset > history_rows {
+            bail!(
+                "structured snapshot display offset {} exceeds {} history rows",
+                snapshot.display_offset,
+                history_rows
             );
         }
 
@@ -3746,6 +3768,8 @@ mod tests {
             cols: 2,
             rows: 1,
             cells: vec![styled.clone(), StructuredTerminalCell::default()],
+            history: Vec::new(),
+            display_offset: 0,
             cursor: Some(StructuredTerminalCursor {
                 point: Point::new(0, 1),
                 shape: CursorShape::Underline,
@@ -3806,6 +3830,8 @@ mod tests {
                 character: 'P',
                 ..Default::default()
             }],
+            history: Vec::new(),
+            display_offset: 0,
             cursor: Some(StructuredTerminalCursor {
                 point: Point::new(0, 0),
                 shape: CursorShape::Bar,
@@ -3831,6 +3857,173 @@ mod tests {
     }
 
     #[gpui::test]
+    async fn structured_snapshot_reconstructs_history_and_display_offset(cx: &mut TestAppContext) {
+        let terminal = cx.new(|cx| {
+            TerminalBuilder::new_display_only(
+                SettingsCursorShape::default(),
+                AlternateScroll::On,
+                Some(10),
+                0,
+                cx.background_executor(),
+                PathStyle::local(),
+            )
+            .subscribe(cx)
+        });
+        let cell = |character| StructuredTerminalCell {
+            character,
+            ..Default::default()
+        };
+        let snapshot = StructuredTerminalSnapshot {
+            cols: 2,
+            rows: 2,
+            cells: vec![cell('C'), cell(' '), cell('D'), cell(' ')],
+            history: vec![cell('A'), cell(' '), cell('B'), cell(' ')],
+            display_offset: 2,
+            cursor: Some(StructuredTerminalCursor {
+                point: Point::new(1, 0),
+                shape: CursorShape::Block,
+                visible: true,
+                blinking: false,
+            }),
+            alternate_screen: false,
+            modes: Modes::SHOW_CURSOR,
+        };
+
+        let applied = terminal.update(cx, |terminal, cx| {
+            terminal.apply_structured_snapshot(&snapshot, cx)
+        });
+        if let Err(error) = applied {
+            panic!("apply structured history snapshot: {error}");
+        }
+        terminal.read_with(cx, |terminal, _cx| {
+            assert_eq!(terminal.total_lines(), 4);
+            let content = terminal.last_content();
+            assert_eq!(content.display_offset, 2);
+            assert_eq!(content.cells[0].character(), 'A');
+            assert_eq!(content.cells[2].character(), 'B');
+            assert_eq!(content.cursor.point, Point::new(1, 0));
+        });
+    }
+
+    #[gpui::test]
+    async fn structured_snapshot_clears_stale_history(cx: &mut TestAppContext) {
+        let terminal = cx.new(|cx| {
+            TerminalBuilder::new_display_only(
+                SettingsCursorShape::default(),
+                AlternateScroll::On,
+                Some(10),
+                0,
+                cx.background_executor(),
+                PathStyle::local(),
+            )
+            .subscribe(cx)
+        });
+        let cell = |character| StructuredTerminalCell {
+            character,
+            ..Default::default()
+        };
+        let with_history = StructuredTerminalSnapshot {
+            cols: 1,
+            rows: 2,
+            cells: vec![cell('C'), cell('D')],
+            history: vec![cell('A'), cell('B')],
+            display_offset: 2,
+            cursor: None,
+            alternate_screen: false,
+            modes: Modes::NONE,
+        };
+        terminal
+            .update(cx, |terminal, cx| {
+                terminal.apply_structured_snapshot(&with_history, cx)
+            })
+            .unwrap_or_else(|error| panic!("apply history snapshot: {error}"));
+        assert_eq!(
+            terminal.read_with(cx, |terminal, _cx| terminal.total_lines()),
+            4
+        );
+
+        let without_history = StructuredTerminalSnapshot {
+            cols: 1,
+            rows: 2,
+            cells: vec![cell('X'), cell('Y')],
+            history: Vec::new(),
+            display_offset: 0,
+            cursor: None,
+            alternate_screen: false,
+            modes: Modes::NONE,
+        };
+        terminal
+            .update(cx, |terminal, cx| {
+                terminal.apply_structured_snapshot(&without_history, cx)
+            })
+            .unwrap_or_else(|error| panic!("apply empty-history snapshot: {error}"));
+
+        terminal.read_with(cx, |terminal, _cx| {
+            assert_eq!(terminal.total_lines(), 2);
+            assert_eq!(terminal.last_content().display_offset, 0);
+            assert_eq!(terminal.last_content().cells[0].character(), 'X');
+            assert_eq!(terminal.last_content().cells[1].character(), 'Y');
+        });
+    }
+
+    #[gpui::test]
+    async fn structured_snapshot_reconstructs_history_larger_than_viewport(
+        cx: &mut TestAppContext,
+    ) {
+        let terminal = cx.new(|cx| {
+            TerminalBuilder::new_display_only(
+                SettingsCursorShape::default(),
+                AlternateScroll::On,
+                Some(100),
+                0,
+                cx.background_executor(),
+                PathStyle::local(),
+            )
+            .subscribe(cx)
+        });
+        let cell = |character| StructuredTerminalCell {
+            character,
+            ..Default::default()
+        };
+        let history = ('A'..='T').map(cell).collect::<Vec<_>>();
+        let snapshot = StructuredTerminalSnapshot {
+            cols: 1,
+            rows: 2,
+            cells: vec![cell('X'), cell('Y')],
+            history,
+            display_offset: 20,
+            cursor: Some(StructuredTerminalCursor {
+                point: Point::new(1, 0),
+                shape: CursorShape::Block,
+                visible: true,
+                blinking: false,
+            }),
+            alternate_screen: false,
+            modes: Modes::SHOW_CURSOR,
+        };
+        terminal
+            .update(cx, |terminal, cx| {
+                terminal.apply_structured_snapshot(&snapshot, cx)
+            })
+            .unwrap_or_else(|error| panic!("apply large history snapshot: {error}"));
+
+        terminal.read_with(cx, |terminal, _cx| {
+            use alacritty_terminal::index::{Column, Line};
+
+            assert_eq!(terminal.total_lines(), 22);
+            assert_eq!(terminal.last_content().display_offset, 20);
+            assert_eq!(terminal.last_content().cells[0].character(), 'A');
+            assert_eq!(terminal.last_content().cells[1].character(), 'B');
+            assert_eq!(terminal.last_content().cursor.point, Point::new(1, 0));
+            let term = terminal.term.lock_unfair();
+            assert_eq!(term.grid()[Line(-20)][Column(0)].c, 'A');
+            assert_eq!(term.grid()[Line(-1)][Column(0)].c, 'T');
+            assert_eq!(term.grid()[Line(0)][Column(0)].c, 'X');
+            assert_eq!(term.grid()[Line(1)][Column(0)].c, 'Y');
+        });
+    }
+
+    #[gpui::test]
     async fn structured_snapshot_rejects_incomplete_grid_without_mutation(cx: &mut TestAppContext) {
         let terminal = cx.new(|cx| {
             TerminalBuilder::new_display_only(
@@ -3850,6 +4043,8 @@ mod tests {
             cells: vec![StructuredTerminalCell::default()],
             cursor: None,
             alternate_screen: false,
+            history: Vec::new(),
+            display_offset: 0,
             modes: Modes::NONE,
         };
         let result = terminal.update(cx, |terminal, cx| {
@@ -3878,6 +4073,8 @@ mod tests {
             cols: 4_097,
             rows: 1,
             cells: vec![StructuredTerminalCell::default(); 4_097],
+            history: Vec::new(),
+            display_offset: 0,
             cursor: None,
             alternate_screen: false,
             modes: Modes::NONE,

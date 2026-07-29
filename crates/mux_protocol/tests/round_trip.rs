@@ -97,6 +97,8 @@ fn test_full_snapshot_serialization() {
         }),
         alternate_screen: false,
         display_offset: 42,
+        history_size: 0,
+        history_version: 0,
         modes: Some(terminal_mode::APP_CURSOR | terminal_mode::BRACKETED_PASTE),
     };
 

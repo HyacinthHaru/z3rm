@@ -19,15 +19,15 @@ use mux_protocol::input::{
     PrefixModeMachine, handle_key_event, is_full_screen_active,
 };
 use mux_protocol::{
-    FullGridSnapshot, GridDiff, fetch_grid_update_response::Update as FetchUpdate,
-    notification::Event as NotifEvent,
+    FetchScrollbackResponse, FullGridSnapshot, GridDiff,
+    fetch_grid_update_response::Update as FetchUpdate, notification::Event as NotifEvent,
 };
 use project::Project;
 use settings::Settings;
 use std::sync::Arc;
 use terminal::{
-    CursorShape as TerminalCursorShape, Hyperlink as TerminalHyperlink, Modes, Rgb,
-    StructuredTerminalCell, StructuredTerminalCursor, StructuredTerminalSnapshot,
+    CursorShape as TerminalCursorShape, Hyperlink as TerminalHyperlink, MAX_SCROLL_HISTORY_LINES,
+    Modes, Rgb, StructuredTerminalCell, StructuredTerminalCursor, StructuredTerminalSnapshot,
     StructuredUnderlineStyle, Terminal, TerminalBounds, TerminalBuilder,
     terminal_settings::TerminalSettings,
 };
@@ -53,6 +53,65 @@ pub enum MuxPaneEvent {
     InputFailed {
         message: SharedString,
     },
+}
+
+const HISTORY_PAGE_ROWS: u32 = 512;
+
+#[derive(Clone, Debug)]
+struct HistoryCache {
+    cols: usize,
+    history_size: usize,
+    history_version: u64,
+    cells: Arc<Vec<StructuredTerminalCell>>,
+}
+
+#[derive(Debug)]
+enum PreparedFetchUpdate {
+    NoChange {
+        expected_generation: u64,
+        generation: u64,
+    },
+    Snapshot {
+        expected_generation: u64,
+        generation: u64,
+        snapshot: FullGridSnapshot,
+        history_cache: HistoryCache,
+        structured: StructuredTerminalSnapshot,
+    },
+}
+
+#[derive(Debug)]
+struct PrepareFetchError {
+    source: anyhow::Error,
+    retry: bool,
+}
+
+impl PrepareFetchError {
+    fn invalid(source: impl Into<anyhow::Error>) -> Self {
+        Self {
+            source: source.into(),
+            retry: false,
+        }
+    }
+
+    fn checkpoint_changed(source: impl Into<anyhow::Error>) -> Self {
+        Self {
+            source: source.into(),
+            retry: true,
+        }
+    }
+}
+
+impl std::fmt::Display for PrepareFetchError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        self.source.fmt(formatter)
+    }
+}
+
+impl std::error::Error for PrepareFetchError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        self.source.source()
+    }
 }
 
 /// §3.3 MuxPaneView — GPUI view for a mux_server pane.
@@ -81,6 +140,8 @@ pub struct MuxPaneView {
     fetch_pending: bool,
     /// §3.3 current grid snapshot (recovery path for reconnect)
     snapshot: FullGridSnapshot,
+    /// Oldest-to-newest authoritative history for `snapshot`.
+    history_cache: HistoryCache,
     /// §15.7 zoom state
     zoomed: bool,
     /// §3.10 last resize dimensions sent to server (cols, rows)
@@ -205,7 +266,15 @@ impl MuxPaneView {
             }),
             alternate_screen: false,
             display_offset: 0,
+            history_size: 0,
+            history_version: 0,
             modes: None,
+        };
+        let history_cache = HistoryCache {
+            cols: 80,
+            history_size: 0,
+            history_version: 0,
+            cells: Arc::new(Vec::new()),
         };
 
         let mut view = Self {
@@ -220,6 +289,7 @@ impl MuxPaneView {
             fetch_in_flight: false,
             fetch_pending: false,
             snapshot,
+            history_cache,
             zoomed: false,
             last_sent_size: (80, 24),
             prefix_machine: PrefixModeMachine::new(PrefixModeConfig::default()),
@@ -351,8 +421,9 @@ impl MuxPaneView {
             });
         }
     }
-
-    /// §3.3 Schedule a fetch_grid_update (recovery path for reconnect §15.12).
+    /// §3.3 Schedule a structured fetch. Full snapshots load every matching
+    /// history page before returning to the GPUI thread, so partial checkpoints
+    /// can never mutate the renderer or advance the local generation.
     fn schedule_fetch(&mut self, cx: &mut Context<Self>) {
         if self.fetch_in_flight {
             self.fetch_pending = true;
@@ -364,15 +435,24 @@ impl MuxPaneView {
         let pane_id = self.pane_id.clone();
         let domain = self.domain.clone();
         let since = self.generation;
+        let snapshot = self.snapshot.clone();
+        let history_cache = self.history_cache.clone();
         let weak = cx.entity().downgrade();
 
         cx.spawn(async move |_, cx| {
-            let result = domain.fetch_grid_update(&pane_id, since).await;
+            let result = prepare_fetch_update(
+                &domain,
+                &pane_id,
+                since,
+                snapshot,
+                history_cache,
+            )
+            .await;
             match weak.update(cx, |view, cx| {
                 view.fetch_in_flight = false;
                 match result {
-                    Ok(resp) => {
-                        if let Err(error) = view.apply_fetch_update(resp, cx) {
+                    Ok(update) => {
+                        if let Err(error) = view.apply_prepared_fetch_update(update, cx) {
                             tracing::error!(pane_id = %pane_id, error = %error, "apply grid update failed");
                             cx.emit(MuxPaneEvent::InputFailed {
                                 message: SharedString::from(format!(
@@ -382,10 +462,12 @@ impl MuxPaneView {
                         }
                     }
                     Err(error) => {
-                        tracing::error!(pane_id = %pane_id, error = %error, "fetch_grid_update failed");
+                        tracing::error!(pane_id = %pane_id, error = %error.source, "prepare grid update failed");
+                        view.fetch_pending |= error.retry;
                         cx.emit(MuxPaneEvent::InputFailed {
                             message: SharedString::from(format!(
-                                "failed to fetch mux pane {pane_id} grid: {error}"
+                                "failed to fetch mux pane {pane_id} grid: {}",
+                                error.source
                             )),
                         });
                     }
@@ -401,48 +483,41 @@ impl MuxPaneView {
         .detach();
     }
 
-    /// §3.3 / §15.12 Apply a fetched update transactionally. The local
-    /// generation advances only after the structured grid was validated and
-    /// imported successfully, so a malformed response remains retryable.
-    fn apply_fetch_update(
+    fn apply_prepared_fetch_update(
         &mut self,
-        resp: mux_protocol::FetchGridUpdateResponse,
+        update: PreparedFetchUpdate,
         cx: &mut Context<Self>,
     ) -> anyhow::Result<()> {
-        validate_generation_envelope(self.generation, &resp)?;
-        let mut candidate = self.snapshot.clone();
-        match resp.update {
-            Some(FetchUpdate::FullSnapshot(full)) => candidate = full,
-            Some(FetchUpdate::Diff(diff)) => apply_diff_to_snapshot(&mut candidate, &diff)?,
-            None => {
-                self.generation = resp.to_generation;
-                cx.notify();
-                return Ok(());
+        match update {
+            PreparedFetchUpdate::NoChange {
+                expected_generation,
+                generation,
+            } => {
+                validate_prepared_generation(self.generation, expected_generation)?;
+                self.generation = generation;
+            }
+            PreparedFetchUpdate::Snapshot {
+                expected_generation,
+                generation,
+                snapshot,
+                history_cache,
+                structured,
+            } => {
+                validate_prepared_generation(self.generation, expected_generation)?;
+                self.terminal
+                    .update(cx, |terminal, cx| {
+                        terminal.apply_structured_snapshot(&structured, cx)
+                    })
+                    .map_err(|error| {
+                        anyhow::anyhow!("structured terminal import failed: {error}")
+                    })?;
+                self.snapshot = snapshot;
+                self.history_cache = history_cache;
+                self.generation = generation;
             }
         }
-
-        self.write_snapshot_to_terminal(&candidate, cx)?;
-        self.snapshot = candidate;
-        self.generation = resp.to_generation;
         cx.notify();
         Ok(())
-    }
-
-    /// Import the server-owned viewport directly into the display-only
-    /// Alacritty grid. `display_offset` is not applied here: the current wire
-    /// snapshot contains only the already-selected server viewport, not enough
-    /// history to reconstruct a local scrollback buffer at that offset.
-    fn write_snapshot_to_terminal(
-        &mut self,
-        snapshot: &FullGridSnapshot,
-        cx: &mut Context<Self>,
-    ) -> anyhow::Result<()> {
-        let structured = structured_terminal_snapshot(snapshot)?;
-        self.terminal
-            .update(cx, |terminal, cx| {
-                terminal.apply_structured_snapshot(&structured, cx)
-            })
-            .map_err(|error| anyhow::anyhow!("structured terminal import failed: {error}"))
     }
 
     /// §3.10 / §16.7 keystroke → priority chain → MuxDomain::send_input.
@@ -709,6 +784,257 @@ pub fn keystroke_to_bytes(keystroke: &Keystroke) -> Vec<u8> {
     bytes
 }
 
+async fn prepare_fetch_update(
+    domain: &MuxDomain,
+    pane_id: &str,
+    expected_generation: u64,
+    mut snapshot: FullGridSnapshot,
+    history_cache: HistoryCache,
+) -> Result<PreparedFetchUpdate, PrepareFetchError> {
+    let response = domain
+        .fetch_grid_update(pane_id, expected_generation)
+        .await
+        .map_err(PrepareFetchError::invalid)?;
+    validate_generation_envelope(expected_generation, &response)
+        .map_err(PrepareFetchError::invalid)?;
+    let generation = response.to_generation;
+
+    match response.update {
+        None => Ok(PreparedFetchUpdate::NoChange {
+            expected_generation,
+            generation,
+        }),
+        Some(FetchUpdate::Diff(diff)) => {
+            apply_diff_to_snapshot(&mut snapshot, &diff).map_err(PrepareFetchError::invalid)?;
+            let history_cache = matching_history_cache(&snapshot, Some(&history_cache))
+                .cloned()
+                .ok_or_else(|| {
+                    PrepareFetchError::invalid(anyhow::anyhow!(
+                        "mux grid diff changed history metadata without a full snapshot"
+                    ))
+                })?;
+            let structured = structured_terminal_snapshot(&snapshot, &history_cache)
+                .map_err(PrepareFetchError::invalid)?;
+            Ok(PreparedFetchUpdate::Snapshot {
+                expected_generation,
+                generation,
+                snapshot,
+                history_cache,
+                structured,
+            })
+        }
+        Some(FetchUpdate::FullSnapshot(full)) => {
+            let history_cache = match matching_history_cache(&full, Some(&history_cache)) {
+                Some(cache) => cache.clone(),
+                None => fetch_history_checkpoint(domain, pane_id, &full).await?,
+            };
+            let structured = structured_terminal_snapshot(&full, &history_cache)
+                .map_err(PrepareFetchError::invalid)?;
+            Ok(PreparedFetchUpdate::Snapshot {
+                expected_generation,
+                generation,
+                snapshot: full,
+                history_cache,
+                structured,
+            })
+        }
+    }
+}
+
+async fn fetch_history_checkpoint(
+    domain: &MuxDomain,
+    pane_id: &str,
+    snapshot: &FullGridSnapshot,
+) -> Result<HistoryCache, PrepareFetchError> {
+    let mut accumulator = HistoryPageAccumulator::new(snapshot)?;
+    let page_rows = history_page_rows(snapshot.cols as usize);
+    while accumulator.next_row < snapshot.history_size {
+        let remaining = snapshot.history_size - accumulator.next_row;
+        let count = remaining.min(page_rows);
+        let page = domain
+            .fetch_scrollback(pane_id, accumulator.next_row, 1, count)
+            .await
+            .map_err(PrepareFetchError::invalid)?;
+        let done = accumulator.push(page)?;
+        if done {
+            break;
+        }
+    }
+    accumulator.finish()
+}
+
+fn matching_history_cache<'a>(
+    snapshot: &FullGridSnapshot,
+    cache: Option<&'a HistoryCache>,
+) -> Option<&'a HistoryCache> {
+    let cols = usize::try_from(snapshot.cols).ok()?;
+    let history_size = usize::try_from(snapshot.history_size).ok()?;
+    cache.filter(|cache| {
+        cache.cols == cols
+            && cache.history_size == history_size
+            && cache.history_version == snapshot.history_version
+            && cache.cells.len() == cols.saturating_mul(history_size)
+    })
+}
+
+fn history_page_rows(cols: usize) -> u32 {
+    let rows = mux_protocol::MAX_GRID_CELLS
+        .checked_div(cols.max(1))
+        .unwrap_or(1)
+        .max(1);
+    u32::try_from(rows.min(HISTORY_PAGE_ROWS as usize)).unwrap_or(1)
+}
+
+struct HistoryPageAccumulator {
+    cols: usize,
+    history_size: usize,
+    history_version: u64,
+    next_row: u32,
+    cells: Vec<StructuredTerminalCell>,
+}
+
+impl HistoryPageAccumulator {
+    fn new(snapshot: &FullGridSnapshot) -> Result<Self, PrepareFetchError> {
+        let cols = usize::try_from(snapshot.cols).map_err(|_| {
+            PrepareFetchError::invalid(anyhow::anyhow!("mux grid columns exceed client limits"))
+        })?;
+        let history_size = usize::try_from(snapshot.history_size).map_err(|_| {
+            PrepareFetchError::invalid(anyhow::anyhow!("mux history size exceeds client limits"))
+        })?;
+        if cols == 0 || cols > mux_protocol::MAX_GRID_COLUMNS {
+            return Err(PrepareFetchError::invalid(anyhow::anyhow!(
+                "mux history has invalid column count {cols}"
+            )));
+        }
+        if history_size > MAX_SCROLL_HISTORY_LINES {
+            return Err(PrepareFetchError::invalid(anyhow::anyhow!(
+                "mux history has {history_size} rows, exceeding client limit {MAX_SCROLL_HISTORY_LINES}"
+            )));
+        }
+        if snapshot.display_offset > snapshot.history_size {
+            return Err(PrepareFetchError::invalid(anyhow::anyhow!(
+                "mux display offset {} exceeds {} history rows",
+                snapshot.display_offset,
+                snapshot.history_size
+            )));
+        }
+        let cell_capacity = cols.checked_mul(history_size).ok_or_else(|| {
+            PrepareFetchError::invalid(anyhow::anyhow!("mux history cell count overflow"))
+        })?;
+        Ok(Self {
+            cols,
+            history_size,
+            history_version: snapshot.history_version,
+            next_row: 0,
+            cells: Vec::with_capacity(cell_capacity),
+        })
+    }
+
+    fn push(&mut self, page: FetchScrollbackResponse) -> Result<bool, PrepareFetchError> {
+        if page.scrollback_version != self.history_version {
+            return Err(PrepareFetchError::checkpoint_changed(anyhow::anyhow!(
+                "mux history changed during pagination: expected version {}, got {}",
+                self.history_version,
+                page.scrollback_version
+            )));
+        }
+        if page.total_lines as usize != self.history_size {
+            return Err(PrepareFetchError::checkpoint_changed(anyhow::anyhow!(
+                "mux history changed during pagination: expected {} rows, got {}",
+                self.history_size,
+                page.total_lines
+            )));
+        }
+        if page.lines.is_empty() && self.next_row as usize != self.history_size {
+            return Err(PrepareFetchError::invalid(anyhow::anyhow!(
+                "mux history page at row {} was empty before completion",
+                self.next_row
+            )));
+        }
+
+        let mut page_cells = Vec::with_capacity(page.lines.len().saturating_mul(self.cols));
+        let mut expected_row = self.next_row;
+        for row in page.lines {
+            if row.row != expected_row {
+                return Err(PrepareFetchError::invalid(anyhow::anyhow!(
+                    "mux history row sequence expected {}, got {}",
+                    expected_row,
+                    row.row
+                )));
+            }
+            if row.cells.len() != self.cols {
+                return Err(PrepareFetchError::invalid(anyhow::anyhow!(
+                    "mux history row {} has {} cells, expected {}",
+                    row.row,
+                    row.cells.len(),
+                    self.cols
+                )));
+            }
+            for (column, cell) in row.cells.iter().enumerate() {
+                page_cells.push(
+                    structured_terminal_cell(
+                        cell,
+                        &format!("history row {}, column {column}", row.row),
+                    )
+                    .map_err(PrepareFetchError::invalid)?,
+                );
+            }
+            expected_row = expected_row.checked_add(1).ok_or_else(|| {
+                PrepareFetchError::invalid(anyhow::anyhow!("mux history row index overflow"))
+            })?;
+            if expected_row as usize > self.history_size {
+                return Err(PrepareFetchError::invalid(anyhow::anyhow!(
+                    "mux history page exceeded declared row count {}",
+                    self.history_size
+                )));
+            }
+        }
+        self.cells.extend(page_cells);
+        self.next_row = expected_row;
+        Ok(self.next_row as usize == self.history_size)
+    }
+
+    fn finish(self) -> Result<HistoryCache, PrepareFetchError> {
+        if self.next_row as usize != self.history_size {
+            return Err(PrepareFetchError::invalid(anyhow::anyhow!(
+                "mux history pagination stopped at row {}, expected {}",
+                self.next_row,
+                self.history_size
+            )));
+        }
+        let expected_cells = self.cols.checked_mul(self.history_size).ok_or_else(|| {
+            PrepareFetchError::invalid(anyhow::anyhow!("mux history cell count overflow"))
+        })?;
+        if self.cells.len() != expected_cells {
+            return Err(PrepareFetchError::invalid(anyhow::anyhow!(
+                "mux history has {} cells, expected {}",
+                self.cells.len(),
+                expected_cells
+            )));
+        }
+        Ok(HistoryCache {
+            cols: self.cols,
+            history_size: self.history_size,
+            history_version: self.history_version,
+            cells: Arc::new(self.cells),
+        })
+    }
+}
+
+fn validate_prepared_generation(
+    current_generation: u64,
+    expected_generation: u64,
+) -> anyhow::Result<()> {
+    if current_generation != expected_generation {
+        anyhow::bail!(
+            "mux grid checkpoint changed locally from {} to {} while fetching",
+            expected_generation,
+            current_generation
+        );
+    }
+    Ok(())
+}
+
 fn validate_generation_envelope(
     current_generation: u64,
     response: &mux_protocol::FetchGridUpdateResponse,
@@ -742,9 +1068,11 @@ fn validate_generation_envelope(
     }
 }
 
-/// Convert the wire snapshot into the terminal crate's transport-neutral DTO.
+/// Convert the active wire snapshot plus its validated history checkpoint into
+/// the terminal crate's transport-neutral DTO.
 fn structured_terminal_snapshot(
     snapshot: &FullGridSnapshot,
+    history_cache: &HistoryCache,
 ) -> anyhow::Result<StructuredTerminalSnapshot> {
     let cols = snapshot.cols as usize;
     let rows = snapshot.rows as usize;
@@ -759,58 +1087,17 @@ fn structured_terminal_snapshot(
             rows
         );
     }
+    if matching_history_cache(snapshot, Some(history_cache)).is_none() {
+        anyhow::bail!("mux history cache does not match full snapshot checkpoint");
+    }
 
     let cells = snapshot
         .cells
         .iter()
         .enumerate()
-        .map(|(index, cell)| {
-            let mut chars = cell.char.chars();
-            let character = chars
-                .next()
-                .ok_or_else(|| anyhow::anyhow!("mux grid cell {index} has no character"))?;
-            if chars.next().is_some() {
-                anyhow::bail!("mux grid cell {index} contains more than one Unicode scalar");
-            }
-            let style = cell.style.as_ref().cloned().unwrap_or_default();
-            let underline = match style.underline_style {
-                2 => StructuredUnderlineStyle::Single,
-                3 => StructuredUnderlineStyle::Double,
-                4 => StructuredUnderlineStyle::Curly,
-                5 => StructuredUnderlineStyle::Dotted,
-                6 => StructuredUnderlineStyle::Dashed,
-                _ if style.underline => StructuredUnderlineStyle::Single,
-                _ => StructuredUnderlineStyle::None,
-            };
-            let hyperlink = cell.hyperlink.as_ref().and_then(|hyperlink| {
-                (!hyperlink.uri.is_empty()).then(|| {
-                    TerminalHyperlink::new(
-                        (!hyperlink.id.is_empty()).then_some(hyperlink.id.as_str()),
-                        hyperlink.uri.clone(),
-                    )
-                })
-            });
-            Ok(StructuredTerminalCell {
-                character,
-                zerowidth: cell.zerowidth.chars().collect(),
-                foreground: rgb_from_u32(cell.foreground),
-                background: rgb_from_u32(cell.background),
-                bold: style.bold,
-                italic: style.italic,
-                underline,
-                underline_color: style.underline_color.map(rgb_from_u32),
-                strikethrough: style.strikethrough,
-                dim: style.dim,
-                reverse: style.reverse,
-                wide_char: style.wide_char,
-                wide_char_spacer: style.wide_char_spacer,
-                leading_wide_char_spacer: style.leading_wide_char_spacer,
-                wrapline: style.wrapline,
-                hidden: style.hidden,
-                hyperlink,
-            })
-        })
+        .map(|(index, cell)| structured_terminal_cell(cell, &format!("grid cell {index}")))
         .collect::<anyhow::Result<Vec<_>>>()?;
+    let history = history_cache.cells.as_ref().clone();
 
     let cursor = snapshot
         .cursor
@@ -856,9 +1143,61 @@ fn structured_terminal_snapshot(
         cols,
         rows,
         cells,
+        history,
+        display_offset: snapshot.display_offset as usize,
         cursor,
         alternate_screen: snapshot.alternate_screen,
         modes,
+    })
+}
+
+fn structured_terminal_cell(
+    cell: &mux_protocol::Cell,
+    location: &str,
+) -> anyhow::Result<StructuredTerminalCell> {
+    let mut chars = cell.char.chars();
+    let character = chars
+        .next()
+        .ok_or_else(|| anyhow::anyhow!("mux {location} has no character"))?;
+    if chars.next().is_some() {
+        anyhow::bail!("mux {location} contains more than one Unicode scalar");
+    }
+    let style = cell.style.as_ref().cloned().unwrap_or_default();
+    let underline = match style.underline_style {
+        2 => StructuredUnderlineStyle::Single,
+        3 => StructuredUnderlineStyle::Double,
+        4 => StructuredUnderlineStyle::Curly,
+        5 => StructuredUnderlineStyle::Dotted,
+        6 => StructuredUnderlineStyle::Dashed,
+        _ if style.underline => StructuredUnderlineStyle::Single,
+        _ => StructuredUnderlineStyle::None,
+    };
+    let hyperlink = cell.hyperlink.as_ref().and_then(|hyperlink| {
+        (!hyperlink.uri.is_empty()).then(|| {
+            TerminalHyperlink::new(
+                (!hyperlink.id.is_empty()).then_some(hyperlink.id.as_str()),
+                hyperlink.uri.clone(),
+            )
+        })
+    });
+    Ok(StructuredTerminalCell {
+        character,
+        zerowidth: cell.zerowidth.chars().collect(),
+        foreground: rgb_from_u32(cell.foreground),
+        background: rgb_from_u32(cell.background),
+        bold: style.bold,
+        italic: style.italic,
+        underline,
+        underline_color: style.underline_color.map(rgb_from_u32),
+        strikethrough: style.strikethrough,
+        dim: style.dim,
+        reverse: style.reverse,
+        wide_char: style.wide_char,
+        wide_char_spacer: style.wide_char_spacer,
+        leading_wide_char_spacer: style.leading_wide_char_spacer,
+        wrapline: style.wrapline,
+        hidden: style.hidden,
+        hyperlink,
     })
 }
 
@@ -1077,8 +1416,8 @@ mod tests {
     use super::*;
     use gpui::TestAppContext;
     use mux_protocol::{
-        Cell, CellStyle, Envelope, FetchGridUpdateResponse, Request, Response, RowChange,
-        envelope::Payload as EnvelopePayload, request::Body as RequestBody,
+        Cell, CellStyle, Envelope, FetchGridUpdateResponse, FetchScrollbackResponse, Request,
+        Response, RowChange, envelope::Payload as EnvelopePayload, request::Body as RequestBody,
         response::Body as ResponseBody,
     };
     use settings::SettingsStore;
@@ -1191,6 +1530,8 @@ mod tests {
                         }),
                         alternate_screen: true,
                         display_offset: 0,
+                        history_size: 0,
+                        history_version: 0,
                         modes: Some(
                             mux_protocol::terminal_mode::ALT_SCREEN
                                 | mux_protocol::terminal_mode::APP_CURSOR
@@ -1298,11 +1639,130 @@ mod tests {
                         }),
                         alternate_screen: false,
                         display_offset: 0,
+                        history_size: 0,
+                        history_version: 0,
                         modes: None,
                     })),
                 })),
             })),
         }
+    }
+
+    #[cfg(unix)]
+    fn history_grid_response(request_id: u64, generation: u64, active: &str) -> Envelope {
+        Envelope {
+            version: Some(mux_protocol::PROTOCOL_VERSION),
+            payload: Some(EnvelopePayload::Response(Response {
+                request_id,
+                body: Some(ResponseBody::GridUpdate(FetchGridUpdateResponse {
+                    from_generation: 0,
+                    to_generation: generation,
+                    update: Some(FetchUpdate::FullSnapshot(FullGridSnapshot {
+                        cols: 1,
+                        rows: 1,
+                        cells: vec![Cell {
+                            char: active.to_string(),
+                            ..Cell::default()
+                        }],
+                        cursor: Some(mux_protocol::CursorState {
+                            col: 0,
+                            row: 0,
+                            style: 1,
+                            visible: true,
+                            blinking: false,
+                        }),
+                        alternate_screen: false,
+                        display_offset: 513,
+                        history_size: 513,
+                        history_version: 42,
+                        modes: Some(mux_protocol::terminal_mode::SHOW_CURSOR),
+                    })),
+                })),
+            })),
+        }
+    }
+
+    #[cfg(unix)]
+    fn serve_paged_history(mut stream: std::os::unix::net::UnixStream) -> Result<(), String> {
+        stream
+            .set_read_timeout(Some(std::time::Duration::from_secs(5)))
+            .map_err(|error| format!("set history server read timeout: {error}"))?;
+
+        let request = read_test_envelope(&mut stream, "initial history grid request")?;
+        let request = match request.payload {
+            Some(EnvelopePayload::Request(request)) => request,
+            payload => return Err(format!("expected initial grid request, got {payload:?}")),
+        };
+        match request.body {
+            Some(RequestBody::FetchGridUpdate(fetch))
+                if fetch.pane_id == "history-pane" && fetch.since_generation == 0 => {}
+            body => return Err(format!("unexpected initial history grid request: {body:?}")),
+        }
+        write_test_envelope(
+            &mut stream,
+            &history_grid_response(request.request_id, 5, "X"),
+            "initial history grid response",
+        )?;
+
+        for (from_line, count) in [(0, 512), (512, 1)] {
+            let request = read_test_envelope(&mut stream, "history page request")?;
+            let request = match request.payload {
+                Some(EnvelopePayload::Request(request)) => request,
+                payload => return Err(format!("expected history page request, got {payload:?}")),
+            };
+            let fetch = match request.body {
+                Some(RequestBody::FetchScrollback(fetch)) => fetch,
+                body => return Err(format!("expected FetchScrollback, got {body:?}")),
+            };
+            if fetch.pane_id != "history-pane"
+                || fetch.from_line != from_line
+                || fetch.direction != 1
+                || fetch.count != count
+            {
+                return Err(format!("unexpected history page request: {fetch:?}"));
+            }
+            let lines = (from_line..from_line + count)
+                .map(|row| {
+                    let character = match row {
+                        0 => "A",
+                        512 => "Z",
+                        _ => "M",
+                    };
+                    history_row(row, &[character])
+                })
+                .collect();
+            write_test_envelope(
+                &mut stream,
+                &Envelope {
+                    version: Some(mux_protocol::PROTOCOL_VERSION),
+                    payload: Some(EnvelopePayload::Response(Response {
+                        request_id: request.request_id,
+                        body: Some(ResponseBody::Scrollback(FetchScrollbackResponse {
+                            lines,
+                            total_lines: 513,
+                            scrollback_version: 42,
+                        })),
+                    })),
+                },
+                "history page response",
+            )?;
+        }
+
+        let request = read_test_envelope(&mut stream, "cached history grid request")?;
+        let request = match request.payload {
+            Some(EnvelopePayload::Request(request)) => request,
+            payload => return Err(format!("expected cached grid request, got {payload:?}")),
+        };
+        match request.body {
+            Some(RequestBody::FetchGridUpdate(fetch))
+                if fetch.pane_id == "history-pane" && fetch.since_generation == 5 => {}
+            body => return Err(format!("unexpected cached history grid request: {body:?}")),
+        }
+        write_test_envelope(
+            &mut stream,
+            &history_grid_response(request.request_id, 6, "Y"),
+            "cached history grid response",
+        )
     }
 
     #[cfg(unix)]
@@ -1382,6 +1842,88 @@ mod tests {
             &grid_response(second_request_id, 7, 8, 1),
             "catch-up grid response",
         )
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn prepare_fetch_pages_history_and_reuses_matching_checkpoint() {
+        let (client, server) = std::os::unix::net::UnixStream::pair()
+            .unwrap_or_else(|error| panic!("create history socket pair: {error}"));
+        client
+            .set_nonblocking(true)
+            .unwrap_or_else(|error| panic!("set history client nonblocking: {error}"));
+        let domain = MuxDomain::connect_with_blocking_stream(client)
+            .map(Arc::new)
+            .unwrap_or_else(|error| panic!("connect history mux domain: {error}"));
+        let server_thread = std::thread::spawn(move || serve_paged_history(server));
+        let initial_snapshot = history_snapshot(1, 0, 0);
+        let initial_cache = HistoryCache {
+            cols: 1,
+            history_size: 0,
+            history_version: 0,
+            cells: Arc::new(Vec::new()),
+        };
+
+        let first = futures::executor::block_on(prepare_fetch_update(
+            &domain,
+            "history-pane",
+            0,
+            initial_snapshot,
+            initial_cache,
+        ))
+        .unwrap_or_else(|error| panic!("prepare paged history update: {error}"));
+        let (snapshot, history_cache) = match first {
+            PreparedFetchUpdate::Snapshot {
+                expected_generation,
+                generation,
+                snapshot,
+                history_cache,
+                structured,
+            } => {
+                assert_eq!(expected_generation, 0);
+                assert_eq!(generation, 5);
+                assert_eq!(structured.history.len(), 513);
+                assert_eq!(structured.display_offset, 513);
+                assert_eq!(structured.history[0].character, 'A');
+                assert_eq!(structured.history[512].character, 'Z');
+                assert_eq!(structured.cells[0].character, 'X');
+                (snapshot, history_cache)
+            }
+            update => panic!("expected prepared snapshot, got {update:?}"),
+        };
+
+        let second = futures::executor::block_on(prepare_fetch_update(
+            &domain,
+            "history-pane",
+            5,
+            snapshot,
+            history_cache,
+        ))
+        .unwrap_or_else(|error| panic!("prepare cached history update: {error}"));
+        match second {
+            PreparedFetchUpdate::Snapshot {
+                expected_generation,
+                generation,
+                history_cache,
+                structured,
+                ..
+            } => {
+                assert_eq!(expected_generation, 5);
+                assert_eq!(generation, 6);
+                assert_eq!(history_cache.history_version, 42);
+                assert_eq!(structured.history.len(), 513);
+                assert_eq!(structured.history[0].character, 'A');
+                assert_eq!(structured.history[512].character, 'Z');
+                assert_eq!(structured.cells[0].character, 'Y');
+            }
+            update => panic!("expected cached prepared snapshot, got {update:?}"),
+        }
+
+        match server_thread.join() {
+            Ok(Ok(())) => {}
+            Ok(Err(error)) => panic!("paged history server failed: {error}"),
+            Err(_) => panic!("paged history server panicked"),
+        }
     }
 
     #[cfg(unix)]
@@ -1615,6 +2157,132 @@ mod tests {
         assert_eq!(keystroke_to_bytes(&keystroke), vec![0x1B, b'a']);
     }
 
+    fn history_snapshot(cols: u32, rows: u32, version: u64) -> FullGridSnapshot {
+        FullGridSnapshot {
+            cols,
+            rows: 1,
+            cells: vec![Cell::default(); cols as usize],
+            cursor: None,
+            alternate_screen: false,
+            display_offset: rows,
+            history_size: rows,
+            history_version: version,
+            modes: None,
+        }
+    }
+
+    fn history_row(row: u32, chars: &[&str]) -> RowChange {
+        RowChange {
+            row,
+            cells: chars
+                .iter()
+                .map(|character| Cell {
+                    char: (*character).to_string(),
+                    ..Cell::default()
+                })
+                .collect(),
+        }
+    }
+
+    #[test]
+    fn paged_history_validates_and_preserves_oldest_first_order() {
+        let snapshot = history_snapshot(2, 3, 9);
+        let mut accumulator = HistoryPageAccumulator::new(&snapshot)
+            .unwrap_or_else(|error| panic!("create history accumulator: {error}"));
+        let first_done = accumulator
+            .push(FetchScrollbackResponse {
+                lines: vec![history_row(0, &["A", "a"]), history_row(1, &["B", "b"])],
+                total_lines: 3,
+                scrollback_version: 9,
+            })
+            .unwrap_or_else(|error| panic!("append first history page: {error}"));
+        assert!(!first_done);
+        let second_done = accumulator
+            .push(FetchScrollbackResponse {
+                lines: vec![history_row(2, &["C", "c"])],
+                total_lines: 3,
+                scrollback_version: 9,
+            })
+            .unwrap_or_else(|error| panic!("append second history page: {error}"));
+        assert!(second_done);
+        let cache = accumulator
+            .finish()
+            .unwrap_or_else(|error| panic!("finish history pages: {error}"));
+        assert_eq!(cache.history_size, 3);
+        assert_eq!(
+            cache
+                .cells
+                .iter()
+                .map(|cell| cell.character)
+                .collect::<Vec<_>>(),
+            vec!['A', 'a', 'B', 'b', 'C', 'c']
+        );
+    }
+
+    #[test]
+    fn paged_history_rejects_mixed_or_malformed_checkpoints() {
+        let snapshot = history_snapshot(2, 2, 7);
+        let invalid_pages = [
+            FetchScrollbackResponse {
+                lines: vec![history_row(0, &["A", "a"])],
+                total_lines: 2,
+                scrollback_version: 8,
+            },
+            FetchScrollbackResponse {
+                lines: vec![history_row(1, &["A", "a"])],
+                total_lines: 2,
+                scrollback_version: 7,
+            },
+            FetchScrollbackResponse {
+                lines: vec![history_row(0, &["A"])],
+                total_lines: 2,
+                scrollback_version: 7,
+            },
+        ];
+        for page in invalid_pages {
+            let mut accumulator = HistoryPageAccumulator::new(&snapshot)
+                .unwrap_or_else(|error| panic!("create history accumulator: {error}"));
+            assert!(accumulator.push(page).is_err());
+            assert_eq!(accumulator.next_row, 0);
+        }
+    }
+
+    #[test]
+    fn matching_history_cache_is_reused_only_for_exact_checkpoint() {
+        let snapshot = history_snapshot(2, 2, 7);
+        let cache = HistoryCache {
+            cols: 2,
+            history_size: 2,
+            history_version: 7,
+            cells: Arc::new(vec![StructuredTerminalCell::default(); 4]),
+        };
+        assert!(matching_history_cache(&snapshot, Some(&cache)).is_some());
+
+        let mut changed = snapshot.clone();
+        changed.history_version = 8;
+        assert!(matching_history_cache(&changed, Some(&cache)).is_none());
+        changed = snapshot.clone();
+        changed.history_size = 1;
+        assert!(matching_history_cache(&changed, Some(&cache)).is_none());
+        changed = snapshot;
+        changed.cols = 3;
+        assert!(matching_history_cache(&changed, Some(&cache)).is_none());
+    }
+
+    #[test]
+    fn prepared_update_generation_gate_rejects_before_commit() {
+        assert!(validate_prepared_generation(7, 7).is_ok());
+        assert!(validate_prepared_generation(7, 6).is_err());
+        assert!(validate_prepared_generation(7, 8).is_err());
+    }
+
+    #[test]
+    fn history_pages_respect_shared_grid_cell_limit() {
+        assert_eq!(history_page_rows(1), HISTORY_PAGE_ROWS);
+        assert_eq!(history_page_rows(4_096), 256);
+        assert!(history_page_rows(4_096) as usize * 4_096 <= mux_protocol::MAX_GRID_CELLS);
+    }
+
     #[test]
     fn diff_generation_must_continue_from_client_checkpoint() {
         let valid = FetchGridUpdateResponse {
@@ -1659,6 +2327,8 @@ mod tests {
                 cursor: None,
                 alternate_screen: false,
                 display_offset: 0,
+                history_size: 0,
+                history_version: 0,
                 modes: None,
             })),
         };
@@ -1674,6 +2344,8 @@ mod tests {
             cursor: None,
             alternate_screen: false,
             display_offset: 0,
+            history_size: 0,
+            history_version: 0,
             modes: None,
         };
         let diff = GridDiff {
@@ -1756,6 +2428,8 @@ mod tests {
             cursor: None,
             alternate_screen: false,
             display_offset: 0,
+            history_size: 0,
+            history_version: 0,
             modes: None,
         };
         assert_eq!(snapshot_to_text(&snapshot), "abc\nde ");

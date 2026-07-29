@@ -239,130 +239,6 @@ fn test_multi_row_diff_application() {
 }
 
 // ============================================================
-// §16.9 Scrollback Buffer 测试
-// ============================================================
-
-/// §16.9 ScrollbackBuffer 创建与推入
-#[test]
-fn test_scrollback_buffer_push() {
-    let mut buf = ScrollbackBuffer::new(100);
-
-    for i in 0..50u32 {
-        buf.push_row(RowChange {
-            row: i,
-            cells: vec![Cell {
-                character: "X".into(),
-                ..Default::default()
-            }],
-        });
-    }
-
-    assert_eq!(buf.total_lines(), 50);
-    assert!(!buf.is_full());
-}
-
-/// §16.9 ScrollbackBuffer 容量溢出
-#[test]
-fn test_scrollback_buffer_capacity() {
-    let mut buf = ScrollbackBuffer::new(5);
-
-    for i in 0..10u32 {
-        buf.push_row(RowChange {
-            row: i,
-            cells: vec![Cell::default()],
-        });
-    }
-
-    assert_eq!(buf.total_lines(), 5);
-    assert!(buf.is_full());
-}
-
-#[test]
-fn scrollback_fetch_lines_rejects_out_of_range_and_zero_count() {
-    let mut buf = ScrollbackBuffer::new(10);
-    for row in 0..3u32 {
-        buf.push_row(RowChange {
-            row,
-            cells: vec![Cell::default()],
-        });
-    }
-
-    assert!(buf.fetch_lines(3, 1, 0).is_empty());
-    assert!(buf.fetch_lines(u32::MAX, 1, 0).is_empty());
-    assert!(buf.fetch_lines(1, 0, 0).is_empty());
-    assert!(buf.fetch_lines(1, 0, 1).is_empty());
-}
-
-#[test]
-fn scrollback_fetch_lines_handles_extreme_counts_without_panic() {
-    let mut buf = ScrollbackBuffer::new(10);
-    for row in 0..3u32 {
-        buf.push_row(RowChange {
-            row,
-            cells: vec![Cell::default()],
-        });
-    }
-
-    let upward = buf.fetch_lines(2, u32::MAX, 0);
-    assert_eq!(upward.len(), 3);
-    assert_eq!(upward[0].row, 0);
-    assert_eq!(upward[2].row, 2);
-
-    let downward = buf.fetch_lines(0, u32::MAX, 1);
-    assert_eq!(downward.len(), 3);
-    assert_eq!(downward[0].row, 0);
-    assert_eq!(downward[2].row, 2);
-}
-
-/// §16.9 ScrollbackVersion bump
-#[test]
-fn test_scrollback_version_bump() {
-    let mut ver = ScrollbackVersion::default();
-    assert_eq!(ver.counter, 0);
-
-    ver.bump();
-    assert_eq!(ver.counter, 1);
-
-    ver.bump();
-    assert_eq!(ver.counter, 2);
-}
-
-/// §16.9 ScrollbackVersion encode/decode
-#[test]
-fn test_scrollback_version_round_trip() {
-    let mut ver = ScrollbackVersion::new();
-    ver.bump();
-
-    let encoded = ver.encode();
-    let decoded = ScrollbackVersion::decode(encoded);
-    assert_eq!(decoded.counter, ver.counter);
-    assert_eq!(decoded.timestamp, ver.timestamp);
-}
-
-/// §16.9 ScrollbackVersion 匹配检查 (counter 相同即匹配)
-#[test]
-fn test_scrollback_version_counter_match() {
-    let v1 = ScrollbackVersion {
-        counter: 1,
-        timestamp: 1000,
-    };
-    let v2 = ScrollbackVersion {
-        counter: 1,
-        timestamp: 2000,
-    };
-    let v3 = ScrollbackVersion {
-        counter: 2,
-        timestamp: 1000,
-    };
-
-    // 相同 counter → 匹配
-    assert!(v1.counter == v2.counter, "相同 counter 应匹配");
-
-    // 不同 counter → 不匹配
-    assert!(v1.counter != v3.counter, "不同 counter 不应匹配");
-}
-
-// ============================================================
 // §15.12 FullGridSnapshot.display_offset 服务端捕获
 // ============================================================
 
@@ -415,6 +291,52 @@ fn test_snapshot_from_term_captures_display_offset() {
     assert!(
         snapshot.display_offset > 0,
         "捕获的 display_offset 必须是非零滚动位置"
+    );
+}
+
+#[test]
+fn snapshot_and_scrollback_share_one_authoritative_grid() {
+    use alacritty_terminal::event::VoidListener;
+    use alacritty_terminal::grid::{Dimensions as _, Scroll as AlacScroll};
+    use alacritty_terminal::term::test::TermSize;
+    use alacritty_terminal::term::{Config as TermConfig, Term};
+    use alacritty_terminal::vte::ansi::Processor;
+
+    let size = TermSize::new(8, 3);
+    let config = TermConfig {
+        scrolling_history: 10,
+        ..TermConfig::default()
+    };
+    let mut term: Term<VoidListener> = Term::new(config, &size, VoidListener);
+    let mut processor = Processor::<alacritty_terminal::vte::ansi::StdSyncHandler>::new();
+    processor.advance(&mut term, b"oldest\r\nmiddle\r\nnewest\r\nbottom");
+    assert_eq!(term.history_size(), 1);
+
+    term.scroll_display(AlacScroll::Top);
+    let snapshot = snapshot_from_term(&term);
+    assert_eq!(snapshot.history_size, 1);
+    assert_eq!(snapshot.display_offset, 1);
+    assert_eq!(
+        snapshot.cells[..8]
+            .iter()
+            .map(|cell| cell.character.as_str())
+            .collect::<String>()
+            .trim_end(),
+        "middle"
+    );
+
+    let (history, total) = fetch_scrollback_from_term(&term, 0, 1, 10);
+    assert_eq!(total, 1);
+    assert_eq!(history.len(), 1);
+    assert_eq!(history[0].row, 0);
+    assert_eq!(
+        history[0]
+            .cells
+            .iter()
+            .map(|cell| cell.character.as_str())
+            .collect::<String>()
+            .trim_end(),
+        "oldest"
     );
 }
 

@@ -1,7 +1,7 @@
 // §3.10 mux_server 单元测试 — 验证 grid diff ring、layout tree、
 // generation counter、session 生命周期等核心功能。
 
-use crate::grid_sync::{GridDiff, GridDiffRing, RowChange};
+use crate::grid_sync::{GridDiff, GridDiffRing};
 use crate::layout::{LayoutNode, LayoutTree, SplitDirection};
 use std::io::Write;
 
@@ -247,181 +247,74 @@ fn test_pane_title() {
     assert_eq!(pane.get_title(), "my-title");
 }
 
-/// §16.9 Scrollback buffer: push + fetch
-#[test]
-fn test_scrollback_push_and_fetch() {
-    let mut buf = crate::grid_sync::ScrollbackBuffer::new(100);
-
-    for i in 0..5 {
-        buf.push_row(RowChange {
-            row: i,
-            cells: vec![crate::grid_sync::Cell {
-                character: format!("Line {}", i),
-                ..Default::default()
-            }],
-        });
-    }
-
-    assert_eq!(buf.total_lines(), 5);
-
-    // §16.9 向下获取 (direction = 1)
-    let lines = buf.fetch_lines(0, 3, 1);
-    assert_eq!(lines.len(), 3);
-    assert_eq!(lines[0].row, 0);
-    assert_eq!(lines[2].row, 2);
-
-    // §16.9 向上获取 (direction = 0)
-    let lines = buf.fetch_lines(4, 3, 0);
-    assert_eq!(lines.len(), 3);
-    assert_eq!(lines[0].row, 2);
-    assert_eq!(lines[2].row, 4);
-}
-
-/// §16.9 Scrollback buffer: capacity overflow
-#[test]
-fn test_scrollback_capacity_overflow() {
-    let mut buf = crate::grid_sync::ScrollbackBuffer::new(3);
-
-    for i in 0..5 {
-        buf.push_row(RowChange {
-            row: i,
-            cells: vec![crate::grid_sync::Cell {
-                character: format!("Line {}", i),
-                ..Default::default()
-            }],
-        });
-    }
-
-    assert_eq!(buf.total_lines(), 3);
-    assert!(buf.is_full());
-    // 最早的行被移除, 剩下行 2, 3, 4
-    assert_eq!(buf.rows[0].row, 2);
-    assert_eq!(buf.rows[2].row, 4);
-}
-
-/// §16.9 Scrollback version: encode/decode roundtrip
-#[test]
-fn test_scrollback_version_roundtrip() {
-    let mut version = crate::grid_sync::ScrollbackVersion::new();
-    let encoded = version.encode();
-    let decoded = crate::grid_sync::ScrollbackVersion::decode(encoded);
-    assert_eq!(decoded.counter, version.counter);
-    assert_eq!(decoded.timestamp, version.timestamp);
-
-    version.bump();
-    assert_eq!(version.counter, 2);
-}
-
-/// §16.9 Scrollback search: regex match
-#[test]
-fn test_scrollback_search() {
-    let mut buf = crate::grid_sync::ScrollbackBuffer::new(100);
-
-    for i in 0..10 {
-        buf.push_row(RowChange {
-            row: i,
-            cells: vec![crate::grid_sync::Cell {
-                character: format!("Line {} test", i),
-                ..Default::default()
-            }],
-        });
-    }
-
-    // §16.9 搜索包含 "test" 的行
-    let matches = buf.search("test", 9, 0, 100);
-    assert_eq!(matches.len(), 10); // 所有行都包含 "test"
-
-    // §16.9 搜索特定模式
-    let matches = buf.search("Line 5", 9, 0, 100);
-    assert_eq!(matches.len(), 1);
-    assert_eq!(matches[0].0, 5);
-
-    // §16.9 向下搜索
-    let matches = buf.search("Line 3", 0, 1, 100);
-    assert_eq!(matches.len(), 1);
-    assert_eq!(matches[0].0, 3);
-
-    // §16.9 无效正则
-    let matches = buf.search("[invalid", 0, 1, 100);
-    assert!(matches.is_empty());
-}
-
-/// §16.9 Pane: scrollback integration
+/// §16.9 Pane: authoritative Alacritty scrollback integration.
 #[test]
 fn test_pane_scrollback() {
-    let pane = crate::pane::Pane::spawn(
+    let pane = crate::pane::Pane::spawn_with_session(
         "pane-1".to_string(),
+        String::new(),
         std::env::temp_dir().to_string_lossy().to_string(),
-        80,
-        24,
+        8,
+        2,
         None,
+        10,
     )
     .expect("spawn pane");
 
-    // §16.9 初始版本
     let initial_version = pane.get_scrollback_version();
     assert_ne!(initial_version, 0);
-
-    // §16.9 获取空回滚
     let (lines, total, version) = pane.fetch_scrollback(0, 1, 10);
     assert!(lines.is_empty());
     assert_eq!(total, 0);
     assert_eq!(version, initial_version);
 
-    // §16.9 推入行
-    pane.push_scrollback_row(RowChange {
-        row: 0,
-        cells: vec![crate::grid_sync::Cell {
-            character: "Hello".to_string(),
-            ..Default::default()
-        }],
-    });
+    let mut processor = alacritty_terminal::vte::ansi::Processor::<
+        alacritty_terminal::vte::ansi::StdSyncHandler,
+    >::new();
+    processor.advance(&mut *pane.term.lock(), b"Hello\r\nWorld\r\n");
 
     let (lines, total, _) = pane.fetch_scrollback(0, 1, 10);
     assert_eq!(total, 1);
     assert_eq!(lines.len(), 1);
-    assert_eq!(lines[0].cells[0].character, "Hello");
+    assert_eq!(lines[0].cells[0].character, "H");
+    assert_eq!(lines[0].cells[4].character, "o");
 }
-// §16.9 Pane: capacity honored from spawn_with_session parameter
-//
-// The connection layer threads `ServerSettings::scrollback_lines()` (env +
-// server.json, hot-reloaded) into spawn_with_session. The pane's buffer
-// capacity MUST equal that threaded value, not the env-only
-// `default_scrollback_lines()` snapshot. We exercise two non-default
-// capacities here — well above and below the 10k DEFAULT — to make sure
-// neither the env path nor the default path leaked into spawn_with_session.
+// §16.9 Pane: capacity honored by the authoritative Alacritty grid.
 #[test]
 fn test_pane_scrollback_capacity_uses_threaded_value() {
     let cwd = std::env::temp_dir().to_string_lossy().to_string();
-
     let small = crate::pane::Pane::spawn_with_session(
         "pane-small".to_string(),
         "sess-small".to_string(),
         cwd.clone(),
-        80,
-        24,
+        8,
+        2,
         None,
         42,
     )
     .expect("spawn pane with small scrollback");
-    assert_eq!(
-        small.scrollback_buffer.read().capacity(),
-        42,
-        "spawn_with_session must use the threaded scrollback value (got {})",
-        small.scrollback_buffer.read().capacity()
-    );
+    let mut processor = alacritty_terminal::vte::ansi::Processor::<
+        alacritty_terminal::vte::ansi::StdSyncHandler,
+    >::new();
+    let small_output = (0..50).map(|_| "x\r\n").collect::<String>();
+    processor.advance(&mut *small.term.lock(), small_output.as_bytes());
+    let (_, small_total, _) = small.fetch_scrollback(0, 1, 100);
+    assert_eq!(small_total, 42);
 
     let large = crate::pane::Pane::spawn_with_session(
         "pane-large".to_string(),
         "sess-large".to_string(),
         cwd,
-        80,
-        24,
+        8,
+        2,
         None,
         87_654,
     )
     .expect("spawn pane with large scrollback");
-    assert_eq!(large.scrollback_buffer.read().capacity(), 87_654);
+    let large_output = (0..10_002).map(|_| "y\r\n").collect::<String>();
+    processor.advance(&mut *large.term.lock(), large_output.as_bytes());
+    let (_, large_total, _) = large.fetch_scrollback(0, 1, 1);
+    assert_eq!(large_total, 10_001);
 }
 
 /// §16.9 Session: sync scrollback

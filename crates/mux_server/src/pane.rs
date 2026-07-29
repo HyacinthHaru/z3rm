@@ -7,14 +7,16 @@
 use crate::coalescing::AdaptiveCoalescer;
 use crate::dec2026::Dec2026Parser;
 use crate::grid_sync::{
-    self, FullGridSnapshot, GridDiff, GridDiffRing, ScrollbackBuffer, ScrollbackVersion,
-    diff_from_dirty, modes_from_alacritty, snapshot_from_term,
+    self, FullGridSnapshot, GridDiff, GridDiffRing, diff_from_dirty, modes_from_alacritty,
+    snapshot_from_term,
 };
 use alacritty_terminal::event::{Event as AlacEvent, EventListener};
 use alacritty_terminal::grid::Dimensions as _;
 use alacritty_terminal::term::test::TermSize;
 use alacritty_terminal::term::{Config as TermConfig, Term, TermDamage, TermMode};
-use alacritty_terminal::vte::ansi::Processor;
+use alacritty_terminal::vte::ansi::{
+    ClearMode, Handler, NamedPrivateMode, PrivateMode, Processor, Rgb, StdSyncHandler,
+};
 use anyhow::Context as _;
 use mux_protocol::Notification as MuxNotification;
 use parking_lot::Mutex;
@@ -49,8 +51,8 @@ pub struct Pane {
     pub zoomed: AtomicBool,
     /// §3.3 OSC 133 prompt marker 计数器。
     pub prompt_marker: AtomicU64,
-    pub scrollback_buffer: Arc<parking_lot::RwLock<ScrollbackBuffer>>,
-    pub scrollback_version: Arc<parking_lot::RwLock<ScrollbackVersion>>,
+    scrollback_capacity: AtomicU64,
+    history_version: AtomicU64,
     /// §3.1 PTY master (用于 resize / reader clone)。
     pty_master: Arc<Mutex<Box<dyn MasterPty + Send>>>,
     /// §3.1 PTY writer (单一 writer)。
@@ -107,10 +109,97 @@ pub(crate) struct PaneMetadataSnapshot {
     pub zoomed: bool,
 }
 
+#[derive(Default)]
+struct HistoryMutationObserver {
+    may_change: bool,
+}
+
+impl HistoryMutationObserver {
+    fn reset(&mut self) {
+        self.may_change = false;
+    }
+
+    fn mark(&mut self) {
+        self.may_change = true;
+    }
+}
+
+impl Handler for HistoryMutationObserver {
+    fn input(&mut self, _: char) {
+        self.mark();
+    }
+
+    fn linefeed(&mut self) {
+        self.mark();
+    }
+
+    fn newline(&mut self) {
+        self.mark();
+    }
+
+    fn scroll_up(&mut self, _: usize) {
+        self.mark();
+    }
+
+    fn scroll_down(&mut self, _: usize) {
+        self.mark();
+    }
+
+    fn insert_blank_lines(&mut self, _: usize) {
+        self.mark();
+    }
+
+    fn delete_lines(&mut self, _: usize) {
+        self.mark();
+    }
+
+    fn clear_screen(&mut self, _: ClearMode) {
+        self.mark();
+    }
+
+    fn reset_state(&mut self) {
+        self.mark();
+    }
+
+    fn reverse_index(&mut self) {
+        self.mark();
+    }
+
+    fn set_color(&mut self, _: usize, _: Rgb) {
+        self.mark();
+    }
+
+    fn reset_color(&mut self, _: usize) {
+        self.mark();
+    }
+
+    fn decaln(&mut self) {
+        self.mark();
+    }
+
+    fn set_private_mode(&mut self, mode: PrivateMode) {
+        if matches!(
+            mode,
+            PrivateMode::Named(
+                NamedPrivateMode::ColumnMode | NamedPrivateMode::SwapScreenAndSetRestoreCursor
+            )
+        ) {
+            self.mark();
+        }
+    }
+
+    fn unset_private_mode(&mut self, mode: PrivateMode) {
+        self.set_private_mode(mode);
+    }
+}
+
 /// §3.3 PTY read-loop 本地状态: DEC-2026 同步延迟 + coalescing 通知节流。
 /// 仅在单一 PTY read 线程内顺序访问, 无需同步原语。
-#[derive(Default)]
 struct ReadLoopState {
+    /// Persistent parsers preserve escape sequences split across PTY reads.
+    terminal_processor: Processor<StdSyncHandler>,
+    history_processor: Processor<StdSyncHandler>,
+    history_observer: HistoryMutationObserver,
     /// 上次 PaneDirty 广播时间 (coalescing 节流基准)
     last_notify: Option<Instant>,
     /// BSU..ESU 同步窗口内累积了尚未发布的变更
@@ -121,6 +210,29 @@ struct ReadLoopState {
     pending_full_snapshot: bool,
     /// 有被 coalescing 推迟、待窗口到期补发的 PaneDirty
     pending_notify: bool,
+}
+
+impl Default for ReadLoopState {
+    fn default() -> Self {
+        Self {
+            terminal_processor: Processor::new(),
+            history_processor: Processor::new(),
+            history_observer: HistoryMutationObserver::default(),
+            last_notify: None,
+            pending_sync: false,
+            pending_dirty_rows: Vec::new(),
+            pending_full_snapshot: false,
+            pending_notify: false,
+        }
+    }
+}
+
+fn initial_history_version() -> u64 {
+    use std::hash::{DefaultHasher, Hash, Hasher};
+
+    let mut hasher = DefaultHasher::new();
+    nanoid::nanoid!().hash(&mut hasher);
+    hasher.finish().max(1)
 }
 
 impl Pane {
@@ -167,6 +279,7 @@ impl Pane {
         command: Option<ShellCommand>,
         scrollback_lines: usize,
     ) -> anyhow::Result<Arc<Self>> {
+        let scrollback_lines = scrollback_lines.min(100_000);
         let cols_usize = usize::try_from(cols).context("pane column count exceeds host limit")?;
         let rows_usize = usize::try_from(rows).context("pane row count exceeds host limit")?;
         mux_protocol::checked_grid_cell_count(cols_usize, rows_usize)
@@ -176,7 +289,10 @@ impl Pane {
             events: events.clone(),
         };
 
-        let term_config = TermConfig::default();
+        let term_config = TermConfig {
+            scrolling_history: scrollback_lines,
+            ..TermConfig::default()
+        };
         let size = TermSize::new(cols_usize, rows_usize);
         let term = Term::new(term_config, &size, listener);
 
@@ -253,10 +369,10 @@ impl Pane {
             bracketed_paste_mode: AtomicBool::new(false),
             zoomed: AtomicBool::new(false),
             prompt_marker: AtomicU64::new(0),
-            scrollback_buffer: Arc::new(parking_lot::RwLock::new(ScrollbackBuffer::new(
-                scrollback_lines,
-            ))),
-            scrollback_version: Arc::new(parking_lot::RwLock::new(ScrollbackVersion::new())),
+            scrollback_capacity: AtomicU64::new(scrollback_lines as u64),
+            // A random non-zero authority epoch prevents a client from reusing
+            // cached history after the daemon reconstructs this pane.
+            history_version: AtomicU64::new(initial_history_version()),
             pty_master: Arc::new(Mutex::new(pair.master)),
             pty_writer: Arc::new(Mutex::new(writer)),
             child: Arc::new(Mutex::new(Some(child))),
@@ -297,7 +413,7 @@ impl Pane {
                 let mut buf = [0u8; 8192];
                 let mut dec = Dec2026Parser::new();
                 let mut coalescer = AdaptiveCoalescer::new();
-                let mut rl_state = ReadLoopState::default();
+                let mut state = ReadLoopState::default();
                 loop {
                     let Some(pane) = pane_weak.upgrade() else {
                         return;
@@ -313,9 +429,9 @@ impl Pane {
 
                     if !readable {
                         if dec.check_timeout() {
-                            pane.force_flush_after_bsu_timeout(&mut coalescer, &mut rl_state);
+                            pane.force_flush_after_bsu_timeout(&mut coalescer, &mut state);
                         } else {
-                            pane.flush_pending_notify(&mut rl_state, coalescer.delay());
+                            pane.flush_pending_notify(&mut state, coalescer.delay());
                         }
                         continue;
                     }
@@ -331,16 +447,13 @@ impl Pane {
                                 &buf[..count],
                                 &mut dec,
                                 &mut coalescer,
-                                &mut rl_state,
+                                &mut state,
                             );
-                            if dec.check_timeout() {
-                                pane.force_flush_after_bsu_timeout(&mut coalescer, &mut rl_state);
-                            }
                         }
                         Err(error) if error.kind() == std::io::ErrorKind::Interrupted => {}
                         Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
                             if dec.check_timeout() {
-                                pane.force_flush_after_bsu_timeout(&mut coalescer, &mut rl_state);
+                                pane.force_flush_after_bsu_timeout(&mut coalescer, &mut state);
                             }
                         }
                         Err(error) => {
@@ -373,9 +486,14 @@ impl Pane {
         self.flush_pending_notify(state, delay);
 
         let commit = self.commit.lock();
-        // Compare every non-cell render field represented by FullGridSnapshot
-        // but absent from GridDiff.
-        let render_state_changed = {
+        let history_may_change = {
+            state.history_observer.reset();
+            state
+                .history_processor
+                .advance(&mut state.history_observer, bytes);
+            state.history_observer.may_change
+        };
+        let (render_state_changed, history_size_before, history_size_after) = {
             let mut term = self.term.lock();
             let before = (
                 term.grid().cursor.point,
@@ -383,24 +501,36 @@ impl Pane {
                 term.grid().display_offset(),
                 modes_from_alacritty(*term.mode()),
             );
-            let mut processor = Processor::<alacritty_terminal::vte::ansi::StdSyncHandler>::new();
-            processor.advance(&mut *term, bytes);
+            let history_size_before = term.grid().history_size();
+            state.terminal_processor.advance(&mut *term, bytes);
             let after = (
                 term.grid().cursor.point,
                 term.cursor_style(),
                 term.grid().display_offset(),
                 modes_from_alacritty(*term.mode()),
             );
-            before != after
+            (
+                before != after,
+                history_size_before,
+                term.grid().history_size(),
+            )
         };
+        let (dirty_rows, fully_damaged) = self.collect_dirty_rows();
+        // Full-capacity scrolls keep history_size unchanged. VTE observer state
+        // identifies batches capable of changing history/layout/palette, while
+        // Alacritty full damage confirms the change escaped a local row diff.
+        let history_changed = history_size_before != history_size_after
+            || (history_size_after != 0 && history_may_change && fully_damaged);
+        if history_changed {
+            self.history_version.fetch_add(1, Ordering::AcqRel);
+        }
 
-        let dirty_rows = self.collect_dirty_rows();
-        let grid_changed = !dirty_rows.is_empty() || render_state_changed;
+        let grid_changed = !dirty_rows.is_empty() || render_state_changed || history_changed;
         let should_broadcast_dirty = if in_sync && !transitions.ended() {
             if grid_changed {
                 state.pending_sync = true;
                 state.pending_dirty_rows.extend(dirty_rows);
-                state.pending_full_snapshot |= render_state_changed;
+                state.pending_full_snapshot |= render_state_changed || history_changed;
             }
             false
         } else if grid_changed || state.pending_sync {
@@ -408,8 +538,9 @@ impl Pane {
             all_dirty_rows.extend(dirty_rows);
             all_dirty_rows.sort_unstable();
             all_dirty_rows.dedup();
-            let requires_full_snapshot =
-                std::mem::take(&mut state.pending_full_snapshot) || render_state_changed;
+            let requires_full_snapshot = std::mem::take(&mut state.pending_full_snapshot)
+                || render_state_changed
+                || history_changed;
             let should_broadcast = self.emit_generation(
                 all_dirty_rows,
                 requires_full_snapshot,
@@ -424,7 +555,6 @@ impl Pane {
         };
         drop(commit);
 
-        // Notifications and side effects are intentionally outside the commit.
         self.broadcast_pane_output(bytes);
         self.handle_pending_events();
         self.parse_osc_sequences(bytes);
@@ -592,6 +722,28 @@ impl Pane {
         }
     }
 
+    /// §3.3 从 alacritty Term 收集 dirty 行号和整屏损伤标志。
+    fn collect_dirty_rows(&self) -> (Vec<usize>, bool) {
+        let mut term = self.term.lock();
+        let mut rows = Vec::new();
+        let fully_damaged = match term.damage() {
+            TermDamage::Full => {
+                // 整屏 dirty — 所有行
+                let n = term.screen_lines();
+                rows.extend(0..n);
+                true
+            }
+            TermDamage::Partial(iter) => {
+                for line in iter {
+                    rows.push(line.line);
+                }
+                false
+            }
+        };
+        term.reset_damage();
+        (rows, fully_damaged)
+    }
+
     /// Broadcast an emulator-originated OSC title change to every pane subscriber.
     fn broadcast_pane_title(&self, title: String) {
         let notification = MuxNotification {
@@ -624,28 +776,6 @@ impl Pane {
     /// broadcast_pane_dirty 下次调用会检测到并清理。
     pub fn add_subscriber(&self, tx: mpsc::UnboundedSender<MuxNotification>) {
         self.subscribers.write().push(tx);
-    }
-
-    /// §3.3 从 alacritty Term 收集 dirty 行号 (viewport 坐标)。
-    ///
-    /// 用 term.damage() + reset_damage() 标准模式。返回 dirty 行号列表。
-    fn collect_dirty_rows(&self) -> Vec<usize> {
-        let mut term = self.term.lock();
-        let mut rows = Vec::new();
-        match term.damage() {
-            TermDamage::Full => {
-                // 整屏 dirty — 所有行
-                let n = term.screen_lines();
-                rows.extend(0..n);
-            }
-            TermDamage::Partial(iter) => {
-                for line in iter {
-                    rows.push(line.line);
-                }
-            }
-        }
-        term.reset_damage();
-        rows
     }
 
     /// Drain Alacritty side effects. Grid-affecting state is compared around
@@ -707,9 +837,29 @@ impl Pane {
         self.generation.load(Ordering::Acquire)
     }
 
-    /// §16.11 Apply hot-reloaded scrollback capacity to this pane.
+    /// §16.11 Apply hot-reloaded scrollback capacity to the authoritative grid.
     pub fn set_scrollback_capacity(&self, capacity: usize) {
-        self.scrollback_buffer.write().set_capacity(capacity);
+        let capacity = capacity.min(100_000);
+        let commit = self.commit.lock();
+        if self.scrollback_capacity.load(Ordering::Acquire) == capacity as u64 {
+            return;
+        }
+
+        let diff = {
+            let mut term = self.term.lock();
+            term.set_options(TermConfig {
+                scrolling_history: capacity,
+                ..TermConfig::default()
+            });
+            let all_rows = (0..term.screen_lines()).collect::<Vec<_>>();
+            diff_from_dirty(&*term, &all_rows)
+        };
+        self.scrollback_capacity
+            .store(capacity as u64, Ordering::Release);
+        self.history_version.fetch_add(1, Ordering::AcqRel);
+        self.publish_generation(diff, true);
+        drop(commit);
+        self.broadcast_pane_dirty();
     }
 
     /// Publish a metadata-triggered generation with a full-screen row diff.
@@ -755,7 +905,9 @@ impl Pane {
         let current = self.generation.load(Ordering::Acquire);
         ring.fetch_update(since_generation, current, || {
             let term = self.term.lock();
-            snapshot_from_term(&*term)
+            let mut snapshot = snapshot_from_term(&*term);
+            snapshot.history_version = self.history_version.load(Ordering::Acquire);
+            snapshot
         })
     }
 
@@ -763,7 +915,9 @@ impl Pane {
     pub fn get_full_snapshot(&self) -> FullGridSnapshot {
         let _commit = self.commit.lock();
         let term = self.term.lock();
-        snapshot_from_term(&*term)
+        let mut snapshot = snapshot_from_term(&*term);
+        snapshot.history_version = self.history_version.load(Ordering::Acquire);
+        snapshot
     }
 
     /// §3.10 Resize — 改 PTY winsize + resize alacritty Term + bump generation。
@@ -792,12 +946,10 @@ impl Pane {
         };
         self.cols.store(cols as u64, Ordering::SeqCst);
         self.rows.store(rows as u64, Ordering::SeqCst);
-        // Dimensions are absent from GridDiff, so any pre-resize checkpoint
-        // requires a full snapshot even though every resized row is included.
+        self.history_version.fetch_add(1, Ordering::AcqRel);
         self.publish_generation(diff, true);
         drop(commit);
 
-        // Peers need a pull signal after the new size is fully committed.
         self.broadcast_pane_dirty();
         Ok(())
     }
@@ -908,12 +1060,12 @@ impl Pane {
         direction: u32,
         count: u32,
     ) -> (Vec<grid_sync::RowChange>, u32, u64) {
-        let buf = self.scrollback_buffer.read();
-        let version = self.scrollback_version.read();
-        let lines = buf.fetch_lines(from_line, count, direction);
-        let total = buf.total_lines();
-        let sv = version.encode();
-        (lines, total, sv)
+        let _commit = self.commit.lock();
+        let term = self.term.lock();
+        let (lines, total) =
+            grid_sync::fetch_scrollback_from_term(&*term, from_line, direction, count);
+        let version = self.history_version.load(Ordering::Acquire);
+        (lines, total, version)
     }
 
     pub fn search_scrollback(
@@ -923,23 +1075,21 @@ impl Pane {
         direction: u32,
         max_results: u32,
     ) -> (Vec<(u32, grid_sync::RowChange)>, u64) {
-        let buf = self.scrollback_buffer.read();
-        let version = self.scrollback_version.read();
-        let matches = buf.search(regex, from_line, direction, max_results);
-        let sv = version.encode();
-        (matches, sv)
+        let _commit = self.commit.lock();
+        let term = self.term.lock();
+        let matches = grid_sync::search_scrollback_from_term(
+            &*term,
+            regex,
+            from_line,
+            direction,
+            max_results,
+        );
+        let version = self.history_version.load(Ordering::Acquire);
+        (matches, version)
     }
 
     pub fn get_scrollback_version(&self) -> u64 {
-        self.scrollback_version.read().encode()
-    }
-
-    pub fn push_scrollback_row(&self, row: grid_sync::RowChange) {
-        let mut buf = self.scrollback_buffer.write();
-        buf.push_row(row);
-        if buf.is_full() {
-            self.scrollback_version.write().bump();
-        }
+        self.history_version.load(Ordering::Acquire)
     }
 
     /// §3.3 Atomically set pane zoom state and publish its generation.
@@ -1197,7 +1347,7 @@ mod tests {
             Ok(pane) => pane,
             Err(error) => panic!("spawn mode test pane: {error}"),
         };
-        pane.collect_dirty_rows();
+        let _ = pane.collect_dirty_rows();
         let mut dec = Dec2026Parser::new();
         let mut coalescer = AdaptiveCoalescer::new();
         let mut state = ReadLoopState::default();
@@ -1218,6 +1368,147 @@ mod tests {
             }
             update => panic!("expected mode-only full snapshot, got {update:?}"),
         }
+    }
+
+    #[test]
+    fn split_escape_sequence_is_parsed_across_pty_batches() {
+        let pane = match Pane::spawn(
+            "split-sequence-pane".to_string(),
+            std::env::temp_dir().to_string_lossy().to_string(),
+            4,
+            2,
+            Some(ShellCommand {
+                program: "/bin/cat".to_string(),
+                ..Default::default()
+            }),
+        ) {
+            Ok(pane) => pane,
+            Err(error) => panic!("spawn split sequence pane: {error}"),
+        };
+        let _ = pane.collect_dirty_rows();
+        let mut dec = Dec2026Parser::new();
+        let mut coalescer = AdaptiveCoalescer::new();
+        let mut state = ReadLoopState::default();
+
+        pane.process_pty_bytes(b"\x1b[?", &mut dec, &mut coalescer, &mut state);
+        assert_eq!(
+            pane.get_full_snapshot().modes & mux_protocol::terminal_mode::APP_CURSOR,
+            0
+        );
+        pane.process_pty_bytes(b"1h", &mut dec, &mut coalescer, &mut state);
+
+        assert_ne!(
+            pane.get_full_snapshot().modes & mux_protocol::terminal_mode::APP_CURSOR,
+            0
+        );
+    }
+
+    #[test]
+    fn mode_only_output_preserves_existing_history_version() {
+        let pane = match Pane::spawn_with_session(
+            "mode-history-pane".to_string(),
+            String::new(),
+            std::env::temp_dir().to_string_lossy().to_string(),
+            4,
+            2,
+            Some(ShellCommand {
+                program: "/bin/cat".to_string(),
+                ..Default::default()
+            }),
+            10,
+        ) {
+            Ok(pane) => pane,
+            Err(error) => panic!("spawn mode history test pane: {error}"),
+        };
+        let _ = pane.collect_dirty_rows();
+        let mut dec = Dec2026Parser::new();
+        let mut coalescer = AdaptiveCoalescer::new();
+        let mut state = ReadLoopState::default();
+
+        pane.process_pty_bytes(b"A\r\nB\r\n", &mut dec, &mut coalescer, &mut state);
+        let history_version = pane.get_scrollback_version();
+        let generation = pane.get_generation();
+
+        pane.process_pty_bytes(b"\x1b[?1h", &mut dec, &mut coalescer, &mut state);
+
+        assert_eq!(pane.get_scrollback_version(), history_version);
+        match pane.fetch_grid_update(generation) {
+            grid_sync::GridUpdate::FullSnapshot { snapshot, .. } => {
+                assert_eq!(snapshot.history_version, history_version);
+                assert_ne!(snapshot.modes & mux_protocol::terminal_mode::APP_CURSOR, 0);
+            }
+            update => panic!("expected mode-only full snapshot, got {update:?}"),
+        }
+    }
+
+    #[test]
+    fn full_history_rotation_advances_history_version() {
+        let pane = match Pane::spawn_with_session(
+            "history-version-pane".to_string(),
+            String::new(),
+            std::env::temp_dir().to_string_lossy().to_string(),
+            4,
+            2,
+            Some(ShellCommand {
+                program: "/bin/cat".to_string(),
+                ..Default::default()
+            }),
+            2,
+        ) {
+            Ok(pane) => pane,
+            Err(error) => panic!("spawn history version test pane: {error}"),
+        };
+        let _ = pane.collect_dirty_rows();
+        let mut dec = Dec2026Parser::new();
+        let mut coalescer = AdaptiveCoalescer::new();
+        let mut state = ReadLoopState::default();
+
+        pane.process_pty_bytes(b"A\r\nB\r\nC\r\n", &mut dec, &mut coalescer, &mut state);
+        let (_, full_total, full_version) = pane.fetch_scrollback(0, 1, 10);
+        assert_eq!(full_total, 2);
+
+        pane.process_pty_bytes(b"D\r\n", &mut dec, &mut coalescer, &mut state);
+        let (lines, rotated_total, rotated_version) = pane.fetch_scrollback(0, 1, 10);
+
+        assert_eq!(rotated_total, full_total);
+        assert_ne!(rotated_version, full_version);
+        assert_eq!(lines.len(), 2);
+        assert_eq!(lines[0].cells[0].character, "B");
+        assert_eq!(lines[1].cells[0].character, "C");
+    }
+    #[test]
+    fn repeated_content_rotation_advances_history_version() {
+        let pane = match Pane::spawn_with_session(
+            "repeated-history-pane".to_string(),
+            String::new(),
+            std::env::temp_dir().to_string_lossy().to_string(),
+            1,
+            2,
+            Some(ShellCommand {
+                program: "/bin/cat".to_string(),
+                ..Default::default()
+            }),
+            2,
+        ) {
+            Ok(pane) => pane,
+            Err(error) => panic!("spawn repeated history pane: {error}"),
+        };
+        let _ = pane.collect_dirty_rows();
+        let mut dec = Dec2026Parser::new();
+        let mut coalescer = AdaptiveCoalescer::new();
+        let mut state = ReadLoopState::default();
+
+        pane.process_pty_bytes(b"X\r\nX\r\nX\r\n", &mut dec, &mut coalescer, &mut state);
+        let (before_rows, before_total, before_version) = pane.fetch_scrollback(0, 1, 10);
+        assert_eq!(before_total, 2);
+        assert!(before_rows.iter().all(|row| row.cells[0].character == "X"));
+
+        pane.process_pty_bytes(b"X\r\n", &mut dec, &mut coalescer, &mut state);
+        let (after_rows, after_total, after_version) = pane.fetch_scrollback(0, 1, 10);
+
+        assert_eq!(after_total, before_total);
+        assert!(after_rows.iter().all(|row| row.cells[0].character == "X"));
+        assert_ne!(after_version, before_version);
     }
 
     #[test]

@@ -334,6 +334,10 @@ message FullGridSnapshot {
     // §15.12 服务端 grid display_offset (0 = 滚动到底部/最新行)。
     uint32 display_offset = 6;
     optional uint32 modes = 7;
+    // Number of authoritative history rows available through FetchScrollback.
+    uint32 history_size = 8;
+    // Changes only when authoritative scrollback contents or layout change.
+    uint64 history_version = 9;
 }
 
 // §3.3 光标状态。

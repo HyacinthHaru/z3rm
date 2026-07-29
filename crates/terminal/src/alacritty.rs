@@ -235,46 +235,26 @@ pub(super) fn apply_structured_snapshot(
     apply_structured_modes(term, snapshot.modes);
 
     term.grid_mut().reset();
+    let history_rows = snapshot.history.len() / snapshot.cols;
+    if history_rows != 0 {
+        let grid = term.grid_mut();
+        grid.update_history(history_rows);
+        grid.scroll_up(&(Line(0)..Line(snapshot.rows as i32)), history_rows);
+        for (index, source) in snapshot.history.iter().enumerate() {
+            let row = index / snapshot.cols;
+            let col = index % snapshot.cols;
+            let line = row as i32 - history_rows as i32;
+            grid[Line(line)][Column(col)] = structured_cell(source);
+        }
+    }
     for (index, source) in snapshot.cells.iter().enumerate() {
         let row = index / snapshot.cols;
         let col = index % snapshot.cols;
-        let mut flags = Flags::empty();
-        flags.set(Flags::BOLD, source.bold);
-        flags.set(Flags::ITALIC, source.italic);
-        flags.set(Flags::STRIKEOUT, source.strikethrough);
-        flags.set(Flags::DIM, source.dim);
-        flags.set(Flags::INVERSE, source.reverse);
-        flags.set(Flags::WIDE_CHAR, source.wide_char);
-        flags.set(Flags::WIDE_CHAR_SPACER, source.wide_char_spacer);
-        flags.set(
-            Flags::LEADING_WIDE_CHAR_SPACER,
-            source.leading_wide_char_spacer,
-        );
-        flags.set(Flags::WRAPLINE, source.wrapline);
-        flags.set(Flags::HIDDEN, source.hidden);
-        flags.insert(match source.underline {
-            StructuredUnderlineStyle::None => Flags::empty(),
-            StructuredUnderlineStyle::Single => Flags::UNDERLINE,
-            StructuredUnderlineStyle::Double => Flags::DOUBLE_UNDERLINE,
-            StructuredUnderlineStyle::Curly => Flags::UNDERCURL,
-            StructuredUnderlineStyle::Dotted => Flags::DOTTED_UNDERLINE,
-            StructuredUnderlineStyle::Dashed => Flags::DASHED_UNDERLINE,
-        });
-
-        let mut cell = AlacCell {
-            c: source.character,
-            fg: Color::Spec(source.foreground),
-            bg: Color::Spec(source.background),
-            flags,
-            extra: None,
-        };
-        for &character in &source.zerowidth {
-            cell.push_zerowidth(character);
-        }
-        cell.set_underline_color(source.underline_color.map(Color::Spec));
-        cell.set_hyperlink(source.hyperlink.clone().map(Into::into));
-        term.grid_mut()[Line(row as i32)][Column(col)] = cell;
+        term.grid_mut()[Line(row as i32)][Column(col)] = structured_cell(source);
     }
+    term.grid_mut().scroll_display(AlacScroll::Delta(
+        i32::try_from(snapshot.display_offset).unwrap_or(i32::MAX),
+    ));
 
     let cursor = snapshot.cursor.unwrap_or(crate::StructuredTerminalCursor {
         point: Point::new(0, 0),
@@ -305,6 +285,45 @@ pub(super) fn apply_structured_snapshot(
     } else {
         term.unset_private_mode(NamedPrivateMode::ShowCursor.into());
     }
+}
+
+fn structured_cell(source: &crate::StructuredTerminalCell) -> AlacCell {
+    let mut flags = Flags::empty();
+    flags.set(Flags::BOLD, source.bold);
+    flags.set(Flags::ITALIC, source.italic);
+    flags.set(Flags::STRIKEOUT, source.strikethrough);
+    flags.set(Flags::DIM, source.dim);
+    flags.set(Flags::INVERSE, source.reverse);
+    flags.set(Flags::WIDE_CHAR, source.wide_char);
+    flags.set(Flags::WIDE_CHAR_SPACER, source.wide_char_spacer);
+    flags.set(
+        Flags::LEADING_WIDE_CHAR_SPACER,
+        source.leading_wide_char_spacer,
+    );
+    flags.set(Flags::WRAPLINE, source.wrapline);
+    flags.set(Flags::HIDDEN, source.hidden);
+    flags.insert(match source.underline {
+        StructuredUnderlineStyle::None => Flags::empty(),
+        StructuredUnderlineStyle::Single => Flags::UNDERLINE,
+        StructuredUnderlineStyle::Double => Flags::DOUBLE_UNDERLINE,
+        StructuredUnderlineStyle::Curly => Flags::UNDERCURL,
+        StructuredUnderlineStyle::Dotted => Flags::DOTTED_UNDERLINE,
+        StructuredUnderlineStyle::Dashed => Flags::DASHED_UNDERLINE,
+    });
+
+    let mut cell = AlacCell {
+        c: source.character,
+        fg: Color::Spec(source.foreground),
+        bg: Color::Spec(source.background),
+        flags,
+        extra: None,
+    };
+    for &character in &source.zerowidth {
+        cell.push_zerowidth(character);
+    }
+    cell.set_underline_color(source.underline_color.map(Color::Spec));
+    cell.set_hyperlink(source.hyperlink.clone().map(Into::into));
+    cell
 }
 
 fn apply_structured_modes(term: &mut AlacrittyTerm, modes: Modes) {

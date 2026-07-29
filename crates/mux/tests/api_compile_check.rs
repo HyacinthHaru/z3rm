@@ -47,7 +47,10 @@ fn test_grid_update_response() {
         to_generation: 2,
         update: Some(fetch_grid_update_response::Update::Diff(diff)),
     };
-    assert!(matches!(update1.update, Some(fetch_grid_update_response::Update::Diff(_))));
+    assert!(matches!(
+        update1.update,
+        Some(fetch_grid_update_response::Update::Diff(_))
+    ));
 
     let snapshot = FullGridSnapshot {
         cols: 80,
@@ -58,9 +61,13 @@ fn test_grid_update_response() {
             row: 0,
             style: 0,
             visible: true,
+            blinking: false,
         }),
         alternate_screen: false,
         display_offset: 0,
+        history_size: 0,
+        history_version: 0,
+        modes: None,
     };
     let update2 = FetchGridUpdateResponse {
         from_generation: 100,
@@ -131,7 +138,10 @@ fn test_notification_events() {
             tab_id: "t1".to_string(),
         })),
     };
-    assert!(matches!(added.event, Some(notification::Event::PaneAdded(_))));
+    assert!(matches!(
+        added.event,
+        Some(notification::Event::PaneAdded(_))
+    ));
 }
 
 /// §9 编译时测试：MuxTransport 枚举。

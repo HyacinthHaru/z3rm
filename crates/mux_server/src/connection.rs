@@ -1606,6 +1606,9 @@ async fn handle_fetch_grid_update(
                             // §15.12 usize → u32 (saturating; scrollback 远小于 u32::MAX)。
                             display_offset: u32::try_from(snapshot.display_offset)
                                 .unwrap_or(u32::MAX),
+                            history_size: u32::try_from(snapshot.history_size)
+                                .unwrap_or(u32::MAX),
+                            history_version: snapshot.history_version,
                             modes: Some(snapshot.modes),
                         },
                     )),

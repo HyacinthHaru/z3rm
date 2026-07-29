@@ -89,6 +89,8 @@ pub struct FullGridSnapshot {
     pub cursor: CursorState,
     pub alternate_screen: bool,
     pub display_offset: usize,
+    pub history_size: usize,
+    pub history_version: u64,
     pub modes: u32,
 }
 
@@ -125,215 +127,6 @@ pub enum GridUpdate {
     },
     /// 无变化 (since_generation == current)
     NoChange(u64),
-}
-
-// === §16.9 Scrollback Buffer ===
-
-/// 回滚缓冲区 (§16.9) — 存储 alacritty 历史行。
-/// 每行保存为 RowChange, 按时间倒序排列 (最新行在末尾)。
-#[derive(Clone, Debug)]
-pub struct ScrollbackBuffer {
-    /// 历史行列表 (从旧到新)
-    pub rows: Vec<RowChange>,
-    /// 容量上限 (默认 10_000 行)
-    capacity: usize,
-}
-
-/// 回滚版本 (§16.9) — counter + timestamp 对, 用于缓存失效检测。
-/// Counter 在环形缓冲区 wrap 时递增, timestamp 为 Unix 秒。
-#[derive(Clone, Copy, Debug, Default)]
-pub struct ScrollbackVersion {
-    /// 环形缓冲区 wrap 计数器
-    pub counter: u64,
-    /// Unix 时间戳 (秒)
-    pub timestamp: u64,
-}
-
-impl ScrollbackVersion {
-    /// 创建新版本 (§16.9)
-    pub fn new() -> Self {
-        Self {
-            counter: 1,
-            timestamp: std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap_or_default()
-                .as_secs(),
-        }
-    }
-
-    /// 递增 counter, 更新 timestamp (§16.9 ring wrap)
-    pub fn bump(&mut self) {
-        self.counter += 1;
-        self.timestamp = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_secs();
-    }
-
-    /// 将版本编码为单个 u64 (counter << 32 | timestamp)
-    pub fn encode(&self) -> u64 {
-        (self.counter << 32) | (self.timestamp & 0xFFFFFFFF)
-    }
-
-    /// 从编码值解码版本
-    pub fn decode(encoded: u64) -> Self {
-        Self {
-            counter: (encoded >> 32) as u64,
-            timestamp: (encoded & 0xFFFFFFFF) as u64,
-        }
-    }
-}
-
-impl ScrollbackBuffer {
-    /// 创建回滚缓冲区 (§16.9 默认 10_000 行)
-    pub fn new(capacity: usize) -> Self {
-        Self {
-            rows: Vec::with_capacity(capacity),
-            capacity,
-        }
-    }
-
-    /// §16.11 Hot-reload scrollback capacity from server settings.
-    /// Shrinks by dropping the oldest rows first (FIFO).
-    pub fn set_capacity(&mut self, capacity: usize) {
-        self.capacity = capacity;
-        if self.rows.len() > self.capacity {
-            let drop_count = self.rows.len() - self.capacity;
-            self.rows.drain(0..drop_count);
-        }
-    }
-
-    pub fn capacity(&self) -> usize {
-        self.capacity
-    }
-
-    /// 追加一行到缓冲区 (§16.9)
-    pub fn push_row(&mut self, row: RowChange) {
-        self.rows.push(row);
-        // 超出容量时移除最早的历史行
-        while self.rows.len() > self.capacity {
-            self.rows.remove(0);
-        }
-    }
-
-    /// 获取总行数 (§16.9)
-    pub fn total_lines(&self) -> u32 {
-        self.rows.len() as u32
-    }
-
-    /// 获取指定范围的行 (§16.9 fetch_scrollback)
-    /// from_line: 起始行号 (0 = 最早的历史行)
-    /// count: 要获取的行数
-    /// direction: 0 = 向上 (from_line 往旧方向), 1 = 向下 (from_line 往新方向)
-    ///
-    /// 全路径 panic-free: 对任意 u32 输入都不会 panic, 不会整数溢出。
-    /// - 缓冲区为空 / `from_line >= total` / `count == 0` → 空 Vec。
-    /// - 向上: 返回 `[start, from_line]` 共 count 行 (不足时从 0 开始)。
-    /// - 向下: 返回 `[from_line, end)` 共 min(count, 余量) 行。
-    pub fn fetch_lines(&self, from_line: u32, count: u32, direction: u32) -> Vec<RowChange> {
-        let total = self.rows.len();
-        if total == 0 || count == 0 {
-            return Vec::new();
-        }
-        // from_line 越界: 向上/向下都没有可返回的行。
-        if from_line as usize >= total {
-            return Vec::new();
-        }
-
-        let from = from_line as usize;
-        let count = count as usize;
-
-        match direction {
-            0 => {
-                // §16.9 向上: 返回 from_line 及之前共 count 行 (行号减小)。
-                // start = from - (count - 1), 下限 0。count >= 1 (上面已排除 0),
-                // saturating_sub 保证不溢出、不 panic。
-                let start = from.saturating_sub(count - 1);
-                self.rows[start..=from].iter().cloned().collect()
-            }
-            _ => {
-                // §16.9 向下: 返回 [from, end)。end = min(from + count, total)。
-                // checked_add 防止 from + count 溢出 (虽然当前上限下不会溢出,
-                // 但对任意 u32 输入保持鲁棒)。
-                let end = from
-                    .checked_add(count)
-                    .map(|x| std::cmp::min(x, total))
-                    .unwrap_or(total);
-                self.rows[from..end].iter().cloned().collect()
-            }
-        }
-    }
-
-    /// §16.9 正则搜索回滚缓冲区
-    /// 返回匹配行号列表 + 对应的 RowChange
-    pub fn search(
-        &self,
-        regex: &str,
-        from_line: u32,
-        direction: u32,
-        max_results: u32,
-    ) -> Vec<(u32, RowChange)> {
-        if self.rows.is_empty() {
-            return Vec::new();
-        }
-
-        // 编译正则表达式 (§16.9)
-        let re = match regex::Regex::new(regex) {
-            Ok(re) => re,
-            Err(_) => return Vec::new(),
-        };
-
-        // 构建搜索顺序
-        let total = self.rows.len();
-        let from = from_line as usize;
-        let max = max_results as usize;
-
-        let indices: Vec<usize> = match direction {
-            0 => {
-                // §16.9 向上搜索: 从 from_line 往 0
-                if from >= total {
-                    (0..total).rev().collect()
-                } else {
-                    (0..=from).rev().collect()
-                }
-            }
-            _ => {
-                // §16.9 向下搜索: 从 from_line 往末尾
-                if from >= total {
-                    Vec::new()
-                } else {
-                    (from..total).collect()
-                }
-            }
-        };
-
-        let mut results = Vec::new();
-        for idx in indices {
-            if results.len() >= max {
-                break;
-            }
-            // 将行内容拼接为字符串, 用正则匹配 (§16.9)
-            let text = self.rows[idx]
-                .cells
-                .iter()
-                .map(|c| c.character.as_str())
-                .collect::<String>();
-            if re.is_match(&text) {
-                results.push((idx as u32, self.rows[idx].clone()));
-            }
-        }
-        results
-    }
-
-    /// 检查缓冲区是否已满, 需要 bump version (§16.9 wrap detection)
-    pub fn is_full(&self) -> bool {
-        self.rows.len() >= self.capacity
-    }
-
-    /// 清空缓冲区 (§16.9)
-    pub fn clear(&mut self) {
-        self.rows.clear();
-    }
 }
 
 impl GridDiffRing {
@@ -462,6 +255,8 @@ pub fn build_empty_snapshot(cols: u32, rows: u32) -> FullGridSnapshot {
         },
         alternate_screen: false,
         display_offset: 0,
+        history_size: 0,
+        history_version: 0,
         modes: mux_protocol::terminal_mode::SHOW_CURSOR,
     }
 }
@@ -703,6 +498,8 @@ impl Palette {
 }
 
 /// §3.3 把 alacritty Term 转成 z3rm FullGridSnapshot。
+/// Export the active bottom screen. `display_offset` is carried separately so
+/// clients can reconstruct the selected viewport from the same history.
 pub fn snapshot_from_term<T: EventListener>(term: &Term<T>) -> FullGridSnapshot {
     let cols = term.columns() as u32;
     let rows = term.screen_lines() as u32;
@@ -710,12 +507,13 @@ pub fn snapshot_from_term<T: EventListener>(term: &Term<T>) -> FullGridSnapshot 
     let colors = content.colors;
 
     let mut cells = Vec::with_capacity((cols * rows) as usize);
-    for cell in content.display_iter {
-        cells.push(cell_from_alacritty(&cell.cell, colors));
-    }
-    // 如果 iter 比 cols*rows 短 (理论上不会发生, 防御性补齐)
-    while cells.len() < (cols * rows) as usize {
-        cells.push(Cell::default());
+    for row in 0..rows as usize {
+        for col in 0..cols as usize {
+            cells.push(cell_from_alacritty(
+                &term.grid()[AlacPoint::new(Line(row as i32), Column(col))],
+                colors,
+            ));
+        }
     }
 
     let alt = content.mode.contains(TermMode::ALT_SCREEN);
@@ -736,7 +534,93 @@ pub fn snapshot_from_term<T: EventListener>(term: &Term<T>) -> FullGridSnapshot 
         },
         alternate_screen: alt,
         display_offset: content.display_offset,
+        history_size: term.grid().history_size(),
+        history_version: 0,
         modes: modes_from_alacritty(content.mode),
+    }
+}
+
+pub fn fetch_scrollback_from_term<T: EventListener>(
+    term: &Term<T>,
+    from_line: u32,
+    direction: u32,
+    count: u32,
+) -> (Vec<RowChange>, u32) {
+    let history_size = term.grid().history_size();
+    let total = u32::try_from(history_size).unwrap_or(u32::MAX);
+    if history_size == 0 || count == 0 {
+        return (Vec::new(), total);
+    }
+
+    let from = from_line as usize;
+    if from >= history_size {
+        return (Vec::new(), total);
+    }
+    let count = count as usize;
+    let indices = if direction == 0 {
+        let start = from.saturating_sub(count.saturating_sub(1));
+        start..from.saturating_add(1)
+    } else {
+        from..from.saturating_add(count).min(history_size)
+    };
+    let rows = indices
+        .map(|index| row_from_history(term, index, history_size))
+        .collect();
+    (rows, total)
+}
+
+pub fn search_scrollback_from_term<T: EventListener>(
+    term: &Term<T>,
+    regex: &str,
+    from_line: u32,
+    direction: u32,
+    max_results: u32,
+) -> Vec<(u32, RowChange)> {
+    let Ok(regex) = regex::Regex::new(regex) else {
+        return Vec::new();
+    };
+    let history_size = term.grid().history_size();
+    if history_size == 0 || max_results == 0 {
+        return Vec::new();
+    }
+
+    let from = from_line as usize;
+    let indices: Box<dyn Iterator<Item = usize>> = if direction == 0 {
+        let start = from.min(history_size.saturating_sub(1));
+        Box::new((0..=start).rev())
+    } else if from >= history_size {
+        Box::new(std::iter::empty())
+    } else {
+        Box::new(from..history_size)
+    };
+
+    indices
+        .filter_map(|index| {
+            let row = row_from_history(term, index, history_size);
+            let text = row
+                .cells
+                .iter()
+                .map(|cell| cell.character.as_str())
+                .collect::<String>();
+            regex.is_match(&text).then_some((index as u32, row))
+        })
+        .take(max_results as usize)
+        .collect()
+}
+
+fn row_from_history<T: EventListener>(
+    term: &Term<T>,
+    index: usize,
+    history_size: usize,
+) -> RowChange {
+    let line = Line(index as i32 - history_size as i32);
+    let colors = term.renderable_content().colors;
+    let cells = (0..term.columns())
+        .map(|col| cell_from_alacritty(&term.grid()[AlacPoint::new(line, Column(col))], colors))
+        .collect();
+    RowChange {
+        row: index as u32,
+        cells,
     }
 }
 

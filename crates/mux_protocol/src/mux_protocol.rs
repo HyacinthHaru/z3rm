@@ -16,7 +16,7 @@ pub mod input;
 pub use proto::*;
 
 // §3.10 当前协议版本：major 用于破坏性变更，minor 用于新增字段。
-pub const PROTOCOL_VERSION: proto::ProtocolVersion = proto::ProtocolVersion { major: 1, minor: 1 };
+pub const PROTOCOL_VERSION: proto::ProtocolVersion = proto::ProtocolVersion { major: 1, minor: 2 };
 
 /// Stable bits used by `FullGridSnapshot.modes`; these do not mirror any
 /// terminal emulator's private representation.
