@@ -12,6 +12,7 @@ use mux_protocol::{
 };
 use prost::Message;
 use sqlez::connection::Connection;
+use std::collections::HashSet;
 use std::sync::Arc;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::sync::mpsc;
@@ -188,8 +189,7 @@ async fn wait_for_connection_tasks<Cleanup, CleanupFuture>(
     mut read_handle: tokio::task::JoinHandle<anyhow::Result<()>>,
     mut write_handle: tokio::task::JoinHandle<anyhow::Result<()>>,
     cleanup: Cleanup,
-)
-where
+) where
     Cleanup: FnOnce() -> CleanupFuture,
     CleanupFuture: Future<Output = ()>,
 {
@@ -239,10 +239,7 @@ async fn cleanup_connection_state(
 ) {
     if let Some(client_id) = connection_client_id.lock().clone() {
         let mut sessions = sessions.write();
-        for session in sessions.iter_mut() {
-            session.remove_attached_client(&client_id);
-            session.remove_lifecycle_subscriber(&client_id);
-        }
+        unregister_client_from_sessions(&mut sessions, &client_id);
     }
 
     let forward_tasks = forward_tasks.lock().drain(..).collect::<Vec<_>>();
@@ -254,6 +251,16 @@ async fn cleanup_connection_state(
             && !error.is_cancelled()
         {
             tracing::warn!(%error, "mux forwarder task failed during connection cleanup");
+        }
+    }
+}
+
+fn unregister_client_from_sessions(sessions: &mut [crate::session::Session], client_id: &str) {
+    for session in sessions {
+        session.remove_attached_client(client_id);
+        session.remove_lifecycle_subscriber(client_id);
+        for pane in session.panes.read().values() {
+            pane.remove_subscriber(client_id);
         }
     }
 }
@@ -738,9 +745,9 @@ async fn handle_attach(
     forward_tasks: &Arc<parking_lot::Mutex<Vec<tokio::task::JoinHandle<()>>>>,
 ) -> anyhow::Result<ResponseBody> {
     let mut sessions_w = sessions.write();
-    let session = sessions_w
-        .iter_mut()
-        .find(|s| s.id == req.session_id)
+    let target_session = sessions_w
+        .iter()
+        .position(|session| session.id == req.session_id)
         .ok_or_else(|| anyhow::anyhow!("session not found: {}", req.session_id))?;
 
     zlog::info!(
@@ -769,6 +776,8 @@ async fn handle_attach(
             minted
         }
     };
+    unregister_client_from_sessions(&mut sessions_w, &client_id);
+    let session = &mut sessions_w[target_session];
 
     // §3.3 角色解析: identity 显式声明时以其为准;否则保留既有角色
     // (本地 socket 默认 Admin,见 dispatch_request)。ReadOnly attach mode
@@ -789,16 +798,8 @@ async fn handle_attach(
     };
     let role = effective_attach_role(requested_role, mode);
     *client_role.lock() = Some(role);
-    // Idempotent attach for this connection; Steal clears other clients'
-    // §3.10 attached_clients AND §3.4 lifecycle_subscribers so the kicker
-    // is the only remaining receiver of PaneAdded/PaneRemoved/SessionLayoutChanged.
-    session.remove_attached_client(&client_id);
+    // The connection-scoped client was removed from every prior session above.
     if mode == crate::session::AttachMode::Steal {
-        // §3.4 BEFORE clearing subscribers, broadcast an empty
-        // SessionLayoutChanged to every soon-to-be-kicked client so they
-        // reconcile to zero panes instead of retaining zombie panes. Losing
-        // this is the §3.4 failure mode: a kicked client never learns it was
-        // kicked and keeps rendering stale panes.
         let kick_notification = Notification {
             event: Some(mux_protocol::notification::Event::SessionLayoutChanged(
                 mux_protocol::SessionLayoutChanged {
@@ -807,8 +808,19 @@ async fn handle_attach(
             )),
         };
         session.broadcast_lifecycle(kick_notification);
+        let mut kicked_clients: HashSet<String> = session
+            .attached_clients
+            .read()
+            .iter()
+            .map(|attached| attached.client_id.clone())
+            .collect();
         session.attached_clients.write().clear();
-        session.clear_lifecycle_subscribers();
+        kicked_clients.extend(session.clear_lifecycle_subscribers());
+        for pane in session.panes.read().values() {
+            for kicked_client in &kicked_clients {
+                pane.remove_subscriber(kicked_client);
+            }
+        }
     }
     session.add_attached_client(client_id.clone(), mode, role);
 
@@ -821,7 +833,7 @@ async fn handle_attach(
     // held by the session; the connection's outbound_tx is closed when its
     // read/write loop exits, after which broadcast_lifecycle prunes it.
     // Re-attach of the same client_id replaces the prior sender idempotently.
-    session.add_lifecycle_subscriber(client_id, outbound_tx.clone());
+    session.add_lifecycle_subscriber(client_id.clone(), outbound_tx.clone());
 
     // §3.4 把该连接的 outbound_tx 注册为 session 内所有 pane 的 subscriber。
     // 后续 PTY output → bump generation → broadcast PaneDirty → 此连接收到。
@@ -832,7 +844,7 @@ async fn handle_attach(
     for (_id, pane) in panes_r.iter() {
         // 创建一个内层 channel, 把 Notification 转成 Envelope 转发
         let (inner_tx, mut inner_rx) = mpsc::unbounded_channel::<Notification>();
-        pane.add_subscriber(inner_tx);
+        pane.add_subscriber(client_id.clone(), inner_tx);
         // forward task: 把 inner Notification 包成 Envelope 发到 outbound
         let forward_tx = notification_forward_tx.clone();
         let handle = tokio::spawn(async move {
@@ -888,12 +900,9 @@ async fn handle_detach(
     connection_client_id: &Arc<parking_lot::Mutex<Option<String>>>,
     forward_tasks: &Arc<parking_lot::Mutex<Vec<tokio::task::JoinHandle<()>>>>,
 ) -> anyhow::Result<ResponseBody> {
+    let mut sessions_w = sessions.write();
     if let Some(client_id) = connection_client_id.lock().take() {
-        let mut sessions_w = sessions.write();
-        for session in sessions_w.iter_mut() {
-            session.remove_attached_client(&client_id);
-            session.remove_lifecycle_subscriber(&client_id);
-        }
+        unregister_client_from_sessions(&mut sessions_w, &client_id);
     }
     // Abort all forward tasks so their outbound_tx clones are dropped,
     // preventing stale PaneDirty/PaneOutput delivery and duplicate
@@ -940,12 +949,12 @@ fn register_pane_with_session_subscribers(
     let subs: Vec<_> = session
         .lifecycle_subscribers
         .read()
-        .values()
-        .cloned()
+        .iter()
+        .map(|(client_id, sender)| (client_id.clone(), sender.clone()))
         .collect();
-    for outbound_tx in subs {
+    for (client_id, outbound_tx) in subs {
         let (inner_tx, mut inner_rx) = mpsc::unbounded_channel::<Notification>();
-        pane.add_subscriber(inner_tx);
+        pane.add_subscriber(client_id, inner_tx);
         let forward_tx = outbound_tx;
         tokio::spawn(async move {
             while let Some(notif) = inner_rx.recv().await {
@@ -1656,8 +1665,7 @@ async fn handle_fetch_grid_update(
                             // §15.12 usize → u32 (saturating; scrollback 远小于 u32::MAX)。
                             display_offset: u32::try_from(snapshot.display_offset)
                                 .unwrap_or(u32::MAX),
-                            history_size: u32::try_from(snapshot.history_size)
-                                .unwrap_or(u32::MAX),
+                            history_size: u32::try_from(snapshot.history_size).unwrap_or(u32::MAX),
                             history_version: snapshot.history_version,
                             modes: Some(snapshot.modes),
                         },
@@ -2267,6 +2275,43 @@ mod connection_unit_tests {
         assert!(sessions.read().is_empty());
     }
 
+    #[test]
+    fn unregister_client_removes_every_session_subscription() {
+        let mut sessions = vec![
+            crate::session::Session::new(
+                "session-1".to_string(),
+                "one".to_string(),
+                "/tmp".to_string(),
+            ),
+            crate::session::Session::new(
+                "session-2".to_string(),
+                "two".to_string(),
+                "/tmp".to_string(),
+            ),
+        ];
+        for session in &mut sessions {
+            session.add_attached_client(
+                "client-1".to_string(),
+                crate::session::AttachMode::Shared,
+                ClientRole::ReadWrite,
+            );
+            let (sender, _receiver) = mpsc::unbounded_channel();
+            session.add_lifecycle_subscriber("client-1".to_string(), sender);
+        }
+
+        unregister_client_from_sessions(&mut sessions, "client-1");
+
+        assert!(
+            sessions
+                .iter()
+                .all(|session| session.attached_client_count() == 0)
+        );
+        assert!(
+            sessions
+                .iter()
+                .all(|session| session.lifecycle_subscribers.read().is_empty())
+        );
+    }
     #[tokio::test]
     async fn connection_cleanup_removes_registration_and_aborts_forwarders() {
         let mut session = crate::session::Session::new(
@@ -2281,6 +2326,22 @@ mod connection_unit_tests {
         );
         let (subscriber, _notifications) = mpsc::unbounded_channel();
         session.add_lifecycle_subscriber("client-1".to_string(), subscriber);
+        let pane = match crate::pane::Pane::spawn(
+            "cleanup-pane".to_string(),
+            std::env::temp_dir().to_string_lossy().to_string(),
+            20,
+            5,
+            Some(crate::pane::ShellCommand {
+                program: "/bin/cat".to_string(),
+                ..Default::default()
+            }),
+        ) {
+            Ok(pane) => pane,
+            Err(error) => panic!("spawn cleanup pane: {error}"),
+        };
+        let (pane_subscriber, mut pane_notifications) = mpsc::unbounded_channel();
+        pane.add_subscriber("client-1".to_string(), pane_subscriber);
+        session.panes.write().insert(pane.id.clone(), pane);
         let sessions = Arc::new(parking_lot::RwLock::new(vec![session]));
         let client_id = Arc::new(parking_lot::Mutex::new(Some("client-1".to_string())));
         let forward_tasks = Arc::new(parking_lot::Mutex::new(vec![tokio::spawn(
@@ -2292,6 +2353,10 @@ mod connection_unit_tests {
         let sessions = sessions.read();
         assert_eq!(sessions[0].attached_client_count(), 0);
         assert!(sessions[0].lifecycle_subscribers.read().is_empty());
+        assert!(matches!(
+            pane_notifications.try_recv(),
+            Err(mpsc::error::TryRecvError::Disconnected)
+        ));
         assert!(forward_tasks.lock().is_empty());
     }
 

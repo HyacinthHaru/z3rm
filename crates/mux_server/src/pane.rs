@@ -61,9 +61,9 @@ pub struct Pane {
     child: Arc<Mutex<Option<Box<dyn portable_pty::Child + Send + Sync>>>>,
     /// §3.3 event 收集: alacritty 事件 → main loop。
     pub events: Arc<parking_lot::Mutex<Vec<AlacEvent>>>,
-    /// §3.3 PaneDirty 订阅者: 每个连接的 notification_tx。
-    /// PTY read loop bump generation 后 fan-out PaneDirty 到所有订阅者。
-    subscribers: Arc<parking_lot::RwLock<Vec<mpsc::UnboundedSender<MuxNotification>>>>,
+    /// §3.3 Pane notification subscribers keyed by attached client identity.
+    /// Re-attach replaces the prior sender; detach removes it synchronously.
+    subscribers: Arc<parking_lot::RwLock<HashMap<String, mpsc::UnboundedSender<MuxNotification>>>>,
     /// §3.4 所属 session id (供 spawn_with_session 设置, 普通 spawn 为 None)。
     /// 强引用未持有 Session 因此不会出现循环, Session 删除后 Pane 实例随之 drop。
     session_id: parking_lot::Mutex<Option<String>>,
@@ -377,7 +377,7 @@ impl Pane {
             pty_writer: Arc::new(Mutex::new(writer)),
             child: Arc::new(Mutex::new(Some(child))),
             events,
-            subscribers: Arc::new(parking_lot::RwLock::new(Vec::new())),
+            subscribers: Arc::new(parking_lot::RwLock::new(HashMap::new())),
             // §3.4 spawn_with_session 携带的 session_id 让 PTY read loop 在自然退出
             // 时能定位会话级 lifecycle 订阅者; 空字符串表示未连接会话, 等价于 None。
             session_id: parking_lot::Mutex::new(if session_id.is_empty() {
@@ -642,84 +642,35 @@ impl Pane {
         self.flush_pending_notify(state, coalescer.delay());
     }
 
-    /// §3.3 / §3.4 向所有订阅者推送 PaneDirty (at-most-once, 丢失无害)。
-    /// 关闭的订阅者会被自动清理。
     fn broadcast_pane_output(&self, bytes: &[u8]) {
-        let notif = MuxNotification {
+        self.broadcast_notification(MuxNotification {
             event: Some(mux_protocol::notification::Event::PaneOutput(
                 mux_protocol::PaneOutputChunk {
                     pane_id: self.id.clone(),
                     data: bytes.to_vec(),
                 },
             )),
-        };
-        let subs = self.subscribers.read().clone();
-        let mut dead = Vec::new();
-        for (i, tx) in subs.iter().enumerate() {
-            if tx.send(notif.clone()).is_err() {
-                dead.push(i);
-            }
-        }
-        if !dead.is_empty() {
-            let mut live = self.subscribers.write();
-            for i in dead.into_iter().rev() {
-                if i < live.len() {
-                    live.remove(i);
-                }
-            }
-        }
+        });
     }
 
     fn broadcast_pane_dirty(&self) {
-        let notif = MuxNotification {
+        self.broadcast_notification(MuxNotification {
             event: Some(mux_protocol::notification::Event::PaneDirty(
                 mux_protocol::PaneDirty {
                     pane_id: self.id.clone(),
                 },
             )),
-        };
-        let subs = self.subscribers.read().clone();
-        // 收集失败的 sender, 后面移除 (避免持有 closed channel)
-        let mut dead = Vec::new();
-        for (i, tx) in subs.iter().enumerate() {
-            if tx.send(notif.clone()).is_err() {
-                dead.push(i);
-            }
-        }
-        if !dead.is_empty() {
-            let mut live = self.subscribers.write();
-            for i in dead.into_iter().rev() {
-                if i < live.len() {
-                    live.remove(i);
-                }
-            }
-        }
+        });
     }
 
-    /// §15.13 / §3.4 向所有订阅者推送 PaneBell (fan-out to subscribers).
     fn broadcast_pane_bell(&self) {
-        let notif = MuxNotification {
+        self.broadcast_notification(MuxNotification {
             event: Some(mux_protocol::notification::Event::PaneBell(
                 mux_protocol::PaneBell {
                     pane_id: self.id.clone(),
                 },
             )),
-        };
-        let subs = self.subscribers.read().clone();
-        let mut dead = Vec::new();
-        for (i, tx) in subs.iter().enumerate() {
-            if tx.send(notif.clone()).is_err() {
-                dead.push(i);
-            }
-        }
-        if !dead.is_empty() {
-            let mut live = self.subscribers.write();
-            for i in dead.into_iter().rev() {
-                if i < live.len() {
-                    live.remove(i);
-                }
-            }
-        }
+        });
     }
 
     /// §3.3 从 alacritty Term 收集 dirty 行号和整屏损伤标志。
@@ -744,38 +695,33 @@ impl Pane {
         (rows, fully_damaged)
     }
 
-    /// Broadcast an emulator-originated OSC title change to every pane subscriber.
     fn broadcast_pane_title(&self, title: String) {
-        let notification = MuxNotification {
+        self.broadcast_notification(MuxNotification {
             event: Some(mux_protocol::notification::Event::PaneTitleChanged(
                 mux_protocol::PaneTitleChanged {
                     pane_id: self.id.clone(),
                     title,
                 },
             )),
-        };
-        let subscribers = self.subscribers.read().clone();
-        let mut dead = Vec::new();
-        for (index, subscriber) in subscribers.iter().enumerate() {
-            if subscriber.send(notification.clone()).is_err() {
-                dead.push(index);
-            }
-        }
-        if !dead.is_empty() {
-            let mut live = self.subscribers.write();
-            for index in dead.into_iter().rev() {
-                if index < live.len() {
-                    live.remove(index);
-                }
-            }
-        }
+        });
     }
 
-    /// §3.4 订阅 PaneDirty / PaneRemoved 通知。
-    /// 返回的 sender 由连接层持有, drop 时关闭 channel,
-    /// broadcast_pane_dirty 下次调用会检测到并清理。
-    pub fn add_subscriber(&self, tx: mpsc::UnboundedSender<MuxNotification>) {
-        self.subscribers.write().push(tx);
+    fn broadcast_notification(&self, notification: MuxNotification) {
+        self.subscribers
+            .write()
+            .retain(|_client_id, subscriber| subscriber.send(notification.clone()).is_ok());
+    }
+
+    pub fn add_subscriber(
+        &self,
+        client_id: String,
+        sender: mpsc::UnboundedSender<MuxNotification>,
+    ) {
+        self.subscribers.write().insert(client_id, sender);
+    }
+
+    pub fn remove_subscriber(&self, client_id: &str) {
+        self.subscribers.write().remove(client_id);
     }
 
     /// Drain Alacritty side effects. Grid-affecting state is compared around
@@ -1225,30 +1171,14 @@ impl Pane {
         }
     }
 
-    /// §3.3 广播 ShellIntegrationChanged 到所有订阅者。
     fn broadcast_shell_integration_changed(&self) {
-        let notif = MuxNotification {
+        self.broadcast_notification(MuxNotification {
             event: Some(mux_protocol::notification::Event::ShellIntegrationChanged(
                 mux_protocol::ShellIntegrationChanged {
                     cwd: self.get_cwd(),
                 },
             )),
-        };
-        let subs = self.subscribers.read().clone();
-        let mut dead = Vec::new();
-        for (i, tx) in subs.iter().enumerate() {
-            if tx.send(notif.clone()).is_err() {
-                dead.push(i);
-            }
-        }
-        if !dead.is_empty() {
-            let mut live = self.subscribers.write();
-            for i in dead.into_iter().rev() {
-                if i < live.len() {
-                    live.remove(i);
-                }
-            }
-        }
+        });
     }
 }
 
@@ -1285,7 +1215,7 @@ mod tests {
             Err(error) => panic!("spawn title test pane: {error}"),
         };
         let (tx, mut rx) = mpsc::unbounded_channel();
-        pane.add_subscriber(tx);
+        pane.add_subscriber("title-client".to_string(), tx);
 
         pane.events
             .lock()
@@ -1330,6 +1260,55 @@ mod tests {
             Ok(notification) => panic!("expected PaneDirty, got {:?}", notification.event),
             Err(error) => panic!("receive reset-title PaneDirty notification: {error}"),
         }
+    }
+
+    #[test]
+    fn subscriber_registration_replaces_and_removes_by_client_id() {
+        let pane = match Pane::spawn(
+            "subscriber-lifecycle-pane".to_string(),
+            std::env::temp_dir().to_string_lossy().to_string(),
+            20,
+            5,
+            Some(ShellCommand {
+                program: "/bin/cat".to_string(),
+                ..Default::default()
+            }),
+        ) {
+            Ok(pane) => pane,
+            Err(error) => panic!("spawn subscriber lifecycle pane: {error}"),
+        };
+        let (old_sender, mut old_receiver) = mpsc::unbounded_channel();
+        let (replacement_sender, mut replacement_receiver) = mpsc::unbounded_channel();
+
+        pane.add_subscriber("client-1".to_string(), old_sender);
+        pane.add_subscriber("client-1".to_string(), replacement_sender);
+        assert!(matches!(
+            old_receiver.try_recv(),
+            Err(mpsc::error::TryRecvError::Disconnected)
+        ));
+
+        pane.events
+            .lock()
+            .push(AlacEvent::Title("replacement title".to_string()));
+        pane.handle_pending_events();
+        assert!(matches!(
+            replacement_receiver.try_recv(),
+            Ok(MuxNotification {
+                event: Some(mux_protocol::notification::Event::PaneTitleChanged(_)),
+            })
+        ));
+        assert!(matches!(
+            replacement_receiver.try_recv(),
+            Ok(MuxNotification {
+                event: Some(mux_protocol::notification::Event::PaneDirty(_)),
+            })
+        ));
+
+        pane.remove_subscriber("client-1");
+        assert!(matches!(
+            replacement_receiver.try_recv(),
+            Err(mpsc::error::TryRecvError::Disconnected)
+        ));
     }
 
     #[test]
