@@ -514,7 +514,7 @@ impl ShadowSnapshotEngine {
     /// full-snapshot VersionNode 成为新的 HEAD。这样后续 record_change 的
     /// parent 链以还原后的内容为基线，而不是还原前的写入链——避免 decline
     /// 被“幽灵地”覆盖回旧状态。
-    pub fn decline(&self, path: &Path, target_version: VersionId) -> Result<()> {
+    pub fn decline(&self, path: &Path, target_version: VersionId) -> Result<ContentHash> {
         use crate::decline::DeclineProtocol;
         use crate::delta_chain::DeltaReplay;
 
@@ -597,7 +597,7 @@ impl ShadowSnapshotEngine {
         );
         // A decline stores a full-snapshot blob; include it in quota accounting.
         self.maybe_run_gc();
-        Ok(())
+        Ok(content_hash)
     }
 
     /// List all versions of a file.

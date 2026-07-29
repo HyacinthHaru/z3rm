@@ -299,10 +299,14 @@ pub fn start_with(
             // second timer thread.
             use crate::coalescing::PathDebouncer;
             let mut debouncer = PathDebouncer::new();
+            let mut suppressed_writes = std::collections::HashMap::new();
+            let suppression_ttl = std::time::Duration::from_secs(5);
             // Poll just under the window so flush latency stays close to 500ms.
             let poll = std::time::Duration::from_millis(100);
             let mut path_disconnected = false;
             loop {
+                let now = std::time::Instant::now();
+                suppressed_writes.retain(|_path_hash, (_content_hash, deadline)| *deadline > now);
                 match path_rx.recv_timeout(poll) {
                     Ok((path, trigger)) => {
                         debouncer.note(path, trigger, std::time::Instant::now());
@@ -314,11 +318,13 @@ pub fn start_with(
                 }
 
                 while let Ok(command) = command_rx.try_recv() {
-                    handle_command(&engine, command);
+                    if let Some((path_hash, content_hash)) = handle_command(&engine, command) {
+                        suppressed_writes.insert(path_hash, (content_hash, now + suppression_ttl));
+                    }
                 }
 
                 for (path, trigger) in debouncer.flush_due(std::time::Instant::now()) {
-                    route_record_event(&engine, &path, trigger);
+                    route_record_event(&engine, &path, trigger, &mut suppressed_writes);
                 }
 
                 if path_disconnected {
@@ -390,7 +396,10 @@ pub fn start_with(
     })))
 }
 
-fn handle_command(engine: &shadow_snapshot::ShadowSnapshotEngine, command: ShadowCommand) {
+fn handle_command(
+    engine: &shadow_snapshot::ShadowSnapshotEngine,
+    command: ShadowCommand,
+) -> Option<(shadow_snapshot::PathHash, shadow_snapshot::ContentHash)> {
     match command {
         ShadowCommand::ListVersions { path, reply } => {
             let result = engine.list_versions(&path).map(|versions| {
@@ -406,6 +415,7 @@ fn handle_command(engine: &shadow_snapshot::ShadowSnapshotEngine, command: Shado
             if reply.send(result).is_err() {
                 zlog::warn!("shadow list-versions requester disconnected");
             }
+            None
         }
         ShadowCommand::GetVersion {
             path,
@@ -418,15 +428,21 @@ fn handle_command(engine: &shadow_snapshot::ShadowSnapshotEngine, command: Shado
             {
                 zlog::warn!("shadow get-version requester disconnected");
             }
+            None
         }
         ShadowCommand::Decline {
             path,
             version_id,
             reply,
         } => {
-            if reply.send(engine.decline(&path, version_id)).is_err() {
+            let result = engine
+                .decline(&path, version_id)
+                .map(|content_hash| (shadow_snapshot::compute_path_hash(&path), content_hash));
+            let suppression = result.as_ref().ok().copied();
+            if reply.send(result.map(|_| ())).is_err() {
                 zlog::warn!("shadow decline requester disconnected");
             }
+            suppression
         }
     }
 }
@@ -471,8 +487,14 @@ fn route_record_event(
     engine: &shadow_snapshot::ShadowSnapshotEngine,
     path: &Path,
     trigger: shadow_snapshot::SnapshotTrigger,
+    suppressed_writes: &mut std::collections::HashMap<
+        shadow_snapshot::PathHash,
+        (shadow_snapshot::ContentHash, std::time::Instant),
+    >,
 ) {
+    let path_hash = shadow_snapshot::compute_path_hash(path);
     if trigger == shadow_snapshot::SnapshotTrigger::Delete {
+        suppressed_writes.remove(&path_hash);
         if let Err(error) = engine.record_delete(path) {
             zlog::warn!(
                 "shadow snapshot delete failed: path={} error={}",
@@ -484,6 +506,14 @@ fn route_record_event(
     }
     match std::fs::read(path) {
         Ok(content) => {
+            if suppressed_writes
+                .remove(&path_hash)
+                .is_some_and(|(expected_hash, _deadline)| {
+                    expected_hash == shadow_snapshot::BlobStore::compute_hash(&content)
+                })
+            {
+                return;
+            }
             if let Err(error) = engine.record_change(path, &content) {
                 zlog::warn!(
                     "shadow snapshot record failed: path={} error={}",
@@ -542,10 +572,12 @@ mod tests {
         let target_file = dir.path().join("victim.txt");
         let _ = engine.record_change(&target_file, b"alive").unwrap();
 
+        let mut suppressed_writes = std::collections::HashMap::new();
         route_record_event(
             &engine,
             &target_file,
             shadow_snapshot::SnapshotTrigger::Delete,
+            &mut suppressed_writes,
         );
 
         let versions = engine.list_versions(&target_file).unwrap();
@@ -556,6 +588,68 @@ mod tests {
             "delete must be versioned with trigger=Delete, got {:?}",
             last.2
         );
+    }
+
+    #[test]
+    fn route_record_event_consumes_matching_decline_write_once() {
+        let directory = tempfile::tempdir().unwrap();
+        let database = directory.path().join("suppression.db");
+        let wal = directory.path().join("suppression.wal");
+        let blobs = directory.path().join("suppression-blobs");
+        std::fs::create_dir_all(&blobs).unwrap();
+        let engine = shadow_snapshot::ShadowSnapshotEngine::open(&database, &wal, &blobs).unwrap();
+        let path = directory.path().join("declined.txt");
+        std::fs::write(&path, b"restored").unwrap();
+        let path_hash = shadow_snapshot::compute_path_hash(&path);
+        let content_hash = shadow_snapshot::BlobStore::compute_hash(b"restored");
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        let mut suppressed_writes =
+            std::collections::HashMap::from([(path_hash, (content_hash, deadline))]);
+
+        route_record_event(
+            &engine,
+            &path,
+            shadow_snapshot::SnapshotTrigger::Write,
+            &mut suppressed_writes,
+        );
+
+        assert!(engine.list_versions(&path).unwrap().is_empty());
+        assert!(suppressed_writes.is_empty());
+
+        route_record_event(
+            &engine,
+            &path,
+            shadow_snapshot::SnapshotTrigger::Write,
+            &mut suppressed_writes,
+        );
+        assert_eq!(engine.list_versions(&path).unwrap().len(), 1);
+    }
+
+    #[test]
+    fn route_record_event_keeps_user_edit_that_differs_from_decline() {
+        let directory = tempfile::tempdir().unwrap();
+        let database = directory.path().join("user-edit.db");
+        let wal = directory.path().join("user-edit.wal");
+        let blobs = directory.path().join("user-edit-blobs");
+        std::fs::create_dir_all(&blobs).unwrap();
+        let engine = shadow_snapshot::ShadowSnapshotEngine::open(&database, &wal, &blobs).unwrap();
+        let path = directory.path().join("edited.txt");
+        std::fs::write(&path, b"user edit").unwrap();
+        let path_hash = shadow_snapshot::compute_path_hash(&path);
+        let declined_hash = shadow_snapshot::BlobStore::compute_hash(b"restored");
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        let mut suppressed_writes =
+            std::collections::HashMap::from([(path_hash, (declined_hash, deadline))]);
+
+        route_record_event(
+            &engine,
+            &path,
+            shadow_snapshot::SnapshotTrigger::Write,
+            &mut suppressed_writes,
+        );
+
+        assert_eq!(engine.list_versions(&path).unwrap().len(), 1);
+        assert!(suppressed_writes.is_empty());
     }
 
     #[test]
