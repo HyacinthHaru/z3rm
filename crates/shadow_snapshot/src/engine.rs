@@ -50,38 +50,34 @@ fn rope_to_bytes(rope: &Rope) -> Vec<u8> {
     rope.to_string().into_bytes()
 }
 
-/// Compute a bounded, reconstructable delta from `old` → `new`.
-///
-/// Emits a single `Replace` op over the differing middle region, found as the
-/// longest common byte prefix and longest common byte suffix. Correct for any
-/// input (applying the op reproduces `new` exactly), bounded in op count, and
-/// cheap to replay on a Rope. Producing a minimal LCS-based edit is not required
-/// for correctness — only that replay reconstructs the bytes.
-fn compute_delta_ops(old: &[u8], new: &[u8]) -> Vec<DeltaOp> {
-    let max_prefix = old.len().min(new.len());
-    let prefix = (0..max_prefix).take_while(|&i| old[i] == new[i]).count();
-    let remaining_old = old.len().saturating_sub(prefix);
-    let remaining_new = new.len().saturating_sub(prefix);
-    let max_suffix = remaining_old.min(remaining_new);
-    let mut suffix = 0;
-    while suffix < max_suffix {
-        let old_idx = old.len().saturating_sub(1).saturating_sub(suffix);
-        let new_idx = new.len().saturating_sub(1).saturating_sub(suffix);
-        if old[old_idx] != new[new_idx] {
+fn compute_delta_ops(old: &str, new: &str) -> Vec<DeltaOp> {
+    let mut prefix_bytes = 0;
+    for (old_character, new_character) in old.chars().zip(new.chars()) {
+        if old_character != new_character {
             break;
         }
-        suffix += 1;
+        prefix_bytes += old_character.len_utf8();
     }
-    let delete_len = remaining_old.saturating_sub(suffix);
-    let tail_start = new.len().saturating_sub(suffix);
-    if delete_len == 0 && tail_start == prefix {
+
+    let old_tail = &old[prefix_bytes..];
+    let new_tail = &new[prefix_bytes..];
+    let mut suffix_bytes = 0;
+    for (old_character, new_character) in old_tail.chars().rev().zip(new_tail.chars().rev()) {
+        if old_character != new_character {
+            break;
+        }
+        suffix_bytes += old_character.len_utf8();
+    }
+
+    let delete_len = old_tail.len().saturating_sub(suffix_bytes);
+    let new_middle_end = new.len().saturating_sub(suffix_bytes);
+    if delete_len == 0 && new_middle_end == prefix_bytes {
         return Vec::new();
     }
-    let text = &new[prefix..tail_start];
     vec![DeltaOp::Replace {
-        offset: prefix,
+        offset: prefix_bytes,
         delete_len,
-        text: Arc::new(Rope::from(String::from_utf8_lossy(text).into_owned())),
+        text: Arc::new(Rope::from(&new[prefix_bytes..new_middle_end])),
     }]
 }
 
@@ -435,8 +431,15 @@ impl ShadowSnapshotEngine {
             Ok(content) => content,
             Err(_) => return Ok(ProducedSnapshot::full(self.blob_store.put(new_content)?)),
         };
-        let delta_ops = compute_delta_ops(&parent_content, new_content);
-        let delta_bytes = serialize_delta_ops(&delta_ops);
+        let (Ok(parent_text), Ok(new_text)) = (
+            std::str::from_utf8(&parent_content),
+            std::str::from_utf8(new_content),
+        ) else {
+            return Ok(ProducedSnapshot::full(self.blob_store.put(new_content)?));
+        };
+        let delta_ops = compute_delta_ops(parent_text, new_text);
+        let delta_bytes = serialize_delta_ops(&delta_ops)
+            .ok_or_else(|| anyhow::anyhow!("delta exceeds serialization limits"))?;
         let delta_hash = self.blob_store.put(&delta_bytes)?;
         let compressed_size = delta_bytes.len() as u64;
 
@@ -1089,5 +1092,57 @@ mod tests {
         let engine = ShadowSnapshotEngine::open(&database, &wal_path, &blobs).unwrap();
         let child = engine.tree.get_node(11).expect("child node exists");
         assert_eq!(child.ancestors.first(), Some(&10));
+    }
+
+    #[test]
+    fn unicode_delta_reconstructs_exact_target() {
+        let cases = [
+            ("préfixe é suffixe", "préfixe ê suffixe"),
+            ("alpha 🦀 omega", "alpha 🚀 omega"),
+            ("前缀中文后缀", "前缀日本語后缀"),
+            ("a e\u{301} z", "a é z"),
+            ("retain 끝", "insert 중간 retain 끝"),
+        ];
+        for (index, (old, new)) in cases.into_iter().enumerate() {
+            let directory = TempDir::new().unwrap();
+            let database = directory.path().join(format!("unicode-{index}.db"));
+            let wal = directory.path().join(format!("unicode-{index}.wal"));
+            let blobs = directory.path().join(format!("unicode-{index}-blobs"));
+            std::fs::create_dir_all(&blobs).unwrap();
+            let path = directory.path().join("unicode.txt");
+            let engine = ShadowSnapshotEngine::open(&database, &wal, &blobs).unwrap();
+
+            engine.record_change(&path, old.as_bytes()).unwrap();
+            let version = engine.record_change(&path, new.as_bytes()).unwrap();
+
+            assert_eq!(
+                engine.query_version(version).unwrap().unwrap(),
+                new.as_bytes()
+            );
+        }
+    }
+
+    #[test]
+    fn non_utf8_change_uses_exact_full_snapshot() {
+        let directory = TempDir::new().unwrap();
+        let database = directory.path().join("binary.db");
+        let wal = directory.path().join("binary.wal");
+        let blobs = directory.path().join("binary-blobs");
+        std::fs::create_dir_all(&blobs).unwrap();
+        let path = directory.path().join("binary.dat");
+        let engine = ShadowSnapshotEngine::open(&database, &wal, &blobs).unwrap();
+        engine.record_change(&path, &[0xff, 0x00, 0x80]).unwrap();
+
+        let version = engine.record_change(&path, &[0xfe, 0x01, 0x81]).unwrap();
+        let node = engine
+            .get_version_node(version)
+            .expect("binary node exists");
+
+        assert!(node.full_content.is_some());
+        assert!(node.delta.is_none());
+        assert_eq!(
+            engine.query_version(version).unwrap().unwrap(),
+            [0xfe, 0x01, 0x81]
+        );
     }
 }

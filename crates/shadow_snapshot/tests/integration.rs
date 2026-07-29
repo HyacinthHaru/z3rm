@@ -309,8 +309,8 @@ fn integration_reconstruct_replays_delta_chain() -> Result<()> {
     }];
 
     // 序列化 deltas,放到模拟 blob store (HashMap<hash, bytes>)
-    let delta_v1_to_v2_bytes = serialize_delta_ops(&delta_v1_to_v2);
-    let delta_v2_to_v3_bytes = serialize_delta_ops(&delta_v2_to_v3);
+    let delta_v1_to_v2_bytes = serialize_delta_ops(&delta_v1_to_v2).expect("serialize delta");
+    let delta_v2_to_v3_bytes = serialize_delta_ops(&delta_v2_to_v3).expect("serialize delta");
     let delta_v1_to_v2_hash: [u8; 32] = blake3::hash(&delta_v1_to_v2_bytes).into();
     let delta_v2_to_v3_hash: [u8; 32] = blake3::hash(&delta_v2_to_v3_bytes).into();
     let delta_v1_to_v2_size = delta_v1_to_v2_bytes.len() as u64;
@@ -604,7 +604,7 @@ fn integration_wal_replay_rebuilds_delta_node_shape() -> Result<()> {
         offset: parent_bytes.len(),
         text: StdArc::new(rope::Rope::from("edits\n")),
     }];
-    let delta_bytes = serialize_delta_ops(&ops);
+    let delta_bytes = serialize_delta_ops(&ops).context("serialize delta")?;
     let delta_hash = blob_store.put(&delta_bytes)?;
     let compressed_size = delta_bytes.len() as u64;
 

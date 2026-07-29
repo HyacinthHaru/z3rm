@@ -13,6 +13,7 @@ use crate::version_tree::VersionNode;
 
 /// Delta 链最大深度
 pub const D_MAX: u8 = 16;
+const MAX_DELTA_OPS: usize = 1024;
 
 /// 单个 delta 操作
 #[derive(Debug, Clone)]
@@ -36,27 +37,48 @@ impl DeltaReplay {
     /// 将 delta 操作应用到 Rope 上
     ///
     /// 时间复杂度：O(log N + ||insert||) 每操作
-    pub fn apply_delta(base: &mut Rope, ops: &[DeltaOp]) {
+    pub fn apply_delta(base: &mut Rope, ops: &[DeltaOp]) -> bool {
+        let mut updated = base.clone();
         for op in ops {
             match op {
                 DeltaOp::Delete { offset, delete_len } => {
-                    let end = offset.saturating_add(*delete_len).min(base.len());
-                    base.replace(*offset..end, "");
+                    let Some(end) = offset.checked_add(*delete_len) else {
+                        return false;
+                    };
+                    if end > updated.len()
+                        || !updated.is_char_boundary(*offset)
+                        || !updated.is_char_boundary(end)
+                    {
+                        return false;
+                    }
+                    updated.replace(*offset..end, "");
                 }
                 DeltaOp::Insert { offset, text } => {
-                    let pos = *offset.min(&base.len());
-                    base.replace(pos..pos, &text.to_string());
+                    if *offset > updated.len() || !updated.is_char_boundary(*offset) {
+                        return false;
+                    }
+                    updated.replace(*offset..*offset, &text.to_string());
                 }
                 DeltaOp::Replace {
                     offset,
                     delete_len,
                     text,
                 } => {
-                    let end = offset.saturating_add(*delete_len).min(base.len());
-                    base.replace(*offset..end, &text.to_string());
+                    let Some(end) = offset.checked_add(*delete_len) else {
+                        return false;
+                    };
+                    if end > updated.len()
+                        || !updated.is_char_boundary(*offset)
+                        || !updated.is_char_boundary(end)
+                    {
+                        return false;
+                    }
+                    updated.replace(*offset..end, &text.to_string());
                 }
             }
         }
+        *base = updated;
+        true
     }
 
     /// 重建内容:从版本 V 回溯到最近的 full snapshot,向前应用 deltas。
@@ -101,7 +123,9 @@ impl DeltaReplay {
             let delta_ref = node.delta.as_ref()?;
             let delta_bytes = get_blob(&delta_ref.hash)?;
             let delta_ops = deserialize_delta_ops(&delta_bytes)?;
-            Self::apply_delta(&mut rope, &delta_ops);
+            if !Self::apply_delta(&mut rope, &delta_ops) {
+                return None;
+            }
         }
         Some(rope)
     }
@@ -158,6 +182,21 @@ mod tests {
     }
 
     #[test]
+    fn invalid_utf8_boundary_delta_is_rejected() {
+        let mut rope = Rope::from("é");
+        let applied = DeltaReplay::apply_delta(
+            &mut rope,
+            &[DeltaOp::Replace {
+                offset: 1,
+                delete_len: 1,
+                text: Arc::new(Rope::from("x")),
+            }],
+        );
+
+        assert!(!applied);
+        assert_eq!(rope.to_string(), "é");
+    }
+    #[test]
     fn test_materialize_threshold() {
         assert!(!DeltaReplay::should_materialize(15));
         assert!(DeltaReplay::should_materialize(16));
@@ -186,41 +225,45 @@ mod tests {
 //
 // 这个格式只用于内部持久化;version 兼容性由 delta_ref.hash (内容寻址) 保证。
 
-/// §4.6 把 DeltaOp 列表序列化为字节。
-pub fn serialize_delta_ops(ops: &[DeltaOp]) -> Vec<u8> {
-    let mut buf = Vec::new();
-    buf.extend_from_slice(&(ops.len() as u32).to_be_bytes());
-    for op in ops {
-        match op {
+/// §4.6 把 DeltaOp 列表序列化为字节。超出格式资源上限时返回 None。
+pub fn serialize_delta_ops(ops: &[DeltaOp]) -> Option<Vec<u8>> {
+    if ops.len() > MAX_DELTA_OPS {
+        return None;
+    }
+    let count = u32::try_from(ops.len()).ok()?;
+    let mut buffer = Vec::new();
+    buffer.extend_from_slice(&count.to_be_bytes());
+    for operation in ops {
+        match operation {
             DeltaOp::Delete { offset, delete_len } => {
-                buf.push(0);
-                buf.extend_from_slice(&(*offset as u64).to_be_bytes());
-                buf.extend_from_slice(&(*delete_len as u64).to_be_bytes());
+                buffer.push(0);
+                buffer.extend_from_slice(&u64::try_from(*offset).ok()?.to_be_bytes());
+                buffer.extend_from_slice(&u64::try_from(*delete_len).ok()?.to_be_bytes());
             }
             DeltaOp::Insert { offset, text } => {
-                buf.push(1);
-                buf.extend_from_slice(&(*offset as u64).to_be_bytes());
-                let s = text.to_string();
-                let bytes = s.as_bytes();
-                buf.extend_from_slice(&(bytes.len() as u32).to_be_bytes());
-                buf.extend_from_slice(bytes);
+                buffer.push(1);
+                buffer.extend_from_slice(&u64::try_from(*offset).ok()?.to_be_bytes());
+                let text = text.to_string();
+                let text_length = u32::try_from(text.len()).ok()?;
+                buffer.extend_from_slice(&text_length.to_be_bytes());
+                buffer.extend_from_slice(text.as_bytes());
             }
             DeltaOp::Replace {
                 offset,
                 delete_len,
                 text,
             } => {
-                buf.push(2);
-                buf.extend_from_slice(&(*offset as u64).to_be_bytes());
-                buf.extend_from_slice(&(*delete_len as u64).to_be_bytes());
-                let s = text.to_string();
-                let bytes = s.as_bytes();
-                buf.extend_from_slice(&(bytes.len() as u32).to_be_bytes());
-                buf.extend_from_slice(bytes);
+                buffer.push(2);
+                buffer.extend_from_slice(&u64::try_from(*offset).ok()?.to_be_bytes());
+                buffer.extend_from_slice(&u64::try_from(*delete_len).ok()?.to_be_bytes());
+                let text = text.to_string();
+                let text_length = u32::try_from(text.len()).ok()?;
+                buffer.extend_from_slice(&text_length.to_be_bytes());
+                buffer.extend_from_slice(text.as_bytes());
             }
         }
     }
-    buf
+    Some(buffer)
 }
 
 /// §4.6 反序列化 DeltaOp 列表。失败返回 None (调用方按缺 blob 处理)。
@@ -230,17 +273,25 @@ pub fn deserialize_delta_ops(bytes: &[u8]) -> Option<Vec<DeltaOp>> {
         return None;
     }
     let count = u32::from_be_bytes(bytes[cur..cur + 4].try_into().ok()?);
+    if count as usize > MAX_DELTA_OPS {
+        return None;
+    }
     cur += 4;
     let mut ops = Vec::with_capacity(count as usize);
     for _ in 0..count {
         let tag = *bytes.get(cur)?;
         cur += 1;
-        let offset = u64::from_be_bytes(bytes.get(cur..cur + 8)?.try_into().ok()?) as usize;
+        let offset = usize::try_from(u64::from_be_bytes(
+            bytes.get(cur..cur + 8)?.try_into().ok()?,
+        ))
+        .ok()?;
         cur += 8;
         let op = match tag {
             0 => {
-                let delete_len =
-                    u64::from_be_bytes(bytes.get(cur..cur + 8)?.try_into().ok()?) as usize;
+                let delete_len = usize::try_from(u64::from_be_bytes(
+                    bytes.get(cur..cur + 8)?.try_into().ok()?,
+                ))
+                .ok()?;
                 cur += 8;
                 DeltaOp::Delete { offset, delete_len }
             }
@@ -255,8 +306,10 @@ pub fn deserialize_delta_ops(bytes: &[u8]) -> Option<Vec<DeltaOp>> {
                 }
             }
             2 => {
-                let delete_len =
-                    u64::from_be_bytes(bytes.get(cur..cur + 8)?.try_into().ok()?) as usize;
+                let delete_len = usize::try_from(u64::from_be_bytes(
+                    bytes.get(cur..cur + 8)?.try_into().ok()?,
+                ))
+                .ok()?;
                 cur += 8;
                 let text_len = u32::from_be_bytes(bytes.get(cur..cur + 4)?.try_into().ok()?) as usize;
                 cur += 4;
@@ -272,5 +325,36 @@ pub fn deserialize_delta_ops(bytes: &[u8]) -> Option<Vec<DeltaOp>> {
         };
         ops.push(op);
     }
-    Some(ops)
+    (cur == bytes.len()).then_some(ops)
+}
+
+#[cfg(test)]
+mod serialization_tests {
+    use super::*;
+
+    #[test]
+    fn deserialize_rejects_excessive_operation_count() {
+        let operations = vec![
+            DeltaOp::Delete {
+                offset: 0,
+                delete_len: 0,
+            };
+            MAX_DELTA_OPS + 1
+        ];
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(&u32::try_from(operations.len()).unwrap().to_be_bytes());
+        for _operation in operations {
+            bytes.push(0);
+            bytes.extend_from_slice(&0u64.to_be_bytes());
+            bytes.extend_from_slice(&0u64.to_be_bytes());
+        }
+        assert!(deserialize_delta_ops(&bytes).is_none());
+    }
+
+    #[test]
+    fn deserialize_rejects_trailing_bytes() {
+        let mut bytes = serialize_delta_ops(&[]).unwrap();
+        bytes.push(0xff);
+        assert!(deserialize_delta_ops(&bytes).is_none());
+    }
 }
