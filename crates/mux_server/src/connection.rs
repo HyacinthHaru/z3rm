@@ -1657,18 +1657,19 @@ fn pane_info_for(
 ) -> Option<mux_protocol::PaneInfo> {
     let panes = session.panes.read();
     let pane = panes.get(pane_id)?;
+    let metadata = pane.metadata_snapshot();
     Some(mux_protocol::PaneInfo {
         id: pane.id.clone(),
         cwd: pane.get_cwd(),
-        title: pane.title.read().clone(),
+        title: metadata.title,
         command: pane.command.clone().unwrap_or_default(),
-        generation: pane.generation.load(std::sync::atomic::Ordering::Relaxed),
+        generation: metadata.generation,
         size: Some(mux_protocol::TerminalSize {
-            cols: pane.cols.load(std::sync::atomic::Ordering::Relaxed) as u32,
-            rows: pane.rows.load(std::sync::atomic::Ordering::Relaxed) as u32,
+            cols: metadata.cols,
+            rows: metadata.rows,
         }),
-        is_alive: pane.alive.load(std::sync::atomic::Ordering::Relaxed),
-        zoomed: pane.is_zoomed(),
+        is_alive: metadata.is_alive,
+        zoomed: metadata.zoomed,
     })
 }
 
@@ -2093,8 +2094,7 @@ async fn handle_set_pane_title(
 
     match matched_pane {
         Some(pane) => {
-            *pane.title.write() = req.title.clone();
-            pane.bump_generation();
+            pane.set_title(req.title.clone());
             // §3.4 / §3.3 broadcast PaneTitleChanged so every attached client
             // learns the title string (PaneDirty only carries pane_id).
             // broadcast_lifecycle_in_session looks up the session by id.
@@ -2136,7 +2136,6 @@ async fn handle_zoom_pane(
         for session in sessions_r.iter() {
             if let Some(pane) = session.panes.read().get(&req.pane_id) {
                 pane.set_zoomed(req.zoom);
-                pane.bump_generation();
                 matched_session_id = Some(session.id.clone());
                 pane_found = true;
                 break;

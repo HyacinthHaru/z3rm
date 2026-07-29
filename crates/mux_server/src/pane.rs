@@ -4,27 +4,27 @@
 // PTY fd、alacritty Term、scrollback、generation counter 全部在此进程内。
 // 客户端只渲染我们 push 过来的 grid diff / snapshot。
 
+use crate::coalescing::AdaptiveCoalescer;
+use crate::dec2026::Dec2026Parser;
 use crate::grid_sync::{
-    self, diff_from_dirty, snapshot_from_term, GridDiff, GridDiffRing, FullGridSnapshot,
-    ScrollbackBuffer, ScrollbackVersion,
+    self, FullGridSnapshot, GridDiff, GridDiffRing, ScrollbackBuffer, ScrollbackVersion,
+    diff_from_dirty, snapshot_from_term,
 };
-use anyhow::Context as _;
 use alacritty_terminal::event::{Event as AlacEvent, EventListener};
 use alacritty_terminal::grid::Dimensions as _;
 use alacritty_terminal::term::test::TermSize;
 use alacritty_terminal::term::{Config as TermConfig, Term, TermDamage, TermMode};
 use alacritty_terminal::vte::ansi::Processor;
+use anyhow::Context as _;
 use mux_protocol::Notification as MuxNotification;
 use parking_lot::Mutex;
 use portable_pty::{CommandBuilder, MasterPty, PtyPair, PtySize, PtySystem};
 use std::collections::HashMap;
 use std::io::{Read, Write};
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
-use tokio::sync::mpsc;
-use crate::coalescing::AdaptiveCoalescer;
-use crate::dec2026::Dec2026Parser;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::{Duration, Instant};
+use tokio::sync::mpsc;
 
 /// §3.1 真正拥有 alacritty Term + PTY pair 的 Pane (server-canonical)。
 pub struct Pane {
@@ -32,6 +32,9 @@ pub struct Pane {
     pub cwd: Arc<parking_lot::RwLock<String>>,
     pub title: Arc<parking_lot::RwLock<String>>,
     pub command: Option<String>,
+    /// Serializes every render-state mutation with its generation publication.
+    /// This lock is always acquired before PTY master, terminal, or diff-ring locks.
+    commit: parking_lot::Mutex<()>,
     /// §3.1 alacritty 终端实例 (server-canonical, 真实 VT 解析)。
     pub term: Arc<parking_lot::Mutex<Term<PaneEventListener>>>,
     /// §3.3 generation counter (每次 grid-affecting 变化递增)。
@@ -95,6 +98,15 @@ pub struct ShellCommand {
     pub env: HashMap<String, String>,
 }
 
+pub(crate) struct PaneMetadataSnapshot {
+    pub title: String,
+    pub generation: u64,
+    pub cols: u32,
+    pub rows: u32,
+    pub is_alive: bool,
+    pub zoomed: bool,
+}
+
 /// §3.3 PTY read-loop 本地状态: DEC-2026 同步延迟 + coalescing 通知节流。
 /// 仅在单一 PTY read 线程内顺序访问, 无需同步原语。
 #[derive(Default)]
@@ -103,6 +115,10 @@ struct ReadLoopState {
     last_notify: Option<Instant>,
     /// BSU..ESU 同步窗口内累积了尚未发布的变更
     pending_sync: bool,
+    /// Dirty rows accumulated across a DEC-2026 synchronized update window.
+    pending_dirty_rows: Vec<usize>,
+    /// Whether the window changed state absent from row diffs.
+    pending_full_snapshot: bool,
     /// 有被 coalescing 推迟、待窗口到期补发的 PaneDirty
     pending_notify: bool,
 }
@@ -152,7 +168,9 @@ impl Pane {
         scrollback_lines: usize,
     ) -> anyhow::Result<Arc<Self>> {
         let events = Arc::new(parking_lot::Mutex::new(Vec::new()));
-        let listener = PaneEventListener { events: events.clone() };
+        let listener = PaneEventListener {
+            events: events.clone(),
+        };
 
         let term_config = TermConfig::default();
         let size = TermSize::new(cols as usize, rows as usize);
@@ -212,11 +230,14 @@ impl Pane {
         // slave 端已经不需要了 (drop 让 child 持有)
         drop(pair.slave);
 
-        let command_str = command.as_ref().map(|c| format!("{} {}", c.program, c.args.join(" ")));
+        let command_str = command
+            .as_ref()
+            .map(|c| format!("{} {}", c.program, c.args.join(" ")));
 
         let pane = Arc::new(Pane {
             id: id.clone(),
             cwd: Arc::new(parking_lot::RwLock::new(cwd)),
+            commit: parking_lot::Mutex::new(()),
             title: Arc::new(parking_lot::RwLock::new(String::new())),
             command: command_str,
             term: Arc::new(parking_lot::Mutex::new(term)),
@@ -228,7 +249,9 @@ impl Pane {
             bracketed_paste_mode: AtomicBool::new(false),
             zoomed: AtomicBool::new(false),
             prompt_marker: AtomicU64::new(0),
-            scrollback_buffer: Arc::new(parking_lot::RwLock::new(ScrollbackBuffer::new(scrollback_lines))),
+            scrollback_buffer: Arc::new(parking_lot::RwLock::new(ScrollbackBuffer::new(
+                scrollback_lines,
+            ))),
             scrollback_version: Arc::new(parking_lot::RwLock::new(ScrollbackVersion::new())),
             pty_master: Arc::new(Mutex::new(pair.master)),
             pty_writer: Arc::new(Mutex::new(writer)),
@@ -237,8 +260,11 @@ impl Pane {
             subscribers: Arc::new(parking_lot::RwLock::new(Vec::new())),
             // §3.4 spawn_with_session 携带的 session_id 让 PTY read loop 在自然退出
             // 时能定位会话级 lifecycle 订阅者; 空字符串表示未连接会话, 等价于 None。
-            session_id: parking_lot::Mutex::new(
-                if session_id.is_empty() { None } else { Some(session_id) }),
+            session_id: parking_lot::Mutex::new(if session_id.is_empty() {
+                None
+            } else {
+                Some(session_id)
+            }),
             exit_hook: parking_lot::Mutex::new(None),
             clipboard_hook: parking_lot::Mutex::new(None),
         });
@@ -328,12 +354,8 @@ impl Pane {
         }
     }
 
-    /// §3.1 / §3.3 喂 PTY 字节给 alacritty Term, 处理事件, 计算 diff, bump generation。
-    ///
-    /// §3.3 DEC-2026: BSU..ESU 同步窗口内的 generation bump 推迟到 ESU (或 100ms
-    /// timeout) 再统一发布, 避免把同步更新的中间态推给客户端。
-    /// §3.3 adaptive coalescing: 按吞吐调整 PaneDirty 广播间隔 (0/2/16ms)。
-    /// §15.4 除 dirty 行外, cursor 样式 / 备用屏切换 / 滚动偏移 / title 变化也 bump。
+    /// Feed one PTY byte batch into the server-owned emulator and publish one
+    /// coherent grid generation outside DEC-2026 synchronized-update windows.
     fn process_pty_bytes(
         self: &Arc<Self>,
         bytes: &[u8],
@@ -341,99 +363,105 @@ impl Pane {
         coalescer: &mut AdaptiveCoalescer,
         state: &mut ReadLoopState,
     ) {
-        // §3.3 DEC-2026: 检测 BSU/ESU 边界; force_flush = unpaired BSU 超过 100ms。
-        let was_in_sync = dec.is_in_sync();
-        let force_flush = dec.parse(bytes);
+        let transitions = dec.parse(bytes);
         let in_sync = dec.is_in_sync();
-        let esu_received = was_in_sync && !in_sync;
-
-        // §3.3 adaptive coalescer: 登记一次输出, 取当前批处理窗口。
         let delay = coalescer.on_output();
-
-        // §3.3 若有被 coalescing 推迟的 PaneDirty 且窗口已到期, 先补发。
         self.flush_pending_notify(state, delay);
 
-        // §3.1 喂字节给 alacritty; 同时捕获 render 状态 (cursor / alt-screen / scroll)
-        // 的变化 —— 它们可能不产生 dirty cell, 但仍影响渲染 (§15.4)。
-        let render_changed = {
+        let commit = self.commit.lock();
+        // Compare every non-cell render field represented by FullGridSnapshot
+        // but absent from GridDiff.
+        let render_state_changed = {
             let mut term = self.term.lock();
             let before = (
                 term.grid().cursor.point,
                 term.cursor_style(),
+                term.mode().contains(TermMode::SHOW_CURSOR),
                 term.grid().display_offset(),
                 term.mode().contains(TermMode::ALT_SCREEN),
             );
-            let mut processor =
-                Processor::<alacritty_terminal::vte::ansi::StdSyncHandler>::new();
+            let mut processor = Processor::<alacritty_terminal::vte::ansi::StdSyncHandler>::new();
             processor.advance(&mut *term, bytes);
-            // §3.1 In-place render-path: broadcast raw PTY bytes to clients.
-            self.broadcast_pane_output(bytes);
             let after = (
                 term.grid().cursor.point,
                 term.cursor_style(),
+                term.mode().contains(TermMode::SHOW_CURSOR),
                 term.grid().display_offset(),
                 term.mode().contains(TermMode::ALT_SCREEN),
             );
             before != after
         };
 
-        // §3.3 收集 dirty 行 + 消费事件 (title 变化由返回值报告, §15.4)。
         let dirty_rows = self.collect_dirty_rows();
-        let title_changed = self.handle_pending_events();
-
-        // §3.3 解析 OSC 7 (cwd) / OSC 133 (prompt markers) — 在 alacritty
-        // 处理之外独立扫描, 因为 alacritty EventListener 不暴露 OSC 事件。
-        self.parse_osc_sequences(bytes);
-
-        let has_change = !dirty_rows.is_empty() || render_changed || title_changed;
-
-        if has_change {
-            // §3.3 DEC-2026: 同步窗口内推迟 bump, 等 ESU / timeout 再发布。
-            if in_sync && !esu_received && !force_flush {
+        let grid_changed = !dirty_rows.is_empty() || render_state_changed;
+        let should_broadcast_dirty = if in_sync && !transitions.ended() {
+            if grid_changed {
                 state.pending_sync = true;
-                return;
+                state.pending_dirty_rows.extend(dirty_rows);
+                state.pending_full_snapshot |= render_state_changed;
             }
-            // ESU / timeout / 普通输出 → 发布 generation bump + 合并通知。
-            let forced = esu_received || force_flush;
-            self.emit_generation(dirty_rows, forced, delay, state);
+            false
+        } else if grid_changed || state.pending_sync {
+            let mut all_dirty_rows = std::mem::take(&mut state.pending_dirty_rows);
+            all_dirty_rows.extend(dirty_rows);
+            all_dirty_rows.sort_unstable();
+            all_dirty_rows.dedup();
+            let requires_full_snapshot =
+                std::mem::take(&mut state.pending_full_snapshot) || render_state_changed;
+            let should_broadcast = self.emit_generation(
+                all_dirty_rows,
+                requires_full_snapshot,
+                transitions.ended(),
+                delay,
+                state,
+            );
             state.pending_sync = false;
-        } else if state.pending_sync && (esu_received || force_flush || !in_sync) {
-            // 同步窗口结束但本批没有新行 —— 仍要发布之前累积的变更。
-            self.emit_generation(Vec::new(), true, delay, state);
-            state.pending_sync = false;
+            should_broadcast
+        } else {
+            false
+        };
+        drop(commit);
+
+        // Notifications and side effects are intentionally outside the commit.
+        self.broadcast_pane_output(bytes);
+        self.handle_pending_events();
+        self.parse_osc_sequences(bytes);
+        if should_broadcast_dirty {
+            self.broadcast_pane_dirty();
         }
     }
 
-    /// §15.4 / §3.3 Bump generation, push diff 到 ring, 并按 coalescing 窗口决定广播。
-    ///
-    /// `dirty_rows` 为空时 push 空 diff —— generation 仍要前进, 客户端据此重新拉取
-    /// (cursor / title 等非行级变更通过 snapshot 反映)。
+    /// Publish one coherent grid generation after its structured state is in
+    /// the diff ring. The state flag forces a full snapshot for clients whose
+    /// checkpoint precedes a cursor/mode/offset change.
     fn emit_generation(
         self: &Arc<Self>,
         dirty_rows: Vec<usize>,
+        requires_full_snapshot: bool,
         force_broadcast: bool,
         delay: Duration,
         state: &mut ReadLoopState,
-    ) {
-        let diff = {
+    ) -> bool {
+        let (diff, viewport_is_scrolled) = {
             let term = self.term.lock();
-            diff_from_dirty(&*term, &dirty_rows)
+            (
+                diff_from_dirty(&*term, &dirty_rows),
+                term.grid().display_offset() != 0,
+            )
         };
-        let new_gen = self.generation.fetch_add(1, Ordering::SeqCst) + 1;
-        self.grid_diff_ring.write().push(new_gen, diff);
+        self.publish_generation(diff, requires_full_snapshot || viewport_is_scrolled);
 
-        // §3.3 coalescing: 高吞吐 (delay=0) 或窗口已到期 → 立即广播; 否则推迟,
-        // 把多次小更新合并成一次 PaneDirty。强制刷新 (ESU / timeout) 总是立即广播。
         let now = Instant::now();
         let window_elapsed = state
             .last_notify
-            .map_or(true, |t| now.duration_since(t) >= delay);
+            .map_or(true, |time| now.duration_since(time) >= delay);
         if force_broadcast || delay.is_zero() || window_elapsed {
-            self.broadcast_pane_dirty();
             state.last_notify = Some(now);
             state.pending_notify = false;
+            true
         } else {
             state.pending_notify = true;
+            false
         }
     }
 
@@ -443,7 +471,10 @@ impl Pane {
             return;
         }
         let now = Instant::now();
-        if state.last_notify.map_or(true, |t| now.duration_since(t) >= delay) {
+        if state
+            .last_notify
+            .map_or(true, |t| now.duration_since(t) >= delay)
+        {
             self.broadcast_pane_dirty();
             state.last_notify = Some(now);
             state.pending_notify = false;
@@ -458,8 +489,23 @@ impl Pane {
         state: &mut ReadLoopState,
     ) {
         if state.pending_sync {
-            self.emit_generation(Vec::new(), true, Duration::ZERO, state);
+            let commit = self.commit.lock();
+            let mut dirty_rows = std::mem::take(&mut state.pending_dirty_rows);
+            dirty_rows.sort_unstable();
+            dirty_rows.dedup();
+            let requires_full_snapshot = std::mem::take(&mut state.pending_full_snapshot);
+            let should_broadcast = self.emit_generation(
+                dirty_rows,
+                requires_full_snapshot,
+                true,
+                Duration::ZERO,
+                state,
+            );
             state.pending_sync = false;
+            drop(commit);
+            if should_broadcast {
+                self.broadcast_pane_dirty();
+            }
         }
         self.flush_pending_notify(state, coalescer.delay());
     }
@@ -485,7 +531,9 @@ impl Pane {
         if !dead.is_empty() {
             let mut live = self.subscribers.write();
             for i in dead.into_iter().rev() {
-                if i < live.len() { live.remove(i); }
+                if i < live.len() {
+                    live.remove(i);
+                }
             }
         }
     }
@@ -493,7 +541,9 @@ impl Pane {
     fn broadcast_pane_dirty(&self) {
         let notif = MuxNotification {
             event: Some(mux_protocol::notification::Event::PaneDirty(
-                mux_protocol::PaneDirty { pane_id: self.id.clone() },
+                mux_protocol::PaneDirty {
+                    pane_id: self.id.clone(),
+                },
             )),
         };
         let subs = self.subscribers.read().clone();
@@ -518,7 +568,9 @@ impl Pane {
     fn broadcast_pane_bell(&self) {
         let notif = MuxNotification {
             event: Some(mux_protocol::notification::Event::PaneBell(
-                mux_protocol::PaneBell { pane_id: self.id.clone() },
+                mux_protocol::PaneBell {
+                    pane_id: self.id.clone(),
+                },
             )),
         };
         let subs = self.subscribers.read().clone();
@@ -533,6 +585,33 @@ impl Pane {
             for i in dead.into_iter().rev() {
                 if i < live.len() {
                     live.remove(i);
+                }
+            }
+        }
+    }
+
+    /// Broadcast an emulator-originated OSC title change to every pane subscriber.
+    fn broadcast_pane_title(&self, title: String) {
+        let notification = MuxNotification {
+            event: Some(mux_protocol::notification::Event::PaneTitleChanged(
+                mux_protocol::PaneTitleChanged {
+                    pane_id: self.id.clone(),
+                    title,
+                },
+            )),
+        };
+        let subscribers = self.subscribers.read().clone();
+        let mut dead = Vec::new();
+        for (index, subscriber) in subscribers.iter().enumerate() {
+            if subscriber.send(notification.clone()).is_err() {
+                dead.push(index);
+            }
+        }
+        if !dead.is_empty() {
+            let mut live = self.subscribers.write();
+            for index in dead.into_iter().rev() {
+                if index < live.len() {
+                    live.remove(index);
                 }
             }
         }
@@ -567,59 +646,63 @@ impl Pane {
         rows
     }
 
-    /// §3.3 处理 alacritty 通过 EventListener push 的事件。
-    /// 返回是否发生 title 变化 (OSC 0/1/2) —— 供 §15.4 bump generation。
-    fn handle_pending_events(&self) -> bool {
+    /// Drain Alacritty side effects. Grid-affecting state is compared around
+    /// `Processor::advance`; titles and bells travel through dedicated events.
+    fn handle_pending_events(&self) {
         let events: Vec<AlacEvent> = self.events.lock().drain(..).collect();
-        let mut title_changed = false;
         for event in events {
             match event {
                 AlacEvent::Title(title) => {
-                    *self.title.write() = title;
-                    title_changed = true;
+                    let commit = self.commit.lock();
+                    self.set_title_locked(title.clone());
+                    drop(commit);
+                    self.broadcast_pane_title(title);
+                    self.broadcast_pane_dirty();
                 }
                 AlacEvent::ResetTitle => {
-                    *self.title.write() = String::new();
-                    title_changed = true;
+                    let commit = self.commit.lock();
+                    self.set_title_locked(String::new());
+                    drop(commit);
+                    self.broadcast_pane_title(String::new());
+                    self.broadcast_pane_dirty();
                 }
-                AlacEvent::Bell => {
-                    // §15.13 bell affects render: bump generation so clients
-                    // fetch the updated grid, then fan-out Bell notification.
-                    self.bump_generation();
-                    self.broadcast_pane_bell();
-                }
+                AlacEvent::Bell => self.broadcast_pane_bell(),
                 AlacEvent::PtyWrite(text) => {
-                    // §3.1 alacritty 请求写 PTY (e.g. color query response)
-                    if let Err(e) = self.pty_writer.lock().write_all(text.as_bytes()) {
-                        tracing::warn!(error = %e, "pty_writer write_all failed");
+                    if let Err(error) = self.pty_writer.lock().write_all(text.as_bytes()) {
+                        tracing::warn!(error = %error, "pty_writer write_all failed");
                     }
                 }
                 AlacEvent::ClipboardStore(_clipboard_type, data) => {
-                    // §16.6 Shell OSC 52 / emulator ClipboardStore → server clipboard.
                     if let Some(hook) = self.clipboard_hook.lock().as_ref() {
                         hook(data);
                     }
                 }
-                AlacEvent::ClipboardLoad(_, _) => {
-                    // Load requests are answered by the client; server holds authority
-                    // for store only in the Day-0 path.
-                }
+                AlacEvent::ClipboardLoad(_, _) => {}
                 AlacEvent::Exit | AlacEvent::ChildExit(_) => {
-                    // §3.4 自然退出: 标记 dead + 调用 connection 层注册的退出钩子
-                    // (例如清理 session.panes / session.layout 并 fan-out PaneRemoved)。
-                    // handle_pending_events 与 PTY read-loop Ok(0) 路径各自独立, 因此
-                    // fire_exit_hook 内部 take 以保证只执行一次。
                     self.set_alive(false);
                     self.fire_exit_hook();
                 }
                 _ => {}
             }
         }
-        title_changed
+    }
+
+    /// Insert the ring entry before exposing its generation. Callers hold the
+    /// commit lock, which serializes PTY, resize, and metadata publishers.
+    fn publish_generation(&self, diff: GridDiff, requires_full_snapshot: bool) -> u64 {
+        let mut ring = self.grid_diff_ring.write();
+        let generation = self.generation.load(Ordering::Relaxed).saturating_add(1);
+        if requires_full_snapshot {
+            ring.push_requiring_full_snapshot(generation, diff);
+        } else {
+            ring.push(generation, diff);
+        }
+        self.generation.store(generation, Ordering::Release);
+        generation
     }
 
     pub fn get_generation(&self) -> u64 {
-        self.generation.load(Ordering::SeqCst)
+        self.generation.load(Ordering::Acquire)
     }
 
     /// §16.11 Apply hot-reloaded scrollback capacity to this pane.
@@ -627,25 +710,21 @@ impl Pane {
         self.scrollback_buffer.write().set_capacity(capacity);
     }
 
-    /// §3.3 bump_generation — bump generation but also push a full-screen
-    /// diff and broadcast PaneDirty so the push/pull contract (§3.3) holds:
-    /// a render-affecting change (zoom, title) MUST wake every attached
-    /// client. The previous implementation only did `fetch_add`, so a
-    /// CLI/one-client title/zoom change left the gap that has to be picked
-    /// up next PTY byte. The full-screen diff aligns with §15.13 which
-    /// treats title as a generation-affecting change.
+    /// Publish a metadata-triggered generation with a full-screen row diff.
     pub fn bump_generation(&self) {
-        let all_rows: Vec<usize> = {
-            let term = self.term.lock();
-            (0..term.screen_lines()).collect()
-        };
+        let commit = self.commit.lock();
+        self.bump_generation_locked();
+        drop(commit);
+        self.broadcast_pane_dirty();
+    }
+
+    fn bump_generation_locked(&self) {
         let diff = {
             let term = self.term.lock();
+            let all_rows = (0..term.screen_lines()).collect::<Vec<_>>();
             diff_from_dirty(&*term, &all_rows)
         };
-        let new_gen = self.generation.fetch_add(1, Ordering::SeqCst) + 1;
-        self.grid_diff_ring.write().push(new_gen, diff);
-        self.broadcast_pane_dirty();
+        self.publish_generation(diff, false);
     }
 
     /// §3.10 SendInput — 向 PTY 写入原始字节。
@@ -666,53 +745,53 @@ impl Pane {
         }
     }
 
-    /// §3.3 fetch_grid_update — 由 connection 层调用响应 RPC。
+    /// Fetch one generation checkpoint while excluding every publisher. The
+    /// full-snapshot closure uses the same committed terminal state as `current`.
     pub fn fetch_grid_update(&self, since_generation: u64) -> grid_sync::GridUpdate {
-        self.grid_diff_ring
-            .read()
-            .fetch_update(since_generation, self)
+        let _commit = self.commit.lock();
+        let ring = self.grid_diff_ring.read();
+        let current = self.generation.load(Ordering::Acquire);
+        ring.fetch_update(since_generation, current, || {
+            let term = self.term.lock();
+            snapshot_from_term(&*term)
+        })
     }
 
     /// §3.3 get_full_snapshot — 当前 grid 完整快照。
     pub fn get_full_snapshot(&self) -> FullGridSnapshot {
+        let _commit = self.commit.lock();
         let term = self.term.lock();
         snapshot_from_term(&*term)
     }
 
     /// §3.10 Resize — 改 PTY winsize + resize alacritty Term + bump generation。
     pub fn resize(&self, cols: u32, rows: u32) -> anyhow::Result<()> {
+        let commit = self.commit.lock();
         self.pty_master.lock().resize(PtySize {
-            rows: rows.try_into().context("pane row count exceeds PTY limit")?,
-            cols: cols.try_into().context("pane column count exceeds PTY limit")?,
+            rows: rows
+                .try_into()
+                .context("pane row count exceeds PTY limit")?,
+            cols: cols
+                .try_into()
+                .context("pane column count exceeds PTY limit")?,
             pixel_width: 0,
             pixel_height: 0,
         })?;
 
-        // §3.1 resize alacritty Term
-        {
-            let mut term = self.term.lock();
-            let size = TermSize::new(cols as usize, rows as usize);
-            term.resize(size);
-        }
-
-        self.cols.store(cols as u64, Ordering::SeqCst);
-        self.rows.store(rows as u64, Ordering::SeqCst);
-        // resize 影响整屏 — 用一个标记所有行 dirty 的 diff + bump generation
-        let all_rows: Vec<usize> = {
-            let term = self.term.lock();
-            (0..term.screen_lines()).collect()
-        };
         let diff = {
-            let term = self.term.lock();
+            let mut term = self.term.lock();
+            term.resize(TermSize::new(cols as usize, rows as usize));
+            let all_rows = (0..term.screen_lines()).collect::<Vec<_>>();
             diff_from_dirty(&*term, &all_rows)
         };
-        let new_gen = self.generation.fetch_add(1, Ordering::SeqCst) + 1;
-        self.grid_diff_ring.write().push(new_gen, diff);
-        // §3.3 / §15.13 resize is render-affecting: wake every attached
-        // client so it pulls the new full-screen grid. Otherwise the
-        // initiating client knows its local size but peers (and the
-        // initiator on a future reconnect path) never fetch until an
-        // unrelated PTY byte happens to bump+broadcast.
+        self.cols.store(cols as u64, Ordering::SeqCst);
+        self.rows.store(rows as u64, Ordering::SeqCst);
+        // Dimensions are absent from GridDiff, so any pre-resize checkpoint
+        // requires a full snapshot even though every resized row is included.
+        self.publish_generation(diff, true);
+        drop(commit);
+
+        // Peers need a pull signal after the new size is fully committed.
         self.broadcast_pane_dirty();
         Ok(())
     }
@@ -774,11 +853,31 @@ impl Pane {
     }
 
     pub fn set_title(&self, title: String) {
+        let commit = self.commit.lock();
+        self.set_title_locked(title);
+        drop(commit);
+        self.broadcast_pane_dirty();
+    }
+
+    fn set_title_locked(&self, title: String) {
         *self.title.write() = title;
+        self.bump_generation_locked();
     }
 
     pub fn get_title(&self) -> String {
         self.title.read().clone()
+    }
+
+    pub(crate) fn metadata_snapshot(&self) -> PaneMetadataSnapshot {
+        let _commit = self.commit.lock();
+        PaneMetadataSnapshot {
+            title: self.title.read().clone(),
+            generation: self.generation.load(Ordering::Acquire),
+            cols: self.cols.load(Ordering::SeqCst) as u32,
+            rows: self.rows.load(Ordering::SeqCst) as u32,
+            is_alive: self.alive.load(Ordering::SeqCst),
+            zoomed: self.zoomed.load(Ordering::SeqCst),
+        }
     }
 
     pub fn is_bracketed_paste_active(&self) -> bool {
@@ -837,9 +936,13 @@ impl Pane {
         }
     }
 
-    /// §3.3 设置 pane zoom 状态。
+    /// §3.3 Atomically set pane zoom state and publish its generation.
     pub fn set_zoomed(&self, zoomed: bool) {
+        let commit = self.commit.lock();
         self.zoomed.store(zoomed, Ordering::SeqCst);
+        self.bump_generation_locked();
+        drop(commit);
+        self.broadcast_pane_dirty();
     }
 
     /// §3.3 获取 pane zoom 状态。
@@ -1002,6 +1105,74 @@ impl Drop for Pane {
             if let Err(error) = killer.kill() {
                 tracing::warn!(%error, "failed to kill child process during pane drop");
             }
+        }
+    }
+}
+
+#[cfg(all(test, unix))]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn emulator_title_events_reach_pane_subscribers() {
+        let pane = match Pane::spawn(
+            "title-test-pane".to_string(),
+            std::env::temp_dir().to_string_lossy().to_string(),
+            20,
+            5,
+            Some(ShellCommand {
+                program: "/bin/cat".to_string(),
+                ..Default::default()
+            }),
+        ) {
+            Ok(pane) => pane,
+            Err(error) => panic!("spawn title test pane: {error}"),
+        };
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        pane.add_subscriber(tx);
+
+        pane.events
+            .lock()
+            .push(AlacEvent::Title("server title".to_string()));
+        pane.handle_pending_events();
+        let notification = match rx.try_recv() {
+            Ok(notification) => notification,
+            Err(error) => panic!("receive title notification: {error}"),
+        };
+        match notification.event {
+            Some(mux_protocol::notification::Event::PaneTitleChanged(changed)) => {
+                assert_eq!(changed.pane_id, pane.id);
+                assert_eq!(changed.title, "server title");
+            }
+            event => panic!("expected PaneTitleChanged, got {event:?}"),
+        }
+        match rx.try_recv() {
+            Ok(MuxNotification {
+                event: Some(mux_protocol::notification::Event::PaneDirty(dirty)),
+            }) => assert_eq!(dirty.pane_id, pane.id),
+            Ok(notification) => panic!("expected PaneDirty, got {:?}", notification.event),
+            Err(error) => panic!("receive title PaneDirty notification: {error}"),
+        }
+
+        pane.events.lock().push(AlacEvent::ResetTitle);
+        pane.handle_pending_events();
+        let notification = match rx.try_recv() {
+            Ok(notification) => notification,
+            Err(error) => panic!("receive reset-title notification: {error}"),
+        };
+        match notification.event {
+            Some(mux_protocol::notification::Event::PaneTitleChanged(changed)) => {
+                assert_eq!(changed.pane_id, pane.id);
+                assert!(changed.title.is_empty());
+            }
+            event => panic!("expected reset PaneTitleChanged, got {event:?}"),
+        }
+        match rx.try_recv() {
+            Ok(MuxNotification {
+                event: Some(mux_protocol::notification::Event::PaneDirty(dirty)),
+            }) => assert_eq!(dirty.pane_id, pane.id),
+            Ok(notification) => panic!("expected PaneDirty, got {:?}", notification.event),
+            Err(error) => panic!("receive reset-title PaneDirty notification: {error}"),
         }
     }
 }
