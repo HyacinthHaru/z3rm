@@ -28,11 +28,14 @@ pub struct WalEntry {
     pub trigger: SnapshotTrigger,
 }
 
-/// WAL 二进制记录格式：
-/// [magic:4][seq_no:8][path_hash:32][parent_id_flag:1][parent_id:8?][
-///   content_ref_flag:1][content_hash:32?][delta_ref_flag:1][
-///   delta_hash:32?][compressed_size:8?][trigger:1][checksum:8]
-const MAGIC: u32 = 0x_666F_726D; // "form"
+/// Legacy records used an unframed payload after `LEGACY_MAGIC`. New records
+/// are self-delimiting and checksummed:
+/// `[magic:4][version:1][payload_len:4][payload][blake3:32]`.
+const LEGACY_MAGIC: u32 = 0x_666F_726D; // "form"
+const FRAMED_MAGIC: u32 = 0x_7A33_574C; // "z3WL"
+const FRAME_VERSION: u8 = 1;
+const CHECKSUM_LEN: usize = 32;
+const MAX_PAYLOAD_LEN: usize = 1024;
 
 /// WAL 日志管理器
 pub struct Wal {
@@ -97,56 +100,92 @@ impl Wal {
         let mut entries = Vec::new();
 
         loop {
-            // 读 magic
-            let mut magic_buf = [0u8; 4];
-            match reader.read_exact(&mut magic_buf) {
-                Ok(_) => {},
-                Err(e) if e.kind() == io::ErrorKind::UnexpectedEof => break,
-                Err(e) => return Err(e),
-            }
-
-            let magic = u32::from_le_bytes(magic_buf);
-            if magic != MAGIC {
-                // 无效记录，停止 replay
+            let Some(magic_buf) = read_or_torn_tail::<4>(&mut reader)? else {
                 break;
+            };
+            let magic = u32::from_le_bytes(magic_buf);
+            match magic {
+                FRAMED_MAGIC => {
+                    let Some(header) = read_or_torn_tail::<5>(&mut reader)? else {
+                        break;
+                    };
+                    let version = header[0];
+                    if version != FRAME_VERSION {
+                        return Err(invalid_data(format!(
+                            "unsupported WAL frame version {version}"
+                        )));
+                    }
+                    let payload_len_bytes = [header[1], header[2], header[3], header[4]];
+                    let payload_len = u32::from_le_bytes(payload_len_bytes) as usize;
+                    if payload_len > MAX_PAYLOAD_LEN {
+                        return Err(invalid_data(format!(
+                            "WAL payload length {payload_len} exceeds {MAX_PAYLOAD_LEN}"
+                        )));
+                    }
+                    let Some(payload) = read_or_torn_tail_vec(&mut reader, payload_len)? else {
+                        break;
+                    };
+                    let Some(checksum) = read_or_torn_tail::<CHECKSUM_LEN>(&mut reader)? else {
+                        break;
+                    };
+                    let expected = frame_checksum(version, &header[1..5], &payload);
+                    if checksum != expected {
+                        return Err(invalid_data("WAL frame checksum mismatch"));
+                    }
+                    let mut payload_reader = std::io::Cursor::new(payload);
+                    let entry = Self::decode_entry(&mut payload_reader)?;
+                    if payload_reader.position() != payload_len as u64 {
+                        return Err(invalid_data("WAL frame contains trailing payload bytes"));
+                    }
+                    entries.push(entry);
+                }
+                LEGACY_MAGIC => match Self::decode_entry(&mut reader) {
+                    Ok(entry) => entries.push(entry),
+                    Err(error) if error.kind() == io::ErrorKind::UnexpectedEof => break,
+                    Err(error) => return Err(error),
+                },
+                _ => return Err(invalid_data(format!("invalid WAL magic {magic:#010x}"))),
             }
-
-            let entry = Self::decode_entry(&mut reader)?;
-            entries.push(entry);
         }
 
         Ok(entries)
     }
 
-    /// 编码 WAL 条目到 writer
     fn encode_entry(entry: &WalEntry, w: &mut impl Write) -> io::Result<()> {
-        // magic
-        w.write_all(&MAGIC.to_le_bytes())?;
-        // seq_no
+        let mut payload = Vec::with_capacity(128);
+        Self::encode_payload(entry, &mut payload)?;
+        let payload_len = u32::try_from(payload.len())
+            .map_err(|_| invalid_data("WAL payload length exceeds u32"))?;
+        let payload_len_bytes = payload_len.to_le_bytes();
+        let checksum = frame_checksum(FRAME_VERSION, &payload_len_bytes, &payload);
+
+        w.write_all(&FRAMED_MAGIC.to_le_bytes())?;
+        w.write_all(&[FRAME_VERSION])?;
+        w.write_all(&payload_len_bytes)?;
+        w.write_all(&payload)?;
+        w.write_all(&checksum)?;
+        Ok(())
+    }
+
+    fn encode_payload(entry: &WalEntry, w: &mut impl Write) -> io::Result<()> {
         w.write_all(&entry.seq_no.to_le_bytes())?;
-        // path_hash
         w.write_all(&entry.path_hash)?;
-        // parent_id
         let has_parent = entry.parent_id.is_some();
         w.write_all(&[has_parent as u8])?;
-        if has_parent {
-            w.write_all(&entry.parent_id.unwrap().to_le_bytes())?;
+        if let Some(parent_id) = entry.parent_id {
+            w.write_all(&parent_id.to_le_bytes())?;
         }
-        // content_ref
         let has_content = entry.content_ref.is_some();
         w.write_all(&[has_content as u8])?;
-        if has_content {
-            w.write_all(&entry.content_ref.unwrap())?;
+        if let Some(content_ref) = entry.content_ref {
+            w.write_all(&content_ref)?;
         }
-        // delta_ref
         let has_delta = entry.delta_ref.is_some();
         w.write_all(&[has_delta as u8])?;
-        if has_delta {
-            let delta = entry.delta_ref.as_ref().unwrap();
+        if let Some(delta) = &entry.delta_ref {
             w.write_all(&delta.hash)?;
             w.write_all(&delta.compressed_size.to_le_bytes())?;
         }
-        // trigger (u8: 0=Write, 1=Close, 2=Debounce, 3=Decline, 4=Delete, 5=DeclineDone)
         w.write_all(&[match entry.trigger {
             SnapshotTrigger::Write => 0,
             SnapshotTrigger::Close => 1,
@@ -155,7 +194,6 @@ impl Wal {
             SnapshotTrigger::Delete => 4,
             SnapshotTrigger::DeclineDone => 5,
         }])?;
-
         Ok(())
     }
 
@@ -174,33 +212,42 @@ impl Wal {
         // parent_id
         let mut flag = [0u8; 1];
         r.read_exact(&mut flag)?;
-        let parent_id = if flag[0] != 0 {
-            r.read_exact(&mut buf)?;
-            Some(u64::from_le_bytes(buf))
-        } else {
-            None
+        let parent_id = match flag[0] {
+            0 => None,
+            1 => {
+                r.read_exact(&mut buf)?;
+                Some(u64::from_le_bytes(buf))
+            }
+            value => return Err(invalid_data(format!("invalid WAL parent flag {value}"))),
         };
 
         // content_ref
         r.read_exact(&mut flag)?;
-        let content_ref = if flag[0] != 0 {
-            let mut hash = [0u8; 32];
-            r.read_exact(&mut hash)?;
-            Some(hash)
-        } else {
-            None
+        let content_ref = match flag[0] {
+            0 => None,
+            1 => {
+                let mut hash = [0u8; 32];
+                r.read_exact(&mut hash)?;
+                Some(hash)
+            }
+            value => return Err(invalid_data(format!("invalid WAL content flag {value}"))),
         };
 
         // delta_ref
         r.read_exact(&mut flag)?;
-        let delta_ref = if flag[0] != 0 {
-            let mut hash = [0u8; 32];
-            r.read_exact(&mut hash)?;
-            r.read_exact(&mut buf)?;
-            let compressed_size = u64::from_le_bytes(buf);
-            Some(DeltaRef { hash, compressed_size })
-        } else {
-            None
+        let delta_ref = match flag[0] {
+            0 => None,
+            1 => {
+                let mut hash = [0u8; 32];
+                r.read_exact(&mut hash)?;
+                r.read_exact(&mut buf)?;
+                let compressed_size = u64::from_le_bytes(buf);
+                Some(DeltaRef {
+                    hash,
+                    compressed_size,
+                })
+            }
+            value => return Err(invalid_data(format!("invalid WAL delta flag {value}"))),
         };
 
         // trigger
@@ -212,7 +259,7 @@ impl Wal {
             3 => SnapshotTrigger::Decline,
             4 => SnapshotTrigger::Delete,
             5 => SnapshotTrigger::DeclineDone,
-            _ => SnapshotTrigger::Write,
+            value => return Err(invalid_data(format!("invalid WAL trigger {value}"))),
         };
 
         Ok(WalEntry {
@@ -224,6 +271,36 @@ impl Wal {
             trigger,
         })
     }
+}
+
+fn frame_checksum(version: u8, payload_len: &[u8], payload: &[u8]) -> [u8; CHECKSUM_LEN] {
+    let mut hasher = blake3::Hasher::new();
+    hasher.update(&[version]);
+    hasher.update(payload_len);
+    hasher.update(payload);
+    *hasher.finalize().as_bytes()
+}
+
+fn read_or_torn_tail<const N: usize>(reader: &mut impl Read) -> io::Result<Option<[u8; N]>> {
+    let mut bytes = [0; N];
+    match reader.read_exact(&mut bytes) {
+        Ok(()) => Ok(Some(bytes)),
+        Err(error) if error.kind() == io::ErrorKind::UnexpectedEof => Ok(None),
+        Err(error) => Err(error),
+    }
+}
+
+fn read_or_torn_tail_vec(reader: &mut impl Read, len: usize) -> io::Result<Option<Vec<u8>>> {
+    let mut bytes = vec![0; len];
+    match reader.read_exact(&mut bytes) {
+        Ok(()) => Ok(Some(bytes)),
+        Err(error) if error.kind() == io::ErrorKind::UnexpectedEof => Ok(None),
+        Err(error) => Err(error),
+    }
+}
+
+fn invalid_data(message: impl Into<String>) -> io::Error {
+    io::Error::new(io::ErrorKind::InvalidData, message.into())
 }
 
 #[cfg(test)]
@@ -316,5 +393,86 @@ mod tests {
         for (i, entry) in entries.iter().enumerate() {
             assert_eq!(entry.trigger, triggers[i]);
         }
+    }
+
+    #[test]
+    fn replay_ignores_only_a_torn_final_frame() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("torn-tail.wal");
+        let wal = Wal::open(&path).unwrap();
+        wal.append(&make_entry(1)).unwrap();
+        wal.append(&make_entry(2)).unwrap();
+        wal.commit().unwrap();
+
+        let original_len = std::fs::metadata(&path).unwrap().len();
+        std::fs::OpenOptions::new()
+            .write(true)
+            .open(&path)
+            .unwrap()
+            .set_len(original_len - 5)
+            .unwrap();
+
+        let entries = wal.replay().unwrap();
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].seq_no, 1);
+    }
+
+    #[test]
+    fn replay_rejects_corrupted_complete_frame() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("corrupted.wal");
+        let wal = Wal::open(&path).unwrap();
+        wal.append(&make_entry(1)).unwrap();
+        wal.commit().unwrap();
+
+        let mut bytes = std::fs::read(&path).unwrap();
+        let payload_byte = bytes.len() / 2;
+        bytes[payload_byte] ^= 0x80;
+        std::fs::write(&path, bytes).unwrap();
+
+        let error = wal.replay().expect_err("corrupted frame must fail replay");
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+    }
+
+    #[test]
+    fn replay_accepts_legacy_records_followed_by_framed_records() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("mixed-format.wal");
+        let mut legacy = Vec::new();
+        legacy.extend_from_slice(&LEGACY_MAGIC.to_le_bytes());
+        Wal::encode_payload(&make_entry(1), &mut legacy).unwrap();
+        std::fs::write(&path, legacy).unwrap();
+
+        let wal = Wal::open(&path).unwrap();
+        wal.append(&make_entry(2)).unwrap();
+        wal.commit().unwrap();
+
+        let entries = wal.replay().unwrap();
+        assert_eq!(entries.len(), 2);
+        assert_eq!(entries[0].seq_no, 1);
+        assert_eq!(entries[1].seq_no, 2);
+    }
+
+    #[test]
+    fn payload_decode_rejects_unknown_trigger() {
+        let mut payload = Vec::new();
+        Wal::encode_payload(&make_entry(1), &mut payload).unwrap();
+        *payload.last_mut().unwrap() = u8::MAX;
+
+        let error = Wal::decode_entry(&mut payload.as_slice())
+            .expect_err("unknown trigger must not silently become Write");
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+    }
+
+    #[test]
+    fn payload_decode_rejects_unknown_option_flag() {
+        let mut payload = Vec::new();
+        Wal::encode_payload(&make_entry(1), &mut payload).unwrap();
+        let parent_flag_offset = 8 + 32;
+        payload[parent_flag_offset] = 2;
+
+        let error = Wal::decode_entry(&mut payload.as_slice())
+            .expect_err("unknown option flag must not change payload shape");
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
     }
 }
