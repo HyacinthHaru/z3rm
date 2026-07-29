@@ -283,13 +283,29 @@ fn test_pane_scrollback() {
 #[test]
 fn test_pane_scrollback_capacity_uses_threaded_value() {
     let cwd = std::env::temp_dir().to_string_lossy().to_string();
+    #[cfg(unix)]
+    let quiet_command = crate::pane::ShellCommand {
+        program: "/bin/cat".to_string(),
+        ..Default::default()
+    };
+    #[cfg(windows)]
+    let quiet_command = crate::pane::ShellCommand {
+        program: "cmd.exe".to_string(),
+        args: vec![
+            "/Q".to_string(),
+            "/D".to_string(),
+            "/C".to_string(),
+            "more >NUL".to_string(),
+        ],
+        ..Default::default()
+    };
     let small = crate::pane::Pane::spawn_with_session(
         "pane-small".to_string(),
         "sess-small".to_string(),
         cwd.clone(),
         8,
         2,
-        None,
+        Some(quiet_command.clone()),
         42,
     )
     .expect("spawn pane with small scrollback");
@@ -307,7 +323,7 @@ fn test_pane_scrollback_capacity_uses_threaded_value() {
         cwd,
         8,
         2,
-        None,
+        Some(quiet_command),
         87_654,
     )
     .expect("spawn pane with large scrollback");
