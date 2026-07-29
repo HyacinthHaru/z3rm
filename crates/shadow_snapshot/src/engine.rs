@@ -4,6 +4,7 @@
 //! The engine is the primary entry point for recording file changes,
 //! querying versions, declining to prior versions, and listing history.
 
+use std::collections::HashSet;
 use std::path::Path;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -119,23 +120,27 @@ impl ShadowSnapshotEngine {
         let blob_store = BlobStore::new(Arc::clone(&storage), blob_dir.to_path_buf());
 
         let loaded = storage.load_nodes()?;
+        let persisted_sequences: HashSet<SeqNo> =
+            loaded.nodes.iter().map(|node| node.seq_no).collect();
         let tree = VersionTree::new();
         tree.rebuild_from_nodes(loaded.nodes, loaded.max_version_id);
 
-        // §4.5 WAL-before-write recovery: rebuild 区块后,回放 WAL 中那些
-        // seq_no 高于已持久化最大值、且产生 version_node 的记录 (Write/Close/
-        // Debounce)。这类条目来自崩溃在 WAL commit 之后、SQLite 写入之前的
-        // 那一瞬;SQLite 缺失,但 WAL 已 fsync,据此补写内存树 + SQLite,
-        // 并把 SeqNo 分配器推进到这些条目之上。Decline/DeclineDone 不在此处
-        // 处理,它们由 recover_incomplete_restores 按 path 解析后再补完。
+        // Rebuild durable WAL operations missing from SQLite. Write-like
+        // records restore their snapshot shape; Delete restores a tombstone.
+        // Decline/DeclineDone remain paired by recover_incomplete_restores,
+        // since resolving their file path requires the mux-owned path map.
         let mut replay_max_seq = loaded.max_seq_no;
         let wal_entries = wal.replay().map_err(|e| anyhow::anyhow!(e))?;
         for entry in wal_entries {
+            replay_max_seq = replay_max_seq.max(entry.seq_no);
             let produces_node = matches!(
                 entry.trigger,
-                SnapshotTrigger::Write | SnapshotTrigger::Close | SnapshotTrigger::Debounce
+                SnapshotTrigger::Write
+                    | SnapshotTrigger::Close
+                    | SnapshotTrigger::Debounce
+                    | SnapshotTrigger::Delete
             );
-            if !produces_node || entry.seq_no <= loaded.max_seq_no {
+            if !produces_node || persisted_sequences.contains(&entry.seq_no) {
                 continue;
             }
             let timestamp_ns = SystemTime::now()
@@ -146,22 +151,31 @@ impl ShadowSnapshotEngine {
             // Rebuild the same node shape record_change would have persisted.
             // A WAL entry with content_ref is a full snapshot; one with delta_ref
             // is a delta node whose depth is parent.depth + 1 (parent is already
-            // in the rebuilt tree, whether from SQLite load or an earlier replay).
-            let (full_content, delta_ref, depth) = match entry.content_ref {
-                Some(full_hash) => (Some(full_hash), None, 0u8),
-                None => {
-                    let delta_ref = entry.delta_ref.clone().ok_or_else(|| {
-                        anyhow::anyhow!(
-                            "WAL replay: entry seq {} has neither full nor delta ref",
-                            entry.seq_no
-                        )
-                    })?;
-                    let depth = entry
-                        .parent_id
-                        .and_then(|pid| tree.get_node(pid))
-                        .map(|parent| parent.delta_depth.saturating_add(1))
-                        .unwrap_or(1);
-                    (None, Some(delta_ref), depth)
+            let (full_content, delta_ref, depth) = if entry.trigger == SnapshotTrigger::Delete {
+                if entry.content_ref.is_some() || entry.delta_ref.is_some() {
+                    return Err(anyhow::anyhow!(
+                        "WAL replay: delete entry seq {} contains snapshot content",
+                        entry.seq_no
+                    ));
+                }
+                (None, None, 0u8)
+            } else {
+                match entry.content_ref {
+                    Some(full_hash) => (Some(full_hash), None, 0u8),
+                    None => {
+                        let delta_ref = entry.delta_ref.clone().ok_or_else(|| {
+                            anyhow::anyhow!(
+                                "WAL replay: entry seq {} has neither full nor delta ref",
+                                entry.seq_no
+                            )
+                        })?;
+                        let depth = entry
+                            .parent_id
+                            .and_then(|parent_id| tree.get_node(parent_id))
+                            .map(|parent| parent.delta_depth.saturating_add(1))
+                            .unwrap_or(1);
+                        (None, Some(delta_ref), depth)
+                    }
                 }
             };
 
@@ -188,7 +202,6 @@ impl ShadowSnapshotEngine {
                 entry.trigger,
                 timestamp_ns,
             )?;
-            replay_max_seq = replay_max_seq.max(entry.seq_no);
         }
 
         // SeqNo 分配器从回放后的最大值 +1 起,保证跨重启严格单调。
@@ -821,5 +834,91 @@ mod tests {
             .get_node(head_id)
             .expect("delete head node present");
         assert_eq!(head_node.trigger, SnapshotTrigger::Delete);
+    }
+
+    #[test]
+    fn wal_only_delete_advances_sequence_after_restart() {
+        let directory = TempDir::new().unwrap();
+        let database = directory.path().join("delete-sequence.db");
+        let wal_path = directory.path().join("delete-sequence.wal");
+        let blobs = directory.path().join("delete-sequence-blobs");
+        std::fs::create_dir_all(&blobs).unwrap();
+        let deleted_path = directory.path().join("deleted.txt");
+
+        let wal = Wal::open(&wal_path).unwrap();
+        wal.append(&WalEntry {
+            seq_no: 42,
+            path_hash: compute_path_hash(&deleted_path),
+            parent_id: None,
+            content_ref: None,
+            delta_ref: None,
+            trigger: SnapshotTrigger::Delete,
+        })
+        .unwrap();
+        wal.commit().unwrap();
+        drop(wal);
+
+        let engine = ShadowSnapshotEngine::open(&database, &wal_path, &blobs).unwrap();
+        let delete_versions = engine.list_versions(&deleted_path).unwrap();
+        assert_eq!(delete_versions.len(), 1);
+        assert_eq!(delete_versions[0].1, 42);
+        assert_eq!(delete_versions[0].2, SnapshotTrigger::Delete);
+        let new_path = directory.path().join("new.txt");
+        engine.record_change(&new_path, b"new content").unwrap();
+        let versions = engine.list_versions(&new_path).unwrap();
+        let sequence = versions.last().expect("new version exists").1;
+        assert!(sequence > 42, "sequence {sequence} reused WAL history");
+    }
+
+    #[test]
+    fn wal_replay_fills_sequence_gap_below_persisted_maximum() {
+        let directory = TempDir::new().unwrap();
+        let database = directory.path().join("sequence-gap.db");
+        let wal_path = directory.path().join("sequence-gap.wal");
+        let blobs = directory.path().join("sequence-gap-blobs");
+        std::fs::create_dir_all(&blobs).unwrap();
+        let durable_path = directory.path().join("durable.txt");
+        let missing_path = directory.path().join("missing-delete.txt");
+
+        let storage = StorageEngine::open(&database).unwrap();
+        storage
+            .write_node(
+                100,
+                &compute_path_hash(&durable_path),
+                100,
+                None,
+                None,
+                None,
+                0,
+                SnapshotTrigger::Delete,
+                1,
+            )
+            .unwrap();
+        drop(storage);
+
+        let wal = Wal::open(&wal_path).unwrap();
+        wal.append(&WalEntry {
+            seq_no: 42,
+            path_hash: compute_path_hash(&missing_path),
+            parent_id: None,
+            content_ref: None,
+            delta_ref: None,
+            trigger: SnapshotTrigger::Delete,
+        })
+        .unwrap();
+        wal.commit().unwrap();
+        drop(wal);
+
+        let engine = ShadowSnapshotEngine::open(&database, &wal_path, &blobs).unwrap();
+        let missing_versions = engine.list_versions(&missing_path).unwrap();
+        assert_eq!(missing_versions.len(), 1);
+        let missing_sequence = missing_versions.first().expect("missing node restored").1;
+        assert_eq!(missing_sequence, 42);
+
+        let new_path = directory.path().join("new.txt");
+        engine.record_change(&new_path, b"new content").unwrap();
+        let new_versions = engine.list_versions(&new_path).unwrap();
+        let new_sequence = new_versions.first().expect("new version exists").1;
+        assert_eq!(new_sequence, 101);
     }
 }
