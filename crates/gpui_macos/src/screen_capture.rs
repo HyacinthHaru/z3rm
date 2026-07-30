@@ -6,7 +6,6 @@ use cocoa::{
     foundation::NSArray,
 };
 use collections::HashMap;
-use core_foundation::base::TCFType;
 use core_graphics::display::{
     CGDirectDisplayID, CGDisplayCopyDisplayMode, CGDisplayModeGetPixelHeight,
     CGDisplayModeGetPixelWidth, CGDisplayModeRelease,
@@ -17,7 +16,7 @@ use gpui::{
     DevicePixels, ForegroundExecutor, ScreenCaptureFrame, ScreenCaptureSource, ScreenCaptureStream,
     SharedString, SourceMetadata, size,
 };
-// use media::core_media::{CMSampleBuffer, CMSampleBufferRef};  // removed-crate: media
+use core_video::image_buffer::{CVImageBuffer, CVImageBufferRef};
 use metal::NSInteger;
 use objc::{
     class,
@@ -332,13 +331,28 @@ extern "C" fn stream_did_output_sample_buffer_of_type(
     }
 
     unsafe {
-        let sample_buffer = sample_buffer as CMSampleBufferRef;
-        let sample_buffer = CMSampleBuffer::wrap_under_get_rule(sample_buffer);
-        if let Some(buffer) = sample_buffer.image_buffer() {
-            let callback: Box<Box<dyn Fn(ScreenCaptureFrame)>> =
-                Box::from_raw(*this.get_ivar::<*mut c_void>(FRAME_CALLBACK_IVAR) as *mut _);
-            callback(ScreenCaptureFrame(buffer));
-            mem::forget(callback);
+        // A sample buffer carrying only timing information (a "marker" frame,
+        // which ScreenCaptureKit emits when nothing on screen changed) has no
+        // image buffer attached.
+        let image_buffer = CMSampleBufferGetImageBuffer(sample_buffer as CMSampleBufferRef);
+        if image_buffer.is_null() {
+            return;
         }
+        let buffer = CVImageBuffer::wrap_under_get_rule(image_buffer);
+        let callback: Box<Box<dyn Fn(ScreenCaptureFrame)>> =
+            Box::from_raw(*this.get_ivar::<*mut c_void>(FRAME_CALLBACK_IVAR) as *mut _);
+        callback(ScreenCaptureFrame(buffer));
+        mem::forget(callback);
     }
+}
+
+/// Opaque handle to a `CMSampleBuffer`.
+type CMSampleBufferRef = *const c_void;
+
+// The `media` crate that wrapped CoreMedia was dropped from the fork, and this
+// is the only CoreMedia entry point still needed, so it is declared directly
+// rather than pulling in a binding crate for one function.
+#[link(name = "CoreMedia", kind = "framework")]
+unsafe extern "C" {
+    fn CMSampleBufferGetImageBuffer(sample_buffer: CMSampleBufferRef) -> CVImageBufferRef;
 }
