@@ -328,6 +328,9 @@ pub fn start_with(
                 }
 
                 if path_disconnected {
+                    for (path, trigger) in debouncer.drain_all() {
+                        route_record_event(&engine, &path, trigger, &mut suppressed_writes);
+                    }
                     break;
                 }
             }

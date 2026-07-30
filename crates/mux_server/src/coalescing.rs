@@ -157,7 +157,9 @@ const DEBOUNCE_WINDOW: Duration = Duration::from_millis(500);
 
 impl PathDebouncer {
     pub fn new() -> Self {
-        Self { pending: HashMap::new() }
+        Self {
+            pending: HashMap::new(),
+        }
     }
 
     /// Record that `path` changed with `trigger` at `now`. If the path is
@@ -174,7 +176,10 @@ impl PathDebouncer {
 
     /// Return and remove paths that have been idle for ≥ `DEBOUNCE_WINDOW`.
     /// A path still receiving events stays pending until it quiets down.
-    pub fn flush_due(&mut self, now: Instant) -> Vec<(std::path::PathBuf, shadow_snapshot::SnapshotTrigger)> {
+    pub fn flush_due(
+        &mut self,
+        now: Instant,
+    ) -> Vec<(std::path::PathBuf, shadow_snapshot::SnapshotTrigger)> {
         let mut released = Vec::new();
         self.pending.retain(|path, (trigger, last)| {
             if now.duration_since(*last) >= DEBOUNCE_WINDOW {
@@ -185,6 +190,13 @@ impl PathDebouncer {
             }
         });
         released
+    }
+
+    pub fn drain_all(&mut self) -> Vec<(std::path::PathBuf, shadow_snapshot::SnapshotTrigger)> {
+        self.pending
+            .drain()
+            .map(|(path, (trigger, _last_change))| (path, trigger))
+            .collect()
     }
 
     /// Number of paths currently being debounced.
@@ -208,12 +220,20 @@ mod path_debouncer_tests {
 
         // §4.7 a burst of 5 writes within the window collapses to one pending entry.
         for i in 0..5 {
-            debouncer.note(path.clone(), SnapshotTrigger::Write, t0 + Duration::from_millis(i));
+            debouncer.note(
+                path.clone(),
+                SnapshotTrigger::Write,
+                t0 + Duration::from_millis(i),
+            );
         }
         assert_eq!(debouncer.pending_count(), 1, "burst must coalesce");
 
         // Nothing flushes before the 500ms window elapses.
-        assert!(debouncer.flush_due(t0 + Duration::from_millis(400)).is_empty());
+        assert!(
+            debouncer
+                .flush_due(t0 + Duration::from_millis(400))
+                .is_empty()
+        );
 
         // After 500ms quiet, exactly one flush occurs carrying the latest trigger.
         let flushed = debouncer.flush_due(t0 + Duration::from_millis(550));
@@ -234,14 +254,49 @@ mod path_debouncer_tests {
 
         // Writes at 0, 200, 400ms — the path never goes 500ms quiet.
         debouncer.note(path.clone(), SnapshotTrigger::Write, t0);
-        assert!(debouncer.flush_due(t0 + Duration::from_millis(450)).is_empty());
-        debouncer.note(path.clone(), SnapshotTrigger::Write, t0 + Duration::from_millis(200));
-        debouncer.note(path.clone(), SnapshotTrigger::Write, t0 + Duration::from_millis(400));
-        assert!(debouncer.flush_due(t0 + Duration::from_millis(600)).is_empty(),
-            "still within window of last note at 400ms (200ms < 500ms)");
+        assert!(
+            debouncer
+                .flush_due(t0 + Duration::from_millis(450))
+                .is_empty()
+        );
+        debouncer.note(
+            path.clone(),
+            SnapshotTrigger::Write,
+            t0 + Duration::from_millis(200),
+        );
+        debouncer.note(
+            path.clone(),
+            SnapshotTrigger::Write,
+            t0 + Duration::from_millis(400),
+        );
+        assert!(
+            debouncer
+                .flush_due(t0 + Duration::from_millis(600))
+                .is_empty(),
+            "still within window of last note at 400ms (200ms < 500ms)"
+        );
 
         // Quiet for 500ms after the last note → flush.
         let flushed = debouncer.flush_due(t0 + Duration::from_millis(901));
         assert_eq!(flushed.len(), 1);
+    }
+
+    #[test]
+    fn drain_all_releases_paths_before_quiet_window() {
+        let mut debouncer = PathDebouncer::new();
+        let path = std::path::PathBuf::from("/tmp/shutdown.txt");
+        debouncer.note(
+            path.clone(),
+            shadow_snapshot::SnapshotTrigger::Write,
+            Instant::now(),
+        );
+
+        let drained = debouncer.drain_all();
+
+        assert_eq!(
+            drained,
+            vec![(path, shadow_snapshot::SnapshotTrigger::Write)]
+        );
+        assert_eq!(debouncer.pending_count(), 0);
     }
 }
