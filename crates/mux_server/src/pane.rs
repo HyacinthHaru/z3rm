@@ -4,7 +4,7 @@
 // PTY fd、alacritty Term、scrollback、generation counter 全部在此进程内。
 // 客户端只渲染我们 push 过来的 grid diff / snapshot。
 
-use crate::coalescing::AdaptiveCoalescer;
+use crate::coalescing::{AdaptiveCoalescer, KeyboardActivity};
 use crate::dec2026::Dec2026Parser;
 use crate::grid_sync::{
     self, FullGridSnapshot, GridDiff, GridDiffRing, diff_from_dirty, modes_from_alacritty,
@@ -25,7 +25,7 @@ use std::collections::HashMap;
 use std::io::{Read, Write};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::time::{Duration, Instant};
+use std::time::Instant;
 use tokio::sync::mpsc;
 
 /// §3.1 真正拥有 alacritty Term + PTY pair 的 Pane (server-canonical)。
@@ -37,6 +37,16 @@ pub struct Pane {
     /// Serializes every render-state mutation with its generation publication.
     /// This lock is always acquired before PTY master, terminal, or diff-ring locks.
     commit: parking_lot::Mutex<()>,
+    /// §16.2 Per-client viewport constraints keyed by attached client identity.
+    /// The applied pane size is the min-fit across all entries, so the smallest
+    /// attached client still sees the whole grid instead of the last resize
+    /// request winning. Held across `resize` to serialize concurrent client
+    /// reports, so it sits *before* `commit` in the lock order; no path takes
+    /// it while holding `commit`.
+    client_viewports: parking_lot::Mutex<HashMap<String, PaneViewport>>,
+    /// §16.3 Last user-input timestamp, shared with the PTY reader thread's
+    /// coalescer so keystrokes select the Interactive (0ms) tier.
+    keyboard_activity: KeyboardActivity,
     /// §3.1 alacritty 终端实例 (server-canonical, 真实 VT 解析)。
     pub term: Arc<parking_lot::Mutex<Term<PaneEventListener>>>,
     /// §3.3 generation counter (每次 grid-affecting 变化递增)。
@@ -90,6 +100,25 @@ impl EventListener for PaneEventListener {
     fn send_event(&self, event: AlacEvent) {
         self.events.lock().push(event);
     }
+}
+
+/// §16.2 One attached client's reported viewport for a pane, in grid cells.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct PaneViewport {
+    pub cols: u32,
+    pub rows: u32,
+}
+
+/// §16.2 Min-fit across every attached client's viewport. Each dimension is
+/// minimized independently: a 100x20 and an 80x40 client yield 80x20.
+fn min_fit(viewports: &HashMap<String, PaneViewport>) -> Option<PaneViewport> {
+    viewports
+        .values()
+        .copied()
+        .reduce(|smallest, viewport| PaneViewport {
+            cols: smallest.cols.min(viewport.cols),
+            rows: smallest.rows.min(viewport.rows),
+        })
 }
 
 /// §3.10 Shell command (从 proto ShellCommand 转换)
@@ -200,8 +229,6 @@ struct ReadLoopState {
     terminal_processor: Processor<StdSyncHandler>,
     history_processor: Processor<StdSyncHandler>,
     history_observer: HistoryMutationObserver,
-    /// 上次 PaneDirty 广播时间 (coalescing 节流基准)
-    last_notify: Option<Instant>,
     /// BSU..ESU 同步窗口内累积了尚未发布的变更
     pending_sync: bool,
     /// Dirty rows accumulated across a DEC-2026 synchronized update window.
@@ -218,7 +245,6 @@ impl Default for ReadLoopState {
             terminal_processor: Processor::new(),
             history_processor: Processor::new(),
             history_observer: HistoryMutationObserver::default(),
-            last_notify: None,
             pending_sync: false,
             pending_dirty_rows: Vec::new(),
             pending_full_snapshot: false,
@@ -358,6 +384,8 @@ impl Pane {
             id: id.clone(),
             cwd: Arc::new(parking_lot::RwLock::new(cwd)),
             commit: parking_lot::Mutex::new(()),
+            client_viewports: parking_lot::Mutex::new(HashMap::new()),
+            keyboard_activity: KeyboardActivity::new(),
             title: Arc::new(parking_lot::RwLock::new(String::new())),
             command: command_str,
             term: Arc::new(parking_lot::Mutex::new(term)),
@@ -406,13 +434,16 @@ impl Pane {
         master_raw_fd: Option<i32>,
     ) {
         let pane_weak = Arc::downgrade(&self);
+        // §16.3 The coalescer reads keystroke activity recorded on connection
+        // tasks, so it must share this pane's handle rather than own its own.
+        let keyboard_activity = self.keyboard_activity.clone();
 
         if let Err(error) = std::thread::Builder::new()
             .name(format!("pty-read-{}", self.id))
             .spawn(move || {
                 let mut buf = [0u8; 8192];
                 let mut dec = Dec2026Parser::new();
-                let mut coalescer = AdaptiveCoalescer::new();
+                let mut coalescer = AdaptiveCoalescer::with_keyboard_activity(keyboard_activity);
                 let mut state = ReadLoopState::default();
                 loop {
                     let Some(pane) = pane_weak.upgrade() else {
@@ -431,7 +462,7 @@ impl Pane {
                         if dec.check_timeout() {
                             pane.force_flush_after_bsu_timeout(&mut coalescer, &mut state);
                         } else {
-                            pane.flush_pending_notify(&mut state, coalescer.delay());
+                            pane.flush_pending_notify(&mut state, &mut coalescer);
                         }
                         continue;
                     }
@@ -482,8 +513,10 @@ impl Pane {
     ) {
         let transitions = dec.parse(bytes);
         let in_sync = dec.is_in_sync();
-        let delay = coalescer.on_output();
-        self.flush_pending_notify(state, delay);
+        // §16.3 Re-classify on the byte volume of this batch before any
+        // notification decision uses the resulting window.
+        coalescer.on_output(bytes.len());
+        self.flush_pending_notify(state, coalescer);
 
         let commit = self.commit.lock();
         let history_may_change = {
@@ -545,7 +578,7 @@ impl Pane {
                 all_dirty_rows,
                 requires_full_snapshot,
                 transitions.ended(),
-                delay,
+                coalescer,
                 state,
             );
             state.pending_sync = false;
@@ -571,7 +604,7 @@ impl Pane {
         dirty_rows: Vec<usize>,
         requires_full_snapshot: bool,
         force_broadcast: bool,
-        delay: Duration,
+        coalescer: &mut AdaptiveCoalescer,
         state: &mut ReadLoopState,
     ) -> bool {
         let (diff, viewport_is_scrolled) = {
@@ -583,32 +616,20 @@ impl Pane {
         };
         self.publish_generation(diff, requires_full_snapshot || viewport_is_scrolled);
 
-        let now = Instant::now();
-        let window_elapsed = state
-            .last_notify
-            .map_or(true, |time| now.duration_since(time) >= delay);
-        if force_broadcast || delay.is_zero() || window_elapsed {
-            state.last_notify = Some(now);
-            state.pending_notify = false;
-            true
-        } else {
-            state.pending_notify = true;
-            false
-        }
+        // §16.3 The generation is already durable in the ring; only the
+        // PaneDirty wakeup is subject to the tier window.
+        let admitted = coalescer.admit_frame(Instant::now(), force_broadcast);
+        state.pending_notify = !admitted;
+        admitted
     }
 
     /// §3.3 补发被 coalescing 推迟、且窗口已到期的 PaneDirty。
-    fn flush_pending_notify(&self, state: &mut ReadLoopState, delay: Duration) {
+    fn flush_pending_notify(&self, state: &mut ReadLoopState, coalescer: &mut AdaptiveCoalescer) {
         if !state.pending_notify {
             return;
         }
-        let now = Instant::now();
-        if state
-            .last_notify
-            .map_or(true, |t| now.duration_since(t) >= delay)
-        {
+        if coalescer.admit_deferred_frame(Instant::now()) {
             self.broadcast_pane_dirty();
-            state.last_notify = Some(now);
             state.pending_notify = false;
         }
     }
@@ -626,20 +647,15 @@ impl Pane {
             dirty_rows.sort_unstable();
             dirty_rows.dedup();
             let requires_full_snapshot = std::mem::take(&mut state.pending_full_snapshot);
-            let should_broadcast = self.emit_generation(
-                dirty_rows,
-                requires_full_snapshot,
-                true,
-                Duration::ZERO,
-                state,
-            );
+            let should_broadcast =
+                self.emit_generation(dirty_rows, requires_full_snapshot, true, coalescer, state);
             state.pending_sync = false;
             drop(commit);
             if should_broadcast {
                 self.broadcast_pane_dirty();
             }
         }
-        self.flush_pending_notify(state, coalescer.delay());
+        self.flush_pending_notify(state, coalescer);
     }
 
     fn broadcast_pane_output(&self, bytes: &[u8]) {
@@ -827,6 +843,11 @@ impl Pane {
 
     /// §3.10 SendInput — 向 PTY 写入原始字节。
     pub fn write_input(&self, data: &[u8]) -> anyhow::Result<()> {
+        // §16.3 This is the only path user input reaches the PTY, so it is
+        // where "keyboard active" is established for the coalescer. A large
+        // paste also lands here, but its echo exceeds the Interactive tier's
+        // 4KB/s ceiling, so it cannot hold the pane at a 0ms window.
+        self.keyboard_activity.note_input();
         let mut writer = self.pty_writer.lock();
         writer.write_all(data)?;
         writer.flush()?;
@@ -866,12 +887,77 @@ impl Pane {
         snapshot
     }
 
-    /// §3.10 Resize — 改 PTY winsize + resize alacritty Term + bump generation。
-    pub fn resize(&self, cols: u32, rows: u32) -> anyhow::Result<()> {
+    /// Reject sizes the protocol cannot carry before any state is recorded, so
+    /// a malformed client viewport can never become part of the min-fit.
+    fn checked_grid_dimensions(cols: u32, rows: u32) -> anyhow::Result<(usize, usize)> {
         let cols_usize = usize::try_from(cols).context("pane column count exceeds host limit")?;
         let rows_usize = usize::try_from(rows).context("pane row count exceeds host limit")?;
         mux_protocol::checked_grid_cell_count(cols_usize, rows_usize)
             .map_err(|message| anyhow::anyhow!("invalid pane size {cols}x{rows}: {message}"))?;
+        Ok((cols_usize, rows_usize))
+    }
+
+    /// §16.2 Record `client_id`'s viewport for this pane and re-apply the
+    /// min-fit size.
+    ///
+    /// Multi-client sessions share one authoritative grid, so the pane shrinks
+    /// to the smallest attached viewport instead of letting whichever client
+    /// resized last overwrite everyone else's size.
+    pub fn set_client_viewport(
+        &self,
+        client_id: String,
+        cols: u32,
+        rows: u32,
+    ) -> anyhow::Result<()> {
+        Self::checked_grid_dimensions(cols, rows)?;
+        let mut viewports = self.client_viewports.lock();
+        viewports.insert(client_id, PaneViewport { cols, rows });
+        self.apply_min_fit(&viewports)
+    }
+
+    /// §16.2 Drop a detached, kicked, or disconnected client's constraint and
+    /// re-apply min-fit. Removing the smallest client lets the pane grow back.
+    pub fn remove_client_viewport(&self, client_id: &str) -> anyhow::Result<()> {
+        let mut viewports = self.client_viewports.lock();
+        if viewports.remove(client_id).is_none() {
+            return Ok(());
+        }
+        self.apply_min_fit(&viewports)
+    }
+
+    /// §16.2 Number of attached clients currently constraining this pane.
+    pub fn client_viewport_count(&self) -> usize {
+        self.client_viewports.lock().len()
+    }
+
+    /// §16.2 Current min-fit across attached clients, or `None` when no client
+    /// has reported a viewport.
+    pub fn min_fit_viewport(&self) -> Option<PaneViewport> {
+        min_fit(&self.client_viewports.lock())
+    }
+
+    /// Apply the min-fit size while still holding the viewport map, so
+    /// concurrent client reports cannot interleave into a size that disagrees
+    /// with the recorded constraints. The last remaining client detaching
+    /// leaves the map empty; the pane then keeps its current size rather than
+    /// collapsing to a default.
+    fn apply_min_fit(&self, viewports: &HashMap<String, PaneViewport>) -> anyhow::Result<()> {
+        let Some(fit) = min_fit(viewports) else {
+            return Ok(());
+        };
+        if self.get_cols() == fit.cols && self.get_rows() == fit.rows {
+            return Ok(());
+        }
+        self.resize(fit.cols, fit.rows)
+    }
+
+    /// §3.10 Resize — 改 PTY winsize + resize alacritty Term + bump generation。
+    ///
+    /// §16.2 callers that represent one client should go through
+    /// `set_client_viewport` so the min-fit constraint is honored; this entry
+    /// point applies a size unconditionally.
+    pub fn resize(&self, cols: u32, rows: u32) -> anyhow::Result<()> {
+        let (cols_usize, rows_usize) = Self::checked_grid_dimensions(cols, rows)?;
         let commit = self.commit.lock();
         self.pty_master.lock().resize(PtySize {
             rows: rows
@@ -1512,6 +1598,184 @@ mod tests {
         assert!(pane.resize(4_097, 1).is_err());
         assert_eq!((pane.get_cols(), pane.get_rows()), (20, 5));
         assert_eq!(pane.get_generation(), generation);
+    }
+
+    fn spawn_viewport_pane(id: &str, cols: u32, rows: u32) -> Arc<Pane> {
+        match Pane::spawn(
+            id.to_string(),
+            std::env::temp_dir().to_string_lossy().to_string(),
+            cols,
+            rows,
+            Some(ShellCommand {
+                program: "/bin/cat".to_string(),
+                ..Default::default()
+            }),
+        ) {
+            Ok(pane) => pane,
+            Err(error) => panic!("spawn {id}: {error}"),
+        }
+    }
+
+    fn record_viewport(pane: &Arc<Pane>, client_id: &str, cols: u32, rows: u32) {
+        if let Err(error) = pane.set_client_viewport(client_id.to_string(), cols, rows) {
+            panic!("record {client_id} viewport {cols}x{rows}: {error}");
+        }
+    }
+
+    /// §16.2 Two clients of different sizes constrain the pane to the smallest
+    /// dimensions, each axis minimized independently.
+    #[test]
+    fn min_fit_takes_the_smallest_viewport_per_axis() {
+        let pane = spawn_viewport_pane("min-fit-per-axis", 120, 50);
+
+        record_viewport(&pane, "wide-client", 100, 20);
+        assert_eq!((pane.get_cols(), pane.get_rows()), (100, 20));
+
+        record_viewport(&pane, "tall-client", 80, 40);
+        assert_eq!(
+            (pane.get_cols(), pane.get_rows()),
+            (80, 20),
+            "min-fit takes 80 cols from the narrow client and 20 rows from the short one"
+        );
+        assert_eq!(pane.client_viewport_count(), 2);
+        assert_eq!(
+            pane.min_fit_viewport(),
+            Some(PaneViewport { cols: 80, rows: 20 })
+        );
+    }
+
+    /// §16.2 A later, larger client must not overwrite an earlier smaller one —
+    /// that is the multi-client size stomp this replaces.
+    #[test]
+    fn larger_client_attaching_later_does_not_grow_the_pane() {
+        let pane = spawn_viewport_pane("min-fit-no-stomp", 120, 50);
+
+        record_viewport(&pane, "small-client", 80, 24);
+        record_viewport(&pane, "large-client", 200, 60);
+
+        assert_eq!((pane.get_cols(), pane.get_rows()), (80, 24));
+    }
+
+    /// §16.2 Detaching the smallest client drops its constraint, so the pane
+    /// grows back to what the remaining clients can display.
+    #[test]
+    fn removing_the_smallest_client_grows_the_pane_back() {
+        let pane = spawn_viewport_pane("min-fit-detach-grow", 120, 50);
+
+        record_viewport(&pane, "large-client", 120, 50);
+        record_viewport(&pane, "small-client", 80, 24);
+        assert_eq!((pane.get_cols(), pane.get_rows()), (80, 24));
+
+        if let Err(error) = pane.remove_client_viewport("small-client") {
+            panic!("remove small client viewport: {error}");
+        }
+
+        assert_eq!((pane.get_cols(), pane.get_rows()), (120, 50));
+        assert_eq!(pane.client_viewport_count(), 1);
+    }
+
+    /// §3.3 / §16.3 A size change is a render-affecting change that row diffs
+    /// cannot express, so it must bump the generation and force a full snapshot.
+    #[test]
+    fn min_fit_resize_bumps_generation_and_forces_full_snapshot() {
+        let pane = spawn_viewport_pane("min-fit-generation", 120, 50);
+
+        record_viewport(&pane, "first-client", 100, 30);
+        let baseline = pane.get_generation();
+        assert!(baseline > 0, "the first viewport report resizes the pane");
+
+        record_viewport(&pane, "second-client", 60, 20);
+        assert!(pane.get_generation() > baseline);
+
+        match pane.fetch_grid_update(baseline) {
+            grid_sync::GridUpdate::FullSnapshot { snapshot, .. } => {
+                assert_eq!((snapshot.cols, snapshot.rows), (60, 20));
+            }
+            other => panic!("size change must force a full snapshot, got {other:?}"),
+        }
+    }
+
+    /// A client re-reporting the size it already has must not publish a
+    /// generation: every attached client reports on each of its own repaints.
+    #[test]
+    fn repeated_identical_viewport_report_does_not_publish_a_generation() {
+        let pane = spawn_viewport_pane("min-fit-idempotent", 120, 50);
+
+        record_viewport(&pane, "client", 80, 24);
+        let generation = pane.get_generation();
+
+        record_viewport(&pane, "client", 80, 24);
+        record_viewport(&pane, "other-client", 100, 40);
+
+        assert_eq!(pane.get_generation(), generation);
+        assert_eq!((pane.get_cols(), pane.get_rows()), (80, 24));
+    }
+
+    /// An unusable viewport must be rejected before it can clamp the pane.
+    #[test]
+    fn invalid_client_viewport_is_rejected_without_being_recorded() {
+        let pane = spawn_viewport_pane("min-fit-invalid", 120, 50);
+        record_viewport(&pane, "good-client", 80, 24);
+        let generation = pane.get_generation();
+
+        assert!(
+            pane.set_client_viewport("zero-client".to_string(), 0, 24)
+                .is_err()
+        );
+        assert!(
+            pane.set_client_viewport("huge-client".to_string(), 4_097, 24)
+                .is_err()
+        );
+
+        assert_eq!(pane.client_viewport_count(), 1);
+        assert_eq!((pane.get_cols(), pane.get_rows()), (80, 24));
+        assert_eq!(pane.get_generation(), generation);
+    }
+
+    /// With no client left there is no constraint to fit, so the pane keeps its
+    /// last size instead of collapsing.
+    #[test]
+    fn last_client_detaching_keeps_the_current_size() {
+        let pane = spawn_viewport_pane("min-fit-last-detach", 120, 50);
+        record_viewport(&pane, "only-client", 80, 24);
+
+        if let Err(error) = pane.remove_client_viewport("only-client") {
+            panic!("remove only client viewport: {error}");
+        }
+
+        assert_eq!(pane.client_viewport_count(), 0);
+        assert_eq!(pane.min_fit_viewport(), None);
+        assert_eq!((pane.get_cols(), pane.get_rows()), (80, 24));
+    }
+
+    /// Removing a client that never reported a viewport must be a no-op.
+    #[test]
+    fn removing_an_unknown_client_viewport_is_a_no_op() {
+        let pane = spawn_viewport_pane("min-fit-unknown-client", 120, 50);
+        record_viewport(&pane, "client", 80, 24);
+        let generation = pane.get_generation();
+
+        if let Err(error) = pane.remove_client_viewport("never-attached") {
+            panic!("remove unknown client viewport: {error}");
+        }
+
+        assert_eq!(pane.client_viewport_count(), 1);
+        assert_eq!(pane.get_generation(), generation);
+    }
+
+    /// §16.3 The Interactive tier depends on `write_input` publishing keyboard
+    /// activity to the PTY reader thread's coalescer.
+    #[test]
+    fn write_input_marks_the_pane_keyboard_active() {
+        let pane = spawn_viewport_pane("keyboard-activity", 20, 5);
+        let before = Instant::now();
+        assert!(!pane.keyboard_activity.is_active_at(before));
+
+        if let Err(error) = pane.write_input(b"a") {
+            panic!("write input: {error}");
+        }
+
+        assert!(pane.keyboard_activity.is_active_at(Instant::now()));
     }
 }
 

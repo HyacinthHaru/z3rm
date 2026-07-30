@@ -261,7 +261,22 @@ fn unregister_client_from_sessions(sessions: &mut [crate::session::Session], cli
         session.remove_lifecycle_subscriber(client_id);
         for pane in session.panes.read().values() {
             pane.remove_subscriber(client_id);
+            drop_client_viewport(pane, client_id);
         }
+    }
+}
+
+/// §16.2 Release a departing client's min-fit constraint. A pane that was
+/// clamped by this client grows back, so the failure has to be visible rather
+/// than leaving every remaining client stuck at the smallest size.
+fn drop_client_viewport(pane: &Arc<crate::pane::Pane>, client_id: &str) {
+    if let Err(error) = pane.remove_client_viewport(client_id) {
+        tracing::warn!(
+            error = %error,
+            pane_id = %pane.id,
+            %client_id,
+            "min-fit resize after client detach failed"
+        );
     }
 }
 
@@ -510,7 +525,7 @@ async fn dispatch_request(
         }
         RequestBody::ResizePane(r) => {
             if check_permission(role, ClientRole::ReadWrite) {
-                handle_resize_pane(r, sessions).await?
+                handle_resize_pane(r, sessions, connection_client_id).await?
             } else {
                 ResponseBody::Error("permission denied: read-write required".to_string())
             }
@@ -823,6 +838,7 @@ async fn handle_attach(
         for pane in session.panes.read().values() {
             for kicked_client in &kicked_clients {
                 pane.remove_subscriber(kicked_client);
+                drop_client_viewport(pane, kicked_client);
             }
         }
     }
@@ -1336,19 +1352,28 @@ async fn handle_focus_pane(
     Ok(ResponseBody::Error(String::new()))
 }
 /// §3.10 调整 pane 尺寸 — 真正调用 pane.resize (PTY TIOCSWINSZ + alacritty)
+///
+/// §16.2 An attached client's resize is a report of *its* viewport, not an
+/// authoritative pane size: the pane takes the min-fit across every attached
+/// client so the smallest one still sees the whole grid. `find_pane` clones the
+/// `Arc` so neither the sessions lock nor the pane map is held across the
+/// resize, which would otherwise nest under the pane commit lock.
 async fn handle_resize_pane(
     req: &ResizePaneRequest,
     sessions: &Arc<parking_lot::RwLock<Vec<crate::session::Session>>>,
+    connection_client_id: &Arc<parking_lot::Mutex<Option<String>>>,
 ) -> anyhow::Result<ResponseBody> {
-    let sessions_r = sessions.read();
-    for session in sessions_r.iter() {
-        let panes = session.panes.clone();
-        if let Some(pane) = panes.read().get(&req.pane_id) {
-            pane.resize(req.cols, req.rows)?;
-            return Ok(ResponseBody::Error(String::new()));
-        }
+    let Some(pane) = find_pane(sessions, &req.pane_id) else {
+        return Ok(ResponseBody::Error("pane not found".to_string()));
+    };
+    let client_id = connection_client_id.lock().clone();
+    match client_id {
+        Some(client_id) => pane.set_client_viewport(client_id, req.cols, req.rows)?,
+        // Pre-attach CLI callers address panes by target and have no viewport
+        // of their own, so there is nothing to min-fit against.
+        None => pane.resize(req.cols, req.rows)?,
     }
-    Ok(ResponseBody::Error("pane not found".to_string()))
+    Ok(ResponseBody::Error(String::new()))
 }
 
 /// §16.9 Resize the server-authoritative layout ratio of a pane.
@@ -2459,6 +2484,10 @@ mod connection_unit_tests {
 
         let resolved = resolve_shadow_path(&root, "nested/deleted.txt").expect("resolve path");
 
-        assert_eq!(resolved, root.join("nested/deleted.txt"));
+        // `resolve_shadow_path` canonicalizes the root, so the expectation has
+        // to as well: on macOS the temp dir is `/var/...`, a symlink to
+        // `/private/var/...`.
+        let canonical_root = root.canonicalize().expect("canonicalize root");
+        assert_eq!(resolved, canonical_root.join("nested/deleted.txt"));
     }
 }
