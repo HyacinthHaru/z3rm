@@ -1060,6 +1060,46 @@ fn main() {
                                 }
                             }
                         });
+
+                    // §15.7 Mount ProjectPanel + GitPanel into their docks so the
+                    // bundled native toggle shortcuts (Ctrl+Shift+E / Ctrl+Shift+G)
+                    // reach real panels instead of no-op lookups against the empty
+                    // docks Workspace::new creates. observe_new fires once per
+                    // Workspace; the guards are defensive against duplicate mounts.
+                    if workspace.panel::<project_panel::ProjectPanel>(cx).is_none() {
+                        let weak = workspace.weak_handle();
+                        let async_cx = window.to_async(cx);
+                        let async_cx_for_load = async_cx.clone();
+                        window
+                            .spawn(cx, async move |cx| {
+                                let panel = project_panel::ProjectPanel::load(
+                                    weak.clone(),
+                                    async_cx_for_load,
+                                )
+                                .await?;
+                                weak.update_in(cx, |workspace, window, cx| {
+                                    workspace.add_panel(panel, window, cx);
+                                })?;
+                                anyhow::Ok(())
+                            })
+                            .detach();
+                    }
+                    if workspace.panel::<git_ui::git_panel::GitPanel>(cx).is_none() {
+                        let weak = workspace.weak_handle();
+                        let async_cx = window.to_async(cx);
+                        let async_cx_for_load = async_cx.clone();
+                        window
+                            .spawn(cx, async move |cx| {
+                                let panel =
+                                    git_ui::git_panel::GitPanel::load(weak.clone(), async_cx_for_load)
+                                        .await?;
+                                weak.update_in(cx, |workspace, window, cx| {
+                                    workspace.add_panel(panel, window, cx);
+                                })?;
+                                anyhow::Ok(())
+                            })
+                            .detach();
+                    }
                     if workspace.active_pane().read(cx).items().next().is_some() {
                         return;
                     }
