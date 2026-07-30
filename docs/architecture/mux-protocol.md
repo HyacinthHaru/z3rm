@@ -1,175 +1,149 @@
-# Mux Protocol (gRPC)
+# Mux Protocol
 
-Defined in `z3rm_mux_proto/proto/mux.proto`. All RPCs are unary unless marked `stream`.
+Defined in `crates/mux_protocol/proto/mux.proto` (package `z3rm.mux`), compiled
+with `prost-build` from `crates/mux_protocol/build.rs`.
 
-## Service: MuxService
+**This is not gRPC.** The wire format is a length-prefixed protobuf `Envelope`
+carried over a Unix domain socket (or a Windows named pipe / SSH-forwarded
+socket). There is no service definition, no HTTP/2, and no streaming RPC — push
+notifications travel as their own envelope variant instead.
+
+## Framing
+
+```
+| varint length | protobuf-encoded Envelope |
+```
+
+Helpers live in `crates/mux_protocol/src/mux_protocol.rs`: `frame()`,
+`unframe()`, `parse_len_prefix()`, `check_frame_len()`.
+
+Hardening limits, enforced *before* any allocation so a hostile length prefix
+cannot exhaust memory:
+
+| Constant | Value | Purpose |
+|---|---|---|
+| `MAX_VARINT_LEN` | 10 | Reject overlong length prefixes. |
+| `MAX_FRAME_PAYLOAD` | 64 MiB | Cap a single frame. |
+| `MAX_GRID_CELLS` | 1 048 576 | Cap cells in one grid payload; scrollback fetches page against this. |
+
+## Envelope
 
 ```protobuf
-service MuxService {
-  // Session management
-  rpc CreateSession(CreateSessionRequest) returns (Session);
-  rpc AttachSession(AttachSessionRequest) returns (AttachSessionResponse);
-  rpc DetachSession(DetachSessionRequest) returns (google.protobuf.Empty);
-  rpc ListSessions(google.protobuf.Empty) returns (stream Session);
-  rpc GetSession(GetSessionRequest) returns (Session);
-  rpc DestroySession(DestroySessionRequest) returns (google.protobuf.Empty);
-  rpc RenameSession(RenameSessionRequest) returns (Session);
-
-  // Grid management
-  rpc ResizeGrid(ResizeGridRequest) returns (Grid);
-  rpc SplitPane(SplitPaneRequest) returns (Pane);
-  rpc ClosePane(ClosePaneRequest) returns (google.protobuf.Empty);
-  rpc FocusPane(FocusPaneRequest) returns (Pane);
-  rpc MovePane(MovePaneRequest) returns (Pane);
-  rpc SwapPanes(SwapPanesRequest) returns (Pane);
-  rpc SetPaneTitle(SetPaneTitleRequest) returns (Pane);
-  rpc SubscribeGrid(SubscribeGridRequest) returns (stream GridUpdate);
-
-  // PTY I/O
-  rpc WritePty(WritePtyRequest) returns (google.protobuf.Empty);
-  rpc ReadPty(ReadPtyRequest) returns (stream PtyOutput);
-  rpc ResizePty(ResizePtyRequest) returns (google.protobuf.Empty);
-
-  // Workspace
-  rpc GetWorkspace(GetWorkspaceRequest) returns (Workspace);
-  rpc SetWorkspace(SetWorkspaceRequest) returns (Workspace);
-
-  // Shadow snapshots
-  rpc CreateSnapshot(CreateSnapshotRequest) returns (Snapshot);
-  rpc RestoreSnapshot(RestoreSnapshotRequest) returns (Snapshot);
-  rpc BranchSnapshot(BranchSnapshotRequest) returns (Snapshot);
-  rpc ListSnapshots(ListSnapshotsRequest) returns (stream Snapshot);
-  rpc DeleteSnapshot(DeleteSnapshotRequest) returns (google.protobuf.Empty);
-  rpc SubscribeSnapshots(SubscribeSnapshotsRequest) returns (stream SnapshotEvent);
+message Envelope {
+    ProtocolVersion version = 1;
+    oneof payload {
+        Request request = 2;
+        Response response = 3;
+        Notification notification = 4;
+    }
 }
 ```
 
-## Key Messages
+`PROTOCOL_VERSION` is `{major: 1, minor: 2}`. A major mismatch is rejected at
+handshake (`crates/mux_server/src/connection.rs`); a minor mismatch is accepted
+so older clients keep working against newer servers.
 
-### Session
-```protobuf
-message Session {
-  string id = 1;              // UUID v7
-  string name = 2;
-  string workspace_id = 3;
-  SessionState state = 4;     // CREATED, ATTACHED, DETACHED, DESTROYED
-  google.protobuf.Timestamp created_at = 5;
-  google.protobuf.Timestamp updated_at = 6;
-}
-```
+## Request / Response
 
-### Grid / Pane
-```protobuf
-message Grid {
-  string session_id = 1;
-  string root_pane_id = 2;
-  map<string, Pane> panes = 3;  // pane_id -> Pane
-  uint32 cols = 4;
-  uint32 rows = 5;
-}
+`Request` carries a `request_id` plus a `oneof body` with 33 variants; the
+matching `Response` echoes `request_id` and carries either a non-empty `error`
+string or a typed body. Correlation is by `request_id` alone — responses may
+arrive out of order.
 
-message Pane {
-  string id = 1;
-  string session_id = 2;
-  PaneType type = 3;          // TERMINAL, EDITOR, PLUGIN
-  PaneState state = 4;        // ACTIVE, INACTIVE, MINIMIZED
-  uint32 cols = 5;
-  uint32 rows = 6;
-  string title = 7;
-  string cwd = 8;
-  string shell = 9;
-  string pty_id = 10;         // if TERMINAL
-  repeated string children = 11;  // if SPLIT (horizontal/vertical)
-  SplitDirection direction = 12;  // HORIZONTAL, VERTICAL
-}
-```
+Session and window lifecycle
+: `CreateSession`, `ListSessions`, `KillSession`, `RenameSession`, `Attach`,
+  `Detach`, `NewWindow`, `Shutdown`
 
-### GridUpdate (stream)
-```protobuf
-message GridUpdate {
-  oneof update {
-    PaneCreated pane_created = 1;
-    PaneDestroyed pane_destroyed = 2;
-    PaneResized pane_resized = 3;
-    PaneFocused pane_focused = 4;
-    PaneMoved pane_moved = 5;
-    PaneSwapped pane_swapped = 6;
-    PaneTitleChanged pane_title_changed = 7;
-    GridResized grid_resized = 8;
-  }
-  uint64 sequence = 100;      // monotonically increasing per session
-}
-```
+Panes and layout
+: `SpawnPane`, `SplitPane`, `ClosePane`, `FocusPane`, `ResizePane`,
+  `SetPaneTitle`, `ZoomPane`, `ResizeLayout`
 
-### PTY I/O
-```protobuf
-message WritePtyRequest {
-  string session_id = 1;
-  string pane_id = 2;
-  bytes data = 3;             // raw bytes to stdin
-}
+Terminal I/O
+: `SendInput`, `Paste`, `SubscribePaneOutput`, `ShellIntegration`
 
-message PtyOutput {
-  string session_id = 1;
-  string pane_id = 2;
-  bytes data = 3;             // raw bytes from stdout
-  uint64 sequence = 4;        // monotonically increasing per pane
-}
+Grid and scrollback
+: `FetchGridUpdate`, `FetchScrollback`, `SearchScrollback`
 
-message ResizePtyRequest {
-  string session_id = 1;
-  string pane_id = 2;
-  uint32 cols = 3;
-  uint32 rows = 4;
-  uint32 pixel_width = 5;
-  uint32 pixel_height = 6;
-}
-```
+Files and clipboard
+: `ReadFile`, `ListDir`, `StatFile`, `SetClipboard`, `GetClipboard`
 
-### Shadow Snapshots
-```protobuf
-message Snapshot {
-  string id = 1;              // UUID v7
-  string session_id = 2;
-  string branch_id = 3;
-  uint64 seq_no = 4;          // global monotonic sequence
-  uint64 parent_seq_no = 5;   // 0 for root
-  SnapshotType type = 6;      // MANUAL, AUTO, BRANCH
-  google.protobuf.Timestamp created_at = 7;
-  bytes payload_hash = 8;     // SHA-256 of serialized payload
-  string description = 9;
-}
+Shadow snapshot (§4)
+: `ListFileVersions`, `GetFileVersion`, `DeclineFileVersion`
 
-message CreateSnapshotRequest {
-  string session_id = 1;
-  string branch_id = 2;       // empty = current branch
-  string description = 3;
-  SnapshotType type = 4;
-}
+Extensions
+: `InstallExtension`
 
-message RestoreSnapshotRequest {
-  string snapshot_id = 1;
-  bool create_branch = 2;     // true = branch from snapshot, false = reset current
-}
+## Notifications
 
-message BranchSnapshotRequest {
-  string snapshot_id = 1;
-  string new_branch_id = 2;   // empty = auto-generate
-}
-```
+Server-to-client pushes, `oneof event` with 16 variants:
 
-## Sequence Numbers
+`PaneDirty`, `PaneAdded`, `PaneRemoved`, `PaneFocused`, `PaneTitleChanged`,
+`PaneZoomed`, `PaneBell`, `PaneOutputChunk`, `TabTitleChanged`,
+`SessionLayoutChanged`, `ClipboardChanged`, `ExtensionChromeUpdate`,
+`SyncScrollbackNotification`, `WindowAdded`, `WindowRemoved`,
+`ShellIntegrationChanged`.
 
-All streaming responses (`SubscribeGrid`, `ReadPty`, `SubscribeSnapshots`) include a monotonically increasing `sequence` per stream. Client uses this for:
-- Detecting missed messages (gap detection)
-- Ordering guarantees
-- Resume tokens (send last seen sequence on reconnect)
+Delivery semantics differ by kind, and the two kinds are routed through
+different channels (§3.4):
 
-## Error Codes
+- **`PaneDirty` is at-most-once.** It is a wake-up signal only; dropping one is
+  harmless because the next one — or the client's own repaint — pulls the same
+  state. Fan-out uses a lossy `try_send`.
+- **Lifecycle events are at-least-once.** `PaneAdded`, `PaneRemoved`,
+  `SessionLayoutChanged`, `PaneZoomed`, `PaneTitleChanged` and `PaneBell` go
+  through per-connection unbounded channels with a blocking send. Losing a
+  `PaneRemoved` would strand a zombie pane on the client.
 
-Standard gRPC codes with `mux_error` detail:
-- `NOT_FOUND`: session/pane/snapshot not found
-- `FAILED_PRECONDITION`: invalid state transition (e.g., split on destroyed pane)
-- `RESOURCE_EXHAUSTED`: max sessions/panes/snapshots reached
-- `UNAVAILABLE`: server shutting down, try another
-- `INTERNAL`: bug, check server logs
+## Grid sync
+
+Push the signal, pull the data (§3.3):
+
+1. PTY output advances the pane's monotonic `generation` counter.
+2. The server pushes `PaneDirty(pane_id)` — no payload.
+3. The client calls `FetchGridUpdate(pane_id, since_generation)`.
+4. The server answers from a 64-entry ring of row-level diffs.
+
+`FetchGridUpdateResponse` is either a `GridDiff` (row-level changes, aligned
+with alacritty's own damage tracking) or a `FullGridSnapshot`. The server falls
+back to a full snapshot when:
+
+- `since == 0`, or `since > current` (the client is ahead — it reconnected),
+- the requested generation has already rolled out of the ring,
+- **any entry in the range is flagged `requires_full_snapshot`.**
+
+That last case is the one to remember when adding code: cursor moves, terminal
+mode changes, scroll-offset changes and resizes cannot be expressed as row
+diffs, so they must be published with `push_requiring_full_snapshot` rather than
+`push`. Publishing them as a plain diff silently loses non-cell render state on
+the client.
+
+## Scrollback
+
+`FetchScrollback(pane_id, from_line, direction, count)` returns rows plus
+`total_lines` and a `scrollback_version`. History indices run oldest-first, from
+`0` to `total_lines - 1`. `direction = 0` walks up and returns
+`[from - count + 1, from]`; `direction = 1` walks down and returns
+`[from, from + count)`. Callers must page against `MAX_GRID_CELLS / cols` rather
+than asking for the whole history at once.
+
+`scrollback_version` changes whenever authoritative history contents or layout
+change, and is what clients use to invalidate a cached history snapshot.
+
+## Client identity and roles
+
+`AttachRequest` carries an optional `ClientIdentity` and an `AttachMode`
+(`Shared`, `Steal`, `ReadOnly`). The server derives an effective `ClientRole`
+from both and stores it on the connection; every request is then checked against
+it (`check_permission` in `crates/mux_server/src/connection.rs`). Attaching
+read-only downgrades the whole connection, not just the attach call.
+
+## Where the code lives
+
+| Concern | File |
+|---|---|
+| Schema | `crates/mux_protocol/proto/mux.proto` |
+| Framing, limits, key/target parsing | `crates/mux_protocol/src/mux_protocol.rs` |
+| Input routing state machine (§16.5) | `crates/mux_protocol/src/input.rs` |
+| Client transport, request correlation | `crates/mux/src/mux.rs` |
+| Server dispatch, permissions, fan-out | `crates/mux_server/src/connection.rs` |
+| Grid diff ring | `crates/mux_server/src/grid_sync.rs` |
