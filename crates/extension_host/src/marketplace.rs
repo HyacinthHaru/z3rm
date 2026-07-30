@@ -153,10 +153,10 @@ pub fn marketplace_entry_to_metadata(entry: &MarketplaceEntry) -> ExtensionMetad
     }
 }
 
-#[cfg(all(test, feature = "z3rm-migration"))]
+#[cfg(test)]
 mod tests {
     use super::*;
-    use http_client::FakeHttpClient;
+    use http_client::{http, FakeHttpClient};
     use std::io::Write;
 
     fn make_registry_json(entries: Vec<MarketplaceEntry>) -> String {
@@ -212,7 +212,9 @@ mod tests {
             async move { Ok(http::Response::new(AsyncBody::from(body))) }
         });
 
-        let registry = fetch_registry(&fake, "https://extensions.z3rm.dev/registry.json").await?;
+        let registry = fetch_registry(fake.as_ref(), "https://extensions.z3rm.dev/registry.json")
+            .await
+            .expect("registry fetch");
         assert_eq!(registry.entries.len(), 2);
         assert_eq!(registry.entries[0].id, "rust");
         assert_eq!(registry.entries[1].id, "python");
@@ -293,7 +295,7 @@ mod tests {
 
         // 正确的校验和应成功
         let result =
-            download_extension(&fake, "https://example.com/ext.tar.gz", &checksum).await;
+            download_extension(fake.as_ref(), "https://example.com/ext.tar.gz", &checksum).await;
         assert!(result.is_ok());
 
         // 错误的校验和应失败
@@ -303,7 +305,7 @@ mod tests {
             async move { Ok(http::Response::new(AsyncBody::from(body))) }
         });
         let result =
-            download_extension(&fake2, "https://example.com/ext.tar.gz", "wrong_checksum").await;
+            download_extension(fake2.as_ref(), "https://example.com/ext.tar.gz", "wrong_checksum").await;
         assert!(result.is_err());
         assert!(result
             .unwrap_err()

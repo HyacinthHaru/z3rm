@@ -897,7 +897,7 @@ impl CacheStore for IncrementalCompilationCache {
     }
 }
 
-#[cfg(all(test, feature = "z3rm-migration"))]
+#[cfg(test)]
 mod tests {
     use super::*;
     use extension::ExtensionHostProxy;
