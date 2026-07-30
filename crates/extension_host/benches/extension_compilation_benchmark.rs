@@ -6,11 +6,10 @@ use extension::{
     LanguageServerManifestEntry, LibManifestEntry, SchemaVersion,
     extension_builder::{CompilationConcurrency, CompileExtensionOptions, ExtensionBuilder},
 };
-use extension_host::wasm_host::WasmHost;
+use extension_host::{NodeRuntime, wasm_host::WasmHost};
 use fs::{Fs, RealFs};
 use gpui::{TestAppContext, TestDispatcher};
 use http_client::{FakeHttpClient, Response};
-// use node_runtime::NodeRuntime;  // removed-crate: node_runtime
 
 use reqwest_client::ReqwestClient;
 use serde_json::json;
