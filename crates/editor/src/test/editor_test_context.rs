@@ -56,7 +56,7 @@ impl EditorTestContext {
         let project = Project::test(fs.clone(), [root], cx).await;
         let buffer = project
             .update(cx, |project, cx| {
-                project.open_local_buffer(root.join("file"), cx)
+                project.open_local_buffer(&root.join("file"), cx)
             })
             .await
             .unwrap();
