@@ -54,10 +54,16 @@ impl FromIterator<Hsla> for ColorScale {
 
 impl ColorScale {
     /// Returns the specified step in the [`ColorScale`].
+    ///
+    /// A `ColorScale` is built from an iterator of arbitrary length, so a theme
+    /// that ships fewer than twelve steps would otherwise take the whole app
+    /// down on the first repaint. Clamping to the last available step keeps a
+    /// short scale rendering in the closest colour it does have.
     #[inline]
     pub fn step(&self, step: ColorScaleStep) -> Hsla {
         // Steps are one-based, so we need convert to the zero-based vec index.
-        self.0[step.0 - 1]
+        let index = step.0.saturating_sub(1).min(self.0.len().saturating_sub(1));
+        self.0.get(index).copied().unwrap_or_default()
     }
 
     /// `Step 1` - Used for main application backgrounds.
