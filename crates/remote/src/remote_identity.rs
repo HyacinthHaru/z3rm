@@ -22,7 +22,9 @@ pub enum RemoteConnectionIdentity {
         name: String,
         remote_user: String,
     },
-    #[cfg(any(test, feature = "test-support"))]
+    /// Test-only identity. The variant is unconditional so that downstream
+    /// matches stay exhaustive no matter which crate in the build turned on
+    /// `remote/test-support`.
     Mock { id: u64 },
 }
 
@@ -51,7 +53,6 @@ impl RemoteConnectionIdentity {
                 name,
                 remote_user,
             } => format!("docker:{remote_user}@{name}:{container_id}"),
-            #[cfg(any(test, feature = "test-support"))]
             Self::Mock { id } => format!("mock:{id}"),
         }
     }
