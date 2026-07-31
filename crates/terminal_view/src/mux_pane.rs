@@ -11,7 +11,7 @@
 use gpui::{
     App, AppContext, AsyncApp, Context, Entity, EventEmitter, FocusHandle, Focusable,
     InteractiveElement, KeyDownEvent, Keystroke, ParentElement, Render, SharedString,
-    StatefulInteractiveElement, Styled, Task, WeakEntity, Window, div,
+    StatefulInteractiveElement, Styled, Task, WeakEntity, Window, div, prelude::FluentBuilder as _,
 };
 use mux::MuxDomain;
 use mux_protocol::input::{
@@ -43,7 +43,7 @@ use workspace::{
 };
 
 /// §3.3 View events (for workspace to subscribe)
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub enum MuxPaneEvent {
     TitleChanged,
     CloseRequested,
@@ -53,7 +53,21 @@ pub enum MuxPaneEvent {
     InputFailed {
         message: SharedString,
     },
+    /// §16.7 the priority chain matched an extension global shortcut. The
+    /// extension host runs off the GPUI thread (§5.2), so the action id is
+    /// handed to the workspace instead of being executed here.
+    ExtensionAction {
+        action_id: SharedString,
+    },
 }
+
+/// §16.7 Resolves a keystroke to an extension global-shortcut action id.
+///
+/// The extension host lives outside `terminal_view`, so the lookup is injected
+/// with [`MuxPaneView::set_extension_shortcut_resolver`]; without one no
+/// extension shortcut can match.
+pub type ExtensionShortcutResolver =
+    Arc<dyn Fn(&Keystroke) -> Option<SharedString> + Send + Sync>;
 
 const HISTORY_PAGE_ROWS: u32 = 512;
 
@@ -149,6 +163,14 @@ pub struct MuxPaneView {
     /// §16.5 / §16.7 Shared prefix-mode state machine (live input router).
     prefix_machine: PrefixModeMachine,
     prefix_timeout_task: Option<gpui::Task<()>>,
+    /// §16.7 extension global-shortcut lookup, injected by the host.
+    extension_shortcuts: Option<ExtensionShortcutResolver>,
+    /// §16.7 Agent CLI passthrough: while set, every key goes straight to the
+    /// PTY without prefix/copy-mode interception.
+    agent_cli_mode: bool,
+    /// §3.3 read-only attach (Plan 33): the client renders but never writes.
+    /// Shared with the mouse input sink, which has no GPUI context.
+    read_only: Arc<std::sync::atomic::AtomicBool>,
     /// §3.1 mouse-input transport errors buffered from the input sink (which
     /// has no GPUI context) and drained into InputFailed events at render.
     pending_input_errors: std::sync::Arc<std::sync::Mutex<Vec<SharedString>>>,
@@ -171,6 +193,7 @@ impl MuxPaneView {
         // at render time.
         let pending_input_errors =
             std::sync::Arc::new(std::sync::Mutex::new(Vec::<SharedString>::new()));
+        let read_only = Arc::new(std::sync::atomic::AtomicBool::new(false));
 
         // §3.1 exception: create DisplayOnly terminal (no PTY ownership)
         let settings = TerminalSettings::get_global(cx);
@@ -213,9 +236,12 @@ impl MuxPaneView {
             let pane_id = pane_id.clone();
             let executor = cx.background_executor().clone();
             let errors = pending_input_errors.clone();
+            let read_only = read_only.clone();
             let sink: std::sync::Arc<dyn Fn(Vec<u8>) + Send + Sync> =
                 std::sync::Arc::new(move |bytes: Vec<u8>| {
-                    if bytes.is_empty() {
+                    // §3.3 read-only attach (Plan 33): mouse reports are input
+                    // too, so they are dropped alongside keystrokes.
+                    if bytes.is_empty() || read_only.load(std::sync::atomic::Ordering::SeqCst) {
                         return;
                     }
                     let domain = domain.clone();
@@ -294,6 +320,9 @@ impl MuxPaneView {
             last_sent_size: (80, 24),
             prefix_machine: PrefixModeMachine::new(PrefixModeConfig::default()),
             prefix_timeout_task: None,
+            extension_shortcuts: None,
+            agent_cli_mode: false,
+            read_only,
             pending_input_errors,
         };
         view.start_notification_listener(cx);
@@ -520,13 +549,40 @@ impl MuxPaneView {
         Ok(())
     }
 
-    /// §3.10 / §16.7 keystroke → priority chain → MuxDomain::send_input.
-    fn dispatch_keystroke(&mut self, keystroke: &Keystroke, cx: &mut Context<Self>) {
+    /// §3.10 / §16.7 keystroke → priority chain → routed action.
+    fn dispatch_keystroke(
+        &mut self,
+        keystroke: &Keystroke,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         let bytes = keystroke_to_bytes(keystroke);
         if bytes.is_empty() {
             return;
         }
 
+        // Only ask the keymap while waiting for a chord: outside prefix mode a
+        // bound key was already dispatched by GPUI before key_down ran, and
+        // re-resolving it here would double-execute the action.
+        let prefix_binding = if self.prefix_machine.is_prefix_wait() {
+            prefix_binding_for(keystroke, window, cx)
+        } else {
+            None
+        };
+
+        let result = self.resolve_keystroke(keystroke, &bytes, prefix_binding.is_some(), cx);
+        self.apply_dispatch_result(result, keystroke, prefix_binding, window, cx);
+    }
+
+    /// §16.7 Run the shared priority chain for `keystroke` and return its
+    /// routing decision, advancing the prefix-mode state machine.
+    fn resolve_keystroke(
+        &mut self,
+        keystroke: &Keystroke,
+        bytes: &[u8],
+        binding_match: bool,
+        cx: &Context<Self>,
+    ) -> KeyDispatchResult {
         let mode = self.terminal.read(cx).last_content().mode;
         let pane_modes = PaneModes {
             alt_screen: mode.contains(Modes::ALT_SCREEN),
@@ -544,31 +600,71 @@ impl MuxPaneView {
         self.prefix_machine
             .set_full_screen_passthrough(is_full_screen_active(&pane_modes));
 
-        let ime_composing = self.terminal_view.read(cx).is_ime_composing();
-        let copy_mode = self.terminal.read(cx).vi_mode_enabled();
+        let terminal_view = self.terminal_view.read(cx);
+        let ime_composing = terminal_view.is_ime_composing();
+        let copy_mode =
+            terminal_view.copy_mode_state().active || self.terminal.read(cx).vi_mode_enabled();
 
-        let mut ctx_dispatch = KeyDispatchContext {
+        let mut dispatch_context = KeyDispatchContext {
             ime_composing,
-            // Extension shortcuts are consumed by the GPUI keymap before raw key_down.
-            extension_shortcut: None,
+            extension_shortcut: self
+                .extension_shortcuts
+                .as_ref()
+                .and_then(|resolve| resolve(keystroke))
+                .map(|action_id| action_id.to_string()),
             prefix_mode_machine: self.prefix_machine.clone(),
             pane_modes,
-            agent_cli_mode: false,
+            agent_cli_mode: self.agent_cli_mode,
             copy_mode,
         };
 
         // Prefix key entry is owned by EnterPrefixMode action; raw path sees unbound keys.
-        let result = handle_key_event(&bytes, false, false, &mut ctx_dispatch);
-        self.prefix_machine = ctx_dispatch.prefix_mode_machine;
+        let result = handle_key_event(bytes, false, binding_match, &mut dispatch_context);
+        self.prefix_machine = dispatch_context.prefix_mode_machine;
+        result
+    }
 
+    /// §16.7 Execute the routing decision produced by [`Self::resolve_keystroke`].
+    fn apply_dispatch_result(
+        &mut self,
+        result: KeyDispatchResult,
+        keystroke: &Keystroke,
+        prefix_binding: Option<Box<dyn gpui::Action>>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         match result {
-            KeyDispatchResult::RouteToIme
-            | KeyDispatchResult::ExecuteExtensionAction(_)
-            | KeyDispatchResult::ExecutePrefixCommand
-            | KeyDispatchResult::Passthrough
-            | KeyDispatchResult::RouteToCopyMode => {}
+            // The IME owns the keystroke; it reaches the PTY as committed text.
+            KeyDispatchResult::RouteToIme => {}
+            // Prefix key entry: the chord key itself is never forwarded.
+            KeyDispatchResult::Passthrough => {}
+            KeyDispatchResult::ExecuteExtensionAction(action_id) => {
+                cx.emit(MuxPaneEvent::ExtensionAction {
+                    action_id: SharedString::from(action_id),
+                });
+            }
+            KeyDispatchResult::ExecutePrefixCommand => {
+                self.clear_prefix_timeout();
+                match prefix_binding {
+                    Some(action) => window.dispatch_action(action, cx),
+                    // The chain only reports a prefix command when a binding
+                    // matched, so this is unreachable in practice; the key is
+                    // still swallowed rather than leaked to the PTY.
+                    None => tracing::warn!(
+                        pane_id = %self.pane_id,
+                        "prefix command without a matching binding"
+                    ),
+                }
+                cx.notify();
+            }
+            KeyDispatchResult::RouteToCopyMode => {
+                self.terminal_view.update(cx, |terminal_view, cx| {
+                    terminal_view.dispatch_copy_mode_keystroke(keystroke, cx)
+                });
+                cx.notify();
+            }
             KeyDispatchResult::RouteToAgentCli => {
-                self.send_bytes_to_pty(bytes, cx);
+                self.send_bytes_to_pty(keystroke_to_bytes(keystroke), cx);
             }
             KeyDispatchResult::SendLiteral { bytes: send_bytes }
             | KeyDispatchResult::SendToPty { bytes: send_bytes } => {
@@ -577,8 +673,50 @@ impl MuxPaneView {
         }
     }
 
+    fn clear_prefix_timeout(&mut self) {
+        if let Some(task) = self.prefix_timeout_task.take() {
+            task.detach();
+        }
+    }
+
+    /// §16.7 Inject the extension global-shortcut lookup. Without it the
+    /// extension step of the priority chain can never match.
+    pub fn set_extension_shortcut_resolver(
+        &mut self,
+        resolver: Option<ExtensionShortcutResolver>,
+    ) {
+        self.extension_shortcuts = resolver;
+    }
+
+    /// §16.7 Agent CLI passthrough state.
+    pub fn set_agent_cli_mode(&mut self, agent_cli_mode: bool, cx: &mut Context<Self>) {
+        self.agent_cli_mode = agent_cli_mode;
+        cx.notify();
+    }
+
+    pub fn agent_cli_mode(&self) -> bool {
+        self.agent_cli_mode
+    }
+
+    /// §3.3 Read-only attach (Plan 33): the pane renders server output but
+    /// never sends input. Set from the attach role once the session is joined.
+    pub fn set_read_only(&mut self, read_only: bool, cx: &mut Context<Self>) {
+        self.read_only
+            .store(read_only, std::sync::atomic::Ordering::SeqCst);
+        self.terminal_view.update(cx, |terminal_view, cx| {
+            terminal_view.set_read_only(read_only, cx);
+        });
+        cx.notify();
+    }
+
+    pub fn is_read_only(&self) -> bool {
+        self.read_only.load(std::sync::atomic::Ordering::SeqCst)
+    }
+
     fn send_bytes_to_pty(&self, bytes: Vec<u8>, cx: &mut Context<Self>) {
-        if bytes.is_empty() {
+        // §3.3 read-only attach (Plan 33): the server would reject the write
+        // anyway, so drop it here and keep the UI honest about it.
+        if bytes.is_empty() || self.is_read_only() {
             return;
         }
         let domain = self.domain.clone();
@@ -709,6 +847,26 @@ impl MuxPaneView {
     fn is_prefix_mode(&self) -> bool {
         self.prefix_machine.is_prefix_wait()
     }
+}
+
+/// §16.7 The prefix-mode command bound to `keystroke`, if the keymap has one.
+///
+/// Reaching this point means GPUI already tried to dispatch the binding and no
+/// handler consumed it (action dispatch stops propagation by default), so the
+/// action is re-dispatched here rather than executed twice.
+fn prefix_binding_for(
+    keystroke: &Keystroke,
+    window: &Window,
+    cx: &App,
+) -> Option<Box<dyn gpui::Action>> {
+    let context_stack = window.context_stack();
+    let keymap = cx.key_bindings();
+    let keymap = keymap.borrow();
+    let (bindings, _pending) =
+        keymap.bindings_for_input(std::slice::from_ref(keystroke), &context_stack);
+    bindings
+        .first()
+        .map(|binding| binding.action().boxed_clone())
 }
 
 /// §3.1 keystroke → terminal byte sequence (xterm standard).
@@ -1317,6 +1475,7 @@ impl Render for MuxPaneView {
 
         div()
             .size_full()
+            .relative()
             .id("mux-pane-root")
             .track_focus(&self.focus_handle)
             .aria_label(self.terminal.read(cx).title(true))
@@ -1339,24 +1498,72 @@ impl Render for MuxPaneView {
                     )),
             )
             // §16.7 keyboard → shared input router → MuxDomain::send_input
-            .on_key_down(cx.listener(|this, event: &KeyDownEvent, _window, cx| {
+            .on_key_down(cx.listener(|this, event: &KeyDownEvent, window, cx| {
                 if this.is_prefix_mode() {
                     // Drop the timeout; machine stays in PrefixWait so handle_key_event
                     // can still resolve the chord. GPUI keymap may also match PrefixMode.
-                    if let Some(task) = this.prefix_timeout_task.take() {
-                        task.detach();
-                    }
-                    this.dispatch_keystroke(&event.keystroke, cx);
+                    this.clear_prefix_timeout();
+                    this.dispatch_keystroke(&event.keystroke, window, cx);
                     cx.notify();
                     cx.stop_propagation();
                     return;
                 }
                 let ime = this.terminal_view.read(cx).is_ime_composing();
-                this.dispatch_keystroke(&event.keystroke, cx);
+                this.dispatch_keystroke(&event.keystroke, window, cx);
                 if !ime {
                     cx.stop_propagation();
                 }
             }))
+            // §12 复制模式搜索指示器 (Plan 31)
+            .when_some(
+                self.terminal_view
+                    .read(cx)
+                    .copy_mode_state()
+                    .search_indicator(),
+                |this, label| {
+                    this.child(
+                        gpui::deferred(
+                            div()
+                                .id("mux-copy-mode-search")
+                                .absolute()
+                                .bottom_0()
+                                .left_0()
+                                .p(gpui::Rems(0.25))
+                                .bg(colors.editor_background)
+                                .rounded_sm()
+                                .child(
+                                    div()
+                                        .text_size(gpui::Rems(0.875))
+                                        .text_color(colors.text)
+                                        .child(label),
+                                ),
+                        )
+                        .with_priority(1),
+                    )
+                },
+            )
+            // §3.3 只读指示器 (Plan 33)
+            .when(self.is_read_only(), |this| {
+                this.child(
+                    gpui::deferred(
+                        div()
+                            .id("mux-read-only-badge")
+                            .absolute()
+                            .top_0()
+                            .right_0()
+                            .p(gpui::Rems(0.5))
+                            .bg(colors.editor_background)
+                            .rounded_sm()
+                            .child(
+                                div()
+                                    .text_size(gpui::Rems(1.))
+                                    .text_color(colors.text_muted)
+                                    .child("READ-ONLY"),
+                            ),
+                    )
+                    .with_priority(1),
+                )
+            })
     }
 }
 
@@ -1405,8 +1612,9 @@ impl Item for MuxPaneView {
             MuxPaneEvent::TitleChanged => f(workspace::item::ItemEvent::UpdateTab),
             // §3.1 InputFailed is informational only — it does not change tab
             // state. Subscribers that want to surface it (toast/status) listen
-            // for the MuxPaneEvent directly via cx.subscribe.
-            MuxPaneEvent::InputFailed { .. } => {}
+            // for the MuxPaneEvent directly via cx.subscribe. §16.7
+            // ExtensionAction is likewise routed by a direct subscriber.
+            MuxPaneEvent::InputFailed { .. } | MuxPaneEvent::ExtensionAction { .. } => {}
         }
     }
 }
