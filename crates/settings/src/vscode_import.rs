@@ -126,6 +126,7 @@ impl VsCodeSettings {
             remote: RemoteSettingsContent::default(),
             workspace: self.workspace_settings_content(),
             theme: Box::new(self.theme_settings_content()),
+            editor: None,
             terminal: Some(self.terminal_settings_content()),
             mux: Some(MuxSettingsContent::default()),
             shadow_snapshot: Some(ShadowSnapshotSettingsContent::default()),
