@@ -408,8 +408,6 @@ actions!(
         Undo,
         /// Redoes the last undone file operation.
         Redo,
-        /// Opens a markdown preview for the selected file.
-        OpenMarkdownPreview,
     ]
 );
 
@@ -1001,7 +999,6 @@ impl ProjectPanel {
             let is_remote = project.is_remote();
             let is_collab = project.is_via_collab();
             let is_local = project.is_local() || project.is_via_wsl_with_host_interop(cx);
-            let is_markdown = !is_dir && Self::is_markdown_path(&entry.path);
 
             let settings = ProjectPanelSettings::get_global(cx);
             let visible_worktrees_count = project.visible_worktrees(cx).count();
@@ -1030,10 +1027,7 @@ impl ProjectPanel {
             let context_menu = ContextMenu::build(window, cx, |menu, _, cx| {
                 menu.context(self.focus_handle.clone()).map(|menu| {
                     if is_read_only {
-                        menu.when(is_markdown, |menu| {
-                            menu.action("Open Markdown Preview", Box::new(OpenMarkdownPreview))
-                        })
-                        .when(is_dir, |menu| {
+                        menu.when(is_dir, |menu| {
                             menu.action("Search Inside", Box::new(NewSearchInDirectory))
                         })
                     } else {
@@ -1050,9 +1044,6 @@ impl ProjectPanel {
                                 menu.action("Open in Default App", Box::new(OpenWithSystem))
                             })
                             .action("Open in Terminal", Box::new(OpenInTerminal))
-                            .when(is_markdown, |menu| {
-                                menu.action("Open Markdown Preview", Box::new(OpenMarkdownPreview))
-                            })
                             .when(is_dir, |menu| {
                                 menu.separator()
                                     .action("Find in Folder…", Box::new(NewSearchInDirectory))
@@ -1683,29 +1674,6 @@ impl ProjectPanel {
             window,
             cx,
         );
-    }
-
-    fn open_markdown_preview(
-        &mut self,
-        _: &OpenMarkdownPreview,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
-        let Some((worktree, entry)) = self.selected_entry(cx) else {
-            return;
-        };
-        if !entry.is_file() || !Self::is_markdown_path(&entry.path) {
-            return;
-        }
-        let project_path = ProjectPath {
-            worktree_id: worktree.id(),
-            path: entry.path.clone(),
-        };
-        self.workspace
-            .update(cx, |_, _| {
-                // markdown_preview crate removed — no-op
-            })
-            .ok();
     }
 
     fn open_internal(
@@ -6886,7 +6854,6 @@ impl Render for ProjectPanel {
                 .on_action(cx.listener(Self::open_permanent))
                 .on_action(cx.listener(Self::open_split_vertical))
                 .on_action(cx.listener(Self::open_split_horizontal))
-                .on_action(cx.listener(Self::open_markdown_preview))
                 .on_action(cx.listener(Self::confirm))
                 .on_action(cx.listener(Self::cancel))
                 .on_action(cx.listener(Self::copy_path))
@@ -7450,9 +7417,14 @@ impl Panel for ProjectPanel {
         matches!(position, DockPosition::Left | DockPosition::Right)
     }
 
-    fn set_position(&mut self, _: DockPosition, _: &mut Window, _: &mut Context<Self>) {
-        // 项目面板设置已从 SettingsContent 中移除 (spec §16 Plan 16)
-        // 停靠位置变更不再持久化到设置文件
+    fn set_position(&mut self, position: DockPosition, _: &mut Window, cx: &mut Context<Self>) {
+        update_settings_file(self.fs.clone(), cx, move |settings, _| {
+            let dock = match position {
+                DockPosition::Left | DockPosition::Bottom => settings::DockSide::Left,
+                DockPosition::Right => settings::DockSide::Right,
+            };
+            settings.project_panel.get_or_insert_default().dock = Some(dock);
+        });
     }
 
     fn default_size(&self, _: &Window, cx: &App) -> Pixels {
@@ -7499,8 +7471,9 @@ impl Panel for ProjectPanel {
     }
 
     fn hide_button_setting(&self, _: &App) -> Option<workspace::HideStatusItem> {
-        // 项目面板设置已从 SettingsContent 中移除 (spec §16 Plan 16)
-        None
+        Some(workspace::HideStatusItem::new(|settings| {
+            settings.project_panel.get_or_insert_default().button = Some(false);
+        }))
     }
 }
 
@@ -7520,15 +7493,6 @@ impl ProjectPanel {
             worktree_id: project_path.worktree_id,
             entry_id: entry.id,
         });
-    }
-
-    /// Check whether the given path is a markdown file
-    fn is_markdown_path(path: &util::rel_path::RelPath) -> bool {
-        if let Some(ext) = path.extension() {
-            matches!(ext, "md" | "markdown" | "mdx")
-        } else {
-            false
-        }
     }
 }
 

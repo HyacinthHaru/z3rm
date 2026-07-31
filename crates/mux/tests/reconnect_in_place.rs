@@ -162,7 +162,7 @@ async fn reconnect_in_place_preserves_subscribers_and_window() -> Result<()> {
 
     // Capture window_id and register a subscriber BEFORE reconnect. The same
     // receiver must keep receiving notifications after the in-place swap.
-    let window_id_before = domain.window_id.clone();
+    let window_id_before = domain.window_id();
     let notif_rx = domain.subscribe();
 
     // Sanity: the connection is alive before reconnect.
@@ -179,7 +179,8 @@ async fn reconnect_in_place_preserves_subscribers_and_window() -> Result<()> {
 
     // window_id is preserved across the swap (same logical window).
     assert_eq!(
-        domain.window_id, window_id_before,
+        domain.window_id(),
+        window_id_before,
         "window_id must survive in-place reconnect"
     );
 

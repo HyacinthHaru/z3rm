@@ -540,7 +540,7 @@ impl Settings for EditorSettings {
             ),
             redact_private_values: editor.redact_private_values.unwrap_or(false),
             expand_excerpt_lines: editor.expand_excerpt_lines.unwrap_or(3),
-            excerpt_context_lines: editor.excerpt_context_lines.unwrap_or(3),
+            excerpt_context_lines: editor.excerpt_context_lines.unwrap_or(2),
             middle_click_paste: editor.middle_click_paste.unwrap_or(false),
             double_click_in_multibuffer: editor.double_click_in_multibuffer.map_or_else(
                 DoubleClickInMultibuffer::default,
@@ -664,7 +664,7 @@ impl Settings for EditorSettings {
                     settings::DiffViewStyle::Split => DiffViewStyle::Split,
                 },
             ),
-            minimum_split_diff_width: editor.minimum_split_diff_width.unwrap_or(480.0),
+            minimum_split_diff_width: editor.minimum_split_diff_width.unwrap_or(100.0),
         }
     }
 }
@@ -945,7 +945,7 @@ mod tests {
         assert_eq!(settings.multi_cursor_modifier, MultiCursorModifier::Alt);
         assert!(!settings.redact_private_values);
         assert_eq!(settings.expand_excerpt_lines, 3);
-        assert_eq!(settings.excerpt_context_lines, 3);
+        assert_eq!(settings.excerpt_context_lines, 2);
         assert!(!settings.middle_click_paste);
         assert_eq!(
             settings.double_click_in_multibuffer,
@@ -996,7 +996,7 @@ mod tests {
             CompletionMenuItemKind::All
         );
         assert_eq!(settings.diff_view_style, DiffViewStyle::Unified);
-        assert_eq!(settings.minimum_split_diff_width, 480.0);
+        assert_eq!(settings.minimum_split_diff_width, 100.0);
 
         assert!(settings.toolbar.breadcrumbs);
         assert!(settings.toolbar.quick_actions);
