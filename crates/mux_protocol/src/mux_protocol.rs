@@ -253,7 +253,7 @@ mod frame_length_tests {
 ///
 /// 支持的格式:
 /// - 命名按键: `Enter`, `Tab`, `BSpace`, `Escape`, `Space`, `Up`, `Down`,
-///   `Left`, `Right`, `Home`, `End`, `PageUp`, `PageDown`
+///   `Left`, `Right`, `Home`, `End`, `PageUp`, `PageDown`, `F1` through `F12`
 /// - Ctrl 组合: `C-a` through `C-z` (以及 `C-A` through `C-Z`)
 /// - Alt 组合: `M-a` through `M-z` (以及 `M-A` through `M-Z`)
 /// - 字面文本: 其他字符串直接作为 UTF-8 字节
@@ -272,6 +272,18 @@ pub fn parse_key(name: &str) -> Vec<u8> {
         "End" => b"\x1b[F".to_vec(),
         "PageUp" => b"\x1b[5~".to_vec(),
         "PageDown" => b"\x1b[6~".to_vec(),
+        "F1" => b"\x1bOP".to_vec(),
+        "F2" => b"\x1bOQ".to_vec(),
+        "F3" => b"\x1bOR".to_vec(),
+        "F4" => b"\x1bOS".to_vec(),
+        "F5" => b"\x1b[15~".to_vec(),
+        "F6" => b"\x1b[17~".to_vec(),
+        "F7" => b"\x1b[18~".to_vec(),
+        "F8" => b"\x1b[19~".to_vec(),
+        "F9" => b"\x1b[20~".to_vec(),
+        "F10" => b"\x1b[21~".to_vec(),
+        "F11" => b"\x1b[23~".to_vec(),
+        "F12" => b"\x1b[24~".to_vec(),
         // C-c → Ctrl+C = 0x03
         s if s.starts_with("C-") && s.len() == 3 => {
             // Ctrl+X: mask to control range (0x00–0x1F). This correctly
@@ -344,6 +356,18 @@ mod key_tests {
     fn parse_page_keys() {
         assert_eq!(parse_key("PageUp"), b"\x1b[5~");
         assert_eq!(parse_key("PageDown"), b"\x1b[6~");
+    }
+
+    #[test]
+    fn parse_function_keys() {
+        let expected: [&[u8]; 12] = [
+            b"\x1bOP", b"\x1bOQ", b"\x1bOR", b"\x1bOS", b"\x1b[15~", b"\x1b[17~",
+            b"\x1b[18~", b"\x1b[19~", b"\x1b[20~", b"\x1b[21~", b"\x1b[23~",
+            b"\x1b[24~",
+        ];
+        for (index, sequence) in expected.into_iter().enumerate() {
+            assert_eq!(parse_key(&format!("F{}", index + 1)), sequence);
+        }
     }
 
     #[test]
