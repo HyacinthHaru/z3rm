@@ -524,7 +524,7 @@ async fn dispatch_request(
         // §3.3 需要 ReadWrite 的输入操作 (Plan 33)
         RequestBody::SendInput(r) => {
             if check_permission(role, ClientRole::ReadWrite) {
-                handle_send_input(r, sessions, clipboard, outbound_tx, connection_client_id).await?
+                handle_send_input(r, sessions, connection_client_id).await?
             } else {
                 ResponseBody::Error("permission denied: read-write required".to_string())
             }
@@ -1397,12 +1397,10 @@ fn find_pane(
         .find_map(|session| session.panes.read().get(pane_id).cloned())
 }
 
-/// §3.10 发送输入 + §16.6 OSC 52 剪贴板拦截
+/// §3.10 Forward raw client input to the PTY unchanged.
 async fn handle_send_input(
     req: &SendInputRequest,
     sessions: &Arc<parking_lot::RwLock<Vec<crate::session::Session>>>,
-    clipboard: &Arc<crate::clipboard::ServerClipboard>,
-    _outbound_tx: &mpsc::UnboundedSender<Envelope>,
     connection_client_id: &Arc<parking_lot::Mutex<Option<String>>>,
 ) -> anyhow::Result<ResponseBody> {
     if !client_still_attached(sessions, connection_client_id) {
@@ -1417,40 +1415,7 @@ async fn handle_send_input(
         )));
     };
 
-    // §16.6 解析 OSC 52 序列: ESC ] 52 ; c ; <base64> BEL/ST
-    let mut osc52_parser = crate::clipboard::Osc52Parser::new();
-    if let Some(base64_content) = osc52_parser.feed(&req.data) {
-        // §16.6 OSC 52 触发剪贴板更新并通知所有客户端
-        let origin_host = std::env::var("HOSTNAME").unwrap_or_else(|_| "z3rm-server".to_string());
-        {
-            let mut txs = Vec::new();
-            for session in sessions.read().iter() {
-                for tx in session.lifecycle_subscribers.read().values() {
-                    txs.push(tx.clone());
-                }
-            }
-            clipboard.set_from_osc52(&base64_content, origin_host, &txs)?;
-        }
-        // OSC 52 序列已被消费, 不转发到 PTY
-        return Ok(ResponseBody::Error(String::new()));
-    }
-
-    // §16.6 检查 bracketed paste 模式切换序列
-    // ESC [ ? 2004 h (enable) / ESC [ ? 2004 l (disable)
-    const BRACKETED_PASTE_ENABLE: &[u8] = &[0x1B, b'[', b'?', b'2', b'0', b'0', b'4', b'h'];
-    const BRACKETED_PASTE_DISABLE: &[u8] = &[0x1B, b'[', b'?', b'2', b'0', b'0', b'4', b'l'];
-    if req.data == BRACKETED_PASTE_ENABLE {
-        // §16.6 启用 bracketed paste
-        pane.set_bracketed_paste_mode(true);
-        return Ok(ResponseBody::Error(String::new()));
-    }
-    if req.data == BRACKETED_PASTE_DISABLE {
-        // §16.6 禁用 bracketed paste
-        pane.set_bracketed_paste_mode(false);
-        return Ok(ResponseBody::Error(String::new()));
-    }
-
-    // §3.10 普通输入: 转发到 PTY
+    // Terminal output sequences are interpreted only by the emulator output path.
     pane.write_input(&req.data)?;
     Ok(ResponseBody::Error(String::new()))
 }
