@@ -155,6 +155,15 @@ pub struct Search {
     search: AlacrittySearch,
 }
 
+/// §12 Plan 31 — the confirmed copy-mode search. The match list itself lives in
+/// [`Terminal::matches`] so search hits highlight through the same renderer path
+/// as search-bar hits.
+#[derive(Clone, Debug)]
+struct SearchState {
+    query: String,
+    searcher: Search,
+}
+
 #[derive(Clone, Debug)]
 struct Selection {
     ty: SelectionType,
@@ -1114,6 +1123,7 @@ impl TerminalBuilder {
             selection_phase: SelectionPhase::Ended,
             hyperlink_regex_searches: RegexSearches::default(),
             vi_mode_enabled: false,
+            search_state: None,
             is_remote_terminal: false,
             last_mouse_move_time: Instant::now(),
             last_hyperlink_search_position: None,
@@ -1389,6 +1399,7 @@ impl TerminalBuilder {
                     path_hyperlink_timeout_ms,
                 ),
                 vi_mode_enabled: false,
+                search_state: None,
                 is_remote_terminal,
                 last_mouse_move_time: Instant::now(),
                 last_hyperlink_search_position: None,
@@ -1572,6 +1583,8 @@ pub struct Terminal {
     hyperlink_regex_searches: RegexSearches,
     task: Option<TaskState>,
     vi_mode_enabled: bool,
+    /// §12 Plan 31 — copy-mode search query, `None` until one is confirmed.
+    search_state: Option<SearchState>,
     is_remote_terminal: bool,
     last_mouse_move_time: Instant,
     last_hyperlink_search_position: Option<GpuiPoint<Pixels>>,
@@ -2394,6 +2407,89 @@ impl Terminal {
         self.events.push_back(InternalEvent::ToggleViMode);
     }
 
+    /// §12 Plan 31 — confirm a copy-mode search query and refresh the match
+    /// list over the whole grid, scrollback included. Returns the number of
+    /// matches, or an error when `query` is not a valid regex so callers can
+    /// show the failure instead of silently browsing a stale match list.
+    pub fn set_search_query(&mut self, query: &str) -> anyhow::Result<usize> {
+        self.clear_search();
+        anyhow::ensure!(!query.is_empty(), "search query is empty");
+        let searcher = Search::new(query)
+            .ok_or_else(|| anyhow::anyhow!("`{query}` is not a valid regular expression"))?;
+        let matches = {
+            let term = self.term.lock();
+            search_matches(&term, searcher.clone())
+        };
+        self.matches = matches;
+        self.search_state = Some(SearchState {
+            query: query.to_string(),
+            searcher,
+        });
+        Ok(self.matches.len())
+    }
+
+    /// §12 Plan 31 — the confirmed copy-mode search query, if any.
+    pub fn search_query(&self) -> Option<&str> {
+        self.search_state.as_ref().map(|state| state.query.as_str())
+    }
+
+    /// §12 Plan 31 — drop the copy-mode search and its highlighted matches.
+    pub fn clear_search(&mut self) {
+        self.search_state = None;
+        self.matches.clear();
+    }
+
+    /// §12 Plan 31 — move to the next match after the cursor, wrapping around.
+    pub fn search_next(&mut self) -> bool {
+        self.advance_search(true)
+    }
+
+    /// §12 Plan 31 — move to the previous match before the cursor, wrapping
+    /// around.
+    pub fn search_previous(&mut self) -> bool {
+        self.advance_search(false)
+    }
+
+    /// Matches and the cursor share absolute grid coordinates (negative lines
+    /// are scrollback), so the next hit is found by ordering alone. The cursor
+    /// only reaches the activated match once the queued events are flushed by
+    /// `sync`, which is why stepping is derived from the cursor rather than
+    /// from a remembered index.
+    fn advance_search(&mut self, forward: bool) -> bool {
+        // Re-run the search rather than reusing `matches`: output that arrived
+        // since the query was confirmed shifts every hit in the scrollback, and
+        // navigating a stale list would jump to the wrong cells.
+        let Some(searcher) = self
+            .search_state
+            .as_ref()
+            .map(|state| state.searcher.clone())
+        else {
+            return false;
+        };
+        self.matches = {
+            let term = self.term.lock();
+            search_matches(&term, searcher)
+        };
+        let match_count = self.matches.len();
+        if match_count == 0 {
+            return false;
+        }
+        let cursor = self.last_content.cursor.point;
+        let index = if forward {
+            self.matches
+                .iter()
+                .position(|search_match| search_match.start() > cursor)
+                .unwrap_or(0)
+        } else {
+            self.matches
+                .iter()
+                .rposition(|search_match| search_match.end() < cursor)
+                .unwrap_or(match_count - 1)
+        };
+        self.activate_match(index);
+        true
+    }
+
     pub fn vi_motion(&mut self, keystroke: &Keystroke) {
         if !self.vi_mode_enabled {
             return;
@@ -2481,13 +2577,13 @@ impl Terminal {
                 self.toggle_vi_mode();
             }
 
-            "v" => {
-                let point = self.last_content.cursor.point;
-                let selection_type = SelectionType::Simple;
-                let side = SelectionSide::Right;
-                let selection = Selection::new(selection_type, point, side);
-                self.events
-                    .push_back(InternalEvent::SetSelection(Some(selection)));
+            // §12 Plan 31 — search navigation over the confirmed query.
+            "n" => {
+                self.search_next();
+            }
+
+            "N" => {
+                self.search_previous();
             }
 
             "V" => {
@@ -5182,6 +5278,195 @@ mod tests {
             restored, target_offset,
             "last_content().display_offset must equal the restored nonzero offset"
         );
+    }
+
+    /// §12 Plan 31 — a confirmed query drives `n` / `N` across every match in
+    /// the grid, wrapping in both directions.
+    #[gpui::test]
+    async fn test_copy_mode_search_walks_matches_in_both_directions(cx: &mut TestAppContext) {
+        cx.update(|cx| {
+            let settings_store = settings::SettingsStore::test(cx);
+            cx.set_global(settings_store);
+        });
+        let cx = cx.add_empty_window();
+        let terminal = cx.new(|cx| {
+            TerminalBuilder::new_display_only(
+                SettingsCursorShape::default(),
+                AlternateScroll::On,
+                None,
+                0,
+                cx.background_executor(),
+                PathStyle::local(),
+            )
+            .subscribe(cx)
+        });
+
+        let match_count = cx.update(|window, cx| {
+            terminal.update(cx, |terminal, cx| {
+                terminal.write_output(b"needle one\r\nfiller\r\nneedle two\r\nneedle three\r\n", cx);
+                terminal.toggle_vi_mode();
+                terminal.sync(window, cx);
+                terminal.set_search_query("needle")
+            })
+        });
+        assert_eq!(
+            match_count.unwrap_or_else(|error| panic!("confirm search query: {error}")),
+            3
+        );
+
+        let mut visited = Vec::new();
+        for _ in 0..4 {
+            visited.push(cx.update(|window, cx| {
+                terminal.update(cx, |terminal, cx| {
+                    assert!(terminal.search_next(), "search_next must find a match");
+                    terminal.sync(window, cx);
+                    terminal.last_content.cursor.point
+                })
+            }));
+        }
+        // "needle" ends at column 5; the cursor starts past every match so the
+        // first step wraps to the top, and the fourth wraps again.
+        assert_eq!(
+            visited,
+            vec![
+                Point::new(0, 5),
+                Point::new(2, 5),
+                Point::new(3, 5),
+                Point::new(0, 5),
+            ]
+        );
+
+        let mut reversed = Vec::new();
+        for _ in 0..2 {
+            reversed.push(cx.update(|window, cx| {
+                terminal.update(cx, |terminal, cx| {
+                    assert!(terminal.search_previous(), "search_previous must find a match");
+                    terminal.sync(window, cx);
+                    terminal.last_content.cursor.point
+                })
+            }));
+        }
+        assert_eq!(reversed, vec![Point::new(3, 5), Point::new(2, 5)]);
+
+        cx.update(|_window, cx| {
+            terminal.update(cx, |terminal, _cx| {
+                assert_eq!(terminal.search_query(), Some("needle"));
+                terminal.clear_search();
+                assert_eq!(terminal.search_query(), None);
+                assert!(terminal.matches.is_empty());
+                assert!(
+                    !terminal.search_next(),
+                    "search_next must be inert without a query"
+                );
+            });
+        });
+    }
+
+    /// §12 Plan 31 — vi mode routes `n` / `N` into the search so copy mode and
+    /// plain vi mode share one implementation.
+    #[gpui::test]
+    async fn test_vi_motion_n_navigates_search_matches(cx: &mut TestAppContext) {
+        cx.update(|cx| {
+            let settings_store = settings::SettingsStore::test(cx);
+            cx.set_global(settings_store);
+        });
+        let cx = cx.add_empty_window();
+        let terminal = cx.new(|cx| {
+            TerminalBuilder::new_display_only(
+                SettingsCursorShape::default(),
+                AlternateScroll::On,
+                None,
+                0,
+                cx.background_executor(),
+                PathStyle::local(),
+            )
+            .subscribe(cx)
+        });
+
+        cx.update(|window, cx| {
+            terminal.update(cx, |terminal, cx| {
+                terminal.write_output(b"match one\r\nfiller\r\nmatch two\r\n", cx);
+                terminal.toggle_vi_mode();
+                terminal.sync(window, cx);
+                terminal
+                    .set_search_query("match")
+                    .unwrap_or_else(|error| panic!("confirm search query: {error}"));
+            });
+        });
+
+        let mut next = Keystroke::default();
+        next.key = "n".to_string();
+        let mut previous = Keystroke::default();
+        previous.key = "n".to_string();
+        previous.modifiers.shift = true;
+
+        let first = cx.update(|window, cx| {
+            terminal.update(cx, |terminal, cx| {
+                terminal.vi_motion(&next);
+                terminal.sync(window, cx);
+                terminal.last_content.cursor.point
+            })
+        });
+        assert_eq!(first, Point::new(0, 4));
+
+        let second = cx.update(|window, cx| {
+            terminal.update(cx, |terminal, cx| {
+                terminal.vi_motion(&next);
+                terminal.sync(window, cx);
+                terminal.last_content.cursor.point
+            })
+        });
+        assert_eq!(second, Point::new(2, 4));
+
+        let back = cx.update(|window, cx| {
+            terminal.update(cx, |terminal, cx| {
+                terminal.vi_motion(&previous);
+                terminal.sync(window, cx);
+                terminal.last_content.cursor.point
+            })
+        });
+        assert_eq!(back, Point::new(0, 4));
+    }
+
+    /// §12 Plan 31 — an uncompilable query is reported instead of leaving the
+    /// previous match list in place.
+    #[gpui::test]
+    async fn test_search_query_rejects_invalid_regex(cx: &mut TestAppContext) {
+        cx.update(|cx| {
+            let settings_store = settings::SettingsStore::test(cx);
+            cx.set_global(settings_store);
+        });
+        let cx = cx.add_empty_window();
+        let terminal = cx.new(|cx| {
+            TerminalBuilder::new_display_only(
+                SettingsCursorShape::default(),
+                AlternateScroll::On,
+                None,
+                0,
+                cx.background_executor(),
+                PathStyle::local(),
+            )
+            .subscribe(cx)
+        });
+
+        cx.update(|window, cx| {
+            terminal.update(cx, |terminal, cx| {
+                terminal.write_output(b"needle\r\n", cx);
+                terminal.sync(window, cx);
+                terminal
+                    .set_search_query("needle")
+                    .unwrap_or_else(|error| panic!("confirm search query: {error}"));
+                assert_eq!(terminal.matches.len(), 1);
+
+                assert!(terminal.set_search_query("(unclosed").is_err());
+                assert_eq!(terminal.search_query(), None);
+                assert!(
+                    terminal.matches.is_empty(),
+                    "a rejected query must not leave stale matches highlighted"
+                );
+                assert!(terminal.set_search_query("").is_err());
+            });
+        });
     }
 
     #[gpui::test]
