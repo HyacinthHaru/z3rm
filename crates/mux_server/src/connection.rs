@@ -482,7 +482,7 @@ async fn dispatch_request(
         // §3.3 需要 ReadWrite 的 pane 操作 (Plan 33)
         RequestBody::SpawnPane(r) => {
             if check_permission(role, ClientRole::ReadWrite) {
-                handle_spawn_pane(r, sessions, outbound_tx, server_settings, clipboard).await?
+                handle_spawn_pane(r, sessions, server_settings, clipboard).await?
             } else {
                 ResponseBody::Error("permission denied: read-write required".to_string())
             }
@@ -1015,14 +1015,27 @@ async fn handle_new_window(
     }))
 }
 
+fn session_cwd(
+    sessions: &Arc<parking_lot::RwLock<Vec<crate::session::Session>>>,
+    session_id: &str,
+) -> Option<String> {
+    sessions
+        .read()
+        .iter()
+        .find(|session| session.id == session_id)
+        .map(|session| session.cwd.clone())
+}
+
 /// §3.10 创建 pane — 真正 spawn PTY + alacritty Term (server-canonical)
 async fn handle_spawn_pane(
     req: &SpawnPaneRequest,
     sessions: &Arc<parking_lot::RwLock<Vec<crate::session::Session>>>,
-    outbound_tx: &mpsc::UnboundedSender<Envelope>,
     server_settings: &Arc<crate::server_settings::ServerSettings>,
     clipboard: &Arc<crate::clipboard::ServerClipboard>,
 ) -> anyhow::Result<ResponseBody> {
+    let session_cwd = session_cwd(sessions, &req.session_id).ok_or_else(|| {
+        anyhow::anyhow!("session not found: {}", req.session_id)
+    })?;
     let pane_id = nanoid::nanoid!();
 
     // §3.1 转换 ShellCommand → pane::ShellCommand
@@ -1032,16 +1045,7 @@ async fn handle_spawn_pane(
         env: c.env.iter().map(|(k, v)| (k.clone(), v.clone())).collect(),
     });
 
-    // §3.10 解析 cwd (空则用 session.cwd)
-    let cwd = {
-        let sessions_r = sessions.read();
-        sessions_r
-            .iter()
-            .find(|s| s.id == req.session_id)
-            .map(|s| s.cwd.clone())
-            .unwrap_or_default()
-    };
-    let cwd = req.cwd.clone().unwrap_or(cwd);
+    let cwd = req.cwd.clone().unwrap_or(session_cwd);
 
     // §3.1 解析 size
     let (cols, rows) = req
@@ -1072,32 +1076,33 @@ async fn handle_spawn_pane(
     // §15.4 attach 返回的权威快照必须反映这些登记。
     {
         let mut sessions_w = sessions.write();
-        if let Some(session) = sessions_w.iter_mut().find(|s| s.id == req.session_id) {
-            session.panes.write().insert(pane_id.clone(), pane);
-            session.set_focused_pane(pane_id.clone());
+        let session = sessions_w
+            .iter_mut()
+            .find(|session| session.id == req.session_id)
+            .ok_or_else(|| anyhow::anyhow!(
+                "session removed while spawning pane: {}",
+                req.session_id
+            ))?;
+        session.panes.write().insert(pane_id.clone(), pane);
+        session.set_focused_pane(pane_id.clone());
 
-            // §3.3 / §16.9 把 pane 注册到指定 tab。Tab 不存在则按 id 创建,
-            // 防止客户端传入尚未创建的 tab_id 时静默丢弃 pane。
-            let tab =
-                session
-                    .tabs
-                    .entry(req.tab_id.clone())
-                    .or_insert_with(|| crate::session::Tab {
-                        id: req.tab_id.clone(),
-                        title: String::new(),
-                        pane_ids: Vec::new(),
-                    });
-            if !tab.pane_ids.contains(&pane_id) {
-                tab.pane_ids.push(pane_id.clone());
-            }
+        let tab = session
+            .tabs
+            .entry(req.tab_id.clone())
+            .or_insert_with(|| crate::session::Tab {
+                id: req.tab_id.clone(),
+                title: String::new(),
+                pane_ids: Vec::new(),
+            });
+        if !tab.pane_ids.contains(&pane_id) {
+            tab.pane_ids.push(pane_id.clone());
+        }
 
-            // §3.7 在 layout 中登记 pane:第一个 pane 成根,后续通过 split 接入。
-            if session.layout.is_empty_root() {
-                session.layout = crate::layout::LayoutTree::with_pane(
-                    format!("node-{}", pane_id),
-                    pane_id.clone(),
-                );
-            }
+        if session.layout.is_empty_root() {
+            session.layout = crate::layout::LayoutTree::with_pane(
+                format!("node-{}", pane_id),
+                pane_id.clone(),
+            );
         }
     }
 
@@ -2310,6 +2315,7 @@ mod connection_unit_tests {
                 program: "/bin/cat".to_string(),
                 ..Default::default()
             }),
+
         ) {
             Ok(pane) => pane,
             Err(error) => panic!("spawn cleanup pane: {error}"),
@@ -2333,6 +2339,30 @@ mod connection_unit_tests {
             Err(mpsc::error::TryRecvError::Disconnected)
         ));
         assert!(forward_tasks.lock().is_empty());
+    }
+
+    #[tokio::test]
+    async fn spawn_pane_rejects_missing_session_before_spawning() {
+        let sessions = Arc::new(parking_lot::RwLock::new(Vec::new()));
+        let settings = crate::server_settings::ServerSettings::load();
+        let clipboard = Arc::new(crate::clipboard::ServerClipboard::new());
+        let request = SpawnPaneRequest {
+            session_id: "missing".to_string(),
+            tab_id: "tab".to_string(),
+            size: Some(mux_protocol::TerminalSize { cols: 80, rows: 24 }),
+            cwd: None,
+            command: Some(mux_protocol::ShellCommand {
+                program: "/definitely/must/not/spawn".to_string(),
+                args: Vec::new(),
+                env: Default::default(),
+            }),
+        };
+
+        let error = handle_spawn_pane(&request, &sessions, &settings, &clipboard)
+            .await
+            .expect_err("missing session must fail before child spawn");
+
+        assert_eq!(error.to_string(), "session not found: missing");
     }
 
     struct DropSignal(Arc<std::sync::atomic::AtomicBool>);
