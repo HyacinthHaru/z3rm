@@ -1,4 +1,5 @@
 mod action;
+mod editor;
 mod extension;
 mod fallible_options;
 mod mux;
@@ -12,6 +13,7 @@ mod title_bar;
 mod workspace;
 
 pub use action::{ActionName, ActionWithArguments, CommandAliasTarget};
+pub use editor::*;
 pub use extension::*;
 pub use fallible_options::*;
 pub use merge_from::MergeFrom as MergeFromTrait;
@@ -108,6 +110,9 @@ pub struct SettingsContent {
     /// 远程连接设置 (spec §16 Plan 16)
     #[serde(flatten)]
     pub remote: RemoteSettingsContent,
+
+    /// 编辑器与搜索设置 (spec §16 Plan 16)
+    pub editor: Option<EditorSettingsContent>,
 
     /// 终端设置 (spec §16 Plan 16)
     pub terminal: Option<TerminalSettingsContent>,
