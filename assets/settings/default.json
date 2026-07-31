@@ -14,7 +14,7 @@
     "**/*.crt",
     "**/secrets.yml"
   ],
-  "hidden_files": [],
+  "hidden_files": ["**/.*"],
   "read_only_files": [],
   "file_scan_inclusions": [".env*"],
 
