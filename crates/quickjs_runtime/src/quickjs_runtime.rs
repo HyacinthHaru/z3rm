@@ -1718,15 +1718,17 @@ mod tests {
     /// spec §5.2: 超预算不是立刻杀，要连续 3 个预算周期 (~150ms) 才中断。
     #[test]
     fn cpu_fuel_interrupts_only_after_three_budget_overruns() {
-        let tracker = CpuFuelTracker::new(10);
+        // 预算取得比睡眠抖动大一个量级：贴着阈值睡会让 thread::sleep 的
+        // 过冲直接决定断言结果。
+        let tracker = CpuFuelTracker::new(20);
 
         // 第一次 check 建立 checkpoint，不计时。
         assert!(!tracker.check());
-        // 20ms（2 × budget）之后仍在容忍范围内。
-        std::thread::sleep(Duration::from_millis(20));
-        assert!(!tracker.check(), "2× 预算不应中断");
-        // 再过 20ms 累计 40ms > 3 × 10ms，应中断。
-        std::thread::sleep(Duration::from_millis(20));
+        // 25ms 远低于 3 × 20ms 的中断阈值。
+        std::thread::sleep(Duration::from_millis(25));
+        assert!(!tracker.check(), "低于 3× 预算不应中断");
+        // 再过 50ms 累计 75ms > 3 × 20ms，应中断。
+        std::thread::sleep(Duration::from_millis(50));
         assert!(tracker.check(), "累计超过 3× 预算应中断");
         assert!(tracker.take_interrupted());
         assert!(!tracker.take_interrupted(), "标志读取后应清零");
