@@ -430,3 +430,20 @@ workspace = true
 [dependencies]
 z3rm_macros = { workspace = true }
 inventory = "0.3"
+
+# --- UI screenshot / a11y regression + mux stress harness (docs/development/ui-regression-testing.md) ---
+
+[dev-dependencies.gpui_platform]
+workspace = true
+features = [ "test-support"]
+
+[dev-dependencies.image]
+workspace = true
+
+[dev-dependencies.tempfile]
+workspace = true
+
+[[test]]
+name = "ui_screenshot_regression"
+path = "tests/ui_screenshot_regression.rs"
+harness = false
