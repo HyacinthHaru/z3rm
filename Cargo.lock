@@ -7624,6 +7624,7 @@ dependencies = [
  "alacritty_terminal",
  "anyhow",
  "base64 0.22.1",
+ "blake3",
  "dirs",
  "interprocess",
  "libc",
@@ -7642,6 +7643,7 @@ dependencies = [
  "tempfile",
  "tokio",
  "tracing",
+ "walkdir",
  "zlog",
  "zlog_settings",
 ]
@@ -10240,6 +10242,7 @@ dependencies = [
  "serde_json",
  "tempfile",
  "tokio",
+ "toml 0.8.23",
  "tracing",
 ]
 

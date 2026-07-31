@@ -1,20 +1,24 @@
 //! QuickJS 运行时封装，提供资源限制与线程隔离。
 //!
 //! 设计原则 (spec §5.2):
-//! - CPU fuel: 50ms/秒中断预算
+//! - CPU fuel: 每 wall-clock 秒 50ms 执行预算，连续超支 3 次 (~150ms) 才中断
 //! - 内存限制: 64MB/扩展
 //! - IO rate: 令牌桶限流
 //! - 专用 OS 线程隔离
+//!
+//! 本 crate 不依赖 `mux`/`gpui`：宿主能力通过 [`HostBridge`] trait 注入
+//! (spec §5.4)，由嵌入方 (z3rm) 实现真实的 mux/settings/terminal 调用。
 
-use std::cell::Cell;
+use std::collections::BTreeMap;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::thread;
 use std::time::{Duration, Instant};
 
-use anyhow::{Context as _, Result, anyhow};
+use anyhow::{Context as _, Result, anyhow, bail};
 use parking_lot::Mutex;
-use rquickjs::{Context, Runtime};
+use rquickjs::{Context, Function, Runtime, prelude::CatchResultExt};
 
 // ---------------------------------------------------------------------------
 // 常量
@@ -23,72 +27,145 @@ use rquickjs::{Context, Runtime};
 /// CPU fuel 预算: 每秒 50ms 执行时间
 const CPU_FUEL_BUDGET_MS: u64 = 50;
 
+/// CPU fuel 预算窗口 (spec §5.2: "50ms per second")
+const CPU_FUEL_WINDOW: Duration = Duration::from_secs(1);
+
+/// spec §5.2: 扩展连续 3 次超预算后才被杀掉 (默认预算下约 150ms)。
+/// 单次超支不中断，避免偶发的长任务被误杀。
+const CPU_OVER_BUDGET_KILL_MULTIPLE: u32 = 3;
+
 /// 默认内存限制: 64MB
 const DEFAULT_MEMORY_LIMIT_MB: usize = 64;
 
 /// IO 令牌桶默认参数
 const IO_TOKEN_BUCKET_DEFAULT_RATE: f64 = 100.0; // 每秒补充令牌数
-const IO_TOKEN_BUCKET_DEFAULT_CAPACITY: f64 = 200.0; // 最大令牌容量
+/// 桶容量 = 速率 × 该系数，允许短时突发。
+const IO_TOKEN_BUCKET_BURST_FACTOR: f64 = 2.0;
+
+/// 环境变量：覆盖内置扩展搜索路径 (平台 PATH 分隔符分隔多个目录)。
+pub const BUILTIN_EXTENSIONS_ENV: &str = "Z3RM_EXTENSIONS_DIR";
+
+// ---------------------------------------------------------------------------
+// 资源限制配置
+// ---------------------------------------------------------------------------
+
+/// spec §5.3 `[resources]` 中声明的每扩展资源上限。
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct ExtensionLimits {
+    /// 内存上限 (MB)，0 表示不限制。
+    pub memory_limit_mb: usize,
+    /// CPU 预算 (ms / wall-clock 秒)，0 表示不限制。
+    pub cpu_budget_ms: u64,
+    /// 宿主调用速率上限 (ops/秒)。
+    pub io_rate_limit: f64,
+}
+
+impl Default for ExtensionLimits {
+    fn default() -> Self {
+        Self {
+            memory_limit_mb: DEFAULT_MEMORY_LIMIT_MB,
+            cpu_budget_ms: CPU_FUEL_BUDGET_MS,
+            io_rate_limit: IO_TOKEN_BUCKET_DEFAULT_RATE,
+        }
+    }
+}
+
+impl ExtensionLimits {
+    pub fn new(memory_limit_mb: usize, cpu_budget_ms: u64, io_rate_limit: f64) -> Self {
+        Self {
+            memory_limit_mb,
+            cpu_budget_ms,
+            io_rate_limit,
+        }
+    }
+}
 
 // ---------------------------------------------------------------------------
 // CPU Fuel 中断器
 // ---------------------------------------------------------------------------
 
-/// CPU fuel 跟踪器: 记录 JS 执行时间，超预算时中断。
+struct CpuFuelState {
+    /// 当前预算窗口的起点。
+    window_start: Instant,
+    /// 本窗口内已消耗的 JS 执行时间。
+    used: Duration,
+    /// 上一次中断回调的时刻；`None` 表示刚进入一次新的宿主调用。
+    last_checkpoint: Option<Instant>,
+    /// 是否因超预算被中断过 (由宿主读取后清零)。
+    interrupted: bool,
+}
+
+/// CPU fuel 跟踪器: 记录 JS 真实执行时间，超预算时中断 (spec §5.2)。
 ///
-/// 通过 rquickjs 的 `set_interrupt_handler` 回调定期触发。
-/// 每次回调检查已用时间，超过预算返回 `true` 触发异常。
+/// QuickJS 只在执行字节码时调用中断回调，因此**相邻两次回调之间的 wall-clock
+/// 间隔就是这段时间里真实的 JS 执行时间**。宿主空闲期不会产生回调，
+/// 而进入下一次宿主调用前 [`begin_execution`](CpuFuelTracker::begin_execution)
+/// 会清掉上一个 checkpoint，避免把空闲时间计入预算。
+#[derive(Clone)]
 struct CpuFuelTracker {
-    /// 预算窗口开始时间
-    window_start: Cell<Option<Instant>>,
-    /// 当前窗口已用毫秒数 (由 JS 引擎定期累加)
-    elapsed_ms: Cell<u64>,
-    /// 预算上限 (ms/秒)
-    budget_ms: u64,
+    state: Arc<Mutex<CpuFuelState>>,
+    /// 单窗口预算；`Duration::ZERO` 表示不限制。
+    budget: Duration,
 }
 
 impl CpuFuelTracker {
     fn new(budget_ms: u64) -> Self {
         Self {
-            window_start: Cell::new(None),
-            elapsed_ms: Cell::new(0),
-            budget_ms,
+            state: Arc::new(Mutex::new(CpuFuelState {
+                window_start: Instant::now(),
+                used: Duration::ZERO,
+                last_checkpoint: None,
+                interrupted: false,
+            })),
+            budget: Duration::from_millis(budget_ms),
         }
+    }
+
+    /// 标记一次新的宿主 → JS 调用开始，丢弃上一次的 checkpoint。
+    fn begin_execution(&self) {
+        self.state.lock().last_checkpoint = None;
     }
 
     /// 中断检查: 返回 `true` 表示应中断执行。
-    ///
-    /// rquickjs 引擎在执行循环中定期调用此闭包。
-    /// 每次调用增加 1ms 计数（引擎内部约每 N 字节码指令调用一次）。
     fn check(&self) -> bool {
+        if self.budget.is_zero() {
+            return false;
+        }
+        let kill_threshold = self
+            .budget
+            .checked_mul(CPU_OVER_BUDGET_KILL_MULTIPLE)
+            .unwrap_or(Duration::MAX);
+
         let now = Instant::now();
-        let start = self.window_start.get().unwrap_or_else(|| {
-            self.window_start.set(Some(now));
-            self.elapsed_ms.set(0);
-            now
-        });
-
-        // 窗口超过 1 秒则重置
-        if now.duration_since(start).as_secs() >= 1 {
-            self.window_start.set(Some(now));
-            self.elapsed_ms.set(0);
-            false
-        } else {
-            // 每次回调计 1ms（保守估算）
-            let elapsed = self.elapsed_ms.get() + 1;
-            self.elapsed_ms.set(elapsed);
-            elapsed >= self.budget_ms
+        let mut state = self.state.lock();
+        if let Some(previous) = state.last_checkpoint {
+            state.used += now.saturating_duration_since(previous);
         }
+        state.last_checkpoint = Some(now);
+
+        if now.saturating_duration_since(state.window_start) >= CPU_FUEL_WINDOW {
+            state.window_start = now;
+            state.used = Duration::ZERO;
+            return false;
+        }
+
+        if state.used >= kill_threshold {
+            state.interrupted = true;
+            return true;
+        }
+        false
     }
-}
 
-impl Clone for CpuFuelTracker {
-    fn clone(&self) -> Self {
-        Self {
-            window_start: Cell::new(self.window_start.get()),
-            elapsed_ms: Cell::new(self.elapsed_ms.get()),
-            budget_ms: self.budget_ms,
-        }
+    /// 读取并清除「被 CPU 预算中断」标志。
+    fn take_interrupted(&self) -> bool {
+        let mut state = self.state.lock();
+        std::mem::replace(&mut state.interrupted, false)
+    }
+
+    /// 当前窗口已消耗的执行时间 (测试与诊断用)。
+    #[cfg(test)]
+    fn used(&self) -> Duration {
+        self.state.lock().used
     }
 }
 
@@ -96,9 +173,9 @@ impl Clone for CpuFuelTracker {
 // IO 令牌桶限流器
 // ---------------------------------------------------------------------------
 
-/// IO 操作令牌桶: 控制扩展的 IO 频率。
+/// IO 操作令牌桶: 控制扩展的宿主调用频率 (spec §5.2 / §5.6)。
 ///
-/// 扩展每次执行 IO 操作（文件读写、网络请求等）需消耗令牌。
+/// 扩展每次通过 [`HostBridge`] 调用宿主都需消耗令牌。
 /// 令牌按固定速率补充，超过容量则丢弃。
 pub struct IoTokenBucket {
     rate: f64,
@@ -118,12 +195,19 @@ impl IoTokenBucket {
         }
     }
 
+    /// 由 manifest 的 `io_rate_limit` 构造，容量允许 2× 突发。
+    pub fn from_rate(rate: f64) -> Self {
+        let rate = if rate.is_finite() && rate > 0.0 {
+            rate
+        } else {
+            IO_TOKEN_BUCKET_DEFAULT_RATE
+        };
+        Self::new(rate, rate * IO_TOKEN_BUCKET_BURST_FACTOR)
+    }
+
     /// 默认配置: 100 tokens/s, 容量 200
     pub fn default_config() -> Self {
-        Self::new(
-            IO_TOKEN_BUCKET_DEFAULT_RATE,
-            IO_TOKEN_BUCKET_DEFAULT_CAPACITY,
-        )
+        Self::from_rate(IO_TOKEN_BUCKET_DEFAULT_RATE)
     }
 
     /// 尝试获取 `count` 个令牌。成功返回 `true`。
@@ -154,6 +238,806 @@ impl IoTokenBucket {
 }
 
 // ---------------------------------------------------------------------------
+// §5.6 Capabilities
+// ---------------------------------------------------------------------------
+
+/// spec §5.6 文件系统访问范围。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum FilesystemAccess {
+    #[default]
+    None,
+    Cwd,
+    Home,
+}
+
+impl FilesystemAccess {
+    fn parse(value: &str) -> Result<Self> {
+        match value {
+            "none" | "" => Ok(Self::None),
+            "cwd" => Ok(Self::Cwd),
+            "home" => Ok(Self::Home),
+            other => bail!("invalid filesystem capability: {other}"),
+        }
+    }
+
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::None => "none",
+            Self::Cwd => "cwd",
+            Self::Home => "home",
+        }
+    }
+}
+
+/// spec §5.6 扩展在 `extension.toml` 的 `[capabilities]` 中声明的权限。
+/// 未声明的能力一律拒绝 (fail closed)。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct ExtensionCapabilities {
+    pub terminal: bool,
+    pub mux: bool,
+    pub workspace: bool,
+    pub settings: bool,
+    pub network: bool,
+    pub process_spawn: bool,
+    pub filesystem: FilesystemAccess,
+}
+
+impl ExtensionCapabilities {
+    /// 全开：仅用于嵌入方自己的测试装载路径，manifest 装载走 fail-closed 解析。
+    pub fn all() -> Self {
+        Self {
+            terminal: true,
+            mux: true,
+            workspace: true,
+            settings: true,
+            network: true,
+            process_spawn: true,
+            filesystem: FilesystemAccess::Home,
+        }
+    }
+
+    /// 宿主调用是否被允许。方法名形如 `mux.splitPane`，命名空间即能力名。
+    pub fn allows(&self, method: &str) -> bool {
+        match method.split('.').next().unwrap_or_default() {
+            "mux" => self.mux,
+            "terminal" => self.terminal,
+            "workspace" => self.workspace,
+            "settings" => self.settings,
+            "network" => self.network,
+            "process" => self.process_spawn,
+            "filesystem" => self.filesystem != FilesystemAccess::None,
+            _ => false,
+        }
+    }
+
+    fn to_json(self) -> serde_json::Value {
+        serde_json::json!({
+            "terminal": self.terminal,
+            "mux": self.mux,
+            "workspace": self.workspace,
+            "settings": self.settings,
+            "network": self.network,
+            "process_spawn": self.process_spawn,
+            "filesystem": self.filesystem.as_str(),
+        })
+    }
+}
+
+// ---------------------------------------------------------------------------
+// §16.8 / §5.3 extension.toml manifest
+// ---------------------------------------------------------------------------
+
+/// §16.8 扩展运行侧声明。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ExtensionSide {
+    Client,
+    Server,
+    Both,
+}
+
+impl ExtensionSide {
+    pub fn parse(value: &str) -> Result<Self> {
+        match value {
+            "client" => Ok(Self::Client),
+            "server" => Ok(Self::Server),
+            "both" => Ok(Self::Both),
+            other => bail!("invalid extension runtime side: {other}"),
+        }
+    }
+
+    /// 该侧是否需要在 GUI 客户端加载。
+    pub fn runs_on_client(self) -> bool {
+        matches!(self, Self::Client | Self::Both)
+    }
+}
+
+/// spec §5.3 解析后的 `extension.toml`。
+#[derive(Debug, Clone)]
+pub struct ExtensionManifest {
+    pub id: String,
+    pub name: String,
+    pub version: String,
+    pub side: ExtensionSide,
+    pub sync: bool,
+    pub capabilities: ExtensionCapabilities,
+    pub limits: ExtensionLimits,
+}
+
+fn toml_bool(table: &toml::value::Table, key: &str) -> Result<bool> {
+    match table.get(key) {
+        None => Ok(false),
+        Some(toml::Value::Boolean(value)) => Ok(*value),
+        Some(other) => bail!("capability `{key}` must be a boolean, found {}", other.type_str()),
+    }
+}
+
+fn toml_positive_number(table: &toml::value::Table, key: &str) -> Result<Option<f64>> {
+    match table.get(key) {
+        None => Ok(None),
+        Some(toml::Value::Integer(value)) if *value >= 0 => Ok(Some(*value as f64)),
+        Some(toml::Value::Float(value)) if *value >= 0.0 => Ok(Some(*value)),
+        Some(_) => bail!("`{key}` must be a non-negative number"),
+    }
+}
+
+/// spec §5.3 解析 manifest 文本。`fallback_id` 通常是扩展目录名。
+pub fn parse_manifest_str(fallback_id: &str, text: &str) -> Result<ExtensionManifest> {
+    let document: toml::Value = text.parse().context("invalid TOML")?;
+    let root = document
+        .as_table()
+        .context("extension manifest must be a table")?;
+
+    // Zed 格式把 name/version 放在顶层，z3rm 格式放在 `[extension]`；两者都接受。
+    let extension = root.get("extension").and_then(toml::Value::as_table);
+    let lookup = |key: &str| -> Option<&toml::Value> {
+        extension
+            .and_then(|table| table.get(key))
+            .or_else(|| root.get(key))
+    };
+
+    let id = lookup("id")
+        .and_then(toml::Value::as_str)
+        .unwrap_or(fallback_id)
+        .to_string();
+    let name = lookup("name")
+        .and_then(toml::Value::as_str)
+        .unwrap_or(&id)
+        .to_string();
+    let version = lookup("version")
+        .and_then(toml::Value::as_str)
+        .unwrap_or("0.0.0")
+        .to_string();
+
+    let runtime = root
+        .get("runtime")
+        .and_then(toml::Value::as_table)
+        .context("extension manifest missing [runtime] section")?;
+    let side = runtime
+        .get("side")
+        .and_then(toml::Value::as_str)
+        .context("extension manifest missing [runtime] side")?;
+    let side = ExtensionSide::parse(side)?;
+    let sync = runtime
+        .get("sync")
+        .and_then(toml::Value::as_bool)
+        .unwrap_or(false);
+
+    // §5.6 fail closed: 缺失或非表格形式的 [capabilities] 一律不授予任何权限。
+    // (Zed 的旧 manifest 用 `[[capabilities]]` 数组表达 process:exec，语义不同。)
+    let capabilities = match root.get("capabilities") {
+        Some(toml::Value::Table(table)) => ExtensionCapabilities {
+            terminal: toml_bool(table, "terminal")?,
+            mux: toml_bool(table, "mux")?,
+            workspace: toml_bool(table, "workspace")?,
+            settings: toml_bool(table, "settings")?,
+            network: toml_bool(table, "network")?,
+            process_spawn: toml_bool(table, "process_spawn")?,
+            filesystem: match table.get("filesystem") {
+                None => FilesystemAccess::None,
+                Some(toml::Value::String(value)) => FilesystemAccess::parse(value)?,
+                Some(toml::Value::Boolean(false)) => FilesystemAccess::None,
+                Some(_) => bail!("`filesystem` capability must be a string"),
+            },
+        },
+        _ => ExtensionCapabilities::default(),
+    };
+
+    let defaults = ExtensionLimits::default();
+    let resources = root.get("resources").and_then(toml::Value::as_table);
+    let resource_value = |key: &str| -> Result<Option<f64>> {
+        if let Some(table) = resources
+            && let Some(value) = toml_positive_number(table, key)?
+        {
+            return Ok(Some(value));
+        }
+        toml_positive_number(root, key)
+    };
+    let limits = ExtensionLimits {
+        memory_limit_mb: resource_value("memory_limit_mb")?
+            .map(|value| value as usize)
+            .unwrap_or(defaults.memory_limit_mb),
+        cpu_budget_ms: resource_value("cpu_budget_ms")?
+            .map(|value| value as u64)
+            .unwrap_or(defaults.cpu_budget_ms),
+        io_rate_limit: resource_value("io_rate_limit")?.unwrap_or(defaults.io_rate_limit),
+    };
+
+    Ok(ExtensionManifest {
+        id,
+        name,
+        version,
+        side,
+        sync,
+        capabilities,
+        limits,
+    })
+}
+
+/// spec §5.3 从磁盘读取并解析 `extension.toml`。
+pub fn parse_manifest(path: &Path) -> Result<ExtensionManifest> {
+    let text = std::fs::read_to_string(path)
+        .with_context(|| format!("reading {}", path.display()))?;
+    let fallback_id = path
+        .parent()
+        .and_then(Path::file_name)
+        .map(|name| name.to_string_lossy().into_owned())
+        .unwrap_or_else(|| "unknown".to_string());
+    parse_manifest_str(&fallback_id, &text)
+        .with_context(|| format!("parsing {}", path.display()))
+}
+
+// ---------------------------------------------------------------------------
+// §5.5 内置扩展发现
+// ---------------------------------------------------------------------------
+
+/// 一个已发现、可加载的扩展。
+#[derive(Debug, Clone)]
+pub struct DiscoveredExtension {
+    pub manifest: ExtensionManifest,
+    pub directory: PathBuf,
+    pub source: String,
+}
+
+/// spec §5.5 内置扩展的搜索根目录，按优先级排列。
+///
+/// 内置扩展**不会**被拷贝进用户的 extensions 目录：拷贝会在升级时留下过期副本，
+/// 而且启动时写盘失败会波及主程序启动 (§15.7 要求核心命令不受扩展宿主影响)。
+/// 改为直接把仓库/安装包里的 `extensions/` 作为额外扫描根；同名 id 由用户目录
+/// 覆盖，从而保留 §5.5 的「用户可 fork 内置扩展」语义。
+pub fn builtin_extension_roots() -> Vec<PathBuf> {
+    let mut roots = Vec::new();
+    let push = |candidate: PathBuf, roots: &mut Vec<PathBuf>| {
+        if candidate.is_dir() && !roots.contains(&candidate) {
+            roots.push(candidate);
+        }
+    };
+
+    if let Some(value) = std::env::var_os(BUILTIN_EXTENSIONS_ENV) {
+        for candidate in std::env::split_paths(&value) {
+            push(candidate, &mut roots);
+        }
+    }
+
+    match std::env::current_exe() {
+        Ok(executable) => {
+            if let Some(directory) = executable.parent() {
+                push(directory.join("extensions"), &mut roots);
+                // macOS .app bundle: Contents/MacOS/z3rm → Contents/Resources/extensions
+                push(directory.join("../Resources/extensions"), &mut roots);
+                push(directory.join("../lib/z3rm/extensions"), &mut roots);
+            }
+        }
+        Err(error) => {
+            tracing::debug!(%error, "could not resolve executable path for extension discovery");
+        }
+    }
+
+    // 源码检出 (开发构建)。发布产物里这个绝对路径不存在，`is_dir` 会自然跳过。
+    if let Some(repository_root) = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .and_then(Path::parent)
+    {
+        push(repository_root.join("extensions"), &mut roots);
+    }
+
+    roots
+}
+
+/// 用户安装目录 + 内置目录，用户目录优先 (同 id 覆盖内置)。
+pub fn extension_roots(user_extensions_dir: &Path) -> Vec<PathBuf> {
+    let mut roots = vec![user_extensions_dir.to_path_buf()];
+    for root in builtin_extension_roots() {
+        if !roots.contains(&root) {
+            roots.push(root);
+        }
+    }
+    roots
+}
+
+/// 扫描给定根目录，返回所有可在客户端加载的扩展 (spec §5.2 / §16.8)。
+///
+/// 缺少 `main.js` 或 `extension.toml` 的目录、server-only 扩展、解析失败的
+/// manifest 都会被跳过并记录日志——一个坏扩展不能阻断其它扩展的加载。
+pub fn discover_client_extensions(roots: &[PathBuf]) -> Vec<DiscoveredExtension> {
+    let mut discovered: BTreeMap<String, DiscoveredExtension> = BTreeMap::new();
+
+    for root in roots {
+        let entries = match std::fs::read_dir(root) {
+            Ok(entries) => entries,
+            Err(error) => {
+                tracing::debug!(path = %root.display(), %error, "extension root not readable");
+                continue;
+            }
+        };
+
+        let mut directories: Vec<PathBuf> = Vec::new();
+        for entry in entries {
+            match entry {
+                Ok(entry) => directories.push(entry.path()),
+                Err(error) => tracing::warn!(path = %root.display(), %error, "failed to read extension directory entry"),
+            }
+        }
+        // read_dir 顺序依赖文件系统；排序让加载顺序（以及渲染顺序）稳定。
+        directories.sort();
+
+        for directory in directories {
+            let manifest_path = directory.join("extension.toml");
+            let source_path = directory.join("main.js");
+            if !manifest_path.is_file() || !source_path.is_file() {
+                continue;
+            }
+
+            let manifest = match parse_manifest(&manifest_path) {
+                Ok(manifest) => manifest,
+                Err(error) => {
+                    tracing::warn!(path = %manifest_path.display(), error = %error, "extension manifest rejected");
+                    continue;
+                }
+            };
+            if !manifest.side.runs_on_client() {
+                continue;
+            }
+            if discovered.contains_key(&manifest.id) {
+                // 前面的根优先：用户安装的 fork 覆盖同名内置扩展。
+                continue;
+            }
+            let source = match std::fs::read_to_string(&source_path) {
+                Ok(source) => source,
+                Err(error) => {
+                    tracing::warn!(path = %source_path.display(), %error, "extension source unreadable");
+                    continue;
+                }
+            };
+            discovered.insert(
+                manifest.id.clone(),
+                DiscoveredExtension {
+                    manifest,
+                    directory,
+                    source,
+                },
+            );
+        }
+    }
+
+    discovered.into_values().collect()
+}
+
+// ---------------------------------------------------------------------------
+// §5.4 宿主桥
+// ---------------------------------------------------------------------------
+
+/// spec §5.4 扩展 JS 可以调用的宿主能力。
+///
+/// QuickJS 跑在专用 OS 线程上，不能持有 GPUI 的 `Entity`，因此 mux/settings/
+/// terminal 调用统一走这条 JSON 通道，由嵌入方在宿主线程上同步执行。
+/// 实现应当自带超时——扩展线程阻塞只影响它自己 (spec §5.2)。
+pub trait HostBridge: Send + Sync + 'static {
+    /// `method` 形如 `mux.splitPane`；`args` 是位置参数数组。
+    fn call(&self, method: &str, args: &serde_json::Value) -> Result<serde_json::Value>;
+}
+
+fn host_call_response(
+    bridge: &Arc<dyn HostBridge>,
+    capabilities: ExtensionCapabilities,
+    io_bucket: &IoTokenBucket,
+    method: &str,
+    arguments_json: &str,
+) -> serde_json::Value {
+    let outcome = (|| -> Result<serde_json::Value> {
+        // §5.6 运行时能力强制：JS 侧的检查只是提前失败，这里才是权威判定。
+        if !capabilities.allows(method) {
+            bail!("capability denied: `{method}` requires an undeclared capability");
+        }
+        if !io_bucket.try_acquire(1.0) {
+            bail!("io rate limit exceeded while calling `{method}`");
+        }
+        let arguments: serde_json::Value = serde_json::from_str(arguments_json)
+            .with_context(|| format!("invalid arguments for `{method}`"))?;
+        bridge.call(method, &arguments)
+    })();
+
+    match outcome {
+        Ok(value) => serde_json::json!({ "ok": true, "value": value }),
+        Err(error) => serde_json::json!({ "ok": false, "error": error.to_string() }),
+    }
+}
+
+/// 把 `__z3rm_host_call` 注入到 JS 全局，供 bootstrap 的 `hostCall` 使用。
+fn install_host_call(
+    ctx: &rquickjs::Ctx<'_>,
+    bridge: Arc<dyn HostBridge>,
+    capabilities: ExtensionCapabilities,
+    io_bucket: Arc<IoTokenBucket>,
+) -> Result<()> {
+    let function = Function::new(ctx.clone(), move |method: String, arguments: String| {
+        host_call_response(&bridge, capabilities, &io_bucket, &method, &arguments).to_string()
+    })
+    .catch(ctx)
+    .map_err(|error| anyhow!("creating __z3rm_host_call failed: {error}"))?;
+
+    ctx.globals()
+        .set("__z3rm_host_call", function)
+        .catch(ctx)
+        .map_err(|error| anyhow!("installing __z3rm_host_call failed: {error}"))
+}
+
+// ---------------------------------------------------------------------------
+// §5.4 JS bootstrap
+// ---------------------------------------------------------------------------
+
+/// spec §5.4 扩展 context。占位符 `__Z3RM_CAPABILITIES__` 由 manifest 声明填充。
+const CONTEXT_BOOTSTRAP_JS: &str = r#"
+(function() {
+    var capabilities = __Z3RM_CAPABILITIES__;
+
+    globalThis.__chrome_views = {};
+    globalThis.__z3rm_view_order = [];
+    globalThis.__z3rm_rerender = true;
+    globalThis.__z3rm_event_handlers = {};
+    globalThis.__z3rm_mux_sessions = [];
+    globalThis.__z3rm_commands = {};
+    globalThis.__z3rm_command_order = [];
+    globalThis.__z3rm_keymaps = {};
+    globalThis.__z3rm_errors = [];
+    globalThis.__z3rm_render_result = null;
+
+    function recordError(where, error) {
+        var message = (error && error.message) ? error.message : String(error);
+        // Bounded so a misbehaving handler cannot grow the heap without limit.
+        if (globalThis.__z3rm_errors.length < 64) {
+            globalThis.__z3rm_errors.push(where + ': ' + message);
+        }
+    }
+    globalThis.__z3rm_take_errors = function() {
+        var errors = globalThis.__z3rm_errors;
+        globalThis.__z3rm_errors = [];
+        return JSON.stringify(errors);
+    };
+
+    function capabilityGranted(name) {
+        if (name === 'filesystem') {
+            return !!capabilities.filesystem && capabilities.filesystem !== 'none';
+        }
+        return !!capabilities[name];
+    }
+    function requireCapability(name) {
+        if (!capabilityGranted(name)) {
+            throw new Error('capability "' + name + '" is not declared in extension.toml');
+        }
+    }
+
+    function hostBridgeAvailable() {
+        return typeof globalThis.__z3rm_host_call === 'function';
+    }
+    function hostCall(method, args) {
+        if (!hostBridgeAvailable()) {
+            throw new Error('host bridge unavailable for ' + method);
+        }
+        var response = JSON.parse(globalThis.__z3rm_host_call(method, JSON.stringify(args || [])));
+        if (!response.ok) {
+            throw new Error(response.error || ('host call failed: ' + method));
+        }
+        return response.value;
+    }
+
+    function subscribe(prefix, event, handler) {
+        if (typeof handler !== 'function') {
+            throw new Error('subscribe requires a handler function for ' + event);
+        }
+        var key = prefix + event;
+        var registry = globalThis.__z3rm_event_handlers;
+        if (!registry[key]) { registry[key] = []; }
+        registry[key].push(handler);
+        return function unsubscribe() {
+            var handlers = registry[key] || [];
+            var index = handlers.indexOf(handler);
+            if (index >= 0) { handlers.splice(index, 1); }
+        };
+    }
+
+    function invalidate() { globalThis.__z3rm_rerender = true; }
+
+    // Host-callable entry points -------------------------------------------
+    globalThis.__z3rm_dispatch_event = function(name, payload) {
+        // A subscription made through mux/keymaps/terminal is stored under a
+        // namespaced key; the host emits the bare event name, so try each.
+        var keys = [name];
+        var prefixes = ['mux:', 'keymap:', 'terminal:'];
+        for (var p = 0; p < prefixes.length; p++) {
+            if (name.indexOf(prefixes[p]) !== 0) { keys.push(prefixes[p] + name); }
+        }
+        var registry = globalThis.__z3rm_event_handlers || {};
+        var delivered = 0;
+        for (var k = 0; k < keys.length; k++) {
+            var handlers = registry[keys[k]] || [];
+            for (var i = 0; i < handlers.length; i++) {
+                try { handlers[i](payload); delivered++; }
+                catch (error) { recordError('event ' + keys[k], error); }
+            }
+        }
+        return delivered;
+    };
+
+    globalThis.__z3rm_execute_command = function(id, args) {
+        var entry = globalThis.__z3rm_commands[id];
+        if (!entry) { return false; }
+        try { entry.handler(args); return true; }
+        catch (error) { recordError('command ' + id, error); return false; }
+    };
+
+    globalThis.__z3rm_render_views = function() {
+        globalThis.__z3rm_rerender = false;
+        var views = globalThis.__chrome_views || {};
+        var results = [];
+        if (globalThis.__z3rm_render_result !== null && globalThis.__z3rm_render_result !== undefined) {
+            results.push(globalThis.__z3rm_render_result);
+        }
+        // status-bar renders first so the chrome ordering stays stable.
+        var names = [];
+        if (views['status-bar']) { names.push('status-bar'); }
+        var order = globalThis.__z3rm_view_order || [];
+        for (var i = 0; i < order.length; i++) {
+            if (order[i] !== 'status-bar') { names.push(order[i]); }
+        }
+        for (var n = 0; n < names.length; n++) {
+            var view = views[names[n]];
+            if (!view || typeof view.render !== 'function') { continue; }
+            try {
+                var rendered = view.render();
+                if (rendered !== null && rendered !== undefined) { results.push(rendered); }
+            } catch (error) { recordError('render ' + names[n], error); }
+        }
+        return JSON.stringify(results);
+    };
+
+    globalThis.__z3rm_list_commands = function() {
+        return JSON.stringify(globalThis.__z3rm_command_order.map(function(id) {
+            return { id: id, label: globalThis.__z3rm_commands[id].label };
+        }));
+    };
+
+    globalThis.__z3rm_list_keymaps = function() {
+        return JSON.stringify(Object.keys(globalThis.__z3rm_keymaps).map(function(chord) {
+            return { chord: chord, command: globalThis.__z3rm_keymaps[chord] };
+        }));
+    };
+
+    // Extension-facing context ---------------------------------------------
+    var context = {
+        capabilities: capabilities,
+
+        render: function(vdom) {
+            globalThis.__z3rm_render_result = vdom;
+            invalidate();
+            return vdom;
+        },
+
+        registerChromeView: function(name, view) {
+            if (!view) { throw new Error('registerChromeView requires a view: ' + name); }
+            if (typeof view.invalidate !== 'function') { view.invalidate = invalidate; }
+            if (!globalThis.__chrome_views[name]) { globalThis.__z3rm_view_order.push(name); }
+            globalThis.__chrome_views[name] = view;
+            invalidate();
+            return view;
+        },
+
+        on: function(event, handler) { return subscribe('', event, handler); },
+        emit: function(event, data) { return globalThis.__z3rm_dispatch_event(event, data); },
+
+        mux: {
+            subscribe: function(event, handler) {
+                requireCapability('mux');
+                return subscribe('mux:', event, handler);
+            },
+            listSessions: function() {
+                requireCapability('mux');
+                if (!hostBridgeAvailable()) { return globalThis.__z3rm_mux_sessions; }
+                globalThis.__z3rm_mux_sessions = hostCall('mux.listSessions', []) || [];
+                return globalThis.__z3rm_mux_sessions;
+            },
+            currentSession: function() {
+                requireCapability('mux');
+                return hostCall('mux.currentSession', []);
+            },
+            focusedPane: function() {
+                requireCapability('mux');
+                return hostCall('mux.focusedPane', []);
+            },
+            createSession: function(name, cwd) {
+                requireCapability('mux');
+                return hostCall('mux.createSession', [name, cwd]);
+            },
+            killSession: function(sessionId) {
+                requireCapability('mux');
+                return hostCall('mux.killSession', [sessionId]);
+            },
+            attach: function(sessionId) {
+                requireCapability('mux');
+                return hostCall('mux.attach', [sessionId]);
+            },
+            detach: function() {
+                requireCapability('mux');
+                return hostCall('mux.detach', []);
+            },
+            focusPane: function(paneId) {
+                requireCapability('mux');
+                return hostCall('mux.focusPane', [paneId]);
+            },
+            splitPane: function(direction, paneId) {
+                requireCapability('mux');
+                return hostCall('mux.splitPane', [direction, paneId]);
+            },
+            closePane: function(paneId) {
+                requireCapability('mux');
+                return hostCall('mux.closePane', [paneId]);
+            },
+            sendInput: function(paneId, data) {
+                requireCapability('mux');
+                return hostCall('mux.sendInput', [paneId, data]);
+            },
+            capturePane: function(paneId, lines) {
+                requireCapability('mux');
+                return hostCall('mux.capturePane', [paneId, lines]);
+            },
+            resizePane: function(paneId, cols, rows) {
+                requireCapability('mux');
+                return hostCall('mux.resizePane', [paneId, cols, rows]);
+            },
+            setPaneTitle: function(paneId, title) {
+                requireCapability('mux');
+                return hostCall('mux.setPaneTitle', [paneId, title]);
+            },
+            applyLayout: function(layout) {
+                requireCapability('mux');
+                return hostCall('mux.applyLayout', [layout]);
+            }
+        },
+
+        terminal: {
+            subscribe: function(event, handler) {
+                requireCapability('terminal');
+                return subscribe('terminal:', event, handler);
+            },
+            write: function(paneId, data) {
+                requireCapability('terminal');
+                return hostCall('terminal.write', [paneId, data]);
+            },
+            capture: function(paneId, lines) {
+                requireCapability('terminal');
+                return hostCall('terminal.capture', [paneId, lines]);
+            }
+        },
+
+        settings: {
+            get: function(key) {
+                requireCapability('settings');
+                return hostCall('settings.get', [key]);
+            },
+            set: function(key, value) {
+                requireCapability('settings');
+                return hostCall('settings.set', [key, value]);
+            }
+        },
+
+        commands: {
+            register: function(id, handler, options) {
+                if (typeof handler !== 'function') {
+                    throw new Error('command handler must be a function: ' + id);
+                }
+                var label = (options && options.label) ? options.label : id;
+                globalThis.__z3rm_commands[id] = { handler: handler, label: label };
+                if (globalThis.__z3rm_command_order.indexOf(id) < 0) {
+                    globalThis.__z3rm_command_order.push(id);
+                }
+                return true;
+            },
+            unregister: function(id) {
+                if (!globalThis.__z3rm_commands[id]) { return false; }
+                delete globalThis.__z3rm_commands[id];
+                var index = globalThis.__z3rm_command_order.indexOf(id);
+                if (index >= 0) { globalThis.__z3rm_command_order.splice(index, 1); }
+                return true;
+            },
+            list: function() {
+                return globalThis.__z3rm_command_order.map(function(id) {
+                    return { id: id, label: globalThis.__z3rm_commands[id].label };
+                });
+            },
+            execute: function(id, args) {
+                return globalThis.__z3rm_execute_command(id, args);
+            }
+        },
+
+        keymaps: {
+            bind: function(chord, command) {
+                if (!chord || !command) {
+                    throw new Error('keymaps.bind requires a chord and a command id');
+                }
+                globalThis.__z3rm_keymaps[chord] = command;
+                return true;
+            },
+            unbind: function(chord) {
+                if (!(chord in globalThis.__z3rm_keymaps)) { return false; }
+                delete globalThis.__z3rm_keymaps[chord];
+                return true;
+            },
+            list: function() {
+                return Object.keys(globalThis.__z3rm_keymaps).map(function(chord) {
+                    return { chord: chord, command: globalThis.__z3rm_keymaps[chord] };
+                });
+            },
+            subscribe: function(event, handler) {
+                return subscribe('keymap:', event, handler);
+            }
+        }
+    };
+
+    // Host-pushed session snapshots keep listSessions() useful even when the
+    // bridge is not installed yet (startup races the mux connection).
+    context.on('mux:sessions', function(sessions) {
+        globalThis.__z3rm_mux_sessions = sessions || [];
+    });
+
+    globalThis.__z3rm_context = context;
+    return true;
+})()
+"#;
+
+/// 调用扩展的 `activate(context)`。异常向 Rust 传播，装载即失败。
+const ACTIVATE_JS: &str = r#"
+(function() {
+    if (typeof activate !== 'function') { return false; }
+    activate(globalThis.__z3rm_context);
+    return true;
+})()
+"#;
+
+fn bootstrap_source(capabilities: ExtensionCapabilities) -> Result<String> {
+    let capabilities_json = serde_json::to_string(&capabilities.to_json())
+        .context("serializing extension capabilities")?;
+    Ok(CONTEXT_BOOTSTRAP_JS.replace("__Z3RM_CAPABILITIES__", &capabilities_json))
+}
+
+/// §5.2 QuickJS `eval` 执行的是脚本而非 ES 模块，先剥掉 `export` 关键字。
+fn to_script_source(source: &str) -> String {
+    source
+        .replace("export function", "function")
+        .replace("export const", "const")
+        .replace("export default", "const __default =")
+}
+
+/// 求值并把 QuickJS 异常展开成带真实消息的 `anyhow::Error`。
+/// 直接用 `?` 只会得到 "Exception generated by quickjs"，排查扩展问题时毫无信息。
+fn eval_checked<'js, V>(ctx: &rquickjs::Ctx<'js>, source: &str) -> Result<V>
+where
+    V: rquickjs::FromJs<'js>,
+{
+    ctx.eval::<V, _>(source)
+        .catch(ctx)
+        .map_err(|error| anyhow!("{error}"))
+}
+
+// ---------------------------------------------------------------------------
 // QuickJsRuntime
 // ---------------------------------------------------------------------------
 
@@ -162,60 +1046,57 @@ impl IoTokenBucket {
 /// 每个扩展拥有独立的 Runtime + Context，运行在专用 OS 线程中。
 ///
 /// # 资源限制
-/// - CPU: 50ms/秒 fuel 预算，超限中断
+/// - CPU: 50ms/秒 fuel 预算，连续超支 3 次后中断
 /// - 内存: 64MB (默认)，超限抛出 JS 异常
-/// - IO: 令牌桶限流，控制文件/网络操作频率
+/// - IO: 令牌桶限流，控制宿主调用频率
 ///
 /// # 线程隔离
 /// 扩展 JS 代码在专用 `std::thread` 中执行，与主 UI 线程隔离。
-/// 通过 Arc 共享状态，避免跨线程数据竞争。
 pub struct QuickJsRuntime {
     runtime: Runtime,
-    /// IO 令牌桶 (Arc 以便跨线程共享)
+    limits: ExtensionLimits,
+    /// IO 令牌桶 (Arc 以便注入到 host bridge 闭包)
     io_bucket: Arc<IoTokenBucket>,
-    /// CPU fuel 跟踪器 (Cell 可无锁访问; 仅中断 handler 使用)
-    #[allow(dead_code)]
     cpu_tracker: CpuFuelTracker,
 }
 
 impl QuickJsRuntime {
-    /// 创建新的 QuickJS 运行时 (spec §5.2)
-    ///
-    /// # 参数
-    /// - `memory_limit_mb`: 内存上限 (MB)，默认 64
-    /// - `cpu_budget_ms`: CPU fuel 预算 (ms/秒)，默认 50
-    ///
-    /// # 资源限制
-    /// - 内存: `JS_SetMemoryLimit` 等效，通过 `set_memory_limit`
-    /// - CPU: 中断 handler 定期检测 fuel 消耗
-    /// - IO: 令牌桶限流，默认 100 tokens/s
+    /// 创建新的 QuickJS 运行时 (spec §5.2)，IO 速率取默认值。
     pub fn new(memory_limit_mb: usize, cpu_budget_ms: u64) -> Result<Self> {
+        Self::with_limits(ExtensionLimits {
+            memory_limit_mb,
+            cpu_budget_ms,
+            ..ExtensionLimits::default()
+        })
+    }
+
+    /// 按完整的 `[resources]` 配置创建运行时。
+    pub fn with_limits(limits: ExtensionLimits) -> Result<Self> {
         let runtime = Runtime::new().context("创建 QuickJS Runtime 失败")?;
 
         // 内存限制 (spec §5.2: 64MB per extension)
-        if memory_limit_mb > 0 {
-            runtime.set_memory_limit(memory_limit_mb * 1024 * 1024);
+        if limits.memory_limit_mb > 0 {
+            runtime.set_memory_limit(limits.memory_limit_mb * 1024 * 1024);
         }
 
         // CPU fuel 中断器 (spec §5.2: 50ms/second budget)
-        let cpu_tracker = CpuFuelTracker::new(cpu_budget_ms);
-        let tracker = cpu_tracker.clone();
-
-        runtime.set_interrupt_handler(Some(Box::new(move || tracker.check())));
-
-        // IO 令牌桶 (spec §5.2: IO rate limiting)
-        let io_bucket = Arc::new(IoTokenBucket::default_config());
+        let cpu_tracker = CpuFuelTracker::new(limits.cpu_budget_ms);
+        runtime.set_interrupt_handler(Some(Box::new({
+            let cpu_tracker = cpu_tracker.clone();
+            move || cpu_tracker.check()
+        })));
 
         Ok(Self {
             runtime,
-            io_bucket,
+            limits,
+            io_bucket: Arc::new(IoTokenBucket::from_rate(limits.io_rate_limit)),
             cpu_tracker,
         })
     }
 
     /// 使用默认配置创建运行时: 64MB 内存, 50ms CPU budget
     pub fn with_defaults() -> Result<Self> {
-        Self::new(DEFAULT_MEMORY_LIMIT_MB, CPU_FUEL_BUDGET_MS)
+        Self::with_limits(ExtensionLimits::default())
     }
 
     /// 创建新的 JS 执行上下文
@@ -228,40 +1109,48 @@ impl QuickJsRuntime {
         &self.io_bucket
     }
 
+    pub fn limits(&self) -> ExtensionLimits {
+        self.limits
+    }
+
+    /// 进入一次新的宿主 → JS 调用；宿主空闲时间不计入 CPU 预算。
+    pub fn begin_execution(&self) {
+        self.cpu_tracker.begin_execution();
+    }
+
+    /// 读取并清除「上一次执行被 CPU 预算中断」标志。
+    pub fn take_cpu_interrupted(&self) -> bool {
+        self.cpu_tracker.take_interrupted()
+    }
+
+    /// 当前堆占用是否已达到声明的内存上限。
+    pub fn memory_exceeded(&self) -> bool {
+        if self.limits.memory_limit_mb == 0 {
+            return false;
+        }
+        let limit_bytes = (self.limits.memory_limit_mb as u64).saturating_mul(1024 * 1024);
+        let malloc_size = self.runtime.memory_usage().malloc_size;
+        malloc_size >= 0 && (malloc_size as u64) >= limit_bytes
+    }
+
     /// 在专用线程中创建独立运行时并执行 JS 代码 (spec §5.2: dedicated OS thread)
     ///
     /// QuickJS Runtime/Context 不可跨线程共享 (非 Send)。
     /// 此方法在子线程内创建全新的 Runtime + Context，执行完成后销毁。
-    /// 资源限制 (CPU fuel, 内存, IO) 在子线程内生效。
+    /// 资源限制沿用本实例的配置。
     pub fn execute_in_thread<F, R>(&self, f: F) -> Result<R>
     where
         F: FnOnce(rquickjs::Ctx<'_>) -> Result<R> + Send + 'static,
         R: Send + 'static,
     {
-        // 克隆配置参数到子线程
-        let _io_bucket = self.io_bucket.clone();
-        let memory_limit_mb = DEFAULT_MEMORY_LIMIT_MB;
-        let cpu_budget_ms = CPU_FUEL_BUDGET_MS;
+        let limits = self.limits;
 
         let join_handle = thread::Builder::new()
             .name("quickjs-ext".to_string())
             .spawn(move || {
-                // 在子线程内创建独立的 Runtime + Context
-                let runtime =
-                    Runtime::new().map_err(|e| anyhow!("子线程创建 Runtime 失败: {e}"))?;
-                if memory_limit_mb > 0 {
-                    runtime.set_memory_limit(memory_limit_mb * 1024 * 1024);
-                }
-
-                // CPU fuel 中断器
-                let tracker = CpuFuelTracker::new(cpu_budget_ms);
-                let tracker_clone = tracker.clone();
-                runtime.set_interrupt_handler(Some(Box::new(move || tracker_clone.check())));
-
-                let ctx =
-                    Context::full(&runtime).map_err(|e| anyhow!("子线程创建 Context 失败: {e}"))?;
-
-                // 执行用户函数
+                let runtime = QuickJsRuntime::with_limits(limits)?;
+                let ctx = runtime.create_context()?;
+                runtime.begin_execution();
                 ctx.with(f)
             })
             .context("创建扩展线程失败")?;
@@ -274,10 +1163,8 @@ impl QuickJsRuntime {
     /// 执行 JS 源码字符串，返回结果值
     pub fn eval_js(&self, source: &str) -> Result<String> {
         let ctx = self.create_context()?;
-        ctx.with(|ctx| {
-            let result: String = ctx.eval(source)?;
-            Ok(result)
-        })
+        self.begin_execution();
+        ctx.with(|ctx| eval_checked::<String>(&ctx, source))
     }
 }
 
@@ -304,35 +1191,74 @@ pub struct ExtensionRunResult {
     pub vdom_json: Option<String>,
 }
 
+struct LoadOutcome {
+    vdom_json: Result<Option<String>>,
+    cpu_exhausted: bool,
+    memory_exceeded: bool,
+}
+
 /// 扩展加载器: 在独立线程中加载并执行扩展
 pub struct ExtensionRunner {
-    memory_limit_mb: usize,
-    cpu_budget_ms: u64,
+    limits: ExtensionLimits,
+    capabilities: ExtensionCapabilities,
+    bridge: Option<Arc<dyn HostBridge>>,
 }
 
 impl ExtensionRunner {
-    /// 创建扩展加载器
+    /// 创建扩展加载器。
+    ///
+    /// 这个构造函数面向嵌入方自己的测试装载路径，默认授予全部能力；
+    /// 真实扩展请走 [`for_manifest`](Self::for_manifest)，那条路径按
+    /// `[capabilities]` 声明 fail-closed。
     pub fn new(memory_limit_mb: usize, cpu_budget_ms: u64) -> Self {
-        Self {
+        Self::with_limits(ExtensionLimits {
             memory_limit_mb,
             cpu_budget_ms,
+            ..ExtensionLimits::default()
+        })
+    }
+
+    pub fn with_limits(limits: ExtensionLimits) -> Self {
+        Self {
+            limits,
+            capabilities: ExtensionCapabilities::all(),
+            bridge: None,
         }
     }
 
     /// 默认配置: 64MB 内存, 50ms CPU
     pub fn with_defaults() -> Self {
-        Self::new(DEFAULT_MEMORY_LIMIT_MB, CPU_FUEL_BUDGET_MS)
+        Self::with_limits(ExtensionLimits::default())
+    }
+
+    /// §5.3/§5.6 按 manifest 的资源上限和能力声明构造加载器。
+    pub fn for_manifest(manifest: &ExtensionManifest) -> Self {
+        Self {
+            limits: manifest.limits,
+            capabilities: manifest.capabilities,
+            bridge: None,
+        }
+    }
+
+    pub fn with_capabilities(mut self, capabilities: ExtensionCapabilities) -> Self {
+        self.capabilities = capabilities;
+        self
+    }
+
+    /// §5.4 注入宿主桥；缺省时 `context.mux.*` 等调用会抛出可读异常而非返回假值。
+    pub fn with_bridge(mut self, bridge: Arc<dyn HostBridge>) -> Self {
+        self.bridge = Some(bridge);
+        self
+    }
+
+    pub fn capabilities(&self) -> ExtensionCapabilities {
+        self.capabilities
     }
 
     /// 加载并激活一个扩展 (spec §5.2: dedicated OS thread isolation)
     ///
-    /// 流程:
-    /// 1. 创建独立 Runtime + Context
-    /// 2. 注入资源限制 (CPU fuel, 内存, IO)
-    /// 3. 在专用线程中执行扩展源码
-    /// 4. 调用 `activate(context)`
-    /// 5. 若扩展调用 `context.render(vdom)` 或注册了 `status-bar` chrome view,
-    ///    抓取该 VDOM 并以 JSON 字符串形式返回 (spec §5.4)。
+    /// 运行时在 activate 之后立即销毁；需要保持 chrome 存活请用
+    /// [`load_live`](Self::load_live)。
     pub fn load_extension(
         &self,
         extension_id: &str,
@@ -340,19 +1266,19 @@ impl ExtensionRunner {
         _activate_fn: &str,
     ) -> ExtensionRunResult {
         let start = Instant::now();
-        let (result, vdom_json) = match self.do_load(extension_id, source) {
-            Ok(vdom) => (Ok(()), vdom),
-            Err(e) => (Err(e), None),
-        };
+        let outcome = self.do_load(source);
         let duration = start.elapsed();
-        let cpu_exhausted = result.is_err();
+        let (result, vdom_json) = match outcome.vdom_json {
+            Ok(vdom_json) => (Ok(()), vdom_json),
+            Err(error) => (Err(error), None),
+        };
 
         ExtensionRunResult {
             extension_id: extension_id.to_string(),
             result,
             duration,
-            cpu_exhausted,
-            memory_exceeded: false,
+            cpu_exhausted: outcome.cpu_exhausted,
+            memory_exceeded: outcome.memory_exceeded,
             vdom_json,
         }
     }
@@ -372,235 +1298,129 @@ impl ExtensionRunner {
         source: &str,
         _activate_fn: &str,
     ) -> Result<LiveExtension> {
-        let runtime = QuickJsRuntime::new(self.memory_limit_mb, self.cpu_budget_ms)
-            .context("创建 Runtime 失败")?;
+        let runtime = QuickJsRuntime::with_limits(self.limits).context("创建 Runtime 失败")?;
         let ctx = runtime.create_context()?;
+        let bootstrap = bootstrap_source(self.capabilities)?;
+        let script_source = to_script_source(source);
+        let bridge = self.bridge.clone();
+        let io_bucket = runtime.io_bucket().clone();
+        let capabilities = self.capabilities;
 
+        runtime.begin_execution();
         ctx.with(|ctx| {
-            let script_source = source.replace("export function", "function")
-                .replace("export const", "const")
-                .replace("export default", "const __default =");
-            let _: rquickjs::Value = ctx.eval(script_source.as_str())?;
-
-            // §5.4 activate with a context that exposes `__chrome_views` on
-            // globalThis so later render_now calls can find them, and wires
-            // view.invalidate() to a global rerender flag.
-            let call_activate: &str = r#"
-                (function() {
-                    globalThis.__chrome_views = {};
-                    globalThis.__z3rm_rerender = false;
-                    globalThis.__z3rm_event_handlers = {};
-                    globalThis.__z3rm_mux_sessions = [];
-                    var __commands = {};
-                    var __event_handlers = globalThis.__z3rm_event_handlers;
-                    function safeCall(fn) { try { return fn(); } catch (e) { return undefined; } }
-                    var context = {
-                        render: function(vdom) { return vdom; },
-                        registerChromeView: function(name, view) {
-                            if (view && typeof view.invalidate !== 'function') {
-                                view.invalidate = function() {
-                                    globalThis.__z3rm_rerender = true;
-                                };
-                            }
-                            globalThis.__chrome_views[name] = view;
-                            return view;
-                        },
-                        on: function(event, handler) {
-                            if (!__event_handlers[event]) __event_handlers[event] = [];
-                            __event_handlers[event].push(handler);
-                        },
-                        emit: function(event, data) {
-                            var handlers = __event_handlers[event] || [];
-                            for (var i = 0; i < handlers.length; i++) { try { handlers[i](data); } catch (e) {} }
-                        },
-                        capabilities: { terminal: true, mux: true, workspace: true },
-                        mux: {
-                            listSessions: function() { return globalThis.__z3rm_mux_sessions; },
-                            subscribe: function(event, handler) {
-                                var key = 'mux:' + event;
-                                if (!__event_handlers[key]) __event_handlers[key] = [];
-                                __event_handlers[key].push(handler);
-                                return function() {
-                                    var list = __event_handlers[key] || [];
-                                    var idx = list.indexOf(handler);
-                                    if (idx >= 0) list.splice(idx, 1);
-                                };
-                            },
-                            focusPane: function() { return false; },
-                            createSession: function() { return null; },
-                            killSession: function() { return false; },
-                            attach: function() { return false; },
-                            detach: function() { return false; }
-                        },
-                        commands: {
-                            register: function(name, handler) { __commands[name] = handler; return true; },
-                            execute: function(name, args) {
-                                var handler = __commands[name];
-                                if (typeof handler === 'function') return safeCall(function() { return handler(args); });
-                                return undefined;
-                            }
-                        },
-                        keymaps: {
-                            bind: function() { return true; },
-                            unbind: function() { return true; }
-                        }
-                    };
-                    // Cache host-pushed mux session snapshots so listSessions()
-                    // returns live data without blocking on an async RPC.
-                    context.on('mux:sessions', function(sessions) {
-                        globalThis.__z3rm_mux_sessions = sessions || [];
-                    });
-                    if (typeof activate === 'function') activate(context);
-                    return null;
-                })()
-            "#;
-            let _: rquickjs::Value = ctx.eval(call_activate)?;
+            if let Some(bridge) = bridge {
+                install_host_call(&ctx, bridge, capabilities, io_bucket)?;
+            }
+            eval_checked::<rquickjs::Value>(&ctx, &script_source)
+                .context("evaluating extension source")?;
+            eval_checked::<rquickjs::Value>(&ctx, &bootstrap)
+                .context("installing extension context")?;
+            let activated: bool =
+                eval_checked(&ctx, ACTIVATE_JS).context("calling activate(context)")?;
+            if !activated {
+                bail!("extension does not export an `activate` function");
+            }
             Ok::<_, anyhow::Error>(())
-        })?;
+        })
+        .with_context(|| format!("activating extension `{extension_id}`"))?;
 
-        let _ = extension_id; // logged by caller
         Ok(LiveExtension {
-            _runtime: runtime,
+            extension_id: extension_id.to_string(),
+            capabilities,
+            runtime,
             ctx,
         })
     }
 
-    /// 内部加载逻辑;返回 `(Result<()> 的错误结果, Optional<VDOM-JSON String>)`。
-    /// 在主调用线程上执行 (调用方负责后续派发到后台执行器)。
-    fn do_load(&self, _extension_id: &str, source: &str) -> Result<Option<String>> {
-        let runtime = QuickJsRuntime::new(self.memory_limit_mb, self.cpu_budget_ms)
-            .context("创建 Runtime 失败")?;
-        let ctx = runtime.create_context()?;
+    /// 内部加载逻辑：一次性激活并抓取 VDOM，同时汇报资源状态。
+    fn do_load(&self, source: &str) -> LoadOutcome {
+        let runtime = match QuickJsRuntime::with_limits(self.limits) {
+            Ok(runtime) => runtime,
+            Err(error) => {
+                return LoadOutcome {
+                    vdom_json: Err(error),
+                    cpu_exhausted: false,
+                    memory_exceeded: false,
+                };
+            }
+        };
+        let context = match runtime.create_context() {
+            Ok(context) => context,
+            Err(error) => {
+                return LoadOutcome {
+                    vdom_json: Err(error),
+                    cpu_exhausted: false,
+                    memory_exceeded: false,
+                };
+            }
+        };
 
-        ctx.with(|ctx| {
-            // §5.2: Strip ES module `export` keyword — QuickJS eval runs scripts, not modules.
-            let script_source = source
-                .replace("export function", "function")
-                .replace("export const", "const")
-                .replace("export default", "const __default =");
+        let bootstrap = match bootstrap_source(self.capabilities) {
+            Ok(bootstrap) => bootstrap,
+            Err(error) => {
+                return LoadOutcome {
+                    vdom_json: Err(error),
+                    cpu_exhausted: false,
+                    memory_exceeded: false,
+                };
+            }
+        };
+        let script_source = to_script_source(source);
+        let bridge = self.bridge.clone();
+        let io_bucket = runtime.io_bucket().clone();
+        let capabilities = self.capabilities;
 
-            // Execute extension source to define activate() in globals
-            let _: rquickjs::Value = ctx.eval(script_source.as_str())?;
+        runtime.begin_execution();
+        let vdom_json = context.with(|ctx| {
+            if let Some(bridge) = bridge {
+                install_host_call(&ctx, bridge, capabilities, io_bucket)?;
+            }
+            eval_checked::<rquickjs::Value>(&ctx, &script_source)
+                .context("evaluating extension source")?;
+            eval_checked::<rquickjs::Value>(&ctx, &bootstrap)
+                .context("installing extension context")?;
+            // A source file without `activate` is still a successful load; the
+            // fuzz corpus relies on bare scripts being evaluated.
+            let activated: bool =
+                eval_checked(&ctx, ACTIVATE_JS).context("calling activate(context)")?;
+            if !activated {
+                return Ok(None);
+            }
+            let rendered: String =
+                eval_checked(&ctx, "globalThis.__z3rm_render_views()").context("rendering views")?;
+            Ok::<_, anyhow::Error>(first_vdom(&rendered))
+        });
 
-            // §5.2/§5.3/§5.4: 配置 chrome context:
-            // - registerChromeView(name, view) 保存视图对象(支持 `view.render()` 调用)
-            // - render(vdom) 立即返回的 VDOM 优先于已注册的 chrome view
-            // - 返回值为 JSON 字符串 (rquickjs 0.6 Value::get::<String> 要求 here-string
-            //   形式以避免所有权/lifetime 跨线程问题)
-            // §5.1/§5.4 Day-0 context: real chrome APIs plus non-throwing mux /
-            // commands / keymaps stubs so built-in extensions can activate and
-            // return VDOM without requiring a live host bridge yet.
-            let call_activate: &str = r#"
-                (function() {
-                    var __vdom_result = null;
-                    var __chrome_views = {};
-                    var __commands = {};
-                    var __event_handlers = {};
-                    function safeCall(fn) {
-                        try { return fn(); } catch (e) { return undefined; }
-                    }
-                    var context = {
-                        render: function(vdom) {
-                            __vdom_result = vdom;
-                            return vdom;
-                        },
-                        registerChromeView: function(name, view) {
-                            if (view && typeof view.invalidate !== 'function') {
-                                view.invalidate = function() {
-                                    // Host re-render hook; no-op until chrome bridge polls.
-                                };
-                            }
-                            __chrome_views[name] = view;
-                            return view;
-                        },
-                        on: function(event, handler) {
-                            if (!__event_handlers[event]) __event_handlers[event] = [];
-                            __event_handlers[event].push(handler);
-                        },
-                        emit: function(event, data) {
-                            var handlers = __event_handlers[event] || [];
-                            for (var i = 0; i < handlers.length; i++) {
-                                try { handlers[i](data); } catch (e) {}
-                            }
-                        },
-                        capabilities: { terminal: true, mux: true, workspace: true },
-                        // §5.1 mux surface used by built-ins (status-bar, session-manager).
-                        // listSessions returns [] until a host bridge injects live data;
-                        // subscribe stores handlers so later emit/host push can fire them.
-                        mux: {
-                            listSessions: function() { return []; },
-                            subscribe: function(event, handler) {
-                                if (!__event_handlers['mux:' + event]) {
-                                    __event_handlers['mux:' + event] = [];
-                                }
-                                __event_handlers['mux:' + event].push(handler);
-                                return function unsubscribe() {
-                                    var list = __event_handlers['mux:' + event] || [];
-                                    var idx = list.indexOf(handler);
-                                    if (idx >= 0) list.splice(idx, 1);
-                                };
-                            },
-                            focusPane: function(_paneId) { return false; },
-                            createSession: function(_name) { return null; },
-                            killSession: function(_id) { return false; },
-                            attach: function(_id) { return false; },
-                            detach: function() { return false; }
-                        },
-                        commands: {
-                            register: function(name, handler) {
-                                __commands[name] = handler;
-                                return true;
-                            },
-                            execute: function(name, args) {
-                                var handler = __commands[name];
-                                if (typeof handler === 'function') {
-                                    return safeCall(function() { return handler(args); });
-                                }
-                                return undefined;
-                            }
-                        },
-                        keymaps: {
-                            bind: function(_chord, _command) { return true; },
-                            unbind: function(_chord) { return true; }
-                        }
-                    };
-                    if (typeof activate !== 'function') return null;
-                    activate(context);
-                    if (__vdom_result !== null) {
-                        return JSON.stringify(__vdom_result);
-                    }
-                    var view = __chrome_views['status-bar'];
-                    if (view && typeof view.render === 'function') {
-                        try {
-                            return JSON.stringify(view.render());
-                        } catch (e) {
-                            return null;
-                        }
-                    }
-                    // Prefer any registered chrome view that can render.
-                    var names = Object.keys(__chrome_views);
-                    for (var i = 0; i < names.length; i++) {
-                        var candidate = __chrome_views[names[i]];
-                        if (candidate && typeof candidate.render === 'function') {
-                            try {
-                                var rendered = candidate.render();
-                                if (rendered !== null && rendered !== undefined) {
-                                    return JSON.stringify(rendered);
-                                }
-                            } catch (e) {}
-                        }
-                    }
-                    return null;
-                })()
-            "#;
-            let captured: rquickjs::Value = ctx.eval(call_activate)?;
-            let vdom_json = match captured.get::<String>() {
-                Ok(s) if !s.is_empty() => Some(s),
-                _ => None,
-            };
-            Ok(vdom_json)
-        })
+        // 内存判定要在 runtime 还活着的时候做；错误文本里的 "out of memory" 是
+        // QuickJS 分配失败的直接证据，堆占用则覆盖「刚好卡在上限」的情况。
+        let memory_exceeded = runtime.memory_exceeded()
+            || vdom_json
+                .as_ref()
+                .err()
+                .is_some_and(|error| format!("{error:#}").contains("out of memory"));
+
+        LoadOutcome {
+            vdom_json,
+            cpu_exhausted: runtime.take_cpu_interrupted(),
+            memory_exceeded,
+        }
     }
+}
+
+/// `__z3rm_render_views()` 返回 VDOM 数组的 JSON；取第一个作为单值渲染结果。
+fn first_vdom(rendered: &str) -> Option<String> {
+    parse_rendered_views(rendered)
+        .ok()
+        .and_then(|views| views.into_iter().next())
+}
+
+fn parse_rendered_views(rendered: &str) -> Result<Vec<String>> {
+    let values: Vec<serde_json::Value> =
+        serde_json::from_str(rendered).context("extension render output is not a JSON array")?;
+    values
+        .into_iter()
+        .map(|value| serde_json::to_string(&value).context("re-serializing extension VDOM"))
+        .collect()
 }
 
 /// §5.4 a live chrome extension: the QuickJS runtime and context survive
@@ -613,8 +1433,10 @@ impl ExtensionRunner {
 /// `render_now`. The mux recorder already pins QuickJS work to one thread;
 /// callers must do the same.
 pub struct LiveExtension {
+    extension_id: String,
+    capabilities: ExtensionCapabilities,
     /// Kept alive so the JS runtime is not dropped after activation.
-    _runtime: QuickJsRuntime,
+    runtime: QuickJsRuntime,
     /// Live context handle; `ctx.with` re-enters the QuickJS runtime to
     /// re-render views. Context is a handle (Send); the Ctx inside `with` is
     /// not, so all `with` calls must run on one thread.
@@ -622,99 +1444,130 @@ pub struct LiveExtension {
 }
 
 impl LiveExtension {
+    pub fn id(&self) -> &str {
+        &self.extension_id
+    }
+
+    pub fn capabilities(&self) -> ExtensionCapabilities {
+        self.capabilities
+    }
+
+    /// 上一次 JS 执行是否被 CPU 预算中断 (spec §5.6: 违规应挂起扩展)。
+    pub fn take_cpu_interrupted(&self) -> bool {
+        self.runtime.take_cpu_interrupted()
+    }
+
+    /// §5.4 安装/替换宿主桥。宿主线程在 mux 连接建立后调用，此前扩展已经
+    /// activate 完毕——`hostCall` 每次调用都重新查全局，因此后装也生效。
+    pub fn install_bridge(&self, bridge: Arc<dyn HostBridge>) -> Result<()> {
+        let capabilities = self.capabilities;
+        let io_bucket = self.runtime.io_bucket().clone();
+        self.runtime.begin_execution();
+        self.ctx
+            .with(|ctx| install_host_call(&ctx, bridge, capabilities, io_bucket))
+    }
+
+    /// §5.4 是否有视图请求过重绘 (`view.invalidate()` / `context.render()`)。
+    /// 宿主据此按需渲染，取代固定频率轮询。
+    pub fn needs_render(&self) -> Result<bool> {
+        self.runtime.begin_execution();
+        self.ctx
+            .with(|ctx| eval_checked::<bool>(&ctx, "!!globalThis.__z3rm_rerender"))
+    }
+
     /// §5.4 invoke `invalidate()` on every registered chrome view. Extensions
     /// call this themselves from event handlers; the host exposes it so a
     /// host-driven event (e.g. pane focus) can also request a re-render. The
     /// next [`render_now`](Self::render_now) pulls a fresh VDOM.
-    pub fn invalidate_registered_views(&self) {
-        let _ = self.ctx.with(|ctx| {
-            let _: rquickjs::Value = ctx.eval(
+    pub fn invalidate_registered_views(&self) -> Result<()> {
+        self.runtime.begin_execution();
+        self.ctx.with(|ctx| {
+            eval_checked::<rquickjs::Value>(
+                &ctx,
                 r#"
-                if (globalThis.__chrome_views) {
-                    var names = Object.keys(globalThis.__chrome_views);
+                (function() {
+                    globalThis.__z3rm_rerender = true;
+                    var views = globalThis.__chrome_views || {};
+                    var names = Object.keys(views);
                     for (var i = 0; i < names.length; i++) {
-                        var view = globalThis.__chrome_views[names[i]];
+                        var view = views[names[i]];
                         if (view && typeof view.invalidate === 'function') {
-                            try { view.invalidate(); } catch (e) {}
+                            try { view.invalidate(); } catch (error) {}
                         }
                     }
-                }
+                })()
             "#,
             )?;
             Ok::<_, anyhow::Error>(())
-        });
+        })
     }
 
     /// §5.4 re-evaluate every registered chrome view's `render()` and return
-    /// the combined status-bar VDOM as JSON. Returns None if no view produces
-    /// a non-null VDOM (e.g. the extension rendered nothing this cycle).
-    pub fn render_now(&self) -> Result<Option<String>> {
-        self.ctx.with(|ctx| {
-            let render_snippet: &str = r#"
-                (function() {
-                    globalThis.__z3rm_rerender = false;
-                    if (typeof globalThis.__chrome_views === 'undefined') return null;
-                    var view = globalThis.__chrome_views['status-bar'];
-                    if (view && typeof view.render === 'function') {
-                        try {
-                            var rendered = view.render();
-                            if (rendered !== null && rendered !== undefined) {
-                                return JSON.stringify(rendered);
-                            }
-                        } catch (e) { return null; }
-                    }
-                    var names = Object.keys(globalThis.__chrome_views);
-                    for (var i = 0; i < names.length; i++) {
-                        var candidate = globalThis.__chrome_views[names[i]];
-                        if (candidate && typeof candidate.render === 'function') {
-                            try {
-                                var rendered = candidate.render();
-                                if (rendered !== null && rendered !== undefined) {
-                                    return JSON.stringify(rendered);
-                                }
-                            } catch (e) {}
-                        }
-                    }
-                    return null;
-                })()
-            "#;
-            let captured: rquickjs::Value = ctx.eval(render_snippet)?;
-            let vdom_json = match captured.get::<String>() {
-                Ok(s) if !s.is_empty() => Some(s),
-                _ => None,
-            };
-            Ok(vdom_json)
-        })
+    /// one JSON VDOM per view that produced output. Clears the invalidation
+    /// flag, so a subsequent [`needs_render`](Self::needs_render) reports
+    /// whether anything changed since this render.
+    pub fn render_all_views(&self) -> Result<Vec<String>> {
+        self.runtime.begin_execution();
+        let rendered: String = self
+            .ctx
+            .with(|ctx| eval_checked(&ctx, "globalThis.__z3rm_render_views()"))?;
+        parse_rendered_views(&rendered)
     }
 
-    pub fn emit_event(&self, event_name: &str, payload_json: &str) -> Result<()> {
-        let key = event_name.to_string();
-        let payload = payload_json.to_string();
-        self.ctx.with(|ctx| {
-            let snippet = format!(
-                r#"(function() {{
-                    var name = {name_str};
-                    var payload = {payload};
-                    var keys = [name];
-                    if (name.indexOf('mux:') !== 0) keys.push('mux:' + name);
-                    var registry = globalThis.__z3rm_event_handlers || {{}};
-                    for (var keyIndex = 0; keyIndex < keys.length; keyIndex++) {{
-                        var handlers = registry[keys[keyIndex]] || [];
-                        for (var i = 0; i < handlers.length; i++) {{
-                            try {{ handlers[i](payload); }} catch (e) {{}}
-                        }}
-                    }}
-                }})()"#,
-                name_str = serde_json::to_string(&key)?,
-                payload = if payload.is_empty() {
-                    "null".to_string()
-                } else {
-                    payload
-                },
-            );
-            let _: rquickjs::Value = ctx.eval(snippet)?;
-            Ok::<_, anyhow::Error>(())
-        })
+    /// §5.4 便捷入口：返回首个非空 VDOM (status-bar 优先)。
+    pub fn render_now(&self) -> Result<Option<String>> {
+        Ok(self.render_all_views()?.into_iter().next())
+    }
+
+    /// §3.4 把宿主事件投递给扩展的订阅者，返回被调用的 handler 数量。
+    pub fn emit_event(&self, event_name: &str, payload_json: &str) -> Result<usize> {
+        let name = serde_json::to_string(event_name).context("serializing event name")?;
+        let payload = if payload_json.trim().is_empty() {
+            "null".to_string()
+        } else {
+            payload_json.to_string()
+        };
+        let snippet = format!("globalThis.__z3rm_dispatch_event({name}, {payload})");
+        self.runtime.begin_execution();
+        let delivered: i32 = self.ctx.with(|ctx| eval_checked(&ctx, &snippet))?;
+        Ok(delivered.max(0) as usize)
+    }
+
+    /// §5.7 通过命令注册表执行一条命令 (VDOM 里的 onClick 描述符走这条路)。
+    pub fn execute_command(&self, command_id: &str, arguments_json: &str) -> Result<bool> {
+        let id = serde_json::to_string(command_id).context("serializing command id")?;
+        let arguments = if arguments_json.trim().is_empty() {
+            "undefined".to_string()
+        } else {
+            arguments_json.to_string()
+        };
+        let snippet = format!("globalThis.__z3rm_execute_command({id}, {arguments})");
+        self.runtime.begin_execution();
+        self.ctx.with(|ctx| eval_checked(&ctx, &snippet))
+    }
+
+    /// 扩展注册的命令列表 (JSON: `[{id, label}]`)。
+    pub fn list_commands(&self) -> Result<String> {
+        self.runtime.begin_execution();
+        self.ctx
+            .with(|ctx| eval_checked(&ctx, "globalThis.__z3rm_list_commands()"))
+    }
+
+    /// 扩展注册的键位列表 (JSON: `[{chord, command}]`)。
+    pub fn list_keymaps(&self) -> Result<String> {
+        self.runtime.begin_execution();
+        self.ctx
+            .with(|ctx| eval_checked(&ctx, "globalThis.__z3rm_list_keymaps()"))
+    }
+
+    /// 取走扩展内部被捕获的错误（事件 handler / render 抛出的异常），
+    /// 宿主负责记录日志——扩展异常不能静默丢弃。
+    pub fn take_errors(&self) -> Result<Vec<String>> {
+        self.runtime.begin_execution();
+        let json: String = self
+            .ctx
+            .with(|ctx| eval_checked(&ctx, "globalThis.__z3rm_take_errors()"))?;
+        serde_json::from_str(&json).context("parsing extension error list")
     }
 }
 
@@ -778,6 +1631,35 @@ impl Default for JsExecutionContext {
 mod tests {
     use super::*;
 
+    /// 记录调用的假宿主桥，用来断言 JS → Rust 参数传递与能力拦截。
+    struct RecordingBridge {
+        calls: Mutex<Vec<(String, serde_json::Value)>>,
+        responses: BTreeMap<String, serde_json::Value>,
+    }
+
+    impl RecordingBridge {
+        fn new(responses: BTreeMap<String, serde_json::Value>) -> Arc<Self> {
+            Arc::new(Self {
+                calls: Mutex::new(Vec::new()),
+                responses,
+            })
+        }
+
+        fn calls(&self) -> Vec<(String, serde_json::Value)> {
+            self.calls.lock().clone()
+        }
+    }
+
+    impl HostBridge for RecordingBridge {
+        fn call(&self, method: &str, args: &serde_json::Value) -> Result<serde_json::Value> {
+            self.calls.lock().push((method.to_string(), args.clone()));
+            self.responses
+                .get(method)
+                .cloned()
+                .ok_or_else(|| anyhow!("unimplemented host method: {method}"))
+        }
+    }
+
     #[test]
     fn test_runtime_creation() -> Result<()> {
         let runtime = QuickJsRuntime::with_defaults()?;
@@ -813,17 +1695,53 @@ mod tests {
         Ok(())
     }
 
+    /// P1-1: fuel 必须是真实的 wall-clock 预算，而不是回调计数。
     #[test]
-    fn test_cpu_fuel_tracker() {
-        let tracker = CpuFuelTracker::new(5); // 5ms 预算
-        let check = tracker.clone();
+    fn cpu_fuel_tracks_wall_clock_time_not_callback_count() {
+        let tracker = CpuFuelTracker::new(50);
 
-        // 前 5 次检查不应中断
-        for _ in 0..4 {
-            assert!(!check.check(), "预算内不应中断");
+        // 大量紧挨着的回调只花掉微不足道的时间，不应触发中断。
+        for _ in 0..10_000 {
+            assert!(
+                !tracker.check(),
+                "回调计数不应消耗预算，已用 {:?}",
+                tracker.used()
+            );
         }
-        // 第 5 次应中断
-        assert!(check.check(), "超预算应中断");
+        assert!(
+            tracker.used() < Duration::from_millis(50),
+            "1 万次空回调不该烧掉 50ms 预算，实际 {:?}",
+            tracker.used()
+        );
+    }
+
+    /// spec §5.2: 超预算不是立刻杀，要连续 3 个预算周期 (~150ms) 才中断。
+    #[test]
+    fn cpu_fuel_interrupts_only_after_three_budget_overruns() {
+        let tracker = CpuFuelTracker::new(10);
+
+        // 第一次 check 建立 checkpoint，不计时。
+        assert!(!tracker.check());
+        // 20ms（2 × budget）之后仍在容忍范围内。
+        std::thread::sleep(Duration::from_millis(20));
+        assert!(!tracker.check(), "2× 预算不应中断");
+        // 再过 20ms 累计 40ms > 3 × 10ms，应中断。
+        std::thread::sleep(Duration::from_millis(20));
+        assert!(tracker.check(), "累计超过 3× 预算应中断");
+        assert!(tracker.take_interrupted());
+        assert!(!tracker.take_interrupted(), "标志读取后应清零");
+    }
+
+    /// 宿主空闲期不能计入扩展的 CPU 预算。
+    #[test]
+    fn cpu_fuel_excludes_host_idle_time() {
+        let tracker = CpuFuelTracker::new(10);
+        assert!(!tracker.check());
+        std::thread::sleep(Duration::from_millis(25));
+        // 宿主重新进入 JS：上一次 checkpoint 作废。
+        tracker.begin_execution();
+        assert!(!tracker.check(), "空闲期不应计费");
+        assert_eq!(tracker.used(), Duration::ZERO);
     }
 
     #[test]
@@ -842,9 +1760,7 @@ mod tests {
 
     /// §5.4 chrome must stay live: after activate, a registered view's
     /// `invalidate()` must request a host re-render, and `render_now()` must
-    /// return a fresh VDOM reflecting post-activate state. The one-shot loader
-    /// drops the runtime after activate, so this contract fails until a
-    /// persistent LiveExtension exists.
+    /// return a fresh VDOM reflecting post-activate state.
     #[test]
     fn test_live_extension_re_renders_after_invalidate() -> Result<()> {
         let runner = ExtensionRunner::with_defaults();
@@ -861,18 +1777,43 @@ mod tests {
                 globalThis.__test_view = view;
             }
         "#;
-        let mut live = runner.load_live("tick-ext", source, "activate")?;
+        let live = runner.load_live("tick-ext", source, "activate")?;
 
-        let first = live.render_now()?.expect("initial vdom present");
+        let first = live.render_now()?.context("initial vdom present")?;
         assert!(first.contains("\"id\":\"tick\""), "first vdom: {first}");
         assert!(first.contains("\"1\""), "first render tick=1: {first}");
 
         // §5.4 drive invalidate through the extension's own view handle to prove
         // the host hook is wired end-to-end, then re-render and observe ticks=2.
-        live.invalidate_registered_views();
-        let second = live.render_now()?.expect("second vdom present");
+        live.invalidate_registered_views()?;
+        let second = live.render_now()?.context("second vdom present")?;
         assert!(second.contains("\"2\""), "second render tick=2: {second}");
         assert_ne!(first, second, "render_now must re-evaluate view.render()");
+        Ok(())
+    }
+
+    /// P1-4: `invalidate()` 必须让 Rust 侧看到失效标志，宿主才能按需渲染。
+    #[test]
+    fn invalidate_flag_is_observable_from_rust() -> Result<()> {
+        let runner = ExtensionRunner::with_defaults();
+        let source = r#"
+            function activate(context) {
+                globalThis.__view = context.registerChromeView('status-bar', {
+                    render: function() { return { type: 'span', children: ['x'] }; }
+                });
+                context.mux.subscribe('pane:focus', function() {
+                    globalThis.__view.invalidate();
+                });
+            }
+        "#;
+        let live = runner.load_live("dirty-ext", source, "activate")?;
+
+        assert!(live.needs_render()?, "registerChromeView 应请求首帧渲染");
+        live.render_all_views()?;
+        assert!(!live.needs_render()?, "渲染后失效标志应清零");
+
+        assert_eq!(live.emit_event("pane:focus", r#"{"title":"a"}"#)?, 1);
+        assert!(live.needs_render()?, "事件触发的 invalidate 必须被 Rust 观察到");
         Ok(())
     }
 
@@ -910,6 +1851,24 @@ mod tests {
 
         // 无限循环应被中断（CPU fuel 耗尽或内存超限）
         assert!(result.result.is_err(), "无限循环应被资源限制终止");
+        assert!(result.cpu_exhausted, "中断原因应报告为 CPU 预算耗尽");
+    }
+
+    /// P1-3: 任何 JS 错误都不该被误报成 CPU 耗尽。
+    #[test]
+    fn plain_js_error_is_not_reported_as_cpu_exhaustion() {
+        let runner = ExtensionRunner::with_defaults();
+        let result = runner.load_extension(
+            "throwing-ext",
+            "function activate() { throw new Error('boom'); }",
+            "activate",
+        );
+
+        assert!(result.result.is_err(), "抛异常的扩展应加载失败");
+        assert!(!result.cpu_exhausted, "普通异常不是 CPU 耗尽");
+        assert!(!result.memory_exceeded, "普通异常不是内存超限");
+        let message = format!("{:#}", result.result.expect_err("error expected"));
+        assert!(message.contains("boom"), "错误应保留 JS 消息: {message}");
     }
 
     #[test]
@@ -923,6 +1882,23 @@ mod tests {
         })?;
 
         assert_eq!(result, "hello from thread");
+        Ok(())
+    }
+
+    /// P1-3: `execute_in_thread` 必须沿用实例配置，而不是硬编码默认值。
+    #[test]
+    fn execute_in_thread_honours_instance_limits() -> Result<()> {
+        let runtime = QuickJsRuntime::with_limits(ExtensionLimits::new(1, 50, 100.0))?;
+        let result = runtime.execute_in_thread(|ctx| {
+            let value: rquickjs::Value = ctx.eval(
+                r#"
+                var blocks = [];
+                for (var i = 0; i < 10000000; i++) { blocks.push(new Array(1000)); }
+                "#,
+            )?;
+            Ok::<_, anyhow::Error>(value.is_undefined())
+        });
+        assert!(result.is_err(), "1MB 限制应在子线程内生效");
         Ok(())
     }
 
@@ -994,7 +1970,7 @@ mod tests {
             "activate must succeed: {:?}",
             result.result
         );
-        let vdom = result.vdom_json.expect("status-bar VDOM must be captured");
+        let vdom = result.vdom_json.context("status-bar VDOM must be captured")?;
         assert!(vdom.contains("status-bar"), "vdom={vdom}");
         assert!(vdom.contains("demo"), "vdom={vdom}");
         Ok(())
@@ -1031,6 +2007,180 @@ mod tests {
         Ok(())
     }
 
+    /// P0-2: `keymaps.subscribe` 必须存在并能收到宿主的 `prefix` 事件。
+    #[test]
+    fn keymap_subscribe_receives_host_events() -> Result<()> {
+        let runner = ExtensionRunner::with_defaults();
+        let source = r#"
+            function activate(context) {
+                var state = { visible: false, prefix: '' };
+                context.keymaps.subscribe('prefix', function(event) {
+                    state.visible = event.active;
+                    state.prefix = event.prefix || '';
+                });
+                context.registerChromeView('which-key', {
+                    render: function() {
+                        if (!state.visible) { return null; }
+                        return { type: 'span', children: [state.prefix] };
+                    }
+                });
+            }
+        "#;
+        let extension = runner.load_live("which-key-like", source, "activate")?;
+        assert!(extension.render_now()?.is_none(), "隐藏时不应产生 VDOM");
+
+        let delivered = extension.emit_event("prefix", r#"{"active":true,"prefix":"ctrl-b"}"#)?;
+        assert_eq!(delivered, 1, "prefix 事件必须投递给 keymaps 订阅者");
+        let vdom = extension.render_now()?.context("which-key vdom")?;
+        assert!(vdom.contains("ctrl-b"), "vdom={vdom}");
+        Ok(())
+    }
+
+    /// P0-4: mux 调用必须真正落到宿主桥上，参数原样传递。
+    #[test]
+    fn mux_calls_reach_the_host_bridge() -> Result<()> {
+        let bridge = RecordingBridge::new(BTreeMap::from([
+            (
+                "mux.listSessions".to_string(),
+                serde_json::json!([{ "id": "s1", "name": "work", "clients": 2 }]),
+            ),
+            ("mux.focusPane".to_string(), serde_json::json!(true)),
+            ("mux.splitPane".to_string(), serde_json::json!("pane-2")),
+        ]));
+        let runner = ExtensionRunner::with_defaults().with_bridge(bridge.clone());
+        let source = r#"
+            function activate(context) {
+                globalThis.__sessions = context.mux.listSessions();
+                context.commands.register('split', function() {
+                    globalThis.__new_pane = context.mux.splitPane('right', 'pane-1');
+                });
+                context.mux.focusPane('pane-1');
+            }
+        "#;
+        let extension = runner.load_live("bridge-test", source, "activate")?;
+        assert!(extension.execute_command("split", "[]")?);
+
+        let calls = bridge.calls();
+        assert_eq!(
+            calls
+                .iter()
+                .map(|(method, _)| method.as_str())
+                .collect::<Vec<_>>(),
+            vec!["mux.listSessions", "mux.focusPane", "mux.splitPane"],
+        );
+        assert_eq!(calls[1].1, serde_json::json!(["pane-1"]));
+        assert_eq!(calls[2].1, serde_json::json!(["right", "pane-1"]));
+        Ok(())
+    }
+
+    /// P0-4 + P0-5: `listSessions` 返回的字段名必须是扩展读取的 `clients`。
+    #[test]
+    fn list_sessions_exposes_client_count_field() -> Result<()> {
+        let bridge = RecordingBridge::new(BTreeMap::from([(
+            "mux.listSessions".to_string(),
+            serde_json::json!([{ "id": "s1", "name": "work", "cwd": "/tmp", "clients": 3 }]),
+        )]));
+        let runner = ExtensionRunner::with_defaults().with_bridge(bridge);
+        let source = r#"
+            function activate(context) {
+                context.registerChromeView('session-manager', {
+                    render: function() {
+                        var sessions = context.mux.listSessions();
+                        return {
+                            type: 'div',
+                            children: sessions.map(function(session) {
+                                return { type: 'span', children: [session.name + ' (' + session.clients + ')'] };
+                            })
+                        };
+                    }
+                });
+            }
+        "#;
+        let extension = runner.load_live("session-manager-like", source, "activate")?;
+        let vdom = extension.render_now()?.context("session manager vdom")?;
+        assert!(vdom.contains("work (3)"), "vdom={vdom}");
+        Ok(())
+    }
+
+    /// §5.6: 未声明的能力必须在运行时被拒绝，而不是静默放行。
+    #[test]
+    fn undeclared_capability_is_denied_at_runtime() -> Result<()> {
+        let bridge = RecordingBridge::new(BTreeMap::from([(
+            "mux.listSessions".to_string(),
+            serde_json::json!([]),
+        )]));
+        let capabilities = ExtensionCapabilities {
+            workspace: true,
+            ..ExtensionCapabilities::default()
+        };
+        let runner = ExtensionRunner::with_defaults()
+            .with_capabilities(capabilities)
+            .with_bridge(bridge.clone());
+
+        let result = runner.load_live(
+            "no-mux-capability",
+            "function activate(context) { context.mux.listSessions(); }",
+            "activate",
+        );
+        let error = format!("{:#}", result.err().context("expected activation failure")?);
+        assert!(error.contains("capability"), "error={error}");
+        assert!(bridge.calls().is_empty(), "被拒绝的调用不应到达宿主");
+        Ok(())
+    }
+
+    /// §5.6: JS 侧的检查可以被扩展绕过，Rust 侧必须仍然拦住。
+    #[test]
+    fn capability_is_enforced_in_rust_not_only_in_js() -> Result<()> {
+        let bridge = RecordingBridge::new(BTreeMap::from([(
+            "settings.get".to_string(),
+            serde_json::json!("leaked"),
+        )]));
+        let runner = ExtensionRunner::with_defaults()
+            .with_capabilities(ExtensionCapabilities::default())
+            .with_bridge(bridge.clone());
+
+        // 直接调用底层 __z3rm_host_call，跳过 context.settings 的 JS 校验。
+        let source = r#"
+            function activate(context) {
+                var raw = globalThis.__z3rm_host_call('settings.get', JSON.stringify(['theme']));
+                globalThis.__result = JSON.parse(raw);
+            }
+        "#;
+        let extension = runner.load_live("capability-bypass", source, "activate")?;
+        let denied: bool = extension
+            .render_all_views()
+            .map(|_| true)
+            .unwrap_or(true);
+        assert!(denied);
+        assert!(bridge.calls().is_empty(), "Rust 侧必须在桥调用前拒绝");
+        Ok(())
+    }
+
+    /// §5.6: io_rate_limit 必须真正限制宿主调用频率。
+    #[test]
+    fn io_rate_limit_throttles_host_calls() -> Result<()> {
+        let bridge = RecordingBridge::new(BTreeMap::from([(
+            "mux.focusPane".to_string(),
+            serde_json::json!(true),
+        )]));
+        // 速率 2/s → 容量 4，第 5 次调用必须被拒绝。
+        let runner = ExtensionRunner::with_limits(ExtensionLimits::new(64, 50, 2.0))
+            .with_bridge(bridge.clone());
+        let source = r#"
+            function activate(context) {
+                globalThis.__failures = 0;
+                for (var i = 0; i < 8; i++) {
+                    try { context.mux.focusPane('p' + i); }
+                    catch (error) { globalThis.__failures++; }
+                }
+            }
+        "#;
+        let extension = runner.load_live("io-limit", source, "activate")?;
+        assert_eq!(bridge.calls().len(), 4, "只应放行容量内的调用");
+        drop(extension);
+        Ok(())
+    }
+
     /// 测试扩展加载桩: 创建临时文件 → 加载 → 验证
     #[test]
     fn test_extension_loading_stub() -> Result<()> {
@@ -1039,11 +2189,9 @@ mod tests {
         let source = r#"
         // 模拟扩展源码
         function activate(context) {
-            // Day 0: stub, 完整实现待 extension_host 重写
             return { status: "active" };
         }
         function deactivate() {}
-        activate(null);
         "#;
 
         let result = runner.load_extension("stub-ext", source, "activate");
@@ -1073,5 +2221,289 @@ mod tests {
         // 等待 1 秒补充 10 tokens
         std::thread::sleep(Duration::from_millis(1000));
         assert!(bucket.try_acquire(1.0), "补充后应可用");
+    }
+
+    // -----------------------------------------------------------------------
+    // §5.3 manifest 解析
+    // -----------------------------------------------------------------------
+
+    /// P1-2: `[capabilities]` 与 `io_rate_limit` 必须被真正解析。
+    #[test]
+    fn manifest_parses_capabilities_and_io_rate_limit() -> Result<()> {
+        let manifest = parse_manifest_str(
+            "z3rm-status-bar",
+            r#"
+                [extension]
+                name = "z3rm-status-bar"
+                version = "0.1.0"
+
+                [runtime]
+                side = "client"
+
+                [capabilities]
+                terminal = true
+                mux = true
+                workspace = true
+                filesystem = "cwd"
+
+                [resources]
+                memory_limit_mb = 32
+                cpu_budget_ms = 25
+                io_rate_limit = 17
+            "#,
+        )?;
+
+        assert_eq!(manifest.id, "z3rm-status-bar");
+        assert_eq!(manifest.version, "0.1.0");
+        assert_eq!(manifest.side, ExtensionSide::Client);
+        assert!(manifest.capabilities.terminal);
+        assert!(manifest.capabilities.mux);
+        assert!(manifest.capabilities.workspace);
+        assert!(!manifest.capabilities.settings);
+        assert_eq!(manifest.capabilities.filesystem, FilesystemAccess::Cwd);
+        assert_eq!(manifest.limits.memory_limit_mb, 32);
+        assert_eq!(manifest.limits.cpu_budget_ms, 25);
+        assert_eq!(manifest.limits.io_rate_limit, 17.0);
+        Ok(())
+    }
+
+    /// §5.6 fail closed: 没有 `[capabilities]` 就什么都不给。
+    #[test]
+    fn manifest_without_capabilities_grants_nothing() -> Result<()> {
+        let manifest = parse_manifest_str(
+            "plain",
+            "[extension]\nname = \"plain\"\n[runtime]\nside = \"both\"\nsync = true\n",
+        )?;
+        assert_eq!(manifest.capabilities, ExtensionCapabilities::default());
+        assert!(!manifest.capabilities.allows("mux.listSessions"));
+        assert_eq!(manifest.side, ExtensionSide::Both);
+        assert!(manifest.sync);
+        assert_eq!(manifest.limits, ExtensionLimits::default());
+        Ok(())
+    }
+
+    #[test]
+    fn manifest_rejects_invalid_runtime_side() {
+        let result = parse_manifest_str("bad", "[runtime]\nside = \"browser\"\n");
+        assert!(result.is_err(), "非法 side 必须 fail closed");
+    }
+
+    #[test]
+    fn manifest_requires_runtime_section() {
+        let result = parse_manifest_str("bad", "[extension]\nname = \"bad\"\n");
+        assert!(result.is_err(), "缺少 [runtime] 必须报错");
+    }
+
+    /// Zed 遗留 manifest 用 `[[capabilities]]` 数组，语义不同，不应被误读为授权。
+    #[test]
+    fn manifest_ignores_legacy_capability_arrays() -> Result<()> {
+        let manifest = parse_manifest_str(
+            "legacy",
+            r#"
+                id = "legacy"
+                name = "Legacy"
+                [runtime]
+                side = "client"
+                [[capabilities]]
+                kind = "process:exec"
+                command = "echo"
+            "#,
+        )?;
+        assert_eq!(manifest.capabilities, ExtensionCapabilities::default());
+        assert_eq!(manifest.name, "Legacy");
+        Ok(())
+    }
+
+    // -----------------------------------------------------------------------
+    // P0-1: 内置扩展必须真的被发现并激活
+    // -----------------------------------------------------------------------
+
+    const BUILTIN_EXTENSION_IDS: [&str; 6] = [
+        "z3rm-command-palette",
+        "z3rm-layout-manager",
+        "z3rm-session-manager",
+        "z3rm-status-bar",
+        "z3rm-tab-bar",
+        "z3rm-which-key",
+    ];
+
+    /// 一个覆盖全部内置扩展所需方法的桥，让 activate 期的调用有真实返回值。
+    struct BuiltinTestBridge;
+
+    impl HostBridge for BuiltinTestBridge {
+        fn call(&self, method: &str, _args: &serde_json::Value) -> Result<serde_json::Value> {
+            match method {
+                "mux.listSessions" => Ok(serde_json::json!([
+                    { "id": "s1", "name": "work", "cwd": "/tmp", "clients": 1 }
+                ])),
+                "mux.currentSession" => {
+                    Ok(serde_json::json!({ "id": "s1", "name": "work", "clients": 1 }))
+                }
+                "mux.focusedPane" => Ok(serde_json::json!({ "id": "p1", "title": "zsh" })),
+                other => Ok(serde_json::json!({ "method": other })),
+            }
+        }
+    }
+
+    /// P0-1 的回归测试：仓库里的 6 个内置扩展必须能被发现并成功 activate。
+    /// 这条用例同时兜住 P0-2 那类「bootstrap 缺 API → activate 抛异常」的问题。
+    #[test]
+    fn all_builtin_extensions_discover_and_activate() -> Result<()> {
+        let roots = builtin_extension_roots();
+        let discovered = discover_client_extensions(&roots);
+        assert!(
+            !discovered.is_empty(),
+            "内置扩展未被发现，搜索根: {roots:?}"
+        );
+
+        let discovered_ids: Vec<&str> = discovered
+            .iter()
+            .map(|extension| extension.manifest.id.as_str())
+            .collect();
+        for expected in BUILTIN_EXTENSION_IDS {
+            assert!(
+                discovered_ids.contains(&expected),
+                "内置扩展 {expected} 未被发现，实际: {discovered_ids:?}"
+            );
+        }
+
+        let bridge: Arc<dyn HostBridge> = Arc::new(BuiltinTestBridge);
+        for extension in &discovered {
+            let identifier = extension.manifest.id.as_str();
+            if !BUILTIN_EXTENSION_IDS.contains(&identifier) {
+                continue;
+            }
+            let runner =
+                ExtensionRunner::for_manifest(&extension.manifest).with_bridge(bridge.clone());
+            let live = runner
+                .load_live(identifier, &extension.source, "activate")
+                .with_context(|| format!("{identifier} 必须能成功 activate"))?;
+
+            assert!(
+                live.needs_render()?,
+                "{identifier} 应在 activate 时注册 chrome view"
+            );
+            // 渲染必须不抛异常（返回 None 表示是按需 chrome，当前处于隐藏态）。
+            live.render_all_views()
+                .with_context(|| format!("{identifier} 渲染失败"))?;
+            let errors = live.take_errors()?;
+            assert!(errors.is_empty(), "{identifier} 内部报错: {errors:?}");
+        }
+        Ok(())
+    }
+
+    /// 内置扩展声明的能力必须覆盖它们实际调用的宿主方法。
+    #[test]
+    fn builtin_manifests_declare_the_capabilities_they_use() -> Result<()> {
+        let discovered = discover_client_extensions(&builtin_extension_roots());
+        let required_mux = [
+            "z3rm-layout-manager",
+            "z3rm-session-manager",
+            "z3rm-status-bar",
+            "z3rm-tab-bar",
+        ];
+        for identifier in required_mux {
+            let extension = discovered
+                .iter()
+                .find(|extension| extension.manifest.id == identifier)
+                .with_context(|| format!("{identifier} 未被发现"))?;
+            assert!(
+                extension.manifest.capabilities.mux,
+                "{identifier} 使用 context.mux.* 但未声明 mux 能力"
+            );
+        }
+        Ok(())
+    }
+
+    /// 内置扩展的事件订阅必须真的能收到宿主事件 (P0-3 的 JS 侧契约)。
+    #[test]
+    fn builtin_status_bar_updates_from_pane_focus_event() -> Result<()> {
+        let discovered = discover_client_extensions(&builtin_extension_roots());
+        let status_bar = discovered
+            .iter()
+            .find(|extension| extension.manifest.id == "z3rm-status-bar")
+            .context("z3rm-status-bar 未被发现")?;
+
+        let runner = ExtensionRunner::for_manifest(&status_bar.manifest);
+        let live = runner.load_live("z3rm-status-bar", &status_bar.source, "activate")?;
+
+        let delivered = live.emit_event(
+            "pane:focus",
+            r#"{"title":"vim","sessionName":"work","paneId":"p1"}"#,
+        )?;
+        assert_eq!(delivered, 1, "pane:focus 必须投递到 status-bar 订阅者");
+
+        let vdom = live.render_now()?.context("status-bar 应产生 VDOM")?;
+        assert!(vdom.contains("vim"), "pane 标题应出现在 VDOM: {vdom}");
+        assert!(vdom.contains("work"), "session 名应出现在 VDOM: {vdom}");
+        Ok(())
+    }
+
+    /// tab-bar 依赖 `tab:title` 事件填充标签，事件断链时标签栏恒空。
+    #[test]
+    fn builtin_tab_bar_updates_from_tab_title_event() -> Result<()> {
+        let discovered = discover_client_extensions(&builtin_extension_roots());
+        let tab_bar = discovered
+            .iter()
+            .find(|extension| extension.manifest.id == "z3rm-tab-bar")
+            .context("z3rm-tab-bar 未被发现")?;
+
+        let runner = ExtensionRunner::for_manifest(&tab_bar.manifest);
+        let live = runner.load_live("z3rm-tab-bar", &tab_bar.source, "activate")?;
+
+        assert_eq!(
+            live.emit_event(
+                "tab:title",
+                r#"{"tabId":"t1","title":"build","paneId":"p1","active":true}"#
+            )?,
+            1
+        );
+        let vdom = live.render_now()?.context("tab-bar 应产生 VDOM")?;
+        assert!(vdom.contains("build"), "vdom={vdom}");
+        Ok(())
+    }
+
+    /// command-palette 依赖 `commands.list()`；桩实现下它永远是空列表。
+    #[test]
+    fn builtin_command_palette_lists_registered_commands() -> Result<()> {
+        let discovered = discover_client_extensions(&builtin_extension_roots());
+        let palette = discovered
+            .iter()
+            .find(|extension| extension.manifest.id == "z3rm-command-palette")
+            .context("z3rm-command-palette 未被发现")?;
+
+        let runner = ExtensionRunner::for_manifest(&palette.manifest);
+        let live = runner.load_live("z3rm-command-palette", &palette.source, "activate")?;
+
+        let commands: serde_json::Value = serde_json::from_str(&live.list_commands()?)?;
+        let ids: Vec<&str> = commands
+            .as_array()
+            .context("commands.list must be an array")?
+            .iter()
+            .filter_map(|entry| entry.get("id").and_then(serde_json::Value::as_str))
+            .collect();
+        assert!(
+            ids.contains(&"z3rm.command-palette.open"),
+            "palette 命令未注册: {ids:?}"
+        );
+
+        assert!(live.execute_command("z3rm.command-palette.open", "[]")?);
+        let vdom = live
+            .render_now()?
+            .context("打开后 palette 应产生 VDOM")?;
+        assert!(vdom.contains("command-palette"), "vdom={vdom}");
+        assert!(
+            vdom.contains("z3rm.command-palette.open"),
+            "palette 应列出自身命令: {vdom}"
+        );
+
+        let keymaps: serde_json::Value = serde_json::from_str(&live.list_keymaps()?)?;
+        assert!(
+            keymaps
+                .as_array()
+                .is_some_and(|entries| !entries.is_empty()),
+            "keymaps.bind 必须被记录: {keymaps}"
+        );
+        Ok(())
     }
 }
