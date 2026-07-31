@@ -3,9 +3,7 @@
 
 use anyhow::{Context, Result};
 use mux::MuxDomain;
-use mux_protocol::proto::{
-    fetch_grid_update_response::Update as GridUpdateKind, Cell, CellStyle,
-};
+use mux_protocol::proto::{Cell, CellStyle, fetch_grid_update_response::Update as GridUpdateKind};
 
 /// 捕获 pane 的可见网格内容，转换为文本。
 ///
@@ -22,16 +20,10 @@ pub async fn capture_pane(
     if let Some(n) = scrollback_lines.filter(|n| *n < 0) {
         let count = n.unsigned_abs();
         let scrollback = domain
-            .fetch_scrollback(pane_id, 0, 0, u32::MAX)
+            .fetch_scrollback(pane_id, 0, 1, u32::MAX)
             .await
             .context("failed to fetch scrollback")?;
-        let total = scrollback.lines.len();
-        let start = total.saturating_sub(count as usize);
-        scrollback_rows.extend(
-            scrollback.lines[start..]
-                .iter()
-                .map(|row| row.cells.clone()),
-        );
+        scrollback_rows.extend(latest_scrollback_rows(&scrollback.lines, count));
     }
 
     let grid = domain
@@ -48,6 +40,14 @@ pub async fn capture_pane(
         grid.update.as_ref(),
         preserve_ansi,
     ))
+}
+
+fn latest_scrollback_rows(
+    lines: &[mux_protocol::proto::RowChange],
+    count: u32,
+) -> impl Iterator<Item = Vec<Cell>> + '_ {
+    let start = lines.len().saturating_sub(count as usize);
+    lines[start..].iter().map(|row| row.cells.clone())
 }
 
 fn render_capture(
@@ -235,6 +235,7 @@ mod tests {
             }),
             foreground: fg,
             background: 0,
+            ..Default::default()
         }
     }
 
@@ -255,7 +256,11 @@ mod tests {
     fn ansi_capture_coalesces_identical_runs() {
         let cells = vec![cell("a", 0xff0000, true), cell("b", 0xff0000, true)];
         let text = render_cells(&cells, true);
-        assert_eq!(text.matches("\x1b[").count(), 2, "one open SGR + one reset: {text:?}");
+        assert_eq!(
+            text.matches("\x1b[").count(),
+            2,
+            "one open SGR + one reset: {text:?}"
+        );
         assert!(text.contains("ab"));
     }
     #[test]
@@ -271,5 +276,21 @@ mod tests {
 
         let text = render_capture(&[scrollback.as_slice()], Some(&update), false);
         assert_eq!(text, "h\nv\n");
+    }
+    #[test]
+    fn capture_selects_latest_requested_scrollback_rows() {
+        let lines = ["oldest", "middle", "newest"]
+            .into_iter()
+            .enumerate()
+            .map(|(row, text)| mux_protocol::proto::RowChange {
+                row: row as u32,
+                cells: vec![cell(text, 0, false)],
+            })
+            .collect::<Vec<_>>();
+
+        let selected = latest_scrollback_rows(&lines, 2).collect::<Vec<_>>();
+        assert_eq!(selected.len(), 2);
+        assert_eq!(selected[0][0].char, "middle");
+        assert_eq!(selected[1][0].char, "newest");
     }
 }
