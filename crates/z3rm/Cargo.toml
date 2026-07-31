@@ -2,11 +2,6 @@
 name = "z3rm"
 path = "src/main.rs"
 
-[[bin]]
-name = "zed_visual_test_runner"
-path = "src/visual_test_runner.rs"
-required-features = [ "visual-tests"]
-
 [package]
 description = "High-performance GPU-rendered terminal with built-in multiplexer."
 name = "z3rm"
@@ -22,7 +17,6 @@ workspace = true
 tracy = [ "ztracing/tracy"]
 track-project-leak = [ "gpui/leak-detection"]
 test-support = [ "gpui/test-support", "gpui_platform/screen-capture", "workspace/test-support", "project/test-support", "editor/test-support", "terminal_view/test-support", "recent_projects/test-support", "title_bar/test-support"]
-visual-tests = [ "gpui/test-support", "gpui_platform/screen-capture", "gpui_platform/test-support", "dep:tempfile", "workspace/test-support", "project/test-support", "editor/test-support", "terminal_view/test-support", "clock/test-support", "db/test-support", "fs/test-support", "recent_projects/test-support", "title_bar/test-support"]
 
 [package.edition]
 workspace = true
@@ -255,7 +249,13 @@ workspace = true
 [dependencies.settings_ui]
 workspace = true
 
+[dependencies.semver]
+workspace = true
+
 [dependencies.serde_json]
+workspace = true
+
+[dependencies.toml]
 workspace = true
 
 [dependencies.shellexpand]

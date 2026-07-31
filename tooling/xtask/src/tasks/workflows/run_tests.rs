@@ -81,7 +81,7 @@ pub(crate) fn run_tests() -> Workflow {
             .then(check_workspace_binaries()),
         should_run_tests
             .and_not_in_merge_queue()
-            .then(build_visual_tests_binary()),
+            .then(run_ui_regression_suite()),
         should_run_tests.and_not_in_merge_queue().then(check_wasm()),
         should_run_tests
             .and_not_in_merge_queue()
@@ -649,9 +649,9 @@ fn run_platform_tests_impl(platform: Platform, filter_packages: bool, harden: bo
     }
 }
 
-fn build_visual_tests_binary() -> NamedJob {
-    pub fn cargo_build_visual_tests() -> Step<Run> {
-        named::bash("cargo build -p zed --bin zed_visual_test_runner --features visual-tests")
+fn run_ui_regression_suite() -> NamedJob {
+    pub fn cargo_test_ui_regression() -> Step<Run> {
+        named::bash("cargo test -p z3rm --test ui_screenshot_regression")
     }
 
     named::job(
@@ -660,7 +660,7 @@ fn build_visual_tests_binary() -> NamedJob {
             .add_step(steps::checkout_repo())
             .add_step(steps::setup_cargo_config(Platform::Mac))
             .add_step(steps::cache_rust_dependencies_namespace())
-            .add_step(cargo_build_visual_tests())
+            .add_step(cargo_test_ui_regression())
             .add_step(steps::cleanup_cargo_config(Platform::Mac)),
     )
 }
