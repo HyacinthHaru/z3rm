@@ -926,16 +926,30 @@ fn main() {
                             let Some(domain) = state.mux_domain.clone() else { return };
                             let Some(mux_view) = workspace.active_item_as::<terminal_view::mux_pane::MuxPaneView>(cx) else { return };
                             let pane_id = mux_view.read(cx).pane_id.clone();
-                            // Close server-side pane first, then remove the workspace item.
-                            cx.background_executor().spawn(async move {
-                                if let Err(e) = domain.close_pane(&pane_id).await {
-                                    tracing::error!(error = %e, "mux_pane::CloseTab: close_pane failed");
+                            let weak_workspace = workspace.weak_handle();
+                            let window_handle = window.window_handle();
+                            window.spawn(cx, async move |cx| {
+                                match domain.close_pane(&pane_id).await {
+                                    Ok(()) => {
+                                        window_handle.update(cx, |_, window, cx| {
+                                            weak_workspace.update(cx, |workspace, cx| {
+                                                workspace.active_pane().update(cx, |pane, cx| {
+                                                    pane.close_active_item(&workspace::CloseActiveItem::default(), window, cx)
+                                                        .detach_and_log_err(cx);
+                                                });
+                                            })
+                                        })??;
+                                    }
+                                    Err(error) => {
+                                        tracing::error!(pane_id, %error, "mux_pane::CloseTab failed");
+                                        cx.update(|_, cx| daemon::show_daemon_error(
+                                            cx,
+                                            format!("Failed to close mux pane {pane_id}: {error}"),
+                                        ))?;
+                                    }
                                 }
+                                anyhow::Ok(())
                             }).detach();
-                            workspace.active_pane().update(cx, |pane, cx| {
-                                pane.close_active_item(&workspace::CloseActiveItem::default(), window, cx)
-                                    .detach_and_log_err(cx);
-                            });
                         })
                         .register_action(|workspace, _: &settings::mux_actions::ZoomToggle, window, cx| {
                             let Some(mux_view) = workspace.active_item_as::<terminal_view::mux_pane::MuxPaneView>(cx) else { return };
