@@ -11,7 +11,7 @@ mod open_diff;
 mod quickjs_extensions;
 mod zed;
 
-use std::{path::Path, sync::Arc};
+use std::{path::Path, rc::Rc, sync::Arc};
 
 use anyhow::Context as _;
 use assets::Assets;
@@ -99,6 +99,35 @@ fn focus_mux_pane_index(
     if let Some(pane) = workspace.panes().get(index as usize).cloned() {
         focus_mux_workspace_pane(pane, window, cx);
     }
+}
+
+/// §15.7 Focus the GPUI pane projecting `pane_id`, for callers that only know
+/// the server-side pane id (the session sidebar).
+fn focus_mux_pane_by_id(
+    workspace: &mut workspace::Workspace,
+    pane_id: &str,
+    window: &mut Window,
+    cx: &mut Context<workspace::Workspace>,
+) {
+    let located = workspace.panes().iter().find_map(|pane| {
+        let item_index = pane.read(cx).items().position(|item| {
+            item.to_any_view()
+                .downcast::<terminal_view::mux_pane::MuxPaneView>()
+                .is_ok_and(|view| view.read(cx).pane_id == pane_id)
+        })?;
+        Some((pane.clone(), item_index))
+    });
+    let Some((pane, item_index)) = located else {
+        // The pane belongs to a tab this window does not project; the server
+        // stays authoritative and there is nothing local to focus.
+        return;
+    };
+    // Activating first makes the pane's active item the one we mean, so the
+    // shared focus helper sends `focus_pane` for the requested id.
+    pane.update(cx, |pane, cx| {
+        pane.activate_item(item_index, true, true, window, cx);
+    });
+    focus_mux_workspace_pane(pane, window, cx);
 }
 
 fn cyclic_pane_index(current: usize, pane_count: usize, forward: bool) -> Option<usize> {
@@ -288,6 +317,9 @@ struct MuxSnapshot {
     focused_pane: Option<String>,
     zoomed: std::collections::HashMap<String, bool>,
     pane_ids: Vec<String>,
+    /// Kept verbatim because the sidebar needs the tab dimension, which the
+    /// layout tree does not model.
+    session: Option<mux_protocol::SessionSnapshot>,
 }
 
 impl MuxSnapshot {
@@ -317,6 +349,7 @@ impl MuxSnapshot {
                 .flat_map(|tab| tab.panes.iter().map(|pane| (pane.id.clone(), pane.zoomed)))
                 .collect(),
             pane_ids,
+            session: Some(snapshot.clone()),
         }
     }
 }
@@ -460,8 +493,158 @@ async fn open_mux_window_with_snapshot(
             cx,
         );
     });
+    window_handle
+        .update(cx, |multi_workspace, window, cx| {
+            install_session_sidebar(
+                multi_workspace,
+                domain.clone(),
+                session_id.clone(),
+                snapshot.session.as_ref(),
+                None,
+                window,
+                cx,
+            );
+        })
+        .log_err();
     watch_mux_session_notifications(domain, session_id, window_handle, cx);
     Ok(window_handle)
+}
+
+/// §15.7 Give this window the native mux session tree.
+///
+/// Session switching and pane focusing must be reachable without the QuickJS
+/// extension host, so the sidebar is registered unconditionally alongside the
+/// window's mux binding rather than by an extension.
+fn install_session_sidebar(
+    multi_workspace: &mut workspace::MultiWorkspace,
+    domain: Arc<mux::MuxDomain>,
+    session_id: String,
+    snapshot: Option<&mux_protocol::SessionSnapshot>,
+    restore_width: Option<gpui::Pixels>,
+    window: &mut Window,
+    cx: &mut Context<workspace::MultiWorkspace>,
+) {
+    let workspace = multi_workspace.workspace().downgrade();
+    let handler_domain = domain.clone();
+    let sidebar = cx.new(|cx| {
+        sidebar::Sidebar::new(
+            domain,
+            session_id,
+            snapshot,
+            Rc::new(move |request, window: &mut Window, cx: &mut App| {
+                handle_sidebar_request(&workspace, &handler_domain, request, window, cx);
+            }),
+            window,
+            cx,
+        )
+    });
+    multi_workspace.register_sidebar(sidebar, cx);
+    if let (Some(width), Some(sidebar)) = (restore_width, multi_workspace.sidebar()) {
+        sidebar.set_width(Some(width), cx);
+    }
+}
+
+fn handle_sidebar_request(
+    workspace: &gpui::WeakEntity<workspace::Workspace>,
+    domain: &Arc<mux::MuxDomain>,
+    request: sidebar::SidebarRequest,
+    window: &mut Window,
+    cx: &mut App,
+) {
+    match request {
+        sidebar::SidebarRequest::FocusPane(pane_id) => {
+            workspace
+                .update(cx, |workspace, cx| {
+                    focus_mux_pane_by_id(workspace, &pane_id, window, cx);
+                })
+                .log_err();
+        }
+        sidebar::SidebarRequest::ActivateSession(session_id) => {
+            activate_mux_session(workspace.clone(), domain.clone(), session_id, window, cx);
+        }
+    }
+}
+
+/// §15.4 / §15.12 Attach `session_id` and reproject its authoritative layout
+/// into this window.
+///
+/// Attach is the snapshot RPC, so this doubles as the resync path when the
+/// requested session is the one already rendered.
+fn activate_mux_session(
+    workspace: gpui::WeakEntity<workspace::Workspace>,
+    domain: Arc<mux::MuxDomain>,
+    session_id: String,
+    window: &mut Window,
+    cx: &mut App,
+) {
+    let window_id = window.window_handle().window_id();
+    window
+        .spawn(cx, async move |cx| {
+            let result: anyhow::Result<()> = async {
+                let response = domain.attach(&session_id, mux::AttachMode::Shared).await?;
+                let snapshot = response
+                    .snapshot
+                    .clone()
+                    .context("attach response contained no session snapshot")?;
+                let proto_layout = snapshot
+                    .layout
+                    .clone()
+                    .context("attached session contained no layout")?;
+                let layout = workspace::layout_projection::LayoutTree::from_proto(&proto_layout);
+                let focused_pane = (!snapshot.focused_pane_id.is_empty())
+                    .then(|| snapshot.focused_pane_id.clone());
+                workspace.update_in(cx, {
+                    let domain = domain.clone();
+                    move |workspace, window, cx| {
+                        apply_mux_layout_to_workspace(
+                            workspace,
+                            &layout,
+                            focused_pane.as_deref(),
+                            domain,
+                            window,
+                            cx,
+                        );
+                    }
+                })?;
+                cx.update(|window, cx| {
+                    register_mux_window(window_id, domain.clone(), session_id.clone(), cx);
+                    // The sidebar's tree is bound to one session, so switching
+                    // rebinds it while keeping the user's chosen width.
+                    let Some(multi_workspace) = window.root::<workspace::MultiWorkspace>().flatten()
+                    else {
+                        return;
+                    };
+                    let previous_width = multi_workspace
+                        .read(cx)
+                        .sidebar()
+                        .map(|sidebar| sidebar.width(cx));
+                    multi_workspace.update(cx, |multi_workspace, cx| {
+                        install_session_sidebar(
+                            multi_workspace,
+                            domain.clone(),
+                            session_id.clone(),
+                            Some(&snapshot),
+                            previous_width,
+                            window,
+                            cx,
+                        );
+                    });
+                })?;
+                anyhow::Ok(())
+            }
+            .await;
+            if let Err(error) = result {
+                tracing::error!(%error, "activating a mux session from the sidebar failed");
+                cx.update(|_, cx| {
+                    daemon::show_daemon_error(
+                        cx,
+                        format!("Failed to switch to mux session: {error}"),
+                    )
+                })
+                .log_err();
+            }
+        })
+        .detach();
 }
 
 /// §15.4 / §15.12 Reconcile a window from the server's lifecycle stream.
@@ -1429,21 +1612,13 @@ fn main() {
                                         .map(|session| session.id.clone())
                                         .ok_or_else(|| anyhow::anyhow!("no mux session is available"))?
                                 };
-                                let response = domain.attach(&session_id, mux::AttachMode::Shared).await?;
-                                let snapshot = response.snapshot
-                                    .ok_or_else(|| anyhow::anyhow!("attach response contained no session snapshot"))?;
-                                let proto_layout = snapshot.layout
-                                    .ok_or_else(|| anyhow::anyhow!("attached session contained no layout"))?;
-                                let layout = workspace::layout_projection::LayoutTree::from_proto(&proto_layout);
-                                let focused_pane = (!snapshot.focused_pane_id.is_empty())
-                                    .then_some(snapshot.focused_pane_id);
-                                let domain_for_layout = domain.clone();
-                                weak_workspace.update_in(cx, |workspace, window, cx| {
-                                    apply_mux_layout_to_workspace(
-                                        workspace,
-                                        &layout,
-                                        focused_pane.as_deref(),
-                                        domain_for_layout,
+                                // Shares the sidebar's activation path so both
+                                // entry points rebind the window identically.
+                                cx.update(|window, cx| {
+                                    activate_mux_session(
+                                        weak_workspace.clone(),
+                                        domain.clone(),
+                                        session_id,
                                         window,
                                         cx,
                                     );
@@ -1869,6 +2044,36 @@ mod tests {
             assert!(
                 action_names.contains(required),
                 "default profile is missing native action {required}"
+            );
+        }
+    }
+
+    /// §15.7 The mux session sidebar is a core surface, so it must be reachable
+    /// from the default keymap. `bind_startup_keymaps` drops bindings whose
+    /// action does not resolve, which the Zed fork still relies on, so assert
+    /// against the bindings that actually survive that pass.
+    #[gpui::test]
+    fn default_keymap_binds_the_session_sidebar(cx: &mut App) {
+        let key_bindings = match KeymapFile::load(settings::default_keymap().as_ref(), cx) {
+            KeymapFileLoadResult::Success { key_bindings }
+            | KeymapFileLoadResult::SomeFailedToLoad { key_bindings, .. } => key_bindings,
+            KeymapFileLoadResult::JsonParseFailure { error } => {
+                panic!("default keymap has invalid JSON: {error}")
+            }
+        };
+        let action_names = key_bindings
+            .iter()
+            .map(|binding| binding.action().name())
+            .collect::<std::collections::HashSet<_>>();
+
+        for required in [
+            "multi_workspace::ToggleWorkspaceSidebar",
+            "multi_workspace::FocusWorkspaceSidebar",
+            "mux_sidebar::FocusFilter",
+        ] {
+            assert!(
+                action_names.contains(required),
+                "default keymap is missing sidebar action {required}"
             );
         }
     }

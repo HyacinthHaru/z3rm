@@ -787,6 +787,13 @@
     },
   },
   {
+    "context": "WorkspaceSidebar",
+    "use_key_equivalents": true,
+    "bindings": {
+      "cmd-f": "mux_sidebar::FocusFilter",
+    },
+  },
+  {
     "context": "ThreadsSidebar",
     "use_key_equivalents": true,
     "bindings": {
