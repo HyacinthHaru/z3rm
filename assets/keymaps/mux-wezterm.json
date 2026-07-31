@@ -7,6 +7,8 @@
     "bindings": {
       // Native lifecycle controls remain available even if QuickJS fails.
       "ctrl-alt-a": "mux::Attach",
+      // §3.3 second window on the same session (Plan 32)
+      "ctrl-alt-n": "mux::NewWindow",
       "ctrl-alt-k": "mux::KillSession",
       "ctrl-alt-q": "mux::KillServer",
       // Tab management

@@ -21,6 +21,11 @@ pub struct Attach;
 #[action(namespace = mux)]
 pub struct Detach;
 
+/// §3.3 打开一个新窗口，attach 到当前 session (Plan 32)。
+#[derive(Clone, Debug, Default, Deserialize, JsonSchema, PartialEq, Action)]
+#[action(namespace = mux)]
+pub struct NewWindow;
+
 /// §16.7 关闭当前 mux session。
 #[derive(Clone, Debug, Default, Deserialize, JsonSchema, PartialEq, Action)]
 #[action(namespace = mux)]
@@ -159,6 +164,7 @@ mod tests {
         // Detach action 可以实例化
         let _action = Detach::default();
         let _attach = Attach::default();
+        let _new_window = NewWindow::default();
     }
 
     #[test]

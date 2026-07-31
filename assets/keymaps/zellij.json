@@ -50,6 +50,8 @@
 
       // Mux session
       "alt-d": "mux::Detach",
+      // §3.3 second window on the same session (Plan 32); alt-n is NextTab
+      "ctrl-alt-n": "mux::NewWindow",
 
       // §12 复制模式 (Plan 31)
       "ctrl-shift-;": "terminal::EnterCopyMode"

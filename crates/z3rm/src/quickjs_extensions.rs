@@ -316,7 +316,9 @@ impl HostBridge for MuxHostBridge {
             }
             "mux.attach" => {
                 let id = required_string(args, 0, method)?;
-                self.run(self.domain.attach_with_window(&id))?;
+                // §3.3 Attaches with this domain's own window id (Plan 32); the
+                // extension host shares the connection of the window it runs in.
+                self.run(self.domain.attach(&id, mux::AttachMode::Shared))?;
                 Ok(serde_json::json!(true))
             }
             "mux.detach" => {

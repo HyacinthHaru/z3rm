@@ -33,6 +33,8 @@
 
       // Mux session
       "ctrl-shift-d": "mux::Detach",
+      // §3.3 second window on the same session (Plan 32); ctrl-shift-n is NextTab
+      "ctrl-alt-n": "mux::NewWindow",
       "ctrl-alt-k": "mux::KillSession",
       "ctrl-alt-q": "mux::KillServer",
 
