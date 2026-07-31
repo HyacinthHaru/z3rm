@@ -1326,7 +1326,7 @@ fn main() {
                         .try_global::<quickjs_extensions::GlobalHostController>()
                         .map(|host| host.0.clone());
                     if let Some(host) = host {
-                        host.update(cx, |host, _| host.add_status_bar(ext_status.downgrade()));
+                        host.update(cx, |host, cx| host.add_status_bar(ext_status.downgrade(), cx));
                     }
                     workspace.status_bar().update(cx, |sb, cx| {
                         sb.add_right_item(ext_status, window, cx);
