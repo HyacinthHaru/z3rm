@@ -22,6 +22,7 @@
 
       // Mux session
       "ctrl-shift-d": "mux::Detach",
+      "ctrl-alt-a": "mux::Attach",
       // §15.7 native kill without extension host (avoid ctrl-shift-k: ResizeUp)
       "ctrl-alt-k": "mux::KillSession",
       "ctrl-alt-q": "mux::KillServer",

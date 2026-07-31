@@ -7,6 +7,10 @@
     "context": "Terminal",
     "bindings": {
       "ctrl-w": ["mux::EnterPrefixMode", { "timeout_ms": 500 }],
+      // Native lifecycle controls remain available even if prefix/QuickJS fails.
+      "ctrl-alt-a": "mux::Attach",
+      "ctrl-alt-k": "mux::KillSession",
+      "ctrl-alt-q": "mux::KillServer",
 
       // §12 复制模式 (Plan 31)
       "ctrl-shift-;": "terminal::EnterCopyMode"

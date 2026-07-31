@@ -130,6 +130,50 @@ fn focus_adjacent_mux_pane(
     focus_mux_workspace_pane(panes[index].clone(), window, cx);
 }
 
+fn apply_mux_layout_to_workspace(
+    workspace: &mut workspace::Workspace,
+    layout: &workspace::layout_projection::LayoutTree,
+    focused_pane_id: Option<&str>,
+    domain: Arc<mux::MuxDomain>,
+    window: &mut Window,
+    cx: &mut Context<workspace::Workspace>,
+) {
+    let mut existing: std::collections::HashMap<String, Entity<workspace::Pane>> =
+        std::collections::HashMap::default();
+    for pane in workspace.panes() {
+        for item in pane.read(cx).items() {
+            if let Ok(view) = item
+                .to_any_view()
+                .downcast::<terminal_view::mux_pane::MuxPaneView>()
+            {
+                let pane_id = view.read(cx).pane_id.clone();
+                existing.entry(pane_id).or_insert_with(|| pane.clone());
+            }
+        }
+    }
+    workspace.apply_layout_snapshot(
+        layout,
+        focused_pane_id,
+        existing,
+        |workspace, window, cx| workspace.add_pane_for_layout(window, cx),
+        |workspace, pane, pane_id, window, cx| {
+            let item: Box<dyn workspace::ItemHandle> = Box::new(cx.new(|cx| {
+                terminal_view::mux_pane::MuxPaneView::new(
+                    pane_id,
+                    domain.clone(),
+                    workspace.weak_handle(),
+                    workspace.project().downgrade(),
+                    window,
+                    cx,
+                )
+            }));
+            workspace.add_item(pane.clone(), item, None, true, true, window, cx);
+        },
+        window,
+        cx,
+    );
+}
+
 /// §16.9 Forward a layout ratio resize to the server.
 fn forward_layout_resize(
     cx: &mut gpui::App,
@@ -1032,6 +1076,54 @@ fn main() {
                                 anyhow::Ok(())
                             }).detach();
                         })
+                        .register_action(|workspace, _: &settings::mux_actions::Attach, window, cx| {
+                            let Some(state) = workspace::AppState::try_global(cx) else { return };
+                            let Some(domain) = state.mux_domain.clone() else { return };
+                            let weak_workspace = workspace.weak_handle();
+                            window.spawn(cx, async move |cx| {
+                                let result: anyhow::Result<()> = async {
+                                let session_id = if let Some(session_id) = domain.last_attached_session_id() {
+                                    session_id
+                                } else {
+                                    domain
+                                        .list_sessions()
+                                        .await?
+                                        .first()
+                                        .map(|session| session.id.clone())
+                                        .ok_or_else(|| anyhow::anyhow!("no mux session is available"))?
+                                };
+                                let response = domain.attach(&session_id, mux::AttachMode::Shared).await?;
+                                let snapshot = response.snapshot
+                                    .ok_or_else(|| anyhow::anyhow!("attach response contained no session snapshot"))?;
+                                let proto_layout = snapshot.layout
+                                    .ok_or_else(|| anyhow::anyhow!("attached session contained no layout"))?;
+                                let layout = workspace::layout_projection::LayoutTree::from_proto(&proto_layout);
+                                let focused_pane = (!snapshot.focused_pane_id.is_empty())
+                                    .then_some(snapshot.focused_pane_id);
+                                let domain_for_layout = domain.clone();
+                                weak_workspace.update_in(cx, |workspace, window, cx| {
+                                    apply_mux_layout_to_workspace(
+                                        workspace,
+                                        &layout,
+                                        focused_pane.as_deref(),
+                                        domain_for_layout,
+                                        window,
+                                        cx,
+                                    );
+                                })?;
+                                anyhow::Ok(())
+                                }
+                                .await;
+                                if let Err(error) = result {
+                                    tracing::error!(%error, "mux::Attach failed");
+                                    cx.update(|_, cx| daemon::show_daemon_error(
+                                        cx,
+                                        format!("Failed to attach mux session: {error}"),
+                                    ))?;
+                                }
+                                anyhow::Ok(())
+                            }).detach();
+                        })
                         .register_action(|_workspace, _: &settings::mux_actions::Detach, _window, cx| {
                             let Some(state) = workspace::AppState::try_global(cx) else { return };
                             let Some(domain) = state.mux_domain.clone() else { return };
@@ -1420,36 +1512,11 @@ fn main() {
                             return;
                         };
                         workspace.update(cx, |workspace, cx| {
-                            let mut existing: std::collections::HashMap<String, Entity<workspace::Pane>> =
-                                std::collections::HashMap::default();
-                            for pane in workspace.panes() {
-                                for item in pane.read(cx).items() {
-                                    if let Ok(view) =
-                                        item.to_any_view().downcast::<terminal_view::mux_pane::MuxPaneView>()
-                                    {
-                                        let pane_id = view.read(cx).pane_id.clone();
-                                        existing.entry(pane_id).or_insert_with(|| pane.clone());
-                                    }
-                                }
-                            }
-                            workspace.apply_layout_snapshot(
+                            apply_mux_layout_to_workspace(
+                                workspace,
                                 &layout,
                                 None,
-                                existing,
-                                |workspace, window, cx| workspace.add_pane_for_layout(window, cx),
-                                |workspace, pane, pane_id, window, cx| {
-                                    let item: Box<dyn workspace::ItemHandle> = Box::new(cx.new(|cx| {
-                                        terminal_view::mux_pane::MuxPaneView::new(
-                                            pane_id,
-                                            domain_for_notify.clone(),
-                                            workspace.weak_handle(),
-                                            workspace.project().downgrade(),
-                                            window,
-                                            cx,
-                                        )
-                                    }));
-                                    workspace.add_item(pane.clone(), item, None, true, true, window, cx);
-                                },
+                                domain_for_notify.clone(),
                                 window,
                                 cx,
                             );

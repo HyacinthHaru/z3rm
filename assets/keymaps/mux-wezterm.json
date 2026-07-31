@@ -5,6 +5,10 @@
   {
     "context": "Terminal",
     "bindings": {
+      // Native lifecycle controls remain available even if QuickJS fails.
+      "ctrl-alt-a": "mux::Attach",
+      "ctrl-alt-k": "mux::KillSession",
+      "ctrl-alt-q": "mux::KillServer",
       // Tab management
       "alt-shift-t": "mux_pane::NewTab",
       "alt-shift-q": "mux_pane::CloseTab",
@@ -48,7 +52,7 @@
       "alt-shift-down": "mux_pane::ResizeDown",
 
       // Mux session
-      "alt-shift-d": "mux::Detach",
+      "ctrl-shift-d": "mux::Detach",
 
       // §12 复制模式 (Plan 31)
       "ctrl-shift-;": "terminal::EnterCopyMode"

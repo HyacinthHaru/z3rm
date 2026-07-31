@@ -11,6 +11,11 @@ use serde::Deserialize;
 // §16.7 mux 命名空间动作 (Mux session operations)
 // ============================================================================
 
+/// §15.7 Attach to the active mux session and reconcile its authoritative layout.
+#[derive(Clone, Debug, Default, Deserialize, JsonSchema, PartialEq, Action)]
+#[action(namespace = mux)]
+pub struct Attach;
+
 /// §16.7 断开当前 mux session 连接。
 #[derive(Clone, Debug, Default, Deserialize, JsonSchema, PartialEq, Action)]
 #[action(namespace = mux)]
@@ -153,6 +158,7 @@ mod tests {
     fn test_mux_detach_action() {
         // Detach action 可以实例化
         let _action = Detach::default();
+        let _attach = Attach::default();
     }
 
     #[test]
