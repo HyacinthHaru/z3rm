@@ -3948,7 +3948,7 @@ mod tests {
         cx.update(|cx| {
             SettingsStore::update_global(cx, |store, cx| {
                 store.update_user_settings(cx, |settings| {
-                    settings.editor.search = Some(SearchSettingsContent {
+                    settings.editor.get_or_insert_default().search = Some(SearchSettingsContent {
                         button: Some(search_settings.button),
                         whole_word: Some(search_settings.whole_word),
                         case_sensitive: Some(search_settings.case_sensitive),
