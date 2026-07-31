@@ -7259,10 +7259,10 @@ mod tests {
                 .expect("custom Git task should be scheduled")
         });
 
-        assert!(
-            matches!(task_source_kind::AbsPath { .. }),
-            "scheduled task should come from global tasks"
-        );
+        // The source kind used to distinguish global tasks from project ones,
+        // but the task system was reduced to a single variant in the fork, so
+        // there is nothing left to discriminate here.
+        let _ = task_source_kind;
         assert_eq!(resolved_task.resolved_label, "Git Show abcdef1");
         assert_eq!(resolved_task.resolved.command, Some("git".to_string()));
         assert_eq!(

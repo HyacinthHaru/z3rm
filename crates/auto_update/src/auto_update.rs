@@ -1388,8 +1388,10 @@ mod tests {
                 Ok(Response::builder().status(404).body("".into()).unwrap())
                 }
             });
-            let client = Client::new(clock, fake_client_http, cx);
-            crate::init(client, cx);
+            // `init` now takes its HTTP client from the app rather than from a
+            // collab client, so the fake has to be installed first.
+            cx.set_http_client(fake_client_http);
+            crate::init(cx);
         });
 
         let auto_updater = cx.update(|cx| AutoUpdater::get(cx).expect("auto updater should exist"));
