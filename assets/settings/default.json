@@ -12,10 +12,28 @@
     }
   },
 
-  // === 扩展设置 (ExtensionSettingsContent - flattened) ===
+  // === 扩展设置 (ExtensionSettingsContent) ===
   "extension": {
     "directory": "~/.config/z3rm/extensions",
-    "auto_sync_to_remote": true
+    "auto_sync_to_remote": true,
+    "auto_install_extensions": {},
+    "auto_update_extensions": {},
+    "granted_capabilities": [
+      {
+        "kind": "process:exec",
+        "command": "*",
+        "args": ["**"]
+      },
+      {
+        "kind": "download_file",
+        "host": "*",
+        "path": ["**"]
+      },
+      {
+        "kind": "npm:install",
+        "package": "*"
+      }
+    ]
   },
 
   // === 工作区设置 (WorkspaceSettingsContent - flattened) ===
@@ -38,6 +56,33 @@
     "mouse_scroll_to_switch": true,
     "show_active_item": false,
     "show_close_button": "hover"
+  },
+
+  // === 单个 Tab 项设置 ===
+  "tabs": {
+    "git_status": true,
+    "close_position": "right",
+    "activate_on_close": "next",
+    "file_icons": true,
+    "show_diagnostics": "off",
+    "show_close_button": "hover"
+  },
+
+  // === 预览 Tab 设置 ===
+  "preview_tabs": {
+    "enabled": true,
+    "enable_preview_from_project_panel": true,
+    "enable_preview_from_file_finder": true,
+    "enable_preview_from_multibuffer": true,
+    "enable_preview_multibuffer_from_code_navigation": true,
+    "enable_preview_file_from_code_navigation": true,
+    "enable_keep_preview_on_code_navigation": false
+  },
+
+  // === Which-key 弹窗设置 ===
+  "which_key": {
+    "enabled": false,
+    "delay_ms": 1000
   },
 
   // === 标题栏设置 ===
