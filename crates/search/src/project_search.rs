@@ -4116,7 +4116,7 @@ pub mod tests {
                 .read(cx)
                 .project()
                 .read(cx)
-                .entry_for_path(&(worktree_id, rel_path("a")).into(), cx)
+                .entry_for_path(&(worktree_id, rel_path("a").into()).into(), cx)
                 .expect("no entry for /a/ directory")
                 .clone()
         });
@@ -4622,7 +4622,7 @@ pub mod tests {
         workspace
             .update_in(cx, |workspace, window, cx| {
                 workspace.open_path(
-                    (worktree_id, rel_path("one.rs")),
+                    (worktree_id, rel_path("one.rs").into()),
                     Some(first_pane.downgrade()),
                     true,
                     window,
@@ -4837,7 +4837,7 @@ pub mod tests {
         workspace
             .update_in(cx, |workspace, window, cx| {
                 workspace.open_path(
-                    (worktree_id, rel_path("one.rs")),
+                    (worktree_id, rel_path("one.rs").into()),
                     Some(first_pane.downgrade()),
                     true,
                     window,
@@ -5068,7 +5068,7 @@ pub mod tests {
 
         let editor = workspace
             .update_in(&mut cx, |workspace, window, cx| {
-                workspace.open_path((worktree_id, rel_path("one.rs")), None, true, window, cx)
+                workspace.open_path((worktree_id, rel_path("one.rs").into()), None, true, window, cx)
             })
             .await
             .unwrap()
@@ -5714,13 +5714,13 @@ pub mod tests {
 
         let buffer_a = project
             .update(cx, |project, cx| {
-                project.open_buffer((worktree_id, rel_path("a.md")), cx)
+                project.open_buffer((worktree_id, rel_path("a.md").into()).into(), cx)
             })
             .await
             .unwrap();
         let buffer_b = project
             .update(cx, |project, cx| {
-                project.open_buffer((worktree_id, rel_path("b.md")), cx)
+                project.open_buffer((worktree_id, rel_path("b.md").into()).into(), cx)
             })
             .await
             .unwrap();
