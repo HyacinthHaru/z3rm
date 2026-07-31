@@ -15,9 +15,8 @@ use language::CursorShape as EditorCursorShape;
 use settings::Settings;
 use std::time::Instant;
 use terminal::{
-    Cell, Color, Content, CursorShape, IndexedCell, kitty_graphics, Modes, NamedColor, Point,
-    Range, Terminal, TerminalBounds,
-    is_app_chosen_exact_color as terminal_is_app_chosen_exact_color,
+    Cell, Color, Content, CursorShape, IndexedCell, Modes, NamedColor, Point, Range, Terminal,
+    TerminalBounds, VisibleImage, is_app_chosen_exact_color as terminal_is_app_chosen_exact_color,
     is_default_background_color, terminal_settings::TerminalSettings,
 };
 use theme::{ActiveTheme, Theme};
@@ -48,9 +47,8 @@ pub struct LayoutState {
     block_below_cursor_element: Option<AnyElement>,
     base_text_style: TextStyle,
     content_mode: ContentMode,
-    /// Kitty Graphics / OSC 1337 图像叠加层
-    /// 每项: (起始行, 起始列, 宽(格), 高(格), 渲染图像)
-    images: Vec<(usize, usize, usize, usize, std::sync::Arc<gpui::RenderImage>)>,
+    /// kitty graphics / OSC 1337 图像叠加层, 已按 z-index 排好绘制顺序。
+    images: Vec<(VisibleImage, std::sync::Arc<gpui::RenderImage>)>,
 }
 
 /// Helper struct for converting terminal cursor points to displayed cursor points.
@@ -1364,13 +1362,7 @@ impl Element for TerminalElement {
                     block_below_cursor_element,
                     base_text_style: text_style,
                     content_mode,
-                    images: resolve_terminal_images(
-                        &self.terminal,
-                        &dimensions,
-                        display_offset,
-                        window,
-                        cx,
-                    ),
+                    images: resolve_terminal_images(&self.terminal, cx),
                 }
             },
         )
@@ -1482,18 +1474,18 @@ impl Element for TerminalElement {
                     }
                     let text_paint_time = text_paint_start.elapsed();
 
-                    // §11.2 渲染 Kitty Graphics / OSC 1337 图像
-                    for (row, col, w, h, render_image) in &layout.images {
+                    // §11.2 渲染 kitty graphics / OSC 1337 图像
+                    for (visible, render_image) in &layout.images {
                         let cell_width = layout.dimensions.cell_width;
                         let line_height = layout.dimensions.line_height;
                         let image_bounds = Bounds {
                             origin: point(
-                                origin.x + (*col as f32 * cell_width),
-                                origin.y + (*row as f32 * line_height),
+                                origin.x + (visible.column as f32 * cell_width),
+                                origin.y + (visible.row as f32 * line_height),
                             ),
                             size: size(
-                                *w as f32 * cell_width,
-                                *h as f32 * line_height,
+                                visible.columns as f32 * cell_width,
+                                visible.rows as f32 * line_height,
                             ),
                         };
                         window
@@ -1956,34 +1948,28 @@ pub fn convert_color(fg: &Color, theme: &Theme) -> Hsla {
     }
 }
 
-/// §11.2 将 Content 中的图像引用解析为 GPUI RenderImage
+/// §11.2 把 `Content` 里的图像引用换成缓存中已解码好的 `RenderImage`。
+///
+/// 可见性和视口行号在 `Terminal::sync` 里就算好了, 这里只做查表, 所以绘制
+/// 一帧不会触发任何图像解码。
 fn resolve_terminal_images(
     terminal: &Entity<Terminal>,
-    dimensions: &TerminalBounds,
-    display_offset: usize,
-    _window: &mut Window,
     cx: &mut App,
-) -> Vec<(usize, usize, usize, usize, std::sync::Arc<gpui::RenderImage>)> {
-    let content = terminal.read(cx).last_content.clone();
-    let cache = terminal.read(cx).image_cache();
+) -> Vec<(VisibleImage, std::sync::Arc<gpui::RenderImage>)> {
+    let terminal = terminal.read(cx);
+    let cache = terminal.image_cache();
 
-    content
+    let mut images: Vec<(VisibleImage, std::sync::Arc<gpui::RenderImage>)> = terminal
+        .last_content
         .images
-        .into_iter()
-        .filter_map(|(img_id, row, col, w, h)| {
-            // 检查图像是否在可见区域内
-            let visible_row_start = display_offset as i32;
-            let visible_row_end = visible_row_start + dimensions.num_lines() as i32;
-            if row as i32 + h as i32 <= visible_row_start || row as i32 >= visible_row_end {
-                return None;
-            }
-
-            // 从缓存中获取图像数据并解码
-            let parsed = cache.get(img_id)?;
-            let render_image = kitty_graphics::decode_to_render_image(&parsed.data)?;
-            Some((row, col, w, h, render_image))
+        .iter()
+        .filter_map(|visible| {
+            let cached = cache.get(visible.id)?;
+            Some((*visible, cached.image.render_image.clone()))
         })
-        .collect()
+        .collect();
+    images.sort_by_key(|(visible, _)| visible.z_index);
+    images
 }
 
 #[cfg(all(test, feature = "z3rm-migration"))]

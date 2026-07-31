@@ -7,7 +7,7 @@ use std::{borrow::Cow, io, ops::RangeInclusive, path::PathBuf, sync::Arc};
 mod hyperlinks;
 
 use alacritty_terminal::{
-    event::{Event as AlacTermEvent, EventListener, Notify, WindowSize},
+    event::{Event as AlacTermEvent, EventListener, Notify, OnResize, WindowSize},
     event_loop::{EventLoop, Msg, Notifier},
     grid::{Dimensions, Grid, GridIterator, Row, Scroll as AlacScroll},
     index::{Boundary, Column, Direction as AlacDirection, Line, Point as AlacPoint},
@@ -40,6 +40,7 @@ use crate::{
     PtyEvent, Range, RenderableCells, Scroll, Search, Selection, SelectionRange, SelectionSide,
     SelectionType, StructuredTerminalSnapshot, StructuredUnderlineStyle, TerminalBackendEvent,
     TerminalBounds, ViMotion,
+    kitty_graphics::GraphicsScanner,
     pty_info::ProcessIdGetter,
     terminal_settings::{AlternateScroll, CursorShape as SettingsCursorShape},
 };
@@ -198,12 +199,111 @@ pub(super) fn new_term(
     Arc::new(FairMutex::new(term))
 }
 
+/// Reader wrapper that scans PTY output for terminal graphics sequences on its
+/// way into the emulator.
+///
+/// vte's state machine discards APC strings outright and never forwards unknown
+/// OSC numbers to `Handler`, so neither the kitty graphics protocol nor iTerm2's
+/// OSC 1337 can be observed through alacritty's handler hooks. The bytes are
+/// passed through untouched — alacritty would drop those sequences anyway — so
+/// this only observes, it never rewrites the stream.
+pub(super) struct GraphicsTapReader<P: tty::EventedReadWrite> {
+    pty: P,
+    scanner: GraphicsScanner,
+    events_tx: UnboundedSender<PtyEvent>,
+}
+
+impl<P: tty::EventedReadWrite> io::Read for GraphicsTapReader<P> {
+    fn read(&mut self, buffer: &mut [u8]) -> io::Result<usize> {
+        let count = self.pty.reader().read(buffer)?;
+        if count > 0 {
+            let events = self.scanner.feed(&buffer[..count]);
+            if !events.is_empty() {
+                // A closed receiver means the terminal is being torn down; the
+                // event loop keeps draining the PTY either way.
+                self.events_tx
+                    .unbounded_send(PtyEvent::Graphics(events))
+                    .ok();
+            }
+        }
+        Ok(count)
+    }
+}
+
+/// PTY wrapper whose reader is a [`GraphicsTapReader`].
+///
+/// `EventedReadWrite::reader` hands out `&mut Self::Reader`, so the tapping
+/// reader has to own the inner PTY; `writer` reaches back through it.
+pub(super) struct GraphicsTapPty<P: tty::EventedReadWrite> {
+    reader: GraphicsTapReader<P>,
+}
+
+impl<P: tty::EventedReadWrite> GraphicsTapPty<P> {
+    fn new(pty: P, events_tx: UnboundedSender<PtyEvent>) -> Self {
+        Self {
+            reader: GraphicsTapReader {
+                pty,
+                scanner: GraphicsScanner::new(),
+                events_tx,
+            },
+        }
+    }
+}
+
+impl<P: tty::EventedReadWrite> tty::EventedReadWrite for GraphicsTapPty<P> {
+    type Reader = GraphicsTapReader<P>;
+    type Writer = P::Writer;
+
+    unsafe fn register(
+        &mut self,
+        poller: &Arc<polling::Poller>,
+        event: polling::Event,
+        mode: polling::PollMode,
+    ) -> io::Result<()> {
+        unsafe { self.reader.pty.register(poller, event, mode) }
+    }
+
+    fn reregister(
+        &mut self,
+        poller: &Arc<polling::Poller>,
+        event: polling::Event,
+        mode: polling::PollMode,
+    ) -> io::Result<()> {
+        self.reader.pty.reregister(poller, event, mode)
+    }
+
+    fn deregister(&mut self, poller: &Arc<polling::Poller>) -> io::Result<()> {
+        self.reader.pty.deregister(poller)
+    }
+
+    fn reader(&mut self) -> &mut Self::Reader {
+        &mut self.reader
+    }
+
+    fn writer(&mut self) -> &mut Self::Writer {
+        self.reader.pty.writer()
+    }
+}
+
+impl<P: tty::EventedPty> tty::EventedPty for GraphicsTapPty<P> {
+    fn next_child_event(&mut self) -> Option<tty::ChildEvent> {
+        self.reader.pty.next_child_event()
+    }
+}
+
+impl<P: tty::EventedReadWrite + OnResize> OnResize for GraphicsTapPty<P> {
+    fn on_resize(&mut self, window_size: WindowSize) {
+        self.reader.pty.on_resize(window_size)
+    }
+}
+
 pub(super) fn spawn_event_loop(
     term: Arc<AlacrittyTermLock>,
     events_tx: UnboundedSender<PtyEvent>,
     pty: AlacrittyPty,
     drain_on_exit: bool,
 ) -> Result<PtySender> {
+    let pty = GraphicsTapPty::new(pty, events_tx.clone());
     let event_loop = EventLoop::new(term, ZedListener(events_tx), pty, drain_on_exit, false)
         .context("failed to create event loop")?;
     let pty_tx = event_loop.channel();
@@ -981,7 +1081,48 @@ pub(super) fn shrink_to_used(term: &mut Term<ZedListener>) {
     term.grid_mut().truncate();
 }
 
-pub(super) fn make_content(term: &Term<ZedListener>, last_content: &Content) -> Content {
+/// 光标当前所在的滚动缓冲区绝对行号和列号。
+pub(super) fn cursor_anchor(term: &AlacrittyTerm) -> (i64, usize) {
+    let cursor = term.grid().cursor.point;
+    (
+        term.history_size() as i64 + cursor.line.0 as i64,
+        cursor.column.0,
+    )
+}
+
+/// 把绝对锚点投影到当前视口, 完全落在视口之外的放置会被丢弃。
+fn visible_images(
+    term: &Term<ZedListener>,
+    display_offset: usize,
+    placements: &[crate::ImagePlacement],
+) -> Vec<crate::VisibleImage> {
+    let viewport_top = term.history_size() as i64 - display_offset as i64;
+    let screen_lines = term.screen_lines() as i64;
+
+    placements
+        .iter()
+        .filter_map(|placement| {
+            let row = placement.anchor_line - viewport_top;
+            if row + placement.rows as i64 <= 0 || row >= screen_lines {
+                return None;
+            }
+            Some(crate::VisibleImage {
+                id: placement.id,
+                row: row as i32,
+                column: placement.column,
+                columns: placement.columns,
+                rows: placement.rows,
+                z_index: placement.z_index,
+            })
+        })
+        .collect()
+}
+
+pub(super) fn make_content(
+    term: &Term<ZedListener>,
+    last_content: &Content,
+    image_placements: &[crate::ImagePlacement],
+) -> Content {
     let content = term.renderable_content();
 
     let estimated_size = content.display_iter.size_hint().0;
@@ -1021,7 +1162,7 @@ pub(super) fn make_content(term: &Term<ZedListener>, last_content: &Content) -> 
         scrolled_to_top: content.display_offset == term.history_size(),
         scrolled_to_bottom: content.display_offset == 0,
         bottom_row_occupied,
-        images: last_content.images.clone(),
+        images: visible_images(term, content.display_offset, image_placements),
     }
 }
 
