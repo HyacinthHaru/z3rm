@@ -241,6 +241,20 @@ impl ShadowSnapshotEngine {
             records_since_gc: AtomicU64::new(0),
         })
     }
+    /// Open the engine with the user's `shadow_snapshot` settings applied
+    /// (§4.9 quota scope + size). `quota_bytes = 0` means unlimited, in which
+    /// case no `QuotaManager` is installed and GC never runs.
+    pub fn open_with_config(
+        db_path: &Path,
+        wal_path: &Path,
+        blob_dir: &Path,
+        config: &crate::config::SnapshotConfig,
+    ) -> Result<Self> {
+        let mut engine = Self::open(db_path, wal_path, blob_dir)?;
+        engine.quota = config.quota_manager();
+        Ok(engine)
+    }
+
     /// §4.9 Install a quota manager (FIFO age-based GC). Optional: when absent,
     /// blob growth is unbounded (still bounded per-path by `D_MAX`, but every
     /// full historical version is retained forever). Returns `&mut self` for
@@ -249,6 +263,37 @@ impl ShadowSnapshotEngine {
     pub fn with_quota(mut self, quota: crate::quota::QuotaManager) -> Self {
         self.quota = Some(quota);
         self
+    }
+
+    /// The installed quota manager, if any. Callers use it to inspect GC
+    /// candidates (`gc_eligible_count`) or tune the orphan grace period.
+    pub fn quota(&self) -> Option<&crate::quota::QuotaManager> {
+        self.quota.as_ref()
+    }
+
+    /// §4.9 Git commit hook: mark every delta version recorded before this
+    /// moment as gc-eligible, and return how many were marked.
+    ///
+    /// The boundary is the engine's monotonic SeqNo — never the commit
+    /// timestamp — so an NTP rollback or a rewritten committer date cannot
+    /// change which versions are considered "pre-commit". Without a quota
+    /// manager there is no GC at all, so marking is a no-op.
+    pub fn on_git_commit(&self) -> usize {
+        let Some(quota) = self.quota.as_ref() else {
+            return 0;
+        };
+        let commit_seq = self.seq_no.load(Ordering::Acquire) as SeqNo;
+        quota.on_git_commit(&self.tree, commit_seq)
+    }
+
+    /// Run a GC pass now, bypassing the write-count throttle. Returns the
+    /// number of bytes reclaimed (0 when no quota is installed).
+    pub fn run_gc(&self) -> Result<u64> {
+        let Some(quota) = self.quota.as_ref() else {
+            return Ok(0);
+        };
+        self.records_since_gc.store(0, Ordering::Release);
+        quota.run_gc(&self.tree, &self.blob_store, &self.storage)
     }
 
     /// §4.9 throttled GC: trigger `run_gc` every `GC_INTERVAL` records so a burst
@@ -287,6 +332,29 @@ impl ShadowSnapshotEngine {
     /// in-memory or SQLite mutation (§4.5/§4.8), so a crash after the WAL commit
     /// but before the node row is written is recovered by `open`'s WAL replay.
     pub fn record_change(&self, path: &Path, new_content: &[u8]) -> Result<VersionId> {
+        self.record_change_with_trigger(path, new_content, SnapshotTrigger::Write)
+    }
+
+    /// Record a file change carrying the trigger that produced it (§4.7).
+    ///
+    /// `SnapshotTrigger::Close` marks a version flushed because the file was
+    /// closed after writing, `Debounce` one flushed by the quiet-period timer.
+    /// Tombstones go through `record_delete`, restores through `decline`;
+    /// passing their triggers here would produce a node whose shape does not
+    /// match its trigger, so they are rejected.
+    pub fn record_change_with_trigger(
+        &self,
+        path: &Path,
+        new_content: &[u8],
+        trigger: SnapshotTrigger,
+    ) -> Result<VersionId> {
+        anyhow::ensure!(
+            matches!(
+                trigger,
+                SnapshotTrigger::Write | SnapshotTrigger::Close | SnapshotTrigger::Debounce
+            ),
+            "record_change_with_trigger: {trigger:?} is not a content-write trigger"
+        );
         let path_hash = compute_path_hash(path);
         let seq_no = self.seq_no.fetch_add(1, Ordering::AcqRel) as SeqNo;
         let timestamp_ns = SystemTime::now()
@@ -311,7 +379,7 @@ impl ShadowSnapshotEngine {
             // replay path rebuilds a delta node from delta_ref.
             content_ref: snapshot.full_content,
             delta_ref: snapshot.delta_ref.clone(),
-            trigger: SnapshotTrigger::Write,
+            trigger,
         };
         self.wal.append(&entry)?;
         // 单写线程路径直接 fsync 一次,保证 WAL 顺序先于任何持久状态变更。
@@ -326,7 +394,7 @@ impl ShadowSnapshotEngine {
             snapshot.full_content,
             snapshot.delta_ref.clone(),
             snapshot.depth,
-            SnapshotTrigger::Write,
+            trigger,
         );
 
         self.storage.write_node(
@@ -337,7 +405,7 @@ impl ShadowSnapshotEngine {
             snapshot.full_content.as_ref(),
             snapshot.delta_ref.as_ref().map(|d| &d.hash),
             snapshot.depth,
-            SnapshotTrigger::Write,
+            trigger,
             timestamp_ns,
         )?;
 
@@ -833,6 +901,196 @@ mod tests {
             .read_node_content(&head_node)
             .expect("HEAD content reconstructable after GC");
         assert_eq!(restored, b"version 127 data");
+    }
+
+    /// Write `count` unique-content versions of one file and return the engine.
+    fn engine_with_history(
+        directory: &TempDir,
+        name: &str,
+        config: &crate::config::SnapshotConfig,
+        count: u32,
+    ) -> (ShadowSnapshotEngine, std::path::PathBuf) {
+        let blobs = directory.path().join(format!("{name}-blobs"));
+        std::fs::create_dir_all(&blobs).expect("blob dir");
+        let engine = ShadowSnapshotEngine::open_with_config(
+            &directory.path().join(format!("{name}.db")),
+            &directory.path().join(format!("{name}.wal")),
+            &blobs,
+            config,
+        )
+        .expect("engine opens");
+        let target = directory.path().join(format!("{name}.txt"));
+        for index in 0..count {
+            // Unique, large-ish payloads so the quota is actually exceeded.
+            let payload = format!("version {index} {}", "x".repeat(256));
+            engine
+                .record_change(&target, payload.as_bytes())
+                .expect("record change");
+        }
+        (engine, target)
+    }
+
+    /// §4.9 `per_project_quota_mb` must really bound storage: a tiny quota
+    /// evicts old versions, "unlimited" (0) keeps every one of them. Without
+    /// the settings wiring both configurations behaved identically.
+    #[test]
+    fn configured_quota_changes_retained_history() {
+        let directory = TempDir::new().unwrap();
+
+        let unlimited = crate::config::SnapshotConfig {
+            quota_bytes: 0,
+            ..crate::config::SnapshotConfig::default()
+        };
+        let (unlimited_engine, unlimited_path) =
+            engine_with_history(&directory, "unlimited", &unlimited, 128);
+        assert!(unlimited_engine.quota().is_none(), "0 MB means no GC");
+        let unlimited_versions = unlimited_engine.list_versions(&unlimited_path).unwrap().len();
+        assert_eq!(unlimited_versions, 128, "unlimited quota retains everything");
+
+        // Blobs are zstd-compressed, so a byte-exact threshold is not
+        // predictable from the payload size; the smallest possible quota makes
+        // the assertion independent of the compression ratio: everything except
+        // what HEAD needs to stay reconstructable has to go.
+        let tiny = crate::config::SnapshotConfig {
+            quota_bytes: 1,
+            ..crate::config::SnapshotConfig::default()
+        };
+        let (tiny_engine, tiny_path) = engine_with_history(&directory, "tiny", &tiny, 128);
+        assert!(tiny_engine.quota().is_some(), "a non-zero quota installs GC");
+        let tiny_versions = tiny_engine.list_versions(&tiny_path).unwrap().len();
+        assert!(
+            tiny_versions < unlimited_versions,
+            "a 1 byte quota must evict history: kept {tiny_versions} of {unlimited_versions}"
+        );
+        assert!(
+            tiny_versions <= usize::from(D_MAX) + 1,
+            "only HEAD's reconstruction chain may survive, kept {tiny_versions}"
+        );
+
+        // Whatever GC dropped, the current content must still be readable.
+        let head_id = tiny_engine
+            .tree
+            .get_head(&compute_path_hash(&tiny_path))
+            .expect("HEAD survives GC");
+        let head_node = tiny_engine.tree.get_node(head_id).expect("head node");
+        assert_eq!(
+            tiny_engine.read_node_content(&head_node).unwrap(),
+            format!("version 127 {}", "x".repeat(256)).as_bytes(),
+        );
+    }
+
+    /// §4.9 git commit hook: a commit must move the pre-commit delta versions
+    /// into the GC candidate set, and versions recorded after the commit must
+    /// stay out of it.
+    #[test]
+    fn git_commit_marks_pre_commit_versions_gc_eligible() {
+        let directory = TempDir::new().unwrap();
+        let config = crate::config::SnapshotConfig::default();
+        let (engine, path) = engine_with_history(&directory, "commit", &config, 6);
+        let before_commit = engine.list_versions(&path).unwrap();
+
+        // 模拟一次 git commit：真实路径上这是 GitCommitTracker 检测到 HEAD
+        // 变化后由 recorder 线程调用的同一个入口。
+        let marked = engine.on_git_commit();
+
+        let quota = engine.quota().expect("default config installs a quota");
+        assert!(marked > 0, "a commit must mark pre-commit deltas");
+        let delta_versions: Vec<_> = before_commit
+            .iter()
+            .filter(|(version_id, _, _)| {
+                engine
+                    .get_version_node(*version_id)
+                    .is_some_and(|node| node.delta.is_some())
+            })
+            .map(|(version_id, _, _)| *version_id)
+            .collect();
+        assert_eq!(marked, delta_versions.len());
+        for version_id in &delta_versions {
+            assert!(
+                quota.is_gc_eligible(*version_id),
+                "pre-commit delta {version_id} must be gc-eligible"
+            );
+        }
+
+        // A version written after the commit belongs to the next commit's
+        // working set and must not be reclaimable yet.
+        let after_commit = engine.record_change(&path, b"after the commit").unwrap();
+        assert!(!quota.is_gc_eligible(after_commit));
+        assert_eq!(quota.gc_eligible_count(), delta_versions.len());
+    }
+
+    /// Without a quota there is no GC, so the git hook has nothing to mark —
+    /// it must be a no-op rather than a panic or a phantom count.
+    #[test]
+    fn git_commit_without_quota_marks_nothing() {
+        let directory = TempDir::new().unwrap();
+        let config = crate::config::SnapshotConfig {
+            quota_bytes: 0,
+            ..crate::config::SnapshotConfig::default()
+        };
+        let (engine, _path) = engine_with_history(&directory, "no-quota", &config, 4);
+
+        assert_eq!(engine.on_git_commit(), 0);
+        assert_eq!(engine.run_gc().unwrap(), 0);
+    }
+
+    /// §4.9 GC prioritises gc-eligible nodes: after a commit marks the old
+    /// deltas, a forced GC pass reclaims those before untouched history of the
+    /// same age, and clears them from the candidate set once really deleted.
+    #[test]
+    fn forced_gc_reclaims_marked_versions_first() {
+        let directory = TempDir::new().unwrap();
+        let config = crate::config::SnapshotConfig {
+            quota_bytes: 1,
+            ..crate::config::SnapshotConfig::default()
+        };
+        let (engine, path) = engine_with_history(&directory, "priority", &config, 40);
+        let quota = engine.quota().expect("quota installed");
+        let marked = engine.on_git_commit();
+        assert!(marked > 0);
+        let candidates_before = quota.gc_eligible_count();
+
+        let freed = engine.run_gc().expect("gc runs");
+
+        assert!(freed > 0, "an over-quota engine must reclaim bytes");
+        assert!(
+            quota.gc_eligible_count() < candidates_before,
+            "deleted candidates must leave the candidate set"
+        );
+        // The file is still readable at HEAD after the pass.
+        let head_id = engine
+            .tree
+            .get_head(&compute_path_hash(&path))
+            .expect("HEAD survives GC");
+        let head_node = engine.tree.get_node(head_id).expect("head node");
+        assert!(engine.read_node_content(&head_node).is_ok());
+    }
+
+    /// §4.7 a Close event is recorded with `trigger=Close`, so history shows
+    /// the version was flushed by a file close rather than a debounce timer.
+    #[test]
+    fn close_trigger_is_recorded_on_the_version_node() {
+        let directory = TempDir::new().unwrap();
+        let blobs = directory.path().join("close-blobs");
+        std::fs::create_dir_all(&blobs).unwrap();
+        let engine = ShadowSnapshotEngine::open(
+            &directory.path().join("close.db"),
+            &directory.path().join("close.wal"),
+            &blobs,
+        )
+        .unwrap();
+        let path = directory.path().join("closed.txt");
+
+        engine
+            .record_change_with_trigger(&path, b"saved", SnapshotTrigger::Close)
+            .unwrap();
+
+        let versions = engine.list_versions(&path).unwrap();
+        assert_eq!(versions.last().expect("a version").2, SnapshotTrigger::Close);
+
+        let rejected =
+            engine.record_change_with_trigger(&path, b"nope", SnapshotTrigger::Delete);
+        assert!(rejected.is_err(), "tombstones must go through record_delete");
     }
 
     /// §4.4 a file deletion must be versioned as a node with
