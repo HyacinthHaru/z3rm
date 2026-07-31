@@ -262,17 +262,10 @@ fn bind_configured_mux_keymap_profile(cx: &mut App) {
                         {
                             return None;
                         }
-                        let keystrokes: Vec<String> =
-                            binding.keystrokes().iter().map(|k| k.to_string()).collect();
-                        if keystrokes.is_empty() {
+                        if binding.keystrokes().is_empty() {
                             return None;
                         }
-                        let action_name = binding.action().name().to_string();
-                        Some(gpui::KeyBinding::new(
-                            &keystrokes.join(" "),
-                            gpui::Unbind(action_name.into()),
-                            None,
-                        ))
+                        Some(binding.unbind())
                     })
                     .collect();
                 if !unbinds.is_empty() {
