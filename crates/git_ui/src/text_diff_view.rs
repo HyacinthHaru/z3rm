@@ -692,13 +692,13 @@ mod tests {
 
         let buffer_a = project
             .update(cx, |project, cx| {
-                project.open_local_buffer(path!("/project/a.txt"), cx)
+                project.open_local_buffer(path!("/project/a.txt").as_ref(), cx)
             })
             .await
             .unwrap();
         let buffer_b = project
             .update(cx, |project, cx| {
-                project.open_local_buffer(path!("/project/b.txt"), cx)
+                project.open_local_buffer(path!("/project/b.txt").as_ref(), cx)
             })
             .await
             .unwrap();
@@ -781,13 +781,13 @@ mod tests {
 
         let buffer_a = project
             .update(cx, |project, cx| {
-                project.open_local_buffer(path!("/project/a.txt"), cx)
+                project.open_local_buffer(path!("/project/a.txt").as_ref(), cx)
             })
             .await
             .unwrap();
         let buffer_b = project
             .update(cx, |project, cx| {
-                project.open_local_buffer(path!("/project/b.txt"), cx)
+                project.open_local_buffer(path!("/project/b.txt").as_ref(), cx)
             })
             .await
             .unwrap();
@@ -887,7 +887,7 @@ mod tests {
         let workspace = multi_workspace.read_with(cx, |mw, _| mw.workspace().clone());
 
         let buffer = project
-            .update(cx, |project, cx| project.open_local_buffer(file_path, cx))
+            .update(cx, |project, cx| project.open_local_buffer(file_path.as_ref(), cx))
             .await
             .unwrap();
 

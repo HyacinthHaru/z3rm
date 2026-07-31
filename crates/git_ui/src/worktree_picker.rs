@@ -1605,7 +1605,7 @@ mod tests {
     use settings::Settings as _;
     use settings::SettingsStore;
     use util::path;
-    use workspace::MultiWorkspace;
+    use workspace::{MultiWorkspace, ProjectGroupKey};
 
     fn init_test(cx: &mut TestAppContext) {
         cx.update(|cx| {
@@ -1651,7 +1651,7 @@ mod tests {
         cx.executor().run_until_parked();
 
         let repository = project.read_with(cx, |project, cx| {
-            project.repositories(cx).values().next().unwrap().clone()
+            project.repositories(cx).first().unwrap().clone()
         });
         let worktree_path = PathBuf::from(path!("/root/worktrees/dirty-wt"));
 
@@ -2039,7 +2039,7 @@ mod tests {
         cx.executor().run_until_parked();
 
         let repository = project.read_with(cx, |project, cx| {
-            project.repositories(cx).values().next().unwrap().clone()
+            project.repositories(cx).first().unwrap().clone()
         });
         let second_worktree_path = PathBuf::from(path!("/root/worktrees/second-wt"));
 
@@ -2138,7 +2138,7 @@ mod tests {
         cx.executor().run_until_parked();
 
         let repository = project.read_with(cx, |project, cx| {
-            project.repositories(cx).values().next().unwrap().clone()
+            project.repositories(cx).first().unwrap().clone()
         });
         let worktree_path = PathBuf::from(path!("/root/worktrees/open-wt"));
         cx.update(|cx| {
@@ -2159,9 +2159,8 @@ mod tests {
         let worktree_project = Project::test(fs.clone(), [worktree_path.as_path()], cx).await;
         cx.executor().run_until_parked();
 
-        let main_group_key = project.read_with(cx, |project, cx| project.project_group_key(cx));
-        let worktree_group_key =
-            worktree_project.read_with(cx, |project, cx| project.project_group_key(cx));
+        let main_group_key = cx.read(|cx| ProjectGroupKey::from_project(&project, cx));
+        let worktree_group_key = cx.read(|cx| ProjectGroupKey::from_project(&worktree_project, cx));
         assert_eq!(
             main_group_key, worktree_group_key,
             "the worktree workspace should belong to the same project group as the main repo"
