@@ -793,8 +793,15 @@ fn main() {
                                             tracing::debug!(error = %e, "window dropped during mux_pane::SplitRight handler");
                                         }
                                     }
-                                    Err(e) => tracing::error!(error = %e, "mux_pane::SplitRight failed"),
+                                    Err(error) => {
+                                        tracing::error!(pane_id, %error, "mux_pane::SplitRight failed");
+                                        cx.update(|_, cx| daemon::show_daemon_error(
+                                            cx,
+                                            format!("Failed to split mux pane {pane_id}: {error}"),
+                                        ))?;
+                                    }
                                 }
+                                anyhow::Ok(())
                             }).detach();
                         })
                         .register_action(|workspace, _: &settings::mux_actions::SplitDown, window, cx| {
@@ -820,8 +827,15 @@ fn main() {
                                             tracing::debug!(error = %e, "window dropped during mux_pane::SplitDown handler");
                                         }
                                     }
-                                    Err(e) => tracing::error!(error = %e, "mux_pane::SplitDown failed"),
+                                    Err(error) => {
+                                        tracing::error!(pane_id, %error, "mux_pane::SplitDown failed");
+                                        cx.update(|_, cx| daemon::show_daemon_error(
+                                            cx,
+                                            format!("Failed to split mux pane {pane_id}: {error}"),
+                                        ))?;
+                                    }
                                 }
+                                anyhow::Ok(())
                             }).detach();
                         })
                         .register_action(|workspace, _: &settings::mux_actions::FocusLeft, window, cx| {
