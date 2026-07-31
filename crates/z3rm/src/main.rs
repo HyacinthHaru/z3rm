@@ -1035,49 +1035,61 @@ fn main() {
                         .register_action(|_workspace, _: &settings::mux_actions::Detach, _window, cx| {
                             let Some(state) = workspace::AppState::try_global(cx) else { return };
                             let Some(domain) = state.mux_domain.clone() else { return };
-                            cx.background_executor().spawn(async move {
-                                if let Err(e) = domain.detach().await {
-                                    tracing::error!(error = %e, "mux::Detach failed");
+                            cx.spawn(async move |_, cx| {
+                                if let Err(error) = domain.detach().await {
+                                    tracing::error!(%error, "mux::Detach failed");
+                                    cx.update(|cx| daemon::show_daemon_error(
+                                        cx,
+                                        format!("Failed to detach from mux session: {error}"),
+                                    ));
                                 }
                             }).detach();
                         })
                         .register_action(|_workspace, _: &settings::mux_actions::KillSession, _window, cx| {
                             let Some(state) = workspace::AppState::try_global(cx) else { return };
                             let Some(domain) = state.mux_domain.clone() else { return };
-                            cx.background_executor().spawn(async move {
-                                // §15.7 Prefer the session this domain last attached to.
-                                // Fall back to list_sessions only if attach never recorded one.
-                                let session_id = domain
-                                    .last_attached_session_id()
-                                    .or_else(|| {
-                                        // Blocking list is not available here; spawn already async.
-                                        None
-                                    });
-                                let session_id = match session_id {
-                                    Some(id) => Some(id),
-                                    None => match domain.list_sessions().await {
-                                        Ok(sessions) => sessions.first().map(|s| s.id.clone()),
-                                        Err(e) => {
-                                            tracing::error!(error = %e, "KillSession: list_sessions failed");
+                            cx.spawn(async move |_, cx| {
+                                let session_id = if let Some(session_id) = domain.last_attached_session_id() {
+                                    Some(session_id)
+                                } else {
+                                    match domain.list_sessions().await {
+                                        Ok(sessions) => sessions.first().map(|session| session.id.clone()),
+                                        Err(error) => {
+                                            tracing::error!(%error, "mux::KillSession list_sessions failed");
+                                            cx.update(|cx| daemon::show_daemon_error(
+                                                cx,
+                                                format!("Failed to find the mux session to kill: {error}"),
+                                            ));
                                             None
                                         }
-                                    },
-                                };
-                                if let Some(session_id) = session_id {
-                                    if let Err(e) = domain.kill_session(&session_id).await {
-                                        tracing::error!(error = %e, "mux::KillSession failed");
                                     }
-                                } else {
-                                    tracing::warn!("KillSession: no attached or listed session");
+                                };
+                                let Some(session_id) = session_id else {
+                                    cx.update(|cx| daemon::show_daemon_error(
+                                        cx,
+                                        "No mux session is available to kill",
+                                    ));
+                                    return;
+                                };
+                                if let Err(error) = domain.kill_session(&session_id).await {
+                                    tracing::error!(session_id, %error, "mux::KillSession failed");
+                                    cx.update(|cx| daemon::show_daemon_error(
+                                        cx,
+                                        format!("Failed to kill mux session {session_id}: {error}"),
+                                    ));
                                 }
                             }).detach();
                         })
                         .register_action(|_workspace, _: &settings::mux_actions::KillServer, _window, cx| {
                             let Some(state) = workspace::AppState::try_global(cx) else { return };
                             let Some(domain) = state.mux_domain.clone() else { return };
-                            cx.background_executor().spawn(async move {
-                                if let Err(e) = domain.shutdown().await {
-                                    tracing::error!(error = %e, "mux::KillServer failed");
+                            cx.spawn(async move |_, cx| {
+                                if let Err(error) = domain.shutdown().await {
+                                    tracing::error!(%error, "mux::KillServer failed");
+                                    cx.update(|cx| daemon::show_daemon_error(
+                                        cx,
+                                        format!("Failed to stop mux server: {error}"),
+                                    ));
                                 }
                             }).detach();
                         })
