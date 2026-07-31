@@ -16,38 +16,74 @@ pub async fn capture_pane(
     scrollback_lines: Option<i32>,
     preserve_ansi: bool,
 ) -> Result<String> {
-    let mut scrollback_rows = Vec::new();
-    if let Some(n) = scrollback_lines.filter(|n| *n < 0) {
-        let count = n.unsigned_abs();
-        let scrollback = domain
-            .fetch_scrollback(pane_id, 0, 1, u32::MAX)
+    const MAX_CAPTURE_ATTEMPTS: usize = 3;
+    let requested_history = scrollback_lines
+        .filter(|lines| *lines < 0)
+        .map(i32::unsigned_abs);
+
+    for _ in 0..MAX_CAPTURE_ATTEMPTS {
+        let grid = domain
+            .fetch_grid_update(pane_id, 0)
             .await
-            .context("failed to fetch scrollback")?;
-        scrollback_rows.extend(latest_scrollback_rows(&scrollback.lines, count));
+            .context("failed to fetch grid update")?;
+        let Some(GridUpdateKind::FullSnapshot(snapshot)) = grid.update.as_ref() else {
+            anyhow::bail!("capture-pane expected a full grid snapshot");
+        };
+
+        let mut scrollback_rows = Vec::new();
+        if let Some(requested) = requested_history {
+            if let Some((from, count)) = scrollback_tail(snapshot.history_size, requested) {
+                let scrollback = domain
+                    .fetch_scrollback(pane_id, from, 1, count)
+                    .await
+                    .context("failed to fetch scrollback")?;
+                if !scrollback_matches_snapshot(
+                    &scrollback,
+                    snapshot.history_version,
+                    snapshot.history_size,
+                    snapshot.cols,
+                    from,
+                    count,
+                ) {
+                    continue;
+                }
+                scrollback_rows.extend(scrollback.lines.iter().map(|row| row.cells.clone()));
+            }
+        }
+
+        let scrollback_row_slices = scrollback_rows
+            .iter()
+            .map(Vec::as_slice)
+            .collect::<Vec<_>>();
+        return Ok(render_capture(
+            &scrollback_row_slices,
+            grid.update.as_ref(),
+            preserve_ansi,
+        ));
     }
 
-    let grid = domain
-        .fetch_grid_update(pane_id, 0)
-        .await
-        .context("failed to fetch grid update")?;
-
-    let scrollback_row_slices = scrollback_rows
-        .iter()
-        .map(Vec::as_slice)
-        .collect::<Vec<_>>();
-    Ok(render_capture(
-        &scrollback_row_slices,
-        grid.update.as_ref(),
-        preserve_ansi,
-    ))
+    anyhow::bail!("terminal history changed while capture-pane was reading it")
 }
 
-fn latest_scrollback_rows(
-    lines: &[mux_protocol::proto::RowChange],
+fn scrollback_tail(history_size: u32, requested: u32) -> Option<(u32, u32)> {
+    let count = requested.min(history_size);
+    (count != 0).then_some((history_size - count, count))
+}
+
+fn scrollback_matches_snapshot(
+    scrollback: &mux_protocol::proto::FetchScrollbackResponse,
+    history_version: u64,
+    history_size: u32,
+    columns: u32,
+    from: u32,
     count: u32,
-) -> impl Iterator<Item = Vec<Cell>> + '_ {
-    let start = lines.len().saturating_sub(count as usize);
-    lines[start..].iter().map(|row| row.cells.clone())
+) -> bool {
+    scrollback.scrollback_version == history_version
+        && scrollback.total_lines == history_size
+        && scrollback.lines.len() == count as usize
+        && scrollback.lines.iter().enumerate().all(|(index, row)| {
+            row.row == from + index as u32 && row.cells.len() == columns as usize
+        })
 }
 
 fn render_capture(
@@ -278,19 +314,36 @@ mod tests {
         assert_eq!(text, "h\nv\n");
     }
     #[test]
-    fn capture_selects_latest_requested_scrollback_rows() {
-        let lines = ["oldest", "middle", "newest"]
-            .into_iter()
-            .enumerate()
-            .map(|(row, text)| mux_protocol::proto::RowChange {
-                row: row as u32,
-                cells: vec![cell(text, 0, false)],
-            })
-            .collect::<Vec<_>>();
+    fn capture_requests_only_the_latest_scrollback_rows() {
+        assert_eq!(scrollback_tail(10_000, 2), Some((9_998, 2)));
+        assert_eq!(scrollback_tail(3, 10), Some((0, 3)));
+        assert_eq!(scrollback_tail(0, 10), None);
+        assert_eq!(scrollback_tail(10, 0), None);
+    }
 
-        let selected = latest_scrollback_rows(&lines, 2).collect::<Vec<_>>();
-        assert_eq!(selected.len(), 2);
-        assert_eq!(selected[0][0].char, "middle");
-        assert_eq!(selected[1][0].char, "newest");
+    #[test]
+    fn capture_rejects_mixed_or_malformed_scrollback_pages() {
+        let row = |index| mux_protocol::proto::RowChange {
+            row: index,
+            cells: vec![cell("x", 0, false), cell("y", 0, false)],
+        };
+        let valid = mux_protocol::proto::FetchScrollbackResponse {
+            lines: vec![row(8), row(9)],
+            total_lines: 10,
+            scrollback_version: 7,
+        };
+        assert!(scrollback_matches_snapshot(&valid, 7, 10, 2, 8, 2));
+
+        let mut changed = valid.clone();
+        changed.scrollback_version = 8;
+        assert!(!scrollback_matches_snapshot(&changed, 7, 10, 2, 8, 2));
+
+        let mut missing = valid.clone();
+        missing.lines[1].row = 10;
+        assert!(!scrollback_matches_snapshot(&missing, 7, 10, 2, 8, 2));
+
+        let mut narrow = valid;
+        narrow.lines[1].cells.pop();
+        assert!(!scrollback_matches_snapshot(&narrow, 7, 10, 2, 8, 2));
     }
 }
