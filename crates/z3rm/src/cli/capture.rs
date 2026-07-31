@@ -126,23 +126,43 @@ fn render_capture(
 
 fn render_cells(cells: &[Cell], preserve_ansi: bool) -> String {
     if !preserve_ansi {
-        return cells.iter().map(|c| c.char.as_str()).collect();
+        return cells.iter().map(cell_text).collect();
     }
 
     let mut output = String::new();
     let mut current: Option<SgrState> = None;
     for cell in cells {
+        if cell
+            .style
+            .as_ref()
+            .is_some_and(|style| style.wide_char_spacer)
+        {
+            continue;
+        }
         let next = SgrState::from_cell(cell);
         if current.as_ref() != Some(&next) {
             output.push_str(&next.to_sgr());
             current = Some(next);
         }
-        output.push_str(&cell.char);
+        output.push_str(&cell_text(cell));
     }
     if current.is_some() {
         output.push_str("\x1b[0m");
     }
     output
+}
+
+fn cell_text(cell: &Cell) -> String {
+    if cell
+        .style
+        .as_ref()
+        .is_some_and(|style| style.wide_char_spacer)
+    {
+        return String::new();
+    }
+    let mut text = cell.char.clone();
+    text.push_str(&cell.zerowidth);
+    text
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -298,6 +318,22 @@ mod tests {
             "one open SGR + one reset: {text:?}"
         );
         assert!(text.contains("ab"));
+    }
+
+    #[test]
+    fn capture_preserves_combining_marks_and_skips_wide_spacers() {
+        let mut combined = cell("e", 0, false);
+        combined.zerowidth = "\u{301}\u{323}".to_string();
+        let mut spacer = cell(" ", 0, false);
+        spacer.style.as_mut().expect("cell style").wide_char_spacer = true;
+
+        assert_eq!(
+            render_cells(&[combined.clone(), spacer.clone()], false),
+            "e\u{301}\u{323}"
+        );
+        let escaped = render_cells(&[combined, spacer], true);
+        assert!(escaped.contains("e\u{301}\u{323}"), "{escaped:?}");
+        assert!(!escaped.contains("e\u{301}\u{323} "), "{escaped:?}");
     }
     #[test]
     fn capture_with_scrollback_appends_visible_grid() {
