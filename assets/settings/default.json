@@ -5,6 +5,18 @@
   // === 项目设置 (ProjectSettingsContent - flattened) ===
   "excluded_paths": ["node_modules", ".git"],
   "scan_symlinks": "local_only",
+  // Files whose contents must never leave the machine.
+  "private_files": [
+    "**/.env*",
+    "**/*.pem",
+    "**/*.key",
+    "**/*.cert",
+    "**/*.crt",
+    "**/secrets.yml"
+  ],
+  "hidden_files": [],
+  "read_only_files": [],
+  "file_scan_inclusions": [".env*"],
 
   "all_languages": {
     "defaults": {
