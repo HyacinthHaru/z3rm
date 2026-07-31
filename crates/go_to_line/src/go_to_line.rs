@@ -359,6 +359,7 @@ mod tests {
     use multi_buffer::{MultiBuffer, PathKey};
     use project::{FakeFs, Project};
     use serde_json::json;
+    use settings::SettingsStore;
     use std::{num::NonZeroU32, sync::Arc, time::Duration};
     use util::{path, rel_path::rel_path};
     use workspace::{AppState, MultiWorkspace, Workspace};
@@ -400,13 +401,19 @@ mod tests {
         });
         let _buffer = project
             .update(cx, |project, cx| {
-                project.open_local_buffer(path!("/dir/a.rs"), cx)
+                project.open_local_buffer(path!("/dir/a.rs").as_ref(), cx)
             })
             .await
             .unwrap();
         let editor = workspace
             .update_in(cx, |workspace, window, cx| {
-                workspace.open_path((worktree_id, rel_path("a.rs")), None, true, window, cx)
+                workspace.open_path(
+                    (worktree_id, rel_path("a.rs").into()),
+                    None,
+                    true,
+                    window,
+                    cx,
+                )
             })
             .await
             .unwrap()
@@ -552,13 +559,19 @@ mod tests {
         });
         let _buffer = project
             .update(cx, |project, cx| {
-                project.open_local_buffer(path!("/dir/a.rs"), cx)
+                project.open_local_buffer(path!("/dir/a.rs").as_ref(), cx)
             })
             .await
             .unwrap();
         let editor = workspace
             .update_in(cx, |workspace, window, cx| {
-                workspace.open_path((worktree_id, rel_path("a.rs")), None, true, window, cx)
+                workspace.open_path(
+                    (worktree_id, rel_path("a.rs").into()),
+                    None,
+                    true,
+                    window,
+                    cx,
+                )
             })
             .await
             .unwrap()
@@ -638,13 +651,19 @@ mod tests {
         });
         let _buffer = project
             .update(cx, |project, cx| {
-                project.open_local_buffer(path!("/dir/a.rs"), cx)
+                project.open_local_buffer(path!("/dir/a.rs").as_ref(), cx)
             })
             .await
             .unwrap();
         let editor = workspace
             .update_in(cx, |workspace, window, cx| {
-                workspace.open_path((worktree_id, rel_path("a.rs")), None, true, window, cx)
+                workspace.open_path(
+                    (worktree_id, rel_path("a.rs").into()),
+                    None,
+                    true,
+                    window,
+                    cx,
+                )
             })
             .await
             .unwrap()
@@ -717,13 +736,19 @@ mod tests {
         });
         let _buffer = project
             .update(cx, |project, cx| {
-                project.open_local_buffer(path!("/dir/a.rs"), cx)
+                project.open_local_buffer(path!("/dir/a.rs").as_ref(), cx)
             })
             .await
             .unwrap();
         let editor = workspace
             .update_in(cx, |workspace, window, cx| {
-                workspace.open_path((worktree_id, rel_path("a.rs")), None, true, window, cx)
+                workspace.open_path(
+                    (worktree_id, rel_path("a.rs").into()),
+                    None,
+                    true,
+                    window,
+                    cx,
+                )
             })
             .await
             .unwrap()
@@ -885,6 +910,11 @@ mod tests {
 
     fn init_test(cx: &mut TestAppContext) -> Arc<AppState> {
         cx.update(|cx| {
+            // `AppState::test` no longer installs the settings store, so tests
+            // have to set it up before anything registers a setting.
+            let settings_store = SettingsStore::test(cx);
+            cx.set_global(settings_store);
+            theme_settings::init(theme::LoadThemes::JustBase, cx);
             let state = AppState::test(cx);
             crate::init(cx);
             editor::init(cx);
@@ -915,13 +945,19 @@ mod tests {
         });
         let _buffer = project
             .update(cx, |project, cx| {
-                project.open_local_buffer(path!("/dir/a.rs"), cx)
+                project.open_local_buffer(path!("/dir/a.rs").as_ref(), cx)
             })
             .await
             .unwrap();
         let editor = workspace
             .update_in(cx, |workspace, window, cx| {
-                workspace.open_path((worktree_id, rel_path("a.rs")), None, true, window, cx)
+                workspace.open_path(
+                    (worktree_id, rel_path("a.rs").into()),
+                    None,
+                    true,
+                    window,
+                    cx,
+                )
             })
             .await
             .unwrap()
@@ -973,13 +1009,19 @@ mod tests {
         });
         let _buffer = project
             .update(cx, |project, cx| {
-                project.open_local_buffer(path!("/dir/a.rs"), cx)
+                project.open_local_buffer(path!("/dir/a.rs").as_ref(), cx)
             })
             .await
             .unwrap();
         let editor = workspace
             .update_in(cx, |workspace, window, cx| {
-                workspace.open_path((worktree_id, rel_path("a.rs")), None, true, window, cx)
+                workspace.open_path(
+                    (worktree_id, rel_path("a.rs").into()),
+                    None,
+                    true,
+                    window,
+                    cx,
+                )
             })
             .await
             .unwrap()
@@ -1029,13 +1071,19 @@ mod tests {
         });
         let _buffer = project
             .update(cx, |project, cx| {
-                project.open_local_buffer(path!("/dir/a.rs"), cx)
+                project.open_local_buffer(path!("/dir/a.rs").as_ref(), cx)
             })
             .await
             .unwrap();
         let editor = workspace
             .update_in(cx, |workspace, window, cx| {
-                workspace.open_path((worktree_id, rel_path("a.rs")), None, true, window, cx)
+                workspace.open_path(
+                    (worktree_id, rel_path("a.rs").into()),
+                    None,
+                    true,
+                    window,
+                    cx,
+                )
             })
             .await
             .unwrap()
