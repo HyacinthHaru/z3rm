@@ -940,9 +940,15 @@ impl Pane {
     /// 之后调用; 闭包在 PTY EOF 或 alacritty Exit/ChildExit 时被触发,
     /// 负责 session 级清理 (从 layout / panes 移除) 以及 PaneRemoved fan-out。
     ///
-    /// 仅设置一次: 重复注册会覆盖前一个钩子, 避免多个连接给同一 pane 重复注册。
+    /// Hook installation races the read loop: a command can exit before the
+    /// connection layer has published the pane and installed its cleanup.
+    /// Re-check `alive` after storing the hook so that late installation
+    /// deterministically replays the one-shot cleanup.
     pub fn set_exit_hook(&self, hook: Arc<dyn Fn() + Send + Sync>) {
         *self.exit_hook.lock() = Some(hook);
+        if !self.is_alive() {
+            self.fire_exit_hook();
+        }
     }
 
     /// §3.4 触发并清空 PTY 退出钩子 (一次性)。
@@ -1488,6 +1494,33 @@ mod tests {
         assert_eq!(after_total, before_total);
         assert!(after_rows.iter().all(|row| row.cells[0].character == "X"));
         assert_ne!(after_version, before_version);
+    }
+
+    #[test]
+    fn exit_hook_installed_after_exit_fires_exactly_once() {
+        let pane = match Pane::spawn(
+            "late-exit-hook".to_string(),
+            std::env::temp_dir().to_string_lossy().to_string(),
+            20,
+            5,
+            Some(ShellCommand {
+                program: "/bin/cat".to_string(),
+                ..Default::default()
+            }),
+        ) {
+            Ok(pane) => pane,
+            Err(error) => panic!("spawn late-exit-hook pane: {error}"),
+        };
+        pane.set_alive(false);
+        let calls = Arc::new(AtomicU64::new(0));
+        let hook_calls = calls.clone();
+
+        pane.set_exit_hook(Arc::new(move || {
+            hook_calls.fetch_add(1, Ordering::SeqCst);
+        }));
+        pane.fire_exit_hook();
+
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
     }
 
     #[test]
