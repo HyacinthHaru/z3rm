@@ -1157,6 +1157,12 @@ impl BufferStore {
             BufferEvent::FileHandleChanged => {
                 self.buffer_changed_file(buffer, cx);
             }
+            // A clean buffer whose backing file changed on disk has to be pulled
+            // back in, otherwise the editor keeps showing stale contents.
+            BufferEvent::ReloadNeeded => {
+                self.reload_buffers(HashSet::from_iter([buffer]), true, cx)
+                    .detach_and_log_err(cx);
+            }
             BufferEvent::Reloaded => {
                 let Some((downstream_client, project_id)) = self.downstream_client.as_ref() else {
                     return;
