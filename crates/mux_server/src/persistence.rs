@@ -72,7 +72,8 @@ fn snapshot_sessions(
         .as_millis() as i64;
 
     // §3.6 UPSERT session: INSERT OR REPLACE
-    let upsert_sql = "INSERT OR REPLACE INTO sessions (id, name, cwd, layout_snapshot, last_snapshot_timestamp)
+    let upsert_sql =
+        "INSERT OR REPLACE INTO sessions (id, name, cwd, layout_snapshot, last_snapshot_timestamp)
                       VALUES (?, ?, ?, ?, ?)";
 
     for session in &*sessions_r {
@@ -101,6 +102,24 @@ fn snapshot_sessions(
     Ok(())
 }
 
+pub fn delete_session(conn: &Connection, session_id: &str) -> anyhow::Result<()> {
+    conn.exec("BEGIN IMMEDIATE")?()?;
+    let result = (|| {
+        conn.exec_bound::<&str>("DELETE FROM layout_nodes WHERE session_id = ?")?(session_id)?;
+        conn.exec_bound::<&str>("DELETE FROM sessions WHERE id = ?")?(session_id)?;
+        conn.exec("COMMIT")?()?;
+        anyhow::Ok(())
+    })();
+    if result.is_err()
+        && let Ok(mut rollback) = conn.exec("ROLLBACK")
+    {
+        if let Err(error) = rollback() {
+            tracing::error!(%error, "failed to roll back session deletion");
+        }
+    }
+    result
+}
+
 pub fn recover_sessions(conn: &Connection) -> anyhow::Result<Vec<crate::session::Session>> {
     let mut stmt = Statement::prepare(
         conn,
@@ -113,4 +132,41 @@ pub fn recover_sessions(conn: &Connection) -> anyhow::Result<Vec<crate::session:
         let cwd: String = stmt.column_text(2)?.to_owned();
         Ok(crate::session::Session::new(id, name, cwd))
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn deleted_session_is_not_recovered() {
+        let connection = Connection::open_memory(Some("deleted_session_is_not_recovered"));
+        init_tables(&connection).expect("initialize persistence tables");
+        let sessions = Arc::new(parking_lot::RwLock::new(vec![
+            crate::session::Session::new(
+                "keep".to_string(),
+                "keep".to_string(),
+                "/tmp".to_string(),
+            ),
+            crate::session::Session::new(
+                "kill".to_string(),
+                "kill".to_string(),
+                "/tmp".to_string(),
+            ),
+        ]));
+        let database = Arc::new(parking_lot::Mutex::new(connection));
+        snapshot_sessions(&sessions, &database).expect("snapshot sessions");
+
+        {
+            let connection = database.lock();
+            delete_session(&connection, "kill").expect("delete killed session");
+        }
+        let recovered = {
+            let connection = database.lock();
+            recover_sessions(&connection).expect("recover remaining sessions")
+        };
+
+        assert_eq!(recovered.len(), 1);
+        assert_eq!(recovered[0].id, "keep");
+    }
 }

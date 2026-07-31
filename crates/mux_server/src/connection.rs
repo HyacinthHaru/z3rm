@@ -306,7 +306,7 @@ async fn dispatch_envelope(
     envelope: &Envelope,
     sessions: &Arc<parking_lot::RwLock<Vec<crate::session::Session>>>,
     outbound_tx: &mpsc::UnboundedSender<Envelope>,
-    _db: &Arc<parking_lot::Mutex<Connection>>,
+    db: &Arc<parking_lot::Mutex<Connection>>,
     clipboard: &Arc<crate::clipboard::ServerClipboard>,
     server_settings: &Arc<crate::server_settings::ServerSettings>,
     client_role: &Arc<parking_lot::Mutex<Option<ClientRole>>>,
@@ -328,6 +328,7 @@ async fn dispatch_envelope(
                 req,
                 sessions,
                 outbound_tx,
+                db,
                 clipboard,
                 server_settings,
                 client_role,
@@ -354,6 +355,7 @@ async fn dispatch_request(
     req: &Request,
     sessions: &Arc<parking_lot::RwLock<Vec<crate::session::Session>>>,
     outbound_tx: &mpsc::UnboundedSender<Envelope>,
+    db: &Arc<parking_lot::Mutex<Connection>>,
     clipboard: &Arc<crate::clipboard::ServerClipboard>,
     server_settings: &Arc<crate::server_settings::ServerSettings>,
     client_role: &Arc<parking_lot::Mutex<Option<ClientRole>>>,
@@ -452,7 +454,7 @@ async fn dispatch_request(
         // §3.3 Admin-only 操作 (Plan 33)
         RequestBody::KillSession(r) => {
             if check_permission(role, ClientRole::Admin) {
-                handle_kill_session(r, sessions).await?
+                handle_kill_session(r, sessions, db).await?
             } else {
                 ResponseBody::Error("permission denied: admin required".to_string())
             }
@@ -713,28 +715,30 @@ async fn handle_list_sessions(
 async fn handle_kill_session(
     req: &KillSessionRequest,
     sessions: &Arc<parking_lot::RwLock<Vec<crate::session::Session>>>,
+    db: &Arc<parking_lot::Mutex<Connection>>,
 ) -> anyhow::Result<ResponseBody> {
-    if let Some(session) = take_session(sessions, &req.id) {
-        if let Some(watch) = session.snapshot_watch.as_ref() {
-            watch.stop();
-        }
-        zlog::info!("session killed: id={}", req.id);
-    } else {
-        zlog::warn!("kill session not found: id={}", req.id);
+    let session = {
+        // Match persist_loop's db -> sessions lock order. Holding the DB lock
+        // across both mutations prevents a periodic snapshot from reinserting
+        // the session between durable deletion and in-memory removal.
+        let conn = db.lock();
+        let mut sessions = sessions.write();
+        let Some(index) = sessions.iter().position(|session| session.id == req.id) else {
+            return Ok(ResponseBody::Error(format!(
+                "session not found: {}",
+                req.id
+            )));
+        };
+        crate::persistence::delete_session(&conn, &req.id)?;
+        sessions.remove(index)
+    };
+    if let Some(watch) = session.snapshot_watch.as_ref() {
+        watch.stop();
     }
+    zlog::info!("session killed: id={}", req.id);
     Ok(ResponseBody::Error(String::new()))
 }
 
-fn take_session(
-    sessions: &Arc<parking_lot::RwLock<Vec<crate::session::Session>>>,
-    session_id: &str,
-) -> Option<crate::session::Session> {
-    let mut sessions = sessions.write();
-    let index = sessions
-        .iter()
-        .position(|session| session.id == session_id)?;
-    Some(sessions.remove(index))
-}
 /// §3.10 连接会话 — 把客户端的 outbound_tx 注册为所有 pane 的 subscriber
 async fn handle_attach(
     req: &AttachRequest,
@@ -2221,27 +2225,10 @@ fn detect_binary(bytes: &[u8]) -> bool {
 mod connection_unit_tests {
     use super::*;
 
-    #[test]
-    fn take_session_returns_removed_session() {
-        let sessions = Arc::new(parking_lot::RwLock::new(vec![
-            crate::session::Session::new(
-                "session-1".to_string(),
-                "one".to_string(),
-                "/tmp".to_string(),
-            ),
-        ]));
-
-        let removed = take_session(&sessions, "session-1");
-
-        assert_eq!(
-            removed.as_ref().map(|session| session.id.as_str()),
-            Some("session-1")
-        );
-        assert!(sessions.read().is_empty());
-    }
 
     #[test]
     fn unregister_client_removes_every_session_subscription() {
+
         let mut sessions = vec![
             crate::session::Session::new(
                 "session-1".to_string(),
@@ -2276,6 +2263,29 @@ mod connection_unit_tests {
                 .iter()
                 .all(|session| session.lifecycle_subscribers.read().is_empty())
         );
+    }
+
+    #[tokio::test]
+    async fn kill_missing_session_returns_nonempty_error() {
+        let sessions = Arc::new(parking_lot::RwLock::new(Vec::new()));
+        let connection = Connection::open_memory(Some("kill_missing_session_returns_nonempty_error"));
+        crate::persistence::init_tables(&connection).expect("initialize persistence tables");
+        let database = Arc::new(parking_lot::Mutex::new(connection));
+
+        let response = handle_kill_session(
+            &KillSessionRequest {
+                id: "missing".to_string(),
+            },
+            &sessions,
+            &database,
+        )
+        .await
+        .expect("handle missing session kill");
+
+        match response {
+            ResponseBody::Error(error) => assert_eq!(error, "session not found: missing"),
+            response => panic!("expected error response, got {response:?}"),
+        }
     }
     #[tokio::test]
     async fn connection_cleanup_removes_registration_and_aborts_forwarders() {
