@@ -981,35 +981,55 @@ fn main() {
                             let weak_workspace = workspace.weak_handle();
                             let window_handle = window.window_handle();
                             window.spawn(cx, async move |cx| {
-                                // Resolve the active session, then spawn a pane in a fresh tab.
-                                let session_id = match domain.list_sessions().await {
-                                    Ok(sessions) => sessions.first().map(|s| s.id.clone()),
-                                    Err(e) => { tracing::error!(error = %e, "list_sessions failed"); None }
+                                let session_id = if let Some(session_id) = domain.last_attached_session_id() {
+                                    Some(session_id)
+                                } else {
+                                    match domain.list_sessions().await {
+                                        Ok(sessions) => sessions.first().map(|session| session.id.clone()),
+                                        Err(error) => {
+                                            tracing::error!(%error, "mux_pane::NewTab list_sessions failed");
+                                            cx.update(|_, cx| daemon::show_daemon_error(
+                                                cx,
+                                                format!("Failed to find a mux session for the new tab: {error}"),
+                                            ))?;
+                                            None
+                                        }
+                                    }
                                 };
-                                let Some(session_id) = session_id else { return };
+                                let Some(session_id) = session_id else {
+                                    cx.update(|_, cx| daemon::show_daemon_error(
+                                        cx,
+                                        "No mux session is available for the new tab",
+                                    ))?;
+                                    return anyhow::Ok(());
+                                };
                                 let size = mux_protocol::TerminalSize { cols: 80, rows: 24 };
-                                let tab_id = format!("tab-{}", std::time::SystemTime::now()
-                                    .duration_since(std::time::UNIX_EPOCH)
-                                    .map(|d| d.as_millis())
-                                    .unwrap_or(0));
+                                let tab_id = format!("tab-{}", nanoid::nanoid!());
                                 match domain.spawn_pane(&session_id, &tab_id, size, None, None).await {
                                     Ok(new_pane_id) => {
-                                        if let Err(e) = window_handle.update(cx, |_, window, cx| {
-                                            if let Err(e) = weak_workspace.update(cx, |workspace, cx| {
+                                        if let Err(error) = window_handle.update(cx, |_, window, cx| {
+                                            if let Err(error) = weak_workspace.update(cx, |workspace, cx| {
                                                 let pane = workspace.active_pane().clone();
                                                 let item: Box<dyn workspace::ItemHandle> = Box::new(cx.new(|cx| {
                                                     terminal_view::mux_pane::MuxPaneView::new(new_pane_id, domain, workspace.weak_handle(), workspace.project().downgrade(), window, cx)
                                                 }));
                                                 workspace.add_item(pane, item, None, true, true, window, cx);
                                             }) {
-                                                tracing::debug!(error = %e, "workspace dropped during mux_pane::NewTab handler");
+                                                tracing::debug!(%error, "workspace dropped during mux_pane::NewTab handler");
                                             }
                                         }) {
-                                            tracing::debug!(error = %e, "window dropped during mux_pane::NewTab handler");
+                                            tracing::debug!(%error, "window dropped during mux_pane::NewTab handler");
                                         }
                                     }
-                                    Err(e) => tracing::error!(error = %e, "mux_pane::NewTab: spawn_pane failed"),
+                                    Err(error) => {
+                                        tracing::error!(session_id, %error, "mux_pane::NewTab spawn failed");
+                                        cx.update(|_, cx| daemon::show_daemon_error(
+                                            cx,
+                                            format!("Failed to create mux tab in session {session_id}: {error}"),
+                                        ))?;
+                                    }
                                 }
+                                anyhow::Ok(())
                             }).detach();
                         })
                         .register_action(|_workspace, _: &settings::mux_actions::Detach, _window, cx| {
