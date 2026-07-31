@@ -97,9 +97,9 @@ pub struct Milliseconds(pub u64);
 #[derive(Copy, Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum AutosaveSetting {
+    #[default]
     Never,
     AfterDelay { milliseconds: Milliseconds },
-    #[default]
     OnFocusChange,
     OnWindowChange,
     OnChange,
