@@ -835,18 +835,31 @@ impl Project {
         path: &std::path::Path,
         cx: &mut gpui::Context<Self>,
     ) -> Task<anyhow::Result<Entity<language::Buffer>>> {
-        let Some(project_path) = self
+        if let Some(project_path) = self
             .worktree_store
             .read(cx)
             .project_path_for_absolute_path(path, cx)
-        else {
-            return Task::ready(Err(anyhow::anyhow!(
-                "path is not in a project worktree: {}",
-                path.display()
-            )));
-        };
-        self.buffer_store
-            .update(cx, |store, cx| store.open_buffer(project_path, cx))
+        {
+            return self
+                .buffer_store
+                .update(cx, |store, cx| store.open_buffer(project_path, cx));
+        }
+
+        // A file outside every worktree gets an invisible worktree of its own,
+        // which is how a standalone file is reopened when its editor is restored.
+        let entry = self.worktree_store.update(cx, |worktree_store, cx| {
+            worktree_store.find_or_create_worktree(path, false, cx)
+        });
+        let buffer_store = self.buffer_store.clone();
+        cx.spawn(async move |_, cx| {
+            let (worktree, path) = entry.await?;
+            let worktree_id = worktree.read_with(cx, |worktree, _| worktree.id());
+            buffer_store
+                .update(cx, |store, cx| {
+                    store.open_buffer(ProjectPath { worktree_id, path }, cx)
+                })
+                .await
+        })
     }
 
     pub fn open_path(

@@ -1337,7 +1337,7 @@ fn should_merge<T: Ord + Copy>(a_start: T, a_end: T, b_start: T, b_end: T, sorte
     is_overlapping || same_start || cursor_at_boundary
 }
 
-#[cfg(all(test, feature = "z3rm-migration"))]
+#[cfg(test)]
 mod tests {
     use super::*;
     use crate::{

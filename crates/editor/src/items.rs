@@ -2089,9 +2089,9 @@ fn compute_modified_ranges(
     merged
 }
 
-#[cfg(all(test, feature = "z3rm-migration"))]
+#[cfg(test)]
 mod tests {
-    use crate::editor_tests::init_test;
+    use crate::test::init_test;
     use fs::Fs;
     use workspace::MultiWorkspace;
 
@@ -2617,7 +2617,7 @@ mod tests {
 
         let buffer = project
             .update(cx, |project, cx| {
-                project.open_local_buffer(path!("/root/file.rs"), cx)
+                project.open_local_buffer(Path::new(path!("/root/file.rs")), cx)
             })
             .await
             .unwrap();
@@ -2651,7 +2651,11 @@ mod tests {
 
         project
             .update(cx, |project, cx| {
-                project.rename_entry(entry_id, (worktree_id, rel_path("renamed.rs")).into(), cx)
+                project.rename_entry(
+                    entry_id,
+                    (worktree_id, rel_path("renamed.rs").into_arc()).into(),
+                    cx,
+                )
             })
             .await
             .unwrap();

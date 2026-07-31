@@ -344,15 +344,17 @@ fn compute_bracket_ranges(
     Vec::new()
 }
 
+// Frozen: most of these drive `EditorLspTestContext`, which cannot complete
+// while z3rm has no LSP startup path (see its doc comment).
 #[cfg(all(test, feature = "z3rm-migration"))]
 mod tests {
-    use std::{cmp, sync::Arc, time::Duration};
+    use std::{cmp, path::Path, sync::Arc, time::Duration};
 
     use super::*;
     use crate::{
         DisplayPoint, EditorMode, EditorSnapshot, MoveToBeginning, MoveToEnd, MoveUp,
         display_map::{DisplayRow, ToDisplayPoint},
-        editor_tests::init_test,
+        test::init_test,
         test::{
             editor_lsp_test_context::EditorLspTestContext, editor_test_context::EditorTestContext,
         },
@@ -1581,13 +1583,13 @@ mod foo «1{
 
         let buffer_1 = project
             .update(cx, |project, cx| {
-                project.open_local_buffer(path!("/a/lib.rs"), cx)
+                project.open_local_buffer(Path::new(path!("/a/lib.rs")), cx)
             })
             .await
             .unwrap();
         let buffer_2 = project
             .update(cx, |project, cx| {
-                project.open_local_buffer(path!("/a/main.rs"), cx)
+                project.open_local_buffer(Path::new(path!("/a/main.rs")), cx)
             })
             .await
             .unwrap();
@@ -1800,7 +1802,7 @@ mod foo «1{
 
         let buffer_1 = project
             .update(cx, |project, cx| {
-                project.open_local_buffer(path!("/a/lib.rs"), cx)
+                project.open_local_buffer(Path::new(path!("/a/lib.rs")), cx)
             })
             .await
             .unwrap();

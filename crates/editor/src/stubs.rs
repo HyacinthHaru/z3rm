@@ -620,7 +620,7 @@ pub enum InlayHintRefreshReason {
 #[derive(Clone, Debug)]
 pub struct InlaySplice {
     pub to_remove: Vec<InlayId>,
-    pub to_insert: Vec<(Anchor, InlayHint)>,
+    pub to_insert: Vec<Inlay>,
 }
 
 impl InlaySplice {
@@ -834,16 +834,16 @@ impl Inlay {
         &self.text
     }
 
-    pub fn mock_hint(_id: usize, anchor: multi_buffer::Anchor, hint_text: &str) -> Self {
-        Self { id: project::InlayId::Hint(0), position: anchor, text: text::Rope::from(hint_text), content: InlayContent::Label(gpui::SharedString::from(hint_text)) }
+    pub fn mock_hint(id: usize, anchor: multi_buffer::Anchor, hint_text: &str) -> Self {
+        Self { id: project::InlayId::Hint(id as u64), position: anchor, text: text::Rope::from(hint_text), content: InlayContent::Label(gpui::SharedString::from(hint_text)) }
     }
 
-    pub fn edit_prediction(_id: usize, anchor: multi_buffer::Anchor, pred_text: &str) -> Self {
-        Self { id: project::InlayId::Hint(0), position: anchor, text: text::Rope::from(pred_text), content: InlayContent::Label(gpui::SharedString::from(pred_text)) }
+    pub fn edit_prediction(id: usize, anchor: multi_buffer::Anchor, pred_text: &str) -> Self {
+        Self { id: project::InlayId::EditPrediction(id as u64), position: anchor, text: text::Rope::from(pred_text), content: InlayContent::Label(gpui::SharedString::from(pred_text)) }
     }
 
-    pub fn debugger(_id: usize, anchor: multi_buffer::Anchor, text: String) -> Self {
-        Self { id: project::InlayId::DebuggerValue(0), position: anchor, text: text::Rope::from(text.clone()), content: InlayContent::Label(gpui::SharedString::from(text)) }
+    pub fn debugger(id: usize, anchor: multi_buffer::Anchor, text: String) -> Self {
+        Self { id: project::InlayId::DebuggerValue(id as u64), position: anchor, text: text::Rope::from(text.clone()), content: InlayContent::Label(gpui::SharedString::from(text)) }
     }
 }
 
@@ -858,6 +858,7 @@ pub enum InlayContent {
 #[derive(Clone, Debug)]
 pub struct InlayHighlight {
     pub inlay: project::InlayId,
-    pub inlay_position: text::Anchor,
+    /// Anchors into the multibuffer, matching `Inlay::position`.
+    pub inlay_position: multi_buffer::Anchor,
     pub range: std::ops::Range<usize>,
 }
