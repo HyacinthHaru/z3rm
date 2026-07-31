@@ -636,6 +636,43 @@ impl MuxDomain {
         }
     }
 
+    /// §3.6 List validated persisted sessions awaiting explicit recovery.
+    pub async fn list_recovery_candidates(
+        &self,
+    ) -> Result<Vec<mux_protocol::RecoveryCandidateInfo>> {
+        let response = self
+            .send_request(RequestBody::ListRecoveryCandidates(
+                mux_protocol::ListRecoveryCandidatesRequest {},
+            ))
+            .await?;
+        match response.body {
+            Some(ResponseBody::RecoveryCandidates(list)) => Ok(list.candidates),
+            _ => Err(anyhow::anyhow!(
+                "unexpected response type for list_recovery_candidates"
+            )),
+        }
+    }
+
+    /// §3.6 Explicitly recreate a persisted session using fresh default shells.
+    pub async fn confirm_recovery(
+        &self,
+        session_id: &str,
+    ) -> Result<mux_protocol::ConfirmRecoveryResponse> {
+        let response = self
+            .send_request(RequestBody::ConfirmRecovery(
+                mux_protocol::ConfirmRecoveryRequest {
+                    session_id: session_id.to_string(),
+                },
+            ))
+            .await?;
+        match response.body {
+            Some(ResponseBody::RecoveryConfirmed(recovered)) => Ok(recovered),
+            _ => Err(anyhow::anyhow!(
+                "unexpected response type for confirm_recovery"
+            )),
+        }
+    }
+
     /// §3.10 创建新会话，返回会话 ID。
     pub async fn create_session(&self, name: &str, cwd: &Path) -> Result<String> {
         let req = RequestBody::CreateSession(mux_protocol::CreateSessionRequest {

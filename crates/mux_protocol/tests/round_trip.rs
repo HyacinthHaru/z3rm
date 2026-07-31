@@ -254,3 +254,52 @@ fn test_shadow_file_version_envelope_round_trip() {
     assert_eq!(req.session_id, "s1");
     assert_eq!(req.path, "/tmp/notes.md");
 }
+
+#[test]
+fn recovery_messages_round_trip() {
+    let request = Request {
+        request_id: 42,
+        body: Some(proto::request::Body::ConfirmRecovery(
+            ConfirmRecoveryRequest {
+                session_id: "session-1".to_string(),
+            },
+        )),
+    };
+    let mut encoded = Vec::new();
+    request
+        .encode(&mut encoded)
+        .expect("encode recovery request");
+    let decoded = Request::decode(encoded.as_slice()).expect("decode recovery request");
+    match decoded.body {
+        Some(proto::request::Body::ConfirmRecovery(request)) => {
+            assert_eq!(request.session_id, "session-1");
+        }
+        body => panic!("unexpected recovery request body: {body:?}"),
+    }
+
+    let response = Response {
+        request_id: 42,
+        body: Some(proto::response::Body::RecoveryCandidates(
+            ListRecoveryCandidatesResponse {
+                candidates: vec![RecoveryCandidateInfo {
+                    id: "session-1".to_string(),
+                    name: "shells".to_string(),
+                    cwd: "/tmp".to_string(),
+                    metadata_complete: true,
+                    pane_ids: vec!["pane-1".to_string()],
+                }],
+            },
+        )),
+    };
+    encoded.clear();
+    response
+        .encode(&mut encoded)
+        .expect("encode recovery response");
+    let decoded = Response::decode(encoded.as_slice()).expect("decode recovery response");
+    match decoded.body {
+        Some(proto::response::Body::RecoveryCandidates(response)) => {
+            assert_eq!(response.candidates[0].pane_ids, vec!["pane-1"]);
+        }
+        body => panic!("unexpected recovery response body: {body:?}"),
+    }
+}

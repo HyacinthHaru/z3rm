@@ -452,6 +452,27 @@ async fn dispatch_request(
         RequestBody::GetClipboard(_) => handle_get_clipboard(clipboard).await?,
 
         // §3.3 Admin-only 操作 (Plan 33)
+        RequestBody::ListRecoveryCandidates(_) => {
+            if check_permission(role, ClientRole::Admin) {
+                match handle_list_recovery_candidates(sessions, db) {
+                    Ok(response) => response,
+                    Err(error) => ResponseBody::Error(error.to_string()),
+                }
+            } else {
+                ResponseBody::Error("permission denied: admin required".to_string())
+            }
+        }
+        RequestBody::ConfirmRecovery(request) => {
+            if check_permission(role, ClientRole::Admin) {
+                match handle_confirm_recovery(request, sessions, db, server_settings, clipboard) {
+                    Ok(response) => response,
+                    Err(error) => ResponseBody::Error(error.to_string()),
+                }
+            } else {
+                ResponseBody::Error("permission denied: admin required".to_string())
+            }
+        }
+
         RequestBody::KillSession(r) => {
             if check_permission(role, ClientRole::Admin) {
                 handle_kill_session(r, sessions, db).await?
@@ -612,6 +633,51 @@ fn send_notification_envelope(
     };
     outbound_tx.send(envelope)
 }
+fn start_session_snapshot_watch(
+    session_id: String,
+    cwd: String,
+    sessions: Arc<parking_lot::RwLock<Vec<crate::session::Session>>>,
+) {
+    tokio::spawn(async move {
+        let session_id_for_start = session_id.clone();
+        let cwd_for_start = cwd.clone();
+        let result = tokio::task::spawn_blocking(move || {
+            crate::snapshot::start(&session_id_for_start, &cwd_for_start)
+        })
+        .await;
+        match result {
+            Ok(Ok(Some(watch))) => {
+                let mut live = sessions.write();
+                if let Some(session) = live.iter_mut().find(|session| session.id == session_id) {
+                    session.snapshot_watch = Some(watch);
+                }
+            }
+            Ok(Ok(None)) => {
+                zlog::info!(
+                    "shadow snapshot not armed: session={} cwd={}",
+                    session_id,
+                    cwd
+                );
+            }
+            Ok(Err(error)) => {
+                zlog::warn!(
+                    "shadow snapshot start failed: session={} cwd={} error={}",
+                    session_id,
+                    cwd,
+                    error
+                );
+            }
+            Err(error) => {
+                zlog::warn!(
+                    "shadow snapshot task panicked: session={} error={}",
+                    session_id,
+                    error
+                );
+            }
+        }
+    });
+}
+
 async fn handle_create_session(
     req: &CreateSessionRequest,
     sessions: &Arc<parking_lot::RwLock<Vec<crate::session::Session>>>,
@@ -625,53 +691,8 @@ async fn handle_create_session(
     session.add_tab(default_tab_id.clone(), req.name.clone());
     session.focused_tab = Some(default_tab_id);
 
-    // §4 Wire shadow_snapshot: start the Monitor + recorder on a blocking
-    // thread so the async task is not stalled by inotify setup / SQLite open.
-    // The session is registered immediately; the snapshot watch is attached
-    // when the background task completes.
-    let snapshot_id = id.clone();
-    let snapshot_cwd = req.cwd.clone();
-    let sessions_for_snapshot = sessions.clone();
-    let log_id = snapshot_id.clone();
-    let log_cwd = snapshot_cwd.clone();
-    tokio::spawn(async move {
-        let result = tokio::task::spawn_blocking(move || {
-            crate::snapshot::start(&snapshot_id, &snapshot_cwd)
-        })
-        .await;
-        match result {
-            Ok(Ok(Some(watch))) => {
-                let mut sessions_w = sessions_for_snapshot.write();
-                if let Some(s) = sessions_w.iter_mut().find(|s| s.id == log_id) {
-                    s.snapshot_watch = Some(watch);
-                }
-            }
-            Ok(Ok(None)) => {
-                zlog::info!(
-                    "shadow snapshot not armed: session={} cwd={}",
-                    log_id,
-                    log_cwd
-                );
-            }
-            Ok(Err(error)) => {
-                zlog::warn!(
-                    "shadow snapshot start failed: session={} cwd={} error={}",
-                    log_id,
-                    log_cwd,
-                    error
-                );
-            }
-            Err(join_error) => {
-                zlog::warn!(
-                    "shadow snapshot task panicked: session={} error={}",
-                    log_id,
-                    join_error
-                );
-            }
-        }
-    });
-
     sessions.write().push(session);
+    start_session_snapshot_watch(id.clone(), req.cwd.clone(), sessions.clone());
 
     // §16.12 记录 session 创建事件
     zlog::info!(
@@ -712,6 +733,203 @@ async fn handle_list_sessions(
 }
 
 /// §3.10 结束会话
+fn handle_list_recovery_candidates(
+    sessions: &Arc<parking_lot::RwLock<Vec<crate::session::Session>>>,
+    db: &Arc<parking_lot::Mutex<Connection>>,
+) -> anyhow::Result<ResponseBody> {
+    let scan = crate::persistence::recovery_candidates(&db.lock())?;
+    for error in &scan.rejected {
+        tracing::warn!(%error, "rejected invalid mux recovery candidate");
+    }
+    let live_ids = sessions
+        .read()
+        .iter()
+        .map(|session| session.id.clone())
+        .collect::<std::collections::HashSet<_>>();
+    Ok(ResponseBody::RecoveryCandidates(
+        ListRecoveryCandidatesResponse {
+            candidates: scan
+                .candidates
+                .into_iter()
+                .filter(|candidate| !live_ids.contains(&candidate.id))
+                .map(|candidate| RecoveryCandidateInfo {
+                    id: candidate.id,
+                    name: candidate.name,
+                    cwd: candidate.cwd,
+                    metadata_complete: candidate.metadata_complete,
+                    pane_ids: candidate.layout.pane_ids(),
+                })
+                .collect(),
+        },
+    ))
+}
+
+static RECOVERY_RESERVATIONS: std::sync::LazyLock<
+    parking_lot::Mutex<std::collections::HashSet<String>>,
+> = std::sync::LazyLock::new(|| parking_lot::Mutex::new(std::collections::HashSet::new()));
+
+struct RecoveryReservation(String);
+
+impl RecoveryReservation {
+    fn acquire(session_id: &str) -> anyhow::Result<Self> {
+        let mut reservations = RECOVERY_RESERVATIONS.lock();
+        anyhow::ensure!(
+            reservations.insert(session_id.to_string()),
+            "session recovery already in progress: {session_id}"
+        );
+        Ok(Self(session_id.to_string()))
+    }
+}
+
+impl Drop for RecoveryReservation {
+    fn drop(&mut self) {
+        RECOVERY_RESERVATIONS.lock().remove(&self.0);
+    }
+}
+
+fn handle_confirm_recovery(
+    request: &ConfirmRecoveryRequest,
+    sessions: &Arc<parking_lot::RwLock<Vec<crate::session::Session>>>,
+    db: &Arc<parking_lot::Mutex<Connection>>,
+    server_settings: &Arc<crate::server_settings::ServerSettings>,
+    clipboard: &Arc<crate::clipboard::ServerClipboard>,
+) -> anyhow::Result<ResponseBody> {
+    let candidate = {
+        let connection = db.lock();
+        let scan = crate::persistence::recovery_candidates(&connection)?;
+        scan.candidates
+            .into_iter()
+            .find(|candidate| candidate.id == request.session_id)
+            .ok_or_else(|| {
+                anyhow::anyhow!("recovery candidate not found: {}", request.session_id)
+            })?
+    };
+    anyhow::ensure!(
+        candidate.metadata_complete,
+        "recovery candidate {} lacks complete pane metadata",
+        candidate.id
+    );
+    anyhow::ensure!(
+        !sessions
+            .read()
+            .iter()
+            .any(|session| session.id == candidate.id),
+        "session already live: {}",
+        candidate.id
+    );
+    let _reservation = RecoveryReservation::acquire(&candidate.id)?;
+
+    let mut spawned = Vec::with_capacity(candidate.panes.len());
+    for pane in &candidate.panes {
+        // Recovery intentionally passes no prior command: only a fresh default
+        // shell may be started after explicit confirmation.
+        let fresh = crate::pane::Pane::spawn_with_session(
+            pane.id.clone(),
+            candidate.id.clone(),
+            pane.cwd.clone(),
+            pane.cols,
+            pane.rows,
+            None,
+            server_settings.scrollback_lines(),
+        )?;
+        fresh.set_title(pane.title.clone());
+        spawned.push(fresh);
+    }
+
+    let mut session = crate::session::Session::new(
+        candidate.id.clone(),
+        candidate.name.clone(),
+        candidate.cwd.clone(),
+    );
+    session.layout = candidate.layout.clone();
+    session.focused_tab = candidate.focused_tab.clone();
+    session.focused_pane = candidate.focused_pane.clone();
+    for (id, title, pane_ids) in &candidate.tabs {
+        session.tabs.insert(
+            id.clone(),
+            crate::session::Tab {
+                id: id.clone(),
+                title: title.clone(),
+                pane_ids: pane_ids.clone(),
+            },
+        );
+    }
+    for pane in &spawned {
+        session.panes.write().insert(pane.id.clone(), pane.clone());
+    }
+    validate_recovered_session(&session)?;
+
+    {
+        let mut live = sessions.write();
+        anyhow::ensure!(
+            !live.iter().any(|session| session.id == candidate.id),
+            "session became live while recovery was in progress: {}",
+            candidate.id
+        );
+        live.push(session);
+    }
+    start_session_snapshot_watch(
+        candidate.id.clone(),
+        candidate.cwd.clone(),
+        sessions.clone(),
+    );
+    for pane in &spawned {
+        let live = sessions.read();
+        let session = live
+            .iter()
+            .find(|session| session.id == candidate.id)
+            .ok_or_else(|| anyhow::anyhow!("recovered session disappeared"))?;
+        register_pane_with_session_subscribers(session, pane);
+        drop(live);
+        install_pane_clipboard_hook(pane, sessions, clipboard);
+        install_pane_exit_hook(pane, sessions, candidate.id.clone(), pane.id.clone());
+    }
+    broadcast_layout_changed(sessions, &candidate.id);
+
+    Ok(ResponseBody::RecoveryConfirmed(ConfirmRecoveryResponse {
+        session_id: candidate.id,
+        pane_ids: spawned.iter().map(|pane| pane.id.clone()).collect(),
+    }))
+}
+
+fn validate_recovered_session(session: &crate::session::Session) -> anyhow::Result<()> {
+    let mut layout_panes = session.layout.pane_ids();
+    layout_panes.sort();
+    let mut registry_panes = session.panes.read().keys().cloned().collect::<Vec<_>>();
+    registry_panes.sort();
+    anyhow::ensure!(
+        layout_panes == registry_panes,
+        "recovered layout does not match panes"
+    );
+    anyhow::ensure!(
+        session
+            .tabs
+            .values()
+            .flat_map(|tab| &tab.pane_ids)
+            .all(|pane_id| { registry_panes.binary_search(pane_id).is_ok() }),
+        "recovered tab references an unknown pane"
+    );
+    anyhow::ensure!(
+        registry_panes.iter().all(|pane_id| {
+            session
+                .tabs
+                .values()
+                .any(|tab| tab.pane_ids.contains(pane_id))
+        }),
+        "recovered pane is not assigned to a tab"
+    );
+    if let Some(focused) = &session.focused_pane {
+        anyhow::ensure!(
+            registry_panes.binary_search(focused).is_ok(),
+            "invalid focused pane"
+        );
+    }
+    if let Some(focused) = &session.focused_tab {
+        anyhow::ensure!(session.tabs.contains_key(focused), "invalid focused tab");
+    }
+    Ok(())
+}
+
 async fn handle_kill_session(
     req: &KillSessionRequest,
     sessions: &Arc<parking_lot::RwLock<Vec<crate::session::Session>>>,
@@ -2460,5 +2678,106 @@ mod connection_unit_tests {
         let resolved = resolve_shadow_path(&root, "nested/deleted.txt").expect("resolve path");
 
         assert_eq!(resolved, root.join("nested/deleted.txt"));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn confirmed_recovery_restores_layout_with_fresh_shells() {
+        let connection = Connection::open_memory(Some("confirmed_recovery_fresh_shells"));
+        crate::persistence::init_tables(&connection).expect("initialize persistence tables");
+        let database = Arc::new(parking_lot::Mutex::new(connection));
+        let original_pane = crate::pane::Pane::spawn(
+            "recovered-pane".to_string(),
+            std::env::temp_dir().to_string_lossy().to_string(),
+            80,
+            24,
+            Some(crate::pane::ShellCommand {
+                program: "/bin/cat".to_string(),
+                ..Default::default()
+            }),
+        )
+        .expect("spawn original pane");
+        let mut original = crate::session::Session::new(
+            "recover-me".to_string(),
+            "recover-me".to_string(),
+            "/tmp".to_string(),
+        );
+        original
+            .panes
+            .write()
+            .insert(original_pane.id.clone(), original_pane.clone());
+        original.add_tab("tab-1".to_string(), "shell".to_string());
+        original
+            .tabs
+            .get_mut("tab-1")
+            .expect("tab")
+            .pane_ids
+            .push(original_pane.id.clone());
+        original.layout =
+            crate::layout::LayoutTree::with_pane("node-1".to_string(), original_pane.id.clone());
+        original.focused_tab = Some("tab-1".to_string());
+        original.set_focused_pane(original_pane.id.clone());
+        let persisted = Arc::new(parking_lot::RwLock::new(vec![original]));
+        crate::persistence::snapshot_sessions(&persisted, &database)
+            .expect("persist recovery candidate");
+        drop(persisted);
+        drop(original_pane);
+
+        let sessions = Arc::new(parking_lot::RwLock::new(Vec::new()));
+        let settings = crate::server_settings::ServerSettings::load();
+        let clipboard = Arc::new(crate::clipboard::ServerClipboard::new());
+
+        let listed = handle_list_recovery_candidates(&sessions, &database)
+            .expect("list recovery candidates");
+        match listed {
+            ResponseBody::RecoveryCandidates(list) => {
+                assert_eq!(list.candidates.len(), 1);
+                assert!(list.candidates[0].metadata_complete);
+            }
+            response => panic!("expected recovery candidates, got {response:?}"),
+        }
+
+        let response = handle_confirm_recovery(
+            &ConfirmRecoveryRequest {
+                session_id: "recover-me".to_string(),
+            },
+            &sessions,
+            &database,
+            &settings,
+            &clipboard,
+        )
+        .expect("confirm recovery");
+        match response {
+            ResponseBody::RecoveryConfirmed(recovered) => {
+                assert_eq!(recovered.session_id, "recover-me");
+                assert_eq!(recovered.pane_ids, vec!["recovered-pane"]);
+            }
+            response => panic!("expected recovery confirmation, got {response:?}"),
+        }
+
+        let listed = handle_list_recovery_candidates(&sessions, &database)
+            .expect("list candidates after recovery");
+        match listed {
+            ResponseBody::RecoveryCandidates(list) => assert!(list.candidates.is_empty()),
+            response => panic!("expected recovery candidates, got {response:?}"),
+        }
+
+        let sessions = sessions.read();
+        assert_eq!(sessions.len(), 1);
+        let recovered = &sessions[0];
+        assert_eq!(recovered.layout.pane_ids(), vec!["recovered-pane"]);
+        assert_eq!(recovered.focused_tab.as_deref(), Some("tab-1"));
+        assert_eq!(recovered.focused_pane.as_deref(), Some("recovered-pane"));
+        let pane = recovered
+            .panes
+            .read()
+            .get("recovered-pane")
+            .cloned()
+            .expect("recovered pane");
+        assert!(
+            pane.command.is_none(),
+            "recovery must not rerun persisted command: {:?}",
+            pane.command
+        );
     }
 }

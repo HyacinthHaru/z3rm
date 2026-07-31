@@ -78,8 +78,9 @@ commands (spec §3.10):\n\
     kill -t <target>                 terminate a session\n\
     kill-server                      gracefully shut down mux_server\n\
     attach [-t <target>]             attach to a session (opens GUI)\n\
-    attach --ssh <ssh://uri>         connect via SSH tunnel to remote mux_server
+    attach --ssh <ssh://uri>         connect via SSH tunnel to remote mux_server\n\
     detach                           detach the current client\n\
+    recover [--list | -t <session>]  list or confirm persisted session recovery\n\
     split-window [-t <target>] [-h|-v] [-c <command>]\n\
                                      split the active pane\n\
     send-keys -t <target> <keys...>  send input to a pane\n\
@@ -170,6 +171,7 @@ fn is_mux_cli_command(command: &str) -> bool {
             | "kill-server"
             | "attach"
             | "detach"
+            | "recover"
             | "split-window"
             | "send-keys"
             | "capture-pane"
@@ -262,6 +264,34 @@ fn parse_cli_args_lossy(args: &[String]) -> Result<Option<CliCommand>, String> {
         }
 
         "detach" => Ok(Some(CliCommand::Detach)),
+
+        "recover" => {
+            let rest = &args[2..];
+            let mut target = None;
+            let mut list = false;
+            let mut index = 0;
+            while index < rest.len() {
+                match rest[index].as_str() {
+                    "--list" => {
+                        list = true;
+                        index += 1;
+                    }
+                    "-t" | "--target" => {
+                        let value = rest
+                            .get(index + 1)
+                            .filter(|value| !value.starts_with('-'))
+                            .ok_or_else(|| "recover requires a value for -t".to_string())?;
+                        target = Some(value.clone());
+                        index += 2;
+                    }
+                    option => return Err(format!("unsupported recover option: {option}")),
+                }
+            }
+            if list && target.is_some() {
+                return Err("recover accepts either --list or -t, not both".to_string());
+            }
+            Ok(Some(CliCommand::Recover { target }))
+        }
 
         "split-window" => {
             let mut target = None;
@@ -602,6 +632,20 @@ mod tests {
             }
             command => panic!("unexpected command: {command:?}"),
         }
+    }
+
+    #[test]
+    fn recovery_cli_parses_list_and_explicit_confirmation() {
+        assert!(matches!(
+            parse_cli_args_from(&args(&["recover", "--list"])),
+            Ok(Some(CliCommand::Recover { target: None }))
+        ));
+        assert!(matches!(
+            parse_cli_args_from(&args(&["recover", "-t", "session-1"])),
+            Ok(Some(CliCommand::Recover { target: Some(target) })) if target == "session-1"
+        ));
+        assert!(parse_cli_args_from(&args(&["recover", "-t"])).is_err());
+        assert!(parse_cli_args_from(&args(&["recover", "--list", "-t", "session-1",])).is_err());
     }
 
     #[test]

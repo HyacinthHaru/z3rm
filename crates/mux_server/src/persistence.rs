@@ -131,12 +131,33 @@ fn persisted_session_state(
         session.id
     );
     anyhow::ensure!(
-        tabs.iter().flat_map(|tab| &tab.pane_ids).all(|pane_id| {
-            registry_panes.binary_search(pane_id).is_ok()
-        }),
+        tabs.iter()
+            .flat_map(|tab| &tab.pane_ids)
+            .all(|pane_id| { registry_panes.binary_search(pane_id).is_ok() }),
         "session {} tab metadata references an unknown pane",
         session.id
     );
+    anyhow::ensure!(
+        registry_panes
+            .iter()
+            .all(|pane_id| { tabs.iter().any(|tab| tab.pane_ids.contains(pane_id)) }),
+        "session {} has a pane not assigned to a tab",
+        session.id
+    );
+    if let Some(focused_tab) = &session.focused_tab {
+        anyhow::ensure!(
+            tabs.iter().any(|tab| &tab.id == focused_tab),
+            "session {} has an invalid focused tab",
+            session.id
+        );
+    }
+    if let Some(focused_pane) = &session.focused_pane {
+        anyhow::ensure!(
+            registry_panes.binary_search(focused_pane).is_ok(),
+            "session {} has an invalid focused pane",
+            session.id
+        );
+    }
 
     Ok(PersistedSessionState {
         version: RECOVERY_FORMAT_VERSION,
@@ -148,8 +169,7 @@ fn persisted_session_state(
     })
 }
 
-/// §3.6 快照所有 session
-fn snapshot_sessions(
+pub(crate) fn snapshot_sessions(
     sessions: &Arc<parking_lot::RwLock<Vec<crate::session::Session>>>,
     db: &Arc<parking_lot::Mutex<Connection>>,
 ) -> anyhow::Result<()> {
@@ -212,7 +232,7 @@ pub fn delete_session(conn: &Connection, session_id: &str) -> anyhow::Result<()>
     result
 }
 
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 pub struct RecoveryCandidate {
     pub id: String,
     pub name: String,
@@ -225,7 +245,7 @@ pub struct RecoveryCandidate {
     pub metadata_complete: bool,
 }
 
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 pub struct RecoveryScan {
     pub candidates: Vec<RecoveryCandidate>,
     pub rejected: Vec<String>,
@@ -270,7 +290,10 @@ pub fn recovery_candidates(conn: &Connection) -> anyhow::Result<RecoveryScan> {
     let mut rejected = Vec::new();
     for (id, name, cwd, layout_snapshot) in rows {
         let validation = (|| {
-            anyhow::ensure!(!layout_snapshot.is_empty(), "session {id} has no persisted layout");
+            anyhow::ensure!(
+                !layout_snapshot.is_empty(),
+                "session {id} has no persisted layout"
+            );
             let (layout, state) = decode_persisted_state(&id, &layout_snapshot)?;
             let pane_ids = layout.pane_ids();
             anyhow::ensure!(
@@ -285,18 +308,60 @@ pub fn recovery_candidates(conn: &Connection) -> anyhow::Result<RecoveryScan> {
                         .map(|pane| pane.id.clone())
                         .collect::<Vec<_>>();
                     persisted_panes.sort();
+                    anyhow::ensure!(
+                        persisted_panes.windows(2).all(|ids| ids[0] != ids[1]),
+                        "persisted pane metadata for session {id} contains duplicate pane ids"
+                    );
+                    anyhow::ensure!(
+                        state.panes.iter().all(|pane| {
+                            !pane.id.is_empty()
+                                && mux_protocol::checked_grid_cell_count(
+                                    pane.cols as usize,
+                                    pane.rows as usize,
+                                )
+                                .is_ok()
+                        }),
+                        "persisted pane metadata for session {id} contains an invalid pane size"
+                    );
                     let mut layout_panes = pane_ids.clone();
                     layout_panes.sort();
                     anyhow::ensure!(
                         layout_panes == persisted_panes,
                         "persisted pane metadata for session {id} does not match its layout"
                     );
+                    let mut tab_ids = state.tabs.iter().map(|tab| &tab.id).collect::<Vec<_>>();
+                    tab_ids.sort();
                     anyhow::ensure!(
-                        state.tabs.iter().flat_map(|tab| &tab.pane_ids).all(|pane_id| {
-                            persisted_panes.binary_search(pane_id).is_ok()
-                        }),
+                        tab_ids.iter().all(|tab_id| !tab_id.is_empty())
+                            && tab_ids.windows(2).all(|ids| ids[0] != ids[1]),
+                        "persisted tab metadata for session {id} contains invalid tab ids"
+                    );
+                    anyhow::ensure!(
+                        state
+                            .tabs
+                            .iter()
+                            .flat_map(|tab| &tab.pane_ids)
+                            .all(|pane_id| persisted_panes.binary_search(pane_id).is_ok()),
                         "persisted tab metadata for session {id} references an unknown pane"
                     );
+                    anyhow::ensure!(
+                        persisted_panes.iter().all(|pane_id| {
+                            state.tabs.iter().any(|tab| tab.pane_ids.contains(pane_id))
+                        }),
+                        "persisted pane metadata for session {id} contains an unassigned pane"
+                    );
+                    if let Some(focused_tab) = &state.focused_tab {
+                        anyhow::ensure!(
+                            state.tabs.iter().any(|tab| &tab.id == focused_tab),
+                            "persisted session {id} has an invalid focused tab"
+                        );
+                    }
+                    if let Some(focused_pane) = &state.focused_pane {
+                        anyhow::ensure!(
+                            persisted_panes.binary_search(focused_pane).is_ok(),
+                            "persisted session {id} has an invalid focused pane"
+                        );
+                    }
                     (
                         state
                             .tabs
@@ -328,7 +393,10 @@ pub fn recovery_candidates(conn: &Connection) -> anyhow::Result<RecoveryScan> {
             Err(error) => rejected.push(error.to_string()),
         }
     }
-    Ok(RecoveryScan { candidates, rejected })
+    Ok(RecoveryScan {
+        candidates,
+        rejected,
+    })
 }
 
 #[cfg(test)]
@@ -388,8 +456,20 @@ mod tests {
     fn deleted_session_is_not_recovered() {
         let connection = Connection::open_memory(Some("deleted_session_is_not_recovered"));
         init_tables(&connection).expect("initialize persistence tables");
-        insert_session_row(&connection, "keep", "keep", "/tmp", &envelope_json("keep-pane"));
-        insert_session_row(&connection, "kill", "kill", "/tmp", &envelope_json("kill-pane"));
+        insert_session_row(
+            &connection,
+            "keep",
+            "keep",
+            "/tmp",
+            &envelope_json("keep-pane"),
+        );
+        insert_session_row(
+            &connection,
+            "kill",
+            "kill",
+            "/tmp",
+            &envelope_json("kill-pane"),
+        );
 
         delete_session(&connection, "kill").expect("delete killed session");
         let scan = recovery_candidates(&connection).expect("load remaining recovery candidates");
@@ -407,7 +487,13 @@ mod tests {
     fn legacy_layout_without_metadata_is_rejected_as_incomplete() {
         let connection = Connection::open_memory(Some("legacy_incomplete_recovery"));
         init_tables(&connection).expect("initialize persistence tables");
-        insert_session_row(&connection, "legacy", "legacy", "/tmp", &raw_layout("legacy-pane"));
+        insert_session_row(
+            &connection,
+            "legacy",
+            "legacy",
+            "/tmp",
+            &raw_layout("legacy-pane"),
+        );
         let scan = recovery_candidates(&connection).expect("scan recovery candidates");
 
         assert!(scan.rejected.is_empty());
@@ -415,6 +501,27 @@ mod tests {
         assert_eq!(scan.candidates[0].id, "legacy");
         assert!(!scan.candidates[0].metadata_complete);
         assert!(scan.candidates[0].panes.is_empty());
+    }
+
+    #[test]
+    fn invalid_recovery_focus_is_rejected_before_shell_spawn() {
+        let connection = Connection::open_memory(Some("invalid_recovery_focus"));
+        init_tables(&connection).expect("initialize persistence tables");
+        let mut envelope = serde_json::from_str::<serde_json::Value>(&envelope_json("pane-1"))
+            .expect("decode test recovery envelope");
+        envelope["focused_pane"] = serde_json::Value::String("missing-pane".to_string());
+        insert_session_row(
+            &connection,
+            "bad-focus",
+            "bad-focus",
+            "/tmp",
+            &serde_json::to_string(&envelope).expect("encode invalid focus envelope"),
+        );
+
+        let scan = recovery_candidates(&connection).expect("scan recovery candidates");
+        assert!(scan.candidates.is_empty());
+        assert_eq!(scan.rejected.len(), 1);
+        assert!(scan.rejected[0].contains("invalid focused pane"));
     }
 
     #[test]
@@ -464,8 +571,14 @@ mod tests {
         );
         session.panes.write().insert(pane.id.clone(), pane.clone());
         session.add_tab("tab-1".to_string(), "shell".to_string());
-        session.tabs.get_mut("tab-1").unwrap().pane_ids.push(pane.id.clone());
-        session.layout = crate::layout::LayoutTree::with_pane("node-1".to_string(), pane.id.clone());
+        session
+            .tabs
+            .get_mut("tab-1")
+            .unwrap()
+            .pane_ids
+            .push(pane.id.clone());
+        session.layout =
+            crate::layout::LayoutTree::with_pane("node-1".to_string(), pane.id.clone());
         session.set_focused_pane(pane.id.clone());
         session.focused_tab = Some("tab-1".to_string());
         let sessions = Arc::new(parking_lot::RwLock::new(vec![session]));
@@ -483,7 +596,13 @@ mod tests {
         assert!(candidate.metadata_complete);
         assert_eq!(candidate.panes.len(), 1);
         assert_eq!(candidate.panes[0].id, "pane-1");
-        assert!(candidate.panes[0].prior_command.as_deref().unwrap().starts_with("/bin/cat"));
+        assert!(
+            candidate.panes[0]
+                .prior_command
+                .as_deref()
+                .unwrap()
+                .starts_with("/bin/cat")
+        );
         assert_eq!(candidate.focused_pane.as_deref(), Some("pane-1"));
         assert_eq!(candidate.tabs[0].2, vec!["pane-1"]);
     }

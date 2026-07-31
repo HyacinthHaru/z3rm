@@ -680,6 +680,34 @@ message ShellIntegrationResponse {
 // the response then exits the accept loop.
 message ShutdownRequest {}
 
+// §3.6 恢复候选列表：daemon 启动时从持久化元数据扫描出的可恢复会话。
+// 这些候选不在 live registry 中，必须经 ConfirmRecovery 显式确认后才重建 shells。
+message ListRecoveryCandidatesRequest {}
+
+message RecoveryCandidateInfo {
+    string id = 1;
+    string name = 2;
+    string cwd = 3;
+    // 是否携带完整 tab/pane 元数据；legacy 行无元数据，确认前不可重建。
+    bool metadata_complete = 4;
+    repeated string pane_ids = 5;
+}
+
+message ListRecoveryCandidatesResponse {
+    repeated RecoveryCandidateInfo candidates = 1;
+}
+
+// §3.6 确认恢复指定会话：为每个持久化 pane 启动 fresh default shell
+// （绝不重跑 prior_command），重建 tab/layout/focus 并注册到 live registry。
+message ConfirmRecoveryRequest {
+    string session_id = 1;
+}
+
+message ConfirmRecoveryResponse {
+    string session_id = 1;
+    repeated string pane_ids = 2;
+}
+
 // === Request/Response envelope ===
 
 // §9 请求信封：携带 request_id 与具体请求体。
@@ -718,6 +746,8 @@ message Request {
         GetFileVersionRequest get_file_version = 31;       // §4 shadow snapshot
         DeclineFileVersionRequest decline_file_version = 32;  // §4 shadow snapshot
         ResizeLayoutRequest resize_layout = 33;  // §16.9 server-owned layout ratios
+        ListRecoveryCandidatesRequest list_recovery_candidates = 34;  // §3.6 recovery
+        ConfirmRecoveryRequest confirm_recovery = 35;  // §3.6 recovery
     }
 }
 
@@ -745,5 +775,7 @@ message Response {
         ListFileVersionsResponse file_versions = 19;          // §4 shadow snapshot
         GetFileVersionResponse file_version_content = 20;     // §4 shadow snapshot
         DeclineFileVersionResponse decline_file_version = 21; // §4 shadow snapshot
+        ListRecoveryCandidatesResponse recovery_candidates = 22;  // §3.6 recovery
+        ConfirmRecoveryResponse recovery_confirmed = 23;  // §3.6 recovery
     }
 }

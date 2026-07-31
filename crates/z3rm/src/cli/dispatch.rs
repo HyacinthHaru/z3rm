@@ -38,6 +38,10 @@ pub enum CliCommand {
         target: String,
     },
     Detach,
+    /// `z3rm recover [--list | -t <session>]` — list or explicitly confirm recovery.
+    Recover {
+        target: Option<String>,
+    },
     /// `z3rm split-window -t <target> [-h|-v]` — 分割 pane
     SplitWindow {
         target: Option<String>,
@@ -537,6 +541,35 @@ pub async fn run_cli_command(cmd: CliCommand) -> Result<()> {
                 .await
                 .context("failed to set pane title")?;
             eprintln!("renamed window pane {} to '{}'", pane_id, title);
+        }
+        CliCommand::Recover { target } => {
+            if let Some(session_id) = target {
+                let recovered = domain
+                    .confirm_recovery(&session_id)
+                    .await
+                    .with_context(|| format!("failed to recover session {session_id}"))?;
+                println!(
+                    "recovered session {} with {} fresh shell pane(s)",
+                    recovered.session_id,
+                    recovered.pane_ids.len()
+                );
+            } else {
+                for candidate in domain.list_recovery_candidates().await? {
+                    let state = if candidate.metadata_complete {
+                        "ready"
+                    } else {
+                        "legacy-incomplete"
+                    };
+                    println!(
+                        "{}: {} (cwd={}, panes={}, {})",
+                        candidate.id,
+                        candidate.name,
+                        candidate.cwd,
+                        candidate.pane_ids.len(),
+                        state
+                    );
+                }
+            }
         }
     }
 
