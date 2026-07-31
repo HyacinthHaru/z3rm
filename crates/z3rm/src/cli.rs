@@ -3,10 +3,12 @@
 
 pub mod capture;
 pub mod dispatch;
+pub mod format;
 pub mod keys;
 pub mod marketplace;
 pub mod target;
 
+pub use capture::CaptureLine;
 pub use dispatch::CliCommand;
 pub use dispatch::SendKeysEncoding;
 pub use dispatch::run_cli_command;
@@ -74,27 +76,47 @@ pub fn format_usage() -> String {
         "usage: z3rm <command> [args]\n\
 \n\
 commands (spec §3.10):\n\
-    ls                              list all sessions\n\
+    ls [-F <format>]                 list all sessions\n\
     new -s <name> [-c <cwd>]         create a new session\n\
     kill -t <target>                 terminate a session\n\
+    rename-session [-t <target>] <name>\n\
+                                     rename a session\n\
+    has-session -t <target>          exit 0 if the session exists\n\
     kill-server                      gracefully shut down mux_server\n\
     attach [-t <target>]             attach to a session (opens GUI)\n\
     attach --ssh <ssh://uri>         connect via SSH tunnel to remote mux_server
     detach                           detach the current client\n\
     split-window [-t <target>] [-h|-v] [-c <command>]\n\
                                      split the active pane\n\
-    send-keys -t <target> <keys...>  send input to a pane\n\
-    capture-pane [-t <target>] [-p] [-S <-N>] [-e]\n\
+    send-keys -t <target> [-l|-H] [-N <count>] <keys...>\n\
+                                     send input to a pane\n\
+    paste-buffer [-t <target>]       paste stdin into a pane\n\
+    capture-pane [-t <target>] [-p] [-S <line>] [-E <line>] [-J] [-e]\n\
                                      capture pane contents\n\
-    list-panes [-t <session>]        list panes in a session\n\
+    list-panes [-t <session>] [-F <format>]\n\
+                                     list panes in a session\n\
+    list-windows [-t <session>] [-F <format>]\n\
+                                     list windows in a session\n\
     select-pane -t <target>          focus a pane\n\
     kill-pane -t <target>            close a pane\n\
-    resize-pane [-t <target>] -x <W> -y <H>\n\
-                                     resize a pane\n\
+    resize-pane [-t <target>] [-x <W>] [-y <H>] [-Z]\n\
+                                     resize a pane, or toggle zoom with -Z\n\
     new-window [-t <session>]         create a new tab\n\
     rename-window -t <target> <title> set the pane title\n\
 \n\
-aliases: list-sessions = ls, kill-session = kill\n\
+capture-pane line numbers follow tmux: 0 is the first visible row, negative\n\
+numbers reach into history, and '-' is the far edge (history start for -S,\n\
+visible end for -E).\n\
+\n\
+-F format strings use tmux syntax: '#{{name}}' substitutes a variable,\n\
+'#{{?name,yes,no}}' branches on it, and '##' is a literal '#'. Unknown or\n\
+out-of-scope variables expand to an empty string. Supported variables:\n\
+    session_id session_name session_path session_attached session_created\n\
+    session_windows window_id window_index window_name window_active\n\
+    window_panes pane_id pane_index pane_title pane_active pane_width\n\
+    pane_height pane_current_path pane_start_command pane_dead\n\
+\n\
+aliases: list-sessions = ls, kill-session = kill, list-windows = lsw\n\
 run 'z3rm extension --help' for marketplace commands\n"
     )
 }
@@ -117,6 +139,7 @@ pub fn parse_cli_args_from(args: &[String]) -> Result<Option<CliCommand>, String
     match normalized[1].as_str() {
         "list-sessions" => normalized[1] = "ls".to_string(),
         "kill-session" => normalized[1] = "kill".to_string(),
+        "lsw" => normalized[1] = "list-windows".to_string(),
         _ => {}
     }
 
@@ -124,11 +147,17 @@ pub fn parse_cli_args_from(args: &[String]) -> Result<Option<CliCommand>, String
         "kill" if !has_option_value(&normalized[2..], "-t", "--target") => {
             return Err("kill requires -t <target>".to_string());
         }
+        "has-session" if !has_option_value(&normalized[2..], "-t", "--target") => {
+            return Err("has-session requires -t <target>".to_string());
+        }
         "send-keys" if send_keys_payload_is_empty(&normalized[2..]) => {
             return Err("send-keys requires at least one key".to_string());
         }
-        "rename-window" if rename_window_title(&normalized[2..]).is_none() => {
+        "rename-window" if positional_after_target(&normalized[2..]).is_none() => {
             return Err("rename-window requires a title".to_string());
+        }
+        "rename-session" if positional_after_target(&normalized[2..]).is_none() => {
+            return Err("rename-session requires a new session name".to_string());
         }
         command if is_mux_cli_command(command) => {}
         command => return Err(format!("unknown CLI command: {command}")),
@@ -154,7 +183,8 @@ fn send_keys_payload_is_empty(args: &[String]) -> bool {
     true
 }
 
-fn rename_window_title(args: &[String]) -> Option<&str> {
+/// 跳过 `-t <target>` 后的第一个位置参数 (rename-window 的标题 / rename-session 的新名字)。
+fn positional_after_target(args: &[String]) -> Option<&str> {
     let mut i = 0;
     while i < args.len() {
         match args[i].as_str() {
@@ -170,19 +200,106 @@ fn is_mux_cli_command(command: &str) -> bool {
         command,
         "ls" | "new"
             | "kill"
+            | "rename-session"
+            | "has-session"
             | "kill-server"
             | "attach"
             | "detach"
             | "split-window"
             | "send-keys"
+            | "paste-buffer"
             | "capture-pane"
             | "list-panes"
+            | "list-windows"
             | "select-pane"
             | "kill-pane"
             | "resize-pane"
             | "new-window"
             | "rename-window"
     )
+}
+
+/// 解析 `-t <target>` / `-F <format>` 这类"只有可选 target + 可选 format"的
+/// 列表命令。未知 flag 一律报错，避免拼错的选项被静默忽略。
+fn parse_list_options(
+    command: &str,
+    args: &[String],
+) -> Result<(Option<String>, Option<String>), String> {
+    let mut target = None;
+    let mut format = None;
+    let mut index = 0;
+    while index < args.len() {
+        match args[index].as_str() {
+            "-t" | "--target" => {
+                let value = args
+                    .get(index + 1)
+                    .filter(|value| !value.starts_with('-'))
+                    .ok_or_else(|| format!("{command} requires a value for -t"))?;
+                target = Some(value.clone());
+                index += 2;
+            }
+            // 格式串是任意文本 (可能以 `-` 开头), 只要存在就照单全收。
+            "-F" | "--format" => {
+                let value = args
+                    .get(index + 1)
+                    .ok_or_else(|| format!("{command} requires a value for -F"))?;
+                format = Some(value.clone());
+                index += 2;
+            }
+            option => return Err(format!("unsupported {command} option: {option}")),
+        }
+    }
+    Ok((target, format))
+}
+
+/// 解析 capture-pane 的 `-S` / `-E` 行号。
+///
+/// tmux 行号模型: `0` 是可见区第一行，负数进入历史，字面量 `-` 是这一侧的
+/// 极端边界 (`-S -` 取到历史最开头，`-E -` 取到可见区最后一行)。
+fn parse_capture_line(value: Option<&String>, flag: &str) -> Result<CaptureLine, String> {
+    let value = value.ok_or_else(|| format!("capture-pane requires a value for {flag}"))?;
+    if value == "-" {
+        return Ok(CaptureLine::Edge);
+    }
+    value
+        .parse::<i32>()
+        .map(CaptureLine::Line)
+        .map_err(|_| format!("invalid integer for {flag}: '{value}'"))
+}
+
+/// 解析 `[-t <target>] [<positional>]` 形式的命令。
+fn parse_target_and_positional(
+    command: &str,
+    args: &[String],
+) -> Result<(Option<String>, Option<String>), String> {
+    let mut target = None;
+    let mut positional: Option<String> = None;
+    let mut index = 0;
+    while index < args.len() {
+        match args[index].as_str() {
+            "-t" | "--target" => {
+                let value = args
+                    .get(index + 1)
+                    .filter(|value| !value.starts_with('-'))
+                    .ok_or_else(|| format!("{command} requires a value for -t"))?;
+                target = Some(value.clone());
+                index += 2;
+            }
+            option if option.starts_with('-') => {
+                return Err(format!("unsupported {command} option: {option}"));
+            }
+            value => {
+                if positional.is_some() {
+                    return Err(format!(
+                        "{command} takes a single argument; quote it if it contains spaces"
+                    ));
+                }
+                positional = Some(value.to_string());
+                index += 1;
+            }
+        }
+    }
+    Ok((target, positional))
 }
 
 fn parse_cli_args_lossy(args: &[String]) -> Result<Option<CliCommand>, String> {
@@ -193,7 +310,13 @@ fn parse_cli_args_lossy(args: &[String]) -> Result<Option<CliCommand>, String> {
     // 第一个参数是程序名, 第二个是子命令
     let subcommand = &args[1];
     match subcommand.as_str() {
-        "ls" => Ok(Some(CliCommand::ListSessions)),
+        "ls" => {
+            let (target, format) = parse_list_options("ls", &args[2..])?;
+            if target.is_some() {
+                return Err("ls does not take -t".to_string());
+            }
+            Ok(Some(CliCommand::ListSessions { format }))
+        }
 
         "new" => {
             let mut name = None;
@@ -233,6 +356,26 @@ fn parse_cli_args_lossy(args: &[String]) -> Result<Option<CliCommand>, String> {
             match target {
                 Some(t) => Ok(Some(CliCommand::KillSession { target: t })),
                 None => Err("kill requires -t <target>".to_string()),
+            }
+        }
+
+        "rename-session" => {
+            let rest = &args[2..];
+            let (target, name) = parse_target_and_positional("rename-session", rest)?;
+            match name {
+                Some(name) => Ok(Some(CliCommand::RenameSession { target, name })),
+                None => Err("rename-session requires a new session name".to_string()),
+            }
+        }
+
+        "has-session" => {
+            let (target, positional) = parse_target_and_positional("has-session", &args[2..])?;
+            if positional.is_some() {
+                return Err("has-session takes only -t <target>".to_string());
+            }
+            match target {
+                Some(target) => Ok(Some(CliCommand::HasSession { target })),
+                None => Err("has-session requires -t <target>".to_string()),
             }
         }
 
@@ -361,7 +504,9 @@ fn parse_cli_args_lossy(args: &[String]) -> Result<Option<CliCommand>, String> {
         "capture-pane" => {
             let mut target = None;
             let mut print = false;
-            let mut scrollback = None;
+            let mut start = None;
+            let mut end = None;
+            let mut join_wrapped = false;
             let mut escape = false;
             let rest = &args[2..];
             let mut index = 0;
@@ -379,20 +524,17 @@ fn parse_cli_args_lossy(args: &[String]) -> Result<Option<CliCommand>, String> {
                         print = true;
                         index += 1;
                     }
-                    "-S" | "--scrollback" => {
-                        let value = rest
-                            .get(index + 1)
-                            .ok_or_else(|| "capture-pane requires a value for -S".to_string())?;
-                        let lines = value
-                            .parse::<i32>()
-                            .map_err(|_| format!("invalid integer for -S: '{value}'"))?;
-                        if lines >= 0 {
-                            return Err(
-                                "capture-pane -S requires a negative line count".to_string()
-                            );
-                        }
-                        scrollback = Some(lines);
+                    "-S" | "--start-line" | "--scrollback" => {
+                        start = Some(parse_capture_line(rest.get(index + 1), "-S")?);
                         index += 2;
+                    }
+                    "-E" | "--end-line" => {
+                        end = Some(parse_capture_line(rest.get(index + 1), "-E")?);
+                        index += 2;
+                    }
+                    "-J" | "--join" => {
+                        join_wrapped = true;
+                        index += 1;
                     }
                     "-e" | "--escape" => {
                         escape = true;
@@ -404,25 +546,32 @@ fn parse_cli_args_lossy(args: &[String]) -> Result<Option<CliCommand>, String> {
             Ok(Some(CliCommand::CapturePane {
                 target,
                 print,
-                scrollback,
+                start,
+                end,
+                join_wrapped,
                 escape,
             }))
         }
 
         "list-panes" => {
-            let mut target = None;
-            let rest = &args[2..];
-            for i in 0..rest.len() {
-                match rest[i].as_str() {
-                    "-t" | "--target" => {
-                        if i + 1 < rest.len() {
-                            target = Some(rest[i + 1].clone());
-                        }
-                    }
-                    _ => {}
-                }
+            let (target, format) = parse_list_options("list-panes", &args[2..])?;
+            Ok(Some(CliCommand::ListPanes { target, format }))
+        }
+
+        "list-windows" => {
+            let (target, format) = parse_list_options("list-windows", &args[2..])?;
+            Ok(Some(CliCommand::ListWindows { target, format }))
+        }
+
+        "paste-buffer" => {
+            let (target, positional) = parse_target_and_positional("paste-buffer", &args[2..])?;
+            if positional.is_some() {
+                return Err(
+                    "paste-buffer reads the buffer from stdin and takes only -t <target>"
+                        .to_string(),
+                );
             }
-            Ok(Some(CliCommand::ListPanes { target }))
+            Ok(Some(CliCommand::PasteBuffer { target }))
         }
 
         "select-pane" => {
@@ -461,6 +610,7 @@ fn parse_cli_args_lossy(args: &[String]) -> Result<Option<CliCommand>, String> {
             let mut target = None;
             let mut width = None;
             let mut height = None;
+            let mut zoom = false;
             let rest = &args[2..];
             let mut i = 0;
             while i < rest.len() {
@@ -495,15 +645,25 @@ fn parse_cli_args_lossy(args: &[String]) -> Result<Option<CliCommand>, String> {
                             i += 1;
                         }
                     }
+                    "-Z" | "--zoom" => {
+                        zoom = true;
+                        i += 1;
+                    }
                     _ => {
                         i += 1;
                     }
                 }
             }
+            if zoom && (width.is_some() || height.is_some()) {
+                return Err(
+                    "resize-pane -Z toggles zoom and cannot be combined with -x/-y".to_string(),
+                );
+            }
             Ok(Some(CliCommand::ResizePane {
                 target,
                 width,
                 height,
+                zoom,
             }))
         }
 
@@ -567,7 +727,129 @@ mod tests {
     #[test]
     fn list_sessions_alias_is_accepted() {
         let parsed = parse_cli_args_from(&args(&["list-sessions"])).expect("parse");
-        assert!(matches!(parsed, Some(CliCommand::ListSessions)));
+        assert!(matches!(
+            parsed,
+            Some(CliCommand::ListSessions { format: None })
+        ));
+    }
+
+    #[test]
+    fn list_windows_alias_and_format_are_accepted() {
+        let parsed = parse_cli_args_from(&args(&["lsw", "-t", "dev", "-F", "#{window_name}"]))
+            .expect("parse");
+        match parsed {
+            Some(CliCommand::ListWindows { target, format }) => {
+                assert_eq!(target.as_deref(), Some("dev"));
+                assert_eq!(format.as_deref(), Some("#{window_name}"));
+            }
+            other => panic!("unexpected parse result: {other:?}"),
+        }
+
+        let parsed = parse_cli_args_from(&args(&["list-windows"])).expect("parse");
+        assert!(matches!(
+            parsed,
+            Some(CliCommand::ListWindows {
+                target: None,
+                format: None
+            })
+        ));
+    }
+
+    #[test]
+    fn list_commands_accept_format_and_reject_unknown_options() {
+        let parsed = parse_cli_args_from(&args(&["ls", "-F", "#{session_name}"])).expect("parse");
+        match parsed {
+            Some(CliCommand::ListSessions { format }) => {
+                assert_eq!(format.as_deref(), Some("#{session_name}"))
+            }
+            other => panic!("unexpected parse result: {other:?}"),
+        }
+
+        let parsed = parse_cli_args_from(&args(&["list-panes", "-t", "dev", "-F", "#{pane_id}"]))
+            .expect("parse");
+        match parsed {
+            Some(CliCommand::ListPanes { target, format }) => {
+                assert_eq!(target.as_deref(), Some("dev"));
+                assert_eq!(format.as_deref(), Some("#{pane_id}"));
+            }
+            other => panic!("unexpected parse result: {other:?}"),
+        }
+
+        for arguments in [
+            vec!["ls", "-t", "dev"],
+            vec!["ls", "-F"],
+            vec!["ls", "--bogus"],
+            vec!["list-panes", "-t"],
+            vec!["list-panes", "--bogus"],
+            vec!["list-windows", "-F"],
+        ] {
+            assert!(
+                parse_cli_args_from(&args(&arguments)).is_err(),
+                "arguments {arguments:?} must be rejected"
+            );
+        }
+    }
+
+    #[test]
+    fn rename_session_requires_a_name() {
+        let parsed =
+            parse_cli_args_from(&args(&["rename-session", "-t", "dev", "prod"])).expect("parse");
+        match parsed {
+            Some(CliCommand::RenameSession { target, name }) => {
+                assert_eq!(target.as_deref(), Some("dev"));
+                assert_eq!(name, "prod");
+            }
+            other => panic!("unexpected parse result: {other:?}"),
+        }
+
+        let err = parse_cli_args_from(&args(&["rename-session", "-t", "dev"]))
+            .expect_err("missing name must be a parse error");
+        assert!(err.contains("rename-session requires"), "{err}");
+    }
+
+    #[test]
+    fn has_session_requires_target_and_rejects_extras() {
+        let parsed = parse_cli_args_from(&args(&["has-session", "-t", "dev"])).expect("parse");
+        match parsed {
+            Some(CliCommand::HasSession { target }) => assert_eq!(target, "dev"),
+            other => panic!("unexpected parse result: {other:?}"),
+        }
+
+        assert!(parse_cli_args_from(&args(&["has-session"])).is_err());
+        assert!(parse_cli_args_from(&args(&["has-session", "dev"])).is_err());
+    }
+
+    #[test]
+    fn paste_buffer_takes_only_a_target() {
+        let parsed = parse_cli_args_from(&args(&["paste-buffer", "-t", "dev"])).expect("parse");
+        match parsed {
+            Some(CliCommand::PasteBuffer { target }) => assert_eq!(target.as_deref(), Some("dev")),
+            other => panic!("unexpected parse result: {other:?}"),
+        }
+
+        assert!(parse_cli_args_from(&args(&["paste-buffer", "some-text"])).is_err());
+    }
+
+    #[test]
+    fn resize_pane_zoom_flag_is_exclusive() {
+        let parsed =
+            parse_cli_args_from(&args(&["resize-pane", "-t", "dev", "-Z"])).expect("parse");
+        match parsed {
+            Some(CliCommand::ResizePane {
+                target,
+                width,
+                height,
+                zoom,
+            }) => {
+                assert_eq!(target.as_deref(), Some("dev"));
+                assert_eq!(width, None);
+                assert_eq!(height, None);
+                assert!(zoom);
+            }
+            other => panic!("unexpected parse result: {other:?}"),
+        }
+
+        assert!(parse_cli_args_from(&args(&["resize-pane", "-Z", "-x", "80"])).is_err());
     }
 
     #[test]
@@ -603,11 +885,10 @@ mod tests {
     }
 
     #[test]
-    fn capture_pane_rejects_missing_nonnegative_and_unknown_options() {
+    fn capture_pane_rejects_missing_values_and_unknown_options() {
         for arguments in [
             vec!["capture-pane", "-S"],
-            vec!["capture-pane", "-S", "0"],
-            vec!["capture-pane", "-S", "2"],
+            vec!["capture-pane", "-E"],
             vec!["capture-pane", "-t"],
             vec!["capture-pane", "--bogus"],
         ] {
@@ -615,6 +896,57 @@ mod tests {
                 parse_cli_args_from(&args(&arguments)).is_err(),
                 "arguments {arguments:?} must be rejected"
             );
+        }
+    }
+
+    #[test]
+    fn capture_pane_parses_tmux_line_numbers_and_join() {
+        // 负数进入历史 (原有语义), 非负是可见区行号, `-` 是这一侧的边界。
+        let parsed = parse_cli_args_from(&args(&[
+            "capture-pane",
+            "-S",
+            "-100",
+            "-E",
+            "-",
+            "-J",
+            "-p",
+        ]))
+        .expect("parse");
+        match parsed {
+            Some(CliCommand::CapturePane {
+                start,
+                end,
+                join_wrapped,
+                print,
+                escape,
+                target,
+            }) => {
+                assert_eq!(start, Some(CaptureLine::Line(-100)));
+                assert_eq!(end, Some(CaptureLine::Edge));
+                assert!(join_wrapped);
+                assert!(print);
+                assert!(!escape);
+                assert_eq!(target, None);
+            }
+            other => panic!("unexpected parse result: {other:?}"),
+        }
+
+        let parsed =
+            parse_cli_args_from(&args(&["capture-pane", "-S", "-", "-E", "5"])).expect("parse");
+        match parsed {
+            Some(CliCommand::CapturePane { start, end, .. }) => {
+                assert_eq!(start, Some(CaptureLine::Edge));
+                assert_eq!(end, Some(CaptureLine::Line(5)));
+            }
+            other => panic!("unexpected parse result: {other:?}"),
+        }
+
+        let parsed = parse_cli_args_from(&args(&["capture-pane", "-S", "0"])).expect("parse");
+        match parsed {
+            Some(CliCommand::CapturePane { start, .. }) => {
+                assert_eq!(start, Some(CaptureLine::Line(0)))
+            }
+            other => panic!("unexpected parse result: {other:?}"),
         }
     }
 
