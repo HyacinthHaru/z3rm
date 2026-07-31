@@ -88,7 +88,7 @@ fn snapshot_sessions(
                 .map(|p| (p.get_cols(), p.get_rows()))
                 .unwrap_or((80, 24))
         };
-        let layout_snapshot = session.layout.serialize(cols, rows).unwrap_or_default();
+        let layout_snapshot = session.layout.serialize(cols, rows)?;
 
         let mut stmt = Statement::prepare(&*conn, upsert_sql)?;
         stmt.bind(&session.id, 1)?;
@@ -120,18 +120,54 @@ pub fn delete_session(conn: &Connection, session_id: &str) -> anyhow::Result<()>
     result
 }
 
-pub fn recover_sessions(conn: &Connection) -> anyhow::Result<Vec<crate::session::Session>> {
+#[derive(Debug)]
+pub struct RecoveryCandidate {
+    pub id: String,
+    pub name: String,
+    pub cwd: String,
+    pub layout: crate::layout::LayoutTree,
+}
+
+#[derive(Debug)]
+pub struct RecoveryScan {
+    pub candidates: Vec<RecoveryCandidate>,
+    pub rejected: Vec<String>,
+}
+
+pub fn recovery_candidates(conn: &Connection) -> anyhow::Result<RecoveryScan> {
     let mut stmt = Statement::prepare(
         conn,
         "SELECT id, name, cwd, layout_snapshot FROM sessions ORDER BY last_snapshot_timestamp DESC",
     )?;
+    let rows = stmt.map(|stmt| {
+        Ok((
+            stmt.column_text(0)?.to_owned(),
+            stmt.column_text(1)?.to_owned(),
+            stmt.column_text(2)?.to_owned(),
+            stmt.column_text(3)?.to_owned(),
+        ))
+    })?;
 
-    stmt.map(|stmt| {
-        let id: String = stmt.column_text(0)?.to_owned();
-        let name: String = stmt.column_text(1)?.to_owned();
-        let cwd: String = stmt.column_text(2)?.to_owned();
-        Ok(crate::session::Session::new(id, name, cwd))
-    })
+    let mut candidates = Vec::new();
+    let mut rejected = Vec::new();
+    for (id, name, cwd, layout_snapshot) in rows {
+        let validation = (|| {
+            anyhow::ensure!(!layout_snapshot.is_empty(), "session {id} has no persisted layout");
+            let layout = crate::layout::LayoutTree::deserialize(&layout_snapshot)
+                .map_err(|error| anyhow::anyhow!("invalid persisted layout for session {id}: {error}"))?;
+            let pane_ids = layout.pane_ids();
+            anyhow::ensure!(
+                !pane_ids.is_empty() && pane_ids.iter().all(|pane_id| !pane_id.is_empty()),
+                "persisted layout for session {id} has no recoverable panes"
+            );
+            anyhow::Ok(RecoveryCandidate { id, name, cwd, layout })
+        })();
+        match validation {
+            Ok(candidate) => candidates.push(candidate),
+            Err(error) => rejected.push(error.to_string()),
+        }
+    }
+    Ok(RecoveryScan { candidates, rejected })
 }
 
 #[cfg(test)]
@@ -142,18 +178,25 @@ mod tests {
     fn deleted_session_is_not_recovered() {
         let connection = Connection::open_memory(Some("deleted_session_is_not_recovered"));
         init_tables(&connection).expect("initialize persistence tables");
-        let sessions = Arc::new(parking_lot::RwLock::new(vec![
-            crate::session::Session::new(
-                "keep".to_string(),
-                "keep".to_string(),
-                "/tmp".to_string(),
-            ),
-            crate::session::Session::new(
-                "kill".to_string(),
-                "kill".to_string(),
-                "/tmp".to_string(),
-            ),
-        ]));
+        let mut keep = crate::session::Session::new(
+            "keep".to_string(),
+            "keep".to_string(),
+            "/tmp".to_string(),
+        );
+        keep.layout = crate::layout::LayoutTree::with_pane(
+            "keep-node".to_string(),
+            "keep-pane".to_string(),
+        );
+        let mut kill = crate::session::Session::new(
+            "kill".to_string(),
+            "kill".to_string(),
+            "/tmp".to_string(),
+        );
+        kill.layout = crate::layout::LayoutTree::with_pane(
+            "kill-node".to_string(),
+            "kill-pane".to_string(),
+        );
+        let sessions = Arc::new(parking_lot::RwLock::new(vec![keep, kill]));
         let database = Arc::new(parking_lot::Mutex::new(connection));
         snapshot_sessions(&sessions, &database).expect("snapshot sessions");
 
@@ -161,12 +204,59 @@ mod tests {
             let connection = database.lock();
             delete_session(&connection, "kill").expect("delete killed session");
         }
-        let recovered = {
+        let scan = {
             let connection = database.lock();
-            recover_sessions(&connection).expect("recover remaining sessions")
+            recovery_candidates(&connection).expect("load remaining recovery candidates")
         };
 
-        assert_eq!(recovered.len(), 1);
-        assert_eq!(recovered[0].id, "keep");
+        assert!(scan.rejected.is_empty());
+        assert_eq!(scan.candidates.len(), 1);
+        assert_eq!(scan.candidates[0].id, "keep");
+        assert_eq!(scan.candidates[0].layout.pane_ids(), vec!["keep-pane"]);
+    }
+
+    #[test]
+    fn corrupt_persisted_layout_is_not_published_as_a_candidate() {
+        let connection = Connection::open_memory(Some("corrupt_persisted_layout"));
+        init_tables(&connection).expect("initialize persistence tables");
+        let mut insert = Statement::prepare(
+            &connection,
+            "INSERT INTO sessions (id, name, cwd, layout_snapshot, last_snapshot_timestamp) VALUES (?, ?, ?, ?, ?)",
+        )
+        .expect("prepare corrupt candidate insert");
+        insert.bind(&"broken", 1).expect("bind id");
+        insert.bind(&"broken", 2).expect("bind name");
+        insert.bind(&"/tmp", 3).expect("bind cwd");
+        insert.bind(&"not-a-layout", 4).expect("bind layout");
+        insert.bind(&0_i64, 5).expect("bind timestamp");
+        insert.exec().expect("insert corrupt candidate");
+
+        let scan = recovery_candidates(&connection).expect("scan recovery candidates");
+        assert!(scan.candidates.is_empty());
+        assert_eq!(scan.rejected.len(), 1);
+        assert!(scan.rejected[0].contains("invalid persisted layout"));
+    }
+
+    #[test]
+    fn empty_session_is_not_published_as_a_recovery_candidate() {
+        let connection = Connection::open_memory(Some("empty_recovery_candidate"));
+        init_tables(&connection).expect("initialize persistence tables");
+        let sessions = Arc::new(parking_lot::RwLock::new(vec![
+            crate::session::Session::new(
+                "empty".to_string(),
+                "empty".to_string(),
+                "/tmp".to_string(),
+            ),
+        ]));
+        let database = Arc::new(parking_lot::Mutex::new(connection));
+        snapshot_sessions(&sessions, &database).expect("snapshot empty session");
+
+        let scan = {
+            let connection = database.lock();
+            recovery_candidates(&connection).expect("scan recovery candidates")
+        };
+        assert!(scan.candidates.is_empty());
+        assert_eq!(scan.rejected.len(), 1);
+        assert!(scan.rejected[0].contains("no recoverable panes"));
     }
 }

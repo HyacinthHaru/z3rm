@@ -248,59 +248,20 @@ pub fn run() -> Result<()> {
         };
         let db = init_database(&db_path)?;
 
-        let recovered = persistence::recover_sessions(&db)?;
-        tracing::info!(count = recovered.len(), "recovered sessions");
-
-        let sessions = std::sync::Arc::new(parking_lot::RwLock::new(recovered));
-        // §4 / §3.6 Re-arm shadow-snapshot watchers for recovered sessions.
-        // Each task mirrors handle_create_session: spawn_blocking → snapshot::start,
-        // then a brief write-lock to assign snapshot_watch if the session still exists.
-        let recovered_shadow_targets: Vec<(String, String)> = {
-            let sessions_r = sessions.read();
-            sessions_r
-                .iter()
-                .map(|s| (s.id.clone(), s.cwd.clone()))
-                .collect()
-        };
-        for (session_id, cwd) in recovered_shadow_targets {
-            let sessions_arc = sessions.clone();
-            tokio::spawn(async move {
-                let session_id_for_start = session_id.clone();
-                match tokio::task::spawn_blocking(move || {
-                    crate::snapshot::start(&session_id_for_start, &cwd)
-                })
-                .await
-                {
-                    Ok(Ok(Some(watch))) => {
-                        let mut sessions_w = sessions_arc.write();
-                        if let Some(session) = sessions_w.iter_mut().find(|s| s.id == session_id) {
-                            session.snapshot_watch = Some(watch);
-                            zlog::info!("shadow snapshot re-armed: session={}", session_id);
-                        }
-                    }
-                    Ok(Ok(None)) => {
-                        zlog::info!(
-                            "shadow snapshot not armed (recovered): session={}",
-                            session_id
-                        );
-                    }
-                    Ok(Err(error)) => {
-                        zlog::warn!(
-                            "shadow snapshot start failed (recovered): session={} error={}",
-                            session_id,
-                            error
-                        );
-                    }
-                    Err(error) => {
-                        zlog::warn!(
-                            "shadow snapshot task join failed (recovered): session={} error={}",
-                            session_id,
-                            error
-                        );
-                    }
-                }
-            });
+        // Persisted rows are recovery candidates, not live sessions. Recreating
+        // shells is destructive and must be explicitly confirmed; publishing
+        // empty Session objects here made attach falsely report successful
+        // recovery and caused the GUI to spawn unrelated replacement shells.
+        let recovery_scan = persistence::recovery_candidates(&db)?;
+        for error in &recovery_scan.rejected {
+            tracing::warn!(%error, "rejected invalid mux recovery candidate");
         }
+        tracing::info!(
+            count = recovery_scan.candidates.len(),
+            rejected = recovery_scan.rejected.len(),
+            "loaded mux recovery candidates pending confirmation"
+        );
+        let sessions = std::sync::Arc::new(parking_lot::RwLock::new(Vec::new()));
         let db = std::sync::Arc::new(parking_lot::Mutex::new(db));
 
         let sessions_clone = sessions.clone();
