@@ -668,9 +668,10 @@ impl MuxDomain {
 
     /// §3.5 Request an explicit mux_server process shutdown.
     pub async fn shutdown(&self) -> Result<()> {
-        self.send_request(RequestBody::Shutdown(mux_protocol::ShutdownRequest {}))
-            .await?;
-        Ok(())
+        Self::empty_or_error_response(
+            self.send_request(RequestBody::Shutdown(mux_protocol::ShutdownRequest {}))
+                .await?,
+        )
     }
 
     /// §3.10 重命名会话。
@@ -826,11 +827,7 @@ impl MuxDomain {
             pane_id: pane.to_string(),
             data: bytes.to_vec(),
         });
-        let resp = self.send_request(req).await?;
-        match resp.body {
-            Some(ResponseBody::Error(msg)) if !msg.is_empty() => Err(anyhow::anyhow!(msg)),
-            _ => Ok(()),
-        }
+        Self::empty_or_error_response(self.send_request(req).await?)
     }
 
     /// §3.10 向 Pane 粘贴文本。
@@ -918,8 +915,7 @@ impl MuxDomain {
     /// §3.10 断开连接。
     pub async fn detach(&self) -> Result<()> {
         let req = RequestBody::Detach(mux_protocol::DetachRequest {});
-        let _resp = self.send_request(req).await?;
-        Ok(())
+        Self::empty_or_error_response(self.send_request(req).await?)
     }
 
     // ========================================================================
@@ -932,8 +928,7 @@ impl MuxDomain {
             pane_id: pane.to_string(),
             zoom,
         });
-        let _resp = self.send_request(req).await?;
-        Ok(())
+        Self::empty_or_error_response(self.send_request(req).await?)
     }
 
     /// §3.3 查询 Pane 的 shell integration 状态 (cwd + prompt marker)。
@@ -956,8 +951,7 @@ impl MuxDomain {
         let req = RequestBody::SubscribePaneOutput(mux_protocol::SubscribePaneOutputRequest {
             pane_id: pane.to_string(),
         });
-        let _resp = self.send_request(req).await?;
-        Ok(())
+        Self::empty_or_error_response(self.send_request(req).await?)
     }
 
     // ========================================================================
@@ -1280,6 +1274,136 @@ mod tests {
         assert!(!new_receiver.is_closed());
     }
     use std::io::Cursor;
+
+    /// A loopback transport that answers every request with one fixed response
+    /// body, so client-side response handling can be exercised without a live
+    /// daemon.
+    struct ScriptedServer {
+        inbound: Vec<u8>,
+        outbound: std::collections::VecDeque<u8>,
+        reply: ResponseBody,
+    }
+
+    impl ScriptedServer {
+        fn new(reply: ResponseBody) -> Self {
+            Self {
+                inbound: Vec::new(),
+                outbound: std::collections::VecDeque::new(),
+                reply,
+            }
+        }
+
+        fn invalid_data(error: impl std::fmt::Display) -> std::io::Error {
+            std::io::Error::new(std::io::ErrorKind::InvalidData, error.to_string())
+        }
+    }
+
+    impl std::io::Write for ScriptedServer {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.inbound.extend_from_slice(buf);
+            while let Some((length, header_len)) =
+                parse_len_prefix(&self.inbound).map_err(Self::invalid_data)?
+            {
+                let payload_len = check_frame_len(length).map_err(Self::invalid_data)?;
+                let total_len = header_len
+                    .checked_add(payload_len)
+                    .ok_or_else(|| Self::invalid_data("frame length overflow"))?;
+                if self.inbound.len() < total_len {
+                    break;
+                }
+                let request_frame: Vec<u8> = self.inbound.drain(0..total_len).collect();
+                let (envelope, _) =
+                    mux_protocol::unframe(&request_frame).map_err(Self::invalid_data)?;
+                let Some(EnvelopePayload::Request(request)) = envelope.payload else {
+                    continue;
+                };
+                let response = Envelope {
+                    version: Some(PROTOCOL_VERSION),
+                    payload: Some(EnvelopePayload::Response(Response {
+                        request_id: request.request_id,
+                        body: Some(self.reply.clone()),
+                    })),
+                };
+                self.outbound
+                    .extend(frame(&response).map_err(Self::invalid_data)?);
+            }
+            Ok(buf.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl std::io::Read for ScriptedServer {
+        fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+            if self.outbound.is_empty() {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::WouldBlock,
+                    "no reply queued",
+                ));
+            }
+            let mut written = 0;
+            for slot in buf.iter_mut() {
+                match self.outbound.pop_front() {
+                    Some(byte) => {
+                        *slot = byte;
+                        written += 1;
+                    }
+                    None => break,
+                }
+            }
+            Ok(written)
+        }
+    }
+
+    fn scripted_domain(reply: ResponseBody) -> MuxDomain {
+        match MuxDomain::connect_with_blocking_stream(ScriptedServer::new(reply)) {
+            Ok(domain) => domain,
+            Err(error) => panic!("scripted domain: {error}"),
+        }
+    }
+
+    /// Requests whose response body was previously discarded must still fail
+    /// when the server refuses them — a `ResponseBody::Error` is not a success.
+    #[test]
+    fn empty_response_requests_surface_server_errors() {
+        for description in ["detach", "zoom_pane", "subscribe_pane_output", "shutdown"] {
+            let domain = scripted_domain(ResponseBody::Error(
+                "permission denied: read-write required".to_string(),
+            ));
+            let result = smol::block_on(async {
+                match description {
+                    "detach" => domain.detach().await,
+                    "zoom_pane" => domain.zoom_pane("pane-1", true).await,
+                    "subscribe_pane_output" => domain.subscribe_pane_output("pane-1").await,
+                    _ => domain.shutdown().await,
+                }
+            });
+            let error = match result {
+                Ok(()) => panic!("{description} must not report success on a server error"),
+                Err(error) => error,
+            };
+            assert!(
+                error.to_string().contains("permission denied"),
+                "{description} lost the server error: {error}"
+            );
+        }
+    }
+
+    #[test]
+    fn empty_response_requests_accept_success_bodies() {
+        let domain = scripted_domain(ResponseBody::Error(String::new()));
+        assert!(smol::block_on(domain.detach()).is_ok());
+
+        let domain = scripted_domain(ResponseBody::ZoomPane(mux_protocol::ZoomPaneResponse {}));
+        assert!(smol::block_on(domain.zoom_pane("pane-1", true)).is_ok());
+
+        let domain = scripted_domain(ResponseBody::SubscribePaneOutput(
+            mux_protocol::SubscribePaneOutputResponse {},
+        ));
+        assert!(smol::block_on(domain.subscribe_pane_output("pane-1")).is_ok());
+    }
 
     #[test]
     fn frame_reader_rejects_oversized_prefix_before_payload_read() {
