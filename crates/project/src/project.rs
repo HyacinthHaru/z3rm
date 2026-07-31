@@ -289,16 +289,34 @@ impl Project {
     #[cfg(any(test, feature = "test-support"))]
     pub async fn test(
         fs: Arc<dyn Fs>,
-        worktree_paths: &[PathBuf],
-        cx: &mut App,
+        root_paths: impl IntoIterator<Item = &Path>,
+        cx: &mut gpui::TestAppContext,
     ) -> Entity<Self> {
-        Self::local(
-            Arc::new(LanguageRegistry::new(cx.background_executor().clone())),
-            fs,
-            None,
-            worktree_paths.to_vec(),
-            cx,
-        )
+        let languages = Arc::new(LanguageRegistry::test(cx.executor()));
+        let project = cx.update(|cx| Self::local(languages, fs, None, Vec::new(), cx));
+
+        for root_path in root_paths {
+            let root_path = root_path.to_path_buf();
+            let worktree = project
+                .update(cx, |project, cx| {
+                    project.add_local_worktree(root_path.clone(), true, cx)
+                })
+                .await
+                .unwrap_or_else(|error| {
+                    panic!("failed to create test worktree at {root_path:?}: {error}")
+                });
+
+            // Tests inspect worktree entries immediately after this returns, so the
+            // initial scan has to finish here or those lookups race against it.
+            let scan_complete = worktree.read_with(cx, |worktree, _| {
+                worktree.as_local().map(|local| local.scan_complete())
+            });
+            if let Some(scan_complete) = scan_complete {
+                scan_complete.await;
+            }
+        }
+
+        project
     }
 
     /// Removed-feature stub: remote project support was deleted with collab.
