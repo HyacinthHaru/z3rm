@@ -38,6 +38,7 @@ fn snapshot_to_text_empty_grid() {
         cursor: None,
         alternate_screen: false,
         display_offset: 0,
+        ..Default::default()
     };
     assert_eq!(snapshot_to_text(&snap), "");
 }
@@ -51,6 +52,7 @@ fn snapshot_to_text_single_row() {
         cursor: None,
         alternate_screen: false,
         display_offset: 0,
+        ..Default::default()
     };
     assert_eq!(snapshot_to_text(&snap), "hello");
 }
@@ -69,6 +71,7 @@ fn snapshot_to_text_multi_row_no_trailing_newline() {
         cursor: None,
         alternate_screen: false,
         display_offset: 0,
+        ..Default::default()
     };
     assert_eq!(snapshot_to_text(&snap), "ab\ncd\nef");
 }
@@ -83,6 +86,7 @@ fn snapshot_to_text_missing_cells_filled_with_space() {
         cursor: None,
         alternate_screen: false,
         display_offset: 0,
+        ..Default::default()
     };
     let text = snapshot_to_text(&snap);
     assert_eq!(text, "x  \n   ");
@@ -97,6 +101,7 @@ fn apply_diff_overwrites_cells_in_row() {
         cursor: None,
         alternate_screen: false,
         display_offset: 0,
+        ..Default::default()
     };
     let diff = GridDiff {
         rows: vec![RowChange {
@@ -104,13 +109,14 @@ fn apply_diff_overwrites_cells_in_row() {
             cells: vec![cell('X'), cell('Y'), cell('Z')],
         }],
     };
-    apply_diff_to_snapshot(&mut snap, &diff);
+    apply_diff_to_snapshot(&mut snap, &diff).expect("well-formed diff applies");
     assert_eq!(snapshot_to_text(&snap), "aaa\nXYZ");
 }
 
 #[test]
-fn apply_diff_truncates_overlong_row() {
-    // §3.3 row cells 多于 cols → 静默丢弃多余 (越界 col break)
+fn apply_diff_rejects_overlong_row() {
+    // §3.3 一行的 cell 数必须正好等于 cols。多出来的部分不能被悄悄丢掉：
+    // 那会让客户端显示一份和服务端不一致的网格却毫无迹象。
     let mut snap = proto::FullGridSnapshot {
         cols: 2,
         rows: 1,
@@ -118,6 +124,7 @@ fn apply_diff_truncates_overlong_row() {
         cursor: None,
         alternate_screen: false,
         display_offset: 0,
+        ..Default::default()
     };
     let diff = GridDiff {
         rows: vec![RowChange {
@@ -125,13 +132,17 @@ fn apply_diff_truncates_overlong_row() {
             cells: vec![cell('X'), cell('Y'), cell('Z'), cell('W')],
         }],
     };
-    apply_diff_to_snapshot(&mut snap, &diff);
-    assert_eq!(snapshot_to_text(&snap), "XY"); // ZW 丢弃
+    let error = apply_diff_to_snapshot(&mut snap, &diff).expect_err("overlong row must be rejected");
+    assert!(
+        error.to_string().contains("expected 2"),
+        "error should name the expected width: {error}"
+    );
+    assert_eq!(snapshot_to_text(&snap), "aa", "rejected diff must not mutate");
 }
 
 #[test]
-fn apply_diff_skips_out_of_bounds_row() {
-    // §3.3 row_idx >= rows → continue (无 panic)
+fn apply_diff_rejects_out_of_bounds_row() {
+    // §3.3 越界行同样必须报错而不是被跳过。
     let mut snap = proto::FullGridSnapshot {
         cols: 2,
         rows: 1,
@@ -139,6 +150,7 @@ fn apply_diff_skips_out_of_bounds_row() {
         cursor: None,
         alternate_screen: false,
         display_offset: 0,
+        ..Default::default()
     };
     let diff = GridDiff {
         rows: vec![RowChange {
@@ -146,8 +158,13 @@ fn apply_diff_skips_out_of_bounds_row() {
             cells: vec![cell('X'), cell('Y')],
         }],
     };
-    apply_diff_to_snapshot(&mut snap, &diff);
-    assert_eq!(snapshot_to_text(&snap), "aa");
+    let error =
+        apply_diff_to_snapshot(&mut snap, &diff).expect_err("out of bounds row must be rejected");
+    assert!(
+        error.to_string().contains("outside 1 rows"),
+        "error should name the row bound: {error}"
+    );
+    assert_eq!(snapshot_to_text(&snap), "aa", "rejected diff must not mutate");
 }
 
 fn cell(ch: char) -> Cell {
@@ -156,6 +173,7 @@ fn cell(ch: char) -> Cell {
         style: None,
         foreground: 0,
         background: 0,
+        ..Default::default()
     }
 }
 
