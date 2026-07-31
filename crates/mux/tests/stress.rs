@@ -152,15 +152,14 @@ async fn wait_for_generation(
     what: &str,
 ) -> Result<u64> {
     let deadline = Instant::now() + timeout;
-    let mut last = 0;
     loop {
         let response = domain.fetch_grid_update(pane_id, 0).await?;
-        last = response.to_generation;
-        if predicate(last) {
-            return Ok(last);
+        let generation = response.to_generation;
+        if predicate(generation) {
+            return Ok(generation);
         }
         if Instant::now() >= deadline {
-            anyhow::bail!("timed out waiting for {what}; last generation was {last}");
+            anyhow::bail!("timed out waiting for {what}; last generation was {generation}");
         }
         tokio::time::sleep(Duration::from_millis(20)).await;
     }

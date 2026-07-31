@@ -68,7 +68,19 @@ gives up after 15 seconds and reports the roles it did see.
 
 ## Stress coverage
 
-Throughput and lifecycle stress lives with the mux end-to-end tests
-(`crates/mux/tests/`), which drive a real `z3rm-server` subprocess. They are the
-right place for generation-counter monotonicity and scrollback eviction, none of
-which needs a window.
+Throughput and lifecycle stress lives in `crates/mux/tests/stress.rs`, which
+drives a real `z3rm-server` subprocess — none of it needs a window:
+
+```sh
+cargo build -p mux_server --bin z3rm-server   # the tests exec this binary
+cargo test -p mux --test stress
+```
+
+It covers generation monotonicity under sustained PTY output, `PaneAdded`
+delivery across dozens of panes at once, repeated attach/detach without server
+state accumulating, scrollback eviction never handing back out-of-range rows,
+and split/close churn leaving the layout tree consistent.
+
+Rebuild `z3rm-server` after touching anything under `crates/mux_server/` —
+`cargo test -p mux` does not rebuild it for you, and the tests will silently
+exercise the previous binary.
