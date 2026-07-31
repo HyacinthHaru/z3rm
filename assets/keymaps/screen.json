@@ -7,6 +7,9 @@
     "context": "Terminal",
     "bindings": {
       "ctrl-a": ["mux::EnterPrefixMode", { "timeout_ms": 500 }],
+      // §3.3 / §15.7 A GUI window has no screen prefix equivalent, so the second
+      // window stays on a native prefix-free chord (Plan 32).
+      "ctrl-alt-n": "mux::NewWindow",
 
       // §12 复制模式 (Plan 31)
       "ctrl-shift-;": "terminal::EnterCopyMode"

@@ -154,16 +154,37 @@ impl Session {
     }
 
     /// 添加附加客户端 (§3.10 AttachRequest)
-    pub fn add_attached_client(&mut self, client_id: String, mode: AttachMode, role: ClientRole) {
+    ///
+    /// §3.3 `window_id` 是该连接所代表的 GUI 窗口 (Plan 32)。窗口成员资格靠
+    /// 这个字段与连接绑定, 断连时才知道该释放哪个窗口。
+    pub fn add_attached_client(
+        &mut self,
+        client_id: String,
+        mode: AttachMode,
+        role: ClientRole,
+        window_id: Option<String>,
+    ) {
         let clients = self.attached_clients.clone();
-        clients.write().push(AttachedClient { client_id, mode, window_id: None, role });
+        clients.write().push(AttachedClient {
+            client_id,
+            mode,
+            window_id,
+            role,
+        });
     }
 
     /// 移除附加客户端 (§3.10 DetachRequest)
-    pub fn remove_attached_client(&mut self, client_id: &str) {
+    ///
+    /// 返回该客户端声明的 window_id (§3.3 Plan 32), 调用方据此决定是否释放窗口。
+    pub fn remove_attached_client(&mut self, client_id: &str) -> Option<String> {
         let clients = self.attached_clients.clone();
         let mut clients_w = clients.write();
+        let window_id = clients_w
+            .iter()
+            .find(|client| client.client_id == client_id)
+            .and_then(|client| client.window_id.clone());
         clients_w.retain(|c| c.client_id != client_id);
+        window_id
     }
 
     /// §3.4 注册 lifecycle 订阅者: attach 时把该连接的 outbound channel 加入会话级注册表。
@@ -252,18 +273,42 @@ impl Session {
     // §3.3 窗口管理方法 (多窗口支持，Plan 32)
     // ========================================================================
 
-    /// §3.3 添加窗口到会话的已连接窗口列表
-    pub fn add_window(&self, window_id: String) {
+    /// §3.3 添加窗口到会话的已连接窗口列表。
+    /// 返回 true 表示这是一次真正的新增 (调用方据此决定是否广播 WindowAdded)。
+    pub fn add_window(&self, window_id: String) -> bool {
         let mut windows = self.connected_windows.write();
-        if !windows.contains(&window_id) {
-            windows.push(window_id);
+        if windows.contains(&window_id) {
+            return false;
         }
+        windows.push(window_id);
+        true
     }
 
     /// §3.3 从会话移除窗口
     pub fn remove_window(&self, window_id: &str) {
         let mut windows = self.connected_windows.write();
         windows.retain(|w| w != window_id);
+    }
+
+    /// §3.3 释放一个窗口引用 (Plan 32), 返回 true 表示窗口确实离开了会话。
+    ///
+    /// 窗口归属记录在 `AttachedClient.window_id` 上, 只有在最后一个引用它的
+    /// attached 客户端离开之后才把窗口从 `connected_windows` 摘掉。§15.4 的
+    /// 原地重连会先用同一个 window_id 建立新连接再清理旧连接, 这段交叠期间
+    /// 引用式判断保证窗口不会被旧连接的清理误删。
+    pub fn release_window(&self, window_id: &str) -> bool {
+        let still_claimed = self
+            .attached_clients
+            .read()
+            .iter()
+            .any(|client| client.window_id.as_deref() == Some(window_id));
+        if still_claimed {
+            return false;
+        }
+        let mut windows = self.connected_windows.write();
+        let before = windows.len();
+        windows.retain(|window| window != window_id);
+        windows.len() != before
     }
 
     /// §3.3 获取会话已连接的窗口 ID 列表
@@ -281,9 +326,19 @@ impl Session {
         self.connected_windows.read().contains(&window_id.to_string())
     }
 
-    /// §3.3 广播布局变更到所有连接的窗口
-    /// 返回已连接的窗口 ID 列表，调用方负责发送通知
-    pub fn broadcast_layout_change(&self) -> Vec<String> {
-        self.connected_windows.read().clone()
+    /// §3.3 / §3.4 广播布局变更到所有连接的窗口 (Plan 32)。
+    ///
+    /// 走的是 §3.4 at-least-once 的 lifecycle 路径, 因此每个 attached 连接
+    /// (即每个窗口) 都会收到, 而不只是触发变更的那一个。返回收到通知的窗口
+    /// ID 列表, 供调用方记录/断言。
+    pub fn broadcast_layout_change(&self, layout: mux_protocol::LayoutTree) -> Vec<String> {
+        self.broadcast_lifecycle(Notification {
+            event: Some(mux_protocol::notification::Event::SessionLayoutChanged(
+                mux_protocol::SessionLayoutChanged {
+                    layout: Some(layout),
+                },
+            )),
+        });
+        self.get_windows()
     }
 }

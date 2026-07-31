@@ -304,7 +304,11 @@ async fn cleanup_connection_state(
 ) {
     if let Some(client_id) = connection_client_id.lock().clone() {
         let mut sessions = sessions.write();
-        unregister_client_from_sessions(&mut sessions, &client_id);
+        // §3.3 A closed socket is the authoritative signal that a GUI window is
+        // gone (Plan 32): one window owns one connection, so the window leaves
+        // the session here even when the client crashed without detaching.
+        let released_windows = unregister_client_from_sessions(&mut sessions, &client_id);
+        broadcast_window_removals(&sessions, &released_windows);
     }
 
     let forward_tasks = forward_tasks.lock().drain(..).collect::<Vec<_>>();
@@ -320,14 +324,79 @@ async fn cleanup_connection_state(
     }
 }
 
-fn unregister_client_from_sessions(sessions: &mut [crate::session::Session], client_id: &str) {
+/// §3.3 一个窗口在某个会话中的注册被释放 (Plan 32)。
+///
+/// `unregister_client_from_sessions` 只做状态变更并把结果交回调用方, 广播由
+/// 调用方决定: `handle_attach` 需要把「同一窗口重新 attach」这种并未真正离开
+/// 会话的情况压掉, 断连 / detach 路径则必须原样 fan-out。
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ReleasedWindow {
+    pub session_id: String,
+    pub window_id: String,
+}
+
+fn unregister_client_from_sessions(
+    sessions: &mut [crate::session::Session],
+    client_id: &str,
+) -> Vec<ReleasedWindow> {
+    let mut released = Vec::new();
     for session in sessions {
-        session.remove_attached_client(client_id);
+        let claimed_window = session.remove_attached_client(client_id);
         session.remove_lifecycle_subscriber(client_id);
         for pane in session.panes.read().values() {
             pane.remove_subscriber(client_id);
             drop_client_viewport(pane, client_id);
         }
+        if let Some(window_id) = claimed_window
+            && session.release_window(&window_id)
+        {
+            released.push(ReleasedWindow {
+                session_id: session.id.clone(),
+                window_id,
+            });
+        }
+    }
+    released
+}
+
+/// §3.3 新窗口加入会话的通知 (Plan 32)。
+fn window_added_notification(session_id: &str, window_id: &str) -> Notification {
+    Notification {
+        event: Some(mux_protocol::notification::Event::WindowAdded(
+            mux_protocol::WindowAdded {
+                window_id: window_id.to_string(),
+                session_id: session_id.to_string(),
+            },
+        )),
+    }
+}
+
+/// §3.3 窗口离开会话的通知 (Plan 32)。
+fn window_removed_notification(session_id: &str, window_id: &str) -> Notification {
+    Notification {
+        event: Some(mux_protocol::notification::Event::WindowRemoved(
+            mux_protocol::WindowRemoved {
+                window_id: window_id.to_string(),
+                session_id: session_id.to_string(),
+            },
+        )),
+    }
+}
+
+/// §3.4 把窗口注销 fan-out 给会话里剩下的每个连接 (at-least-once)。
+/// 丢一条 `WindowRemoved` 会在其他窗口留下一个不存在的窗口条目。
+fn broadcast_window_removals(sessions: &[crate::session::Session], released: &[ReleasedWindow]) {
+    for window in released {
+        let Some(session) = sessions
+            .iter()
+            .find(|session| session.id == window.session_id)
+        else {
+            continue;
+        };
+        session.broadcast_lifecycle(window_removed_notification(
+            &window.session_id,
+            &window.window_id,
+        ));
     }
 }
 
@@ -549,7 +618,7 @@ async fn dispatch_request(
         }
         RequestBody::NewWindow(r) => {
             if check_permission(role, ClientRole::Admin) {
-                handle_new_window(r, sessions, outbound_tx).await?
+                handle_new_window(r, sessions).await?
             } else {
                 ResponseBody::Error("permission denied: admin required".to_string())
             }
@@ -696,17 +765,6 @@ fn send_response(
         .map_err(|_| anyhow::anyhow!("client disconnected"))
 }
 
-/// §9 通过 outbound channel 把 Notification 封装成 Envelope 推送。
-fn send_notification_envelope(
-    outbound_tx: &mpsc::UnboundedSender<Envelope>,
-    notification: Notification,
-) -> Result<(), mpsc::error::SendError<Envelope>> {
-    let envelope = Envelope {
-        version: Some(mux_protocol::PROTOCOL_VERSION.clone()),
-        payload: Some(EnvelopePayload::Notification(notification)),
-    };
-    outbound_tx.send(envelope)
-}
 async fn handle_create_session(
     req: &CreateSessionRequest,
     sessions: &Arc<parking_lot::RwLock<Vec<crate::session::Session>>>,
@@ -874,7 +932,22 @@ async fn handle_attach(
             minted
         }
     };
-    unregister_client_from_sessions(&mut sessions_w, &client_id);
+    let released_windows = unregister_client_from_sessions(&mut sessions_w, &client_id);
+
+    // §3.3 空 window_id 表示对端不是 GUI 窗口 (CLI 一次性命令), 不参与窗口成员
+    // 资格。
+    let attach_window_id = (!req.window_id.is_empty()).then(|| req.window_id.clone());
+    // 同一个窗口重新 attach (§15.4 原地重连 / 幂等 attach) 会先释放再注册, 但它
+    // 从未真正离开会话, 所以这一对 WindowRemoved/WindowAdded 都压掉, 只 fan-out
+    // 该连接此前占用的其他窗口注册。
+    let (reattached_windows, stale_windows): (Vec<ReleasedWindow>, Vec<ReleasedWindow>) =
+        released_windows.into_iter().partition(|released| {
+            released.session_id == req.session_id
+                && Some(released.window_id.as_str()) == attach_window_id.as_deref()
+        });
+    let reattaching_same_window = !reattached_windows.is_empty();
+    broadcast_window_removals(&sessions_w, &stale_windows);
+
     let session = &mut sessions_w[target_session];
 
     // §3.3 角色解析: identity 显式声明时以其为准;否则保留既有角色, 首次
@@ -913,7 +986,21 @@ async fn handle_attach(
             .iter()
             .map(|attached| attached.client_id.clone())
             .collect();
+        let kicked_windows: Vec<String> = session
+            .attached_clients
+            .read()
+            .iter()
+            .filter_map(|attached| attached.window_id.clone())
+            .collect();
         session.attached_clients.write().clear();
+        // §3.3 抢占踢出的窗口注销必须在清空 lifecycle 订阅之前广播, 否则被踢的
+        // 客户端永远收不到「自己已离开会话」这条通知 (Plan 32)。
+        for window_id in &kicked_windows {
+            if session.release_window(window_id) {
+                session
+                    .broadcast_lifecycle(window_removed_notification(&req.session_id, window_id));
+            }
+        }
         kicked_clients.extend(session.clear_lifecycle_subscribers());
         for pane in session.panes.read().values() {
             for kicked_client in &kicked_clients {
@@ -922,11 +1009,7 @@ async fn handle_attach(
             }
         }
     }
-    session.add_attached_client(client_id.clone(), mode, role);
-
-    if !req.window_id.is_empty() {
-        session.add_window(req.window_id.clone());
-    }
+    session.add_attached_client(client_id.clone(), mode, role, attach_window_id.clone());
 
     // §3.4 Register this connection's outbound channel as a session-level
     // lifecycle subscriber. lifecycle_subscribers is keyed by client_id and
@@ -934,6 +1017,16 @@ async fn handle_attach(
     // read/write loop exits, after which broadcast_lifecycle prunes it.
     // Re-attach of the same client_id replaces the prior sender idempotently.
     session.add_lifecycle_subscriber(client_id.clone(), outbound_tx.clone());
+
+    // §3.3 窗口在这里才真正加入会话 (Plan 32): 只有 attach 才带连接身份, 也只有
+    // 绑定了连接身份的窗口才能在断连时被精确释放。注册在 lifecycle 订阅之后,
+    // 这样刚接入的窗口自己也会收到这条 WindowAdded。
+    if let Some(window_id) = &attach_window_id
+        && session.add_window(window_id.clone())
+        && !reattaching_same_window
+    {
+        session.broadcast_lifecycle(window_added_notification(&req.session_id, window_id));
+    }
 
     // §3.4 把该连接的 outbound_tx 注册为 session 内所有 pane 的 subscriber。
     // 后续 PTY output → bump generation → broadcast PaneDirty → 此连接收到。
@@ -961,31 +1054,35 @@ async fn handle_attach(
         forward_tasks.lock().push(handle);
     }
 
-    // §15.4 权威快照:tabs / layout / focused 必须反映 server 真实状态。
-    // 旧实现写死 tabs: Vec::new() 是严重违反 spec §15.4 的 bug。
-    let tabs_proto: Vec<mux_protocol::TabInfo> = session
+    Ok(ResponseBody::Attach(AttachResponse {
+        snapshot: Some(session_snapshot(session)),
+    }))
+}
+
+/// §15.4 权威快照:tabs / layout / focused 必须反映 server 真实状态。
+/// 旧实现写死 tabs: Vec::new() 是严重违反 spec §15.4 的 bug。
+fn session_snapshot(session: &crate::session::Session) -> SessionSnapshot {
+    let tabs = session
         .tabs
         .values()
-        .map(|t| mux_protocol::TabInfo {
-            id: t.id.clone(),
-            title: t.title.clone(),
-            panes: t
+        .map(|tab| mux_protocol::TabInfo {
+            id: tab.id.clone(),
+            title: tab.title.clone(),
+            panes: tab
                 .pane_ids
                 .iter()
-                .filter_map(|pid| pane_info_for(session, pid))
+                .filter_map(|pane_id| pane_info_for(session, pane_id))
                 .collect(),
         })
         .collect();
 
-    Ok(ResponseBody::Attach(AttachResponse {
-        snapshot: Some(SessionSnapshot {
-            session_id: session.id.clone(),
-            focused_pane_id: session.focused_pane.clone().unwrap_or_default(),
-            focused_tab_id: session.focused_tab.clone().unwrap_or_default(),
-            tabs: tabs_proto,
-            layout: Some(layout_tree_to_proto(&session.layout)),
-        }),
-    }))
+    SessionSnapshot {
+        session_id: session.id.clone(),
+        focused_pane_id: session.focused_pane.clone().unwrap_or_default(),
+        focused_tab_id: session.focused_tab.clone().unwrap_or_default(),
+        tabs,
+        layout: Some(layout_tree_to_proto(&session.layout)),
+    }
 }
 
 /// §3.10 断开连接 — remove this connection's client registration.
@@ -1002,7 +1099,10 @@ async fn handle_detach(
 ) -> anyhow::Result<ResponseBody> {
     let mut sessions_w = sessions.write();
     if let Some(client_id) = connection_client_id.lock().take() {
-        unregister_client_from_sessions(&mut sessions_w, &client_id);
+        // §3.3 Detach retires this connection's window from the session too
+        // (Plan 32) — the GUI calls it when its window closes.
+        let released_windows = unregister_client_from_sessions(&mut sessions_w, &client_id);
+        broadcast_window_removals(&sessions_w, &released_windows);
     }
     // Abort all forward tasks so their outbound_tx clones are dropped,
     // preventing stale PaneDirty/PaneOutput delivery and duplicate
@@ -1070,44 +1170,35 @@ fn register_pane_with_session_subscribers(
     }
 }
 
+/// §3.3 为一个即将打开的 GUI 窗口分配权威窗口 ID (Plan 32)。
+///
+/// 只分配 ID 并回一份会话快照, 不改动 `connected_windows`: 窗口的成员资格必须
+/// 与一个连接绑定 (见 `handle_attach`), 否则 daemon 会留下一个没人认领、断连时
+/// 也无从释放的窗口。客户端拿到 ID 后立即用它 attach。
 async fn handle_new_window(
     req: &NewWindowRequest,
     sessions: &Arc<parking_lot::RwLock<Vec<crate::session::Session>>>,
-    outbound_tx: &mpsc::UnboundedSender<Envelope>,
 ) -> anyhow::Result<ResponseBody> {
-    // §3.3 生成新窗口 ID
     let window_id = format!("win-{}-{}", std::process::id(), nanoid::nanoid!());
 
-    let mut sessions_w = sessions.write();
-    let session = sessions_w
-        .iter_mut()
+    let sessions_r = sessions.read();
+    let session = sessions_r
+        .iter()
         .find(|s| s.id == req.session_id)
         .ok_or_else(|| anyhow::anyhow!("session not found: {}", req.session_id))?;
-    session.add_window(window_id.clone());
-    drop(sessions_w);
+    let snapshot = session_snapshot(session);
+    drop(sessions_r);
 
     // §16.12 记录新窗口创建事件
     zlog::info!(
-        "new window created: session={} window={}",
+        "new window id minted: session={} window={}",
         req.session_id,
         window_id
     );
 
-    // §3.3 广播 WindowAdded 通知到所有已连接窗口
-    let notify = Notification {
-        event: Some(mux_protocol::proto::notification::Event::WindowAdded(
-            mux_protocol::WindowAdded {
-                window_id: window_id.clone(),
-                session_id: req.session_id.clone(),
-            },
-        )),
-    };
-    let _ = send_notification_envelope(outbound_tx, notify);
-
-    // §3.3 返回新窗口信息 (无 snapshot — 客户端应另行 attach)
     Ok(ResponseBody::NewWindow(NewWindowResponse {
         window_id,
-        snapshot: None,
+        snapshot: Some(snapshot),
     }))
 }
 
@@ -1968,24 +2059,17 @@ fn broadcast_layout_changed(
     sessions: &Arc<parking_lot::RwLock<Vec<crate::session::Session>>>,
     session_id: &str,
 ) {
-    let layout_proto = {
-        let sessions_r = sessions.read();
-        sessions_r
-            .iter()
-            .find(|s| s.id == session_id)
-            .map(|s| layout_tree_to_proto(&s.layout))
-    };
-    let Some(layout) = layout_proto else {
+    let sessions_r = sessions.read();
+    let Some(session) = sessions_r.iter().find(|s| s.id == session_id) else {
         return;
     };
-    let notify = Notification {
-        event: Some(mux_protocol::notification::Event::SessionLayoutChanged(
-            mux_protocol::SessionLayoutChanged {
-                layout: Some(layout),
-            },
-        )),
-    };
-    broadcast_lifecycle_in_session(sessions, session_id, notify);
+    // §3.3 一次 fan-out 覆盖会话的每个已连接窗口 (Plan 32)。
+    let notified_windows = session.broadcast_layout_change(layout_tree_to_proto(&session.layout));
+    tracing::trace!(
+        session_id,
+        windows = notified_windows.len(),
+        "layout change broadcast"
+    );
 }
 
 /// §3.4 fan-out PaneAdded 到该会话所有 attached 连接 (split / spawn 后调用)。
@@ -2621,13 +2705,15 @@ mod connection_unit_tests {
                 "client-1".to_string(),
                 crate::session::AttachMode::Shared,
                 ClientRole::ReadWrite,
+                None,
             );
             let (sender, _receiver) = mpsc::unbounded_channel();
             session.add_lifecycle_subscriber("client-1".to_string(), sender);
         }
 
-        unregister_client_from_sessions(&mut sessions, "client-1");
+        let released = unregister_client_from_sessions(&mut sessions, "client-1");
 
+        assert!(released.is_empty(), "no client claimed a window");
         assert!(
             sessions
                 .iter()
@@ -2638,6 +2724,58 @@ mod connection_unit_tests {
                 .iter()
                 .all(|session| session.lifecycle_subscribers.read().is_empty())
         );
+    }
+
+    /// §3.3 断连必须让 `connected_windows` 收缩, 并把 `WindowRemoved` fan-out
+    /// 给会话里剩下的窗口 (Plan 32)。
+    #[test]
+    fn unregister_client_releases_its_window_and_notifies_peers() {
+        let mut session = crate::session::Session::new(
+            "session-1".to_string(),
+            "one".to_string(),
+            "/tmp".to_string(),
+        );
+        for (client_id, window_id) in [("client-a", "win-a"), ("client-b", "win-b")] {
+            session.add_attached_client(
+                client_id.to_string(),
+                crate::session::AttachMode::Shared,
+                ClientRole::ReadWrite,
+                Some(window_id.to_string()),
+            );
+            session.add_window(window_id.to_string());
+        }
+        let (peer_sender, mut peer_notifications) = mpsc::unbounded_channel();
+        session.add_lifecycle_subscriber("client-b".to_string(), peer_sender);
+        let (leaving_sender, _leaving_notifications) = mpsc::unbounded_channel();
+        session.add_lifecycle_subscriber("client-a".to_string(), leaving_sender);
+        let mut sessions = vec![session];
+
+        let released = unregister_client_from_sessions(&mut sessions, "client-a");
+
+        assert_eq!(
+            released,
+            vec![ReleasedWindow {
+                session_id: "session-1".to_string(),
+                window_id: "win-a".to_string(),
+            }]
+        );
+        assert_eq!(sessions[0].get_windows(), vec!["win-b".to_string()]);
+
+        broadcast_window_removals(&sessions, &released);
+
+        let envelope = match peer_notifications.try_recv() {
+            Ok(envelope) => envelope,
+            Err(error) => panic!("surviving window must receive WindowRemoved: {error}"),
+        };
+        match envelope.payload {
+            Some(EnvelopePayload::Notification(Notification {
+                event: Some(mux_protocol::notification::Event::WindowRemoved(removed)),
+            })) => {
+                assert_eq!(removed.window_id, "win-a");
+                assert_eq!(removed.session_id, "session-1");
+            }
+            other => panic!("expected WindowRemoved, got {other:?}"),
+        }
     }
     #[tokio::test]
     async fn connection_cleanup_removes_registration_and_aborts_forwarders() {
@@ -2650,7 +2788,9 @@ mod connection_unit_tests {
             "client-1".to_string(),
             crate::session::AttachMode::Shared,
             ClientRole::ReadWrite,
+            Some("win-1".to_string()),
         );
+        session.add_window("win-1".to_string());
         let (subscriber, _notifications) = mpsc::unbounded_channel();
         session.add_lifecycle_subscriber("client-1".to_string(), subscriber);
         let pane = match crate::pane::Pane::spawn(
@@ -2680,6 +2820,12 @@ mod connection_unit_tests {
         let sessions = sessions.read();
         assert_eq!(sessions[0].attached_client_count(), 0);
         assert!(sessions[0].lifecycle_subscribers.read().is_empty());
+        // §3.3 A dropped connection must shrink connected_windows (Plan 32),
+        // otherwise every crashed GUI leaks a window into the session forever.
+        assert!(
+            sessions[0].get_windows().is_empty(),
+            "connection cleanup must release the window it claimed"
+        );
         assert!(matches!(
             pane_notifications.try_recv(),
             Err(mpsc::error::TryRecvError::Disconnected)
@@ -2831,6 +2977,7 @@ mod connection_unit_tests {
             client_id.to_string(),
             crate::session::AttachMode::Shared,
             ClientRole::ReadWrite,
+            None,
         );
         session
     }

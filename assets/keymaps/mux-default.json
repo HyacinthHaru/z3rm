@@ -23,6 +23,8 @@
       // Mux session
       "ctrl-shift-d": "mux::Detach",
       "ctrl-alt-a": "mux::Attach",
+      // §3.3 second window on the same session (Plan 32); ctrl-shift-n is NextTab
+      "ctrl-alt-n": "mux::NewWindow",
       // §15.7 native kill without extension host (avoid ctrl-shift-k: ResizeUp)
       "ctrl-alt-k": "mux::KillSession",
       "ctrl-alt-q": "mux::KillServer",

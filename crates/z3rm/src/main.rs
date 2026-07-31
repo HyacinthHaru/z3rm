@@ -18,7 +18,10 @@ use assets::Assets;
 use crashes::InitCrashHandler;
 use fs::{Fs, RealFs};
 use futures::StreamExt as _;
-use gpui::{App, AppContext as _, Application, Context, Entity, Global, TaskExt, Window};
+use gpui::{
+    App, AppContext as _, Application, BorrowAppContext as _, Context, Entity, Global, TaskExt,
+    Window,
+};
 use gpui_platform;
 use parking_lot::Mutex;
 use release_channel::{AppCommitSha, AppVersion, ReleaseChannel};
@@ -172,6 +175,384 @@ fn apply_mux_layout_to_workspace(
         window,
         cx,
     );
+}
+
+// ============================================================================
+// §3.3 Multiple windows per session (Plan 32)
+// ============================================================================
+
+/// §3.3 One GPUI window's mux binding.
+///
+/// A window owns its own `MuxDomain`, i.e. its own socket, client identity and
+/// server-minted window id. That is what makes window teardown precise: closing
+/// the window closes exactly one connection, and the server releases exactly
+/// that window's session membership — including when the process crashes.
+struct MuxWindow {
+    domain: Arc<mux::MuxDomain>,
+    session_id: String,
+}
+
+/// §3.3 Client-side view of which windows share which session (Plan 32).
+///
+/// `windows` holds the windows this process owns; `roster` is the server's
+/// authoritative membership, rebuilt from the at-least-once `WindowAdded` /
+/// `WindowRemoved` lifecycle stream.
+#[derive(Default)]
+struct MuxWindows {
+    windows: std::collections::HashMap<gpui::WindowId, MuxWindow>,
+    roster: std::collections::HashMap<String, std::collections::BTreeSet<String>>,
+}
+
+impl Global for MuxWindows {}
+
+impl MuxWindows {
+    fn apply_window_event(&mut self, event: &mux_protocol::notification::Event) -> bool {
+        match event {
+            mux_protocol::notification::Event::WindowAdded(added) => {
+                self.roster
+                    .entry(added.session_id.clone())
+                    .or_default()
+                    .insert(added.window_id.clone());
+                true
+            }
+            mux_protocol::notification::Event::WindowRemoved(removed) => {
+                if let Some(windows) = self.roster.get_mut(&removed.session_id) {
+                    windows.remove(&removed.window_id);
+                    if windows.is_empty() {
+                        self.roster.remove(&removed.session_id);
+                    }
+                }
+                true
+            }
+            _ => false,
+        }
+    }
+
+    fn session_window_ids(&self, session_id: &str) -> Vec<String> {
+        self.roster
+            .get(session_id)
+            .map(|windows| windows.iter().cloned().collect())
+            .unwrap_or_default()
+    }
+}
+
+fn register_mux_window(
+    window_id: gpui::WindowId,
+    domain: Arc<mux::MuxDomain>,
+    session_id: String,
+    cx: &mut App,
+) {
+    if cx.try_global::<MuxWindows>().is_none() {
+        cx.set_global(MuxWindows::default());
+    }
+    cx.update_global::<MuxWindows, ()>(|windows, _| {
+        windows
+            .windows
+            .insert(window_id, MuxWindow { domain, session_id });
+    });
+}
+
+fn take_mux_window(window_id: gpui::WindowId, cx: &mut App) -> Option<MuxWindow> {
+    if cx.try_global::<MuxWindows>().is_none() {
+        return None;
+    }
+    cx.update_global::<MuxWindows, Option<MuxWindow>>(|windows, _| {
+        windows.windows.remove(&window_id)
+    })
+}
+
+/// §3.3 The mux connection that drives `window`.
+///
+/// Falls back to the process-wide `AppState` domain so windows opened outside
+/// the multi-window path (and every pre-Plan-32 caller) keep working.
+fn mux_domain_for_window(window: &Window, cx: &App) -> Option<Arc<mux::MuxDomain>> {
+    let window_id = window.window_handle().window_id();
+    cx.try_global::<MuxWindows>()
+        .and_then(|windows| windows.windows.get(&window_id))
+        .map(|mux_window| mux_window.domain.clone())
+        .or_else(|| workspace::AppState::try_global(cx).and_then(|state| state.mux_domain.clone()))
+}
+
+/// §3.3 The session `window` renders, preferring this window's own binding.
+fn mux_session_for_window(window: &Window, cx: &App) -> Option<String> {
+    let window_id = window.window_handle().window_id();
+    cx.try_global::<MuxWindows>()
+        .and_then(|windows| windows.windows.get(&window_id))
+        .map(|mux_window| mux_window.session_id.clone())
+}
+
+/// §15.4 / §15.12 Client-side projection of one authoritative attach snapshot.
+#[derive(Clone, Default)]
+struct MuxSnapshot {
+    layout: Option<workspace::layout_projection::LayoutTree>,
+    focused_pane: Option<String>,
+    zoomed: std::collections::HashMap<String, bool>,
+    pane_ids: Vec<String>,
+}
+
+impl MuxSnapshot {
+    fn from_attach(response: &mux_protocol::AttachResponse) -> Self {
+        let Some(snapshot) = response.snapshot.as_ref() else {
+            return Self::default();
+        };
+        let layout = snapshot
+            .layout
+            .as_ref()
+            .map(workspace::layout_projection::LayoutTree::from_proto);
+        let pane_ids = match &layout {
+            Some(layout) => layout.pane_ids(),
+            None => snapshot
+                .tabs
+                .iter()
+                .flat_map(|tab| tab.panes.iter().map(|pane| pane.id.clone()))
+                .collect(),
+        };
+        Self {
+            layout,
+            focused_pane: (!snapshot.focused_pane_id.is_empty())
+                .then(|| snapshot.focused_pane_id.clone()),
+            zoomed: snapshot
+                .tabs
+                .iter()
+                .flat_map(|tab| tab.panes.iter().map(|pane| (pane.id.clone(), pane.zoomed)))
+                .collect(),
+            pane_ids,
+        }
+    }
+}
+
+/// §15.4 / §15.12 Project the authoritative server layout into a workspace:
+/// one GPUI pane per server pane.
+///
+/// Must run inside the `cx.new(|cx| Workspace::new(..))` closure — items added
+/// after the workspace is constructed never reach the render tree.
+fn install_snapshot_panes(
+    workspace: &mut workspace::Workspace,
+    snapshot: &MuxSnapshot,
+    domain: Arc<mux::MuxDomain>,
+    window: &mut Window,
+    cx: &mut Context<workspace::Workspace>,
+) {
+    match &snapshot.layout {
+        Some(layout) => {
+            workspace.apply_initial_layout(
+                layout,
+                snapshot.focused_pane.as_deref(),
+                |workspace, window, cx| workspace.add_pane_for_layout(window, cx),
+                |workspace, pane, pane_id, window, cx| {
+                    let item: Box<dyn workspace::ItemHandle> = Box::new(cx.new(|cx| {
+                        terminal_view::mux_pane::MuxPaneView::new(
+                            pane_id,
+                            domain.clone(),
+                            workspace.weak_handle(),
+                            workspace.project().downgrade(),
+                            window,
+                            cx,
+                        )
+                    }));
+                    workspace.add_item(pane.clone(), item, None, true, true, window, cx);
+                },
+                window,
+                cx,
+            );
+
+            // §15.4 seed zoom from PaneInfo without re-RPC.
+            // Two-pass: collect then mutate to avoid borrow conflicts.
+            let mut panes_to_zoom: Vec<Entity<workspace::Pane>> = Vec::new();
+            for pane in workspace.panes() {
+                for item in pane.read(cx).items() {
+                    if let Ok(view) = item
+                        .to_any_view()
+                        .downcast::<terminal_view::mux_pane::MuxPaneView>()
+                    {
+                        let pane_id = view.read(cx).pane_id.clone();
+                        if snapshot.zoomed.get(&pane_id) == Some(&true) {
+                            panes_to_zoom.push(pane.clone());
+                        }
+                    }
+                }
+            }
+            for pane in panes_to_zoom {
+                workspace.set_pane_zoomed(pane, true, window, cx);
+            }
+        }
+        None => {
+            // No layout tree: single default pane with all views as tabs.
+            let pane = workspace.active_pane().clone();
+            pane.update(cx, |pane, _| {
+                pane.set_should_display_welcome_page(false);
+            });
+            let pane_ids = if snapshot.pane_ids.is_empty() {
+                vec!["default".to_string()]
+            } else {
+                snapshot.pane_ids.clone()
+            };
+            for (index, pane_id) in pane_ids.into_iter().enumerate() {
+                let item: Box<dyn workspace::ItemHandle> = Box::new(cx.new(|cx| {
+                    terminal_view::mux_pane::MuxPaneView::new(
+                        pane_id,
+                        domain.clone(),
+                        workspace.weak_handle(),
+                        workspace.project().downgrade(),
+                        window,
+                        cx,
+                    )
+                }));
+                workspace.add_item(pane.clone(), item, None, index == 0, true, window, cx);
+            }
+        }
+    }
+}
+
+/// §3.3 Open one GPUI window bound to its own mux connection (Plan 32).
+///
+/// The window attaches with a server-minted window id before it is opened, so
+/// the layout it renders is the authoritative snapshot the server handed back
+/// for this very window rather than a snapshot borrowed from another window.
+async fn open_mux_window(
+    domain: Arc<mux::MuxDomain>,
+    session_id: String,
+    app_state: Arc<workspace::AppState>,
+    cx: &mut gpui::AsyncApp,
+) -> anyhow::Result<gpui::WindowHandle<workspace::MultiWorkspace>> {
+    let attach_response = domain.create_and_attach_window(&session_id).await?;
+    let snapshot = MuxSnapshot::from_attach(&attach_response);
+    open_mux_window_with_snapshot(domain, session_id, snapshot, app_state, cx).await
+}
+
+/// §3.3 Open a window for a session this domain has already attached to.
+///
+/// Split out of `open_mux_window` because the bootstrap window needs the
+/// snapshot before the window exists: `observe_new` is registered against it.
+async fn open_mux_window_with_snapshot(
+    domain: Arc<mux::MuxDomain>,
+    session_id: String,
+    snapshot: MuxSnapshot,
+    app_state: Arc<workspace::AppState>,
+    cx: &mut gpui::AsyncApp,
+) -> anyhow::Result<gpui::WindowHandle<workspace::MultiWorkspace>> {
+    let open_result = cx
+        .update(|cx| {
+            workspace::Workspace::new_local(
+                vec![],
+                app_state,
+                None,
+                None,
+                Some(Box::new({
+                    let domain = domain.clone();
+                    let snapshot = snapshot.clone();
+                    move |workspace: &mut workspace::Workspace, window, cx| {
+                        install_snapshot_panes(workspace, &snapshot, domain, window, cx);
+                    }
+                })),
+                workspace::OpenMode::NewWindow,
+                cx,
+            )
+        })
+        .await?;
+
+    let window_handle = open_result.window;
+    cx.update(|cx| {
+        register_mux_window(
+            window_handle.window_id(),
+            domain.clone(),
+            session_id.clone(),
+            cx,
+        );
+    });
+    watch_mux_session_notifications(domain, session_id, window_handle, cx);
+    Ok(window_handle)
+}
+
+/// §15.4 / §15.12 Reconcile a window from the server's lifecycle stream.
+///
+/// `SessionLayoutChanged` carries the authoritative layout tree, which is
+/// projected into this window's workspace. `WindowAdded` / `WindowRemoved`
+/// maintain the client's view of which windows share the session (§3.4
+/// at-least-once), and a `WindowRemoved` naming *this* window means the server
+/// dropped it — surfaced to the user rather than silently ignored.
+fn watch_mux_session_notifications(
+    domain: Arc<mux::MuxDomain>,
+    session_id: String,
+    window_handle: gpui::WindowHandle<workspace::MultiWorkspace>,
+    cx: &mut gpui::AsyncApp,
+) {
+    let notifications = domain.subscribe();
+    let window_id = domain.window_id();
+    // Weak, so a closed window's connection is not pinned open by this task:
+    // the socket closes with the last strong handle, and the notification
+    // stream then ends, which is what stops this loop.
+    let domain = Arc::downgrade(&domain);
+    cx.spawn(async move |cx| {
+        while let Ok(notification) = notifications.recv().await {
+            let Some(event) = notification.event else {
+                continue;
+            };
+            match &event {
+                mux_protocol::notification::Event::SessionLayoutChanged(layout_change) => {
+                    let Some(proto_layout) = layout_change.layout.as_ref() else {
+                        continue;
+                    };
+                    let layout =
+                        workspace::layout_projection::LayoutTree::from_proto(proto_layout);
+                    let Some(domain) = domain.upgrade() else {
+                        break;
+                    };
+                    if let Err(error) = cx.update_window(window_handle.into(), move |_, window, cx| {
+                        let Some(multi_workspace) =
+                            window.root::<workspace::MultiWorkspace>().flatten()
+                        else {
+                            return;
+                        };
+                        let Some(workspace) =
+                            multi_workspace.read(cx).workspaces().next().cloned()
+                        else {
+                            return;
+                        };
+                        workspace.update(cx, |workspace, cx| {
+                            apply_mux_layout_to_workspace(
+                                workspace, &layout, None, domain, window, cx,
+                            );
+                        });
+                    }) {
+                        tracing::debug!(error = %error, "app context closed during SessionLayoutChanged reconcile");
+                        break;
+                    }
+                }
+                mux_protocol::notification::Event::WindowAdded(_)
+                | mux_protocol::notification::Event::WindowRemoved(_) => {
+                    let dropped_this_window = matches!(
+                        &event,
+                        mux_protocol::notification::Event::WindowRemoved(removed)
+                            if removed.window_id == window_id
+                    );
+                    let session_id = session_id.clone();
+                    cx.update(|cx| {
+                        if cx.try_global::<MuxWindows>().is_none() {
+                            cx.set_global(MuxWindows::default());
+                        }
+                        let windows = cx.update_global::<MuxWindows, Vec<String>>(|windows, _| {
+                            windows.apply_window_event(&event);
+                            windows.session_window_ids(&session_id)
+                        });
+                        tracing::info!(
+                            session_id = %session_id,
+                            windows = windows.len(),
+                            "mux session window membership changed"
+                        );
+                        if dropped_this_window {
+                            daemon::show_daemon_error(
+                                cx,
+                                "This window was removed from the mux session",
+                            );
+                        }
+                    });
+                }
+                _ => {}
+            }
+        }
+    })
+    .detach();
 }
 
 /// §16.9 Forward a layout ratio resize to the server.
@@ -709,46 +1090,12 @@ fn main() {
 
             daemon::ensure_pane_in_session(&domain, &session_id).await?;
             eprintln!("[z3rm] Pane ensured");
-            let attach_resp = domain
-                .attach(&session_id, mux::AttachMode::Shared)
-                .await?;
+            // §3.3 Attach with a server-minted window id so this GUI window is a
+            // distinct session member (Plan 32).
+            let attach_resp = domain.create_and_attach_window(&session_id).await?;
             // §15.12 / §15.4 Authoritative snapshot: layout tree + pane IDs.
-            let snapshot_layout: Option<workspace::layout_projection::LayoutTree> = attach_resp
-                .snapshot
-                .as_ref()
-                .and_then(|s| s.layout.as_ref())
-                .map(workspace::layout_projection::LayoutTree::from_proto);
-            let snapshot_focused_pane: Option<String> = attach_resp
-                .snapshot
-                .as_ref()
-                .and_then(|s| {
-                    let id = s.focused_pane_id.clone();
-                    if id.is_empty() { None } else { Some(id) }
-                });
-            let snapshot_zoomed: std::collections::HashMap<String, bool> = attach_resp
-                .snapshot
-                .as_ref()
-                .map(|s| {
-                    s.tabs
-                        .iter()
-                        .flat_map(|t| t.panes.iter().map(|p| (p.id.clone(), p.zoomed)))
-                        .collect()
-                })
-                .unwrap_or_default();
-            let snapshot_pane_ids: Vec<String> = match &snapshot_layout {
-                Some(layout) => layout.pane_ids(),
-                None => attach_resp
-                    .snapshot
-                    .as_ref()
-                    .map(|s| {
-                        s.tabs
-                            .iter()
-                            .flat_map(|t| t.panes.iter().map(|p| p.id.clone()))
-                            .collect()
-                    })
-                    .unwrap_or_default(),
-            };
-            eprintln!("[z3rm] Attached to session ({} panes in snapshot)", snapshot_pane_ids.len());
+            let snapshot = MuxSnapshot::from_attach(&attach_resp);
+            eprintln!("[z3rm] Attached to session ({} panes in snapshot)", snapshot.pane_ids.len());
 
             // §3.2 把 domain 注入 AppState. AppState 是 Arc<AppState>,
             // 替换整个 Arc 让后续代码 (含未来的 workspace::Open 路径) 能拿到。
@@ -778,10 +1125,7 @@ fn main() {
             // 任何新 Workspace 如果 active pane 为空, 自动 spawn terminal pane。
             // 覆盖 bootstrap / workspace::Open / NewWindow / restore 全部路径。
             let session_for_observer = session_id.clone();
-            let snapshot_layout_for_observer = snapshot_layout.clone();
-            let snapshot_panes_for_observer = snapshot_pane_ids.clone();
-            let snapshot_focused_for_observer = snapshot_focused_pane.clone();
-            let snapshot_zoomed_for_observer = snapshot_zoomed.clone();
+            let snapshot_for_observer = snapshot.clone();
             cx.update(|cx| {
                 cx.observe_new::<workspace::Workspace>(move |workspace, window, cx| {
                     let Some(window) = window else { return };
@@ -1117,9 +1461,45 @@ fn main() {
                                 anyhow::Ok(())
                             }).detach();
                         })
-                        .register_action(|_workspace, _: &settings::mux_actions::Detach, _window, cx| {
-                            let Some(state) = workspace::AppState::try_global(cx) else { return };
-                            let Some(domain) = state.mux_domain.clone() else { return };
+                        .register_action(|_workspace, _: &settings::mux_actions::NewWindow, window, cx| {
+                            // §3.3 / §15.7 Native path to a second window on the
+                            // same session, reachable without the extension host.
+                            let Some(app_state) = workspace::AppState::try_global(cx) else { return };
+                            let Some(domain) = mux_domain_for_window(window, cx) else { return };
+                            let known_session = mux_session_for_window(window, cx);
+                            cx.spawn(async move |_, cx| {
+                                let result: anyhow::Result<()> = async {
+                                    let session_id = match known_session
+                                        .or_else(|| domain.last_attached_session_id())
+                                    {
+                                        Some(session_id) => session_id,
+                                        None => domain
+                                            .list_sessions()
+                                            .await?
+                                            .first()
+                                            .map(|session| session.id.clone())
+                                            .ok_or_else(|| anyhow::anyhow!("no mux session is available"))?,
+                                    };
+                                    // A window is one connection, so the new window
+                                    // opens its own domain rather than sharing this
+                                    // window's socket (Plan 32).
+                                    let new_domain = Arc::new(daemon::ensure_daemon_running().await?);
+                                    open_mux_window(new_domain, session_id, app_state, cx).await?;
+                                    anyhow::Ok(())
+                                }
+                                .await;
+                                if let Err(error) = result {
+                                    tracing::error!(%error, "mux::NewWindow failed");
+                                    cx.update(|cx| daemon::show_daemon_error(
+                                        cx,
+                                        format!("Failed to open a new mux window: {error}"),
+                                    ));
+                                }
+                            }).detach();
+                        })
+                        .register_action(|_workspace, _: &settings::mux_actions::Detach, window, cx| {
+                            // §3.3 Detach this window's own connection (Plan 32).
+                            let Some(domain) = mux_domain_for_window(window, cx) else { return };
                             cx.spawn(async move |_, cx| {
                                 if let Err(error) = domain.detach().await {
                                     tracing::error!(%error, "mux::Detach failed");
@@ -1250,77 +1630,12 @@ fn main() {
                     }
                     let Some(state) = workspace::AppState::try_global(cx) else { return };
                     let Some(domain) = state.mux_domain.clone() else { return };
-                    let snapshot_layout_for_observer = snapshot_layout_for_observer.clone();
-                    let snapshot_panes = snapshot_panes_for_observer.clone();
-                    let zoomed_map = snapshot_zoomed_for_observer.clone();
-                    tracing::info!("observe_new Workspace: injecting {} MuxPaneViews", snapshot_panes.len());
+                    let snapshot = snapshot_for_observer.clone();
+                    tracing::info!("observe_new Workspace: injecting {} MuxPaneViews", snapshot.pane_ids.len());
 
                     // §15.12 Sync path: snapshot has panes → project the authoritative layout.
-                    if !snapshot_panes.is_empty() {
-                        match &snapshot_layout_for_observer {
-                            Some(layout) => {
-                                workspace.apply_initial_layout(
-                                    layout,
-                                    snapshot_focused_for_observer.as_deref(),
-                                    |workspace, window, cx| workspace.add_pane_for_layout(window, cx),
-                                    |workspace, pane, pane_id, window, cx| {
-                                        let item: Box<dyn workspace::ItemHandle> = Box::new(cx.new(|cx| {
-                                            terminal_view::mux_pane::MuxPaneView::new(
-                                                pane_id,
-                                                domain.clone(),
-                                                workspace.weak_handle(),
-                                                workspace.project().downgrade(),
-                                                window,
-                                                cx,
-                                            )
-                                        }));
-                                        workspace.add_item(pane.clone(), item, None, true, true, window, cx);
-                                    },
-                                    window,
-                                    cx,
-                                );
-
-                                // §15.4 seed zoom from PaneInfo without re-RPC.
-                                // Two-pass: collect then mutate to avoid borrow conflicts.
-                                let mut panes_to_zoom: Vec<Entity<workspace::Pane>> = Vec::new();
-                                for pane in workspace.panes() {
-                                    for item in pane.read(cx).items() {
-                                        if let Ok(view) = item
-                                            .to_any_view()
-                                            .downcast::<terminal_view::mux_pane::MuxPaneView>()
-                                        {
-                                            let pane_id = view.read(cx).pane_id.clone();
-                                            if zoomed_map.get(&pane_id) == Some(&true) {
-                                                panes_to_zoom.push(pane.clone());
-                                            }
-                                        }
-                                    }
-                                }
-                                for pane in panes_to_zoom {
-                                    workspace.set_pane_zoomed(pane, true, window, cx);
-                                }
-                            }
-                            None => {
-                                // No layout tree in snapshot: tabs in the default pane.
-                                workspace.active_pane().update(cx, |pane, _| {
-                                    pane.set_should_display_welcome_page(false);
-                                });
-                                for (index, pane_id) in snapshot_panes.into_iter().enumerate() {
-                                    let item: Box<dyn workspace::ItemHandle> = Box::new(cx.new(|cx| {
-                                        terminal_view::mux_pane::MuxPaneView::new(
-                                            pane_id,
-                                            domain.clone(),
-                                            workspace.weak_handle(),
-                                            workspace.project().downgrade(),
-                                            window,
-                                            cx,
-                                        )
-                                    }));
-                                    let pane = workspace.active_pane().clone();
-                                    workspace.add_item(pane, item, None, index == 0, true, window, cx);
-                                }
-                            }
-                        }
+                    if !snapshot.pane_ids.is_empty() {
+                        install_snapshot_panes(workspace, &snapshot, domain, window, cx);
                         return;
                     }
 
@@ -1375,15 +1690,21 @@ fn main() {
                 .detach();
             });
 
-            // window close = detach
-            let domain_for_close = domain.clone();
+            // §3.3 Window close = detach that window's own connection (Plan 32).
+            // Detaching the process-wide domain here would tear down the first
+            // window's session membership whenever any other window closed.
             cx.update(|cx| {
-                cx.on_window_closed(move |app, _window_id| {
-                    let d = domain_for_close.clone();
+                cx.on_window_closed(move |app, window_id| {
+                    let Some(closed_window) = take_mux_window(window_id, app) else {
+                        return;
+                    };
                     app.spawn(async move |_| {
-                        if let Err(e) = d.detach().await {
-                            tracing::warn!(error = %e, "detach failed");
+                        if let Err(error) = closed_window.domain.detach().await {
+                            tracing::warn!(error = %error, "detach after window close failed");
                         }
+                        // Dropping the last handle closes the socket, so the
+                        // server releases this window even if detach failed.
+                        drop(closed_window);
                     })
                     .detach();
                 })
@@ -1391,136 +1712,15 @@ fn main() {
             });
 
             eprintln!("[z3rm] Creating window via Workspace::new_local");
-            let domain_for_init = domain.clone();
-            let snapshot_for_init = snapshot_pane_ids.clone();
-            let layout_for_init = snapshot_layout.clone();
-            let focused_for_init = snapshot_focused_pane.clone();
-            let zoomed_for_init = snapshot_zoomed.clone();
-            let open_result = cx.update(|cx| {
-                workspace::Workspace::new_local(
-                    vec![],
-                    app_state.clone(),
-                    None,
-                    None,
-                    Some(Box::new(move |workspace: &mut workspace::Workspace, window, cx| {
-                        // §15.4 / §15.12 Project the authoritative server layout during
-                        // construction: one GPUI pane per server pane.
-                        match &layout_for_init {
-                            Some(layout) => {
-                                workspace.apply_initial_layout(
-                                    layout,
-                                    focused_for_init.as_deref(),
-                                    |workspace, window, cx| workspace.add_pane_for_layout(window, cx),
-                                    |workspace, pane, pane_id, window, cx| {
-                                        let item: Box<dyn workspace::ItemHandle> = Box::new(cx.new(|cx| {
-                                            terminal_view::mux_pane::MuxPaneView::new(
-                                                pane_id,
-                                                domain_for_init.clone(),
-                                                workspace.weak_handle(),
-                                                workspace.project().downgrade(),
-                                                window,
-                                                cx,
-                                            )
-                                        }));
-                                        workspace.add_item(pane.clone(), item, None, true, true, window, cx);
-                                    },
-                                    window,
-                                    cx,
-                                );
-
-                                // §15.4 seed zoom from PaneInfo without re-RPC.
-                                // Two-pass: collect then mutate to avoid borrow conflicts.
-                                let mut panes_to_zoom: Vec<Entity<workspace::Pane>> = Vec::new();
-                                for pane in workspace.panes() {
-                                    for item in pane.read(cx).items() {
-                                        if let Ok(view) = item
-                                            .to_any_view()
-                                            .downcast::<terminal_view::mux_pane::MuxPaneView>()
-                                        {
-                                            let pane_id = view.read(cx).pane_id.clone();
-                                            if zoomed_for_init.get(&pane_id) == Some(&true) {
-                                                panes_to_zoom.push(pane.clone());
-                                            }
-                                        }
-                                    }
-                                }
-                                for pane in panes_to_zoom {
-                                    workspace.set_pane_zoomed(pane, true, window, cx);
-                                }
-                            }
-                            None => {
-                                // No layout tree: single default pane with all views as tabs.
-                                let pane = workspace.active_pane().clone();
-                                pane.update(cx, |pane, _| {
-                                    pane.set_should_display_welcome_page(false);
-                                });
-                                let pane_ids = if !snapshot_for_init.is_empty() {
-                                    snapshot_for_init.clone()
-                                } else {
-                                    vec!["default".to_string()]
-                                };
-                                for (index, pane_id) in pane_ids.into_iter().enumerate() {
-                                    let item: Box<dyn workspace::ItemHandle> = Box::new(cx.new(|cx| {
-                                        terminal_view::mux_pane::MuxPaneView::new(
-                                            pane_id,
-                                            domain_for_init.clone(),
-                                            workspace.weak_handle(),
-                                            workspace.project().downgrade(),
-                                            window,
-                                            cx,
-                                        )
-                                    }));
-                                    workspace.add_item(pane.clone(), item, None, index == 0, true, window, cx);
-                                }
-                            }
-                        }
-                    })),
-                    workspace::OpenMode::default(),
-                    cx,
-                )
-            }).await?;
-            eprintln!("[z3rm] Window created Ok: {:?}", open_result.window);
-
-            // §15.4 / §15.12 Authoritative reconcile: every SessionLayoutChanged carries
-            // the server's layout tree; project it into the window's workspace.
-            let domain_for_notify = domain.clone();
-            let window_handle: gpui::AnyWindowHandle = open_result.window.into();
-            cx.spawn(async move |cx| {
-                let rx = domain_for_notify.subscribe();
-                while let Ok(notif) = rx.recv().await {
-                    let Some(mux_protocol::notification::Event::SessionLayoutChanged(layout_change)) =
-                        notif.event
-                    else {
-                        continue;
-                    };
-                    let Some(proto_layout) = layout_change.layout else {
-                        continue;
-                    };
-                    let layout = workspace::layout_projection::LayoutTree::from_proto(&proto_layout);
-                    if let Err(e) = cx.update_window(window_handle, |_, window, cx| {
-                        let Some(multi_workspace) = window.root::<workspace::MultiWorkspace>().flatten() else {
-                            return;
-                        };
-                        let Some(workspace) = multi_workspace.read(cx).workspaces().next().cloned() else {
-                            return;
-                        };
-                        workspace.update(cx, |workspace, cx| {
-                            apply_mux_layout_to_workspace(
-                                workspace,
-                                &layout,
-                                None,
-                                domain_for_notify.clone(),
-                                window,
-                                cx,
-                            );
-                        });
-                    }) {
-                        tracing::debug!(error = %e, "app context closed during SessionLayoutChanged reconcile");
-                        break;
-                    }
-                }
-            })
-            .detach();
+            let window_handle = open_mux_window_with_snapshot(
+                domain,
+                session_id,
+                snapshot,
+                app_state.clone(),
+                cx,
+            )
+            .await?;
+            eprintln!("[z3rm] Window created Ok: {:?}", window_handle);
 
             anyhow::Ok(())
         })
@@ -1565,6 +1765,71 @@ mod tests {
         );
     }
 
+    fn window_added(session_id: &str, window_id: &str) -> mux_protocol::notification::Event {
+        mux_protocol::notification::Event::WindowAdded(mux_protocol::WindowAdded {
+            window_id: window_id.to_string(),
+            session_id: session_id.to_string(),
+        })
+    }
+
+    fn window_removed(session_id: &str, window_id: &str) -> mux_protocol::notification::Event {
+        mux_protocol::notification::Event::WindowRemoved(mux_protocol::WindowRemoved {
+            window_id: window_id.to_string(),
+            session_id: session_id.to_string(),
+        })
+    }
+
+    /// §3.3 / §3.4 The client's view of session membership is rebuilt purely
+    /// from the at-least-once `WindowAdded` / `WindowRemoved` stream (Plan 32).
+    #[test]
+    fn window_events_maintain_the_session_roster() {
+        let mut windows = super::MuxWindows::default();
+
+        assert!(windows.apply_window_event(&window_added("session-1", "win-1")));
+        assert!(windows.apply_window_event(&window_added("session-1", "win-2")));
+        assert_eq!(
+            windows.session_window_ids("session-1"),
+            vec!["win-1".to_string(), "win-2".to_string()]
+        );
+
+        // Duplicates are expected: lifecycle delivery is at-least-once.
+        windows.apply_window_event(&window_added("session-1", "win-2"));
+        assert_eq!(windows.session_window_ids("session-1").len(), 2);
+
+        assert!(windows.apply_window_event(&window_removed("session-1", "win-1")));
+        assert_eq!(
+            windows.session_window_ids("session-1"),
+            vec!["win-2".to_string()]
+        );
+
+        windows.apply_window_event(&window_removed("session-1", "win-2"));
+        assert!(windows.session_window_ids("session-1").is_empty());
+
+        assert!(
+            !windows.apply_window_event(&mux_protocol::notification::Event::PaneDirty(
+                mux_protocol::PaneDirty {
+                    pane_id: "pane-1".to_string(),
+                }
+            )),
+            "non-window events must not be treated as membership changes"
+        );
+    }
+
+    /// §3.3 A window that never joined must not corrupt another session's roster.
+    #[test]
+    fn removing_an_unknown_window_is_a_no_op() {
+        let mut windows = super::MuxWindows::default();
+        windows.apply_window_event(&window_added("session-1", "win-1"));
+
+        windows.apply_window_event(&window_removed("session-2", "win-9"));
+
+        assert_eq!(
+            windows.session_window_ids("session-1"),
+            vec!["win-1".to_string()]
+        );
+        assert!(windows.session_window_ids("session-2").is_empty());
+    }
+
     #[test]
     fn cyclic_pane_navigation_wraps_both_directions() {
         assert_eq!(super::cyclic_pane_index(0, 0, true), None);
@@ -1599,6 +1864,7 @@ mod tests {
             "mux_pane::FocusPane7",
             "mux::KillSession",
             "mux::KillServer",
+            "mux::NewWindow",
         ] {
             assert!(
                 action_names.contains(required),

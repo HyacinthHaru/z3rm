@@ -44,14 +44,46 @@ pub use mux_protocol::attach_request::AttachMode;
 // ============================================================================
 
 /// Mux 客户端域：连接到 mux_server，发送 RPC 请求，接收通知。
+///
+/// §3.3 一个 `MuxDomain` 就是一个 GUI 窗口 (Plan 32): 连接 / 客户端身份 /
+/// 窗口三者一一对应, 所以窗口关闭 = socket 关闭 = 服务端精确释放这一个窗口。
 pub struct MuxDomain {
     inner: Arc<parking_lot::RwLock<DomainInner>>,
-    /// §9 窗口 ID (多窗口支持，Plan 32)
-    pub window_id: String,
+    /// §3.3 本连接代表的窗口 ID (多窗口支持，Plan 32)。
+    ///
+    /// 连接时先本地铸一个唯一 ID (与服务端同为 `win-{pid}-{nanoid}` 格式), 供
+    /// 没有走 `NewWindow` 的对端使用; GUI 打开窗口时会用 `create_window` 换成
+    /// 服务端分配的权威 ID。
+    window_id: parking_lot::RwLock<String>,
     /// §15.7 Last session successfully attached by this domain. Used by native
     /// KillSession keybindings so the GUI targets the attached session rather
     /// than an arbitrary `list_sessions().first()`.
     last_attached_session_id: parking_lot::RwLock<Option<String>>,
+}
+
+impl Drop for MuxDomain {
+    /// §3.3 Retiring the transport epoch is what actually closes the socket.
+    ///
+    /// The I/O thread holds its own `Arc` to `DomainInner`, which owns
+    /// `write_tx`, so dropping the last `MuxDomain` handle alone would leave the
+    /// channel connected and the thread spinning forever — the daemon would
+    /// never see the connection close. Plan 32 relies on that close: it is the
+    /// signal that releases the window from the session when a GUI window goes
+    /// away without a clean detach.
+    fn drop(&mut self) {
+        self.inner
+            .read()
+            .transport_epoch
+            .fetch_add(1, Ordering::SeqCst);
+    }
+}
+
+/// §3.3 铸一个进程内唯一的窗口 ID (Plan 32)。
+///
+/// 旧实现用 `win-{pid}`, 同一个进程的每个窗口都会撞成同一个 ID, 服务端根本
+/// 分不出是哪个窗口在 attach。格式与服务端 `handle_new_window` 保持一致。
+fn mint_window_id() -> String {
+    format!("win-{}-{}", std::process::id(), nanoid::nanoid!())
 }
 /// §9 内部状态：请求 ID 计数器、待处理请求、订阅者列表、写通道。
 struct DomainInner {
@@ -335,10 +367,9 @@ impl MuxDomain {
             })
             .map_err(|e| anyhow::anyhow!("failed to spawn mux I/O thread: {}", e))?;
 
-        let window_id = format!("win-{}", std::process::id());
         Ok(MuxDomain {
             inner,
-            window_id,
+            window_id: parking_lot::RwLock::new(mint_window_id()),
             last_attached_session_id: parking_lot::RwLock::new(None),
         })
     }
@@ -366,10 +397,9 @@ impl MuxDomain {
                 Self::io_and_router_loop(stream, write_rx, io_inner, io_subscribers, io_epoch);
             })
             .map_err(|e| anyhow::anyhow!("failed to spawn mux I/O thread: {}", e))?;
-        let window_id = format!("win-{}", std::process::id());
         Ok(MuxDomain {
             inner,
-            window_id,
+            window_id: parking_lot::RwLock::new(mint_window_id()),
             last_attached_session_id: parking_lot::RwLock::new(None),
         })
     }
@@ -455,6 +485,11 @@ impl MuxDomain {
                                     | Some(NotifEvent::PaneZoomed(_))
                                     | Some(NotifEvent::PaneTitleChanged(_))
                                     | Some(NotifEvent::PaneBell(_))
+                                    // §3.4 / §3.3 Window membership is lifecycle
+                                    // state (Plan 32): losing a WindowRemoved
+                                    // leaves a zombie window in every peer.
+                                    | Some(NotifEvent::WindowAdded(_))
+                                    | Some(NotifEvent::WindowRemoved(_))
                             );
                             for tx in subs.iter() {
                                 if is_lifecycle {
@@ -687,22 +722,21 @@ impl MuxDomain {
     // §3.3 窗口管理方法 (多窗口支持，Plan 32)
     // ========================================================================
 
-    /// §3.3 连接到会话并注册窗口 ID。
-    pub async fn attach_with_window(&self, session_id: &str) -> Result<AttachResponse> {
-        let req = RequestBody::Attach(mux_protocol::AttachRequest {
-            session_id: session_id.to_string(),
-            mode: AttachMode::Shared as i32,
-            window_id: self.window_id.clone(),
-            identity: None,
-        });
-        let resp = self.send_request(req).await?;
-        match resp.body {
-            Some(ResponseBody::Attach(r)) => Ok(r),
-            _ => Err(anyhow::anyhow!("unexpected response type for attach")),
-        }
+    /// §3.3 本连接代表的窗口 ID。
+    pub fn window_id(&self) -> String {
+        self.window_id.read().clone()
     }
 
-    /// §3.3 在指定会话中创建新窗口，返回窗口 ID。
+    /// §3.3 换用服务端分配的权威窗口 ID。必须在 `attach` 之前调用, 否则服务端
+    /// 记录的是本地铸的那个 ID。
+    pub fn set_window_id(&self, window_id: String) {
+        *self.window_id.write() = window_id;
+    }
+
+    /// §3.3 在指定会话中申请一个新窗口 ID，由服务端分配。
+    ///
+    /// 只分配 ID: 窗口真正加入会话是在随后的 `attach` 里完成的, 因为只有 attach
+    /// 携带连接身份, 服务端才能在断连时精确释放这个窗口。
     pub async fn create_window(&self, session_id: &str) -> Result<String> {
         let req = RequestBody::NewWindow(mux_protocol::NewWindowRequest {
             session_id: session_id.to_string(),
@@ -714,6 +748,23 @@ impl MuxDomain {
                 "unexpected response type for create_window"
             )),
         }
+    }
+
+    /// §3.3 为这个域申请一个服务端分配的窗口 ID 并用它 attach (Plan 32)。
+    ///
+    /// GUI 每开一个窗口就建一个 `MuxDomain` 并走这条路径, 因此服务端看到的
+    /// 每个窗口都对应一条独立连接。`NewWindow` 失败不阻断 attach: 窗口 ID 只是
+    /// 成员资格标签, 退回本地铸的 ID 仍然全局唯一, 不值得让整个窗口打不开。
+    pub async fn create_and_attach_window(&self, session_id: &str) -> Result<AttachResponse> {
+        match self.create_window(session_id).await {
+            Ok(window_id) => self.set_window_id(window_id),
+            Err(error) => tracing::warn!(
+                session_id,
+                %error,
+                "NewWindow failed; attaching with the locally minted window id"
+            ),
+        }
+        self.attach(session_id, AttachMode::Shared).await
     }
     // ========================================================================
     // §9 Pane 生命周期方法（§3.10）
@@ -894,7 +945,7 @@ impl MuxDomain {
         let req = RequestBody::Attach(mux_protocol::AttachRequest {
             session_id: session.to_string(),
             mode: mode as i32,
-            window_id: self.window_id.clone(),
+            window_id: self.window_id(),
             identity: None,
         });
         let resp = self.send_request(req).await?;
@@ -1166,7 +1217,7 @@ mod tests {
                 write_tx,
                 transport_epoch: AtomicU64::new(0),
             })),
-            window_id: "test-window".to_string(),
+            window_id: parking_lot::RwLock::new("test-window".to_string()),
             last_attached_session_id: parking_lot::RwLock::new(None),
         };
         (domain, write_rx)

@@ -9,6 +9,8 @@
       "ctrl-w": ["mux::EnterPrefixMode", { "timeout_ms": 500 }],
       // Native lifecycle controls remain available even if prefix/QuickJS fails.
       "ctrl-alt-a": "mux::Attach",
+      // §3.3 second window on the same session (Plan 32)
+      "ctrl-alt-n": "mux::NewWindow",
       "ctrl-alt-k": "mux::KillSession",
       "ctrl-alt-q": "mux::KillServer",
 
