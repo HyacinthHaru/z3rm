@@ -22,9 +22,14 @@
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 use std::sync::{Arc, mpsc};
+use std::time::Duration;
 
 use anyhow::{Context, Result};
-use shadow_snapshot::{EventKind, FileEvent, Monitor, SnapshotTrigger, WatchHandle};
+use serde::Deserialize;
+use shadow_snapshot::{
+    DebounceQueue, EventKind, FileEvent, GitCommitHookMode, GitCommitTracker, GitCommitWatcher,
+    Monitor, QuotaMode, SnapshotConfig, SnapshotTrigger, WatchHandle,
+};
 use zlog; // external crate, not crate::zlog
 
 #[derive(Debug, Clone)]
@@ -49,6 +54,9 @@ enum ShadowCommand {
         version_id: u64,
         reply: mpsc::Sender<Result<()>>,
     },
+    /// §4.9 a git commit landed on the watched worktree; the recorder marks
+    /// pre-commit deltas gc-eligible on its own (single-writer) thread.
+    GitCommit { commit: String },
 }
 
 /// Handle to one session's shadow-snapshot watcher + recorder.
@@ -69,6 +77,10 @@ struct WatchInner {
     session_id: String,
     /// notify watcher; dropping stops watching and ends the watcher thread.
     watch_handle: Mutex<Option<WatchHandle>>,
+    /// §4.9 `.git` watcher feeding commit notifications into the recorder.
+    /// Absent when the worktree is not a git repository or the user selected
+    /// `git_commit_hook: "skip"`.
+    git_watch_handle: Mutex<Option<GitCommitWatcher>>,
     /// Feed of changed paths from watcher thread → recorder thread.
     /// Dropping this sender makes the recorder's recv loop exit.
     path_sender: Mutex<Option<mpsc::Sender<(PathBuf, shadow_snapshot::SnapshotTrigger)>>>,
@@ -83,6 +95,14 @@ fn stop_inner(inner: &WatchInner) {
         .watch_handle
         .lock()
         .expect("watch mutex poisoned")
+        .take()
+    {
+        drop(handle);
+    }
+    if let Some(handle) = inner
+        .git_watch_handle
+        .lock()
+        .expect("git watch mutex poisoned")
         .take()
     {
         drop(handle);
@@ -175,6 +195,250 @@ impl Drop for WatchInner {
     }
 }
 
+/// §16.11 the `shadow_snapshot` section of the user's `settings.json`.
+///
+/// Every field is optional so a partial section keeps the documented defaults
+/// instead of collapsing to Rust zero values. The daemon deliberately parses
+/// this itself rather than depending on `settings_content` / the GPUI settings
+/// stack — the same reasoning as `server_settings.rs`: a remote daemon must be
+/// able to read its own configuration without the client crate graph.
+#[derive(Debug, Default, Deserialize)]
+struct ShadowSnapshotSettingsFile {
+    #[serde(default)]
+    enabled: Option<bool>,
+    #[serde(default)]
+    quota_mode: Option<String>,
+    #[serde(default)]
+    per_project_quota_mb: Option<u64>,
+    #[serde(default)]
+    ignore_patterns: Option<Vec<String>>,
+    #[serde(default)]
+    binary_detection: Option<bool>,
+    #[serde(default)]
+    debounce_ms: Option<u64>,
+    #[serde(default)]
+    frequency_circuit_breaker_k: Option<f64>,
+    #[serde(default)]
+    git_commit_hook: Option<String>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+struct SettingsFile {
+    #[serde(default)]
+    shadow_snapshot: Option<ShadowSnapshotSettingsFile>,
+}
+
+impl ShadowSnapshotSettingsFile {
+    /// Translate user settings into the engine's runtime config. Unknown enum
+    /// spellings fall back to the documented default and are logged rather than
+    /// failing session creation over a typo.
+    fn to_config(&self) -> SnapshotConfig {
+        let defaults = SnapshotConfig::default();
+        let quota_mode = match self.quota_mode.as_deref() {
+            None => defaults.quota_mode,
+            Some("per_project") => QuotaMode::PerProject,
+            Some("global") => QuotaMode::Global,
+            Some(other) => {
+                zlog::warn!("shadow_snapshot.quota_mode: unknown value {}", other);
+                defaults.quota_mode
+            }
+        };
+        let git_commit_hook = match self.git_commit_hook.as_deref() {
+            None => defaults.git_commit_hook,
+            Some("clear") => GitCommitHookMode::Clear,
+            Some("keep") => GitCommitHookMode::Keep,
+            Some("skip") => GitCommitHookMode::Skip,
+            Some(other) => {
+                zlog::warn!("shadow_snapshot.git_commit_hook: unknown value {}", other);
+                defaults.git_commit_hook
+            }
+        };
+        SnapshotConfig {
+            enabled: self.enabled.unwrap_or(defaults.enabled),
+            quota_mode,
+            // 0 MB is the documented "unlimited" setting (§4.9), so it is not
+            // clamped up to the default.
+            quota_bytes: self
+                .per_project_quota_mb
+                .map(|megabytes| megabytes.saturating_mul(1024 * 1024))
+                .unwrap_or(defaults.quota_bytes),
+            ignore_patterns: self
+                .ignore_patterns
+                .clone()
+                .unwrap_or(defaults.ignore_patterns),
+            binary_detection: self.binary_detection.unwrap_or(defaults.binary_detection),
+            debounce: self
+                .debounce_ms
+                .map(Duration::from_millis)
+                .unwrap_or(defaults.debounce),
+            circuit_breaker_writes_per_second: self
+                .frequency_circuit_breaker_k
+                // A non-positive K would suspend every single write; treat it
+                // as "unset" instead of silently disabling snapshotting.
+                .filter(|k| *k > 0.0)
+                .unwrap_or(defaults.circuit_breaker_writes_per_second),
+            git_commit_hook,
+        }
+    }
+}
+
+/// Resolve the settings file the daemon should read. `Z3RM_SETTINGS` overrides;
+/// otherwise this mirrors `paths::config_dir()` (which the daemon cannot depend
+/// on) so the daemon reads exactly the file the settings UI writes.
+fn settings_file_path() -> Option<PathBuf> {
+    if let Ok(path) = std::env::var("Z3RM_SETTINGS") {
+        return Some(PathBuf::from(path));
+    }
+    let config_dir = if cfg!(target_os = "windows") {
+        dirs::config_dir().map(|dir| dir.join("Z3rm"))
+    } else if cfg!(any(target_os = "linux", target_os = "freebsd")) {
+        dirs::config_dir().map(|dir| dir.join("z3rm"))
+    } else {
+        dirs::home_dir().map(|home| home.join(".config").join("z3rm"))
+    };
+    Some(config_dir?.join("settings.json"))
+}
+
+/// Load the effective `shadow_snapshot` configuration. A missing or unreadable
+/// settings file yields the documented defaults — snapshotting must not be
+/// silently disabled because a user has not written a settings file yet.
+fn load_config() -> SnapshotConfig {
+    let Some(path) = settings_file_path() else {
+        return SnapshotConfig::default();
+    };
+    let contents = match std::fs::read_to_string(&path) {
+        Ok(contents) => contents,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            return SnapshotConfig::default();
+        }
+        Err(error) => {
+            zlog::warn!(
+                "shadow snapshot settings unreadable ({}): {}",
+                path.display(),
+                error,
+            );
+            return SnapshotConfig::default();
+        }
+    };
+    parse_settings(&contents).unwrap_or_else(|error| {
+        zlog::warn!(
+            "shadow snapshot settings parse failed ({}): {}",
+            path.display(),
+            error,
+        );
+        SnapshotConfig::default()
+    })
+}
+
+fn parse_settings(contents: &str) -> Result<SnapshotConfig> {
+    let file: SettingsFile = serde_json::from_str(&strip_jsonc(contents))
+        .context("parsing settings.json shadow_snapshot section")?;
+    Ok(file.shadow_snapshot.unwrap_or_default().to_config())
+}
+
+/// Rewrite JSONC into JSON that `serde_json` accepts: drop `//` and `/* */`
+/// comments and trailing commas. settings.json is authored by hand (the shipped
+/// default file itself is commented), so a strict parse would reject the very
+/// file the settings UI maintains.
+///
+/// Comments are removed first: a trailing comma is only recognisable once the
+/// comment that may sit between it and the closing brace is gone.
+fn strip_jsonc(input: &str) -> String {
+    strip_trailing_commas(&strip_comments(input))
+}
+
+fn strip_comments(input: &str) -> String {
+    let mut output = String::with_capacity(input.len());
+    let mut characters = input.chars().peekable();
+    let mut in_string = false;
+    let mut escaped = false;
+
+    while let Some(character) = characters.next() {
+        if in_string {
+            output.push(character);
+            if escaped {
+                escaped = false;
+            } else if character == '\\' {
+                escaped = true;
+            } else if character == '"' {
+                in_string = false;
+            }
+            continue;
+        }
+        match character {
+            '"' => {
+                in_string = true;
+                output.push(character);
+            }
+            '/' if characters.peek() == Some(&'/') => {
+                for next in characters.by_ref() {
+                    if next == '\n' {
+                        output.push('\n');
+                        break;
+                    }
+                }
+            }
+            '/' if characters.peek() == Some(&'*') => {
+                characters.next();
+                let mut previous = '\0';
+                for next in characters.by_ref() {
+                    if previous == '*' && next == '/' {
+                        break;
+                    }
+                    previous = next;
+                }
+            }
+            _ => output.push(character),
+        }
+    }
+    output
+}
+
+fn strip_trailing_commas(input: &str) -> String {
+    let mut output = String::with_capacity(input.len());
+    let mut characters = input.chars().peekable();
+    let mut in_string = false;
+    let mut escaped = false;
+
+    while let Some(character) = characters.next() {
+        if in_string {
+            output.push(character);
+            if escaped {
+                escaped = false;
+            } else if character == '\\' {
+                escaped = true;
+            } else if character == '"' {
+                in_string = false;
+            }
+            continue;
+        }
+        if character == '"' {
+            in_string = true;
+            output.push(character);
+            continue;
+        }
+        if character != ',' {
+            output.push(character);
+            continue;
+        }
+        // A comma followed only by whitespace and a closer is trailing.
+        let mut whitespace = String::new();
+        while let Some(&next) = characters.peek() {
+            if next.is_whitespace() {
+                whitespace.push(next);
+                characters.next();
+            } else {
+                break;
+            }
+        }
+        if !matches!(characters.peek(), Some('}') | Some(']')) {
+            output.push(',');
+        }
+        output.push_str(&whitespace);
+    }
+    output
+}
+
 /// Per-session storage directory layout root: `$LOCAL_DATA/z3rm/shadow/<session_id>`.
 fn session_shadow_dir(session_id: &str) -> PathBuf {
     dirs::data_local_dir()
@@ -186,25 +450,41 @@ fn session_shadow_dir(session_id: &str) -> PathBuf {
 
 /// Start shadow-snapshot watching + recording for a session's cwd.
 ///
-/// Returns `Ok(None)` when the cwd is not a usable directory (e.g. recovered or
-/// test sessions with an abstract cwd) — session creation still succeeds, the
-/// snapshot subsystem is simply not armed for it. Returns `Err` only for truly
-/// unexpected failures so the caller can decide how much noise to make.
+/// Returns `Ok(None)` when the user disabled shadow snapshots or the cwd is not
+/// a usable directory (e.g. recovered or test sessions with an abstract cwd) —
+/// session creation still succeeds, the snapshot subsystem is simply not armed
+/// for it. Returns `Err` only for truly unexpected failures so the caller can
+/// decide how much noise to make.
 ///
 /// The engine's DB / WAL / blobs are placed under
 /// `$LOCAL_DATA/z3rm/shadow/<session_id>/` so each session gets its own
 /// single-writer engine instance.
+///
+/// Settings are read once per session start: a settings change applies to
+/// sessions created afterwards, existing sessions keep the config they booted
+/// with (their engine, quota and watcher are already constructed).
 pub fn start(session_id: &str, cwd: &str) -> Result<Option<Arc<SnapshotWatch>>> {
-    start_with(session_id, cwd, |monitor, root| {
+    start_with_config(session_id, cwd, load_config(), |monitor, root| {
         monitor.watch_directory(root)
     })
 }
 
-pub fn start_with(
+pub fn start_with_config(
     session_id: &str,
     cwd: &str,
+    config: SnapshotConfig,
     watch: impl FnOnce(Arc<Monitor>, PathBuf) -> std::io::Result<shadow_snapshot::WatchHandle>,
 ) -> Result<Option<Arc<SnapshotWatch>>> {
+    // `shadow_snapshot.enabled = false` must really turn the engine off: no
+    // storage directory, no watcher, no recorder thread for this session.
+    if !config.enabled {
+        zlog::info!(
+            "shadow snapshot disabled by settings: session={}",
+            session_id,
+        );
+        return Ok(None);
+    }
+
     let root = Path::new(cwd);
     // A usable watch root must be an existing directory. Recovered/test
     // sessions carry a cwd that is just a string (e.g. "/home/user"); starting
@@ -243,18 +523,20 @@ pub fn start_with(
     // move into the closure.
     let recorder_session_id = session_id.to_string();
     let root_for_recorder = root.to_path_buf();
+    let recorder_config = config.clone();
     let recorder = std::thread::Builder::new()
         .name(format!("shadow-snap-{}", session_id))
         .spawn(move || {
             let root = root_for_recorder;
+            let config = recorder_config;
             let engine =
-                match shadow_snapshot::ShadowSnapshotEngine::open(&db_path, &wal_path, &blob_dir)
-                    // §4.9 age-based FIFO GC: cap shadow blob growth at 500MB so a
-                    // long-running session cannot fill the disk. `with_quota` is
-                    // optional; absent, growth stays bounded per-path by `D_MAX`
-                    // but accumulates full base versions forever.
-                    .map(|e| e.with_quota(shadow_snapshot::QuotaManager::new(500 * 1024 * 1024)))
-                {
+                // §4.9 age-based FIFO GC bounded by the user's quota setting
+                // (`per_project_quota_mb`, 0 = unlimited). Without a quota,
+                // growth stays bounded per-path by `D_MAX` but accumulates
+                // full base versions forever.
+                match shadow_snapshot::ShadowSnapshotEngine::open_with_config(
+                    &db_path, &wal_path, &blob_dir, &config,
+                ) {
                     Ok(engine) => {
                         // §4.8: complete any Decline intents that crashed mid-restore.
                         // Resolve path_hash by hashing every file under the session cwd
@@ -280,29 +562,45 @@ pub fn start_with(
                             }
                         }
                         // Engine opened fine; tell the caller and enter the loop.
-                        // A send failure means the caller gave up — just exit.
-                        let _ = init_tx.send(Ok(()));
+                        // A send failure means the caller gave up before the
+                        // engine was ready; nothing left to serve, so exit.
+                        if init_tx.send(Ok(())).is_err() {
+                            zlog::warn!(
+                                "shadow snapshot starter gone before engine ready: session={}",
+                                recorder_session_id,
+                            );
+                            return;
+                        }
                         engine
                     }
                     Err(error) => {
                         // Surface the open failure; the caller surfaces it as Err.
-                        let _ = init_tx.send(Err(error));
+                        if init_tx.send(Err(error)).is_err() {
+                            zlog::warn!(
+                                "shadow snapshot engine open failed and starter is gone: session={}",
+                                recorder_session_id,
+                            );
+                        }
                         return;
                     }
                 };
 
-            // §4.7 single-writer loop with 500ms path debounce. Events are
-            // coalesced per-path so a chatty editor saving many times per
-            // second produces one version per quiet period, not one per save.
-            // `recv_timeout` wakes the loop to flush due paths even when the
-            // watcher is silent, satisfying the debounce window without a
-            // second timer thread.
-            use crate::coalescing::PathDebouncer;
-            let mut debouncer = PathDebouncer::new();
+            // §4.7 single-writer loop with a per-path debounce whose window
+            // comes from `shadow_snapshot.debounce_ms`. Events are coalesced
+            // per-path so a chatty editor saving many times per second produces
+            // one version per quiet period, not one per save. `recv_timeout`
+            // wakes the loop to flush due paths even when the watcher is
+            // silent, satisfying the debounce window without a second timer
+            // thread.
+            let mut debouncer = DebounceQueue::new(config.debounce);
             let mut suppressed_writes = std::collections::HashMap::new();
             let suppression_ttl = std::time::Duration::from_secs(5);
-            // Poll just under the window so flush latency stays close to 500ms.
-            let poll = std::time::Duration::from_millis(100);
+            // Poll well inside the window so flush latency stays close to it,
+            // and never slower than 100ms for the default 500ms window.
+            let poll = (config.debounce / 5).clamp(
+                std::time::Duration::from_millis(5),
+                std::time::Duration::from_millis(100),
+            );
             let mut path_disconnected = false;
             loop {
                 let now = std::time::Instant::now();
@@ -318,7 +616,9 @@ pub fn start_with(
                 }
 
                 while let Ok(command) = command_rx.try_recv() {
-                    if let Some((path_hash, content_hash)) = handle_command(&engine, command) {
+                    if let Some((path_hash, content_hash)) =
+                        handle_command(&engine, command, config.git_commit_hook)
+                    {
                         suppressed_writes.insert(path_hash, (content_hash, now + suppression_ttl));
                     }
                 }
@@ -328,9 +628,6 @@ pub fn start_with(
                 }
 
                 if path_disconnected {
-                    for (path, trigger) in debouncer.drain_all() {
-                        route_record_event(&engine, &path, trigger, &mut suppressed_writes);
-                    }
                     break;
                 }
             }
@@ -345,28 +642,32 @@ pub fn start_with(
 
     // on_event runs on Monitor's own watcher thread; it must not touch the
     // engine, so it only enqueues the changed path and maps the event kind to
-    // a trigger. The Drop of the sender is silently ignored: a failed send
-    // merely means the recorder channel drained / stopped, which is not an
-    // error worth propagating into the watcher pipeline's trigger decisions.
+    // a trigger. A send failure means the recorder stopped: it is returned as
+    // an error so the watcher pipeline logs it instead of dropping events into
+    // a closed channel unnoticed.
     let on_event = {
         let path_tx = path_tx.clone();
         let session_id = session_id.to_string();
-        move |event: FileEvent| -> SnapshotTrigger {
+        move |event: FileEvent| -> Result<SnapshotTrigger> {
             // §4.4 send the path together with its trigger so the recorder can
             // route Delete vs Write without re-reading the (now-absent) file.
             let trigger = event_to_trigger(event.kind, &session_id);
-            let _ = path_tx.send((event.path, trigger));
-            trigger
+            path_tx
+                .send((event.path, trigger))
+                .context("shadow recorder channel closed")?;
+            Ok(trigger)
         }
     };
 
-    let monitor = Arc::new(Monitor::new(root.to_path_buf(), on_event));
+    let monitor = Arc::new(Monitor::with_config(root.to_path_buf(), &config, on_event));
     let watch_handle = match watch(monitor.clone(), root.to_path_buf()) {
         Ok(handle) => {
             zlog::info!(
-                "shadow snapshot started: session={} cwd={}",
+                "shadow snapshot started: session={} cwd={} quota_bytes={} debounce_ms={}",
                 session_id,
                 cwd,
+                config.quota_bytes,
+                config.debounce.as_millis(),
             );
             handle
         }
@@ -388,10 +689,13 @@ pub fn start_with(
         }
     };
 
+    let git_watch_handle = start_git_commit_watch(session_id, root, &config, command_tx.clone());
+
     Ok(Some(Arc::new(SnapshotWatch {
         inner: Arc::new(WatchInner {
             session_id: session_id.to_string(),
             watch_handle: Mutex::new(Some(watch_handle)),
+            git_watch_handle: Mutex::new(git_watch_handle),
             path_sender: Mutex::new(Some(path_tx)),
             command_sender: Mutex::new(Some(command_tx)),
             recorder: Mutex::new(Some(recorder)),
@@ -399,9 +703,59 @@ pub fn start_with(
     })))
 }
 
+/// §4.9 Arm git commit detection for the session worktree.
+///
+/// Returns `None` when the user selected `git_commit_hook: "skip"`, when the
+/// cwd is not inside a git repository (shadow snapshot must work in non-git
+/// directories, §4.1), or when the watcher could not be installed — none of
+/// those are reasons to fail session creation, so they are logged instead.
+///
+/// The callback runs on the notify watcher thread and therefore must not touch
+/// the engine: it only posts a command to the single-writer recorder thread
+/// (§4.3), which does the actual GC marking.
+fn start_git_commit_watch(
+    session_id: &str,
+    root: &Path,
+    config: &SnapshotConfig,
+    command_tx: mpsc::Sender<ShadowCommand>,
+) -> Option<GitCommitWatcher> {
+    if config.git_commit_hook == GitCommitHookMode::Skip {
+        return None;
+    }
+    let tracker = Arc::new(GitCommitTracker::new(root)?);
+    let git_dir = tracker.git_dir().to_path_buf();
+    let watch_session_id = session_id.to_string();
+    match shadow_snapshot::watch_git_commits(tracker, move |commit| {
+        if command_tx.send(ShadowCommand::GitCommit { commit }).is_err() {
+            zlog::warn!(
+                "shadow git commit hook: recorder gone, session={}",
+                watch_session_id,
+            );
+        }
+    }) {
+        Ok(watcher) => {
+            zlog::info!(
+                "shadow git commit hook armed: session={} git_dir={}",
+                session_id,
+                git_dir.display(),
+            );
+            Some(watcher)
+        }
+        Err(error) => {
+            zlog::warn!(
+                "shadow git commit hook not armed: session={} error={}",
+                session_id,
+                error,
+            );
+            None
+        }
+    }
+}
+
 fn handle_command(
     engine: &shadow_snapshot::ShadowSnapshotEngine,
     command: ShadowCommand,
+    git_commit_hook: GitCommitHookMode,
 ) -> Option<(shadow_snapshot::PathHash, shadow_snapshot::ContentHash)> {
     match command {
         ShadowCommand::ListVersions { path, reply } => {
@@ -447,6 +801,21 @@ fn handle_command(
             }
             suppression
         }
+        ShadowCommand::GitCommit { commit } => {
+            // §4.9 Clear marks pre-commit deltas gc-eligible; Keep records the
+            // boundary but retains everything. Skip never reaches here (no
+            // watcher is installed for it).
+            match git_commit_hook {
+                GitCommitHookMode::Clear => {
+                    let marked = engine.on_git_commit();
+                    zlog::info!("shadow git commit: commit={} gc_marked={}", commit, marked);
+                }
+                GitCommitHookMode::Keep | GitCommitHookMode::Skip => {
+                    zlog::info!("shadow git commit: commit={} history kept", commit);
+                }
+            }
+            None
+        }
     }
 }
 
@@ -471,10 +840,12 @@ fn build_path_hash_index(root: &Path) -> std::collections::HashMap<[u8; 32], Pat
 
 /// Map a filesystem event kind to the snapshot trigger reason it represents.
 /// Deleted files surface as `Delete` so the version tree records the
-/// removal rather than a content write.
+/// removal rather than a content write; close-after-write surfaces as `Close`
+/// so §4.7's "file close → force flush version" bypasses the debounce window.
 fn event_to_trigger(kind: EventKind, _session_id: &str) -> SnapshotTrigger {
     match kind {
         EventKind::Created | EventKind::Modified | EventKind::Renamed => SnapshotTrigger::Write,
+        EventKind::Closed => SnapshotTrigger::Close,
         EventKind::Deleted => SnapshotTrigger::Delete,
     }
 }
@@ -517,7 +888,7 @@ fn route_record_event(
             {
                 return;
             }
-            if let Err(error) = engine.record_change(path, &content) {
+            if let Err(error) = engine.record_change_with_trigger(path, &content, trigger) {
                 zlog::warn!(
                     "shadow snapshot record failed: path={} error={}",
                     path.display(),
@@ -670,16 +1041,139 @@ mod tests {
         let directory = tempfile::tempdir().expect("temp directory");
         let cwd = directory.path().to_str().expect("utf-8 cwd").to_string();
 
-        let result = start_with("fail-watch-test", &cwd, |_monitor, _root| {
-            Err(std::io::Error::new(
-                std::io::ErrorKind::PermissionDenied,
-                "injected watcher failure",
-            ))
-        });
+        let result = start_with_config(
+            "fail-watch-test",
+            &cwd,
+            SnapshotConfig::default(),
+            |_monitor, _root| {
+                Err(std::io::Error::new(
+                    std::io::ErrorKind::PermissionDenied,
+                    "injected watcher failure",
+                ))
+            },
+        );
 
         assert!(
             result.is_err(),
             "injected watch failure must surface as Err"
         );
+    }
+
+    /// `shadow_snapshot.enabled = false` must stop the engine from being armed
+    /// at all: no storage directory, no watcher, no recorder thread.
+    #[test]
+    fn disabled_setting_prevents_engine_start() {
+        let directory = tempfile::tempdir().expect("temp directory");
+        let cwd = directory.path().to_str().expect("utf-8 cwd").to_string();
+        let session_id = "shadow-disabled-test";
+        let config = SnapshotConfig {
+            enabled: false,
+            ..SnapshotConfig::default()
+        };
+
+        let watch = start_with_config(session_id, &cwd, config, |_monitor, _root| {
+            panic!("a disabled engine must never install a watcher")
+        })
+        .expect("disabled settings are not an error");
+
+        assert!(watch.is_none(), "disabled settings must not arm a session");
+        assert!(
+            !session_shadow_dir(session_id).exists(),
+            "disabled settings must not create session storage",
+        );
+    }
+
+    /// The settings the UI writes must reach the engine's runtime config: a
+    /// non-default quota, debounce, circuit breaker K and git hook mode all
+    /// have to survive the JSON → SnapshotConfig translation.
+    #[test]
+    fn settings_json_drives_runtime_config() {
+        let config = parse_settings(
+            r#"{
+                // z3rm settings
+                "mux": { "keep_alive": true },
+                "shadow_snapshot": {
+                    "enabled": true,
+                    "quota_mode": "global",
+                    "per_project_quota_mb": 12,
+                    "ignore_patterns": ["*.generated.rs"],
+                    "binary_detection": false,
+                    "debounce_ms": 50,
+                    "frequency_circuit_breaker_k": 3,
+                    "git_commit_hook": "keep",
+                },
+            }"#,
+        )
+        .expect("settings parse");
+
+        assert!(config.enabled);
+        assert_eq!(config.quota_mode, QuotaMode::Global);
+        assert_eq!(config.quota_bytes, 12 * 1024 * 1024);
+        assert_eq!(config.ignore_patterns, vec!["*.generated.rs".to_string()]);
+        assert!(!config.binary_detection);
+        assert_eq!(config.debounce, Duration::from_millis(50));
+        assert_eq!(config.circuit_breaker_writes_per_second, 3.0);
+        assert_eq!(config.git_commit_hook, GitCommitHookMode::Keep);
+    }
+
+    /// A missing section, a missing field, and `enabled: false` must all behave
+    /// predictably: documented defaults except for what the user actually set.
+    #[test]
+    fn settings_json_partial_sections_keep_documented_defaults() {
+        let defaults = parse_settings(r#"{ "mux": {} }"#).expect("settings parse");
+        assert!(defaults.enabled);
+        assert_eq!(defaults.quota_bytes, 500 * 1024 * 1024);
+        assert_eq!(defaults.debounce, Duration::from_millis(500));
+        assert_eq!(defaults.circuit_breaker_writes_per_second, 10.0);
+
+        let partial = parse_settings(r#"{ "shadow_snapshot": { "enabled": false } }"#)
+            .expect("settings parse");
+        assert!(!partial.enabled);
+        assert_eq!(partial.quota_bytes, 500 * 1024 * 1024);
+        assert_eq!(partial.debounce, Duration::from_millis(500));
+
+        // 0 MB is the documented "unlimited" value, not "fall back to 500MB".
+        let unlimited = parse_settings(r#"{ "shadow_snapshot": { "per_project_quota_mb": 0 } }"#)
+            .expect("settings parse");
+        assert_eq!(unlimited.quota_bytes, 0);
+        assert!(unlimited.quota_manager().is_none());
+    }
+
+    /// The shipped default settings file is JSONC (comments); the daemon parser
+    /// has to accept exactly the file the settings UI maintains.
+    #[test]
+    fn shipped_default_settings_parse_with_documented_values() {
+        let repository_root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .and_then(|crates| crates.parent())
+            .expect("workspace root");
+        let defaults = repository_root.join("assets/settings/default.json");
+        let contents = std::fs::read_to_string(&defaults)
+            .unwrap_or_else(|error| panic!("read {}: {error}", defaults.display()));
+
+        let config = parse_settings(&contents).expect("default settings parse");
+
+        assert!(config.enabled);
+        assert_eq!(config.quota_mode, QuotaMode::PerProject);
+        assert_eq!(config.quota_bytes, 500 * 1024 * 1024);
+        assert!(config.binary_detection);
+        assert_eq!(config.debounce, Duration::from_millis(500));
+        assert_eq!(config.circuit_breaker_writes_per_second, 10.0);
+        assert_eq!(config.git_commit_hook, GitCommitHookMode::Clear);
+    }
+
+    #[test]
+    fn jsonc_stripping_preserves_string_contents() {
+        let stripped = strip_jsonc(
+            r#"{
+                "a": "http://example.com//not-a-comment",
+                /* block */ "b": "sl\"ash // inside",
+                "c": [1, 2,], // trailing
+            }"#,
+        );
+        let value: serde_json::Value = serde_json::from_str(&stripped).expect("valid JSON");
+        assert_eq!(value["a"], "http://example.com//not-a-comment");
+        assert_eq!(value["b"], "sl\"ash // inside");
+        assert_eq!(value["c"], serde_json::json!([1, 2]));
     }
 }

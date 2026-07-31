@@ -281,8 +281,19 @@ impl StorageEngine {
     }
 
 
-    /// 删除版本节点
+    /// 删除版本节点。
+    ///
+    /// 先把子节点 detach（parent_id = NULL）再删除自己：`version_nodes.parent_id`
+    /// 是自引用外键，而 rusqlite 的 bundled SQLite 默认开启外键约束，直接删除
+    /// 一个还有子节点的版本会以 "FOREIGN KEY constraint failed" 失败。
+    /// GC 在删除 full base 之前已经把仍需重建的 delta child 提升为 full
+    /// （§4.9 promote-to-full），detach 之后它们仍然自洽；剩下的 delta-only
+    /// 子节点本来就不可达，detach 只是让它们变成下一轮 GC 的候选。
     pub fn delete_node(&self, version_id: VersionId) -> Result<()> {
+        self.conn.execute(
+            "UPDATE version_nodes SET parent_id = NULL WHERE parent_id = ?1",
+            params![version_id as i64],
+        )?;
         self.conn
             .execute("DELETE FROM version_nodes WHERE version_id = ?1", params![version_id as i64])?;
         Ok(())

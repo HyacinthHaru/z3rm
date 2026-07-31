@@ -352,13 +352,29 @@ impl VersionTree {
         heads.clone()
     }
 
-    /// 删除一个节点：从 nodes、heads、orphans 中移除。
+    /// 删除一个节点：从 nodes、heads、orphans 中移除，并把它的直接子节点
+    /// detach（parent_id / ancestors 清空）。
     ///
     /// 由 GC 在确认该节点不在任何 HEAD 的重建链上、且其 delta children
     /// 已提升为 full 之后调用。不会级联删除子节点——调用方负责先提升依赖者。
+    /// detach 让内存树和持久层保持一致（SQLite 侧 parent_id 是外键，删除时
+    /// 必须同样置空），也避免留下指向已删除 id 的悬空 parent。
     pub fn remove_node(&self, version_id: VersionId) {
         let mut nodes = self.nodes.write();
         if let Some(node) = nodes.remove(&version_id) {
+            let children: Vec<VersionId> = nodes
+                .iter()
+                .filter(|(_, child)| child.parent_id == Some(version_id))
+                .map(|(id, _)| *id)
+                .collect();
+            for child_id in children {
+                if let Some(child) = nodes.get(&child_id) {
+                    let mut detached = (**child).clone();
+                    detached.parent_id = None;
+                    detached.ancestors = SmallVec::new();
+                    nodes.insert(child_id, Arc::new(detached));
+                }
+            }
             drop(nodes);
             // 若它是某 path 的 HEAD，则把该 path 的 HEAD 清空；
             // 调用方在删 HEAD 前必须保证已无依赖者（GC 流程保证）。
