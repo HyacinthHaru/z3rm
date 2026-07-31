@@ -959,7 +959,7 @@ async fn test_ignored_root_with_file_inclusions(cx: &mut TestAppContext) {
     cx.update(|cx| {
         cx.update_global::<SettingsStore, _>(|store, cx| {
             store.update_user_settings(cx, |settings| {
-                settings.project.worktree.file_scan_inclusions = Some(vec![
+                settings.project.file_scan_inclusions = Some(vec![
                     "height_demo/**/hi_bonjour".to_string(),
                     "**/height_1".to_string(),
                 ]);
@@ -1053,7 +1053,7 @@ async fn test_ignored_root_with_file_inclusions_repro(cx: &mut TestAppContext) {
     cx.update(|cx| {
         cx.update_global::<SettingsStore, _>(|store, cx| {
             store.update_user_settings(cx, |settings| {
-                settings.project.worktree.file_scan_inclusions = Some(vec!["**/.env".to_string()]);
+                settings.project.file_scan_inclusions = Some(vec!["**/.env".to_string()]);
             });
         })
     });
@@ -2315,7 +2315,7 @@ async fn test_external_files_history(cx: &mut gpui::TestAppContext) {
     let project = Project::test(app_state.fs.clone(), [path!("/src").as_ref()], cx).await;
     cx.update(|cx| {
         project.update(cx, |project, cx| {
-            project.find_or_create_worktree(path!("/external-src"), false, cx)
+            project.find_or_create_worktree(Path::new(path!("/external-src")), false, cx)
         })
     })
     .detach();
@@ -3029,7 +3029,7 @@ async fn test_setting_auto_select_first_and_select_active_file(cx: &mut TestAppC
     let app_state = init_test(cx);
 
     cx.update(|cx| {
-        let settings = *FileFinderSettings::get_global(cx);
+        let settings = FileFinderSettings::get_global(cx).clone();
 
         FileFinderSettings::override_global(
             FileFinderSettings {
@@ -3641,7 +3641,7 @@ async fn test_search_results_refreshed_on_adding_and_removing_worktrees(
     project
         .update(cx, |project, cx| {
             project
-                .find_or_create_worktree("/test/project_2", true, cx)
+                .find_or_create_worktree(Path::new("/test/project_2"), true, cx)
                 .into_future()
         })
         .await
@@ -4479,6 +4479,10 @@ async fn open_queried_buffer(
 
 pub(crate) fn init_test(cx: &mut TestAppContext) -> Arc<AppState> {
     cx.update(|cx| {
+        // `AppState::test` does not install the settings store, and every
+        // `Settings::get_global` below reads through it.
+        let settings_store = SettingsStore::test(cx);
+        cx.set_global(settings_store);
         let state = AppState::test(cx);
         theme_settings::init(theme::LoadThemes::JustBase, cx);
         super::init(cx);
@@ -4601,7 +4605,6 @@ fn collect_search_matches(picker: &Picker<FileFinderDelegate>) -> SearchEntries 
                 search_entries.search_matches.push(path_match.0.clone());
             }
             Match::CreateNew(_) => {}
-            Match::Channel { .. } => {}
         }
     }
     search_entries
@@ -4636,7 +4639,6 @@ fn assert_match_at_position(
         Match::History { path, .. } => path.absolute.file_name().and_then(|s| s.to_str()),
         Match::Search(path_match) => path_match.0.path.file_name(),
         Match::CreateNew(project_path) => project_path.path.file_name(),
-        Match::Channel { channel_name, .. } => Some(channel_name.as_str()),
     }
     .unwrap();
     assert_eq!(match_file_name, expected_file_name);

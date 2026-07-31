@@ -1526,22 +1526,6 @@ impl Project {
     }
 }
 
-/// Stub: FileFinderSettings (open_path_prompt 模块已删除)
-#[derive(Clone, Debug, Default, Serialize, Deserialize)]
-pub struct FileFinderSettings {
-    pub file_icons: bool,
-}
-
-impl settings::SettingsKey for FileFinderSettings {
-    const KEY: Option<&'static str> = None;
-}
-
-impl settings::Settings for FileFinderSettings {
-    fn from_settings(_content: &settings::SettingsContent) -> Self {
-        Self::default()
-    }
-}
-
 // ---------------------------------------------------------------------------
 // Extension stubs (spec §8.2 M2)
 // ---------------------------------------------------------------------------

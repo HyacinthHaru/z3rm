@@ -146,6 +146,25 @@ impl VsCodeSettings {
             line_indicator_format: Some(LineIndicatorFormat::Short),
             diagnostics: Some(DiagnosticsSettingsContent::default()),
             file_finder: Some(FileFinderSettingsContent::default()),
+            project_panel: Some(self.project_panel_settings_content()),
+            session: Some(SessionSettingsContent::default()),
+            global_lsp_settings: Some(GlobalLspSettingsContent::default()),
+            load_direnv: Some(LoadDirenv::default()),
+        }
+    }
+
+    fn project_panel_settings_content(&self) -> ProjectPanelSettingsContent {
+        ProjectPanelSettingsContent {
+            auto_reveal_entries: self.read_bool("explorer.autoReveal"),
+            auto_fold_dirs: self.read_bool("explorer.compactFolders"),
+            drag_and_drop: self.read_bool("explorer.enableDragAndDrop"),
+            sort_mode: self.read_enum("explorer.sortOrder", |s| match s {
+                "default" | "type" => Some(ProjectPanelSortMode::DirectoriesFirst),
+                "mixed" => Some(ProjectPanelSortMode::Mixed),
+                "filesFirst" => Some(ProjectPanelSortMode::FilesFirst),
+                _ => None,
+            }),
+            ..Default::default()
         }
     }
 

@@ -9,7 +9,7 @@ use gpui::{
     Render, TaskExt, WeakEntity, Window, actions,
 };
 use language::{Buffer, LanguageMatcher, LanguageName, LanguageRegistry};
-use project::FileFinderSettings;
+use file_finder::FileFinderSettings;
 use picker::{Picker, PickerDelegate};
 use project::Project;
 use settings::Settings;
