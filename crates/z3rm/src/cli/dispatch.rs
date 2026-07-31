@@ -384,7 +384,7 @@ pub async fn run_cli_command(cmd: CliCommand) -> Result<()> {
             horizontal,
             command,
         } => {
-            let target = super::target::parse_target(&target);
+            let target = super::target::parse_target(&target)?;
             let pane_id = resolve_pane_id(&domain, &target, ResolveAccess::ReadWrite).await?;
             let direction = if horizontal {
                 SplitDirection::LeftRight
@@ -404,7 +404,7 @@ pub async fn run_cli_command(cmd: CliCommand) -> Result<()> {
         }
 
         CliCommand::SendKeys { target, keys } => {
-            let target = super::target::parse_target(&target);
+            let target = super::target::parse_target(&target)?;
             let pane_id = resolve_pane_id(&domain, &target, ResolveAccess::ReadWrite).await?;
             let bytes = parse_keys(&keys);
             domain
@@ -419,7 +419,7 @@ pub async fn run_cli_command(cmd: CliCommand) -> Result<()> {
             scrollback,
             escape,
         } => {
-            let target = super::target::parse_target(&target);
+            let target = super::target::parse_target(&target)?;
             let pane_id = resolve_pane_id(&domain, &target, ResolveAccess::ReadOnly).await?;
             let text = super::capture::capture_pane(&domain, &pane_id, scrollback, escape)
                 .await
@@ -432,7 +432,7 @@ pub async fn run_cli_command(cmd: CliCommand) -> Result<()> {
         }
 
         CliCommand::ListPanes { target } => {
-            let target = super::target::parse_target(&target);
+            let target = super::target::parse_target(&target)?;
             let session_id = resolve_session_id(&domain, &target, &default_session).await?;
             let snapshot = domain
                 .attach(&session_id, mux::AttachMode::ReadOnly)
@@ -458,7 +458,7 @@ pub async fn run_cli_command(cmd: CliCommand) -> Result<()> {
         }
 
         CliCommand::SelectPane { target } => {
-            let target = super::target::parse_target(&target);
+            let target = super::target::parse_target(&target)?;
             let pane_id = resolve_pane_id(&domain, &target, ResolveAccess::ReadWrite).await?;
             domain
                 .focus_pane(&pane_id)
@@ -468,7 +468,7 @@ pub async fn run_cli_command(cmd: CliCommand) -> Result<()> {
         }
 
         CliCommand::KillPane { target } => {
-            let target = super::target::parse_target(&target);
+            let target = super::target::parse_target(&target)?;
             let pane_id = resolve_pane_id(&domain, &target, ResolveAccess::ReadWrite).await?;
             domain
                 .close_pane(&pane_id)
@@ -482,7 +482,7 @@ pub async fn run_cli_command(cmd: CliCommand) -> Result<()> {
             width,
             height,
         } => {
-            let target = super::target::parse_target(&target);
+            let target = super::target::parse_target(&target)?;
             let pane_id = resolve_pane_id(&domain, &target, ResolveAccess::ReadWrite).await?;
 
             // §3.10 Preserve unspecified axis from current pane size (do not wipe to 80x24).
@@ -516,7 +516,7 @@ pub async fn run_cli_command(cmd: CliCommand) -> Result<()> {
         }
 
         CliCommand::NewWindow { target } => {
-            let target = super::target::parse_target(&target);
+            let target = super::target::parse_target(&target)?;
             let session_id = resolve_session_id(&domain, &target, &default_session).await?;
 
             // 创建新 tab (通过 spawn_pane 隐式创建)
@@ -530,7 +530,7 @@ pub async fn run_cli_command(cmd: CliCommand) -> Result<()> {
         }
 
         CliCommand::RenameWindow { target, title } => {
-            let target = super::target::parse_target(&target);
+            let target = super::target::parse_target(&target)?;
             let pane_id = resolve_pane_id(&domain, &target, ResolveAccess::ReadWrite).await?;
             domain
                 .set_pane_title(&pane_id, &title)

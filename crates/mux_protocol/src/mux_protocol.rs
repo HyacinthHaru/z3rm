@@ -431,6 +431,19 @@ pub enum Target {
     Current,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct TargetParseError {
+    target: String,
+}
+
+impl std::fmt::Display for TargetParseError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(formatter, "invalid mux target: {:?}", self.target)
+    }
+}
+
+impl std::error::Error for TargetParseError {}
+
 /// 解析 tmux 风格的目标字符串。
 ///
 /// 支持格式:
@@ -438,20 +451,52 @@ pub enum Target {
 /// - `%N` → PaneByIndex(N)
 /// - `session:W.P` → PaneInSession { session, window: W, pane: P }
 /// - `session` → Session(session)
-pub fn parse_target(s: &Option<String>) -> Target {
-    match s {
-        None => Target::Current,
-        Some(s) if s.starts_with('%') => Target::PaneByIndex(s[1..].parse().unwrap_or(0)),
-        Some(s) if s.contains(':') && s.contains('.') => {
-            let parts: Vec<&str> = s.splitn(3, |c| c == ':' || c == '.').collect();
-            Target::PaneInSession {
-                session: parts[0].to_string(),
-                window: parts[1].parse().unwrap_or(0),
-                pane: parts[2].parse().unwrap_or(0),
-            }
-        }
-        Some(s) => Target::Session(s.clone()),
+pub fn parse_target(target: &Option<String>) -> Result<Target, TargetParseError> {
+    let Some(target) = target else {
+        return Ok(Target::Current);
+    };
+    if target.is_empty() {
+        return Err(TargetParseError {
+            target: target.clone(),
+        });
     }
+    if let Some(index) = target.strip_prefix('%') {
+        return index
+            .parse::<u32>()
+            .map(Target::PaneByIndex)
+            .map_err(|_| TargetParseError {
+                target: target.clone(),
+            });
+    }
+    if target.contains(':') || target.contains('.') {
+        let Some((session, indexes)) = target.split_once(':') else {
+            return Err(TargetParseError {
+                target: target.clone(),
+            });
+        };
+        let Some((window, pane)) = indexes.split_once('.') else {
+            return Err(TargetParseError {
+                target: target.clone(),
+            });
+        };
+        if session.is_empty() || window.is_empty() || pane.is_empty() || pane.contains('.') {
+            return Err(TargetParseError {
+                target: target.clone(),
+            });
+        }
+        let window = window.parse::<u32>().map_err(|_| TargetParseError {
+            target: target.clone(),
+        })?;
+        let pane = pane.parse::<u32>().map_err(|_| TargetParseError {
+            target: target.clone(),
+        })?;
+        return Ok(Target::PaneInSession {
+            session: session.to_string(),
+            window,
+            pane,
+        });
+    }
+    Ok(Target::Session(target.clone()))
 }
 
 #[cfg(test)]
@@ -460,51 +505,67 @@ mod target_tests {
 
     #[test]
     fn parse_none() {
-        let target = parse_target(&None);
-        assert!(matches!(target, Target::Current));
+        assert_eq!(parse_target(&None), Ok(Target::Current));
     }
 
     #[test]
     fn parse_session_name() {
-        let target = parse_target(&Some("mysession".to_string()));
-        assert_eq!(target, Target::Session("mysession".to_string()));
+        assert_eq!(
+            parse_target(&Some("mysession".to_string())),
+            Ok(Target::Session("mysession".to_string()))
+        );
     }
 
     #[test]
     fn parse_pane_index() {
-        let target = parse_target(&Some("%3".to_string()));
-        assert_eq!(target, Target::PaneByIndex(3));
+        assert_eq!(
+            parse_target(&Some("%3".to_string())),
+            Ok(Target::PaneByIndex(3))
+        );
     }
 
     #[test]
     fn parse_session_window_pane() {
-        let target = parse_target(&Some("dev:0.1".to_string()));
         assert_eq!(
-            target,
-            Target::PaneInSession {
+            parse_target(&Some("dev:0.1".to_string())),
+            Ok(Target::PaneInSession {
                 session: "dev".to_string(),
                 window: 0,
                 pane: 1,
-            }
+            })
         );
     }
 
     #[test]
     fn parse_session_window_pane_multi() {
-        let target = parse_target(&Some("prod:2.5".to_string()));
         assert_eq!(
-            target,
-            Target::PaneInSession {
+            parse_target(&Some("prod:2.5".to_string())),
+            Ok(Target::PaneInSession {
                 session: "prod".to_string(),
                 window: 2,
                 pane: 5,
-            }
+            })
         );
     }
 
     #[test]
     fn parse_pane_index_zero() {
-        let target = parse_target(&Some("%0".to_string()));
-        assert_eq!(target, Target::PaneByIndex(0));
+        assert_eq!(
+            parse_target(&Some("%0".to_string())),
+            Ok(Target::PaneByIndex(0))
+        );
+    }
+
+    #[test]
+    fn malformed_targets_are_rejected_instead_of_falling_back_to_zero() {
+        for target in [
+            "", "%", "%abc", "%4294967296", "dev:x.1", "dev:1.x", "dev:.",
+            "dev.1", "dev:1", "dev:1.2.3", ":1.2",
+        ] {
+            assert!(
+                parse_target(&Some(target.to_string())).is_err(),
+                "target {target:?} must be rejected"
+            );
+        }
     }
 }
