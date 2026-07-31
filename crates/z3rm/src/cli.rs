@@ -8,6 +8,7 @@ pub mod marketplace;
 pub mod target;
 
 pub use dispatch::CliCommand;
+pub use dispatch::SendKeysEncoding;
 pub use dispatch::run_cli_command;
 
 use std::path::PathBuf;
@@ -140,11 +141,13 @@ fn has_option_value(args: &[String], short: &str, long: &str) -> bool {
         .any(|window| (window[0] == short || window[0] == long) && !window[1].starts_with('-'))
 }
 
+/// `-l` / `-H` 只切换编码方式，`-N` 带一个计数值，它们后面仍然必须有按键载荷。
 fn send_keys_payload_is_empty(args: &[String]) -> bool {
     let mut i = 0;
     while i < args.len() {
         match args[i].as_str() {
-            "-t" | "--target" => i += 2,
+            "-t" | "--target" | "-N" => i += 2,
+            "-l" | "-H" => i += 1,
             _ => return false,
         }
     }
@@ -295,6 +298,8 @@ fn parse_cli_args_lossy(args: &[String]) -> Result<Option<CliCommand>, String> {
         "send-keys" => {
             let mut target = None;
             let mut keys = Vec::new();
+            let mut encoding = SendKeysEncoding::KeyNames;
+            let mut repeat: u32 = 1;
             let rest = &args[2..];
             let mut index = 0;
             let mut options_done = false;
@@ -312,6 +317,26 @@ fn parse_cli_args_lossy(args: &[String]) -> Result<Option<CliCommand>, String> {
                         target = Some(value.clone());
                         index += 2;
                     }
+                    "-l" if !options_done => {
+                        encoding = SendKeysEncoding::Literal;
+                        index += 1;
+                    }
+                    "-H" if !options_done => {
+                        encoding = SendKeysEncoding::Hex;
+                        index += 1;
+                    }
+                    "-N" if !options_done => {
+                        let value = rest
+                            .get(index + 1)
+                            .ok_or_else(|| "send-keys requires a value for -N".to_string())?;
+                        repeat = value
+                            .parse::<u32>()
+                            .map_err(|_| format!("invalid repeat count for -N: {value}"))?;
+                        if repeat == 0 {
+                            return Err("send-keys -N requires a count of at least 1".to_string());
+                        }
+                        index += 2;
+                    }
                     option if !options_done && option.starts_with('-') => {
                         return Err(format!("unsupported send-keys option: {option}"));
                     }
@@ -324,7 +349,12 @@ fn parse_cli_args_lossy(args: &[String]) -> Result<Option<CliCommand>, String> {
             if keys.is_empty() {
                 Err("send-keys requires at least one key".to_string())
             } else {
-                Ok(Some(CliCommand::SendKeys { target, keys }))
+                Ok(Some(CliCommand::SendKeys {
+                    target,
+                    keys,
+                    encoding,
+                    repeat,
+                }))
             }
         }
 
@@ -590,18 +620,58 @@ mod tests {
 
     #[test]
     fn send_keys_rejects_options_but_allows_literal_hyphen_after_terminator() {
-        assert!(parse_cli_args_from(&args(&["send-keys", "-l", "hello"])).is_err());
+        assert!(parse_cli_args_from(&args(&["send-keys", "-X", "copy-mode"])).is_err());
         assert!(parse_cli_args_from(&args(&["send-keys", "-t"])).is_err());
 
         let parsed = parse_cli_args_from(&args(&["send-keys", "--", "-literal"]))
             .expect("parse literal key after option terminator");
         match parsed {
-            Some(CliCommand::SendKeys { target, keys }) => {
+            Some(CliCommand::SendKeys {
+                target,
+                keys,
+                encoding,
+                repeat,
+            }) => {
                 assert_eq!(target, None);
                 assert_eq!(keys, vec!["-literal"]);
+                assert_eq!(encoding, SendKeysEncoding::KeyNames);
+                assert_eq!(repeat, 1);
             }
             command => panic!("unexpected command: {command:?}"),
         }
+    }
+
+    #[test]
+    fn send_keys_literal_hex_and_repeat_are_parsed() {
+        // `-l` 必须绕开按键名解析，否则 `Enter` 这个单词会被当成回车。
+        let parsed = parse_cli_args_from(&args(&["send-keys", "-l", "Enter"]))
+            .expect("parse literal send-keys");
+        match parsed {
+            Some(CliCommand::SendKeys { keys, encoding, .. }) => {
+                assert_eq!(keys, vec!["Enter"]);
+                assert_eq!(encoding, SendKeysEncoding::Literal);
+            }
+            command => panic!("unexpected command: {command:?}"),
+        }
+
+        let parsed = parse_cli_args_from(&args(&["send-keys", "-H", "1b", "5b"]))
+            .expect("parse hex send-keys");
+        match parsed {
+            Some(CliCommand::SendKeys { encoding, .. }) => {
+                assert_eq!(encoding, SendKeysEncoding::Hex);
+            }
+            command => panic!("unexpected command: {command:?}"),
+        }
+
+        let parsed =
+            parse_cli_args_from(&args(&["send-keys", "-N", "3", "a"])).expect("parse repeat count");
+        match parsed {
+            Some(CliCommand::SendKeys { repeat, .. }) => assert_eq!(repeat, 3),
+            command => panic!("unexpected command: {command:?}"),
+        }
+
+        assert!(parse_cli_args_from(&args(&["send-keys", "-N", "0", "a"])).is_err());
+        assert!(parse_cli_args_from(&args(&["send-keys", "-N", "x", "a"])).is_err());
     }
 
     #[test]

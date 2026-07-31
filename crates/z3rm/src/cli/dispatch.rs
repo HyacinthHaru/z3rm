@@ -11,6 +11,38 @@ use mux_protocol::proto::{ShellCommand, split_node::SplitDirection};
 use super::keys::parse_keys;
 use super::target::Target;
 
+/// 把 send-keys 的参数编码成要写进 PTY 的字节。
+///
+/// 字面量和十六进制模式绕开按键名解析，否则像 `Enter` 这样的普通单词会被
+/// 当成回车发出去。
+fn encode_send_keys(keys: &[String], encoding: SendKeysEncoding) -> Result<Vec<u8>> {
+    match encoding {
+        SendKeysEncoding::KeyNames => Ok(parse_keys(keys)),
+        SendKeysEncoding::Literal => Ok(keys.concat().into_bytes()),
+        SendKeysEncoding::Hex => keys
+            .iter()
+            .map(|value| {
+                let digits = value.strip_prefix("0x").unwrap_or(value);
+                u8::from_str_radix(digits, 16)
+                    .with_context(|| format!("invalid hex byte for send-keys -H: {value}"))
+            })
+            .collect(),
+    }
+}
+
+/// send-keys 载荷的解释方式。
+/// 来源: spec §3.10 — 与 tmux 的 `-l` / `-H` 对齐。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum SendKeysEncoding {
+    /// 参数是按键名（`Enter`、`C-c`），未识别的按 UTF-8 字面量发送。
+    #[default]
+    KeyNames,
+    /// `-l`：参数一律按字面文本发送，不做按键名解析。
+    Literal,
+    /// `-H`：每个参数是一个十六进制字节值。
+    Hex,
+}
+
 /// CLI 控制命令枚举
 /// 来源: spec §3.10 — tmux 兼容的 CLI 命令，让 agent 零学习成本操控 z3rm
 #[derive(Debug)]
@@ -44,10 +76,12 @@ pub enum CliCommand {
         horizontal: bool,
         command: Option<String>,
     },
-    /// `z3rm send-keys -t <target> <keys...>` — 发送输入到 pane
+    /// `z3rm send-keys -t <target> [-l] [-H] [-N <count>] <keys...>` — 发送输入到 pane
     SendKeys {
         target: Option<String>,
         keys: Vec<String>,
+        encoding: SendKeysEncoding,
+        repeat: u32,
     },
     /// `z3rm capture-pane -t <target> [-p] [-S <-N>] [-e]` — 捕获 pane 内容
     CapturePane {
@@ -403,10 +437,16 @@ pub async fn run_cli_command(cmd: CliCommand) -> Result<()> {
             println!("split pane: new pane {}", new_pane);
         }
 
-        CliCommand::SendKeys { target, keys } => {
+        CliCommand::SendKeys {
+            target,
+            keys,
+            encoding,
+            repeat,
+        } => {
             let target = super::target::parse_target(&target)?;
             let pane_id = resolve_pane_id(&domain, &target, ResolveAccess::ReadWrite).await?;
-            let bytes = parse_keys(&keys);
+            let bytes = encode_send_keys(&keys, encoding)?;
+            let bytes = bytes.repeat(repeat as usize);
             domain
                 .send_input(&pane_id, &bytes)
                 .await
@@ -549,6 +589,53 @@ mod tests {
     use std::sync::Mutex;
 
     static ENV_LOCK: Mutex<()> = Mutex::new(());
+
+    fn strings(values: &[&str]) -> Vec<String> {
+        values.iter().map(|value| value.to_string()).collect()
+    }
+
+    #[test]
+    fn send_keys_encodings_produce_distinct_payloads() {
+        // 同一个词在按键名模式下是回车，在字面模式下是五个字符 —— 混淆这两者
+        // 会把用户想输入的文本当成控制键发进 PTY。
+        let keys = strings(&["Enter"]);
+        assert_eq!(
+            encode_send_keys(&keys, SendKeysEncoding::KeyNames).expect("key names"),
+            b"\r".to_vec()
+        );
+        assert_eq!(
+            encode_send_keys(&keys, SendKeysEncoding::Literal).expect("literal"),
+            b"Enter".to_vec()
+        );
+    }
+
+    #[test]
+    fn send_keys_literal_joins_arguments_without_separators() {
+        let keys = strings(&["echo", " ", "hi"]);
+        assert_eq!(
+            encode_send_keys(&keys, SendKeysEncoding::Literal).expect("literal"),
+            b"echo hi".to_vec()
+        );
+    }
+
+    #[test]
+    fn send_keys_hex_accepts_bare_and_prefixed_bytes() {
+        let keys = strings(&["1b", "0x5b", "41"]);
+        assert_eq!(
+            encode_send_keys(&keys, SendKeysEncoding::Hex).expect("hex"),
+            vec![0x1b, 0x5b, 0x41]
+        );
+    }
+
+    #[test]
+    fn send_keys_hex_rejects_non_hex_arguments() {
+        let keys = strings(&["zz"]);
+        let error = encode_send_keys(&keys, SendKeysEncoding::Hex).expect_err("non-hex must fail");
+        assert!(
+            error.to_string().contains("zz"),
+            "error should name the offending argument: {error}"
+        );
+    }
 
     #[test]
     fn current_pane_from_env_prefers_explicit_pane() {
