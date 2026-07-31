@@ -551,7 +551,9 @@ impl GitBlame {
                                     project.blame_buffer(&buffer, None, cx)
                                 })
                             } else {
-                                Task::ready(Err(anyhow::anyhow!("no repository")))
+                                // A buffer outside any git repository is not an error: it
+                                // simply has no blame data, and must not raise a toast.
+                                Task::ready(Ok(None))
                             };
 
                             Ok(async move {
@@ -570,11 +572,19 @@ impl GitBlame {
                             let mut errors = vec![];
                             for (id, snapshot, buffer_edits, blame, remote_url) in blame {
                                 match blame {
-                                    Ok(git::blame::Blame {
+                                    Ok(None) => res.push((
+                                        id,
+                                        snapshot,
+                                        buffer_edits,
+                                        None,
+                                        Default::default(),
+                                        Default::default(),
+                                    )),
+                                    Ok(Some(git::blame::Blame {
                                         entries,
                                         messages,
                                         tag_names,
-                                    }) => {
+                                    })) => {
                                         let entries = build_blame_entry_sum_tree(
                                             entries,
                                             snapshot.max_point().row,
@@ -723,7 +733,7 @@ fn build_blame_entry_sum_tree(entries: Vec<BlameEntry>, max_row: u32) -> SumTree
     entries
 }
 
-#[cfg(all(test, feature = "z3rm-migration"))]
+#[cfg(test)]
 mod tests {
     use super::*;
     use git::repository::repo_path;
@@ -733,7 +743,12 @@ mod tests {
     use rand::prelude::*;
     use serde_json::json;
     use settings::SettingsStore;
-    use std::{cmp, env, ops::Range, path::Path, sync::Mutex};
+    use std::{
+        cmp, env,
+        ops::Range,
+        path::Path,
+        sync::{Arc, Mutex},
+    };
     use text::BufferId;
     use unindent::Unindent as _;
     use util::{RandomCharIter, path};
@@ -811,23 +826,43 @@ mod tests {
         let project = Project::test(fs, ["/my-repo".as_ref()], cx).await;
         let buffer = project
             .update(cx, |project, cx| {
-                project.open_local_buffer("/my-repo/file.txt", cx)
+                project.open_local_buffer(Path::new("/my-repo/file.txt"), cx)
             })
             .await
             .unwrap();
         let buffer = cx.new(|cx| MultiBuffer::singleton(buffer, cx));
 
+        // `project::Event` is neither `Clone` nor `PartialEq` in z3rm, so the toast is
+        // captured through a subscription instead of `TestAppContext::next_event`.
+        let toasts = Arc::new(Mutex::new(Vec::new()));
+        let _toast_subscription = cx.update(|cx| {
+            let toasts = toasts.clone();
+            cx.subscribe(&project, move |_, event: &project::Event, _| {
+                if let project::Event::Toast {
+                    notification_id,
+                    message,
+                    link,
+                } = event
+                {
+                    toasts.lock().expect("toast mutex poisoned").push((
+                        notification_id.clone(),
+                        message.clone(),
+                        link.clone(),
+                    ));
+                }
+            })
+        });
+
         let blame = cx.new(|cx| GitBlame::new(buffer.clone(), project.clone(), true, true, cx));
 
-        let event = project.next_event(cx).await;
+        cx.run_until_parked();
         assert_eq!(
-            event,
-            project::Event::Toast {
-                notification_id: "git-blame".into(),
-                message: "Failed to blame \"file.txt\": failed to get blame for \"file.txt\""
-                    .to_string(),
-                link: None
-            }
+            *toasts.lock().expect("toast mutex poisoned"),
+            vec![(
+                "git-blame".to_string(),
+                "Failed to blame \"file.txt\": failed to get blame for \"file.txt\"".to_string(),
+                None
+            )]
         );
 
         blame.update(cx, |blame, cx| {
@@ -866,7 +901,7 @@ mod tests {
 
         let buffer = project
             .update(cx, |project, cx| {
-                project.open_local_buffer("/not-a-repo/foo", cx)
+                project.open_local_buffer(Path::new("/not-a-repo/foo"), cx)
             })
             .await
             .unwrap();
@@ -881,11 +916,12 @@ mod tests {
             cx.subscribe(&project, {
                 let events = events.clone();
 
+                // `project::Event` is not `Clone`, so only its discriminant is recorded.
                 move |_, _, event: &project::Event, _| {
                     events
                         .lock()
                         .expect("events mutex poisoned")
-                        .push(event.clone());
+                        .push(std::mem::discriminant(event));
                 }
             })
         });
@@ -959,7 +995,7 @@ mod tests {
         let project = Project::test(fs, ["/my-repo".as_ref()], cx).await;
         let buffer = project
             .update(cx, |project, cx| {
-                project.open_local_buffer("/my-repo/file.txt", cx)
+                project.open_local_buffer(Path::new("/my-repo/file.txt"), cx)
             })
             .await
             .unwrap();
@@ -1070,7 +1106,7 @@ mod tests {
         let project = Project::test(fs, [path!("/my-repo").as_ref()], cx).await;
         let buffer = project
             .update(cx, |project, cx| {
-                project.open_local_buffer(path!("/my-repo/file.txt"), cx)
+                project.open_local_buffer(Path::new(path!("/my-repo/file.txt")), cx)
             })
             .await
             .unwrap();
@@ -1238,7 +1274,7 @@ mod tests {
         let project = Project::test(fs.clone(), [path!("/my-repo").as_ref()], cx).await;
         let buffer = project
             .update(cx, |project, cx| {
-                project.open_local_buffer(path!("/my-repo/file.txt"), cx)
+                project.open_local_buffer(Path::new(path!("/my-repo/file.txt")), cx)
             })
             .await
             .unwrap();
@@ -1366,7 +1402,7 @@ mod tests {
         let project = project::Project::test(fs, ["/my-repo".as_ref()], cx).await;
         let buffer = project
             .update(cx, |project, cx| {
-                project.open_local_buffer("/my-repo/file.txt", cx)
+                project.open_local_buffer(Path::new("/my-repo/file.txt"), cx)
             })
             .await
             .unwrap();
