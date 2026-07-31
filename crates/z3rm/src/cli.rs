@@ -98,7 +98,6 @@ run 'z3rm extension --help' for marketplace commands\n"
     )
 }
 
-
 pub fn parse_cli_args_from(args: &[String]) -> Result<Option<CliCommand>, String> {
     if args.len() <= 1 {
         return Ok(None);
@@ -166,8 +165,7 @@ fn rename_window_title(args: &[String]) -> Option<&str> {
 fn is_mux_cli_command(command: &str) -> bool {
     matches!(
         command,
-        "ls"
-            | "new"
+        "ls" | "new"
             | "kill"
             | "kill-server"
             | "attach"
@@ -188,7 +186,6 @@ fn parse_cli_args_lossy(args: &[String]) -> Result<Option<CliCommand>, String> {
     if args.len() <= 1 {
         return Ok(None);
     }
-
 
     // 第一个参数是程序名, 第二个是子命令
     let subcommand = &args[1];
@@ -299,20 +296,28 @@ fn parse_cli_args_lossy(args: &[String]) -> Result<Option<CliCommand>, String> {
             let mut target = None;
             let mut keys = Vec::new();
             let rest = &args[2..];
-            let mut i = 0;
-            while i < rest.len() {
-                match rest[i].as_str() {
-                    "-t" | "--target" => {
-                        if i + 1 < rest.len() {
-                            target = Some(rest[i + 1].clone());
-                            i += 2;
-                        } else {
-                            i += 1;
-                        }
+            let mut index = 0;
+            let mut options_done = false;
+            while index < rest.len() {
+                match rest[index].as_str() {
+                    "--" if !options_done => {
+                        options_done = true;
+                        index += 1;
+                    }
+                    "-t" | "--target" if !options_done => {
+                        let value = rest
+                            .get(index + 1)
+                            .filter(|value| !value.starts_with('-'))
+                            .ok_or_else(|| "send-keys requires a value for -t".to_string())?;
+                        target = Some(value.clone());
+                        index += 2;
+                    }
+                    option if !options_done && option.starts_with('-') => {
+                        return Err(format!("unsupported send-keys option: {option}"));
                     }
                     _ => {
-                        keys.push(rest[i].clone());
-                        i += 1;
+                        keys.push(rest[index].clone());
+                        index += 1;
                     }
                 }
             }
@@ -329,38 +334,41 @@ fn parse_cli_args_lossy(args: &[String]) -> Result<Option<CliCommand>, String> {
             let mut scrollback = None;
             let mut escape = false;
             let rest = &args[2..];
-            let mut i = 0;
-            while i < rest.len() {
-                match rest[i].as_str() {
+            let mut index = 0;
+            while index < rest.len() {
+                match rest[index].as_str() {
                     "-t" | "--target" => {
-                        if i + 1 < rest.len() {
-                            target = Some(rest[i + 1].clone());
-                            i += 2;
-                        } else {
-                            i += 1;
-                        }
+                        let value = rest
+                            .get(index + 1)
+                            .filter(|value| !value.starts_with('-'))
+                            .ok_or_else(|| "capture-pane requires a value for -t".to_string())?;
+                        target = Some(value.clone());
+                        index += 2;
                     }
                     "-p" | "--print" => {
                         print = true;
-                        i += 1;
+                        index += 1;
                     }
                     "-S" | "--scrollback" => {
-                        if i + 1 < rest.len() {
-                            let n = rest[i + 1].parse::<i32>()
-                                .map_err(|_| format!("invalid integer for -S: '{}'", rest[i + 1]))?;
-                            scrollback = Some(n);
-                            i += 2;
-                        } else {
-                            i += 1;
+                        let value = rest
+                            .get(index + 1)
+                            .ok_or_else(|| "capture-pane requires a value for -S".to_string())?;
+                        let lines = value
+                            .parse::<i32>()
+                            .map_err(|_| format!("invalid integer for -S: '{value}'"))?;
+                        if lines >= 0 {
+                            return Err(
+                                "capture-pane -S requires a negative line count".to_string()
+                            );
                         }
+                        scrollback = Some(lines);
+                        index += 2;
                     }
                     "-e" | "--escape" => {
                         escape = true;
-                        i += 1;
+                        index += 1;
                     }
-                    _ => {
-                        i += 1;
-                    }
+                    option => return Err(format!("unsupported capture-pane option: {option}")),
                 }
             }
             Ok(Some(CliCommand::CapturePane {
@@ -437,8 +445,9 @@ fn parse_cli_args_lossy(args: &[String]) -> Result<Option<CliCommand>, String> {
                     }
                     "-x" | "--width" => {
                         if i + 1 < rest.len() {
-                            let n = rest[i + 1].parse::<u16>()
-                                .map_err(|_| format!("invalid integer for -x: '{}'", rest[i + 1]))?;
+                            let n = rest[i + 1].parse::<u16>().map_err(|_| {
+                                format!("invalid integer for -x: '{}'", rest[i + 1])
+                            })?;
                             width = Some(n);
                             i += 2;
                         } else {
@@ -447,8 +456,9 @@ fn parse_cli_args_lossy(args: &[String]) -> Result<Option<CliCommand>, String> {
                     }
                     "-y" | "--height" => {
                         if i + 1 < rest.len() {
-                            let n = rest[i + 1].parse::<u16>()
-                                .map_err(|_| format!("invalid integer for -y: '{}'", rest[i + 1]))?;
+                            let n = rest[i + 1].parse::<u16>().map_err(|_| {
+                                format!("invalid integer for -y: '{}'", rest[i + 1])
+                            })?;
                             height = Some(n);
                             i += 2;
                         } else {
@@ -558,7 +568,40 @@ mod tests {
         let err = parse_cli_args_from(&args(&["capture-pane", "-S", "abc"]))
             .expect_err("-S with non-integer must be a parse error");
         assert!(err.contains("-S"), "error should name the flag: {err}");
+
         assert!(err.contains("abc"), "error should show bad value: {err}");
+    }
+
+    #[test]
+    fn capture_pane_rejects_missing_nonnegative_and_unknown_options() {
+        for arguments in [
+            vec!["capture-pane", "-S"],
+            vec!["capture-pane", "-S", "0"],
+            vec!["capture-pane", "-S", "2"],
+            vec!["capture-pane", "-t"],
+            vec!["capture-pane", "--bogus"],
+        ] {
+            assert!(
+                parse_cli_args_from(&args(&arguments)).is_err(),
+                "arguments {arguments:?} must be rejected"
+            );
+        }
+    }
+
+    #[test]
+    fn send_keys_rejects_options_but_allows_literal_hyphen_after_terminator() {
+        assert!(parse_cli_args_from(&args(&["send-keys", "-l", "hello"])).is_err());
+        assert!(parse_cli_args_from(&args(&["send-keys", "-t"])).is_err());
+
+        let parsed = parse_cli_args_from(&args(&["send-keys", "--", "-literal"]))
+            .expect("parse literal key after option terminator");
+        match parsed {
+            Some(CliCommand::SendKeys { target, keys }) => {
+                assert_eq!(target, None);
+                assert_eq!(keys, vec!["-literal"]);
+            }
+            command => panic!("unexpected command: {command:?}"),
+        }
     }
 
     #[test]
@@ -577,8 +620,8 @@ mod tests {
 
     #[test]
     fn help_flag_emits_usage() {
-        let err = parse_cli_args_from(&args(&["--help"]))
-            .expect_err("--help must be a handled case");
+        let err =
+            parse_cli_args_from(&args(&["--help"])).expect_err("--help must be a handled case");
         assert!(err.contains("usage"), "help should contain usage: {err}");
     }
 
@@ -587,7 +630,9 @@ mod tests {
         let intent = parse_launch_intent_from(&args(&["attach", "-t", "dev"]));
         assert_eq!(
             intent,
-            Some(LaunchIntent::Gui { target: Some("dev".into()) })
+            Some(LaunchIntent::Gui {
+                target: Some("dev".into())
+            })
         );
     }
 
@@ -624,7 +669,9 @@ mod tests {
         let intent = parse_launch_intent_from(&args(&["attach", "--target", "dev:0.1"]));
         assert_eq!(
             intent,
-            Some(LaunchIntent::Gui { target: Some("dev:0.1".into()) })
+            Some(LaunchIntent::Gui {
+                target: Some("dev:0.1".into())
+            })
         );
     }
 
@@ -665,8 +712,8 @@ mod tests {
     #[test]
     fn new_session_with_cwd_preserves_explicit_cwd() {
         // §3.10 -c 必须保留, 让 dispatch 直接使用, 不再去 current_dir 推算。
-        let parsed = parse_cli_args_from(&args(&["new", "-s", "dev", "-c", "/tmp/work"]))
-            .expect("parse");
+        let parsed =
+            parse_cli_args_from(&args(&["new", "-s", "dev", "-c", "/tmp/work"])).expect("parse");
         match parsed {
             Some(CliCommand::NewSession { name, cwd }) => {
                 assert_eq!(name.as_deref(), Some("dev"));
@@ -679,9 +726,8 @@ mod tests {
 
     #[test]
     fn new_session_accepts_long_cwd_flag() {
-        let parsed =
-            parse_cli_args_from(&args(&["new", "--session-name", "dev", "--cwd", "/var"]))
-                .expect("parse");
+        let parsed = parse_cli_args_from(&args(&["new", "--session-name", "dev", "--cwd", "/var"]))
+            .expect("parse");
         if let Some(CliCommand::NewSession { name, cwd }) = &parsed {
             assert_eq!(name.as_deref(), Some("dev"));
             let cwd = cwd.as_ref().expect("cwd should be Some when --cwd passed");
@@ -700,7 +746,12 @@ mod tests {
         let args_vec = args(&["attach", "-t", "dev"]);
         let intent = parse_launch_intent_from(&args_vec);
         let parsed = parse_cli_args_from(&args_vec).expect("parse");
-        assert_eq!(intent, Some(LaunchIntent::Gui { target: Some("dev".into()) }));
+        assert_eq!(
+            intent,
+            Some(LaunchIntent::Gui {
+                target: Some("dev".into())
+            })
+        );
         if let Some(CliCommand::Attach { target }) = &parsed {
             assert_eq!(target.as_deref(), Some("dev"));
         } else {
