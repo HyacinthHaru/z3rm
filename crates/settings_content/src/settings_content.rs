@@ -99,7 +99,7 @@ pub struct SettingsContent {
     #[serde(flatten)]
     pub theme: Box<ThemeSettingsContent>,
 
-    #[serde(flatten)]
+    /// 扩展设置 (spec §16 Plan 16)
     pub extension: ExtensionSettingsContent,
 
     #[serde(flatten)]
@@ -123,6 +123,15 @@ pub struct SettingsContent {
 
     /// Tab 栏设置 (spec §16 Plan 16)
     pub tab_bar: Option<TabBarSettingsContent>,
+
+    /// 单个 Tab 项设置 (spec §16 Plan 16)
+    pub tabs: Option<ItemSettingsContent>,
+
+    /// 预览 Tab 设置 (spec §16 Plan 16)
+    pub preview_tabs: Option<PreviewTabsSettingsContent>,
+
+    /// Which-key 弹窗设置
+    pub which_key: Option<WhichKeySettingsContent>,
 
     /// 状态栏设置 (spec §16 Plan 16)
     pub status_bar: Option<StatusBarSettingsContent>,
@@ -166,6 +175,21 @@ pub struct SettingsContent {
 pub struct DiagnosticsSettingsContent {
     /// 是否在状态栏显示诊断按钮
     pub button: bool,
+}
+
+/// Which-key 弹窗设置 (spec §16 Plan 16)
+#[with_fallible_options]
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize, JsonSchema, MergeFrom)]
+pub struct WhichKeySettingsContent {
+    /// 按住键组合时是否显示 which-key 弹窗
+    ///
+    /// Default: false
+    pub enabled: Option<bool>,
+
+    /// 显示 which-key 弹窗前的延迟毫秒数
+    ///
+    /// Default: 1000
+    pub delay_ms: Option<u64>,
 }
 
 /// 文件查找器宽度 (spec §16 Plan 16)

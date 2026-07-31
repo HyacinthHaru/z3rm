@@ -72,30 +72,66 @@ pub struct PreviewTabsSettings {
 }
 
 impl Settings for ItemSettings {
-    fn from_settings(_content: &settings::SettingsContent) -> Self {
-        // tabs, git 字段已从 SettingsContent 移除 (spec §16 Plan 16)
+    fn from_settings(content: &settings::SettingsContent) -> Self {
+        let tabs = content.tabs.clone().unwrap_or_default();
         Self {
-            git_status: true,
-            close_position: ClosePosition::default(),
-            activate_on_close: ActivateOnClose::default(),
-            file_icons: true,
-            show_diagnostics: ShowDiagnostics::default(),
-            show_close_button: ShowCloseButton::default(),
+            git_status: tabs.git_status.unwrap_or(true),
+            close_position: tabs.close_position.map_or_else(
+                ClosePosition::default,
+                |close_position| match close_position {
+                    settings::ClosePosition::Left => ClosePosition::Left,
+                    settings::ClosePosition::Right => ClosePosition::Right,
+                },
+            ),
+            activate_on_close: tabs.activate_on_close.map_or_else(
+                ActivateOnClose::default,
+                |activate_on_close| match activate_on_close {
+                    settings::ActivateOnClose::Next => ActivateOnClose::Next,
+                    settings::ActivateOnClose::Neighbour => ActivateOnClose::Neighbour,
+                    settings::ActivateOnClose::LeftNeighbour => ActivateOnClose::LeftNeighbour,
+                    settings::ActivateOnClose::History => ActivateOnClose::History,
+                    settings::ActivateOnClose::None => ActivateOnClose::None,
+                },
+            ),
+            file_icons: tabs.file_icons.unwrap_or(true),
+            show_diagnostics: tabs.show_diagnostics.map_or_else(
+                ShowDiagnostics::default,
+                |show_diagnostics| match show_diagnostics {
+                    settings::ShowDiagnostics::Off => ShowDiagnostics::Off,
+                    settings::ShowDiagnostics::Errors => ShowDiagnostics::Errors,
+                    settings::ShowDiagnostics::All => ShowDiagnostics::All,
+                    settings::ShowDiagnostics::Inline => ShowDiagnostics::Inline,
+                    settings::ShowDiagnostics::OnHover => ShowDiagnostics::OnHover,
+                },
+            ),
+            show_close_button: tabs.show_close_button.unwrap_or_default(),
         }
     }
 }
 
 impl Settings for PreviewTabsSettings {
-    fn from_settings(_content: &settings::SettingsContent) -> Self {
-        // preview_tabs 字段已从 SettingsContent 移除 (spec §16 Plan 16)
+    fn from_settings(content: &settings::SettingsContent) -> Self {
+        let preview_tabs = content.preview_tabs.clone().unwrap_or_default();
         Self {
-            enabled: true,
-            enable_preview_from_project_panel: true,
-            enable_preview_from_file_finder: true,
-            enable_preview_from_multibuffer: true,
-            enable_preview_multibuffer_from_code_navigation: true,
-            enable_preview_file_from_code_navigation: true,
-            enable_keep_preview_on_code_navigation: false,
+            enabled: preview_tabs.enabled.unwrap_or(true),
+            enable_preview_from_project_panel: preview_tabs
+                .enable_preview_from_project_panel
+                .unwrap_or(true),
+            enable_preview_from_file_finder: preview_tabs
+                .enable_preview_from_file_finder
+                .unwrap_or(true),
+            enable_preview_from_multibuffer: preview_tabs
+                .enable_preview_from_multibuffer
+                .unwrap_or(true),
+            enable_preview_multibuffer_from_code_navigation: preview_tabs
+                .enable_preview_multibuffer_from_code_navigation
+                .unwrap_or(true),
+            enable_preview_file_from_code_navigation: preview_tabs
+                .enable_preview_file_from_code_navigation
+                .unwrap_or(true),
+            enable_keep_preview_on_code_navigation: preview_tabs
+                .enable_keep_preview_on_code_navigation
+                .unwrap_or(false),
         }
     }
 }
@@ -1605,5 +1641,100 @@ pub mod test {
         fn should_serialize(&self, _event: &Self::Event) -> bool {
             false
         }
+    }
+}
+
+#[cfg(test)]
+mod settings_tests {
+    use super::*;
+    use settings::{ItemSettingsContent, PreviewTabsSettingsContent, SettingsContent};
+
+    #[test]
+    fn test_item_settings_read_from_content() {
+        let mut content = SettingsContent::default();
+        content.tabs = Some(ItemSettingsContent {
+            git_status: Some(false),
+            close_position: Some(settings::ClosePosition::Left),
+            activate_on_close: Some(settings::ActivateOnClose::History),
+            file_icons: Some(false),
+            show_diagnostics: Some(settings::ShowDiagnostics::Errors),
+            show_close_button: Some(ShowCloseButton::Always),
+        });
+
+        let settings = ItemSettings::from_settings(&content);
+
+        assert!(!settings.git_status);
+        assert_eq!(settings.close_position, ClosePosition::Left);
+        assert_eq!(settings.activate_on_close, ActivateOnClose::History);
+        assert!(!settings.file_icons);
+        assert_eq!(settings.show_diagnostics, ShowDiagnostics::Errors);
+        assert_eq!(settings.show_close_button, ShowCloseButton::Always);
+    }
+
+    #[test]
+    fn test_item_settings_fall_back_to_defaults() {
+        let settings = ItemSettings::from_settings(&SettingsContent::default());
+
+        assert!(settings.git_status);
+        assert_eq!(settings.close_position, ClosePosition::Right);
+        assert_eq!(settings.activate_on_close, ActivateOnClose::Next);
+        assert!(settings.file_icons);
+        assert_eq!(settings.show_diagnostics, ShowDiagnostics::Off);
+        assert_eq!(settings.show_close_button, ShowCloseButton::Hover);
+    }
+
+    #[test]
+    fn test_preview_tabs_settings_read_from_content() {
+        let mut content = SettingsContent::default();
+        content.preview_tabs = Some(PreviewTabsSettingsContent {
+            enabled: Some(false),
+            enable_preview_from_project_panel: Some(false),
+            enable_preview_from_file_finder: Some(false),
+            enable_preview_from_multibuffer: Some(false),
+            enable_preview_multibuffer_from_code_navigation: Some(false),
+            enable_preview_file_from_code_navigation: Some(false),
+            enable_keep_preview_on_code_navigation: Some(true),
+        });
+
+        let settings = PreviewTabsSettings::from_settings(&content);
+
+        assert!(!settings.enabled);
+        assert!(!settings.enable_preview_from_project_panel);
+        assert!(!settings.enable_preview_from_file_finder);
+        assert!(!settings.enable_preview_from_multibuffer);
+        assert!(!settings.enable_preview_multibuffer_from_code_navigation);
+        assert!(!settings.enable_preview_file_from_code_navigation);
+        assert!(settings.enable_keep_preview_on_code_navigation);
+    }
+
+    #[test]
+    fn test_preview_tabs_settings_fall_back_to_defaults() {
+        let settings = PreviewTabsSettings::from_settings(&SettingsContent::default());
+
+        assert!(settings.enabled);
+        assert!(settings.enable_preview_from_project_panel);
+        assert!(settings.enable_preview_from_file_finder);
+        assert!(settings.enable_preview_from_multibuffer);
+        assert!(settings.enable_preview_multibuffer_from_code_navigation);
+        assert!(settings.enable_preview_file_from_code_navigation);
+        assert!(!settings.enable_keep_preview_on_code_navigation);
+    }
+
+    #[test]
+    fn test_tab_settings_parse_from_json() {
+        let content: SettingsContent = settings::parse_json_with_comments(
+            r#"{
+                "tabs": { "git_status": false, "show_diagnostics": "errors" },
+                "preview_tabs": { "enabled": false }
+            }"#,
+        )
+        .expect("tab settings should parse");
+
+        assert!(!ItemSettings::from_settings(&content).git_status);
+        assert_eq!(
+            ItemSettings::from_settings(&content).show_diagnostics,
+            ShowDiagnostics::Errors
+        );
+        assert!(!PreviewTabsSettings::from_settings(&content).enabled);
     }
 }
