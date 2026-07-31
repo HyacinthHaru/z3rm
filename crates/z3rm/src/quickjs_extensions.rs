@@ -23,7 +23,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::{Context as _, Result, anyhow, bail};
-use extension_host::vdom_bridge::{self, VDomNode};
+use extension_host::vdom_bridge::{self, CommandInvocation, VDomNode};
 use futures::StreamExt as _;
 use gpui::{AppContext as _, Global};
 use parking_lot::Mutex;
@@ -693,10 +693,13 @@ impl ExtensionHostController {
     }
 
     pub fn start(&mut self, extensions_dir: &Path, cx: &mut gpui::Context<Self>) {
+        self.start_with_roots(quickjs_runtime::extension_roots(extensions_dir), cx);
+    }
+
+    fn start_with_roots(&mut self, roots: Vec<std::path::PathBuf>, cx: &mut gpui::Context<Self>) {
         let (command_sender, command_receiver) = std::sync::mpsc::channel::<HostCommand>();
         let (chrome_sender, chrome_receiver) =
             futures::channel::mpsc::unbounded::<Vec<VDomNode>>();
-        let roots = quickjs_runtime::extension_roots(extensions_dir);
 
         let host_thread = std::thread::Builder::new()
             .name("quickjs-ext-host".into())
@@ -874,10 +877,6 @@ impl ExtensionHostController {
 
     /// §5.7 Dispatch a command registered by an extension (VDOM `onClick`
     /// descriptors and native keybindings both route through here).
-    // The VDOM bridge that turns `{ command, args }` props into clicks lives in
-    // `extension_host::vdom_bridge`; until it calls this, the entry point has no
-    // in-tree caller.
-    #[allow(dead_code)]
     pub fn execute_command(&self, command: &str, arguments_json: &str) {
         self.send(HostCommand::ExecuteCommand {
             command: command.to_string(),
@@ -899,12 +898,50 @@ impl ExtensionHostController {
         }
     }
 
+    /// Register a chrome surface and hand it the callback that turns an
+    /// `onClick` / `onChange` descriptor back into a command on the extension
+    /// thread. Without it the bridge parses the descriptors and then drops
+    /// them, so every control an extension renders is inert.
     pub fn add_status_bar(
         &self,
         status_bar: gpui::WeakEntity<crate::extension_status_bar::ExtensionStatusBar>,
+        cx: &mut gpui::Context<Self>,
     ) {
+        if let Some(bar) = status_bar.upgrade() {
+            let dispatch = Self::command_dispatch(cx.weak_entity());
+            bar.update(cx, |bar, _| bar.set_dispatch(dispatch));
+        }
         self.status_bars.lock().push(status_bar);
         self.request_render();
+    }
+
+    fn command_dispatch(this: gpui::WeakEntity<Self>) -> vdom_bridge::CommandDispatch {
+        std::rc::Rc::new(
+            move |invocation: CommandInvocation,
+                  _window: &mut gpui::Window,
+                  cx: &mut gpui::App| {
+                let arguments = match serde_json::to_string(&invocation.args) {
+                    Ok(arguments) => arguments,
+                    Err(error) => {
+                        tracing::warn!(
+                            %error,
+                            command = %invocation.command,
+                            "chrome command arguments are not serializable"
+                        );
+                        return;
+                    }
+                };
+                if let Err(error) = this.update(cx, |this, _| {
+                    this.execute_command(&invocation.command, &arguments);
+                }) {
+                    tracing::debug!(
+                        %error,
+                        command = %invocation.command,
+                        "extension host is gone; chrome command dropped"
+                    );
+                }
+            },
+        )
     }
 }
 
@@ -1451,5 +1488,131 @@ mod tests {
         });
         assert_eq!(count, 1);
         assert_eq!(element_type.as_deref(), Some("div"));
+    }
+
+    /// A chrome extension whose only button carries an `onClick` descriptor and
+    /// whose label reports the command's side effect, so the rendered text is
+    /// proof that the click reached QuickJS.
+    const CLICK_PROBE_JS: &str = r#"
+        export function activate(context) {
+            const state = { total: 0 };
+            const View = {
+                render() {
+                    return {
+                        type: 'button',
+                        props: {
+                            id: 'probe',
+                            onClick: { command: 'probe.add', args: [7] },
+                        },
+                        style: { width: '400px', height: '200px' },
+                        children: ['total=' + state.total],
+                    };
+                },
+            };
+            context.commands.register('probe.add', function(args) {
+                state.total += (args && args.length) ? args[0] : 1;
+                View.invalidate();
+            });
+            context.registerChromeView('status-bar', View);
+        }
+    "#;
+
+    /// Pump the foreground executor until `condition` holds. The extension host
+    /// runs on a real OS thread, so simulated time cannot advance it; the loop
+    /// yields wall clock between drains.
+    fn wait_for(cx: &mut gpui::TestAppContext, what: &str, mut condition: impl FnMut(&mut gpui::TestAppContext) -> bool) {
+        let deadline = std::time::Instant::now() + Duration::from_secs(20);
+        loop {
+            cx.run_until_parked();
+            if condition(cx) {
+                return;
+            }
+            assert!(std::time::Instant::now() < deadline, "timed out waiting for {what}");
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    }
+
+    fn status_bar_text(cx: &mut gpui::TestAppContext, bar: &gpui::Entity<ExtensionStatusBar>) -> String {
+        cx.read(|cx| {
+            bar.read(cx)
+                .vdom_nodes()
+                .iter()
+                .map(|node| vdom_bridge::vdom_to_text(node, 0))
+                .collect::<String>()
+        })
+    }
+
+    /// The full chrome interaction loop, end to end: a QuickJS extension renders
+    /// a button carrying an `onClick` descriptor, the bridge turns it into a
+    /// GPUI click handler, a real mouse click dispatches the command back to the
+    /// host thread, and the extension's own re-render reports the new state.
+    ///
+    /// Every link is the shipping one — no hand-built VDOM and no directly
+    /// invoked dispatch closure — because each of them has silently regressed
+    /// before while the individual pieces still had passing unit tests.
+    // `#[gpui::test]` discards the function's return value, so a `Result` body
+    // would swallow every `?`; failures have to panic to be seen.
+    #[gpui::test]
+    fn chrome_button_click_executes_the_extension_command(cx: &mut gpui::TestAppContext) {
+        // §5.2 puts the extension host on its own OS thread, so the scheduler's
+        // determinism check has to be relaxed for it to touch the app at all.
+        cx.background_executor.allow_parking();
+
+        cx.update(|cx| {
+            let settings_store = settings::SettingsStore::test(cx);
+            cx.set_global(settings_store);
+            theme_settings::init(theme::LoadThemes::JustBase, cx);
+        });
+
+        // Extensions are discovered as subdirectories of a root, so the probe
+        // needs its own directory inside the temporary root.
+        let root = temporary_extension_dir("click-probe").expect("create extension root");
+        let directory = root.join("click-probe");
+        std::fs::create_dir_all(&directory).expect("create extension directory");
+        std::fs::write(
+            directory.join("extension.toml"),
+            "[extension]\nname = \"click-probe\"\n[runtime]\nside = \"client\"\n",
+        )
+        .expect("write manifest");
+        std::fs::write(directory.join("main.js"), CLICK_PROBE_JS).expect("write extension source");
+
+        // Only the probe is loaded: the built-in roots would render their own
+        // chrome ahead of it and move the button out from under the click.
+        let discovered = quickjs_runtime::discover_client_extensions(std::slice::from_ref(&root));
+        assert_eq!(
+            discovered.len(),
+            1,
+            "probe extension was not discovered under {}",
+            root.display()
+        );
+
+        let host = cx.update(|cx| {
+            cx.new(|cx| {
+                let mut host = ExtensionHostController::new();
+                host.start_with_roots(vec![root.clone()], cx);
+                host
+            })
+        });
+
+        let window = cx.add_window(|_, _| ExtensionStatusBar::new());
+        let bar = window.root(cx).expect("status bar window root");
+        cx.update(|cx| host.update(cx, |host, cx| host.add_status_bar(bar.downgrade(), cx)));
+
+        wait_for(cx, "the probe's first chrome push", |cx| {
+            status_bar_text(cx, &bar).contains("total=0")
+        });
+
+        let mut window_cx = gpui::VisualTestContext::from_window(window.into(), cx);
+        window_cx.run_until_parked();
+        window_cx.simulate_click(
+            gpui::point(gpui::px(10.0), gpui::px(10.0)),
+            gpui::Modifiers::none(),
+        );
+
+        wait_for(cx, "the clicked command to re-render the chrome", |cx| {
+            status_bar_text(cx, &bar).contains("total=7")
+        });
+
+        std::fs::remove_dir_all(&root).expect("remove extension root");
     }
 }
