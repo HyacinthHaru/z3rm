@@ -21,6 +21,19 @@ pub struct ProjectSettingsContent {
     /// Whether to scan symlinks when indexing content. Default: local_only
     pub scan_symlinks: ScanSymlinksSetting,
 
+    /// Globs matching files whose contents must never leave the machine.
+    /// Matching entries are marked private and excluded from sharing.
+    pub private_files: Option<Vec<String>>,
+
+    /// Globs matching files the UI should treat as hidden.
+    pub hidden_files: Option<Vec<String>>,
+
+    /// Globs matching files that must not be edited.
+    pub read_only_files: Option<Vec<String>>,
+
+    /// Globs re-including paths that `excluded_paths` would otherwise skip.
+    pub file_scan_inclusions: Option<Vec<String>>,
+
     // 兼容字段 - 已删除模块占位 (spec §16 Plan 16)
     pub all_languages: LanguageToSettingsMap,
     pub disable_ai: SaturatingBool,
