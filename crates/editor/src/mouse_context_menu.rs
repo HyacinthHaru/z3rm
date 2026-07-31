@@ -342,10 +342,12 @@ pub fn deploy_context_menu(
     cx.notify();
 }
 
+// Frozen: `EditorLspTestContext` cannot complete while z3rm has no LSP startup
+// path (see its doc comment).
 #[cfg(all(test, feature = "z3rm-migration"))]
 mod tests {
     use super::*;
-    use crate::{editor_tests::init_test, test::editor_lsp_test_context::EditorLspTestContext};
+    use crate::test::{editor_lsp_test_context::EditorLspTestContext, init_test};
     use indoc::indoc;
 
     #[gpui::test]

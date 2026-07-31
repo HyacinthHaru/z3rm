@@ -10622,14 +10622,14 @@ fn compute_auto_height_layout(
     Some(size(width, final_height))
 }
 
-#[cfg(all(test, feature = "z3rm-migration"))]
+#[cfg(test)]
 mod tests {
     use super::*;
     use crate::{
         Editor, FoldPlaceholder, HighlightKey, Inlay, MultiBuffer, NavigationOverlayKey,
         NavigationOverlayLabel, NavigationTargetOverlay, SelectionEffects,
         display_map::{BlockPlacement, BlockProperties, DisplayMap},
-        editor_tests::{init_test, update_test_language_settings},
+        test::{init_test, update_test_language_settings},
     };
     use gpui::{TestAppContext, VisualTestContext, font};
     use language::{Buffer, SelectionGoal, language_settings, tree_sitter_python};
