@@ -78,37 +78,23 @@ struct WatchInner {
     recorder: Mutex<Option<std::thread::JoinHandle<()>>>,
 }
 
+fn lock_for_shutdown<T>(mutex: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
+    // Shutdown releases handles and joins the recorder best-effort; a panic that
+    // poisoned the lock must not abort teardown, and the value is still valid to take.
+    mutex.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
 fn stop_inner(inner: &WatchInner) {
-    if let Some(handle) = inner
-        .watch_handle
-        .lock()
-        .expect("watch mutex poisoned")
-        .take()
-    {
+    if let Some(handle) = lock_for_shutdown(&inner.watch_handle).take() {
         drop(handle);
     }
-    if let Some(sender) = inner
-        .path_sender
-        .lock()
-        .expect("sender mutex poisoned")
-        .take()
-    {
+    if let Some(sender) = lock_for_shutdown(&inner.path_sender).take() {
         drop(sender);
     }
-    if let Some(sender) = inner
-        .command_sender
-        .lock()
-        .expect("command mutex poisoned")
-        .take()
-    {
+    if let Some(sender) = lock_for_shutdown(&inner.command_sender).take() {
         drop(sender);
     }
-    if let Some(join) = inner
-        .recorder
-        .lock()
-        .expect("recorder mutex poisoned")
-        .take()
-    {
+    if let Some(join) = lock_for_shutdown(&inner.recorder).take() {
         if join.join().is_err() {
             zlog::warn!("shadow snapshot recorder thread panicked during shutdown");
         }
@@ -156,11 +142,7 @@ impl SnapshotWatch {
     }
 
     fn send_command(&self, command: ShadowCommand) -> Result<()> {
-        let sender = self
-            .inner
-            .command_sender
-            .lock()
-            .expect("command mutex poisoned");
+        let sender = lock_for_shutdown(&self.inner.command_sender);
         sender
             .as_ref()
             .context("shadow recorder is stopped")?

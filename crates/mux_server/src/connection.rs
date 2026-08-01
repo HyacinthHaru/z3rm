@@ -1316,11 +1316,13 @@ async fn handle_spawn_pane(
                         .find(|id| !id.is_empty())
                 })
                 .ok_or_else(|| anyhow::anyhow!("session layout has no pane anchor"))?;
-            session.layout.split(
+            if let Err(error) = session.layout.split(
                 &anchor,
                 pane_id.clone(),
                 crate::layout::SplitDirection::TopBottom,
-            )?;
+            ) {
+                return Ok(ResponseBody::Error(format!("spawn pane rejected: {error}")));
+            }
         }
 
         session.panes.write().insert(pane_id.clone(), pane);
@@ -1442,9 +1444,13 @@ async fn handle_split_pane(
             )?;
             // Only mutate the authoritative layout after PTY creation has
             // succeeded; a spawn error must leave the original tree intact.
-            session
-                .layout
-                .split(&req.pane_id, new_pane_id.clone(), direction)?;
+            if let Err(error) =
+                session
+                    .layout
+                    .split(&req.pane_id, new_pane_id.clone(), direction)
+            {
+                return Ok(ResponseBody::Error(format!("split pane rejected: {error}")));
+            }
             session.panes.write().insert(new_pane_id.clone(), pane);
             session.set_focused_pane(new_pane_id.clone());
             session.focused_tab = Some(parent_tab_id.clone());
@@ -1929,6 +1935,50 @@ fn layout_tree_to_proto(tree: &crate::layout::LayoutTree) -> mux_protocol::Layou
     use mux_protocol::proto::split_node::SplitDirection as ProtoDir;
     use mux_protocol::proto::{LayoutNode as ProtoNode, PaneLeaf, SplitNode};
 
+    fn normalized_weights(ratios: &[f32], child_count: usize) -> Vec<f32> {
+        if ratios.len() != child_count || ratios.is_empty() {
+            return vec![1.0 / child_count.max(1) as f32; child_count];
+        }
+        let sum: f32 = ratios.iter().sum();
+        if !sum.is_finite() || sum <= 0.0 || ratios.iter().any(|r| !r.is_finite() || *r < 0.0) {
+            return vec![1.0 / child_count.max(1) as f32; child_count];
+        }
+        ratios.iter().map(|r| r / sum).collect()
+    }
+
+    fn append_axis_children(
+        node: &LayoutNode,
+        direction: SplitDirection,
+        weight: f32,
+        proto_children: &mut Vec<ProtoNode>,
+        proto_ratios: &mut Vec<f32>,
+    ) {
+        if let LayoutNode::Split {
+            direction: child_direction,
+            children,
+            ratios,
+            ..
+        } = node
+            && *child_direction == direction
+        {
+            let weights = normalized_weights(ratios, children.len());
+            for (child, child_weight) in children.iter().zip(weights) {
+                append_axis_children(
+                    child,
+                    direction,
+                    weight * child_weight,
+                    proto_children,
+                    proto_ratios,
+                );
+            }
+            return;
+        }
+        if let Some(child) = convert(node) {
+            proto_children.push(child);
+            proto_ratios.push(weight);
+        }
+    }
+
     fn convert(node: &LayoutNode) -> Option<ProtoNode> {
         let proto_node = match node {
             LayoutNode::Pane { id, pane_id } if id.is_empty() && pane_id.is_empty() => {
@@ -1946,7 +1996,18 @@ fn layout_tree_to_proto(tree: &crate::layout::LayoutTree) -> mux_protocol::Layou
                 children,
                 ratios,
             } => {
-                let proto_children: Vec<ProtoNode> = children.iter().filter_map(convert).collect();
+                let weights = normalized_weights(ratios, children.len());
+                let mut proto_children = Vec::new();
+                let mut proto_ratios = Vec::new();
+                for (child, weight) in children.iter().zip(weights) {
+                    append_axis_children(
+                        child,
+                        *direction,
+                        weight,
+                        &mut proto_children,
+                        &mut proto_ratios,
+                    );
+                }
                 let proto_dir = match direction {
                     SplitDirection::LeftRight => ProtoDir::LeftRight,
                     SplitDirection::TopBottom => ProtoDir::TopBottom,
@@ -1956,7 +2017,7 @@ fn layout_tree_to_proto(tree: &crate::layout::LayoutTree) -> mux_protocol::Layou
                     node: Some(Node::Split(SplitNode {
                         direction: proto_dir,
                         children: proto_children,
-                        ratios: ratios.clone(),
+                        ratios: proto_ratios,
                     })),
                 }
             }

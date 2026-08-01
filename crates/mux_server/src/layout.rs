@@ -1,7 +1,7 @@
 // §3.10 Layout 模块 — 从 workspace pane_group 迁移的 split tree。
 // 管理 pane 分割、合并、尺寸比例。
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 /// 布局树 (§3.10 LayoutTree)
 #[derive(Clone, Debug)]
@@ -44,6 +44,11 @@ pub enum SplitDirection {
     TopBottom,
 }
 
+/// Bound internal recursion for persistence and tree operations.
+pub const MAX_INTERNAL_LAYOUT_DEPTH: usize = 128;
+/// Each direction change contributes a `LayoutNode` + `SplitNode` pair on the wire.
+pub use mux_protocol::MAX_LAYOUT_WIRE_DEPTH as MAX_WIRE_LAYOUT_DEPTH;
+
 impl LayoutTree {
     /// 空布局树
     pub fn empty() -> Self {
@@ -82,17 +87,17 @@ impl LayoutTree {
         new_pane_id: String,
         direction: SplitDirection,
     ) -> anyhow::Result<()> {
-        let old_node_id = Self::find_pane_node_id(&self.root, pane_id)?;
-        let old_root = std::mem::replace(
-            &mut self.root,
-            LayoutNode::Pane {
-                id: String::new(),
-                pane_id: String::new(),
-            },
+        anyhow::ensure!(!new_pane_id.is_empty(), "new pane id must not be empty");
+        anyhow::ensure!(
+            self.root.find_pane(&new_pane_id).is_none(),
+            "pane already exists in layout: {new_pane_id}"
         );
-        let mut root = old_root;
-        Self::split_node(&mut root, &old_node_id, new_pane_id, direction)?;
-        self.root = root;
+
+        let mut candidate = self.root.clone();
+        let old_node_id = Self::find_pane_node_id(&candidate, pane_id)?;
+        Self::split_node(&mut candidate, &old_node_id, new_pane_id, direction)?;
+        Self::validate_structure(&candidate)?;
+        self.root = candidate;
         Ok(())
     }
 
@@ -137,16 +142,91 @@ impl LayoutTree {
                 Ok(())
             }
             LayoutNode::Split { children, .. } => {
-                for child in children.iter_mut() {
-                    if Self::split_node(child, old_node_id, new_pane_id.clone(), direction).is_ok()
-                    {
-                        return Ok(());
-                    }
-                }
-                Err(anyhow::anyhow!("node not found: {}", old_node_id))
+                let child = children
+                    .iter_mut()
+                    .find(|child| Self::contains_node_id(child, old_node_id))
+                    .ok_or_else(|| anyhow::anyhow!("node not found: {}", old_node_id))?;
+                Self::split_node(child, old_node_id, new_pane_id, direction)
             }
             LayoutNode::Pane { .. } => Err(anyhow::anyhow!("node not found: {}", old_node_id)),
         }
+    }
+
+    fn contains_node_id(node: &LayoutNode, node_id: &str) -> bool {
+        match node {
+            LayoutNode::Pane { id, .. } => id == node_id,
+            LayoutNode::Split { id, children, .. } => {
+                id == node_id || children.iter().any(|c| Self::contains_node_id(c, node_id))
+            }
+        }
+    }
+
+    fn validate_structure(root: &LayoutNode) -> anyhow::Result<()> {
+        fn visit(
+            node: &LayoutNode,
+            internal_depth: usize,
+            wire_depth: usize,
+            parent_direction: Option<SplitDirection>,
+            node_ids: &mut HashSet<String>,
+            pane_ids: &mut HashSet<String>,
+        ) -> anyhow::Result<()> {
+            anyhow::ensure!(
+                internal_depth <= MAX_INTERNAL_LAYOUT_DEPTH,
+                "layout depth exceeds internal maximum of {MAX_INTERNAL_LAYOUT_DEPTH}"
+            );
+            match node {
+                LayoutNode::Pane { id, pane_id } => {
+                    anyhow::ensure!(!id.is_empty(), "layout node id must not be empty");
+                    anyhow::ensure!(!pane_id.is_empty(), "layout pane id must not be empty");
+                    anyhow::ensure!(node_ids.insert(id.clone()), "duplicate layout node id: {id}");
+                    anyhow::ensure!(
+                        pane_ids.insert(pane_id.clone()),
+                        "duplicate pane id in layout: {pane_id}"
+                    );
+                }
+                LayoutNode::Split {
+                    id,
+                    direction,
+                    children,
+                    ratios,
+                } => {
+                    let wire_depth = if parent_direction == Some(*direction) {
+                        wire_depth
+                    } else {
+                        wire_depth + 1
+                    };
+                    anyhow::ensure!(
+                        wire_depth <= MAX_WIRE_LAYOUT_DEPTH,
+                        "layout wire depth exceeds maximum of {MAX_WIRE_LAYOUT_DEPTH}"
+                    );
+                    anyhow::ensure!(!id.is_empty(), "layout node id must not be empty");
+                    anyhow::ensure!(node_ids.insert(id.clone()), "duplicate layout node id: {id}");
+                    anyhow::ensure!(children.len() >= 2, "layout split needs at least two children");
+                    anyhow::ensure!(
+                        children.len() == ratios.len(),
+                        "layout split has mismatched children and ratios"
+                    );
+                    let ratio_sum: f32 = ratios.iter().sum();
+                    anyhow::ensure!(
+                        ratio_sum.is_finite() && ratio_sum > 0.0,
+                        "layout split ratio sum must be finite and positive"
+                    );
+                    for child in children {
+                        visit(
+                            child,
+                            internal_depth + 1,
+                            wire_depth,
+                            Some(*direction),
+                            node_ids,
+                            pane_ids,
+                        )?;
+                    }
+                }
+            }
+            Ok(())
+        }
+
+        visit(root, 0, 0, None, &mut HashSet::new(), &mut HashSet::new())
     }
 
     /// §3.10 从布局树移除一个 pane。

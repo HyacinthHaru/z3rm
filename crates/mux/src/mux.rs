@@ -774,6 +774,7 @@ impl MuxDomain {
         let resp = self.send_request(req).await?;
         match resp.body {
             Some(ResponseBody::PaneId(id)) => Ok(id),
+            Some(ResponseBody::Error(message)) => Err(anyhow::anyhow!(message)),
             _ => Err(anyhow::anyhow!("unexpected response type for spawn_pane")),
         }
     }
@@ -799,6 +800,7 @@ impl MuxDomain {
         let resp = self.send_request(req).await?;
         match resp.body {
             Some(ResponseBody::PaneId(id)) => Ok(id),
+            Some(ResponseBody::Error(message)) => Err(anyhow::anyhow!(message)),
             _ => Err(anyhow::anyhow!("unexpected response type for split_pane")),
         }
     }

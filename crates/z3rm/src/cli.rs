@@ -551,7 +551,7 @@ fn parse_cli_args_lossy(args: &[String]) -> Result<Option<CliCommand>, String> {
             Ok(Some(CliCommand::RenameWindow { target, title }))
         }
 
-        _ => unreachable!(),
+        _ => Err(format!("unknown subcommand: {subcommand}")),
     }
 }
 

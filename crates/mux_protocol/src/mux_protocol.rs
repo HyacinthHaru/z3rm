@@ -82,6 +82,11 @@ pub const MAX_VARINT_LEN: usize = 10;
 /// §9 单帧 payload 长度上限 (64 MiB)。读取器在分配或扩容前据此拒绝越界前缀。
 pub const MAX_FRAME_PAYLOAD: usize = 64 * 1024 * 1024;
 
+/// Maximum number of direction-changing split levels in a wire layout.
+/// Each level consumes both a `LayoutNode` and a `SplitNode` decoder frame,
+/// so this stays well below prost's decode recursion budget.
+pub const MAX_LAYOUT_WIRE_DEPTH: usize = 32;
+
 pub const MAX_GRID_COLUMNS: usize = 4_096;
 pub const MAX_GRID_ROWS: usize = 4_096;
 pub const MAX_GRID_CELLS: usize = 1_048_576;
