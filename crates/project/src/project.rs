@@ -6,10 +6,10 @@ pub mod manifest_tree;
 pub mod project_settings;
 pub mod search;
 pub mod search_history;
-pub mod stubs;
 pub mod toolchain_store;
 pub mod trusted_worktrees;
 pub mod worktree_store;
+pub mod stubs;
 pub use stubs::*;
 
 use buffer_diff::BufferDiff;
@@ -26,6 +26,7 @@ use crate::{
 pub use git_store::{
     ConflictRegion, ConflictSet, ConflictSetSnapshot, ConflictSetUpdate,
     git_traversal::{ChildEntriesGitIter, GitEntry, GitEntryRef, GitTraversal},
+    repo_identity_path,
 };
 pub use manifest_tree::ManifestTree;
 pub use worktree_store::WorktreePaths;
@@ -84,8 +85,8 @@ use worktree_store::{WorktreeStore, WorktreeStoreEvent};
 pub use buffer_store::ProjectTransaction;
 pub use fs::*;
 pub use language::Location;
-pub use stubs::Shell;
 pub use toolchain_store::{ToolchainStore, Toolchains};
+pub use stubs::Shell;
 const MAX_PROJECT_SEARCH_HISTORY_SIZE: usize = 500;
 
 #[derive(Clone, Copy, Debug)]
@@ -149,13 +150,8 @@ pub enum Event {
     WorktreeOrderChanged,
     ActiveEntryChanged(Option<ProjectEntryId>),
     DeletedEntry(WorktreeId, ProjectEntryId),
-    WorktreePathsChanged {
-        old_worktree_paths: WorktreePaths,
-    },
-    WorktreeUpdatedEntries(
-        WorktreeId,
-        Vec<(ProjectEntryId, ProjectEntryId, PathChange)>,
-    ),
+    WorktreePathsChanged { old_worktree_paths: WorktreePaths },
+    WorktreeUpdatedEntries(WorktreeId, UpdatedEntriesSet),
     Toast {
         notification_id: String,
         message: String,
@@ -163,17 +159,13 @@ pub enum Event {
     },
     /// Stub variants for deleted diagnostic/remote features (spec §8.2 M2)
     DiskBasedDiagnosticsStarted,
-    DiskBasedDiagnosticsFinished {
-        language_server_id: lsp::LanguageServerId,
-    },
+    DiskBasedDiagnosticsFinished { language_server_id: lsp::LanguageServerId },
     DiagnosticsUpdated {
         paths: Vec<Arc<util::rel_path::RelPath>>,
         language_server_id: lsp::LanguageServerId,
     },
     LanguageServerRemoved(lsp::LanguageServerId),
-    DisconnectedFromRemote {
-        server_not_running: bool,
-    },
+    DisconnectedFromRemote { server_not_running: bool },
     DisconnectedFromHost,
     LanguageNotFound(Entity<language::Buffer>),
     /// Stub variants for project_panel (spec §8.2 M3)
@@ -253,6 +245,9 @@ impl Project {
                 )
             });
 
+            let worktree_store_subscription =
+                cx.subscribe(&worktree_store, Self::on_worktree_store_event);
+
             let mut project = Self {
                 active_entry: None,
                 languages,
@@ -260,7 +255,7 @@ impl Project {
                 git_store,
                 worktree_store,
                 buffer_store,
-                _subscriptions: Vec::new(),
+                _subscriptions: vec![worktree_store_subscription],
                 buffers_needing_diff: HashSet::default(),
                 git_diff_debouncer: DebouncedDelay::new(),
                 search_history: SearchHistory::new(
@@ -278,11 +273,10 @@ impl Project {
                 environment,
                 settings_observer: project_settings,
                 toolchain_store: None,
-                task_store_entity: cx.new(|_| crate::task_store::TaskStore::default()),
-                dap_store_entity: cx.new(|_| stubs::DapStore::default()),
-                bookmark_store_entity: cx.new(|_| stubs::bookmark_store::BookmarkStore::default()),
-                breakpoint_store_entity: cx
-                    .new(|_| stubs::debugger::breakpoint_store::BreakpointStore::default()),
+            task_store_entity: cx.new(|_| crate::task_store::TaskStore::default()),
+            dap_store_entity: cx.new(|_| stubs::DapStore::default()),
+            bookmark_store_entity: cx.new(|_| stubs::bookmark_store::BookmarkStore::default()),
+            breakpoint_store_entity: cx.new(|_| stubs::debugger::breakpoint_store::BreakpointStore::default()),
                 last_worktree_paths: WorktreePaths::default(),
             };
 
@@ -297,14 +291,36 @@ impl Project {
     }
 
     #[cfg(any(test, feature = "test-support"))]
-    pub async fn test(fs: Arc<dyn Fs>, worktree_paths: &[PathBuf], cx: &mut App) -> Entity<Self> {
-        Self::local(
-            Arc::new(LanguageRegistry::new(cx.background_executor().clone())),
-            fs,
-            None,
-            worktree_paths.to_vec(),
-            cx,
-        )
+    pub async fn test(
+        fs: Arc<dyn Fs>,
+        root_paths: impl IntoIterator<Item = &Path>,
+        cx: &mut gpui::TestAppContext,
+    ) -> Entity<Self> {
+        let languages = Arc::new(LanguageRegistry::test(cx.executor()));
+        let project = cx.update(|cx| Self::local(languages, fs, None, Vec::new(), cx));
+
+        for root_path in root_paths {
+            let root_path = root_path.to_path_buf();
+            let worktree = project
+                .update(cx, |project, cx| {
+                    project.add_local_worktree(root_path.clone(), true, cx)
+                })
+                .await
+                .unwrap_or_else(|error| {
+                    panic!("failed to create test worktree at {root_path:?}: {error}")
+                });
+
+            // Tests inspect worktree entries immediately after this returns, so the
+            // initial scan has to finish here or those lookups race against it.
+            let scan_complete = worktree.read_with(cx, |worktree, _| {
+                worktree.as_local().map(|local| local.scan_complete())
+            });
+            if let Some(scan_complete) = scan_complete {
+                scan_complete.await;
+            }
+        }
+
+        project
     }
 
     /// Removed-feature stub: remote project support was deleted with collab.
@@ -367,8 +383,15 @@ impl Project {
         active_entry: Option<ProjectEntryId>,
         cx: &mut Context<Self>,
     ) {
-        self.active_entry = active_entry;
-        cx.emit(Event::ActiveEntryChanged(active_entry));
+        if active_entry != self.active_entry {
+            self.active_entry = active_entry;
+            cx.emit(Event::ActiveEntryChanged(active_entry));
+        }
+    }
+
+    pub fn set_active_path(&mut self, path: Option<&ProjectPath>, cx: &mut Context<Self>) {
+        let active_entry = path.and_then(|path| Some(self.entry_for_path(path, cx)?.id));
+        self.set_active_entry(active_entry, cx);
     }
 
     pub fn worktree_for_entry(
@@ -431,6 +454,51 @@ impl Project {
             .unwrap_or(PathStyle::Posix)
     }
 
+    /// Re-emits `WorktreeStore` events as `project::Event`s. Everything downstream
+    /// (project panel, file finder, workspace serialization, git blame) subscribes
+    /// to the project rather than to the store, so without this bridge those views
+    /// never learn that the tree changed.
+    fn on_worktree_store_event(
+        &mut self,
+        _: Entity<WorktreeStore>,
+        event: &WorktreeStoreEvent,
+        cx: &mut Context<Self>,
+    ) {
+        match event {
+            WorktreeStoreEvent::WorktreeAdded(worktree) => {
+                let worktree_id = worktree.read(cx).id();
+                cx.emit(Event::WorktreeAdded(worktree_id));
+                self.emit_worktree_paths_changed(cx);
+            }
+            WorktreeStoreEvent::WorktreeRemoved(_, worktree_id) => {
+                cx.emit(Event::WorktreeRemoved(*worktree_id));
+                self.emit_worktree_paths_changed(cx);
+            }
+            WorktreeStoreEvent::WorktreeOrderChanged => {
+                cx.emit(Event::WorktreeOrderChanged);
+                self.emit_worktree_paths_changed(cx);
+            }
+            WorktreeStoreEvent::WorktreeUpdatedEntries(worktree_id, changes) => {
+                cx.emit(Event::WorktreeUpdatedEntries(*worktree_id, changes.clone()));
+            }
+            WorktreeStoreEvent::WorktreeDeletedEntry(worktree_id, entry_id) => {
+                cx.emit(Event::DeletedEntry(*worktree_id, *entry_id));
+            }
+            WorktreeStoreEvent::WorktreeReleased(..)
+            | WorktreeStoreEvent::WorktreeUpdateSent(_)
+            | WorktreeStoreEvent::WorktreeUpdatedGitRepositories(..)
+            | WorktreeStoreEvent::WorktreeUpdatedRootRepoCommonDir(_) => {}
+        }
+    }
+
+    fn emit_worktree_paths_changed(&mut self, cx: &mut Context<Self>) {
+        let worktree_paths = self.worktree_store.read(cx).paths(cx);
+        if worktree_paths != self.last_worktree_paths {
+            let old_worktree_paths = std::mem::replace(&mut self.last_worktree_paths, worktree_paths);
+            cx.emit(Event::WorktreePathsChanged { old_worktree_paths });
+        }
+    }
+
     pub fn add_local_worktree(
         &mut self,
         abs_path: impl Into<PathBuf> + Send + 'static,
@@ -438,17 +506,11 @@ impl Project {
         cx: &mut Context<Self>,
     ) -> Task<Result<Entity<Worktree>>> {
         let worktree_store = self.worktree_store.clone();
-        cx.spawn(async move |this, cx| {
+        cx.spawn(async move |_, cx| {
             let task = worktree_store.update(cx, |store, cx| {
                 store.create_worktree(abs_path.into(), visible, cx)
             });
-            let worktree = task.await?;
-            let worktree_id = worktree.read_with(cx, |tree, _| tree.id());
-            this.update(cx, |project, cx| {
-                project.last_worktree_paths = project.worktree_store.read(cx).paths(cx);
-                cx.emit(Event::WorktreeAdded(worktree_id));
-            })?;
-            Ok(worktree)
+            task.await
         })
     }
 
@@ -592,9 +654,9 @@ impl Project {
         visible: bool,
         cx: &mut Context<Self>,
     ) -> gpui::Task<anyhow::Result<gpui::Entity<Worktree>>> {
-        let task = self.worktree_store.update(cx, |store, cx| {
-            store.find_or_create_worktree(abs_path, visible, cx)
-        });
+        let task = self
+            .worktree_store
+            .update(cx, |store, cx| store.find_or_create_worktree(abs_path, visible, cx));
         cx.spawn(async move |_, _| {
             let (worktree, _rel) = task.await?;
             Ok(worktree)
@@ -639,6 +701,7 @@ impl Project {
             None => Task::ready(Err(anyhow::anyhow!("delete_entry unavailable"))),
         }
     }
+
 
     pub fn create_worktree(
         &mut self,
@@ -691,9 +754,7 @@ impl Project {
         fallback_branch_name: String,
         cx: &mut gpui::Context<Self>,
     ) -> Task<anyhow::Result<()>> {
-        self.git_store
-            .read(cx)
-            .git_init(path, fallback_branch_name, cx)
+        self.git_store.read(cx).git_init(path, fallback_branch_name, cx)
     }
 
     /// §16.6 Delegate git_config to GitStore. Returns the raw stdout string
@@ -719,7 +780,7 @@ impl ProjectItem for Buffer {
     }
 
     fn entry_id(&self, _cx: &App) -> Option<ProjectEntryId> {
-        None
+        worktree::File::from_dyn(self.file()).and_then(|file| file.project_entry_id())
     }
 
     fn project_path(&self, cx: &App) -> Option<ProjectPath> {
@@ -752,11 +813,6 @@ impl<'a> From<&'a ProjectPath> for SettingsLocation<'a> {
     }
 }
 
-/// 存根: git 仓库身份路径解析 (来源: spec §2.1 — git 功能保留但简化)
-pub fn repo_identity_path(_common_dir: &Path) -> PathBuf {
-    PathBuf::new()
-}
-
 // file finder 相关类型 (来源: spec §2.1 — file_finder 保留)
 #[derive(Clone)]
 pub struct PathMatchCandidateSet {
@@ -768,6 +824,8 @@ pub struct PathMatchCandidateSet {
 
 #[derive(Clone, Copy, Debug)]
 pub enum Candidates {
+    Entries,
+    Directories,
     Files,
 }
 
@@ -782,27 +840,64 @@ impl<'a> fuzzy_nucleo::PathMatchCandidateSet<'a> for PathMatchCandidateSet {
     }
 
     fn len(&self) -> usize {
-        self.snapshot.file_count() + self.snapshot.dir_count()
+        match self.candidates {
+            Candidates::Files => {
+                if self.include_ignored {
+                    self.snapshot.file_count()
+                } else {
+                    self.snapshot.visible_file_count()
+                }
+            }
+            Candidates::Directories => {
+                if self.include_ignored {
+                    self.snapshot.dir_count()
+                } else {
+                    self.snapshot.visible_dir_count()
+                }
+            }
+            Candidates::Entries => {
+                if self.include_ignored {
+                    self.snapshot.entry_count()
+                } else {
+                    self.snapshot.visible_entry_count()
+                }
+            }
+        }
     }
 
     fn root_is_file(&self) -> bool {
         self.snapshot
             .root_entry()
-            .map_or(false, |entry| !entry.is_dir())
+            .is_some_and(|entry| !entry.is_dir())
     }
 
     fn prefix(&self) -> std::sync::Arc<util::rel_path::RelPath> {
-        self.snapshot.root_name().clone().into()
+        let root_is_file = self
+            .snapshot
+            .root_entry()
+            .is_some_and(|entry| !entry.is_dir());
+        if self.include_root_name || root_is_file {
+            self.snapshot.root_name().into()
+        } else {
+            util::rel_path::RelPath::empty_arc()
+        }
     }
 
     fn candidates(&'a self, start: usize) -> Self::Candidates {
-        self.snapshot
-            .entries(self.include_ignored, start)
-            .map(|entry| fuzzy_nucleo::PathMatchCandidate {
+        fn to_candidate(entry: &worktree::Entry) -> fuzzy_nucleo::PathMatchCandidate<'_> {
+            fuzzy_nucleo::PathMatchCandidate {
                 is_dir: entry.is_dir(),
                 path: entry.path.as_ref(),
-                char_bag: entry.char_bag.clone(),
-            })
+                char_bag: entry.char_bag,
+            }
+        }
+
+        let traversal = match self.candidates {
+            Candidates::Files => self.snapshot.files(self.include_ignored, start),
+            Candidates::Directories => self.snapshot.directories(self.include_ignored, start),
+            Candidates::Entries => self.snapshot.entries(self.include_ignored, start),
+        };
+        traversal.map(to_candidate as fn(&worktree::Entry) -> fuzzy_nucleo::PathMatchCandidate<'_>)
     }
 
     fn path_style(&self) -> util::paths::PathStyle {
@@ -836,10 +931,7 @@ mod z3rm_path_tests {
             .into(),
         };
         assert!(child.starts_with(&root), "child should start_with root");
-        assert!(
-            !root.starts_with(&child),
-            "root should not start_with child"
-        );
+        assert!(!root.starts_with(&child), "root should not start_with child");
     }
 
     #[test]

@@ -1,9 +1,11 @@
 mod action;
+mod editor;
 mod extension;
 mod fallible_options;
 pub mod merge_from;
 mod mux;
 mod project;
+mod project_panel;
 mod serde_helper;
 mod shadow_snapshot;
 mod terminal;
@@ -12,11 +14,13 @@ mod title_bar;
 mod workspace;
 
 pub use action::{ActionName, ActionWithArguments, CommandAliasTarget};
+pub use editor::*;
 pub use extension::*;
 pub use fallible_options::*;
 pub use merge_from::MergeFrom as MergeFromTrait;
 pub use mux::*;
 pub use project::*;
+pub use project_panel::*;
 use serde::de::DeserializeOwned;
 pub use serde_helper::{
     serialize_f32_with_two_decimal_places, serialize_optional_f32_with_two_decimal_places,
@@ -109,7 +113,7 @@ pub struct SettingsContent {
     #[serde(flatten)]
     pub theme: Box<ThemeSettingsContent>,
 
-    #[serde(flatten)]
+    /// 扩展设置 (spec §16 Plan 16)
     pub extension: ExtensionSettingsContent,
 
     #[serde(flatten)]
@@ -118,6 +122,9 @@ pub struct SettingsContent {
     /// 远程连接设置 (spec §16 Plan 16)
     #[serde(flatten)]
     pub remote: RemoteSettingsContent,
+
+    /// 编辑器与搜索设置 (spec §16 Plan 16)
+    pub editor: Option<EditorSettingsContent>,
 
     /// 终端设置 (spec §16 Plan 16)
     pub terminal: Option<TerminalSettingsContent>,
@@ -133,6 +140,15 @@ pub struct SettingsContent {
 
     /// Tab 栏设置 (spec §16 Plan 16)
     pub tab_bar: Option<TabBarSettingsContent>,
+
+    /// 单个 Tab 项设置 (spec §16 Plan 16)
+    pub tabs: Option<ItemSettingsContent>,
+
+    /// 预览 Tab 设置 (spec §16 Plan 16)
+    pub preview_tabs: Option<PreviewTabsSettingsContent>,
+
+    /// Which-key 弹窗设置
+    pub which_key: Option<WhichKeySettingsContent>,
 
     /// 状态栏设置 (spec §16 Plan 16)
     pub status_bar: Option<StatusBarSettingsContent>,
@@ -167,6 +183,18 @@ pub struct SettingsContent {
 
     /// 文件查找器设置 (spec §16 Plan 16)
     pub file_finder: Option<FileFinderSettingsContent>,
+
+    /// 项目面板设置 (spec §16 Plan 16)
+    pub project_panel: Option<ProjectPanelSettingsContent>,
+
+    /// 会话恢复设置 (spec §16 Plan 16)
+    pub session: Option<SessionSettingsContent>,
+
+    /// 通用语言服务器设置 (spec §16 Plan 16)
+    pub global_lsp_settings: Option<GlobalLspSettingsContent>,
+
+    /// direnv 配置加载方式 (spec §16 Plan 16)
+    pub load_direnv: Option<LoadDirenv>,
 }
 
 /// 诊断设置内容 (spec §16 Plan 16)
@@ -175,7 +203,138 @@ pub struct SettingsContent {
 #[serde(default)]
 pub struct DiagnosticsSettingsContent {
     /// 是否在状态栏显示诊断按钮
-    pub button: bool,
+    ///
+    /// Default: true
+    pub button: Option<bool>,
+
+    /// 是否在诊断视图中包含警告级别的诊断
+    ///
+    /// Default: true
+    pub include_warnings: Option<bool>,
+
+    /// LSP 拉取式诊断设置
+    pub lsp_pull_diagnostics: Option<LspPullDiagnosticsSettingsContent>,
+
+    /// 内联诊断设置
+    pub inline: Option<InlineDiagnosticsSettingsContent>,
+}
+
+/// LSP 拉取式诊断设置 (spec §16 Plan 16)
+#[with_fallible_options]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema, MergeFrom)]
+#[serde(default)]
+pub struct LspPullDiagnosticsSettingsContent {
+    /// 是否向语言服务器拉取诊断
+    ///
+    /// Default: true
+    pub enabled: Option<bool>,
+
+    /// 拉取诊断前的最小等待时间, 0 表示关闭防抖
+    ///
+    /// Default: 50
+    pub debounce_ms: Option<u64>,
+}
+
+/// 内联诊断设置 (spec §16 Plan 16)
+#[with_fallible_options]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema, MergeFrom)]
+#[serde(default)]
+pub struct InlineDiagnosticsSettingsContent {
+    /// 是否显示内联诊断
+    ///
+    /// Default: false
+    pub enabled: Option<bool>,
+
+    /// 编辑器最后一次事件之后、显示内联诊断之前的等待时间
+    ///
+    /// Default: 150
+    pub update_debounce_ms: Option<u64>,
+
+    /// 源代码行尾与内联诊断之间的间距, 以列为单位
+    ///
+    /// Default: 4
+    pub padding: Option<u32>,
+
+    /// 显示内联诊断的最小列号, 用于横向对齐。超过该列的行仍会把诊断继续右推。
+    ///
+    /// Default: 0
+    pub min_column: Option<u32>,
+
+    /// 内联显示的最高诊断级别, null 表示跟随编辑器的 `diagnostics_max_severity`
+    ///
+    /// Default: null
+    pub max_severity: Option<DiagnosticSeverityContent>,
+}
+
+/// 会话恢复设置 (spec §16 Plan 16)
+#[with_fallible_options]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema, MergeFrom)]
+#[serde(default)]
+pub struct SessionSettingsContent {
+    /// 重启后是否恢复未保存的缓冲区。为 true 时关闭应用不再询问是否保存。
+    ///
+    /// Default: true
+    pub restore_unsaved_buffers: Option<bool>,
+
+    /// 是否跳过 worktree 信任检查。信任后项目设置会自动同步, 语言服务器与 MCP
+    /// 服务器会自动下载并启动。
+    ///
+    /// Default: false
+    pub trust_all_worktrees: Option<bool>,
+}
+
+/// 通用语言服务器设置 (spec §16 Plan 16)
+///
+/// 仅包含 z3rm 中仍有消费方的字段; 其余 `GlobalLspSettings` 字段随 LSP 子系统一起
+/// 被裁剪, 暂不暴露为用户设置。
+#[with_fallible_options]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema, MergeFrom)]
+#[serde(default)]
+pub struct GlobalLspSettingsContent {
+    /// 语言服务器通知设置
+    pub notifications: Option<LspNotificationSettingsContent>,
+}
+
+/// 语言服务器通知设置 (spec §16 Plan 16)
+#[with_fallible_options]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema, MergeFrom)]
+#[serde(default)]
+pub struct LspNotificationSettingsContent {
+    /// 自动消除语言服务器通知的超时毫秒数, 0 表示不自动消除
+    ///
+    /// Default: 5000
+    pub dismiss_timeout_ms: Option<u64>,
+}
+
+/// direnv 配置加载方式 (spec §16 Plan 16)
+#[derive(
+    Copy, Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema, MergeFrom,
+    strum::VariantArray, strum::VariantNames,
+)]
+#[serde(rename_all = "snake_case")]
+pub enum LoadDirenv {
+    /// 不加载 direnv 配置
+    #[default]
+    Disabled,
+    /// 直接执行 direnv 命令
+    Direct,
+    /// 使用 shell hook 方式加载
+    ShellHook,
+}
+
+/// Which-key 弹窗设置 (spec §16 Plan 16)
+#[with_fallible_options]
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize, JsonSchema, MergeFrom)]
+pub struct WhichKeySettingsContent {
+    /// 按住键组合时是否显示 which-key 弹窗
+    ///
+    /// Default: false
+    pub enabled: Option<bool>,
+
+    /// 显示 which-key 弹窗前的延迟毫秒数
+    ///
+    /// Default: 1000
+    pub delay_ms: Option<u64>,
 }
 
 /// 文件查找器宽度 (spec §16 Plan 16)

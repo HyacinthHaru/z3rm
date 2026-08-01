@@ -156,7 +156,10 @@ impl LayoutTree {
         match node {
             LayoutNode::Pane { id, .. } => id == node_id,
             LayoutNode::Split { id, children, .. } => {
-                id == node_id || children.iter().any(|c| Self::contains_node_id(c, node_id))
+                id == node_id
+                    || children
+                        .iter()
+                        .any(|child| Self::contains_node_id(child, node_id))
             }
         }
     }
@@ -178,7 +181,10 @@ impl LayoutTree {
                 LayoutNode::Pane { id, pane_id } => {
                     anyhow::ensure!(!id.is_empty(), "layout node id must not be empty");
                     anyhow::ensure!(!pane_id.is_empty(), "layout pane id must not be empty");
-                    anyhow::ensure!(node_ids.insert(id.clone()), "duplicate layout node id: {id}");
+                    anyhow::ensure!(
+                        node_ids.insert(id.clone()),
+                        "duplicate layout node id: {id}"
+                    );
                     anyhow::ensure!(
                         pane_ids.insert(pane_id.clone()),
                         "duplicate pane id in layout: {pane_id}"
@@ -200,11 +206,23 @@ impl LayoutTree {
                         "layout wire depth exceeds maximum of {MAX_WIRE_LAYOUT_DEPTH}"
                     );
                     anyhow::ensure!(!id.is_empty(), "layout node id must not be empty");
-                    anyhow::ensure!(node_ids.insert(id.clone()), "duplicate layout node id: {id}");
-                    anyhow::ensure!(children.len() >= 2, "layout split needs at least two children");
+                    anyhow::ensure!(
+                        node_ids.insert(id.clone()),
+                        "duplicate layout node id: {id}"
+                    );
+                    anyhow::ensure!(
+                        children.len() >= 2,
+                        "layout split needs at least two children"
+                    );
                     anyhow::ensure!(
                         children.len() == ratios.len(),
                         "layout split has mismatched children and ratios"
+                    );
+                    anyhow::ensure!(
+                        ratios
+                            .iter()
+                            .all(|ratio| ratio.is_finite() && *ratio >= 0.0),
+                        "layout ratios must be finite and non-negative"
                     );
                     let ratio_sum: f32 = ratios.iter().sum();
                     anyhow::ensure!(
@@ -238,39 +256,20 @@ impl LayoutTree {
     /// - 找不到 `pane_id` → 返回 `Err` (不修改原树)。
     /// - 其余情形正常移除并扁平化, 失败路径原树完整恢复。
     pub fn remove_pane(&mut self, pane_id: &str) -> anyhow::Result<()> {
-        // 先拦截 sole-root: 根是叶子且正是要删的 pane。此时没有兄弟可塌缩,
-        // 删除会留下空布局树 → 拒绝。原树未被触碰, 不变量保持。
-        if let LayoutNode::Pane { pane_id: pid, .. } = &self.root {
-            if pid == pane_id {
-                anyhow::bail!("cannot remove sole root pane: layout would be empty");
-            }
+        if let LayoutNode::Pane { pane_id: pid, .. } = &self.root
+            && pid == pane_id
+        {
+            anyhow::bail!("cannot remove sole root pane: layout would be empty");
         }
 
-        // 取出原树; 失败路径 (`?` 提前返回) 不会写回 self.root, 但我们已经在
-        // 上层替换成了哨兵, 必须在错误路径恢复。用显式作用域 + 始终恢复。
-        let mut old_root = std::mem::replace(
-            &mut self.root,
-            LayoutNode::Pane {
-                id: String::new(),
-                pane_id: String::new(),
-            },
+        let mut candidate = self.root.clone();
+        anyhow::ensure!(
+            Self::remove_from_node(&mut candidate, pane_id)?,
+            "pane not found in layout: {pane_id}"
         );
-        match Self::remove_from_node(&mut old_root, pane_id) {
-            Ok(true) => {
-                self.root = old_root;
-                Ok(())
-            }
-            Ok(false) => {
-                // 没有找到该 pane: 恢复原树, 返回错误而非虚假成功。
-                self.root = old_root;
-                anyhow::bail!("pane not found in layout: {}", pane_id);
-            }
-            Err(e) => {
-                // 移除过程出错: 恢复原树, 向上传递错误。
-                self.root = old_root;
-                Err(e)
-            }
-        }
+        Self::validate_structure(&candidate)?;
+        self.root = candidate;
+        Ok(())
     }
 
     fn remove_from_node(node: &mut LayoutNode, pane_id: &str) -> anyhow::Result<bool> {
@@ -285,18 +284,26 @@ impl LayoutTree {
             matches!(child, LayoutNode::Pane { pane_id: child_pane_id, .. } if child_pane_id == pane_id)
         });
         let removed = if let Some(index) = direct_child_index {
+            anyhow::ensure!(
+                children.len() == ratios.len(),
+                "layout split has mismatched children and ratios"
+            );
+            let removed_ratio = ratios[index];
             children.remove(index);
             ratios.remove(index);
+            if children.len() > 1 {
+                let recipient = index.checked_sub(1).unwrap_or(0);
+                ratios[recipient] += removed_ratio;
+            }
             true
         } else {
-            let mut removed = false;
-            for child in children.iter_mut() {
-                if Self::remove_from_node(child, pane_id)? {
-                    removed = true;
-                    break;
-                }
+            let child = children
+                .iter_mut()
+                .find(|child| Self::contains_pane(child, pane_id));
+            match child {
+                Some(child) => Self::remove_from_node(child, pane_id)?,
+                None => false,
             }
-            removed
         };
 
         if !removed {
@@ -304,24 +311,8 @@ impl LayoutTree {
         }
         if children.len() == 1 {
             *node = children.remove(0);
-        } else {
-            Self::normalize_ratios(ratios);
         }
         Ok(true)
-    }
-
-    /// 归一化比例
-    fn normalize_ratios(ratios: &mut Vec<f32>) {
-        if ratios.is_empty() {
-            return;
-        }
-        let sum: f32 = ratios.iter().sum();
-        if (sum - 0.0f32).abs() < 1e-6 {
-            return;
-        }
-        for r in ratios.iter_mut() {
-            *r = *r / sum;
-        }
     }
 
     pub fn resize_pane(
@@ -330,16 +321,14 @@ impl LayoutTree {
         direction: SplitDirection,
         delta: f32,
     ) -> anyhow::Result<()> {
-        let old_root = std::mem::replace(
-            &mut self.root,
-            LayoutNode::Pane {
-                id: String::new(),
-                pane_id: String::new(),
-            },
+        anyhow::ensure!(delta.is_finite(), "layout resize delta must be finite");
+        let mut candidate = self.root.clone();
+        anyhow::ensure!(
+            Self::resize_in_node(&mut candidate, pane_id, direction, delta)?,
+            "pane has no matching layout split: {pane_id}"
         );
-        let mut root = old_root;
-        Self::resize_in_node(&mut root, pane_id, direction, delta)?;
-        self.root = root;
+        Self::validate_structure(&candidate)?;
+        self.root = candidate;
         Ok(())
     }
 
@@ -352,33 +341,45 @@ impl LayoutTree {
         match node {
             LayoutNode::Pane { .. } => Ok(false),
             LayoutNode::Split {
-                direction: dir,
+                direction: split_direction,
                 children,
                 ratios,
                 ..
             } => {
-                if *dir != direction {
-                    for child in children.iter_mut() {
-                        if Self::resize_in_node(child, pane_id, direction, delta)? {
-                            return Ok(true);
-                        }
-                    }
+                let Some(index) = children
+                    .iter()
+                    .position(|child| Self::contains_pane(child, pane_id))
+                else {
+                    return Ok(false);
+                };
+
+                if Self::resize_in_node(&mut children[index], pane_id, direction, delta)? {
+                    return Ok(true);
+                }
+                if *split_direction != direction {
                     return Ok(false);
                 }
-
-                for (i, child) in children.iter().enumerate() {
-                    if Self::contains_pane(child, pane_id) {
-                        ratios[i] = (ratios[i] + delta).max(0.05);
-                        if i > 0 {
-                            ratios[i - 1] = (ratios[i - 1] - delta).max(0.05);
-                        } else if i + 1 < ratios.len() {
-                            ratios[i + 1] = (ratios[i + 1] - delta).max(0.05);
-                        }
-                        Self::normalize_ratios(ratios);
-                        return Ok(true);
-                    }
-                }
-                Ok(false)
+                anyhow::ensure!(
+                    children.len() == ratios.len(),
+                    "layout split has mismatched children and ratios"
+                );
+                let neighbor = if index > 0 {
+                    index - 1
+                } else if index + 1 < ratios.len() {
+                    index + 1
+                } else {
+                    anyhow::bail!("layout split has no resize neighbor");
+                };
+                let pair_total = ratios[index] + ratios[neighbor];
+                anyhow::ensure!(
+                    pair_total.is_finite() && pair_total > 0.0,
+                    "layout resize pair has invalid ratios"
+                );
+                let minimum = (pair_total / 2.0).min(0.05);
+                let resized = (ratios[index] + delta).clamp(minimum, pair_total - minimum);
+                ratios[index] = resized;
+                ratios[neighbor] = pair_total - resized;
+                Ok(true)
             }
         }
     }
@@ -488,10 +489,16 @@ impl LayoutTree {
     /// 优先解析新的 tmux 风格格式 (`<checksum>,<body>`); 失败时回退到旧的
     /// float-ratio 行格式 (向后兼容已持久化的旧快照)。
     pub fn deserialize(s: &str) -> anyhow::Result<LayoutTree> {
-        if let Ok(tree) = Self::deserialize_tmux(s) {
-            return Ok(tree);
+        let tree = match Self::deserialize_tmux(s) {
+            Ok(tree) => tree,
+            Err(_) => Self::deserialize_legacy(s)?,
+        };
+        let empty_persisted_session =
+            matches!(&tree.root, LayoutNode::Pane { pane_id, .. } if pane_id.is_empty());
+        if !empty_persisted_session {
+            Self::validate_structure(&tree.root)?;
         }
-        Self::deserialize_legacy(s)
+        Ok(tree)
     }
 
     /// §3.7 解析 tmux 风格格式: `<checksum>,<body>`。

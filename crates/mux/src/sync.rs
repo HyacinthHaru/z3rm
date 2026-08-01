@@ -12,8 +12,11 @@ use std::path::{Path, PathBuf};
 // §16.6 扩展信息结构
 // ============================================================================
 
+/// §16.8 扩展 manifest 文件名。`[runtime] side` 就声明在这里。
+const EXTENSION_MANIFEST: &str = "extension.toml";
+
 /// §16.6 扩展信息：名称、版本、运行时类型。
-#[derive(Debug, Clone, serde::Deserialize)]
+#[derive(Debug, Clone)]
 pub struct ExtensionInfo {
     /// 扩展名称（目录名）。
     pub name: String,
@@ -28,7 +31,7 @@ pub struct ExtensionInfo {
 }
 
 /// §16.6 扩展运行时位置。
-#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ExtensionRuntimeSide {
     /// 仅客户端运行。
     ClientSide,
@@ -43,6 +46,9 @@ pub enum ExtensionRuntimeSide {
 // ============================================================================
 
 /// §16.6 扫描本地扩展目录，返回需要同步的扩展列表。
+///
+/// manifest 解析失败会中止整次扫描：静默降级成"客户端扩展"会让一个真正的
+/// 服务端扩展被悄悄跳过，同步"成功"但远端什么都没装。
 pub fn scan_extensions_dir(base_dir: &Path) -> Result<Vec<ExtensionInfo>> {
     let mut extensions = Vec::new();
 
@@ -61,28 +67,11 @@ pub fn scan_extensions_dir(base_dir: &Path) -> Result<Vec<ExtensionInfo>> {
             continue;
         }
 
-        // §16.6 读取扩展 manifest（JSON）。
-        let manifest_path = path.join("extension.json");
-        if !manifest_path.exists() {
+        if !path.join(EXTENSION_MANIFEST).exists() {
             continue;
         }
 
-        let manifest = std::fs::read_to_string(&manifest_path)
-            .with_context(|| format!("读取扩展 manifest 失败: {}", manifest_path.display()))?;
-
-        let info: ExtensionInfo = serde_json::from_str(&manifest).map_or_else(
-            |e| {
-                tracing::warn!(error = %e, "解析扩展 manifest 失败，使用默认值");
-                ExtensionInfo {
-                    name: entry.file_name().to_string_lossy().to_string(),
-                    version: "0.0.0".to_string(),
-                    runtime_side: ExtensionRuntimeSide::ClientSide,
-                    sync: true,
-                    source_dir: path,
-                }
-            },
-            |m| m,
-        );
+        let info = read_extension_manifest(&path)?;
 
         // §16.6 仅同步服务端扩展和双端扩展。
         if matches!(
@@ -102,6 +91,123 @@ pub fn scan_extensions_dir(base_dir: &Path) -> Result<Vec<ExtensionInfo>> {
     Ok(extensions)
 }
 
+/// §16.8 从扩展目录读取 `extension.toml` 并解析出同步需要的字段。
+fn read_extension_manifest(source_dir: &Path) -> Result<ExtensionInfo> {
+    let manifest_path = source_dir.join(EXTENSION_MANIFEST);
+    let manifest = std::fs::read_to_string(&manifest_path)
+        .with_context(|| format!("读取扩展 manifest 失败: {}", manifest_path.display()))?;
+    let fields = parse_manifest_fields(&manifest)
+        .with_context(|| format!("解析扩展 manifest 失败: {}", manifest_path.display()))?;
+
+    let side = fields.runtime_side.ok_or_else(|| {
+        anyhow!(
+            "扩展 manifest 缺少 [runtime] side: {}",
+            manifest_path.display()
+        )
+    })?;
+    let runtime_side = match side.as_str() {
+        "client" => ExtensionRuntimeSide::ClientSide,
+        "server" => ExtensionRuntimeSide::ServerSide,
+        "both" => ExtensionRuntimeSide::Both,
+        other => {
+            return Err(anyhow!(
+                "扩展 manifest 的 [runtime] side 取值无法识别 '{}': {}",
+                other,
+                manifest_path.display()
+            ));
+        }
+    };
+
+    let directory_name = source_dir
+        .file_name()
+        .ok_or_else(|| anyhow!("扩展目录没有名字: {}", source_dir.display()))?
+        .to_string_lossy()
+        .to_string();
+
+    Ok(ExtensionInfo {
+        name: fields.name.unwrap_or(directory_name),
+        version: fields.version.unwrap_or_else(|| "0.0.0".to_string()),
+        runtime_side,
+        // 未声明时默认参与同步：runtime_side 已经限定了范围。
+        sync: fields.sync.unwrap_or(true),
+        source_dir: source_dir.to_path_buf(),
+    })
+}
+
+#[derive(Debug, Default, PartialEq, Eq)]
+struct ManifestFields {
+    name: Option<String>,
+    version: Option<String>,
+    runtime_side: Option<String>,
+    sync: Option<bool>,
+}
+
+/// §16.8 从 `extension.toml` 中取出同步需要的标量字段。
+///
+/// mux crate 没有 TOML 依赖，而同步只关心四个标量
+/// （`name` / `version` / `[runtime] side` / `[runtime] sync`），所以这里只读
+/// 这个子集：逐行扫描 `key = value`，记录当前 section，跳过注释、数组与内联
+/// 表这些用不到的形态。`name` / `version` 同时接受顶层和 `[extension]` 下的
+/// 写法（仓库里两种 manifest 都存在）。真正的必需字段缺失或取值无法识别由
+/// `read_extension_manifest` 报错，不做静默降级。
+fn parse_manifest_fields(manifest: &str) -> Result<ManifestFields> {
+    let mut fields = ManifestFields::default();
+    let mut section = String::new();
+
+    for line in manifest.lines() {
+        let line = strip_comment(line).trim();
+        if line.is_empty() {
+            continue;
+        }
+        if let Some(header) = line.strip_prefix('[') {
+            // `[[array.of.tables]]` 里没有我们要的标量，按未知 section 处理。
+            section = header
+                .strip_suffix(']')
+                .unwrap_or(header)
+                .trim_matches(['[', ']'])
+                .trim()
+                .to_string();
+            continue;
+        }
+        let Some((key, value)) = line.split_once('=') else {
+            continue;
+        };
+        let key = key.trim();
+        let value = value.trim();
+        match (section.as_str(), key) {
+            ("" | "extension", "name") => fields.name = parse_toml_string(value),
+            ("" | "extension", "version") => fields.version = parse_toml_string(value),
+            ("runtime", "side") => fields.runtime_side = parse_toml_string(value),
+            ("runtime", "sync") => fields.sync = value.parse::<bool>().ok(),
+            _ => {}
+        }
+    }
+
+    Ok(fields)
+}
+
+/// 去掉行尾注释。字符串字面量里的 `#` 必须保留（例如 `name = "a#b"`）。
+fn strip_comment(line: &str) -> &str {
+    let mut in_string = false;
+    for (index, character) in line.char_indices() {
+        match character {
+            '"' => in_string = !in_string,
+            '#' if !in_string => return &line[..index],
+            _ => {}
+        }
+    }
+    line
+}
+
+/// 只接受单行双引号字符串；数组、内联表等形态返回 `None`（调用方按缺失处理）。
+fn parse_toml_string(value: &str) -> Option<String> {
+    let inner = value.strip_prefix('"')?.strip_suffix('"')?;
+    if inner.contains('"') {
+        return None;
+    }
+    Some(inner.to_string())
+}
+
 #[allow(dead_code)]
 pub fn default_extensions_dir() -> PathBuf {
     dirs::config_dir()
@@ -115,22 +221,17 @@ pub fn default_extensions_dir() -> PathBuf {
 // ============================================================================
 
 /// §16.6 将扩展目录打包为字节数组（tar.gz）。
+///
+/// 打包整棵目录树：扩展的 JS 入口、assets 通常在子目录里，只 append 顶层文件
+/// 会打出一个装到远端也跑不起来的残包。归档内的路径相对于 `source_dir`。
 pub fn pack_extension(source_dir: &Path) -> Result<Vec<u8>> {
-    // §16.6 实际打包逻辑（简化版）。
     let mut archive = tar::Builder::new(Vec::new());
-    for entry in std::fs::read_dir(source_dir)? {
-        let entry = entry?;
-        let path = entry.path();
-        if path.is_file() {
-            let mut file = std::fs::File::open(&path)?;
-            let name = path
-                .file_name()
-                .ok_or_else(|| anyhow!("path has no file name: {}", path.display()))?
-                .to_string_lossy()
-                .to_string();
-            archive.append_file(&name, &mut file)?;
-        }
-    }
+    // 不跟随 symlink：扩展目录里的 symlink 可能指向 worktree 之外，跟随会把
+    // 无关文件打进包里。
+    archive.follow_symlinks(false);
+    archive
+        .append_dir_all("", source_dir)
+        .with_context(|| format!("打包扩展目录失败: {}", source_dir.display()))?;
     let packed = archive.into_inner()?;
 
     // §16.6 用 gzip 压缩。
@@ -157,16 +258,16 @@ pub async fn install_remote_extension(
     source: &[u8],
 ) -> Result<()> {
     // §16.6 构建 InstallExtensionRequest。
-    let body = RequestBody::InstallExtension(mux_protocol::InstallExtensionRequest {
-        name: name.to_string(),
-        manifest: manifest.to_vec(),
-        source: source.to_vec(),
-    });
+    let body = RequestBody::InstallExtension(
+        mux_protocol::InstallExtensionRequest {
+            name: name.to_string(),
+            manifest: manifest.to_vec(),
+            source: source.to_vec(),
+        },
+    );
 
     // §16.6 发送请求并等待响应。
-    let resp = domain
-        .send_request(body)
-        .await
+    let resp = domain.send_request(body).await
         .context("发送扩展安装请求失败")?;
 
     // §16.6 检查响应结果。
@@ -207,9 +308,9 @@ pub async fn sync_extensions_to_remote(domain: &MuxDomain, base_dir: &Path) -> R
         );
 
         // §16.6 读取 manifest。
-        let manifest_path = ext.source_dir.join("extension.json");
+        let manifest_path = ext.source_dir.join(EXTENSION_MANIFEST);
         let manifest = std::fs::read(&manifest_path)
-            .with_context(|| format!("读取扩展 manifest 失败: {:?}", manifest_path))?;
+            .with_context(|| format!("读取扩展 manifest 失败: {}", manifest_path.display()))?;
 
         // §16.6 打包扩展源。
         let source = pack_extension(&ext.source_dir)
@@ -221,7 +322,10 @@ pub async fn sync_extensions_to_remote(domain: &MuxDomain, base_dir: &Path) -> R
             .with_context(|| format!("安装远程扩展失败: {}", ext.name))?;
     }
 
-    tracing::info!(count = extensions.len(), "扩展同步完成");
+    tracing::info!(
+        count = extensions.len(),
+        "扩展同步完成"
+    );
     Ok(())
 }
 
@@ -250,5 +354,150 @@ mod tests {
         let nonexistent = temp.path().join("nonexistent");
         let result = scan_extensions_dir(&nonexistent).unwrap();
         assert!(result.is_empty());
+    }
+
+    fn write_extension(base_dir: &Path, name: &str, manifest: &str) -> PathBuf {
+        let directory = base_dir.join(name);
+        std::fs::create_dir_all(&directory).expect("create extension directory");
+        std::fs::write(directory.join(EXTENSION_MANIFEST), manifest).expect("write manifest");
+        directory
+    }
+
+    /// 仓库里所有扩展用的都是 `extension.toml`；找 `extension.json` 会让扫描
+    /// 恒返回空列表，同步链路整条失效。
+    #[test]
+    fn scan_reads_toml_manifests_and_filters_by_runtime_side() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        write_extension(
+            temp.path(),
+            "server-side",
+            "[extension]\nname = \"server-side\"\nversion = \"1.2.3\"\n\n[runtime]\nside = \"server\"\n",
+        );
+        write_extension(
+            temp.path(),
+            "both-sides",
+            "id = \"both-sides\"\nname = \"both-sides\"\nversion = \"0.2.0\"\n\n[runtime]\nside = \"both\"\n",
+        );
+        write_extension(
+            temp.path(),
+            "client-side",
+            "[extension]\nname = \"client-side\"\nversion = \"0.1.0\"\n\n[runtime]\nside = \"client\"\n",
+        );
+        // 没有 manifest 的目录直接跳过。
+        std::fs::create_dir_all(temp.path().join("not-an-extension")).expect("create plain dir");
+
+        let mut found = scan_extensions_dir(temp.path()).expect("scan");
+        found.sort_by(|left, right| left.name.cmp(&right.name));
+
+        let names: Vec<&str> = found.iter().map(|info| info.name.as_str()).collect();
+        assert_eq!(names, vec!["both-sides", "server-side"]);
+        assert_eq!(found[1].version, "1.2.3");
+        assert_eq!(found[0].runtime_side, ExtensionRuntimeSide::Both);
+        assert_eq!(found[1].runtime_side, ExtensionRuntimeSide::ServerSide);
+    }
+
+    #[test]
+    fn scan_fails_loudly_on_a_manifest_it_cannot_understand() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        write_extension(
+            temp.path(),
+            "no-runtime",
+            "[extension]\nname = \"no-runtime\"\nversion = \"0.1.0\"\n",
+        );
+        let error = scan_extensions_dir(temp.path()).expect_err("missing [runtime] side must fail");
+        assert!(
+            error.to_string().contains("[runtime] side"),
+            "unexpected error: {error:#}"
+        );
+
+        let temp = tempfile::tempdir().expect("temp dir");
+        write_extension(
+            temp.path(),
+            "bad-side",
+            "[extension]\nname = \"bad-side\"\n\n[runtime]\nside = \"middle\"\n",
+        );
+        let error = scan_extensions_dir(temp.path()).expect_err("unknown side must fail");
+        assert!(
+            error.to_string().contains("middle"),
+            "unexpected error: {error:#}"
+        );
+    }
+
+    #[test]
+    fn manifest_parser_reads_scalars_and_ignores_unrelated_shapes() {
+        let manifest = "\
+id = \"demo\"           # trailing comment
+name = \"demo\"
+version = \"0.4.0\"
+authors = [\"someone\"]
+
+[runtime]
+side = \"both\"
+sync = false
+
+[[capabilities]]
+kind = \"process:exec\"
+name = \"not-the-extension-name\"
+";
+        let fields = parse_manifest_fields(manifest).expect("parse manifest");
+        assert_eq!(
+            fields,
+            ManifestFields {
+                name: Some("demo".to_string()),
+                version: Some("0.4.0".to_string()),
+                runtime_side: Some("both".to_string()),
+                sync: Some(false),
+            }
+        );
+    }
+
+    #[test]
+    fn manifest_sync_false_is_honored() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        write_extension(
+            temp.path(),
+            "opted-out",
+            "[extension]\nname = \"opted-out\"\n\n[runtime]\nside = \"server\"\nsync = false\n",
+        );
+
+        assert!(scan_extensions_dir(temp.path()).expect("scan").is_empty());
+    }
+
+    /// 只 `read_dir` 一层会静默丢掉所有子目录，打出来的是残包。
+    #[test]
+    fn pack_extension_includes_nested_files() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let source = write_extension(
+            temp.path(),
+            "nested",
+            "[extension]\nname = \"nested\"\n\n[runtime]\nside = \"server\"\n",
+        );
+        std::fs::create_dir_all(source.join("src/handlers")).expect("create nested dirs");
+        std::fs::write(source.join("src/main.js"), b"export default {}").expect("write entry");
+        std::fs::write(source.join("src/handlers/on_key.js"), b"// handler")
+            .expect("write handler");
+
+        let packed = pack_extension(&source).expect("pack");
+
+        let decoder = flate2::read::GzDecoder::new(&packed[..]);
+        let mut archive = tar::Archive::new(decoder);
+        let mut packed_paths: Vec<String> = archive
+            .entries()
+            .expect("archive entries")
+            .filter_map(|entry| entry.ok())
+            .filter_map(|entry| Some(entry.path().ok()?.to_string_lossy().into_owned()))
+            .collect();
+        packed_paths.sort();
+
+        for expected in [
+            EXTENSION_MANIFEST,
+            "src/main.js",
+            "src/handlers/on_key.js",
+        ] {
+            assert!(
+                packed_paths.iter().any(|path| path == expected),
+                "{expected} missing from archive: {packed_paths:?}"
+            );
+        }
     }
 }

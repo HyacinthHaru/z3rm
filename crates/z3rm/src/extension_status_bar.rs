@@ -9,21 +9,36 @@
 //! resulting VDOM trees here via [`ExtensionStatusBar::set_vdom_nodes`];
 //! `cx.notify()` triggers a re-render so the chrome updates without polling.
 
-use extension_host::vdom_bridge::{self, VDomNode};
+use extension_host::vdom_bridge::{CommandDispatch, DrawOp, VDomNode, VDomPalette, VDomRenderer};
 use gpui::{App, Context, Render, Window};
+use theme::ActiveTheme;
 use workspace::{HideStatusItem, StatusItemView};
 
 /// Status bar view that renders extension VDOM output.
 pub struct ExtensionStatusBar {
     /// VDOM trees from loaded extensions, rendered left-to-right.
     vdom_nodes: Vec<VDomNode>,
+    renderer: VDomRenderer,
 }
 
 impl ExtensionStatusBar {
     pub fn new() -> Self {
         Self {
             vdom_nodes: Vec::new(),
+            renderer: VDomRenderer::new(),
         }
+    }
+
+    /// Route `onClick` / `onChange` descriptors back to the extension host so
+    /// chrome interactions reach the command that owns them.
+    pub fn set_dispatch(&mut self, dispatch: CommandDispatch) {
+        self.renderer.set_dispatch(dispatch);
+    }
+
+    /// §5.4 Publish the draw ops a display-list renderer produced this tick.
+    pub fn set_display_list(&mut self, region_id: &str, ops: Vec<DrawOp>, cx: &mut Context<Self>) {
+        self.renderer.set_display_list(region_id.to_string(), ops);
+        cx.notify();
     }
 
     /// §5.5 Replace the full VDOM set and request a re-render.
@@ -52,14 +67,24 @@ impl ExtensionStatusBar {
 }
 
 impl Render for ExtensionStatusBar {
-    fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl gpui::IntoElement {
-        use gpui::{ParentElement, Styled, div};
+    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl gpui::IntoElement {
+        use gpui::{div, ParentElement, Styled};
+
+        let colors = cx.theme().colors();
+        self.renderer.set_palette(VDomPalette {
+            text: colors.text,
+            muted_text: colors.text_muted,
+            background: colors.element_background,
+            selected_background: colors.element_selection_background,
+            border: colors.border,
+        });
 
         let mut container = div().flex().flex_row().gap(gpui::px(8.0));
-
-        for node in &self.vdom_nodes {
-            container = container.child(vdom_bridge::vdom_to_element(node));
+        let nodes = std::mem::take(&mut self.vdom_nodes);
+        for node in &nodes {
+            container = container.child(self.renderer.render(node, cx));
         }
+        self.vdom_nodes = nodes;
 
         container
     }

@@ -5,8 +5,11 @@ version = "0.1.0"
 [runtime]
 side = "client"
 
+# main.js subscribes to mux `tab:title` events and calls mux.focusPane when a
+# tab is clicked, so the mux capability is required (§5.6 denies undeclared).
 [capabilities]
 workspace = true
+mux = true
 
 [resources]
 memory_limit_mb = 64

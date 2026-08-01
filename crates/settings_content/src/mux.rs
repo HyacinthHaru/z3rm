@@ -1,6 +1,14 @@
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use settings_macros::{MergeFrom, with_fallible_options};
+use std::time::Duration;
+
+/// spec §16.1 默认 mux socket 连接超时 (毫秒)。
+///
+/// §16.1 treats a connect timeout as "no daemon is answering here" — the
+/// trigger for spawning one — so this bound has to stay short enough that GUI
+/// startup does not visibly stall.
+pub const DEFAULT_CONNECT_TIMEOUT_MS: u64 = 500;
 
 /// 多路复用器设置 (spec §16 Plan 16)
 #[with_fallible_options]
@@ -30,6 +38,13 @@ pub struct MuxSettingsContent {
     pub scroll_mode: ScrollMode,
 }
 
+impl MuxSettingsContent {
+    /// spec §16.1 已解析的 socket 连接超时。
+    pub fn connect_timeout(&self) -> Duration {
+        Duration::from_millis(self.connect_timeout_ms.unwrap_or(DEFAULT_CONNECT_TIMEOUT_MS))
+    }
+}
+
 /// Tabbar position in the terminal UI.
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema, MergeFrom)]
 #[serde(rename_all = "snake_case")]
@@ -52,4 +67,36 @@ pub enum ScrollMode {
     PerClient,
     /// All clients share a single global scroll position.
     Global,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// spec §16.1 未配置时必须落到 500ms 默认值。
+    #[test]
+    fn connect_timeout_defaults_to_500ms() {
+        assert_eq!(
+            MuxSettingsContent::default().connect_timeout(),
+            Duration::from_millis(500)
+        );
+    }
+
+    #[test]
+    fn connect_timeout_honors_configured_value() {
+        let content = MuxSettingsContent {
+            connect_timeout_ms: Some(1500),
+            ..Default::default()
+        };
+        assert_eq!(content.connect_timeout(), Duration::from_millis(1500));
+    }
+
+    /// The connection path parses just the `mux` object out of settings.json,
+    /// so it has to deserialize on its own with every other field absent.
+    #[test]
+    fn connect_timeout_parses_from_partial_json() -> anyhow::Result<()> {
+        let content: MuxSettingsContent = serde_json::from_str(r#"{"connect_timeout_ms": 250}"#)?;
+        assert_eq!(content.connect_timeout(), Duration::from_millis(250));
+        Ok(())
+    }
 }

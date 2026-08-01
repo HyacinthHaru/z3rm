@@ -2374,8 +2374,8 @@ impl GitStore {
     ) {
         match event {
             BufferStoreEvent::BufferAdded(buffer) => {
-                cx.subscribe(buffer, |this, buffer, event, cx| {
-                    if let BufferEvent::LanguageChanged(_) = event {
+                cx.subscribe(buffer, |this, buffer, event, cx| match event {
+                    BufferEvent::LanguageChanged(_) => {
                         let buffer_id = buffer.read(cx).remote_id();
                         if let Some(diff_state) = this.diffs.get(&buffer_id) {
                             diff_state.update(cx, |diff_state, cx| {
@@ -2383,6 +2383,18 @@ impl GitStore {
                             });
                         }
                     }
+                    // Without this the gutter and every diff view keep showing
+                    // the hunks computed when the buffer was opened.
+                    BufferEvent::Edited { .. } | BufferEvent::Reloaded => {
+                        let buffer_id = buffer.read(cx).remote_id();
+                        if let Some(diff_state) = this.diffs.get(&buffer_id) {
+                            let snapshot = buffer.read(cx).text_snapshot();
+                            diff_state.update(cx, |diff_state, cx| {
+                                diff_state.recalculate_diffs(snapshot, cx);
+                            });
+                        }
+                    }
+                    _ => {}
                 })
                 .detach();
             }

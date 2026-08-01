@@ -4949,6 +4949,7 @@ pub mod test {
             title_bar: None,
             original_window: None,
             worktree_root_dirs: HashMap::default(),
+            hidden_deleted_skill_directory_paths: HashSet::default(),
             files: Vec::default(),
             current_file: crate::SettingsUiFile::User,
             project_setting_file_buffers: HashMap::default(),
@@ -5306,46 +5307,40 @@ pub mod test {
 
         let project1 = cx.update(|cx| {
             Project::local(
-                app_state.client.clone(),
-                app_state.node_runtime.clone(),
-                app_state.user_store.clone(),
                 app_state.languages.clone(),
                 app_state.fs.clone(),
                 None,
-                project::LocalProjectFlags::default(),
+                Vec::new(),
                 cx,
             )
         });
 
         project1
             .update(cx, |project, cx| {
-                project.find_or_create_worktree("/workspace1/worktree_a", true, cx)
+                project.find_or_create_worktree(std::path::Path::new("/workspace1/worktree_a"), true, cx)
             })
             .await
             .expect("Failed to create worktree_a");
         project1
             .update(cx, |project, cx| {
-                project.find_or_create_worktree("/workspace1/worktree_b", true, cx)
+                project.find_or_create_worktree(std::path::Path::new("/workspace1/worktree_b"), true, cx)
             })
             .await
             .expect("Failed to create worktree_b");
 
         let project2 = cx.update(|cx| {
             Project::local(
-                app_state.client.clone(),
-                app_state.node_runtime.clone(),
-                app_state.user_store.clone(),
                 app_state.languages.clone(),
                 app_state.fs.clone(),
                 None,
-                project::LocalProjectFlags::default(),
+                Vec::new(),
                 cx,
             )
         });
 
         project2
             .update(cx, |project, cx| {
-                project.find_or_create_worktree("/workspace2/worktree_c", true, cx)
+                project.find_or_create_worktree(std::path::Path::new("/workspace2/worktree_c"), true, cx)
             })
             .await
             .expect("Failed to create worktree_c");
@@ -5477,20 +5472,17 @@ pub mod test {
 
         let project1 = cx.update(|cx| {
             Project::local(
-                app_state.client.clone(),
-                app_state.node_runtime.clone(),
-                app_state.user_store.clone(),
                 app_state.languages.clone(),
                 app_state.fs.clone(),
                 None,
-                project::LocalProjectFlags::default(),
+                Vec::new(),
                 cx,
             )
         });
 
         project1
             .update(cx, |project, cx| {
-                project.find_or_create_worktree("/workspace1/worktree_a", true, cx)
+                project.find_or_create_worktree(std::path::Path::new("/workspace1/worktree_a"), true, cx)
             })
             .await
             .expect("Failed to create worktree_a");
@@ -5527,20 +5519,17 @@ pub mod test {
 
         let project2 = cx.update(|_, cx| {
             Project::local(
-                app_state.client.clone(),
-                app_state.node_runtime.clone(),
-                app_state.user_store.clone(),
                 app_state.languages.clone(),
                 app_state.fs.clone(),
                 None,
-                project::LocalProjectFlags::default(),
+                Vec::new(),
                 cx,
             )
         });
 
         project2
             .update(&mut cx.cx, |project, cx| {
-                project.find_or_create_worktree("/workspace2/worktree_b", true, cx)
+                project.find_or_create_worktree(std::path::Path::new("/workspace2/worktree_b"), true, cx)
             })
             .await
             .expect("Failed to create worktree_b");

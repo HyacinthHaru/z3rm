@@ -368,7 +368,7 @@ mod tests {
 
         let _buffer = project
             .update(cx, |project, cx| {
-                project.open_local_buffer_with_lsp(path!("/dir/test.rs"), cx)
+                project.open_local_buffer(std::path::Path::new(path!("/dir/test.rs")), cx)
             })
             .await
             .unwrap();
@@ -521,7 +521,7 @@ mod tests {
 
         let _buffer = project
             .update(cx, |project, cx| {
-                project.open_local_buffer_with_lsp(path!("/dir/test.rs"), cx)
+                project.open_local_buffer(std::path::Path::new(path!("/dir/test.rs")), cx)
             })
             .await
             .unwrap();

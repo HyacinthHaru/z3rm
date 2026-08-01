@@ -2590,9 +2590,9 @@ mod tests {
 
     fn remote_project_group(index: usize) -> ProjectGroupKey {
         ProjectGroupKey::new(
-            Some(RemoteConnectionOptions::Mock(
-                remote::MockConnectionOptions { id: index as u64 },
-            )),
+            Some(
+                remote::RemoteConnectionIdentity::Mock { id: index as u64 }.persistence_key(),
+            ),
             PathList::new(&[PathBuf::from(format!(
                 "/this-window/remote-project-{index}"
             ))]),
@@ -2946,15 +2946,6 @@ mod tests {
     async fn test_open_local_project_reuses_multi_workspace_window(cx: &mut TestAppContext) {
         let app_state = init_test(cx);
 
-        // Disable system path prompts so the injected mock is used.
-        cx.update(|cx| {
-            SettingsStore::update_global(cx, |store, cx| {
-                store.update_user_settings(cx, |settings| {
-                    settings.workspace.use_system_path_prompts = Some(false);
-                });
-            });
-        });
-
         app_state
             .fs
             .as_fake()
@@ -2992,7 +2983,7 @@ mod tests {
 
         // Set up the prompt mock to return the new project path.
         workspace.update(cx, |workspace, _cx| {
-            workspace.set_prompt_for_open_path(Box::new(|_, _, _, _| {
+            workspace.set_prompt_for_open_path(Box::new(|_, _, _| {
                 let (tx, rx) = futures::channel::oneshot::channel();
                 tx.send(Some(vec![PathBuf::from(path!("/new-project"))]))
                     .ok();
@@ -3022,15 +3013,6 @@ mod tests {
     async fn test_open_local_project_new_window_creates_new_window(cx: &mut TestAppContext) {
         let app_state = init_test(cx);
 
-        // Disable system path prompts so the injected mock is used.
-        cx.update(|cx| {
-            SettingsStore::update_global(cx, |store, cx| {
-                store.update_user_settings(cx, |settings| {
-                    settings.workspace.use_system_path_prompts = Some(false);
-                });
-            });
-        });
-
         app_state
             .fs
             .as_fake()
@@ -3068,7 +3050,7 @@ mod tests {
 
         // Set up the prompt mock to return the new project path.
         workspace.update(cx, |workspace, _cx| {
-            workspace.set_prompt_for_open_path(Box::new(|_, _, _, _| {
+            workspace.set_prompt_for_open_path(Box::new(|_, _, _| {
                 let (tx, rx) = futures::channel::oneshot::channel();
                 tx.send(Some(vec![PathBuf::from(path!("/new-project"))]))
                     .ok();

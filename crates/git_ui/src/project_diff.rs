@@ -972,6 +972,13 @@ mod tests {
             theme_settings::init(theme::LoadThemes::JustBase, cx);
             editor::init(cx);
             crate::init(cx);
+            // These tests assert exact excerpt contents, so pin the context size
+            // instead of inheriting it. Note that the bundled default is
+            // currently 3 while upstream documents 2.
+            use settings::Settings as _;
+            let mut editor_settings = editor::EditorSettings::get_global(cx).clone();
+            editor_settings.excerpt_context_lines = 2;
+            editor::EditorSettings::override_global(editor_settings, cx);
         });
     }
 
@@ -1064,7 +1071,13 @@ mod tests {
 
         let _editor = workspace
             .update_in(cx, |workspace, window, cx| {
-                workspace.open_path((worktree_id, rel_path("README.md")), None, true, window, cx)
+                workspace.open_path(
+                    (worktree_id, rel_path("README.md").into()),
+                    None,
+                    true,
+                    window,
+                    cx,
+                )
             })
             .await
             .unwrap()
@@ -1611,7 +1624,7 @@ mod tests {
 
         let buffer = project
             .update(cx, |project, cx| {
-                project.open_local_buffer(path!("/project/foo"), cx)
+                project.open_local_buffer(path!("/project/foo").as_ref(), cx)
             })
             .await
             .unwrap();
@@ -1778,7 +1791,7 @@ mod tests {
         // The project diff updates its excerpts when a new hunk appears in a buffer that already has a diff.
         let buffer = project
             .update(cx, |project, cx| {
-                project.open_local_buffer(path!("/project/foo.txt"), cx)
+                project.open_local_buffer(path!("/project/foo.txt").as_ref(), cx)
             })
             .await
             .unwrap();

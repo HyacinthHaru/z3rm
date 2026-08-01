@@ -686,6 +686,10 @@ const DOUBLE_CLICK_THRESHOLD_MS: u128 = 300;
 const SEARCH_RESULTS_BATCH_SIZE: usize = 256;
 const MAX_MATCH_CONTEXT_BYTES: usize = 512;
 
+/// Project search caps ranges per file, so a single minified line still arrives
+/// uncapped; this bounds what the finder will hold for one query.
+pub const MAX_SEARCH_RESULT_RANGES: usize = 500;
+
 impl PickerDelegate for Delegate {
     type ListItem = AnyElement;
 
@@ -1210,9 +1214,6 @@ async fn stream_results_to_picker(
             .ready_chunks(SEARCH_RESULTS_BATCH_SIZE)
     );
 
-    // Project search enforces its ranges cap per file,
-    // so one minified line slips through uncapped; cap it here.
-    const MAX_SEARCH_RESULT_RANGES: usize = 500;
     let cap = MAX_SEARCH_RESULT_RANGES;
     let mut total_matches = 0;
 
@@ -1504,7 +1505,7 @@ mod tests {
 
         init_test(cx);
 
-        let line = "return ".repeat(Search::MAX_SEARCH_RESULT_RANGES * 2);
+        let line = "return ".repeat(MAX_SEARCH_RESULT_RANGES * 2);
         let project = project_with_file(cx, line).await;
 
         let window =
@@ -1539,7 +1540,7 @@ mod tests {
         picker.read_with(cx, |picker, _| {
             assert_eq!(
                 picker.delegate.matches.len(),
-                Search::MAX_SEARCH_RESULT_RANGES
+                MAX_SEARCH_RESULT_RANGES
             );
         });
     }
@@ -1564,7 +1565,7 @@ mod tests {
         )
         .unwrap();
 
-        let search = project.update(cx, |project, cx| project.search(query, cx));
+        let mut search = project.update(cx, |project, cx| project.search(query, cx));
         let async_cx = cx.to_async();
         let mut matches = Vec::new();
         while let Ok(SearchResult::Buffer { buffer, ranges }) = search.rx.recv().await {

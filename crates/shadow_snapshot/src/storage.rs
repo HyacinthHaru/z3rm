@@ -10,12 +10,10 @@ use std::path::Path;
 use std::sync::Arc;
 
 use anyhow::{Context, Result};
-use rusqlite::{Connection, OptionalExtension, params};
-use sha2::{Digest, Sha256};
+use rusqlite::{Connection, params, OptionalExtension};
+use sha2::{Sha256, Digest};
 
-use crate::version_tree::{
-    ContentHash, DeltaRef, PathHash, SeqNo, SnapshotTrigger, VersionId, VersionNode,
-};
+use crate::version_tree::{ContentHash, DeltaRef, PathHash, SeqNo, SnapshotTrigger, VersionId, VersionNode};
 
 /// 小 blob 阈值：小于此值内联到 SQLite
 const INLINE_THRESHOLD: u64 = 4096;
@@ -122,9 +120,9 @@ impl StorageEngine {
 
     /// 查询版本节点存在性
     pub fn has_node(&self, version_id: VersionId) -> Result<bool> {
-        let mut stmt = self
-            .conn
-            .prepare("SELECT COUNT(*) FROM version_nodes WHERE version_id = ?1")?;
+        let mut stmt = self.conn.prepare(
+            "SELECT COUNT(*) FROM version_nodes WHERE version_id = ?1",
+        )?;
         let count: i64 = stmt.query_row(params![version_id as i64], |row| row.get(0))?;
         Ok(count > 0)
     }
@@ -135,9 +133,10 @@ impl StorageEngine {
             "SELECT version_id FROM version_nodes
              WHERE path_hash = ?1 ORDER BY seq_no DESC LIMIT 1",
         )?;
-        let result: Option<i64> = stmt
-            .query_row(params![path_hash as &[u8]], |row| row.get(0))
-            .optional()?;
+        let result: Option<i64> = stmt.query_row(params![path_hash as &[u8]], |row| {
+            row.get(0)
+        })
+        .optional()?;
         Ok(result)
     }
 
@@ -177,17 +176,14 @@ impl StorageEngine {
             let mut path_hash = [0u8; 32];
             let path_blob: Vec<u8> = row.get(1)?;
             if path_blob.len() != 32 {
-                anyhow::bail!(
-                    "corrupt path_hash (len {}) for version_id {}",
-                    path_blob.len(),
-                    version_id
-                );
+                anyhow::bail!("corrupt path_hash (len {}) for version_id {}", path_blob.len(), version_id);
             }
             path_hash.copy_from_slice(&path_blob);
 
             let seq_no = row.get::<_, i64>(2)? as SeqNo;
-            let parent_id: Option<VersionId> =
-                row.get::<_, Option<i64>>(3)?.map(|v| v as VersionId);
+            let parent_id: Option<VersionId> = row
+                .get::<_, Option<i64>>(3)?
+                .map(|v| v as VersionId);
 
             let full_content_hash: Option<ContentHash> = match row.get::<_, Option<Vec<u8>>>(4)? {
                 Some(blob) if blob.len() == 32 => {
@@ -212,21 +208,14 @@ impl StorageEngine {
             let delta_depth: u8 = row.get::<_, i32>(6)?.clamp(0, 255) as u8;
             let trigger_str: String = row.get(7)?;
             let trigger = parse_trigger(&trigger_str).ok_or_else(|| {
-                anyhow::anyhow!(
-                    "corrupt trigger {:?} for version_id {}",
-                    trigger_str,
-                    version_id
-                )
+                anyhow::anyhow!("corrupt trigger {:?} for version_id {}", trigger_str, version_id)
             })?;
             let timestamp_ns: u128 = row.get::<_, i64>(8)? as u128;
 
             let delta = delta_hash.map(|hash| {
                 // delta.compressed_size 用于配额估算；持久层不存它，重建阶段记 0，
                 // run_gc 会用 node_blob_sizes 从 blob_refs 读真实大小。
-                DeltaRef {
-                    hash,
-                    compressed_size: 0,
-                }
+                DeltaRef { hash, compressed_size: 0 }
             });
 
             nodes.push(VersionNode {
@@ -269,30 +258,44 @@ impl StorageEngine {
         content_hash: &[u8; 32],
         delta_hash: Option<&[u8; 32]>,
     ) -> anyhow::Result<(u64, u64)> {
-        let content_size: i64 = self.conn.query_row(
-            "SELECT COALESCE(SUM(size), 0) FROM blob_refs
-                 WHERE content_hash = ?1 AND ref_count > 0",
-            rusqlite::params![&content_hash[..]],
-            |row| row.get(0),
-        )?;
-        let delta_size: i64 = match delta_hash {
-            Some(hash) => self.conn.query_row(
+        let content_size: i64 = self
+            .conn
+            .query_row(
                 "SELECT COALESCE(SUM(size), 0) FROM blob_refs
-                     WHERE content_hash = ?1 AND ref_count > 0",
-                rusqlite::params![&hash[..]],
+                 WHERE content_hash = ?1 AND ref_count > 0",
+                rusqlite::params![&content_hash[..]],
                 |row| row.get(0),
-            )?,
+            )?;
+        let delta_size: i64 = match delta_hash {
+            Some(hash) => self
+                .conn
+                .query_row(
+                    "SELECT COALESCE(SUM(size), 0) FROM blob_refs
+                     WHERE content_hash = ?1 AND ref_count > 0",
+                    rusqlite::params![&hash[..]],
+                    |row| row.get(0),
+                )?,
             None => 0,
         };
         Ok((content_size as u64, delta_size as u64))
     }
 
-    /// 删除版本节点
+
+    /// 删除版本节点。
+    ///
+    /// 先把子节点 detach（parent_id = NULL）再删除自己：`version_nodes.parent_id`
+    /// 是自引用外键，而 rusqlite 的 bundled SQLite 默认开启外键约束，直接删除
+    /// 一个还有子节点的版本会以 "FOREIGN KEY constraint failed" 失败。
+    /// GC 在删除 full base 之前已经把仍需重建的 delta child 提升为 full
+    /// （§4.9 promote-to-full），detach 之后它们仍然自洽；剩下的 delta-only
+    /// 子节点本来就不可达，detach 只是让它们变成下一轮 GC 的候选。
     pub fn delete_node(&self, version_id: VersionId) -> Result<()> {
         self.conn.execute(
-            "DELETE FROM version_nodes WHERE version_id = ?1",
+            "UPDATE version_nodes SET parent_id = NULL WHERE parent_id = ?1",
             params![version_id as i64],
         )?;
+        self.conn
+            .execute("DELETE FROM version_nodes WHERE version_id = ?1", params![version_id as i64])?;
         Ok(())
     }
 
@@ -341,10 +344,7 @@ pub struct BlobStore {
 
 impl BlobStore {
     /// 创建 BlobStore,与调用方共享 StorageEngine。
-    pub fn new(
-        engine: impl Into<Arc<StorageEngine>>,
-        blob_dir: impl Into<std::path::PathBuf>,
-    ) -> Self {
+    pub fn new(engine: impl Into<Arc<StorageEngine>>, blob_dir: impl Into<std::path::PathBuf>) -> Self {
         Self {
             engine: engine.into(),
             blob_dir: blob_dir.into(),
@@ -367,7 +367,8 @@ impl BlobStore {
         let size = data.len() as u64;
 
         // Zstd 压缩
-        let compressed = zstd::encode_all(data, 1).context("Zstd compression failed")?;
+        let compressed = zstd::encode_all(data, 1)
+            .context("Zstd compression failed")?;
         let is_compressed = compressed.len() < data.len();
         let store_data = if is_compressed { &compressed } else { data };
         let compressed_flag = if is_compressed { 1 } else { 0 };
@@ -375,15 +376,11 @@ impl BlobStore {
         let inline = size < INLINE_THRESHOLD;
 
         // 检查是否已存在
-        let existing: Option<i64> = self
-            .engine
-            .connection()
-            .query_row(
-                "SELECT ref_count FROM blob_refs WHERE content_hash = ?1",
-                params![&hash[..] as &[u8]],
-                |row| row.get(0),
-            )
-            .optional()?;
+        let existing: Option<i64> = self.engine.connection().query_row(
+            "SELECT ref_count FROM blob_refs WHERE content_hash = ?1",
+            params![&hash[..] as &[u8]],
+            |row| row.get(0),
+        ).optional()?;
 
         if existing.is_some() {
             // 已存在 → refcount++
@@ -397,12 +394,7 @@ impl BlobStore {
                 self.engine.connection().execute(
                     "INSERT INTO blob_refs (content_hash, ref_count, size, compressed, inline_data)
                      VALUES (?1, 1, ?2, ?3, ?4)",
-                    params![
-                        &hash[..] as &[u8],
-                        size as i64,
-                        compressed_flag,
-                        store_data as &[u8]
-                    ],
+                    params![&hash[..] as &[u8], size as i64, compressed_flag, store_data as &[u8]],
                 )?;
             } else {
                 // 大 blob：写磁盘
@@ -437,7 +429,8 @@ impl BlobStore {
             // 内联 blob
             if row.1 != 0 {
                 // 已压缩，需要解压缩
-                zstd::decode_all(&data[..]).context("Zstd decompression failed")
+                zstd::decode_all(&data[..])
+                    .context("Zstd decompression failed")
             } else {
                 Ok(data)
             }
@@ -447,7 +440,8 @@ impl BlobStore {
             let blob_path = self.blob_dir.join(&shard).join(hash_to_hex(hash));
             let data = fs::read(&blob_path)?;
             if row.1 != 0 {
-                zstd::decode_all(data.as_slice()).context("Zstd decompression failed")
+                zstd::decode_all(data.as_slice())
+                    .context("Zstd decompression failed")
             } else {
                 Ok(data)
             }
@@ -456,17 +450,13 @@ impl BlobStore {
 
     /// 释放引用：refcount--，为 0 时删除
     pub fn unref(&self, hash: &ContentHash) -> Result<()> {
-        let new_count: i64 = self
-            .engine
-            .connection()
-            .query_row(
-                "SELECT ref_count FROM blob_refs WHERE content_hash = ?1",
-                params![&hash[..] as &[u8]],
-                |row| row.get::<_, i64>(0),
-            )
-            .optional()?
-            .map(|c| c - 1)
-            .unwrap_or(0);
+        let new_count: i64 = self.engine.connection().query_row(
+            "SELECT ref_count FROM blob_refs WHERE content_hash = ?1",
+            params![&hash[..] as &[u8]],
+            |row| row.get::<_, i64>(0),
+        ).optional()?
+        .map(|c| c - 1)
+        .unwrap_or(0);
 
         if new_count <= 0 {
             self.delete_blob(hash)?;
@@ -483,15 +473,11 @@ impl BlobStore {
     /// 删除 blob 数据
     fn delete_blob(&self, hash: &ContentHash) -> Result<()> {
         // 检查是否磁盘存储
-        let inline: Option<Vec<u8>> = self
-            .engine
-            .connection()
-            .query_row(
-                "SELECT inline_data FROM blob_refs WHERE content_hash = ?1",
-                params![&hash[..] as &[u8]],
-                |row| row.get::<_, Vec<u8>>(0),
-            )
-            .optional()?;
+        let inline: Option<Vec<u8>> = self.engine.connection().query_row(
+            "SELECT inline_data FROM blob_refs WHERE content_hash = ?1",
+            params![&hash[..] as &[u8]],
+            |row| row.get::<_, Vec<u8>>(0),
+        ).optional()?;
 
         if inline.is_none() {
             // 磁盘 blob：删除文件
@@ -513,15 +499,11 @@ impl BlobStore {
 
     /// 获取 blob 引用计数
     pub fn refcount(&self, hash: &ContentHash) -> Result<Option<i64>> {
-        let count: Option<i64> = self
-            .engine
-            .connection()
-            .query_row(
-                "SELECT ref_count FROM blob_refs WHERE content_hash = ?1",
-                params![&hash[..] as &[u8]],
-                |row| row.get::<_, i64>(0),
-            )
-            .optional()?;
+        let count: Option<i64> = self.engine.connection().query_row(
+            "SELECT ref_count FROM blob_refs WHERE content_hash = ?1",
+            params![&hash[..] as &[u8]],
+            |row| row.get::<_, i64>(0),
+        ).optional()?;
         Ok(count)
     }
 }

@@ -96,6 +96,31 @@ impl CliEnv {
         let stderr = String::from_utf8_lossy(&out.stderr).into_owned();
         Ok((code, stdout, stderr))
     }
+
+    /// §3.10 `paste-buffer` 从 stdin 读缓冲区,所以要能把数据喂进子进程。
+    fn run_with_stdin(&self, args: &[&str], stdin: &str) -> Result<(i32, String, String)> {
+        use std::io::Write;
+
+        let mut child = Command::new(&self.z3rm_bin)
+            .env("Z3RM_MUX_SOCKET", &self.socket_path)
+            .args(args)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .with_context(|| format!("spawn z3rm {:?}", args))?;
+        child
+            .stdin
+            .take()
+            .context("child stdin was not piped")?
+            .write_all(stdin.as_bytes())
+            .context("write child stdin")?;
+        let out = child.wait_with_output().context("wait for z3rm")?;
+        let code = out.status.code().unwrap_or(-1);
+        let stdout = String::from_utf8_lossy(&out.stdout).into_owned();
+        let stderr = String::from_utf8_lossy(&out.stderr).into_owned();
+        Ok((code, stdout, stderr))
+    }
 }
 
 impl Drop for CliEnv {
@@ -296,6 +321,341 @@ fn cli_attach_prints_confirmation_and_exits() -> Result<()> {
         stderr.contains("attach"),
         "attach should print confirmation to stderr, got: {stderr}"
     );
+
+    Ok(())
+}
+
+// ============================================================================
+// §3.10 list-windows / -F 格式引擎 / 新增命令 e2e
+// ============================================================================
+
+#[test]
+fn cli_list_windows_lists_session_windows() -> Result<()> {
+    let env = CliEnv::spawn()?;
+    env.run(&["new", "-s", "windows-test"])?;
+    std::thread::sleep(Duration::from_millis(300));
+
+    let (code, stdout, stderr) = env.run(&["list-windows", "-t", "windows-test"])?;
+    assert_eq!(code, 0, "list-windows should succeed; stderr={stderr}");
+    assert!(
+        stdout.contains("0:") && stdout.contains("panes"),
+        "list-windows should print an indexed window with a pane count, got: {stdout:?}"
+    );
+
+    // `lsw` 是 tmux 的别名,必须走同一条路径。
+    let (code, alias_stdout, stderr) = env.run(&["lsw", "-t", "windows-test"])?;
+    assert_eq!(code, 0, "lsw alias should succeed; stderr={stderr}");
+    assert_eq!(alias_stdout, stdout, "lsw must behave like list-windows");
+
+    Ok(())
+}
+
+#[test]
+fn cli_format_strings_render_session_window_and_pane_fields() -> Result<()> {
+    let env = CliEnv::spawn()?;
+    env.run(&["new", "-s", "fmt-test"])?;
+    std::thread::sleep(Duration::from_millis(300));
+
+    let (code, stdout, stderr) =
+        env.run(&["ls", "-F", "[#{session_name}][#{session_attached}]"])?;
+    assert_eq!(code, 0, "ls -F should succeed; stderr={stderr}");
+    assert!(
+        stdout.contains("[fmt-test]["),
+        "ls -F should substitute session_name, got: {stdout:?}"
+    );
+
+    // 未知变量按 tmux 语义展开成空串,`##` 是字面 `#`。
+    let (code, stdout, stderr) = env.run(&["ls", "-F", "##{session_name}=[#{pane_pid}]"])?;
+    assert_eq!(code, 0, "ls -F escaping should succeed; stderr={stderr}");
+    assert_eq!(
+        stdout.trim(),
+        "#{session_name}=[]",
+        "unknown variables expand to empty and ## is a literal #"
+    );
+
+    let (code, stdout, stderr) = env.run(&[
+        "list-windows",
+        "-t",
+        "fmt-test",
+        "-F",
+        "#{session_name}:#{window_index} #{window_panes} #{?window_active,active,idle}",
+    ])?;
+    assert_eq!(code, 0, "list-windows -F should succeed; stderr={stderr}");
+    assert!(
+        stdout.starts_with("fmt-test:0 1 "),
+        "list-windows -F should render window fields, got: {stdout:?}"
+    );
+
+    // `session:window.pane` 是可以直接回填给 -t 的目标形式。
+    let (code, stdout, stderr) = env.run(&[
+        "list-panes",
+        "-t",
+        "fmt-test",
+        "-F",
+        "#{session_name}:#{window_index}.#{pane_index} #{pane_width}x#{pane_height}",
+    ])?;
+    assert_eq!(code, 0, "list-panes -F should succeed; stderr={stderr}");
+    assert!(
+        stdout.starts_with("fmt-test:0.0 80x24"),
+        "list-panes -F should render a usable target and size, got: {stdout:?}"
+    );
+
+    let target = stdout
+        .split_whitespace()
+        .next()
+        .context("format output had no target")?
+        .to_string();
+    let (code, _, stderr) = env.run(&["capture-pane", "-t", &target, "-p"])?;
+    assert_eq!(
+        code, 0,
+        "the target produced by -F should resolve; stderr={stderr}"
+    );
+
+    Ok(())
+}
+
+#[test]
+fn cli_format_string_error_is_reported() -> Result<()> {
+    let env = CliEnv::spawn()?;
+    env.run(&["new", "-s", "fmt-error"])?;
+    std::thread::sleep(Duration::from_millis(300));
+
+    let (code, _, stderr) = env.run(&["ls", "-F", "#{session_name"])?;
+    assert_ne!(code, 0, "an unterminated #{{ must fail");
+    assert!(
+        stderr.contains("unterminated"),
+        "error should explain the unterminated variable, got: {stderr:?}"
+    );
+
+    Ok(())
+}
+
+#[test]
+fn cli_rename_session_changes_the_name() -> Result<()> {
+    let env = CliEnv::spawn()?;
+    env.run(&["new", "-s", "old-name"])?;
+    std::thread::sleep(Duration::from_millis(300));
+
+    let (code, _, stderr) = env.run(&["rename-session", "-t", "old-name", "new-name"])?;
+    assert_eq!(code, 0, "rename-session should succeed; stderr={stderr}");
+
+    let (_, ls, _) = env.run(&["ls"])?;
+    assert!(ls.contains("new-name"), "ls should show the new name: {ls}");
+    assert!(
+        !ls.contains("old-name"),
+        "ls should not show the old name: {ls}"
+    );
+
+    Ok(())
+}
+
+#[test]
+fn cli_has_session_exit_codes_match_tmux() -> Result<()> {
+    let env = CliEnv::spawn()?;
+    env.run(&["new", "-s", "present"])?;
+    std::thread::sleep(Duration::from_millis(300));
+
+    let (code, stdout, stderr) = env.run(&["has-session", "-t", "present"])?;
+    assert_eq!(code, 0, "existing session should exit 0; stderr={stderr}");
+    assert!(
+        stdout.trim().is_empty(),
+        "has-session should be silent on success, got: {stdout:?}"
+    );
+
+    let (code, _, stderr) = env.run(&["has-session", "-t", "absent"])?;
+    assert_ne!(code, 0, "missing session must exit non-zero");
+    assert!(
+        stderr.contains("absent"),
+        "error should name the session, got: {stderr:?}"
+    );
+
+    Ok(())
+}
+
+#[test]
+fn cli_paste_buffer_writes_stdin_into_the_pane() -> Result<()> {
+    let env = CliEnv::spawn()?;
+    env.run(&["new", "-s", "paste-test"])?;
+    std::thread::sleep(Duration::from_millis(300));
+
+    let (code, _, stderr) = env.run_with_stdin(
+        &["paste-buffer", "-t", "paste-test"],
+        "echo PASTED_MARKER\n",
+    )?;
+    assert_eq!(code, 0, "paste-buffer should succeed; stderr={stderr}");
+    std::thread::sleep(Duration::from_millis(700));
+
+    let (code, stdout, _) = env.run(&["capture-pane", "-t", "paste-test", "-p"])?;
+    assert_eq!(code, 0);
+    assert!(
+        stdout.contains("PASTED_MARKER"),
+        "pasted text should reach the pane, got:\n{stdout}"
+    );
+
+    // 空 stdin 是错误,不能装作粘贴成功。
+    let (code, _, stderr) = env.run_with_stdin(&["paste-buffer", "-t", "paste-test"], "")?;
+    assert_ne!(code, 0, "an empty buffer must fail");
+    assert!(stderr.contains("empty buffer"), "stderr={stderr:?}");
+
+    Ok(())
+}
+
+#[test]
+fn cli_resize_pane_zoom_toggles() -> Result<()> {
+    let env = CliEnv::spawn()?;
+    env.run(&["new", "-s", "zoom-test"])?;
+    std::thread::sleep(Duration::from_millis(300));
+    env.run(&["split-window", "-t", "zoom-test", "-h"])?;
+    std::thread::sleep(Duration::from_millis(300));
+
+    let (code, _, stderr) = env.run(&["resize-pane", "-t", "zoom-test", "-Z"])?;
+    assert_eq!(code, 0, "resize-pane -Z should succeed; stderr={stderr}");
+    assert!(stderr.contains("zoomed"), "stderr={stderr:?}");
+
+    let (code, _, stderr) = env.run(&["resize-pane", "-t", "zoom-test", "-Z"])?;
+    assert_eq!(code, 0, "a second -Z should unzoom; stderr={stderr}");
+    assert!(
+        stderr.contains("unzoomed"),
+        "-Z must toggle rather than always zoom, stderr={stderr:?}"
+    );
+
+    Ok(())
+}
+
+#[test]
+fn cli_capture_pane_end_line_bounds_the_output() -> Result<()> {
+    let env = CliEnv::spawn()?;
+    env.run(&["new", "-s", "end-line-test"])?;
+    // 两次 capture 要逐行相等,先等 shell 把 prompt 画完再抓。
+    std::thread::sleep(Duration::from_millis(900));
+
+    let (code, full, stderr) = env.run(&["capture-pane", "-t", "end-line-test", "-p"])?;
+    assert_eq!(code, 0, "capture-pane should succeed; stderr={stderr}");
+    assert_eq!(full.lines().count(), 24, "default capture is the 24 rows");
+
+    let (code, bounded, stderr) = env.run(&[
+        "capture-pane",
+        "-t",
+        "end-line-test",
+        "-p",
+        "-S",
+        "0",
+        "-E",
+        "2",
+    ])?;
+    assert_eq!(code, 0, "capture-pane -E should succeed; stderr={stderr}");
+    assert_eq!(
+        bounded.lines().count(),
+        3,
+        "-S 0 -E 2 is an inclusive 3-row window, got: {bounded:?}"
+    );
+    assert_eq!(
+        bounded.lines().collect::<Vec<_>>(),
+        full.lines().take(3).collect::<Vec<_>>(),
+        "the bounded capture must be the top of the visible region"
+    );
+
+    Ok(())
+}
+
+#[test]
+fn cli_capture_pane_join_merges_wrapped_lines() -> Result<()> {
+    let env = CliEnv::spawn()?;
+    env.run(&["new", "-s", "join-test"])?;
+    std::thread::sleep(Duration::from_millis(500));
+
+    // 200 个字符在 80 列的 pane 里必然折行,alacritty 会给折行处打 WRAPLINE。
+    let payload = "A".repeat(200);
+    let command = format!("echo {payload}");
+    let (code, _, stderr) = env.run(&["send-keys", "-t", "join-test", "-l", &command])?;
+    assert_eq!(code, 0, "send-keys -l should succeed; stderr={stderr}");
+    env.run(&["send-keys", "-t", "join-test", "Enter"])?;
+    std::thread::sleep(Duration::from_millis(900));
+
+    let (code, plain, stderr) = env.run(&["capture-pane", "-t", "join-test", "-p"])?;
+    assert_eq!(code, 0, "capture-pane should succeed; stderr={stderr}");
+    assert!(
+        !plain.lines().any(|line| line.contains(&payload)),
+        "without -J the wrapped output must stay split across rows:\n{plain}"
+    );
+
+    let (code, joined, stderr) = env.run(&["capture-pane", "-t", "join-test", "-p", "-J"])?;
+    assert_eq!(code, 0, "capture-pane -J should succeed; stderr={stderr}");
+    assert!(
+        joined.lines().any(|line| line.contains(&payload)),
+        "-J must rejoin the wrapped output into one line:\n{joined}"
+    );
+
+    Ok(())
+}
+
+#[test]
+fn cli_extension_help_does_not_fall_through_to_the_gui() -> Result<()> {
+    let env = CliEnv::spawn()?;
+
+    let (code, stdout, stderr) = env.run(&["extension", "--help"])?;
+    assert_eq!(code, 0, "extension --help should exit 0; stderr={stderr}");
+    for expected in ["search", "install", "update", "uninstall", "list"] {
+        assert!(
+            stdout.contains(expected),
+            "extension --help should advertise '{expected}', got:\n{stdout}"
+        );
+    }
+
+    // 未知子命令必须报错,而不是静默启动 GUI。
+    let (code, _, stderr) = env.run(&["extension", "bogus-subcommand"])?;
+    assert_ne!(code, 0, "an unknown extension subcommand must fail");
+    assert!(!stderr.is_empty(), "clap should explain the failure");
+
+    Ok(())
+}
+
+#[test]
+fn cli_extension_uninstall_removes_the_directory() -> Result<()> {
+    let env = CliEnv::spawn()?;
+    let extensions_dir = env._tmp.path().join("extensions");
+    let installed = extensions_dir.join("demo-extension");
+    std::fs::create_dir_all(&installed).context("create fake extension")?;
+    std::fs::write(
+        installed.join("extension.toml"),
+        "id = \"demo-extension\"\nname = \"Demo\"\nversion = \"1.2.3\"\n\n[grammars.demo]\nversion = \"9.9.9\"\n",
+    )
+    .context("write fake manifest")?;
+
+    let extensions_dir_arg = extensions_dir.to_string_lossy().into_owned();
+    let (code, stdout, stderr) =
+        env.run(&["extension", "list", "--extensions-dir", &extensions_dir_arg])?;
+    assert_eq!(code, 0, "extension list should succeed; stderr={stderr}");
+    assert!(
+        stdout.contains("demo-extension") && stdout.contains("1.2.3"),
+        "list must read the top-level version, not the grammar's, got:\n{stdout}"
+    );
+
+    let (code, stdout, stderr) = env.run(&[
+        "extension",
+        "uninstall",
+        "demo-extension",
+        "--extensions-dir",
+        &extensions_dir_arg,
+        "--yes",
+    ])?;
+    assert_eq!(
+        code, 0,
+        "extension uninstall should succeed; stderr={stderr}"
+    );
+    assert!(stdout.contains("uninstalled"), "stdout={stdout:?}");
+    assert!(!installed.exists(), "the extension directory must be gone");
+
+    let (code, _, stderr) = env.run(&[
+        "extension",
+        "uninstall",
+        "demo-extension",
+        "--extensions-dir",
+        &extensions_dir_arg,
+        "--yes",
+    ])?;
+    assert_ne!(code, 0, "uninstalling a missing extension must fail");
+    assert!(stderr.contains("not installed"), "stderr={stderr:?}");
 
     Ok(())
 }

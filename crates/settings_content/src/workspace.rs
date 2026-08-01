@@ -111,6 +111,120 @@ pub enum ShowCloseButton {
     Hidden,
 }
 
+/// Tab item settings (spec §16 Plan 16)
+#[with_fallible_options]
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize, JsonSchema, MergeFrom)]
+pub struct ItemSettingsContent {
+    /// Whether to show the Git file status on a tab item.
+    ///
+    /// Default: true
+    pub git_status: Option<bool>,
+
+    /// Position of the close button in a tab.
+    ///
+    /// Default: right
+    pub close_position: Option<ClosePosition>,
+
+    /// What to do after closing the current tab.
+    ///
+    /// Default: next
+    pub activate_on_close: Option<ActivateOnClose>,
+
+    /// Whether to show the file icon for a tab.
+    ///
+    /// Default: true
+    pub file_icons: Option<bool>,
+
+    /// Which files containing diagnostic errors/warnings to mark in the tabs.
+    ///
+    /// Default: off
+    pub show_diagnostics: Option<ShowDiagnostics>,
+
+    /// When to show the close button in a tab.
+    ///
+    /// Default: hover
+    pub show_close_button: Option<ShowCloseButton>,
+}
+
+/// Position of the close button within a tab.
+#[derive(Copy, Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema, MergeFrom)]
+#[serde(rename_all = "lowercase")]
+pub enum ClosePosition {
+    Left,
+    #[default]
+    Right,
+}
+
+/// Which tab to activate after the current one is closed.
+#[derive(Copy, Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema, MergeFrom)]
+#[serde(rename_all = "snake_case")]
+pub enum ActivateOnClose {
+    #[default]
+    Next,
+    Neighbour,
+    LeftNeighbour,
+    History,
+    None,
+}
+
+/// Which diagnostic severities to mark on a tab.
+#[derive(Copy, Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema, MergeFrom)]
+#[serde(rename_all = "snake_case")]
+pub enum ShowDiagnostics {
+    #[default]
+    Off,
+    Errors,
+    All,
+    Inline,
+    OnHover,
+}
+
+/// Preview tab settings (spec §16 Plan 16)
+#[with_fallible_options]
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize, JsonSchema, MergeFrom)]
+pub struct PreviewTabsSettingsContent {
+    /// Whether to show opened items as preview tabs. Preview tabs do not stay
+    /// open, are reused until explicitly set to be kept open and show their
+    /// title in italic.
+    ///
+    /// Default: true
+    pub enabled: Option<bool>,
+
+    /// Whether to open tabs in preview mode when opened from the project panel
+    /// with a single click.
+    ///
+    /// Default: true
+    pub enable_preview_from_project_panel: Option<bool>,
+
+    /// Whether to open tabs in preview mode when selected from the file finder.
+    ///
+    /// Default: true
+    pub enable_preview_from_file_finder: Option<bool>,
+
+    /// Whether to open tabs in preview mode when opened from a multibuffer.
+    ///
+    /// Default: true
+    pub enable_preview_from_multibuffer: Option<bool>,
+
+    /// Whether to open tabs in preview mode when code navigation is used to
+    /// open a multibuffer.
+    ///
+    /// Default: true
+    pub enable_preview_multibuffer_from_code_navigation: Option<bool>,
+
+    /// Whether to open tabs in preview mode when code navigation is used to
+    /// open a single file.
+    ///
+    /// Default: true
+    pub enable_preview_file_from_code_navigation: Option<bool>,
+
+    /// Whether to keep tabs in preview mode when code navigation is used to
+    /// navigate away from them.
+    ///
+    /// Default: false
+    pub enable_keep_preview_on_code_navigation: Option<bool>,
+}
+
 /// Status bar settings (spec §16 Plan 16)
 #[with_fallible_options]
 #[derive(Clone, Default, Serialize, Deserialize, JsonSchema, MergeFrom, Debug, PartialEq, Eq)]

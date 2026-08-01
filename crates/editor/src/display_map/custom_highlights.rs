@@ -274,7 +274,7 @@ impl Ord for HighlightEndpoint {
     }
 }
 
-#[cfg(all(test, feature = "z3rm-migration"))]
+#[cfg(test)]
 mod tests {
     use std::sync::Arc;
 

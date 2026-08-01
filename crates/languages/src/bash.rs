@@ -205,7 +205,7 @@ mod tests {
             );
 
             assert_eq!(buffer.text(), "if foo; then\n  1\n  \nelse\n  3\nfi");
-        })
-        .await;
+            buffer
+        });
     }
 }

@@ -2202,3 +2202,78 @@ impl<'a> PathComponentSlice<'a> {
         Some(byte_range)
     }
 }
+
+#[cfg(test)]
+mod file_finder_settings_tests {
+    use super::*;
+    use settings::SettingsContent;
+
+    #[test]
+    fn test_reads_file_finder_settings_from_content() {
+        let content: SettingsContent = settings::parse_json_with_comments(
+            r#"{
+                "file_finder": {
+                    "file_icons": true,
+                    "modal_max_width": "x_large",
+                    "skip_focus_for_active_in_search": true
+                }
+            }"#,
+        )
+        .expect("file finder settings should parse");
+
+        let settings = FileFinderSettings::from_settings(&content);
+
+        assert!(settings.file_icons);
+        assert_eq!(settings.modal_max_width, FileFinderWidth::XLarge);
+        assert!(settings.skip_focus_for_active_in_search);
+    }
+
+    #[test]
+    fn test_falls_back_to_defaults_when_unset() {
+        let settings = FileFinderSettings::from_settings(&SettingsContent::default());
+
+        assert!(!settings.file_icons);
+        assert_eq!(settings.modal_max_width, FileFinderWidth::Small);
+        assert!(!settings.skip_focus_for_active_in_search);
+        assert_eq!(settings.include_ignored, None);
+    }
+
+    /// Guards the JSON shape written in `assets/settings/default.json`: every
+    /// key there has to deserialize, and the values have to agree with the
+    /// fallbacks `from_settings` applies when the key is absent.
+    ///
+    /// Parsed through `UserSettingsContent` rather than `SettingsContent` so the
+    /// test walks the same flattening that `SettingsStore` uses at startup.
+    #[test]
+    fn test_default_json_file_finder_section_matches_fallbacks() {
+        let user_content = <settings::UserSettingsContent as settings::RootUserSettings>::parse_json_with_comments(
+            settings::default_settings().as_ref(),
+        )
+        .expect("assets/settings/default.json should parse");
+        let content = *user_content.content;
+        let file_finder = content
+            .file_finder
+            .as_ref()
+            .expect("assets/settings/default.json should define a `file_finder` section");
+
+        let from_default_json = FileFinderSettings::from_settings(&content);
+        let from_fallbacks = FileFinderSettings::from_settings(&SettingsContent::default());
+
+        assert_eq!(
+            from_default_json.file_icons, from_fallbacks.file_icons,
+            "file_finder.file_icons in default.json disagrees with the Rust fallback"
+        );
+        assert_eq!(
+            from_default_json.modal_max_width,
+            from_fallbacks.modal_max_width
+        );
+        assert_eq!(
+            from_default_json.skip_focus_for_active_in_search,
+            from_fallbacks.skip_focus_for_active_in_search
+        );
+
+        // A misspelled key deserializes to `None`, so spot-check that the
+        // enum-valued key really was populated rather than skipped.
+        assert!(file_finder.modal_max_width.is_some());
+    }
+}

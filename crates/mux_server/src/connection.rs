@@ -21,12 +21,73 @@ use tokio::sync::mpsc;
 use crate::session::ClientRole;
 
 /// §3.3 将 proto ClientRole 值映射为内部 ClientRole
+///
+/// 未指定 (CLIENT_ROLE_UNSPECIFIED) 与无法识别的枚举值都必须 fail-closed:
+/// 这个整数完全由对端提供, 把它当成 ReadWrite 等于让客户端自己挑权限。
 pub fn proto_role_to_client_role(role: i32) -> ClientRole {
     match role {
         1 => ClientRole::ReadOnly,
         2 => ClientRole::ReadWrite,
         3 => ClientRole::Admin,
-        _ => ClientRole::ReadWrite, // 未指定时默认为 ReadWrite
+        _ => ClientRole::ReadOnly,
+    }
+}
+
+/// §3.3 连接所用 transport 在客户端 attach 之前能提供的信任级别。
+///
+/// 角色是 attach 时才协商的, attach 之前只能靠 transport 判断。把这个判断
+/// 提成一个显式类型, 是为了让新增 transport 的人必须选一个分支, 而不是默默
+/// 继承本地 socket 的 Admin 默认值。
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ConnectionTrust {
+    /// §9 本地 socket: 0600 ACL 保证对端与 daemon 同 UID, 与 tmux 对自己
+    /// socket 的信任模型一致。
+    LocalSocket,
+    /// 没有对端认证的 transport (§25 resilient UDP、未来的 mTLS)。
+    Unauthenticated,
+}
+
+impl ConnectionTrust {
+    /// §3.3 客户端 attach 时没有声明 identity 的话使用的角色。
+    pub fn attach_default_role(self) -> ClientRole {
+        match self {
+            ConnectionTrust::LocalSocket => ClientRole::Admin,
+            ConnectionTrust::Unauthenticated => ClientRole::ReadOnly,
+        }
+    }
+}
+
+/// §3.3 尚未 attach 的连接在某一条请求上拥有的角色。
+///
+/// 默认 fail-closed 到 ReadOnly; 这里逐条列出的写操作是 tmux 风格的一次性
+/// CLI 命令 —— `z3rm kill` / `kill-server` 从不 attach, `send-keys` /
+/// `split-window` 等在 `$Z3RM_PANE` 已经指明目标时也会跳过 attach
+/// (见 `z3rm::cli::dispatch::resolve_pane_id`)。没有对端认证的 transport
+/// 一条都不放行。
+pub fn pre_attach_role(trust: ConnectionTrust, body: &RequestBody) -> ClientRole {
+    if trust != ConnectionTrust::LocalSocket {
+        return ClientRole::ReadOnly;
+    }
+    match body {
+        RequestBody::KillSession(_)
+        | RequestBody::Shutdown(_)
+        | RequestBody::RenameSession(_)
+        | RequestBody::NewWindow(_)
+        | RequestBody::ListRecoveryCandidates(_)
+        | RequestBody::ConfirmRecovery(_) => ClientRole::Admin,
+        RequestBody::SpawnPane(_)
+        | RequestBody::SplitPane(_)
+        | RequestBody::ClosePane(_)
+        | RequestBody::FocusPane(_)
+        | RequestBody::ResizePane(_)
+        | RequestBody::ResizeLayout(_)
+        | RequestBody::SendInput(_)
+        | RequestBody::Paste(_)
+        | RequestBody::SetClipboard(_)
+        | RequestBody::SetPaneTitle(_)
+        | RequestBody::ZoomPane(_)
+        | RequestBody::DeclineFileVersion(_) => ClientRole::ReadWrite,
+        _ => ClientRole::ReadOnly,
     }
 }
 
@@ -62,6 +123,11 @@ pub async fn handle_connection(
     shutdown_state: Arc<crate::ShutdownState>,
 ) -> anyhow::Result<()> {
     let (reader, writer) = tokio::io::split(stream);
+
+    // §3.3 这个函数的参数类型本身就是信任凭据: 能走到这里的一定是 §9 那个
+    // 0600 ACL 的本地 socket。网络 transport 必须走自己的入口并传入
+    // `ConnectionTrust::Unauthenticated`。
+    let trust = ConnectionTrust::LocalSocket;
 
     // §9 outbound channel: Response 或 Notification 都走这个
     let (outbound_tx, mut outbound_rx) = mpsc::unbounded_channel::<Envelope>();
@@ -120,6 +186,7 @@ pub async fn handle_connection(
                     &connection_client_id,
                     &shutdown_state,
                     &forward_tasks,
+                    trust,
                 )
                 .await?;
             }
@@ -239,7 +306,11 @@ async fn cleanup_connection_state(
 ) {
     if let Some(client_id) = connection_client_id.lock().clone() {
         let mut sessions = sessions.write();
-        unregister_client_from_sessions(&mut sessions, &client_id);
+        // §3.3 A closed socket is the authoritative signal that a GUI window is
+        // gone (Plan 32): one window owns one connection, so the window leaves
+        // the session here even when the client crashed without detaching.
+        let released_windows = unregister_client_from_sessions(&mut sessions, &client_id);
+        broadcast_window_removals(&sessions, &released_windows);
     }
 
     let forward_tasks = forward_tasks.lock().drain(..).collect::<Vec<_>>();
@@ -255,13 +326,93 @@ async fn cleanup_connection_state(
     }
 }
 
-fn unregister_client_from_sessions(sessions: &mut [crate::session::Session], client_id: &str) {
+/// §3.3 一个窗口在某个会话中的注册被释放 (Plan 32)。
+///
+/// `unregister_client_from_sessions` 只做状态变更并把结果交回调用方, 广播由
+/// 调用方决定: `handle_attach` 需要把「同一窗口重新 attach」这种并未真正离开
+/// 会话的情况压掉, 断连 / detach 路径则必须原样 fan-out。
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ReleasedWindow {
+    pub session_id: String,
+    pub window_id: String,
+}
+
+fn unregister_client_from_sessions(
+    sessions: &mut [crate::session::Session],
+    client_id: &str,
+) -> Vec<ReleasedWindow> {
+    let mut released = Vec::new();
     for session in sessions {
-        session.remove_attached_client(client_id);
+        let claimed_window = session.remove_attached_client(client_id);
         session.remove_lifecycle_subscriber(client_id);
         for pane in session.panes.read().values() {
             pane.remove_subscriber(client_id);
+            drop_client_viewport(pane, client_id);
         }
+        if let Some(window_id) = claimed_window
+            && session.release_window(&window_id)
+        {
+            released.push(ReleasedWindow {
+                session_id: session.id.clone(),
+                window_id,
+            });
+        }
+    }
+    released
+}
+
+/// §3.3 新窗口加入会话的通知 (Plan 32)。
+fn window_added_notification(session_id: &str, window_id: &str) -> Notification {
+    Notification {
+        event: Some(mux_protocol::notification::Event::WindowAdded(
+            mux_protocol::WindowAdded {
+                window_id: window_id.to_string(),
+                session_id: session_id.to_string(),
+            },
+        )),
+    }
+}
+
+/// §3.3 窗口离开会话的通知 (Plan 32)。
+fn window_removed_notification(session_id: &str, window_id: &str) -> Notification {
+    Notification {
+        event: Some(mux_protocol::notification::Event::WindowRemoved(
+            mux_protocol::WindowRemoved {
+                window_id: window_id.to_string(),
+                session_id: session_id.to_string(),
+            },
+        )),
+    }
+}
+
+/// §3.4 把窗口注销 fan-out 给会话里剩下的每个连接 (at-least-once)。
+/// 丢一条 `WindowRemoved` 会在其他窗口留下一个不存在的窗口条目。
+fn broadcast_window_removals(sessions: &[crate::session::Session], released: &[ReleasedWindow]) {
+    for window in released {
+        let Some(session) = sessions
+            .iter()
+            .find(|session| session.id == window.session_id)
+        else {
+            continue;
+        };
+        session.broadcast_lifecycle(window_removed_notification(
+            &window.session_id,
+            &window.window_id,
+        ));
+    }
+}
+
+/// §16.2 Release a departing client's min-fit constraint. A pane that was
+/// clamped by this client grows back, so the failure has to be visible rather
+/// than leaving every remaining client stuck at the smallest size.
+fn drop_client_viewport(pane: &Arc<crate::pane::Pane>, client_id: &str) {
+    if let Err(error) = pane.remove_client_viewport(client_id) {
+        tracing::warn!(
+            error = %error,
+            pane_id = %pane.id,
+            %client_id,
+            "min-fit resize after client detach failed"
+        );
     }
 }
 
@@ -313,6 +464,7 @@ async fn dispatch_envelope(
     connection_client_id: &Arc<parking_lot::Mutex<Option<String>>>,
     shutdown_state: &Arc<crate::ShutdownState>,
     forward_tasks: &Arc<parking_lot::Mutex<Vec<tokio::task::JoinHandle<()>>>>,
+    trust: ConnectionTrust,
 ) -> anyhow::Result<()> {
     let payload = match &envelope.payload {
         Some(p) => p,
@@ -335,6 +487,7 @@ async fn dispatch_envelope(
                 connection_client_id,
                 shutdown_state,
                 &forward_tasks,
+                trust,
             )
             .await?;
             // request_id 仅用于日志, 实际 response 已经在 dispatch_request 内发出
@@ -362,6 +515,7 @@ async fn dispatch_request(
     connection_client_id: &Arc<parking_lot::Mutex<Option<String>>>,
     shutdown_state: &Arc<crate::ShutdownState>,
     forward_tasks: &Arc<parking_lot::Mutex<Vec<tokio::task::JoinHandle<()>>>>,
+    trust: ConnectionTrust,
 ) -> anyhow::Result<()> {
     let request_id = req.request_id;
 
@@ -379,20 +533,12 @@ async fn dispatch_request(
         }
     };
 
-    // §3.3 客户端角色:未 attach 时默认 Admin。
-    //
-    // **fail-open 假设** (此处显式记录,新增 transport 时必须重新评估):
-    //   - 本地 Unix socket 走 §9 的 0600 ACL,已保证 user-level 隔离
-    //   - 当前唯一的 transport 就是 Local;SSH 走 SSH-forwarded Unix socket,
-    //     同样落到本机 socket 权限模型
-    //   - 因此本地连接 = 同 UID 信任 = Admin
-    //
-    // **风险**:如果未来加入网络 transport (mTLS、UDP resilient §25),
-    // 0600 ACL 不再适用,此默认会变成提权漏洞。届时必须改为:
-    //   - 默认 ReadOnly (fail-closed)
-    //   - 显式 identity 才能提权到 Admin
-    //   - 或按 transport 类型分支默认角色
-    let role = client_role.lock().unwrap_or(ClientRole::Admin);
+    // §3.3 客户端角色: attach 时协商; 尚未 attach 的连接由 `pre_attach_role`
+    // 按 transport + 请求类型显式放行, 默认落到 ReadOnly (fail-closed)。
+    let role = match *client_role.lock() {
+        Some(role) => role,
+        None => pre_attach_role(trust, body),
+    };
 
     let resp_body = match body {
         // §3.3 无权限要求的操作
@@ -406,6 +552,7 @@ async fn dispatch_request(
                 connection_client_id,
                 outbound_tx,
                 forward_tasks,
+                trust,
             )
             .await?
         }
@@ -475,7 +622,7 @@ async fn dispatch_request(
 
         RequestBody::KillSession(r) => {
             if check_permission(role, ClientRole::Admin) {
-                handle_kill_session(r, sessions, db).await?
+                handle_kill_session(r, sessions).await?
             } else {
                 ResponseBody::Error("permission denied: admin required".to_string())
             }
@@ -487,14 +634,16 @@ async fn dispatch_request(
                 ResponseBody::Error("permission denied: admin required".to_string())
             }
         }
-        RequestBody::InstallExtension(_) => {
-            // §16.12 Extension install 是 client-side 操作,server 端没有 extension host。
-            // 返回空 response 而非 error;真正的安装逻辑在 crates/z3rm/src/cli/marketplace.rs。
-            ResponseBody::Error(String::new())
+        RequestBody::InstallExtension(r) => {
+            if check_permission(role, ClientRole::Admin) {
+                handle_install_extension(r).await?
+            } else {
+                ResponseBody::Error("permission denied: admin required".to_string())
+            }
         }
         RequestBody::NewWindow(r) => {
             if check_permission(role, ClientRole::Admin) {
-                handle_new_window(r, sessions, outbound_tx).await?
+                handle_new_window(r, sessions).await?
             } else {
                 ResponseBody::Error("permission denied: admin required".to_string())
             }
@@ -531,7 +680,7 @@ async fn dispatch_request(
         }
         RequestBody::ResizePane(r) => {
             if check_permission(role, ClientRole::ReadWrite) {
-                handle_resize_pane(r, sessions).await?
+                handle_resize_pane(r, sessions, connection_client_id).await?
             } else {
                 ResponseBody::Error("permission denied: read-write required".to_string())
             }
@@ -547,7 +696,7 @@ async fn dispatch_request(
         // §3.3 需要 ReadWrite 的输入操作 (Plan 33)
         RequestBody::SendInput(r) => {
             if check_permission(role, ClientRole::ReadWrite) {
-                handle_send_input(r, sessions, connection_client_id).await?
+                handle_send_input(r, sessions, clipboard, outbound_tx, connection_client_id).await?
             } else {
                 ResponseBody::Error("permission denied: read-write required".to_string())
             }
@@ -575,10 +724,29 @@ async fn dispatch_request(
         }
 
         // §3.3 文件操作:server 在本地或远端文件系统执行。§16.6 GUI file viewer
-        // 通过这些 RPC 读文件。权限:任意角色可读 (§15.1 client 是同 UID 信任)。
-        RequestBody::ReadFile(r) => handle_read_file(r).await?,
-        RequestBody::ListDir(r) => handle_list_dir(r).await?,
-        RequestBody::StatFile(r) => handle_stat_file(r).await?,
+        // 通过这些 RPC 读文件。路径由 `resolve_session_file_path` 限制在调用方
+        // 已 attach 的 session cwd 之内 (§3.2 worktree 根)。
+        RequestBody::ReadFile(r) => {
+            if check_permission(role, ClientRole::ReadOnly) {
+                handle_read_file(r, sessions, connection_client_id).await?
+            } else {
+                ResponseBody::Error("permission denied: read-only required".to_string())
+            }
+        }
+        RequestBody::ListDir(r) => {
+            if check_permission(role, ClientRole::ReadOnly) {
+                handle_list_dir(r, sessions, connection_client_id).await?
+            } else {
+                ResponseBody::Error("permission denied: read-only required".to_string())
+            }
+        }
+        RequestBody::StatFile(r) => {
+            if check_permission(role, ClientRole::ReadOnly) {
+                handle_stat_file(r, sessions, connection_client_id).await?
+            } else {
+                ResponseBody::Error("permission denied: read-only required".to_string())
+            }
+        }
 
         // §3.3 Pane zoom 和 shell integration
         RequestBody::ZoomPane(r) => {
@@ -677,7 +845,6 @@ fn start_session_snapshot_watch(
         }
     });
 }
-
 async fn handle_create_session(
     req: &CreateSessionRequest,
     sessions: &Arc<parking_lot::RwLock<Vec<crate::session::Session>>>,
@@ -933,30 +1100,28 @@ fn validate_recovered_session(session: &crate::session::Session) -> anyhow::Resu
 async fn handle_kill_session(
     req: &KillSessionRequest,
     sessions: &Arc<parking_lot::RwLock<Vec<crate::session::Session>>>,
-    db: &Arc<parking_lot::Mutex<Connection>>,
 ) -> anyhow::Result<ResponseBody> {
-    let session = {
-        // Match persist_loop's db -> sessions lock order. Holding the DB lock
-        // across both mutations prevents a periodic snapshot from reinserting
-        // the session between durable deletion and in-memory removal.
-        let conn = db.lock();
-        let mut sessions = sessions.write();
-        let Some(index) = sessions.iter().position(|session| session.id == req.id) else {
-            return Ok(ResponseBody::Error(format!(
-                "session not found: {}",
-                req.id
-            )));
-        };
-        crate::persistence::delete_session(&conn, &req.id)?;
-        sessions.remove(index)
-    };
-    if let Some(watch) = session.snapshot_watch.as_ref() {
-        watch.stop();
+    if let Some(session) = take_session(sessions, &req.id) {
+        if let Some(watch) = session.snapshot_watch.as_ref() {
+            watch.stop();
+        }
+        zlog::info!("session killed: id={}", req.id);
+    } else {
+        zlog::warn!("kill session not found: id={}", req.id);
     }
-    zlog::info!("session killed: id={}", req.id);
     Ok(ResponseBody::Error(String::new()))
 }
 
+fn take_session(
+    sessions: &Arc<parking_lot::RwLock<Vec<crate::session::Session>>>,
+    session_id: &str,
+) -> Option<crate::session::Session> {
+    let mut sessions = sessions.write();
+    let index = sessions
+        .iter()
+        .position(|session| session.id == session_id)?;
+    Some(sessions.remove(index))
+}
 /// §3.10 连接会话 — 把客户端的 outbound_tx 注册为所有 pane 的 subscriber
 async fn handle_attach(
     req: &AttachRequest,
@@ -965,6 +1130,7 @@ async fn handle_attach(
     connection_client_id: &Arc<parking_lot::Mutex<Option<String>>>,
     outbound_tx: &mpsc::UnboundedSender<Envelope>,
     forward_tasks: &Arc<parking_lot::Mutex<Vec<tokio::task::JoinHandle<()>>>>,
+    trust: ConnectionTrust,
 ) -> anyhow::Result<ResponseBody> {
     let mut sessions_w = sessions.write();
     let target_session = sessions_w
@@ -998,17 +1164,33 @@ async fn handle_attach(
             minted
         }
     };
-    unregister_client_from_sessions(&mut sessions_w, &client_id);
+    let released_windows = unregister_client_from_sessions(&mut sessions_w, &client_id);
+
+    // §3.3 空 window_id 表示对端不是 GUI 窗口 (CLI 一次性命令), 不参与窗口成员
+    // 资格。
+    let attach_window_id = (!req.window_id.is_empty()).then(|| req.window_id.clone());
+    // 同一个窗口重新 attach (§15.4 原地重连 / 幂等 attach) 会先释放再注册, 但它
+    // 从未真正离开会话, 所以这一对 WindowRemoved/WindowAdded 都压掉, 只 fan-out
+    // 该连接此前占用的其他窗口注册。
+    let (reattached_windows, stale_windows): (Vec<ReleasedWindow>, Vec<ReleasedWindow>) =
+        released_windows.into_iter().partition(|released| {
+            released.session_id == req.session_id
+                && Some(released.window_id.as_str()) == attach_window_id.as_deref()
+        });
+    let reattaching_same_window = !reattached_windows.is_empty();
+    broadcast_window_removals(&sessions_w, &stale_windows);
+
     let session = &mut sessions_w[target_session];
 
-    // §3.3 角色解析: identity 显式声明时以其为准;否则保留既有角色
-    // (本地 socket 默认 Admin,见 dispatch_request)。ReadOnly attach mode
-    // 是会话级写保护, 必须降权整个连接, 否则 attach -r 后续 SendInput
-    // 仍会按 Admin/ReadWrite 通过。
+    // §3.3 角色解析: identity 显式声明时以其为准;否则保留既有角色, 首次
+    // attach 则退回 transport 的默认角色 (本地 socket = 同 UID = Admin,
+    // 无认证 transport = ReadOnly)。ReadOnly attach mode 是会话级写保护,
+    // 必须降权整个连接, 否则 attach -r 后续 SendInput 仍会按
+    // Admin/ReadWrite 通过。
     let requested_role = if let Some(identity) = &req.identity {
         proto_role_to_client_role(identity.role)
     } else {
-        client_role.lock().unwrap_or(ClientRole::Admin)
+        client_role.lock().unwrap_or(trust.attach_default_role())
     };
 
     let mode = match req.mode {
@@ -1036,19 +1218,30 @@ async fn handle_attach(
             .iter()
             .map(|attached| attached.client_id.clone())
             .collect();
+        let kicked_windows: Vec<String> = session
+            .attached_clients
+            .read()
+            .iter()
+            .filter_map(|attached| attached.window_id.clone())
+            .collect();
         session.attached_clients.write().clear();
+        // §3.3 抢占踢出的窗口注销必须在清空 lifecycle 订阅之前广播, 否则被踢的
+        // 客户端永远收不到「自己已离开会话」这条通知 (Plan 32)。
+        for window_id in &kicked_windows {
+            if session.release_window(window_id) {
+                session
+                    .broadcast_lifecycle(window_removed_notification(&req.session_id, window_id));
+            }
+        }
         kicked_clients.extend(session.clear_lifecycle_subscribers());
         for pane in session.panes.read().values() {
             for kicked_client in &kicked_clients {
                 pane.remove_subscriber(kicked_client);
+                drop_client_viewport(pane, kicked_client);
             }
         }
     }
-    session.add_attached_client(client_id.clone(), mode, role);
-
-    if !req.window_id.is_empty() {
-        session.add_window(req.window_id.clone());
-    }
+    session.add_attached_client(client_id.clone(), mode, role, attach_window_id.clone());
 
     // §3.4 Register this connection's outbound channel as a session-level
     // lifecycle subscriber. lifecycle_subscribers is keyed by client_id and
@@ -1056,6 +1249,16 @@ async fn handle_attach(
     // read/write loop exits, after which broadcast_lifecycle prunes it.
     // Re-attach of the same client_id replaces the prior sender idempotently.
     session.add_lifecycle_subscriber(client_id.clone(), outbound_tx.clone());
+
+    // §3.3 窗口在这里才真正加入会话 (Plan 32): 只有 attach 才带连接身份, 也只有
+    // 绑定了连接身份的窗口才能在断连时被精确释放。注册在 lifecycle 订阅之后,
+    // 这样刚接入的窗口自己也会收到这条 WindowAdded。
+    if let Some(window_id) = &attach_window_id
+        && session.add_window(window_id.clone())
+        && !reattaching_same_window
+    {
+        session.broadcast_lifecycle(window_added_notification(&req.session_id, window_id));
+    }
 
     // §3.4 把该连接的 outbound_tx 注册为 session 内所有 pane 的 subscriber。
     // 后续 PTY output → bump generation → broadcast PaneDirty → 此连接收到。
@@ -1083,31 +1286,35 @@ async fn handle_attach(
         forward_tasks.lock().push(handle);
     }
 
-    // §15.4 权威快照:tabs / layout / focused 必须反映 server 真实状态。
-    // 旧实现写死 tabs: Vec::new() 是严重违反 spec §15.4 的 bug。
-    let tabs_proto: Vec<mux_protocol::TabInfo> = session
+    Ok(ResponseBody::Attach(AttachResponse {
+        snapshot: Some(session_snapshot(session)),
+    }))
+}
+
+/// §15.4 权威快照:tabs / layout / focused 必须反映 server 真实状态。
+/// 旧实现写死 tabs: Vec::new() 是严重违反 spec §15.4 的 bug。
+fn session_snapshot(session: &crate::session::Session) -> SessionSnapshot {
+    let tabs = session
         .tabs
         .values()
-        .map(|t| mux_protocol::TabInfo {
-            id: t.id.clone(),
-            title: t.title.clone(),
-            panes: t
+        .map(|tab| mux_protocol::TabInfo {
+            id: tab.id.clone(),
+            title: tab.title.clone(),
+            panes: tab
                 .pane_ids
                 .iter()
-                .filter_map(|pid| pane_info_for(session, pid))
+                .filter_map(|pane_id| pane_info_for(session, pane_id))
                 .collect(),
         })
         .collect();
 
-    Ok(ResponseBody::Attach(AttachResponse {
-        snapshot: Some(SessionSnapshot {
-            session_id: session.id.clone(),
-            focused_pane_id: session.focused_pane.clone().unwrap_or_default(),
-            focused_tab_id: session.focused_tab.clone().unwrap_or_default(),
-            tabs: tabs_proto,
-            layout: Some(layout_tree_to_proto(&session.layout)),
-        }),
-    }))
+    SessionSnapshot {
+        session_id: session.id.clone(),
+        focused_pane_id: session.focused_pane.clone().unwrap_or_default(),
+        focused_tab_id: session.focused_tab.clone().unwrap_or_default(),
+        tabs,
+        layout: Some(layout_tree_to_proto(&session.layout)),
+    }
 }
 
 /// §3.10 断开连接 — remove this connection's client registration.
@@ -1124,7 +1331,10 @@ async fn handle_detach(
 ) -> anyhow::Result<ResponseBody> {
     let mut sessions_w = sessions.write();
     if let Some(client_id) = connection_client_id.lock().take() {
-        unregister_client_from_sessions(&mut sessions_w, &client_id);
+        // §3.3 Detach retires this connection's window from the session too
+        // (Plan 32) — the GUI calls it when its window closes.
+        let released_windows = unregister_client_from_sessions(&mut sessions_w, &client_id);
+        broadcast_window_removals(&sessions_w, &released_windows);
     }
     // Abort all forward tasks so their outbound_tx clones are dropped,
     // preventing stale PaneDirty/PaneOutput delivery and duplicate
@@ -1192,56 +1402,36 @@ fn register_pane_with_session_subscribers(
     }
 }
 
+/// §3.3 为一个即将打开的 GUI 窗口分配权威窗口 ID (Plan 32)。
+///
+/// 只分配 ID 并回一份会话快照, 不改动 `connected_windows`: 窗口的成员资格必须
+/// 与一个连接绑定 (见 `handle_attach`), 否则 daemon 会留下一个没人认领、断连时
+/// 也无从释放的窗口。客户端拿到 ID 后立即用它 attach。
 async fn handle_new_window(
     req: &NewWindowRequest,
     sessions: &Arc<parking_lot::RwLock<Vec<crate::session::Session>>>,
-    outbound_tx: &mpsc::UnboundedSender<Envelope>,
 ) -> anyhow::Result<ResponseBody> {
-    // §3.3 生成新窗口 ID
     let window_id = format!("win-{}-{}", std::process::id(), nanoid::nanoid!());
 
-    let mut sessions_w = sessions.write();
-    let session = sessions_w
-        .iter_mut()
+    let sessions_r = sessions.read();
+    let session = sessions_r
+        .iter()
         .find(|s| s.id == req.session_id)
         .ok_or_else(|| anyhow::anyhow!("session not found: {}", req.session_id))?;
-    session.add_window(window_id.clone());
-    drop(sessions_w);
+    let snapshot = session_snapshot(session);
+    drop(sessions_r);
 
     // §16.12 记录新窗口创建事件
     zlog::info!(
-        "new window created: session={} window={}",
+        "new window id minted: session={} window={}",
         req.session_id,
         window_id
     );
 
-    // §3.3 广播 WindowAdded 通知到所有已连接窗口
-    let notify = Notification {
-        event: Some(mux_protocol::proto::notification::Event::WindowAdded(
-            mux_protocol::WindowAdded {
-                window_id: window_id.clone(),
-                session_id: req.session_id.clone(),
-            },
-        )),
-    };
-    let _ = send_notification_envelope(outbound_tx, notify);
-
-    // §3.3 返回新窗口信息 (无 snapshot — 客户端应另行 attach)
     Ok(ResponseBody::NewWindow(NewWindowResponse {
         window_id,
-        snapshot: None,
+        snapshot: Some(snapshot),
     }))
-}
-
-fn session_cwd(
-    sessions: &Arc<parking_lot::RwLock<Vec<crate::session::Session>>>,
-    session_id: &str,
-) -> Option<String> {
-    sessions
-        .read()
-        .iter()
-        .find(|session| session.id == session_id)
-        .map(|session| session.cwd.clone())
 }
 
 /// §3.10 创建 pane — 真正 spawn PTY + alacritty Term (server-canonical)
@@ -1251,8 +1441,6 @@ async fn handle_spawn_pane(
     server_settings: &Arc<crate::server_settings::ServerSettings>,
     clipboard: &Arc<crate::clipboard::ServerClipboard>,
 ) -> anyhow::Result<ResponseBody> {
-    let session_cwd = session_cwd(sessions, &req.session_id)
-        .ok_or_else(|| anyhow::anyhow!("session not found: {}", req.session_id))?;
     let pane_id = nanoid::nanoid!();
 
     // §3.1 转换 ShellCommand → pane::ShellCommand
@@ -1262,6 +1450,16 @@ async fn handle_spawn_pane(
         env: c.env.iter().map(|(k, v)| (k.clone(), v.clone())).collect(),
     });
 
+    // Validate the authoritative session before spawning a child. Otherwise a
+    // stale CLI request can create an unregistered PTY and only fail later.
+    let session_cwd = {
+        let sessions_r = sessions.read();
+        sessions_r
+            .iter()
+            .find(|session| session.id == req.session_id)
+            .map(|session| session.cwd.clone())
+            .ok_or_else(|| anyhow::anyhow!("session not found: {}", req.session_id))?
+    };
     let cwd = req.cwd.clone().unwrap_or(session_cwd);
 
     // §3.1 解析 size
@@ -1443,11 +1641,10 @@ async fn handle_split_pane(
                 server_settings.scrollback_lines(),
             )?;
             // Only mutate the authoritative layout after PTY creation has
-            // succeeded; a spawn error must leave the original tree intact.
-            if let Err(error) =
-                session
-                    .layout
-                    .split(&req.pane_id, new_pane_id.clone(), direction)
+            // succeeded; on rejection `pane` drops here and kills the child.
+            if let Err(error) = session
+                .layout
+                .split(&req.pane_id, new_pane_id.clone(), direction)
             {
                 return Ok(ResponseBody::Error(format!("split pane rejected: {error}")));
             }
@@ -1579,19 +1776,28 @@ async fn handle_focus_pane(
     Ok(ResponseBody::Error(String::new()))
 }
 /// §3.10 调整 pane 尺寸 — 真正调用 pane.resize (PTY TIOCSWINSZ + alacritty)
+///
+/// §16.2 An attached client's resize is a report of *its* viewport, not an
+/// authoritative pane size: the pane takes the min-fit across every attached
+/// client so the smallest one still sees the whole grid. `find_pane` clones the
+/// `Arc` so neither the sessions lock nor the pane map is held across the
+/// resize, which would otherwise nest under the pane commit lock.
 async fn handle_resize_pane(
     req: &ResizePaneRequest,
     sessions: &Arc<parking_lot::RwLock<Vec<crate::session::Session>>>,
+    connection_client_id: &Arc<parking_lot::Mutex<Option<String>>>,
 ) -> anyhow::Result<ResponseBody> {
-    let sessions_r = sessions.read();
-    for session in sessions_r.iter() {
-        let panes = session.panes.clone();
-        if let Some(pane) = panes.read().get(&req.pane_id) {
-            pane.resize(req.cols, req.rows)?;
-            return Ok(ResponseBody::Error(String::new()));
-        }
+    let Some(pane) = find_pane(sessions, &req.pane_id) else {
+        return Ok(ResponseBody::Error("pane not found".to_string()));
+    };
+    let client_id = connection_client_id.lock().clone();
+    match client_id {
+        Some(client_id) => pane.set_client_viewport(client_id, req.cols, req.rows)?,
+        // Pre-attach CLI callers address panes by target and have no viewport
+        // of their own, so there is nothing to min-fit against.
+        None => pane.resize(req.cols, req.rows)?,
     }
-    Ok(ResponseBody::Error("pane not found".to_string()))
+    Ok(ResponseBody::Error(String::new()))
 }
 
 /// §16.9 Resize the server-authoritative layout ratio of a pane.
@@ -1649,10 +1855,12 @@ fn find_pane(
         .find_map(|session| session.panes.read().get(pane_id).cloned())
 }
 
-/// §3.10 Forward raw client input to the PTY unchanged.
+/// §3.10 发送输入 + §16.6 OSC 52 剪贴板拦截
 async fn handle_send_input(
     req: &SendInputRequest,
     sessions: &Arc<parking_lot::RwLock<Vec<crate::session::Session>>>,
+    clipboard: &Arc<crate::clipboard::ServerClipboard>,
+    _outbound_tx: &mpsc::UnboundedSender<Envelope>,
     connection_client_id: &Arc<parking_lot::Mutex<Option<String>>>,
 ) -> anyhow::Result<ResponseBody> {
     if !client_still_attached(sessions, connection_client_id) {
@@ -1667,7 +1875,40 @@ async fn handle_send_input(
         )));
     };
 
-    // Terminal output sequences are interpreted only by the emulator output path.
+    // §16.6 解析 OSC 52 序列: ESC ] 52 ; c ; <base64> BEL/ST
+    let mut osc52_parser = crate::clipboard::Osc52Parser::new();
+    if let Some(base64_content) = osc52_parser.feed(&req.data) {
+        // §16.6 OSC 52 触发剪贴板更新并通知所有客户端
+        let origin_host = std::env::var("HOSTNAME").unwrap_or_else(|_| "z3rm-server".to_string());
+        {
+            let mut txs = Vec::new();
+            for session in sessions.read().iter() {
+                for tx in session.lifecycle_subscribers.read().values() {
+                    txs.push(tx.clone());
+                }
+            }
+            clipboard.set_from_osc52(&base64_content, origin_host, &txs)?;
+        }
+        // OSC 52 序列已被消费, 不转发到 PTY
+        return Ok(ResponseBody::Error(String::new()));
+    }
+
+    // §16.6 检查 bracketed paste 模式切换序列
+    // ESC [ ? 2004 h (enable) / ESC [ ? 2004 l (disable)
+    const BRACKETED_PASTE_ENABLE: &[u8] = &[0x1B, b'[', b'?', b'2', b'0', b'0', b'4', b'h'];
+    const BRACKETED_PASTE_DISABLE: &[u8] = &[0x1B, b'[', b'?', b'2', b'0', b'0', b'4', b'l'];
+    if req.data == BRACKETED_PASTE_ENABLE {
+        // §16.6 启用 bracketed paste
+        pane.set_bracketed_paste_mode(true);
+        return Ok(ResponseBody::Error(String::new()));
+    }
+    if req.data == BRACKETED_PASTE_DISABLE {
+        // §16.6 禁用 bracketed paste
+        pane.set_bracketed_paste_mode(false);
+        return Ok(ResponseBody::Error(String::new()));
+    }
+
+    // §3.10 普通输入: 转发到 PTY
     pane.write_input(&req.data)?;
     Ok(ResponseBody::Error(String::new()))
 }
@@ -1940,10 +2181,15 @@ fn layout_tree_to_proto(tree: &crate::layout::LayoutTree) -> mux_protocol::Layou
             return vec![1.0 / child_count.max(1) as f32; child_count];
         }
         let sum: f32 = ratios.iter().sum();
-        if !sum.is_finite() || sum <= 0.0 || ratios.iter().any(|r| !r.is_finite() || *r < 0.0) {
+        if !sum.is_finite()
+            || sum <= 0.0
+            || ratios
+                .iter()
+                .any(|ratio| !ratio.is_finite() || *ratio < 0.0)
+        {
             return vec![1.0 / child_count.max(1) as f32; child_count];
         }
-        ratios.iter().map(|r| r / sum).collect()
+        ratios.iter().map(|ratio| ratio / sum).collect()
     }
 
     fn append_axis_children(
@@ -1973,6 +2219,7 @@ fn layout_tree_to_proto(tree: &crate::layout::LayoutTree) -> mux_protocol::Layou
             }
             return;
         }
+
         if let Some(child) = convert(node) {
             proto_children.push(child);
             proto_ratios.push(weight);
@@ -2059,6 +2306,32 @@ fn broadcast_lifecycle_in_session(
 /// 调用方在 split/close/focus/zoom 后调用此函数; 通知进入会话级 lifecycle 路径
 /// 而非仅发起方的 outbound_tx, 因此多个 attached 客户端都会收到 layout 刷新。
 
+/// §3.7 把 pane 从会话 layout 中摘除。
+///
+/// `LayoutTree::remove_pane` 拒绝移除唯一的根 pane (移除后树就没有根了), 而
+/// 会话最后一个 pane 退出时正好落在这个分支上 —— 忽略这个错误会让 layout 留下
+/// 一个指向已死 pane 的僵尸节点。这种情况下正确的结果是回到空根,
+/// `handle_spawn_pane` 会在下一个 pane 出现时重新播种它。
+fn detach_pane_from_layout(session: &mut crate::session::Session, pane_id: &str) {
+    let is_sole_root = matches!(
+        &session.layout.root,
+        crate::layout::LayoutNode::Pane { pane_id: root_pane_id, .. }
+            if root_pane_id.as_str() == pane_id
+    );
+    if is_sole_root {
+        session.layout = crate::layout::LayoutTree::empty();
+        return;
+    }
+    if let Err(error) = session.layout.remove_pane(pane_id) {
+        tracing::error!(
+            %error,
+            %pane_id,
+            session_id = %session.id,
+            "failed to remove pane from layout"
+        );
+    }
+}
+
 /// §3.4 When a pane's shell exits, remove it from the session and fan-out PaneRemoved.
 fn install_pane_exit_hook(
     pane: &std::sync::Arc<crate::pane::Pane>,
@@ -2118,24 +2391,17 @@ fn broadcast_layout_changed(
     sessions: &Arc<parking_lot::RwLock<Vec<crate::session::Session>>>,
     session_id: &str,
 ) {
-    let layout_proto = {
-        let sessions_r = sessions.read();
-        sessions_r
-            .iter()
-            .find(|s| s.id == session_id)
-            .map(|s| layout_tree_to_proto(&s.layout))
-    };
-    let Some(layout) = layout_proto else {
+    let sessions_r = sessions.read();
+    let Some(session) = sessions_r.iter().find(|s| s.id == session_id) else {
         return;
     };
-    let notify = Notification {
-        event: Some(mux_protocol::notification::Event::SessionLayoutChanged(
-            mux_protocol::SessionLayoutChanged {
-                layout: Some(layout),
-            },
-        )),
-    };
-    broadcast_lifecycle_in_session(sessions, session_id, notify);
+    // §3.3 一次 fan-out 覆盖会话的每个已连接窗口 (Plan 32)。
+    let notified_windows = session.broadcast_layout_change(layout_tree_to_proto(&session.layout));
+    tracing::trace!(
+        session_id,
+        windows = notified_windows.len(),
+        "layout change broadcast"
+    );
 }
 
 /// §3.4 fan-out PaneAdded 到该会话所有 attached 连接 (split / spawn 后调用)。
@@ -2174,7 +2440,14 @@ fn broadcast_pane_removed(
     broadcast_lifecycle_in_session(sessions, session_id, notify);
 }
 
-fn resolve_shadow_path(
+/// §4.7 / §16.6 把客户端提供的路径解析到 `root` 之内, 越界一律拒绝。
+///
+/// 三条约束缺一不可:
+/// - 显式拒绝 `..`, 否则相对路径可以向上跳出 root;
+/// - 目标可能还不存在 (被删除的版本 / 尚未创建的文件), 所以 canonicalize 的是
+///   最近的**已存在祖先** —— canonicalize 失败绝不能等同于放行;
+/// - 比较的是 canonical 前缀, 因此 root 内指向外部的 symlink 也会被挡下。
+fn resolve_path_within_root(
     root: &std::path::Path,
     requested: &str,
 ) -> anyhow::Result<std::path::PathBuf> {
@@ -2182,17 +2455,14 @@ fn resolve_shadow_path(
 
     let canonical_root = root
         .canonicalize()
-        .with_context(|| format!("canonicalizing shadow root: {}", root.display()))?;
+        .with_context(|| format!("canonicalizing session root: {}", root.display()))?;
     let requested_path = std::path::Path::new(requested);
-    anyhow::ensure!(
-        !requested_path.as_os_str().is_empty(),
-        "shadow path is empty"
-    );
+    anyhow::ensure!(!requested_path.as_os_str().is_empty(), "path is empty");
     anyhow::ensure!(
         !requested_path
             .components()
             .any(|component| matches!(component, Component::ParentDir)),
-        "shadow path may not contain parent traversal"
+        "path may not contain parent traversal"
     );
 
     let candidate = if requested_path.is_absolute() {
@@ -2205,23 +2475,89 @@ fn resolve_shadow_path(
     while !existing_ancestor.exists() {
         existing_ancestor = existing_ancestor
             .parent()
-            .context("shadow path has no existing ancestor")?;
+            .context("path has no existing ancestor")?;
     }
     let canonical_ancestor = existing_ancestor.canonicalize().with_context(|| {
         format!(
-            "canonicalizing shadow path ancestor: {}",
+            "canonicalizing path ancestor: {}",
             existing_ancestor.display()
         )
     })?;
     anyhow::ensure!(
         canonical_ancestor.starts_with(&canonical_root),
-        "shadow path escapes session cwd"
+        "path escapes session cwd"
     );
 
     let suffix = candidate
         .strip_prefix(existing_ancestor)
-        .context("resolving shadow path suffix")?;
+        .context("resolving path suffix")?;
     Ok(canonical_ancestor.join(suffix))
+}
+
+/// §16.6 一个连接可以访问的文件系统范围。
+///
+/// `root` 是它已 attach 的 session 的 cwd (§3.2 的 worktree 根);
+/// `snapshot_watch` 用来回答 §4.7 的"这个文件改过没有"。
+struct SessionFileScope {
+    root: std::path::PathBuf,
+    snapshot_watch: Option<Arc<crate::snapshot::SnapshotWatch>>,
+}
+
+fn session_file_scopes(
+    sessions: &Arc<parking_lot::RwLock<Vec<crate::session::Session>>>,
+    connection_client_id: &Arc<parking_lot::Mutex<Option<String>>>,
+) -> Vec<SessionFileScope> {
+    let Some(client_id) = connection_client_id.lock().clone() else {
+        return Vec::new();
+    };
+    sessions
+        .read()
+        .iter()
+        .filter(|session| {
+            session
+                .attached_clients
+                .read()
+                .iter()
+                .any(|attached| attached.client_id == client_id)
+        })
+        .map(|session| SessionFileScope {
+            root: std::path::PathBuf::from(&session.cwd),
+            snapshot_watch: session.snapshot_watch.clone(),
+        })
+        .collect()
+}
+
+/// §16.6 把 ReadFile / ListDir / StatFile 的路径限制在调用方已 attach 的
+/// session cwd 之内, 并返回该 session 的 shadow watch。
+///
+/// server 跑在用户真实的文件系统上, 这几个 RPC 没有沙箱就等于把整台机器的读
+/// 权限交给任何能连上 socket 的客户端 (`../../etc/passwd`)。没有 attach 的连接
+/// 没有 worktree 范围, 直接拒绝, 而不是退化成"整个文件系统"。
+fn resolve_session_file_path(
+    sessions: &Arc<parking_lot::RwLock<Vec<crate::session::Session>>>,
+    connection_client_id: &Arc<parking_lot::Mutex<Option<String>>>,
+    requested: &str,
+) -> anyhow::Result<(
+    std::path::PathBuf,
+    Option<Arc<crate::snapshot::SnapshotWatch>>,
+)> {
+    let scopes = session_file_scopes(sessions, connection_client_id);
+    anyhow::ensure!(
+        !scopes.is_empty(),
+        "file access requires an attached session"
+    );
+    let mut last_error = None;
+    for scope in scopes {
+        match resolve_path_within_root(&scope.root, requested) {
+            Ok(path) => return Ok((path, scope.snapshot_watch)),
+            Err(error) => last_error = Some(error),
+        }
+    }
+    Err(last_error
+        .unwrap_or_else(|| anyhow::anyhow!("no attached session worktree"))
+        .context(format!(
+            "path is outside the attached session worktree: {requested}"
+        )))
 }
 
 async fn handle_list_file_versions(
@@ -2229,7 +2565,7 @@ async fn handle_list_file_versions(
     sessions: &Arc<parking_lot::RwLock<Vec<crate::session::Session>>>,
 ) -> anyhow::Result<ResponseBody> {
     let (watch, root) = snapshot_context_for_session(sessions, &request.session_id)?;
-    let path = resolve_shadow_path(&root, &request.path)?;
+    let path = resolve_path_within_root(&root, &request.path)?;
     let versions = tokio::task::spawn_blocking(move || watch.list_versions(path))
         .await
         .context("joining shadow list-versions request")??;
@@ -2252,7 +2588,7 @@ async fn handle_get_file_version(
     sessions: &Arc<parking_lot::RwLock<Vec<crate::session::Session>>>,
 ) -> anyhow::Result<ResponseBody> {
     let (watch, root) = snapshot_context_for_session(sessions, &request.session_id)?;
-    let path = resolve_shadow_path(&root, &request.path)?;
+    let path = resolve_path_within_root(&root, &request.path)?;
     let version_id = request.version_id;
     let content = tokio::task::spawn_blocking(move || watch.get_version(path, version_id))
         .await
@@ -2268,14 +2604,21 @@ async fn handle_decline_file_version(
     sessions: &Arc<parking_lot::RwLock<Vec<crate::session::Session>>>,
 ) -> anyhow::Result<ResponseBody> {
     let (watch, root) = snapshot_context_for_session(sessions, &request.session_id)?;
-    let path = resolve_shadow_path(&root, &request.path)?;
+    let path = resolve_path_within_root(&root, &request.path)?;
     let version_id = request.version_id;
-    tokio::task::spawn_blocking(move || watch.decline(path, version_id))
+    let declined = tokio::task::spawn_blocking(move || watch.decline(path, version_id))
         .await
-        .context("joining shadow decline request")??;
-    Ok(ResponseBody::DeclineFileVersion(
-        mux_protocol::DeclineFileVersionResponse { restored: true },
-    ))
+        .context("joining shadow decline request")?;
+    match declined {
+        Ok(()) => Ok(ResponseBody::DeclineFileVersion(
+            mux_protocol::DeclineFileVersionResponse { restored: true },
+        )),
+        // §4.8 恢复失败必须让客户端看到原因: 写死 restored=true 会把一次没有
+        // 发生的回滚显示成成功, 而 `?` 会连带拆掉整条连接。
+        Err(error) => Ok(ResponseBody::Error(format!(
+            "decline_file_version: {error:#}"
+        ))),
+    }
 }
 
 fn snapshot_context_for_session(
@@ -2298,11 +2641,17 @@ fn snapshot_context_for_session(
 // Plan 10: §3.3 / §16.6 Real file RPC handlers (previously stubs)
 // ============================================================================
 
-/// §16.6 ReadFile: 读取本地文件,自动检测 binary。
-/// §4.7 shadow_snapshot 集成后,路径会经过 worktree 解析。当前直接读 fs。
-async fn handle_read_file(req: &mux_protocol::ReadFileRequest) -> anyhow::Result<ResponseBody> {
-    let path = std::path::Path::new(&req.path);
-    match std::fs::read(path) {
+/// §16.6 ReadFile: 读取 attach 会话 worktree 内的文件,自动检测 binary。
+async fn handle_read_file(
+    req: &mux_protocol::ReadFileRequest,
+    sessions: &Arc<parking_lot::RwLock<Vec<crate::session::Session>>>,
+    connection_client_id: &Arc<parking_lot::Mutex<Option<String>>>,
+) -> anyhow::Result<ResponseBody> {
+    let path = match resolve_session_file_path(sessions, connection_client_id, &req.path) {
+        Ok((path, _snapshot_watch)) => path,
+        Err(error) => return Ok(ResponseBody::Error(format!("read_file: {error:#}"))),
+    };
+    match std::fs::read(&path) {
         Ok(bytes) => {
             // Binary detection: check for null bytes in first 8KB (same heuristic
             // as shadow_snapshot Monitor — ELF/PE/Mach-O magic or > 10% null).
@@ -2322,36 +2671,122 @@ async fn handle_read_file(req: &mux_protocol::ReadFileRequest) -> anyhow::Result
     }
 }
 
-/// §16.6 ListDir: 列出目录条目。
-async fn handle_list_dir(req: &mux_protocol::ListDirRequest) -> anyhow::Result<ResponseBody> {
-    let path = std::path::Path::new(&req.path);
-    match std::fs::read_dir(path) {
-        Ok(entries) => {
-            let mut out = Vec::new();
-            for entry in entries.flatten() {
-                let meta = entry.metadata().ok();
-                let name = entry.file_name().to_string_lossy().into_owned();
-                out.push(mux_protocol::DirEntry {
-                    name,
-                    is_dir: meta.as_ref().map(|m| m.is_dir()).unwrap_or(false),
-                    size: meta.as_ref().map(|m| m.len()).unwrap_or(0),
-                    is_modified: false, // §4.7 shadow_snapshot 集成后填充
-                });
-            }
-            // 目录列表排序:目录优先,然后按名称 (确定性输出便于测试)。
-            out.sort_by(|a, b| b.is_dir.cmp(&a.is_dir).then_with(|| a.name.cmp(&b.name)));
-            Ok(ResponseBody::DirListing(mux_protocol::ListDirResponse {
-                entries: out,
-            }))
-        }
-        Err(e) => Ok(ResponseBody::Error(format!("list_dir: {}", e))),
+/// §16.6 ListDir: 列出 attach 会话 worktree 内某个目录的条目。
+async fn handle_list_dir(
+    req: &mux_protocol::ListDirRequest,
+    sessions: &Arc<parking_lot::RwLock<Vec<crate::session::Session>>>,
+    connection_client_id: &Arc<parking_lot::Mutex<Option<String>>>,
+) -> anyhow::Result<ResponseBody> {
+    let (path, snapshot_watch) =
+        match resolve_session_file_path(sessions, connection_client_id, &req.path) {
+            Ok(resolved) => resolved,
+            Err(error) => return Ok(ResponseBody::Error(format!("list_dir: {error:#}"))),
+        };
+    // §4.3 list_versions 要和单写 recorder 线程做一次同步 round-trip,
+    // 目录里每个文件一次, 不能压在 async worker 上。
+    let listing = tokio::task::spawn_blocking(move || {
+        let has_shadow_versions = |file: &std::path::Path| match snapshot_watch.as_ref() {
+            Some(watch) => match watch.list_versions(file.to_path_buf()) {
+                Ok(versions) => !versions.is_empty(),
+                Err(error) => {
+                    tracing::warn!(
+                        path = %file.display(),
+                        %error,
+                        "shadow version lookup failed during list_dir"
+                    );
+                    false
+                }
+            },
+            None => false,
+        };
+        read_dir_entries(&path, &has_shadow_versions)
+    })
+    .await
+    .context("joining list-dir request")?;
+    match listing {
+        Ok(entries) => Ok(ResponseBody::DirListing(mux_protocol::ListDirResponse {
+            entries,
+        })),
+        Err(error) => Ok(ResponseBody::Error(format!("list_dir: {error:#}"))),
     }
 }
 
-/// §16.6 StatFile: 返回文件元数据。
-async fn handle_stat_file(req: &mux_protocol::StatFileRequest) -> anyhow::Result<ResponseBody> {
-    let path = std::path::Path::new(&req.path);
-    match std::fs::metadata(path) {
+/// §16.6 读取一个目录的条目。
+///
+/// `is_modified` 的语义 (§4.7): shadow snapshot 在本 session 的监视期内为该
+/// 路径记录过版本, 也就是"session 启动之后被改过"。目录恒为 false —— watcher
+/// 只给文件建版本。session 没有 armed 的 watcher 时该字段恒为 false, 含义是
+/// "未知"而不是"未修改"。
+///
+/// 元数据读不到的条目会被跳过并记日志: proto `DirEntry` 没有错误字段, 把权限
+/// 失败或竞态删除报成 `is_dir=false, size=0` 会让客户端把它当成一个空文件。
+/// 指向目录的 symlink 按目标类型上报 (文件浏览器要的是目标语义), 断链 symlink
+/// 退回它自身的 lstat, 这样它仍然出现在列表里。
+fn read_dir_entries(
+    path: &std::path::Path,
+    has_shadow_versions: &dyn Fn(&std::path::Path) -> bool,
+) -> anyhow::Result<Vec<mux_protocol::DirEntry>> {
+    let mut entries = Vec::new();
+    let read_dir = std::fs::read_dir(path)
+        .with_context(|| format!("reading directory: {}", path.display()))?;
+    for entry in read_dir {
+        let entry = match entry {
+            Ok(entry) => entry,
+            Err(error) => {
+                tracing::warn!(
+                    directory = %path.display(),
+                    %error,
+                    "list_dir skipped an unreadable directory entry"
+                );
+                continue;
+            }
+        };
+        let entry_path = entry.path();
+        let metadata = match std::fs::metadata(&entry_path) {
+            Ok(metadata) => metadata,
+            Err(target_error) => match entry.metadata() {
+                Ok(link_metadata) => {
+                    tracing::debug!(
+                        path = %entry_path.display(),
+                        error = %target_error,
+                        "list_dir reporting link metadata for an unresolvable target"
+                    );
+                    link_metadata
+                }
+                Err(error) => {
+                    tracing::warn!(
+                        path = %entry_path.display(),
+                        %error,
+                        "list_dir skipped an entry with unreadable metadata"
+                    );
+                    continue;
+                }
+            },
+        };
+        let is_dir = metadata.is_dir();
+        entries.push(mux_protocol::DirEntry {
+            name: entry.file_name().to_string_lossy().into_owned(),
+            is_dir,
+            size: metadata.len(),
+            is_modified: !is_dir && has_shadow_versions(&entry_path),
+        });
+    }
+    // 目录列表排序:目录优先,然后按名称 (确定性输出便于测试)。
+    entries.sort_by(|a, b| b.is_dir.cmp(&a.is_dir).then_with(|| a.name.cmp(&b.name)));
+    Ok(entries)
+}
+
+/// §16.6 StatFile: 返回 attach 会话 worktree 内某个路径的元数据。
+async fn handle_stat_file(
+    req: &mux_protocol::StatFileRequest,
+    sessions: &Arc<parking_lot::RwLock<Vec<crate::session::Session>>>,
+    connection_client_id: &Arc<parking_lot::Mutex<Option<String>>>,
+) -> anyhow::Result<ResponseBody> {
+    let path = match resolve_session_file_path(sessions, connection_client_id, &req.path) {
+        Ok((path, _snapshot_watch)) => path,
+        Err(error) => return Ok(ResponseBody::Error(format!("stat_file: {error:#}"))),
+    };
+    match std::fs::metadata(&path) {
         Ok(meta) => Ok(ResponseBody::FileStat(mux_protocol::StatFileResponse {
             exists: true,
             size: meta.len(),
@@ -2373,6 +2808,31 @@ async fn handle_stat_file(req: &mux_protocol::StatFileRequest) -> anyhow::Result
         }
         Err(e) => Ok(ResponseBody::Error(format!("stat_file: {}", e))),
     }
+}
+
+/// §16.8 / §16.12 InstallExtension: server 端没有 extension host。
+///
+/// QuickJS runtime 只在 client 侧 (`crates/quickjs_runtime`), daemon 既不能
+/// 执行也不能校验 server-side 扩展; 真正的安装逻辑在
+/// `crates/z3rm/src/cli/marketplace.rs`。这里返回 `success=false` 的类型化
+/// 响应而不是空 `Error` —— 空 `Error` 在客户端等价于成功, 会让
+/// `mux::sync_extensions_to_remote` 把一次没发生的安装报成成功。
+async fn handle_install_extension(
+    req: &mux_protocol::InstallExtensionRequest,
+) -> anyhow::Result<ResponseBody> {
+    zlog::warn!(
+        "extension install rejected: name={} (mux_server has no extension host)",
+        req.name
+    );
+    Ok(ResponseBody::ExtensionInstalled(
+        mux_protocol::InstallExtensionResponse {
+            name: req.name.clone(),
+            success: false,
+            error: "mux_server has no extension host: server-side extension install is not \
+                    supported"
+                .to_string(),
+        },
+    ))
 }
 
 /// §3.10 RenameSession: 更新 session 名称。
@@ -2540,6 +3000,25 @@ mod connection_unit_tests {
     use super::*;
 
     #[test]
+    fn take_session_returns_removed_session() {
+        let sessions = Arc::new(parking_lot::RwLock::new(vec![
+            crate::session::Session::new(
+                "session-1".to_string(),
+                "one".to_string(),
+                "/tmp".to_string(),
+            ),
+        ]));
+
+        let removed = take_session(&sessions, "session-1");
+
+        assert_eq!(
+            removed.as_ref().map(|session| session.id.as_str()),
+            Some("session-1")
+        );
+        assert!(sessions.read().is_empty());
+    }
+
+    #[test]
     fn unregister_client_removes_every_session_subscription() {
         let mut sessions = vec![
             crate::session::Session::new(
@@ -2558,13 +3037,15 @@ mod connection_unit_tests {
                 "client-1".to_string(),
                 crate::session::AttachMode::Shared,
                 ClientRole::ReadWrite,
+                None,
             );
             let (sender, _receiver) = mpsc::unbounded_channel();
             session.add_lifecycle_subscriber("client-1".to_string(), sender);
         }
 
-        unregister_client_from_sessions(&mut sessions, "client-1");
+        let released = unregister_client_from_sessions(&mut sessions, "client-1");
 
+        assert!(released.is_empty(), "no client claimed a window");
         assert!(
             sessions
                 .iter()
@@ -2577,27 +3058,55 @@ mod connection_unit_tests {
         );
     }
 
-    #[tokio::test]
-    async fn kill_missing_session_returns_nonempty_error() {
-        let sessions = Arc::new(parking_lot::RwLock::new(Vec::new()));
-        let connection =
-            Connection::open_memory(Some("kill_missing_session_returns_nonempty_error"));
-        crate::persistence::init_tables(&connection).expect("initialize persistence tables");
-        let database = Arc::new(parking_lot::Mutex::new(connection));
+    /// §3.3 断连必须让 `connected_windows` 收缩, 并把 `WindowRemoved` fan-out
+    /// 给会话里剩下的窗口 (Plan 32)。
+    #[test]
+    fn unregister_client_releases_its_window_and_notifies_peers() {
+        let mut session = crate::session::Session::new(
+            "session-1".to_string(),
+            "one".to_string(),
+            "/tmp".to_string(),
+        );
+        for (client_id, window_id) in [("client-a", "win-a"), ("client-b", "win-b")] {
+            session.add_attached_client(
+                client_id.to_string(),
+                crate::session::AttachMode::Shared,
+                ClientRole::ReadWrite,
+                Some(window_id.to_string()),
+            );
+            session.add_window(window_id.to_string());
+        }
+        let (peer_sender, mut peer_notifications) = mpsc::unbounded_channel();
+        session.add_lifecycle_subscriber("client-b".to_string(), peer_sender);
+        let (leaving_sender, _leaving_notifications) = mpsc::unbounded_channel();
+        session.add_lifecycle_subscriber("client-a".to_string(), leaving_sender);
+        let mut sessions = vec![session];
 
-        let response = handle_kill_session(
-            &KillSessionRequest {
-                id: "missing".to_string(),
-            },
-            &sessions,
-            &database,
-        )
-        .await
-        .expect("handle missing session kill");
+        let released = unregister_client_from_sessions(&mut sessions, "client-a");
 
-        match response {
-            ResponseBody::Error(error) => assert_eq!(error, "session not found: missing"),
-            response => panic!("expected error response, got {response:?}"),
+        assert_eq!(
+            released,
+            vec![ReleasedWindow {
+                session_id: "session-1".to_string(),
+                window_id: "win-a".to_string(),
+            }]
+        );
+        assert_eq!(sessions[0].get_windows(), vec!["win-b".to_string()]);
+
+        broadcast_window_removals(&sessions, &released);
+
+        let envelope = match peer_notifications.try_recv() {
+            Ok(envelope) => envelope,
+            Err(error) => panic!("surviving window must receive WindowRemoved: {error}"),
+        };
+        match envelope.payload {
+            Some(EnvelopePayload::Notification(Notification {
+                event: Some(mux_protocol::notification::Event::WindowRemoved(removed)),
+            })) => {
+                assert_eq!(removed.window_id, "win-a");
+                assert_eq!(removed.session_id, "session-1");
+            }
+            other => panic!("expected WindowRemoved, got {other:?}"),
         }
     }
     #[tokio::test]
@@ -2611,7 +3120,9 @@ mod connection_unit_tests {
             "client-1".to_string(),
             crate::session::AttachMode::Shared,
             ClientRole::ReadWrite,
+            Some("win-1".to_string()),
         );
+        session.add_window("win-1".to_string());
         let (subscriber, _notifications) = mpsc::unbounded_channel();
         session.add_lifecycle_subscriber("client-1".to_string(), subscriber);
         let pane = match crate::pane::Pane::spawn(
@@ -2641,6 +3152,12 @@ mod connection_unit_tests {
         let sessions = sessions.read();
         assert_eq!(sessions[0].attached_client_count(), 0);
         assert!(sessions[0].lifecycle_subscribers.read().is_empty());
+        // §3.3 A dropped connection must shrink connected_windows (Plan 32),
+        // otherwise every crashed GUI leaks a window into the session forever.
+        assert!(
+            sessions[0].get_windows().is_empty(),
+            "connection cleanup must release the window it claimed"
+        );
         assert!(matches!(
             pane_notifications.try_recv(),
             Err(mpsc::error::TryRecvError::Disconnected)
@@ -2878,7 +3395,6 @@ mod connection_unit_tests {
         assert_eq!(session.focused_tab.as_deref(), Some("tab-2"));
         assert_eq!(session.focused_pane.as_deref(), Some(pane_ids[1].as_str()));
     }
-
     struct DropSignal(Arc<std::sync::atomic::AtomicBool>);
 
     impl Drop for DropSignal {
@@ -2956,12 +3472,12 @@ mod connection_unit_tests {
         std::fs::create_dir_all(&root).expect("create root");
         std::fs::create_dir_all(&outside).expect("create outside");
 
-        assert!(resolve_shadow_path(&root, "../outside/file.txt").is_err());
+        assert!(resolve_path_within_root(&root, "../outside/file.txt").is_err());
 
         #[cfg(unix)]
         {
             std::os::unix::fs::symlink(&outside, root.join("escape")).expect("create symlink");
-            assert!(resolve_shadow_path(&root, "escape/file.txt").is_err());
+            assert!(resolve_path_within_root(&root, "escape/file.txt").is_err());
         }
     }
 
@@ -2971,9 +3487,312 @@ mod connection_unit_tests {
         let root = directory.path().join("root");
         std::fs::create_dir_all(root.join("nested")).expect("create root");
 
-        let resolved = resolve_shadow_path(&root, "nested/deleted.txt").expect("resolve path");
+        let resolved = resolve_path_within_root(&root, "nested/deleted.txt").expect("resolve path");
 
-        assert_eq!(resolved, root.join("nested/deleted.txt"));
+        // `resolve_path_within_root` canonicalizes the root, so the expectation
+        // has to as well: on macOS the temp dir is `/var/...`, a symlink to
+        // `/private/var/...`.
+        let canonical_root = root.canonicalize().expect("canonicalize root");
+        assert_eq!(resolved, canonical_root.join("nested/deleted.txt"));
+    }
+
+    #[test]
+    fn path_within_root_rejects_absolute_escape_and_accepts_absolute_inside() {
+        let directory = tempfile::tempdir().expect("temp directory");
+        let root = directory.path().join("root");
+        std::fs::create_dir_all(&root).expect("create root");
+        std::fs::write(root.join("inside.txt"), b"inside").expect("write file");
+        let canonical_root = root.canonicalize().expect("canonicalize root");
+
+        assert!(resolve_path_within_root(&root, "/etc/passwd").is_err());
+        // A path that does not exist outside the root must be rejected too:
+        // failing to canonicalize is not a reason to let it through.
+        assert!(resolve_path_within_root(&root, "/etc/definitely-not-here").is_err());
+        assert_eq!(
+            resolve_path_within_root(
+                &root,
+                canonical_root.join("inside.txt").to_string_lossy().as_ref()
+            )
+            .expect("absolute path inside root"),
+            canonical_root.join("inside.txt")
+        );
+    }
+
+    /// A file that does not exist yet must still be refused when it resolves
+    /// outside the root — `..` is only one of the two escape routes.
+    #[test]
+    fn path_within_root_rejects_missing_file_outside_root() {
+        let directory = tempfile::tempdir().expect("temp directory");
+        let root = directory.path().join("root");
+        std::fs::create_dir_all(&root).expect("create root");
+        let outside = directory.path().join("outside");
+        std::fs::create_dir_all(&outside).expect("create outside");
+
+        let missing = outside.join("never-created.txt");
+        assert!(resolve_path_within_root(&root, missing.to_string_lossy().as_ref()).is_err());
+    }
+
+    fn attached_session(
+        id: &str,
+        cwd: &std::path::Path,
+        client_id: &str,
+    ) -> crate::session::Session {
+        let mut session = crate::session::Session::new(
+            id.to_string(),
+            id.to_string(),
+            cwd.to_string_lossy().into_owned(),
+        );
+        session.add_attached_client(
+            client_id.to_string(),
+            crate::session::AttachMode::Shared,
+            ClientRole::ReadWrite,
+            None,
+        );
+        session
+    }
+
+    #[test]
+    fn file_path_requires_an_attached_session() {
+        let directory = tempfile::tempdir().expect("temp directory");
+        let sessions = Arc::new(parking_lot::RwLock::new(vec![attached_session(
+            "session-1",
+            directory.path(),
+            "client-1",
+        )]));
+
+        let unattached = Arc::new(parking_lot::Mutex::new(None));
+        assert!(resolve_session_file_path(&sessions, &unattached, "file.txt").is_err());
+
+        // A connection whose client id is not registered with any session has
+        // no worktree either — it must not fall back to the whole filesystem.
+        let stranger = Arc::new(parking_lot::Mutex::new(Some("client-2".to_string())));
+        assert!(resolve_session_file_path(&sessions, &stranger, "file.txt").is_err());
+    }
+
+    #[test]
+    fn file_path_is_sandboxed_to_the_attached_session_cwd() {
+        let directory = tempfile::tempdir().expect("temp directory");
+        let root = directory.path().join("root");
+        let outside = directory.path().join("outside");
+        std::fs::create_dir_all(root.join("nested")).expect("create root");
+        std::fs::create_dir_all(&outside).expect("create outside");
+        std::fs::write(outside.join("secret.txt"), b"secret").expect("write secret");
+        let canonical_root = root.canonicalize().expect("canonicalize root");
+
+        let sessions = Arc::new(parking_lot::RwLock::new(vec![attached_session(
+            "session-1",
+            &root,
+            "client-1",
+        )]));
+        let client_id = Arc::new(parking_lot::Mutex::new(Some("client-1".to_string())));
+
+        let (resolved, watch) = resolve_session_file_path(&sessions, &client_id, "nested/file.txt")
+            .expect("path inside the session cwd resolves");
+        assert_eq!(resolved, canonical_root.join("nested/file.txt"));
+        assert!(watch.is_none());
+
+        // `..` traversal.
+        assert!(resolve_session_file_path(&sessions, &client_id, "../outside/secret.txt").is_err());
+        // Absolute path outside the session cwd.
+        assert!(resolve_session_file_path(&sessions, &client_id, "/etc/passwd").is_err());
+        assert!(
+            resolve_session_file_path(
+                &sessions,
+                &client_id,
+                outside.join("secret.txt").to_string_lossy().as_ref()
+            )
+            .is_err()
+        );
+        // A path that does not exist and is outside the root.
+        assert!(
+            resolve_session_file_path(
+                &sessions,
+                &client_id,
+                outside.join("missing.txt").to_string_lossy().as_ref()
+            )
+            .is_err()
+        );
+
+        #[cfg(unix)]
+        {
+            std::os::unix::fs::symlink(&outside, root.join("escape")).expect("create symlink");
+            assert!(resolve_session_file_path(&sessions, &client_id, "escape/secret.txt").is_err());
+        }
+    }
+
+    #[test]
+    fn read_dir_entries_reports_shadow_modification_and_sorts_directories_first() {
+        let directory = tempfile::tempdir().expect("temp directory");
+        std::fs::create_dir_all(directory.path().join("sub")).expect("create sub");
+        std::fs::write(directory.path().join("edited.txt"), b"edited").expect("write edited");
+        std::fs::write(directory.path().join("pristine.txt"), b"pristine").expect("write pristine");
+
+        let entries = read_dir_entries(directory.path(), &|path: &std::path::Path| {
+            path.file_name().and_then(|name| name.to_str()) == Some("edited.txt")
+        })
+        .expect("read entries");
+
+        let names: Vec<&str> = entries.iter().map(|entry| entry.name.as_str()).collect();
+        assert_eq!(names, vec!["sub", "edited.txt", "pristine.txt"]);
+        assert!(entries[0].is_dir);
+        assert!(entries[1].is_modified);
+        assert_eq!(entries[1].size, b"edited".len() as u64);
+        assert!(!entries[2].is_modified);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn read_dir_entries_distinguishes_symlinks_from_empty_files() {
+        let directory = tempfile::tempdir().expect("temp directory");
+        let target_directory = directory.path().join("target");
+        std::fs::create_dir_all(&target_directory).expect("create target");
+        std::os::unix::fs::symlink(&target_directory, directory.path().join("link-to-dir"))
+            .expect("create dir symlink");
+        std::os::unix::fs::symlink(
+            directory.path().join("gone"),
+            directory.path().join("broken"),
+        )
+        .expect("create broken symlink");
+
+        let entries = read_dir_entries(directory.path(), &|_path| false).expect("read entries");
+
+        let link_to_dir = entries
+            .iter()
+            .find(|entry| entry.name == "link-to-dir")
+            .expect("dir symlink listed");
+        assert!(
+            link_to_dir.is_dir,
+            "a symlink to a directory is a directory"
+        );
+
+        let broken = entries
+            .iter()
+            .find(|entry| entry.name == "broken")
+            .expect("broken symlink still listed");
+        assert!(!broken.is_dir);
+        assert!(
+            broken.size > 0,
+            "a broken symlink must carry its own lstat size, not a fabricated 0"
+        );
+    }
+
+    #[test]
+    fn detach_pane_from_layout_clears_sole_root_instead_of_leaving_a_zombie() {
+        let mut session = crate::session::Session::new(
+            "session-1".to_string(),
+            "one".to_string(),
+            "/tmp".to_string(),
+        );
+        session.layout =
+            crate::layout::LayoutTree::with_pane("node-pane-1".to_string(), "pane-1".to_string());
+
+        detach_pane_from_layout(&mut session, "pane-1");
+
+        assert!(
+            session.layout.is_empty_root(),
+            "the last pane's node must not survive its shell"
+        );
+        assert!(session.layout.root.find_pane("pane-1").is_none());
+    }
+
+    #[test]
+    fn detach_pane_from_layout_removes_a_split_child() {
+        let mut session = crate::session::Session::new(
+            "session-1".to_string(),
+            "one".to_string(),
+            "/tmp".to_string(),
+        );
+        session.layout =
+            crate::layout::LayoutTree::with_pane("node-pane-1".to_string(), "pane-1".to_string());
+        session
+            .layout
+            .split(
+                "pane-1",
+                "pane-2".to_string(),
+                crate::layout::SplitDirection::LeftRight,
+            )
+            .expect("split layout");
+
+        detach_pane_from_layout(&mut session, "pane-2");
+
+        assert!(session.layout.root.find_pane("pane-2").is_none());
+        assert!(session.layout.root.find_pane("pane-1").is_some());
+    }
+
+    #[test]
+    fn repeated_spawn_layout_round_trips_without_exhausting_proto_recursion() {
+        let mut layout =
+            crate::layout::LayoutTree::with_pane("node-pane-0".to_string(), "pane-0".to_string());
+        let mut focused = "pane-0".to_string();
+        for index in 1..=100 {
+            let next = format!("pane-{index}");
+            layout
+                .split(
+                    &focused,
+                    next.clone(),
+                    crate::layout::SplitDirection::TopBottom,
+                )
+                .expect("split focused pane");
+            focused = next;
+        }
+
+        let envelope = Envelope {
+            version: Some(mux_protocol::PROTOCOL_VERSION.clone()),
+            payload: Some(EnvelopePayload::Notification(Notification {
+                event: Some(mux_protocol::notification::Event::SessionLayoutChanged(
+                    mux_protocol::SessionLayoutChanged {
+                        layout: Some(layout_tree_to_proto(&layout)),
+                    },
+                )),
+            })),
+        };
+        let framed = mux_protocol::frame(&envelope).expect("frame lifecycle notification");
+        let (decoded, consumed) =
+            mux_protocol::unframe(&framed).expect("decode lifecycle notification");
+
+        assert_eq!(consumed, framed.len());
+        match decoded.payload {
+            Some(EnvelopePayload::Notification(Notification {
+                event: Some(mux_protocol::notification::Event::SessionLayoutChanged(changed)),
+            })) => {
+                let root = changed
+                    .layout
+                    .and_then(|layout| layout.root)
+                    .expect("decoded layout root");
+                match root.node {
+                    Some(mux_protocol::layout_node::Node::Split(split)) => {
+                        assert_eq!(split.children.len(), 101);
+                        assert_eq!(split.ratios.len(), 101);
+                        assert!((split.ratios.iter().sum::<f32>() - 1.0).abs() < 1e-6);
+                        assert!((split.ratios[0] - 0.5).abs() < 1e-6);
+                        assert!(split.ratios.iter().all(|ratio| *ratio > 0.0));
+                        assert!(split.ratios[1..].windows(2).all(|pair| pair[0] >= pair[1]));
+                    }
+                    node => panic!("expected flat decoded split, got {node:?}"),
+                }
+            }
+            payload => panic!("expected layout notification, got {payload:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn install_extension_reports_failure_instead_of_an_empty_error() {
+        let response = handle_install_extension(&mux_protocol::InstallExtensionRequest {
+            name: "z3rm-demo".to_string(),
+            manifest: Vec::new(),
+            source: Vec::new(),
+        })
+        .await
+        .expect("install handler");
+
+        match response {
+            ResponseBody::ExtensionInstalled(installed) => {
+                assert_eq!(installed.name, "z3rm-demo");
+                assert!(!installed.success);
+                assert!(!installed.error.is_empty());
+            }
+            other => panic!("expected a typed install response, got {other:?}"),
+        }
     }
 
     #[cfg(unix)]

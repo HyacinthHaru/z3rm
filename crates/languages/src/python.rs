@@ -2541,7 +2541,7 @@ mod tests {
         };
 
         let script = cx
-            .update(|cx| provider.activation_script(&toolchain, ShellKind::Posix, cx))
+            .update(|cx| provider.activation_script(&toolchain, util::shell::ShellKind::Posix, cx))
             .await;
 
         assert!(
@@ -2610,7 +2610,7 @@ mod tests {
         };
 
         let script = cx
-            .update(|cx| provider.activation_script(&toolchain, ShellKind::Posix, cx))
+            .update(|cx| provider.activation_script(&toolchain, util::shell::ShellKind::Posix, cx))
             .await;
 
         assert!(
@@ -2680,7 +2680,7 @@ mod tests {
         };
 
         let script = cx
-            .update(|cx| provider.activation_script(&toolchain, ShellKind::Posix, cx))
+            .update(|cx| provider.activation_script(&toolchain, util::shell::ShellKind::Posix, cx))
             .await;
 
         assert!(

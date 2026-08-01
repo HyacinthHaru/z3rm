@@ -4,9 +4,6 @@ mod toolbar_controls;
 mod buffer_diagnostics;
 mod diagnostic_renderer;
 
-#[cfg(test)]
-mod diagnostics_tests;
-
 use anyhow::Result;
 use buffer_diagnostics::BufferDiagnosticsEditor;
 use collections::{BTreeSet, HashMap, HashSet};

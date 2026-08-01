@@ -198,31 +198,7 @@ pub enum FullScreenMode {
 /// 注意: 此函数只检测 "enable" 序列 (h suffix)。
 /// "disable" 序列 (l suffix) 应调用 `detect_full_screen_disable` 来清除状态。
 pub fn detect_full_screen_enable(output: &[u8]) -> FullScreenMode {
-    // §16.7 查找 ESC [ ? 开头的 sequence (CSI Ps)
-    let mut mode = FullScreenMode::None;
-
-    // ESC = 0x1B, '[' = 0x5B, '?' = 0x3F
-    // 查找 \x1b[?NNNNh 模式
-    if let Some(pos) = find_csi_sequence(output, b'?', b'h') {
-        if let Some(code) = parse_csi_parameter(output, pos) {
-            match code {
-                1049 | 1047 => mode = FullScreenMode::AltScreen,
-                2004 => {
-                    if mode == FullScreenMode::None {
-                        mode = FullScreenMode::BracketedPaste
-                    }
-                }
-                1002 | 1003 | 1006 => {
-                    if mode == FullScreenMode::None {
-                        mode = FullScreenMode::MouseTracking
-                    }
-                }
-                _ => {}
-            }
-        }
-    }
-
-    mode
+    detect_full_screen_mode(output, b'h')
 }
 
 /// §16.7 检测 output bytes 中是否包含全屏模式关闭序列
@@ -237,79 +213,108 @@ pub fn detect_full_screen_enable(output: &[u8]) -> FullScreenMode {
 ///
 /// 返回被关闭的模式，若无则为 `FullScreenMode::None`。
 pub fn detect_full_screen_disable(output: &[u8]) -> FullScreenMode {
-    let mut mode = FullScreenMode::None;
+    detect_full_screen_mode(output, b'l')
+}
 
-    if let Some(pos) = find_csi_sequence(output, b'?', b'l') {
-        if let Some(code) = parse_csi_parameter(output, pos) {
-            match code {
-                1049 | 1047 => mode = FullScreenMode::AltScreen,
-                2004 => mode = FullScreenMode::BracketedPaste,
-                1002 | 1003 | 1006 => mode = FullScreenMode::MouseTracking,
-                _ => {}
+/// §16.7 扫描 output 中**全部** DECSET/DECRST 序列，返回优先级最高的模式。
+///
+/// 一次 PTY 读常常带回多个私有模式序列（`\x1b[?1049h\x1b[?2004h`），且一条
+/// 序列可以携带多个分号分隔的参数（`\x1b[?1002;1006h`）。只看第一条或只看第
+/// 一个参数会漏掉 alt screen，导致全屏应用的按键被错误路由。
+fn detect_full_screen_mode(output: &[u8], final_byte: u8) -> FullScreenMode {
+    let mut mode = FullScreenMode::None;
+    for parameters in DecPrivateModes::new(output, final_byte) {
+        for code in parameters {
+            let candidate = match code {
+                1049 | 1047 => FullScreenMode::AltScreen,
+                2004 => FullScreenMode::BracketedPaste,
+                1002 | 1003 | 1006 => FullScreenMode::MouseTracking,
+                _ => continue,
+            };
+            // Alt screen 覆盖一切：它决定按键是否整体透传给应用。
+            if candidate == FullScreenMode::AltScreen {
+                return FullScreenMode::AltScreen;
+            }
+            if mode == FullScreenMode::None {
+                mode = candidate;
             }
         }
     }
-
     mode
 }
 
-/// §16.7 查找 CSI ? 序列: ESC [ ? ... suffix
-fn find_csi_sequence(bytes: &[u8], _mode_byte: u8, suffix: u8) -> Option<usize> {
-    // §16.7 查找 \x1b[?NNNNsuffix 模式
-    // ESC = 0x1B, '[' = 0x5B, '?' = 0x3F
-    const ESC: u8 = 0x1B;
-    const LBRACKET: u8 = 0x5B;
-    const QMARK: u8 = 0x3F;
+/// 迭代 `ESC [ ? <params> <final_byte>` 序列，逐条产出其参数列表。
+struct DecPrivateModes<'a> {
+    bytes: &'a [u8],
+    position: usize,
+    final_byte: u8,
+}
 
-    for i in 0..bytes.len().saturating_sub(3) {
-        if bytes[i] == ESC && bytes[i + 1] == LBRACKET && bytes[i + 2] == QMARK {
-            // 找到 ESC[? 开头，向后查找 suffix
-            for j in (i + 3)..bytes.len() {
-                if bytes[j] == suffix {
-                    return Some(i);
-                }
-                // 数字或 ':' 分隔符，继续扫描
-                if bytes[j] != b'0'
-                    && bytes[j] != b'1'
-                    && bytes[j] != b'2'
-                    && bytes[j] != b'3'
-                    && bytes[j] != b'4'
-                    && bytes[j] != b'5'
-                    && bytes[j] != b'6'
-                    && bytes[j] != b'7'
-                    && bytes[j] != b'8'
-                    && bytes[j] != b'9'
-                    && bytes[j] != b':'
-                {
-                    break;
-                }
-            }
+impl<'a> DecPrivateModes<'a> {
+    fn new(bytes: &'a [u8], final_byte: u8) -> Self {
+        Self {
+            bytes,
+            position: 0,
+            final_byte,
         }
     }
+}
 
-    None
+impl Iterator for DecPrivateModes<'_> {
+    type Item = Vec<u32>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        const ESC: u8 = 0x1B;
+        const LBRACKET: u8 = 0x5B;
+        const QMARK: u8 = 0x3F;
+
+        while self.position + 3 <= self.bytes.len() {
+            let start = self.position;
+            if self.bytes[start] != ESC
+                || self.bytes.get(start + 1) != Some(&LBRACKET)
+                || self.bytes.get(start + 2) != Some(&QMARK)
+            {
+                self.position += 1;
+                continue;
+            }
+
+            let mut parameters = Vec::new();
+            let mut current: Option<u32> = None;
+            let mut index = start + 3;
+            while index < self.bytes.len() {
+                let byte = self.bytes[index];
+                match byte {
+                    b'0'..=b'9' => {
+                        let digit = u32::from(byte - b'0');
+                        current = Some(current.unwrap_or(0).saturating_mul(10) + digit);
+                    }
+                    b';' | b':' => {
+                        parameters.extend(current.take());
+                    }
+                    _ => break,
+                }
+                index += 1;
+            }
+
+            // A sequence ending in some other final byte is a different private
+            // mode command; skip past its introducer and keep scanning.
+            if self.bytes.get(index) != Some(&self.final_byte) {
+                self.position = start + 1;
+                continue;
+            }
+
+            parameters.extend(current);
+            self.position = index + 1;
+            if !parameters.is_empty() {
+                return Some(parameters);
+            }
+        }
+
+        None
+    }
 }
 
 /// §16.7 解析 CSI 序列中的参数数字
-fn parse_csi_parameter(bytes: &[u8], start: usize) -> Option<u32> {
-    // §16.7 从 ESC[? 之后读取数字参数
-    let param_start = start + 3; // skip ESC[?
-    let mut num = 0u32;
-    let mut found_digit = false;
-
-    for &b in bytes[param_start..].iter() {
-        match b {
-            b'0'..=b'9' => {
-                num = num.saturating_mul(10) + (b - b'0') as u32;
-                found_digit = true;
-            }
-            _ => break,
-        }
-    }
-
-    if found_digit { Some(num) } else { None }
-}
-
 /// §16.7 Prefix mode 超时配置
 pub fn default_prefix_timeout() -> Duration {
     Duration::from_millis(500)
@@ -437,7 +442,7 @@ pub fn handle_key_event(
             PrefixAction::DoubleTapLiteral => {
                 return KeyDispatchResult::SendLiteral {
                     bytes: key_bytes.to_vec(),
-                };
+                }
             }
             // §16.7 unmatched key after prefix: exit prefix mode and send the
             // key to the PTY (tmux parity). Passthrough here means "to PTY",
@@ -465,7 +470,7 @@ pub fn handle_key_event(
             machine.on_timeout();
             return KeyDispatchResult::SendLiteral {
                 bytes: key_bytes.to_vec(),
-            };
+            }
         }
         // §16.7 全屏应用 passthrough: 直接发送到 PTY
         return KeyDispatchResult::SendToPty {
@@ -676,21 +681,72 @@ mod tests {
     #[test]
     fn test_csi_parameter_parsing() {
         // §16.7 测试: CSI 参数解析
-        let bytes = b"\x1b[?1049h";
-        let code = parse_csi_parameter(bytes, 0);
-        assert_eq!(code, Some(1049));
+        let sequences: Vec<Vec<u32>> = DecPrivateModes::new(b"\x1b[?1049h", b'h').collect();
+        assert_eq!(sequences, vec![vec![1049]]);
 
-        let bytes2 = b"\x1b[?1002h";
-        let code2 = parse_csi_parameter(bytes2, 0);
-        assert_eq!(code2, Some(1002));
+        let sequences = DecPrivateModes::new(b"\x1b[?1002h", b'h').collect::<Vec<_>>();
+        assert_eq!(sequences, vec![vec![1002]]);
     }
 
     #[test]
     fn test_csi_parameter_no_digit() {
         // §16.7 测试: 无数字参数的 CSI 序列
-        let bytes = b"\x1b[?h";
-        let code = parse_csi_parameter(bytes, 0);
-        assert_eq!(code, None);
+        let sequences = DecPrivateModes::new(b"\x1b[?h", b'h').collect::<Vec<_>>();
+        assert!(sequences.is_empty());
+    }
+
+    #[test]
+    fn test_detect_scans_every_sequence_in_the_buffer() {
+        // 一次 PTY 读常常带回多条私有模式序列。只看第一条会漏掉 alt screen，
+        // 全屏应用的按键就会被错误地当成普通输入处理。
+        let output = b"\x1b[?2004h\x1b[?1049h";
+        assert_eq!(
+            detect_full_screen_enable(output),
+            FullScreenMode::AltScreen
+        );
+
+        let reversed = b"\x1b[?1049h\x1b[?2004h";
+        assert_eq!(
+            detect_full_screen_enable(reversed),
+            FullScreenMode::AltScreen
+        );
+
+        let disable = b"\x1b[?2004l\x1b[?1049l";
+        assert_eq!(
+            detect_full_screen_disable(disable),
+            FullScreenMode::AltScreen
+        );
+    }
+
+    #[test]
+    fn test_detect_reads_every_parameter_of_a_sequence() {
+        // `\x1b[?1002;1006h` 是一条序列携带两个参数，两个都必须被看到。
+        assert_eq!(
+            detect_full_screen_enable(b"\x1b[?1002;1006h"),
+            FullScreenMode::MouseTracking
+        );
+        assert_eq!(
+            detect_full_screen_enable(b"\x1b[?2004;1049h"),
+            FullScreenMode::AltScreen
+        );
+    }
+
+    #[test]
+    fn test_detect_ignores_sequences_with_other_final_bytes() {
+        // 关闭序列不能被当成开启序列，反之亦然。
+        assert_eq!(
+            detect_full_screen_enable(b"\x1b[?1049l"),
+            FullScreenMode::None
+        );
+        assert_eq!(
+            detect_full_screen_disable(b"\x1b[?1049h"),
+            FullScreenMode::None
+        );
+        // 未终结的序列（分块读的边界）不能误判。
+        assert_eq!(
+            detect_full_screen_enable(b"\x1b[?1049"),
+            FullScreenMode::None
+        );
     }
 
     #[test]
@@ -796,7 +852,10 @@ mod tests {
 
         // 再次按下 prefix key (double-tap)
         let result = handle_key_event(b"\x02", true, false, &mut ctx);
-        assert_eq!(result, KeyDispatchResult::SendLiteral { bytes: vec![0x02] });
+        assert_eq!(
+            result,
+            KeyDispatchResult::SendLiteral { bytes: vec![0x02] }
+        );
     }
 
     #[test]
@@ -835,7 +894,10 @@ mod tests {
         };
 
         let result = handle_key_event(b"v", false, false, &mut ctx);
-        assert_eq!(result, KeyDispatchResult::SendToPty { bytes: vec![b'v'] });
+        assert_eq!(
+            result,
+            KeyDispatchResult::SendToPty { bytes: vec![b'v'] }
+        );
     }
 
     #[test]

@@ -511,32 +511,48 @@ pub struct LspPullDiagnosticsSettings {
 }
 
 impl Settings for ProjectSettings {
-    fn from_settings(_content: &settings::SettingsContent) -> Self {
-        // 设置结构已重构, 原 settings content 类型已移除
-        // 使用默认值初始化所有字段 (spec §16 Plan 16)
+    fn from_settings(content: &settings::SettingsContent) -> Self {
+        let diagnostics = content.diagnostics.clone().unwrap_or_default();
+        let lsp_pull_diagnostics = diagnostics.lsp_pull_diagnostics.unwrap_or_default();
+        let inline_diagnostics = diagnostics.inline.unwrap_or_default();
+        let global_lsp_settings = content.global_lsp_settings.unwrap_or_default();
+        let lsp_notifications = global_lsp_settings.notifications.unwrap_or_default();
+        let session = content.session.unwrap_or_default();
+
         Self {
+            // `settings::LspSettings` currently carries no fields and no reader,
+            // so there is nothing for a user to configure per language server.
             lsp: HashMap::default(),
             global_lsp_settings: GlobalLspSettings {
                 button: true,
                 request_timeout: DEFAULT_LSP_REQUEST_TIMEOUT_SECS,
                 notifications: LspNotificationSettings {
-                    dismiss_timeout_ms: Some(5000),
+                    dismiss_timeout_ms: Some(
+                        lsp_notifications.dismiss_timeout_ms.unwrap_or(5000),
+                    ),
                 },
                 semantic_token_rules: settings::SemanticTokenRules::default(),
             },
             diagnostics: DiagnosticsSettings {
-                button: true,
-                include_warnings: true,
+                button: diagnostics.button.unwrap_or(true),
+                include_warnings: diagnostics.include_warnings.unwrap_or(true),
                 lsp_pull_diagnostics: LspPullDiagnosticsSettings {
-                    enabled: true,
-                    debounce_ms: 0,
+                    enabled: lsp_pull_diagnostics.enabled.unwrap_or(true),
+                    debounce_ms: lsp_pull_diagnostics.debounce_ms.unwrap_or(50),
                 },
                 inline: InlineDiagnosticsSettings {
-                    enabled: false,
-                    update_debounce_ms: 0,
-                    padding: 0,
-                    min_column: 0,
-                    max_severity: None,
+                    enabled: inline_diagnostics.enabled.unwrap_or(false),
+                    update_debounce_ms: inline_diagnostics.update_debounce_ms.unwrap_or(150),
+                    padding: inline_diagnostics.padding.unwrap_or(4),
+                    min_column: inline_diagnostics.min_column.unwrap_or(0),
+                    max_severity: inline_diagnostics.max_severity.map(|severity| match severity {
+                        settings::DiagnosticSeverityContent::Off => DiagnosticSeverity::Off,
+                        settings::DiagnosticSeverityContent::Error => DiagnosticSeverity::Error,
+                        settings::DiagnosticSeverityContent::Warning => DiagnosticSeverity::Warning,
+                        settings::DiagnosticSeverityContent::Info => DiagnosticSeverity::Info,
+                        settings::DiagnosticSeverityContent::Hint
+                        | settings::DiagnosticSeverityContent::All => DiagnosticSeverity::Hint,
+                    }),
                 },
             },
             git: GitSettings {
@@ -563,11 +579,18 @@ impl Settings for ProjectSettings {
                 show_stage_restore_buttons: true,
                 worktree_directory: DEFAULT_WORKTREE_DIRECTORY.to_string(),
             },
+            // z3rm bundles no Node runtime, so nothing reads these paths yet.
             node: NodeBinarySettings::default(),
-            load_direnv: DirenvSettings::default(),
+            load_direnv: content
+                .load_direnv
+                .map_or_else(DirenvSettings::default, |load_direnv| match load_direnv {
+                    settings::LoadDirenv::Disabled => DirenvSettings::Disabled,
+                    settings::LoadDirenv::Direct => DirenvSettings::Direct,
+                    settings::LoadDirenv::ShellHook => DirenvSettings::ShellHook,
+                }),
             session: SessionSettings {
-                restore_unsaved_buffers: true,
-                trust_all_worktrees: false,
+                restore_unsaved_buffers: session.restore_unsaved_buffers.unwrap_or(true),
+                trust_all_worktrees: session.trust_all_worktrees.unwrap_or(false),
             },
         }
     }
@@ -1098,6 +1121,210 @@ pub fn local_settings_kind_from_proto(kind: proto::LocalSettingsKind) -> LocalSe
         proto::LocalSettingsKind::Tasks => LocalSettingsKind::Tasks,
         proto::LocalSettingsKind::Editorconfig => LocalSettingsKind::Editorconfig,
         proto::LocalSettingsKind::Debug => LocalSettingsKind::Debug,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use settings::{
+        DiagnosticsSettingsContent, GlobalLspSettingsContent, InlineDiagnosticsSettingsContent,
+        LspNotificationSettingsContent, LspPullDiagnosticsSettingsContent, SessionSettingsContent,
+        SettingsContent,
+    };
+
+    fn content_with_project_settings() -> SettingsContent {
+        let mut content = SettingsContent::default();
+        content.diagnostics = Some(DiagnosticsSettingsContent {
+            button: Some(false),
+            include_warnings: Some(false),
+            lsp_pull_diagnostics: Some(LspPullDiagnosticsSettingsContent {
+                enabled: Some(false),
+                debounce_ms: Some(750),
+            }),
+            inline: Some(InlineDiagnosticsSettingsContent {
+                enabled: Some(true),
+                update_debounce_ms: Some(900),
+                padding: Some(12),
+                max_severity: Some(settings::DiagnosticSeverityContent::Warning),
+                ..Default::default()
+            }),
+        });
+        content.session = Some(SessionSettingsContent {
+            restore_unsaved_buffers: Some(false),
+            trust_all_worktrees: Some(true),
+        });
+        content.global_lsp_settings = Some(GlobalLspSettingsContent {
+            notifications: Some(LspNotificationSettingsContent {
+                dismiss_timeout_ms: Some(0),
+            }),
+        });
+        content.load_direnv = Some(settings::LoadDirenv::ShellHook);
+        content
+    }
+
+    #[test]
+    fn test_reads_top_level_project_settings_from_content() {
+        let settings = ProjectSettings::from_settings(&content_with_project_settings());
+
+        assert!(!settings.diagnostics.button);
+        assert!(!settings.diagnostics.include_warnings);
+        assert!(!settings.session.restore_unsaved_buffers);
+        assert!(settings.session.trust_all_worktrees);
+        assert_eq!(settings.load_direnv, DirenvSettings::ShellHook);
+        assert_eq!(
+            settings.global_lsp_settings.notifications.dismiss_timeout_ms,
+            Some(0)
+        );
+    }
+
+    #[test]
+    fn test_reads_nested_diagnostics_settings_from_content() {
+        let settings = ProjectSettings::from_settings(&content_with_project_settings());
+
+        assert_eq!(
+            settings.diagnostics.lsp_pull_diagnostics,
+            LspPullDiagnosticsSettings {
+                enabled: false,
+                debounce_ms: 750,
+            }
+        );
+        assert_eq!(
+            settings.diagnostics.inline,
+            InlineDiagnosticsSettings {
+                enabled: true,
+                update_debounce_ms: 900,
+                padding: 12,
+                // Sibling fields the user did not mention keep their own defaults.
+                min_column: 0,
+                max_severity: Some(DiagnosticSeverity::Warning),
+            }
+        );
+    }
+
+    #[test]
+    fn test_falls_back_to_defaults_when_unset() {
+        let settings = ProjectSettings::from_settings(&SettingsContent::default());
+
+        assert!(settings.diagnostics.button);
+        assert!(settings.diagnostics.include_warnings);
+        assert_eq!(
+            settings.diagnostics.lsp_pull_diagnostics,
+            LspPullDiagnosticsSettings {
+                enabled: true,
+                debounce_ms: 50,
+            }
+        );
+        assert_eq!(
+            settings.diagnostics.inline,
+            InlineDiagnosticsSettings {
+                enabled: false,
+                update_debounce_ms: 150,
+                padding: 4,
+                min_column: 0,
+                max_severity: None,
+            }
+        );
+        assert!(settings.session.restore_unsaved_buffers);
+        assert!(!settings.session.trust_all_worktrees);
+        assert_eq!(settings.load_direnv, DirenvSettings::Disabled);
+        assert_eq!(
+            settings.global_lsp_settings.notifications.dismiss_timeout_ms,
+            Some(5000)
+        );
+    }
+
+    #[test]
+    fn test_parses_project_settings_from_json() {
+        let content: SettingsContent = parse_json_with_comments(
+            r#"{
+                "diagnostics": {
+                    "include_warnings": false,
+                    "inline": { "enabled": true, "min_column": 40 }
+                },
+                "session": { "trust_all_worktrees": true },
+                "load_direnv": "direct"
+            }"#,
+        )
+        .expect("project settings should parse");
+
+        let settings = ProjectSettings::from_settings(&content);
+
+        assert!(!settings.diagnostics.include_warnings);
+        assert!(settings.diagnostics.inline.enabled);
+        assert_eq!(settings.diagnostics.inline.min_column, 40);
+        // Sibling keys keep their fallbacks rather than being reset.
+        assert_eq!(settings.diagnostics.inline.padding, 4);
+        assert!(settings.diagnostics.button);
+        assert!(settings.session.trust_all_worktrees);
+        assert!(settings.session.restore_unsaved_buffers);
+        assert_eq!(settings.load_direnv, DirenvSettings::Direct);
+    }
+
+    /// Guards the JSON shape written in `assets/settings/default.json`: every
+    /// key there has to deserialize, and the values have to agree with the
+    /// fallbacks `from_settings` applies when the key is absent.
+    ///
+    /// Parsed through `UserSettingsContent` rather than `SettingsContent` so the
+    /// test walks the same flattening that `SettingsStore` uses at startup.
+    #[test]
+    fn test_default_json_project_sections_match_fallbacks() {
+        let user_content = <settings::UserSettingsContent as settings::RootUserSettings>::parse_json_with_comments(
+            settings::default_settings().as_ref(),
+        )
+        .expect("assets/settings/default.json should parse");
+        let content = *user_content.content;
+        let diagnostics = content
+            .diagnostics
+            .as_ref()
+            .expect("assets/settings/default.json should define a `diagnostics` section");
+
+        let from_default_json = ProjectSettings::from_settings(&content);
+        let from_fallbacks = ProjectSettings::from_settings(&SettingsContent::default());
+
+        assert_eq!(
+            from_default_json.diagnostics.button, from_fallbacks.diagnostics.button,
+            "diagnostics.button in default.json disagrees with the Rust fallback"
+        );
+        assert_eq!(
+            from_default_json.diagnostics.include_warnings,
+            from_fallbacks.diagnostics.include_warnings
+        );
+        assert_eq!(
+            from_default_json.diagnostics.lsp_pull_diagnostics,
+            from_fallbacks.diagnostics.lsp_pull_diagnostics
+        );
+        assert_eq!(
+            from_default_json.diagnostics.inline,
+            from_fallbacks.diagnostics.inline
+        );
+        assert_eq!(
+            from_default_json.session.restore_unsaved_buffers,
+            from_fallbacks.session.restore_unsaved_buffers
+        );
+        assert_eq!(
+            from_default_json.session.trust_all_worktrees,
+            from_fallbacks.session.trust_all_worktrees
+        );
+        assert_eq!(from_default_json.load_direnv, from_fallbacks.load_direnv);
+        assert_eq!(
+            from_default_json
+                .global_lsp_settings
+                .notifications
+                .dismiss_timeout_ms,
+            from_fallbacks
+                .global_lsp_settings
+                .notifications
+                .dismiss_timeout_ms
+        );
+
+        // A misspelled key deserializes to `None`, so spot-check that the
+        // nested sections really were populated rather than skipped.
+        assert!(diagnostics.inline.is_some());
+        assert!(diagnostics.lsp_pull_diagnostics.is_some());
+        assert!(content.session.is_some());
+        assert!(content.global_lsp_settings.is_some());
+        assert!(content.load_direnv.is_some());
     }
 }
 

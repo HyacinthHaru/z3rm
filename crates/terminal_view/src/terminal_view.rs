@@ -1,13 +1,13 @@
-mod copy_mode;
-pub mod diff_view;
-pub mod file_viewer;
-pub mod mux_pane;
+pub mod copy_mode;
 mod persistence;
-pub mod settings_pane;
 pub mod terminal_element;
 pub mod terminal_panel;
 mod terminal_path_like_target;
 pub mod terminal_scrollbar;
+pub mod mux_pane;
+pub mod file_viewer;
+pub mod diff_view;
+pub mod settings_pane;
 
 use editor::{
     Editor, EditorSettings, actions::SelectAll, blink_manager::BlinkManager,
@@ -16,16 +16,16 @@ use editor::{
 use gpui::{
     Action, AnyElement, App, ClipboardEntry, DismissEvent, Entity, EventEmitter, ExternalPaths,
     FocusHandle, Focusable, Font, KeyContext, KeyDownEvent, Keystroke, MouseButton, MouseDownEvent,
-    Pixels, Point as GpuiPoint, Rems, Render, ScrollWheelEvent, Styled, Subscription, Task,
-    TaskExt, WeakEntity, actions, anchored, deferred, div,
+    Pixels, Point as GpuiPoint, Rems, Render, ScrollWheelEvent, Styled, Subscription, Task, TaskExt,
+    WeakEntity, actions, anchored, deferred, div,
 };
 use menu;
 use persistence::TerminalDb;
-use project::TaskId;
 use project::{Project, ProjectEntryId, search::SearchQuery};
 use schemars::JsonSchema;
 use serde::Deserialize;
 use settings::{Settings, SettingsStore, TerminalBell, TerminalBlink, WorkingDirectory};
+use workspace::settings_stubs::SeedQuerySetting;
 use std::{
     any::Any,
     cmp,
@@ -35,6 +35,7 @@ use std::{
     sync::Arc,
     time::Duration,
 };
+use project::TaskId;
 use terminal::{
     Clear, Copy, Event, HoveredWord, MaybeNavigationTarget, Modes, Paste, PasteText, Point, Range,
     ScrollLineDown, ScrollLineUp, ScrollPageDown, ScrollPageUp, ScrollToBottom, ScrollToTop,
@@ -51,7 +52,6 @@ use ui::{
     scrollbars::{self, ScrollbarVisibility},
 };
 use util::ResultExt;
-use workspace::settings_stubs::SeedQuerySetting;
 use workspace::{
     CloseActiveItem, DraggedSelection, DraggedTab, NewCenterTerminal, NewTerminal, Pane,
     ToolbarItemLocation, Workspace, WorkspaceId, delete_unloaded_items,
@@ -128,17 +128,20 @@ pub fn init(cx: &mut App) {
     // Only file_viewer and mux_pane paths remain.
     cx.observe_new(|workspace: &mut Workspace, _window, _cx| {
         // §16.6 file viewer: open a file read-only from command palette
-        workspace.register_action(|workspace, action: &file_viewer::OpenFile, window, cx| {
-            let path = PathBuf::from(&action.path);
-            let abs_path = if path.is_absolute() {
-                path
-            } else if let Some(worktree) = workspace.project().read(cx).worktrees(cx).next() {
-                worktree.read(cx).abs_path().join(&path)
-            } else {
-                path
-            };
-            file_viewer::open_file_in_viewer(workspace, abs_path, window, cx);
-        });
+        workspace.register_action(
+            |workspace, action: &file_viewer::OpenFile, window, cx| {
+                let path = PathBuf::from(&action.path);
+                let abs_path = if path.is_absolute() {
+                    path
+                } else if let Some(worktree) = workspace.project().read(cx).worktrees(cx).next()
+                {
+                    worktree.read(cx).abs_path().join(&path)
+                } else {
+                    path
+                };
+                file_viewer::open_file_in_viewer(workspace, abs_path, window, cx);
+            },
+        );
     })
     .detach();
 }
@@ -1442,6 +1445,12 @@ impl TerminalView {
     /// updates the cursor locally without sending data to the shell, so there's no
     /// shell output to automatically trigger a re-render.
     fn process_keystroke(&mut self, keystroke: &Keystroke, cx: &mut Context<Self>) -> bool {
+        // §3.3 只读客户端不写 PTY (Plan 33)。vi 模式下 try_keystroke 只移动本地
+        // 视口，不产生输入字节，所以浏览按键仍然放行。
+        if self.read_only && !self.terminal.read(cx).vi_mode_enabled() {
+            return false;
+        }
+
         let (handled, vi_mode_enabled) = self.terminal.update(cx, |term, cx| {
             (
                 term.try_keystroke(keystroke, TerminalSettings::get_global(cx).option_as_meta),
@@ -1461,21 +1470,14 @@ impl TerminalView {
         self.pause_cursor_blinking(window, cx);
 
         // §12 复制模式按键拦截 (Plan 31)
-        if self.copy_mode_state.active {
-            if copy_mode::dispatch_copy_mode_key(
-                &event.keystroke,
-                &mut self.copy_mode_state,
-                &self.terminal,
-                cx,
-            ) {
-                cx.stop_propagation();
-                cx.notify();
-                return;
-            }
-            // 未被拦截 → 转发到 vi_motion (不发送到 PTY)
-            self.terminal
-                .update(cx, |term, _| term.vi_motion(&event.keystroke));
-            cx.notify();
+        if self.dispatch_copy_mode_keystroke(&event.keystroke, cx) {
+            cx.stop_propagation();
+            return;
+        }
+
+        // §3.3 只读客户端吞掉按键 (Plan 33): process_keystroke 已拒绝写 PTY，
+        // 这里同时阻止事件继续冒泡到把它当作输入的宿主。
+        if self.read_only {
             cx.stop_propagation();
             return;
         }
@@ -1483,6 +1485,40 @@ impl TerminalView {
         if self.process_keystroke(&event.keystroke, cx) {
             cx.stop_propagation();
         }
+    }
+
+    /// §12 / §16.7 把按键路由到复制模式 / vi 模式处理器。
+    ///
+    /// 返回 `false` 表示两种模式都未激活，调用方应走常规输入路径。
+    /// 返回 `true` 表示按键已被消费（绝不发送到 PTY）。
+    pub fn dispatch_copy_mode_keystroke(
+        &mut self,
+        keystroke: &Keystroke,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        let vi_mode_enabled = self.terminal.read(cx).vi_mode_enabled();
+        if !self.copy_mode_state.active && !vi_mode_enabled {
+            return false;
+        }
+
+        let intercepted = self.copy_mode_state.active
+            && copy_mode::dispatch_copy_mode_key(
+                keystroke,
+                &mut self.copy_mode_state,
+                &self.terminal,
+                cx,
+            );
+        if !intercepted {
+            // 未被复制模式拦截 → 转发到 vi_motion (不发送到 PTY)
+            self.terminal.update(cx, |term, _| term.vi_motion(keystroke));
+        }
+        cx.notify();
+        true
+    }
+
+    /// §12 复制模式状态 (Plan 31)，供 mux pane 等宿主渲染搜索指示器。
+    pub fn copy_mode_state(&self) -> &copy_mode::CopyModeState {
+        &self.copy_mode_state
     }
 
     fn focus_in(&mut self, window: &mut Window, cx: &mut Context<Self>) {
@@ -1623,6 +1659,28 @@ impl Render for TerminalView {
                         )
                     }),
             )
+            // §12 复制模式搜索指示器 (Plan 31)
+            .when_some(self.copy_mode_state.search_indicator(), |this, label| {
+                this.child(
+                    deferred(
+                        div()
+                            .id("copy-mode-search")
+                            .absolute()
+                            .bottom_0()
+                            .left_0()
+                            .p(Rems(0.25))
+                            .bg(cx.theme().colors().editor_background)
+                            .rounded_sm()
+                            .child(
+                                div()
+                                    .text_size(Rems(0.875))
+                                    .text_color(cx.theme().colors().text)
+                                    .child(label),
+                            ),
+                    )
+                    .with_priority(1),
+                )
+            })
             // §3.3 只读指示器 (Plan 33)
             .when(self.read_only, |this| {
                 this.child(
@@ -1924,20 +1982,15 @@ impl Item for TerminalView {
                 .collect::<Vec<_>>();
 
             if !paths.is_empty() {
-                self.add_paths_to_terminal(
-                    &paths
-                        .iter()
-                        .map(|p| p.path.as_std_path().to_path_buf())
-                        .collect::<Vec<_>>(),
-                    window,
-                    cx,
-                );
+                self.add_paths_to_terminal(&paths.iter().map(|p| p.path.as_std_path().to_path_buf()).collect::<Vec<_>>(), window, cx);
             }
 
             return true;
         } else if let Some(&entry_id) = dropped.downcast_ref::<ProjectEntryId>() {
             let project = project.read(cx);
-            if let Some(path) = project.path_for_entry(entry_id, cx) {
+            if let Some(path) = project
+                .path_for_entry(entry_id, cx)
+            {
                 self.add_paths_to_terminal(&[path.path.as_std_path().to_path_buf()], window, cx);
             }
 
@@ -3401,10 +3454,7 @@ mod tests {
     fn test_copy_mode_state_default() {
         let state = copy_mode::CopyModeState::default();
         assert!(!state.active, "copy mode should be inactive by default");
-        assert!(
-            state.search_query.is_none(),
-            "search_query should be None by default"
-        );
+        assert!(state.search_query.is_none(), "search_query should be None by default");
     }
 
     #[test]
@@ -3415,5 +3465,256 @@ mod tests {
         assert!(state.active);
         state.active = false;
         assert!(!state.active);
+    }
+
+    /// §12 Plan 31 — `/` opens a real query buffer, Enter confirms it, and
+    /// `n` / `N` then walk every match without touching the PTY.
+    #[gpui::test]
+    async fn copy_mode_search_navigates_between_matches(cx: &mut TestAppContext) {
+        let (project, _workspace, window_handle) = init_test_with_window(cx).await;
+        let (_pane, terminal, terminal_view) =
+            add_display_only_terminal(&project, window_handle, true, cx);
+
+        let mut cx = VisualTestContext::from_window(window_handle.into(), cx);
+        cx.update(|window, cx| {
+            let _ = window.draw(cx);
+        });
+        cx.run_until_parked();
+
+        cx.update(|window, cx| {
+            terminal.update(cx, |terminal, cx| {
+                terminal.write_output(b"needle one\r\nfiller\r\nneedle two\r\nneedle three\r\n", cx);
+                terminal.sync(window, cx);
+            });
+        });
+        terminal_view.update_in(&mut cx, |view, window, cx| {
+            view.enter_copy_mode(&EnterCopyMode, window, cx);
+        });
+        sync_terminal(&terminal, &mut cx);
+
+        cx.simulate_keystrokes("/");
+        terminal_view.read_with(&cx, |view, _| {
+            assert_eq!(
+                view.copy_mode_state().search_input.as_deref(),
+                Some(""),
+                "`/` must open a query buffer"
+            );
+        });
+
+        cx.simulate_keystrokes("n e e d l e x");
+        cx.simulate_keystrokes("backspace");
+        terminal_view.read_with(&cx, |view, _| {
+            assert_eq!(
+                view.copy_mode_state().search_input.as_deref(),
+                Some("needle"),
+                "typed keys must accumulate and backspace must delete"
+            );
+        });
+
+        cx.simulate_keystrokes("enter");
+        sync_terminal(&terminal, &mut cx);
+        terminal_view.read_with(&cx, |view, _| {
+            let state = view.copy_mode_state();
+            assert_eq!(state.search_input, None, "enter must close the query buffer");
+            assert_eq!(state.search_query.as_deref(), Some("needle"));
+            assert_eq!(state.match_count, 3);
+            assert_eq!(state.search_error, None);
+        });
+        // Confirming jumps to the first match; the cursor starts below all of
+        // them so the search wraps to the top.
+        assert_eq!(cursor_point(&terminal, &cx), terminal::Point::new(0, 5));
+
+        cx.simulate_keystrokes("n");
+        sync_terminal(&terminal, &mut cx);
+        assert_eq!(cursor_point(&terminal, &cx), terminal::Point::new(2, 5));
+
+        cx.simulate_keystrokes("n");
+        sync_terminal(&terminal, &mut cx);
+        assert_eq!(cursor_point(&terminal, &cx), terminal::Point::new(3, 5));
+
+        cx.simulate_keystrokes("shift-n");
+        sync_terminal(&terminal, &mut cx);
+        assert_eq!(cursor_point(&terminal, &cx), terminal::Point::new(2, 5));
+
+        cx.simulate_keystrokes("shift-n");
+        sync_terminal(&terminal, &mut cx);
+        assert_eq!(cursor_point(&terminal, &cx), terminal::Point::new(0, 5));
+
+        assert!(
+            terminal
+                .update(&mut cx, |terminal, _| terminal.take_input_log())
+                .is_empty(),
+            "copy mode search must never reach the PTY"
+        );
+    }
+
+    /// §12 Plan 31 — escape abandons the query buffer and leaves copy mode
+    /// usable; the previous query is untouched.
+    #[gpui::test]
+    async fn copy_mode_search_input_can_be_cancelled(cx: &mut TestAppContext) {
+        let (project, _workspace, window_handle) = init_test_with_window(cx).await;
+        let (_pane, terminal, terminal_view) =
+            add_display_only_terminal(&project, window_handle, true, cx);
+
+        let mut cx = VisualTestContext::from_window(window_handle.into(), cx);
+        cx.update(|window, cx| {
+            let _ = window.draw(cx);
+        });
+        cx.run_until_parked();
+
+        cx.update(|window, cx| {
+            terminal.update(cx, |terminal, cx| {
+                terminal.write_output(b"needle one\r\n", cx);
+                terminal.sync(window, cx);
+            });
+        });
+        terminal_view.update_in(&mut cx, |view, window, cx| {
+            view.enter_copy_mode(&EnterCopyMode, window, cx);
+        });
+        sync_terminal(&terminal, &mut cx);
+
+        cx.simulate_keystrokes("/ n e e d l e escape");
+        terminal_view.read_with(&cx, |view, _| {
+            let state = view.copy_mode_state();
+            assert_eq!(state.search_input, None, "escape must drop the query buffer");
+            assert_eq!(state.search_query, None);
+            assert!(state.active, "escape in search input must stay in copy mode");
+        });
+
+        // The indicator is what makes the search visible to the user.
+        cx.simulate_keystrokes("/ n e");
+        terminal_view.read_with(&cx, |view, _| {
+            assert_eq!(
+                view.copy_mode_state().search_indicator().as_deref(),
+                Some("/ne")
+            );
+        });
+        cx.simulate_keystrokes("enter");
+        terminal_view.read_with(&cx, |view, _| {
+            assert_eq!(
+                view.copy_mode_state().search_indicator().as_deref(),
+                Some("/ne — 1 matches")
+            );
+        });
+
+        assert!(
+            terminal
+                .update(&mut cx, |terminal, _| terminal.take_input_log())
+                .is_empty(),
+            "copy mode search must never reach the PTY"
+        );
+    }
+
+    /// §12 Plan 31 — an invalid regex is surfaced instead of silently doing
+    /// nothing.
+    #[gpui::test]
+    async fn copy_mode_search_reports_invalid_regex(cx: &mut TestAppContext) {
+        let (project, _workspace, window_handle) = init_test_with_window(cx).await;
+        let (_pane, terminal, terminal_view) =
+            add_display_only_terminal(&project, window_handle, true, cx);
+
+        let mut cx = VisualTestContext::from_window(window_handle.into(), cx);
+        cx.update(|window, cx| {
+            let _ = window.draw(cx);
+        });
+        cx.run_until_parked();
+        terminal_view.update_in(&mut cx, |view, window, cx| {
+            view.enter_copy_mode(&EnterCopyMode, window, cx);
+        });
+        sync_terminal(&terminal, &mut cx);
+
+        cx.simulate_keystrokes("/ ( enter");
+        terminal_view.read_with(&cx, |view, _| {
+            let state = view.copy_mode_state();
+            assert_eq!(state.search_query.as_deref(), Some("("));
+            assert_eq!(state.match_count, 0);
+            assert!(
+                state.search_error.is_some(),
+                "an uncompilable query must report why"
+            );
+            assert!(
+                state
+                    .search_indicator()
+                    .is_some_and(|indicator| indicator.starts_with("/(")),
+                "the failing query stays visible"
+            );
+        });
+    }
+
+    /// §3.3 Plan 33 — a read-only client never writes to the PTY, but can still
+    /// browse scrollback in copy mode.
+    #[gpui::test]
+    async fn read_only_terminal_view_drops_keystrokes(cx: &mut TestAppContext) {
+        let (project, _workspace, window_handle) = init_test_with_window(cx).await;
+        let (_pane, terminal, terminal_view) =
+            add_display_only_terminal(&project, window_handle, true, cx);
+
+        let mut cx = VisualTestContext::from_window(window_handle.into(), cx);
+        cx.update(|window, cx| {
+            let _ = window.draw(cx);
+        });
+        cx.run_until_parked();
+
+        cx.simulate_keystrokes("a");
+        assert_eq!(
+            terminal.update(&mut cx, |terminal, _| terminal.take_input_log()),
+            vec![b"a".to_vec()],
+            "precondition: a writable view forwards keystrokes"
+        );
+
+        terminal_view.update(&mut cx, |view, cx| {
+            view.set_read_only(true, cx);
+            assert!(view.is_read_only());
+        });
+        cx.simulate_keystrokes("b");
+        assert!(
+            terminal
+                .update(&mut cx, |terminal, _| terminal.take_input_log())
+                .is_empty(),
+            "a read-only view must not forward keystrokes"
+        );
+
+        terminal_view.update_in(&mut cx, |view, window, cx| {
+            view.send_text(&SendText("text".to_string()), window, cx);
+            view.send_keystroke(&SendKeystroke("c".to_string()), window, cx);
+        });
+        assert!(
+            terminal
+                .update(&mut cx, |terminal, _| terminal.take_input_log())
+                .is_empty(),
+            "a read-only view must not forward SendText/SendKeystroke either"
+        );
+
+        // Copy mode is local browsing, so it stays available while read-only.
+        cx.update(|window, cx| {
+            terminal.update(cx, |terminal, cx| {
+                terminal.write_output(b"needle\r\n", cx);
+                terminal.sync(window, cx);
+            });
+        });
+        terminal_view.update_in(&mut cx, |view, window, cx| {
+            view.enter_copy_mode(&EnterCopyMode, window, cx);
+        });
+        sync_terminal(&terminal, &mut cx);
+        cx.simulate_keystrokes("/ n e e d l e enter");
+        terminal_view.read_with(&cx, |view, _| {
+            assert_eq!(view.copy_mode_state().match_count, 1);
+        });
+        assert!(
+            terminal
+                .update(&mut cx, |terminal, _| terminal.take_input_log())
+                .is_empty(),
+            "copy mode must not write to the PTY in a read-only view"
+        );
+    }
+
+    fn sync_terminal(terminal: &Entity<Terminal>, cx: &mut VisualTestContext) {
+        cx.update(|window, cx| {
+            terminal.update(cx, |terminal, cx| terminal.sync(window, cx));
+        });
+    }
+
+    fn cursor_point(terminal: &Entity<Terminal>, cx: &VisualTestContext) -> terminal::Point {
+        terminal.read_with(cx, |terminal, _| terminal.last_content.cursor.point)
     }
 }

@@ -18,10 +18,76 @@ use project::{Project, project_settings::DiagnosticSeverity};
 use ui::{App, BorrowAppContext, IntoElement, px};
 use util::test::{generate_marked_text, marked_text_offsets, marked_text_ranges};
 
-#[cfg(all(test, feature = "z3rm-migration"))]
+#[cfg(test)]
 #[ctor::ctor(unsafe)]
 fn init_logger() {
     zlog::init_test();
+}
+
+// `release_channel` and `semver` are dev-dependencies, so these helpers cannot be
+// exposed through the `test-support` feature.
+#[cfg(test)]
+pub(crate) fn update_test_language_settings(
+    cx: &mut gpui::TestAppContext,
+    f: &dyn Fn(&mut settings::AllLanguageSettingsContent),
+) {
+    use gpui::UpdateGlobal as _;
+    use settings::{SettingsContent, SettingsStore};
+    cx.update(|cx| {
+        SettingsStore::update_global(cx, |store, cx| {
+            store.update_user_settings(cx, &|settings: &mut SettingsContent| {
+                f(&mut settings.project.all_languages)
+            });
+        });
+    });
+}
+
+#[cfg(test)]
+pub(crate) fn update_test_project_settings(
+    cx: &mut gpui::TestAppContext,
+    f: &dyn Fn(&mut settings::ProjectSettingsContent),
+) {
+    use gpui::UpdateGlobal as _;
+    use settings::SettingsStore;
+    cx.update(|cx| {
+        SettingsStore::update_global(cx, |store, cx| {
+            store.update_user_settings(cx, |settings| f(&mut settings.project));
+        });
+    });
+}
+
+#[cfg(test)]
+pub(crate) fn update_test_editor_settings(
+    cx: &mut gpui::TestAppContext,
+    f: &dyn Fn(&mut settings::EditorSettingsContent),
+) {
+    use gpui::UpdateGlobal as _;
+    use settings::SettingsStore;
+    cx.update(|cx| {
+        SettingsStore::update_global(cx, |store, cx| {
+            store.update_user_settings(cx, |settings| {
+                f(settings.editor.get_or_insert_default())
+            });
+        })
+    })
+}
+
+#[cfg(test)]
+pub(crate) fn init_test(
+    cx: &mut gpui::TestAppContext,
+    f: fn(&mut settings::AllLanguageSettingsContent),
+) {
+    use settings::SettingsStore;
+    cx.update(|cx| {
+        assets::Assets.load_test_fonts(cx);
+        let store = SettingsStore::test(cx);
+        cx.set_global(store);
+        theme_settings::init(theme::LoadThemes::JustBase, cx);
+        release_channel::init(semver::Version::new(0, 0, 0), cx);
+        crate::init(cx);
+    });
+    zlog::init_test();
+    update_test_language_settings(cx, &f);
 }
 
 pub fn test_font() -> Font {

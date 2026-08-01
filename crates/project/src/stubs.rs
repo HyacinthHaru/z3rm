@@ -835,18 +835,31 @@ impl Project {
         path: &std::path::Path,
         cx: &mut gpui::Context<Self>,
     ) -> Task<anyhow::Result<Entity<language::Buffer>>> {
-        let Some(project_path) = self
+        if let Some(project_path) = self
             .worktree_store
             .read(cx)
             .project_path_for_absolute_path(path, cx)
-        else {
-            return Task::ready(Err(anyhow::anyhow!(
-                "path is not in a project worktree: {}",
-                path.display()
-            )));
-        };
-        self.buffer_store
-            .update(cx, |store, cx| store.open_buffer(project_path, cx))
+        {
+            return self
+                .buffer_store
+                .update(cx, |store, cx| store.open_buffer(project_path, cx));
+        }
+
+        // A file outside every worktree gets an invisible worktree of its own,
+        // which is how a standalone file is reopened when its editor is restored.
+        let entry = self.worktree_store.update(cx, |worktree_store, cx| {
+            worktree_store.find_or_create_worktree(path, false, cx)
+        });
+        let buffer_store = self.buffer_store.clone();
+        cx.spawn(async move |_, cx| {
+            let (worktree, path) = entry.await?;
+            let worktree_id = worktree.read_with(cx, |worktree, _| worktree.id());
+            buffer_store
+                .update(cx, |store, cx| {
+                    store.open_buffer(ProjectPath { worktree_id, path }, cx)
+                })
+                .await
+        })
     }
 
     pub fn open_path(
@@ -879,14 +892,27 @@ impl Project {
         Task::ready(Err(anyhow::anyhow!("stub: open_local_buffer_via_lsp")))
     }
 
+    /// Resolves either an absolute path or a path prefixed with a visible
+    /// worktree's root name (the form shown in the UI, e.g. `project_root/dir/file`).
     pub fn find_project_path(
         &self,
         full_path: &std::path::Path,
         cx: &gpui::App,
     ) -> Option<ProjectPath> {
-        self.worktree_store
-            .read(cx)
-            .project_path_for_absolute_path(full_path, cx)
+        let worktree_store = self.worktree_store.read(cx);
+        let path_style = worktree_store.path_style();
+        for worktree in worktree_store.visible_worktrees(cx) {
+            let worktree = worktree.read(cx);
+            let root_name = worktree.root_name();
+            if let Some(relative_path) = path_style.strip_prefix(full_path, root_name.as_std_path())
+            {
+                return Some(ProjectPath {
+                    worktree_id: worktree.id(),
+                    path: relative_path.into_arc(),
+                });
+            }
+        }
+        worktree_store.project_path_for_absolute_path(full_path, cx)
     }
 
     pub fn find_worktree(
@@ -897,13 +923,24 @@ impl Project {
         self.worktree_store.read(cx).find_worktree(abs_path, cx)
     }
 
-    /// 存根: 解析绝对文件路径 (来源: spec §8.2 M3)
     pub fn resolve_abs_file_path(
         &mut self,
-        _abs_path: &str,
-        _cx: &mut gpui::Context<Self>,
+        abs_path: &str,
+        cx: &mut gpui::Context<Self>,
     ) -> Task<Option<ProjectPath>> {
-        Task::ready(None)
+        let abs_path = std::path::PathBuf::from(abs_path);
+        if !abs_path.is_absolute() {
+            return Task::ready(None);
+        }
+        let project_path = self.find_project_path(&abs_path, cx);
+        let fs = self.fs.clone();
+        gpui::AppContext::background_spawn(cx, async move {
+            if fs.is_file(&abs_path).await {
+                project_path
+            } else {
+                None
+            }
+        })
     }
 
     pub fn save_buffers(
@@ -947,11 +984,12 @@ impl Project {
 
     pub fn blame_buffer(
         &mut self,
-        _buffer: &Entity<language::Buffer>,
-        _version: Option<git::Oid>,
-        _cx: &mut gpui::Context<Self>,
-    ) -> Task<anyhow::Result<Blame>> {
-        Task::ready(Err(anyhow::anyhow!("stub: blame_buffer")))
+        buffer: &Entity<language::Buffer>,
+        version: Option<clock::Global>,
+        cx: &mut gpui::Context<Self>,
+    ) -> Task<anyhow::Result<Option<Blame>>> {
+        self.git_store
+            .update(cx, |git_store, cx| git_store.blame_buffer(buffer, version, cx))
     }
 
     pub fn references(
@@ -1493,14 +1531,15 @@ impl Project {
         gpui::Task::ready(Err(anyhow::anyhow!("stub: download_file")))
     }
 
-    /// 移动 worktree (stub)
     pub fn move_worktree(
         &mut self,
-        _worktree_id: worktree::WorktreeId,
-        _destination_id: worktree::WorktreeId,
-        _cx: &mut gpui::Context<Self>,
-    ) -> gpui::Task<anyhow::Result<()>> {
-        gpui::Task::ready(Err(anyhow::anyhow!("stub: move_worktree")))
+        worktree_id: worktree::WorktreeId,
+        destination_id: worktree::WorktreeId,
+        cx: &mut gpui::Context<Self>,
+    ) -> anyhow::Result<()> {
+        self.worktree_store.update(cx, |worktree_store, cx| {
+            worktree_store.move_worktree(worktree_id, destination_id, cx)
+        })
     }
 
     /// 获取符号列表
@@ -1510,22 +1549,6 @@ impl Project {
         _cx: &mut gpui::Context<Self>,
     ) -> gpui::Task<anyhow::Result<Vec<crate::lsp_store::SymbolLocation>>> {
         gpui::Task::ready(Ok(Vec::new()))
-    }
-}
-
-/// Stub: FileFinderSettings (open_path_prompt 模块已删除)
-#[derive(Clone, Debug, Default, Serialize, Deserialize)]
-pub struct FileFinderSettings {
-    pub file_icons: bool,
-}
-
-impl settings::SettingsKey for FileFinderSettings {
-    const KEY: Option<&'static str> = None;
-}
-
-impl settings::Settings for FileFinderSettings {
-    fn from_settings(_content: &settings::SettingsContent) -> Self {
-        Self::default()
     }
 }
 

@@ -389,7 +389,6 @@ impl Render for FileDiffView {
 mod tests {
     use super::*;
     use editor::test::editor_test_context::assert_state_with_diff;
-    use gpui::BorrowAppContext;
     use gpui::TestAppContext;
     use language::{Language, LanguageConfig};
     use project::{FakeFs, Fs, Project};
@@ -404,6 +403,7 @@ mod tests {
             let settings_store = SettingsStore::test(cx);
             cx.set_global(settings_store);
             theme_settings::init(theme::LoadThemes::JustBase, cx);
+            editor::init(cx);
         });
     }
 
@@ -553,13 +553,6 @@ mod tests {
         cx: &mut TestAppContext,
     ) {
         init_test(cx);
-        cx.update(|cx| {
-            cx.update_global::<SettingsStore, _>(|store, cx| {
-                store.update_user_settings(cx, |settings| {
-                    settings.editor.diff_view_style = Some(DiffViewStyle::Split);
-                });
-            });
-        });
 
         let fs = FakeFs::new(cx.executor());
         fs.insert_tree(
@@ -572,6 +565,16 @@ mod tests {
         .await;
 
         let project = Project::test(fs.clone(), [path!("/test").as_ref()], cx).await;
+        // Overriding the resolved global has to happen after the project exists:
+        // creating one re-reads the settings files, which would drop the override.
+        cx.update(|cx| {
+            let mut editor_settings = EditorSettings::get_global(cx).clone();
+            editor_settings.diff_view_style = editor::DiffViewStyle::Split;
+            // The test window is narrower than the default minimum split width,
+            // which would auto-collapse the split back to unified.
+            editor_settings.minimum_split_diff_width = 0.0;
+            EditorSettings::override_global(editor_settings, cx);
+        });
         let (multi_workspace, cx) =
             cx.add_window_view(|window, cx| MultiWorkspace::test_new(project.clone(), window, cx));
         let workspace = multi_workspace.read_with(cx, |mw, _| mw.workspace().clone());

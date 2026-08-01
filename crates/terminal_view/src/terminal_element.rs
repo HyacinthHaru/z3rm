@@ -1,14 +1,14 @@
-use accesskit;
 use editor::{CursorLayout, EditorSettings, HighlightedRange, HighlightedRangeLine};
 use gpui::{
-    A11ySubtreeBuilder, AbsoluteLength, AnyElement, App, AvailableSpace, Bounds, ContentMask,
-    Context, DispatchPhase, Element, ElementId, Entity, FocusHandle, Font, FontFeatures, FontStyle,
-    FontWeight, GlobalElementId, HighlightStyle, Hitbox, Hsla, InputHandler, InteractiveElement,
-    Interactivity, IntoElement, LayoutId, Length, ModifiersChangedEvent, MouseButton,
-    MouseMoveEvent, Pixels, Point as GpuiPoint, Role, Stateful, StatefulInteractiveElement,
-    StrikethroughStyle, Styled, TextRun, TextStyle, UTF16Selection, UnderlineStyle, WeakEntity,
-    WhiteSpace, Window, div, fill, point, px, relative, size,
+    AbsoluteLength, AnyElement, App, AvailableSpace, Bounds, ContentMask, Context, DispatchPhase,
+    Element, ElementId, Entity, FocusHandle, Font, FontFeatures, FontStyle, FontWeight,
+    GlobalElementId, HighlightStyle, Hitbox, Hsla, InputHandler, InteractiveElement, Interactivity,
+    IntoElement, LayoutId, Length, ModifiersChangedEvent, MouseButton, MouseMoveEvent, Pixels,
+    Point as GpuiPoint, Role, Stateful, StatefulInteractiveElement, StrikethroughStyle, Styled,
+    TextRun, TextStyle, UTF16Selection, UnderlineStyle, WeakEntity, WhiteSpace, Window, div, fill,
+    point, px, relative, size, A11ySubtreeBuilder,
 };
+use accesskit;
 
 use itertools::Itertools;
 use language::CursorShape as EditorCursorShape;
@@ -16,8 +16,8 @@ use settings::Settings;
 use std::time::Instant;
 use terminal::{
     Cell, Color, Content, CursorShape, IndexedCell, Modes, NamedColor, Point, Range, Terminal,
-    TerminalBounds, is_app_chosen_exact_color as terminal_is_app_chosen_exact_color,
-    is_default_background_color, kitty_graphics, terminal_settings::TerminalSettings,
+    TerminalBounds, VisibleImage, is_app_chosen_exact_color as terminal_is_app_chosen_exact_color,
+    is_default_background_color, terminal_settings::TerminalSettings,
 };
 use theme::{ActiveTheme, Theme};
 use theme_settings::ThemeSettings;
@@ -47,15 +47,8 @@ pub struct LayoutState {
     block_below_cursor_element: Option<AnyElement>,
     base_text_style: TextStyle,
     content_mode: ContentMode,
-    /// Kitty Graphics / OSC 1337 图像叠加层
-    /// 每项: (起始行, 起始列, 宽(格), 高(格), 渲染图像)
-    images: Vec<(
-        usize,
-        usize,
-        usize,
-        usize,
-        std::sync::Arc<gpui::RenderImage>,
-    )>,
+    /// kitty graphics / OSC 1337 图像叠加层, 已按 z-index 排好绘制顺序。
+    images: Vec<(VisibleImage, std::sync::Arc<gpui::RenderImage>)>,
 }
 
 /// Helper struct for converting terminal cursor points to displayed cursor points.
@@ -611,13 +604,6 @@ impl TerminalElement {
         terminal_is_app_chosen_exact_color(*fg)
     }
 
-    fn cell_text_color(hidden: bool, mut foreground: Hsla) -> Hsla {
-        if hidden {
-            foreground.a = 0.0;
-        }
-        foreground
-    }
-
     /// Converts terminal cell styles to GPUI text styles and background color.
     fn cell_style(
         point: Point,
@@ -642,13 +628,9 @@ impl TerminalElement {
             fg.a *= 0.7;
         }
 
-        let underline_color = cell
-            .underline_color()
-            .map(|color| convert_color(&color, colors))
-            .unwrap_or(fg);
         let underline =
             (cell.has_underline() || cell.hyperlink().is_some()).then(|| UnderlineStyle {
-                color: Some(underline_color),
+                color: Some(fg),
                 thickness: Pixels::from(1.0),
                 wavy: cell.has_undercurl(),
             });
@@ -693,12 +675,6 @@ impl TerminalElement {
             if let Some(color) = style.color {
                 result.color = color;
             }
-        }
-
-        result.color = Self::cell_text_color(cell.is_hidden(), result.color);
-        if cell.is_hidden() {
-            result.underline = None;
-            result.strikethrough = None;
         }
 
         result
@@ -1386,13 +1362,7 @@ impl Element for TerminalElement {
                     block_below_cursor_element,
                     base_text_style: text_style,
                     content_mode,
-                    images: resolve_terminal_images(
-                        &self.terminal,
-                        &dimensions,
-                        display_offset,
-                        window,
-                        cx,
-                    ),
+                    images: resolve_terminal_images(&self.terminal, cx),
                 }
             },
         )
@@ -1504,16 +1474,19 @@ impl Element for TerminalElement {
                     }
                     let text_paint_time = text_paint_start.elapsed();
 
-                    // §11.2 渲染 Kitty Graphics / OSC 1337 图像
-                    for (row, col, w, h, render_image) in &layout.images {
+                    // §11.2 渲染 kitty graphics / OSC 1337 图像
+                    for (visible, render_image) in &layout.images {
                         let cell_width = layout.dimensions.cell_width;
                         let line_height = layout.dimensions.line_height;
                         let image_bounds = Bounds {
                             origin: point(
-                                origin.x + (*col as f32 * cell_width),
-                                origin.y + (*row as f32 * line_height),
+                                origin.x + (visible.column as f32 * cell_width),
+                                origin.y + (visible.row as f32 * line_height),
                             ),
-                            size: size(*w as f32 * cell_width, *h as f32 * line_height),
+                            size: size(
+                                visible.columns as f32 * cell_width,
+                                visible.rows as f32 * line_height,
+                            ),
                         };
                         window
                             .paint_image(
@@ -1856,9 +1829,13 @@ fn build_terminal_line_runs(
 /// `value`, `character_lengths` and `word_starts` so platform text patterns
 /// can drive caret/review. Synthetic ids key off the parent node id + a
 /// `(line, chunk)` key, so they are stable frame-to-frame.
-fn push_terminal_line_text_runs(builder: &mut A11ySubtreeBuilder, runs: &[BatchedTextRun]) {
-    let runs =
-        build_terminal_line_runs(runs, |line, chunk| builder.synthetic_node_id((line, chunk)));
+fn push_terminal_line_text_runs(
+    builder: &mut A11ySubtreeBuilder,
+    runs: &[BatchedTextRun],
+) {
+    let runs = build_terminal_line_runs(runs, |line, chunk| {
+        builder.synthetic_node_id((line, chunk))
+    });
     for (id, node) in runs {
         builder.push_child(id, node);
     }
@@ -1971,54 +1948,28 @@ pub fn convert_color(fg: &Color, theme: &Theme) -> Hsla {
     }
 }
 
-/// §11.2 将 Content 中的图像引用解析为 GPUI RenderImage
+/// §11.2 把 `Content` 里的图像引用换成缓存中已解码好的 `RenderImage`。
+///
+/// 可见性和视口行号在 `Terminal::sync` 里就算好了, 这里只做查表, 所以绘制
+/// 一帧不会触发任何图像解码。
 fn resolve_terminal_images(
     terminal: &Entity<Terminal>,
-    dimensions: &TerminalBounds,
-    display_offset: usize,
-    _window: &mut Window,
     cx: &mut App,
-) -> Vec<(
-    usize,
-    usize,
-    usize,
-    usize,
-    std::sync::Arc<gpui::RenderImage>,
-)> {
-    let content = terminal.read(cx).last_content.clone();
-    let cache = terminal.read(cx).image_cache();
+) -> Vec<(VisibleImage, std::sync::Arc<gpui::RenderImage>)> {
+    let terminal = terminal.read(cx);
+    let cache = terminal.image_cache();
 
-    content
+    let mut images: Vec<(VisibleImage, std::sync::Arc<gpui::RenderImage>)> = terminal
+        .last_content
         .images
-        .into_iter()
-        .filter_map(|(img_id, row, col, w, h)| {
-            // 检查图像是否在可见区域内
-            let visible_row_start = display_offset as i32;
-            let visible_row_end = visible_row_start + dimensions.num_lines() as i32;
-            if row as i32 + h as i32 <= visible_row_start || row as i32 >= visible_row_end {
-                return None;
-            }
-
-            // 从缓存中获取图像数据并解码
-            let parsed = cache.get(img_id)?;
-            let render_image = kitty_graphics::decode_to_render_image(&parsed.data)?;
-            Some((row, col, w, h, render_image))
+        .iter()
+        .filter_map(|visible| {
+            let cached = cache.get(visible.id)?;
+            Some((*visible, cached.image.render_image.clone()))
         })
-        .collect()
-}
-
-#[cfg(test)]
-mod structured_render_tests {
-    use super::*;
-
-    #[test]
-    fn hidden_cells_render_with_transparent_foreground() {
-        assert_eq!(
-            TerminalElement::cell_text_color(false, gpui::red()),
-            gpui::red()
-        );
-        assert_eq!(TerminalElement::cell_text_color(true, gpui::red()).a, 0.0);
-    }
+        .collect();
+    images.sort_by_key(|(visible, _)| visible.z_index);
+    images
 }
 
 #[cfg(all(test, feature = "z3rm-migration"))]
@@ -2840,13 +2791,7 @@ mod tests {
             .collect();
         assert_eq!(values, vec!["foo-bar", "baz"]);
         // Three runs on line 3 collapse to a single TextRun node.
-        assert_eq!(
-            nodes
-                .iter()
-                .filter(|(_, n)| n.value() == Some("foo-bar"))
-                .count(),
-            1
-        );
+        assert_eq!(nodes.iter().filter(|(_, n)| n.value() == Some("foo-bar")).count(), 1);
     }
 
     /// A single line longer than [`MAX_CHARS_PER_A11Y_RUN`] characters must
@@ -2866,29 +2811,27 @@ mod tests {
             .iter()
             .map(|(_, n)| n.value().map(str::len).unwrap_or(0))
             .sum();
-        assert_eq!(
-            total,
-            long.len(),
-            "chunk values concatenate back to the line"
-        );
+        assert_eq!(total, long.len(), "chunk values concatenate back to the line");
 
         // Chunk 0 has `next_on_line`, chunk 2 has `previous_on_line`, chunk 1
         // has both. The middle chunk must not be orphaned: it links both ways.
-        let has_next = |i: usize| nodes[i].1.next_on_line().is_some();
+        let has_next = |i: usize| {
+            nodes[i].1.next_on_line().is_some()
+        };
         let has_prev = |i: usize| nodes[i].1.previous_on_line().is_some();
-        assert!(
-            has_next(0) && !has_prev(0),
-            "first chunk links forward only"
-        );
+        assert!(has_next(0) && !has_prev(0), "first chunk links forward only");
         assert!(has_next(1) && has_prev(1), "middle chunk links both ways");
-        assert!(
-            !has_next(2) && has_prev(2),
-            "last chunk links backward only"
-        );
+        assert!(!has_next(2) && has_prev(2), "last chunk links backward only");
 
         // Chunks link to the neighbouring chunks' ids.
-        assert_eq!(nodes[0].1.next_on_line(), Some(fake_id(0, 1)),);
-        assert_eq!(nodes[2].1.previous_on_line(), Some(fake_id(0, 1)),);
+        assert_eq!(
+            nodes[0].1.next_on_line(),
+            Some(fake_id(0, 1)),
+        );
+        assert_eq!(
+            nodes[2].1.previous_on_line(),
+            Some(fake_id(0, 1)),
+        );
     }
 
     /// `character_lengths` and `word_starts` are the inputs the platform text
@@ -2914,13 +2857,10 @@ mod tests {
     fn a11y_trailing_blanks_are_trimmed_not_announced() {
         let runs = vec![
             a11y_run(0, "done.   "), // trailing spaces within a non-empty line
-            a11y_run(1, "   "),      // entirely blank row
+            a11y_run(1, "   "), // entirely blank row
         ];
         let nodes = build_terminal_line_runs(&runs, fake_id);
-        let values: Vec<&str> = nodes
-            .iter()
-            .map(|(_, n)| n.value().unwrap_or_default())
-            .collect();
+        let values: Vec<&str> = nodes.iter().map(|(_, n)| n.value().unwrap_or_default()).collect();
         assert_eq!(values, vec!["done.", ""]);
     }
 

@@ -83,8 +83,7 @@ pub const MAX_VARINT_LEN: usize = 10;
 pub const MAX_FRAME_PAYLOAD: usize = 64 * 1024 * 1024;
 
 /// Maximum number of direction-changing split levels in a wire layout.
-/// Each level consumes both a `LayoutNode` and a `SplitNode` decoder frame,
-/// so this stays well below prost's decode recursion budget.
+/// Each level consumes both a `LayoutNode` and a `SplitNode` decoder frame.
 pub const MAX_LAYOUT_WIRE_DEPTH: usize = 32;
 
 pub const MAX_GRID_COLUMNS: usize = 4_096;
@@ -366,17 +365,8 @@ mod key_tests {
     #[test]
     fn parse_function_keys() {
         let expected: [&[u8]; 12] = [
-            b"\x1bOP",
-            b"\x1bOQ",
-            b"\x1bOR",
-            b"\x1bOS",
-            b"\x1b[15~",
-            b"\x1b[17~",
-            b"\x1b[18~",
-            b"\x1b[19~",
-            b"\x1b[20~",
-            b"\x1b[21~",
-            b"\x1b[23~",
+            b"\x1bOP", b"\x1bOQ", b"\x1bOR", b"\x1bOS", b"\x1b[15~", b"\x1b[17~",
+            b"\x1b[18~", b"\x1b[19~", b"\x1b[20~", b"\x1b[21~", b"\x1b[23~",
             b"\x1b[24~",
         ];
         for (index, sequence) in expected.into_iter().enumerate() {
@@ -597,17 +587,8 @@ mod target_tests {
     #[test]
     fn malformed_targets_are_rejected_instead_of_falling_back_to_zero() {
         for target in [
-            "",
-            "%",
-            "%abc",
-            "%4294967296",
-            "dev:x.1",
-            "dev:1.x",
-            "dev:.",
-            "dev.1",
-            "dev:1",
-            "dev:1.2.3",
-            ":1.2",
+            "", "%", "%abc", "%4294967296", "dev:x.1", "dev:1.x", "dev:.",
+            "dev.1", "dev:1", "dev:1.2.3", ":1.2",
         ] {
             assert!(
                 parse_target(&Some(target.to_string())).is_err(),

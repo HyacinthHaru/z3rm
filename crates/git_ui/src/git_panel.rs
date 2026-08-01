@@ -35,7 +35,8 @@ use git::status::{DiffStat, StageStatus};
 use git::{Amend, Commit, Signoff, ToggleStaged, repository::RepoPath, status::FileStatus};
 use git::{
     GitHostingProviderRegistry, GitRemote, RestoreTrackedFiles, StageAll, StashAll, StashApply,
-    StashPop, TrashUntrackedFiles, UnstageAll, ViewFile, parse_git_remote_url,
+    StashPop, ToggleFillCommitEditor, TrashUntrackedFiles, UnstageAll, ViewFile,
+    parse_git_remote_url,
 };
 use gpui::{
     AbsoluteLength, Action, Anchor, AnyElement, AsyncApp, AsyncWindowContext, ClickEvent,
@@ -62,11 +63,11 @@ use project::{
     project_settings::{GitPathStyle, ProjectSettings},
 };
 // use prompt_store::RULES_FILE_NAMES;  // removed-crate: prompt_store
+use proto::RpcError;
+use serde::{Deserialize, Serialize};
 use crate::git_panel_settings::{
     GitPanelClickBehavior, GitPanelGroupBy, GitPanelSortBy, StatusStyle,
 };
-use proto::RpcError;
-use serde::{Deserialize, Serialize};
 use settings::{Settings, SettingsStore, update_settings_file};
 use smallvec::SmallVec;
 use std::cell::Cell;
@@ -374,6 +375,13 @@ pub fn register(workspace: &mut Workspace) {
     workspace.register_action(|workspace, _: &Toggle, window, cx| {
         if !workspace.toggle_panel_focus::<GitPanel>(window, cx) {
             workspace.close_panel::<GitPanel>(window, cx);
+        }
+    });
+    workspace.register_action(|workspace, _: &ToggleFillCommitEditor, window, cx| {
+        if let Some(panel) = workspace.panel::<GitPanel>(cx) {
+            panel.update(cx, |panel, cx| {
+                panel.toggle_fill_commit_editor(&ToggleFillCommitEditor, window, cx)
+            });
         }
     });
     workspace.register_action(|workspace, _: &git::Init, window, cx| {
@@ -1063,6 +1071,7 @@ impl GitPanel {
             });
 
             let scroll_handle = UniformListScrollHandle::new();
+
 
             cx.subscribe_in(
                 &git_store,
@@ -2193,9 +2202,9 @@ impl GitPanel {
                         let project_path = active_repo
                             .read(cx)
                             .repo_path_to_project_path(&entry.repo_path, cx)?;
-                        Some(workspace.project().update(cx, |project, cx| {
-                            project.delete_file(project_path, true, cx)
-                        }))
+                        Some(workspace
+                            .project()
+                            .update(cx, |project, cx| project.delete_file(project_path, true, cx)))
                     })
                     .collect::<Vec<_>>()
             })?;
@@ -2992,6 +3001,7 @@ impl GitPanel {
         Some(format!("{} {}", action_text, file_name))
     }
 
+
     fn split_patch(patch: &str) -> Vec<String> {
         let mut result = Vec::new();
         let mut current_patch = String::new();
@@ -3082,6 +3092,7 @@ impl GitPanel {
         compressed
     }
 
+
     fn build_commit_message_prompt(
         prompt: &str,
         user_agents_md: Option<&str>,
@@ -3124,6 +3135,7 @@ impl GitPanel {
             "{prompt}{user_agents_md_section}{rules_section}{instructions_section}{subject_section}\nHere are the changes in this commit:\n{diff_text}"
         )
     }
+
 
     fn get_fetch_options(
         &self,
@@ -3300,7 +3312,11 @@ impl GitPanel {
                 let fallback_branch_name = GitPanelSettings::get_global(cx)
                     .fallback_branch_name
                     .clone();
-                project.git_init(worktree.read(cx).abs_path(), fallback_branch_name, cx)
+                project.git_init(
+                    worktree.read(cx).abs_path(),
+                    fallback_branch_name,
+                    cx,
+                )
             });
 
             let result = result.await;
@@ -4777,6 +4793,7 @@ impl GitPanel {
             .anchor(Anchor::TopRight)
     }
 
+
     pub(crate) fn render_co_authors(&self, cx: &Context<Self>) -> Option<AnyElement> {
         let potential_co_authors = self.potential_co_authors(cx);
 
@@ -4911,6 +4928,31 @@ impl GitPanel {
         } else {
             "Commit Tracked"
         }
+    }
+
+    fn toggle_fill_commit_editor(
+        &mut self,
+        _: &ToggleFillCommitEditor,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.commit_editor_expanded = !self.commit_editor_expanded;
+        self.commit_editor.update(cx, |editor, _cx| {
+            if self.commit_editor_expanded {
+                editor.set_mode(EditorMode::Full {
+                    scale_ui_elements_with_buffer_font_size: false,
+                    show_active_line_background: false,
+                    sizing_behavior: SizingBehavior::ExcludeOverscrollMargin,
+                })
+            } else {
+                editor.set_mode(EditorMode::AutoHeight {
+                    min_lines: MAX_PANEL_EDITOR_LINES,
+                    max_lines: Some(MAX_PANEL_EDITOR_LINES),
+                })
+            }
+        });
+
+        cx.notify();
     }
 
     fn render_git_changes_actions_menu(
@@ -7173,6 +7215,7 @@ impl GitPanel {
     }
 }
 
+
 impl GitPanel {
     pub fn selected_file_history_target(&self) -> Option<(Entity<Repository>, RepoPath)> {
         let entry = self.get_selected_entry()?.status_entry()?;
@@ -8033,7 +8076,7 @@ mod tests {
         repository::repo_path,
         status::{StatusCode, TrackedStatus, UnmergedStatus, UnmergedStatusCode},
     };
-    use gpui::{TestAppContext, UpdateGlobal, VisualTestContext, px};
+    use gpui::{TestAppContext, VisualTestContext, px};
     use indoc::indoc;
     use project::FakeFs;
     use serde_json::json;
@@ -8056,6 +8099,16 @@ mod tests {
             editor::init(cx);
             crate::init(cx);
         });
+    }
+
+    /// `SettingsContent` no longer carries a `git_panel` section, so
+    /// `GitPanelSettings::from_settings` always yields the built-in defaults.
+    /// Tests therefore override the resolved global directly instead of writing
+    /// user settings JSON.
+    fn update_git_panel_settings(cx: &mut gpui::App, update: impl FnOnce(&mut GitPanelSettings)) {
+        let mut settings = GitPanelSettings::get_global(cx).clone();
+        update(&mut settings);
+        GitPanelSettings::override_global(settings, cx);
     }
 
     #[test]
@@ -8314,10 +8367,8 @@ mod tests {
         .await;
 
         cx.update(|_window, cx| {
-            SettingsStore::update_global(cx, |store, cx| {
-                store.update_user_settings(cx, |settings| {
-                    settings.git_panel.get_or_insert_default().sort_by = Some(GitPanelSortBy::Path);
-                })
+            update_git_panel_settings(cx, |settings| {
+                settings.sort_by = GitPanelSortBy::Path;
             });
         });
 
@@ -8358,10 +8409,8 @@ mod tests {
         .await;
 
         cx.update(|_window, cx| {
-            SettingsStore::update_global(cx, |store, cx| {
-                store.update_user_settings(cx, |settings| {
-                    settings.git_panel.get_or_insert_default().tree_view = Some(true);
-                })
+            update_git_panel_settings(cx, |settings| {
+                settings.tree_view = true;
             });
         });
         await_git_panel_entries(&panel, &mut cx).await;
@@ -8863,11 +8912,8 @@ mod tests {
         let mut cx = VisualTestContext::from_window(window_handle.into(), cx);
 
         cx.update(|_window, cx| {
-            SettingsStore::update_global(cx, |store, cx| {
-                store.update_user_settings(cx, |settings| {
-                    settings.git_panel.get_or_insert_default().group_by =
-                        Some(GitPanelGroupBy::Staging);
-                })
+            update_git_panel_settings(cx, |settings| {
+                settings.group_by = GitPanelGroupBy::Staging;
             });
         });
 
@@ -9085,11 +9131,8 @@ mod tests {
         let mut cx = VisualTestContext::from_window(window_handle.into(), cx);
 
         cx.update(|_window, cx| {
-            SettingsStore::update_global(cx, |store, cx| {
-                store.update_user_settings(cx, |settings| {
-                    settings.git_panel.get_or_insert_default().group_by =
-                        Some(GitPanelGroupBy::Staging);
-                })
+            update_git_panel_settings(cx, |settings| {
+                settings.group_by = GitPanelGroupBy::Staging;
             });
         });
 
@@ -9215,11 +9258,8 @@ mod tests {
         let mut cx = VisualTestContext::from_window(window_handle.into(), cx);
 
         cx.update(|_window, cx| {
-            SettingsStore::update_global(cx, |store, cx| {
-                store.update_user_settings(cx, |settings| {
-                    settings.git_panel.get_or_insert_default().group_by =
-                        Some(GitPanelGroupBy::Staging);
-                })
+            update_git_panel_settings(cx, |settings| {
+                settings.group_by = GitPanelGroupBy::Staging;
             });
         });
 
@@ -9283,11 +9323,8 @@ mod tests {
         let mut cx = VisualTestContext::from_window(window_handle.into(), cx);
 
         cx.update(|_window, cx| {
-            SettingsStore::update_global(cx, |store, cx| {
-                store.update_user_settings(cx, |settings| {
-                    settings.git_panel.get_or_insert_default().group_by =
-                        Some(GitPanelGroupBy::Staging);
-                })
+            update_git_panel_settings(cx, |settings| {
+                settings.group_by = GitPanelGroupBy::Staging;
             });
         });
 
@@ -9661,11 +9698,8 @@ mod tests {
         });
 
         cx.update(|_window, cx| {
-            SettingsStore::update_global(cx, |store, cx| {
-                store.update_user_settings(cx, |settings| {
-                    settings.git_panel.get_or_insert_default().group_by =
-                        Some(GitPanelGroupBy::None);
-                })
+            update_git_panel_settings(cx, |settings| {
+                settings.group_by = GitPanelGroupBy::None;
             });
         });
 
@@ -10256,11 +10290,8 @@ mod tests {
         // as there should no longer be separators between Tracked and Untracked
         // files.
         cx.update(|_window, cx| {
-            SettingsStore::update_global(cx, |store, cx| {
-                store.update_user_settings(cx, |settings| {
-                    settings.git_panel.get_or_insert_default().group_by =
-                        Some(GitPanelGroupBy::None);
-                })
+            update_git_panel_settings(cx, |settings| {
+                settings.group_by = GitPanelGroupBy::None;
             });
         });
 
@@ -10383,12 +10414,9 @@ mod tests {
 
         cx.executor().run_until_parked();
         cx.update(|_window, cx| {
-            SettingsStore::update_global(cx, |store, cx| {
-                store.update_user_settings(cx, |settings| {
-                    let git_panel = settings.git_panel.get_or_insert_default();
-                    git_panel.tree_view = Some(true);
-                    git_panel.group_by = Some(GitPanelGroupBy::None);
-                })
+            update_git_panel_settings(cx, |settings| {
+                settings.tree_view = true;
+                settings.group_by = GitPanelGroupBy::None;
             });
         });
 
@@ -10496,10 +10524,8 @@ mod tests {
         cx.executor().run_until_parked();
 
         cx.update(|_window, cx| {
-            SettingsStore::update_global(cx, |store, cx| {
-                store.update_user_settings(cx, |settings| {
-                    settings.git_panel.get_or_insert_default().tree_view = Some(true);
-                })
+            update_git_panel_settings(cx, |settings| {
+                settings.tree_view = true;
             });
         });
 
@@ -10624,10 +10650,8 @@ mod tests {
 
         cx.executor().run_until_parked();
         cx.update(|_window, cx| {
-            SettingsStore::update_global(cx, |store, cx| {
-                store.update_user_settings(cx, |settings| {
-                    settings.git_panel.get_or_insert_default().tree_view = Some(true);
-                })
+            update_git_panel_settings(cx, |settings| {
+                settings.tree_view = true;
             });
         });
 
@@ -11014,11 +11038,8 @@ mod tests {
         assert_eq!(message, Some("Update tracked".to_string()));
 
         cx.update(|_window, cx| {
-            SettingsStore::update_global(cx, |store, cx| {
-                store.update_user_settings(cx, |settings| {
-                    settings.git_panel.get_or_insert_default().group_by =
-                        Some(GitPanelGroupBy::Staging);
-                });
+            update_git_panel_settings(cx, |settings| {
+                settings.group_by = GitPanelGroupBy::Staging;
             });
         });
         await_git_panel_entries(&panel, cx).await;

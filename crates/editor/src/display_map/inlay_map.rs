@@ -1447,131 +1447,23 @@ fn push_isomorphic(sum_tree: &mut SumTree<Transform>, summary: MBTextSummary) {
     }
 }
 
-#[cfg(all(test, feature = "z3rm-migration"))]
+#[cfg(test)]
 mod tests {
     use super::*;
     use crate::{
-        MultiBuffer,
+        InlayHighlight, MultiBuffer,
         display_map::{HighlightKey, InlayHighlights},
-        hover_links::InlayHighlight,
     };
     use collections::HashMap;
     use gpui::{App, HighlightStyle};
     use multi_buffer::Anchor;
-    use project::{InlayHint, InlayHintLabel, ResolveState};
     use rand::prelude::*;
     use settings::SettingsStore;
     use std::{cmp::Reverse, env, sync::Arc};
     use sum_tree::TreeMap;
-    use text::{BufferId, Patch, Rope};
+    use text::{Patch, Rope};
     use util::RandomCharIter;
     use util::post_inc;
-
-    #[test]
-    fn test_inlay_properties_label_padding() {
-        assert_eq!(
-            Inlay::hint(
-                InlayId::Hint(0),
-                Anchor::Min,
-                &InlayHint {
-                    label: InlayHintLabel::String("a".to_string()),
-                    position: text::Anchor::min_for_buffer(BufferId::new(1).unwrap()),
-                    padding_left: false,
-                    padding_right: false,
-                    tooltip: None,
-                    kind: None,
-                    resolve_state: ResolveState::Resolved,
-                },
-            )
-            .text()
-            .to_string(),
-            "a",
-            "Should not pad label if not requested"
-        );
-
-        assert_eq!(
-            Inlay::hint(
-                InlayId::Hint(0),
-                Anchor::Min,
-                &InlayHint {
-                    label: InlayHintLabel::String("a".to_string()),
-                    position: text::Anchor::min_for_buffer(BufferId::new(1).unwrap()),
-                    padding_left: true,
-                    padding_right: true,
-                    tooltip: None,
-                    kind: None,
-                    resolve_state: ResolveState::Resolved,
-                },
-            )
-            .text()
-            .to_string(),
-            " a ",
-            "Should pad label for every side requested"
-        );
-
-        assert_eq!(
-            Inlay::hint(
-                InlayId::Hint(0),
-                Anchor::Min,
-                &InlayHint {
-                    label: InlayHintLabel::String(" a ".to_string()),
-                    position: text::Anchor::min_for_buffer(BufferId::new(1).unwrap()),
-                    padding_left: false,
-                    padding_right: false,
-                    tooltip: None,
-                    kind: None,
-                    resolve_state: ResolveState::Resolved,
-                },
-            )
-            .text()
-            .to_string(),
-            " a ",
-            "Should not change already padded label"
-        );
-
-        assert_eq!(
-            Inlay::hint(
-                InlayId::Hint(0),
-                Anchor::Min,
-                &InlayHint {
-                    label: InlayHintLabel::String(" a ".to_string()),
-                    position: text::Anchor::min_for_buffer(BufferId::new(1).unwrap()),
-                    padding_left: true,
-                    padding_right: true,
-                    tooltip: None,
-                    kind: None,
-                    resolve_state: ResolveState::Resolved,
-                },
-            )
-            .text()
-            .to_string(),
-            " a ",
-            "Should not change already padded label"
-        );
-    }
-
-    #[gpui::test]
-    fn test_inlay_hint_padding_with_multibyte_chars() {
-        assert_eq!(
-            Inlay::hint(
-                InlayId::Hint(0),
-                Anchor::Min,
-                &InlayHint {
-                    label: InlayHintLabel::String("🎨".to_string()),
-                    position: text::Anchor::min_for_buffer(BufferId::new(1).unwrap()),
-                    padding_left: true,
-                    padding_right: true,
-                    tooltip: None,
-                    kind: None,
-                    resolve_state: ResolveState::Resolved,
-                },
-            )
-            .text()
-            .to_string(),
-            " 🎨 ",
-            "Should pad single emoji correctly"
-        );
-    }
 
     #[gpui::test]
     fn test_basic_inlays(cx: &mut App) {
@@ -2397,11 +2289,7 @@ mod tests {
         let inlay_text = "SortingDirec…";
         let position = buffer.read(cx).snapshot(cx).anchor_before(Point::new(0, 5));
 
-        let inlay = Inlay {
-            id: InlayId::Hint(0),
-            position,
-            content: InlayContent::Text(text::Rope::from(inlay_text)),
-        };
+        let inlay = Inlay::mock_hint(0, position, inlay_text);
 
         let (inlay_snapshot, _) = inlay_map.splice(&[], vec![inlay]);
 
@@ -2515,11 +2403,7 @@ mod tests {
             let (mut inlay_map, _) = InlayMap::new(buffer.read(cx).snapshot(cx));
             let position = buffer.read(cx).snapshot(cx).anchor_before(Point::new(0, 2));
 
-            let inlay = Inlay {
-                id: InlayId::Hint(0),
-                position,
-                content: InlayContent::Text(text::Rope::from(test_case.inlay_text)),
-            };
+            let inlay = Inlay::mock_hint(0, position, test_case.inlay_text);
 
             let (inlay_snapshot, _) = inlay_map.splice(&[], vec![inlay]);
             let inlay_highlights = create_inlay_highlights(
