@@ -622,7 +622,12 @@ fn maybe_propagate_worktree_trust(
             return;
         }
 
-        let worktree_store = new_workspace.read(cx).project().read(cx).worktree_store().clone();
+        let worktree_store = new_workspace
+            .read(cx)
+            .project()
+            .read(cx)
+            .worktree_store()
+            .clone();
         let paths_to_trust: HashSet<_> = paths
             .iter()
             .filter_map(|path| {
@@ -1372,7 +1377,7 @@ mod tests {
     use std::path::{Path, PathBuf};
     use std::process::ExitStatus;
     use std::sync::Mutex;
-// use task::SpawnInTerminal;  // removed-crate: task
+    // use task::SpawnInTerminal;  // removed-crate: task
     use theme::LoadThemes;
     use util::path;
     use util::rel_path::rel_path;

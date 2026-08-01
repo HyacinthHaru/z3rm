@@ -1,6 +1,5 @@
 use gpui::{
-    FontFeatures, FontStyle, FontWeight, Pixels, SharedString,
-    WindowBackgroundAppearance, px,
+    FontFeatures, FontStyle, FontWeight, Pixels, SharedString, WindowBackgroundAppearance, px,
 };
 use settings_content::{
     FontFamilyName, FontFeaturesContent, FontSize, FontStyleContent, FontWeightContent,
@@ -53,7 +52,6 @@ impl IntoGpui for WindowBackgroundContent {
         }
     }
 }
-
 
 impl IntoGpui for FontSize {
     type Output = Pixels;

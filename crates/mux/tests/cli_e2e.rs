@@ -145,10 +145,7 @@ fn cli_kill_removes_session() -> Result<()> {
 
     let (code, stdout, _) = env.run(&["kill", "-t", "to-kill"])?;
     assert_eq!(code, 0);
-    assert!(
-        stdout.contains("killed session to-kill"),
-        "got: {stdout}"
-    );
+    assert!(stdout.contains("killed session to-kill"), "got: {stdout}");
 
     let (_, ls, _) = env.run(&["ls"])?;
     assert!(
@@ -225,21 +222,23 @@ fn cli_capture_pane_escape_flag_preserves_ansi() -> Result<()> {
     let (code, plain, stderr) = env.run(&["capture-pane", "-t", "ansi-capture", "-p"])?;
     assert_eq!(code, 0, "plain capture failed: {stderr}");
     assert!(plain.contains("ANSI_MARKER"), "plain capture: {plain:?}");
-    assert!(!plain.contains("\u{1b}["), "plain capture leaked ANSI: {plain:?}");
+    assert!(
+        !plain.contains("\u{1b}["),
+        "plain capture leaked ANSI: {plain:?}"
+    );
 
-    let (code, escaped, stderr) = env.run(&[
-        "capture-pane",
-        "-t",
-        "ansi-capture",
-        "-p",
-        "-e",
-    ])?;
+    let (code, escaped, stderr) = env.run(&["capture-pane", "-t", "ansi-capture", "-p", "-e"])?;
     assert_eq!(code, 0, "escaped capture failed: {stderr}");
     assert!(
-        escaped.contains("\u{1b}[31m") || escaped.contains(";31m") || escaped.contains("\u{1b}[0;31m"),
+        escaped.contains("\u{1b}[31m")
+            || escaped.contains(";31m")
+            || escaped.contains("\u{1b}[0;31m"),
         "escaped capture should include red SGR, got: {escaped:?}"
     );
-    assert!(escaped.contains("\u{1b}[0m"), "escaped capture: {escaped:?}");
+    assert!(
+        escaped.contains("\u{1b}[0m"),
+        "escaped capture: {escaped:?}"
+    );
 
     Ok(())
 }

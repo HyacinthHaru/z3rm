@@ -37,7 +37,9 @@ pub enum WindowDecorations {
 }
 
 /// The text rendering mode to use.
-#[derive(Copy, Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema, MergeFrom)]
+#[derive(
+    Copy, Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema, MergeFrom,
+)]
 #[serde(rename_all = "snake_case")]
 pub enum TextRenderingMode {
     /// Use the platform default.
@@ -59,7 +61,9 @@ pub struct FocusFollowsMouse {
 }
 
 /// What to do when the last window is closed.
-#[derive(Copy, Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema, MergeFrom)]
+#[derive(
+    Copy, Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema, MergeFrom,
+)]
 #[serde(rename_all = "snake_case")]
 pub enum OnLastWindowClosed {
     /// Do nothing.
@@ -91,7 +95,9 @@ pub struct TabBarSettingsContent {
 }
 
 /// Position of the close button in a tab.
-#[derive(Copy, Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema, MergeFrom)]
+#[derive(
+    Copy, Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema, MergeFrom,
+)]
 #[serde(rename_all = "lowercase")]
 pub enum ShowCloseButton {
     /// Show when the mouse hovers over the tab.
@@ -133,7 +139,9 @@ pub struct StatusBarSettingsContent {
 }
 
 /// 行号指示器格式 (spec §16 Plan 16)
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema, MergeFrom)]
+#[derive(
+    Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema, MergeFrom,
+)]
 #[serde(rename_all = "snake_case")]
 pub enum LineIndicatorFormat {
     #[default]
@@ -142,7 +150,9 @@ pub enum LineIndicatorFormat {
 }
 
 /// 编码显示选项 (spec §16 Plan 16)
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema, MergeFrom)]
+#[derive(
+    Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema, MergeFrom,
+)]
 #[serde(rename_all = "snake_case")]
 pub enum EncodingDisplayOptions {
     #[default]

@@ -875,7 +875,6 @@ impl Language {
         }
     }
 
-
     pub fn with_toolchain_lister(mut self, provider: Option<Arc<dyn ToolchainLister>>) -> Self {
         self.toolchain = provider;
         self

@@ -70,7 +70,9 @@ impl RttEstimator {
     /// 限制在 [RTO_MIN, RTO_MAX] 范围内。
     pub fn rto(&self) -> Duration {
         let rto_ms = self.srtt + (4.0 * self.rttvar).max(RTO_MIN.as_millis() as f64);
-        let rto_ms = rto_ms.max(RTO_MIN.as_millis() as f64).min(RTO_MAX.as_millis() as f64);
+        let rto_ms = rto_ms
+            .max(RTO_MIN.as_millis() as f64)
+            .min(RTO_MAX.as_millis() as f64);
         Duration::from_millis(rto_ms as u64)
     }
 

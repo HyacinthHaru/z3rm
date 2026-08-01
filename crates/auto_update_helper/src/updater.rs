@@ -428,7 +428,7 @@ pub(crate) fn perform_update(app_dir: &Path, hwnd: Option<isize>, launch: bool) 
 
     if launch {
         #[allow(clippy::disallowed_methods, reason = "doesn't run in the main binary")]
-        let _ = std::process::Command::new(app_dir.join("z3rm.exe")));
+        let _ = std::process::Command::new(app_dir.join("z3rm.exe")).spawn();
     }
     log::info!("Update completed successfully");
     Ok(())

@@ -3872,7 +3872,10 @@ impl GitGraph {
                             .size_full()
                             .overflow_y_scroll()
                             .track_scroll(scroll_handle)
-                            .child(MarkdownElement::new(message.clone(), markdown::MarkdownStyle::default())),
+                            .child(MarkdownElement::new(
+                                message.clone(),
+                                markdown::MarkdownStyle::default(),
+                            )),
                     )
                     .vertical_scrollbar_for(scroll_handle, window, cx),
             )
@@ -4897,7 +4900,7 @@ mod tests {
             let settings_store = SettingsStore::test(cx);
             cx.set_global(settings_store);
             theme_settings::init(theme::LoadThemes::JustBase, cx);
-//             language_model::init(cx);
+            //             language_model::init(cx);
             crate::init(cx);
         });
     }

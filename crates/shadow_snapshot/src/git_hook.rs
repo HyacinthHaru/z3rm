@@ -4,12 +4,11 @@
 //! 下一次 GC cycle 优先回收 gc-eligible nodes。
 
 use std::collections::HashSet;
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 
-use parking_lot::Mutex;
 use crate::version_tree::VersionId;
-
+use parking_lot::Mutex;
 
 /// Git commit hook handler (§4.9)
 ///

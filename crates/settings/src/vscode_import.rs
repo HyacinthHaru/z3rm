@@ -5,7 +5,10 @@ use fs::Fs;
 use gpui::Rgba;
 use paths::{cursor_settings_file_paths, vscode_settings_file_paths};
 use serde_json::{Map, Value};
-use std::{path::{Path, PathBuf}, sync::Arc};
+use std::{
+    path::{Path, PathBuf},
+    sync::Arc,
+};
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum VsCodeSettingsSource {
@@ -60,12 +63,24 @@ impl VsCodeSettings {
             ));
         };
         let content = fs.load(&path).await.with_context(|| {
-            format!("Error loading {} settings file from {}", source, path.display())
+            format!(
+                "Error loading {} settings file from {}",
+                source,
+                path.display()
+            )
         })?;
         let content = serde_json_lenient::from_str(&content).with_context(|| {
-            format!("Error parsing {} settings file from {}", source, path.display())
+            format!(
+                "Error parsing {} settings file from {}",
+                source,
+                path.display()
+            )
         })?;
-        Ok(Self { source, path: path.into(), content })
+        Ok(Self {
+            source,
+            path: path.into(),
+            content,
+        })
     }
 
     fn read_value(&self, setting: &str) -> Option<&Value> {
@@ -73,7 +88,9 @@ impl VsCodeSettings {
     }
 
     fn read_string(&self, setting: &str) -> Option<String> {
-        self.read_value(setting).and_then(|v| v.as_str()).map(|s| s.to_owned())
+        self.read_value(setting)
+            .and_then(|v| v.as_str())
+            .map(|s| s.to_owned())
     }
 
     fn read_bool(&self, setting: &str) -> Option<bool> {
@@ -81,11 +98,15 @@ impl VsCodeSettings {
     }
 
     fn read_f32(&self, setting: &str) -> Option<f32> {
-        self.read_value(setting).and_then(|v| v.as_f64()).map(|v| v as f32)
+        self.read_value(setting)
+            .and_then(|v| v.as_f64())
+            .map(|v| v as f32)
     }
 
     fn read_usize(&self, setting: &str) -> Option<usize> {
-        self.read_value(setting).and_then(|v| v.as_u64()).and_then(|v| v.try_into().ok())
+        self.read_value(setting)
+            .and_then(|v| v.as_u64())
+            .and_then(|v| v.try_into().ok())
     }
 
     fn read_enum<T>(&self, key: &str, f: impl FnOnce(&str) -> Option<T>) -> Option<T> {
@@ -108,14 +129,24 @@ impl VsCodeSettings {
         };
         for ch in css_name.chars() {
             match (ch, quote_char) {
-                ('"' | '\'', None) => { quote_char = Some(ch); }
-                (_, Some(q)) if ch == q => { quote_char = None; }
-                (',', None) => { add_font(&mut name_buffer); }
-                _ => { name_buffer.push(ch); }
+                ('"' | '\'', None) => {
+                    quote_char = Some(ch);
+                }
+                (_, Some(q)) if ch == q => {
+                    quote_char = None;
+                }
+                (',', None) => {
+                    add_font(&mut name_buffer);
+                }
+                _ => {
+                    name_buffer.push(ch);
+                }
             }
         }
         add_font(&mut name_buffer);
-        if fonts.is_empty() { return (None, None); }
+        if fonts.is_empty() {
+            return (None, None);
+        }
         (Some(fonts.remove(0)), skip_default(fonts))
     }
 
@@ -149,7 +180,11 @@ impl VsCodeSettings {
         let excluded_paths = self
             .read_value("files.watcherExclude")
             .and_then(|v| v.as_array())
-            .map(|v| v.iter().filter_map(|n| n.as_str().map(str::to_owned).map(PathBuf::from)).collect());
+            .map(|v| {
+                v.iter()
+                    .filter_map(|n| n.as_str().map(str::to_owned).map(PathBuf::from))
+                    .collect()
+            });
         ProjectSettingsContent {
             linked_projects: None,
             excluded_paths,
@@ -166,11 +201,13 @@ impl VsCodeSettings {
             window_decorations: WindowDecorations::default(),
             text_rendering_mode: TextRenderingMode::default(),
             focus_follows_mouse: FocusFollowsMouse::default(),
-            confirm_quit: self.read_enum("window.confirmBeforeClose", |s| match s {
-                "always" | "keyboardOnly" => Some(true),
-                "never" => Some(false),
-                _ => None,
-            }).unwrap_or(false),
+            confirm_quit: self
+                .read_enum("window.confirmBeforeClose", |s| match s {
+                    "always" | "keyboardOnly" => Some(true),
+                    "never" => Some(false),
+                    _ => None,
+                })
+                .unwrap_or(false),
             on_last_window_closed: OnLastWindowClosed::default(),
         }
     }
@@ -213,7 +250,13 @@ impl VsCodeSettings {
             show_active_item: false,
             show_close_button: self
                 .read_bool("workbench.editor.tabActionCloseVisibility")
-                .map(|b| if b { ShowCloseButton::Always } else { ShowCloseButton::Never })
+                .map(|b| {
+                    if b {
+                        ShowCloseButton::Always
+                    } else {
+                        ShowCloseButton::Never
+                    }
+                })
                 .unwrap_or_default(),
         }
     }
@@ -233,8 +276,15 @@ impl VsCodeSettings {
     fn terminal_settings_content(&self) -> TerminalSettingsContent {
         let (font_family, font_fallbacks) = self.read_fonts("terminal.integrated.fontFamily");
         TerminalSettingsContent {
-            blinking: self.read_bool("terminal.integrated.cursorBlinking")
-                .map(|b| if b { TerminalBlink::On } else { TerminalBlink::Off }),
+            blinking: self
+                .read_bool("terminal.integrated.cursorBlinking")
+                .map(|b| {
+                    if b {
+                        TerminalBlink::On
+                    } else {
+                        TerminalBlink::Off
+                    }
+                }),
             cursor_shape: self.read_enum("terminal.integrated.cursorStyle", |s| match s {
                 "block" => Some(CursorShapeContent::Block),
                 "line" => Some(CursorShapeContent::Bar),
@@ -243,10 +293,13 @@ impl VsCodeSettings {
             }),
             font_fallbacks,
             font_family,
-            font_size: self.read_f32("terminal.integrated.fontSize").map(FontSize::from),
+            font_size: self
+                .read_f32("terminal.integrated.fontSize")
+                .map(FontSize::from),
             font_features: None,
             font_weight: None,
-            line_height: self.read_f32("terminal.integrated.lineHeight")
+            line_height: self
+                .read_f32("terminal.integrated.lineHeight")
                 .map(|lh| TerminalLineHeight::Custom(lh)),
             max_scroll_history_lines: self.read_usize("terminal.integrated.scrollback"),
             bell: None,
@@ -256,18 +309,27 @@ impl VsCodeSettings {
     }
 
     fn project_terminal_settings_content(&self) -> ProjectTerminalSettingsContent {
-        #[cfg(target_os = "windows")] let platform = "windows";
-        #[cfg(target_os = "linux")] let platform = "linux";
-        #[cfg(target_os = "macos")] let platform = "osx";
-        #[cfg(target_os = "freebsd")] let platform = "freebsd";
-        let env = self.read_value(&format!("terminal.integrated.env.{platform}"))
+        #[cfg(target_os = "windows")]
+        let platform = "windows";
+        #[cfg(target_os = "linux")]
+        let platform = "linux";
+        #[cfg(target_os = "macos")]
+        let platform = "osx";
+        #[cfg(target_os = "freebsd")]
+        let platform = "freebsd";
+        let env = self
+            .read_value(&format!("terminal.integrated.env.{platform}"))
             .and_then(|v| v.as_object())
-            .map(|v| v.iter()
-                .map(|(k, v)| (k.clone(), v.to_string()))
-                .filter(|(_, v)| !v.contains('$'))
-                .collect::<HashMap<_, _>>());
+            .map(|v| {
+                v.iter()
+                    .map(|(k, v)| (k.clone(), v.to_string()))
+                    .filter(|(_, v)| !v.contains('$'))
+                    .collect::<HashMap<_, _>>()
+            });
         ProjectTerminalSettingsContent {
-            shell: self.read_string(&format!("terminal.integrated.{platform}Exec")).map(|s| Shell::Program(s)),
+            shell: self
+                .read_string(&format!("terminal.integrated.{platform}Exec"))
+                .map(|s| Shell::Program(s)),
             working_directory: None,
             env,
             ..Default::default()
@@ -275,20 +337,28 @@ impl VsCodeSettings {
     }
 
     fn telemetry_settings_content(&self) -> TelemetrySettingsContent {
-        let (metrics, diagnostics) = self.read_enum("telemetry.telemetryLevel", |level| {
-            Some(match level {
-                "all" => (true, true),
-                "error" | "crash" => (false, true),
-                "off" => (false, false),
-                _ => (true, true),
+        let (metrics, diagnostics) = self
+            .read_enum("telemetry.telemetryLevel", |level| {
+                Some(match level {
+                    "all" => (true, true),
+                    "error" | "crash" => (false, true),
+                    "off" => (false, false),
+                    _ => (true, true),
+                })
             })
-        }).unwrap_or((true, true));
+            .unwrap_or((true, true));
         TelemetrySettingsContent {
-            diagnostics, events: true, metrics,
+            diagnostics,
+            events: true,
+            metrics,
         }
     }
 }
 
 fn skip_default<T: Default + PartialEq>(value: T) -> Option<T> {
-    if value == T::default() { None } else { Some(value) }
+    if value == T::default() {
+        None
+    } else {
+        Some(value)
+    }
 }

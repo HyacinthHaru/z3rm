@@ -4,9 +4,7 @@ use collections::HashMap;
 use futures::future::join_all;
 use gpui::{AsyncApp, Entity};
 use itertools::Itertools as _;
-use language::{
-    Buffer, LanguageName, LspAdapter, LspAdapterDelegate, LspInstaller, Toolchain,
-};
+use language::{Buffer, LanguageName, LspAdapter, LspAdapterDelegate, LspInstaller, Toolchain};
 use lsp::{CodeActionKind, LanguageServerBinary, LanguageServerName, Uri};
 use project::Fs;
 use semver::Version;
@@ -28,9 +26,8 @@ fn typescript_server_binary_arguments(server_path: &Path) -> Vec<OsString> {
 }
 
 fn replace_test_name_parameters(test_name: &str) -> String {
-    static PATTERN: LazyLock<regex::Regex> = LazyLock::new(|| {
-        regex::Regex::new(r"(\$([A-Za-z0-9_\.]+|[\#])|%[psdifjo#\$%])").unwrap()
-    });
+    static PATTERN: LazyLock<regex::Regex> =
+        LazyLock::new(|| regex::Regex::new(r"(\$([A-Za-z0-9_\.]+|[\#])|%[psdifjo#\$%])").unwrap());
     PATTERN.split(test_name).map(regex::escape).join("(.+?)")
 }
 
@@ -138,11 +135,7 @@ impl LspInstaller for TypeScriptLspAdapter {
         _container_dir: PathBuf,
         _delegate: &Arc<dyn LspAdapterDelegate>,
     ) -> impl Send + Future<Output = Result<LanguageServerBinary>> + use<> {
-        async {
-            anyhow::bail!(
-                "language server installation unavailable (node_runtime removed)"
-            )
-        }
+        async { anyhow::bail!("language server installation unavailable (node_runtime removed)") }
     }
 
     async fn cached_server_binary(

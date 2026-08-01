@@ -4,4 +4,4 @@
 // 实现已移至 mux_protocol crate,让 CLI 与 server 共享 (避免漂移)。
 // 此处仅 re-export,保持调用方兼容。
 
-pub use mux_protocol::{parse_target, Target};
+pub use mux_protocol::{Target, parse_target};

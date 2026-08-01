@@ -10,8 +10,8 @@ pub use platform_title_bar::{
     self, DraggedWindowTab, MergeAllWindows, MoveTabToNewWindow, PlatformTitleBar,
     ShowNextWindowTab, ShowPreviousWindowTab,
 };
-use project::repo_identity_path;
 use project::git_store::linked_worktree_short_name;
+use project::repo_identity_path;
 
 #[cfg(not(target_os = "macos"))]
 use crate::application_menu::{
@@ -48,8 +48,6 @@ const MAX_PROJECT_NAME_LENGTH: usize = 40;
 const MAX_BRANCH_NAME_LENGTH: usize = 40;
 const MAX_SHORT_SHA_LENGTH: usize = 8;
 
-
-
 actions!(
     collab,
     [
@@ -63,8 +61,6 @@ actions!(
         SimulateUpdateAvailable
     ]
 );
-
-
 
 pub fn init(cx: &mut App) {
     cx.observe_new(|workspace: &mut Workspace, window, cx| {
@@ -270,7 +266,6 @@ impl Render for TitleBar {
                 .into_any_element(),
         );
 
-
         if title_bar_settings.show_onboarding_banner {
             if let Some(banner) = &self.banner {
                 children.push(banner.clone().into_any_element())
@@ -404,7 +399,6 @@ impl TitleBar {
             update_version,
         };
 
-
         this
     }
 
@@ -522,21 +516,18 @@ impl TitleBar {
                     ButtonLike::new("remote_project")
                         .selected_style(ButtonStyle::Tinted(TintColor::Accent))
                         .child(
-                            h_flex()
-                                .gap_2()
-                                .max_w_32()
-                                .child(
-                                    IconWithIndicator::new(
-                                        Icon::new(icon).size(IconSize::Small).color(icon_color),
-                                        Some(Indicator::dot().color(indicator_color)),
-                                    )
-                                    .indicator_border_color(Some(
-                                        cx.theme().colors().title_bar_background,
-                                    ))
-                                    .into_any_element(),
+                            h_flex().gap_2().max_w_32().child(
+                                IconWithIndicator::new(
+                                    Icon::new(icon).size(IconSize::Small).color(icon_color),
+                                    Some(Indicator::dot().color(indicator_color)),
                                 )
-                            )
-                    )
+                                .indicator_border_color(Some(
+                                    cx.theme().colors().title_bar_background,
+                                ))
+                                .into_any_element(),
+                            ),
+                        ),
+                )
                 .anchor(gpui::Anchor::TopLeft)
                 .into_any_element(),
         )
@@ -558,7 +549,6 @@ impl TitleBar {
                     .size(IconSize::Small)
                     .color(Color::Warning),
             )
-            
             .on_click({
                 cx.listener(move |this, _, window, cx| {
                     this.workspace
@@ -581,7 +571,6 @@ impl TitleBar {
         if self.project.read(cx).is_via_remote_server() {
             return self.render_remote_project_connection(cx);
         }
-
 
         None
     }
@@ -805,8 +794,8 @@ impl TitleBar {
                             Icon::new(IconName::GitWorktree)
                                 .size(IconSize::XSmall)
                                 .color(Color::Muted),
-                        )
-                    )
+                        ),
+                )
                 .anchor(gpui::Anchor::TopLeft)
         };
 

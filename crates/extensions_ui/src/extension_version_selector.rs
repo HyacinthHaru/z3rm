@@ -209,8 +209,7 @@ impl PickerDelegate for ExtensionVersionSelectorDelegate {
         let version_match = &self.matches.get(ix)?;
         let extension_version = &self.extension_versions.get(version_match.candidate_id)?;
 
-        let is_version_compatible =
-            true;
+        let is_version_compatible = true;
         let disabled = !is_version_compatible;
 
         Some(

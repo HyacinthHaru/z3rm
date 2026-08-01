@@ -39,7 +39,10 @@ fn cmd_status() -> Result<()> {
     let socket_path = default_socket_path();
 
     if !socket_path.exists() {
-        eprintln!("z3rm-server is not running (socket not found: {})", socket_path.display());
+        eprintln!(
+            "z3rm-server is not running (socket not found: {})",
+            socket_path.display()
+        );
         std::process::exit(1);
     }
 
@@ -76,14 +79,20 @@ fn cmd_status() -> Result<()> {
             .and_then(|pid| sys.process(sysinfo::Pid::from(pid)).map(|p| p.memory()))
             .unwrap_or(0);
 
-        let uptime = socket_path.metadata().ok().and_then(|m| {
-            m.modified().ok().map(|t| {
-                let elapsed = std::time::SystemTime::now().duration_since(t).unwrap_or_default();
-                let hours = elapsed.as_secs() / 3600;
-                let mins = (elapsed.as_secs() % 3600) / 60;
-                format!("{hours}h {mins}m")
+        let uptime = socket_path
+            .metadata()
+            .ok()
+            .and_then(|m| {
+                m.modified().ok().map(|t| {
+                    let elapsed = std::time::SystemTime::now()
+                        .duration_since(t)
+                        .unwrap_or_default();
+                    let hours = elapsed.as_secs() / 3600;
+                    let mins = (elapsed.as_secs() % 3600) / 60;
+                    format!("{hours}h {mins}m")
+                })
             })
-        }).unwrap_or_else(|| "unknown".to_string());
+            .unwrap_or_else(|| "unknown".to_string());
 
         let session_count = sessions.len();
         let attached = sessions.iter().filter(|s| s.attached_clients > 0).count();

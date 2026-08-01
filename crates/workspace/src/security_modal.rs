@@ -529,4 +529,3 @@ fn validate_trust_scope(
 
 // #[cfg(all(test, unix))]
 // mod tests;
-

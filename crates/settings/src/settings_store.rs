@@ -32,11 +32,11 @@ use util::{
 use crate::editorconfig_store::EditorconfigStore;
 use crate::{
     ActiveSettingsProfileName, ExtensionsSettingsContent, FontFamilyName, IconThemeName,
-    LanguageSettingsContent, LanguageToSettingsMap, LspSettings, LspSettingsMap, SemanticTokenRules,
-    ThemeName, UserSettingsContentExt, VsCodeSettings, WorktreeId,
+    LanguageSettingsContent, LanguageToSettingsMap, LspSettings, LspSettingsMap,
+    SemanticTokenRules, ThemeName, UserSettingsContentExt, VsCodeSettings, WorktreeId,
     settings_content::{
-        ProfileBase, ProjectSettingsContent, RootUserSettings, SettingsContent, UserSettingsContent,
-        merge_from::MergeFrom,
+        ProfileBase, ProjectSettingsContent, RootUserSettings, SettingsContent,
+        UserSettingsContent, merge_from::MergeFrom,
     },
 };
 
@@ -1625,4 +1625,3 @@ impl<T: Settings> AnySettingValue for SettingValue<T> {
             .retain(|(worktree_id, _, _)| *worktree_id != root_id);
     }
 }
-

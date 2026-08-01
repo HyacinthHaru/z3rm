@@ -13,7 +13,7 @@
 
 use anyhow::{Context, Result};
 use shadow_snapshot::{
-    DeltaRef, PathHash, SnapshotTrigger, VersionTree, Wal, WalEntry, StorageEngine,
+    DeltaRef, PathHash, SnapshotTrigger, StorageEngine, VersionTree, Wal, WalEntry,
 };
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -129,7 +129,9 @@ fn integration_record_first_file_version() -> Result<()> {
     assert_eq!(tree_head, Some(version_id));
 
     // 验证:blob 内容能寻回
-    let recovered = open_blob_store(&stack)?.get(&content_hash).context("blob get")?;
+    let recovered = open_blob_store(&stack)?
+        .get(&content_hash)
+        .context("blob get")?;
     assert_eq!(recovered, content);
 
     Ok(())
@@ -160,7 +162,15 @@ fn integration_delta_chain_grows() -> Result<()> {
         SnapshotTrigger::Write,
     );
     stack.storage.write_node(
-        v1, &ph, seq1, None, Some(&v1_hash), None, 0, SnapshotTrigger::Write, ts1,
+        v1,
+        &ph,
+        seq1,
+        None,
+        Some(&v1_hash),
+        None,
+        0,
+        SnapshotTrigger::Write,
+        ts1,
     )?;
 
     // 版本 2: delta。DeltaRef 包含 SHA-256(parent || child) 和压缩大小。
@@ -195,8 +205,15 @@ fn integration_delta_chain_grows() -> Result<()> {
         SnapshotTrigger::Write,
     );
     stack.storage.write_node(
-        v2, &ph, seq2, Some(v1),
-        None, Some(&delta_ref.hash), 1, SnapshotTrigger::Write, ts2,
+        v2,
+        &ph,
+        seq2,
+        Some(v1),
+        None,
+        Some(&delta_ref.hash),
+        1,
+        SnapshotTrigger::Write,
+        ts2,
     )?;
     assert_eq!(stack.tree.get_head(&ph), Some(v2));
 
@@ -270,11 +287,7 @@ fn integration_wal_checkpoint_clears_log() -> Result<()> {
 
     stack.wal.checkpoint()?;
     let after = stack.wal.replay()?;
-    assert_eq!(
-        after.len(),
-        0,
-        "replay after checkpoint should be empty"
-    );
+    assert_eq!(after.len(), 0, "replay after checkpoint should be empty");
 
     Ok(())
 }
@@ -287,8 +300,7 @@ fn integration_wal_checkpoint_clears_log() -> Result<()> {
 #[test]
 fn integration_reconstruct_replays_delta_chain() -> Result<()> {
     use shadow_snapshot::{
-        DeltaOp, DeltaReplay, DeltaRef, VersionNode,
-        deserialize_delta_ops, serialize_delta_ops,
+        DeltaOp, DeltaRef, DeltaReplay, VersionNode, deserialize_delta_ops, serialize_delta_ops,
     };
     use std::collections::HashMap;
     use std::sync::Arc;
@@ -357,8 +369,7 @@ fn integration_reconstruct_replays_delta_chain() -> Result<()> {
         ..(*v2).clone()
     });
 
-    let nodes: HashMap<u64, Arc<VersionNode>> =
-        [(1, v1), (2, v2), (3, v3)].into_iter().collect();
+    let nodes: HashMap<u64, Arc<VersionNode>> = [(1, v1), (2, v2), (3, v3)].into_iter().collect();
 
     // 重建 v2:应该是 v1 + insert "more\n"
     let reconstructed_v2 = DeltaReplay::reconstruct(
@@ -398,7 +409,9 @@ fn integration_reconstruct_replays_delta_chain() -> Result<()> {
 
 /// 打开一个位于同一临时目录的 ShadowSnapshotEngine,并暴露各路径供
 /// “直接写 WAL”的崩溃注入使用。
-fn open_engine(dir: &tempfile::TempDir) -> Result<(
+fn open_engine(
+    dir: &tempfile::TempDir,
+) -> Result<(
     shadow_snapshot::ShadowSnapshotEngine,
     std::path::PathBuf,
     std::path::PathBuf,
@@ -427,17 +440,22 @@ fn integration_restart_preserves_monotonicity_and_rebuilds_tree() -> Result<()> 
         let v1 = engine.record_change(std::path::Path::new("doc.md"), b"alpha\n")?;
         let v2 = engine.record_change(std::path::Path::new("doc.md"), b"alpha\nbeta\n")?;
         // 第二个版本走 delta 路径:父存在且 depth+1 <= 16。
-        let node = engine
-            .get_version_node(v2)
-            .expect("test helper invariant");
+        let node = engine.get_version_node(v2).expect("test helper invariant");
         assert_eq!(node.delta_depth, 1, "second change should be a delta");
-        assert!(node.full_content.is_none(), "delta node has no full content");
+        assert!(
+            node.full_content.is_none(),
+            "delta node has no full content"
+        );
         let _ = v1;
     } // engine dropped; blobs + db + wal persist on disk.
 
     let (engine, _, _, _) = open_engine(&dir)?;
     let versions = engine.list_versions(std::path::Path::new("doc.md"))?;
-    assert_eq!(versions.len(), 2, "reopened engine must rebuild both persisted versions");
+    assert_eq!(
+        versions.len(),
+        2,
+        "reopened engine must rebuild both persisted versions"
+    );
     let last_seq_before = versions.iter().map(|(_, s, _)| *s).max().unwrap();
 
     // 内容必须能从重建的树 + blob store 查回。
@@ -519,14 +537,19 @@ fn integration_wal_before_write_recovers_unpersisted_node() -> Result<()> {
         .iter()
         .find(|(_, s, _)| *s == 10_000)
         .expect("replayed seq_no 10000 node must be present");
-    let content = engine.query_version(recovered.0)?.expect("recovered content");
+    let content = engine
+        .query_version(recovered.0)?
+        .expect("recovered content");
     assert_eq!(content, v2_content);
 
     // 下一次写入必须高于回放后的最大 seq_no(10000),不能复用。
     let _v3 = engine.record_change(std::path::Path::new("note.txt"), b"hello\nworld!\n")?;
     let after = engine.list_versions(std::path::Path::new("note.txt"))?;
     let max_seq = after.iter().map(|(_, s, _)| *s).max().unwrap();
-    assert!(max_seq > 10_000, "seq_no allocator must advance past replayed max");
+    assert!(
+        max_seq > 10_000,
+        "seq_no allocator must advance past replayed max"
+    );
 
     Ok(())
 }
@@ -557,15 +580,26 @@ fn integration_delta_generation_grows_then_forces_full() -> Result<()> {
     // v18: would push depth to 17 > D_MAX → forced full snapshot, depth 0.
     let id = engine.record_change(path, b"line17")?;
     let node = engine.get_version_node(id).expect("node present");
-    assert_eq!(node.delta_depth, 0, "17th delta forces full snapshot, depth resets to 0");
-    assert!(node.full_content.is_some(), "forced node is a full snapshot");
+    assert_eq!(
+        node.delta_depth, 0,
+        "17th delta forces full snapshot, depth resets to 0"
+    );
+    assert!(
+        node.full_content.is_some(),
+        "forced node is a full snapshot"
+    );
     assert!(node.delta.is_none(), "forced node has no delta ref");
     // 全链可重建:每个版本 query 都返回其原始内容。
     for i in 0..=17 {
         let expected = format!("line{}", i).into_bytes();
         let versions = engine.list_versions(path)?;
         let vid = versions[i].0;
-        assert_eq!(engine.query_version(vid)?.unwrap(), expected, "content of version {}", i);
+        assert_eq!(
+            engine.query_version(vid)?.unwrap(),
+            expected,
+            "content of version {}",
+            i
+        );
     }
     let _ = last_id;
     Ok(())
@@ -577,7 +611,7 @@ fn integration_delta_generation_grows_then_forces_full() -> Result<()> {
 /// depth 沿父链恢复,内容可重建。
 #[test]
 fn integration_wal_replay_rebuilds_delta_node_shape() -> Result<()> {
-    use shadow_snapshot::{serialize_delta_ops, DeltaOp, BlobStore};
+    use shadow_snapshot::{BlobStore, DeltaOp, serialize_delta_ops};
     use std::sync::Arc as StdArc;
 
     let dir = tempfile::tempdir().context("temp dir")?;
@@ -628,7 +662,11 @@ fn integration_wal_replay_rebuilds_delta_node_shape() -> Result<()> {
 
     let (engine, _, _, _) = open_engine(&dir)?;
     let versions = engine.list_versions(std::path::Path::new("delta.txt"))?;
-    assert_eq!(versions.len(), 2, "WAL replay must reconstruct the unpersisted delta node");
+    assert_eq!(
+        versions.len(),
+        2,
+        "WAL replay must reconstruct the unpersisted delta node"
+    );
 
     let replayed = versions
         .iter()
@@ -639,11 +677,16 @@ fn integration_wal_replay_rebuilds_delta_node_shape() -> Result<()> {
         .expect("replayed node in tree");
     // 关键断言:回放必须重建为 delta 形态,而不是 full。
     assert_eq!(node.delta_depth, 1, "replayed node takes parent.depth + 1");
-    assert!(node.full_content.is_none(), "replayed delta node has no full blob");
+    assert!(
+        node.full_content.is_none(),
+        "replayed delta node has no full blob"
+    );
     assert!(node.delta.is_some(), "replayed node carries the delta ref");
 
     // delta 节点必须可重建为正确内容。
-    let content = engine.query_version(replayed.0)?.expect("reconstructed content");
+    let content = engine
+        .query_version(replayed.0)?
+        .expect("reconstructed content");
     assert_eq!(content, new_content);
 
     Ok(())

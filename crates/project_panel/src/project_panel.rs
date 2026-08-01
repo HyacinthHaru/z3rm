@@ -39,8 +39,8 @@ use project::{
 };
 use project_panel_settings::ProjectPanelSettings;
 use project_panel_settings::{
-    DockSide, ProjectPanelEntrySpacing, ProjectPanelSortMode, ProjectPanelSortOrder, ShowDiagnostics,
-    ShowIndentGuides,
+    DockSide, ProjectPanelEntrySpacing, ProjectPanelSortMode, ProjectPanelSortOrder,
+    ShowDiagnostics, ShowIndentGuides,
 };
 use rayon::slice::ParallelSliceMut;
 use schemars::JsonSchema;
@@ -674,7 +674,10 @@ impl ProjectPanel {
                         }
                     }
                     project::Event::RevealInProjectPanel(entry_id) => {
-                        if this.reveal_entry(project.clone(), *entry_id, false, window, cx).is_ok() {
+                        if this
+                            .reveal_entry(project.clone(), *entry_id, false, window, cx)
+                            .is_ok()
+                        {
                             cx.emit(PanelEvent::Activate);
                         }
                     }
@@ -860,64 +863,72 @@ impl ProjectPanel {
                     allow_preview,
                 } => {
                     if let Some(worktree) = project.read(cx).worktree_for_entry(entry_id, cx)
-                        && let Some(entry) = worktree.read(cx).entry_for_id(entry_id) {
-                            let file_path = entry.path.clone();
-                            let worktree_id = worktree.read(cx).id();
-                            let entry_id = entry.id;
-                            let is_via_ssh = project.read(cx).is_via_remote_server();
+                        && let Some(entry) = worktree.read(cx).entry_for_id(entry_id)
+                    {
+                        let file_path = entry.path.clone();
+                        let worktree_id = worktree.read(cx).id();
+                        let entry_id = entry.id;
+                        let is_via_ssh = project.read(cx).is_via_remote_server();
 
-                            let task = if focus_opened_item {
-                                // §16.5 双击打开可编辑编辑器
-                                workspace
-                                    .open_path_preview(
-                                        ProjectPath {
-                                            worktree_id,
-                                            path: file_path.clone(),
-                                        },
-                                        None,
-                                        focus_opened_item,
-                                        allow_preview,
-                                        true,
-                                        window, cx,
-                                    )
-                            } else {
-                                // §16.5 单击打开只读文件查看器
-                                workspace
-                                    .open_path_readonly(
-                                        ProjectPath {
-                                            worktree_id,
-                                            path: file_path.clone(),
-                                        },
-                                        None,
-                                        focus_opened_item,
-                                        allow_preview,
-                                        true,
-                                        window, cx,
-                                    )
-                            };
-                            task
-                                .detach_and_prompt_err("Failed to open file", window, cx, move |e, _, _| {
-                                    if e.to_string().contains("File is too large to load") {
-                                        Some(e.to_string())
-                                    } else {
-                                        None
-                                    }
-                                });
-
-                            if let Some(project_panel) = project_panel.upgrade() {
-                                // Always select and mark the entry, regardless of whether it is opened or not.
-                                project_panel.update(cx, |project_panel, _| {
-                                    let entry = SelectedEntry { worktree_id, entry_id };
-                                    project_panel.marked_entries.clear();
-                                    project_panel.marked_entries.push(entry);
-                                    project_panel.selection = Some(entry);
-                                });
-                                if !focus_opened_item {
-                                    let focus_handle = project_panel.read(cx).focus_handle.clone();
-                                    window.focus(&focus_handle, cx);
+                        let task = if focus_opened_item {
+                            // §16.5 双击打开可编辑编辑器
+                            workspace.open_path_preview(
+                                ProjectPath {
+                                    worktree_id,
+                                    path: file_path.clone(),
+                                },
+                                None,
+                                focus_opened_item,
+                                allow_preview,
+                                true,
+                                window,
+                                cx,
+                            )
+                        } else {
+                            // §16.5 单击打开只读文件查看器
+                            workspace.open_path_readonly(
+                                ProjectPath {
+                                    worktree_id,
+                                    path: file_path.clone(),
+                                },
+                                None,
+                                focus_opened_item,
+                                allow_preview,
+                                true,
+                                window,
+                                cx,
+                            )
+                        };
+                        task.detach_and_prompt_err(
+                            "Failed to open file",
+                            window,
+                            cx,
+                            move |e, _, _| {
+                                if e.to_string().contains("File is too large to load") {
+                                    Some(e.to_string())
+                                } else {
+                                    None
                                 }
+                            },
+                        );
+
+                        if let Some(project_panel) = project_panel.upgrade() {
+                            // Always select and mark the entry, regardless of whether it is opened or not.
+                            project_panel.update(cx, |project_panel, _| {
+                                let entry = SelectedEntry {
+                                    worktree_id,
+                                    entry_id,
+                                };
+                                project_panel.marked_entries.clear();
+                                project_panel.marked_entries.push(entry);
+                                project_panel.selection = Some(entry);
+                            });
+                            if !focus_opened_item {
+                                let focus_handle = project_panel.read(cx).focus_handle.clone();
+                                window.focus(&focus_handle, cx);
                             }
                         }
+                    }
                 }
                 &Event::SplitEntry {
                     entry_id,
@@ -925,19 +936,21 @@ impl ProjectPanel {
                     split_direction,
                 } => {
                     if let Some(worktree) = project.read(cx).worktree_for_entry(entry_id, cx)
-                        && let Some(entry) = worktree.read(cx).entry_for_id(entry_id) {
-                            workspace
-                                .split_path_preview(
-                                    ProjectPath {
-                                        worktree_id: worktree.read(cx).id(),
-                                        path: entry.path.clone(),
-                                    },
-                                    allow_preview,
-                                    split_direction,
-                                    window, cx,
-                                )
-                                .detach_and_log_err(cx);
-                        }
+                        && let Some(entry) = worktree.read(cx).entry_for_id(entry_id)
+                    {
+                        workspace
+                            .split_path_preview(
+                                ProjectPath {
+                                    worktree_id: worktree.read(cx).id(),
+                                    path: entry.path.clone(),
+                                },
+                                allow_preview,
+                                split_direction,
+                                window,
+                                cx,
+                            )
+                            .detach_and_log_err(cx);
+                    }
                 }
 
                 _ => {}
@@ -961,8 +974,6 @@ impl ProjectPanel {
         // Diagnostics stripped — no-op (spec §8.2 M3)
         let _ = cx;
     }
-
-
 
     fn focus_in(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if !self.focus_handle.contains_focused(window, cx) {
@@ -3552,7 +3563,15 @@ impl ProjectPanel {
                         let download_task = this.update(cx, |this, cx| {
                             let project = this.project.clone();
                             project.update(cx, |project, cx| {
-                                project.download_file(worktree_id, project::ProjectPath { worktree_id, path: entry_path }, destination_path, cx)
+                                project.download_file(
+                                    worktree_id,
+                                    project::ProjectPath {
+                                        worktree_id,
+                                        path: entry_path,
+                                    },
+                                    destination_path,
+                                    cx,
+                                )
                             })
                         });
                         if let Ok(task) = download_task {
@@ -4685,7 +4704,14 @@ impl ProjectPanel {
                     )?;
 
                     let task = self.project.update(cx, |project, cx| {
-                        project.copy_entry(selection.entry_id, project::ProjectPath { worktree_id, path: new_path.into() }, cx)
+                        project.copy_entry(
+                            selection.entry_id,
+                            project::ProjectPath {
+                                worktree_id,
+                                path: new_path.into(),
+                            },
+                            cx,
+                        )
                     });
                     copy_tasks.push(task);
                     disambiguation_range = new_disambiguation_range.or(disambiguation_range);
@@ -4699,7 +4725,10 @@ impl ProjectPanel {
                     for task in copy_tasks.into_iter() {
                         if let Some(CreatedEntry::Included(entry)) = task.await.log_err() {
                             last_succeed = Some(entry.id);
-                            changes.push(Change::Created(project::ProjectPath { worktree_id, path: entry.path }));
+                            changes.push(Change::Created(project::ProjectPath {
+                                worktree_id,
+                                path: entry.path,
+                            }));
                         }
                     }
                     // update selection

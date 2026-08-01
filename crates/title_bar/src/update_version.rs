@@ -100,7 +100,10 @@ impl Render for UpdateVersion {
                     .color(Color::Muted)
                     .into_any_element()
             }
-            AutoUpdateStatus::Downloading { version, progress: _ } => {
+            AutoUpdateStatus::Downloading {
+                version,
+                progress: _,
+            } => {
                 let version = Self::version_tooltip_message(version);
                 Label::new(format!("Downloading {version}"))
                     .size(LabelSize::Small)
@@ -131,9 +134,7 @@ impl Render for UpdateVersion {
                     .color(Color::Error)
                     .into_any_element()
             }
-            AutoUpdateStatus::Idle | AutoUpdateStatus::Checking { .. } => {
-                Empty.into_any_element()
-            }
+            AutoUpdateStatus::Idle | AutoUpdateStatus::Checking { .. } => Empty.into_any_element(),
         }
     }
 }

@@ -41,11 +41,10 @@ use util::{
     rel_path::RelPath,
 };
 use workspace::{
-    ModalView, OpenOptions, OpenVisible, SplitDirection, Workspace,
-    item::PreviewTabsSettings, notifications::NotifyResultExt, pane,
+    ModalView, OpenOptions, OpenVisible, SplitDirection, Workspace, item::PreviewTabsSettings,
+    notifications::NotifyResultExt, pane,
 };
 use zed_actions::search::ToggleIncludeIgnored;
-
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum FileFinderWidth {
@@ -1130,7 +1129,6 @@ impl FileFinderDelegate {
                 path_style,
             );
 
-
             let query_path = query.raw_query.as_str();
             if let Ok(mut query_path) = RelPath::new(Path::new(query_path), path_style) {
                 let available_worktree = self
@@ -1489,7 +1487,6 @@ impl FileFinderDelegate {
         let Some(workspace) = self.workspace.upgrade() else {
             return;
         };
-
 
         // Focus the new item only when dismissing — this avoids stealing focus from the modal.
         // Always activate (make the tab current) so every opened file is visually reflected.

@@ -1,25 +1,29 @@
 mod header;
 mod mouse;
 
-use crate::actions::{ShowSignatureHelp, SignatureHelpPrevious, SignatureHelpNext, ShowEditPrediction};
+use crate::actions::{
+    ShowEditPrediction, ShowSignatureHelp, SignatureHelpNext, SignatureHelpPrevious,
+};
 
 #[cfg(test)]
 pub(crate) use header::StickyHeader;
 pub use header::file_status_label_color;
 pub(crate) use header::{header_jump_data, render_buffer_header};
 
+use crate::stubs::inlay_hint_settings;
 use crate::{
-    BUFFER_HEADER_PADDING, AvailableCodeAction, BlockId, ChunkRendererContext, ChunkReplacement, CodeActionSource,
-    CodeActionsMenu, ComposeCompletion, ConfirmCodeAction, ConfirmCompletion, ConfirmCompletionInsert, ConfirmCompletionReplace,
-    ConflictsOurs, ConflictsOursMarker, ConflictsOuter, ConflictsTheirs, ConflictsTheirsMarker,
-    CodeContextMenu, ContextMenuOrigin, ContextMenuPlacement, CursorPopoverType, CursorShape, CustomBlockId, DisplayDiffHunk, DisplayPoint, DisplayRow,
-    EditDisplayMode, Editor, EditorMode, EditorSettings, EditorSnapshot, EditorStyle, FindAllReferences,
-    FILE_HEADER_HEIGHT, FocusedBlock, GutterDimensions, HalfPageDown, HalfPageUp,
-    HandleInput, HOVER_POPOVER_GAP, HoveredCursor, InlayHintRefreshReason, LineDown, LineHighlight, LineUp,
-    MENU_GAP, MENU_ASIDE_MIN_WIDTH, MENU_ASIDE_MAX_WIDTH, MIN_POPOVER_CHARACTER_WIDTH, MIN_POPOVER_LINE_HEIGHT, POPOVER_RIGHT_OFFSET,
-    MAX_LINE_LEN, MINIMAP_FONT_SIZE, PageDown, PageUp, Point, Rename, RowExt, RowRangeExt, Selection,
-    SelectionDragState, SizingBehavior, SoftWrap, ToPoint,
-    column_pixels,
+    AvailableCodeAction, BUFFER_HEADER_PADDING, BlockId, ChunkRendererContext, ChunkReplacement,
+    CodeActionSource, CodeActionsMenu, CodeContextMenu, ComposeCompletion, ConfirmCodeAction,
+    ConfirmCompletion, ConfirmCompletionInsert, ConfirmCompletionReplace, ConflictsOurs,
+    ConflictsOursMarker, ConflictsOuter, ConflictsTheirs, ConflictsTheirsMarker, ContextMenuOrigin,
+    ContextMenuPlacement, CursorPopoverType, CursorShape, CustomBlockId, DisplayDiffHunk,
+    DisplayPoint, DisplayRow, EditDisplayMode, Editor, EditorMode, EditorSettings, EditorSnapshot,
+    EditorStyle, FILE_HEADER_HEIGHT, FindAllReferences, FocusedBlock, GutterDimensions,
+    HOVER_POPOVER_GAP, HalfPageDown, HalfPageUp, HandleInput, HoveredCursor,
+    InlayHintRefreshReason, LineDown, LineHighlight, LineUp, MAX_LINE_LEN, MENU_ASIDE_MAX_WIDTH,
+    MENU_ASIDE_MIN_WIDTH, MENU_GAP, MIN_POPOVER_CHARACTER_WIDTH, MIN_POPOVER_LINE_HEIGHT,
+    MINIMAP_FONT_SIZE, POPOVER_RIGHT_OFFSET, PageDown, PageUp, Point, Rename, RowExt, RowRangeExt,
+    Selection, SelectionDragState, SizingBehavior, SoftWrap, ToPoint, column_pixels,
     display_map::{
         Block, BlockContext, BlockStyle, ChunkRendererId, DisplaySnapshot, EditorMargins,
         HighlightKey, HighlightedChunk, ToDisplayPoint,
@@ -34,7 +38,6 @@ use crate::{
         scroll_amount::ScrollAmount,
     },
 };
-use crate::stubs::inlay_hint_settings;
 use buffer_diff::{DiffHunkStatus, DiffHunkStatusKind};
 use collections::{BTreeMap, HashMap, HashSet};
 use feature_flags::{DiffReviewFeatureFlag, FeatureFlagAppExt as _};
@@ -61,10 +64,11 @@ use multi_buffer::{
     MultiBufferRow, RowInfo, ToOffset,
 };
 
+use crate::stubs::CollaboratorId;
 use crate::stubs::{Breakpoint, BreakpointSessionState};
 use project::project_settings::ProjectSettings;
-use settings::{IndentGuideBackgroundColoring, IndentGuideColoring, Settings};
 use project::project_settings::{GitGutterSetting, GitHunkStyleSetting};
+use settings::{IndentGuideBackgroundColoring, IndentGuideColoring, Settings};
 use smallvec::{SmallVec, smallvec};
 use std::{
     any::TypeId,
@@ -86,8 +90,10 @@ use ui::utils::ensure_minimum_contrast;
 use ui::{ButtonLike, POPOVER_Y_PADDING, Tooltip, prelude::*, scrollbars::ShowScrollbar};
 use unicode_segmentation::UnicodeSegmentation;
 use util::{ResultExt, debug_panic};
-use crate::stubs::CollaboratorId;
-use workspace::{ItemHandle, Workspace, item::{Item, ItemBufferKind}};
+use workspace::{
+    ItemHandle, Workspace,
+    item::{Item, ItemBufferKind},
+};
 
 /// Determines what kinds of highlights should be applied to a lines background.
 #[derive(Clone, Copy, Default)]
@@ -503,32 +509,56 @@ impl EditorElement {
         register_action(editor, window, Editor::restart_language_server);
         register_action(editor, window, Editor::stop_language_server);
         register_action(editor, window, Editor::show_character_palette);
-        register_action(editor, window, |editor, action: &ComposeCompletion, window, cx| {
-            if let Some(task) = editor.compose_completion(action, &mut *window, &mut *cx) {
-                editor.detach_and_notify_err::<(), anyhow::Error>(task, &mut *window, &mut *cx);
-            } else {
-                cx.propagate();
-            }
-        });
-        register_action(editor, window, |editor, action: &FindAllReferences, window, cx| {
-            if let Some(task) = editor.find_all_references(action, window, cx) {
-                task.detach_and_log_err(cx);
-            } else {
-                cx.propagate();
-            }
-        });
-        register_action(editor, window, |editor: &mut Editor, action: &ShowSignatureHelp, window, cx| {
-            editor.show_signature_help(action, window, cx);
-        });
-        register_action(editor, window, |editor: &mut Editor, action: &SignatureHelpPrevious, window, cx| {
-            editor.signature_help_prev(action, window, cx);
-        });
-        register_action(editor, window, |editor: &mut Editor, action: &SignatureHelpNext, window, cx| {
-            editor.signature_help_next(action, window, cx);
-        });
-        register_action(editor, window, |editor: &mut Editor, action: &ShowEditPrediction, window, cx| {
-            editor.show_edit_prediction(action, window, cx);
-        });
+        register_action(
+            editor,
+            window,
+            |editor, action: &ComposeCompletion, window, cx| {
+                if let Some(task) = editor.compose_completion(action, &mut *window, &mut *cx) {
+                    editor.detach_and_notify_err::<(), anyhow::Error>(task, &mut *window, &mut *cx);
+                } else {
+                    cx.propagate();
+                }
+            },
+        );
+        register_action(
+            editor,
+            window,
+            |editor, action: &FindAllReferences, window, cx| {
+                if let Some(task) = editor.find_all_references(action, window, cx) {
+                    task.detach_and_log_err(cx);
+                } else {
+                    cx.propagate();
+                }
+            },
+        );
+        register_action(
+            editor,
+            window,
+            |editor: &mut Editor, action: &ShowSignatureHelp, window, cx| {
+                editor.show_signature_help(action, window, cx);
+            },
+        );
+        register_action(
+            editor,
+            window,
+            |editor: &mut Editor, action: &SignatureHelpPrevious, window, cx| {
+                editor.signature_help_prev(action, window, cx);
+            },
+        );
+        register_action(
+            editor,
+            window,
+            |editor: &mut Editor, action: &SignatureHelpNext, window, cx| {
+                editor.signature_help_next(action, window, cx);
+            },
+        );
+        register_action(
+            editor,
+            window,
+            |editor: &mut Editor, action: &ShowEditPrediction, window, cx| {
+                editor.show_edit_prediction(action, window, cx);
+            },
+        );
         register_action(editor, window, Editor::edit_bookmark);
         register_action(editor, window, Editor::go_to_next_bookmark);
         register_action(editor, window, Editor::go_to_previous_bookmark);
@@ -650,38 +680,58 @@ impl EditorElement {
                     cx.propagate();
                 }
             });
-            register_action(editor, window, |editor, action: &ConfirmCompletion, window, cx| {
-                if let Some(task) = editor.confirm_completion(action, &mut *window, &mut *cx) {
-                    let _: gpui::Task<Result<Vec<AvailableCodeAction>, anyhow::Error>> = task;
-                    editor.detach_and_notify_err(task, &mut *window, &mut *cx);
-                } else {
-                    cx.propagate();
-                }
-            });
-            register_action(editor, window, |editor, action: &ConfirmCompletionReplace, window, cx| {
-                if let Some(task) = editor.confirm_completion_replace(action, &mut *window, &mut *cx) {
-                    let _: gpui::Task<Result<Vec<String>, anyhow::Error>> = task;
-                    editor.detach_and_notify_err(task, &mut *window, &mut *cx);
-                } else {
-                    cx.propagate();
-                }
-            });
-            register_action(editor, window, |editor, action: &ConfirmCompletionInsert, window, cx| {
-                if let Some(task) = editor.confirm_completion_insert(action, &mut *window, &mut *cx) {
-                    let _: gpui::Task<Result<Vec<String>, anyhow::Error>> = task;
-                    editor.detach_and_notify_err(task, &mut *window, &mut *cx);
-                } else {
-                    cx.propagate();
-                }
-            });
-            register_action(editor, window, |editor, action: &ConfirmCodeAction, window, cx| {
-                if let Some(task) = editor.confirm_code_action(action, &mut *window, &mut *cx) {
-                    let _: gpui::Task<Result<Vec<AvailableCodeAction>, anyhow::Error>> = task;
-                    editor.detach_and_notify_err(task, &mut *window, &mut *cx);
-                } else {
-                    cx.propagate();
-                }
-            });
+            register_action(
+                editor,
+                window,
+                |editor, action: &ConfirmCompletion, window, cx| {
+                    if let Some(task) = editor.confirm_completion(action, &mut *window, &mut *cx) {
+                        let _: gpui::Task<Result<Vec<AvailableCodeAction>, anyhow::Error>> = task;
+                        editor.detach_and_notify_err(task, &mut *window, &mut *cx);
+                    } else {
+                        cx.propagate();
+                    }
+                },
+            );
+            register_action(
+                editor,
+                window,
+                |editor, action: &ConfirmCompletionReplace, window, cx| {
+                    if let Some(task) =
+                        editor.confirm_completion_replace(action, &mut *window, &mut *cx)
+                    {
+                        let _: gpui::Task<Result<Vec<String>, anyhow::Error>> = task;
+                        editor.detach_and_notify_err(task, &mut *window, &mut *cx);
+                    } else {
+                        cx.propagate();
+                    }
+                },
+            );
+            register_action(
+                editor,
+                window,
+                |editor, action: &ConfirmCompletionInsert, window, cx| {
+                    if let Some(task) =
+                        editor.confirm_completion_insert(action, &mut *window, &mut *cx)
+                    {
+                        let _: gpui::Task<Result<Vec<String>, anyhow::Error>> = task;
+                        editor.detach_and_notify_err(task, &mut *window, &mut *cx);
+                    } else {
+                        cx.propagate();
+                    }
+                },
+            );
+            register_action(
+                editor,
+                window,
+                |editor, action: &ConfirmCodeAction, window, cx| {
+                    if let Some(task) = editor.confirm_code_action(action, &mut *window, &mut *cx) {
+                        let _: gpui::Task<Result<Vec<AvailableCodeAction>, anyhow::Error>> = task;
+                        editor.detach_and_notify_err(task, &mut *window, &mut *cx);
+                    } else {
+                        cx.propagate();
+                    }
+                },
+            );
             register_action(editor, window, |editor, action: &Rename, window, cx| {
                 if let Some(task) = editor.rename(action, window, cx) {
                     let _: gpui::Task<Result<(), anyhow::Error>> = task;
@@ -1692,7 +1742,10 @@ impl EditorElement {
             None => return HashMap::default(),
         };
 
-        let active_diagnostics_group = self.editor.read(cx).active_diagnostic_group_id::<Option<u64>>();
+        let active_diagnostics_group = self
+            .editor
+            .read(cx)
+            .active_diagnostic_group_id::<Option<u64>>();
 
         let diagnostics_by_rows = self.editor.update(cx, |editor, cx| {
             let snapshot = editor.snapshot(window, cx);
@@ -1847,21 +1900,16 @@ impl EditorElement {
             if !editor.has_available_code_actions_for_selection::<bool>() {
                 return None;
             }
-            let active = editor
-                .context_menu
-                .borrow()
-                .as_ref()
-                .is_some_and(|menu| {
-                    if let crate::CodeContextMenu::CodeActions(CodeActionsMenu {
-                        deployed_from,
-                        ..
-                    }) = menu
-                    {
-                        matches!(deployed_from, ContextMenuOrigin::GutterIndicator(..))
-                    } else {
-                        false
-                    }
-                });
+            let active = editor.context_menu.borrow().as_ref().is_some_and(|menu| {
+                if let crate::CodeContextMenu::CodeActions(CodeActionsMenu {
+                    deployed_from, ..
+                }) = menu
+                {
+                    matches!(deployed_from, ContextMenuOrigin::GutterIndicator(..))
+                } else {
+                    false
+                }
+            });
             Some(editor.render_inline_code_actions(icon_size, display_point.row(), active, cx))
         })?;
 
@@ -4291,9 +4339,9 @@ impl EditorElement {
             return;
         }
 
-        let text_layout_details = self.editor.update(cx, |editor, cx| {
-            editor.text_layout_details(window, cx)
-        });
+        let text_layout_details = self
+            .editor
+            .update(cx, |editor, cx| editor.text_layout_details(window, cx));
         let hover_popovers = self.editor.update(cx, |editor, cx| {
             editor.hover_state.render(
                 snapshot,
@@ -6315,7 +6363,9 @@ impl EditorElement {
                                 ..Default::default()
                             },
                             MinimapThumbBorder::None => Default::default(),
-                            MinimapThumbBorder::Rounded | MinimapThumbBorder::Square | MinimapThumbBorder::Full => Edges::all(ScrollbarLayout::BORDER_WIDTH),
+                            MinimapThumbBorder::Rounded
+                            | MinimapThumbBorder::Square
+                            | MinimapThumbBorder::Full => Edges::all(ScrollbarLayout::BORDER_WIDTH),
                         };
 
                         window.paint_layer(minimap_hitbox.bounds, |window| {
@@ -8765,28 +8815,30 @@ impl Element for EditorElement {
                             )
                         });
 
-                    let (edit_prediction_popover, edit_prediction_popover_origin) = self
-                        .editor
-                        .update(cx, |editor, _cx| -> (Option<AnyElement>, gpui::Point<Pixels>) {
-                            editor.render_edit_prediction_popover(
-                                &text_hitbox.bounds,
-                                content_origin,
-                                right_margin,
-                                &snapshot,
-                                start_row..end_row,
-                                scroll_position.y,
-                                scroll_position.y + height_in_lines,
-                                &line_layouts,
-                                line_height,
-                                scroll_position,
-                                scroll_pixel_position,
-                                newest_selection_head,
-                                editor_width,
-                                style,
-                                (),
-                                (),
-                            )
-                        });
+                    let (edit_prediction_popover, edit_prediction_popover_origin) =
+                        self.editor.update(
+                            cx,
+                            |editor, _cx| -> (Option<AnyElement>, gpui::Point<Pixels>) {
+                                editor.render_edit_prediction_popover(
+                                    &text_hitbox.bounds,
+                                    content_origin,
+                                    right_margin,
+                                    &snapshot,
+                                    start_row..end_row,
+                                    scroll_position.y,
+                                    scroll_position.y + height_in_lines,
+                                    &line_layouts,
+                                    line_height,
+                                    scroll_position,
+                                    scroll_pixel_position,
+                                    newest_selection_head,
+                                    editor_width,
+                                    style,
+                                    (),
+                                    (),
+                                )
+                            },
+                        );
 
                     let mut inline_diagnostics = self.layout_inline_diagnostics(
                         &line_layouts,
@@ -10531,8 +10583,6 @@ impl HighlightedRange {
         }
     }
 }
-
-
 
 pub fn register_action<T: Action>(
     editor: &Entity<Editor>,

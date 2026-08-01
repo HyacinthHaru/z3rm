@@ -58,7 +58,7 @@ pub enum PaneEvent {
 ///
 /// Provides split operations, input injection, output capture, and session listing.
 /// Maps to mux_server's session/pane model (spec §3).
- 
+
 pub trait MuxApi: Send + Sync {
     /// Split the active pane in the given direction, returning the new pane ID.
     fn split_pane(&self, direction: SplitDirection) -> Result<PaneId>;
@@ -86,7 +86,7 @@ pub trait MuxApi: Send + Sync {
 /// API for registering and executing extension commands.
 ///
 /// Commands are user-invokable actions that appear in the command palette.
- 
+
 pub trait CommandApi: Send + Sync {
     /// Register a command with a unique ID and display label.
     fn register_command(&self, id: CommandId, label: Arc<str>) -> Result<()>;
@@ -106,7 +106,7 @@ pub trait CommandApi: Send + Sync {
 // ---------------------------------------------------------------------------
 
 /// API for binding key sequences to commands.
- 
+
 pub trait KeymapApi: Send + Sync {
     /// Bind a key sequence to a command.
     fn bind_key(&self, key: KeySequence, command: CommandId) -> Result<()>;
@@ -125,7 +125,7 @@ pub trait KeymapApi: Send + Sync {
 /// API for reading and writing extension settings.
 ///
 /// Settings are persisted per-extension in the z3rm config directory.
- 
+
 pub trait SettingsApi: Send + Sync {
     /// Read a setting value by key for this extension.
     fn read_setting(&self, key: &str) -> Result<Option<serde_json::Value>>;
@@ -151,11 +151,14 @@ pub trait SettingsApi: Send + Sync {
 ///
 /// Extensions use this to react to pane lifecycle events (title changes,
 /// output, close) for chrome overlays and status indicators.
- 
+
 pub trait TerminalApi: Send + Sync {
     /// Subscribe to events from a specific pane.
     /// Returns a channel receiver for the events.
-    fn subscribe_pane(&self, pane_id: &PaneId) -> Result<futures::channel::mpsc::UnboundedReceiver<PaneEvent>>;
+    fn subscribe_pane(
+        &self,
+        pane_id: &PaneId,
+    ) -> Result<futures::channel::mpsc::UnboundedReceiver<PaneEvent>>;
 
     /// Unsubscribe from a pane's events.
     fn unsubscribe_pane(&self, pane_id: &PaneId) -> Result<()>;

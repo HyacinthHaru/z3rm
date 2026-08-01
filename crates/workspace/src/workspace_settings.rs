@@ -3,15 +3,14 @@ use std::{num::NonZeroUsize, time::Duration};
 use crate::DockPosition;
 pub use crate::settings_stubs::{
     ActivateOnClose, AutosaveSetting, BottomDockLayout, CenteredLayoutSettings,
-    CliDefaultOpenBehavior, CloseWindowWhenNoItems, DefaultOpenBehavior,
-    InactiveOpacity, PaneSplitDirectionHorizontal, PaneSplitDirectionVertical,
-    RestoreOnStartupBehavior,
+    CliDefaultOpenBehavior, CloseWindowWhenNoItems, DefaultOpenBehavior, InactiveOpacity,
+    PaneSplitDirectionHorizontal, PaneSplitDirectionVertical, RestoreOnStartupBehavior,
 };
 use collections::HashMap;
 use gpui::{App, Subscription};
 use serde::Deserialize;
-pub use settings::{RegisterSetting, Settings};
 pub use settings::{CommandAliasTarget, EncodingDisplayOptions, SettingsStore};
+pub use settings::{RegisterSetting, Settings};
 
 /// 工作区设置 (spec §16 Plan 16)
 /// 原 settings 字段已大幅精简，保留向后兼容桩值

@@ -92,7 +92,8 @@ impl Sidebar {
         cx: &mut Context<Self>,
     ) -> Self {
         let focus_handle = cx.focus_handle();
-        cx.on_focus_in(&focus_handle, window, Self::on_focus_in).detach();
+        cx.on_focus_in(&focus_handle, window, Self::on_focus_in)
+            .detach();
 
         let filter_editor = cx.new(|cx| {
             let mut editor = Editor::single_line(window, cx);
@@ -128,7 +129,12 @@ impl Sidebar {
         cx.notify();
     }
 
-    fn select_previous(&mut self, _: &SelectPrevious, _window: &mut Window, cx: &mut Context<Self>) {
+    fn select_previous(
+        &mut self,
+        _: &SelectPrevious,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         if let Some(ix) = self.selection {
             self.selection = Some(ix.saturating_sub(1));
         }

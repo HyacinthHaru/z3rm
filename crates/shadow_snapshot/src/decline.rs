@@ -16,9 +16,9 @@
 
 use std::path::Path;
 
-use std::io::Write as _;
 use anyhow::{Context, Result};
-use sha2::{Sha256, Digest};
+use sha2::{Digest, Sha256};
+use std::io::Write as _;
 use tracing::{info, warn};
 
 use crate::storage::BlobStore;
@@ -89,9 +89,7 @@ impl<'a> DeclineProtocol<'a> {
             .get(content_hash)
             .context("decline: target content blob missing")?;
 
-        let parent = target_path
-            .parent()
-            .filter(|p| !p.as_os_str().is_empty());
+        let parent = target_path.parent().filter(|p| !p.as_os_str().is_empty());
         if let Some(parent_dir) = parent {
             std::fs::create_dir_all(parent_dir)
                 .context("decline: failed to create parent directory")?;
@@ -107,7 +105,8 @@ impl<'a> DeclineProtocol<'a> {
                 .context("decline: failed to open temp file")?;
             file.write_all(&content)
                 .context("decline: failed to write restored content")?;
-            file.sync_all().context("decline: failed to fsync restored file")?;
+            file.sync_all()
+                .context("decline: failed to fsync restored file")?;
         }
 
         std::fs::rename(&tmp_path, target_path)
@@ -116,7 +115,8 @@ impl<'a> DeclineProtocol<'a> {
         if let Some(parent_dir) = parent {
             let dir = std::fs::File::open(parent_dir)
                 .context("decline: failed to open parent dir for fsync")?;
-            dir.sync_all().context("decline: failed to fsync parent dir")?;
+            dir.sync_all()
+                .context("decline: failed to fsync parent dir")?;
         }
 
         info!(path = ?target_path, "decline: file restored and fsynced");
@@ -182,7 +182,10 @@ impl<'a> DeclineProtocol<'a> {
             .collect();
 
         if !pending.is_empty() {
-            warn!(count = pending.len(), "decline: incomplete intents to recover");
+            warn!(
+                count = pending.len(),
+                "decline: incomplete intents to recover"
+            );
         }
 
         Ok(pending)
@@ -214,7 +217,10 @@ impl<'a> DeclineProtocol<'a> {
         };
         wal.append(&done)?;
         wal.commit()?;
-        info!(seq_no = entry.seq_no, "decline: recovery completed and marked done");
+        info!(
+            seq_no = entry.seq_no,
+            "decline: recovery completed and marked done"
+        );
         Ok(())
     }
 }
@@ -239,7 +245,11 @@ mod tests {
             );
             let blob_store = BlobStore::new(storage, dir.path().join("blobs"));
             let wal = Wal::open(dir.path().join("test.wal")).unwrap();
-            Self { _dir: dir, blob_store, wal }
+            Self {
+                _dir: dir,
+                blob_store,
+                wal,
+            }
         }
 
         fn path(&self, name: &str) -> std::path::PathBuf {
@@ -336,7 +346,10 @@ mod tests {
         stack.wal.commit().unwrap();
 
         let pending = DeclineProtocol::recover(&stack.wal).unwrap();
-        assert!(pending.is_empty(), "completed decline must not be recovered");
+        assert!(
+            pending.is_empty(),
+            "completed decline must not be recovered"
+        );
         let found = DeclineProtocol::check_pending(&stack.wal, [0x11; 32]).unwrap();
         assert!(found.is_none());
     }
@@ -472,6 +485,9 @@ mod tests {
         assert_eq!(written, new_content.as_slice());
         // 临时文件应被 rename 消费，不再残留
         let tmp = file_path.with_extension("decline_tmp");
-        assert!(!tmp.exists(), "temp file must not linger after atomic rename");
+        assert!(
+            !tmp.exists(),
+            "temp file must not linger after atomic rename"
+        );
     }
 }

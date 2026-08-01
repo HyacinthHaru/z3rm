@@ -282,8 +282,8 @@ impl minidumper::ServerHandler for CrashServer {
             Err(e) => Some(format!("{e:?}")),
         };
 
-// system_specs 已删除, GPU 信息收集暂时跳过
-let gpus = vec![];
+        // system_specs 已删除, GPU 信息收集暂时跳过
+        let gpus = vec![];
 
         let crash_info = CrashInfo {
             init: self

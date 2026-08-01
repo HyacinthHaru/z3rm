@@ -87,9 +87,7 @@ mod mux_forward {
 
     /// True iff `first` names a mux subcommand this wrapper must forward.
     pub(super) fn is_mux_subcommand(first: &OsStr) -> bool {
-        first
-            .to_str()
-            .is_some_and(|s| MUX_SUBCOMMANDS.contains(&s))
+        first.to_str().is_some_and(|s| MUX_SUBCOMMANDS.contains(&s))
     }
 
     /// Replaces this process with the sibling mux binary, forwarding `args`
@@ -212,8 +210,15 @@ mod mux_forward {
 
         #[test]
         fn does_not_forward_editor_flags_or_paths() {
-            for name in ["--foreground", "--version", "--help", "--z3rm", "-n", "new-window-foo", "lsx"]
-            {
+            for name in [
+                "--foreground",
+                "--version",
+                "--help",
+                "--z3rm",
+                "-n",
+                "new-window-foo",
+                "lsx",
+            ] {
                 assert!(
                     !is_mux_subcommand(&OsString::from(name)),
                     "{name:?} must not forward (clap/editor path owns it)"
@@ -275,10 +280,21 @@ mod mux_forward {
             let args: Vec<OsString> = vec!["ls".into(), "--z3rm".into()];
             assert_eq!(strip_z3rm(&args), vec![OsString::from("ls")]);
         }
+        #[test]
+        fn extension_is_forwarded_before_path_parsing() {
+            // `extension` must route to the sibling core binary instead of being
+            // consumed as the first positional path by the wrapper's clap Args.
+            assert!(
+                is_mux_subcommand(&OsString::from("extension")),
+                "extension must forward to the core z3rm binary"
+            );
+            // Marketplace subcommand and its args survive the --z3rm strip so the
+            // sibling sees `extension install <name>` verbatim.
+            let args: Vec<OsString> = vec!["extension".into(), "install".into(), "some-ext".into()];
+            assert_eq!(strip_z3rm(&args), args);
+        }
     }
 }
-
-
 
 trait InstalledApp {
     fn zed_version_string(&self) -> String;
@@ -1157,11 +1173,11 @@ mod linux {
         time::Duration,
     };
 
+    use crate::{Detect, InstalledApp};
     use anyhow::{Context as _, anyhow};
     use cli::FORCE_CLI_MODE_ENV_VAR_NAME;
     use fork::Fork;
     use paths;
-    use crate::{Detect, InstalledApp};
 
     struct App(PathBuf);
 
@@ -1175,8 +1191,7 @@ mod linux {
 
                 // libexec is the standard, lib/zed is for Arch (and other non-libexec distros),
                 // ./zed is for the target directory in development builds.
-                let possible_locations =
-                    ["../libexec/z3rm", "../lib/z3rm/z3rm", "./z3rm"];
+                let possible_locations = ["../libexec/z3rm", "../lib/z3rm/z3rm", "./z3rm"];
                 possible_locations
                     .iter()
                     .find_map(|p| dir.join(p).canonicalize().ok().filter(|path| path != &cli))
@@ -1316,7 +1331,10 @@ mod linux {
             // §3.3 创建新窗口
             let window_id = mux.create_window(&session_id).await?;
 
-            println!("New window '{}' created in session '{}'", window_id, session_id);
+            println!(
+                "New window '{}' created in session '{}'",
+                window_id, session_id
+            );
 
             // §3.3 启动新 GUI 窗口连接到该窗口 ID
             let data_dir = paths::data_dir().clone();
@@ -1413,7 +1431,12 @@ mod flatpak {
             && args.zed.is_none()
         {
             args.zed = Some("/app/libexec/z3rm".into());
-            unsafe { env::set_var("Z3RM_UPDATE_EXPLANATION", "Please use flatpak to update z3rm") };
+            unsafe {
+                env::set_var(
+                    "Z3RM_UPDATE_EXPLANATION",
+                    "Please use flatpak to update z3rm",
+                )
+            };
         }
         args
     }
@@ -1570,7 +1593,8 @@ mod windows {
 
                 // ../z3rm.exe is the standard, lib/z3rm is for MSYS2, ./z3rm.exe is for the target
                 // directory in development builds.
-                let possible_locations = ["../z3rm.exe", "../lib/z3rm/z3rm-editor.exe", "./z3rm.exe"];
+                let possible_locations =
+                    ["../z3rm.exe", "../lib/z3rm/z3rm-editor.exe", "./z3rm.exe"];
                 possible_locations
                     .iter()
                     .find_map(|p| dir.join(p).canonicalize().ok().filter(|path| path != &cli))

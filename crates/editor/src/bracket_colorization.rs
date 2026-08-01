@@ -32,20 +32,17 @@ impl Editor {
         let multi_buffer_snapshot = self.buffer().read(cx).snapshot(cx);
 
         let visible_excerpts = self.visible_buffer_ranges(cx);
-        let excerpt_data: Vec<(
-            BufferSnapshot,
-            Range<BufferOffset>,
-            ExcerptRange<Anchor>,
-        )> = visible_excerpts
-            .into_iter()
-            .filter(|(buffer_snapshot, _, _)| {
-                let Some(buffer) = self.buffer().read(cx).buffer(buffer_snapshot.remote_id())
-                else {
-                    return false;
-                };
-                LanguageSettings::for_buffer(buffer.read(cx), cx).colorize_brackets
-            })
-            .collect();
+        let excerpt_data: Vec<(BufferSnapshot, Range<BufferOffset>, ExcerptRange<Anchor>)> =
+            visible_excerpts
+                .into_iter()
+                .filter(|(buffer_snapshot, _, _)| {
+                    let Some(buffer) = self.buffer().read(cx).buffer(buffer_snapshot.remote_id())
+                    else {
+                        return false;
+                    };
+                    LanguageSettings::for_buffer(buffer.read(cx), cx).colorize_brackets
+                })
+                .collect();
 
         let mut fetched_tree_sitter_chunks = excerpt_data
             .iter()

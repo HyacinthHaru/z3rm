@@ -1251,9 +1251,8 @@ async fn handle_spawn_pane(
     server_settings: &Arc<crate::server_settings::ServerSettings>,
     clipboard: &Arc<crate::clipboard::ServerClipboard>,
 ) -> anyhow::Result<ResponseBody> {
-    let session_cwd = session_cwd(sessions, &req.session_id).ok_or_else(|| {
-        anyhow::anyhow!("session not found: {}", req.session_id)
-    })?;
+    let session_cwd = session_cwd(sessions, &req.session_id)
+        .ok_or_else(|| anyhow::anyhow!("session not found: {}", req.session_id))?;
     let pane_id = nanoid::nanoid!();
 
     // §3.1 转换 ShellCommand → pane::ShellCommand
@@ -2479,10 +2478,8 @@ fn detect_binary(bytes: &[u8]) -> bool {
 mod connection_unit_tests {
     use super::*;
 
-
     #[test]
     fn unregister_client_removes_every_session_subscription() {
-
         let mut sessions = vec![
             crate::session::Session::new(
                 "session-1".to_string(),
@@ -2522,7 +2519,8 @@ mod connection_unit_tests {
     #[tokio::test]
     async fn kill_missing_session_returns_nonempty_error() {
         let sessions = Arc::new(parking_lot::RwLock::new(Vec::new()));
-        let connection = Connection::open_memory(Some("kill_missing_session_returns_nonempty_error"));
+        let connection =
+            Connection::open_memory(Some("kill_missing_session_returns_nonempty_error"));
         crate::persistence::init_tables(&connection).expect("initialize persistence tables");
         let database = Arc::new(parking_lot::Mutex::new(connection));
 
@@ -2564,7 +2562,6 @@ mod connection_unit_tests {
                 program: "/bin/cat".to_string(),
                 ..Default::default()
             }),
-
         ) {
             Ok(pane) => pane,
             Err(error) => panic!("spawn cleanup pane: {error}"),

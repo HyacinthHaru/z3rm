@@ -1,9 +1,9 @@
-use std::sync::Arc;
+use crate::log_viewer;
 use crashes;
 use fs::Fs;
 use gpui::{App, Global, UpdateGlobal as _};
 use settings::SettingsStore;
-use crate::log_viewer;
+use std::sync::Arc;
 
 #[allow(dead_code)]
 pub struct CrashHandler(pub Arc<crashes::Client>);

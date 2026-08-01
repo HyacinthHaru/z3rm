@@ -3,29 +3,29 @@
 //! 单写线程 (watcher)，WAL-first，content-addressed blob store，
 //! age-based FIFO eviction。所有操作以单调 SeqNo 为键。
 
-mod delta_chain;
 mod decline;
+mod delta_chain;
+mod engine;
+mod git_hook;
 mod lca;
 mod memtable;
 mod monitor;
-mod git_hook;
 mod quota;
 mod storage;
 mod version_tree;
 mod wal;
-mod engine;
 
-pub use delta_chain::{serialize_delta_ops, deserialize_delta_ops, DeltaOp, DeltaReplay, D_MAX};
 pub use decline::DeclineProtocol;
-pub use lca::{compute_lca, build_ancestor_table};
+pub use delta_chain::{D_MAX, DeltaOp, DeltaReplay, deserialize_delta_ops, serialize_delta_ops};
+pub use engine::ShadowSnapshotEngine;
+pub use engine::compute_path_hash;
+pub use lca::{build_ancestor_table, compute_lca};
 pub use memtable::{MemTable, PathChange};
-pub use version_tree::SnapshotTrigger;
+pub use monitor::{EventKind, FileEvent, Monitor, WatchHandle};
 pub use quota::QuotaManager;
 pub use storage::{BlobStore, StorageEngine};
+pub use version_tree::SnapshotTrigger;
 pub use version_tree::{
     ContentHash, DeltaRef, PathHash, SeqNo, VersionId, VersionNode, VersionTree,
 };
 pub use wal::{Wal, WalEntry};
-pub use engine::ShadowSnapshotEngine;
-pub use engine::compute_path_hash;
-pub use monitor::{EventKind, FileEvent, Monitor, WatchHandle};

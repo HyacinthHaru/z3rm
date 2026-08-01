@@ -5,11 +5,10 @@ use multi_buffer::Anchor;
 use project::{DocumentColor, InlayId};
 use settings::Settings as _;
 use text::BufferId;
-use ui::{Window};
+use ui::Window;
 
 use crate::{
-    DisplayPoint, Editor, EditorSettings, EditorSnapshot,
-    editor_settings::DocumentColorsRenderMode,
+    DisplayPoint, Editor, EditorSettings, EditorSnapshot, editor_settings::DocumentColorsRenderMode,
 };
 
 #[derive(Debug)]

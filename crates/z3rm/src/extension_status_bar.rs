@@ -53,7 +53,7 @@ impl ExtensionStatusBar {
 
 impl Render for ExtensionStatusBar {
     fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl gpui::IntoElement {
-        use gpui::{div, ParentElement, Styled};
+        use gpui::{ParentElement, Styled, div};
 
         let mut container = div().flex().flex_row().gap(gpui::px(8.0));
 

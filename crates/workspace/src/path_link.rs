@@ -299,8 +299,8 @@ fn possible_open_target_internal(
 
     let project = workspace.read(cx).project().clone();
     // §2.1 删除远程协同后，项目永远按本地文件系统解析路径；不再依赖 Project::is_local。
-    let background_path_checks = background_path_checks
-        .unwrap_or(BackgroundPathChecks::LocalFileSystem);
+    let background_path_checks =
+        background_path_checks.unwrap_or(BackgroundPathChecks::LocalFileSystem);
 
     let background_resolution_task = match background_path_checks {
         // §15.1 Project::resolve_abs_path 已删除，远程路径解析分支已移除。

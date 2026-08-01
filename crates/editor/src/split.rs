@@ -12,6 +12,7 @@ use gpui::{
     canvas, prelude::*,
 };
 
+use crate::editor_settings::DiffViewStyle;
 use language::{Buffer, Capability, HighlightedText};
 use multi_buffer::{
     Anchor, AnchorRangeExt as _, BufferOffset, ExcerptRange, ExpandExcerptDirection, MultiBuffer,
@@ -20,9 +21,8 @@ use multi_buffer::{
 use project::Project;
 use rope::Point;
 use settings::{Settings, SettingsStore, update_settings_file};
-use crate::editor_settings::DiffViewStyle;
-use workspace::settings_stubs::SeedQuerySetting;
 use text::{Bias, BufferId, OffsetRangeExt as _, Patch, ToPoint as _};
+use workspace::settings_stubs::SeedQuerySetting;
 
 use ui::{Toggleable as _, Tooltip, prelude::*, render_modifiers};
 use util::ResultExt as _;

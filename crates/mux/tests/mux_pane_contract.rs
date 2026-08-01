@@ -16,8 +16,8 @@
 use anyhow::{Context, Result};
 use mux::MuxDomain;
 use mux_protocol::proto::{
-    self, fetch_grid_update_response::Update as FetchUpdate, Cell, GridDiff, RowChange,
-    TerminalSize,
+    self, Cell, GridDiff, RowChange, TerminalSize,
+    fetch_grid_update_response::Update as FetchUpdate,
 };
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -38,6 +38,9 @@ fn snapshot_to_text_empty_grid() {
         cursor: None,
         alternate_screen: false,
         display_offset: 0,
+        history_size: 0,
+        history_version: 0,
+        modes: None,
     };
     assert_eq!(snapshot_to_text(&snap), "");
 }
@@ -51,6 +54,9 @@ fn snapshot_to_text_single_row() {
         cursor: None,
         alternate_screen: false,
         display_offset: 0,
+        history_size: 0,
+        history_version: 0,
+        modes: None,
     };
     assert_eq!(snapshot_to_text(&snap), "hello");
 }
@@ -62,13 +68,19 @@ fn snapshot_to_text_multi_row_no_trailing_newline() {
         cols: 2,
         rows: 3,
         cells: vec![
-            cell('a'), cell('b'),
-            cell('c'), cell('d'),
-            cell('e'), cell('f'),
+            cell('a'),
+            cell('b'),
+            cell('c'),
+            cell('d'),
+            cell('e'),
+            cell('f'),
         ],
         cursor: None,
         alternate_screen: false,
         display_offset: 0,
+        history_size: 0,
+        history_version: 0,
+        modes: None,
     };
     assert_eq!(snapshot_to_text(&snap), "ab\ncd\nef");
 }
@@ -83,13 +95,16 @@ fn snapshot_to_text_missing_cells_filled_with_space() {
         cursor: None,
         alternate_screen: false,
         display_offset: 0,
+        history_size: 0,
+        history_version: 0,
+        modes: None,
     };
     let text = snapshot_to_text(&snap);
     assert_eq!(text, "x  \n   ");
 }
 
 #[test]
-fn apply_diff_overwrites_cells_in_row() {
+fn apply_diff_overwrites_complete_row() {
     let mut snap = proto::FullGridSnapshot {
         cols: 3,
         rows: 2,
@@ -97,6 +112,9 @@ fn apply_diff_overwrites_cells_in_row() {
         cursor: None,
         alternate_screen: false,
         display_offset: 0,
+        history_size: 0,
+        history_version: 0,
+        modes: None,
     };
     let diff = GridDiff {
         rows: vec![RowChange {
@@ -104,13 +122,13 @@ fn apply_diff_overwrites_cells_in_row() {
             cells: vec![cell('X'), cell('Y'), cell('Z')],
         }],
     };
-    apply_diff_to_snapshot(&mut snap, &diff);
+    apply_diff_to_snapshot(&mut snap, &diff).expect("complete row diff should apply");
     assert_eq!(snapshot_to_text(&snap), "aaa\nXYZ");
 }
 
 #[test]
-fn apply_diff_truncates_overlong_row() {
-    // §3.3 row cells 多于 cols → 静默丢弃多余 (越界 col break)
+fn apply_diff_rejects_overlong_row_without_mutation() {
+    // Row width is an authoritative protocol invariant; malformed rows are rejected.
     let mut snap = proto::FullGridSnapshot {
         cols: 2,
         rows: 1,
@@ -118,6 +136,9 @@ fn apply_diff_truncates_overlong_row() {
         cursor: None,
         alternate_screen: false,
         display_offset: 0,
+        history_size: 0,
+        history_version: 0,
+        modes: None,
     };
     let diff = GridDiff {
         rows: vec![RowChange {
@@ -125,13 +146,13 @@ fn apply_diff_truncates_overlong_row() {
             cells: vec![cell('X'), cell('Y'), cell('Z'), cell('W')],
         }],
     };
-    apply_diff_to_snapshot(&mut snap, &diff);
-    assert_eq!(snapshot_to_text(&snap), "XY"); // ZW 丢弃
+    assert!(apply_diff_to_snapshot(&mut snap, &diff).is_err());
+    assert_eq!(snapshot_to_text(&snap), "aa");
 }
 
 #[test]
-fn apply_diff_skips_out_of_bounds_row() {
-    // §3.3 row_idx >= rows → continue (无 panic)
+fn apply_diff_rejects_out_of_bounds_row_without_mutation() {
+    // Out-of-bounds rows are malformed and must not partially mutate the cache.
     let mut snap = proto::FullGridSnapshot {
         cols: 2,
         rows: 1,
@@ -139,6 +160,9 @@ fn apply_diff_skips_out_of_bounds_row() {
         cursor: None,
         alternate_screen: false,
         display_offset: 0,
+        history_size: 0,
+        history_version: 0,
+        modes: None,
     };
     let diff = GridDiff {
         rows: vec![RowChange {
@@ -146,7 +170,7 @@ fn apply_diff_skips_out_of_bounds_row() {
             cells: vec![cell('X'), cell('Y')],
         }],
     };
-    apply_diff_to_snapshot(&mut snap, &diff);
+    assert!(apply_diff_to_snapshot(&mut snap, &diff).is_err());
     assert_eq!(snapshot_to_text(&snap), "aa");
 }
 
@@ -156,6 +180,8 @@ fn cell(ch: char) -> Cell {
         style: None,
         foreground: 0,
         background: 0,
+        zerowidth: String::new(),
+        hyperlink: None,
     }
 }
 

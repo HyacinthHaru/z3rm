@@ -120,11 +120,7 @@ impl LspInstaller for EsLintLspAdapter {
         _container_dir: PathBuf,
         _delegate: &Arc<dyn LspAdapterDelegate>,
     ) -> impl Send + Future<Output = Result<LanguageServerBinary>> + use<> {
-        async {
-            anyhow::bail!(
-                "language server installation unavailable (node_runtime removed)"
-            )
-        }
+        async { anyhow::bail!("language server installation unavailable (node_runtime removed)") }
     }
 
     async fn cached_server_binary(
@@ -371,7 +367,8 @@ fn match_glob_pattern(pattern: &str, file_path: &Path) -> Option<String> {
         .build()
         .ok()?;
     let matcher = glob.compile_matcher();
-    matcher.is_match(&PathBuf::from(&normalized_file_path))
+    matcher
+        .is_match(&PathBuf::from(&normalized_file_path))
         .then(|| {
             let mut path = PathBuf::from(pattern);
             // Replace ** with the relative path between the pattern root and the file
@@ -478,9 +475,6 @@ mod tests {
         );
 
         // No version defaults to v8.21 behavior
-        assert_eq!(
-            flat_config_file_names(None),
-            &["eslint.config.js"]
-        );
+        assert_eq!(flat_config_file_names(None), &["eslint.config.js"]);
     }
 }

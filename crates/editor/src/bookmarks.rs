@@ -1,5 +1,6 @@
 use std::ops::Range;
 
+use crate::stubs::ProjectBufferExt;
 use gpui::Entity;
 use language::Buffer;
 use multi_buffer::{Anchor, MultiBufferOffset, MultiBufferSnapshot, ToOffset as _};
@@ -9,7 +10,6 @@ use text::Bias;
 use ui::{Context, Window};
 use util::ResultExt as _;
 use workspace::{Workspace, searchable::Direction};
-use crate::stubs::ProjectBufferExt;
 
 use crate::display_map::DisplayRow;
 use crate::{
@@ -192,7 +192,12 @@ impl Editor {
                 "Enter bookmark label (Optional)",
                 Some(Box::new(move |label: String, _, cx| {
                     bookmark_store.update(cx, |store, cx| {
-                        BookmarkStore::toggle_bookmark(target.buffer, target.buffer_anchor, label, cx);
+                        BookmarkStore::toggle_bookmark(
+                            target.buffer,
+                            target.buffer_anchor,
+                            label,
+                            cx,
+                        );
                     });
                 })),
                 None,
@@ -211,7 +216,12 @@ impl Editor {
         if let Some(bookmark_store) = self.bookmark_store.clone() {
             bookmark_store.update(cx, |store, cx| {
                 for target in targets {
-                    BookmarkStore::toggle_bookmark(target.buffer, target.buffer_anchor, label.clone(), cx);
+                    BookmarkStore::toggle_bookmark(
+                        target.buffer,
+                        target.buffer_anchor,
+                        label.clone(),
+                        cx,
+                    );
                 }
             });
         }

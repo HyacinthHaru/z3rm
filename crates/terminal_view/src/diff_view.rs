@@ -7,9 +7,7 @@ use gpui::{
 };
 use language::Capability;
 use ui::{Color, Icon, IconName, Label, LabelSize, prelude::*};
-use workspace::{
-    item::{HighlightedText, Item, ItemEvent, TabContentParams, TabTooltipContent},
-};
+use workspace::item::{HighlightedText, Item, ItemEvent, TabContentParams, TabTooltipContent};
 
 /// §16.6 DiffView — read-only editor for unified diff content.
 ///
@@ -68,16 +66,15 @@ impl DiffView {
 
         // Propagate editor lifecycle events as workspace ItemEvents so the
         // tab title / dirty indicator update correctly.
-        let editor_subscription =
-            cx.subscribe(&editor, |_, _, event, cx| match event {
-                EditorEvent::TitleChanged | EditorEvent::DirtyChanged => {
-                    cx.emit(ItemEvent::UpdateTab);
-                }
-                EditorEvent::Edited { .. } => {
-                    cx.emit(ItemEvent::Edit);
-                }
-                _ => {}
-            });
+        let editor_subscription = cx.subscribe(&editor, |_, _, event, cx| match event {
+            EditorEvent::TitleChanged | EditorEvent::DirtyChanged => {
+                cx.emit(ItemEvent::UpdateTab);
+            }
+            EditorEvent::Edited { .. } => {
+                cx.emit(ItemEvent::Edit);
+            }
+            _ => {}
+        });
 
         DiffView {
             editor,
@@ -198,10 +195,7 @@ impl Item for DiffView {
         workspace::ToolbarItemLocation::PrimaryLeft
     }
 
-    fn breadcrumbs(
-        &self,
-        _cx: &App,
-    ) -> Option<(Vec<HighlightedText>, Option<gpui::Font>)> {
+    fn breadcrumbs(&self, _cx: &App) -> Option<(Vec<HighlightedText>, Option<gpui::Font>)> {
         Some((
             vec![HighlightedText {
                 text: self.title.as_str().into(),

@@ -1,9 +1,10 @@
-
+use crate::{
+    GitHostingProviderConfig, LanguageToSettingsMap, ProjectTerminalSettingsContent, SaturatingBool,
+};
 use collections::HashMap;
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use settings_macros::{MergeFrom, with_fallible_options};
-use crate::{GitHostingProviderConfig, LanguageToSettingsMap, ProjectTerminalSettingsContent, SaturatingBool};
 use std::path::PathBuf;
 
 /// 项目基础设置 (spec §16 Plan 16)

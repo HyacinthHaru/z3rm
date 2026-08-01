@@ -1063,9 +1063,9 @@ impl Editor {
                         None => Ok(Navigated::No),
                     }
                 }
-                GoToDefinitionFallback::Lens | GoToDefinitionFallback::Search | GoToDefinitionFallback::Never => {
-                    Ok(Navigated::No)
-                }
+                GoToDefinitionFallback::Lens
+                | GoToDefinitionFallback::Search
+                | GoToDefinitionFallback::Never => Ok(Navigated::No),
             }
         })
     }

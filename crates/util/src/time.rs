@@ -43,10 +43,9 @@ pub fn format_localized_timestamp(
 ) -> String {
     match format {
         TimestampFormat::Relative => relative_time(&dt, &now),
-        TimestampFormat::MediumAbsolute => {
-            dt.format(&time::format_description::well_known::Rfc3339)
-                .unwrap_or_else(|_| dt.to_string())
-        }
+        TimestampFormat::MediumAbsolute => dt
+            .format(&time::format_description::well_known::Rfc3339)
+            .unwrap_or_else(|_| dt.to_string()),
         TimestampFormat::EnhancedAbsolute => {
             let day = dt.day();
             let month_num = match dt.month() {

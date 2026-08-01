@@ -15,7 +15,19 @@ use util::rel_path::{PathExt, RelPathBuf};
 use crate::ExtensionCapability;
 
 /// Extension 提供的功能类别 (stub: replaced deleted cloud_api_types::ExtensionProvides)
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize, strum::EnumIter)]
+#[derive(
+    Debug,
+    Clone,
+    Copy,
+    PartialEq,
+    Eq,
+    PartialOrd,
+    Ord,
+    Hash,
+    Serialize,
+    Deserialize,
+    strum::EnumIter,
+)]
 #[serde(rename_all = "snake_case")]
 pub enum ExtensionProvides {
     Themes,

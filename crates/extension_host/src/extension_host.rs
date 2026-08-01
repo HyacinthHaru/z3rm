@@ -1,10 +1,10 @@
+pub mod api;
 mod capability_granter;
 pub mod extension_settings;
 pub mod headless_host;
 pub mod marketplace;
-pub mod wasm_host;
-pub mod api;
 pub mod vdom_bridge;
+pub mod wasm_host;
 
 // #[cfg(test)]
 // mod extension_store_test;
@@ -81,10 +81,7 @@ impl NodeRuntime {
         bail!("Node runtime unavailable")
     }
 
-    pub async fn npm_package_latest_version(
-        &self,
-        _package_name: &str,
-    ) -> Result<Version> {
+    pub async fn npm_package_latest_version(&self, _package_name: &str) -> Result<Version> {
         bail!("Node runtime unavailable")
     }
 
@@ -1817,7 +1814,6 @@ impl ExtensionStore {
     }
 
     // 远程扩展同步已随 `proto` crate 删除（spec §7 M2）。
-
 
     pub async fn update_remote_clients(_this: &WeakEntity<Self>, _cx: &mut AsyncApp) -> Result<()> {
         // 远程扩展同步已随 `proto` crate 删除（spec §7 M2）。

@@ -1,11 +1,11 @@
 // §3.6 Persistence 模块 — SQLite 布局元数据持久化。
 // 每 10s 快照 session layout metadata。grid 内容不持久化 (§3.6)。
 
+use serde::{Deserialize, Serialize};
 use sqlez::connection::Connection;
 use sqlez::statement::Statement;
 use std::sync::Arc;
 use std::time::Duration;
-use serde::{Deserialize, Serialize};
 
 const RECOVERY_FORMAT_VERSION: u32 = 1;
 
@@ -36,7 +36,6 @@ pub struct PersistedPane {
     /// Informational only. Recovery always starts a fresh default shell.
     pub prior_command: Option<String>,
 }
-
 
 // §3.6 SQLite schema: session 元数据表
 const SCHEMA_SQL: &str = r#"

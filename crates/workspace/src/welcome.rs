@@ -6,22 +6,20 @@ use crate::{
 };
 // use agent_settings::AgentSettings;  // removed-crate: agent_settings
 use git::Clone as GitClone;
+use gpui::WeakEntity;
 use gpui::{
     Action, App, Context, Entity, EventEmitter, FocusHandle, Focusable, InteractiveElement,
     ParentElement, Render, Styled, Task, TaskExt, Window, actions,
 };
-use gpui::WeakEntity;
 use menu::{SelectNext, SelectPrevious};
 
+use crate::settings_stubs::DefaultOpenBehavior;
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use settings::Settings;
-use crate::settings_stubs::DefaultOpenBehavior;
 use ui::{ButtonLike, Divider, DividerColor, KeyBinding, Vector, VectorName, prelude::*};
 use util::ResultExt;
-use zed_actions::{
-    Extensions, OpenKeymap, OpenOnboarding, OpenSettings, command_palette,
-};
+use zed_actions::{Extensions, OpenKeymap, OpenOnboarding, OpenSettings, command_palette};
 
 #[derive(PartialEq, Clone, Debug, Deserialize, Serialize, JsonSchema, Action)]
 #[action(namespace = welcome)]
@@ -617,4 +615,3 @@ fn project_name(paths: &PathList) -> String {
 
 // #[cfg(test)]
 // mod tests;
-

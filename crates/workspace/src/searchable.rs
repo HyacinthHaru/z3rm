@@ -1,12 +1,12 @@
 use std::{any::Any, sync::Arc};
 
+use crate::settings_stubs::SeedQuerySetting;
 use any_vec::AnyVec;
 use gpui::{
     AnyView, AnyWeakEntity, App, Context, Entity, EventEmitter, Subscription, Task, WeakEntity,
     Window,
 };
 use project::search::SearchQuery;
-use crate::settings_stubs::SeedQuerySetting;
 
 use crate::{
     ItemHandle,

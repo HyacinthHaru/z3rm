@@ -6,9 +6,9 @@
 
 use std::sync::atomic::{AtomicU64, Ordering};
 
+use aes_gcm::Aes256Gcm;
 use aes_gcm::aead::{Aead, Key, KeyInit};
 use aes_gcm::aes::cipher::typenum::U12;
-use aes_gcm::Aes256Gcm;
 use anyhow::Result;
 use generic_array::GenericArray;
 
@@ -153,7 +153,9 @@ impl PacketCodec {
         // 提取 nonce 计数器值。
         let nonce_counter = &packet[..NONCE_COUNTER_LEN];
         let nonce_val = u64::from_be_bytes(
-            nonce_counter.try_into().map_err(|_| anyhow::anyhow!("invalid nonce"))?,
+            nonce_counter
+                .try_into()
+                .map_err(|_| anyhow::anyhow!("invalid nonce"))?,
         );
 
         // §16.6 检查重放保护窗口。

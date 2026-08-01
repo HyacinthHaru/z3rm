@@ -238,10 +238,7 @@ impl Item for FileViewer {
         workspace::ToolbarItemLocation::PrimaryLeft
     }
 
-    fn breadcrumbs(
-        &self,
-        _cx: &App,
-    ) -> Option<(Vec<HighlightedText>, Option<gpui::Font>)> {
+    fn breadcrumbs(&self, _cx: &App) -> Option<(Vec<HighlightedText>, Option<gpui::Font>)> {
         let mut segments = Vec::new();
         if let Some(parent) = self.path.parent() {
             segments.push(HighlightedText {
@@ -274,23 +271,19 @@ pub fn open_file_in_viewer(
     let split_direction = SplitDirection::Right;
     let target_pane = workspace
         .find_pane_in_direction(split_direction, cx)
-        .unwrap_or_else(|| {
-            workspace.split_pane(active_pane.clone(), split_direction, window, cx)
-        });
+        .unwrap_or_else(|| workspace.split_pane(active_pane.clone(), split_direction, window, cx));
 
     let open_task = FileViewer::open(abs_path, project, window, cx);
-    cx.spawn_in(window, async move |_workspace, cx| {
-        match open_task.await {
-            Ok(viewer) => {
-                target_pane
-                    .update_in(cx, |pane, window, cx| {
-                        pane.add_item(Box::new(viewer), true, true, None, window, cx);
-                    })
-                    .ok();
-            }
-            Err(err) => {
-                log::error!("failed to open file viewer: {err:#}");
-            }
+    cx.spawn_in(window, async move |_workspace, cx| match open_task.await {
+        Ok(viewer) => {
+            target_pane
+                .update_in(cx, |pane, window, cx| {
+                    pane.add_item(Box::new(viewer), true, true, None, window, cx);
+                })
+                .ok();
+        }
+        Err(err) => {
+            log::error!("failed to open file viewer: {err:#}");
         }
     })
     .detach();

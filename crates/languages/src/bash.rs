@@ -67,11 +67,7 @@ impl LspInstaller for BashLspAdapter {
         _container_dir: PathBuf,
         _delegate: &Arc<dyn LspAdapterDelegate>,
     ) -> impl Send + Future<Output = Result<LanguageServerBinary>> + use<> {
-        async {
-            anyhow::bail!(
-                "language server installation unavailable (node_runtime removed)"
-            )
-        }
+        async { anyhow::bail!("language server installation unavailable (node_runtime removed)") }
     }
 }
 

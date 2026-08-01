@@ -5,7 +5,6 @@ use futures::{StreamExt, channel::mpsc};
 use gpui::{App, BackgroundExecutor, ReadGlobal};
 use std::{path::PathBuf, sync::Arc, time::Duration};
 
-
 pub const EMPTY_THEME_NAME: &str = "empty-theme";
 
 /// Settings for visual tests that use proper fonts instead of Courier.

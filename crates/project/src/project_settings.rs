@@ -93,7 +93,6 @@ pub struct NodeBinarySettings {
     pub ignore_system_version: bool,
 }
 
-
 /// Common language server settings.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
 #[serde(default)]
@@ -383,14 +382,12 @@ pub enum GitPathStyle {
     FilePathFirst,
 }
 
-
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum InlineBlameLocation {
     #[default]
     Inline,
     StatusBar,
 }
-
 
 #[derive(Clone, Copy, Debug)]
 pub struct InlineBlameSettings {
@@ -557,9 +554,7 @@ impl Settings for ProjectSettings {
                     min_column: 0,
                     show_commit_summary: false,
                 },
-                blame: BlameSettings {
-                    show_avatar: false,
-                },
+                blame: BlameSettings { show_avatar: false },
                 branch_picker: BranchPickerSettings {
                     show_author_name: true,
                 },

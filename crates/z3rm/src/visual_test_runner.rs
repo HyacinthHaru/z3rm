@@ -964,7 +964,7 @@ cargo run
 #[cfg(target_os = "macos")]
 fn init_app_state(cx: &mut App) -> Arc<AppState> {
     use fs::Fs;
-// use node_runtime::NodeRuntime;  // removed-crate: node_runtime
+    // use node_runtime::NodeRuntime;  // removed-crate: node_runtime
     use session::Session;
     use settings::SettingsStore;
 
@@ -2007,8 +2007,8 @@ fn run_agent_thread_view_test(
     cx: &mut VisualTestAppContext,
     update_baseline: bool,
 ) -> Result<TestResult> {
-// use agent::{AgentTool, ToolInput};  // removed-crate: agent
-// use agent_ui::AgentPanel;  // removed-crate: agent_ui
+    // use agent::{AgentTool, ToolInput};  // removed-crate: agent
+    // use agent_ui::AgentPanel;  // removed-crate: agent_ui
 
     // Create a temporary directory with the test image
     // Canonicalize to resolve symlinks (on macOS, /var -> /private/var)
@@ -2313,7 +2313,7 @@ fn run_tool_permissions_visual_tests(
     cx: &mut VisualTestAppContext,
     _update_baseline: bool,
 ) -> Result<TestResult> {
-// use agent_settings::{AgentSettings, CompiledRegex, ToolPermissions, ToolRules};  // removed-crate: agent_settings
+    // use agent_settings::{AgentSettings, CompiledRegex, ToolPermissions, ToolRules};  // removed-crate: agent_settings
     use collections::HashMap;
     use settings::ToolPermissionMode;
     use zed_actions::OpenSettingsAt;

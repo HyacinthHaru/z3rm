@@ -245,7 +245,12 @@ impl Editor {
             let trigger_in_words =
                 this.show_edit_predictions_in_menu() || !had_active_edit_prediction;
 
-            let _: () = this.trigger_completion_on_input::<_, _, _, _, ()>(text, trigger_in_words, window, cx);
+            let _: () = this.trigger_completion_on_input::<_, _, _, _, ()>(
+                text,
+                trigger_in_words,
+                window,
+                cx,
+            );
         });
     }
 

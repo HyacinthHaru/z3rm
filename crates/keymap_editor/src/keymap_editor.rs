@@ -3434,7 +3434,6 @@ impl Render for ActionArgumentsEditor {
     }
 }
 
-
 async fn load_json_language(workspace: WeakEntity<Workspace>, cx: &mut AsyncApp) -> Arc<Language> {
     let json_language_task = workspace
         .read_with(cx, |workspace, cx| {

@@ -15,10 +15,12 @@ use gpui::{
     Window, actions,
 };
 use itertools::Itertools;
-use project::{Fs, Project, RevealStrategy, RevealTarget, Shell, ShellBuilder, SpawnInTerminal, TaskId};
-use terminal::{Terminal, terminal_settings::TerminalSettings};
-use settings::TerminalDockPosition;
+use project::{
+    Fs, Project, RevealStrategy, RevealTarget, Shell, ShellBuilder, SpawnInTerminal, TaskId,
+};
 use settings::Settings as _;
+use settings::TerminalDockPosition;
+use terminal::{Terminal, terminal_settings::TerminalSettings};
 use ui::{
     ButtonLike, Clickable, ContextMenu, FluentBuilder, PopoverMenu, SplitButton, Toggleable,
     Tooltip, prelude::*,
@@ -898,7 +900,9 @@ impl TerminalPanel {
                             RevealStrategy::NoFocus => {
                                 workspace.open_panel::<Self>(window, cx);
                             }
-                            RevealStrategy::Never | RevealStrategy::Center | RevealStrategy::Top => {}
+                            RevealStrategy::Never
+                            | RevealStrategy::Center
+                            | RevealStrategy::Top => {}
                         }
 
                         pane.update(cx, |pane, cx| {

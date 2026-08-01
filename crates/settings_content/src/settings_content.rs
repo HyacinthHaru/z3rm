@@ -1,8 +1,8 @@
 mod action;
 mod extension;
 mod fallible_options;
-mod mux;
 pub mod merge_from;
+mod mux;
 mod project;
 mod serde_helper;
 mod shadow_snapshot;
@@ -31,8 +31,8 @@ pub use workspace::*;
 use collections::{HashMap, IndexMap};
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
-use std::num::NonZeroU32;
 use settings_macros::{MergeFrom, with_fallible_options};
+use std::num::NonZeroU32;
 
 /// 定义设置覆盖结构体，每个字段为 `Option<Box<SettingsContent>>`，
 /// 同时生成 `OVERRIDE_KEYS` 和 `get_by_key` 方法。
@@ -74,8 +74,18 @@ pub enum ParseStatus {
 /// 键盘输入时隐藏鼠标的时机 (spec §16 Plan 16)
 /// 默认: on_typing_and_action
 #[derive(
-    Copy, Clone, Debug, Default, Serialize, Deserialize, PartialEq, Eq, JsonSchema, MergeFrom,
-    strum::VariantArray, strum::VariantNames,
+    Copy,
+    Clone,
+    Debug,
+    Default,
+    Serialize,
+    Deserialize,
+    PartialEq,
+    Eq,
+    JsonSchema,
+    MergeFrom,
+    strum::VariantArray,
+    strum::VariantNames,
 )]
 #[serde(rename_all = "snake_case")]
 pub enum HideMouseMode {
@@ -301,7 +311,9 @@ settings_overrides! {
 }
 
 /// 配置文件基于的基础设置
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema, MergeFrom)]
+#[derive(
+    Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema, MergeFrom,
+)]
 #[serde(rename_all = "snake_case")]
 pub enum ProfileBase {
     /// 在用户设置之上应用配置文件覆盖
@@ -342,8 +354,19 @@ pub struct UserSettingsContent {
 
 /// 基础键盘映射方案
 #[derive(
-    Copy, Clone, Debug, Default, Serialize, Deserialize, JsonSchema, MergeFrom, PartialEq, Eq,
-    strum::VariantArray, strum::VariantNames, strum::FromRepr,
+    Copy,
+    Clone,
+    Debug,
+    Default,
+    Serialize,
+    Deserialize,
+    JsonSchema,
+    MergeFrom,
+    PartialEq,
+    Eq,
+    strum::VariantArray,
+    strum::VariantNames,
+    strum::FromRepr,
 )]
 #[serde(rename_all = "snake_case")]
 pub enum BaseKeymapContent {
@@ -386,11 +409,15 @@ impl std::fmt::Display for SaturatingBool {
 }
 
 impl From<bool> for SaturatingBool {
-    fn from(b: bool) -> Self { Self(b) }
+    fn from(b: bool) -> Self {
+        Self(b)
+    }
 }
 
 impl From<SaturatingBool> for bool {
-    fn from(s: SaturatingBool) -> Self { s.0 }
+    fn from(s: SaturatingBool) -> Self {
+        s.0
+    }
 }
 
 impl merge_from::MergeFrom for SaturatingBool {
@@ -492,7 +519,9 @@ pub struct LspSettingsMap {
 // ============================================================
 
 /// 软换行模式
-#[derive(Copy, Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema, MergeFrom)]
+#[derive(
+    Copy, Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema, MergeFrom,
+)]
 #[serde(rename_all = "snake_case")]
 pub enum SoftWrap {
     #[default]
@@ -503,7 +532,9 @@ pub enum SoftWrap {
 }
 
 /// 光标形状
-#[derive(Copy, Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema, MergeFrom)]
+#[derive(
+    Copy, Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema, MergeFrom,
+)]
 #[serde(rename_all = "snake_case")]
 pub enum CursorShape {
     Bar,
@@ -514,7 +545,9 @@ pub enum CursorShape {
 }
 
 /// 缩进引导线着色
-#[derive(Copy, Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema, MergeFrom)]
+#[derive(
+    Copy, Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema, MergeFrom,
+)]
 #[serde(rename_all = "snake_case")]
 pub enum IndentGuideColoring {
     /// Use the same color for all indent guides.
@@ -526,7 +559,9 @@ pub enum IndentGuideColoring {
 }
 
 /// 缩进引导背景着色
-#[derive(Copy, Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema, MergeFrom)]
+#[derive(
+    Copy, Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema, MergeFrom,
+)]
 #[serde(rename_all = "snake_case")]
 pub enum IndentGuideBackgroundColoring {
     #[default]
@@ -535,7 +570,9 @@ pub enum IndentGuideBackgroundColoring {
 }
 
 /// 文档折叠范围
-#[derive(Copy, Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema, MergeFrom)]
+#[derive(
+    Copy, Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema, MergeFrom,
+)]
 #[serde(rename_all = "snake_case")]
 pub enum DocumentFoldingRanges {
     #[default]
@@ -544,7 +581,9 @@ pub enum DocumentFoldingRanges {
 }
 
 /// 文档符号来源
-#[derive(Copy, Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema, MergeFrom)]
+#[derive(
+    Copy, Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema, MergeFrom,
+)]
 #[serde(rename_all = "snake_case")]
 pub enum DocumentSymbols {
     #[default]
@@ -553,7 +592,9 @@ pub enum DocumentSymbols {
 }
 
 /// 语义 token 高亮模式
-#[derive(Copy, Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema, MergeFrom)]
+#[derive(
+    Copy, Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema, MergeFrom,
+)]
 #[serde(rename_all = "snake_case")]
 pub enum SemanticTokens {
     #[default]
@@ -563,7 +604,9 @@ pub enum SemanticTokens {
 }
 
 /// 自动缩进模式
-#[derive(Copy, Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema, MergeFrom)]
+#[derive(
+    Copy, Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema, MergeFrom,
+)]
 #[serde(rename_all = "snake_case")]
 pub enum AutoIndentMode {
     #[default]
@@ -576,7 +619,9 @@ pub enum AutoIndentMode {
 }
 
 /// 保存时格式化模式
-#[derive(Copy, Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema, MergeFrom)]
+#[derive(
+    Copy, Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema, MergeFrom,
+)]
 #[serde(rename_all = "snake_case")]
 pub enum FormatOnSave {
     #[default]
@@ -598,7 +643,9 @@ pub struct FormatterList {
 }
 
 /// 空白显示设置
-#[derive(Copy, Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema, MergeFrom)]
+#[derive(
+    Copy, Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema, MergeFrom,
+)]
 #[serde(rename_all = "snake_case")]
 pub enum ShowWhitespaceSetting {
     #[default]
@@ -609,7 +656,9 @@ pub enum ShowWhitespaceSetting {
 }
 
 /// 单词补全模式
-#[derive(Copy, Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema, MergeFrom)]
+#[derive(
+    Copy, Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema, MergeFrom,
+)]
 #[serde(rename_all = "snake_case")]
 pub enum WordsCompletionMode {
     #[default]
@@ -619,7 +668,9 @@ pub enum WordsCompletionMode {
 }
 
 /// 行尾设置
-#[derive(Copy, Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema, MergeFrom)]
+#[derive(
+    Copy, Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema, MergeFrom,
+)]
 #[serde(rename_all = "snake_case")]
 pub enum LineEndingSetting {
     #[default]
@@ -631,7 +682,9 @@ pub enum LineEndingSetting {
 }
 
 /// LSP 插入模式
-#[derive(Copy, Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema, MergeFrom)]
+#[derive(
+    Copy, Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema, MergeFrom,
+)]
 #[serde(rename_all = "snake_case")]
 pub enum LspInsertMode {
     #[default]
@@ -640,7 +693,9 @@ pub enum LspInsertMode {
 }
 
 /// 内联提示类型
-#[derive(Copy, Clone, Debug, Default, PartialEq, Eq, Hash, Serialize, Deserialize, JsonSchema, MergeFrom)]
+#[derive(
+    Copy, Clone, Debug, Default, PartialEq, Eq, Hash, Serialize, Deserialize, JsonSchema, MergeFrom,
+)]
 #[serde(rename_all = "snake_case")]
 pub enum InlayHintKind {
     #[default]
@@ -653,7 +708,9 @@ pub enum InlayHintKind {
 }
 
 /// 重排行为
-#[derive(Copy, Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema, MergeFrom)]
+#[derive(
+    Copy, Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema, MergeFrom,
+)]
 #[serde(rename_all = "snake_case")]
 pub enum RewrapBehavior {
     #[default]
@@ -663,7 +720,9 @@ pub enum RewrapBehavior {
 }
 
 /// 编辑预测提供者
-#[derive(Copy, Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema, MergeFrom)]
+#[derive(
+    Copy, Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema, MergeFrom,
+)]
 #[serde(rename_all = "snake_case")]
 pub enum EditPredictionProvider {
     #[default]
@@ -674,7 +733,9 @@ pub enum EditPredictionProvider {
 }
 
 /// 编辑预测模式
-#[derive(Copy, Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema, MergeFrom)]
+#[derive(
+    Copy, Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema, MergeFrom,
+)]
 #[serde(rename_all = "snake_case")]
 pub enum EditPredictionsMode {
     #[default]
@@ -684,7 +745,9 @@ pub enum EditPredictionsMode {
 }
 
 /// 数据收集选项
-#[derive(Copy, Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema, MergeFrom)]
+#[derive(
+    Copy, Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema, MergeFrom,
+)]
 #[serde(rename_all = "snake_case")]
 pub enum EditPredictionDataCollectionChoice {
     #[default]
@@ -693,7 +756,9 @@ pub enum EditPredictionDataCollectionChoice {
 }
 
 /// 提示格式
-#[derive(Copy, Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema, MergeFrom)]
+#[derive(
+    Copy, Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema, MergeFrom,
+)]
 #[serde(rename_all = "snake_case")]
 pub enum EditPredictionPromptFormatContent {
     #[default]
@@ -842,7 +907,9 @@ pub struct GitHostingProviderConfig {
 }
 
 /// Git 托管提供者类型
-#[derive(Copy, Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema, MergeFrom)]
+#[derive(
+    Copy, Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema, MergeFrom,
+)]
 #[serde(rename_all = "snake_case")]
 pub enum GitHostingProviderKind {
     #[default]
@@ -855,7 +922,9 @@ pub enum GitHostingProviderKind {
 }
 
 /// SSH 端口转发选项 (spec §16 Plan 16)
-#[derive(Debug, Clone, Default, PartialEq, Eq, Hash, Serialize, Deserialize, JsonSchema, MergeFrom)]
+#[derive(
+    Debug, Clone, Default, PartialEq, Eq, Hash, Serialize, Deserialize, JsonSchema, MergeFrom,
+)]
 pub struct SshPortForwardOption {
     pub local_host: String,
     pub remote_host: String,
@@ -886,7 +955,9 @@ pub struct WslConnection {
 /// 其余语言服务器占位常量
 pub const REST_OF_LANGUAGE_SERVERS: &str = "...";
 /// 修饰键设置 (spec §16 Plan 16) - 兼容 gpui::Modifiers
-#[derive(Copy, Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema, MergeFrom)]
+#[derive(
+    Copy, Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema, MergeFrom,
+)]
 pub struct ModifiersContent {
     pub control: bool,
     pub alt: bool,

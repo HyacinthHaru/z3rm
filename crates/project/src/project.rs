@@ -6,10 +6,10 @@ pub mod manifest_tree;
 pub mod project_settings;
 pub mod search;
 pub mod search_history;
+pub mod stubs;
 pub mod toolchain_store;
 pub mod trusted_worktrees;
 pub mod worktree_store;
-pub mod stubs;
 pub use stubs::*;
 
 use buffer_diff::BufferDiff;
@@ -84,8 +84,8 @@ use worktree_store::{WorktreeStore, WorktreeStoreEvent};
 pub use buffer_store::ProjectTransaction;
 pub use fs::*;
 pub use language::Location;
-pub use toolchain_store::{ToolchainStore, Toolchains};
 pub use stubs::Shell;
+pub use toolchain_store::{ToolchainStore, Toolchains};
 const MAX_PROJECT_SEARCH_HISTORY_SIZE: usize = 500;
 
 #[derive(Clone, Copy, Debug)]
@@ -149,8 +149,13 @@ pub enum Event {
     WorktreeOrderChanged,
     ActiveEntryChanged(Option<ProjectEntryId>),
     DeletedEntry(WorktreeId, ProjectEntryId),
-    WorktreePathsChanged { old_worktree_paths: WorktreePaths },
-    WorktreeUpdatedEntries(WorktreeId, Vec<(ProjectEntryId, ProjectEntryId, PathChange)>),
+    WorktreePathsChanged {
+        old_worktree_paths: WorktreePaths,
+    },
+    WorktreeUpdatedEntries(
+        WorktreeId,
+        Vec<(ProjectEntryId, ProjectEntryId, PathChange)>,
+    ),
     Toast {
         notification_id: String,
         message: String,
@@ -158,13 +163,17 @@ pub enum Event {
     },
     /// Stub variants for deleted diagnostic/remote features (spec §8.2 M2)
     DiskBasedDiagnosticsStarted,
-    DiskBasedDiagnosticsFinished { language_server_id: lsp::LanguageServerId },
+    DiskBasedDiagnosticsFinished {
+        language_server_id: lsp::LanguageServerId,
+    },
     DiagnosticsUpdated {
         paths: Vec<Arc<util::rel_path::RelPath>>,
         language_server_id: lsp::LanguageServerId,
     },
     LanguageServerRemoved(lsp::LanguageServerId),
-    DisconnectedFromRemote { server_not_running: bool },
+    DisconnectedFromRemote {
+        server_not_running: bool,
+    },
     DisconnectedFromHost,
     LanguageNotFound(Entity<language::Buffer>),
     /// Stub variants for project_panel (spec §8.2 M3)
@@ -269,10 +278,11 @@ impl Project {
                 environment,
                 settings_observer: project_settings,
                 toolchain_store: None,
-            task_store_entity: cx.new(|_| crate::task_store::TaskStore::default()),
-            dap_store_entity: cx.new(|_| stubs::DapStore::default()),
-            bookmark_store_entity: cx.new(|_| stubs::bookmark_store::BookmarkStore::default()),
-            breakpoint_store_entity: cx.new(|_| stubs::debugger::breakpoint_store::BreakpointStore::default()),
+                task_store_entity: cx.new(|_| crate::task_store::TaskStore::default()),
+                dap_store_entity: cx.new(|_| stubs::DapStore::default()),
+                bookmark_store_entity: cx.new(|_| stubs::bookmark_store::BookmarkStore::default()),
+                breakpoint_store_entity: cx
+                    .new(|_| stubs::debugger::breakpoint_store::BreakpointStore::default()),
                 last_worktree_paths: WorktreePaths::default(),
             };
 
@@ -287,11 +297,7 @@ impl Project {
     }
 
     #[cfg(any(test, feature = "test-support"))]
-    pub async fn test(
-        fs: Arc<dyn Fs>,
-        worktree_paths: &[PathBuf],
-        cx: &mut App,
-    ) -> Entity<Self> {
+    pub async fn test(fs: Arc<dyn Fs>, worktree_paths: &[PathBuf], cx: &mut App) -> Entity<Self> {
         Self::local(
             Arc::new(LanguageRegistry::new(cx.background_executor().clone())),
             fs,
@@ -586,9 +592,9 @@ impl Project {
         visible: bool,
         cx: &mut Context<Self>,
     ) -> gpui::Task<anyhow::Result<gpui::Entity<Worktree>>> {
-        let task = self
-            .worktree_store
-            .update(cx, |store, cx| store.find_or_create_worktree(abs_path, visible, cx));
+        let task = self.worktree_store.update(cx, |store, cx| {
+            store.find_or_create_worktree(abs_path, visible, cx)
+        });
         cx.spawn(async move |_, _| {
             let (worktree, _rel) = task.await?;
             Ok(worktree)
@@ -633,7 +639,6 @@ impl Project {
             None => Task::ready(Err(anyhow::anyhow!("delete_entry unavailable"))),
         }
     }
-
 
     pub fn create_worktree(
         &mut self,
@@ -686,7 +691,9 @@ impl Project {
         fallback_branch_name: String,
         cx: &mut gpui::Context<Self>,
     ) -> Task<anyhow::Result<()>> {
-        self.git_store.read(cx).git_init(path, fallback_branch_name, cx)
+        self.git_store
+            .read(cx)
+            .git_init(path, fallback_branch_name, cx)
     }
 
     /// §16.6 Delegate git_config to GitStore. Returns the raw stdout string
@@ -760,7 +767,9 @@ pub struct PathMatchCandidateSet {
 }
 
 #[derive(Clone, Copy, Debug)]
-pub enum Candidates { Files }
+pub enum Candidates {
+    Files,
+}
 
 impl<'a> fuzzy_nucleo::PathMatchCandidateSet<'a> for PathMatchCandidateSet {
     type Candidates = std::iter::Map<
@@ -787,13 +796,13 @@ impl<'a> fuzzy_nucleo::PathMatchCandidateSet<'a> for PathMatchCandidateSet {
     }
 
     fn candidates(&'a self, start: usize) -> Self::Candidates {
-        self.snapshot.entries(self.include_ignored, start).map(|entry| {
-            fuzzy_nucleo::PathMatchCandidate {
+        self.snapshot
+            .entries(self.include_ignored, start)
+            .map(|entry| fuzzy_nucleo::PathMatchCandidate {
                 is_dir: entry.is_dir(),
                 path: entry.path.as_ref(),
                 char_bag: entry.char_bag.clone(),
-            }
-        })
+            })
     }
 
     fn path_style(&self) -> util::paths::PathStyle {
@@ -827,7 +836,10 @@ mod z3rm_path_tests {
             .into(),
         };
         assert!(child.starts_with(&root), "child should start_with root");
-        assert!(!root.starts_with(&child), "root should not start_with child");
+        assert!(
+            !root.starts_with(&child),
+            "root should not start_with child"
+        );
     }
 
     #[test]

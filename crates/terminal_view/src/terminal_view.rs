@@ -1,13 +1,13 @@
 mod copy_mode;
+pub mod diff_view;
+pub mod file_viewer;
+pub mod mux_pane;
 mod persistence;
+pub mod settings_pane;
 pub mod terminal_element;
 pub mod terminal_panel;
 mod terminal_path_like_target;
 pub mod terminal_scrollbar;
-pub mod mux_pane;
-pub mod file_viewer;
-pub mod diff_view;
-pub mod settings_pane;
 
 use editor::{
     Editor, EditorSettings, actions::SelectAll, blink_manager::BlinkManager,
@@ -16,16 +16,16 @@ use editor::{
 use gpui::{
     Action, AnyElement, App, ClipboardEntry, DismissEvent, Entity, EventEmitter, ExternalPaths,
     FocusHandle, Focusable, Font, KeyContext, KeyDownEvent, Keystroke, MouseButton, MouseDownEvent,
-    Pixels, Point as GpuiPoint, Rems, Render, ScrollWheelEvent, Styled, Subscription, Task, TaskExt,
-    WeakEntity, actions, anchored, deferred, div,
+    Pixels, Point as GpuiPoint, Rems, Render, ScrollWheelEvent, Styled, Subscription, Task,
+    TaskExt, WeakEntity, actions, anchored, deferred, div,
 };
 use menu;
 use persistence::TerminalDb;
+use project::TaskId;
 use project::{Project, ProjectEntryId, search::SearchQuery};
 use schemars::JsonSchema;
 use serde::Deserialize;
 use settings::{Settings, SettingsStore, TerminalBell, TerminalBlink, WorkingDirectory};
-use workspace::settings_stubs::SeedQuerySetting;
 use std::{
     any::Any,
     cmp,
@@ -35,7 +35,6 @@ use std::{
     sync::Arc,
     time::Duration,
 };
-use project::TaskId;
 use terminal::{
     Clear, Copy, Event, HoveredWord, MaybeNavigationTarget, Modes, Paste, PasteText, Point, Range,
     ScrollLineDown, ScrollLineUp, ScrollPageDown, ScrollPageUp, ScrollToBottom, ScrollToTop,
@@ -52,6 +51,7 @@ use ui::{
     scrollbars::{self, ScrollbarVisibility},
 };
 use util::ResultExt;
+use workspace::settings_stubs::SeedQuerySetting;
 use workspace::{
     CloseActiveItem, DraggedSelection, DraggedTab, NewCenterTerminal, NewTerminal, Pane,
     ToolbarItemLocation, Workspace, WorkspaceId, delete_unloaded_items,
@@ -128,20 +128,17 @@ pub fn init(cx: &mut App) {
     // Only file_viewer and mux_pane paths remain.
     cx.observe_new(|workspace: &mut Workspace, _window, _cx| {
         // §16.6 file viewer: open a file read-only from command palette
-        workspace.register_action(
-            |workspace, action: &file_viewer::OpenFile, window, cx| {
-                let path = PathBuf::from(&action.path);
-                let abs_path = if path.is_absolute() {
-                    path
-                } else if let Some(worktree) = workspace.project().read(cx).worktrees(cx).next()
-                {
-                    worktree.read(cx).abs_path().join(&path)
-                } else {
-                    path
-                };
-                file_viewer::open_file_in_viewer(workspace, abs_path, window, cx);
-            },
-        );
+        workspace.register_action(|workspace, action: &file_viewer::OpenFile, window, cx| {
+            let path = PathBuf::from(&action.path);
+            let abs_path = if path.is_absolute() {
+                path
+            } else if let Some(worktree) = workspace.project().read(cx).worktrees(cx).next() {
+                worktree.read(cx).abs_path().join(&path)
+            } else {
+                path
+            };
+            file_viewer::open_file_in_viewer(workspace, abs_path, window, cx);
+        });
     })
     .detach();
 }
@@ -1476,7 +1473,8 @@ impl TerminalView {
                 return;
             }
             // 未被拦截 → 转发到 vi_motion (不发送到 PTY)
-            self.terminal.update(cx, |term, _| term.vi_motion(&event.keystroke));
+            self.terminal
+                .update(cx, |term, _| term.vi_motion(&event.keystroke));
             cx.notify();
             cx.stop_propagation();
             return;
@@ -1926,15 +1924,20 @@ impl Item for TerminalView {
                 .collect::<Vec<_>>();
 
             if !paths.is_empty() {
-                self.add_paths_to_terminal(&paths.iter().map(|p| p.path.as_std_path().to_path_buf()).collect::<Vec<_>>(), window, cx);
+                self.add_paths_to_terminal(
+                    &paths
+                        .iter()
+                        .map(|p| p.path.as_std_path().to_path_buf())
+                        .collect::<Vec<_>>(),
+                    window,
+                    cx,
+                );
             }
 
             return true;
         } else if let Some(&entry_id) = dropped.downcast_ref::<ProjectEntryId>() {
             let project = project.read(cx);
-            if let Some(path) = project
-                .path_for_entry(entry_id, cx)
-            {
+            if let Some(path) = project.path_for_entry(entry_id, cx) {
                 self.add_paths_to_terminal(&[path.path.as_std_path().to_path_buf()], window, cx);
             }
 
@@ -3398,7 +3401,10 @@ mod tests {
     fn test_copy_mode_state_default() {
         let state = copy_mode::CopyModeState::default();
         assert!(!state.active, "copy mode should be inactive by default");
-        assert!(state.search_query.is_none(), "search_query should be None by default");
+        assert!(
+            state.search_query.is_none(),
+            "search_query should be None by default"
+        );
     }
 
     #[test]

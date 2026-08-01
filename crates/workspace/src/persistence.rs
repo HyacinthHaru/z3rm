@@ -1756,7 +1756,9 @@ impl WorkspaceDb {
                 if let Some(connection_options) = remote_connections.get(&remote_connection_id) {
                     result.push(RecentWorkspace {
                         workspace_id: id,
-                        location: SerializedWorkspaceLocation::Remote(connection_options.display_name()),
+                        location: SerializedWorkspaceLocation::Remote(
+                            connection_options.display_name(),
+                        ),
                         paths: paths.clone(),
                         identity_paths: identity_paths_hint.unwrap_or(paths),
                         timestamp,
@@ -1803,9 +1805,7 @@ impl WorkspaceDb {
         let target_paths = &target.identity_paths;
         let target_remote_connection = match &target.location {
             SerializedWorkspaceLocation::Local => None,
-            SerializedWorkspaceLocation::Remote(_name) => {
-                None
-            }
+            SerializedWorkspaceLocation::Remote(_name) => None,
         };
 
         let remote_connections = self.remote_connections()?;
@@ -2439,9 +2439,7 @@ fn dedupe_recent_workspaces(
     for workspace in workspaces {
         let location_identity = match &workspace.location {
             SerializedWorkspaceLocation::Local => None,
-            SerializedWorkspaceLocation::Remote(_name) => {
-                None
-            }
+            SerializedWorkspaceLocation::Remote(_name) => None,
         };
         let key = (location_identity, workspace.identity_paths.paths().to_vec());
         if let Some(&existing_index) = indices_by_key.get(&key) {
@@ -2490,4 +2488,3 @@ pub fn delete_unloaded_items(
 
 // #[cfg(test)]
 // mod tests;
-

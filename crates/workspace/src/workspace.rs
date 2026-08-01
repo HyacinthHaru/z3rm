@@ -7,10 +7,10 @@ mod modal_layer;
 mod multi_workspace;
 // #[cfg(test)]
 // mod multi_workspace_tests;
+pub mod layout_projection;
 pub mod notifications;
 pub mod pane;
 pub mod pane_group;
-pub mod layout_projection;
 pub mod path_list {
     pub use util::path_list::{PathList, SerializedPathList};
 }
@@ -21,6 +21,7 @@ pub mod security_modal;
 pub mod shared_screen;
 pub use shared_screen::SharedScreen;
 pub mod focus_follows_mouse;
+pub mod settings_stubs;
 mod status_bar;
 mod theme_preview;
 mod toast_layer;
@@ -28,7 +29,6 @@ mod toolbar;
 pub mod welcome;
 pub mod workspace_error;
 pub mod workspace_settings;
-pub mod settings_stubs;
 
 pub use dock::Panel;
 pub use multi_workspace::{
@@ -61,7 +61,6 @@ use fs::Fs;
 // §15.1 导入 mux_protocol 用于 LayoutTree 类型转换
 use mux_protocol;
 // §15.1 导入 mux client 用于 RPC 转发
-use mux;
 use futures::{
     Future, FutureExt, StreamExt,
     channel::{
@@ -80,12 +79,15 @@ use gpui::{
 };
 pub use history_manager::*;
 pub use item::{
-    Item, ItemHandle, ItemSettings, PreviewTabsSettings,
-    ProjectItem, SerializableItem, SerializableItemHandle, WeakItemHandle,
+    Item, ItemHandle, ItemSettings, PreviewTabsSettings, ProjectItem, SerializableItem,
+    SerializableItemHandle, WeakItemHandle,
 };
 use itertools::Itertools;
-use language::{Buffer, Capability, LanguageRegistry, Rope, language_settings::all_language_settings};
+use language::{
+    Buffer, Capability, LanguageRegistry, Rope, language_settings::all_language_settings,
+};
 pub use modal_layer::*;
+use mux;
 // use node_runtime::NodeRuntime;  // removed-crate: node_runtime
 use notifications::{
     DetachAndPromptErr, Notifications, dismiss_app_notification,
@@ -128,7 +130,7 @@ use sqlez::{
 use status_bar::StatusBar;
 pub use status_bar::{HideStatusItem, StatusItemView, add_hide_button_entry};
 use std::{
-    any::{TypeId, Any},
+    any::{Any, TypeId},
     borrow::Cow,
     cell::{Cell, RefCell},
     cmp,
@@ -827,7 +829,9 @@ impl ProjectItemRegistry {
                     match project_item.await.with_context(|| {
                         format!(
                             "opening project path {:?}",
-                            entry_abs_path.as_deref().unwrap_or(&project_path.path.as_std_path())
+                            entry_abs_path
+                                .as_deref()
+                                .unwrap_or(&project_path.path.as_std_path())
                         )
                     }) {
                         Ok(project_item) => {
@@ -1074,8 +1078,6 @@ impl AppState {
     fn test_fs(cx: &mut App) -> Arc<dyn Fs> {
         fs::FakeFs::new(cx.background_executor().clone())
     }
-
-
 }
 
 struct DelayedDebouncedEditAction {
@@ -1361,8 +1363,6 @@ impl Workspace {
 
         cx.subscribe_in(&project, window, move |this, _, event, window, cx| {
             match event {
-
-
                 &project::Event::WorktreeRemoved(_) => {
                     this.update_window_title(window, cx);
                     this.serialize_workspace(window, cx);
@@ -1382,8 +1382,6 @@ impl Workspace {
                     }
                 }
 
-
-
                 project::Event::Closed => {
                     window.remove_window();
                 }
@@ -1396,16 +1394,11 @@ impl Workspace {
                     }
                 }
 
-
-
-
-
                 _ => {}
             }
             cx.notify()
         })
         .detach();
-
 
         cx.on_focus_lost(window, |this, window, cx| {
             let focus_handle = this.focus_handle(cx);
@@ -1437,9 +1430,6 @@ impl Workspace {
         window.focus(&center_pane.focus_handle(cx), cx);
 
         cx.emit(Event::PaneAdded(center_pane.clone()));
-
-
-
 
         cx.emit(Event::WorkspaceCreated(weak_handle.clone()));
         let modal_layer = cx.new(|_| ModalLayer::new());
@@ -1473,7 +1463,6 @@ impl Workspace {
 
         let session_id = app_state.session.read(cx).id().to_owned();
 
-
         let (serializable_items_tx, serializable_items_rx) =
             mpsc::unbounded::<Box<dyn SerializableItemHandle>>();
         let _items_serializer = cx.spawn_in(window, async move |this, cx| {
@@ -1506,7 +1495,7 @@ impl Workspace {
                 theme_settings::reload_theme(cx);
                 theme_settings::reload_icon_theme(cx);
             }),
-            cx.on_release(|_, _cx| {})
+            cx.on_release(|_, _cx| {}),
         ];
 
         cx.defer_in(window, move |this, window, cx| {
@@ -1822,7 +1811,6 @@ impl Workspace {
             })
         })
     }
-
 
     pub fn weak_handle(&self) -> WeakEntity<Self> {
         self.weak_self.clone()
@@ -2283,7 +2271,6 @@ impl Workspace {
         self._panels_task.take()
     }
 
-
     pub fn project(&self) -> &Entity<Project> {
         &self.project
     }
@@ -2609,7 +2596,6 @@ impl Workspace {
         )
     }
 
-
     pub fn set_titlebar_item(&mut self, item: AnyView, _: &mut Window, cx: &mut Context<Self>) {
         self.titlebar_item = Some(item);
         cx.notify();
@@ -2655,7 +2641,8 @@ impl Workspace {
                 }
                 Err(err) => {
                     workspace.update_in(cx, |workspace, _window, cx| {
-                        workspace.show_error(workspace_error::PortalError::new(err.to_string()), cx);
+                        workspace
+                            .show_error(workspace_error::PortalError::new(err.to_string()), cx);
                     })?;
                 }
             };
@@ -2686,7 +2673,8 @@ impl Workspace {
                 Ok(path) => path,
                 Err(err) => {
                     workspace.update_in(cx, |workspace, _window, cx| {
-                        workspace.show_error(workspace_error::PortalError::new(err.to_string()), cx);
+                        workspace
+                            .show_error(workspace_error::PortalError::new(err.to_string()), cx);
                     })?;
                     return anyhow::Ok(());
                 }
@@ -2849,7 +2837,6 @@ impl Workspace {
                 close_intent != CloseIntent::ReplaceWindow && remaining_workspaces == 0
             };
 
-
             // Hot-exit silently writes dirty buffers to the DB; only allow it
             // if the workspace will be reachable again, either via session
             // restore or by reopening its folder paths. Otherwise prompt, so
@@ -2858,12 +2845,7 @@ impl Workspace {
                 || save_last_workspace
                 || this
                     .read_with(cx, |workspace, cx| {
-                        workspace
-                            .project
-                            .read(cx)
-                            .worktrees(cx)
-                            .next()
-                            .is_some()
+                        workspace.project.read(cx).worktrees(cx).next().is_some()
                     })
                     .unwrap_or(false);
             let save_result = this
@@ -3261,7 +3243,6 @@ impl Workspace {
         })
     }
 
-
     // spec §2.1 / §15.1：移除 project 所有权检查（is_local / is_via_collab 已删除）。
     pub fn add_folder_to_project(
         &mut self,
@@ -3317,8 +3298,8 @@ impl Workspace {
         cx.spawn(async move |cx| {
             let project_path = project_path.context("path not found in project")?;
             let worktree_id = project_path.worktree_id;
-            let Some(worktree) = project
-                .read_with(cx, |project, cx| project.worktree_for_id(worktree_id, cx))
+            let Some(worktree) =
+                project.read_with(cx, |project, cx| project.worktree_for_id(worktree_id, cx))
             else {
                 return Err(anyhow!("worktree not found"));
             };
@@ -4124,7 +4105,8 @@ impl Workspace {
                     .expect("There must be an active pane")
                     .clone()
             });
-            self.split_pane(old_pane_entity, SplitDirection::Right, window, cx).downgrade()
+            self.split_pane(old_pane_entity, SplitDirection::Right, window, cx)
+                .downgrade()
         } else {
             self.last_active_center_pane.clone().unwrap_or_else(|| {
                 self.panes
@@ -4167,9 +4149,9 @@ impl Workspace {
             return true;
         }
         // §16.5 Terminal 的 buffer_kind 为 None，Editor 为 Singleton/Multibuffer
-        items.iter().all(|item| {
-            item.buffer_kind(cx) == ItemBufferKind::None
-        })
+        items
+            .iter()
+            .all(|item| item.buffer_kind(cx) == ItemBufferKind::None)
     }
 
     /// Opens a URL or file path, intelligently routing to the appropriate handler:
@@ -4240,8 +4222,8 @@ impl Workspace {
         let path = Path::new(url_or_path);
         // Try to resolve relative path against base_path first
         if let Some(base) = base_path
-            // TODO: remotes, the exists check below hits the local FS, unsure
-            // if this runs on the remote or not
+        // TODO: remotes, the exists check below hits the local FS, unsure
+        // if this runs on the remote or not
         {
             let resolved = path_style.join(base, path).map(PathBuf::from);
             if let Some(resolved) = resolved
@@ -4466,8 +4448,6 @@ impl Workspace {
     pub fn auto_watch_state(&self) -> &AutoWatch {
         &self.auto_watch
     }
-
-    
 
     // spec §2.1 / §15.1：auto_watch 仅保留本地开关语义；移除 active_call / 共享屏幕逻辑。
     pub fn toggle_auto_watch(&mut self, _window: &mut Window, cx: &mut Context<Self>) {
@@ -5035,8 +5015,7 @@ impl Workspace {
                 pane.update(cx, |pane, _| {
                     pane.track_alternate_file_items();
                 });
-                if *local {
-                }
+                if *local {}
                 serialize_workspace = *focus_changed || pane != self.active_pane();
                 if pane == self.active_pane() {
                     self.active_item_path_changed(*focus_changed, window, cx);
@@ -5100,8 +5079,6 @@ impl Workspace {
             self.serialize_workspace(window, cx);
         }
     }
-
-    
 
     pub fn split_pane(
         &mut self,
@@ -5267,18 +5244,6 @@ impl Workspace {
             .cloned()
     }
 
-    
-
-    
-
-    
-
-    
-
-    
-
-    
-
     pub(crate) fn active_item_path_changed(
         &mut self,
         focus_changed: bool,
@@ -5287,8 +5252,7 @@ impl Workspace {
     ) {
         cx.emit(Event::ActiveItemChanged);
         let active_entry = self.active_project_path(cx);
-        self.project.update(cx, |project, cx| {
-        });
+        self.project.update(cx, |project, cx| {});
 
         if focus_changed && let Some(project_path) = &active_entry {
             let git_store_entity = self.project.read(cx).git_store().clone();
@@ -5477,35 +5441,8 @@ impl Workspace {
 
     // RPC handlers
 
-    
-
-    
-
-    
-
-    
-
-    
-
-    
-
-    
-
-    
-
-    
-
-    
-
-    
-
-    
-
-    
-
     pub fn on_window_activation_changed(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if window.is_window_active() {
-
             if let Some(database_id) = self.database_id {
                 let db = WorkspaceDb::global(cx);
                 cx.background_spawn(async move { db.update_timestamp(database_id).await })
@@ -5532,12 +5469,6 @@ impl Workspace {
             }
         }
     }
-
-    
-
-    
-
-    
 
     pub fn database_id(&self) -> Option<WorkspaceId> {
         self.database_id
@@ -5745,7 +5676,12 @@ impl Workspace {
         // spec §2.1 / §15.1：workspace 序列化仅保留 pane/tab/layout/window 核心状态。
         match self.workspace_location(cx) {
             WorkspaceLocation::Location(location, paths) => {
-                let identity_paths = self.project.read(cx).worktree_paths(cx).main_worktree_path_list().clone();
+                let identity_paths = self
+                    .project
+                    .read(cx)
+                    .worktree_paths(cx)
+                    .main_worktree_path_list()
+                    .clone();
                 let center_group = build_serialized_pane_group(&self.center.root, window, cx);
                 let docks = build_serialized_docks(self, window, cx);
                 let window_bounds = Some(SerializedWindowBounds(window.window_bounds()));
@@ -5960,7 +5896,6 @@ impl Workspace {
                 cx.notify();
             })?;
 
-
             // Clean up all the items that have _not_ been loaded. Our ItemIds aren't stable. That means
             // after loading the items, we might have different items and in order to avoid
             // the database filling up, we delete items that haven't been loaded now.
@@ -6045,8 +5980,7 @@ impl Workspace {
             .on_action(cx.listener(Self::toggle_edit_predictions_all_files))
             .on_action(cx.listener(Self::toggle_theme_mode))
             // spec §2.1 / §15.1：跟随/取消跟随功能已删除，Unfollow 处理为空操作。
-            .on_action(cx.listener(|_workspace, _: &Unfollow, _window, _cx| {
-            }))
+            .on_action(cx.listener(|_workspace, _: &Unfollow, _window, _cx| {}))
             .on_action(cx.listener(|workspace, action: &Save, window, cx| {
                 workspace
                     .save_active_item(action.save_intent.unwrap_or(SaveIntent::Save), window, cx)
@@ -6505,13 +6439,7 @@ impl Workspace {
         layout: &crate::layout_projection::LayoutTree,
         focused_pane_id: Option<&str>,
         mut create_pane: impl FnMut(&mut Workspace, &mut Window, &mut Context<Self>) -> Entity<Pane>,
-        mut add_item: impl FnMut(
-            &mut Workspace,
-            &Entity<Pane>,
-            String,
-            &mut Window,
-            &mut Context<Self>,
-        ),
+        mut add_item: impl FnMut(&mut Workspace, &Entity<Pane>, String, &mut Window, &mut Context<Self>),
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
@@ -6539,13 +6467,7 @@ impl Workspace {
         focused_pane_id: Option<&str>,
         mut existing: std::collections::HashMap<String, Entity<Pane>>,
         mut create_pane: impl FnMut(&mut Workspace, &mut Window, &mut Context<Self>) -> Entity<Pane>,
-        mut add_item: impl FnMut(
-            &mut Workspace,
-            &Entity<Pane>,
-            String,
-            &mut Window,
-            &mut Context<Self>,
-        ),
+        mut add_item: impl FnMut(&mut Workspace, &Entity<Pane>, String, &mut Window, &mut Context<Self>),
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
@@ -6566,7 +6488,11 @@ impl Workspace {
         layout: &crate::layout_projection::LayoutTree,
         focused_pane_id: Option<&str>,
         existing: &mut std::collections::HashMap<String, Entity<Pane>>,
-        create_pane: &mut dyn FnMut(&mut Workspace, &mut Window, &mut Context<Self>) -> Entity<Pane>,
+        create_pane: &mut dyn FnMut(
+            &mut Workspace,
+            &mut Window,
+            &mut Context<Self>,
+        ) -> Entity<Pane>,
         add_item: &mut dyn FnMut(
             &mut Workspace,
             &Entity<Pane>,
@@ -6627,7 +6553,11 @@ impl Workspace {
         existing: &mut std::collections::HashMap<String, Entity<Pane>>,
         used: &mut std::collections::HashSet<gpui::EntityId>,
         pane_id_map: &mut std::collections::HashMap<String, Entity<Pane>>,
-        create_pane: &mut dyn FnMut(&mut Workspace, &mut Window, &mut Context<Self>) -> Entity<Pane>,
+        create_pane: &mut dyn FnMut(
+            &mut Workspace,
+            &mut Window,
+            &mut Context<Self>,
+        ) -> Entity<Pane>,
         add_item: &mut dyn FnMut(
             &mut Workspace,
             &Entity<Pane>,
@@ -6686,20 +6616,24 @@ impl Workspace {
                     LayoutSplit::LeftRight => gpui::Axis::Horizontal,
                     LayoutSplit::TopBottom => gpui::Axis::Vertical,
                 };
-                let flexes = if ratios.len() == members.len() && ratios.iter().all(|r| r.is_finite() && *r > 0.0) {
+                let flexes = if ratios.len() == members.len()
+                    && ratios.iter().all(|r| r.is_finite() && *r > 0.0)
+                {
                     let sum: f32 = ratios.iter().sum();
                     if sum > 0.0 {
-                        Some(ratios.iter().map(|r| r / sum * members.len() as f32).collect())
+                        Some(
+                            ratios
+                                .iter()
+                                .map(|r| r / sum * members.len() as f32)
+                                .collect(),
+                        )
                     } else {
                         None
                     }
                 } else {
                     None
                 };
-                (
-                    Member::Axis(PaneAxis::load(axis, members, flexes)),
-                    focus,
-                )
+                (Member::Axis(PaneAxis::load(axis, members, flexes)), focus)
             }
         }
     }
@@ -6747,10 +6681,9 @@ impl Workspace {
         domain.resize_pane(pane_id, cols, rows).await
     }
 
-
     #[cfg(any(test, feature = "test-support"))]
     pub fn test_new(project: Entity<Project>, window: &mut Window, cx: &mut Context<Self>) -> Self {
-// use node_runtime::NodeRuntime;  // removed-crate: node_runtime
+        // use node_runtime::NodeRuntime;  // removed-crate: node_runtime
         use session::Session;
 
         let session = cx.new(|cx| AppSession::new(Session::test(), cx));
@@ -7677,7 +7610,6 @@ impl Workspace {
     pub fn run_create_worktree_tasks(&mut self, _window: &mut Window, _cx: &mut Context<Self>) {
         // no-op stub
     }
-
 }
 
 #[derive(Clone)]
@@ -7711,12 +7643,8 @@ impl Render for Workspace {
         let paddings = if centered_layout {
             let settings = WorkspaceSettings::get_global(cx).centered_layout;
             (
-                render_padding(Self::adjust_padding(Some(
-                    settings.left_padding,
-                ))),
-                render_padding(Self::adjust_padding(Some(
-                    settings.right_padding,
-                ))),
+                render_padding(Self::adjust_padding(Some(settings.left_padding))),
+                render_padding(Self::adjust_padding(Some(settings.right_padding))),
             )
         } else {
             (None, None)
@@ -8127,16 +8055,12 @@ impl Render for Workspace {
                                     // Stacked 和 SideBySide 布局回退到 Full (spec §16 Plan 16)
                                     BottomDockLayout::Stacked | BottomDockLayout::SideBySide => {
                                         // 回退到 Full 布局
-                                        div()
-                                            .flex()
-                                            .flex_col()
-                                            .h_full()
-                                            .children(self.render_dock(
-                                                DockPosition::Bottom,
-                                                &self.bottom_dock,
-                                                window,
-                                                cx,
-                                            ))
+                                        div().flex().flex_col().h_full().children(self.render_dock(
+                                            DockPosition::Bottom,
+                                            &self.bottom_dock,
+                                            window,
+                                            cx,
+                                        ))
                                     }
                                 }
                             })
@@ -8360,7 +8284,10 @@ pub async fn apply_restored_multiworkspace_state(
                     resolved_paths.push(path.to_path_buf());
                 }
             }
-            let resolved = ProjectGroupKey::new(key.host().map(|s| s.to_string()), PathList::new(&resolved_paths));
+            let resolved = ProjectGroupKey::new(
+                key.host().map(|s| s.to_string()),
+                PathList::new(&resolved_paths),
+            );
             if !resolved_groups.iter().any(|g| g.key == resolved) {
                 resolved_groups.push(SerializedProjectGroupState {
                     key: resolved,
@@ -8440,10 +8367,6 @@ actions!(
         RevealLogInFileManager
     ]
 );
-
-
-
-
 
 pub async fn get_any_active_multi_workspace(
     app_state: Arc<AppState>,
@@ -9082,16 +9005,6 @@ pub fn create_and_open_local_file(
         item.with_context(|| format!("path {path_for_error:?} is not a file"))
     })
 }
-
-
-
-
-
-
-
-
-
-
 
 pub fn reload(cx: &mut App) {
     let should_confirm = WorkspaceSettings::get_global(cx).confirm_quit;

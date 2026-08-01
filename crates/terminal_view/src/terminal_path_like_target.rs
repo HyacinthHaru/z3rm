@@ -146,16 +146,13 @@ fn possibly_open_target(
         let path_to_open = open_target.path();
 
         // §16.5 终端路径点击以只读模式打开文件
-        let opened_items: Vec<Option<anyhow::Result<Box<dyn ItemHandle>>>> = if open_target.is_file() {
+        let opened_items: Vec<Option<anyhow::Result<Box<dyn ItemHandle>>>> = if open_target
+            .is_file()
+        {
             // 文件：以只读模式打开
             let item_result = workspace
                 .update_in(cx, |workspace, window, cx| {
-                    workspace.open_abs_path_readonly(
-                        path_to_open.path.clone(),
-                        true,
-                        window,
-                        cx,
-                    )
+                    workspace.open_abs_path_readonly(path_to_open.path.clone(), true, window, cx)
                 })
                 .context("workspace update")?
                 .await;

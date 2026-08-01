@@ -56,7 +56,6 @@ pub enum ShowIndentGuides {
     Never,
 }
 
-
 /// 诊断显示模式 (spec §16 Plan 16)
 #[derive(Copy, Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "snake_case")]

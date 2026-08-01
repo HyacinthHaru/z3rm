@@ -34,9 +34,8 @@ use git::stash::GitStash;
 use git::status::{DiffStat, StageStatus};
 use git::{Amend, Commit, Signoff, ToggleStaged, repository::RepoPath, status::FileStatus};
 use git::{
-    GitHostingProviderRegistry, GitRemote, RestoreTrackedFiles, StageAll,
-    StashAll, StashApply, StashPop, TrashUntrackedFiles, UnstageAll,
-    ViewFile, parse_git_remote_url,
+    GitHostingProviderRegistry, GitRemote, RestoreTrackedFiles, StageAll, StashAll, StashApply,
+    StashPop, TrashUntrackedFiles, UnstageAll, ViewFile, parse_git_remote_url,
 };
 use gpui::{
     AbsoluteLength, Action, Anchor, AnyElement, AsyncApp, AsyncWindowContext, ClickEvent,
@@ -63,11 +62,11 @@ use project::{
     project_settings::{GitPathStyle, ProjectSettings},
 };
 // use prompt_store::RULES_FILE_NAMES;  // removed-crate: prompt_store
-use proto::RpcError;
-use serde::{Deserialize, Serialize};
 use crate::git_panel_settings::{
     GitPanelClickBehavior, GitPanelGroupBy, GitPanelSortBy, StatusStyle,
 };
+use proto::RpcError;
+use serde::{Deserialize, Serialize};
 use settings::{Settings, SettingsStore, update_settings_file};
 use smallvec::SmallVec;
 use std::cell::Cell;
@@ -1064,7 +1063,6 @@ impl GitPanel {
             });
 
             let scroll_handle = UniformListScrollHandle::new();
-
 
             cx.subscribe_in(
                 &git_store,
@@ -2195,9 +2193,9 @@ impl GitPanel {
                         let project_path = active_repo
                             .read(cx)
                             .repo_path_to_project_path(&entry.repo_path, cx)?;
-                        Some(workspace
-                            .project()
-                            .update(cx, |project, cx| project.delete_file(project_path, true, cx)))
+                        Some(workspace.project().update(cx, |project, cx| {
+                            project.delete_file(project_path, true, cx)
+                        }))
                     })
                     .collect::<Vec<_>>()
             })?;
@@ -2994,7 +2992,6 @@ impl GitPanel {
         Some(format!("{} {}", action_text, file_name))
     }
 
-
     fn split_patch(patch: &str) -> Vec<String> {
         let mut result = Vec::new();
         let mut current_patch = String::new();
@@ -3085,7 +3082,6 @@ impl GitPanel {
         compressed
     }
 
-
     fn build_commit_message_prompt(
         prompt: &str,
         user_agents_md: Option<&str>,
@@ -3128,7 +3124,6 @@ impl GitPanel {
             "{prompt}{user_agents_md_section}{rules_section}{instructions_section}{subject_section}\nHere are the changes in this commit:\n{diff_text}"
         )
     }
-
 
     fn get_fetch_options(
         &self,
@@ -3305,11 +3300,7 @@ impl GitPanel {
                 let fallback_branch_name = GitPanelSettings::get_global(cx)
                     .fallback_branch_name
                     .clone();
-                project.git_init(
-                    worktree.read(cx).abs_path(),
-                    fallback_branch_name,
-                    cx,
-                )
+                project.git_init(worktree.read(cx).abs_path(), fallback_branch_name, cx)
             });
 
             let result = result.await;
@@ -4786,7 +4777,6 @@ impl GitPanel {
             .anchor(Anchor::TopRight)
     }
 
-
     pub(crate) fn render_co_authors(&self, cx: &Context<Self>) -> Option<AnyElement> {
         let potential_co_authors = self.potential_co_authors(cx);
 
@@ -4922,7 +4912,6 @@ impl GitPanel {
             "Commit Tracked"
         }
     }
-
 
     fn render_git_changes_actions_menu(
         &self,
@@ -7183,7 +7172,6 @@ impl GitPanel {
         }
     }
 }
-
 
 impl GitPanel {
     pub fn selected_file_history_target(&self) -> Option<(Entity<Repository>, RepoPath)> {

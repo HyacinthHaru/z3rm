@@ -1,3 +1,4 @@
+use anyhow;
 use editor::{Bias, Editor, SelectionEffects, scroll::Autoscroll, styled_runs_for_code_label};
 use fuzzy::{StringMatch, StringMatchCandidate};
 use gpui::{
@@ -10,7 +11,6 @@ use project::{Project, Symbol, lsp_store::SymbolLocation};
 use rope::Unclipped;
 use settings::Settings;
 use std::{cmp::Reverse, sync::Arc};
-use anyhow;
 use theme::ActiveTheme;
 use theme_settings::ThemeSettings;
 use util::ResultExt;
@@ -224,9 +224,7 @@ impl PickerDelegate for ProjectSymbolsDelegate {
                     let (visible_match_candidates, external_match_candidates) = symbols
                         .iter()
                         .enumerate()
-                        .map(|(id, symbol)| {
-                            StringMatchCandidate::new(id, &symbol.symbol.name)
-                        })
+                        .map(|(id, symbol)| StringMatchCandidate::new(id, &symbol.symbol.name))
                         .partition(|candidate| {
                             let path = &symbols[candidate.id].path;
                             project

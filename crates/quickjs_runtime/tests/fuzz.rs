@@ -15,16 +15,16 @@ use std::time::Duration;
 #[test]
 fn test_vdom_bridge_malformed_json() {
     let malformed_inputs = [
-        "",                    // 空字符串
-        "{",                   // 不完整对象
-        "{\"key\":",           // 缺少值
-        "{\"key\": value}",    // 未引用的值
-        "[1, 2, ]",           // 尾随逗号
-        "{{}}",                // 嵌套花括号
-        "null",                // null
-        "true",                // 布尔值
-        "42",                  // 数字
-        "{\"depth\": {\"a\": {\"b\": {\"c\":",  // 深度嵌套不完整
+        "",                                    // 空字符串
+        "{",                                   // 不完整对象
+        "{\"key\":",                           // 缺少值
+        "{\"key\": value}",                    // 未引用的值
+        "[1, 2, ]",                            // 尾随逗号
+        "{{}}",                                // 嵌套花括号
+        "null",                                // null
+        "true",                                // 布尔值
+        "42",                                  // 数字
+        "{\"depth\": {\"a\": {\"b\": {\"c\":", // 深度嵌套不完整
     ];
 
     for input in &malformed_inputs {
@@ -103,8 +103,10 @@ fn test_cpu_fuel_infinite_loop() {
     // 验证：CPU fuel 耗尽应返回错误，不应 panic
     let result = runner.load_extension("test", code, "activate");
     // 无限循环会被 fuel 中断器终止，结果为 Err
-    assert!(result.cpu_exhausted || result.result.is_err(),
-        "无限循环应被 CPU fuel 中断");
+    assert!(
+        result.cpu_exhausted || result.result.is_err(),
+        "无限循环应被 CPU fuel 中断"
+    );
 }
 
 /// §5.2 内存限制: 大量内存分配应被限制
@@ -122,8 +124,10 @@ fn test_memory_limit_enforced() {
 
     let result = runner.load_extension("test", code, "activate");
     // 验证：内存超限应返回错误，不 crash
-    assert!(result.result.is_err() || result.memory_exceeded,
-        "大量内存分配应被限制");
+    assert!(
+        result.result.is_err() || result.memory_exceeded,
+        "大量内存分配应被限制"
+    );
 }
 
 // ============================================================

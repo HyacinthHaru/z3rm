@@ -1,3 +1,4 @@
+use crate::git_panel_settings::StatusStyle;
 use crate::{git_panel::GitStatusEntry, git_panel_settings::GitPanelSettings, git_status_icon};
 use anyhow::{Context as _, Result};
 use buffer_diff::DiffHunkSecondaryStatus;
@@ -21,7 +22,6 @@ use project::{
     Project,
     git_store::{Repository, RepositoryId},
 };
-use crate::git_panel_settings::StatusStyle;
 use settings::{Settings, SettingsStore};
 use std::{
     any::{Any, TypeId},

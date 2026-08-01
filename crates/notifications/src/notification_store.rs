@@ -1,8 +1,8 @@
 use gpui::{App, AppContext as _, Context, Entity, EventEmitter, Global, Task};
 use rpc::{Notification, proto};
+use std::ops::Range;
 use sum_tree::{Bias, Dimensions, SumTree};
 use time::OffsetDateTime;
-use std::ops::Range;
 
 pub fn init(cx: &mut App) {
     let notification_store = cx.new(|cx| NotificationStore::new(cx));
@@ -109,7 +109,6 @@ impl NotificationStore {
 
     // handle_disconnect removed: requires client connection status
     // fn handle_disconnect(&mut self, cx: &mut Context<Self>) { … }
-
 
     // handle_new_notification removed: requires client message handler
     // async fn handle_new_notification(this, envelope, cx) -> Result<()> { … }

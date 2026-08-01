@@ -113,9 +113,7 @@ impl DeltaReplay {
                 None => return None,
             }
         }
-        let mut rope = Rope::from(
-            std::str::from_utf8(&base_content?).ok()?.to_string(),
-        );
+        let mut rope = Rope::from(std::str::from_utf8(&base_content?).ok()?.to_string());
 
         // deltas 按从 base 到 target 的顺序应用 (path 是反向收集的)。
         path.reverse();
@@ -145,10 +143,13 @@ mod tests {
     #[test]
     fn test_delta_apply_delete() {
         let mut rope = Rope::from("Hello, World!");
-        DeltaReplay::apply_delta(&mut rope, &[DeltaOp::Delete {
-            offset: 7,
-            delete_len: 5, // "World"
-        }]);
+        DeltaReplay::apply_delta(
+            &mut rope,
+            &[DeltaOp::Delete {
+                offset: 7,
+                delete_len: 5, // "World"
+            }],
+        );
         assert_eq!(rope.to_string(), "Hello, !");
     }
 
@@ -296,9 +297,12 @@ pub fn deserialize_delta_ops(bytes: &[u8]) -> Option<Vec<DeltaOp>> {
                 DeltaOp::Delete { offset, delete_len }
             }
             1 => {
-                let text_len = u32::from_be_bytes(bytes.get(cur..cur + 4)?.try_into().ok()?) as usize;
+                let text_len =
+                    u32::from_be_bytes(bytes.get(cur..cur + 4)?.try_into().ok()?) as usize;
                 cur += 4;
-                let text = std::str::from_utf8(bytes.get(cur..cur + text_len)?).ok()?.to_string();
+                let text = std::str::from_utf8(bytes.get(cur..cur + text_len)?)
+                    .ok()?
+                    .to_string();
                 cur += text_len;
                 DeltaOp::Insert {
                     offset,
@@ -311,9 +315,12 @@ pub fn deserialize_delta_ops(bytes: &[u8]) -> Option<Vec<DeltaOp>> {
                 ))
                 .ok()?;
                 cur += 8;
-                let text_len = u32::from_be_bytes(bytes.get(cur..cur + 4)?.try_into().ok()?) as usize;
+                let text_len =
+                    u32::from_be_bytes(bytes.get(cur..cur + 4)?.try_into().ok()?) as usize;
                 cur += 4;
-                let text = std::str::from_utf8(bytes.get(cur..cur + text_len)?).ok()?.to_string();
+                let text = std::str::from_utf8(bytes.get(cur..cur + text_len)?)
+                    .ok()?
+                    .to_string();
                 cur += text_len;
                 DeltaOp::Replace {
                     offset,

@@ -31,7 +31,11 @@ fn test_wal_replay_correctness() {
             seq_no: (i as u64 + 1),
             path_hash: random_hash(),
             parent_id: if i == 0 { None } else { Some(i as u64) },
-            content_ref: if i % 3 == 0 { Some(random_hash()) } else { None },
+            content_ref: if i % 3 == 0 {
+                Some(random_hash())
+            } else {
+                None
+            },
             delta_ref: if i % 3 != 0 {
                 Some(DeltaRef {
                     hash: random_hash(),
@@ -205,8 +209,14 @@ fn test_gc_invariant_reachable_versions() {
     let mut parent_a = None;
     for i in 1..=3u64 {
         let vid = tree.advance_head(
-            path_a, i, (i * 100) as u128, parent_a,
-            Some(content_hash), None, 0, SnapshotTrigger::Write,
+            path_a,
+            i,
+            (i * 100) as u128,
+            parent_a,
+            Some(content_hash),
+            None,
+            0,
+            SnapshotTrigger::Write,
         );
         parent_a = Some(vid);
     }
@@ -214,8 +224,14 @@ fn test_gc_invariant_reachable_versions() {
     let mut parent_b = None;
     for i in 1..=2u64 {
         let vid = tree.advance_head(
-            path_b, 10 + i, ((10 + i) * 100) as u128, parent_b,
-            Some(content_hash), None, 0, SnapshotTrigger::Write,
+            path_b,
+            10 + i,
+            ((10 + i) * 100) as u128,
+            parent_b,
+            Some(content_hash),
+            None,
+            0,
+            SnapshotTrigger::Write,
         );
         parent_b = Some(vid);
     }
@@ -240,8 +256,14 @@ fn test_gc_invariant_no_dangling_parent_refs() {
     let mut parent = None;
     for i in 1..=10u64 {
         let _vid = tree.advance_head(
-            path_hash, i, (i * 100) as u128, parent,
-            Some(content_hash), None, 0, SnapshotTrigger::Write,
+            path_hash,
+            i,
+            (i * 100) as u128,
+            parent,
+            Some(content_hash),
+            None,
+            0,
+            SnapshotTrigger::Write,
         );
         parent = Some(_vid);
     }
@@ -249,7 +271,9 @@ fn test_gc_invariant_no_dangling_parent_refs() {
     let nodes = tree.iter_nodes();
     for (_id, node) in &nodes {
         if let Some(pid) = node.parent_id {
-            let _ = tree.get_node(pid).expect(&format!("parent_id {} 不存在于节点集合中", pid));
+            let _ = tree
+                .get_node(pid)
+                .expect(&format!("parent_id {} 不存在于节点集合中", pid));
         }
     }
 }
@@ -265,9 +289,14 @@ fn test_memtable_range_query_correctness() {
 
     for i in 1..=5u64 {
         let path_hash = random_hash();
-        table.insert(i, PathChange {
-            path_hash, seq_no: i, content: None,
-        });
+        table.insert(
+            i,
+            PathChange {
+                path_hash,
+                seq_no: i,
+                content: None,
+            },
+        );
     }
 
     let changed = table.query_changed_files(2, 4);
@@ -284,9 +313,14 @@ fn test_memtable_trim_correctness() {
 
     for i in 1..=10u64 {
         let path_hash = random_hash();
-        table.insert(i, PathChange {
-            path_hash, seq_no: i, content: None,
-        });
+        table.insert(
+            i,
+            PathChange {
+                path_hash,
+                seq_no: i,
+                content: None,
+            },
+        );
     }
 
     assert_eq!(table.len(), 10);

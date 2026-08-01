@@ -30,7 +30,12 @@ fn cell_at(term: &Term<VoidListener>, line: i32, col: usize) -> &Cell {
 }
 
 fn cell_char(term: &Term<VoidListener>, line: i32, col: usize) -> char {
-    cell_at(term, line, col).c.to_string().chars().next().unwrap_or(' ')
+    cell_at(term, line, col)
+        .c
+        .to_string()
+        .chars()
+        .next()
+        .unwrap_or(' ')
 }
 
 fn cursor(term: &Term<VoidListener>) -> (i32, usize) {

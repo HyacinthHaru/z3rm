@@ -10,7 +10,7 @@
 
 use proc_macro::TokenStream;
 use quote::quote;
-use syn::{parse::Parse, parse::ParseStream, LitStr, Token};
+use syn::{LitStr, Token, parse::Parse, parse::ParseStream};
 
 struct Z3rmTodoArgs {
     category: LitStr,
@@ -26,7 +26,10 @@ impl Parse for Z3rmTodoArgs {
         } else {
             None
         };
-        Ok(Z3rmTodoArgs { category, description })
+        Ok(Z3rmTodoArgs {
+            category,
+            description,
+        })
     }
 }
 

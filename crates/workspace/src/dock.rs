@@ -308,7 +308,6 @@ pub enum DockPosition {
     Right,
 }
 
-
 impl From<TerminalDockPosition> for DockPosition {
     fn from(value: TerminalDockPosition) -> Self {
         match value {

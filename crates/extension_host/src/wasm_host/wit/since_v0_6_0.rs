@@ -419,4 +419,3 @@ impl dap::Host for WasmState {
         Ok(Err("DAP support has been removed".to_string()))
     }
 }
-

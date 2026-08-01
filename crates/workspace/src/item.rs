@@ -1,7 +1,10 @@
 use crate::{
     DelayedDebouncedEditAction, ItemNavHistory, SerializableItemRegistry, ToolbarItemLocation,
-    Workspace, WorkspaceId, invalid_item_view::InvalidItemView, pane::{self, Pane},
-    persistence::model::ItemId, searchable::SearchableItemHandle,
+    Workspace, WorkspaceId,
+    invalid_item_view::InvalidItemView,
+    pane::{self, Pane},
+    persistence::model::ItemId,
+    searchable::SearchableItemHandle,
     workspace_settings::{AutosaveSetting, WorkspaceSettings},
 };
 // 按 spec §15.1 移除协作相关类型（CollaboratorId / ViewId / FollowableViewRegistry）的导入，
@@ -9,6 +12,7 @@ use crate::{
 use anyhow::Result;
 // use client::{Client, proto};  // removed-crate: client
 // spec §2.1：移除 futures::channel::mpsc，仅用于已删除的跟随更新通道。
+pub use crate::settings_stubs::{ActivateOnClose, ClosePosition, ShowDiagnostics};
 use gpui::{
     Action, AnyElement, AnyEntity, AnyView, App, AppContext, Context, Entity, EntityId,
     EventEmitter, FocusHandle, Focusable, Font, Pixels, Point, Render, SharedString, Task, TaskExt,
@@ -17,10 +21,7 @@ use gpui::{
 use language::Capability;
 pub use language::HighlightedText;
 use project::{Project, ProjectEntryId, ProjectPath};
-pub use settings::{
-    RegisterSetting, Settings, SettingsLocation, ShowCloseButton,
-};
-pub use crate::settings_stubs::{ActivateOnClose, ClosePosition, ShowDiagnostics};
+pub use settings::{RegisterSetting, Settings, SettingsLocation, ShowCloseButton};
 use smallvec::SmallVec;
 use std::{
     any::{Any, TypeId},

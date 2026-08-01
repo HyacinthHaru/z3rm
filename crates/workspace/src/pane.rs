@@ -3330,7 +3330,6 @@ impl Pane {
                 cx,
             )
         }
-
     }
 
     // §16.9 堆叠式 tabbar: 垂直排列的 tab 列表 (左侧堆叠)
@@ -4795,4 +4794,3 @@ impl Render for DraggedTab {
 
 // #[cfg(test)]
 // mod tests;
-

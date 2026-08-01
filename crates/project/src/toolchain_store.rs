@@ -5,7 +5,6 @@ use anyhow::{Context as _, Result, bail};
 use async_trait::async_trait;
 use collections::{BTreeMap, IndexSet};
 
-use util::shell::Shell;
 use gpui::{
     App, AppContext as _, AsyncApp, Context, Entity, EventEmitter, Subscription, Task, WeakEntity,
 };
@@ -21,6 +20,7 @@ use rpc::{
     },
 };
 use settings::WorktreeId;
+use util::shell::Shell;
 use util::{ResultExt as _, rel_path::RelPath};
 
 use crate::{

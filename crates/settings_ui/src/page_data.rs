@@ -80,7 +80,6 @@ fn general_page() -> SettingsPage {
                 title: "Auto Update",
                 description: "Whether or not to automatically check for updates.",
                 field: Box::new(SettingField {
-
                     json_path: Some("auto_update"),
                     pick: |settings_content| settings_content.auto_update.as_ref(),
                     write: |settings_content, value, _| {
@@ -100,7 +99,6 @@ fn general_page() -> SettingsPage {
                 title: "Telemetry Diagnostics",
                 description: "Send debug information like crash reports.",
                 field: Box::new(SettingField {
-
                     json_path: Some("telemetry.diagnostics"),
                     pick: |settings_content| {
                         settings_content.telemetry.as_ref().map(|t| &t.diagnostics)
@@ -119,16 +117,11 @@ fn general_page() -> SettingsPage {
                 title: "Telemetry Events",
                 description: "Send anonymous usage events.",
                 field: Box::new(SettingField {
-
                     json_path: Some("telemetry.events"),
-                    pick: |settings_content| {
-                        settings_content.telemetry.as_ref().map(|t| &t.events)
-                    },
+                    pick: |settings_content| settings_content.telemetry.as_ref().map(|t| &t.events),
                     write: |settings_content, value, _| {
-                        settings_content
-                            .telemetry
-                            .get_or_insert_default()
-                            .events = value.unwrap_or(false);
+                        settings_content.telemetry.get_or_insert_default().events =
+                            value.unwrap_or(false);
                     },
                 }),
                 metadata: None,
@@ -138,16 +131,13 @@ fn general_page() -> SettingsPage {
                 title: "Telemetry Metrics",
                 description: "Send anonymized metrics.",
                 field: Box::new(SettingField {
-
                     json_path: Some("telemetry.metrics"),
                     pick: |settings_content| {
                         settings_content.telemetry.as_ref().map(|t| &t.metrics)
                     },
                     write: |settings_content, value, _| {
-                        settings_content
-                            .telemetry
-                            .get_or_insert_default()
-                            .metrics = value.unwrap_or(false);
+                        settings_content.telemetry.get_or_insert_default().metrics =
+                            value.unwrap_or(false);
                     },
                 }),
                 metadata: None,
@@ -165,7 +155,6 @@ fn general_page() -> SettingsPage {
                 description: "Which settings should be activated only in Preview build.",
                 field: Box::new(
                     SettingField {
-
                         json_path: Some("preview_channel_settings"),
                         pick: |settings_content| Some(settings_content),
                         write: |_settings_content, _value, _| {},
@@ -180,7 +169,6 @@ fn general_page() -> SettingsPage {
                 description: "Any number of settings profiles that are temporarily applied on top of your existing user settings.",
                 field: Box::new(
                     SettingField {
-
                         json_path: Some("settings_profiles"),
                         pick: |settings_content| Some(settings_content),
                         write: |_settings_content, _value, _| {},
@@ -199,11 +187,8 @@ fn general_page() -> SettingsPage {
                 title: "Window Decorations",
                 description: "What draws window decorations/titlebar. Default: client",
                 field: Box::new(SettingField {
-
                     json_path: Some("window_decorations"),
-                    pick: |settings_content| {
-                        Some(&settings_content.workspace.window_decorations)
-                    },
+                    pick: |settings_content| Some(&settings_content.workspace.window_decorations),
                     write: |settings_content, value, _| {
                         if let Some(v) = value {
                             settings_content.workspace.window_decorations = v;
@@ -217,11 +202,8 @@ fn general_page() -> SettingsPage {
                 title: "Text Rendering Mode",
                 description: "The text rendering mode to use. Default: platform_default",
                 field: Box::new(SettingField {
-
                     json_path: Some("text_rendering_mode"),
-                    pick: |settings_content| {
-                        Some(&settings_content.workspace.text_rendering_mode)
-                    },
+                    pick: |settings_content| Some(&settings_content.workspace.text_rendering_mode),
                     write: |settings_content, value, _| {
                         if let Some(v) = value {
                             settings_content.workspace.text_rendering_mode = v;
@@ -235,7 +217,6 @@ fn general_page() -> SettingsPage {
                 title: "Confirm Quit",
                 description: "Whether or not to prompt the user to confirm before closing the application. Default: false",
                 field: Box::new(SettingField {
-
                     json_path: Some("confirm_quit"),
                     pick: |settings_content| Some(&settings_content.workspace.confirm_quit),
                     write: |settings_content, value, _| {
@@ -251,7 +232,6 @@ fn general_page() -> SettingsPage {
                 title: "On Last Window Closed",
                 description: "What to do when the last window is closed.",
                 field: Box::new(SettingField {
-
                     json_path: Some("on_last_window_closed"),
                     pick: |settings_content| {
                         Some(&settings_content.workspace.on_last_window_closed)
@@ -275,11 +255,8 @@ fn general_page() -> SettingsPage {
                 title: "Remote Server Path",
                 description: "Path to the remote server binary",
                 field: Box::new(SettingField {
-
                     json_path: Some("remote.remote_server_path"),
-                    pick: |settings_content| {
-                        settings_content.remote.remote_server_path.as_ref()
-                    },
+                    pick: |settings_content| settings_content.remote.remote_server_path.as_ref(),
                     write: |settings_content, value, _| {
                         settings_content.remote.remote_server_path = value;
                     },
@@ -291,11 +268,8 @@ fn general_page() -> SettingsPage {
                 title: "Auto Install",
                 description: "Whether to auto install remote server. Default: true",
                 field: Box::new(SettingField {
-
                     json_path: Some("remote.auto_install"),
-                    pick: |settings_content| {
-                        Some(&settings_content.remote.auto_install)
-                    },
+                    pick: |settings_content| Some(&settings_content.remote.auto_install),
                     write: |settings_content, value, _| {
                         settings_content.remote.auto_install = value.unwrap_or(true);
                     },
@@ -699,7 +673,6 @@ fn appearance_page() -> SettingsPage {
                 title: "Buffer Font Family",
                 description: "The name of a font to use for rendering in text buffers.",
                 field: Box::new(SettingField {
-
                     json_path: Some("buffer_font_family"),
                     pick: |settings_content| settings_content.theme.buffer_font_family.as_ref(),
                     write: |settings_content, value, _| {
@@ -713,7 +686,6 @@ fn appearance_page() -> SettingsPage {
                 title: "Buffer Font Size",
                 description: "The default font size for rendering in text buffers.",
                 field: Box::new(SettingField {
-
                     json_path: Some("buffer_font_size"),
                     pick: |settings_content| settings_content.theme.buffer_font_size.as_ref(),
                     write: |settings_content, value, _| {
@@ -727,7 +699,6 @@ fn appearance_page() -> SettingsPage {
                 title: "UI Font Family",
                 description: "The name of a font to use for rendering in the UI.",
                 field: Box::new(SettingField {
-
                     json_path: Some("ui_font_family"),
                     pick: |settings_content| settings_content.theme.ui_font_family.as_ref(),
                     write: |settings_content, value, _| {
@@ -741,7 +712,6 @@ fn appearance_page() -> SettingsPage {
                 title: "UI Font Size",
                 description: "The default font size for text in the UI.",
                 field: Box::new(SettingField {
-
                     json_path: Some("ui_font_size"),
                     pick: |settings_content| settings_content.theme.ui_font_size.as_ref(),
                     write: |settings_content, value, _| {
@@ -755,11 +725,7 @@ fn appearance_page() -> SettingsPage {
 
     SettingsPage {
         title: "Appearance",
-        items: concat_sections!(
-            theme_section(),
-            font_section(),
-        )
-        .into(),
+        items: concat_sections!(theme_section(), font_section(),).into(),
     }
 }
 
@@ -775,7 +741,6 @@ fn keymap_page() -> SettingsPage {
                 title: "Base Keymap",
                 description: "The base keymap to use. Default: VSCode",
                 field: Box::new(SettingField {
-
                     json_path: Some("base_keymap"),
                     pick: |settings_content| settings_content.base_keymap.as_ref(),
                     write: |settings_content, value, _| {
@@ -795,7 +760,6 @@ fn keymap_page() -> SettingsPage {
                 title: "Hide Mouse",
                 description: "Mouse hide mode during typing",
                 field: Box::new(SettingField {
-
                     json_path: Some("hide_mouse"),
                     pick: |settings_content| settings_content.hide_mouse.as_ref(),
                     write: |settings_content, value, _| {
@@ -810,11 +774,7 @@ fn keymap_page() -> SettingsPage {
 
     SettingsPage {
         title: "Keymap",
-        items: concat_sections!(
-            base_keymap_section(),
-            hide_mouse_section(),
-        )
-        .into(),
+        items: concat_sections!(base_keymap_section(), hide_mouse_section(),).into(),
     }
 }
 
@@ -830,7 +790,6 @@ fn terminal_page() -> SettingsPage {
                 title: "Font Family",
                 description: "Sets the terminal's font family.",
                 field: Box::new(SettingField {
-
                     json_path: Some("terminal.font_family"),
                     pick: |settings_content| {
                         settings_content
@@ -852,7 +811,6 @@ fn terminal_page() -> SettingsPage {
                 title: "Font Size",
                 description: "Sets the terminal's font size.",
                 field: Box::new(SettingField {
-
                     json_path: Some("terminal.font_size"),
                     pick: |settings_content| {
                         settings_content
@@ -861,10 +819,7 @@ fn terminal_page() -> SettingsPage {
                             .and_then(|t| t.font_size.as_ref())
                     },
                     write: |settings_content, value, _| {
-                        settings_content
-                            .terminal
-                            .get_or_insert_default()
-                            .font_size = value;
+                        settings_content.terminal.get_or_insert_default().font_size = value;
                     },
                 }),
                 metadata: None,
@@ -880,7 +835,6 @@ fn terminal_page() -> SettingsPage {
                 title: "Cursor Shape",
                 description: "Default cursor shape for the terminal.",
                 field: Box::new(SettingField {
-
                     json_path: Some("terminal.cursor_shape"),
                     pick: |settings_content| {
                         settings_content
@@ -902,7 +856,6 @@ fn terminal_page() -> SettingsPage {
                 title: "Blinking",
                 description: "Sets the cursor blinking behavior in the terminal.",
                 field: Box::new(SettingField {
-
                     json_path: Some("terminal.blinking"),
                     pick: |settings_content| {
                         settings_content
@@ -911,10 +864,7 @@ fn terminal_page() -> SettingsPage {
                             .and_then(|t| t.blinking.as_ref())
                     },
                     write: |settings_content, value, _| {
-                        settings_content
-                            .terminal
-                            .get_or_insert_default()
-                            .blinking = value;
+                        settings_content.terminal.get_or_insert_default().blinking = value;
                     },
                 }),
                 metadata: None,
@@ -924,7 +874,6 @@ fn terminal_page() -> SettingsPage {
                 title: "Option as Meta",
                 description: "Whether the option key behaves as the meta key.",
                 field: Box::new(SettingField {
-
                     json_path: Some("terminal.option_as_meta"),
                     pick: |settings_content| {
                         settings_content
@@ -946,7 +895,6 @@ fn terminal_page() -> SettingsPage {
                 title: "Copy on Select",
                 description: "Whether or not selecting text in the terminal will automatically copy to the system clipboard.",
                 field: Box::new(SettingField {
-
                     json_path: Some("terminal.copy_on_select"),
                     pick: |settings_content| {
                         settings_content
@@ -968,7 +916,6 @@ fn terminal_page() -> SettingsPage {
                 title: "Keep Selection on Copy",
                 description: "Whether to keep the text selection after copying it to the clipboard.",
                 field: Box::new(SettingField {
-
                     json_path: Some("terminal.keep_selection_on_copy"),
                     pick: |settings_content| {
                         settings_content
@@ -996,7 +943,6 @@ fn terminal_page() -> SettingsPage {
                 title: "Button",
                 description: "Whether to show the terminal button in the status bar.",
                 field: Box::new(SettingField {
-
                     json_path: Some("terminal.button"),
                     pick: |settings_content| {
                         settings_content
@@ -1005,10 +951,7 @@ fn terminal_page() -> SettingsPage {
                             .and_then(|t| t.button.as_ref())
                     },
                     write: |settings_content, value, _| {
-                        settings_content
-                            .terminal
-                            .get_or_insert_default()
-                            .button = value;
+                        settings_content.terminal.get_or_insert_default().button = value;
                     },
                 }),
                 metadata: None,
@@ -1018,7 +961,6 @@ fn terminal_page() -> SettingsPage {
                 title: "Flexible",
                 description: "Whether the terminal panel should use flexible (proportional) sizing.",
                 field: Box::new(SettingField {
-
                     json_path: Some("terminal.flexible"),
                     pick: |settings_content| {
                         settings_content
@@ -1027,10 +969,7 @@ fn terminal_page() -> SettingsPage {
                             .and_then(|t| t.flexible.as_ref())
                     },
                     write: |settings_content, value, _| {
-                        settings_content
-                            .terminal
-                            .get_or_insert_default()
-                            .flexible = value;
+                        settings_content.terminal.get_or_insert_default().flexible = value;
                     },
                 }),
                 metadata: None,
@@ -1062,7 +1001,6 @@ fn mux_page() -> SettingsPage {
                 title: "Socket Path",
                 description: "Unix socket path for the mux server.",
                 field: Box::new(SettingField {
-
                     json_path: Some("mux.socket_path"),
                     pick: |settings_content| {
                         settings_content
@@ -1071,10 +1009,7 @@ fn mux_page() -> SettingsPage {
                             .and_then(|m| m.socket_path.as_ref())
                     },
                     write: |settings_content, value, _| {
-                        settings_content
-                            .mux
-                            .get_or_insert_default()
-                            .socket_path = value;
+                        settings_content.mux.get_or_insert_default().socket_path = value;
                     },
                 }),
                 metadata: None,
@@ -1090,16 +1025,11 @@ fn mux_page() -> SettingsPage {
                 title: "Keep Alive",
                 description: "Whether to keep the mux server alive when no clients are connected. Default: true",
                 field: Box::new(SettingField {
-
                     json_path: Some("mux.keep_alive"),
-                    pick: |settings_content| {
-                        settings_content.mux.as_ref().map(|m| &m.keep_alive)
-                    },
+                    pick: |settings_content| settings_content.mux.as_ref().map(|m| &m.keep_alive),
                     write: |settings_content, value, _| {
-                        settings_content
-                            .mux
-                            .get_or_insert_default()
-                            .keep_alive = value.unwrap_or(true);
+                        settings_content.mux.get_or_insert_default().keep_alive =
+                            value.unwrap_or(true);
                     },
                 }),
                 metadata: None,
@@ -1115,7 +1045,6 @@ fn mux_page() -> SettingsPage {
                 title: "Keymap Profile",
                 description: "Keymap profile: default, tmux, vim, or wezterm",
                 field: Box::new(SettingField {
-
                     json_path: Some("mux.keymap_profile"),
                     pick: |settings_content| {
                         settings_content
@@ -1124,10 +1053,7 @@ fn mux_page() -> SettingsPage {
                             .and_then(|m| m.keymap_profile.as_ref())
                     },
                     write: |settings_content, value, _| {
-                        settings_content
-                            .mux
-                            .get_or_insert_default()
-                            .keymap_profile = value;
+                        settings_content.mux.get_or_insert_default().keymap_profile = value;
                     },
                 }),
                 metadata: None,
@@ -1160,10 +1086,12 @@ fn shadow_snapshot_page() -> SettingsPage {
                 title: "Enabled",
                 description: "Whether shadow snapshots are enabled. Default: true",
                 field: Box::new(SettingField {
-
                     json_path: Some("shadow_snapshot.enabled"),
                     pick: |settings_content| {
-                        settings_content.shadow_snapshot.as_ref().map(|s| &s.enabled)
+                        settings_content
+                            .shadow_snapshot
+                            .as_ref()
+                            .map(|s| &s.enabled)
                     },
                     write: |settings_content, value, _| {
                         settings_content
@@ -1185,10 +1113,12 @@ fn shadow_snapshot_page() -> SettingsPage {
                 title: "Per Project Quota (MB)",
                 description: "Per-project quota in megabytes. Default: 500",
                 field: Box::new(SettingField {
-
                     json_path: Some("shadow_snapshot.per_project_quota_mb"),
                     pick: |settings_content| {
-                        settings_content.shadow_snapshot.as_ref().map(|s| &s.per_project_quota_mb)
+                        settings_content
+                            .shadow_snapshot
+                            .as_ref()
+                            .map(|s| &s.per_project_quota_mb)
                     },
                     write: |settings_content, value, _| {
                         if let Some(value) = value {
@@ -1212,10 +1142,12 @@ fn shadow_snapshot_page() -> SettingsPage {
                 title: "Binary Detection",
                 description: "Whether to detect and skip binary files. Default: true",
                 field: Box::new(SettingField {
-
                     json_path: Some("shadow_snapshot.binary_detection"),
                     pick: |settings_content| {
-                        settings_content.shadow_snapshot.as_ref().map(|s| &s.binary_detection)
+                        settings_content
+                            .shadow_snapshot
+                            .as_ref()
+                            .map(|s| &s.binary_detection)
                     },
                     write: |settings_content, value, _| {
                         settings_content
@@ -1231,10 +1163,12 @@ fn shadow_snapshot_page() -> SettingsPage {
                 title: "Debounce MS",
                 description: "Debounce interval in milliseconds for file change events. Default: 500",
                 field: Box::new(SettingField {
-
                     json_path: Some("shadow_snapshot.debounce_ms"),
                     pick: |settings_content| {
-                        settings_content.shadow_snapshot.as_ref().map(|s| &s.debounce_ms)
+                        settings_content
+                            .shadow_snapshot
+                            .as_ref()
+                            .map(|s| &s.debounce_ms)
                     },
                     write: |settings_content, value, _| {
                         if let Some(value) = value {
@@ -1275,11 +1209,8 @@ fn extensions_page() -> SettingsPage {
                 title: "Directory",
                 description: "Directory where extensions are stored. Default: ~/.config/z3rm/extensions",
                 field: Box::new(SettingField {
-
                     json_path: Some("extension.directory"),
-                    pick: |settings_content| {
-                        Some(&settings_content.extension.directory)
-                    },
+                    pick: |settings_content| Some(&settings_content.extension.directory),
                     write: |settings_content, value, _| {
                         if let Some(value) = value {
                             settings_content.extension.directory = value.clone();
@@ -1293,11 +1224,8 @@ fn extensions_page() -> SettingsPage {
                 title: "Auto Sync to Remote",
                 description: "Whether to automatically sync extensions to remote servers. Default: true",
                 field: Box::new(SettingField {
-
                     json_path: Some("extension.auto_sync_to_remote"),
-                    pick: |settings_content| {
-                        Some(&settings_content.extension.auto_sync_to_remote)
-                    },
+                    pick: |settings_content| Some(&settings_content.extension.auto_sync_to_remote),
                     write: |settings_content, value, _| {
                         settings_content.extension.auto_sync_to_remote = value.unwrap_or(true);
                     },
@@ -1310,10 +1238,7 @@ fn extensions_page() -> SettingsPage {
 
     SettingsPage {
         title: "Extensions",
-        items: concat_sections!(
-            extension_section(),
-        )
-        .into(),
+        items: concat_sections!(extension_section(),).into(),
     }
 }
 
@@ -1329,11 +1254,8 @@ fn workspace_page() -> SettingsPage {
                 title: "Focus Follows Mouse",
                 description: "Whether the focused panel follows the mouse location.",
                 field: Box::new(SettingField {
-
                     json_path: Some("workspace.focus_follows_mouse"),
-                    pick: |settings_content| {
-                        Some(&settings_content.workspace.focus_follows_mouse)
-                    },
+                    pick: |settings_content| Some(&settings_content.workspace.focus_follows_mouse),
                     write: |settings_content, value, _| {
                         if let Some(v) = value {
                             settings_content.workspace.focus_follows_mouse = v;
@@ -1353,7 +1275,6 @@ fn workspace_page() -> SettingsPage {
                 title: "Show Branch Status Icon",
                 description: "Whether to show git status indicators on the branch icon in the title bar.",
                 field: Box::new(SettingField {
-
                     json_path: Some("title_bar.show_branch_status_icon"),
                     pick: |settings_content| {
                         settings_content
@@ -1375,7 +1296,6 @@ fn workspace_page() -> SettingsPage {
                 title: "Show Branch Name",
                 description: "Whether to show the branch name button in the titlebar.",
                 field: Box::new(SettingField {
-
                     json_path: Some("title_bar.show_branch_name"),
                     pick: |settings_content| {
                         settings_content
@@ -1403,7 +1323,6 @@ fn workspace_page() -> SettingsPage {
                 title: "Show Stack Size",
                 description: "Whether to show the stack size on the status bar.",
                 field: Box::new(SettingField {
-
                     json_path: Some("status_bar.stack_size"),
                     pick: |settings_content| {
                         settings_content.status_bar.as_ref().map(|s| &s.stack_size)
@@ -1422,10 +1341,12 @@ fn workspace_page() -> SettingsPage {
                 title: "Show Working Directory",
                 description: "Whether to show the working directory on the status bar.",
                 field: Box::new(SettingField {
-
                     json_path: Some("status_bar.working_directory"),
                     pick: |settings_content| {
-                        settings_content.status_bar.as_ref().map(|s| &s.working_directory)
+                        settings_content
+                            .status_bar
+                            .as_ref()
+                            .map(|s| &s.working_directory)
                     },
                     write: |settings_content, value, _| {
                         settings_content
@@ -1447,10 +1368,12 @@ fn workspace_page() -> SettingsPage {
                 title: "Middle Click to Close",
                 description: "Whether to show the middle click to close tab behavior.",
                 field: Box::new(SettingField {
-
                     json_path: Some("tab_bar.middle_click_to_close"),
                     pick: |settings_content| {
-                        settings_content.tab_bar.as_ref().map(|t| &t.middle_click_to_close)
+                        settings_content
+                            .tab_bar
+                            .as_ref()
+                            .map(|t| &t.middle_click_to_close)
                     },
                     write: |settings_content, value, _| {
                         settings_content
@@ -1466,10 +1389,12 @@ fn workspace_page() -> SettingsPage {
                 title: "Mouse Scroll to Switch",
                 description: "Whether to show the mouse scroll to switch tab behavior.",
                 field: Box::new(SettingField {
-
                     json_path: Some("tab_bar.mouse_scroll_to_switch"),
                     pick: |settings_content| {
-                        settings_content.tab_bar.as_ref().map(|t| &t.mouse_scroll_to_switch)
+                        settings_content
+                            .tab_bar
+                            .as_ref()
+                            .map(|t| &t.mouse_scroll_to_switch)
                     },
                     write: |settings_content, value, _| {
                         settings_content
@@ -1502,7 +1427,6 @@ fn workspace_page() -> SettingsPage {
 // =========================================================================
 
 fn developer_page(cx: &App) -> SettingsPage {
-
     fn log_section() -> [SettingsPageItem; 2] {
         [
             SettingsPageItem::SectionHeader("Log"),
@@ -1563,11 +1487,17 @@ fn developer_page(cx: &App) -> SettingsPage {
 // =========================================================================
 
 fn ai_page() -> SettingsPage {
-    SettingsPage { title: "AI", items: Box::new([]) }
+    SettingsPage {
+        title: "AI",
+        items: Box::new([]),
+    }
 }
 
 fn network_page() -> SettingsPage {
-    SettingsPage { title: "Network", items: Box::new([]) }
+    SettingsPage {
+        title: "Network",
+        items: Box::new([]),
+    }
 }
 
 // =========================================================================

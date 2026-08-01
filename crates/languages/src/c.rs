@@ -374,7 +374,6 @@ impl super::LspAdapter for CLspAdapter {
         }
         Ok(original)
     }
-
 }
 
 async fn get_cached_server_binary(container_dir: PathBuf) -> Option<LanguageServerBinary> {

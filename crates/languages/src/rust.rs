@@ -15,11 +15,11 @@ use serde_json::json;
 use settings::{SemanticTokenRules, Settings as _};
 use smallvec::SmallVec;
 use smol::fs::{self};
+use std::borrow::Cow;
 use std::cmp::Reverse;
 use std::fmt::Display;
 use std::future::Future;
 use std::ops::Range;
-use std::borrow::Cow;
 use std::{
     path::{Path, PathBuf},
     sync::{Arc, LazyLock},
@@ -29,7 +29,6 @@ use util::fs::{make_file_executable, remove_matching};
 use util::merge_json_value_into;
 use util::rel_path::RelPath;
 use util::{ResultExt, maybe};
-
 
 /// snippet crate 已删除，替代 stub (spec §3.1 L1)
 mod snippet {
@@ -327,7 +326,6 @@ impl LspAdapter for RustLspAdapter {
         SERVER_NAME
     }
     fn disk_based_diagnostic_sources(&self) -> Vec<String> {
-
         vec!["cargo".to_owned()]
     }
 

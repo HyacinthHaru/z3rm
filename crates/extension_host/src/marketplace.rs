@@ -80,10 +80,7 @@ pub async fn fetch_registry(
         .context("failed to fetch marketplace registry")?;
 
     if !response.status().is_success() {
-        bail!(
-            "marketplace registry request failed: {}",
-            response.status()
-        );
+        bail!("marketplace registry request failed: {}", response.status());
     }
 
     let mut body_bytes = Vec::new();
@@ -108,10 +105,7 @@ pub async fn download_extension(
         .context("failed to download extension")?;
 
     if !response.status().is_success() {
-        bail!(
-            "extension download failed: {}",
-            response.status()
-        );
+        bail!("extension download failed: {}", response.status());
     }
 
     let mut body_bytes = Vec::new();
@@ -292,8 +286,7 @@ mod tests {
         });
 
         // 正确的校验和应成功
-        let result =
-            download_extension(&fake, "https://example.com/ext.tar.gz", &checksum).await;
+        let result = download_extension(&fake, "https://example.com/ext.tar.gz", &checksum).await;
         assert!(result.is_ok());
 
         // 错误的校验和应失败
@@ -305,10 +298,12 @@ mod tests {
         let result =
             download_extension(&fake2, "https://example.com/ext.tar.gz", "wrong_checksum").await;
         assert!(result.is_err());
-        assert!(result
-            .unwrap_err()
-            .to_string()
-            .contains("checksum mismatch"));
+        assert!(
+            result
+                .unwrap_err()
+                .to_string()
+                .contains("checksum mismatch")
+        );
     }
 
     #[test]

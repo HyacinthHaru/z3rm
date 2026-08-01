@@ -7,14 +7,13 @@
 use std::collections::HashMap;
 use std::io::Read;
 use std::path::{Path, PathBuf};
+use std::sync::{Arc, mpsc};
 use std::time::{Duration, Instant};
-use std::sync::{mpsc, Arc};
 
 use notify::Watcher;
 use parking_lot::Mutex;
 
 use crate::version_tree::SnapshotTrigger;
-
 
 /// 默认忽略模式
 const DEFAULT_IGNORE: &[&str] = &[
@@ -216,7 +215,9 @@ impl Monitor {
             })
             .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
 
-        Ok(WatchHandle { watcher: Some(watcher) })
+        Ok(WatchHandle {
+            watcher: Some(watcher),
+        })
     }
 }
 

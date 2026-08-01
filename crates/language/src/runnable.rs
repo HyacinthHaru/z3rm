@@ -137,12 +137,7 @@ fn runnable_tags_from_pattern(
         .iter()
         .filter_map(|property| {
             (*property.key == *"tag")
-                .then(|| {
-                    property
-                        .value
-                        .as_ref()
-                        .map(|value| value.to_string())
-                })
+                .then(|| property.value.as_ref().map(|value| value.to_string()))
                 .flatten()
         })
         .collect()
@@ -515,6 +510,4 @@ mod tests {
             .collect();
         assert_eq!(outer_names, vec!["outer", "outer", "outer"]);
     }
-
-
 }

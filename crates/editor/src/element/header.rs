@@ -1,6 +1,7 @@
 use std::path::Path;
 use std::rc::Rc;
 
+use crate::editor_settings::RelativeLineNumbers;
 use collections::HashMap;
 use file_icons::FileIcons;
 use git::status::FileStatus;
@@ -15,7 +16,6 @@ use language::language_settings::ShowWhitespaceSetting;
 use multi_buffer::{Anchor, ExcerptBoundaryInfo, MultiBuffer};
 use project::Entry;
 use settings::Settings;
-use crate::editor_settings::RelativeLineNumbers;
 use smallvec::SmallVec;
 use sum_tree::Bias;
 use text::BufferId;

@@ -64,7 +64,10 @@ impl LayoutTree {
         // that as an empty single-pane tree rather than panicking (AGENTS.md).
         let Some(root_node) = tree.root.as_ref() else {
             return Self {
-                root: LayoutNode::Pane { id: String::new(), pane_id: String::new() },
+                root: LayoutNode::Pane {
+                    id: String::new(),
+                    pane_id: String::new(),
+                },
             };
         };
         Self {
@@ -184,7 +187,11 @@ impl LayoutTree {
                     equal_ratios.as_slice()
                 };
                 let total_ratio: f32 = safe_ratios.iter().sum();
-                let total_ratio = if total_ratio <= 0.0 { children.len() as f32 } else { total_ratio };
+                let total_ratio = if total_ratio <= 0.0 {
+                    children.len() as f32
+                } else {
+                    total_ratio
+                };
 
                 // §15.1 计算每个子节点的 bounds (考虑分割条宽度)
                 let num_children = children.len() as f32;
@@ -215,12 +222,7 @@ impl LayoutTree {
                         }
                     };
 
-                    self.project_node(
-                        child,
-                        child_bounds,
-                        splitter_width,
-                        pane_bounds,
-                    );
+                    self.project_node(child, child_bounds, splitter_width, pane_bounds);
 
                     // §15.1 加上分割条宽度偏移
                     current_offset += child_size + splitter_width;
@@ -258,10 +260,7 @@ impl LayoutRenderer {
 /// 在给定区域内的 Bounds。返回扁平的 (pane_id, Bounds) 列表供 GPUI 渲染。
 ///
 /// 替代 PaneGroup 的 flexbox 布局计算 (spec §16.9)。
-pub fn render_layout(
-    tree: &LayoutTree,
-    bounds: Bounds<Pixels>,
-) -> Vec<(String, Bounds<Pixels>)> {
+pub fn render_layout(tree: &LayoutTree, bounds: Bounds<Pixels>) -> Vec<(String, Bounds<Pixels>)> {
     let splitter_width = gpui::px(2.0);
     let projection = tree.project(ProjectionConfig {
         available_bounds: bounds,
@@ -393,4 +392,3 @@ impl TryFrom<mux_protocol::LayoutNode> for LayoutNode {
 
 // #[cfg(test)]
 // mod tests;
-

@@ -74,22 +74,27 @@ pub fn parse_extension_args() -> Result<Option<ExtensionArgs>> {
     }
 
     let rest = &args[1..];
-    let extension_args = ExtensionArgs::try_parse_from(rest).context("failed to parse extension args")?;
+    let extension_args =
+        ExtensionArgs::try_parse_from(rest).context("failed to parse extension args")?;
     Ok(Some(extension_args))
 }
 
 /// 运行 extension marketplace 命令
 pub async fn run_extension_command(args: ExtensionArgs) -> Result<()> {
     match args.command {
-        ExtensionCommand::Search { query, registry_url } => {
-            run_search(&query, registry_url.as_deref()).await
-        }
-        ExtensionCommand::Install { id, extensions_dir, registry_url } => {
-            run_install(&id, extensions_dir, registry_url.as_deref()).await
-        }
-        ExtensionCommand::Update { extensions_dir, registry_url } => {
-            run_update(extensions_dir, registry_url.as_deref()).await
-        }
+        ExtensionCommand::Search {
+            query,
+            registry_url,
+        } => run_search(&query, registry_url.as_deref()).await,
+        ExtensionCommand::Install {
+            id,
+            extensions_dir,
+            registry_url,
+        } => run_install(&id, extensions_dir, registry_url.as_deref()).await,
+        ExtensionCommand::Update {
+            extensions_dir,
+            registry_url,
+        } => run_update(extensions_dir, registry_url.as_deref()).await,
         ExtensionCommand::List { extensions_dir } => run_list(extensions_dir).await,
     }
 }
@@ -111,7 +116,10 @@ async fn run_search(query: &str, registry_url: Option<&str>) -> Result<()> {
         return Ok(());
     }
 
-    println!("{:<20} {:<20} {:<12} {:<15} {}", "ID", "NAME", "VERSION", "AUTHOR", "DESCRIPTION");
+    println!(
+        "{:<20} {:<20} {:<12} {:<15} {}",
+        "ID", "NAME", "VERSION", "AUTHOR", "DESCRIPTION"
+    );
     println!("{}", "-".repeat(87));
     for entry in &results {
         println!(
@@ -142,7 +150,10 @@ async fn run_install(
         .get(id)
         .ok_or_else(|| anyhow::anyhow!("extension '{}' not found in marketplace", id))?;
 
-    println!("downloading {} {} from marketplace...", entry.name, entry.version);
+    println!(
+        "downloading {} {} from marketplace...",
+        entry.name, entry.version
+    );
 
     // 下载扩展包并校验 checksum
     let tar_bytes = extension_host::marketplace::download_extension(
@@ -177,21 +188,27 @@ async fn run_install(
     .context("spawn_blocking failed")?
     .context("failed to unpack extension archive")?;
 
-    println!("installed {} {} to {:?}", entry.name, entry.version, target_dir);
+    println!(
+        "installed {} {} to {:?}",
+        entry.name, entry.version, target_dir
+    );
     Ok(())
 }
 
 /// 检查更新
 /// 来源: spec §16.11
 async fn run_update(extensions_dir: Option<PathBuf>, registry_url: Option<&str>) -> Result<()> {
-    let extensions_path = extensions_dir
-        .unwrap_or_else(|| paths::extensions_dir().clone());
+    let extensions_path = extensions_dir.unwrap_or_else(|| paths::extensions_dir().clone());
 
     let installed = tokio::fs::read_dir(&extensions_path).await;
     let installed = match installed {
         Ok(mut entries) => {
             let mut result = Vec::new();
-            while let Some(entry) = entries.next_entry().await.context("failed to read directory")? {
+            while let Some(entry) = entries
+                .next_entry()
+                .await
+                .context("failed to read directory")?
+            {
                 let path = entry.path();
                 if path.is_dir() {
                     result.push(path);
@@ -230,17 +247,17 @@ async fn run_update(extensions_dir: Option<PathBuf>, registry_url: Option<&str>)
         if let Some(entry) = registry.get(&ext_name) {
             let manifest_path = ext_dir.join("extension.toml");
             if tokio::fs::metadata(&manifest_path).await.is_ok() {
-                let manifest_content =
-                    tokio::fs::read_to_string(&manifest_path).await.context(format!(
-                        "failed to read manifest for {}",
-                        ext_name
-                    ))?;
+                let manifest_content = tokio::fs::read_to_string(&manifest_path)
+                    .await
+                    .context(format!("failed to read manifest for {}", ext_name))?;
 
                 let installed_version: String = manifest_content
                     .lines()
                     .find(|line| line.starts_with("version"))
                     .and_then(|line| {
-                        line.split('=').nth(1).map(|v| v.trim().trim_matches('"').to_string())
+                        line.split('=')
+                            .nth(1)
+                            .map(|v| v.trim().trim_matches('"').to_string())
                     })
                     .unwrap_or_else(|| "unknown".to_string());
 
@@ -269,8 +286,7 @@ async fn run_update(extensions_dir: Option<PathBuf>, registry_url: Option<&str>)
 /// 列出已安装的扩展
 /// 来源: spec §16.11
 async fn run_list(extensions_dir: Option<PathBuf>) -> Result<()> {
-    let extensions_path = extensions_dir
-        .unwrap_or_else(|| paths::extensions_dir().clone());
+    let extensions_path = extensions_dir.unwrap_or_else(|| paths::extensions_dir().clone());
 
     let installed = tokio::fs::read_dir(&extensions_path).await;
     let mut entries: Vec<(String, String)> = Vec::new();
@@ -292,7 +308,9 @@ async fn run_list(extensions_dir: Option<PathBuf>) -> Result<()> {
                                 .lines()
                                 .find(|line| line.starts_with("version"))
                                 .and_then(|line| {
-                                    line.split('=').nth(1).map(|v| v.trim().trim_matches('"').to_string())
+                                    line.split('=')
+                                        .nth(1)
+                                        .map(|v| v.trim().trim_matches('"').to_string())
                                 })
                                 .unwrap_or_else(|| "unknown".to_string()),
                             Err(_) => "unknown".to_string(),

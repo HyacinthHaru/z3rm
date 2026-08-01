@@ -54,8 +54,7 @@ pub enum VDomChild {
 /// Extensions return `serde_json::Value` from QuickJS; this validates
 /// and converts to typed VDomNode for the renderer.
 pub fn parse_vdom(value: &serde_json::Value) -> Result<VDomNode> {
-    serde_json::from_value(value.clone())
-        .map_err(|e| anyhow::anyhow!("VDOM parse error: {}", e))
+    serde_json::from_value(value.clone()).map_err(|e| anyhow::anyhow!("VDOM parse error: {}", e))
 }
 
 /// Flatten a VDOM tree into a text representation (for placeholder rendering).
@@ -84,7 +83,6 @@ pub fn vdom_to_text(node: &VDomNode, depth: usize) -> String {
     out
 }
 
-
 /// §5.4 Convert a VDOM tree into a GPUI element tree.
 ///
 /// Maps VDOM node types to GPUI elements:
@@ -95,15 +93,19 @@ pub fn vdom_to_text(node: &VDomNode, depth: usize) -> String {
 ///
 /// Style properties are mapped to GPUI style methods where possible.
 pub fn vdom_to_element(node: &VDomNode) -> gpui::AnyElement {
-    use gpui::{div, px, IntoElement, ParentElement, SharedString, Styled};
+    use gpui::{IntoElement, ParentElement, SharedString, Styled, div, px};
 
     let mut element = div();
 
     // Apply flex layout styles from VDOM
     if let Some(direction) = node.style.get("flexDirection") {
         match direction.as_str() {
-            "row" => { element = element.flex_row(); }
-            "column" => { element = element.flex_col(); }
+            "row" => {
+                element = element.flex_row();
+            }
+            "column" => {
+                element = element.flex_col();
+            }
             _ => {}
         }
     } else {
@@ -121,8 +123,12 @@ pub fn vdom_to_element(node: &VDomNode) -> gpui::AnyElement {
 
     if let Some(justify) = node.style.get("justifyContent") {
         match justify.as_str() {
-            "space-between" => { element = element.justify_between(); }
-            "center" => { element = element.justify_center(); }
+            "space-between" => {
+                element = element.justify_between();
+            }
+            "center" => {
+                element = element.justify_center();
+            }
             _ => {}
         }
     }

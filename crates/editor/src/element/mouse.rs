@@ -1,6 +1,7 @@
 use std::ops::Range;
 use std::time::{Duration, Instant};
 
+use crate::stubs::DisableAiSettings;
 use collections::HashMap;
 use feature_flags::{DiffReviewFeatureFlag, FeatureFlagAppExt as _};
 use gpui::{
@@ -10,7 +11,6 @@ use gpui::{
     Window, anchored, deferred, point, px,
 };
 use multi_buffer::MultiBufferRow;
-use crate::stubs::DisableAiSettings;
 use settings::Settings;
 use sum_tree::Bias;
 use text::SelectionGoal;
@@ -22,8 +22,8 @@ use crate::{
     CURSORS_VISIBLE_FOR, ColumnarMode, DisplayDiffHunk, DisplayPoint, DisplayRow, Editor,
     EditorSettings, EditorSnapshot, GutterHoverButton, HoveredCursor, JumpData,
     PhantomDiffReviewIndicator, SelectPhase, Selection, SelectionDragState,
-    display_map::ToDisplayPoint, editor_settings::DoubleClickInMultibuffer,
-    hover_at, mouse_context_menu, scroll::ScrollPixelOffset,
+    display_map::ToDisplayPoint, editor_settings::DoubleClickInMultibuffer, hover_at,
+    mouse_context_menu, scroll::ScrollPixelOffset,
 };
 
 impl EditorElement {

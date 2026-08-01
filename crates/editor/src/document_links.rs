@@ -2,7 +2,7 @@ use collections::HashMap;
 use gpui::{App, Context, Entity, Task};
 use language::Buffer;
 use lsp::LanguageServerId;
-use project::lsp_store::{LspDocumentLink};
+use project::lsp_store::LspDocumentLink;
 use settings::Settings;
 use text::BufferId;
 

@@ -499,17 +499,20 @@ impl Inner {
             return Err(anyhow!("Failed to obtain workspace."));
         };
 
-        let entry_id = workspace.update(cx, |workspace, cx| {
-            let project = workspace.project().read(cx);
-            project.entry_for_path(project_path, cx)
-                .map(|entry| entry.id)
-        }).ok_or_else(|| anyhow!("No entry for path."))?;
+        let entry_id = workspace
+            .update(cx, |workspace, cx| {
+                let project = workspace.project().read(cx);
+                project
+                    .entry_for_path(project_path, cx)
+                    .map(|entry| entry.id)
+            })
+            .ok_or_else(|| anyhow!("No entry for path."))?;
 
         let trashed = workspace
             .update(cx, |workspace, cx| {
-                workspace.project().update(cx, |project, cx| {
-                    project.delete_entry(entry_id, true, cx)
-                })
+                workspace
+                    .project()
+                    .update(cx, |project, cx| project.delete_entry(entry_id, true, cx))
             })
             .await
             .ok()

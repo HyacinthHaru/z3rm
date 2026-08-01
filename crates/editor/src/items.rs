@@ -1,3 +1,4 @@
+use crate::stubs::ProjectBufferExt;
 use crate::{
     ActiveDebugLine, Anchor, Autoscroll, BufferSerialization, Capability, Editor, EditorEvent,
     EditorSettings, ExcerptRange, FormatTarget, MultiBuffer, MultiBufferSnapshot, NavigationData,
@@ -7,8 +8,6 @@ use crate::{
     persistence::{EditorDb, SerializedEditor},
     scroll::{ScrollAnchor, ScrollOffset},
 };
-use workspace::settings_stubs::SeedQuerySetting;
-use crate::stubs::ProjectBufferExt;
 use anyhow::{Context as _, Result, anyhow};
 use collections::{HashMap, HashSet};
 use file_icons::FileIcons;
@@ -47,6 +46,7 @@ use text::{BufferId, BufferSnapshot, OffsetRangeExt, Selection, ToPoint as _};
 use ui::{IconDecorationKind, prelude::*};
 use util::{ResultExt, TryFutureExt, paths::PathExt, rel_path::RelPath};
 use workspace::item::{ItemSettings, SerializableItem, TabContentParams};
+use workspace::settings_stubs::SeedQuerySetting;
 use workspace::{
     ItemId, ItemNavHistory, ToolbarItemLocation, Workspace, WorkspaceId,
     invalid_item_view::InvalidItemView,
@@ -57,17 +57,13 @@ use workspace::{
     },
 };
 use workspace::{
-    Pane, TabBarSettings, WorkspaceSettings,
-    item::ProjectItemKind,
-    searchable::SearchOptions,
+    Pane, TabBarSettings, WorkspaceSettings, item::ProjectItemKind, searchable::SearchOptions,
 };
 use zed_actions::preview::{
     markdown::OpenPreview as OpenMarkdownPreview, svg::OpenPreview as OpenSvgPreview,
 };
 
 pub const MAX_TAB_TITLE_LEN: usize = 24;
-
-
 
 async fn update_editor_from_message(
     this: WeakEntity<Editor>,
@@ -1459,11 +1455,9 @@ impl SearchableItem for Editor {
         let buffer_snapshot = snapshot.buffer_snapshot();
         match setting {
             SeedQuerySetting::None => String::new(),
-            SeedQuerySetting::Selection if !selection.is_empty() => {
-                buffer_snapshot
-                    .text_for_range(selection.start..selection.end)
-                    .collect()
-            }
+            SeedQuerySetting::Selection if !selection.is_empty() => buffer_snapshot
+                .text_for_range(selection.start..selection.end)
+                .collect(),
             SeedQuerySetting::Line => {
                 // Seed from current line text
                 // MultiBufferSnapshot lacks TextBufferSnapshot ToPoint/ToOffset traits,

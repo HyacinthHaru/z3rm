@@ -59,7 +59,9 @@ async fn test_latency_injection() -> Result<()> {
         payload: Some(mux_protocol::proto::envelope::Payload::Notification(
             mux_protocol::Notification {
                 event: Some(mux_protocol::proto::notification::Event::PaneDirty(
-                    mux_protocol::PaneDirty { pane_id: "p1".into() },
+                    mux_protocol::PaneDirty {
+                        pane_id: "p1".into(),
+                    },
                 )),
             },
         )),
@@ -131,7 +133,9 @@ async fn test_reconnect_after_disconnect() -> Result<()> {
         payload: Some(mux_protocol::proto::envelope::Payload::Notification(
             mux_protocol::Notification {
                 event: Some(mux_protocol::proto::notification::Event::PaneFocused(
-                    mux_protocol::PaneFocused { pane_id: "p1".into() },
+                    mux_protocol::PaneFocused {
+                        pane_id: "p1".into(),
+                    },
                 )),
             },
         )),
@@ -185,7 +189,9 @@ fn test_truncated_frame_handling() {
         payload: Some(mux_protocol::proto::envelope::Payload::Notification(
             mux_protocol::Notification {
                 event: Some(mux_protocol::proto::notification::Event::PaneDirty(
-                    mux_protocol::PaneDirty { pane_id: "p1".into() },
+                    mux_protocol::PaneDirty {
+                        pane_id: "p1".into(),
+                    },
                 )),
             },
         )),
@@ -206,7 +212,8 @@ fn test_frame_consumption_count() {
                 request_id: 1,
                 body: Some(mux_protocol::proto::request::Body::CreateSession(
                     mux_protocol::CreateSessionRequest {
-                        name: "test".into(), cwd: "/tmp".into(),
+                        name: "test".into(),
+                        cwd: "/tmp".into(),
                     },
                 )),
             },

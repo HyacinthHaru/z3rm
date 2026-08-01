@@ -31,8 +31,8 @@ use project::{
 };
 
 use settings::Settings;
-use workspace::settings_stubs::SeedQuerySetting;
 use std::{any::TypeId, sync::Arc};
+use workspace::settings_stubs::SeedQuerySetting;
 use zed_actions::{outline::ToggleOutline, workspace::CopyPath, workspace::CopyRelativePath};
 
 use ui::{BASE_REM_SIZE_IN_PX, IconButtonShape, Tooltip, prelude::*, utils::SearchInputWidth};

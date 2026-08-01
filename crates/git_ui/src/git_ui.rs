@@ -1,6 +1,6 @@
 use anyhow::anyhow;
-use std::sync::Arc;
 use editor::{Editor, actions::DiffClipboardWithSelectionData};
+use std::sync::Arc;
 
 use workspace::{Toast, notifications::NotificationId};
 
@@ -79,7 +79,6 @@ pub fn init(cx: &mut App) {
     editor::set_blame_renderer(blame_ui::GitBlameRenderer, cx);
     commit_view::init(cx);
     git_graph::init(cx);
-
 
     cx.observe_new(|workspace: &mut Workspace, _, cx| {
         ProjectDiff::register(workspace, cx);

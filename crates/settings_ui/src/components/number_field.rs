@@ -11,9 +11,7 @@ use gpui::{
     TextAlign, TextStyleRefinement, WeakEntity,
 };
 
-use settings::{
-    CodeFade, FontSize, FontWeightContent,
-};
+use settings::{CodeFade, FontSize, FontWeightContent};
 use ui::prelude::*;
 use zed_actions::editor::{MoveDown, MoveUp};
 

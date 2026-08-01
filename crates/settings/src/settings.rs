@@ -3,10 +3,10 @@ mod content_into_gpui;
 mod editable_setting_control;
 mod editorconfig_store;
 mod keymap_file;
+pub mod mux_actions;
 mod settings_file;
 mod settings_store;
 mod vscode_import;
-pub mod mux_actions;
 
 pub use settings_macros::RegisterSetting;
 
@@ -25,7 +25,7 @@ pub mod private {
 }
 
 use gpui::{App, Global};
-use serde::{Serialize, Deserialize};
+use serde::{Deserialize, Serialize};
 
 use rust_embed::RustEmbed;
 use std::env;
@@ -55,22 +55,21 @@ pub use vscode_import::{VsCodeSettings, VsCodeSettingsSource};
 
 pub use keymap_file::ActionSequence;
 pub use settings_content::{
-    AllLanguageSettingsContent, AutoIndentMode, CompletionSettingsContent, CopilotSettingsContent,
-    CodestralSettingsContent, CursorShape, EditPredictionDataCollectionChoice,
+    AllLanguageSettingsContent, AutoIndentMode, CodestralSettingsContent,
+    CompletionSettingsContent, CopilotSettingsContent, CursorShape, DiagnosticsSettingsContent,
+    DocumentFoldingRanges, DocumentSymbols, EditPredictionDataCollectionChoice,
     EditPredictionPromptFormatContent, EditPredictionProvider, EditPredictionSettingsContent,
-    EditPredictionsMode, FormatOnSave, Formatter, FormatterList,
-    GitHostingProviderConfig, GitHostingProviderKind, IndentGuideBackgroundColoring,
-    IndentGuideColoring, IndentGuidesSettingsContent, InlayHintKind, InlayHintsSettingsContent,
-    JsxTagAutoCloseContent, LanguageFileTypeContent, LanguageSettingsContent, LanguageToSettingsMap,
-    LineEndingSetting, LspInsertMode, LspSettings, LspSettingsMap, ModifiersContent,
+    EditPredictionsMode, EncodingDisplayOptions, ExtensionsSettingsContent, FormatOnSave,
+    Formatter, FormatterList, GitHostingProviderConfig, GitHostingProviderKind, IconThemeName,
+    IndentGuideBackgroundColoring, IndentGuideColoring, IndentGuidesSettingsContent, InlayHintKind,
+    InlayHintsSettingsContent, JsxTagAutoCloseContent, LanguageFileTypeContent,
+    LanguageSettingsContent, LanguageToSettingsMap, LineEndingSetting, LineIndicatorFormat,
+    LspInsertMode, LspSettings, LspSettingsMap, ModifiersContent,
     OpenAiCompatibleApiSettingsContent, PrettierSettingsContent, REST_OF_LANGUAGE_SERVERS,
-    RewrapBehavior, SemanticTokenRules, SemanticTokens, ShowWhitespaceSetting, SshConnection,
-    SshPortForwardOption, SoftWrap, TaskSettingsContent, WhitespaceMapContent, WordsCompletionMode,
-    DocumentFoldingRanges, DocumentSymbols, WslConnection, ExtensionsSettingsContent, IconThemeName,
-    LineIndicatorFormat, DiagnosticsSettingsContent,
-    EncodingDisplayOptions,
+    RewrapBehavior, SemanticTokenRules, SemanticTokens, ShowWhitespaceSetting, SoftWrap,
+    SshConnection, SshPortForwardOption, TaskSettingsContent, WhitespaceMapContent,
+    WordsCompletionMode, WslConnection,
 };
-
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct ActiveSettingsProfileName(pub String);
@@ -178,7 +177,6 @@ pub fn vim_keymap() -> Cow<'static, str> {
 // §16.7 Mux keymap profile loading (spec §16.7 Plan 17)
 // ============================================================================
 
-
 /// §16.7 mux keymap profile 路径映射表。
 pub const MUX_KEYMAP_PROFILE_PATHS: [(&str, &str); 4] = [
     ("default", "keymaps/default.json"),
@@ -188,8 +186,7 @@ pub const MUX_KEYMAP_PROFILE_PATHS: [(&str, &str); 4] = [
 ];
 
 /// §16.7 可用的 mux keymap profile 名称列表。
-pub const MUX_KEYMAP_PROFILE_NAMES: [&str; 4] =
-    ["default", "tmux", "zellij", "screen"];
+pub const MUX_KEYMAP_PROFILE_NAMES: [&str; 4] = ["default", "tmux", "zellij", "screen"];
 
 /// §16.7 根据 profile 名称获取对应的 keymap 文件路径。
 /// 未知名称回退到 "default"。
@@ -224,7 +221,6 @@ pub fn load_mux_keymap_profile(
     // in the bundled profile rather than a user typo and must surface as an error.
     KeymapFile::load_asset(path, None, cx)
 }
-
 
 /// Specific keybinding overrides. Loaded after the base keymap so they win over
 /// conflicting base-keymap (and default `Editor`) bindings for the same chords,

@@ -737,7 +737,9 @@ impl settings::Settings for AllLanguageSettings {
                 remove_trailing_whitespace_on_save: settings
                     .remove_trailing_whitespace_on_save
                     .unwrap_or_default(),
-                ensure_final_newline_on_save: settings.ensure_final_newline_on_save.unwrap_or_default(),
+                ensure_final_newline_on_save: settings
+                    .ensure_final_newline_on_save
+                    .unwrap_or_default(),
                 line_ending: settings.line_ending.unwrap_or_default(),
                 formatter: settings.formatter.unwrap_or_default(),
                 prettier: PrettierSettings {
@@ -749,7 +751,11 @@ impl settings::Settings for AllLanguageSettings {
                         _ => Default::default(),
                     },
                 },
-                jsx_tag_auto_close: settings.jsx_tag_auto_close.unwrap_or_default().enabled.unwrap_or_default(),
+                jsx_tag_auto_close: settings
+                    .jsx_tag_auto_close
+                    .unwrap_or_default()
+                    .enabled
+                    .unwrap_or_default(),
                 enable_language_server: settings.enable_language_server.unwrap_or_default(),
                 language_servers: settings.language_servers.unwrap_or_default(),
                 semantic_tokens: settings.semantic_tokens.unwrap_or_default(),
@@ -757,7 +763,9 @@ impl settings::Settings for AllLanguageSettings {
                 document_symbols: settings.document_symbols.unwrap_or_default(),
                 allow_rewrap: settings.allow_rewrap.unwrap_or_default(),
                 show_edit_predictions: settings.show_edit_predictions.unwrap_or_default(),
-                edit_predictions_disabled_in: settings.edit_predictions_disabled_in.unwrap_or_default(),
+                edit_predictions_disabled_in: settings
+                    .edit_predictions_disabled_in
+                    .unwrap_or_default(),
                 show_whitespaces: settings.show_whitespaces.unwrap_or_default(),
                 whitespace_map: WhitespaceMap {
                     space: SharedString::new(whitespace_map.space.unwrap_or_default().to_string()),
@@ -795,13 +803,16 @@ impl settings::Settings for AllLanguageSettings {
                     prefer_lsp: tasks.prefer_lsp.unwrap_or_default(),
                 },
                 show_completions_on_input: settings.show_completions_on_input.unwrap_or_default(),
-                show_completion_documentation: settings.show_completion_documentation.unwrap_or_default(),
+                show_completion_documentation: settings
+                    .show_completion_documentation
+                    .unwrap_or_default(),
                 colorize_brackets: settings.colorize_brackets.unwrap_or_default(),
                 completions: CompletionSettings {
                     words: completions.words.unwrap_or_default(),
                     words_min_length: completions.words_min_length.unwrap_or_default() as usize,
                     lsp: completions.lsp.unwrap_or_default(),
-                    lsp_fetch_timeout_ms: completions.lsp_fetch_timeout_ms.unwrap_or_default() as u64,
+                    lsp_fetch_timeout_ms: completions.lsp_fetch_timeout_ms.unwrap_or_default()
+                        as u64,
                     lsp_insert_mode: completions.lsp_insert_mode.unwrap_or_default(),
                 },
                 debuggers: settings.debuggers.unwrap_or_default(),
@@ -830,7 +841,10 @@ impl settings::Settings for AllLanguageSettings {
         let edit_predictions_mode = edit_predictions.mode.unwrap_or_default();
 
         let disabled_globs: HashSet<&String> = edit_predictions
-            .disabled_globs.as_ref().map(|v| v.iter().collect()).unwrap_or_default();
+            .disabled_globs
+            .as_ref()
+            .map(|v| v.iter().collect())
+            .unwrap_or_default();
 
         let copilot = edit_predictions.copilot.unwrap_or_default();
         let copilot_settings = CopilotSettings {
@@ -848,16 +862,16 @@ impl settings::Settings for AllLanguageSettings {
         };
 
         let ollama = edit_predictions.ollama.unwrap_or_default();
-        let ollama_settings = ollama
-            .model
-            .filter(|model| !model.is_empty())
-            .map(|model| OpenAiCompatibleEditPredictionSettings {
+        let ollama_settings = ollama.model.filter(|model| !model.is_empty()).map(|model| {
+            OpenAiCompatibleEditPredictionSettings {
                 model: model,
                 max_output_tokens: ollama.max_output_tokens.unwrap_or_default(),
                 api_url: ollama.api_url.unwrap_or_default().into(),
                 prompt_format: ollama.prompt_format.unwrap_or_default().into(),
-            });
-        let openai_compatible_settings = edit_predictions.open_ai_compatible_api.unwrap_or_default();
+            }
+        });
+        let openai_compatible_settings =
+            edit_predictions.open_ai_compatible_api.unwrap_or_default();
         let openai_compatible_settings = openai_compatible_settings
             .model
             .filter(|model| !model.is_empty())
@@ -870,7 +884,10 @@ impl settings::Settings for AllLanguageSettings {
                 model,
                 max_output_tokens: 0,
                 api_url: api_url.into(),
-                prompt_format: openai_compatible_settings.prompt_format.unwrap_or_default().into(),
+                prompt_format: openai_compatible_settings
+                    .prompt_format
+                    .unwrap_or_default()
+                    .into(),
             });
 
         // 文件类型映射: 当前设置结构为 Vec<LanguageFileTypeContent>,

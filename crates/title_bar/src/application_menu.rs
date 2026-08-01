@@ -342,5 +342,3 @@ impl Render for ApplicationMenu {
             })
     }
 }
-
-

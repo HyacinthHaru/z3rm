@@ -5,9 +5,7 @@
 //! The core of this module is the [`InlayMap`] struct, which maintains a vec of [`Inlay`]s, and
 //! [`InlaySnapshot`], which holds a sum tree of [`Transform`]s.
 
-use crate::{
-    ChunkRenderer, HighlightStyles, Inlay, InlayContent,
-};
+use crate::{ChunkRenderer, HighlightStyles, Inlay, InlayContent};
 use collections::BTreeSet;
 use language::{Chunk, Edit, LanguageAwareStyling, Point, TextSummary};
 use multi_buffer::{

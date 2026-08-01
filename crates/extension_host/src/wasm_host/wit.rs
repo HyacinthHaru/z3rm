@@ -1043,7 +1043,6 @@ impl Extension {
             }
         }
     }
-
 }
 
 trait ToWasmtimeResult<T> {

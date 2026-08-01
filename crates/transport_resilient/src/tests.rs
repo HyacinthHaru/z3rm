@@ -3,9 +3,9 @@
 use std::net::SocketAddr;
 use std::time::Duration;
 
-use super::crypto::{PacketCodec, KEY_SIZE, NONCE_PREFIX_LEN};
-use super::rtt::{RttEstimator, HeartbeatManager, RTO_MIN, SEND_INTERVAL_MAX, SEND_INTERVAL_MIN};
-use super::transport::{UdpClient, UdpServer, MTU};
+use super::crypto::{KEY_SIZE, NONCE_PREFIX_LEN, PacketCodec};
+use super::rtt::{HeartbeatManager, RTO_MIN, RttEstimator, SEND_INTERVAL_MAX, SEND_INTERVAL_MIN};
+use super::transport::{MTU, UdpClient, UdpServer};
 
 /// §16.6 AEAD 加密/解密往返测试。
 #[test]
@@ -61,7 +61,11 @@ fn test_rtt_estimator() {
 
     // §16.6 SRTT 应接近采样均值。
     let srtt = estimator.srtt().as_millis() as f64;
-    assert!(srtt > 90.0 && srtt < 130.0, "SRTT={} out of expected range", srtt);
+    assert!(
+        srtt > 90.0 && srtt < 130.0,
+        "SRTT={} out of expected range",
+        srtt
+    );
 
     // §16.6 RTO 应在合理范围内。
     let rto = estimator.rto().as_millis();
@@ -207,5 +211,9 @@ fn test_encrypt_decrypt_perf() {
 
     let elapsed = start.elapsed();
     // §16.6 100 次加解密应在 1s 内完成。
-    assert!(elapsed < Duration::from_secs(1), "encryption too slow: {:?}", elapsed);
+    assert!(
+        elapsed < Duration::from_secs(1),
+        "encryption too slow: {:?}",
+        elapsed
+    );
 }

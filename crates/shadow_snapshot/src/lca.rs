@@ -68,7 +68,11 @@ pub fn build_ancestor_table(
 }
 
 /// 向上跳 $2^k$ 步，返回到达的节点 ID
-fn jump(nodes: &HashMap<VersionId, Arc<VersionNode>>, node_id: VersionId, k: usize) -> Option<VersionId> {
+fn jump(
+    nodes: &HashMap<VersionId, Arc<VersionNode>>,
+    node_id: VersionId,
+    k: usize,
+) -> Option<VersionId> {
     let node = nodes.get(&node_id)?;
     let ancestors = build_ancestor_table(node, nodes);
 
@@ -212,5 +216,3 @@ mod tests {
         assert_eq!(compute_depth(&nodes, 3), 2);
     }
 }
-
-

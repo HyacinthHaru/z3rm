@@ -16,7 +16,6 @@ use remote_connection::connect_with_modal;
 #[cfg(target_os = "windows")]
 mod wsl_picker;
 
-
 use disconnected_overlay::DisconnectedOverlay;
 use fuzzy_nucleo::{StringMatch, StringMatchCandidate, match_strings};
 use gpui::{
@@ -199,8 +198,9 @@ fn get_open_folders(workspace: &Workspace, cx: &App) -> Vec<OpenFolderEntry> {
         let repo_path: Arc<Path> = Arc::from(Path::new(""));
         project.visible_worktrees(cx).find_map(|worktree| {
             let worktree_path = worktree.read(cx).abs_path();
-            (worktree_path.as_ref() == repo_path.as_ref() || worktree_path.as_ref().starts_with(repo_path.as_ref()))
-                .then(|| worktree.read(cx).id())
+            (worktree_path.as_ref() == repo_path.as_ref()
+                || worktree_path.as_ref().starts_with(repo_path.as_ref()))
+            .then(|| worktree.read(cx).id())
         })
     } else {
         project
@@ -260,9 +260,16 @@ fn get_branch_for_worktree(
         .iter()
         .filter(|repo| {
             let repo_path = repo.read(cx).snapshot().work_directory_abs_path.clone();
-            repo_path.as_ref() == worktree_abs_path.as_ref() || worktree_abs_path.starts_with(repo_path.as_ref())
+            repo_path.as_ref() == worktree_abs_path.as_ref()
+                || worktree_abs_path.starts_with(repo_path.as_ref())
         })
-        .max_by_key(|repo| repo.read(cx).snapshot().work_directory_abs_path.as_os_str().len())
+        .max_by_key(|repo| {
+            repo.read(cx)
+                .snapshot()
+                .work_directory_abs_path
+                .as_os_str()
+                .len()
+        })
         .and_then(|repo| {
             repo.read(cx)
                 .branch
@@ -1277,7 +1284,8 @@ impl PickerDelegate for RecentProjectsDelegate {
                     )
                     .into_any_element();
 
-                let icon = icon_for_remote_connection(folder.connection_options.as_ref().map(|_| ""));
+                let icon =
+                    icon_for_remote_connection(folder.connection_options.as_ref().map(|_| ""));
                 let show_icon = self.filtered_entries_include_remote_project();
 
                 let tooltip_path: SharedString = path.to_string_lossy().to_string().into();
@@ -2461,7 +2469,6 @@ impl gpui::Render for RemoteServerProjects {
         div()
     }
 }
-
 
 impl RemoteServerProjects {
     pub fn new(

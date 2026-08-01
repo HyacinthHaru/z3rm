@@ -18,11 +18,7 @@ use language::{Toolchain, ToolchainScope};
 use project::Project;
 use remote::RemoteConnectionOptions;
 use serde::{Deserialize, Serialize};
-use std::{
-    collections::BTreeMap,
-    path::PathBuf,
-    sync::Arc,
-};
+use std::{collections::BTreeMap, path::PathBuf, sync::Arc};
 use util::{ResultExt, path_list::SerializedPathList};
 use uuid::Uuid;
 

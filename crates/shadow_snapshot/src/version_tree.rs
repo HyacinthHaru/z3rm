@@ -146,11 +146,7 @@ impl VersionTree {
     /// 不按旧 HEAD 语义改链。调用方应按 version_id 升序传入节点，保证父节点先于
     /// 子节点入树，使 ancestor 跳表能正确构建。HEAD 取每个 path 下 seq_no 最大
     /// 的节点。`next_version_id` 设为已存最大 version_id + 1。
-    pub fn rebuild_from_nodes(
-        &self,
-        nodes: Vec<VersionNode>,
-        max_version_id: VersionId,
-    ) {
+    pub fn rebuild_from_nodes(&self, nodes: Vec<VersionNode>, max_version_id: VersionId) {
         let mut next_id = self.next_id.lock();
         *next_id = max_version_id.saturating_add(1).max(1);
         drop(next_id);
@@ -162,7 +158,8 @@ impl VersionTree {
         nodes_map.clear();
         for mut node in nodes {
             // 重算 ancestor 跳表；build_ancestor_table 读取已插入的父节点。
-            node.ancestors = self.build_ancestor_table_locked(&nodes_map, node.version_id, node.parent_id);
+            node.ancestors =
+                self.build_ancestor_table_locked(&nodes_map, node.version_id, node.parent_id);
             let path = node.path_hash;
             let seq = node.seq_no;
             let vid = node.version_id;
@@ -249,7 +246,11 @@ impl VersionTree {
     /// 为节点构建 binary lifting 祖先跳表
     ///
     /// ancestors[k] = 向上跳 2^k 步的祖先 ID
-    fn build_ancestor_table(&self, _version_id: VersionId, parent_id: Option<VersionId>) -> SmallVec<[VersionId; 16]> {
+    fn build_ancestor_table(
+        &self,
+        _version_id: VersionId,
+        parent_id: Option<VersionId>,
+    ) -> SmallVec<[VersionId; 16]> {
         let mut table: SmallVec<[VersionId; 16]> = SmallVec::new();
 
         if let Some(parent) = parent_id {

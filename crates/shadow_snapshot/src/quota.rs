@@ -134,7 +134,12 @@ impl QuotaManager {
                 eligible.insert(id);
             }
             freed += node_bytes;
-            info!(version_id = id, seq_no, freed_bytes = node_bytes, "gc: evicted node");
+            info!(
+                version_id = id,
+                seq_no,
+                freed_bytes = node_bytes,
+                "gc: evicted node"
+            );
         }
 
         // 用实际的回收后大小刷新 used_bytes（保守按 freed 扣减）。
@@ -178,7 +183,9 @@ impl QuotaManager {
             )
             .context("gc: promote: reconstruct delta child")?;
             let content = rope_to_bytes(&rope);
-            let new_full_hash = blob_store.put(&content).context("gc: promote: store full")?;
+            let new_full_hash = blob_store
+                .put(&content)
+                .context("gc: promote: store full")?;
             // 在树中改写 child：full_content=新 hash, delta=None, depth=0；拿回旧 delta。
             let old_delta = tree.promote_to_full(child_id, new_full_hash);
             // 持久化改写后的 child 节点。
@@ -201,7 +208,11 @@ impl QuotaManager {
                     .unref(&delta.hash)
                     .context("gc: promote: unref old delta blob")?;
             }
-            info!(version_id = child_id, parent = base_id, "gc: promoted delta child to full");
+            info!(
+                version_id = child_id,
+                parent = base_id,
+                "gc: promoted delta child to full"
+            );
         }
         Ok(())
     }
@@ -366,4 +377,3 @@ fn rope_to_bytes(rope: &rope::Rope) -> Vec<u8> {
     // DeltaReplay 的 apply 依赖 UTF-8 文本语义，故用 to_string 路径。
     rope.to_string().into_bytes()
 }
-

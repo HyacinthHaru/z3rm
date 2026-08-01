@@ -13,8 +13,8 @@ use gpui::{
 use language::{Buffer, Capability, LanguageRegistry};
 use ui::prelude::*;
 use workspace::{
-    item::{Item, ItemEvent, TabTooltipContent},
     ItemHandle, ToolbarItemLocation,
+    item::{Item, ItemEvent, TabTooltipContent},
 };
 
 /// A settings viewer backed by the retained editor crate.

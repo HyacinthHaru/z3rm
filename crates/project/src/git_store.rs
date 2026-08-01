@@ -27,7 +27,6 @@ impl ProjectId {
         self.0
     }
 }
-use util::shell::Shell;
 pub use conflict_set::{ConflictRegion, ConflictSet, ConflictSetSnapshot, ConflictSetUpdate};
 use fs::{Fs, RemoveOptions};
 use futures::{
@@ -92,6 +91,7 @@ use std::{
 };
 use sum_tree::{Edit, SumTree, TreeMap};
 use text::{Bias, BufferId, OffsetRangeExt, Rope, ToOffset};
+use util::shell::Shell;
 use util::{
     ResultExt, debug_panic,
     paths::{PathStyle, SanitizedPath},

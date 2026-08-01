@@ -9,9 +9,7 @@ use util::ResultExt;
 
 pub use language::*;
 
-use crate::{
-    python::{BasedPyrightLspAdapter, RuffLspAdapter},
-};
+use crate::python::{BasedPyrightLspAdapter, RuffLspAdapter};
 
 mod bash;
 mod c;

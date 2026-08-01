@@ -16,10 +16,7 @@ fn main() {
     let mut by_category: std::collections::BTreeMap<&str, Vec<&Z3rmTodo>> =
         std::collections::BTreeMap::new();
     for todo in &todos {
-        by_category
-            .entry(todo.category)
-            .or_default()
-            .push(todo);
+        by_category.entry(todo.category).or_default().push(todo);
     }
 
     for (category, items) in &by_category {

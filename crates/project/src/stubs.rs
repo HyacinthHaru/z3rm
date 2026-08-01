@@ -1282,11 +1282,7 @@ impl Project {
     }
 
     /// Resolve a `ProjectPath` for an entry by locating its owning worktree.
-    pub fn path_for_entry(
-        &self,
-        entry_id: ProjectEntryId,
-        cx: &App,
-    ) -> Option<crate::ProjectPath> {
+    pub fn path_for_entry(&self, entry_id: ProjectEntryId, cx: &App) -> Option<crate::ProjectPath> {
         self.worktree_store
             .read(cx)
             .worktree_and_entry_for_id(entry_id, cx)
@@ -1310,7 +1306,11 @@ impl Project {
 
     /// Whether the given entry is the root of its worktree.
     pub fn entry_is_worktree_root(&self, entry_id: ProjectEntryId, cx: &App) -> bool {
-        let Some(worktree) = self.worktree_store.read(cx).worktree_for_entry(entry_id, cx) else {
+        let Some(worktree) = self
+            .worktree_store
+            .read(cx)
+            .worktree_for_entry(entry_id, cx)
+        else {
             return false;
         };
         worktree
@@ -1344,9 +1344,8 @@ impl Project {
         new_path: crate::ProjectPath,
         cx: &mut gpui::Context<Self>,
     ) -> gpui::Task<anyhow::Result<worktree::CreatedEntry>> {
-        self.worktree_store.update(cx, |store, cx| {
-            store.rename_entry(entry_id, new_path, cx)
-        })
+        self.worktree_store
+            .update(cx, |store, cx| store.rename_entry(entry_id, new_path, cx))
     }
 
     /// Delete an entry, returning the trashed entry when trashing.
@@ -1359,20 +1358,14 @@ impl Project {
         cx: &mut gpui::Context<Self>,
     ) -> gpui::Task<anyhow::Result<Option<fs::TrashedEntry>>> {
         let Some(worktree) = self.worktree_for_entry(entry_id, cx) else {
-            return gpui::Task::ready(Err(anyhow::anyhow!(
-                "no worktree for entry {:?}",
-                entry_id
-            )));
+            return gpui::Task::ready(Err(anyhow::anyhow!("no worktree for entry {:?}", entry_id)));
         };
         let task = worktree.update(cx, |worktree, cx| {
             worktree.delete_entry(entry_id, trash, cx)
         });
         match task {
             Some(task) => cx.spawn(async move |_, _| task.await),
-            None => gpui::Task::ready(Err(anyhow::anyhow!(
-                "no such entry {:?}",
-                entry_id
-            ))),
+            None => gpui::Task::ready(Err(anyhow::anyhow!("no such entry {:?}", entry_id))),
         }
     }
 
@@ -1384,10 +1377,7 @@ impl Project {
         cx: &mut gpui::Context<Self>,
     ) -> gpui::Task<anyhow::Result<crate::ProjectPath>> {
         let Some(worktree) = self.worktree_for_id(worktree_id, cx) else {
-            return gpui::Task::ready(Err(anyhow::anyhow!(
-                "worktree {} not found",
-                worktree_id
-            )));
+            return gpui::Task::ready(Err(anyhow::anyhow!("worktree {} not found", worktree_id)));
         };
         cx.spawn(async move |this, cx| {
             let restored_path =
@@ -1401,11 +1391,9 @@ impl Project {
                 ))),
             });
             refresh.await?;
-            this.update(cx, |_, _| {
-                crate::ProjectPath {
-                    worktree_id,
-                    path: path.clone(),
-                }
+            this.update(cx, |_, _| crate::ProjectPath {
+                worktree_id,
+                path: path.clone(),
             })
         })
     }
@@ -1418,9 +1406,9 @@ impl Project {
         cx: &mut gpui::Context<Self>,
     ) -> gpui::Task<anyhow::Result<worktree::CreatedEntry>> {
         let worktree_store = self.worktree_store.clone();
-        let copy = self.worktree_store.update(cx, |store, cx| {
-            store.copy_entry(entry_id, path.clone(), cx)
-        });
+        let copy = self
+            .worktree_store
+            .update(cx, |store, cx| store.copy_entry(entry_id, path.clone(), cx));
         cx.spawn(async move |_, cx| match copy.await? {
             Some(entry) => Ok(worktree::CreatedEntry::Included(entry)),
             None => {
@@ -1442,9 +1430,8 @@ impl Project {
         let Some(worktree) = self.worktree_for_id(worktree_id, cx) else {
             return;
         };
-        let Some(task) = worktree.update(cx, |worktree, cx| {
-            worktree.expand_entry(entry_id, cx)
-        }) else {
+        let Some(task) = worktree.update(cx, |worktree, cx| worktree.expand_entry(entry_id, cx))
+        else {
             return;
         };
         cx.spawn(async move |_, _| {
@@ -1849,9 +1836,9 @@ mod stub_delegate_tests {
             project.read_with(cx, |p, cx| p.worktree_id_for_entry(ProjectEntryId::MAX, cx)),
             None
         );
-        assert!(
-            !project.read_with(cx, |p, cx| p.entry_is_worktree_root(ProjectEntryId::MAX, cx))
-        );
+        assert!(!project.read_with(cx, |p, cx| {
+            p.entry_is_worktree_root(ProjectEntryId::MAX, cx)
+        }));
     }
 
     #[gpui::test]
@@ -1932,6 +1919,9 @@ mod stub_delegate_tests {
                 p.create_entry(project_path(bogus, "x.txt"), false, cx)
             })
             .await;
-        assert!(result.is_err(), "create_entry in unknown worktree must error");
+        assert!(
+            result.is_err(),
+            "create_entry in unknown worktree must error"
+        );
     }
 }

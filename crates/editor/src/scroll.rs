@@ -3,13 +3,13 @@ pub(crate) mod autoscroll;
 pub(crate) mod scroll_amount;
 
 use crate::editor_settings::ScrollBeyondLastLine;
+use crate::stubs::hide_hover;
 use crate::{
     Anchor, DisplayPoint, DisplayRow, Editor, EditorEvent, EditorMode, EditorSettings,
     MultiBufferSnapshot, RowExt, SelectionEffects, SizingBehavior, ToPoint,
     display_map::{DisplaySnapshot, ToDisplayPoint},
     persistence::EditorDb,
 };
-use crate::stubs::hide_hover;
 pub use autoscroll::{Autoscroll, AutoscrollStrategy};
 use core::fmt::Debug;
 use gpui::{

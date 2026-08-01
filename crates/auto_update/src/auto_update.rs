@@ -648,7 +648,8 @@ impl AutoUpdater {
     ) -> Result<ReleaseAsset> {
         let http_client = this.read_with(cx, |this, _| this.http_client.clone());
 
-        let (system_id, metrics_id, is_staff): (Option<String>, Option<String>, Option<bool>) = (None, None, None);
+        let (system_id, metrics_id, is_staff): (Option<String>, Option<String>, Option<bool>) =
+            (None, None, None);
 
         let version = if let Some(mut version) = version {
             version.pre = semver::Prerelease::EMPTY;
@@ -1308,7 +1309,7 @@ pub async fn finalize_auto_update_on_quit() {
 
 #[cfg(test)]
 mod tests {
-// use client::Client;  // removed-crate: client
+    // use client::Client;  // removed-crate: client
     use clock::FakeSystemClock;
     use futures::channel::oneshot;
     use gpui::TestAppContext;

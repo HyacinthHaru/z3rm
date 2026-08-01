@@ -28,9 +28,9 @@ mod fold;
 mod folding_ranges;
 mod git;
 mod highlight_matching_bracket;
+pub mod hover_popover;
 mod indent_guides;
 pub mod items;
-pub mod hover_popover;
 mod mouse_context_menu;
 pub mod movement;
 mod persistence;
@@ -51,10 +51,10 @@ mod task;
 // mod editor_tests;
 // §8.1 z3rm 迁移:editor::test 模块依赖已删除的 project::Project::test 旧签名。
 // 默认禁用,启用 z3rm-migration feature 才尝试编译,暴露迁移洞。
-#[cfg(all(test, feature = "z3rm-migration"))]
-pub mod test;
 #[cfg(test)]
 mod core_action_tests;
+#[cfg(all(test, feature = "z3rm-migration"))]
+pub mod test;
 
 mod clipboard;
 mod config;
@@ -74,36 +74,6 @@ mod jsx_tag_auto_close {
 pub(crate) use actions::*;
 pub use clipboard::ClipboardSelection;
 use collections::TypeIdHashMap;
-pub use stubs::{
-    AvailableCodeAction, Breakpoint, BreakpointEditAction, BreakpointSessionState, BreakpointState,
-    BreakpointStore, BreakpointStoreEvent, BreakpointWithPosition, BufferSemanticTokens,
-    CacheInlayHints, CodeActionProvider, CodeActionsMenu, CodeContextMenu, Collaborator, CollaboratorId,
-    Completion, CompletionDisplayOptions, CompletionDocumentation, CompletionGroup,
-    CompletionIntent, CompletionProvider, CompletionResponse, CompletionSource, CompletionsMenu,
-    ContextMenuOrigin, CursorPopoverType, DiagnosticRenderer, Direction, DocumentHighlight, EditDisplayMode,
-    EditPredictionDelegate, EditPredictionDelegateHandle, EditPredictionDiscardReason,
-    EditPredictionGranularity, EditPredictionPreview, EditPredictionRequestTrigger,
-    EditPredictionSettings, EditPredictionState, FileTarget, GlobalDiagnosticRenderer, Hover, HoverLink,
-    HoverState, HoveredLinkState, Inlay, InlayContent, InlayHint, InlayHintLabel, InlayHintLabelPart,
-    InlayHintLabelPartTooltip, InlayHintTooltip, InlayId, InlayHighlight, InlaySplice, InlineDiagnostic,
-    LinkTarget,
-    InlineValueCache, InvalidationStrategy, LanguageServerToQuery, LinkedEditingRanges,
-    LocationLink, LspAction, LspFormatTarget, LspInlayHintData, MenuEditPredictionsPolicy,
-    OpenLspBufferHandle, ParticipantIndex, PrepareRenameResponse, ProjectExt, ProjectLspStoreExt,
-    RevealInFileManager, RegisteredEditPredictionDelegate,
-    RunnableData, RunnableTasks, ResolvedTask, ResolvedTasks, Session, SessionEvent,
-    SignatureHelpHiddenBy, SignatureHelpState, Snippet, SuggestionDisplayType, TaskContext,
-    TaskSourceKind, TaskTemplate, TaskVariables,
-    TelemetrySpawnLocation, VariableName, ViewId, VimModeSetting, make_suggestion_styles,
-    set_diagnostic_renderer,
-};
-pub(crate) use stubs::{
-    ActiveDiagnostic, CodeLensState, CompletionId, DiagnosticRenderer as _,
-    HOVER_POPOVER_GAP, MENU_ASIDE_MAX_WIDTH, MENU_ASIDE_MIN_WIDTH, MENU_GAP,
-    MIN_POPOVER_CHARACTER_WIDTH, MIN_POPOVER_LINE_HEIGHT, POPOVER_RIGHT_OFFSET,
-    FormatTrigger, RefreshForServer,
-    InlayHintRefreshReason, ProjectBufferExt, ProjectCapabilityExt, find_file, hide_hover, hover_at, inlay_hint_settings, refresh_linked_ranges,
-};
 pub use display_map::{
     ChunkRenderer, ChunkRendererContext, DisplayPoint, FoldPlaceholder, HighlightKey,
     NavigationOverlayKey, SemanticTokenHighlight,
@@ -137,6 +107,35 @@ pub use multi_buffer::{
 };
 pub use split::{DiffStyleControls, SplittableEditor, ToggleSplitDiff};
 pub use split_editor_view::SplitEditorView;
+pub(crate) use stubs::{
+    ActiveDiagnostic, CodeLensState, CompletionId, DiagnosticRenderer as _, FormatTrigger,
+    HOVER_POPOVER_GAP, InlayHintRefreshReason, MENU_ASIDE_MAX_WIDTH, MENU_ASIDE_MIN_WIDTH,
+    MENU_GAP, MIN_POPOVER_CHARACTER_WIDTH, MIN_POPOVER_LINE_HEIGHT, POPOVER_RIGHT_OFFSET,
+    ProjectBufferExt, ProjectCapabilityExt, RefreshForServer, find_file, hide_hover, hover_at,
+    inlay_hint_settings, refresh_linked_ranges,
+};
+pub use stubs::{
+    AvailableCodeAction, Breakpoint, BreakpointEditAction, BreakpointSessionState, BreakpointState,
+    BreakpointStore, BreakpointStoreEvent, BreakpointWithPosition, BufferSemanticTokens,
+    CacheInlayHints, CodeActionProvider, CodeActionsMenu, CodeContextMenu, Collaborator,
+    CollaboratorId, Completion, CompletionDisplayOptions, CompletionDocumentation, CompletionGroup,
+    CompletionIntent, CompletionProvider, CompletionResponse, CompletionSource, CompletionsMenu,
+    ContextMenuOrigin, CursorPopoverType, DiagnosticRenderer, Direction, DocumentHighlight,
+    EditDisplayMode, EditPredictionDelegate, EditPredictionDelegateHandle,
+    EditPredictionDiscardReason, EditPredictionGranularity, EditPredictionPreview,
+    EditPredictionRequestTrigger, EditPredictionSettings, EditPredictionState, FileTarget,
+    GlobalDiagnosticRenderer, Hover, HoverLink, HoverState, HoveredLinkState, Inlay, InlayContent,
+    InlayHighlight, InlayHint, InlayHintLabel, InlayHintLabelPart, InlayHintLabelPartTooltip,
+    InlayHintTooltip, InlayId, InlaySplice, InlineDiagnostic, InlineValueCache,
+    InvalidationStrategy, LanguageServerToQuery, LinkTarget, LinkedEditingRanges, LocationLink,
+    LspAction, LspFormatTarget, LspInlayHintData, MenuEditPredictionsPolicy, OpenLspBufferHandle,
+    ParticipantIndex, PrepareRenameResponse, ProjectExt, ProjectLspStoreExt,
+    RegisteredEditPredictionDelegate, ResolvedTask, ResolvedTasks, RevealInFileManager,
+    RunnableData, RunnableTasks, Session, SessionEvent, SignatureHelpHiddenBy, SignatureHelpState,
+    Snippet, SuggestionDisplayType, TaskContext, TaskSourceKind, TaskTemplate, TaskVariables,
+    TelemetrySpawnLocation, VariableName, ViewId, VimModeSetting, make_suggestion_styles,
+    set_diagnostic_renderer,
+};
 pub use text::Bias;
 
 use ::git::{Blame, status::FileStatus};
@@ -155,6 +154,7 @@ use document_links::LspDocumentLinks;
 // EditPredictionDelegate, EditPredictionDelegateHandle, EditPredictionDiscardReason,
 // EditPredictionGranularity, SuggestionDisplayType,
 // };  // removed-crate: edit_prediction_types
+use crate::editor_settings::RelativeLineNumbers;
 use editor_settings::{GoToDefinitionFallback, Minimap as MinimapSettings};
 use element::{LineWithInvisibles, PositionMap};
 use futures::{
@@ -163,29 +163,27 @@ use futures::{
 };
 use git::blame::{GitBlame, GlobalBlameRenderer};
 use gpui::{
-    Action, AnimationExt, AnyElement, App, AppContext, AsyncWindowContext, Background, Bounds, ClickEvent, ClipboardEntry, ClipboardItem, Context,
-    DispatchPhase, Entity, EntityInputHandler, EventEmitter, FocusHandle,
-    FocusOutEvent, Focusable, FontId, FontStyle, Global, HighlightStyle, Hsla,
-    KeyContext, Modifiers, MouseButton, MouseDownEvent, MouseMoveEvent, PaintQuad, ParentElement,
-    Pixels, PressureStage, Render, ScrollHandle, SharedString, SharedUri, Size, Styled,
-    Subscription, Task, TextRun, TextStyle, TextStyleRefinement, WeakEntity, WeakFocusHandle, Window, div, prelude::*, px, relative,
+    Action, AnimationExt, AnyElement, App, AppContext, AsyncWindowContext, Background, Bounds,
+    ClickEvent, ClipboardEntry, ClipboardItem, Context, DispatchPhase, Entity, EntityInputHandler,
+    EventEmitter, FocusHandle, FocusOutEvent, Focusable, FontId, FontStyle, Global, HighlightStyle,
+    Hsla, KeyContext, Modifiers, MouseButton, MouseDownEvent, MouseMoveEvent, PaintQuad,
+    ParentElement, Pixels, PressureStage, Render, ScrollHandle, SharedString, SharedUri, Size,
+    Styled, Subscription, Task, TextRun, TextStyle, TextStyleRefinement, WeakEntity,
+    WeakFocusHandle, Window, div, prelude::*, px, relative,
 };
 use indent_guides::ActiveIndentGuidesState;
 use itertools::{Either, Itertools};
 use language::{
-    AutoindentMode, BracketPair, Buffer, BufferRow, Capability, CharKind, CodeLabel, CursorShape, HighlightedText,
-    IndentSize, Language, LanguageAwareStyling, LanguageName,
-    LocalFile, OffsetRangeExt, OutlineItem, Point, Selection, SelectionGoal, TextObject,
-    TransactionId, TreeSitterOptions,
+    AutoindentMode, BracketPair, Buffer, BufferRow, Capability, CharKind, CodeLabel, CursorShape,
+    HighlightedText, IndentSize, Language, LanguageAwareStyling, LanguageName, LocalFile,
+    OffsetRangeExt, OutlineItem, Point, Selection, SelectionGoal, TextObject, TransactionId,
+    TreeSitterOptions,
     language_settings::{
         self, AllLanguageSettings, LanguageSettings, LspInsertMode, all_language_settings,
     },
     point_from_lsp,
 };
-use lsp::{
-    CodeActionKind, CompletionItemKind,
-    LanguageServerId,
-};
+use lsp::{CodeActionKind, CompletionItemKind, LanguageServerId};
 use markdown::Markdown;
 use mouse_context_menu::MouseContextMenu;
 use multi_buffer::{
@@ -194,11 +192,12 @@ use multi_buffer::{
 };
 use parking_lot::Mutex;
 use persistence::EditorDb;
+use project::project_settings::GitGutterSetting;
 use project::{
-    git_store::GitStoreEvent,
-    project_settings::{DiagnosticSeverity, ProjectSettings},
     Location, Project, ProjectItem, ProjectPath, ProjectTransaction,
     bookmark_store::BookmarkStore,
+    git_store::GitStoreEvent,
+    project_settings::{DiagnosticSeverity, ProjectSettings},
 };
 use rand::seq::SliceRandom;
 use rpc::{ErrorCode, ErrorExt, proto::PeerId};
@@ -206,8 +205,6 @@ use scroll::{Autoscroll, OngoingScroll, ScrollAnchor, ScrollManager, SharedScrol
 use selections_collection::{MutableSelectionsCollection, SelectionsCollection};
 use serde::{Deserialize, Serialize};
 use settings::{Settings, SettingsLocation, SettingsStore, update_settings_file};
-use project::project_settings::GitGutterSetting;
-use crate::editor_settings::RelativeLineNumbers;
 use smallvec::{SmallVec, smallvec};
 // use snippet::Snippet;  // removed-crate: snippet
 use std::{
@@ -231,15 +228,15 @@ use theme::{
 };
 use theme_settings::{ThemeSettings, observe_buffer_font_size_adjustment};
 use ui::{
-    Avatar, ContextMenu, Disclosure, IconButtonShape, Indicator, KeyBinding, Tooltip,
-    prelude::*, scrollbars::ScrollbarAutoHide, tooltip_container, utils::WithRemSize,
+    Avatar, ContextMenu, Disclosure, IconButtonShape, Indicator, KeyBinding, Tooltip, prelude::*,
+    scrollbars::ScrollbarAutoHide, tooltip_container, utils::WithRemSize,
 };
 use ui_input::ErasedEditor;
 use util::{RangeExt, ResultExt, TryFutureExt, maybe, post_inc};
 use workspace::{
-    Item as WorkspaceItem, ItemId, ItemNavHistory, NavigationEntry, OpenInTerminal,
-    OpenTerminal, Pane, RestoreOnStartupBehavior, SERIALIZATION_THROTTLE_TIME, SplitDirection,
-    TabBarSettings, Toast, Workspace, WorkspaceId, WorkspaceSettings,
+    Item as WorkspaceItem, ItemId, ItemNavHistory, NavigationEntry, OpenInTerminal, OpenTerminal,
+    Pane, RestoreOnStartupBehavior, SERIALIZATION_THROTTLE_TIME, SplitDirection, TabBarSettings,
+    Toast, Workspace, WorkspaceId, WorkspaceSettings,
     item::{ItemBufferKind, ItemHandle, PreviewTabsSettings, SaveOptions},
     notifications::{DetachAndPromptErr, NotificationId, NotifyResultExt, NotifyTaskExt},
     searchable::SearchEvent,
@@ -247,9 +244,7 @@ use workspace::{
 use zed_actions::editor::{MoveDown, MoveUp};
 
 use crate::{
-    editor_settings::MultiCursorModifier,
-    scroll::ScrollOffset,
-    semantic_tokens::SemanticTokenState,
+    editor_settings::MultiCursorModifier, scroll::ScrollOffset, semantic_tokens::SemanticTokenState,
 };
 
 pub const FILE_HEADER_HEIGHT: u32 = 2;
@@ -1689,19 +1684,18 @@ impl Editor {
     // 以下为 stub 方法 — 对应已删除的编辑功能模块
     // =====================================================================
 
-    pub fn insert(
-        &mut self,
-        new_text: &str,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
+    pub fn insert(&mut self, new_text: &str, window: &mut Window, cx: &mut Context<Self>) {
         if self.read_only(cx) {
             return;
         }
 
         let display_snapshot = self.display_snapshot(cx);
         let selections = self.selections.all::<MultiBufferOffset>(&display_snapshot);
-        if new_text.is_empty() && selections.iter().all(|selection| selection.start == selection.end) {
+        if new_text.is_empty()
+            && selections
+                .iter()
+                .all(|selection| selection.start == selection.end)
+        {
             return;
         }
 
@@ -1714,7 +1708,10 @@ impl Editor {
             for selection in selections {
                 let start = selection.start.0.min(selection.end.0);
                 let end = selection.start.0.max(selection.end.0);
-                edits.push((MultiBufferOffset(start)..MultiBufferOffset(end), new_text.to_string()));
+                edits.push((
+                    MultiBufferOffset(start)..MultiBufferOffset(end),
+                    new_text.to_string(),
+                ));
 
                 let adjusted_start = start.saturating_add_signed(accumulated_delta);
                 let cursor = adjusted_start.saturating_add(new_text.len());
@@ -1732,12 +1729,23 @@ impl Editor {
     }
 
     /// Stub: visible_buffer_ranges (collaboration 模块已删除)
-    pub fn visible_buffer_ranges(&mut self, _cx: &App) -> Vec<(language::BufferSnapshot, Range<BufferOffset>, ExcerptRange<Anchor>)> {
+    pub fn visible_buffer_ranges(
+        &mut self,
+        _cx: &App,
+    ) -> Vec<(
+        language::BufferSnapshot,
+        Range<BufferOffset>,
+        ExcerptRange<Anchor>,
+    )> {
         Vec::new()
     }
 
     /// Stub: refresh inlay hints (inlay hints 模块已删除)
-    pub fn refresh_inlay_hints(&mut self, _reason: InlayHintRefreshReason, _cx: &mut Context<Self>) {
+    pub fn refresh_inlay_hints(
+        &mut self,
+        _reason: InlayHintRefreshReason,
+        _cx: &mut Context<Self>,
+    ) {
     }
 
     /// Stub: refresh edit prediction (edit prediction 模块已删除)
@@ -1752,7 +1760,12 @@ impl Editor {
     }
 
     /// Stub: refresh runnables (runnables 模块已删除)
-    pub fn refresh_runnables(&mut self, _buffer_id: Option<text::BufferId>, _window: &mut Window, _cx: &mut Context<Self>) {
+    pub fn refresh_runnables(
+        &mut self,
+        _buffer_id: Option<text::BufferId>,
+        _window: &mut Window,
+        _cx: &mut Context<Self>,
+    ) {
     }
 
     /// Stub: splice inlays (inlay hints 模块已删除)
@@ -1765,12 +1778,15 @@ impl Editor {
     }
 
     /// Stub: update visible edit prediction (edit prediction 模块已删除)
-    pub fn update_visible_edit_prediction(&mut self, _window: &mut Window, _cx: &mut Context<Self>) {
+    pub fn update_visible_edit_prediction(
+        &mut self,
+        _window: &mut Window,
+        _cx: &mut Context<Self>,
+    ) {
     }
 
     /// Stub: update edit prediction settings (edit prediction 模块已删除)
-    pub fn update_edit_prediction_settings(&mut self, _cx: &mut Context<Self>) {
-    }
+    pub fn update_edit_prediction_settings(&mut self, _cx: &mut Context<Self>) {}
 
     /// Stub: update hovered link (hover popover 模块已删除)
     pub fn update_hovered_link(
@@ -1785,16 +1801,13 @@ impl Editor {
     }
 
     /// Stub: hide hovered link (hover popover 模块已删除)
-    pub fn hide_hovered_link(&mut self, _cx: &mut Context<Self>) {
-    }
+    pub fn hide_hovered_link(&mut self, _cx: &mut Context<Self>) {}
 
     /// Stub: set_input_enabled (input mode 模块已删除)
-    pub fn set_input_enabled(&mut self, _enabled: bool) {
-    }
+    pub fn set_input_enabled(&mut self, _enabled: bool) {}
 
     /// Stub: disable_diagnostics (diagnostics UI 模块已删除)
-    pub fn disable_diagnostics(&mut self, _cx: &mut Context<Self>) {
-    }
+    pub fn disable_diagnostics(&mut self, _cx: &mut Context<Self>) {}
 
     /// Stub: unmark text (编辑功能已删除)
     pub fn unmark_text(
@@ -1856,7 +1869,11 @@ impl Editor {
     }
 
     /// Stub: refresh code actions for selection (code actions 模块已删除)
-    pub fn refresh_code_actions_for_selection(&mut self, _window: &mut Window, _cx: &mut Context<Self>) {
+    pub fn refresh_code_actions_for_selection(
+        &mut self,
+        _window: &mut Window,
+        _cx: &mut Context<Self>,
+    ) {
     }
 
     /// Stub: linked edits for selections (linked editing 模块已删除)
@@ -2571,18 +2588,16 @@ impl Editor {
 
             editor
                 ._subscriptions
-                .push(
-                    cx.observe_new::<crate::Session>(move |_, _, cx| {
-                        let session_entity = cx.entity();
-                        weak_editor
-                            .update(cx, |editor, cx| {
-                                editor._subscriptions.push(
-                                    cx.subscribe(&session_entity, Self::on_debug_session_event),
-                                );
-                            })
-                            .ok();
-                    }),
-                );
+                .push(cx.observe_new::<crate::Session>(move |_, _, cx| {
+                    let session_entity = cx.entity();
+                    weak_editor
+                        .update(cx, |editor, cx| {
+                            editor
+                                ._subscriptions
+                                .push(cx.subscribe(&session_entity, Self::on_debug_session_event));
+                        })
+                        .ok();
+                }));
 
             for session in dap_store.read(cx).sessions().cloned().collect::<Vec<_>>() {
                 editor
@@ -2865,7 +2880,9 @@ impl Editor {
         _cx: &mut Context<Workspace>,
     ) -> Task<Result<Entity<Editor>>> {
         // 只读编辑器：project.create_buffer 签名不匹配，返回错误。
-        Task::ready(Err(anyhow!("new buffer creation disabled in read-only editor")))
+        Task::ready(Err(anyhow!(
+            "new buffer creation disabled in read-only editor"
+        )))
     }
 
     fn new_file_vertical(
@@ -3303,8 +3320,7 @@ impl Editor {
         dismissed |= self.hide_signature_help(cx, SignatureHelpHiddenBy::Escape);
         dismissed |= self.hide_context_menu(window, cx).is_some();
         dismissed |= self.mouse_context_menu.take().is_some();
-        dismissed |= is_user_requested
-            && false;
+        dismissed |= is_user_requested && false;
         dismissed |= self.snippet_stack.pop().is_some();
         if self.diff_review_drag_state.is_some() {
             self.cancel_diff_review_drag(cx);
@@ -4707,7 +4723,10 @@ impl Editor {
                     }
                     let cursor_display = MultiBufferOffset(cursor).to_display_point(&snapshot);
                     let prev_display = snapshot.clip_point(
-                        DisplayPoint::new(cursor_display.row(), cursor_display.column().saturating_sub(1)),
+                        DisplayPoint::new(
+                            cursor_display.row(),
+                            cursor_display.column().saturating_sub(1),
+                        ),
                         Bias::Left,
                     );
                     (prev_display.to_offset(&snapshot, Bias::Left).0, cursor)
@@ -4847,12 +4866,7 @@ impl Editor {
     /// Stub: autoindent (编辑功能已删除)
     pub fn autoindent(&mut self, _: &AutoIndent, _window: &mut Window, _cx: &mut Context<Self>) {}
 
-    pub fn delete_line(
-        &mut self,
-        _: &DeleteLine,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
+    pub fn delete_line(&mut self, _: &DeleteLine, window: &mut Window, cx: &mut Context<Self>) {
         if self.read_only(cx) {
             return;
         }
@@ -4871,7 +4885,9 @@ impl Editor {
             for selection in selections {
                 let cursor_display = selection.head().to_display_point(&snapshot);
                 let start_row = cursor_display.row();
-                let line_start = DisplayPoint::new(start_row, 0).to_offset(&snapshot, Bias::Left).0;
+                let line_start = DisplayPoint::new(start_row, 0)
+                    .to_offset(&snapshot, Bias::Left)
+                    .0;
                 let next_line = DisplayPoint::new(start_row + DisplayRow(1), 0);
                 let end_offset = if next_line <= max_point {
                     next_line.to_offset(&snapshot, Bias::Left).0
@@ -4881,7 +4897,10 @@ impl Editor {
 
                 let adjusted = line_start.saturating_add_signed(delta);
                 new_cursors.push(MultiBufferOffset(adjusted)..MultiBufferOffset(adjusted));
-                edits.push((MultiBufferOffset(line_start)..MultiBufferOffset(end_offset), String::new()));
+                edits.push((
+                    MultiBufferOffset(line_start)..MultiBufferOffset(end_offset),
+                    String::new(),
+                ));
                 delta -= (end_offset - line_start) as isize;
             }
 
@@ -5396,7 +5415,8 @@ impl Editor {
                         &buffer_snapshot,
                         cx,
                     )
-                    .into_iter().next()
+                    .into_iter()
+                    .next()
                     .and_then(|(bp, _)| {
                         let breakpoint_row = buffer_snapshot
                             .summary_for_anchor::<text::PointUtf16>(&bp.position)
@@ -5744,7 +5764,9 @@ impl Editor {
 
             let position = active_stack_frame.position;
             let snapshot = self.buffer.read(cx).snapshot(cx);
-            let Some(buffer) = self.buffer.read(cx).all_buffers_iter().next() else { return None };
+            let Some(buffer) = self.buffer.read(cx).all_buffers_iter().next() else {
+                return None;
+            };
             let text_anchor = buffer.read(cx).snapshot().anchor_before(position);
             let multibuffer_anchor = snapshot.anchor_in_excerpt(text_anchor)?;
 
@@ -6849,8 +6871,7 @@ impl Editor {
     }
 
     /// Stub: transpose (编辑功能已删除)
-    pub fn transpose(&mut self, _: &Transpose, _window: &mut Window, _cx: &mut Context<Self>) {
-    }
+    pub fn transpose(&mut self, _: &Transpose, _window: &mut Window, _cx: &mut Context<Self>) {}
 
     fn restore_selections(
         &mut self,
@@ -7202,8 +7223,7 @@ impl Editor {
                 transaction = apply_action.log_err().fuse() => transaction.map(Some),
             };
             buffer.update(cx, |buffer, cx| {
-                if !buffer.is_singleton()
-                {
+                if !buffer.is_singleton() {
                     // transaction already applied by apply_code_action_kind
                 }
                 cx.notify();
@@ -8451,25 +8471,23 @@ impl Editor {
             .and_then(|lines| lines.last().map(|line| line.range.end));
 
         self.inline_value_cache.refresh_task = cx.spawn(async move |editor, cx| {
-            let inline_values = editor
-                .update(cx, |editor, cx| {
-                    let Some(current_execution_position) = current_execution_position else {
-                        return None;
-                    };
+            let inline_values = editor.update(cx, |editor, cx| {
+                let Some(current_execution_position) = current_execution_position else {
+                    return None;
+                };
 
-                    let (buffer, buffer_anchor) =
-                        editor.buffer.read_with(cx, |multibuffer, cx| {
-                            let multibuffer_snapshot = multibuffer.snapshot(cx);
-                            let (buffer_anchor, _) = multibuffer_snapshot
-                                .anchor_to_buffer_anchor(current_execution_position)?;
-                            let buffer = multibuffer.buffer(buffer_anchor.buffer_id)?;
-                            Some((buffer, buffer_anchor))
-                        })?;
+                let (buffer, buffer_anchor) = editor.buffer.read_with(cx, |multibuffer, cx| {
+                    let multibuffer_snapshot = multibuffer.snapshot(cx);
+                    let (buffer_anchor, _) =
+                        multibuffer_snapshot.anchor_to_buffer_anchor(current_execution_position)?;
+                    let buffer = multibuffer.buffer(buffer_anchor.buffer_id)?;
+                    Some((buffer, buffer_anchor))
+                })?;
 
-                    let range = buffer.read(cx).anchor_before(0)..buffer_anchor;
+                let range = buffer.read(cx).anchor_before(0)..buffer_anchor;
 
-                    semantics.inline_values(buffer, range, cx)
-                });
+                semantics.inline_values(buffer, range, cx)
+            });
             let inline_values = match inline_values {
                 Ok(Some(task)) => task.await.ok().unwrap_or_default(),
                 _ => Vec::new(),
@@ -10092,22 +10110,47 @@ impl Editor {
     }
 
     /// Stub: invalidate_autoclose_regions
-    pub fn invalidate_autoclose_regions(&mut self, _a0: &Arc<[text::Selection<Anchor>]>, _a1: &multi_buffer::MultiBufferSnapshot) {}
+    pub fn invalidate_autoclose_regions(
+        &mut self,
+        _a0: &Arc<[text::Selection<Anchor>]>,
+        _a1: &multi_buffer::MultiBufferSnapshot,
+    ) {
+    }
 
     /// Stub: is_lsp_relevant
-    pub fn is_lsp_relevant(&mut self, _file: Option<&dyn language::File>, _cx: &mut App) -> bool { false }
+    pub fn is_lsp_relevant(&mut self, _file: Option<&dyn language::File>, _cx: &mut App) -> bool {
+        false
+    }
 
     /// Stub: pull_diagnostics
-    pub fn pull_diagnostics(&mut self, _buffer_id: BufferId, _window: &mut Window, _cx: &mut Context<Self>) {}
+    pub fn pull_diagnostics(
+        &mut self,
+        _buffer_id: BufferId,
+        _window: &mut Window,
+        _cx: &mut Context<Self>,
+    ) {
+    }
 
     /// Stub: refresh_active_diagnostics
     pub fn refresh_active_diagnostics(&mut self, _cx: &mut Context<Self>) {}
 
     /// Stub: refresh_code_lenses
-    pub fn refresh_code_lenses(&mut self, _for_buffer: Option<BufferId>, _window: &mut Window, _cx: &mut Context<Self>) {}
+    pub fn refresh_code_lenses(
+        &mut self,
+        _for_buffer: Option<BufferId>,
+        _window: &mut Window,
+        _cx: &mut Context<Self>,
+    ) {
+    }
 
     /// Stub: refresh_inline_diagnostics
-    pub fn refresh_inline_diagnostics(&mut self, _a0: bool, _a1: &mut Window, _a2: &mut Context<Self>) {}
+    pub fn refresh_inline_diagnostics(
+        &mut self,
+        _a0: bool,
+        _a1: &mut Window,
+        _a2: &mut Context<Self>,
+    ) {
+    }
 
     /// Stub: render_edit_prediction_cursor_popover
     pub fn render_edit_prediction_cursor_popover<A, B, C, D, E, F, R>(
@@ -10184,18 +10227,39 @@ impl Editor {
     pub fn rewrap(&mut self, _options: crate::RewrapOptions, _cx: &mut Context<Self>) {}
 
     /// Stub: set_max_diagnostics_severity
-    pub fn set_max_diagnostics_severity(&mut self, _severity: DiagnosticSeverity, _cx: &mut Context<Self>) {}
+    pub fn set_max_diagnostics_severity(
+        &mut self,
+        _severity: DiagnosticSeverity,
+        _cx: &mut Context<Self>,
+    ) {
+    }
 
-    pub fn toggle_code_lens(&mut self, _inline: bool, _window: &mut Window, _cx: &mut Context<Self>) {}
+    pub fn toggle_code_lens(
+        &mut self,
+        _inline: bool,
+        _window: &mut Window,
+        _cx: &mut Context<Self>,
+    ) {
+    }
 
-    pub fn trigger_completion_on_input<A, B, C, D, R>(&mut self, _a0: A, _a1: B, _a2: C, _a3: D) -> R
+    pub fn trigger_completion_on_input<A, B, C, D, R>(
+        &mut self,
+        _a0: A,
+        _a1: B,
+        _a2: C,
+        _a3: D,
+    ) -> R
     where
         R: Default,
     {
         R::default()
     }
 
-    pub fn should_open_signature_help_automatically(&self, _old_cursor_position: impl ::core::clone::Clone, _cx: &mut Context<Self>) -> bool {
+    pub fn should_open_signature_help_automatically(
+        &self,
+        _old_cursor_position: impl ::core::clone::Clone,
+        _cx: &mut Context<Self>,
+    ) -> bool {
         false
     }
 
@@ -10204,12 +10268,24 @@ impl Editor {
     pub fn update_diagnostics_state(&mut self, _window: &mut Window, _cx: &mut Context<Self>) {}
 
     /// Stub: should_open_signature_help_automatically
-    pub fn cut_to_end_of_line(&mut self, _action: &CutToEndOfLine, window: &mut Window, cx: &mut Context<Self>) {
+    pub fn cut_to_end_of_line(
+        &mut self,
+        _action: &CutToEndOfLine,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         self.delete_to_line_end(window, cx);
     }
 
-    pub fn delete_to_beginning_of_line(&mut self, _action: &DeleteToBeginningOfLine, window: &mut Window, cx: &mut Context<Self>) {
-        if self.read_only(cx) { return; }
+    pub fn delete_to_beginning_of_line(
+        &mut self,
+        _action: &DeleteToBeginningOfLine,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if self.read_only(cx) {
+            return;
+        }
         let snapshot = self.display_snapshot(cx);
         let selections = self.selections.all::<MultiBufferOffset>(&snapshot);
         self.transact(window, cx, |this, window, cx| {
@@ -10224,20 +10300,32 @@ impl Editor {
                 let end_off = selection.head().0;
                 let adjusted = start_off.saturating_add_signed(delta);
                 new_cursors.push(MultiBufferOffset(adjusted)..MultiBufferOffset(adjusted));
-                edits.push((MultiBufferOffset(start_off)..MultiBufferOffset(end_off), String::new()));
+                edits.push((
+                    MultiBufferOffset(start_off)..MultiBufferOffset(end_off),
+                    String::new(),
+                ));
                 delta -= (end_off - start_off) as isize;
             }
             this.edit(edits, cx);
-            this.change_selections(SelectionEffects::no_scroll(), window, cx, |s| s.select_ranges(new_cursors));
+            this.change_selections(SelectionEffects::no_scroll(), window, cx, |s| {
+                s.select_ranges(new_cursors)
+            });
         });
     }
 
-    pub fn delete_to_end_of_line(&mut self, _action: &DeleteToEndOfLine, window: &mut Window, cx: &mut Context<Self>) {
+    pub fn delete_to_end_of_line(
+        &mut self,
+        _action: &DeleteToEndOfLine,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         self.delete_to_line_end(window, cx);
     }
 
     fn delete_to_line_end(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        if self.read_only(cx) { return; }
+        if self.read_only(cx) {
+            return;
+        }
         let snapshot = self.display_snapshot(cx);
         let max_point = snapshot.max_point();
         let selections = self.selections.all::<MultiBufferOffset>(&snapshot);
@@ -10249,41 +10337,76 @@ impl Editor {
             let mut delta = 0isize;
             for selection in selections {
                 let head_display = selection.head().to_display_point(&snapshot);
-                let line_end = snapshot.clip_point(DisplayPoint::new(head_display.row(), u32::MAX), Bias::Right);
+                let line_end = snapshot
+                    .clip_point(DisplayPoint::new(head_display.row(), u32::MAX), Bias::Right);
                 let start_off = selection.head().0;
                 let end_off = if line_end < max_point {
-                    DisplayPoint::new(head_display.row() + DisplayRow(1), 0).to_offset(&snapshot, Bias::Left).0
+                    DisplayPoint::new(head_display.row() + DisplayRow(1), 0)
+                        .to_offset(&snapshot, Bias::Left)
+                        .0
                 } else {
                     max_point.to_offset(&snapshot, Bias::Right).0
                 };
                 let adjusted = start_off.saturating_add_signed(delta);
                 new_cursors.push(MultiBufferOffset(adjusted)..MultiBufferOffset(adjusted));
-                edits.push((MultiBufferOffset(start_off)..MultiBufferOffset(end_off), String::new()));
+                edits.push((
+                    MultiBufferOffset(start_off)..MultiBufferOffset(end_off),
+                    String::new(),
+                ));
                 delta -= (end_off - start_off) as isize;
             }
             this.edit(edits, cx);
-            this.change_selections(SelectionEffects::no_scroll(), window, cx, |s| s.select_ranges(new_cursors));
+            this.change_selections(SelectionEffects::no_scroll(), window, cx, |s| {
+                s.select_ranges(new_cursors)
+            });
         });
     }
 
-    pub fn delete_to_next_subword_end(&mut self, _action: &DeleteToNextSubwordEnd, window: &mut Window, cx: &mut Context<Self>) {
+    pub fn delete_to_next_subword_end(
+        &mut self,
+        _action: &DeleteToNextSubwordEnd,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         self.delete_forward_to_word(window, cx, true);
     }
 
-    pub fn delete_to_next_word_end(&mut self, _action: &DeleteToNextWordEnd, window: &mut Window, cx: &mut Context<Self>) {
+    pub fn delete_to_next_word_end(
+        &mut self,
+        _action: &DeleteToNextWordEnd,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         self.delete_forward_to_word(window, cx, false);
     }
 
-    pub fn delete_to_previous_subword_start(&mut self, _action: &DeleteToPreviousSubwordStart, window: &mut Window, cx: &mut Context<Self>) {
+    pub fn delete_to_previous_subword_start(
+        &mut self,
+        _action: &DeleteToPreviousSubwordStart,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         self.delete_backward_to_word(window, cx, true);
     }
 
-    pub fn delete_to_previous_word_start(&mut self, _action: &DeleteToPreviousWordStart, window: &mut Window, cx: &mut Context<Self>) {
+    pub fn delete_to_previous_word_start(
+        &mut self,
+        _action: &DeleteToPreviousWordStart,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         self.delete_backward_to_word(window, cx, false);
     }
 
-    fn delete_backward_to_word(&mut self, window: &mut Window, cx: &mut Context<Self>, subword: bool) {
-        if self.read_only(cx) { return; }
+    fn delete_backward_to_word(
+        &mut self,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+        subword: bool,
+    ) {
+        if self.read_only(cx) {
+            return;
+        }
         let snapshot = self.display_snapshot(cx);
         let selections = self.selections.all::<MultiBufferOffset>(&snapshot);
         self.transact(window, cx, |this, window, cx| {
@@ -10302,16 +10425,28 @@ impl Editor {
                 let end_off = selection.head().0;
                 let adjusted = start_off.saturating_add_signed(delta);
                 new_cursors.push(MultiBufferOffset(adjusted)..MultiBufferOffset(adjusted));
-                edits.push((MultiBufferOffset(start_off)..MultiBufferOffset(end_off), String::new()));
+                edits.push((
+                    MultiBufferOffset(start_off)..MultiBufferOffset(end_off),
+                    String::new(),
+                ));
                 delta -= (end_off - start_off) as isize;
             }
             this.edit(edits, cx);
-            this.change_selections(SelectionEffects::no_scroll(), window, cx, |s| s.select_ranges(new_cursors));
+            this.change_selections(SelectionEffects::no_scroll(), window, cx, |s| {
+                s.select_ranges(new_cursors)
+            });
         });
     }
 
-    fn delete_forward_to_word(&mut self, window: &mut Window, cx: &mut Context<Self>, subword: bool) {
-        if self.read_only(cx) { return; }
+    fn delete_forward_to_word(
+        &mut self,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+        subword: bool,
+    ) {
+        if self.read_only(cx) {
+            return;
+        }
         let snapshot = self.display_snapshot(cx);
         let selections = self.selections.all::<MultiBufferOffset>(&snapshot);
         self.transact(window, cx, |this, window, cx| {
@@ -10330,29 +10465,59 @@ impl Editor {
                 let end_off = target.to_offset(&snapshot, Bias::Right).0;
                 let adjusted = start_off.saturating_add_signed(delta);
                 new_cursors.push(MultiBufferOffset(adjusted)..MultiBufferOffset(adjusted));
-                edits.push((MultiBufferOffset(start_off)..MultiBufferOffset(end_off), String::new()));
+                edits.push((
+                    MultiBufferOffset(start_off)..MultiBufferOffset(end_off),
+                    String::new(),
+                ));
                 delta -= (end_off - start_off) as isize;
             }
             this.edit(edits, cx);
-            this.change_selections(SelectionEffects::no_scroll(), window, cx, |s| s.select_ranges(new_cursors));
+            this.change_selections(SelectionEffects::no_scroll(), window, cx, |s| {
+                s.select_ranges(new_cursors)
+            });
         });
     }
 
     /// Stub: update_edit_prediction_preview
-    pub fn update_edit_prediction_preview(&mut self, _a0: &gpui::Modifiers, _window: &mut Window, _cx: &mut Context<Self>) {}
+    pub fn update_edit_prediction_preview(
+        &mut self,
+        _a0: &gpui::Modifiers,
+        _window: &mut Window,
+        _cx: &mut Context<Self>,
+    ) {
+    }
 
     /// Stub: visible_buffers
-    pub fn visible_buffers(&mut self, _cx: &mut Context<Self>) -> Vec<gpui::Entity<Buffer>> { Vec::new() }
+    pub fn visible_buffers(&mut self, _cx: &mut Context<Self>) -> Vec<gpui::Entity<Buffer>> {
+        Vec::new()
+    }
 
     /// Stub: accept_edit_prediction
-    pub fn accept_edit_prediction(&mut self, _action: &AcceptEditPrediction, _window: &mut Window, _cx: &mut Context<Self>) {}
+    pub fn accept_edit_prediction(
+        &mut self,
+        _action: &AcceptEditPrediction,
+        _window: &mut Window,
+        _cx: &mut Context<Self>,
+    ) {
+    }
 
     /// Stub: accept_next_line_edit_prediction
-    pub fn accept_next_line_edit_prediction(&mut self, _action: &AcceptNextLineEditPrediction, _window: &mut Window, _cx: &mut Context<Self>) {}
+    pub fn accept_next_line_edit_prediction(
+        &mut self,
+        _action: &AcceptNextLineEditPrediction,
+        _window: &mut Window,
+        _cx: &mut Context<Self>,
+    ) {
+    }
 
     /// Stub: accept_next_word_edit_prediction
-    pub fn accept_next_word_edit_prediction(&mut self, _action: &AcceptNextWordEditPrediction, _window: &mut Window, _cx: &mut Context<Self>) {}
-
+    pub fn accept_next_word_edit_prediction(
+        &mut self,
+        _action: &AcceptNextWordEditPrediction,
+        _window: &mut Window,
+        _cx: &mut Context<Self>,
+    ) {
+    }
 
     pub fn newline(&mut self, _: &Newline, window: &mut Window, cx: &mut Context<Self>) {
         self.insert("\n", window, cx);
@@ -10377,7 +10542,10 @@ impl Editor {
                 let display_point = MultiBufferOffset(cursor).to_display_point(&snapshot);
                 let line_start = DisplayPoint::new(display_point.row(), 0);
                 let insert_offset = line_start.to_offset(&snapshot, Bias::Left).0;
-                edits.push((MultiBufferOffset(insert_offset)..MultiBufferOffset(insert_offset), "\n".to_string()));
+                edits.push((
+                    MultiBufferOffset(insert_offset)..MultiBufferOffset(insert_offset),
+                    "\n".to_string(),
+                ));
 
                 let adjusted = insert_offset.saturating_add_signed(delta) + 1;
                 new_cursors.push(MultiBufferOffset(adjusted)..MultiBufferOffset(adjusted));
@@ -10410,7 +10578,10 @@ impl Editor {
                 let display_point = MultiBufferOffset(cursor).to_display_point(&snapshot);
                 let next_line = DisplayPoint::new(display_point.row() + DisplayRow(1), 0);
                 let insert_offset = next_line.to_offset(&snapshot, Bias::Left).0;
-                edits.push((MultiBufferOffset(insert_offset)..MultiBufferOffset(insert_offset), "\n".to_string()));
+                edits.push((
+                    MultiBufferOffset(insert_offset)..MultiBufferOffset(insert_offset),
+                    "\n".to_string(),
+                ));
 
                 let adjusted = insert_offset.saturating_add_signed(delta) + 1;
                 new_cursors.push(MultiBufferOffset(adjusted)..MultiBufferOffset(adjusted));
@@ -10425,29 +10596,70 @@ impl Editor {
     }
 
     /// Stub: observe_pending_input
-    pub fn observe_pending_input(&mut self, _window: &mut Window, _cx: &mut Context<Self>) {
-    }
+    pub fn observe_pending_input(&mut self, _window: &mut Window, _cx: &mut Context<Self>) {}
 
     /// Stub: show_edit_prediction
-    pub fn show_edit_prediction(&mut self, _action: &ShowEditPrediction, _window: &mut Window, _cx: &mut Context<Self>) {}
+    pub fn show_edit_prediction(
+        &mut self,
+        _action: &ShowEditPrediction,
+        _window: &mut Window,
+        _cx: &mut Context<Self>,
+    ) {
+    }
 
     /// Stub: show_signature_help
-    pub fn show_signature_help(&mut self, _action: &ShowSignatureHelp, _window: &mut Window, _cx: &mut Context<Self>) {}
+    pub fn show_signature_help(
+        &mut self,
+        _action: &ShowSignatureHelp,
+        _window: &mut Window,
+        _cx: &mut Context<Self>,
+    ) {
+    }
 
     /// Stub: spawn_nearest_task
-    pub fn spawn_nearest_task(&mut self, _action: &SpawnNearestTask, _window: &mut Window, _cx: &mut Context<Self>) {}
+    pub fn spawn_nearest_task(
+        &mut self,
+        _action: &SpawnNearestTask,
+        _window: &mut Window,
+        _cx: &mut Context<Self>,
+    ) {
+    }
 
     /// Stub: toggle_block_comments
-    pub fn toggle_block_comments(&mut self, _action: &ToggleBlockComments, _window: &mut Window, _cx: &mut Context<Self>) {}
+    pub fn toggle_block_comments(
+        &mut self,
+        _action: &ToggleBlockComments,
+        _window: &mut Window,
+        _cx: &mut Context<Self>,
+    ) {
+    }
 
     /// Stub: toggle_comments
-    pub fn toggle_comments(&mut self, _action: &ToggleComments, _window: &mut Window, _cx: &mut Context<Self>) {}
+    pub fn toggle_comments(
+        &mut self,
+        _action: &ToggleComments,
+        _window: &mut Window,
+        _cx: &mut Context<Self>,
+    ) {
+    }
 
     /// Stub: toggle_markdown_block_quote
-    pub fn toggle_markdown_block_quote(&mut self, _action: &ToggleBlockQuote, _window: &mut Window, _cx: &mut Context<Self>) {}
+    pub fn toggle_markdown_block_quote(
+        &mut self,
+        _action: &ToggleBlockQuote,
+        _window: &mut Window,
+        _cx: &mut Context<Self>,
+    ) {
+    }
 
     /// Stub: unwrap_syntax_node
-    pub fn unwrap_syntax_node(&mut self, _action: &UnwrapSyntaxNode, _window: &mut Window, _cx: &mut Context<Self>) {}
+    pub fn unwrap_syntax_node(
+        &mut self,
+        _action: &UnwrapSyntaxNode,
+        _window: &mut Window,
+        _cx: &mut Context<Self>,
+    ) {
+    }
 
     /// Stub: active_diagnostic_group_id
     pub fn active_diagnostic_group_id<R>(&self) -> R
@@ -10504,12 +10716,10 @@ impl Editor {
     }
 
     /// Stub: disable_inline_diagnostics
-    pub fn disable_inline_diagnostics(&mut self) {
-    }
+    pub fn disable_inline_diagnostics(&mut self) {}
 
     /// Stub: set_all_diagnostics_active
-    pub fn set_all_diagnostics_active(&mut self, _cx: &mut Context<Self>) {
-    }
+    pub fn set_all_diagnostics_active(&mut self, _cx: &mut Context<Self>) {}
 }
 
 fn process_completion_for_edit(
@@ -10735,7 +10945,9 @@ impl SemanticsProvider for WeakEntity<Project> {
         position: text::Anchor,
         cx: &mut App,
     ) -> Option<Task<Option<Vec<project::Hover>>>> {
-        let task = self.update(cx, |project, cx| project.hover(buffer, position, cx)).ok()?;
+        let task = self
+            .update(cx, |project, cx| project.hover(buffer, position, cx))
+            .ok()?;
         Some(cx.background_spawn(async move { task.await.ok().flatten() }))
     }
 
@@ -10745,14 +10957,24 @@ impl SemanticsProvider for WeakEntity<Project> {
         position: text::Anchor,
         cx: &mut App,
     ) -> Option<Task<Result<Vec<DocumentHighlight>>>> {
-        let Some(task) = self.update(cx, |project, cx| {
-            project.document_highlights(buffer, position, cx)
-        }).ok() else { return None };
-        Some(cx.background_spawn(async move { 
-            task.await.map(|highlights| highlights.into_iter().map(|h| crate::stubs::DocumentHighlight { 
-                range: h.range, 
-                kind: h.kind 
-            }).collect())
+        let Some(task) = self
+            .update(cx, |project, cx| {
+                project.document_highlights(buffer, position, cx)
+            })
+            .ok()
+        else {
+            return None;
+        };
+        Some(cx.background_spawn(async move {
+            task.await.map(|highlights| {
+                highlights
+                    .into_iter()
+                    .map(|h| crate::stubs::DocumentHighlight {
+                        range: h.range,
+                        kind: h.kind,
+                    })
+                    .collect()
+            })
         }))
     }
 
@@ -10767,13 +10989,23 @@ impl SemanticsProvider for WeakEntity<Project> {
             GotoDefinitionKind::Symbol => project::stubs::GotoDefinitionKind::Symbol,
             GotoDefinitionKind::Declaration => project::stubs::GotoDefinitionKind::Declaration,
             GotoDefinitionKind::Type => project::stubs::GotoDefinitionKind::Type,
-            GotoDefinitionKind::Implementation => project::stubs::GotoDefinitionKind::Implementation,
+            GotoDefinitionKind::Implementation => {
+                project::stubs::GotoDefinitionKind::Implementation
+            }
         };
         self.update(cx, |project, cx| match project_kind {
-            project::stubs::GotoDefinitionKind::Symbol => project.definitions(buffer, position, project_kind, cx),
-            project::stubs::GotoDefinitionKind::Declaration => project.declarations(buffer, position, cx),
-            project::stubs::GotoDefinitionKind::Type => project.type_definitions(buffer, position, cx),
-            project::stubs::GotoDefinitionKind::Implementation => project.implementations(buffer, position, cx),
+            project::stubs::GotoDefinitionKind::Symbol => {
+                project.definitions(buffer, position, project_kind, cx)
+            }
+            project::stubs::GotoDefinitionKind::Declaration => {
+                project.declarations(buffer, position, cx)
+            }
+            project::stubs::GotoDefinitionKind::Type => {
+                project.type_definitions(buffer, position, cx)
+            }
+            project::stubs::GotoDefinitionKind::Implementation => {
+                project.implementations(buffer, position, cx)
+            }
         })
         .ok()
     }
@@ -10789,14 +11021,16 @@ impl SemanticsProvider for WeakEntity<Project> {
 
             let buf_id = buffer.read(cx).remote_id();
             project.any_language_server_supports_inlay_hints(&buffer.read(cx))
-        }).unwrap_or(false)
+        })
+        .unwrap_or(false)
     }
 
     fn supports_semantic_tokens(&self, buffer: &Entity<Buffer>, cx: &mut App) -> bool {
         self.update(cx, |project, cx| {
             let buf_id = buffer.read(cx).remote_id();
             project.any_language_server_supports_semantic_tokens(&buffer.read(cx))
-        }).unwrap_or(false)
+        })
+        .unwrap_or(false)
     }
 
     fn inline_values(
@@ -11304,7 +11538,6 @@ impl EditorSnapshot {
             })
             .collect()
     }
-
 }
 
 pub fn column_pixels(style: &EditorStyle, column: usize, window: &Window) -> Pixels {
@@ -12069,7 +12302,8 @@ impl gpui::EntityInputHandler for Editor {
     ) -> Option<String> {
         let snapshot = self.display_snapshot(cx);
         let buffer_snapshot = snapshot.buffer_snapshot();
-        let start = MultiBufferOffsetUtf16(text::OffsetUtf16(range.start)).to_offset(buffer_snapshot);
+        let start =
+            MultiBufferOffsetUtf16(text::OffsetUtf16(range.start)).to_offset(buffer_snapshot);
         let end = MultiBufferOffsetUtf16(text::OffsetUtf16(range.end)).to_offset(buffer_snapshot);
         Some(buffer_snapshot.text_for_range(start..end).collect())
     }
@@ -12086,7 +12320,7 @@ impl gpui::EntityInputHandler for Editor {
         let start_utf16 = MultiBufferOffset(selection.start.0).to_offset_utf16(buffer_snapshot);
         let end_utf16 = MultiBufferOffset(selection.end.0).to_offset_utf16(buffer_snapshot);
         Some(gpui::UTF16Selection {
-            range: start_utf16.0 .0..end_utf16.0 .0,
+            range: start_utf16.0.0..end_utf16.0.0,
             reversed: selection.reversed,
         })
     }
@@ -12115,14 +12349,13 @@ impl gpui::EntityInputHandler for Editor {
         if let Some(range) = range {
             let snapshot = self.display_snapshot(cx);
             let buffer_snapshot = snapshot.buffer_snapshot();
-            let start = MultiBufferOffsetUtf16(text::OffsetUtf16(range.start)).to_offset(buffer_snapshot);
-            let end = MultiBufferOffsetUtf16(text::OffsetUtf16(range.end)).to_offset(buffer_snapshot);
+            let start =
+                MultiBufferOffsetUtf16(text::OffsetUtf16(range.start)).to_offset(buffer_snapshot);
+            let end =
+                MultiBufferOffsetUtf16(text::OffsetUtf16(range.end)).to_offset(buffer_snapshot);
 
             self.transact(window, cx, |this, window, cx| {
-                this.edit(
-                    vec![(start..end, text.to_string())],
-                    cx,
-                );
+                this.edit(vec![(start..end, text.to_string())], cx);
                 let cursor = MultiBufferOffset(start.0 + text.len());
                 this.change_selections(SelectionEffects::no_scroll(), window, cx, |selections| {
                     selections.select_ranges(vec![cursor..cursor])

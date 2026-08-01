@@ -22,9 +22,12 @@ pub use rtt::{HeartbeatManager, RttEstimator};
 pub use transport::{UdpClient, UdpServer};
 
 // §16.6 导出常量。
-pub use rtt::{ACK_INTERVAL, RTO_MAX, RTO_MIN, SEND_INTERVAL_MAX, SEND_INTERVAL_MIN, SERVER_ASSOCIATION_TIMEOUT};
-pub use transport::MTU;
 pub use crypto::{KEY_SIZE, NONCE_SIZE, REPLAY_WINDOW_SIZE};
+pub use rtt::{
+    ACK_INTERVAL, RTO_MAX, RTO_MIN, SEND_INTERVAL_MAX, SEND_INTERVAL_MIN,
+    SERVER_ASSOCIATION_TIMEOUT,
+};
+pub use transport::MTU;
 
 use anyhow::Result;
 use mux_protocol::proto::Envelope;
@@ -42,7 +45,10 @@ pub struct UdpResilientTransport {
 
 impl UdpResilientTransport {
     /// §16.6 连接到 UDP 服务端。
-    pub async fn connect(server_addr: std::net::SocketAddr, session_key: [u8; KEY_SIZE]) -> Result<Self> {
+    pub async fn connect(
+        server_addr: std::net::SocketAddr,
+        session_key: [u8; KEY_SIZE],
+    ) -> Result<Self> {
         let inner = transport::UdpClient::connect(server_addr, session_key).await?;
         Ok(Self { inner })
     }

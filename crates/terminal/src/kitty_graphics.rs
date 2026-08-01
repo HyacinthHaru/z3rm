@@ -277,7 +277,8 @@ pub fn parse_osc1337(payload: &str) -> Option<ParsedImage> {
         return None;
     }
 
-    let raw_bytes = base64::Engine::decode(&base64::engine::general_purpose::STANDARD, encoded_data).ok()?;
+    let raw_bytes =
+        base64::Engine::decode(&base64::engine::general_purpose::STANDARD, encoded_data).ok()?;
     if raw_bytes.is_empty() {
         return None;
     }
@@ -519,7 +520,10 @@ pub struct ParsedGraphics {
 /// 根据 payload 格式自动识别协议类型并解析
 ///
 /// §11.2 协议分派入口
-pub fn parse_graphics_protocol(protocol: GraphicsProtocol, payload: &str) -> Option<ParsedGraphics> {
+pub fn parse_graphics_protocol(
+    protocol: GraphicsProtocol,
+    payload: &str,
+) -> Option<ParsedGraphics> {
     match protocol {
         GraphicsProtocol::Osci1337 => {
             let image = parse_osc1337(payload)?;
@@ -766,28 +770,24 @@ mod tests {
         let payload = format!("File=name=test.png;inline=1:{base64}");
         let result = parse_graphics_protocol(GraphicsProtocol::Osci1337, &payload);
         assert!(result.is_some());
-        assert_eq!(
-            result.unwrap().protocol,
-            GraphicsProtocol::Osci1337
-        );
+        assert_eq!(result.unwrap().protocol, GraphicsProtocol::Osci1337);
 
         // Kitty Graphics
         let payload = format!("a=S,t=0,T=1;{base64}");
         let result = parse_graphics_protocol(GraphicsProtocol::KittyGraphics, &payload);
         assert!(result.is_some());
-        assert_eq!(
-            result.unwrap().protocol,
-            GraphicsProtocol::KittyGraphics
-        );
+        assert_eq!(result.unwrap().protocol, GraphicsProtocol::KittyGraphics);
     }
 
     /// 创建一个 1x1 白色像素的 PNG 用于测试
     fn create_test_png() -> Vec<u8> {
         let img = image::RgbaImage::new(1, 1);
         let mut png_buf = Vec::new();
-        img.write_to(&mut std::io::Cursor::new(&mut png_buf), image::ImageFormat::Png)
-            .expect("write test png");
+        img.write_to(
+            &mut std::io::Cursor::new(&mut png_buf),
+            image::ImageFormat::Png,
+        )
+        .expect("write test png");
         png_buf
     }
 }
-

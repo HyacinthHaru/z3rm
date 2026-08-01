@@ -96,10 +96,7 @@ impl MemTable {
     /// 清除指定范围之前的所有条目（checkpoint 后调用）
     pub fn trim_before(&self, seq_no: SeqNo) {
         let mut entries = self.entries.write();
-        let keys_to_remove: Vec<SeqNo> = entries
-            .range(..seq_no)
-            .map(|(k, _)| *k)
-            .collect();
+        let keys_to_remove: Vec<SeqNo> = entries.range(..seq_no).map(|(k, _)| *k).collect();
         for key in keys_to_remove {
             entries.remove(&key);
         }

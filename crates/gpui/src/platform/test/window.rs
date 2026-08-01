@@ -292,7 +292,6 @@ impl PlatformWindow for TestWindow {
 
     fn on_appearance_changed(&self, _callback: Box<dyn FnMut()>) {}
 
-
     fn a11y_init(&self, callbacks: crate::A11yCallbacks) {
         // §15.11 Headless a11y capture: by default TestWindow leaves the
         // a11y active flag untouched (the real adapter is absent). When a

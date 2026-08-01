@@ -67,7 +67,10 @@ pub(crate) struct IncludeWarnings(bool);
 impl Global for IncludeWarnings {}
 
 pub fn init(cx: &mut App) {
-    editor::set_diagnostic_renderer(Some(Box::new(diagnostic_renderer::DiagnosticRenderer {})), cx);
+    editor::set_diagnostic_renderer(
+        Some(Box::new(diagnostic_renderer::DiagnosticRenderer {})),
+        cx,
+    );
     cx.observe_new(ProjectDiagnosticsEditor::register).detach();
     cx.observe_new(BufferDiagnosticsEditor::register).detach();
 }

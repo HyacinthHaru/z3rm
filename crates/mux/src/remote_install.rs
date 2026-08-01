@@ -3,8 +3,8 @@
 //! 远程服务器自动探测与安装模块（§16.6 / Plan 19）。
 //! 支持同架构 scp 上传和跨架构下载安装。
 
-use anyhow::{Context, Result, anyhow};
 use crate::ssh::SshSession;
+use anyhow::{Context, Result, anyhow};
 use std::path::{Path, PathBuf};
 
 // ============================================================================
@@ -17,7 +17,9 @@ use std::path::{Path, PathBuf};
 /// 返回服务器路径（如存在）。
 pub async fn probe_remote_server(session: &SshSession) -> Result<Option<String>> {
     // §16.6 检查 PATH 中的 z3rm-server。
-    let output = session.exec("command -v z3rm-server 2>/dev/null || echo ''").await?;
+    let output = session
+        .exec("command -v z3rm-server 2>/dev/null || echo ''")
+        .await?;
     let path = output.trim().to_string();
 
     if !path.is_empty() {
@@ -26,7 +28,9 @@ pub async fn probe_remote_server(session: &SshSession) -> Result<Option<String>>
     }
 
     // §16.6 检查 ~/.z3rm-server/z3rm-server。
-    let output = session.exec("ls ~/.z3rm-server/z3rm-server 2>/dev/null || echo ''").await?;
+    let output = session
+        .exec("ls ~/.z3rm-server/z3rm-server 2>/dev/null || echo ''")
+        .await?;
     let path = output.trim().to_string();
 
     if !path.is_empty() {
@@ -67,7 +71,10 @@ pub async fn is_same_arch(session: &SshSession) -> Result<bool> {
 /// §16.6 获取远程 z3rm-server 版本号。
 pub async fn get_remote_version(session: &SshSession, server_path: &str) -> Result<Option<String>> {
     let output = session
-        .exec(&format!("{} --version 2>/dev/null || echo ''", shell_escape(server_path)))
+        .exec(&format!(
+            "{} --version 2>/dev/null || echo ''",
+            shell_escape(server_path)
+        ))
         .await?;
     let version = output.trim();
     if version.is_empty() {
@@ -125,10 +132,7 @@ pub fn find_local_server_binary() -> Result<PathBuf> {
     }
 
     // §16.6 尝试常见安装路径。
-    let candidates = [
-        "/usr/local/bin/z3rm-server",
-        "/usr/bin/z3rm-server",
-    ];
+    let candidates = ["/usr/local/bin/z3rm-server", "/usr/bin/z3rm-server"];
     for candidate in &candidates {
         let path = Path::new(candidate).to_path_buf();
         if path.exists() {
@@ -151,10 +155,7 @@ pub fn find_local_server_binary() -> Result<PathBuf> {
 // ============================================================================
 
 /// §16.6 跨架构下通过远程下载安装。
-pub async fn install_cross_arch(
-    session: &SshSession,
-    target_arch: &str,
-) -> Result<String> {
+pub async fn install_cross_arch(session: &SshSession, target_arch: &str) -> Result<String> {
     let remote_dir = "~/.z3rm-server";
     let target_os = detect_remote_os(session).await?;
 
@@ -257,7 +258,30 @@ fn shell_escape(s: &str) -> String {
     }
     // §16.6 检查是否需要转义。
     let needs_escape = s.chars().any(|c| {
-        matches!(c, ' ' | '\'' | '"' | '\\' | '$' | '`' | '!' | '#' | '&' | '|' | ';' | '(' | ')' | '<' | '>' | '*' | '?' | '[' | ']' | '{' | '}' | '~')
+        matches!(
+            c,
+            ' ' | '\''
+                | '"'
+                | '\\'
+                | '$'
+                | '`'
+                | '!'
+                | '#'
+                | '&'
+                | '|'
+                | ';'
+                | '('
+                | ')'
+                | '<'
+                | '>'
+                | '*'
+                | '?'
+                | '['
+                | ']'
+                | '{'
+                | '}'
+                | '~'
+        )
     });
 
     if needs_escape {
@@ -284,18 +308,12 @@ mod tests {
 
     #[test]
     fn test_shell_escape_with_spaces() {
-        assert_eq!(
-            shell_escape("hello world"),
-            "'hello world'".to_string()
-        );
+        assert_eq!(shell_escape("hello world"), "'hello world'".to_string());
     }
 
     #[test]
     fn test_shell_escape_with_single_quote() {
-        assert_eq!(
-            shell_escape("it's"),
-            "'it'\\''s'".to_string()
-        );
+        assert_eq!(shell_escape("it's"), "'it'\\''s'".to_string());
     }
 
     #[test]
@@ -305,9 +323,6 @@ mod tests {
 
     #[test]
     fn test_shell_escape_special_chars() {
-        assert_eq!(
-            shell_escape("hello $world"),
-            "'hello $world'".to_string()
-        );
+        assert_eq!(shell_escape("hello $world"), "'hello $world'".to_string());
     }
 }

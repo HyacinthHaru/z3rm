@@ -8,10 +8,10 @@ use std::time::Duration;
 use std::{any::TypeId, ops::Range, sync::Arc};
 
 use anyhow::Context as _;
-use extension::ExtensionProvides;
 use collections::{BTreeMap, BTreeSet};
 use command_palette_hooks::CommandPaletteFilter;
 use editor::{Editor, EditorElement, EditorStyle};
+use extension::ExtensionProvides;
 use extension_host::{ExtensionManifest, ExtensionMetadata, ExtensionOperation, ExtensionStore};
 use fuzzy::{StringMatch, StringMatchCandidate, match_strings};
 use gpui::{
@@ -22,6 +22,7 @@ use gpui::{
 use num_format::{Locale, ToFormattedString};
 use picker::{Picker, PickerDelegate};
 use project::DirectoryLister;
+use project::VimModeSetting;
 use release_channel::ReleaseChannel;
 use schemars::JsonSchema;
 use serde::Deserialize;
@@ -34,7 +35,6 @@ use ui::{
     Tooltip, WithScrollbar, prelude::*,
 };
 use util::ResultExt;
-use project::VimModeSetting;
 use workspace::{
     Workspace,
     item::{Item, ItemEvent},
@@ -928,7 +928,9 @@ impl ExtensionsPage {
                                                     _ => {}
                                                 }
 
-                                                Some(Chip::new(SharedString::from(extension_provides_label(*provides))))
+                                                Some(Chip::new(SharedString::from(
+                                                    extension_provides_label(*provides),
+                                                )))
                                             })
                                             .collect::<Vec<_>>(),
                                     ),
@@ -1002,9 +1004,11 @@ impl ExtensionsPage {
                                         cx,
                                     )
                                 })
-                                .on_click(cx.listener(move |_, _, _, cx| {
-                                    cx.open_url(&repository_url.as_ref().unwrap().clone());
-                                }))
+                                .on_click(cx.listener(
+                                    move |_, _, _, cx| {
+                                        cx.open_url(&repository_url.as_ref().unwrap().clone());
+                                    },
+                                ))
                             })
                             .child(
                                 PopoverMenu::new(SharedString::from(format!(
@@ -1119,8 +1123,7 @@ impl ExtensionsPage {
         has_dev_extension: bool,
         cx: &mut Context<Self>,
     ) -> ExtensionCardButtons {
-        let is_compatible =
-            true;
+        let is_compatible = true;
 
         if has_dev_extension {
             // If we have a dev extension for the given extension, just treat it as uninstalled.

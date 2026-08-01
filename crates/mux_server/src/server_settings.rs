@@ -15,8 +15,8 @@
 //! cycle via the shared AtomicU64.
 
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
 use serde::Deserialize;
@@ -60,10 +60,7 @@ impl ServerSettings {
                 if let Some(v) = file.keep_alive_seconds {
                     keep_alive = v;
                 }
-                if let Some(v) = file
-                    .scrollback_lines
-                    .or(file.max_scroll_history_lines)
-                {
+                if let Some(v) = file.scrollback_lines.or(file.max_scroll_history_lines) {
                     scrollback = v.min(100_000);
                 }
             }
@@ -159,10 +156,7 @@ pub fn spawn_hot_reload(
             }
             last_mtime = Some(mtime);
             let Some(file) = read_file(path) else {
-                zlog::warn!(
-                    "server settings reload failed to parse {}",
-                    path.display()
-                );
+                zlog::warn!("server settings reload failed to parse {}", path.display());
                 continue;
             };
             let scrollback_changed = settings.apply_file(&file);
@@ -228,7 +222,11 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("server.json");
         let mut f = std::fs::File::create(&path).unwrap();
-        write!(f, r#"{{"keep_alive_seconds": 12, "scrollback_lines": 1234}}"#).unwrap();
+        write!(
+            f,
+            r#"{{"keep_alive_seconds": 12, "scrollback_lines": 1234}}"#
+        )
+        .unwrap();
         let parsed = read_file(&path).expect("parse");
         assert_eq!(parsed.keep_alive_seconds, Some(12));
         assert_eq!(parsed.scrollback_lines, Some(1234));
@@ -240,10 +238,9 @@ mod tests {
     /// guards the "default server.json sample" against schema drift.
     #[test]
     fn example_file_parses_with_defaults() {
-        let sample = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-            .join("server.example.json");
-        let parsed = read_file(&sample)
-            .unwrap_or_else(|| panic!("parse {}: failed", sample.display()));
+        let sample = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("server.example.json");
+        let parsed =
+            read_file(&sample).unwrap_or_else(|| panic!("parse {}: failed", sample.display()));
         assert_eq!(parsed.keep_alive_seconds, Some(0));
         assert_eq!(parsed.scrollback_lines, Some(10_000));
         assert_eq!(parsed.max_scroll_history_lines, Some(10_000));

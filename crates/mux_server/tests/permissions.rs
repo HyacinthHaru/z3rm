@@ -2,7 +2,7 @@
 //!
 //! §3.3 客户端角色与权限控制测试 (Plan 33)
 
-use mux_server::session::{ClientRole, AttachedClient, AttachMode};
+use mux_server::session::{AttachMode, AttachedClient, ClientRole};
 
 // ============================================================
 // §3.3 ClientRole 枚举测试
@@ -74,8 +74,14 @@ fn test_admin_allows_all() {
 #[test]
 fn test_readwrite_allows_readwrite() {
     use mux_server::connection::check_permission;
-    assert!(check_permission(ClientRole::ReadWrite, ClientRole::ReadOnly));
-    assert!(check_permission(ClientRole::ReadWrite, ClientRole::ReadWrite));
+    assert!(check_permission(
+        ClientRole::ReadWrite,
+        ClientRole::ReadOnly
+    ));
+    assert!(check_permission(
+        ClientRole::ReadWrite,
+        ClientRole::ReadWrite
+    ));
     // ReadWrite 不能执行 Admin 操作
     assert!(!check_permission(ClientRole::ReadWrite, ClientRole::Admin));
 }
@@ -86,7 +92,10 @@ fn test_readonly_only_readonly() {
     use mux_server::connection::check_permission;
     assert!(check_permission(ClientRole::ReadOnly, ClientRole::ReadOnly));
     // ReadOnly 不能执行 ReadWrite 操作
-    assert!(!check_permission(ClientRole::ReadOnly, ClientRole::ReadWrite));
+    assert!(!check_permission(
+        ClientRole::ReadOnly,
+        ClientRole::ReadWrite
+    ));
     // ReadOnly 不能执行 Admin 操作
     assert!(!check_permission(ClientRole::ReadOnly, ClientRole::Admin));
 }
@@ -102,12 +111,21 @@ fn test_proto_role_mapping() {
     // 1 = READ_ONLY
     assert!(matches!(proto_role_to_client_role(1), ClientRole::ReadOnly));
     // 2 = READ_WRITE
-    assert!(matches!(proto_role_to_client_role(2), ClientRole::ReadWrite));
+    assert!(matches!(
+        proto_role_to_client_role(2),
+        ClientRole::ReadWrite
+    ));
     // 3 = ADMIN
     assert!(matches!(proto_role_to_client_role(3), ClientRole::Admin));
     // 0 或其他值 = 默认 ReadWrite
-    assert!(matches!(proto_role_to_client_role(0), ClientRole::ReadWrite));
-    assert!(matches!(proto_role_to_client_role(99), ClientRole::ReadWrite));
+    assert!(matches!(
+        proto_role_to_client_role(0),
+        ClientRole::ReadWrite
+    ));
+    assert!(matches!(
+        proto_role_to_client_role(99),
+        ClientRole::ReadWrite
+    ));
 }
 
 #[test]
@@ -139,12 +157,21 @@ fn test_permission_matrix() {
 
     // ReadOnly
     assert!(check_permission(ClientRole::ReadOnly, ClientRole::ReadOnly));
-    assert!(!check_permission(ClientRole::ReadOnly, ClientRole::ReadWrite));
+    assert!(!check_permission(
+        ClientRole::ReadOnly,
+        ClientRole::ReadWrite
+    ));
     assert!(!check_permission(ClientRole::ReadOnly, ClientRole::Admin));
 
     // ReadWrite
-    assert!(check_permission(ClientRole::ReadWrite, ClientRole::ReadOnly));
-    assert!(check_permission(ClientRole::ReadWrite, ClientRole::ReadWrite));
+    assert!(check_permission(
+        ClientRole::ReadWrite,
+        ClientRole::ReadOnly
+    ));
+    assert!(check_permission(
+        ClientRole::ReadWrite,
+        ClientRole::ReadWrite
+    ));
     assert!(!check_permission(ClientRole::ReadWrite, ClientRole::Admin));
 
     // Admin

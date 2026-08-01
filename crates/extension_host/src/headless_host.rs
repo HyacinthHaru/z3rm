@@ -13,7 +13,10 @@ use http_client::HttpClient;
 use language::{LanguageConfig, LanguageName, LanguageQueries, LoadedLanguage};
 use lsp::LanguageServerName;
 
-use crate::{NodeRuntime, wasm_host::{WasmExtension, WasmHost}};
+use crate::{
+    NodeRuntime,
+    wasm_host::{WasmExtension, WasmHost},
+};
 
 #[derive(Clone, Debug)]
 pub struct ExtensionVersion {

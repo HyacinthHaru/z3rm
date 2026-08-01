@@ -8,11 +8,9 @@ use futures::{AsyncBufReadExt, StreamExt as _};
 use gpui::{App, AsyncApp, Entity, SharedString, Task};
 use http_client::github::{AssetKind, GitHubLspBinaryVersion, latest_github_release};
 use language::language_settings::LanguageSettings;
-use language::{
-    Buffer, DynLspInstaller, LspInstaller, Symbol,
-};
-use language::{LspAdapter, LspAdapterDelegate};
+use language::{Buffer, DynLspInstaller, LspInstaller, Symbol};
 use language::{LanguageName, ManifestName, ManifestProvider, ManifestQuery};
+use language::{LspAdapter, LspAdapterDelegate};
 use language::{Toolchain, ToolchainList, ToolchainLister, ToolchainMetadata};
 use lsp::{CompletionItemKind, LanguageServerBinary, Uri};
 use lsp::{LanguageServerBinaryOptions, LanguageServerName};
@@ -833,7 +831,9 @@ impl LspInstaller for PyrightLspAdapter {
             if !server_path.exists() {
                 anyhow::bail!("npm install unavailable");
             }
-            let node = delegate.which("node".as_ref()).await
+            let node = delegate
+                .which("node".as_ref())
+                .await
                 .context("node not found in PATH")?;
             let env = delegate.shell_env().await;
             Ok(LanguageServerBinary {
@@ -893,7 +893,6 @@ impl LspInstaller for PyrightLspAdapter {
         }
     }
 }
-
 
 fn python_module_name_from_relative_path(relative_path: &str) -> Option<String> {
     let rel_path = RelPath::new(relative_path.as_ref(), PathStyle::local()).ok()?;
@@ -1815,7 +1814,6 @@ impl BasedPyrightLspAdapter {
     pub(crate) fn new() -> Self {
         BasedPyrightLspAdapter
     }
-
 }
 
 #[async_trait(?Send)]
@@ -2019,7 +2017,9 @@ impl LspInstaller for BasedPyrightLspAdapter {
             if !server_path.exists() {
                 anyhow::bail!("npm install unavailable");
             }
-            let node = delegate.which("node".as_ref()).await
+            let node = delegate
+                .which("node".as_ref())
+                .await
                 .context("node not found in PATH")?;
             let env = delegate.shell_env().await;
             Ok(LanguageServerBinary {
@@ -2486,7 +2486,7 @@ mod tests {
     async fn test_conda_activation_script_injection(cx: &mut TestAppContext) {
         use language::{LanguageName, Toolchain, ToolchainLister};
         use settings::{CondaManager, VenvSettings};
-// use task::ShellKind;  // removed-crate: task
+        // use task::ShellKind;  // removed-crate: task
 
         use crate::python::PythonToolchainProvider;
 
@@ -2557,7 +2557,7 @@ mod tests {
     async fn test_conda_activation_skips_when_name_missing(cx: &mut TestAppContext) {
         use language::{LanguageName, Toolchain, ToolchainLister};
         use settings::{CondaManager, VenvSettings};
-// use task::ShellKind;  // removed-crate: task
+        // use task::ShellKind;  // removed-crate: task
 
         use crate::python::PythonToolchainProvider;
 
@@ -2624,7 +2624,7 @@ mod tests {
     async fn test_conda_activation_skips_unquotable_name(cx: &mut TestAppContext) {
         use language::{LanguageName, Toolchain, ToolchainLister};
         use settings::{CondaManager, VenvSettings};
-// use task::ShellKind;  // removed-crate: task
+        // use task::ShellKind;  // removed-crate: task
 
         use crate::python::PythonToolchainProvider;
 

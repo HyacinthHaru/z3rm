@@ -1,6 +1,6 @@
 use anyhow::{Context as _, Result};
 use futures::{StreamExt as _, channel::mpsc};
-use gpui::{AsyncApp, App, WindowHandle};
+use gpui::{App, AsyncApp, WindowHandle};
 use std::{path::PathBuf, sync::Arc, time::Duration};
 
 use ::cli::{CliRequest, CliResponse, IpcHandshake, ipc};
@@ -93,8 +93,14 @@ async fn handle_cli_request(
         anyhow::bail!("unexpected CLI request before an open request");
     };
 
-    anyhow::ensure!(wsl.is_none(), "WSL path opening is not supported by this z3rm build");
-    anyhow::ensure!(!dev_container, "dev-container path opening is not supported by z3rm");
+    anyhow::ensure!(
+        wsl.is_none(),
+        "WSL path opening is not supported by this z3rm build"
+    );
+    anyhow::ensure!(
+        !dev_container,
+        "dev-container path opening is not supported by z3rm"
+    );
     anyhow::ensure!(
         diff_paths.is_empty(),
         "--diff is not yet supported by the z3rm read-only file viewer"
@@ -117,15 +123,7 @@ async fn handle_cli_request(
     ) {
         let open_result = cx
             .update(|cx| {
-                Workspace::new_local(
-                    paths,
-                    app_state,
-                    None,
-                    env,
-                    None,
-                    OpenMode::NewWindow,
-                    cx,
-                )
+                Workspace::new_local(paths, app_state, None, env, None, OpenMode::NewWindow, cx)
             })
             .await?;
         ensure_open_results(open_result.opened_items)?;
@@ -163,7 +161,10 @@ fn collect_open_paths(paths: Vec<String>, urls: Vec<String>) -> Result<Vec<PathB
     }
     for url in urls {
         let parsed = url::Url::parse(&url).with_context(|| format!("invalid URL {url:?}"))?;
-        anyhow::ensure!(parsed.scheme() == "file", "unsupported URL scheme in {url:?}");
+        anyhow::ensure!(
+            parsed.scheme() == "file",
+            "unsupported URL scheme in {url:?}"
+        );
         let path = parsed
             .to_file_path()
             .map_err(|_| anyhow::anyhow!("invalid file URL {url:?}"))?;
@@ -181,7 +182,11 @@ fn ensure_open_results(
         .filter_map(Result::err)
         .map(|error| format!("{error:#}"))
         .collect::<Vec<_>>();
-    anyhow::ensure!(errors.is_empty(), "failed to open paths: {}", errors.join("; "));
+    anyhow::ensure!(
+        errors.is_empty(),
+        "failed to open paths: {}",
+        errors.join("; ")
+    );
     Ok(())
 }
 
@@ -199,7 +204,9 @@ async fn wait_for_workspace_window(cx: &mut AsyncApp) -> Result<WindowHandle<Mul
             std::time::Instant::now() < deadline,
             "timed out waiting for the z3rm window"
         );
-        cx.background_executor().timer(Duration::from_millis(20)).await;
+        cx.background_executor()
+            .timer(Duration::from_millis(20))
+            .await;
     }
 }
 
@@ -286,18 +293,24 @@ mod tests {
             vec!["file:///tmp/with%20space.txt".into()],
         )
         .expect("valid paths");
-        assert_eq!(paths, vec![PathBuf::from("/tmp/plain.txt"), PathBuf::from("/tmp/with space.txt")]);
+        assert_eq!(
+            paths,
+            vec![
+                PathBuf::from("/tmp/plain.txt"),
+                PathBuf::from("/tmp/with space.txt")
+            ]
+        );
     }
 
     #[test]
     fn ipc_handshake_round_trip_delivers_requests_and_responses() {
-        let (server, server_name) = ipc::IpcOneShotServer::<IpcHandshake>::new()
-            .expect("create one-shot IPC server");
+        let (server, server_name) =
+            ipc::IpcOneShotServer::<IpcHandshake>::new().expect("create one-shot IPC server");
         let worker = std::thread::spawn(move || {
             let (mut requests, responses) =
                 connect_to_cli(&server_name).expect("connect to one-shot IPC server");
-            let request = futures::executor::block_on(requests.next())
-                .expect("receive CLI open request");
+            let request =
+                futures::executor::block_on(requests.next()).expect("receive CLI open request");
             assert!(matches!(request, CliRequest::Open { .. }));
             responses
                 .send(CliResponse::Exit { status: 0 })

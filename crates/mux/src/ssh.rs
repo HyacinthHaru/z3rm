@@ -50,9 +50,9 @@ impl SshConnectionOptions {
     ///
     /// 格式: `ssh://[user@]host[:port]`
     pub fn from_uri(uri: &str) -> Result<Self> {
-        let uri = uri.strip_prefix("ssh://").ok_or_else(|| {
-            anyhow!("invalid SSH URI, must start with ssh://: {}", uri)
-        })?;
+        let uri = uri
+            .strip_prefix("ssh://")
+            .ok_or_else(|| anyhow!("invalid SSH URI, must start with ssh://: {}", uri))?;
 
         let mut host = uri.to_string();
         let mut username = None;
@@ -169,9 +169,9 @@ impl SshSession {
         let mut cmd = Command::new("ssh");
         let control_str = format!("ControlPath={}", control_path.display());
         cmd.args(&ssh_args)
-            .arg("-N")                           // §16.6 不执行远程命令
+            .arg("-N") // §16.6 不执行远程命令
             .arg("-o")
-            .arg("ControlMaster=yes")            // §16.6 启用 ControlMaster
+            .arg("ControlMaster=yes") // §16.6 启用 ControlMaster
             .arg("-o")
             .arg(control_str)
             .arg(&destination)
@@ -208,7 +208,7 @@ impl SshSession {
                             stderr_msg.trim()
                         ));
                     }
-                    Ok(None) => {}     // §16.6 进程仍在运行，继续等待 socket 出现。
+                    Ok(None) => {} // §16.6 进程仍在运行，继续等待 socket 出现。
                     Err(e) => return Err(anyhow!("检查 SSH 进程状态失败: {e}")),
                 }
                 if control_path.exists() {
@@ -313,10 +313,7 @@ impl SshSession {
     ///
     /// 转发子进程及其本地 socket 临时目录由本会话拥有，随 `SshSession` Drop 一并清理。
     /// 返回本地 socket 路径供后续连接。多次调用会替换上一次的转发资源。
-    pub async fn forward_socket(
-        &mut self,
-        remote_socket: &str,
-    ) -> Result<PathBuf> {
+    pub async fn forward_socket(&mut self, remote_socket: &str) -> Result<PathBuf> {
         // §16.6 先清理上一次的转发资源（若有），避免遗留进程与 socket。
         self.take_forward();
 
@@ -330,11 +327,7 @@ impl SshSession {
         // §16.6 通过 SSH 控制通道转发 socket：ssh -L local:remote 复用 ControlMaster。
         let mut cmd = Command::new("ssh");
         let control_str = format!("ControlPath={}", self.control_path.display());
-        let forward_str = format!(
-            "{}:{}",
-            local_socket_path.display(),
-            remote_socket
-        );
+        let forward_str = format!("{}:{}", local_socket_path.display(), remote_socket);
         cmd.args(&ssh_args)
             .arg("-o")
             .arg(control_str)
@@ -433,7 +426,10 @@ pub async fn connect_ssh(target: &str) -> anyhow::Result<(super::MuxDomain, SshS
 
     // §16.6 步骤 4：启动远程 mux_server 守护进程。
     session
-        .exec(&format!("nohup {} --daemonize </dev/null >/dev/null 2>&1 &", shell_escape(&server_path)))
+        .exec(&format!(
+            "nohup {} --daemonize </dev/null >/dev/null 2>&1 &",
+            shell_escape(&server_path)
+        ))
         .await
         .context("启动远程 mux_server 失败")?;
 
@@ -452,7 +448,8 @@ pub async fn connect_ssh(target: &str) -> anyhow::Result<(super::MuxDomain, SshS
         .context("建立远程 mux socket 转发失败")?;
 
     // §16.6 步骤 5：转发远程 socket 到本地。
-    let domain = super::connect_local(Some(&local_socket)).await
+    let domain = super::connect_local(Some(&local_socket))
+        .await
         .context("通过转发的 socket 连接 mux_server 失败")?;
 
     tracing::info!(
@@ -470,7 +467,28 @@ fn shell_escape(s: &str) -> String {
         return "''".to_string();
     }
     let needs_escape = s.chars().any(|c| {
-        matches!(c, ' ' | '\'' | '"' | '\\' | '$' | '`' | '!' | '#' | '&' | '|' | ';' | '(' | ')' | '<' | '>' | '*' | '?' | '[' | ']' | '~')
+        matches!(
+            c,
+            ' ' | '\''
+                | '"'
+                | '\\'
+                | '$'
+                | '`'
+                | '!'
+                | '#'
+                | '&'
+                | '|'
+                | ';'
+                | '('
+                | ')'
+                | '<'
+                | '>'
+                | '*'
+                | '?'
+                | '['
+                | ']'
+                | '~'
+        )
     });
     if needs_escape {
         let escaped = s.replace('\'', "'\\\''");
@@ -688,9 +706,18 @@ mod tests {
         let (forward_child, _pid) = long_sleep_child();
         let mut session = fake_session(None, None, Some(forward_dir), Some(forward_child));
         session.take_forward();
-        assert!(session.forward_process.is_none(), "take_forward 后 forward_process 应为 None");
-        assert!(session.forward_dir.is_none(), "take_forward 后 forward_dir 应为 None");
-        assert!(!dir_path.exists(), "take_forward 后本地 socket 目录应被删除");
+        assert!(
+            session.forward_process.is_none(),
+            "take_forward 后 forward_process 应为 None"
+        );
+        assert!(
+            session.forward_dir.is_none(),
+            "take_forward 后 forward_dir 应为 None"
+        );
+        assert!(
+            !dir_path.exists(),
+            "take_forward 后本地 socket 目录应被删除"
+        );
     }
 
     /// Drop 必须终止 forward 子进程，而非 mem::forget。

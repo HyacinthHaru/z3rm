@@ -1370,9 +1370,7 @@ impl Window {
         }
 
         let accessibility_force_disabled = cx.accessibility_force_disabled;
-        let a11y_active_flag = Arc::new(AtomicBool::new(
-            std::env::var("Z3RM_A11Y_FORCE").is_ok(),
-        ));
+        let a11y_active_flag = Arc::new(AtomicBool::new(std::env::var("Z3RM_A11Y_FORCE").is_ok()));
 
         #[cfg(not(target_family = "wasm"))]
         if !accessibility_force_disabled {
@@ -6457,12 +6455,9 @@ mod tests {
         // node, proving the a11y tree structure is well-formed for downstream
         // TerminalElement/TextRun assertions.
         let json = json.expect("checked Some above");
-        let parsed: serde_json::Value = serde_json::from_str(&json)
-            .expect("a11y tree JSON must be parseable");
-        assert!(
-            parsed.is_object(),
-            "a11y tree root must be a JSON object"
-        );
+        let parsed: serde_json::Value =
+            serde_json::from_str(&json).expect("a11y tree JSON must be parseable");
+        assert!(parsed.is_object(), "a11y tree root must be a JSON object");
         // The tree contains nodes keyed by NodeId; verify at least one node
         // carries Role::Window (the root).
         let json_str = parsed.to_string();

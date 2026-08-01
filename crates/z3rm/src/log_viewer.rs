@@ -7,9 +7,9 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
 use gpui::{
-    App, AnyElement, Context, DismissEvent, Entity, EventEmitter, FocusHandle, Focusable,
-    IntoElement, ListAlignment, ListState, ParentElement, Render, SharedString, Styled,
-    Task, TaskExt, WeakEntity, Window, list, prelude::*,
+    AnyElement, App, Context, DismissEvent, Entity, EventEmitter, FocusHandle, Focusable,
+    IntoElement, ListAlignment, ListState, ParentElement, Render, SharedString, Styled, Task,
+    TaskExt, WeakEntity, Window, list, prelude::*,
 };
 use parking_lot::Mutex;
 use ui::{
@@ -276,12 +276,12 @@ impl LogViewer {
         let filters_clone_for_load = filters.clone();
         cx.spawn(async move |_, cx| {
             let log_path_entries = log_path_load.clone();
-            let entries = cx.background_spawn(async move {
-                read_log_file_sync(&log_path_entries)
-            }).await;
-            let file_size = cx.background_spawn(async move {
-                get_file_size_sync(&log_path_load)
-            }).await;
+            let entries = cx
+                .background_spawn(async move { read_log_file_sync(&log_path_entries) })
+                .await;
+            let file_size = cx
+                .background_spawn(async move { get_file_size_sync(&log_path_load) })
+                .await;
             last_file_size_load.store(file_size, Ordering::Relaxed);
 
             if let Err(e) = viewer.update(cx, |this, cx| {
@@ -305,9 +305,9 @@ impl LogViewer {
                 smol::Timer::after(refresh_interval).await;
                 let last_size = last_file_size_refresh.load(Ordering::Relaxed);
                 let log_path_copy = log_path_refresh.clone();
-                let new_entries = cx.background_spawn(async move {
-                    read_new_lines_sync(&log_path_copy, last_size)
-                }).await;
+                let new_entries = cx
+                    .background_spawn(async move { read_new_lines_sync(&log_path_copy, last_size) })
+                    .await;
                 if let Some((entries, new_size)) = new_entries {
                     this.update(cx, |this, cx| {
                         let was_at_bottom = this.is_scrolled_to_bottom();
@@ -614,12 +614,9 @@ impl Render for LogViewer {
                             .color(Color::Muted),
                     )
                     .child(
-                        Label::new(format!(
-                            "{} entries",
-                            self.filtered_indices.len()
-                        ))
-                        .size(LabelSize::Small)
-                        .color(Color::Muted),
+                        Label::new(format!("{} entries", self.filtered_indices.len()))
+                            .size(LabelSize::Small)
+                            .color(Color::Muted),
                     ),
             )
             .child(if self.filtered_indices.is_empty() {
@@ -700,7 +697,8 @@ mod tests {
 
     #[test]
     fn test_parse_log_line() {
-        let line = "2024-01-15T10:30:00+08:00 ERROR mux_server::connection:42 Connection established";
+        let line =
+            "2024-01-15T10:30:00+08:00 ERROR mux_server::connection:42 Connection established";
         let entry = parse_log_line(line).expect("should parse valid log line");
         assert_eq!(entry.timestamp, "2024-01-15T10:30:00+08:00");
         assert_eq!(entry.level, LogLevel::Error);

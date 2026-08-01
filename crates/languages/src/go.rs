@@ -9,8 +9,8 @@ use language::{
     LanguageName, LspAdapterDelegate, LspInstaller, language_settings::LanguageSettings,
 };
 use lsp::{CodeActionKind, LanguageServerBinary, LanguageServerName, Uri};
-use semver::Version;
 use regex::Regex;
+use semver::Version;
 use serde_json::{Value, json};
 use settings::SemanticTokenRules;
 use smol::fs;
@@ -129,9 +129,7 @@ impl LspInstaller for GoLspAdapter {
 fn parse_version_output(output: &str) -> Option<Version> {
     let stdout = output.trim();
     // gopls v0.16.0
-    let version_str = stdout
-        .split_whitespace()
-        .find(|t| t.starts_with('v'))?;
+    let version_str = stdout.split_whitespace().find(|t| t.starts_with('v'))?;
     let version_str = version_str.strip_prefix('v')?;
     Version::parse(version_str).ok()
 }
@@ -269,4 +267,3 @@ fn adjust_runs(
     }
     runs
 }
-

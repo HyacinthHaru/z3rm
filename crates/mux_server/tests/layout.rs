@@ -43,7 +43,8 @@ fn test_split_invariants() {
     let mut tree = LayoutTree::with_pane("n1".into(), "p1".into());
 
     // 分割 p1，创建 p2
-    tree.split("p1", "p2".into(), SplitDirection::LeftRight).unwrap();
+    tree.split("p1", "p2".into(), SplitDirection::LeftRight)
+        .unwrap();
 
     // 不变量 1：所有 pane 可达
     let ids = tree.pane_ids();
@@ -54,17 +55,16 @@ fn test_split_invariants() {
     // 不变量 2：比例和 = 1.0
     if let LayoutNode::Split { ratios, .. } = &tree.root {
         let sum: f32 = ratios.iter().sum();
-        assert!(
-            (sum - 1.0).abs() < 0.001,
-            "比例和应为 1.0, 实际: {}",
-            sum
-        );
+        assert!((sum - 1.0).abs() < 0.001, "比例和应为 1.0, 实际: {}", sum);
     } else {
         panic!("分割后根节点应为 Split");
     }
 
     // 不变量 3：Split 节点子节点数 = ratios 数
-    if let LayoutNode::Split { children, ratios, .. } = &tree.root {
+    if let LayoutNode::Split {
+        children, ratios, ..
+    } = &tree.root
+    {
         assert_eq!(children.len(), ratios.len());
     }
 }
@@ -75,9 +75,11 @@ fn test_multiple_splits_invariants() {
     let mut tree = LayoutTree::with_pane("root".into(), "p1".into());
 
     // p1 → split → p1 + p2
-    tree.split("p1", "p2".into(), SplitDirection::LeftRight).unwrap();
+    tree.split("p1", "p2".into(), SplitDirection::LeftRight)
+        .unwrap();
     // p2 → split → p2 + p3
-    tree.split("p2", "p3".into(), SplitDirection::TopBottom).unwrap();
+    tree.split("p2", "p3".into(), SplitDirection::TopBottom)
+        .unwrap();
 
     let ids = tree.pane_ids();
     assert_eq!(ids.len(), 3, "应有 3 个 pane");
@@ -92,7 +94,9 @@ fn test_multiple_splits_invariants() {
 fn check_ratios(node: &LayoutNode) {
     match node {
         LayoutNode::Pane { .. } => {}
-        LayoutNode::Split { ratios, children, .. } => {
+        LayoutNode::Split {
+            ratios, children, ..
+        } => {
             let sum: f32 = ratios.iter().sum();
             assert!(
                 (sum - 1.0).abs() < 0.001,
@@ -112,8 +116,10 @@ fn check_ratios(node: &LayoutNode) {
 #[test]
 fn test_close_pane_invariants() {
     let mut tree = LayoutTree::with_pane("n1".into(), "p1".into());
-    tree.split("p1", "p2".into(), SplitDirection::LeftRight).unwrap();
-    tree.split("p2", "p3".into(), SplitDirection::TopBottom).unwrap();
+    tree.split("p1", "p2".into(), SplitDirection::LeftRight)
+        .unwrap();
+    tree.split("p2", "p3".into(), SplitDirection::TopBottom)
+        .unwrap();
 
     // 关闭 p3
     tree.remove_pane("p3").unwrap();
@@ -142,7 +148,8 @@ fn remove_sole_root_pane_errors_and_preserves_tree() {
 #[test]
 fn remove_missing_pane_errors_and_preserves_tree() {
     let mut tree = LayoutTree::with_pane("n1".into(), "p1".into());
-    tree.split("p1", "p2".into(), SplitDirection::LeftRight).unwrap();
+    tree.split("p1", "p2".into(), SplitDirection::LeftRight)
+        .unwrap();
     let before = tree.serialize(80, 24).unwrap();
 
     let error = tree
@@ -152,12 +159,12 @@ fn remove_missing_pane_errors_and_preserves_tree() {
     assert_eq!(tree.serialize(80, 24).unwrap(), before);
 }
 
-
 /// §3.10 Resize pane 后不变量
 #[test]
 fn test_resize_pane_invariants() {
     let mut tree = LayoutTree::with_pane("n1".into(), "p1".into());
-    tree.split("p1", "p2".into(), SplitDirection::LeftRight).unwrap();
+    tree.split("p1", "p2".into(), SplitDirection::LeftRight)
+        .unwrap();
 
     // 初始比例 [0.5, 0.5]
     if let LayoutNode::Split { ratios, .. } = &tree.root {
@@ -165,7 +172,8 @@ fn test_resize_pane_invariants() {
     }
 
     // 放大 p1 (delta = 0.1)
-    tree.resize_pane("p1", SplitDirection::LeftRight, 0.1).unwrap();
+    tree.resize_pane("p1", SplitDirection::LeftRight, 0.1)
+        .unwrap();
 
     // 验证比例归一化后和 ≈ 1.0
     check_ratios(&tree.root);
@@ -208,7 +216,8 @@ fn test_serialize_single_pane() {
 #[test]
 fn test_serialize_split_layout() {
     let mut tree = LayoutTree::with_pane("n1".into(), "p1".into());
-    tree.split("p1", "p2".into(), SplitDirection::LeftRight).unwrap();
+    tree.split("p1", "p2".into(), SplitDirection::LeftRight)
+        .unwrap();
 
     let serialized = tree.serialize(80, 24).unwrap();
 
@@ -224,7 +233,9 @@ fn test_serialize_split_layout() {
     ids.sort();
     assert_eq!(ids, vec!["p1".to_string(), "p2".to_string()]);
     match &parsed.root {
-        LayoutNode::Split { direction, ratios, .. } => {
+        LayoutNode::Split {
+            direction, ratios, ..
+        } => {
             assert_eq!(*direction, SplitDirection::LeftRight);
             assert_eq!(ratios.len(), 2);
             assert!((ratios[0] - 0.5).abs() < 0.05);

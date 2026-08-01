@@ -2,9 +2,9 @@
 // ServerClipboard 维护全局剪贴板状态，支持 text/image/file-path 内容类型，
 // 携带 origin_host 元数据，通过 OSC 52 和 bracketed paste 集成 (§16.6)。
 
-use mux_protocol::proto::clipboard_entry::ClipboardContentType as ProtoContentType;
-use mux_protocol::proto::ClipboardEntry as ProtoClipboardEntry;
 use base64::Engine;
+use mux_protocol::proto::ClipboardEntry as ProtoClipboardEntry;
+use mux_protocol::proto::clipboard_entry::ClipboardContentType as ProtoContentType;
 use tokio::sync::mpsc;
 
 /// §16.6 剪贴板内容类型
@@ -106,11 +106,9 @@ impl ServerClipboard {
         }
         // §16.6 推送 ClipboardChanged 到所有会话客户端 (at-least-once fan-out)。
         let notification = mux_protocol::Notification {
-            event: Some(
-                mux_protocol::notification::Event::ClipboardChanged(
-                    mux_protocol::ClipboardChanged {},
-                ),
-            ),
+            event: Some(mux_protocol::notification::Event::ClipboardChanged(
+                mux_protocol::ClipboardChanged {},
+            )),
         };
         let envelope = mux_protocol::Envelope {
             version: Some(mux_protocol::PROTOCOL_VERSION.clone()),
@@ -291,8 +289,8 @@ mod tests {
         let mut parser = Osc52Parser::new();
         // OSC 52 ; c ; SGVsbG8= BEL (base64 for "Hello")
         let bytes: Vec<u8> = vec![
-            0x1B, 0x5D, b'5', b'2', b';', b'c', b';', b'S', b'G', b'V', b's', b'b', b'G',
-            b'8', b'=', 0x07,
+            0x1B, 0x5D, b'5', b'2', b';', b'c', b';', b'S', b'G', b'V', b's', b'b', b'G', b'8',
+            b'=', 0x07,
         ];
         let result = parser.feed(&bytes);
         assert!(result.is_some());
@@ -306,8 +304,8 @@ mod tests {
         let mut parser = Osc52Parser::new();
         // OSC 52 ; c ; dGVzdA== ESC \
         let bytes: Vec<u8> = vec![
-            0x1B, 0x5D, b'5', b'2', b';', b'c', b';', b'd', b'G', b'V', b'z', b'd', b'A',
-            b'=', b'=', 0x1B, b'\\',
+            0x1B, 0x5D, b'5', b'2', b';', b'c', b';', b'd', b'G', b'V', b'z', b'd', b'A', b'=',
+            b'=', 0x1B, b'\\',
         ];
         let result = parser.feed(&bytes);
         assert!(result.is_some());
@@ -403,10 +401,7 @@ mod tests {
         ));
 
         // 第二次更新
-        clipboard.set_clipboard(
-            ClipboardEntry::text("second", "host2".to_string()),
-            &[tx],
-        );
+        clipboard.set_clipboard(ClipboardEntry::text("second", "host2".to_string()), &[tx]);
         let notification = rx.try_recv();
         assert!(notification.is_ok());
 
@@ -423,16 +418,19 @@ mod tests {
             (1, ClipboardContentType::Text),
             (2, ClipboardContentType::ImagePng),
             (3, ClipboardContentType::FilePath),
-            (0, ClipboardContentType::Text), // unspecified → text
+            (0, ClipboardContentType::Text),  // unspecified → text
             (99, ClipboardContentType::Text), // unknown → text
         ] {
             let ct = ClipboardContentType::from_proto_value(val);
             assert_eq!(ct, expected);
-            assert_eq!(ct.to_proto_value(), match expected {
-                ClipboardContentType::Text => ProtoContentType::Text as i32,
-                ClipboardContentType::ImagePng => ProtoContentType::ImagePng as i32,
-                ClipboardContentType::FilePath => ProtoContentType::FilePath as i32,
-            });
+            assert_eq!(
+                ct.to_proto_value(),
+                match expected {
+                    ClipboardContentType::Text => ProtoContentType::Text as i32,
+                    ClipboardContentType::ImagePng => ProtoContentType::ImagePng as i32,
+                    ClipboardContentType::FilePath => ProtoContentType::FilePath as i32,
+                }
+            );
         }
     }
 }

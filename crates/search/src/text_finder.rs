@@ -14,9 +14,9 @@ use language::Buffer;
 use picker::Picker;
 
 use project::ProjectPath;
-use workspace::settings_stubs::SeedQuerySetting;
 use text::Anchor;
 use ui::Window;
+use workspace::settings_stubs::SeedQuerySetting;
 use workspace::{
     DismissDecision, ModalView, Workspace, WorkspaceDb, WorkspaceId,
     searchable::SearchableItemHandle,

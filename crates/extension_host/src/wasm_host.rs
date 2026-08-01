@@ -430,7 +430,6 @@ impl extension::Extension for WasmExtension {
         })
         .await?
     }
-
 }
 
 pub struct WasmState {

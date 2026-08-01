@@ -1,3 +1,4 @@
+use crate::git_panel_settings::{GitPanelGroupBy, GitPanelSortBy};
 use crate::{
     git_panel::{GitPanel, GitStatusEntry},
     git_panel_settings::GitPanelSettings,
@@ -24,7 +25,6 @@ use project::{
         diff_buffer_list::{self, BranchDiffEvent, DiffBase},
     },
 };
-use crate::git_panel_settings::{GitPanelGroupBy, GitPanelSortBy};
 use settings::{Settings, SettingsStore};
 use std::{collections::BTreeMap, sync::Arc};
 use theme::ActiveTheme;

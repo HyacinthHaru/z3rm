@@ -49,14 +49,12 @@ use workspace::{
     client_side_decorations,
 };
 use zed_actions::{
-    OpenProjectSettings, OpenSettings, OpenSettingsAt,
-    OpenSettingsAtTarget, OpenSettingsPage,
+    OpenProjectSettings, OpenSettings, OpenSettingsAt, OpenSettingsAtTarget, OpenSettingsPage,
 };
 
 use crate::components::{
     EnumVariantDropdown, NumberField, NumberFieldMode, NumberFieldType, SettingsInputField,
-    SettingsSectionHeader, font_picker, icon_theme_picker,
-    text_field_a11y_state, theme_picker,
+    SettingsSectionHeader, font_picker, icon_theme_picker, text_field_a11y_state, theme_picker,
 };
 
 const NAVBAR_CONTAINER_TAB_INDEX: isize = 0;
@@ -114,7 +112,7 @@ struct SettingField<T: 'static> {
     /// organization's settings. Takes the organization configuration and the
     /// resolved settings value, and returns `Some(...)` if the organization
     /// overrides the setting, otherwise `None`.
-//     organization_override: Option<fn(&OrganizationConfiguration) -> Option<&T>>,
+    //     organization_override: Option<fn(&OrganizationConfiguration) -> Option<&T>>,
 
     /// A json-path-like string that gives a unique-ish string that identifies
     /// where in the JSON the setting is defined.
@@ -1650,8 +1648,6 @@ impl SettingsWindow {
         })
         .detach();
 
-
-
         cx.on_window_closed(|cx, _window_id| {
             if let Some(existing_window) = cx
                 .windows()
@@ -1668,7 +1664,6 @@ impl SettingsWindow {
             }
         })
         .detach();
-
 
         let this_weak = cx.weak_entity();
         cx.observe_new::<Project>({
@@ -3499,7 +3494,6 @@ impl SettingsWindow {
         let page_content;
 
         if let Some(current_sub_page) = self.sub_page_stack.last() {
-
             page_header = h_flex()
                 .w_full()
                 .min_w_0()
@@ -3536,7 +3530,7 @@ impl SettingsWindow {
                                         this.open_current_settings_file(window, cx);
                                     })),
                             )
-                        })
+                        }),
                 )
                 .into_any_element();
 
@@ -4882,7 +4876,7 @@ pub mod test {
         theme_settings::init(theme::LoadThemes::JustBase, cx);
         editor::init(cx);
         menu::init();
-//         language_model::init(cx);
+        //         language_model::init(cx);
     }
 
     fn parse(input: &'static str, window: &mut Window, cx: &mut App) -> SettingsWindow {
@@ -4991,7 +4985,6 @@ pub mod test {
             regex_validation_error: None,
             sandbox_host_validation_error: None,
             last_copied_link_path: None,
-
         };
 
         settings_window.build_filter_table();
@@ -5610,8 +5603,6 @@ pub mod test {
             );
         });
     }
-
-
 }
 
 #[cfg(test)]

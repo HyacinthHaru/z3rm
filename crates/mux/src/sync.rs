@@ -51,9 +51,9 @@ pub fn scan_extensions_dir(base_dir: &Path) -> Result<Vec<ExtensionInfo>> {
         return Ok(extensions);
     }
 
-    for entry in std::fs::read_dir(base_dir).with_context(|| {
-        format!("读取扩展目录失败: {}", base_dir.display())
-    })? {
+    for entry in std::fs::read_dir(base_dir)
+        .with_context(|| format!("读取扩展目录失败: {}", base_dir.display()))?
+    {
         let entry = entry.context("读取目录条目失败")?;
         let path = entry.path();
 
@@ -85,8 +85,10 @@ pub fn scan_extensions_dir(base_dir: &Path) -> Result<Vec<ExtensionInfo>> {
         );
 
         // §16.6 仅同步服务端扩展和双端扩展。
-        if matches!(info.runtime_side, ExtensionRuntimeSide::ServerSide | ExtensionRuntimeSide::Both)
-            && info.sync
+        if matches!(
+            info.runtime_side,
+            ExtensionRuntimeSide::ServerSide | ExtensionRuntimeSide::Both
+        ) && info.sync
         {
             extensions.push(info);
         }
@@ -114,8 +116,6 @@ pub fn default_extensions_dir() -> PathBuf {
 
 /// §16.6 将扩展目录打包为字节数组（tar.gz）。
 pub fn pack_extension(source_dir: &Path) -> Result<Vec<u8>> {
-
-
     // §16.6 实际打包逻辑（简化版）。
     let mut archive = tar::Builder::new(Vec::new());
     for entry in std::fs::read_dir(source_dir)? {
@@ -123,9 +123,11 @@ pub fn pack_extension(source_dir: &Path) -> Result<Vec<u8>> {
         let path = entry.path();
         if path.is_file() {
             let mut file = std::fs::File::open(&path)?;
-            let name = path.file_name()
+            let name = path
+                .file_name()
                 .ok_or_else(|| anyhow!("path has no file name: {}", path.display()))?
-                .to_string_lossy().to_string();
+                .to_string_lossy()
+                .to_string();
             archive.append_file(&name, &mut file)?;
         }
     }
@@ -155,16 +157,16 @@ pub async fn install_remote_extension(
     source: &[u8],
 ) -> Result<()> {
     // §16.6 构建 InstallExtensionRequest。
-    let body = RequestBody::InstallExtension(
-        mux_protocol::InstallExtensionRequest {
-            name: name.to_string(),
-            manifest: manifest.to_vec(),
-            source: source.to_vec(),
-        },
-    );
+    let body = RequestBody::InstallExtension(mux_protocol::InstallExtensionRequest {
+        name: name.to_string(),
+        manifest: manifest.to_vec(),
+        source: source.to_vec(),
+    });
 
     // §16.6 发送请求并等待响应。
-    let resp = domain.send_request(body).await
+    let resp = domain
+        .send_request(body)
+        .await
         .context("发送扩展安装请求失败")?;
 
     // §16.6 检查响应结果。
@@ -219,10 +221,7 @@ pub async fn sync_extensions_to_remote(domain: &MuxDomain, base_dir: &Path) -> R
             .with_context(|| format!("安装远程扩展失败: {}", ext.name))?;
     }
 
-    tracing::info!(
-        count = extensions.len(),
-        "扩展同步完成"
-    );
+    tracing::info!(count = extensions.len(), "扩展同步完成");
     Ok(())
 }
 

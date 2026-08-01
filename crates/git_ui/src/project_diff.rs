@@ -58,7 +58,6 @@ actions!(
 #[action(namespace = git, name = "BranchDiff")]
 pub(crate) struct DeployBranchDiff;
 
-
 pub struct ProjectDiff {
     project: Entity<Project>,
     workspace: WeakEntity<Workspace>,
@@ -162,7 +161,7 @@ impl ProjectDiff {
         window: &mut Window,
         cx: &mut Context<Workspace>,
     ) {
-//         telemetry::event!("Git Diff Opened", source = "Agent Panel");
+        //         telemetry::event!("Git Diff Opened", source = "Agent Panel");
         let existing = workspace.items_of_type::<Self>(cx).next();
         let project_diff = if let Some(existing) = existing {
             workspace.activate_item(&existing, true, true, window, cx);
@@ -944,6 +943,7 @@ impl Render for ProjectDiffToolbar {
 
 #[cfg(test)]
 mod tests {
+    use crate::git_panel_settings::{GitPanelGroupBy, GitPanelSortBy};
     use buffer_diff::DiffHunkSecondaryStatus;
     use db::indoc;
     use editor::test::editor_test_context::{EditorTestContext, assert_state_with_diff};
@@ -951,7 +951,6 @@ mod tests {
     use multi_buffer::PathKey;
     use project::FakeFs;
     use serde_json::json;
-    use crate::git_panel_settings::{GitPanelGroupBy, GitPanelSortBy};
     use settings::SettingsStore;
     use std::path::Path;
     use unindent::Unindent as _;
@@ -1829,8 +1828,6 @@ mod tests {
             .unindent(),
         );
     }
-
-
 
     #[gpui::test]
     async fn test_excerpts_splitting_after_restoring_the_middle_excerpt(cx: &mut TestAppContext) {

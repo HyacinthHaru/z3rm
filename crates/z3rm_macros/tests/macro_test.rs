@@ -55,7 +55,9 @@ fn macro_fills_file_and_line() {
 #[test]
 fn macro_description_optional() {
     let all: Vec<&Z3rmTodo> = inventory::iter::<Z3rmTodo>().into_iter().collect();
-    let no_desc = all.iter().find(|h| h.category == "stub" && h.description.is_empty());
+    let no_desc = all
+        .iter()
+        .find(|h| h.category == "stub" && h.description.is_empty());
     assert!(no_desc.is_some());
 }
 

@@ -109,7 +109,7 @@ use multi_buffer::{
 use project::project_settings::DiagnosticSeverity;
 use project::{InlayId, lsp_store::LspFoldingRange, lsp_store::TokenType};
 use serde::Deserialize;
-use settings::{Settings, SemanticTokens};
+use settings::{SemanticTokens, Settings};
 use smallvec::SmallVec;
 use sum_tree::{Bias, TreeMap};
 use text::{BufferId, LineIndent, Patch};
@@ -130,9 +130,7 @@ use std::{
     sync::Arc,
 };
 
-use crate::{
-    EditorStyle, RowExt, InlayHighlight, Inlay, movement::TextLayoutDetails,
-};
+use crate::{EditorStyle, Inlay, InlayHighlight, RowExt, movement::TextLayoutDetails};
 use block_map::{BlockPointCursor, BlockRow, BlockSnapshot};
 use fold_map::{FoldPointCursor, FoldSnapshot};
 use inlay_map::{BufferOffsetToInlayPointCursor, InlaySnapshot};

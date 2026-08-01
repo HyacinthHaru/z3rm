@@ -207,12 +207,16 @@ pub fn detect_full_screen_enable(output: &[u8]) -> FullScreenMode {
         if let Some(code) = parse_csi_parameter(output, pos) {
             match code {
                 1049 | 1047 => mode = FullScreenMode::AltScreen,
-                2004 => if mode == FullScreenMode::None {
-                    mode = FullScreenMode::BracketedPaste
-                },
-                1002 | 1003 | 1006 => if mode == FullScreenMode::None {
-                    mode = FullScreenMode::MouseTracking
-                },
+                2004 => {
+                    if mode == FullScreenMode::None {
+                        mode = FullScreenMode::BracketedPaste
+                    }
+                }
+                1002 | 1003 | 1006 => {
+                    if mode == FullScreenMode::None {
+                        mode = FullScreenMode::MouseTracking
+                    }
+                }
                 _ => {}
             }
         }
@@ -258,10 +262,7 @@ fn find_csi_sequence(bytes: &[u8], _mode_byte: u8, suffix: u8) -> Option<usize> 
     const QMARK: u8 = 0x3F;
 
     for i in 0..bytes.len().saturating_sub(3) {
-        if bytes[i] == ESC
-            && bytes[i + 1] == LBRACKET
-            && bytes[i + 2] == QMARK
-        {
+        if bytes[i] == ESC && bytes[i + 1] == LBRACKET && bytes[i + 2] == QMARK {
             // 找到 ESC[? 开头，向后查找 suffix
             for j in (i + 3)..bytes.len() {
                 if bytes[j] == suffix {
@@ -306,11 +307,7 @@ fn parse_csi_parameter(bytes: &[u8], start: usize) -> Option<u32> {
         }
     }
 
-    if found_digit {
-        Some(num)
-    } else {
-        None
-    }
+    if found_digit { Some(num) } else { None }
 }
 
 /// §16.7 Prefix mode 超时配置
@@ -440,7 +437,7 @@ pub fn handle_key_event(
             PrefixAction::DoubleTapLiteral => {
                 return KeyDispatchResult::SendLiteral {
                     bytes: key_bytes.to_vec(),
-                }
+                };
             }
             // §16.7 unmatched key after prefix: exit prefix mode and send the
             // key to the PTY (tmux parity). Passthrough here means "to PTY",
@@ -468,7 +465,7 @@ pub fn handle_key_event(
             machine.on_timeout();
             return KeyDispatchResult::SendLiteral {
                 bytes: key_bytes.to_vec(),
-            }
+            };
         }
         // §16.7 全屏应用 passthrough: 直接发送到 PTY
         return KeyDispatchResult::SendToPty {
@@ -799,10 +796,7 @@ mod tests {
 
         // 再次按下 prefix key (double-tap)
         let result = handle_key_event(b"\x02", true, false, &mut ctx);
-        assert_eq!(
-            result,
-            KeyDispatchResult::SendLiteral { bytes: vec![0x02] }
-        );
+        assert_eq!(result, KeyDispatchResult::SendLiteral { bytes: vec![0x02] });
     }
 
     #[test]
@@ -841,10 +835,7 @@ mod tests {
         };
 
         let result = handle_key_event(b"v", false, false, &mut ctx);
-        assert_eq!(
-            result,
-            KeyDispatchResult::SendToPty { bytes: vec![b'v'] }
-        );
+        assert_eq!(result, KeyDispatchResult::SendToPty { bytes: vec![b'v'] });
     }
 
     #[test]

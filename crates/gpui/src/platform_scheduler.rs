@@ -3,8 +3,8 @@ use async_task::Runnable;
 use chrono::{DateTime, Utc};
 use futures::channel::oneshot;
 use scheduler::{
-    BackgroundExecutor, Clock, Instant, LocalExecutor, Priority, Scheduler, SessionId,
-    SpawnTime, Task, TestScheduler, Timer, spawn_dedicated_thread,
+    BackgroundExecutor, Clock, Instant, LocalExecutor, Priority, Scheduler, SessionId, SpawnTime,
+    Task, TestScheduler, Timer, spawn_dedicated_thread,
 };
 #[cfg(not(target_family = "wasm"))]
 use std::task::{Context, Poll};

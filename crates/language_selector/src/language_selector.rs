@@ -9,8 +9,8 @@ use gpui::{
     Render, TaskExt, WeakEntity, Window, actions,
 };
 use language::{Buffer, LanguageMatcher, LanguageName, LanguageRegistry};
-use project::FileFinderSettings;
 use picker::{Picker, PickerDelegate};
+use project::FileFinderSettings;
 use project::Project;
 use settings::Settings;
 use std::{ops::Not as _, path::Path, sync::Arc};
