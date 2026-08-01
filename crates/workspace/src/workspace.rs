@@ -1680,7 +1680,13 @@ impl Workspace {
                                 multi_workspace.add(workspace.clone(), &*window, cx);
                             }
                             OpenMode::NewWindow => {
-                                unreachable!()
+                                // A new-window request opens its own window, so it must never
+                                // arrive together with a window to replace. Degrade to adding
+                                // the workspace rather than aborting the process.
+                                log::warn!(
+                                    "OpenMode::NewWindow paired with window_to_replace; degrading to add"
+                                );
+                                multi_workspace.add(workspace.clone(), &*window, cx);
                             }
                         }
                         workspace

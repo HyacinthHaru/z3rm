@@ -158,11 +158,10 @@ impl SnapshotWatch {
     }
 
     fn send_command(&self, command: ShadowCommand) -> Result<()> {
-        let sender = self
-            .inner
-            .command_sender
-            .lock()
-            .expect("command mutex poisoned");
+        // A prior panic may poison this mutex, but the optional sender itself is
+        // still usable. Recover the guard so an RPC returns an ordinary channel
+        // error instead of aborting the process.
+        let sender = lock_for_shutdown(&self.inner.command_sender);
         sender
             .as_ref()
             .context("shadow recorder is stopped")?
