@@ -591,3 +591,46 @@ fn test_session_new_has_no_windows() {
     assert_eq!(session.window_count(), 0);
     assert!(session.get_windows().is_empty());
 }
+
+#[test]
+fn split_rejects_existing_pane_id_atomically() {
+    let mut tree = LayoutTree::with_pane("n1".into(), "p1".into());
+    tree.split("p1", "p2".into(), SplitDirection::TopBottom).expect("first split");
+    let before = tree.pane_ids();
+    assert!(
+        tree.split("p1", "p2".into(), SplitDirection::TopBottom).is_err(),
+        "re-splitting an existing pane id must fail"
+    );
+    assert_eq!(tree.pane_ids(), before, "failed split must not mutate the tree");
+}
+
+#[test]
+fn alternating_split_depth_is_bounded_on_the_wire() {
+    let mut tree = LayoutTree::with_pane("node-1".into(), "pane-0".into());
+    let mut focused = "pane-0".to_string();
+    for index in 1..=crate::layout::MAX_WIRE_LAYOUT_DEPTH {
+        let next = format!("pane-{index}");
+        let direction = if index % 2 == 0 {
+            SplitDirection::LeftRight
+        } else {
+            SplitDirection::TopBottom
+        };
+        tree.split(&focused, next.clone(), direction).expect("split within wire depth");
+        focused = next;
+    }
+    let before = tree.pane_ids();
+    let overflow_direction = if crate::layout::MAX_WIRE_LAYOUT_DEPTH % 2 == 0 {
+        SplitDirection::TopBottom
+    } else {
+        SplitDirection::LeftRight
+    };
+    let error = tree
+        .split(&focused, "too-deep".into(), overflow_direction)
+        .expect_err("alternating split beyond wire depth must fail");
+    assert!(
+        error.to_string().contains("wire depth"),
+        "error should name the wire-depth limit: {error}"
+    );
+    assert_eq!(tree.pane_ids(), before);
+    assert!(tree.root.find_pane("too-deep").is_none());
+}
