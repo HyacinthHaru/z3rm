@@ -6351,8 +6351,9 @@ pub fn outline(
 #[cfg(test)]
 mod tests {
     use crate::{
-        AppContext as _, Bounds, Context, IntoElement, ParentElement as _, Pixels, Render,
-        Styled as _, TestAppContext, Window, canvas, div, px, size,
+        accesskit, AppContext as _, Bounds, Context, InteractiveElement as _, IntoElement,
+        ParentElement as _, Pixels, Render, StatefulInteractiveElement as _, Styled as _,
+        TestAppContext, Window, canvas, div, px, size,
     };
     use std::{cell::Cell, rc::Rc};
 
@@ -6490,6 +6491,219 @@ mod tests {
                 .unwrap();
             assert!(json.is_some(), "a11y tree must be available every frame");
         }
+        unsafe {
+            std::env::remove_var("Z3RM_A11Y_BUILD_HEADLESS");
+        }
+    }
+
+    struct ActionRootView {
+        clicked: Rc<Cell<bool>>,
+    }
+
+    impl Render for ActionRootView {
+        fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+            let clicked = self.clicked.clone();
+            div().size_full().child(
+                div()
+                    .id("a11y-button")
+                    .role(accesskit::Role::Button)
+                    .w(px(100.))
+                    .h(px(40.))
+                    .on_click(move |_event, _window, _app| clicked.set(true)),
+            )
+        }
+    }
+
+    struct DeclarativeActionRootView {
+        activated: Rc<Cell<bool>>,
+    }
+
+    impl Render for DeclarativeActionRootView {
+        fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+            let activated = self.activated.clone();
+            div().size_full().child(
+                div()
+                    .id("declarative-a11y-button")
+                    .role(accesskit::Role::Button)
+                    .w(px(100.))
+                    .h(px(40.))
+                    .on_a11y_action(accesskit::Action::Click, move |_data, _window, _cx| {
+                        activated.set(true)
+                    }),
+            )
+        }
+    }
+
+    #[test]
+    fn declarative_a11y_action_reaches_element_listener() {
+        unsafe {
+            std::env::set_var("Z3RM_A11Y_BUILD_HEADLESS", "1");
+        }
+        let mut cx = TestAppContext::single();
+        let activated = Rc::new(Cell::new(false));
+        let window = cx.add_window({
+            let activated = activated.clone();
+            move |_, _| DeclarativeActionRootView { activated }
+        });
+
+        let tree_json = cx
+            .update_window(window.into(), |_, window, cx| {
+                window.draw(cx).clear();
+                window.debug_a11y_tree_json()
+            })
+            .unwrap()
+            .expect("a11y tree must be available under Z3RM_A11Y_BUILD_HEADLESS");
+        let button_id = button_a11y_node_id(&tree_json);
+        let delivered = cx
+            .test_window(window.into())
+            .simulate_a11y_action(accesskit::ActionRequest {
+                target_tree: accesskit::TreeId::ROOT,
+                target_node: button_id,
+                action: accesskit::Action::Click,
+                data: None,
+            });
+        assert!(delivered, "TestWindow must preserve the AccessKit action callback");
+        cx.run_until_parked();
+        assert!(activated.get(), "declarative element listener must run");
+        unsafe {
+            std::env::remove_var("Z3RM_A11Y_BUILD_HEADLESS");
+        }
+    }
+
+    /// Extracts the `accesskit::NodeId` the built tree assigned to the
+    /// Button node from a `debug_a11y_tree_json` dump. Using the identity
+    /// the tree actually produced (rather than a re-derived guess) makes the
+    /// semantic-action tests verify stable node identity end to end.
+    fn button_a11y_node_id(tree_json: &str) -> accesskit::NodeId {
+        let parsed: serde_json::Value =
+            serde_json::from_str(tree_json).expect("a11y tree JSON must parse");
+        let nodes = parsed["nodes"]
+            .as_object()
+            .expect("a11y tree JSON must contain a nodes object");
+        for node in nodes.values() {
+            if node["aria"]["role"].as_str() == Some("Button") {
+                let id = node["accesskit_id"]
+                    .as_str()
+                    .expect("node must carry an accesskit_id");
+                return accesskit::NodeId(id.parse().expect("accesskit_id must be a u64"));
+            }
+        }
+        panic!("a11y tree must contain a Button node");
+    }
+
+    /// §15.12 Semantic actions: `TestWindow::a11y_init` must preserve the
+    /// AccessKit action callback (it was previously dropped), so a screen
+    /// reader action can be injected deterministically. The injected request
+    /// must travel through the production callback into
+    /// `Window::handle_a11y_action` and invoke the listener registered with
+    /// `Window::on_a11y_action` for the exact node id the built tree
+    /// produced — stable node identity, not an inspection-only path.
+    #[test]
+    fn a11y_semantic_action_reaches_registered_listener() {
+        // SAFETY: testenv isolation — this test is the only toucher of the
+        // env var on its thread, and TestAppContext owns its own state.
+        unsafe {
+            std::env::set_var("Z3RM_A11Y_BUILD_HEADLESS", "1");
+        }
+        let mut cx = TestAppContext::single();
+        let window = cx.add_window(|_, _| ActionRootView {
+            clicked: Rc::new(Cell::new(false)),
+        });
+
+        // Draw once so the in-memory a11y builder produces the tree, then
+        // read the node id the tree assigned to the button. Registering the
+        // listener after the last draw matters: `begin_frame` clears
+        // `action_listeners` at the start of each frame.
+        let tree_json = cx
+            .update_window(window.into(), |_, window, cx| {
+                window.draw(cx).clear();
+                window.debug_a11y_tree_json()
+            })
+            .unwrap()
+            .expect("a11y tree must be available under Z3RM_A11Y_BUILD_HEADLESS");
+        let button_id = button_a11y_node_id(&tree_json);
+        cx.run_until_parked();
+
+        let action_received = Rc::new(Cell::new(false));
+        cx.update_window(window.into(), |_, window, _cx| {
+            window.on_a11y_action(button_id, accesskit::Action::Click, {
+                let action_received = action_received.clone();
+                move |_data, _window, _cx| action_received.set(true)
+            });
+        })
+        .unwrap();
+
+        // Inject the semantic action through the preserved platform callback.
+        let delivered = cx
+            .test_window(window.into())
+            .simulate_a11y_action(accesskit::ActionRequest {
+                target_tree: accesskit::TreeId::ROOT,
+                target_node: button_id,
+                action: accesskit::Action::Click,
+                data: None,
+            });
+        assert!(
+            delivered,
+            "TestWindow must preserve the AccessKit action callback"
+        );
+        // Pump the GPUI dispatcher so the production action channel task
+        // delivers the request to `Window::handle_a11y_action`.
+        cx.run_until_parked();
+
+        assert!(
+            action_received.get(),
+            "a11y action must reach the listener registered for node {button_id:?}"
+        );
+        unsafe {
+            std::env::remove_var("Z3RM_A11Y_BUILD_HEADLESS");
+        }
+    }
+
+    /// §15.12 Built-in action handling: with no listener registered for a
+    /// node, `Action::Click` must still produce the real GPUI event effect —
+    /// synthesized mouse down/up at the node's bounds center — firing the
+    /// element's actual click handler.
+    #[test]
+    fn a11y_click_action_dispatches_real_click_event() {
+        // SAFETY: testenv isolation — this test is the only toucher of the
+        // env var on its thread, and TestAppContext owns its own state.
+        unsafe {
+            std::env::set_var("Z3RM_A11Y_BUILD_HEADLESS", "1");
+        }
+        let mut cx = TestAppContext::single();
+        let clicked = Rc::new(Cell::new(false));
+        let window = cx.add_window({
+            let clicked = clicked.clone();
+            move |_, _| ActionRootView { clicked }
+        });
+
+        let tree_json = cx
+            .update_window(window.into(), |_, window, cx| {
+                window.draw(cx).clear();
+                window.debug_a11y_tree_json()
+            })
+            .unwrap()
+            .expect("a11y tree must be available under Z3RM_A11Y_BUILD_HEADLESS");
+        let button_id = button_a11y_node_id(&tree_json);
+
+        let delivered = cx
+            .test_window(window.into())
+            .simulate_a11y_action(accesskit::ActionRequest {
+                target_tree: accesskit::TreeId::ROOT,
+                target_node: button_id,
+                action: accesskit::Action::Click,
+                data: None,
+            });
+        assert!(
+            delivered,
+            "TestWindow must preserve the AccessKit action callback"
+        );
+        cx.run_until_parked();
+
+        assert!(
+            clicked.get(),
+            "a11y Click must dispatch a real mouse click to the element at the node's bounds"
+        );
         unsafe {
             std::env::remove_var("Z3RM_A11Y_BUILD_HEADLESS");
         }

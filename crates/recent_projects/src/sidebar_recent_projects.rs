@@ -249,22 +249,12 @@ impl PickerDelegate for SidebarRecentProjectsDelegate {
                     });
                 }
             }
-            SerializedWorkspaceLocation::Remote(_host) => {
-                // Remote project reopening stubbed (spec §8.2 M3)
-                let workspace = workspace.clone();
-                let paths = recent_workspace.paths.paths().to_vec();
+            SerializedWorkspaceLocation::Remote(host) => {
+                let message = format!(
+                    "Cannot reopen remote project at {host}: remote project workspaces are not supported by this build"
+                );
                 workspace.update(cx, |workspace, cx| {
-                    let app_state = workspace.app_state().clone();
-                    let replace_window = window.window_handle().downcast::<MultiWorkspace>();
-                    let open_options = OpenOptions {
-                        requesting_window: replace_window,
-                        ..Default::default()
-                    };
-                    cx.spawn_in(window, async move |_, cx| {
-                        // Stub: remote project no longer supported
-                        let _ = (paths, app_state, open_options);
-                    })
-                    .detach();
+                    workspace.show_error(message, cx);
                 });
             }
         }

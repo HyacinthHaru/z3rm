@@ -740,9 +740,11 @@ impl<'de> Deserialize<'de> for Hsla {
     }
 }
 
+/// The kind of a [`Background`]: a solid fill, a linear gradient, a slash
+/// pattern, or a checkerboard pattern.
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize, JsonSchema)]
 #[repr(C)]
-pub(crate) enum BackgroundTag {
+pub enum BackgroundTag {
     Solid = 0,
     LinearGradient = 1,
     PatternSlash = 2,
@@ -806,6 +808,35 @@ impl std::fmt::Debug for Background {
                 self.solid, self.gradient_angle_or_pattern_height
             ),
         }
+    }
+}
+
+impl Background {
+    /// The kind of background (solid, gradient, or pattern).
+    pub fn tag(&self) -> BackgroundTag {
+        self.tag
+    }
+
+    /// The color space used for gradient interpolation.
+    pub fn interpolation_color_space(&self) -> ColorSpace {
+        self.color_space
+    }
+
+    /// The solid color, used directly for solid backgrounds and as the
+    /// pattern color for slash/checkerboard backgrounds.
+    pub fn solid_color(&self) -> Hsla {
+        self.solid
+    }
+
+    /// For gradients, the angle in degrees; for slash/checkerboard patterns,
+    /// the encoded pattern height.
+    pub fn gradient_angle_or_pattern_height(&self) -> f32 {
+        self.gradient_angle_or_pattern_height
+    }
+
+    /// The gradient color stops.
+    pub fn gradient_stops(&self) -> [LinearColorStop; 2] {
+        self.colors
     }
 }
 

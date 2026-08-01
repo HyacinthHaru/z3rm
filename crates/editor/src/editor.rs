@@ -215,6 +215,7 @@ use std::{
     iter::{self, Peekable},
     mem,
     ops::{Deref, DerefMut, Not, Range, RangeInclusive},
+    num::NonZeroU32,
     path::{Path, PathBuf},
     rc::Rc,
     sync::Arc,
@@ -1790,12 +1791,29 @@ impl Editor {
     pub fn hide_hovered_link(&mut self, _cx: &mut Context<Self>) {
     }
 
-    /// Stub: set_input_enabled (input mode 模块已删除)
-    pub fn set_input_enabled(&mut self, _enabled: bool) {
+    pub fn set_input_enabled(&mut self, enabled: bool) {
+        self.input_enabled = enabled;
+        self.expects_character_input = enabled;
     }
 
-    /// Stub: disable_diagnostics (diagnostics UI 模块已删除)
-    pub fn disable_diagnostics(&mut self, _cx: &mut Context<Self>) {
+    pub fn disable_diagnostics(&mut self, cx: &mut Context<Self>) {
+        self.diagnostics_enabled = false;
+        self.inline_diagnostics_enabled = false;
+        self.inline_diagnostics.clear();
+        cx.notify();
+    }
+
+    pub fn toggle_diagnostics(
+        &mut self,
+        _: &ToggleDiagnostics,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.diagnostics_enabled = !self.diagnostics_enabled;
+        if !self.diagnostics_enabled {
+            self.inline_diagnostics.clear();
+        }
+        cx.notify();
     }
 
     /// Stub: unmark text (编辑功能已删除)
@@ -1884,9 +1902,8 @@ impl Editor {
     ) {
     }
 
-    /// Stub: diagnostics_enabled (diagnostics 模块已删除)
     pub fn diagnostics_enabled(&self) -> bool {
-        false
+        self.diagnostics_enabled
     }
 
     /// Stub: insert_snippet_at_selections (snippet 模块已删除)
@@ -2862,12 +2879,31 @@ impl Editor {
     }
 
     pub fn new_in_workspace(
-        _workspace: &mut Workspace,
-        _window: &mut Window,
-        _cx: &mut Context<Workspace>,
+        workspace: &mut Workspace,
+        window: &mut Window,
+        cx: &mut Context<Workspace>,
     ) -> Task<Result<Entity<Editor>>> {
-        // 只读编辑器：project.create_buffer 签名不匹配，返回错误。
-        Task::ready(Err(anyhow!("new buffer creation disabled in read-only editor")))
+        let project = workspace.project().clone();
+        let create = project.update(cx, |project, cx| project.create_buffer(None, true, cx));
+
+        cx.spawn_in(window, async move |workspace, cx| {
+            let buffer = create.await?;
+            workspace.update_in(cx, |workspace, window, cx| {
+                let editor =
+                    cx.new(|cx| Editor::for_buffer(buffer, Some(project.clone()), window, cx));
+                workspace.add_item_to_active_pane(Box::new(editor.clone()), None, true, window, cx);
+                editor
+            })
+        })
+    }
+
+    fn new_file_split(
+        workspace: &mut Workspace,
+        action: &workspace::NewFileSplit,
+        window: &mut Window,
+        cx: &mut Context<Workspace>,
+    ) {
+        Self::new_file_in_direction(workspace, action.0, window, cx);
     }
 
     fn new_file_vertical(
@@ -2888,23 +2924,26 @@ impl Editor {
         Self::new_file_in_direction(workspace, SplitDirection::horizontal(cx), window, cx)
     }
 
-    fn new_file_split(
+    fn new_file_in_direction(
         workspace: &mut Workspace,
-        action: &workspace::NewFileSplit,
+        direction: SplitDirection,
         window: &mut Window,
         cx: &mut Context<Workspace>,
     ) {
-        Self::new_file_in_direction(workspace, action.0, window, cx)
+        let project = workspace.project().clone();
+        let create = project.update(cx, |project, cx| project.create_buffer(None, true, cx));
+
+        cx.spawn_in(window, async move |workspace, cx| {
+            let buffer = create.await?;
+            workspace.update_in(cx, |workspace, window, cx| {
+                let editor =
+                    cx.new(|cx| Editor::for_buffer(buffer, Some(project.clone()), window, cx));
+                workspace.split_item(direction, Box::new(editor), window, cx);
+            })
+        })
+        .detach_and_prompt_err("Failed to create buffer", window, cx, |_, _, _| None);
     }
 
-    fn new_file_in_direction(
-        _workspace: &mut Workspace,
-        _direction: SplitDirection,
-        _window: &mut Window,
-        _cx: &mut Context<Workspace>,
-    ) {
-        // 只读编辑器：project.create_buffer 签名不匹配，跳过。
-    }
 
     pub fn leader_id(&self) -> Option<CollaboratorId> {
         self.leader_id
@@ -4684,8 +4723,16 @@ impl Editor {
         false
     }
 
-    /// Stub: clear (编辑功能已删除)
-    pub fn clear(&mut self, _window: &mut Window, _cx: &mut Context<Self>) {}
+    pub fn clear(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.read_only(cx) {
+            return;
+        }
+
+        self.transact(window, cx, |this, window, cx| {
+            this.select_all(&SelectAll, window, cx);
+            this.insert("", window, cx);
+        });
+    }
 
     pub fn backspace(&mut self, _: &Backspace, window: &mut Window, cx: &mut Context<Self>) {
         if self.read_only(cx) {
@@ -4825,29 +4872,255 @@ impl Editor {
         cx.propagate();
     }
 
-    /// Stub: tab (编辑功能已删除)
-    pub fn tab(&mut self, _: &Tab, _window: &mut Window, _cx: &mut Context<Self>) {}
+    pub fn tab(&mut self, _: &Tab, window: &mut Window, cx: &mut Context<Self>) {
+        if self.mode.is_single_line() {
+            cx.propagate();
+            return;
+        }
 
-    /// Stub: indent (编辑功能已删除)
-    pub fn indent(&mut self, _: &Indent, _window: &mut Window, _cx: &mut Context<Self>) {}
+        if self.move_to_next_snippet_tabstop(window, cx) {
+            return;
+        }
 
-    /// Stub: indent_selection (编辑功能已删除)
-    fn indent_selection(
-        _buffer: &MultiBuffer,
-        _snapshot: &MultiBufferSnapshot,
-        _selection: &mut Selection<Point>,
-        _edits: &mut Vec<(Range<Point>, String)>,
-        _delta_for_start_row: u32,
-        _cx: &App,
-    ) -> u32 {
-        0
+        let display_snapshot = self.display_snapshot(cx);
+        let buffer_snapshot = display_snapshot.buffer_snapshot();
+        let mut selections = self.selections.all::<Point>(&display_snapshot);
+        let suggested_indents = buffer_snapshot
+            .suggested_indents(selections.iter().map(|selection| selection.head().row), cx);
+        let mut edits = Vec::new();
+        let mut previous_selection_end_row = 0;
+        let mut row_delta = 0;
+
+        for selection in &mut selections {
+            if selection.start.row != previous_selection_end_row {
+                row_delta = 0;
+            }
+
+            if selection.is_empty() {
+                let cursor = selection.head();
+                let mut did_auto_indent = false;
+                if let Some(suggested_indent) =
+                    suggested_indents.get(&MultiBufferRow(cursor.row)).copied()
+                {
+                    let current_indent =
+                        buffer_snapshot.indent_size_for_line(MultiBufferRow(cursor.row));
+                    if cursor.column < suggested_indent.len
+                        && cursor.column <= current_indent.len
+                        && current_indent.len <= suggested_indent.len
+                    {
+                        selection.start = Point::new(cursor.row, suggested_indent.len);
+                        selection.end = selection.start;
+                        if row_delta == 0
+                            && let Some(edit) = Buffer::edit_for_indent_size_adjustment(
+                                cursor.row,
+                                current_indent,
+                                suggested_indent,
+                            )
+                        {
+                            edits.push(edit);
+                            row_delta = suggested_indent.len.saturating_sub(current_indent.len);
+                        }
+                        did_auto_indent = true;
+                    }
+                }
+
+                if !did_auto_indent {
+                    let indent_size = buffer_snapshot
+                        .language_indent_size_at(cursor, cx)
+                        .unwrap_or_else(|| IndentSize::spaces(4));
+                    let char_column = buffer_snapshot
+                        .text_for_range(Point::new(cursor.row, 0)..cursor)
+                        .flat_map(str::chars)
+                        .count()
+                        .saturating_add(row_delta as usize);
+                    let tab_size = indent_size.len.max(1);
+                    let spaces_to_next_tab_stop =
+                        tab_size - (char_column as u32 % tab_size);
+                    let inserted_indent = match indent_size.kind {
+                        language::IndentKind::Space => IndentSize::spaces(spaces_to_next_tab_stop),
+                        language::IndentKind::Tab => IndentSize::tab(),
+                    };
+                    let insertion_column = cursor
+                        .column
+                        .saturating_add(row_delta)
+                        .saturating_add(inserted_indent.len);
+                    selection.start = Point::new(cursor.row, insertion_column);
+                    selection.end = selection.start;
+                    edits.push((
+                        cursor..cursor,
+                        inserted_indent.chars().collect::<String>(),
+                    ));
+                    row_delta = row_delta.saturating_add(inserted_indent.len);
+                }
+            } else {
+                row_delta = Self::indent_selection(
+                    buffer_snapshot,
+                    selection,
+                    &mut edits,
+                    row_delta,
+                    cx,
+                );
+            }
+            previous_selection_end_row = selection.end.row;
+        }
+
+        self.transact(window, cx, |this, window, cx| {
+            this.edit(edits, cx);
+            this.change_selections(SelectionEffects::no_scroll(), window, cx, |selections_collection| {
+                selections_collection.select(selections);
+            });
+        });
     }
 
-    /// Stub: outdent (编辑功能已删除)
-    pub fn outdent(&mut self, _: &Outdent, _window: &mut Window, _cx: &mut Context<Self>) {}
+    pub fn indent(&mut self, _: &Indent, window: &mut Window, cx: &mut Context<Self>) {
+        if self.read_only(cx) {
+            return;
+        }
 
-    /// Stub: autoindent (编辑功能已删除)
-    pub fn autoindent(&mut self, _: &AutoIndent, _window: &mut Window, _cx: &mut Context<Self>) {}
+        let display_snapshot = self.display_snapshot(cx);
+        let buffer_snapshot = display_snapshot.buffer_snapshot();
+        let mut selections = self.selections.all::<Point>(&display_snapshot);
+        let mut previous_selection_end_row = 0;
+        let mut row_delta = 0;
+        let mut edits = Vec::new();
+
+        for selection in &mut selections {
+            if selection.start.row != previous_selection_end_row {
+                row_delta = 0;
+            }
+            row_delta =
+                Self::indent_selection(buffer_snapshot, selection, &mut edits, row_delta, cx);
+            previous_selection_end_row = selection.end.row;
+        }
+
+        self.transact(window, cx, |this, window, cx| {
+            this.edit(edits, cx);
+            this.change_selections(SelectionEffects::no_scroll(), window, cx, |selections_collection| {
+                selections_collection.select(selections);
+            });
+        });
+    }
+
+    fn indent_selection(
+        snapshot: &MultiBufferSnapshot,
+        selection: &mut Selection<Point>,
+        edits: &mut Vec<(Range<Point>, String)>,
+        delta_for_start_row: u32,
+        cx: &App,
+    ) -> u32 {
+        let indent_size = snapshot
+            .language_indent_size_at(selection.start, cx)
+            .unwrap_or_else(|| IndentSize::spaces(4));
+        let tab_size = indent_size.len.max(1);
+        let mut start_row = selection.start.row;
+        let mut end_row = selection.end.row.saturating_add(1);
+
+        if selection.end.column == 0 {
+            end_row = end_row.saturating_sub(1);
+        }
+
+        if delta_for_start_row > 0 {
+            start_row = start_row.saturating_add(1);
+            selection.start.column = selection.start.column.saturating_add(delta_for_start_row);
+            if selection.end.row == selection.start.row {
+                selection.end.column = selection.end.column.saturating_add(delta_for_start_row);
+            }
+        }
+
+        let mut delta_for_end_row = 0;
+        for row in start_row..end_row {
+            let current_indent = snapshot.indent_size_for_line(MultiBufferRow(row));
+            let indent_delta = match (current_indent.kind, indent_size.kind) {
+                (language::IndentKind::Space, language::IndentKind::Space) => {
+                    IndentSize::spaces(tab_size - (current_indent.len % tab_size))
+                }
+                (language::IndentKind::Tab, language::IndentKind::Space) => {
+                    IndentSize::spaces(tab_size)
+                }
+                (_, language::IndentKind::Tab) => IndentSize::tab(),
+            };
+
+            let row_start = Point::new(row, 0);
+            edits.push((
+                row_start..row_start,
+                indent_delta.chars().collect::<String>(),
+            ));
+
+            if row == selection.start.row {
+                selection.start.column = selection.start.column.saturating_add(indent_delta.len);
+            }
+            if row == selection.end.row {
+                selection.end.column = selection.end.column.saturating_add(indent_delta.len);
+                delta_for_end_row = indent_delta.len;
+            }
+        }
+
+        delta_for_end_row
+    }
+
+    pub fn outdent(&mut self, _: &Outdent, window: &mut Window, cx: &mut Context<Self>) {
+        if self.read_only(cx) {
+            return;
+        }
+
+        let display_snapshot = self.display_snapshot(cx);
+        let buffer_snapshot = display_snapshot.buffer_snapshot();
+        let selections = self.selections.all::<Point>(&display_snapshot);
+        let mut deletion_ranges = Vec::new();
+        let mut last_outdented_row = None;
+
+        for selection in &selections {
+            let language_indent_size = buffer_snapshot
+                .language_indent_size_at(selection.start, cx)
+                .unwrap_or_else(|| IndentSize::spaces(4));
+            let tab_size = NonZeroU32::new(language_indent_size.len.max(1))
+                .unwrap_or(NonZeroU32::MIN);
+            let mut rows = selection.spanned_rows(false, &display_snapshot);
+
+            if last_outdented_row == Some(rows.start) {
+                rows.start = MultiBufferRow(rows.start.0.saturating_add(1));
+            }
+
+            for row_index in rows.start.0..rows.end.0 {
+                let row = MultiBufferRow(row_index);
+                let indent_size = buffer_snapshot.indent_size_for_line(row);
+                let deletion_len = indent_size.outdent_len(tab_size);
+                if deletion_len > 0 {
+                    deletion_ranges.push((
+                        Point::new(row.0, 0)..Point::new(row.0, deletion_len),
+                        String::new(),
+                    ));
+                    last_outdented_row = Some(row);
+                }
+            }
+        }
+
+        self.transact(window, cx, |this, window, cx| {
+            this.edit(deletion_ranges, cx);
+            let display_snapshot = this.display_snapshot(cx);
+            let selections = this.selections.all::<Point>(&display_snapshot);
+            this.change_selections(SelectionEffects::no_scroll(), window, cx, |collection| {
+                collection.select(selections);
+            });
+        });
+    }
+
+    pub fn autoindent(&mut self, _: &AutoIndent, window: &mut Window, cx: &mut Context<Self>) {
+        if self.read_only(cx) {
+            return;
+        }
+
+        let display_snapshot = self.display_snapshot(cx);
+        let selections = self.selections.all::<MultiBufferOffset>(&display_snapshot);
+        self.transact(window, cx, |this, _window, cx| {
+            this.buffer.update(cx, |buffer, cx| {
+                buffer.autoindent_ranges(
+                    selections.iter().map(|selection| selection.start..selection.end),
+                    cx,
+                );
+            });
+        });
+    }
 
     pub fn delete_line(
         &mut self,
@@ -10185,8 +10458,14 @@ impl Editor {
     /// Stub: rewrap
     pub fn rewrap(&mut self, _options: crate::RewrapOptions, _cx: &mut Context<Self>) {}
 
-    /// Stub: set_max_diagnostics_severity
-    pub fn set_max_diagnostics_severity(&mut self, _severity: DiagnosticSeverity, _cx: &mut Context<Self>) {}
+    pub fn set_max_diagnostics_severity(
+        &mut self,
+        severity: DiagnosticSeverity,
+        cx: &mut Context<Self>,
+    ) {
+        self.diagnostics_max_severity = severity;
+        cx.notify();
+    }
 
     pub fn toggle_code_lens(&mut self, _inline: bool, _window: &mut Window, _cx: &mut Context<Self>) {}
 
@@ -10480,22 +10759,18 @@ impl Editor {
         R::default()
     }
 
-    /// Stub: inline_diagnostics_enabled
-    pub fn inline_diagnostics_enabled<R>(&self) -> R
-    where
-        R: Default,
-    {
-        R::default()
+    pub fn inline_diagnostics_enabled(&self) -> bool {
+        self.inline_diagnostics_enabled
     }
 
     // --- Stub methods for deleted diagnostic features (spec §8.2 M2) ---
 
-    /// Stub: any_active_diagnostics
     pub fn any_active_diagnostics(&self) -> bool {
-        false
+        self.diagnostics_enabled && !self.inline_diagnostics.is_empty()
     }
 
-    /// Stub: go_to_diagnostic_at_cursor
+    /// Diagnostic navigation is unavailable without the removed diagnostics
+    /// store; callers keep the editor state unchanged.
     pub fn go_to_diagnostic_at_cursor(
         &mut self,
         _direction: crate::Direction,
@@ -10505,12 +10780,14 @@ impl Editor {
     ) {
     }
 
-    /// Stub: disable_inline_diagnostics
     pub fn disable_inline_diagnostics(&mut self) {
+        self.inline_diagnostics_enabled = false;
+        self.inline_diagnostics.clear();
     }
 
-    /// Stub: set_all_diagnostics_active
-    pub fn set_all_diagnostics_active(&mut self, _cx: &mut Context<Self>) {
+    pub fn set_all_diagnostics_active(&mut self, cx: &mut Context<Self>) {
+        self.inline_diagnostics_enabled = self.diagnostics_enabled && self.show_inline_diagnostics;
+        cx.notify();
     }
 }
 

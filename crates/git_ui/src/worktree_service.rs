@@ -1209,7 +1209,7 @@ async fn open_worktree_workspace(
 
     new_workspace
         .update(cx, |workspace, cx| {
-            workspace.project().read(cx).wait_for_initial_scan()
+            workspace.project().read(cx).wait_for_initial_scan(cx)
         })
         .await;
 

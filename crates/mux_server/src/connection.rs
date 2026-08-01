@@ -121,6 +121,7 @@ pub async fn handle_connection(
     clipboard: Arc<crate::clipboard::ServerClipboard>,
     server_settings: Arc<crate::server_settings::ServerSettings>,
     shutdown_state: Arc<crate::ShutdownState>,
+    extension_host: Arc<crate::extension_host::ServerExtensionHost>,
 ) -> anyhow::Result<()> {
     let (reader, writer) = tokio::io::split(stream);
 
@@ -152,6 +153,7 @@ pub async fn handle_connection(
         let client_role = client_role.clone();
         let connection_client_id = connection_client_id.clone();
         let shutdown_state = shutdown_state.clone();
+        let extension_host = extension_host.clone();
         let forward_tasks = forward_tasks.clone();
         tokio::spawn(async move {
             let mut reader = reader;
@@ -185,6 +187,7 @@ pub async fn handle_connection(
                     &client_role,
                     &connection_client_id,
                     &shutdown_state,
+                    &extension_host,
                     &forward_tasks,
                     trust,
                 )
@@ -463,6 +466,7 @@ async fn dispatch_envelope(
     client_role: &Arc<parking_lot::Mutex<Option<ClientRole>>>,
     connection_client_id: &Arc<parking_lot::Mutex<Option<String>>>,
     shutdown_state: &Arc<crate::ShutdownState>,
+    extension_host: &Arc<crate::extension_host::ServerExtensionHost>,
     forward_tasks: &Arc<parking_lot::Mutex<Vec<tokio::task::JoinHandle<()>>>>,
     trust: ConnectionTrust,
 ) -> anyhow::Result<()> {
@@ -486,6 +490,7 @@ async fn dispatch_envelope(
                 client_role,
                 connection_client_id,
                 shutdown_state,
+                extension_host,
                 &forward_tasks,
                 trust,
             )
@@ -514,10 +519,12 @@ async fn dispatch_request(
     client_role: &Arc<parking_lot::Mutex<Option<ClientRole>>>,
     connection_client_id: &Arc<parking_lot::Mutex<Option<String>>>,
     shutdown_state: &Arc<crate::ShutdownState>,
+    extension_host: &Arc<crate::extension_host::ServerExtensionHost>,
     forward_tasks: &Arc<parking_lot::Mutex<Vec<tokio::task::JoinHandle<()>>>>,
     trust: ConnectionTrust,
 ) -> anyhow::Result<()> {
     let request_id = req.request_id;
+    extension_host.bind_sessions(sessions);
 
     let body = match &req.body {
         Some(b) => b,
@@ -553,6 +560,7 @@ async fn dispatch_request(
                 outbound_tx,
                 forward_tasks,
                 trust,
+                extension_host,
             )
             .await?
         }
@@ -636,7 +644,7 @@ async fn dispatch_request(
         }
         RequestBody::InstallExtension(r) => {
             if check_permission(role, ClientRole::Admin) {
-                handle_install_extension(r).await?
+                handle_install_extension(r, extension_host).await?
             } else {
                 ResponseBody::Error("permission denied: admin required".to_string())
             }
@@ -764,6 +772,7 @@ async fn dispatch_request(
         }
     };
 
+    extension_host.bind_sessions(sessions);
     // §9 把 Response 通过 outbound channel 写回客户端
     send_response(
         outbound_tx,
@@ -1131,6 +1140,7 @@ async fn handle_attach(
     outbound_tx: &mpsc::UnboundedSender<Envelope>,
     forward_tasks: &Arc<parking_lot::Mutex<Vec<tokio::task::JoinHandle<()>>>>,
     trust: ConnectionTrust,
+    extension_host: &Arc<crate::extension_host::ServerExtensionHost>,
 ) -> anyhow::Result<ResponseBody> {
     let mut sessions_w = sessions.write();
     let target_session = sessions_w
@@ -1249,6 +1259,10 @@ async fn handle_attach(
     // read/write loop exits, after which broadcast_lifecycle prunes it.
     // Re-attach of the same client_id replaces the prior sender idempotently.
     session.add_lifecycle_subscriber(client_id.clone(), outbound_tx.clone());
+
+    // The startup render can race attach; repaint after this subscriber is
+    // registered so server-owned chrome is available on every new connection.
+    extension_host.request_render();
 
     // §3.3 窗口在这里才真正加入会话 (Plan 32): 只有 attach 才带连接身份, 也只有
     // 绑定了连接身份的窗口才能在断连时被精确释放。注册在 lifecycle 订阅之后,
@@ -2075,7 +2089,7 @@ async fn handle_fetch_grid_update(
     for session in sessions_r.iter() {
         let panes = session.panes.clone();
         if let Some(pane) = panes.read().get(&req.pane_id) {
-            let update = pane.fetch_grid_update(req.since_generation);
+            let (update, output_sequence) = pane.fetch_grid_update(req.since_generation);
             let resp = match update {
                 crate::grid_sync::GridUpdate::Diff {
                     from_generation,
@@ -2094,6 +2108,7 @@ async fn handle_fetch_grid_update(
                             })
                             .collect(),
                     })),
+                    output_sequence,
                 },
                 crate::grid_sync::GridUpdate::FullSnapshot {
                     to_generation,
@@ -2128,11 +2143,13 @@ async fn handle_fetch_grid_update(
                             modes: Some(snapshot.modes),
                         },
                     )),
+                    output_sequence,
                 },
                 crate::grid_sync::GridUpdate::NoChange(current_gen) => FetchGridUpdateResponse {
                     from_generation: current_gen,
                     to_generation: current_gen,
                     update: None,
+                    output_sequence,
                 },
             };
             return Ok(ResponseBody::GridUpdate(resp));
@@ -2810,27 +2827,34 @@ async fn handle_stat_file(
     }
 }
 
-/// §16.8 / §16.12 InstallExtension: server 端没有 extension host。
+/// §16.8 / §16.12 InstallExtension: validate and load a server-side extension
+/// on the daemon's extension host.
 ///
-/// QuickJS runtime 只在 client 侧 (`crates/quickjs_runtime`), daemon 既不能
-/// 执行也不能校验 server-side 扩展; 真正的安装逻辑在
-/// `crates/z3rm/src/cli/marketplace.rs`。这里返回 `success=false` 的类型化
-/// 响应而不是空 `Error` —— 空 `Error` 在客户端等价于成功, 会让
-/// `mux::sync_extensions_to_remote` 把一次没发生的安装报成成功。
+/// The response is always the typed `ExtensionInstalled` — an empty `Error`
+/// body reads as success on the client and would make
+/// `mux::sync_extensions_to_remote` report an install that never happened.
+/// Validation failures (bad manifest, client-only side, unsafe archive) come
+/// back as `success=false` with the underlying error.
 async fn handle_install_extension(
     req: &mux_protocol::InstallExtensionRequest,
+    extension_host: &Arc<crate::extension_host::ServerExtensionHost>,
 ) -> anyhow::Result<ResponseBody> {
-    zlog::warn!(
-        "extension install rejected: name={} (mux_server has no extension host)",
-        req.name
-    );
+    let result = extension_host.install_extension(req).await;
+    let (success, error) = match &result {
+        Ok(()) => {
+            zlog::info!("extension installed: name={}", req.name);
+            (true, String::new())
+        }
+        Err(err) => {
+            zlog::warn!("extension install rejected: name={} error={:#}", req.name, err);
+            (false, format!("{err:#}"))
+        }
+    };
     Ok(ResponseBody::ExtensionInstalled(
         mux_protocol::InstallExtensionResponse {
             name: req.name.clone(),
-            success: false,
-            error: "mux_server has no extension host: server-side extension install is not \
-                    supported"
-                .to_string(),
+            success,
+            error,
         },
     ))
 }
@@ -3777,11 +3801,20 @@ mod connection_unit_tests {
 
     #[tokio::test]
     async fn install_extension_reports_failure_instead_of_an_empty_error() {
-        let response = handle_install_extension(&mux_protocol::InstallExtensionRequest {
-            name: "z3rm-demo".to_string(),
-            manifest: Vec::new(),
-            source: Vec::new(),
-        })
+        let temp = tempfile::tempdir().unwrap();
+        let sessions = Arc::new(parking_lot::RwLock::new(Vec::new()));
+        let host = crate::extension_host::ServerExtensionHost::start(
+            sessions,
+            temp.path().to_path_buf(),
+        );
+        let response = handle_install_extension(
+            &mux_protocol::InstallExtensionRequest {
+                name: "z3rm-demo".to_string(),
+                manifest: Vec::new(),
+                source: Vec::new(),
+            },
+            &host,
+        )
         .await
         .expect("install handler");
 

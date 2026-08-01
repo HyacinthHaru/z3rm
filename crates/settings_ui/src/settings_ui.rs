@@ -49,7 +49,8 @@ use workspace::{
     client_side_decorations,
 };
 use zed_actions::{
-    OpenProjectSettings, OpenSettings, OpenSettingsAt, OpenSettingsAtTarget, OpenSettingsPage,
+    OpenProjectSettings, OpenSettings, OpenSettingsAt, OpenSettingsAtTarget, OpenSettingsFile,
+    OpenSettingsPage,
 };
 
 use crate::components::{
@@ -418,6 +419,9 @@ pub fn init(cx: &mut App) {
     let queue = ProjectSettingsUpdateQueue::new(cx);
     cx.set_global(queue);
 
+    cx.on_action(|_: &OpenSettingsFile, cx| {
+        open_settings_editor_at_target(None, Some(SettingsFileTarget::User), None, cx);
+    });
     cx.on_action(|_: &OpenSettings, cx| {
         open_settings_editor(None, None, None, cx);
     });

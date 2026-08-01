@@ -10,8 +10,8 @@
 use anyhow::Result;
 use gpui::{
     div, px, AnyElement, App, ClickEvent, ElementId, FocusHandle, Hsla, InteractiveElement,
-    IntoElement, KeyDownEvent, ParentElement, SharedString, StatefulInteractiveElement, Styled,
-    Window,
+    IntoElement, KeyDownEvent, ParentElement, Role, SharedString, StatefulInteractiveElement,
+    Styled, Window,
 };
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, HashMap};
@@ -44,7 +44,7 @@ pub struct VDomNode {
     pub children: Vec<VDomChild>,
 }
 
-/// A VDOM child — either a text string or a nested element node.
+/// A VDOM child — either text, a scalar rendered as text, or a nested element.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(untagged)]
 pub enum VDomChild {
@@ -54,12 +54,42 @@ pub enum VDomChild {
     Node(VDomNode),
 }
 
+fn normalize_vdom_node(value: &mut serde_json::Value) {
+    let serde_json::Value::Object(properties) = value else {
+        return;
+    };
+    let Some(serde_json::Value::Array(children)) = properties.get_mut("children") else {
+        return;
+    };
+
+    let mut normalized = Vec::with_capacity(children.len());
+    for mut child in std::mem::take(children) {
+        match child {
+            serde_json::Value::Null => {}
+            serde_json::Value::Number(number) => {
+                normalized.push(serde_json::Value::String(number.to_string()));
+            }
+            serde_json::Value::Bool(boolean) => {
+                normalized.push(serde_json::Value::String(boolean.to_string()));
+            }
+            _ => {
+                normalize_vdom_node(&mut child);
+                normalized.push(child);
+            }
+        }
+    }
+    *children = normalized;
+}
+
 /// Parse a VDOM JSON value into a VDomNode tree.
 ///
-/// Extensions return `serde_json::Value` from QuickJS; this validates
-/// and converts to typed VDomNode for the renderer.
+/// QuickJS extensions commonly put numbers, booleans, or null in `children`.
+/// Normalize those JavaScript scalar semantics before deserializing the typed
+/// tree; null children are ignored and other scalars render as text.
 pub fn parse_vdom(value: &serde_json::Value) -> Result<VDomNode> {
-    serde_json::from_value(value.clone())
+    let mut normalized = value.clone();
+    normalize_vdom_node(&mut normalized);
+    serde_json::from_value(normalized)
         .map_err(|e| anyhow::anyhow!("VDOM parse error: {}", e))
 }
 
@@ -270,21 +300,59 @@ impl VDomRenderer {
             .and_then(CommandInvocation::parse);
         let is_button = node.element_type == "button";
 
-        // Only id'd elements can carry click handlers in GPUI, and an id costs
-        // a stateful element, so plain nodes stay stateless.
+        // Only interactive nodes need a stateful element id. Plain containers
+        // remain stateless while buttons expose keyboard and accessibility
+        // semantics equivalent to a native control.
         if click.is_none() && !is_button {
             let element = self.style_and_fill(div(), node, path, cx);
             return element.into_any_element();
         }
 
-        let element = div().id(self.element_id(node, path));
-        let mut element = self.style_and_fill(element, node, path, cx);
-        if is_button {
-            element = element.cursor_pointer();
+        let mut element = self
+            .style_and_fill(div().id(self.element_id(node, path)), node, path, cx);
+        if let Some(label) = node
+            .props
+            .get("aria-label")
+            .or_else(|| node.props.get("ariaLabel"))
+            .and_then(|value| value.as_str())
+        {
+            element = element.aria_label(SharedString::from(label.to_owned()));
         }
-        if let (Some(invocation), Some(dispatch)) = (click, self.dispatch.clone()) {
+
+        let button_focus_handle = if is_button {
+            Some(
+                self.focus_handles
+                    .entry(self.element_key(node, path).into())
+                    .or_insert_with(|| cx.focus_handle())
+                    .clone(),
+            )
+        } else {
+            None
+        };
+        if let Some(focus_handle) = button_focus_handle.as_ref() {
+            element = element
+                .role(Role::Button)
+                .tab_stop(true)
+                .track_focus(focus_handle)
+                .cursor_pointer();
+        }
+
+        if let (Some(invocation), Some(dispatch)) = (click.clone(), self.dispatch.clone()) {
+            let focus_handle = button_focus_handle.clone();
             element = element.on_click(move |_event: &ClickEvent, window, cx| {
+                if let Some(focus_handle) = focus_handle.as_ref() {
+                    window.focus(focus_handle, cx);
+                }
                 dispatch(invocation.clone(), window, cx);
+            });
+        }
+        if is_button
+            && let (Some(invocation), Some(dispatch)) = (click, self.dispatch.clone())
+        {
+            element = element.on_key_down(move |event: &KeyDownEvent, window, cx| {
+                if matches!(event.keystroke.key.as_str(), "enter" | "space") {
+                    dispatch(invocation.clone(), window, cx);
+                }
             });
         }
         element.into_any_element()
@@ -293,7 +361,12 @@ impl VDomRenderer {
     /// A text field driven entirely by the extension: the displayed value comes
     /// from `props.value` and every edit is dispatched through `onChange`, so
     /// the extension stays the single owner of the text.
-    fn render_input(&mut self, node: &VDomNode, path: &mut ElementPath, cx: &mut App) -> AnyElement {
+    fn render_input(
+        &mut self,
+        node: &VDomNode,
+        path: &mut ElementPath,
+        cx: &mut App,
+    ) -> AnyElement {
         let id: SharedString = self.element_key(node, path).into();
         let focus_handle = self
             .focus_handles
@@ -304,13 +377,13 @@ impl VDomRenderer {
         let value = node
             .props
             .get("value")
-            .and_then(|v| v.as_str())
+            .and_then(|value| value.as_str())
             .unwrap_or_default()
             .to_string();
         let placeholder = node
             .props
             .get("placeholder")
-            .and_then(|v| v.as_str())
+            .and_then(|value| value.as_str())
             .unwrap_or_default()
             .to_string();
         let change = node
@@ -327,6 +400,8 @@ impl VDomRenderer {
 
         let mut element = div()
             .id(ElementId::Name(id))
+            .role(Role::TextInput)
+            .tab_stop(true)
             .track_focus(&focus_handle)
             .border_1()
             .border_color(self.palette.border)
@@ -336,6 +411,14 @@ impl VDomRenderer {
             } else {
                 self.palette.text
             });
+        if let Some(aria_label) = node
+            .props
+            .get("aria-label")
+            .or_else(|| node.props.get("ariaLabel"))
+            .and_then(|value| value.as_str())
+        {
+            element = element.aria_label(SharedString::from(aria_label.to_owned()));
+        }
         element = apply_styles(element, node, &self.palette);
 
         if let (Some(invocation), Some(dispatch)) = (change, self.dispatch.clone()) {
@@ -354,17 +437,25 @@ impl VDomRenderer {
 
     /// Paint the draw ops the host collected for this region. Positions are
     /// absolute within the region so ops never disturb sibling layout.
-    fn render_display_list(&self, node: &VDomNode) -> AnyElement {
+    fn render_display_list(&mut self, node: &VDomNode) -> AnyElement {
         let region_id = node
             .props
             .get("id")
             .and_then(|v| v.as_str())
             .unwrap_or_default();
+        if let Some(value) = node.props.get("drawOps") {
+            match parse_display_list(value) {
+                Ok(ops) => self.set_display_list(region_id.to_string(), ops),
+                Err(error) => {
+                    tracing::warn!(region_id, %error, "extension display list rejected");
+                    self.display_lists.remove(region_id);
+                }
+            }
+        }
         let mut container = apply_styles(div().relative(), node, &self.palette);
         let Some(ops) = self.display_lists.get(region_id) else {
             return container.into_any_element();
         };
-
         for op in ops {
             match op {
                 DrawOp::DrawText { text, x, y, color } => {
@@ -635,6 +726,19 @@ mod tests {
             VDomChild::Text(t) => assert_eq!(t, "hello"),
             other => panic!("expected text child, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn parse_javascript_scalar_children() {
+        let json = serde_json::json!({
+            "type": "div",
+            "children": [0, false, null, "text"]
+        });
+        let node = parse_vdom(&json).expect("parse scalar children");
+        assert_eq!(node.children.len(), 3);
+        assert!(matches!(&node.children[0], VDomChild::Text(text) if text == "0"));
+        assert!(matches!(&node.children[1], VDomChild::Text(text) if text == "false"));
+        assert!(matches!(&node.children[2], VDomChild::Text(text) if text == "text"));
     }
 
     #[test]

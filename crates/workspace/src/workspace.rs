@@ -7,6 +7,8 @@ mod modal_layer;
 mod multi_workspace;
 // #[cfg(test)]
 // mod multi_workspace_tests;
+#[cfg(test)]
+mod workspace_render_tests;
 pub mod notifications;
 pub mod pane;
 pub mod pane_group;
@@ -44,7 +46,9 @@ pub use remote::{
 };
 pub use toast_layer::{ToastAction, ToastLayer, ToastView};
 
-/// Stub: TerminalProvider trait (replaces deleted terminal_view::TerminalProvider)
+/// Provides terminal task execution for workspace callers such as the terminal
+/// panel. The provider is optional because mux-only workspaces do not create a
+/// local terminal panel.
 pub trait TerminalProvider: Send + Sync {
     fn spawn(
         &self,
@@ -1257,6 +1261,7 @@ pub struct Workspace {
     serializable_items_tx: UnboundedSender<Box<dyn SerializableItemHandle>>,
     _items_serializer: Task<Result<()>>,
     session_id: Option<String>,
+    terminal_provider: Option<Box<dyn TerminalProvider>>,
     scheduled_tasks: Vec<Task<()>>,
     last_open_dock_positions: Vec<DockPosition>,
     removing: bool,
@@ -1562,6 +1567,7 @@ impl Workspace {
             on_prompt_for_open_path: None,
             serializable_items_tx,
             _items_serializer,
+            terminal_provider: None,
             session_id: Some(session_id),
 
             scheduled_tasks: Vec::new(),
@@ -2646,7 +2652,12 @@ impl Workspace {
         path_prompt_options: PathPromptOptions,
         window: &mut Window,
         cx: &mut Context<Self>,
+
     ) -> oneshot::Receiver<Option<Vec<PathBuf>>> {
+        if let Some(prompt) = self.on_prompt_for_open_path.take() {
+            return prompt(self, window, cx);
+        }
+
         let (tx, rx) = oneshot::channel();
         let abs_path = cx.prompt_for_paths(path_prompt_options);
 
@@ -2678,6 +2689,10 @@ impl Workspace {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> oneshot::Receiver<Option<Vec<PathBuf>>> {
+        if let Some(prompt) = self.on_prompt_for_new_path.take() {
+            return prompt(self, suggested_name, window, cx);
+        }
+
         let (tx, rx) = oneshot::channel();
         cx.spawn_in(window, async move |workspace, cx| {
             let abs_path = workspace.update(cx, |workspace, cx| {
@@ -5222,12 +5237,31 @@ impl Workspace {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        if self.center.remove(&pane, cx).unwrap() {
+        let removed_from_center = match self.center.remove(&pane, cx) {
+            Ok(removed) => removed,
+            Err(error) => {
+                log::warn!("pane was absent from the current center layout: {error}");
+                false
+            }
+        };
+        if removed_from_center {
             self.force_remove_pane(&pane, &focus_on, window, cx);
             for removed_item in pane.read(cx).items() {
                 self.panes_by_item.remove(&removed_item.item_id());
             }
 
+            cx.notify();
+        } else if self.panes.iter().any(|candidate| candidate == &pane)
+            && !self
+                .center
+                .panes()
+                .into_iter()
+                .any(|candidate| candidate == &pane)
+        {
+            self.force_remove_pane(&pane, &focus_on, window, cx);
+            for removed_item in pane.read(cx).items() {
+                self.panes_by_item.remove(&removed_item.item_id());
+            }
             cx.notify();
         } else {
             self.active_item_path_changed(true, window, cx);
@@ -5664,14 +5698,26 @@ impl Workspace {
             }
             focus_on.update(cx, |pane, cx| window.focus(&pane.focus_handle(cx), cx));
         } else if removing_active_pane {
-            let fallback_pane = self.panes.last().unwrap().clone();
-            self.set_active_pane(&fallback_pane, window, cx);
-            if !self.has_active_modal(window, cx) {
-                fallback_pane.update(cx, |pane, cx| window.focus(&pane.focus_handle(cx), cx));
+            if let Some(fallback_pane) = self.panes.last().cloned() {
+                self.set_active_pane(&fallback_pane, window, cx);
+                if !self.has_active_modal(window, cx) {
+                    fallback_pane.update(cx, |pane, cx| window.focus(&pane.focus_handle(cx), cx));
+                }
+            } else {
+                log::warn!("removed the last workspace pane without a focus target");
             }
         }
         if self.last_active_center_pane == Some(pane.downgrade()) {
             self.last_active_center_pane = None;
+        }
+        let clear_zoom = self.zoomed.as_ref().is_some_and(|view| {
+            view.upgrade()
+                .is_none_or(|zoomed| zoomed.entity_id() == pane.entity_id())
+        });
+        if clear_zoom {
+            self.zoomed = None;
+            self.zoomed_position = None;
+            cx.emit(Event::ZoomChanged);
         }
         cx.notify();
     }
@@ -6610,6 +6656,12 @@ impl Workspace {
             cx,
         );
 
+        // Replace the center tree before removing stale panes. `PaneGroup::remove`
+        // cannot remove a root pane, so doing this in the opposite order leaves
+        // the old root in `self.panes` and can panic on the next layout update.
+        self.center = PaneGroup::with_root(root);
+        self.center.set_is_center(true);
+
         // Drop panes that are no longer present in the authoritative tree.
         let stale: Vec<Entity<Pane>> = self
             .panes
@@ -6619,11 +6671,11 @@ impl Workspace {
             .collect();
         let fallback_focus = dfs_focus.clone();
         for pane in stale {
-            self.remove_pane(pane, fallback_focus.clone(), window, cx);
+            self.force_remove_pane(&pane, &fallback_focus, window, cx);
+            for removed_item in pane.read(cx).items() {
+                self.panes_by_item.remove(&removed_item.item_id());
+            }
         }
-
-        self.center = PaneGroup::with_root(root);
-        self.center.set_is_center(true);
 
         // §15.4 prefer the authoritative focused pane over the DFS-first leaf.
         // Build a pane_id → Entity<Pane> map from items in the used panes,
@@ -7146,6 +7198,7 @@ impl Workspace {
     ) -> impl IntoElement {
         div()
             .id("editor-region")
+            .debug_selector(|| "workspace-center".into())
             .role(gpui::Role::Main)
             .aria_label("Editor")
             .when(window.is_a11y_active(), |this| {
@@ -7371,12 +7424,22 @@ impl Workspace {
         }
     }
 
-    /// Stub: set_terminal_provider (collab 已删除)
-    pub fn set_terminal_provider(&mut self, _provider: Box<dyn crate::TerminalProvider>) {}
+    /// Install the workspace's terminal task provider.
+    pub fn set_terminal_provider(&mut self, provider: Box<dyn crate::TerminalProvider>) {
+        self.terminal_provider = Some(provider);
+    }
 
-    /// Stub: active_call (collab 已删除)
-    pub fn active_call(&self) -> Option<()> {
-        None
+    /// Spawn a task in the workspace's terminal panel when one is installed.
+    pub fn spawn_in_terminal(
+        &self,
+        task: project::SpawnInTerminal,
+        window: &mut Window,
+        cx: &mut App,
+    ) -> gpui::Task<Option<anyhow::Result<std::process::ExitStatus>>> {
+        self.terminal_provider
+            .as_ref()
+            .map(|provider| provider.spawn(task, window, cx))
+            .unwrap_or_else(|| gpui::Task::ready(None))
     }
 }
 
@@ -7691,11 +7754,64 @@ impl Workspace {
         ProjectGroupKey::from_project(&self.project, cx)
     }
 
-    /// Stub: run_create_worktree_tasks (crates removed)
-    pub fn run_create_worktree_tasks(&mut self, _window: &mut Window, _cx: &mut Context<Self>) {
-        // no-op stub
-    }
+    /// Runs post-creation setup after a git worktree workspace has been opened.
+    ///
+    /// Upstream Zed schedules user-configured `CreateWorktree` task hooks here
+    /// (zed-industries/zed#51337, #54612); the task-hook store is not part of
+    /// this tree, so the invariant those hooks depended on — every visible
+    /// worktree of the new workspace completing its initial scan — is enforced
+    /// through the worktree store directly, with failures surfaced to the log
+    /// and as a workspace toast instead of being swallowed.
+    pub fn run_create_worktree_tasks(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let project = self.project.clone();
+        let worktree_ids: Vec<WorktreeId> = self
+            .visible_worktrees(cx)
+            .map(|worktree| worktree.read(cx).id())
+            .collect();
 
+        if worktree_ids.is_empty() {
+            log::error!(
+                "run_create_worktree_tasks: newly created worktree workspace has no visible worktrees"
+            );
+            return;
+        }
+
+        let scan_complete = project
+            .read(cx)
+            .worktree_store()
+            .read(cx)
+            .wait_for_initial_scan();
+
+        cx.spawn_in(window, async move |workspace, cx| {
+            scan_complete.await;
+
+            let missing = workspace.update(cx, |workspace, cx| {
+                let project = workspace.project().read(cx);
+                worktree_ids
+                    .iter()
+                    .copied()
+                    .filter(|worktree_id| project.worktree_for_id(*worktree_id, cx).is_none())
+                    .collect::<Vec<_>>()
+            })?;
+
+            if !missing.is_empty() {
+                let message = format!(
+                    "Worktree setup failed: worktrees {missing:?} disappeared before their initial scan completed"
+                );
+                log::error!("{message}");
+                workspace.update(cx, |workspace, cx| {
+                    struct WorktreeSetupToast;
+                    workspace.show_toast(
+                        Toast::new(NotificationId::unique::<WorktreeSetupToast>(), message),
+                        cx,
+                    );
+                })?;
+            }
+
+            anyhow::Ok(())
+        })
+        .detach_and_log_err(cx);
+    }
 }
 
 #[derive(Clone)]
@@ -7909,7 +8025,13 @@ impl Render for Workspace {
                             })
                             .child({
                                 match bottom_dock_layout {
-                                    BottomDockLayout::Full => div()
+                                    // Stacked and SideBySide fall back to the Full layout
+                                    // (spec §16 Plan 16): they must still render the center
+                                    // pane group — rendering only the bottom dock would make
+                                    // the whole editor area disappear.
+                                    BottomDockLayout::Full
+                                    | BottomDockLayout::Stacked
+                                    | BottomDockLayout::SideBySide => div()
                                         .flex()
                                         .flex_col()
                                         .h_full()
@@ -8142,20 +8264,6 @@ impl Render for Workspace {
                                             window,
                                             cx,
                                         )),
-                                    // Stacked 和 SideBySide 布局回退到 Full (spec §16 Plan 16)
-                                    BottomDockLayout::Stacked | BottomDockLayout::SideBySide => {
-                                        // 回退到 Full 布局
-                                        div()
-                                            .flex()
-                                            .flex_col()
-                                            .h_full()
-                                            .children(self.render_dock(
-                                                DockPosition::Bottom,
-                                                &self.bottom_dock,
-                                                window,
-                                                cx,
-                                            ))
-                                    }
                                 }
                             })
                             .children(self.zoomed.as_ref().and_then(|view| {

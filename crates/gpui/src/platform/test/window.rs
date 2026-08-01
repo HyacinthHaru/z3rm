@@ -33,6 +33,7 @@ pub(crate) struct TestWindowState {
     hover_status_change_callback: Option<Box<dyn FnMut(bool)>>,
     resize_callback: Option<Box<dyn FnMut(Size<Pixels>, f32)>>,
     moved_callback: Option<Box<dyn FnMut()>>,
+    a11y_action_callback: Option<Box<dyn Fn(accesskit::ActionRequest) + Send + 'static>>,
     input_handler: Option<PlatformInputHandler>,
     is_fullscreen: bool,
 }
@@ -75,7 +76,10 @@ impl TestWindow {
             handle,
             sprite_atlas,
             renderer,
-            title: Default::default(),
+            title: params
+                .titlebar
+                .as_ref()
+                .and_then(|titlebar| titlebar.title.as_ref().map(ToString::to_string)),
             edited: false,
             document_path: None,
             should_close_handler: None,
@@ -85,6 +89,7 @@ impl TestWindow {
             hover_status_change_callback: None,
             resize_callback: None,
             moved_callback: None,
+            a11y_action_callback: None,
             input_handler: None,
             is_fullscreen: false,
         })))
@@ -122,6 +127,23 @@ impl TestWindow {
         let result = callback(event);
         self.0.lock().input_callback = Some(callback);
         !result.propagate
+    }
+
+    /// Simulates a semantic action request from a screen reader (e.g. an
+    /// AT-SPI client). The request is delivered through the genuine AccessKit
+    /// action callback installed by [`crate::Window::new`], so it flows
+    /// through the production action channel into
+    /// `Window::handle_a11y_action`. Returns `true` when a callback was
+    /// registered and invoked, `false` when none is present.
+    pub fn simulate_a11y_action(&mut self, request: accesskit::ActionRequest) -> bool {
+        let mut lock = self.0.lock();
+        let Some(callback) = lock.a11y_action_callback.take() else {
+            return false;
+        };
+        drop(lock);
+        callback(request);
+        self.0.lock().a11y_action_callback = Some(callback);
+        true
     }
 }
 
@@ -225,6 +247,10 @@ impl PlatformWindow for TestWindow {
         self.0.lock().title = Some(title.to_owned());
     }
 
+    fn get_title(&self) -> String {
+        self.0.lock().title.clone().unwrap_or_default()
+    }
+
     fn set_app_id(&mut self, _app_id: &str) {}
 
     fn set_background_appearance(&self, _background: WindowBackgroundAppearance) {}
@@ -293,6 +319,11 @@ impl PlatformWindow for TestWindow {
     fn on_appearance_changed(&self, _callback: Box<dyn FnMut()>) {}
 
     fn a11y_init(&self, callbacks: crate::A11yCallbacks) {
+        let crate::A11yCallbacks {
+            activation,
+            action,
+            deactivation: _,
+        } = callbacks;
         // §15.11 Headless a11y capture: by default TestWindow leaves the
         // a11y active flag untouched (the real adapter is absent). When a
         // process opts in via `Z3RM_A11Y_BUILD_HEADLESS`, immediately fire
@@ -300,8 +331,14 @@ impl PlatformWindow for TestWindow {
         // tree construction runs. The returned `TreeUpdate` is dropped: the
         // in-memory builder keeps its own copy for `debug_a11y_tree_json`.
         if std::env::var("Z3RM_A11Y_BUILD_HEADLESS").is_ok() {
-            let _ = (callbacks.activation)();
+            let _ = activation();
         }
+        // §15.12 Semantic actions: retain the action callback (it was
+        // previously dropped, so tests could not inject actions). It is the
+        // genuine callback installed by `Window::new`, so requests injected
+        // via `simulate_a11y_action` still flow through the production
+        // action channel into `Window::handle_a11y_action`.
+        self.0.lock().a11y_action_callback = Some(action);
     }
     fn draw(&self, scene: &Scene) {
         let scale_factor = self.scale_factor();

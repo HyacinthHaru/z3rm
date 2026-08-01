@@ -10,6 +10,8 @@ pub mod toolchain_store;
 pub mod trusted_worktrees;
 pub mod worktree_store;
 pub mod stubs;
+pub mod bookmark_store;
+
 pub use stubs::*;
 
 use buffer_diff::BufferDiff;
@@ -134,12 +136,13 @@ pub struct Project {
     environment: Entity<ProjectEnvironment>,
     settings_observer: Entity<SettingsObserver>,
     toolchain_store: Option<Entity<ToolchainStore>>,
-    /// Inert store entities for removed features (task/debugger/bookmarks/breakpoints).
+    /// Inert store entities for removed features (task/debugger/bookmarks/breakpoints/LSP).
     /// Created once at construction so callers get a valid handle instead of a panic.
     task_store_entity: Entity<crate::task_store::TaskStore>,
     dap_store_entity: Entity<stubs::DapStore>,
-    bookmark_store_entity: Entity<stubs::bookmark_store::BookmarkStore>,
+    bookmark_store_entity: Entity<crate::bookmark_store::BookmarkStore>,
     breakpoint_store_entity: Entity<stubs::debugger::breakpoint_store::BreakpointStore>,
+    lsp_store_entity: Entity<stubs::lsp_store::LspStore>,
     last_worktree_paths: WorktreePaths,
 }
 
@@ -248,6 +251,13 @@ impl Project {
             let worktree_store_subscription =
                 cx.subscribe(&worktree_store, Self::on_worktree_store_event);
 
+            let bookmark_store_entity = cx.new(|_| {
+                crate::bookmark_store::BookmarkStore::new(
+                    worktree_store.clone(),
+                    buffer_store.clone(),
+                )
+            });
+
             let mut project = Self {
                 active_entry: None,
                 languages,
@@ -273,10 +283,13 @@ impl Project {
                 environment,
                 settings_observer: project_settings,
                 toolchain_store: None,
-            task_store_entity: cx.new(|_| crate::task_store::TaskStore::default()),
-            dap_store_entity: cx.new(|_| stubs::DapStore::default()),
-            bookmark_store_entity: cx.new(|_| stubs::bookmark_store::BookmarkStore::default()),
-            breakpoint_store_entity: cx.new(|_| stubs::debugger::breakpoint_store::BreakpointStore::default()),
+                task_store_entity: cx.new(|_| crate::task_store::TaskStore::default()),
+                dap_store_entity: cx.new(|_| stubs::DapStore::default()),
+                bookmark_store_entity,
+                breakpoint_store_entity: cx.new(|_| {
+                    stubs::debugger::breakpoint_store::BreakpointStore::default()
+                }),
+                lsp_store_entity: cx.new(|_| stubs::lsp_store::LspStore::default()),
                 last_worktree_paths: WorktreePaths::default(),
             };
 
@@ -597,54 +610,163 @@ impl Project {
             .update(cx, |store, cx| store.open_buffer(path, cx))
     }
 
-    /// Stub: create_terminal_shell (task crate 已删除)
+    /// Create an interactive terminal using the configured shell.
     pub fn create_terminal_shell(
         &self,
-        _working_directory: Option<std::path::PathBuf>,
-        _cx: &mut Context<Self>,
+        working_directory: Option<std::path::PathBuf>,
+        cx: &mut Context<Self>,
     ) -> Task<anyhow::Result<gpui::Entity<terminal::Terminal>>> {
-        Task::ready(Err(anyhow::anyhow!("stub: terminal creation disabled")))
+        let settings = terminal::terminal_settings::TerminalSettings::get_global(cx);
+        let path_style = self.path_style(cx);
+        let builder = terminal::TerminalBuilder::new(
+            working_directory,
+            None,
+            settings.shell.clone(),
+            settings.env.clone(),
+            settings.cursor_shape,
+            settings.alternate_scroll,
+            settings.max_scroll_history_lines,
+            settings.path_hyperlink_regexes.clone(),
+            settings.path_hyperlink_timeout_ms,
+            false,
+            0,
+            None,
+            cx,
+            Vec::new(),
+            path_style,
+        );
+        cx.spawn(async move |_, cx| {
+            let builder = builder.await?;
+            Ok(cx.new(|cx| builder.subscribe(cx)))
+        })
     }
 
-    /// Stub: clone_terminal (task crate 已删除)
+    /// Clone an existing terminal, preserving its shell and terminal settings.
     pub fn clone_terminal(
         &self,
-        _terminal: &gpui::Entity<terminal::Terminal>,
-        _cx: &mut Context<Self>,
-        _working_directory: Option<std::path::PathBuf>,
+        terminal: &gpui::Entity<terminal::Terminal>,
+        cx: &mut Context<Self>,
+        working_directory: Option<std::path::PathBuf>,
     ) -> Task<anyhow::Result<gpui::Entity<terminal::Terminal>>> {
-        Task::ready(Err(anyhow::anyhow!("stub: terminal clone disabled")))
+        let builder = terminal.read(cx).clone_builder(cx, working_directory);
+        cx.spawn(async move |_, cx| {
+            let builder = builder.await?;
+            Ok(cx.new(|cx| builder.subscribe(cx)))
+        })
     }
 
-    /// Stub: is_via_collab (collab 已删除)
     pub fn is_via_collab(&self) -> bool {
         false
     }
 
-    /// Stub: create_terminal_task (task crate 已删除)
+fn shell_for_terminal_task(task: &SpawnInTerminal) -> util::shell::Shell {
+    let program = if !task.command.is_empty() {
+        Some(task.command.clone())
+    } else if !task.program.is_empty() {
+        Some(task.program.clone())
+    } else {
+        None
+    };
+
+    if let Some(program) = program {
+        return util::shell::Shell::WithArguments {
+            program,
+            args: task.args.clone(),
+            title_override: None,
+        };
+    }
+
+    match &task.shell {
+        Shell::System => util::shell::Shell::System,
+        Shell::Program(config) => util::shell::Shell::WithArguments {
+            program: config.program.clone(),
+            args: config.args.clone(),
+            title_override: None,
+        },
+    }
+}
+
+
+    /// Create a terminal that runs a task and reports its exit status to the view.
     pub fn create_terminal_task(
         &mut self,
-        _task: SpawnInTerminal,
-        _cx: &mut Context<Self>,
+        task: SpawnInTerminal,
+        cx: &mut Context<Self>,
     ) -> Task<anyhow::Result<gpui::Entity<terminal::Terminal>>> {
-        Task::ready(Err(anyhow::anyhow!("stub: terminal task disabled")))
+        let settings = terminal::terminal_settings::TerminalSettings::get_global(cx);
+        let path_style = self.path_style(cx);
+        let working_directory = task
+            .cwd
+            .clone()
+            .or_else(|| {
+                task.working_directory
+                    .as_ref()
+                    .and_then(|path| self.absolute_path(path, cx))
+            });
+        let shell = Self::shell_for_terminal_task(&task);
+        let command = if task.command.is_empty() {
+            (!task.program.is_empty()).then(|| task.program.clone())
+        } else {
+            Some(task.command.clone())
+        };
+
+        let (completion_tx, completion_rx) = async_channel::unbounded();
+        let spawned_task = terminal::SpawnInTerminal {
+            command,
+            args: task.args.clone(),
+            label: task.label.clone(),
+            full_label: task.full_label.clone(),
+            command_label: task.command_label.clone(),
+            hide: terminal::HideStrategy::Never,
+            show_summary: task.show_summary,
+            show_command: task.show_command,
+            id: task.id,
+            show_rerun: task.show_rerun,
+        };
+        let task_state = terminal::TaskState {
+            status: terminal::TaskStatus::Running,
+            completion_rx,
+            spawned_task,
+        };
+        let mut env = settings.env.clone();
+        env.extend(task.env);
+        let builder = terminal::TerminalBuilder::new(
+            working_directory,
+            Some(task_state),
+            shell,
+            env,
+            settings.cursor_shape,
+            settings.alternate_scroll,
+            settings.max_scroll_history_lines,
+            settings.path_hyperlink_regexes.clone(),
+            settings.path_hyperlink_timeout_ms,
+            false,
+            0,
+            Some(completion_tx),
+            cx,
+            Vec::new(),
+            path_style,
+        );
+        cx.spawn(async move |_, cx| {
+            let builder = builder.await?;
+            Ok(cx.new(|cx| builder.subscribe(cx)))
+        })
     }
 
-    /// Stub: create_local_terminal (task crate 已删除)
+    /// Local projects use the same configured shell as their regular terminal.
     pub fn create_local_terminal(
         &mut self,
-        _cx: &mut Context<Self>,
+        cx: &mut Context<Self>,
     ) -> Task<anyhow::Result<gpui::Entity<terminal::Terminal>>> {
-        Task::ready(Err(anyhow::anyhow!("stub: local terminal disabled")))
+        self.create_terminal_shell(None, cx)
     }
 
-    /// Stub: try_windows_path_to_wsl
     pub fn try_windows_path_to_wsl(
         &mut self,
-        _path: &std::path::Path,
+        path: &std::path::Path,
         _cx: &mut Context<Self>,
     ) -> gpui::Task<anyhow::Result<std::path::PathBuf>> {
-        gpui::Task::ready(Err(anyhow::anyhow!("stub: try_windows_path_to_wsl")))
+        gpui::Task::ready(Ok(path.to_path_buf()))
     }
 
     /// §8.2 Delegate to WorktreeStore::find_or_create_worktree.
@@ -663,14 +785,14 @@ impl Project {
         })
     }
 
-    /// Stub: is_read_only
     pub fn is_read_only(&self, _cx: &App) -> bool {
         false
     }
 
-    /// Stub: wait_for_initial_scan
-    pub fn wait_for_initial_scan(&self) -> gpui::Task<()> {
-        gpui::Task::ready(())
+    /// Wait until all visible worktrees have completed their initial scan.
+    pub fn wait_for_initial_scan(&self, cx: &App) -> gpui::Task<()> {
+        let wait = self.worktree_store.read(cx).wait_for_initial_scan();
+        cx.background_spawn(wait)
     }
 
     /// Delete a project path via its worktree entry.
@@ -962,5 +1084,27 @@ mod z3rm_path_tests {
         let proto = original.to_proto();
         let recovered = ProjectPath::from_proto(proto).expect("round trip");
         assert_eq!(original, recovered);
+    }
+    #[test]
+    fn prepared_terminal_task_uses_prepared_executable_and_arguments() {
+        let task = SpawnInTerminal {
+            command: "/bin/bash".to_string(),
+            args: vec![
+                "-i".to_string(),
+                "-c".to_string(),
+                "printf task".to_string(),
+            ],
+            shell: Shell::System,
+            ..Default::default()
+        };
+        let shell = Project::shell_for_terminal_task(&task);
+        assert_eq!(
+            shell,
+            util::shell::Shell::WithArguments {
+                program: "/bin/bash".to_string(),
+                args: task.args.clone(),
+                title_override: None,
+            }
+        );
     }
 }

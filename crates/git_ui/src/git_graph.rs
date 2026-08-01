@@ -4406,8 +4406,7 @@ impl workspace::SerializableItem for GitGraph {
         let window_handle = window.window_handle();
         let project = project.read(cx);
         let git_store = project.git_store().clone();
-        let wait = project.wait_for_initial_scan();
-
+        let wait = project.wait_for_initial_scan(cx);
         cx.spawn(async move |cx| {
             wait.await;
 

@@ -24,7 +24,7 @@
 //!
 //! See `docs/development/ui-regression-testing.md`.
 
-#![cfg(all(target_os = "macos", unix))]
+#![cfg(all(unix, any(target_os = "macos", target_os = "linux")))]
 
 use anyhow::{Context as _, Result};
 use assets::Assets;
@@ -77,9 +77,9 @@ fn init_process_env() {
     });
 }
 
-/// Build a headless app with a real platform text system (so glyph metrics and
-/// rasterization match the shipping app), real embedded fonts, and a real GPU
-/// renderer for screenshot capture.
+/// Build a headless app with the shipping platform text system and embedded
+/// fonts. macOS uses the Metal renderer; Linux uses the deterministic software
+/// renderer so screenshots are reproducible without a display server.
 fn headless_app() -> Result<HeadlessAppContext> {
     init_process_env();
 
@@ -156,6 +156,15 @@ fn save_frame(name: &str, image: &RgbaImage, tree: &serde_json::Value) -> Result
     save_screenshot(name, image)?;
     save_a11y_tree(name, tree)?;
     Ok(())
+}
+
+fn image_digest(image: &RgbaImage) -> u64 {
+    let mut digest = 0xcbf29ce484222325u64;
+    for byte in image.as_raw() {
+        digest ^= u64::from(*byte);
+        digest = digest.wrapping_mul(0x100000001b3);
+    }
+    digest
 }
 
 /// Number of distinct RGB triples in the frame. A blank or single-fill frame
@@ -406,6 +415,7 @@ fn mock_response(
                 from_generation: fetch.since_generation,
                 to_generation: generation,
                 update: Some(FetchUpdate::FullSnapshot(snapshot.clone())),
+                output_sequence: 0,
             }))
         }
         // Empty body = success. Anything the view issues during startup that is
@@ -538,6 +548,13 @@ fn mux_pane_renders_terminal_grid_and_exposes_a11y_tree() -> Result<()> {
     })?;
     save_frame("mux_pane_terminal_grid", &image, &tree)?;
 
+    #[cfg(target_os = "linux")]
+    assert_eq!(
+        image_digest(&image),
+        0x9295b034f2e44153,
+        "Linux mux screenshot baseline changed; inspect target/ui_screenshots/mux_pane_terminal_grid.png"
+    );
+
     // --- a11y structure (§16.4) ---
     let terminals = a11y_nodes_with_role(&tree, "Terminal");
     assert!(
@@ -584,18 +601,11 @@ fn mux_pane_renders_terminal_grid_and_exposes_a11y_tree() -> Result<()> {
         text_runs.len()
     );
 
-    // KNOWN GAP (§16.4): `MuxPaneView::render` puts `.aria_label(pane title)`
-    // on the root div, but `Styled::aria_label` alone leaves `a11y_role()` at
-    // `None`, and GPUI drops role-less elements from the tree. The pane title
-    // therefore never reaches assistive technology, and the focusable pane root
-    // contributes no tab stop. Pinned here so a fix is noticed.
     assert!(
-        !a11y_nodes(&tree)
-            .iter()
-            .any(|(_, node)| a11y_string_field(node, "label")
-                .is_some_and(|label| label != "terminal output")),
-        "the pane title is exposed now — replace this with a positive assertion \
-         and update docs/development/ui-regression-testing.md"
+        a11y_nodes(&tree).iter().any(|(_, node)| {
+            a11y_string_field(node, "label").as_deref() == Some("Terminal")
+        }),
+        "the mux pane root should expose its accessible terminal title"
     );
     assert_eq!(
         tree.get("frame")
@@ -804,6 +814,13 @@ fn extension_chrome_vdom_renders_status_bar() -> Result<()> {
     let (image, tree) = draw_frame(&mut cx, window.into())?;
     save_frame("extension_chrome_status_bar", &image, &tree)?;
 
+    #[cfg(target_os = "linux")]
+    assert_eq!(
+        image_digest(&image),
+        0x1ceb2b6e4d850ada,
+        "Linux extension screenshot baseline changed; inspect target/ui_screenshots/extension_chrome_status_bar.png"
+    );
+
     let colors = distinct_colors(&image);
     assert!(
         colors > 4,
@@ -847,26 +864,28 @@ fn extension_chrome_vdom_renders_status_bar() -> Result<()> {
         "expected rasterized label glyphs in the status bar, found {glyph_pixels}"
     );
 
-    // KNOWN GAP (§5.4 / §16.4): `vdom_bridge` never calls `Styled::role`, and
-    // GPUI only emits an AccessKit node for elements whose `a11y_role()` is
-    // `Some`. Every button, input and label the bridge produces is therefore
-    // invisible to assistive technology — the whole chrome collapses to the
-    // bare Window root. This assertion pins the current behaviour so the gap
-    // cannot be forgotten, and fails the moment the bridge starts emitting
-    // roles (at which point it should be replaced with positive assertions
-    // for Role::Button / Role::TextInput).
     let roles = a11y_role_summary(&tree);
-    assert_eq!(
-        roles,
-        vec!["Window".to_string()],
-        "extension chrome a11y expectations changed. If vdom_bridge now sets \
-         roles, replace this with positive Role::Button / Role::TextInput \
-         assertions and update docs/development/ui-regression-testing.md"
+    assert!(
+        roles.iter().any(|role| role == "Button"),
+        "extension button must be exposed to assistive technology: {roles:?}"
     );
     assert!(
-        a11y_text_run_values(&tree).is_empty(),
-        "chrome label text is not exposed as TextRun today; if it is now, \
-         update this test and the docs"
+        roles.iter().any(|role| role == "TextInput"),
+        "extension input must be exposed to assistive technology: {roles:?}"
+    );
+    assert_eq!(
+        a11y_nodes_with_role(&tree, "Button").len(),
+        1,
+        "the status bar fixture contains one semantic button"
+    );
+    assert_eq!(
+        a11y_nodes_with_role(&tree, "TextInput").len(),
+        1,
+        "the status bar fixture contains one semantic text input"
+    );
+    assert!(
+        roles.iter().any(|role| role == "Window"),
+        "the accessibility tree must retain its window root: {roles:?}"
     );
 
     Ok(())
@@ -940,14 +959,19 @@ impl Render for Swatch {
 }
 
 fn headless_renderer_produces_real_pixels() -> Result<()> {
-    // Guards the harness: if the Metal headless renderer silently degrades to a
-    // blank surface, every other assertion in this file becomes meaningless.
+    // Guards the harness: a blank software or GPU frame makes every other
+    // visual assertion meaningless.
     let mut cx = headless_app()?;
     let window = cx.open_window(size(px(100.0), px(100.0)), |_, cx| cx.new(|_| Swatch))?;
     let (image, _) = draw_frame(&mut cx, window.into())?;
     save_screenshot("harness_swatch", &image)?;
-
     let green = count_near_color(&image, [0, 255, 0], 2);
+    #[cfg(target_os = "linux")]
+    assert_eq!(
+        image_digest(&image),
+        0x473a8a51de9b6d25,
+        "Linux swatch screenshot baseline changed; inspect target/ui_screenshots/harness_swatch.png"
+    );
     assert!(
         green > 1_000,
         "expected a solid green swatch in the framebuffer, found {green} pixels"

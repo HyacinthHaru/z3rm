@@ -325,6 +325,7 @@ pub(super) fn apply_structured_snapshot(
     term: &mut AlacrittyTerm,
     snapshot: &StructuredTerminalSnapshot,
     bounds: TerminalBounds,
+    history_capacity: usize,
 ) {
     resize(term, bounds);
 
@@ -338,7 +339,7 @@ pub(super) fn apply_structured_snapshot(
     let history_rows = snapshot.history.len() / snapshot.cols;
     if history_rows != 0 {
         let grid = term.grid_mut();
-        grid.update_history(history_rows);
+        grid.update_history(history_capacity.max(history_rows));
         grid.scroll_up(&(Line(0)..Line(snapshot.rows as i32)), history_rows);
         for (index, source) in snapshot.history.iter().enumerate() {
             let row = index / snapshot.cols;

@@ -92,3 +92,48 @@ fn read_only_editor_rejects_mutating_actions(cx: &mut TestAppContext) {
         assert_eq!(editor.text(cx), "abc");
     });
 }
+
+#[gpui::test]
+fn clear_action_removes_all_text(cx: &mut TestAppContext) {
+    init(cx);
+    let editor = editor_with_text("first\nsecond", cx);
+
+    editor.update(cx, |editor, window, cx| {
+        editor.clear(window, cx);
+        assert_eq!(editor.text(cx), "");
+    });
+}
+
+#[gpui::test]
+fn indentation_actions_round_trip_selected_lines(cx: &mut TestAppContext) {
+    init(cx);
+    let editor = editor_with_text("one\ntwo\nthree", cx);
+
+    editor.update(cx, |editor, window, cx| {
+        editor.change_selections(SelectionEffects::no_scroll(), window, cx, |selections| {
+            selections.select_ranges([MultiBufferOffset(0)..MultiBufferOffset(7)]);
+        });
+        editor.indent(&Indent, window, cx);
+        assert_eq!(editor.text(cx), "    one\n    two\nthree");
+
+        editor.outdent(&Outdent, window, cx);
+        assert_eq!(editor.text(cx), "one\ntwo\nthree");
+    });
+}
+
+#[gpui::test]
+fn tab_action_indents_a_cursor_and_backtab_reverses_it(cx: &mut TestAppContext) {
+    init(cx);
+    let editor = editor_with_text("one", cx);
+
+    editor.update(cx, |editor, window, cx| {
+        editor.change_selections(SelectionEffects::no_scroll(), window, cx, |selections| {
+            selections.select_ranges([MultiBufferOffset(0)..MultiBufferOffset(0)]);
+        });
+        editor.tab(&Tab, window, cx);
+        assert_eq!(editor.text(cx), "    one");
+
+        editor.backtab(&Backtab, window, cx);
+        assert_eq!(editor.text(cx), "one");
+    });
+}

@@ -1727,7 +1727,7 @@ impl EditorElement {
         let max_severity = match self
             .editor
             .read(cx)
-            .inline_diagnostics_enabled::<bool>()
+            .inline_diagnostics_enabled()
             .then(|| {
                 ProjectSettings::get_global(cx)
                     .diagnostics

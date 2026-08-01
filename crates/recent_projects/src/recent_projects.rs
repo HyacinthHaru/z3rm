@@ -20,7 +20,7 @@ use disconnected_overlay::DisconnectedOverlay;
 use fuzzy_nucleo::{StringMatch, StringMatchCandidate, match_strings};
 use gpui::{
     Action, AnyElement, App, Context, DismissEvent, Entity, EventEmitter, FocusHandle, Focusable,
-    Subscription, Task, TaskExt, WeakEntity, Window, actions, px,
+    SharedString, Subscription, Task, TaskExt, WeakEntity, Window, actions, px,
 };
 
 use picker::{
@@ -342,7 +342,18 @@ pub fn init(cx: &mut App) {
                         ..Default::default()
                     };
 
-                    open_remote_project(connection_options, vec![path.into()], app_state, open_options, cx).await.log_err();
+                    if let Err(error) =
+                        open_remote_project(connection_options, vec![path.into()], app_state, open_options, cx)
+                            .await
+                    {
+                        let message = format!("Unable to open the WSL project: {error}");
+                        if let Err(prompt_error) = cx
+                            .prompt(gpui::PromptLevel::Critical, "Unable to open project", Some(&message), &["OK"])
+                            .await
+                        {
+                            log::error!("failed to show WSL project error: {prompt_error}");
+                        }
+                    }
                     return;
                 }
 
@@ -1154,6 +1165,16 @@ impl PickerDelegate for RecentProjectsDelegate {
                 }
 
                 let key = key.clone();
+                if let Some(host) = key.host() {
+                    if let Some(workspace) = self.workspace.upgrade() {
+                        workspace.update(cx, |workspace, cx| {
+                            workspace.show_error(remote_recent_project_error(host), cx);
+                        });
+                    }
+                    cx.emit(DismissEvent);
+                    return;
+                }
+
                 if let Some(handle) = window.window_handle().downcast::<MultiWorkspace>() {
                     cx.defer(move |cx| {
                         // Try to activate an existing workspace for this project group
@@ -2082,7 +2103,6 @@ fn open_local_project(
     cx: &mut App,
 ) {
     use gpui::PathPromptOptions;
-    use project::DirectoryLister;
 
     let Some(workspace) = workspace.upgrade() else {
         return;
@@ -2189,14 +2209,8 @@ impl RecentProjectsDelegate {
                             );
                     }
                 }
-                SerializedWorkspaceLocation::Remote(_host) => {
-                    // Remote project reopening stubbed (spec §8.2 M3)
-                    let _app_state = workspace.app_state().clone();
-                    let _replace_window = if replace_current_window {
-                        window.window_handle().downcast::<MultiWorkspace>()
-                    } else {
-                        None
-                    };
+                SerializedWorkspaceLocation::Remote(host) => {
+                    workspace.show_error(remote_recent_project_error(&host), cx);
                 }
             }
         });
@@ -2429,7 +2443,15 @@ impl RecentProjectsDelegate {
     }
 }
 
-/// Stub: open_remote_project (remote project 功能已删除 spec §8.2 M3)
+fn remote_recent_project_error(host: &str) -> String {
+    format!(
+        "Cannot reopen remote project at {host}: remote project workspaces are not supported by this build"
+    )
+}
+
+/// Attempt to reopen a remote recent project through the canonical workspace
+/// path. Remote project workspaces are not available in this build, so the
+/// caller receives an explicit error instead of a false success.
 pub async fn open_remote_project(
     _connection_options: RemoteConnectionOptions,
     _paths: Vec<std::path::PathBuf>,
@@ -2437,12 +2459,14 @@ pub async fn open_remote_project(
     _open_options: workspace::OpenOptions,
     _cx: &mut gpui::AsyncWindowContext,
 ) -> anyhow::Result<()> {
-    Ok(())
+    anyhow::bail!("remote project reopening is not supported by this build")
 }
 
-/// Stub: RemoteServerProjects (remote server 功能已删除 spec §8.2 M3)
+/// Reports unsupported legacy remote and dev-container entry points instead of
+/// presenting a blank modal.
 pub struct RemoteServerProjects {
     focus_handle: gpui::FocusHandle,
+    message: SharedString,
 }
 
 impl gpui::Focusable for RemoteServerProjects {
@@ -2466,7 +2490,7 @@ impl workspace::ModalView for RemoteServerProjects {
 }
 impl gpui::Render for RemoteServerProjects {
     fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
-        div()
+        div().p_4().child(self.message.clone())
     }
 }
 
@@ -2480,6 +2504,7 @@ impl RemoteServerProjects {
     ) -> Self {
         Self {
             focus_handle: cx.focus_handle(),
+            message: "Remote project workspaces are not supported by this build.".into(),
         }
     }
 
@@ -2492,6 +2517,7 @@ impl RemoteServerProjects {
     ) -> Self {
         Self {
             focus_handle: cx.focus_handle(),
+            message: "WSL remote workspaces are not supported by this build.".into(),
         }
     }
 
@@ -2506,6 +2532,7 @@ impl RemoteServerProjects {
     ) -> Self {
         Self {
             focus_handle: cx.focus_handle(),
+            message: "Dev container support is not available in this build.".into(),
         }
     }
 
@@ -2518,6 +2545,7 @@ impl RemoteServerProjects {
     ) -> gpui::Entity<Self> {
         cx.new(|cx| Self {
             focus_handle: cx.focus_handle(),
+            message: "Remote project workspaces are not supported by this build.".into(),
         })
     }
 }
@@ -2877,9 +2905,11 @@ mod tests {
                     .workspace()
                     .read(cx)
                     .active_modal::<RemoteServerProjects>(cx);
+                let modal = modal
+                    .expect("Dev container modal should be open after dispatching OpenDevContainer");
                 assert!(
-                    modal.is_some(),
-                    "Dev container modal should be open after dispatching OpenDevContainer"
+                    modal.read(cx).message.to_string().contains("Dev container"),
+                    "unsupported dev container modal must explain the unavailable feature"
                 );
             })
             .unwrap();
@@ -3079,12 +3109,24 @@ mod tests {
 
     fn init_test(cx: &mut TestAppContext) -> Arc<AppState> {
         cx.update(|cx| {
+            let settings_store = SettingsStore::test(cx);
+            cx.set_global(settings_store);
+            theme_settings::init(theme::LoadThemes::JustBase, cx);
             let state = AppState::test(cx);
+            <dyn Fs>::set_global(state.fs.clone(), cx);
             crate::init(cx);
             editor::init(cx);
             state
         })
     }
+    #[test]
+    fn remote_recent_project_error_identifies_host() {
+        assert_eq!(
+            remote_recent_project_error("build-host"),
+            "Cannot reopen remote project at build-host: remote project workspaces are not supported by this build"
+        );
+    }
+
 
     #[gpui::test]
     async fn test_remote_project_group_confirm_does_not_create_local_workspace(
@@ -3182,16 +3224,24 @@ mod tests {
 
         cx.run_until_parked();
 
-        // Verify no local workspace was created for the remote paths
-        let has_local = mw
+        // Reopening a persisted remote location must report the unsupported
+        // operation instead of silently treating it as a successful no-op.
+        let (has_local, notification_count) = mw
             .read_with(cx, |mw, cx| {
-                mw.workspace_for_paths(remote_key.path_list(), None, cx)
-                    .is_some()
+                (
+                    mw.workspace_for_paths(remote_key.path_list(), None, cx)
+                        .is_some(),
+                    mw.workspace().read(cx).notification_ids().len(),
+                )
             })
             .unwrap();
         assert!(
             !has_local,
             "remote project group confirm should not create a local workspace"
+        );
+        assert!(
+            notification_count > 0,
+            "remote project group confirm should surface an error notification"
         );
     }
 }

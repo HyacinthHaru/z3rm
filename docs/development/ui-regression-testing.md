@@ -44,9 +44,9 @@ Pixel comparison across machines is dominated by font rasterization and GPU
 driver differences, which produce failures that say nothing about the code. The
 suite asserts on properties instead:
 
-- the framebuffer is not blank, and carries the colors the view asked for
 - the accessibility tree contains the expected roles (`Terminal` for a pane,
-  a `TextRun` per visible line)
+  `Button` and `TextInput` for extension chrome, and a `TextRun` per visible
+  line)
 - a display-list repaint changes the pixels without disturbing the surrounding
   VDOM tree
 

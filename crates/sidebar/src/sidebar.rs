@@ -296,6 +296,14 @@ impl ListEntry {
             ListEntry::Pane { pane_id, .. } => format!("pane-{pane_id}").into(),
         }
     }
+    fn is_session(&self) -> bool {
+        matches!(self, ListEntry::Session { .. })
+    }
+
+    fn is_pane(&self) -> bool {
+        matches!(self, ListEntry::Pane { .. })
+    }
+
 
     fn request(&self) -> Option<SidebarRequest> {
         match self {
@@ -791,13 +799,68 @@ impl WorkspaceSidebar for Sidebar {
         SidebarSide::Left
     }
 
-    /// Opening the sidebar re-pulls the session list, which is the only part of
-    /// the tree the server does not push notifications for.
-    ///
-    /// Focus deliberately stays on the sidebar container so the arrow keys and
-    /// `menu::Confirm` work immediately; the filter is one `FocusFilter` away.
-    fn prepare_for_focus(&mut self, _window: &mut Window, cx: &mut Context<Self>) {
-        self.refresh_sessions(cx);
+    /// The mux sidebar has no separate thread-switcher popup. Focusing its
+    /// filter provides the same keyboard-first entry point while keeping the
+    /// native controls available without the extension host.
+    fn toggle_thread_switcher(
+        &mut self,
+        select_last: bool,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if select_last {
+            self.select_last(&SelectLast, window, cx);
+        }
+        let focus_handle = self.filter_editor.focus_handle(cx);
+        window.focus(&focus_handle, cx);
+    }
+
+    fn cycle_project(&mut self, forward: bool, window: &mut Window, cx: &mut Context<Self>) {
+        let session_indices: Vec<usize> = self
+            .entries
+            .iter()
+            .enumerate()
+            .filter_map(|(index, entry)| entry.is_session().then_some(index))
+            .collect();
+        let Some(current_position) = session_indices.iter().position(|index| {
+            matches!(
+                self.entries.get(*index),
+                Some(ListEntry::Session { session_id, .. })
+                    if session_id.as_ref() == self.session_id.as_str()
+            )
+        }) else {
+            return;
+        };
+        let target_position = if forward {
+            (current_position + 1) % session_indices.len()
+        } else {
+            (current_position + session_indices.len() - 1) % session_indices.len()
+        };
+        self.activate_entry(session_indices[target_position], window, cx);
+    }
+
+    fn cycle_thread(&mut self, forward: bool, window: &mut Window, cx: &mut Context<Self>) {
+        let pane_indices: Vec<usize> = self
+            .entries
+            .iter()
+            .enumerate()
+            .filter_map(|(index, entry)| entry.is_pane().then_some(index))
+            .collect();
+        let Some(current_position) = pane_indices.iter().position(|index| {
+            matches!(
+                self.entries.get(*index),
+                Some(ListEntry::Pane { pane_id, .. })
+                    if self.tree.focused_pane_id.as_deref() == Some(pane_id.as_ref())
+            )
+        }) else {
+            return;
+        };
+        let target_position = if forward {
+            (current_position + 1) % pane_indices.len()
+        } else {
+            (current_position + pane_indices.len() - 1) % pane_indices.len()
+        };
+        self.activate_entry(pane_indices[target_position], window, cx);
     }
 
     fn serialized_state(&self, _cx: &App) -> Option<String> {

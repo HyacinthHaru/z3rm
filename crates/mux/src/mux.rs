@@ -7,11 +7,12 @@
 //! 请求/响应关联通过 request_id（§9）。
 
 use anyhow::{Context as _, Result};
-use std::collections::HashMap;
-use std::path::Path;
+use std::collections::{HashMap, VecDeque};
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
+const WRITE_QUEUE_CAPACITY: usize = 1024;
 
 // §9 从 mux_protocol 导入所有 protobuf 类型。
 use mux_protocol::{
@@ -55,6 +56,10 @@ pub struct MuxDomain {
     /// 没有走 `NewWindow` 的对端使用; GUI 打开窗口时会用 `create_window` 换成
     /// 服务端分配的权威 ID。
     window_id: parking_lot::RwLock<String>,
+    /// §15.4 The local socket used for reconnecting this domain.
+    local_socket_path: Option<PathBuf>,
+    /// §15.4 Last authoritative snapshot returned by attach/reconnect.
+    last_attached_snapshot: parking_lot::RwLock<Option<mux_protocol::SessionSnapshot>>,
     /// §15.7 Last session successfully attached by this domain. Used by native
     /// KillSession keybindings so the GUI targets the attached session rather
     /// than an arbitrary `list_sessions().first()`.
@@ -91,7 +96,7 @@ struct DomainInner {
     pending_requests: HashMap<u64, PendingRequest>,
     /// §9 通知订阅者列表。subscribe() 添加新 sender, 路由器 fan-out 到所有。
     subscribers: Arc<parking_lot::Mutex<Vec<async_channel::Sender<Notification>>>>,
-    write_tx: std::sync::mpsc::Sender<Vec<u8>>,
+    write_tx: std::sync::mpsc::SyncSender<Vec<u8>>,
     /// Monotonic transport epoch. Each I/O worker records the epoch it was
     /// spawned with; reconnect increments it so a stale worker can no longer
     /// fulfill or cancel requests registered against the new transport.
@@ -155,6 +160,30 @@ fn drain_pending_requests_for_epoch(
     }
     worker_senders
 }
+/// Notifications that must never be dropped by the router fan-out.
+///
+/// Lifecycle events are at-least-once by contract (§3.4): losing PaneRemoved
+/// leaves a zombie pane, so they briefly block the dedicated I/O thread rather
+/// than drop. PaneOutput is delivered best-effort: it is the §3.1 render-path
+/// byte stream, and the client guards it with a monotonic output sequence — a
+/// dropped or reordered chunk is detected and repaired by an authoritative grid
+/// resync, so the router never blocks on a slow renderer. PaneDirty is lossy
+/// too; the next generation pull repairs it.
+fn notification_requires_reliable_delivery(notification: &Notification) -> bool {
+    matches!(
+        notification.event,
+        Some(NotifEvent::PaneAdded(_))
+            | Some(NotifEvent::PaneRemoved(_))
+            | Some(NotifEvent::SessionLayoutChanged(_))
+            | Some(NotifEvent::PaneZoomed(_))
+            | Some(NotifEvent::PaneTitleChanged(_))
+            | Some(NotifEvent::PaneBell(_))
+            | Some(NotifEvent::ExtensionChrome(_))
+            | Some(NotifEvent::WindowAdded(_))
+            | Some(NotifEvent::WindowRemoved(_))
+    )
+}
+
 // §9 MuxTransport: 传输层枚举
 // ============================================================================
 
@@ -204,7 +233,9 @@ fn connect_local_blocking(path: &Path) -> Result<MuxDomain> {
         use std::os::unix::net::UnixStream;
         let stream = UnixStream::connect(path)?;
         stream.set_nonblocking(true)?;
-        MuxDomain::connect_with_blocking_stream(stream)
+        let mut domain = MuxDomain::connect_with_blocking_stream(stream)?;
+        domain.local_socket_path = Some(path.to_path_buf());
+        Ok(domain)
     }
     #[cfg(windows)]
     {
@@ -217,7 +248,9 @@ fn connect_local_blocking(path: &Path) -> Result<MuxDomain> {
             .map_err(|error| anyhow::anyhow!("invalid pipe name: {error}"))?;
         let stream = LocalSocketStream::connect(name)
             .map_err(|error| anyhow::anyhow!("connect failed: {error}"))?;
-        MuxDomain::connect_with_stream(stream)
+        let mut domain = MuxDomain::connect_with_stream(stream)?;
+        domain.local_socket_path = Some(path.to_path_buf());
+        Ok(domain)
     }
 }
 
@@ -344,7 +377,7 @@ fn connect_local_stream(socket_path: Option<&Path>) -> Result<Box<dyn ReadWrite 
 
 impl MuxDomain {
     pub fn connect_with_stream(stream: interprocess::local_socket::Stream) -> Result<Self> {
-        let (write_tx, write_rx) = std::sync::mpsc::channel();
+        let (write_tx, write_rx) = std::sync::mpsc::sync_channel(WRITE_QUEUE_CAPACITY);
 
         let subscribers: Arc<parking_lot::Mutex<Vec<async_channel::Sender<Notification>>>> =
             Arc::new(parking_lot::Mutex::new(Vec::new()));
@@ -370,6 +403,8 @@ impl MuxDomain {
         Ok(MuxDomain {
             inner,
             window_id: parking_lot::RwLock::new(mint_window_id()),
+            local_socket_path: None,
+            last_attached_snapshot: parking_lot::RwLock::new(None),
             last_attached_session_id: parking_lot::RwLock::new(None),
         })
     }
@@ -378,7 +413,7 @@ impl MuxDomain {
     pub fn connect_with_blocking_stream<S: std::io::Read + std::io::Write + Send + 'static>(
         stream: S,
     ) -> Result<Self> {
-        let (write_tx, write_rx) = std::sync::mpsc::channel();
+        let (write_tx, write_rx) = std::sync::mpsc::sync_channel(WRITE_QUEUE_CAPACITY);
         let subscribers: Arc<parking_lot::Mutex<Vec<async_channel::Sender<Notification>>>> =
             Arc::new(parking_lot::Mutex::new(Vec::new()));
         let inner = Arc::new(parking_lot::RwLock::new(DomainInner {
@@ -400,6 +435,8 @@ impl MuxDomain {
         Ok(MuxDomain {
             inner,
             window_id: parking_lot::RwLock::new(mint_window_id()),
+            local_socket_path: None,
+            last_attached_snapshot: parking_lot::RwLock::new(None),
             last_attached_session_id: parking_lot::RwLock::new(None),
         })
     }
@@ -422,24 +459,43 @@ impl MuxDomain {
         worker_epoch: u64,
     ) {
         let mut buf = Vec::new();
+        let mut pending_writes: VecDeque<(Vec<u8>, usize)> = VecDeque::new();
 
         'outer: loop {
             if inner.read().transport_epoch.load(Ordering::SeqCst) != worker_epoch {
                 break;
             }
-            // §9 轮询写通道（非阻塞）
+            // Drain the request channel into a partial-write queue. Local sockets
+            // are nonblocking; `write_all` would treat a full kernel buffer as a
+            // fatal disconnect and silently lose the frame.
+            while let Ok(framed) = write_rx.try_recv() {
+                pending_writes.push_back((framed, 0));
+            }
+
             loop {
-                match write_rx.try_recv() {
-                    Ok(framed) => {
-                        if stream.write_all(&framed).is_err() {
-                            tracing::error!("socket write error");
+                let finished = match pending_writes.front_mut() {
+                    None => break,
+                    Some((frame, offset)) if *offset == frame.len() => true,
+                    Some((frame, offset)) => match stream.write(&frame[*offset..]) {
+                        Ok(0) => {
+                            tracing::error!("socket write returned zero bytes");
                             break 'outer;
                         }
-                    }
-                    Err(std::sync::mpsc::TryRecvError::Empty) => break,
-                    Err(std::sync::mpsc::TryRecvError::Disconnected) => {
-                        break 'outer;
-                    }
+                        Ok(written) => {
+                            *offset += written;
+                            *offset == frame.len()
+                        }
+                        Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                            break
+                        }
+                        Err(error) => {
+                            tracing::error!(error = %error, "socket write error");
+                            break 'outer;
+                        }
+                    },
+                };
+                if finished {
+                    pending_writes.pop_front();
                 }
             }
 
@@ -475,32 +531,30 @@ impl MuxDomain {
                             }
                         }
                         Some(EnvelopePayload::Notification(notif)) => {
-                            let mut subs = subscribers.lock();
-                            subs.retain(|tx| !tx.is_closed());
-                            let is_lifecycle = matches!(
-                                notif.event,
-                                Some(NotifEvent::PaneAdded(_))
-                                    | Some(NotifEvent::PaneRemoved(_))
-                                    | Some(NotifEvent::SessionLayoutChanged(_))
-                                    | Some(NotifEvent::PaneZoomed(_))
-                                    | Some(NotifEvent::PaneTitleChanged(_))
-                                    | Some(NotifEvent::PaneBell(_))
-                                    // §3.4 / §3.3 Window membership is lifecycle
-                                    // state (Plan 32): losing a WindowRemoved
-                                    // leaves a zombie window in every peer.
-                                    | Some(NotifEvent::WindowAdded(_))
-                                    | Some(NotifEvent::WindowRemoved(_))
-                            );
-                            for tx in subs.iter() {
-                                if is_lifecycle {
-                                    // §3.4 at-least-once: block rather than drop lifecycle.
-                                    // The I/O thread is dedicated; a slow GUI may stall
-                                    // briefly but must not lose PaneRemoved.
-                                    if tx.send_blocking(notif.clone()).is_err() {
-                                        // closed
+                            let senders = {
+                                let mut subscribers = subscribers.lock();
+                                subscribers.retain(|tx| !tx.is_closed());
+                                subscribers.iter().cloned().collect::<Vec<_>>()
+                            };
+                            let reliable = notification_requires_reliable_delivery(&notif);
+                            for sender in senders {
+                                if reliable {
+                                    // §3.1 / §3.4 reliable path: block the dedicated I/O
+                                    // thread instead of dropping lifecycle state or PTY bytes.
+                                    // The bounded subscriber queue applies backpressure.
+                                    if let Err(error) = sender.send_blocking(notif.clone()) {
+                                        tracing::debug!(
+                                            ?error,
+                                            "reliable notification subscriber closed before delivery"
+                                        );
                                     }
-                                } else if tx.try_send(notif.clone()).is_err() {
-                                    // PaneDirty is at-most-once / lossy under pressure.
+                                } else if let Err(error) = sender.try_send(notif.clone()) {
+                                    // PaneDirty is at-most-once/lossy under pressure; a later
+                                    // generation pull repairs it without corrupting byte order.
+                                    tracing::trace!(
+                                        ?error,
+                                        "lossy notification subscriber unavailable"
+                                    );
                                 }
                             }
                         }
@@ -631,9 +685,17 @@ impl MuxDomain {
             transport_epoch,
         };
 
-        write_tx
-            .send(framed)
-            .map_err(|error| anyhow::anyhow!("write channel error: {}", error))?;
+        match write_tx.try_send(framed) {
+            Ok(()) => {}
+            Err(std::sync::mpsc::TrySendError::Full(_)) => {
+                return Err(anyhow::anyhow!(
+                    "mux write queue is full; request rejected before transport"
+                ));
+            }
+            Err(std::sync::mpsc::TrySendError::Disconnected(_)) => {
+                return Err(anyhow::anyhow!("mux write channel disconnected"));
+            }
+        }
         // This future is also polled by GPUI's executor, where no Tokio reactor
         // exists, so the timeout must be executor-neutral.
         let response = smol::future::or(async { Some(rx.recv().await) }, async {
@@ -990,6 +1052,7 @@ impl MuxDomain {
         let resp = self.send_request(req).await?;
         match resp.body {
             Some(ResponseBody::Attach(resp)) => {
+                *self.last_attached_snapshot.write() = resp.snapshot.clone();
                 *self.last_attached_session_id.write() = Some(session.to_string());
                 Ok(resp)
             }
@@ -1000,6 +1063,10 @@ impl MuxDomain {
     /// §15.7 Session this domain last attached to, if any.
     pub fn last_attached_session_id(&self) -> Option<String> {
         self.last_attached_session_id.read().clone()
+    }
+    /// §15.4 Most recent authoritative snapshot for extension/UI hydration.
+    pub fn last_attached_snapshot(&self) -> Option<mux_protocol::SessionSnapshot> {
+        self.last_attached_snapshot.read().clone()
     }
 
     /// §3.10 断开连接。
@@ -1156,12 +1223,15 @@ impl MuxDomain {
     /// Used after reconnect to deliver a SessionLayoutChanged without waiting
     /// for the server to push one.
     pub fn broadcast_notification(&self, notif: Notification) {
-        let inner = self.inner.read();
-        let mut subs = inner.subscribers.lock();
-        subs.retain(|tx| !tx.is_closed());
-        for tx in subs.iter() {
-            if tx.try_send(notif.clone()).is_err() {
-                tracing::debug!("notification subscriber dropped before delivery");
+        let senders = {
+            let inner = self.inner.read();
+            let mut subscribers = inner.subscribers.lock();
+            subscribers.retain(|tx| !tx.is_closed());
+            subscribers.iter().cloned().collect::<Vec<_>>()
+        };
+        for sender in senders {
+            if sender.send_blocking(notif.clone()).is_err() {
+                tracing::debug!("notification subscriber closed before synthetic delivery");
             }
         }
     }
@@ -1191,8 +1261,10 @@ impl MuxDomain {
         session_id: &str,
         attach_mode: AttachMode,
     ) -> Result<()> {
-        let stream = connect_local_stream(None)?;
-        let (new_write_tx, new_write_rx) = std::sync::mpsc::channel();
+        let local_socket_path = self.local_socket_path.clone();
+        let stream = connect_local_stream(local_socket_path.as_deref())?;
+        let (new_write_tx, new_write_rx) =
+            std::sync::mpsc::sync_channel(WRITE_QUEUE_CAPACITY);
         let io_inner = self.inner.clone();
 
         let old_pending = {
@@ -1203,7 +1275,11 @@ impl MuxDomain {
                 .ok_or_else(|| anyhow::anyhow!("mux transport epoch exhausted"))?;
             let io_subscribers = inner.subscribers.clone();
 
-            std::thread::Builder::new()
+            let old_pending = drain_pending_requests_for_epoch(&mut inner, old_epoch);
+            inner.write_tx = new_write_tx;
+            inner.transport_epoch.store(new_epoch, Ordering::SeqCst);
+
+            if let Err(error) = std::thread::Builder::new()
                 .name("mux-io".into())
                 .spawn(move || {
                     Self::io_and_router_loop(
@@ -1214,24 +1290,36 @@ impl MuxDomain {
                         new_epoch,
                     );
                 })
-                .map_err(|error| anyhow::anyhow!("failed to spawn mux I/O thread: {}", error))?;
+            {
+                return Err(anyhow::anyhow!(
+                    "failed to spawn mux I/O thread: {}",
+                    error
+                ));
+            }
 
-            let old_pending = drain_pending_requests_for_epoch(&mut inner, old_epoch);
-            inner.write_tx = new_write_tx;
-            inner.transport_epoch.store(new_epoch, Ordering::SeqCst);
             old_pending
         };
         drop(old_pending);
 
         let attach_resp = self.attach(session_id, attach_mode).await?;
-        if let Some(snapshot) = attach_resp.snapshot.as_ref()
-            && let Some(layout) = snapshot.layout.as_ref()
-        {
-            self.broadcast_notification(Notification {
-                event: Some(NotifEvent::SessionLayoutChanged(SessionLayoutChanged {
-                    layout: Some(layout.clone()),
-                })),
-            });
+        if let Some(snapshot) = attach_resp.snapshot.as_ref() {
+            if let Some(layout) = snapshot.layout.as_ref() {
+                self.broadcast_notification(Notification {
+                    event: Some(NotifEvent::SessionLayoutChanged(SessionLayoutChanged {
+                        layout: Some(layout.clone()),
+                    })),
+                });
+            }
+
+            for tab in &snapshot.tabs {
+                for pane in &tab.panes {
+                    self.broadcast_notification(Notification {
+                        event: Some(NotifEvent::PaneDirty(mux_protocol::PaneDirty {
+                            pane_id: pane.id.clone(),
+                        })),
+                    });
+                }
+            }
         }
         Ok(())
     }
@@ -1245,8 +1333,49 @@ impl MuxDomain {
 mod tests {
     use super::*;
 
+    #[test]
+    fn lifecycle_blocks_while_byte_stream_and_dirty_are_lossy() {
+        let output = Notification {
+            event: Some(NotifEvent::PaneOutput(mux_protocol::PaneOutputChunk {
+                pane_id: "pane-1".to_string(),
+                data: b"\x1b[2;3Htext".to_vec(),
+                output_sequence: 7,
+            })),
+        };
+        let dirty = Notification {
+            event: Some(NotifEvent::PaneDirty(mux_protocol::PaneDirty {
+                pane_id: "pane-1".to_string(),
+            })),
+        };
+        let removed = Notification {
+            event: Some(NotifEvent::PaneRemoved(mux_protocol::PaneRemoved {
+                pane_id: "pane-1".to_string(),
+                exit_code: 0,
+            })),
+        };
+
+        assert!(!notification_requires_reliable_delivery(&output));
+        assert!(!notification_requires_reliable_delivery(&dirty));
+        assert!(notification_requires_reliable_delivery(&removed));
+    }
+
+    #[test]
+    fn server_extension_chrome_is_reliable() {
+        let notification = Notification {
+            event: Some(NotifEvent::ExtensionChrome(
+                mux_protocol::ExtensionChromeUpdate {
+                    extension_id: "server-ext".to_string(),
+                    view_id: "status".to_string(),
+                    vdom_payload: br#"{"type":"span"}"#.to_vec(),
+                },
+            )),
+        };
+
+        assert!(notification_requires_reliable_delivery(&notification));
+    }
+
     fn unresponsive_domain() -> (MuxDomain, std::sync::mpsc::Receiver<Vec<u8>>) {
-        let (write_tx, write_rx) = std::sync::mpsc::channel();
+        let (write_tx, write_rx) = std::sync::mpsc::sync_channel(WRITE_QUEUE_CAPACITY);
         let subscribers = Arc::new(parking_lot::Mutex::new(Vec::new()));
         let domain = MuxDomain {
             inner: Arc::new(parking_lot::RwLock::new(DomainInner {
@@ -1257,6 +1386,8 @@ mod tests {
                 transport_epoch: AtomicU64::new(0),
             })),
             window_id: parking_lot::RwLock::new("test-window".to_string()),
+            local_socket_path: None,
+            last_attached_snapshot: parking_lot::RwLock::new(None),
             last_attached_session_id: parking_lot::RwLock::new(None),
         };
         (domain, write_rx)

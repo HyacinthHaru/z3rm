@@ -23,6 +23,8 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tempfile::TempDir;
+use tokio::io::AsyncWriteExt;
+use tokio::net::UnixStream;
 
 /// Isolated `z3rm-server` process bound to a socket inside its own temp dir.
 struct TestServer {
@@ -478,5 +480,236 @@ async fn split_and_close_churn_keeps_layout_consistent() -> Result<()> {
     );
 
     domain.kill_session(&session_id).await?;
+    Ok(())
+}
+
+/// Poll until the domain reports its connection dead. After a SIGKILL the
+/// client's IO worker must notice EOF/broken pipe promptly and fail pending
+/// requests — never leave them hanging on the 15s request timeout.
+async fn wait_for_dead_connection(domain: &MuxDomain, timeout: Duration) -> Result<()> {
+    let deadline = Instant::now() + timeout;
+    loop {
+        if !domain.check_connection().await {
+            return Ok(());
+        }
+        if Instant::now() >= deadline {
+            anyhow::bail!(
+                "connection still reports live {timeout:?} after the server was killed"
+            );
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+}
+
+/// §15.4 / §3.5 Killing the server mid-session (`kill -9` semantics) must make
+/// in-flight clients fail loudly, and a fresh server instance must recover to
+/// a clean slate — no leaked state from the dead process, no client that
+/// mistakes a dead transport for an empty success.
+#[tokio::test(flavor = "multi_thread")]
+async fn killed_server_fails_loudly_and_fresh_instance_recovers() -> Result<()> {
+    let mut server = TestServer::spawn()?;
+    let domain = server.connect().await?;
+    let (session_id, _tab_id) = open_session(&domain, "killed-server").await?;
+    anyhow::ensure!(
+        domain.check_connection().await,
+        "connection must be live before the kill"
+    );
+
+    // SIGKILL mid-session, exactly like `kill -9`: no graceful detach.
+    server.child.kill().context("SIGKILL the mux server")?;
+    server.child.wait().context("reap the killed mux server")?;
+
+    // Requests on the dead connection must surface an error — a silent empty
+    // response or a hang would leave the UI pointing at a ghost server.
+    wait_for_dead_connection(&domain, Duration::from_secs(5)).await?;
+    let list = domain.list_sessions().await;
+    anyhow::ensure!(
+        list.is_err(),
+        "list_sessions on a killed server must error, got {list:?}"
+    );
+
+    // Recovery path: a fresh instance on a fresh socket serves a fresh client,
+    // and the dead process's session state does not leak into it.
+    let replacement = TestServer::spawn()?;
+    let recovered = replacement.connect().await?;
+    let recovered_session = recovered
+        .create_session("recovered", std::path::Path::new("/tmp"))
+        .await?;
+    let attach = recovered
+        .attach(&recovered_session, AttachMode::Shared)
+        .await?;
+    anyhow::ensure!(
+        attach.snapshot.is_some(),
+        "recovered session attach returned no snapshot"
+    );
+    let sessions = recovered.list_sessions().await?;
+    anyhow::ensure!(
+        sessions.iter().any(|session| session.id == recovered_session),
+        "replacement server does not list the session it just created"
+    );
+    anyhow::ensure!(
+        !sessions.iter().any(|session| session.id == session_id),
+        "session from the killed server leaked into the replacement instance"
+    );
+    Ok(())
+}
+
+/// Flip every byte after the single-byte length prefix so the frame carries a
+/// plausible prefix but a payload no `Envelope` encodes to.
+fn corrupt_payload(mut frame: Vec<u8>) -> Vec<u8> {
+    for byte in &mut frame[1..] {
+        *byte = 0xFF;
+    }
+    frame
+}
+
+/// §9 One malformed frame must take down only its own connection. Each garbage
+/// connection is followed by a fresh, real client that must still be served
+/// and must still see the session created before the garbage — a server that
+/// panics, wedges its accept loop, or drops shared state fails here.
+#[tokio::test(flavor = "multi_thread")]
+async fn malformed_frames_do_not_poison_the_server() -> Result<()> {
+    let server = TestServer::spawn()?;
+    let baseline = server.connect().await?;
+    let (session_id, _tab_id) = open_session(&baseline, "garbage").await?;
+
+    let good_frame = mux_protocol::frame(&mux_protocol::Envelope {
+        version: Some(mux_protocol::PROTOCOL_VERSION),
+        payload: Some(mux_protocol::proto::envelope::Payload::Request(
+            mux_protocol::Request {
+                request_id: 1,
+                body: Some(mux_protocol::proto::request::Body::ListSessions(
+                    mux_protocol::ListSessionsRequest {},
+                )),
+            },
+        )),
+    })?;
+    anyhow::ensure!(
+        good_frame.len() < 128,
+        "probe frame must keep a single-byte prefix, got {}",
+        good_frame.len()
+    );
+
+    let garbage_frames: Vec<(&str, Vec<u8>)> = vec![
+        ("overlong varint prefix", vec![0xFF; mux_protocol::MAX_VARINT_LEN + 1]),
+        (
+            "declared length near i64::MAX with no payload",
+            vec![0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0x7F],
+        ),
+        ("valid prefix with corrupted payload", corrupt_payload(good_frame.clone())),
+        ("frame truncated mid-payload", good_frame[..good_frame.len() / 2].to_vec()),
+    ];
+
+    for (label, garbage) in garbage_frames {
+        let mut junk = UnixStream::connect(&server.socket_path)
+            .await
+            .with_context(|| format!("{label}: connect"))?;
+        junk.write_all(&garbage)
+            .await
+            .with_context(|| format!("{label}: write"))?;
+        junk.shutdown()
+            .await
+            .with_context(|| format!("{label}: half-close"))?;
+        drop(junk);
+
+        // The fresh connection is also the synchronization point: if the
+        // server died on the garbage, this connect or RPC fails.
+        let probe = server
+            .connect()
+            .await
+            .with_context(|| format!("{label}: server no longer accepts connections"))?;
+        let sessions = probe
+            .list_sessions()
+            .await
+            .with_context(|| format!("{label}: server stopped serving after malformed frame"))?;
+        anyhow::ensure!(
+            sessions.iter().any(|session| session.id == session_id),
+            "{label}: session {session_id} vanished after the malformed frame"
+        );
+    }
+    Ok(())
+}
+
+/// §3.4 / §15.5 A subscriber that never drains its bounded (4096) channel
+/// must not stall the wire: lossy notifications pile up or drop, but grid
+/// fetches keep answering, generations stay monotonic, and ordinary RPCs
+/// still work for the whole burst. If fan-out blocked the I/O thread on the
+/// lossy path, the per-fetch timeout below would trip. (Reliable lifecycle
+/// events apply backpressure by design per §3.1 and are not this test.)
+#[tokio::test(flavor = "multi_thread")]
+async fn undrained_subscriber_does_not_stall_the_wire() -> Result<()> {
+    let server = TestServer::spawn()?;
+    let domain = server.connect().await?;
+    let (session_id, tab_id) = open_session(&domain, "backpressure").await?;
+
+    // Bounded and intentionally never drained during the burst.
+    let undrained = domain.subscribe();
+
+    let pane_id = domain
+        .spawn_pane(
+            &session_id,
+            &tab_id,
+            size(200, 50),
+            Some(shell("/usr/bin/yes", &["z3rm-backpressure"])),
+            Some(std::path::Path::new("/tmp")),
+        )
+        .await?;
+
+    let mut previous = 0u64;
+    let mut advances = 0u64;
+    let deadline = Instant::now() + Duration::from_secs(3);
+    while Instant::now() < deadline {
+        let fetch = tokio::time::timeout(
+            Duration::from_secs(2),
+            domain.fetch_grid_update(&pane_id, previous),
+        )
+        .await
+        .context("grid fetch stalled while the subscriber channel was never drained")?
+        .context("grid fetch failed under backpressure")?;
+        let current = fetch.to_generation;
+        anyhow::ensure!(
+            current >= previous,
+            "generation went backwards under backpressure: {previous} then {current}"
+        );
+        if current > previous {
+            advances += 1;
+            previous = current;
+        }
+    }
+    anyhow::ensure!(
+        advances > 5,
+        "the pane barely advanced under backpressure: {advances} generation bumps in 3s"
+    );
+
+    // The RPC path must still be live for requests unrelated to the pane.
+    anyhow::ensure!(
+        domain.check_connection().await,
+        "connection died while the subscriber channel was never drained"
+    );
+    let sessions = domain.list_sessions().await?;
+    anyhow::ensure!(
+        sessions.iter().any(|session| session.id == session_id),
+        "the session vanished under subscriber backpressure"
+    );
+
+    domain.kill_session(&session_id).await?;
+
+    // With the session gone the notification stream must drain and go quiet
+    // rather than block: a wedged fan-out would hang this loop.
+    let mut drained = 0usize;
+    while tokio::time::timeout(Duration::from_millis(500), undrained.recv())
+        .await
+        .is_ok()
+    {
+        drained += 1;
+        anyhow::ensure!(
+            drained < 10_000_000,
+            "notification stream never went quiet after the session was killed"
+        );
+    }
+    anyhow::ensure!(
+        drained > 0,
+        "no notification was ever delivered while the channel was under pressure"
+    );
     Ok(())
 }

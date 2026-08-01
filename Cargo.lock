@@ -5106,12 +5106,14 @@ dependencies = [
 name = "gpui_platform"
 version = "0.1.0"
 dependencies = [
+ "anyhow",
  "console_error_panic_hook",
  "gpui",
  "gpui_linux",
  "gpui_macos",
  "gpui_web",
  "gpui_windows",
+ "image",
 ]
 
 [[package]]
@@ -7555,6 +7557,7 @@ dependencies = [
  "base64 0.22.1",
  "blake3",
  "dirs",
+ "flate2",
  "interprocess",
  "libc",
  "mux",
@@ -7563,12 +7566,14 @@ dependencies = [
  "parking_lot",
  "portable-pty",
  "prost",
+ "quickjs_runtime",
  "regex",
  "serde",
  "serde_json",
  "shadow_snapshot",
  "sqlez",
  "sysinfo 0.37.2",
+ "tar",
  "tempfile",
  "tokio",
  "tracing",
@@ -10485,6 +10490,8 @@ dependencies = [
  "serde_json",
  "settings",
  "telemetry",
+ "theme",
+ "theme_settings",
  "ui",
  "util",
  "windows-registry 0.6.1",

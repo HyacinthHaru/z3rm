@@ -32,6 +32,23 @@ fn encode_send_keys(keys: &[String], encoding: SendKeysEncoding) -> Result<Vec<u
     }
 }
 
+/// 把 send-keys 的载荷重复 `repeat` 次。`-N` 可以大到让乘法或 `Vec::repeat`
+/// 的容量计算溢出, 这里在分配前用 checked 算术 + 上限拦截, 变成可恢复错误。
+fn repeated_payload(bytes: &[u8], repeat: u32) -> Result<Vec<u8>> {
+    const MAX_REPEATED_PAYLOAD: usize = 1024 * 1024;
+    let payload_len = bytes
+        .len()
+        .checked_mul(repeat as usize)
+        .ok_or_else(|| anyhow::anyhow!("send-keys -N {repeat}: payload size overflow"))?;
+    if payload_len > MAX_REPEATED_PAYLOAD {
+        anyhow::bail!(
+            "send-keys -N {repeat}: payload would be {payload_len} bytes \
+             (max {MAX_REPEATED_PAYLOAD})"
+        );
+    }
+    Ok(bytes.repeat(repeat as usize))
+}
+
 /// send-keys 载荷的解释方式。
 /// 来源: spec §3.10 — 与 tmux 的 `-l` / `-H` 对齐。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -550,7 +567,7 @@ pub async fn run_cli_command(cmd: CliCommand) -> Result<()> {
             let target = super::target::parse_target(&target)?;
             let pane_id = resolve_pane_id(&domain, &target, ResolveAccess::ReadWrite).await?;
             let bytes = encode_send_keys(&keys, encoding)?;
-            let bytes = bytes.repeat(repeat as usize);
+            let bytes = repeated_payload(&bytes, repeat)?;
             domain
                 .send_input(&pane_id, &bytes)
                 .await
@@ -842,6 +859,15 @@ mod tests {
             error.to_string().contains("zz"),
             "error should name the offending argument: {error}"
         );
+    }
+
+    #[test]
+    fn send_keys_repeat_payload_is_bounded() {
+        assert_eq!(repeated_payload(b"ab", 3).expect("repeat"), b"ababab");
+        // 超上限 -> 可恢复错误, 不是 Vec::repeat 的 capacity overflow panic。
+        assert!(repeated_payload(&[0u8; 4096], 1024 * 1024).is_err());
+        // 乘法溢出 -> 可恢复错误。
+        assert!(repeated_payload(&[0u8; 1024], u32::MAX).is_err());
     }
 
     #[test]

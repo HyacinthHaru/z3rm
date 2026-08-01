@@ -14,7 +14,7 @@ pub use settings::{RegisterSetting, Settings};
 
 /// 工作区设置 (spec §16 Plan 16)
 /// 原 settings 字段已大幅精简，保留向后兼容桩值
-#[derive(RegisterSetting)]
+#[derive(Clone, RegisterSetting)]
 pub struct WorkspaceSettings {
     pub active_pane_modifiers: ActivePanelModifiers,
     pub bottom_dock_layout: BottomDockLayout,

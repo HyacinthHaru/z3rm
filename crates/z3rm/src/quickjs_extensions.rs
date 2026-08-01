@@ -16,7 +16,7 @@
 //! a synchronous [`quickjs_runtime::HostBridge`] that blocks the extension
 //! thread on the async `MuxDomain` RPC with a short timeout.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::future::Future;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -124,6 +124,35 @@ fn parse_vdom_json(json: &str) -> Result<VDomNode> {
 }
 
 /// §5.5 Publish collected VDOM into the app-global chrome state so freshly
+
+/// Keep client-side QuickJS chrome and server-rendered chrome in one display
+/// order. Server views are keyed by extension and view so an update replaces
+/// the previous render instead of accumulating duplicate nodes.
+fn merge_chrome_nodes(
+    local_nodes: &[VDomNode],
+    server_nodes: &BTreeMap<(String, String), VDomNode>,
+) -> Vec<VDomNode> {
+    let mut merged = Vec::with_capacity(local_nodes.len() + server_nodes.len());
+    merged.extend(local_nodes.iter().cloned());
+    merged.extend(server_nodes.values().cloned());
+    merged
+}
+
+fn apply_server_chrome_node(
+    server_nodes: &mut BTreeMap<(String, String), VDomNode>,
+    update: mux_protocol::ExtensionChromeUpdate,
+) -> Result<()> {
+    let key = (update.extension_id, update.view_id);
+    if update.vdom_payload.is_empty() {
+        server_nodes.remove(&key);
+        return Ok(());
+    }
+    let json = std::str::from_utf8(&update.vdom_payload)
+        .context("server extension VDOM payload is not UTF-8")?;
+    let node = parse_vdom_json(json).context("server extension VDOM rejected")?;
+    server_nodes.insert(key, node);
+    Ok(())
+}
 /// created status bars inherit it.
 fn publish_vdom(cx: &mut gpui::App, nodes: Vec<VDomNode>) {
     if cx.try_global::<AcceptedVdom>().is_none() {
@@ -582,10 +611,16 @@ pub struct ExtensionHostController {
     host_thread: Option<std::thread::JoinHandle<()>>,
     /// Applies chrome the host thread pushes; replaces the old 1Hz poll.
     chrome_task: Option<gpui::Task<()>>,
+    /// Invalidates display-list clock views without running on the render thread.
+    clock_task: Option<gpui::Task<()>>,
     /// Forwards mux notifications into the extensions as events.
     mux_task: Option<gpui::Task<()>>,
     status_bars:
         parking_lot::Mutex<Vec<gpui::WeakEntity<crate::extension_status_bar::ExtensionStatusBar>>>,
+    /// Last local render and authoritative server views are kept separately so
+    /// either source can update without duplicating the other.
+    local_chrome: Vec<VDomNode>,
+    server_chrome: BTreeMap<(String, String), VDomNode>,
 }
 
 pub struct GlobalHostController(pub gpui::Entity<ExtensionHostController>);
@@ -603,12 +638,38 @@ impl HostedExtension {
     /// §5.6 "Resource limits are enforced at runtime — exceeding them results
     /// in extension suspension." Suspension lasts for the process lifetime;
     /// the chrome falls back to the native GPUI baseline (§5.1).
+    ///
+    /// Called after every host → extension interaction (render and each
+    /// command), so a runaway handler is suspended before the next command
+    /// even if nothing requested a re-render.
     fn note_resource_violations(&mut self) {
+        // Extensions report internally caught exceptions (render/event
+        // handlers) through the error list; drain it here on every path so
+        // nothing is silently dropped. "out of memory" in that list is a
+        // resource violation the JS layer swallowed — it must suspend too.
+        match self.live.take_errors() {
+            Ok(errors) => {
+                for error in errors {
+                    tracing::warn!(id = %self.live.id(), %error, "extension reported an error");
+                }
+            }
+            Err(error) => {
+                tracing::warn!(id = %self.live.id(), %error, "draining extension errors failed");
+            }
+        }
         if self.live.take_cpu_interrupted() {
             self.suspended = true;
             tracing::error!(
                 id = %self.live.id(),
                 "extension exceeded its CPU budget and was suspended"
+            );
+            return;
+        }
+        if self.live.take_memory_violated() {
+            self.suspended = true;
+            tracing::error!(
+                id = %self.live.id(),
+                "extension exceeded its memory budget and was suspended"
             );
         }
     }
@@ -638,16 +699,8 @@ fn render_live_extensions(live_extensions: &mut [HostedExtension]) -> Vec<VDomNo
                 tracing::warn!(id = %live_extension.id(), %error, "extension render failed")
             }
         }
-        match live_extension.take_errors() {
-            Ok(errors) => {
-                for error in errors {
-                    tracing::warn!(id = %live_extension.id(), %error, "extension reported an error");
-                }
-            }
-            Err(error) => {
-                tracing::warn!(id = %live_extension.id(), %error, "draining extension errors failed")
-            }
-        }
+        // Drains the internal error list, logs it, and suspends the extension
+        // on CPU/memory violations.
         hosted.note_resource_violations();
     }
     nodes
@@ -687,8 +740,11 @@ impl ExtensionHostController {
             command_sender: None,
             host_thread: None,
             chrome_task: None,
+            clock_task: None,
             mux_task: None,
             status_bars: parking_lot::Mutex::new(Vec::new()),
+            local_chrome: Vec::new(),
+            server_chrome: BTreeMap::new(),
         }
     }
 
@@ -768,6 +824,7 @@ impl ExtensionHostController {
                 self.command_sender = Some(command_sender.clone());
                 self.host_thread = Some(host_thread);
                 self.start_chrome_task(chrome_receiver, cx);
+                self.start_clock_task(cx);
                 self.start_mux_task(cx);
             }
             Err(error) => {
@@ -778,6 +835,36 @@ impl ExtensionHostController {
 
     /// §5.5 Apply chrome pushed by the host thread. Event driven: the task
     /// parks on the channel instead of polling on a timer.
+    fn publish_chrome(&mut self, cx: &mut gpui::Context<Self>) {
+        let nodes = merge_chrome_nodes(&self.local_chrome, &self.server_chrome);
+        self.status_bars.lock().retain(|status_bar| {
+            let Some(status_bar) = status_bar.upgrade() else {
+                return false;
+            };
+            let nodes_for_bar = nodes.clone();
+            status_bar.update(cx, |status_bar, cx| {
+                status_bar.set_vdom_nodes(nodes_for_bar, cx);
+            });
+            true
+        });
+        publish_vdom(cx, nodes);
+    }
+
+    fn apply_local_chrome(&mut self, nodes: Vec<VDomNode>, cx: &mut gpui::Context<Self>) {
+        self.local_chrome = nodes;
+        self.publish_chrome(cx);
+    }
+
+    fn apply_server_chrome_update(
+        &mut self,
+        update: mux_protocol::ExtensionChromeUpdate,
+        cx: &mut gpui::Context<Self>,
+    ) -> Result<()> {
+        apply_server_chrome_node(&mut self.server_chrome, update)?;
+        self.publish_chrome(cx);
+        Ok(())
+    }
+
     fn start_chrome_task(
         &mut self,
         mut chrome_receiver: futures::channel::mpsc::UnboundedReceiver<Vec<VDomNode>>,
@@ -786,18 +873,26 @@ impl ExtensionHostController {
         self.chrome_task = Some(cx.spawn(async move |this, cx| {
             while let Some(nodes) = chrome_receiver.next().await {
                 let update = this.update(cx, |this, cx| {
-                    this.status_bars.lock().retain(|status_bar| {
-                        let Some(status_bar) = status_bar.upgrade() else {
-                            return false;
-                        };
-                        status_bar
-                            .update(cx, |status_bar, cx| status_bar.set_vdom_nodes(nodes.clone(), cx));
-                        true
-                    });
-                    publish_vdom(cx, nodes);
+                    this.apply_local_chrome(nodes, cx);
                 });
                 if let Err(error) = update {
                     tracing::debug!(%error, "extension controller dropped while applying chrome");
+                    break;
+                }
+            }
+        }));
+    }
+
+    fn start_clock_task(&mut self, cx: &mut gpui::Context<Self>) {
+        self.clock_task = Some(cx.spawn(async move |this, cx| {
+            loop {
+                cx.background_executor()
+                    .timer(Duration::from_secs(1))
+                    .await;
+                if this
+                    .update(cx, |this, _| this.send(HostCommand::Render))
+                    .is_err()
+                {
                     break;
                 }
             }
@@ -845,9 +940,80 @@ impl ExtensionHostController {
                 tracing::debug!(%error, "extension controller dropped before the mux bridge was installed");
                 return;
             }
+            if let Some(snapshot) = domain.last_attached_snapshot() {
+                {
+                    let mut bridge_state = state.lock();
+                    for tab in &snapshot.tabs {
+                        for pane in &tab.panes {
+                            bridge_state
+                                .pane_tabs
+                                .insert(pane.id.clone(), tab.id.clone());
+                            bridge_state
+                                .pane_titles
+                                .insert(pane.id.clone(), pane.title.clone());
+                        }
+                    }
+                    if !snapshot.focused_pane_id.is_empty() {
+                        bridge_state.focused_pane = Some(snapshot.focused_pane_id.clone());
+                    }
+                }
+
+                if !snapshot.focused_pane_id.is_empty() {
+                    let hydration = mux_protocol::Notification {
+                        event: Some(mux_protocol::notification::Event::PaneFocused(
+                            mux_protocol::PaneFocused {
+                                pane_id: snapshot.focused_pane_id,
+                            },
+                        )),
+                    };
+                    for (event, payload) in notification_events(&hydration, &state) {
+                        let payload = match serde_json::to_string(&payload) {
+                            Ok(payload) => payload,
+                            Err(error) => {
+                                tracing::warn!(
+                                    %event,
+                                    %error,
+                                    "serializing initial extension focus failed"
+                                );
+                                continue;
+                            }
+                        };
+                        if let Err(error) =
+                            this.read_with(cx, |this, _| this.emit_event(&event, &payload))
+                        {
+                            tracing::debug!(
+                                %error,
+                                "extension host dropped before initial focus hydration"
+                            );
+                            return;
+                        }
+                    }
+                }
+            }
 
             let notifications = domain.subscribe();
+
             while let Ok(notification) = notifications.recv().await {
+                let server_update = match notification.event.as_ref() {
+                    Some(mux_protocol::notification::Event::ExtensionChrome(update)) => {
+                        Some(update.clone())
+                    }
+                    _ => None,
+                };
+                if let Some(update) = server_update {
+                    let applied = this.update(cx, |this, cx| {
+                        if let Err(error) = this.apply_server_chrome_update(update, cx) {
+                            tracing::warn!(%error, "server extension chrome update rejected");
+                        }
+                    });
+                    if let Err(error) = applied {
+                        tracing::debug!(
+                            %error,
+                            "extension controller dropped; ending server chrome forwarding"
+                        );
+                        return;
+                    }
+                }
                 for (event, payload) in notification_events(&notification, &state) {
                     let payload = match serde_json::to_string(&payload) {
                         Ok(payload) => payload,
@@ -1159,6 +1325,60 @@ mod tests {
         );
         live_extensions[0].note_resource_violations();
         assert!(live_extensions[0].suspended, "CPU violation must suspend");
+        assert!(
+            render_live_extensions(&mut live_extensions).is_empty(),
+            "a suspended extension must stop contributing chrome"
+        );
+
+        std::fs::remove_dir_all(root)?;
+        Ok(())
+    }
+
+    /// §5.6: an extension that blows its memory budget must be suspended, and
+    /// the rest of the chrome must keep rendering. The OOM is caught by the
+    /// bootstrap's render try/catch, so the violation must be detected through
+    /// the drained error list rather than a Rust-level render failure.
+    #[test]
+    fn runaway_memory_extension_is_suspended_and_stops_rendering() -> Result<()> {
+        let root = temporary_extension_dir("memory-runaway-root")?;
+        let extension = root.join("memory-runaway");
+        std::fs::create_dir_all(&extension)?;
+        std::fs::write(
+            extension.join("extension.toml"),
+            "[extension]\nname = \"memory-runaway\"\n[runtime]\nside = \"client\"\n[resources]\nmemory_limit_mb = 1\n",
+        )?;
+        std::fs::write(
+            extension.join("main.js"),
+            r#"
+            function activate(context) {
+                context.registerChromeView('memory-runaway', {
+                    render: function() {
+                        var blocks = [];
+                        for (var i = 0; i < 10000000; i++) { blocks.push(new Array(1000)); }
+                        return { type: 'span', children: ['alive'] };
+                    }
+                });
+            }
+            "#,
+        )?;
+
+        let mut live_extensions = activate_extensions(
+            quickjs_runtime::discover_client_extensions(std::slice::from_ref(&root)),
+        );
+        assert_eq!(live_extensions.len(), 1);
+        assert!(
+            !live_extensions[0].suspended,
+            "a healthy extension must not be suspended before the violation"
+        );
+
+        // First paint: the runaway render hits the 1MB ceiling; the OOM is
+        // swallowed by the JS try/catch but must still suspend the extension.
+        let nodes = render_live_extensions(&mut live_extensions);
+        assert!(nodes.is_empty(), "OOM 的渲染不得产生 chrome");
+        assert!(
+            live_extensions[0].suspended,
+            "memory violation must suspend the extension"
+        );
         assert!(
             render_live_extensions(&mut live_extensions).is_empty(),
             "a suspended extension must stop contributing chrome"
@@ -1613,6 +1833,78 @@ mod tests {
             status_bar_text(cx, &bar).contains("total=7")
         });
 
+        // The semantic button retains focus after the click, so Enter must
+        // activate the same command through the keyboard path.
+        window_cx.simulate_keystrokes("enter");
+        wait_for(cx, "the keyboard-activated command to re-render the chrome", |cx| {
+            status_bar_text(cx, &bar).contains("total=14")
+        });
+
         std::fs::remove_dir_all(&root).expect("remove extension root");
+    }
+
+    #[test]
+    fn server_chrome_update_replaces_and_removes_view() {
+        let mut server = BTreeMap::new();
+        let key = ("server-ext".to_string(), "status".to_string());
+        let update = |_id: &str, payload: Vec<u8>| mux_protocol::ExtensionChromeUpdate {
+            extension_id: key.0.clone(),
+            view_id: key.1.clone(),
+            vdom_payload: payload,
+        };
+
+        apply_server_chrome_node(
+            &mut server,
+            update("old", br#"{"type":"span","props":{"id":"old"}}"#.to_vec()),
+        )
+        .expect("initial server chrome must parse");
+        apply_server_chrome_node(
+            &mut server,
+            update("new", br#"{"type":"span","props":{"id":"new"}}"#.to_vec()),
+        )
+        .expect("replacement server chrome must parse");
+        assert_eq!(
+            server
+                .get(&key)
+                .and_then(|node| node.props.get("id")),
+            Some(&serde_json::json!("new"))
+        );
+
+        apply_server_chrome_node(&mut server, update("removed", Vec::new()))
+            .expect("server chrome removal must succeed");
+        assert!(server.is_empty());
+    }
+
+    #[test]
+    fn server_chrome_nodes_merge_after_local_nodes() {
+        let local = VDomNode {
+            element_type: "span".into(),
+            props: [("id".to_string(), serde_json::json!("local"))]
+                .into_iter()
+                .collect(),
+            style: Default::default(),
+            children: vec![VDomChild::Text("local".into())],
+        };
+        let remote = VDomNode {
+            element_type: "span".into(),
+            props: [("id".to_string(), serde_json::json!("remote"))]
+                .into_iter()
+                .collect(),
+            style: Default::default(),
+            children: vec![VDomChild::Text("remote".into())],
+        };
+        let mut server = BTreeMap::new();
+        server.insert(("server-ext".to_string(), "status".to_string()), remote);
+        let merged = merge_chrome_nodes(&[local], &server);
+
+        assert_eq!(merged.len(), 2);
+        assert_eq!(
+            merged[0].props.get("id"),
+            Some(&serde_json::json!("local"))
+        );
+        assert_eq!(
+            merged[1].props.get("id"),
+            Some(&serde_json::json!("remote"))
+        );
     }
 }

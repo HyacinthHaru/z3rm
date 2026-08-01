@@ -23,6 +23,9 @@ tokio = { workspace = true, features = ["full"] }
 prost = { workspace = true }
 anyhow = { workspace = true }
 parking_lot = { workspace = true }
+quickjs_runtime = { workspace = true }
+tar = "0.4"
+flate2 = { workspace = true }
 tracing = { workspace = true }
 zlog = { workspace = true }
 zlog_settings = { workspace = true }

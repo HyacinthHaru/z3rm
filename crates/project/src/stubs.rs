@@ -6,7 +6,7 @@ use std::{ops::Range, path::PathBuf, sync::Arc};
 use collections::BTreeMap;
 use extension::ExtensionProvides;
 use fs::Fs;
-use gpui::{App, Entity, SharedString, Task};
+use gpui::{App, Entity, SharedString, Task, TaskExt};
 use serde::{Deserialize, Serialize};
 use text::Anchor;
 use worktree::ProjectEntryId;
@@ -235,70 +235,7 @@ pub enum DirectoryLister {
 }
 
 // ---------------------------------------------------------------------------
-// Bookmark store
-// ---------------------------------------------------------------------------
-
-pub mod bookmark_store {
-    use super::*;
-    use std::ops::Range;
-
-    #[derive(Default)]
-    pub struct BookmarkStore;
-
-    impl BookmarkStore {
-        pub fn all_bookmark_locations(
-            _store: Entity<BookmarkStore>,
-            _cx: &mut gpui::AsyncApp,
-        ) -> Task<
-            anyhow::Result<
-                std::collections::HashMap<
-                    gpui::Entity<language::Buffer>,
-                    (Vec<std::ops::Range<text::Point>>),
-                >,
-            >,
-        > {
-            Task::ready(Ok(std::collections::HashMap::new()))
-        }
-
-        /// Stub: toggle bookmark (bookmark 模块已删除)
-        pub fn toggle_bookmark(
-            _buffer: Entity<language::Buffer>,
-            _anchor: text::Anchor,
-            _label: String,
-            _cx: &mut gpui::Context<Self>,
-        ) {
-        }
-
-        /// Stub: bookmarks for buffer (bookmark 模块已删除)
-        pub fn bookmarks_for_buffer(
-            _store: Entity<BookmarkStore>,
-            _buffer: &Entity<language::Buffer>,
-            _cx: &mut gpui::Context<Entity<BookmarkStore>>,
-        ) -> Task<anyhow::Result<Vec<text::Anchor>>> {
-            Task::ready(Ok(Vec::new()))
-        }
-
-        /// Stub: find bookmark (bookmark 模块已删除)
-        pub fn find_bookmark(
-            _store: Entity<BookmarkStore>,
-            _buffer: Entity<language::Buffer>,
-            _point: text::Point,
-            _cx: &gpui::App,
-        ) -> Option<text::Anchor> {
-            None
-        }
-
-        pub fn edit_bookmark(
-            &mut self,
-            _buffer: &Entity<language::Buffer>,
-            _anchor: text::Anchor,
-            _label: String,
-            _cx: &mut gpui::Context<Self>,
-        ) {
-        }
-    }
-}
-
+// Bookmark store lives in the project crate's retained bookmark_store module.
 // ---------------------------------------------------------------------------
 // Debugger
 // ---------------------------------------------------------------------------
@@ -593,6 +530,24 @@ pub mod lsp_store {
         ) -> Option<String> {
             None
         }
+
+        /// No LSP store exists; no inlay chunks can be applicable.
+        pub fn applicable_inlay_chunks(
+            &self,
+            _buffer: &Entity<language::Buffer>,
+            _ranges: &[Range<text::Anchor>],
+            _cx: &mut gpui::Context<Self>,
+        ) -> Vec<Range<language::BufferRow>> {
+            Vec::new()
+        }
+
+        /// No LSP store exists; nothing to invalidate.
+        pub fn invalidate_inlay_hints(
+            &self,
+            _for_buffers: &collections::HashSet<text::BufferId>,
+            _cx: &mut gpui::Context<Self>,
+        ) {
+        }
     }
 
     /// Stub: SymbolLocation (from lsp_store crate)
@@ -729,7 +684,7 @@ impl Telemetry {
 // ---------------------------------------------------------------------------
 
 use crate::{
-    Location, Project, ProjectPath, ProjectTransaction, Worktree, WorktreeId,
+    Location, Project, ProjectItem, ProjectPath, ProjectTransaction, Worktree, WorktreeId,
     bookmark_store::BookmarkStore, debugger::breakpoint_store::BreakpointStore,
 };
 use git::blame::Blame;
@@ -885,11 +840,19 @@ impl Project {
 
     pub fn open_local_buffer_via_lsp(
         &mut self,
-        _uri: lsp::Uri,
+        uri: lsp::Uri,
         _server_id: LanguageServerId,
-        _cx: &mut gpui::Context<Self>,
+        cx: &mut gpui::Context<Self>,
     ) -> Task<anyhow::Result<Entity<language::Buffer>>> {
-        Task::ready(Err(anyhow::anyhow!("stub: open_local_buffer_via_lsp")))
+        let path = match uri.to_file_path() {
+            Ok(path) => path,
+            Err(_) => {
+                return Task::ready(Err(anyhow::anyhow!(
+                    "LSP location is not a local file URI: {uri}"
+                )));
+            }
+        };
+        self.open_local_buffer(&path, cx)
     }
 
     /// Resolves either an absolute path or a path prefixed with a visible
@@ -975,11 +938,12 @@ impl Project {
 
     pub fn reload_buffers(
         &mut self,
-        _buffers: collections::HashSet<Entity<language::Buffer>>,
-        _reload: bool,
-        _cx: &mut gpui::Context<Self>,
+        buffers: collections::HashSet<Entity<language::Buffer>>,
+        reload: bool,
+        cx: &mut gpui::Context<Self>,
     ) -> Task<anyhow::Result<ProjectTransaction>> {
-        Task::ready(Ok(ProjectTransaction::default()))
+        self.buffer_store
+            .update(cx, |store, cx| store.reload_buffers(buffers, reload, cx))
     }
 
     pub fn blame_buffer(
@@ -1107,7 +1071,9 @@ impl Project {
     ) {
     }
 
-    pub fn reveal_path(&mut self, _path: &std::path::Path, _cx: &mut gpui::Context<Self>) {}
+    pub fn reveal_path(&mut self, path: &std::path::Path, cx: &mut gpui::Context<Self>) {
+        cx.reveal_path(path);
+    }
 
     pub fn register_buffer_with_language_servers(
         &mut self,
@@ -1136,6 +1102,10 @@ impl Project {
 
     pub fn breakpoint_store(&self) -> Entity<BreakpointStore> {
         self.breakpoint_store_entity.clone()
+    }
+
+    pub fn lsp_store(&self) -> Entity<crate::stubs::lsp_store::LspStore> {
+        self.lsp_store_entity.clone()
     }
 
     pub fn active_debug_session(
@@ -1218,10 +1188,13 @@ impl Project {
 
     pub fn remove_worktree(
         &mut self,
-        _worktree_id: WorktreeId,
-        _cx: &mut gpui::Context<Self>,
+        worktree_id: WorktreeId,
+        cx: &mut gpui::Context<Self>,
     ) -> Task<anyhow::Result<()>> {
-        Task::ready(Ok(()))
+        self.worktree_store.update(cx, |store, cx| {
+            store.remove_worktree(worktree_id, cx);
+            Task::ready(Ok(()))
+        })
     }
 
     pub fn repositories(&self, cx: &App) -> Vec<Entity<crate::git_store::Repository>> {
@@ -1289,35 +1262,172 @@ impl Project {
         }
     }
 
-    /// 执行项目搜索
     pub fn search(
         &mut self,
-        _query: crate::search::SearchQuery,
-        _cx: &mut gpui::Context<Self>,
+        query: crate::search::SearchQuery,
+        cx: &mut gpui::Context<Self>,
     ) -> SearchResults<crate::search::SearchResult> {
-        let (tx, rx) = futures::channel::mpsc::unbounded();
+        const MAX_SEARCH_RESULT_RANGES: usize = 100_000;
+
+        let (tx, rx) = async_channel::unbounded();
+        let search_tx = tx.clone();
+        let worktree_store = self.worktree_store.clone();
+        let buffer_store = self.buffer_store.clone();
+        let scan_completed = worktree_store.read(cx).initial_scan_completed();
+        let wait_for_scan = worktree_store.read(cx).wait_for_initial_scan();
+        let worktrees = worktree_store
+            .read(cx)
+            .visible_worktrees_and_single_files(cx)
+            .collect::<Vec<_>>();
+        let opened_buffers = query.buffers().cloned();
+
+        cx.spawn(async move |_, cx| {
+            let send = |result: crate::search::SearchResult| async {
+                search_tx.send(result).await.is_ok()
+            };
+
+            if !scan_completed {
+                if !send(crate::search::SearchResult::WaitingForScan).await {
+                    return;
+                }
+                wait_for_scan.await;
+            }
+            if !send(crate::search::SearchResult::Searching).await {
+                return;
+            }
+
+            let mut candidates = Vec::new();
+            if let Some(opened_buffers) = opened_buffers {
+                candidates.extend(
+                    opened_buffers
+                        .into_iter()
+                        .filter_map(|buffer| {
+                            let path = buffer.read_with(cx, |buffer, cx| {
+                                buffer.project_path(cx)
+                            })?;
+                            query.match_path(&path.path).then_some((Some(buffer), path))
+                        }),
+                );
+            } else {
+                for worktree in worktrees {
+                    let (worktree_id, snapshot) = worktree.read_with(cx, |worktree, _| {
+                        (worktree.id(), worktree.snapshot())
+                    });
+                    candidates.extend(snapshot.files(query.include_ignored(), 0).filter_map(
+                        |entry| {
+                            if query.match_path(&entry.path) {
+                                Some(ProjectPath {
+                                    worktree_id,
+                                    path: entry.path.clone(),
+                                })
+                            } else {
+                                None
+                            }
+                        },
+                    ).map(|path| (None, path)));
+                }
+            }
+
+            let mut total_ranges = 0;
+            for (opened_buffer, project_path) in candidates {
+                if total_ranges >= MAX_SEARCH_RESULT_RANGES {
+                    break;
+                }
+
+                let buffer = match opened_buffer {
+                    Some(buffer) => buffer,
+                    None => {
+                        match buffer_store
+                            .update(cx, |store, cx| {
+                                store.open_buffer(project_path.clone(), cx)
+                            })
+                            .await
+                        {
+                            Ok(buffer) => buffer,
+                            Err(error) => {
+                                tracing::warn!(
+                                    path = ?project_path.path,
+                                    error = %error,
+                                    "failed to load project search buffer"
+                                );
+                                continue;
+                            }
+                        }
+                    }
+                };
+
+                let snapshot = buffer.read_with(cx, |buffer, _| buffer.snapshot());
+                let offsets = query.search(&snapshot, None).await;
+                if offsets.is_empty() {
+                    continue;
+                }
+
+                let remaining = MAX_SEARCH_RESULT_RANGES - total_ranges;
+                let ranges = offsets
+                    .into_iter()
+                    .take(remaining)
+                    .map(|range| {
+                        snapshot.anchor_after(range.start)..snapshot.anchor_before(range.end)
+                    })
+                    .collect::<Vec<_>>();
+                total_ranges += ranges.len();
+
+                if !send(crate::search::SearchResult::Buffer { buffer, ranges }).await {
+                    return;
+                }
+
+                if total_ranges >= MAX_SEARCH_RESULT_RANGES {
+                    if !send(crate::search::SearchResult::LimitReached).await {
+                        return;
+                    }
+                    break;
+                }
+            }
+
+            ()
+        })
+        .detach();
+
         SearchResults { tx, rx }
     }
 
-    /// 是否支持终端
+    /// Whether this local project can create terminal sessions.
     pub fn supports_terminal(&self, _cx: &App) -> bool {
         true
     }
 
-    /// 当前活动项目目录
-    pub fn active_project_directory(&self, _cx: &App) -> Option<std::path::PathBuf> {
-        None
+    /// Return the worktree containing the active entry.
+    pub fn active_project_directory(&self, cx: &App) -> Option<std::path::PathBuf> {
+        self.active_entry
+            .and_then(|entry_id| self.worktree_for_entry(entry_id, cx))
+            .map(|worktree| worktree.read(cx).abs_path().to_path_buf())
+            .or_else(|| {
+                self.worktree_store
+                    .read(cx)
+                    .visible_worktrees(cx)
+                    .next()
+                    .map(|worktree| worktree.read(cx).abs_path().to_path_buf())
+            })
     }
 
-    /// 当前活动项目目录 (const ref)
-    pub fn active_entry_directory(&self, _cx: &App) -> Option<std::path::PathBuf> {
-        None
+    /// Return the directory containing the active entry.
+    pub fn active_entry_directory(&self, cx: &App) -> Option<std::path::PathBuf> {
+        let entry_id = self.active_entry?;
+        let worktree = self.worktree_for_entry(entry_id, cx)?;
+        let worktree = worktree.read(cx);
+        let entry = worktree.entry_for_id(entry_id)?;
+        let path = worktree.absolutize(&entry.path);
+        if entry.is_dir() {
+            Some(path)
+        } else {
+            path.parent().map(std::path::Path::to_path_buf)
+        }
     }
 
-    /// 是否远程项目
     pub fn is_remote(&self) -> bool {
         false
     }
+
 
     /// Resolve a `ProjectPath` for an entry by locating its owning worktree.
     pub fn path_for_entry(&self, entry_id: ProjectEntryId, cx: &App) -> Option<crate::ProjectPath> {
@@ -1501,34 +1611,66 @@ impl Project {
         }))
     }
 
-    /// 获取 buffer (stub)
+    /// Return a loaded buffer by its stable identifier.
     pub fn buffer_for_id(
-        &mut self,
+        &self,
         buffer_id: text::BufferId,
-        cx: &mut gpui::Context<Self>,
+        cx: &gpui::App,
     ) -> Option<gpui::Entity<language::Buffer>> {
         self.buffer_store.read(cx).get(buffer_id)
     }
 
-    /// 获取脏 buffers (stub)
-    pub fn dirty_buffers(&self, _cx: &App) -> impl Iterator<Item = crate::ProjectPath> {
-        std::iter::empty()
+    /// Return project paths for open buffers with unsaved changes.
+    pub fn dirty_buffers(&self, cx: &App) -> impl Iterator<Item = crate::ProjectPath> {
+        let paths = self
+            .buffer_store
+            .read(cx)
+            .buffers()
+            .filter_map(|buffer| {
+                let buffer = buffer.read(cx);
+                if !buffer.is_dirty() {
+                    return None;
+                }
+                let file = buffer.file()?;
+                Some(crate::ProjectPath {
+                    worktree_id: file.worktree_id(cx),
+                    path: file.path().clone(),
+                })
+            })
+            .collect::<Vec<_>>();
+        paths.into_iter()
     }
 
-    /// WSL 互操作性检查 (stub)
     pub fn is_via_wsl_with_host_interop(&self, _cx: &App) -> bool {
         false
     }
 
-    /// 下载文件 (stub)
+    /// Copy a local project file to a destination selected by the user.
     pub fn download_file(
         &mut self,
-        _worktree_id: worktree::WorktreeId,
-        _entry_path: crate::ProjectPath,
-        _destination_path: PathBuf,
-        _cx: &mut gpui::Context<Self>,
+        worktree_id: worktree::WorktreeId,
+        entry_path: crate::ProjectPath,
+        destination_path: PathBuf,
+        cx: &mut gpui::Context<Self>,
     ) -> gpui::Task<anyhow::Result<()>> {
-        gpui::Task::ready(Err(anyhow::anyhow!("stub: download_file")))
+        if entry_path.worktree_id != worktree_id {
+            return gpui::Task::ready(Err(anyhow::anyhow!(
+                "download path belongs to worktree {}, expected {}",
+                entry_path.worktree_id,
+                worktree_id
+            )));
+        }
+        let Some(source_path) = self.absolute_path(&entry_path, cx) else {
+            return gpui::Task::ready(Err(anyhow::anyhow!(
+                "project entry does not exist: {}",
+                entry_path.path.as_std_path().display()
+            )));
+        };
+        let fs = self.fs.clone();
+        gpui::AppContext::background_spawn(cx, async move {
+            fs.copy_file(&source_path, &destination_path, fs::CopyOptions::default())
+                .await
+        })
     }
 
     pub fn move_worktree(
@@ -1728,18 +1870,17 @@ pub fn path_suffix(path: &std::path::Path, detail: usize) -> String {
 /// Stub: TerminalDockPosition re-export from settings
 pub use settings::TerminalDockPosition;
 
-/// Stub: SearchResults (task crate 已删除)
+/// Search result stream shared by project and text-finder searches.
 pub struct SearchResults<T> {
-    pub tx: futures::channel::mpsc::UnboundedSender<T>,
-    pub rx: futures::channel::mpsc::UnboundedReceiver<T>,
+    pub tx: async_channel::Sender<T>,
+    pub rx: async_channel::Receiver<T>,
 }
 
 impl<T> Clone for SearchResults<T> {
     fn clone(&self) -> Self {
-        let (tx2, rx2) = futures::channel::mpsc::unbounded();
-        SearchResults {
+        Self {
             tx: self.tx.clone(),
-            rx: rx2,
+            rx: self.rx.clone(),
         }
     }
 }
@@ -1770,8 +1911,11 @@ mod stub_delegate_tests {
         cx: &mut TestAppContext,
     ) -> (Arc<FakeFs>, gpui::Entity<Project>, worktree::WorktreeId) {
         let fs = FakeFs::new(cx.executor());
-        fs.insert_tree(Path::new("/project"), json!({ "dir": {} }))
-            .await;
+        fs.insert_tree(
+            Path::new("/project"),
+            json!({ "dir": {}, "search.txt": "hello needle world\n" }),
+        )
+        .await;
         // Build the Project synchronously (Project::test needs &mut App, which we
         // obtain via cx.update), then add the worktree with an awaitable task.
         let project = cx.update(|cx| {
@@ -1947,4 +2091,32 @@ mod stub_delegate_tests {
             "create_entry in unknown worktree must error"
         );
     }
+    #[gpui::test]
+    async fn test_project_search_stream_returns_matching_buffer(cx: &mut TestAppContext) {
+        init_test(cx);
+        let (_fs, project, _worktree_id) = setup_project(cx).await;
+        let query = crate::search::SearchQuery::text(
+            "needle",
+            false,
+            true,
+            false,
+            util::paths::PathMatcher::default(),
+            util::paths::PathMatcher::default(),
+            false,
+            None,
+        )
+        .expect("valid text query");
+        let results = project.update(cx, |project, cx| project.search(query, cx));
+
+        let mut found = false;
+        while let Ok(result) = results.rx.recv().await {
+            if let crate::search::SearchResult::Buffer { ranges, .. } = result {
+                assert!(!ranges.is_empty(), "matching buffers must contain ranges");
+                found = true;
+                break;
+            }
+        }
+        assert!(found, "project search must emit a matching buffer result");
+    }
+
 }

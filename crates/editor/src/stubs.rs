@@ -1,18 +1,20 @@
-//! Stub types and helpers for APIs removed during dependency stripping.
-//! Avoids duplicating definitions that remain in `project::stubs`.
+//! Stub types for project-crate APIs removed during dependency stripping.
+//! These keep downstream crates (editor, picker, platform_title_bar) compiling.
+use super::*;
 
-use std::{any::Any, ops::Range, sync::Arc};
 
-use gpui::{App, AnyElement, Context, Element as _, Entity, IntoElement, Modifiers, Pixels, ScrollHandle, SharedString, Task, TextStyle, WeakEntity, Window, div, px};
-use language::{Buffer, DiagnosticEntryRef, LanguageRegistry, Location};
-use project::Project;
-use rpc::proto::PeerId;
-use text::{Anchor, BufferId, Point};
+use std::{ops::Range, sync::Arc};
+
 use schemars::JsonSchema;
+use collections::BTreeMap;
+use gpui::{App, Entity, SharedString, Task};
+use language::LanguageRegistry;
 use serde::{Deserialize, Serialize};
+use text::{Anchor, Point};
+use util::paths::{normalize_lexically, PathWithPosition};
 use crate::editor_settings::SnippetSortOrder;
 use markdown::Markdown;
-use crate::display_map::BlockProperties;
+use linkify::{LinkFinder, LinkKind};
 
 // Types that were previously imported from project but no longer exist there.
 // Defined as stubs locally to keep the editor crate compiling.
@@ -133,12 +135,12 @@ impl ProjectExt for Project {
 }
 
 pub trait ProjectLspStoreExt {
-    fn lsp_store(&self) -> Entity<Project>;
+    fn lsp_store(&self) -> Entity<project::lsp_store::LspStore>;
 }
 
 impl ProjectLspStoreExt for Project {
-    fn lsp_store(&self) -> Entity<Project> {
-        panic!("LSP store not available: LSP support removed during migration")
+    fn lsp_store(&self) -> Entity<project::lsp_store::LspStore> {
+        Project::lsp_store(self)
     }
 }
 
@@ -148,25 +150,32 @@ pub trait ProjectCapabilityExt {
 
 impl ProjectCapabilityExt for Project {
     fn capability(&self) -> language::Capability {
-        language::Capability::ReadOnly
+        // Local-only projects (remote support was removed) are writable.
+        language::Capability::ReadWrite
     }
 }
 
 pub trait ProjectBufferExt {
-    fn buffer_for_id(&self, _buffer_id: BufferId, _cx: &App) -> Option<Entity<Buffer>>;
-    fn create_buffer(&mut self, _language: Option<Arc<language::Language>>, _has_root: bool, _cx: &mut Context<Project>)
-    -> Task<anyhow::Result<Entity<Buffer>>>;
+    fn buffer_for_id(&self, buffer_id: BufferId, cx: &App) -> Option<Entity<Buffer>>;
+    fn create_buffer(
+        &mut self,
+        language: Option<Arc<language::Language>>,
+        has_root: bool,
+        cx: &mut Context<Project>,
+    ) -> Task<anyhow::Result<Entity<Buffer>>>;
 }
 
 impl ProjectBufferExt for Project {
-    fn buffer_for_id(&self, _buffer_id: BufferId, _cx: &App) -> Option<Entity<Buffer>> { None }
+    fn buffer_for_id(&self, buffer_id: BufferId, cx: &App) -> Option<Entity<Buffer>> {
+        Project::buffer_for_id(self, buffer_id, cx)
+    }
     fn create_buffer(
         &mut self,
-        _language: Option<Arc<language::Language>>,
-        _has_root: bool,
-        _cx: &mut Context<Project>,
+        language: Option<Arc<language::Language>>,
+        has_root: bool,
+        cx: &mut Context<Project>,
     ) -> Task<anyhow::Result<Entity<Buffer>>> {
-        Task::ready(Err(anyhow::anyhow!("create_buffer stub")))
+        Project::create_buffer(self, language, has_root, cx)
     }
 }
 
@@ -464,10 +473,23 @@ pub struct HoveredLinkState {
 pub struct FileTarget {
     pub resolved_path: project::ResolvedPath,
     pub project_path: project::ProjectPath,
+    pub position: Option<Point>,
 }
 
 impl FileTarget {
-    pub fn navigate_item_to_position(&self, _item: gpui::AnyView, _cx: &mut gpui::AsyncApp) {}
+    pub fn navigate_item_to_position(&self, item: gpui::AnyView, cx: &mut gpui::AsyncApp) {
+        let Some(point) = self.position else {
+            return;
+        };
+        let Some(editor) = item.downcast::<crate::Editor>().ok() else {
+            return;
+        };
+        if let Err(error) = editor.downgrade().update_in(cx, |editor, window, cx| {
+            editor.go_to_singleton_buffer_point(point, window, cx);
+        }) {
+            log::warn!("failed to navigate opened file to {point:?}: {error}");
+        }
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -484,11 +506,160 @@ pub enum HoverLink {
     Text(LinkTarget),
 }
 
-pub fn find_file(_buffer: &Entity<Buffer>, _project: Option<Entity<Project>>, _position: text::Anchor, _cx: &mut gpui::AsyncWindowContext) -> Option<(Entity<Buffer>, FileTarget)> { None }
+pub fn find_file(
+    buffer: &Entity<Buffer>,
+    project: Option<Entity<Project>>,
+    position: text::Anchor,
+    cx: &App,
+) -> Option<(Entity<Buffer>, FileTarget)> {
+    let project = project?;
+    let buffer_snapshot = buffer.read(cx).snapshot();
+    let point = position.to_point(&buffer_snapshot);
+    let line_end = buffer_snapshot.line_len(point.row);
+    let line = buffer_snapshot
+        .text_for_range(Point::new(point.row, 0)..Point::new(point.row, line_end))
+        .collect::<String>();
+    let path_with_position = PathWithPosition::parse_str(path_at_position(
+        &line,
+        point.column as usize,
+    )?);
+    if path_with_position.path.as_os_str().is_empty() {
+        return None;
+    }
 
-pub fn find_url(_text: &str) -> Option<String> { None }
+    let project_ref = project.read(cx);
+    let path_style = project_ref.path_style(cx);
+    let mut candidate_paths = Vec::new();
+    if path_style.is_absolute(path_with_position.path.to_string_lossy().as_ref()) {
+        candidate_paths.push(path_with_position.path.clone());
+    } else {
+        if let Some(source_file) = buffer.read(cx).file() {
+            let source_path = source_file.full_path(cx);
+            if let Some(source_directory) = source_path.parent() {
+                candidate_paths.push(source_directory.join(&path_with_position.path));
+            }
+        }
 
-pub fn find_url_from_range(_text: &str, _range: std::ops::Range<usize>) -> Option<String> { None }
+        for worktree in project_ref.visible_worktrees(cx) {
+            let worktree = worktree.read(cx);
+            let root = worktree.abs_path();
+            candidate_paths.push(root.join(&path_with_position.path));
+            if let Some(relative_path) =
+                path_style.strip_prefix(&path_with_position.path, worktree.root_name().as_std_path())
+            {
+                candidate_paths.push(root.join(relative_path.as_std_path()));
+            }
+        }
+    }
+
+    for candidate_path in candidate_paths {
+        let candidate_path = match normalize_lexically(&candidate_path) {
+            Ok(path) => path,
+            Err(_) => candidate_path,
+        };
+        let Some(project_path) = project_ref.project_path_for_absolute_path(&candidate_path, cx)
+        else {
+            continue;
+        };
+        if project_ref
+            .entry_for_path(&project_path, cx)
+            .is_some_and(|entry| entry.is_file())
+        {
+            let position = path_with_position.row.map(|row| {
+                Point::new(
+                    row.saturating_sub(1),
+                    path_with_position.column.unwrap_or(1).saturating_sub(1),
+                )
+            });
+            return Some((
+                buffer.clone(),
+                FileTarget {
+                    resolved_path: project::ResolvedPath {
+                        path: candidate_path,
+                    },
+                    project_path,
+                    position,
+                },
+            ));
+        }
+    }
+
+    None
+}
+
+fn path_at_position(line: &str, column: usize) -> Option<&str> {
+    if line.is_empty() {
+        return None;
+    }
+    let mut cursor = column.min(line.len());
+    if cursor == line.len() {
+        cursor = cursor.saturating_sub(1);
+    }
+    if line.as_bytes().get(cursor).is_some_and(|byte| is_path_boundary(*byte)) {
+        if cursor == 0 || is_path_boundary(line.as_bytes()[cursor - 1]) {
+            return None;
+        }
+        cursor -= 1;
+    }
+
+    let bytes = line.as_bytes();
+    let mut start = cursor;
+    while start > 0 && !is_path_boundary(bytes[start - 1]) {
+        start -= 1;
+    }
+    let mut end = cursor + 1;
+    while end < bytes.len() && !is_path_boundary(bytes[end]) {
+        end += 1;
+    }
+    let mut candidate = line.get(start..end)?.trim_matches(|character: char| {
+        matches!(character, '"' | '\'' | '`' | '<' | '>' | '[' | ']' | '{' | '}' | ',')
+    });
+    while candidate
+        .as_bytes()
+        .last()
+        .is_some_and(|byte| matches!(*byte, b')' | b';' | b'!'))
+    {
+        candidate = candidate.get(..candidate.len().saturating_sub(1))?;
+    }
+    (!candidate.is_empty()).then_some(candidate)
+}
+
+fn is_path_boundary(byte: u8) -> bool {
+    byte.is_ascii_whitespace()
+        || matches!(
+            byte,
+            b'"' | b'\'' | b'`' | b'<' | b'>' | b'[' | b']' | b'{' | b'}' | b',' | b'='
+        )
+}
+
+pub fn find_url(text: &str) -> Option<String> {
+    let mut finder = LinkFinder::new();
+    finder.kinds(&[LinkKind::Url]);
+    finder.links(text).next().map(|link| link.as_str().to_owned())
+}
+
+pub fn find_url_at(text: &str, offset: usize) -> Option<String> {
+    let mut finder = LinkFinder::new();
+    finder.kinds(&[LinkKind::Url]);
+    finder
+        .links(text)
+        .find(|link| link.start() <= offset && offset <= link.end())
+        .map(|link| link.as_str().to_owned())
+}
+
+pub fn find_url_from_range(text: &str, range: std::ops::Range<usize>) -> Option<String> {
+    let start = range.start.min(text.len());
+    let end = range.end.min(text.len());
+    let selected = text.get(start.min(end)..end.max(start))?.trim();
+    if selected.is_empty() {
+        return None;
+    }
+
+    let mut finder = LinkFinder::new();
+    finder.kinds(&[LinkKind::Url]);
+    let link = finder.links(selected).next()?;
+    (link.start() == 0 && link.end() == selected.len()).then(|| link.as_str().to_owned())
+}
 
 pub fn exclude_link_to_position(
     _buffer: &Entity<Buffer>,
@@ -678,13 +849,30 @@ pub trait DiagnosticRenderer: Send + Sync {
 }
 
 impl Clone for Box<dyn DiagnosticRenderer> {
-    fn clone(&self) -> Self { self.clone_box() }
+    fn clone(&self) -> Self {
+        self.clone_box()
+    }
 }
 
-pub fn set_diagnostic_renderer(_renderer: Option<Box<dyn DiagnosticRenderer>>, _cx: &mut gpui::App) {}
+pub fn set_diagnostic_renderer(
+    renderer: Option<Box<dyn DiagnosticRenderer>>,
+    cx: &mut gpui::App,
+) {
+    if let Some(renderer) = renderer {
+        cx.set_global(GlobalDiagnosticRenderer(Arc::from(renderer)));
+    }
+}
 
-#[derive(Clone, Debug, Default)]
-pub struct GlobalDiagnosticRenderer;
+#[derive(Clone)]
+pub struct GlobalDiagnosticRenderer(Arc<dyn DiagnosticRenderer>);
+
+impl gpui::Global for GlobalDiagnosticRenderer {}
+
+impl GlobalDiagnosticRenderer {
+    pub fn global(cx: &App) -> Option<Arc<dyn DiagnosticRenderer>> {
+        cx.try_global::<Self>().map(|renderer| renderer.0.clone())
+    }
+}
 
 #[derive(Clone, Copy, Debug, Default)]
 pub enum CursorPopoverType {
@@ -861,4 +1049,37 @@ pub struct InlayHighlight {
     /// Anchors into the multibuffer, matching `Inlay::position`.
     pub inlay_position: multi_buffer::Anchor,
     pub range: std::ops::Range<usize>,
+}
+
+#[cfg(test)]
+mod url_tests {
+    use super::{find_url, find_url_at, find_url_from_range};
+
+    #[test]
+    fn finds_url_in_text() {
+        assert_eq!(
+            find_url("see https://example.com/docs for details").as_deref(),
+            Some("https://example.com/docs"),
+        );
+    }
+
+    #[test]
+    fn selected_url_must_cover_the_whole_range() {
+        let text = "prefix https://example.com suffix";
+        assert_eq!(
+            find_url_from_range(text, 7..26).as_deref(),
+            Some("https://example.com"),
+        );
+        assert_eq!(find_url_from_range(text, 0..text.len()), None);
+    }
+
+    #[test]
+    fn finds_url_containing_cursor() {
+        let text = "one https://example.com two https://zed.dev";
+        assert_eq!(
+            find_url_at(text, "one https://".len()).as_deref(),
+            Some("https://example.com"),
+        );
+        assert_eq!(find_url_at(text, 0), None);
+    }
 }

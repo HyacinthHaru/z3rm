@@ -8,6 +8,12 @@ use std::sync::Arc;
 use mux_protocol::proto::envelope::Payload as EnvelopePayload;
 use mux_protocol::{Envelope, Notification};
 
+/// Optional daemon-side observer for lifecycle notifications.
+///
+/// The observer is deliberately separate from client subscribers: extension
+/// delivery must not depend on an attached GUI connection.
+pub type LifecycleHook = Arc<dyn Fn(Notification) + Send + Sync>;
+
 /// 会话状态 (§3.2)
 #[derive(Clone)]
 pub struct Session {
@@ -35,11 +41,11 @@ pub struct Session {
     pub sync_scrollback: Arc<parking_lot::RwLock<SyncScrollbackState>>,
     /// §3.3 已连接的窗口 ID 列表 (多窗口支持，Plan 32)
     pub connected_windows: Arc<parking_lot::RwLock<Vec<String>>>,
-    /// §3.4 会话级 lifecycle 通知订阅者: client_id → 该连接的 outbound channel。
-    /// 承载 PaneAdded / PaneRemoved / SessionLayoutChanged (§3.4 at-least-once 路径)。
-    /// 与 `attached_clients` 分离: attached_clients 是 §3.10 客户端状态 (role / mode),
-    /// lifecycle_subscribers 是 §3.4 通知投递通道, 必须在 attach 时注册、断连时退订,
-    /// 否则单连接广播会漏掉其他 attached 客户端。
+    /// §3.4 Daemon-side lifecycle observer used by the server extension host.
+    /// It is not serialized or sent to clients.
+    pub(crate) lifecycle_hook: Option<LifecycleHook>,
+    /// §3.4 Session-level lifecycle notification subscribers: client_id → that
+    /// connection's outbound channel.
     pub lifecycle_subscribers:
         Arc<parking_lot::RwLock<HashMap<String, tokio::sync::mpsc::UnboundedSender<Envelope>>>>,
     /// §4 Shadow snapshot watcher handle: cwd file changes → snapshot engine.
@@ -129,6 +135,7 @@ impl Session {
             panes: Arc::new(parking_lot::RwLock::new(HashMap::new())),
             sync_scrollback: Arc::new(parking_lot::RwLock::new(SyncScrollbackState::default())),
             connected_windows: Arc::new(parking_lot::RwLock::new(Vec::new())),
+            lifecycle_hook: None,
             lifecycle_subscribers: Arc::new(parking_lot::RwLock::new(HashMap::new())),
             snapshot_watch: None,
         }
@@ -227,6 +234,11 @@ impl Session {
         window_id
     }
 
+    /// Install or replace the daemon-side lifecycle observer.
+    pub fn set_lifecycle_hook(&mut self, hook: Option<LifecycleHook>) {
+        self.lifecycle_hook = hook;
+    }
+
     /// §3.4 注册 lifecycle 订阅者: attach 时把该连接的 outbound channel 加入会话级注册表。
     /// 同一 client_id 重复 attach (幂等 / steal) 时直接替换旧的 sender, 旧的 outbound
     /// channel 因无引用而关闭——旧连接若仍存活, 其读循环会在下次发信失败时退出。
@@ -263,6 +275,9 @@ impl Session {
     /// outbound channel 是 tokio::mpsc::unbounded, 因此不会因 subscriber 慢而丢弃
     /// (会背压到整个连接的内存), closed channel 的 send 失败时立即清理对应订阅。
     pub fn broadcast_lifecycle(&self, notification: Notification) {
+        if let Some(hook) = self.lifecycle_hook.clone() {
+            hook(notification.clone());
+        }
         let envelope = Envelope {
             version: Some(mux_protocol::PROTOCOL_VERSION.clone()),
             payload: Some(EnvelopePayload::Notification(notification)),

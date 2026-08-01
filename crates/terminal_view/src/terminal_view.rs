@@ -791,6 +791,10 @@ impl TerminalView {
 
         max_scroll_top_in_lines as f32 * line_height
     }
+    fn sync_scrollback_offset_from_terminal(&mut self, cx: &App) {
+        let display_offset = self.terminal.read(cx).last_content().display_offset;
+        self.scrollback_offset = (display_offset > 0).then_some(display_offset);
+    }
 
     fn scroll_wheel(&mut self, event: &ScrollWheelEvent, cx: &mut Context<Self>) {
         let terminal_content = self.terminal.read(cx).last_content();
@@ -813,6 +817,8 @@ impl TerminalView {
                 TerminalSettings::get_global(cx).scroll_multiplier.max(0.01),
             )
         });
+        self.sync_scrollback_offset_from_terminal(cx);
+        cx.notify();
     }
 
     fn is_alt_screen(&self, cx: &App) -> bool {
@@ -840,6 +846,7 @@ impl TerminalView {
         }
 
         self.terminal.update(cx, |term, _| term.scroll_line_up());
+        self.sync_scrollback_offset_from_terminal(cx);
         cx.notify();
     }
 
@@ -860,6 +867,7 @@ impl TerminalView {
         }
 
         self.terminal.update(cx, |term, _| term.scroll_line_down());
+        self.sync_scrollback_offset_from_terminal(cx);
         cx.notify();
     }
 
@@ -890,6 +898,7 @@ impl TerminalView {
                     .update(cx, |term, _| term.scroll_up_by(visible_content_lines));
             }
         }
+        self.sync_scrollback_offset_from_terminal(cx);
         cx.notify();
     }
 
@@ -900,6 +909,7 @@ impl TerminalView {
         }
 
         self.terminal.update(cx, |term, _| term.scroll_page_down());
+        self.sync_scrollback_offset_from_terminal(cx);
         let terminal = self.terminal.read(cx);
         if terminal.last_content().display_offset < terminal.viewport_lines() {
             self.scroll_top = self.max_scroll_top(cx);
@@ -914,6 +924,7 @@ impl TerminalView {
         }
 
         self.terminal.update(cx, |term, _| term.scroll_to_top());
+        self.sync_scrollback_offset_from_terminal(cx);
         cx.notify();
     }
 
@@ -924,6 +935,7 @@ impl TerminalView {
         }
 
         self.terminal.update(cx, |term, _| term.scroll_to_bottom());
+        self.sync_scrollback_offset_from_terminal(cx);
         if self.block_below_cursor.is_some() {
             self.scroll_top = self.max_scroll_top(cx);
         }

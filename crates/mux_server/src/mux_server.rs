@@ -18,6 +18,7 @@ pub mod clipboard;
 pub mod coalescing;
 pub mod dec2026;
 pub mod grid_sync;
+pub mod extension_host;
 pub mod layout;
 pub mod pane;
 pub mod persistence;
@@ -264,6 +265,13 @@ pub fn run() -> Result<()> {
         let sessions = std::sync::Arc::new(parking_lot::RwLock::new(Vec::new()));
         let db = std::sync::Arc::new(parking_lot::Mutex::new(db));
 
+        // §16.8 Server-side QuickJS extension host: dedicated OS thread;
+        // discovery/load failures log and never stop the daemon (§15.7).
+        let extension_host = extension_host::ServerExtensionHost::start(
+            sessions.clone(),
+            extension_host::default_user_extensions_dir(),
+        );
+
         let sessions_clone = sessions.clone();
         let db_clone = db.clone();
         let persist_handle = tokio::spawn(async move {
@@ -289,6 +297,7 @@ pub fn run() -> Result<()> {
             _db: db,
             _persist_handle: Some(persist_handle),
             clipboard,
+            extension_host,
             start_time: SystemTime::now(),
             server_settings: server_settings.clone(),
             // §3.5 active connection counter — drives the idle-shutdown timer.
@@ -309,7 +318,8 @@ pub struct Server {
     _persist_handle: Option<tokio::task::JoinHandle<()>>,
     // §16.6 服务器剪贴板
     clipboard: std::sync::Arc<clipboard::ServerClipboard>,
-    // §16.12 启动时间 (用于 status 计算运行时长)
+    // §16.8 服务端 QuickJS 扩展宿主 (专用线程)。
+    extension_host: std::sync::Arc<extension_host::ServerExtensionHost>,
     start_time: SystemTime,
     // §16.11 Shared server settings (env + server.json); hot-reloaded.
     // keep_alive_seconds is read live via AtomicU64 — not snapshotted at boot.
@@ -378,12 +388,13 @@ impl Server {
                     // §16.11 thread the live ServerSettings handle so new panes
                     // honor env + server.json scrollback (hot-reloaded) at spawn.
                     let server_settings = self.server_settings.clone();
+                    let extension_host = self.extension_host.clone();
                     let counter = self.active_connections.clone();
                     let done_tx = done_tx.clone();
                     let shutdown_state = shutdown_state.clone();
 
                     tokio::spawn(async move {
-                        match connection::handle_connection(stream, sessions, db, clipboard, server_settings, shutdown_state).await {
+                        match connection::handle_connection(stream, sessions, db, clipboard, server_settings, shutdown_state, extension_host).await {
                             Ok(()) => {
                                 zlog::info!("client disconnected");
                             }
