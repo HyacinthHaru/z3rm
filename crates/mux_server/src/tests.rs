@@ -195,6 +195,64 @@ fn test_session_add_tab() {
     assert_eq!(tab.title, "Terminal");
 }
 
+#[cfg(unix)]
+#[test]
+fn session_remove_pane_cleans_layout_tabs_and_focus() {
+    let mut session = crate::session::Session::new(
+        "sess-remove".to_string(),
+        "remove".to_string(),
+        "/tmp".to_string(),
+    );
+    let pane_one = crate::pane::Pane::spawn(
+        "pane-1".to_string(),
+        std::env::temp_dir().to_string_lossy().to_string(),
+        20,
+        5,
+        Some(crate::pane::ShellCommand {
+            program: "/bin/cat".to_string(),
+            ..Default::default()
+        }),
+    )
+    .expect("spawn pane one");
+    let pane_two = crate::pane::Pane::spawn(
+        "pane-2".to_string(),
+        std::env::temp_dir().to_string_lossy().to_string(),
+        20,
+        5,
+        Some(crate::pane::ShellCommand {
+            program: "/bin/cat".to_string(),
+            ..Default::default()
+        }),
+    )
+    .expect("spawn pane two");
+    session.panes.write().insert(pane_one.id.clone(), pane_one);
+    session.panes.write().insert(pane_two.id.clone(), pane_two);
+    session.add_tab("tab-1".to_string(), "shells".to_string());
+    session.tabs.get_mut("tab-1").unwrap().pane_ids =
+        vec!["pane-1".to_string(), "pane-2".to_string()];
+    session.layout = LayoutTree::with_pane("node-1".to_string(), "pane-1".to_string());
+    session
+        .layout
+        .split("pane-1", "pane-2".to_string(), SplitDirection::LeftRight)
+        .expect("split test layout");
+    session.focused_pane = Some("pane-2".to_string());
+    session.focused_tab = Some("tab-1".to_string());
+
+    assert!(session.remove_pane("pane-2").expect("remove second pane"));
+    assert_eq!(session.layout.pane_ids(), vec!["pane-1"]);
+    assert_eq!(session.tabs["tab-1"].pane_ids, vec!["pane-1"]);
+    assert_eq!(session.focused_pane.as_deref(), Some("pane-1"));
+    assert_eq!(session.focused_tab.as_deref(), Some("tab-1"));
+
+    assert!(session.remove_pane("pane-1").expect("remove final pane"));
+    assert!(session.panes.read().is_empty());
+    assert!(session.layout.is_empty_root());
+    assert!(session.tabs["tab-1"].pane_ids.is_empty());
+    assert!(session.focused_pane.is_none());
+    assert!(session.focused_tab.is_none());
+    assert!(!session.remove_pane("pane-1").expect("repeat removal"));
+}
+
 /// §3.10 Pane: creation and generation
 #[test]
 fn test_pane_creation() {

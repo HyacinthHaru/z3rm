@@ -1297,12 +1297,36 @@ async fn handle_spawn_pane(
         let session = sessions_w
             .iter_mut()
             .find(|session| session.id == req.session_id)
-            .ok_or_else(|| anyhow::anyhow!(
-                "session removed while spawning pane: {}",
-                req.session_id
-            ))?;
+            .ok_or_else(|| {
+                anyhow::anyhow!("session removed while spawning pane: {}", req.session_id)
+            })?;
+        if session.layout.is_empty_root() {
+            session.layout =
+                crate::layout::LayoutTree::with_pane(format!("node-{}", pane_id), pane_id.clone());
+        } else {
+            let anchor = session
+                .focused_pane
+                .as_ref()
+                .filter(|focused| session.layout.root.find_pane(focused).is_some())
+                .cloned()
+                .or_else(|| {
+                    session
+                        .layout
+                        .pane_ids()
+                        .into_iter()
+                        .find(|id| !id.is_empty())
+                })
+                .ok_or_else(|| anyhow::anyhow!("session layout has no pane anchor"))?;
+            session.layout.split(
+                &anchor,
+                pane_id.clone(),
+                crate::layout::SplitDirection::TopBottom,
+            )?;
+        }
+
         session.panes.write().insert(pane_id.clone(), pane);
         session.set_focused_pane(pane_id.clone());
+        session.focused_tab = Some(req.tab_id.clone());
 
         let tab = session
             .tabs
@@ -1314,13 +1338,6 @@ async fn handle_spawn_pane(
             });
         if !tab.pane_ids.contains(&pane_id) {
             tab.pane_ids.push(pane_id.clone());
-        }
-
-        if session.layout.is_empty_root() {
-            session.layout = crate::layout::LayoutTree::with_pane(
-                format!("node-{}", pane_id),
-                pane_id.clone(),
-            );
         }
     }
 
@@ -1338,20 +1355,23 @@ async fn handle_spawn_pane(
 
     zlog::info!("pane spawned: id={} session={}", pane_id, req.session_id);
 
-    // §3.4 Install natural-exit hook before fan-out so a fast-exiting shell
-    // still produces PaneRemoved for every attached client.
-    {
-        let sessions_r = sessions.read();
-        if let Some(session) = sessions_r.iter().find(|s| s.id == req.session_id) {
-            if let Some(pane) = session.panes.read().get(&pane_id) {
-                install_pane_exit_hook(pane, sessions, req.session_id.clone(), pane_id.clone());
-            }
-        }
-    }
-
-    // §3.4 fan-out PaneAdded 到所有 attached 客户端 (session 级 lifecycle 路径,
-    // at-least-once: 每个 attached 连接的 outbound channel 都收一份, 不只是发起方)。
+    // Publish existence before installing the exit hook. If the command has
+    // already exited, late hook installation immediately replays removal,
+    // preserving per-pane Added -> Removed ordering.
     broadcast_pane_added(sessions, &req.session_id, &pane_id, &req.tab_id);
+    // Install only after PaneAdded publication. A command that already exited
+    // replays cleanup here, preserving Added -> Removed ordering.
+    let pane_for_exit = {
+        let sessions_r = sessions.read();
+        sessions_r
+            .iter()
+            .find(|session| session.id == req.session_id)
+            .and_then(|session| session.panes.read().get(&pane_id).cloned())
+    };
+    if let Some(pane) = pane_for_exit {
+        install_pane_exit_hook(&pane, sessions, req.session_id.clone(), pane_id.clone());
+    }
+    broadcast_layout_changed(sessions, &req.session_id);
 
     Ok(ResponseBody::PaneId(pane_id))
 }
@@ -1374,10 +1394,6 @@ async fn handle_split_pane(
     let mut sessions_w = sessions.write();
     for session in sessions_w.iter_mut() {
         if session.layout.root.find_pane(&req.pane_id).is_some() {
-            session
-                .layout
-                .split(&req.pane_id, new_pane_id.clone(), direction)?;
-
             let parent_cwd = session
                 .panes
                 .read()
@@ -1396,6 +1412,12 @@ async fn handle_split_pane(
                 .get(&req.pane_id)
                 .map(|pane| pane.get_rows())
                 .unwrap_or(24);
+            let parent_tab_id = session
+                .tabs
+                .iter()
+                .find(|(_, tab)| tab.pane_ids.contains(&req.pane_id))
+                .map(|(id, _)| id.clone())
+                .ok_or_else(|| anyhow::anyhow!("pane is not assigned to a tab: {}", req.pane_id))?;
             let cwd = req
                 .cwd
                 .clone()
@@ -1419,21 +1441,20 @@ async fn handle_split_pane(
                 // §16.11 honor live ServerSettings scrollback (env + server.json).
                 server_settings.scrollback_lines(),
             )?;
+            // Only mutate the authoritative layout after PTY creation has
+            // succeeded; a spawn error must leave the original tree intact.
+            session
+                .layout
+                .split(&req.pane_id, new_pane_id.clone(), direction)?;
             session.panes.write().insert(new_pane_id.clone(), pane);
             session.set_focused_pane(new_pane_id.clone());
+            session.focused_tab = Some(parent_tab_id.clone());
 
-            let parent_tab_id = session
-                .tabs
-                .iter()
-                .find(|(_, tab)| tab.pane_ids.contains(&req.pane_id))
-                .map(|(id, _)| id.clone());
-            let parent_tab_id_for_broadcast = parent_tab_id.clone().unwrap_or_default();
-            if let Some(tab_id) = parent_tab_id {
-                if let Some(tab) = session.tabs.get_mut(&tab_id) {
-                    if !tab.pane_ids.contains(&new_pane_id) {
-                        tab.pane_ids.push(new_pane_id.clone());
-                    }
-                }
+            let parent_tab_id_for_broadcast = parent_tab_id.clone();
+            if let Some(tab) = session.tabs.get_mut(&parent_tab_id)
+                && !tab.pane_ids.contains(&new_pane_id)
+            {
+                tab.pane_ids.push(new_pane_id.clone());
             }
 
             let pane_ref = session.panes.read().get(&new_pane_id).cloned();
@@ -1448,26 +1469,27 @@ async fn handle_split_pane(
             // 由 lifecycle helper 重新获取读锁单次发送, 避免嵌套写锁的死锁。
             let session_id_for_broadcast = session.id.clone();
             drop(sessions_w);
-            {
-                let sessions_r = sessions.read();
-                if let Some(session) = sessions_r.iter().find(|s| s.id == session_id_for_broadcast)
-                {
-                    if let Some(pane) = session.panes.read().get(&new_pane_id) {
-                        install_pane_exit_hook(
-                            pane,
-                            sessions,
-                            session_id_for_broadcast.clone(),
-                            new_pane_id.clone(),
-                        );
-                    }
-                }
-            }
             broadcast_pane_added(
                 sessions,
                 &session_id_for_broadcast,
                 &new_pane_id,
                 &parent_tab_id_for_broadcast,
             );
+            let pane_for_exit = {
+                let sessions_r = sessions.read();
+                sessions_r
+                    .iter()
+                    .find(|session| session.id == session_id_for_broadcast)
+                    .and_then(|session| session.panes.read().get(&new_pane_id).cloned())
+            };
+            if let Some(pane) = pane_for_exit {
+                install_pane_exit_hook(
+                    &pane,
+                    sessions,
+                    session_id_for_broadcast.clone(),
+                    new_pane_id.clone(),
+                );
+            }
             broadcast_layout_changed(sessions, &session_id_for_broadcast);
             return Ok(ResponseBody::PaneId(new_pane_id));
         }
@@ -1494,14 +1516,12 @@ async fn handle_close_pane(
     {
         let mut sessions_w = sessions.write();
         for session in sessions_w.iter_mut() {
-            let had = session.panes.write().remove(&req.pane_id).is_some();
-            if had {
-                removed = true;
+            if session.panes.read().contains_key(&req.pane_id) {
+                removed = session.remove_pane(&req.pane_id)?;
                 session_id = Some(session.id.clone());
-                if let Err(e) = session.layout.remove_pane(&req.pane_id) {
-                    tracing::error!(error = ?e, pane_id = %req.pane_id, "failed to remove pane from layout");
+                if removed {
+                    zlog::info!("pane closed: id={}", req.pane_id);
                 }
-                zlog::info!("pane closed: id={}", req.pane_id);
                 break;
             }
         }
@@ -1513,8 +1533,8 @@ async fn handle_close_pane(
         )));
     }
     if let Some(sid) = session_id {
-        broadcast_layout_changed(sessions, &sid);
         broadcast_pane_removed(sessions, &sid, &req.pane_id, 0);
+        broadcast_layout_changed(sessions, &sid);
     }
     Ok(ResponseBody::Error(String::new()))
 }
@@ -1988,15 +2008,26 @@ fn install_pane_exit_hook(
 ) {
     let sessions = sessions.clone();
     let hook = std::sync::Arc::new(move || {
-        {
+        let removed = {
             let mut sessions_w = sessions.write();
-            if let Some(session) = sessions_w.iter_mut().find(|s| s.id == session_id) {
-                let _ = session.layout.remove_pane(&pane_id);
-                session.panes.write().remove(&pane_id);
+            match sessions_w
+                .iter_mut()
+                .find(|session| session.id == session_id)
+            {
+                Some(session) => match session.remove_pane(&pane_id) {
+                    Ok(removed) => removed,
+                    Err(error) => {
+                        tracing::error!(%error, %pane_id, "failed to clean up exited pane");
+                        false
+                    }
+                },
+                None => false,
             }
+        };
+        if removed {
+            broadcast_pane_removed(&sessions, &session_id, &pane_id, 0);
+            broadcast_layout_changed(&sessions, &session_id);
         }
-        broadcast_pane_removed(&sessions, &session_id, &pane_id, 0);
-        broadcast_layout_changed(&sessions, &session_id);
     });
     pane.set_exit_hook(hook);
 }
@@ -2581,6 +2612,213 @@ mod connection_unit_tests {
             .expect_err("missing session must fail before child spawn");
 
         assert_eq!(error.to_string(), "session not found: missing");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn split_spawn_failure_preserves_layout_and_registry() {
+        let pane = crate::pane::Pane::spawn(
+            "parent-pane".to_string(),
+            std::env::temp_dir().to_string_lossy().to_string(),
+            20,
+            5,
+            Some(crate::pane::ShellCommand {
+                program: "/bin/cat".to_string(),
+                ..Default::default()
+            }),
+        )
+        .expect("spawn split parent");
+        let mut session = crate::session::Session::new(
+            "split-session".to_string(),
+            "split-session".to_string(),
+            "/tmp".to_string(),
+        );
+        session.panes.write().insert(pane.id.clone(), pane);
+        session.add_tab("tab-1".to_string(), "shell".to_string());
+        session
+            .tabs
+            .get_mut("tab-1")
+            .unwrap()
+            .pane_ids
+            .push("parent-pane".to_string());
+        session.layout =
+            crate::layout::LayoutTree::with_pane("node-1".to_string(), "parent-pane".to_string());
+        session.focused_pane = Some("parent-pane".to_string());
+        session.focused_tab = Some("tab-1".to_string());
+        let sessions = Arc::new(parking_lot::RwLock::new(vec![session]));
+        let settings = crate::server_settings::ServerSettings::load();
+        let clipboard = Arc::new(crate::clipboard::ServerClipboard::new());
+        let (outbound, _notifications) = mpsc::unbounded_channel();
+
+        let error = handle_split_pane(
+            &SplitPaneRequest {
+                pane_id: "parent-pane".to_string(),
+                direction: mux_protocol::split_node::SplitDirection::LeftRight as i32,
+                command: Some(mux_protocol::ShellCommand {
+                    program: "/definitely/must/not/spawn".to_string(),
+                    args: Vec::new(),
+                    env: Default::default(),
+                }),
+                cwd: None,
+            },
+            &sessions,
+            &outbound,
+            &settings,
+            &clipboard,
+        )
+        .await
+        .expect_err("split spawn must fail");
+        assert!(!error.to_string().is_empty());
+
+        let sessions = sessions.read();
+        let session = &sessions[0];
+        assert_eq!(session.layout.pane_ids(), vec!["parent-pane"]);
+        assert_eq!(
+            session.panes.read().keys().cloned().collect::<Vec<_>>(),
+            vec!["parent-pane"]
+        );
+        assert_eq!(session.tabs["tab-1"].pane_ids, vec!["parent-pane"]);
+        assert_eq!(session.focused_pane.as_deref(), Some("parent-pane"));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn fast_exit_spawn_is_added_then_removed_without_zombie_state() {
+        let mut session = crate::session::Session::new(
+            "fast-exit-session".to_string(),
+            "fast-exit-session".to_string(),
+            "/tmp".to_string(),
+        );
+        session.add_tab("tab-1".to_string(), "shell".to_string());
+        session.focused_tab = Some("tab-1".to_string());
+        let (lifecycle_tx, mut lifecycle_rx) = mpsc::unbounded_channel();
+        session.add_lifecycle_subscriber("test-client".to_string(), lifecycle_tx);
+        let sessions = Arc::new(parking_lot::RwLock::new(vec![session]));
+        let settings = crate::server_settings::ServerSettings::load();
+        let clipboard = Arc::new(crate::clipboard::ServerClipboard::new());
+
+        let response = handle_spawn_pane(
+            &SpawnPaneRequest {
+                session_id: "fast-exit-session".to_string(),
+                tab_id: "tab-1".to_string(),
+                size: Some(mux_protocol::TerminalSize { cols: 20, rows: 5 }),
+                cwd: None,
+                command: Some(mux_protocol::ShellCommand {
+                    program: "/bin/true".to_string(),
+                    args: Vec::new(),
+                    env: Default::default(),
+                }),
+            },
+            &sessions,
+            &settings,
+            &clipboard,
+        )
+        .await
+        .expect("spawn fast-exit pane");
+        let pane_id = match response {
+            ResponseBody::PaneId(id) => id,
+            response => panic!("expected pane id, got {response:?}"),
+        };
+
+        let first = tokio::time::timeout(std::time::Duration::from_secs(2), lifecycle_rx.recv())
+            .await
+            .expect("PaneAdded timeout")
+            .expect("PaneAdded channel closed");
+        let first_event = match first.payload {
+            Some(EnvelopePayload::Notification(notification)) => notification.event,
+            payload => panic!("expected notification envelope, got {payload:?}"),
+        };
+        assert!(matches!(
+            first_event,
+            Some(mux_protocol::notification::Event::PaneAdded(ref added))
+                if added.pane_id == pane_id
+        ));
+        let removed = tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            loop {
+                let envelope = lifecycle_rx.recv().await.expect("lifecycle channel closed");
+                let event = match envelope.payload {
+                    Some(EnvelopePayload::Notification(notification)) => notification.event,
+                    payload => panic!("expected notification envelope, got {payload:?}"),
+                };
+                match event {
+                    Some(mux_protocol::notification::Event::PaneRemoved(removed))
+                        if removed.pane_id == pane_id =>
+                    {
+                        return removed;
+                    }
+                    Some(mux_protocol::notification::Event::PaneAdded(added))
+                        if added.pane_id == pane_id =>
+                    {
+                        panic!("duplicate PaneAdded for {pane_id}")
+                    }
+                    _ => {}
+                }
+            }
+        })
+        .await
+        .expect("PaneRemoved timeout");
+        assert_eq!(removed.pane_id, pane_id);
+
+        let sessions = sessions.read();
+        let session = &sessions[0];
+        assert!(session.panes.read().is_empty());
+        assert!(session.layout.is_empty_root());
+        assert!(session.tabs["tab-1"].pane_ids.is_empty());
+        assert!(session.focused_pane.is_none());
+        assert!(session.focused_tab.is_none());
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn spawn_into_second_tab_keeps_layout_registry_and_focus_coherent() {
+        let mut session = crate::session::Session::new(
+            "tab-session".to_string(),
+            "tab-session".to_string(),
+            "/tmp".to_string(),
+        );
+        session.add_tab("tab-1".to_string(), "one".to_string());
+        session.focused_tab = Some("tab-1".to_string());
+        let sessions = Arc::new(parking_lot::RwLock::new(vec![session]));
+        let settings = crate::server_settings::ServerSettings::load();
+        let clipboard = Arc::new(crate::clipboard::ServerClipboard::new());
+
+        let mut pane_ids = Vec::new();
+        for tab_id in ["tab-1", "tab-2"] {
+            let response = handle_spawn_pane(
+                &SpawnPaneRequest {
+                    session_id: "tab-session".to_string(),
+                    tab_id: tab_id.to_string(),
+                    size: Some(mux_protocol::TerminalSize { cols: 20, rows: 5 }),
+                    cwd: None,
+                    command: Some(mux_protocol::ShellCommand {
+                        program: "/bin/cat".to_string(),
+                        args: Vec::new(),
+                        env: Default::default(),
+                    }),
+                },
+                &sessions,
+                &settings,
+                &clipboard,
+            )
+            .await
+            .expect("spawn tab pane");
+            match response {
+                ResponseBody::PaneId(id) => pane_ids.push(id),
+                response => panic!("expected pane id, got {response:?}"),
+            }
+        }
+
+        let sessions = sessions.read();
+        let session = &sessions[0];
+        let mut layout_ids = session.layout.pane_ids();
+        layout_ids.sort();
+        let mut registry_ids = session.panes.read().keys().cloned().collect::<Vec<_>>();
+        registry_ids.sort();
+        assert_eq!(layout_ids, registry_ids);
+        assert_eq!(session.tabs["tab-1"].pane_ids, vec![pane_ids[0].clone()]);
+        assert_eq!(session.tabs["tab-2"].pane_ids, vec![pane_ids[1].clone()]);
+        assert_eq!(session.focused_tab.as_deref(), Some("tab-2"));
+        assert_eq!(session.focused_pane.as_deref(), Some(pane_ids[1].as_str()));
     }
 
     struct DropSignal(Arc<std::sync::atomic::AtomicBool>);

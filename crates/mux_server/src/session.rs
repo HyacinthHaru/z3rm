@@ -153,6 +153,46 @@ impl Session {
         self.focused_pane = Some(pane_id);
     }
 
+    /// Remove a pane from every server-authoritative session index.
+    /// Returns `false` when another cleanup path already removed it.
+    pub fn remove_pane(&mut self, pane_id: &str) -> anyhow::Result<bool> {
+        if !self.panes.read().contains_key(pane_id) {
+            return Ok(false);
+        }
+
+        let layout_panes = self.layout.pane_ids();
+        if layout_panes.len() == 1 && layout_panes[0] == pane_id {
+            self.layout = crate::layout::LayoutTree::empty();
+        } else if layout_panes.iter().any(|id| id == pane_id) {
+            self.layout.remove_pane(pane_id)?;
+        }
+
+        self.panes.write().remove(pane_id);
+        for tab in self.tabs.values_mut() {
+            tab.pane_ids.retain(|id| id != pane_id);
+        }
+
+        let focused_is_valid = self
+            .focused_pane
+            .as_ref()
+            .is_some_and(|focused| self.panes.read().contains_key(focused));
+        if !focused_is_valid {
+            self.focused_pane = self
+                .layout
+                .pane_ids()
+                .into_iter()
+                .find(|id| !id.is_empty() && self.panes.read().contains_key(id));
+        }
+        self.focused_tab = self.focused_pane.as_ref().and_then(|focused| {
+            self.tabs
+                .iter()
+                .find(|(_, tab)| tab.pane_ids.contains(focused))
+                .map(|(id, _)| id.clone())
+        });
+
+        Ok(true)
+    }
+
     /// 添加附加客户端 (§3.10 AttachRequest)
     pub fn add_attached_client(&mut self, client_id: String, mode: AttachMode, role: ClientRole) {
         let clients = self.attached_clients.clone();
