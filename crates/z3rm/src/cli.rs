@@ -741,7 +741,7 @@ fn parse_cli_args_lossy(args: &[String]) -> Result<Option<CliCommand>, String> {
             Ok(Some(CliCommand::RenameWindow { target, title }))
         }
 
-        _ => unreachable!(),
+        _ => Err(format!("unknown subcommand: {subcommand}")),
     }
 }
 
@@ -1203,5 +1203,19 @@ mod tests {
         } else {
             panic!("unexpected parse result: {parsed:?}");
         }
+    }
+
+    #[test]
+    fn unknown_subcommand_is_rejected_not_panicked() {
+        // The subcommand match's default arm used to be `unreachable!()`; if the
+        // pre-filter and the match ever drift, that aborts the process. It must
+        // be a recoverable parse error instead. Call the lossy parser directly so
+        // the default arm is exercised regardless of pre-filtering.
+        let err = parse_cli_args_lossy(&args(&["z3rm", "definitely-not-a-command"]))
+            .expect_err("unknown subcommand must error, never panic");
+        assert!(
+            err.contains("unknown subcommand"),
+            "error should name the condition: {err}"
+        );
     }
 }
