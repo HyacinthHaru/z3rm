@@ -586,3 +586,267 @@ async fn e2e_bogus_pane_mutations_return_errors() -> Result<()> {
     domain.kill_session(&session_id).await?;
     Ok(())
 }
+
+// ============================================================================
+// §3.3 多窗口 (Plan 32)
+// ============================================================================
+
+/// 等待一条满足 `matches` 的通知,或超时失败。
+async fn wait_for_notification<T>(
+    notifications: &async_channel::Receiver<proto::Notification>,
+    description: &str,
+    timeout: Duration,
+    mut matches: impl FnMut(&proto::notification::Event) -> Option<T>,
+) -> Result<T> {
+    let deadline = Instant::now() + timeout;
+    loop {
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            anyhow::bail!("timed out waiting for {description}");
+        }
+        let notification = match tokio::time::timeout(remaining, notifications.recv()).await {
+            Ok(Ok(notification)) => notification,
+            Ok(Err(error)) => {
+                anyhow::bail!("notification stream closed waiting for {description}: {error}")
+            }
+            Err(_) => anyhow::bail!("timed out waiting for {description}"),
+        };
+        let Some(event) = notification.event.as_ref() else {
+            continue;
+        };
+        if let Some(matched) = matches(event) {
+            return Ok(matched);
+        }
+    }
+}
+
+/// §3.3 窗口注册/注销往返: 第二个窗口 attach 时第一个窗口收到 `WindowAdded`,
+/// 第二个窗口断开连接时收到 `WindowRemoved`。
+///
+/// 断开走的是「直接丢弃 domain 让 socket 关闭」这条路径, 因为崩溃的 GUI 不会
+/// 礼貌地 detach —— 会话必须靠连接关闭来收缩 `connected_windows`。
+#[tokio::test(flavor = "multi_thread")]
+async fn e2e_window_lifecycle_round_trip() -> Result<()> {
+    let server = TestServer::spawn()?;
+    let first_window = server.connect().await?;
+    let session_id = first_window
+        .create_session("e2e-windows", &PathBuf::from("/"))
+        .await?;
+
+    let first_window_id = first_window.create_window(&session_id).await?;
+    assert!(
+        first_window_id.starts_with("win-"),
+        "server-minted window ids keep the win-<pid>-<nanoid> shape, got {first_window_id}"
+    );
+    first_window.set_window_id(first_window_id.clone());
+    first_window.attach(&session_id, AttachMode::Shared).await?;
+
+    // Subscribe only after the first window joined, so the stream contains the
+    // peer's events rather than this window's own registration.
+    let notifications = first_window.subscribe();
+
+    let second_window = server.connect().await?;
+    let second_attach = second_window.create_and_attach_window(&session_id).await?;
+    assert!(
+        second_attach.snapshot.is_some(),
+        "the second window must receive its own authoritative snapshot"
+    );
+    let second_window_id = second_window.window_id();
+    assert_ne!(
+        first_window_id, second_window_id,
+        "each window must get its own id, otherwise the server cannot tell them apart"
+    );
+
+    let added = wait_for_notification(
+        &notifications,
+        "WindowAdded for the second window",
+        Duration::from_secs(5),
+        |event| match event {
+            proto::notification::Event::WindowAdded(added) => Some(added.clone()),
+            _ => None,
+        },
+    )
+    .await?;
+    assert_eq!(added.window_id, second_window_id);
+    assert_eq!(added.session_id, session_id);
+
+    // Dropping the domain closes the socket; the daemon must treat that as the
+    // window leaving the session.
+    drop(second_window);
+
+    let removed = wait_for_notification(
+        &notifications,
+        "WindowRemoved after the second window's socket closed",
+        Duration::from_secs(5),
+        |event| match event {
+            proto::notification::Event::WindowRemoved(removed) => Some(removed.clone()),
+            _ => None,
+        },
+    )
+    .await?;
+    assert_eq!(removed.window_id, second_window_id);
+    assert_eq!(removed.session_id, session_id);
+
+    first_window.kill_session(&session_id).await?;
+    Ok(())
+}
+
+/// §3.3 显式 detach 也必须让窗口离开会话 (GUI 关窗走这条路径)。
+#[tokio::test(flavor = "multi_thread")]
+async fn e2e_detach_removes_the_window_from_the_session() -> Result<()> {
+    let server = TestServer::spawn()?;
+    let first_window = server.connect().await?;
+    let session_id = first_window
+        .create_session("e2e-window-detach", &PathBuf::from("/"))
+        .await?;
+    first_window.create_and_attach_window(&session_id).await?;
+    let notifications = first_window.subscribe();
+
+    let second_window = server.connect().await?;
+    second_window.create_and_attach_window(&session_id).await?;
+    let second_window_id = second_window.window_id();
+    wait_for_notification(
+        &notifications,
+        "WindowAdded for the second window",
+        Duration::from_secs(5),
+        |event| match event {
+            proto::notification::Event::WindowAdded(added)
+                if added.window_id == second_window_id =>
+            {
+                Some(())
+            }
+            _ => None,
+        },
+    )
+    .await?;
+
+    second_window.detach().await?;
+
+    wait_for_notification(
+        &notifications,
+        "WindowRemoved after detach",
+        Duration::from_secs(5),
+        |event| match event {
+            proto::notification::Event::WindowRemoved(removed)
+                if removed.window_id == second_window_id =>
+            {
+                Some(())
+            }
+            _ => None,
+        },
+    )
+    .await?;
+
+    first_window.kill_session(&session_id).await?;
+    Ok(())
+}
+
+/// §15.4 原地重连用同一个 window_id 重新 attach: 窗口从未离开会话, 所以不应该
+/// 冒出一对 WindowRemoved/WindowAdded 噪音。
+#[tokio::test(flavor = "multi_thread")]
+async fn e2e_reattaching_the_same_window_is_silent() -> Result<()> {
+    let server = TestServer::spawn()?;
+    let observer = server.connect().await?;
+    let session_id = observer
+        .create_session("e2e-window-reattach", &PathBuf::from("/"))
+        .await?;
+    observer.create_and_attach_window(&session_id).await?;
+
+    let window = server.connect().await?;
+    window.create_and_attach_window(&session_id).await?;
+    let window_id = window.window_id();
+
+    let notifications = observer.subscribe();
+    window.attach(&session_id, AttachMode::Shared).await?;
+
+    // The re-attach round-trip already completed, so any window event the server
+    // meant to emit for it is either queued or was never produced.
+    observer.list_sessions().await?;
+    while let Ok(notification) = notifications.try_recv() {
+        match notification.event {
+            Some(proto::notification::Event::WindowAdded(added)) => {
+                assert_ne!(
+                    added.window_id, window_id,
+                    "re-attaching the same window must not re-announce it"
+                );
+            }
+            Some(proto::notification::Event::WindowRemoved(removed)) => {
+                assert_ne!(
+                    removed.window_id, window_id,
+                    "re-attaching the same window must not announce it leaving"
+                );
+            }
+            _ => {}
+        }
+    }
+
+    observer.kill_session(&session_id).await?;
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn e2e_layout_depth_rejection_keeps_connection_usable() -> Result<()> {
+    let server = TestServer::spawn()?;
+    let domain = server.connect().await?;
+    let session_id = domain
+        .create_session("e2e-layout-depth", &PathBuf::from("/"))
+        .await?;
+    let attach = domain.attach(&session_id, AttachMode::Shared).await?;
+    let tab_id = attach
+        .snapshot
+        .as_ref()
+        .context("layout depth attach snapshot missing")?
+        .tabs
+        .first()
+        .context("layout depth attach snapshot has no tabs")?
+        .id
+        .clone();
+    let mut focused = domain
+        .spawn_pane(
+            &session_id,
+            &tab_id,
+            proto::TerminalSize { cols: 40, rows: 5 },
+            Some(proto::ShellCommand {
+                program: "/bin/cat".into(),
+                args: Vec::new(),
+                env: HashMap::new(),
+            }),
+            Some(&PathBuf::from("/")),
+        )
+        .await?;
+
+    for index in 1..=mux_protocol::MAX_LAYOUT_WIRE_DEPTH {
+        let direction = if index % 2 == 0 {
+            SplitDirection::LeftRight
+        } else {
+            SplitDirection::TopBottom
+        };
+        focused = domain.split_pane(&focused, direction).await?;
+    }
+    let error = domain
+        .split_pane(
+            &focused,
+            if mux_protocol::MAX_LAYOUT_WIRE_DEPTH % 2 == 0 {
+                SplitDirection::TopBottom
+            } else {
+                SplitDirection::LeftRight
+            },
+        )
+        .await
+        .expect_err("split beyond wire depth must be rejected");
+
+    assert!(
+        error.to_string().contains("wire depth"),
+        "expected specific layout depth error, got {error:#}"
+    );
+    assert!(
+        domain
+            .list_sessions()
+            .await?
+            .iter()
+            .any(|session| session.id == session_id),
+        "connection must remain usable after layout rejection"
+    );
+    domain.kill_session(&session_id).await?;
+    Ok(())
+}

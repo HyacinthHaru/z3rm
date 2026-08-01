@@ -2366,7 +2366,7 @@ impl Render for SplittableEditor {
     }
 }
 
-#[cfg(all(test, feature = "z3rm-migration"))]
+#[cfg(test)]
 mod tests {
     use std::{any::TypeId, sync::Arc};
 
@@ -2381,7 +2381,7 @@ mod tests {
     use pretty_assertions::assert_eq;
     use project::Project;
     use rand::rngs::StdRng;
-    use settings::{DiffViewStyle, SettingsStore};
+    use settings::SettingsStore;
     use ui::{VisualContext as _, div, px};
     use util::rel_path::rel_path;
     use workspace::{Item, MultiWorkspace};
@@ -2389,9 +2389,8 @@ mod tests {
     use crate::display_map::{
         BlockPlacement, BlockProperties, BlockStyle, Crease, FoldPlaceholder,
     };
-    use crate::inlays::Inlay;
     use crate::test::{editor_content_with_blocks_and_width, set_block_content_for_tests};
-    use crate::{Editor, SplittableEditor};
+    use crate::{DiffViewStyle, Editor, Inlay, SplittableEditor};
     use multi_buffer::MultiBufferOffset;
 
     async fn init_test(
@@ -2400,11 +2399,24 @@ mod tests {
         style: DiffViewStyle,
     ) -> (Entity<SplittableEditor>, &mut VisualTestContext) {
         cx.update(|cx| {
+            // Soft-wrap assertions below depend on the bundled test font's metrics.
+            assets::Assets.load_test_fonts(cx);
             let store = SettingsStore::test(cx);
             cx.set_global(store);
             cx.update_global::<SettingsStore, _>(|store, cx| {
                 store.update_user_settings(cx, |settings| {
-                    settings.editor.diff_view_style = Some(style);
+                    let editor_settings = settings.editor.get_or_insert_default();
+                    editor_settings.diff_view_style = Some(match style {
+                        DiffViewStyle::Unified => settings::DiffViewStyle::Unified,
+                        DiffViewStyle::Split => settings::DiffViewStyle::Split,
+                    });
+                    // The soft-wrap assertions below depend on the gutter width, which
+                    // scales with this setting. Pin it so the expected column layout does
+                    // not silently change when the default moves.
+                    editor_settings
+                        .gutter
+                        .get_or_insert_default()
+                        .min_line_number_digits = Some(4);
                 });
             });
             theme_settings::init(theme::LoadThemes::JustBase, cx);

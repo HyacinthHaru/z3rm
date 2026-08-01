@@ -2,7 +2,7 @@ use std::rc::Rc;
 
 use crate::{
     Action, AsKeystroke, DummyKeyboardMapper, InvalidKeystrokeError, KeyBindingContextPredicate,
-    KeybindingKeystroke, Keystroke, PlatformKeyboardMapper, SharedString,
+    KeybindingKeystroke, Keystroke, PlatformKeyboardMapper, SharedString, Unbind,
 };
 use smallvec::SmallVec;
 
@@ -103,6 +103,23 @@ impl KeyBinding {
     /// Get the keystrokes associated with this binding
     pub fn keystrokes(&self) -> &[KeybindingKeystroke] {
         self.keystrokes.as_slice()
+    }
+
+    /// Build the `Unbind` marker that cancels this binding.
+    ///
+    /// Keymap resolution matches an unbind to its target by comparing
+    /// keystrokes for equality, and a `KeybindingKeystroke` carries more than
+    /// its rendered text. Rebuilding one by re-parsing `to_string()` therefore
+    /// produces a marker that silently fails to match, so the keystrokes are
+    /// carried over verbatim instead.
+    pub fn unbind(&self) -> Self {
+        Self {
+            action: Box::new(Unbind(self.action.name().into())),
+            keystrokes: self.keystrokes.clone(),
+            context_predicate: self.context_predicate.clone(),
+            meta: self.meta,
+            action_input: self.action_input.clone(),
+        }
     }
 
     /// Get the action associated with this binding

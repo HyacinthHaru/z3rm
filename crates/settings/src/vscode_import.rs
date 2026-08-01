@@ -126,11 +126,15 @@ impl VsCodeSettings {
             remote: RemoteSettingsContent::default(),
             workspace: self.workspace_settings_content(),
             theme: Box::new(self.theme_settings_content()),
+            editor: None,
             terminal: Some(self.terminal_settings_content()),
             mux: Some(MuxSettingsContent::default()),
             shadow_snapshot: Some(ShadowSnapshotSettingsContent::default()),
             title_bar: Some(TitleBarSettingsContent::default()),
             tab_bar: Some(self.tab_bar_settings_content()),
+            tabs: None,
+            preview_tabs: None,
+            which_key: None,
             status_bar: Some(self.status_bar_settings_content()),
             base_keymap: Some(BaseKeymapContent::VSCode),
             hide_mouse: Some(HideMouseMode::default()),
@@ -142,6 +146,25 @@ impl VsCodeSettings {
             line_indicator_format: Some(LineIndicatorFormat::Short),
             diagnostics: Some(DiagnosticsSettingsContent::default()),
             file_finder: Some(FileFinderSettingsContent::default()),
+            project_panel: Some(self.project_panel_settings_content()),
+            session: Some(SessionSettingsContent::default()),
+            global_lsp_settings: Some(GlobalLspSettingsContent::default()),
+            load_direnv: Some(LoadDirenv::default()),
+        }
+    }
+
+    fn project_panel_settings_content(&self) -> ProjectPanelSettingsContent {
+        ProjectPanelSettingsContent {
+            auto_reveal_entries: self.read_bool("explorer.autoReveal"),
+            auto_fold_dirs: self.read_bool("explorer.compactFolders"),
+            drag_and_drop: self.read_bool("explorer.enableDragAndDrop"),
+            sort_mode: self.read_enum("explorer.sortOrder", |s| match s {
+                "default" | "type" => Some(ProjectPanelSortMode::DirectoriesFirst),
+                "mixed" => Some(ProjectPanelSortMode::Mixed),
+                "filesFirst" => Some(ProjectPanelSortMode::FilesFirst),
+                _ => None,
+            }),
+            ..Default::default()
         }
     }
 
@@ -154,6 +177,10 @@ impl VsCodeSettings {
             linked_projects: None,
             excluded_paths,
             scan_symlinks: ScanSymlinksSetting::default(),
+            private_files: None,
+            hidden_files: None,
+            read_only_files: None,
+            file_scan_inclusions: None,
             all_languages: LanguageToSettingsMap::default(),
             disable_ai: SaturatingBool::default(),
             git_hosting_providers: Some(Vec::default()),

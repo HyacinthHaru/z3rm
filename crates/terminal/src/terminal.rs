@@ -89,10 +89,10 @@ use crate::alacritty::{
     AlacrittyCell, AlacrittyGridIterator, AlacrittyHyperlink, AlacrittySearch, AlacrittyTerm,
     AlacrittyTermConfig, AlacrittyTermLock, HyperlinkMatch, PtySender, RegexSearches,
     append_text_to_term, apply_config, apply_structured_snapshot, clear_saved_screen, content_text,
-    display_offset, display_only_term_config, find_from_terminal_point, full_content_range,
-    last_non_empty_lines, make_content, new_term, open_pty, pty_options, pty_term_config, resize,
-    screen_lines, scroll_display, scroll_to_point, search_matches, selection_text,
-    set_default_cursor_style, set_selection as set_term_selection, shrink_to_used,
+    cursor_anchor, display_offset, display_only_term_config, find_from_terminal_point,
+    full_content_range, last_non_empty_lines, make_content, new_term, open_pty, pty_options,
+    pty_term_config, resize, screen_lines, scroll_display, scroll_to_point, search_matches,
+    selection_text, set_default_cursor_style, set_selection as set_term_selection, shrink_to_used,
     spawn_event_loop, toggle_vi_mode as toggle_term_vi_mode, total_lines,
     update_selection as update_term_selection, update_selection_to_vi_cursor,
     update_vi_cursor_for_scroll, vi_goto_point, vi_motion,
@@ -153,6 +153,15 @@ enum ViMotion {
 #[derive(Clone, Debug)]
 pub struct Search {
     search: AlacrittySearch,
+}
+
+/// §12 Plan 31 — the confirmed copy-mode search. The match list itself lives in
+/// [`Terminal::matches`] so search hits highlight through the same renderer path
+/// as search-bar hits.
+#[derive(Clone, Debug)]
+struct SearchState {
+    query: String,
+    searcher: Search,
 }
 
 #[derive(Clone, Debug)]
@@ -623,10 +632,38 @@ pub struct Content {
     pub scrolled_to_top: bool,
     pub scrolled_to_bottom: bool,
     pub bottom_row_occupied: bool,
-    /// Kitty Graphics / OSC 1337 图像叠加层
-    /// 每项: (图像 ID, 起始行, 起始列, 宽(格), 高(格))
-    pub images: Vec<(kitty_graphics::ImageId, usize, usize, usize, usize)>,
+    /// Kitty graphics / OSC 1337 图像叠加层, 已经投影到当前视口。
+    pub images: Vec<VisibleImage>,
 }
+
+/// 一次图像放置。
+///
+/// 锚点用滚动缓冲区的绝对行号而不是视口行号, 这样内容滚动时图像跟着一起走。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ImagePlacement {
+    pub id: kitty_graphics::ImageId,
+    /// 从当前滚动缓冲区最老一行算起的行号。
+    pub anchor_line: i64,
+    pub column: usize,
+    pub columns: usize,
+    pub rows: usize,
+    pub z_index: i32,
+}
+
+/// [`ImagePlacement`] 投影到当前视口后的结果。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct VisibleImage {
+    pub id: kitty_graphics::ImageId,
+    /// 相对视口顶端的行号。图像从视口上方开始时为负。
+    pub row: i32,
+    pub column: usize,
+    pub columns: usize,
+    pub rows: usize,
+    pub z_index: i32,
+}
+
+/// 单个 pane 同时保留的放置数量上限。
+const MAX_IMAGE_PLACEMENTS: usize = 256;
 
 #[derive(Debug, Clone, Eq, PartialEq)]
 pub struct HoveredWord {
@@ -872,6 +909,9 @@ impl fmt::Debug for TerminalBackendEvent {
 
 enum PtyEvent {
     Event(TerminalBackendEvent),
+    /// 由 [`kitty_graphics::GraphicsScanner`] 在 PTY 读取线程上解析出来的
+    /// 图形协议动作。
+    Graphics(Vec<kitty_graphics::GraphicsEvent>),
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -1114,6 +1154,7 @@ impl TerminalBuilder {
             selection_phase: SelectionPhase::Ended,
             hyperlink_regex_searches: RegexSearches::default(),
             vi_mode_enabled: false,
+            search_state: None,
             is_remote_terminal: false,
             last_mouse_move_time: Instant::now(),
             last_hyperlink_search_position: None,
@@ -1139,6 +1180,8 @@ impl TerminalBuilder {
             background_executor: background_executor.clone(),
             path_style,
             image_cache: kitty_graphics::PaneImageCache::new(),
+            image_placements: Vec::new(),
+            graphics_scanner: kitty_graphics::GraphicsScanner::new(),
             #[cfg(any(test, feature = "test-support"))]
             input_log: Vec::new(),
             #[cfg(any(test, feature = "test-support"))]
@@ -1389,6 +1432,7 @@ impl TerminalBuilder {
                     path_hyperlink_timeout_ms,
                 ),
                 vi_mode_enabled: false,
+                search_state: None,
                 is_remote_terminal,
                 last_mouse_move_time: Instant::now(),
                 last_hyperlink_search_position: None,
@@ -1414,6 +1458,8 @@ impl TerminalBuilder {
                 background_executor,
                 path_style,
                 image_cache: kitty_graphics::PaneImageCache::new(),
+                image_placements: Vec::new(),
+                graphics_scanner: kitty_graphics::GraphicsScanner::new(),
                 #[cfg(any(test, feature = "test-support"))]
                 input_log: Vec::new(),
                 #[cfg(any(test, feature = "test-support"))]
@@ -1572,6 +1618,8 @@ pub struct Terminal {
     hyperlink_regex_searches: RegexSearches,
     task: Option<TaskState>,
     vi_mode_enabled: bool,
+    /// §12 Plan 31 — copy-mode search query, `None` until one is confirmed.
+    search_state: Option<SearchState>,
     is_remote_terminal: bool,
     last_mouse_move_time: Instant,
     last_hyperlink_search_position: Option<GpuiPoint<Pixels>>,
@@ -1587,8 +1635,13 @@ pub struct Terminal {
     event_loop_task: Task<Result<(), anyhow::Error>>,
     background_executor: BackgroundExecutor,
     path_style: PathStyle,
-    /// 每 pane 图像缓存 (Kitty Graphics / OSC 1337)
+    /// 每 pane 图像缓存 (kitty graphics / OSC 1337)
     image_cache: kitty_graphics::PaneImageCache,
+    /// 当前有效的图像放置, 按插入顺序保存。
+    image_placements: Vec<ImagePlacement>,
+    /// 扫描 [`Terminal::write_output`] 注入的字节流, PTY 路径上的扫描器在
+    /// 读取线程里 (见 [`crate::alacritty::spawn_event_loop`])。
+    graphics_scanner: kitty_graphics::GraphicsScanner,
     #[cfg(any(test, feature = "test-support"))]
     input_log: Vec<Vec<u8>>,
     #[cfg(any(test, feature = "test-support"))]
@@ -1651,6 +1704,7 @@ impl Terminal {
     fn process_pty_event(&mut self, event: PtyEvent, cx: &mut Context<Self>) {
         match event {
             PtyEvent::Event(event) => self.process_event(event, cx),
+            PtyEvent::Graphics(events) => self.apply_graphics_events(events, cx),
         }
     }
 
@@ -2015,7 +2069,7 @@ impl Terminal {
         let mut term = term.lock_unfair();
         apply_structured_snapshot(&mut term, snapshot, bounds);
         term.selection = None;
-        self.last_content = make_content(&term, &self.last_content);
+        self.last_content = make_content(&term, &self.last_content, &self.image_placements);
         drop(term);
 
         self.selection_head = None;
@@ -2082,9 +2136,16 @@ impl Terminal {
         let mut previous_byte_was_cr = false;
         let converted = convert_lf_to_crlf(bytes, &mut previous_byte_was_cr);
 
+        // vte 会整段丢弃 APC 和未知 OSC, 所以图形协议必须在字节进入模拟器
+        // 之前单独扫一遍。
+        let graphics_events = self.graphics_scanner.feed(&converted);
+
         let mut term = self.term.lock();
         self.output_processor.advance(&mut *term, &converted);
         drop(term);
+        if !graphics_events.is_empty() {
+            self.apply_graphics_events(graphics_events, cx);
+        }
         self.detect_init_command_startup_marker();
         cx.emit(Event::Wakeup);
     }
@@ -2360,7 +2421,7 @@ impl Terminal {
     fn clear_for_init_command(&mut self, cx: &mut Context<Self>) {
         let mut term = self.term.lock_unfair();
         clear_saved_screen(&mut term);
-        self.last_content = make_content(&term, &self.last_content);
+        self.last_content = make_content(&term, &self.last_content, &self.image_placements);
         cx.emit(Event::Wakeup);
     }
 
@@ -2392,6 +2453,89 @@ impl Terminal {
 
     pub fn toggle_vi_mode(&mut self) {
         self.events.push_back(InternalEvent::ToggleViMode);
+    }
+
+    /// §12 Plan 31 — confirm a copy-mode search query and refresh the match
+    /// list over the whole grid, scrollback included. Returns the number of
+    /// matches, or an error when `query` is not a valid regex so callers can
+    /// show the failure instead of silently browsing a stale match list.
+    pub fn set_search_query(&mut self, query: &str) -> anyhow::Result<usize> {
+        self.clear_search();
+        anyhow::ensure!(!query.is_empty(), "search query is empty");
+        let searcher = Search::new(query)
+            .ok_or_else(|| anyhow::anyhow!("`{query}` is not a valid regular expression"))?;
+        let matches = {
+            let term = self.term.lock();
+            search_matches(&term, searcher.clone())
+        };
+        self.matches = matches;
+        self.search_state = Some(SearchState {
+            query: query.to_string(),
+            searcher,
+        });
+        Ok(self.matches.len())
+    }
+
+    /// §12 Plan 31 — the confirmed copy-mode search query, if any.
+    pub fn search_query(&self) -> Option<&str> {
+        self.search_state.as_ref().map(|state| state.query.as_str())
+    }
+
+    /// §12 Plan 31 — drop the copy-mode search and its highlighted matches.
+    pub fn clear_search(&mut self) {
+        self.search_state = None;
+        self.matches.clear();
+    }
+
+    /// §12 Plan 31 — move to the next match after the cursor, wrapping around.
+    pub fn search_next(&mut self) -> bool {
+        self.advance_search(true)
+    }
+
+    /// §12 Plan 31 — move to the previous match before the cursor, wrapping
+    /// around.
+    pub fn search_previous(&mut self) -> bool {
+        self.advance_search(false)
+    }
+
+    /// Matches and the cursor share absolute grid coordinates (negative lines
+    /// are scrollback), so the next hit is found by ordering alone. The cursor
+    /// only reaches the activated match once the queued events are flushed by
+    /// `sync`, which is why stepping is derived from the cursor rather than
+    /// from a remembered index.
+    fn advance_search(&mut self, forward: bool) -> bool {
+        // Re-run the search rather than reusing `matches`: output that arrived
+        // since the query was confirmed shifts every hit in the scrollback, and
+        // navigating a stale list would jump to the wrong cells.
+        let Some(searcher) = self
+            .search_state
+            .as_ref()
+            .map(|state| state.searcher.clone())
+        else {
+            return false;
+        };
+        self.matches = {
+            let term = self.term.lock();
+            search_matches(&term, searcher)
+        };
+        let match_count = self.matches.len();
+        if match_count == 0 {
+            return false;
+        }
+        let cursor = self.last_content.cursor.point;
+        let index = if forward {
+            self.matches
+                .iter()
+                .position(|search_match| search_match.start() > cursor)
+                .unwrap_or(0)
+        } else {
+            self.matches
+                .iter()
+                .rposition(|search_match| search_match.end() < cursor)
+                .unwrap_or(match_count - 1)
+        };
+        self.activate_match(index);
+        true
     }
 
     pub fn vi_motion(&mut self, keystroke: &Keystroke) {
@@ -2481,13 +2625,13 @@ impl Terminal {
                 self.toggle_vi_mode();
             }
 
-            "v" => {
-                let point = self.last_content.cursor.point;
-                let selection_type = SelectionType::Simple;
-                let side = SelectionSide::Right;
-                let selection = Selection::new(selection_type, point, side);
-                self.events
-                    .push_back(InternalEvent::SetSelection(Some(selection)));
+            // §12 Plan 31 — search navigation over the confirmed query.
+            "n" => {
+                self.search_next();
+            }
+
+            "N" => {
+                self.search_previous();
             }
 
             "V" => {
@@ -2559,7 +2703,9 @@ impl Terminal {
             self.process_terminal_event(&e, &mut terminal, window, cx)
         }
 
-        self.last_content = make_content(&terminal, &self.last_content);
+        self.image_placements
+            .retain(|placement| self.image_cache.get(placement.id).is_some());
+        self.last_content = make_content(&terminal, &self.last_content, &self.image_placements);
     }
 
     pub fn with_renderable_cells<R>(&self, f: impl for<'a> FnOnce(RenderableCells<'a>) -> R) -> R {
@@ -3223,61 +3369,195 @@ impl Terminal {
         )
     }
 
-    /// 加载图像到缓存
-    ///
-    /// §11.2 将解析后的图像数据存入 pane 缓存
-    pub fn load_image(&mut self, image: kitty_graphics::ParsedImage) -> kitty_graphics::ImageId {
-        self.image_cache.insert(image)
-    }
-
     /// 获取图像缓存引用
     pub fn image_cache(&self) -> &kitty_graphics::PaneImageCache {
         &self.image_cache
     }
 
-    /// 获取可变图像缓存引用
-    pub fn image_cache_mut(&mut self) -> &mut kitty_graphics::PaneImageCache {
-        &mut self.image_cache
+    /// 当前有效的图像放置。
+    pub fn image_placements(&self) -> &[ImagePlacement] {
+        &self.image_placements
     }
 
-    /// 解析并加载 Kitty Graphics 协议数据
+    /// 执行扫描器解析出来的图形协议动作。
     ///
-    /// §11.2 解析 Kitty Graphics DCS 序列并加载图像
-    pub fn parse_and_load_kitty_graphics(
+    /// §11.2 kitty graphics / iTerm2 OSC 1337 动作落地
+    fn apply_graphics_events(
         &mut self,
-        payload: &str,
-    ) -> Option<kitty_graphics::ImageId> {
-        if let Some((params, image)) = kitty_graphics::parse_kitty_graphics(payload) {
-            match params.action {
-                kitty_graphics::ImageAction::Send => {
-                    let id = self.image_cache.insert(image);
-                    Some(id)
+        events: Vec<kitty_graphics::GraphicsEvent>,
+        cx: &mut Context<Self>,
+    ) {
+        use kitty_graphics::GraphicsEvent;
+
+        let mut changed = false;
+        for event in events {
+            match event {
+                GraphicsEvent::Transmit {
+                    image_id,
+                    image_number,
+                    image,
+                } => {
+                    self.image_cache.insert(image, image_id, image_number);
                 }
-                kitty_graphics::ImageAction::Delete => {
-                    if params.identifier > 0 {
-                        self.image_cache
-                            .remove(kitty_graphics::ImageId(params.identifier as u64));
-                    } else {
-                        self.image_cache.clear();
-                    }
-                    None
-                }
-                kitty_graphics::ImageAction::Query => None,
+                GraphicsEvent::Place(request) => changed |= self.place_image(request),
+                GraphicsEvent::Delete(request) => changed |= self.delete_images(request),
+                GraphicsEvent::Respond(bytes) => self.write_to_pty(bytes),
             }
-        } else {
-            None
+        }
+
+        // 从缓存里淘汰掉的图像还留在 GPUI 的纹理图集里, 必须显式释放。
+        for image in self.image_cache.take_dropped_images() {
+            cx.drop_image(image, None);
+        }
+
+        if changed {
+            cx.emit(Event::Wakeup);
+            cx.notify();
         }
     }
 
-    /// 解析并加载 iTerm2 OSC 1337 数据
-    ///
-    /// §11.2 解析 iTerm2 OSC 1337 序列并加载图像
-    pub fn parse_and_load_osc1337(&mut self, payload: &str) -> Option<kitty_graphics::ImageId> {
-        if let Some(image) = kitty_graphics::parse_osc1337(payload) {
-            Some(self.image_cache.insert(image))
-        } else {
-            None
+    fn place_image(&mut self, request: kitty_graphics::PlacementRequest) -> bool {
+        let id = match request.image_id {
+            Some(client_id) => self.image_cache.resolve_client_id(client_id),
+            None => self.image_cache.last_transmitted(),
+        };
+        let Some(id) = id else {
+            return false;
+        };
+        let Some(cached) = self.image_cache.get(id) else {
+            return false;
+        };
+        let (pixel_width, pixel_height) = cached.image.pixel_size;
+
+        let bounds = self.last_content.terminal_bounds;
+        let cell_width = f32::from(bounds.cell_width()).max(1.0);
+        let line_height = f32::from(bounds.line_height()).max(1.0);
+        let (columns, rows) = resolve_image_cell_size(
+            request.columns,
+            request.rows,
+            (pixel_width as f32, pixel_height as f32),
+            (cell_width, line_height),
+            (bounds.num_columns(), bounds.num_lines()),
+        );
+        if columns == 0 || rows == 0 {
+            return false;
         }
+
+        // 放置点取"事件被执行时光标在哪儿"。扫描器在 PTY 读取线程上先于
+        // alacritty 看到字节, 但事件要跨线程送到这里才执行, 那时同一批字节
+        // 里图形序列之后的文本可能已经被模拟器消化掉了, 所以这是个近似值。
+        // 要做到逐格精确需要 kitty 的 Unicode placeholder 方案, 把图像锚在
+        // 真实网格单元上。
+        let (anchor_line, column) = {
+            let term = self.term.lock_unfair();
+            cursor_anchor(&term)
+        };
+
+        self.image_cache.touch(id);
+        self.image_placements.push(ImagePlacement {
+            id,
+            anchor_line,
+            column,
+            columns,
+            rows,
+            z_index: request.z_index,
+        });
+        if self.image_placements.len() > MAX_IMAGE_PLACEMENTS {
+            let excess = self.image_placements.len() - MAX_IMAGE_PLACEMENTS;
+            self.image_placements.drain(..excess);
+        }
+        true
+    }
+
+    fn delete_images(&mut self, request: kitty_graphics::DeleteRequest) -> bool {
+        use kitty_graphics::DeleteScope;
+
+        let removed: Vec<kitty_graphics::ImageId> = match request.scope {
+            DeleteScope::All => self.image_placements.iter().map(|p| p.id).collect(),
+            DeleteScope::ImageId(client_id) => self
+                .image_cache
+                .resolve_client_id(client_id)
+                .into_iter()
+                .collect(),
+            DeleteScope::ImageNumber(image_number) => self
+                .image_cache
+                .resolve_image_number(image_number)
+                .into_iter()
+                .collect(),
+        };
+
+        if removed.is_empty() && !matches!(request.scope, DeleteScope::All) {
+            return false;
+        }
+
+        let placements_before = self.image_placements.len();
+        self.image_placements
+            .retain(|placement| !removed.contains(&placement.id));
+
+        if request.free_data {
+            match request.scope {
+                DeleteScope::All => self.image_cache.clear(),
+                _ => {
+                    for id in removed {
+                        self.image_cache.remove(id);
+                    }
+                }
+            }
+        }
+
+        placements_before != self.image_placements.len()
+    }
+}
+
+/// 把协议里的尺寸描述换算成单元格数。
+///
+/// 只给出一个方向时按图像原始宽高比补另一个方向, 两个都没给就按图像像素
+/// 尺寸铺满对应的格子数。
+fn resolve_image_cell_size(
+    requested_columns: kitty_graphics::ImageDimension,
+    requested_rows: kitty_graphics::ImageDimension,
+    pixel_size: (f32, f32),
+    cell_size: (f32, f32),
+    grid_size: (usize, usize),
+) -> (usize, usize) {
+    use kitty_graphics::ImageDimension;
+
+    let (pixel_width, pixel_height) = pixel_size;
+    let (cell_width, line_height) = cell_size;
+    let (grid_columns, grid_rows) = grid_size;
+
+    let resolve = |dimension: ImageDimension, unit: f32, available: usize| {
+        let cells = match dimension {
+            ImageDimension::Auto => return None,
+            ImageDimension::Cells(cells) => cells as usize,
+            ImageDimension::Pixels(value) => ((value as f32) / unit).ceil() as usize,
+            ImageDimension::Percent(percent) => {
+                ((available as f32) * (percent as f32) / 100.0).ceil() as usize
+            }
+        };
+        Some(cells.clamp(1, available.max(1)))
+    };
+
+    let columns = resolve(requested_columns, cell_width, grid_columns);
+    let rows = resolve(requested_rows, line_height, grid_rows);
+
+    let natural_columns =
+        ((pixel_width / cell_width).ceil() as usize).clamp(1, grid_columns.max(1));
+    let natural_rows = ((pixel_height / line_height).ceil() as usize).clamp(1, grid_rows.max(1));
+
+    match (columns, rows) {
+        (Some(columns), Some(rows)) => (columns, rows),
+        (Some(columns), None) => {
+            let scale = (columns as f32 * cell_width) / pixel_width.max(1.0);
+            let rows = ((pixel_height * scale) / line_height).ceil() as usize;
+            (columns, rows.clamp(1, grid_rows.max(1)))
+        }
+        (None, Some(rows)) => {
+            let scale = (rows as f32 * line_height) / pixel_height.max(1.0);
+            let columns = ((pixel_width * scale) / cell_width).ceil() as usize;
+            (columns.clamp(1, grid_columns.max(1)), rows)
+        }
+        (None, None) => (natural_columns, natural_rows),
     }
 }
 
@@ -3396,6 +3676,7 @@ fn spawn_task_subprocess(
                 async move {
                     let Some(mut reader) = reader else { return };
                     let mut processor = Processor::<StdSyncHandler>::new();
+                    let mut scanner = kitty_graphics::GraphicsScanner::new();
                     let mut buffer = [0u8; 8192];
                     let mut previous_byte_was_cr = false;
                     loop {
@@ -3408,9 +3689,15 @@ fn spawn_task_subprocess(
                             Ok(count) => {
                                 let converted =
                                     convert_lf_to_crlf(&buffer[..count], &mut previous_byte_was_cr);
+                                let graphics_events = scanner.feed(&converted);
                                 {
                                     let mut term = term.lock();
                                     processor.advance(&mut *term, &converted);
+                                }
+                                if !graphics_events.is_empty() {
+                                    events_tx
+                                        .unbounded_send(PtyEvent::Graphics(graphics_events))
+                                        .ok();
                                 }
                                 events_tx
                                     .unbounded_send(PtyEvent::Event(TerminalBackendEvent::Wakeup))
@@ -4316,7 +4603,11 @@ mod tests {
 
         terminal.update(cx, |terminal, _cx| {
             let term_lock = terminal.term.lock();
-            terminal.last_content = make_content(&term_lock, &terminal.last_content);
+            terminal.last_content = make_content(
+                &term_lock,
+                &terminal.last_content,
+                &terminal.image_placements,
+            );
             drop(term_lock);
 
             let terminal_bounds = TerminalBounds::new(
@@ -5007,7 +5298,7 @@ mod tests {
         // Get the content by directly accessing the term
         let content = terminal.update(cx, |terminal, _cx| {
             let term = terminal.term.lock_unfair();
-            make_content(&term, &terminal.last_content)
+            make_content(&term, &terminal.last_content, &terminal.image_placements)
         });
 
         // If LF is properly converted to CRLF, each line should start at column 0
@@ -5032,6 +5323,201 @@ mod tests {
         assert!(line2_col0, "Second line should start at column 0");
     }
 
+    fn kitty_png_sequence(width: u32, height: u32, control: &str) -> Vec<u8> {
+        use base64::Engine as _;
+
+        let image = image::RgbaImage::from_pixel(width, height, image::Rgba([9, 9, 9, 255]));
+        let mut png = Vec::new();
+        image
+            .write_to(&mut std::io::Cursor::new(&mut png), image::ImageFormat::Png)
+            .expect("write test png");
+        let encoded = base64::engine::general_purpose::STANDARD.encode(&png);
+        format!("\x1b_G{control};{encoded}\x1b\\").into_bytes()
+    }
+
+    fn display_only_terminal(cx: &mut TestAppContext) -> Entity<Terminal> {
+        cx.new(|cx| {
+            TerminalBuilder::new_display_only(
+                SettingsCursorShape::default(),
+                AlternateScroll::On,
+                Some(10_000),
+                0,
+                cx.background_executor(),
+                PathStyle::local(),
+            )
+            .subscribe(cx)
+        })
+    }
+
+    #[gpui::test]
+    async fn kitty_graphics_sequence_reaches_the_renderable_content(cx: &mut TestAppContext) {
+        let terminal = display_only_terminal(cx);
+
+        terminal.update(cx, |terminal, cx| {
+            terminal.write_output(b"before\r\n", cx);
+            terminal.write_output(&kitty_png_sequence(32, 16, "a=T,f=100,t=d,c=4,r=2"), cx);
+        });
+
+        terminal.update(cx, |terminal, _| {
+            assert_eq!(terminal.image_cache().len(), 1, "image must be cached");
+            assert_eq!(
+                terminal.image_placements().len(),
+                1,
+                "the sequence must produce a placement"
+            );
+            let placement = terminal.image_placements()[0];
+            assert_eq!(placement.columns, 4);
+            assert_eq!(placement.rows, 2);
+
+            // The overlay only lands in `Content` once the emulator state is
+            // projected back into viewport coordinates.
+            let term = terminal.term.lock_unfair();
+            let content = make_content(&term, &terminal.last_content, &terminal.image_placements);
+            assert_eq!(content.images.len(), 1);
+            assert_eq!(content.images[0].id, placement.id);
+            assert_eq!(content.images[0].row, 1, "the cursor was on the second row");
+            assert_eq!(content.images[0].columns, 4);
+            assert_eq!(content.images[0].rows, 2);
+        });
+    }
+
+    #[gpui::test]
+    async fn iterm_inline_image_reaches_the_renderable_content(cx: &mut TestAppContext) {
+        use base64::Engine as _;
+
+        let terminal = display_only_terminal(cx);
+        let image = image::RgbaImage::from_pixel(8, 8, image::Rgba([1, 2, 3, 255]));
+        let mut png = Vec::new();
+        image
+            .write_to(&mut std::io::Cursor::new(&mut png), image::ImageFormat::Png)
+            .expect("write test png");
+        let sequence = format!(
+            "\x1b]1337;File=inline=1;width=3;height=2:{}\x07",
+            base64::engine::general_purpose::STANDARD.encode(&png)
+        );
+
+        terminal.update(cx, |terminal, cx| {
+            terminal.write_output(sequence.as_bytes(), cx);
+        });
+
+        terminal.update(cx, |terminal, _| {
+            assert_eq!(terminal.image_cache().len(), 1);
+            let placement = terminal.image_placements()[0];
+            assert_eq!(placement.columns, 3);
+            assert_eq!(placement.rows, 2);
+        });
+    }
+
+    #[gpui::test]
+    async fn graphics_overlay_follows_scrollback(cx: &mut TestAppContext) {
+        let terminal = display_only_terminal(cx);
+
+        terminal.update(cx, |terminal, cx| {
+            terminal.write_output(&kitty_png_sequence(16, 16, "a=T,f=100,c=2,r=1"), cx);
+        });
+        let anchor = terminal.update(cx, |terminal, _| terminal.image_placements()[0].anchor_line);
+
+        // Push the anchored row far up into scrollback.
+        terminal.update(cx, |terminal, cx| {
+            let mut bytes = Vec::new();
+            for index in 0..200u32 {
+                bytes.extend_from_slice(format!("line {index}\r\n").as_bytes());
+            }
+            terminal.write_output(&bytes, cx);
+        });
+
+        terminal.update(cx, |terminal, _| {
+            assert_eq!(
+                terminal.image_placements()[0].anchor_line,
+                anchor,
+                "the anchor is scroll independent"
+            );
+            let term = terminal.term.lock_unfair();
+            let content = make_content(&term, &terminal.last_content, &terminal.image_placements);
+            assert!(
+                content.images.is_empty(),
+                "an image scrolled out of the viewport must not be drawn"
+            );
+        });
+    }
+
+    #[gpui::test]
+    async fn kitty_delete_removes_the_placement(cx: &mut TestAppContext) {
+        let terminal = display_only_terminal(cx);
+
+        terminal.update(cx, |terminal, cx| {
+            terminal.write_output(&kitty_png_sequence(8, 8, "a=T,f=100,i=17,c=2,r=1"), cx);
+            assert_eq!(terminal.image_placements().len(), 1);
+
+            terminal.write_output(b"\x1b_Ga=d,d=I,i=17\x1b\\", cx);
+        });
+
+        terminal.update(cx, |terminal, _| {
+            assert!(terminal.image_placements().is_empty());
+            assert!(terminal.image_cache().is_empty(), "d=I frees the data");
+        });
+    }
+
+    /// The PTY path routes bytes through alacritty's own event loop, so the
+    /// graphics tap can only be verified with a real child process.
+    #[cfg(not(target_os = "windows"))]
+    #[gpui::test]
+    async fn kitty_graphics_survives_the_pty_event_loop(cx: &mut TestAppContext) {
+        init_test(cx);
+        cx.executor().allow_parking();
+
+        let sequence = String::from_utf8(kitty_png_sequence(16, 16, "a=T,f=100,c=2,r=1"))
+            .expect("kitty sequences are ascii");
+        let (terminal, _completion_rx) = build_test_terminal_with_arguments(
+            cx,
+            "/bin/sh".to_string(),
+            vec![
+                "-c".to_string(),
+                format!("printf '%s' '{sequence}'; sleep 30"),
+            ],
+        )
+        .await;
+
+        let deadline = Instant::now() + Duration::from_secs(10);
+        loop {
+            if terminal.update(cx, |terminal, _| terminal.image_cache().len() == 1) {
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "the PTY graphics tap never delivered the image"
+            );
+            cx.background_executor
+                .timer(Duration::from_millis(20))
+                .await;
+        }
+
+        terminal.update(cx, |terminal, _| {
+            assert_eq!(terminal.image_placements().len(), 1);
+            assert_eq!(terminal.image_placements()[0].columns, 2);
+        });
+    }
+
+    #[gpui::test]
+    async fn kitty_query_writes_a_protocol_response(cx: &mut TestAppContext) {
+        let terminal = display_only_terminal(cx);
+
+        terminal.update(cx, |terminal, cx| {
+            terminal.write_output(&kitty_png_sequence(1, 1, "a=q,f=100,i=31"), cx);
+        });
+
+        terminal.update(cx, |terminal, _| {
+            assert!(terminal.image_cache().is_empty(), "a query stores nothing");
+            let writes = terminal.pty_write_log.borrow();
+            assert!(
+                writes
+                    .iter()
+                    .any(|write| write == b"\x1b_Gi=31;OK\x1b\\".as_slice()),
+                "expected an OK response, got {writes:?}"
+            );
+        });
+    }
+
     #[gpui::test]
     async fn test_write_output_preserves_existing_crlf(cx: &mut TestAppContext) {
         let terminal = cx.new(|cx| {
@@ -5054,7 +5540,7 @@ mod tests {
         // Get the content by directly accessing the term
         let content = terminal.update(cx, |terminal, _cx| {
             let term = terminal.term.lock_unfair();
-            make_content(&term, &terminal.last_content)
+            make_content(&term, &terminal.last_content, &terminal.image_placements)
         });
 
         let cells = &content.cells;
@@ -5095,7 +5581,7 @@ mod tests {
         // Get the content by directly accessing the term
         let content = terminal.update(cx, |terminal, _cx| {
             let term = terminal.term.lock_unfair();
-            make_content(&term, &terminal.last_content)
+            make_content(&term, &terminal.last_content, &terminal.image_placements)
         });
 
         let cells = &content.cells;
@@ -5182,6 +5668,201 @@ mod tests {
             restored, target_offset,
             "last_content().display_offset must equal the restored nonzero offset"
         );
+    }
+
+    /// §12 Plan 31 — a confirmed query drives `n` / `N` across every match in
+    /// the grid, wrapping in both directions.
+    #[gpui::test]
+    async fn test_copy_mode_search_walks_matches_in_both_directions(cx: &mut TestAppContext) {
+        cx.update(|cx| {
+            let settings_store = settings::SettingsStore::test(cx);
+            cx.set_global(settings_store);
+        });
+        let cx = cx.add_empty_window();
+        let terminal = cx.new(|cx| {
+            TerminalBuilder::new_display_only(
+                SettingsCursorShape::default(),
+                AlternateScroll::On,
+                None,
+                0,
+                cx.background_executor(),
+                PathStyle::local(),
+            )
+            .subscribe(cx)
+        });
+
+        let match_count = cx.update(|window, cx| {
+            terminal.update(cx, |terminal, cx| {
+                terminal.write_output(
+                    b"needle one\r\nfiller\r\nneedle two\r\nneedle three\r\n",
+                    cx,
+                );
+                terminal.toggle_vi_mode();
+                terminal.sync(window, cx);
+                terminal.set_search_query("needle")
+            })
+        });
+        assert_eq!(
+            match_count.unwrap_or_else(|error| panic!("confirm search query: {error}")),
+            3
+        );
+
+        let mut visited = Vec::new();
+        for _ in 0..4 {
+            visited.push(cx.update(|window, cx| {
+                terminal.update(cx, |terminal, cx| {
+                    assert!(terminal.search_next(), "search_next must find a match");
+                    terminal.sync(window, cx);
+                    terminal.last_content.cursor.point
+                })
+            }));
+        }
+        // "needle" ends at column 5; the cursor starts past every match so the
+        // first step wraps to the top, and the fourth wraps again.
+        assert_eq!(
+            visited,
+            vec![
+                Point::new(0, 5),
+                Point::new(2, 5),
+                Point::new(3, 5),
+                Point::new(0, 5),
+            ]
+        );
+
+        let mut reversed = Vec::new();
+        for _ in 0..2 {
+            reversed.push(cx.update(|window, cx| {
+                terminal.update(cx, |terminal, cx| {
+                    assert!(
+                        terminal.search_previous(),
+                        "search_previous must find a match"
+                    );
+                    terminal.sync(window, cx);
+                    terminal.last_content.cursor.point
+                })
+            }));
+        }
+        assert_eq!(reversed, vec![Point::new(3, 5), Point::new(2, 5)]);
+
+        cx.update(|_window, cx| {
+            terminal.update(cx, |terminal, _cx| {
+                assert_eq!(terminal.search_query(), Some("needle"));
+                terminal.clear_search();
+                assert_eq!(terminal.search_query(), None);
+                assert!(terminal.matches.is_empty());
+                assert!(
+                    !terminal.search_next(),
+                    "search_next must be inert without a query"
+                );
+            });
+        });
+    }
+
+    /// §12 Plan 31 — vi mode routes `n` / `N` into the search so copy mode and
+    /// plain vi mode share one implementation.
+    #[gpui::test]
+    async fn test_vi_motion_n_navigates_search_matches(cx: &mut TestAppContext) {
+        cx.update(|cx| {
+            let settings_store = settings::SettingsStore::test(cx);
+            cx.set_global(settings_store);
+        });
+        let cx = cx.add_empty_window();
+        let terminal = cx.new(|cx| {
+            TerminalBuilder::new_display_only(
+                SettingsCursorShape::default(),
+                AlternateScroll::On,
+                None,
+                0,
+                cx.background_executor(),
+                PathStyle::local(),
+            )
+            .subscribe(cx)
+        });
+
+        cx.update(|window, cx| {
+            terminal.update(cx, |terminal, cx| {
+                terminal.write_output(b"match one\r\nfiller\r\nmatch two\r\n", cx);
+                terminal.toggle_vi_mode();
+                terminal.sync(window, cx);
+                terminal
+                    .set_search_query("match")
+                    .unwrap_or_else(|error| panic!("confirm search query: {error}"));
+            });
+        });
+
+        let mut next = Keystroke::default();
+        next.key = "n".to_string();
+        let mut previous = Keystroke::default();
+        previous.key = "n".to_string();
+        previous.modifiers.shift = true;
+
+        let first = cx.update(|window, cx| {
+            terminal.update(cx, |terminal, cx| {
+                terminal.vi_motion(&next);
+                terminal.sync(window, cx);
+                terminal.last_content.cursor.point
+            })
+        });
+        assert_eq!(first, Point::new(0, 4));
+
+        let second = cx.update(|window, cx| {
+            terminal.update(cx, |terminal, cx| {
+                terminal.vi_motion(&next);
+                terminal.sync(window, cx);
+                terminal.last_content.cursor.point
+            })
+        });
+        assert_eq!(second, Point::new(2, 4));
+
+        let back = cx.update(|window, cx| {
+            terminal.update(cx, |terminal, cx| {
+                terminal.vi_motion(&previous);
+                terminal.sync(window, cx);
+                terminal.last_content.cursor.point
+            })
+        });
+        assert_eq!(back, Point::new(0, 4));
+    }
+
+    /// §12 Plan 31 — an uncompilable query is reported instead of leaving the
+    /// previous match list in place.
+    #[gpui::test]
+    async fn test_search_query_rejects_invalid_regex(cx: &mut TestAppContext) {
+        cx.update(|cx| {
+            let settings_store = settings::SettingsStore::test(cx);
+            cx.set_global(settings_store);
+        });
+        let cx = cx.add_empty_window();
+        let terminal = cx.new(|cx| {
+            TerminalBuilder::new_display_only(
+                SettingsCursorShape::default(),
+                AlternateScroll::On,
+                None,
+                0,
+                cx.background_executor(),
+                PathStyle::local(),
+            )
+            .subscribe(cx)
+        });
+
+        cx.update(|window, cx| {
+            terminal.update(cx, |terminal, cx| {
+                terminal.write_output(b"needle\r\n", cx);
+                terminal.sync(window, cx);
+                terminal
+                    .set_search_query("needle")
+                    .unwrap_or_else(|error| panic!("confirm search query: {error}"));
+                assert_eq!(terminal.matches.len(), 1);
+
+                assert!(terminal.set_search_query("(unclosed").is_err());
+                assert_eq!(terminal.search_query(), None);
+                assert!(
+                    terminal.matches.is_empty(),
+                    "a rejected query must not leave stale matches highlighted"
+                );
+                assert!(terminal.set_search_query("").is_err());
+            });
+        });
     }
 
     #[gpui::test]

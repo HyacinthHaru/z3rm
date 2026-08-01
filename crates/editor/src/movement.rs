@@ -1022,12 +1022,12 @@ pub fn split_display_range_by_lines(
     result
 }
 
-#[cfg(all(test, feature = "z3rm-migration"))]
+#[cfg(test)]
 mod tests {
     use super::*;
     use crate::{
         Buffer, DisplayMap, DisplayRow, FoldPlaceholder, MultiBuffer,
-        inlays::Inlay,
+        Inlay,
         test::{editor_test_context::EditorTestContext, marked_display_snapshot},
     };
     use gpui::{AppContext as _, font, px};

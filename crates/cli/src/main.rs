@@ -68,14 +68,19 @@ mod mux_forward {
         "new",
         "kill",
         "kill-session",
+        "rename-session",
+        "has-session",
         "kill-server",
         "attach",
         "detach",
         "recover",
         "split-window",
         "send-keys",
+        "paste-buffer",
         "capture-pane",
         "list-panes",
+        "list-windows",
+        "lsw",
         "select-pane",
         "kill-pane",
         "resize-pane",
@@ -187,14 +192,19 @@ mod mux_forward {
                 "new",
                 "kill",
                 "kill-session",
+                "rename-session",
+                "has-session",
                 "kill-server",
                 "attach",
                 "detach",
                 "recover",
                 "split-window",
                 "send-keys",
+                "paste-buffer",
                 "capture-pane",
                 "list-panes",
+                "list-windows",
+                "lsw",
                 "select-pane",
                 "kill-pane",
                 "resize-pane",
@@ -820,10 +830,13 @@ fn run() -> Result<()> {
 
     // §3.3 处理 new-window 子命令 (Plan 32)
     if let Some(Commands::NewWindow { target }) = &args.command {
-        linux::handle_new_window(target, &app.path())?;
+        #[cfg(any(target_os = "linux", target_os = "freebsd"))]
+        {
+            linux::handle_new_window(target, &app.path())?;
+            return Ok(());
+        }
         #[cfg(not(any(target_os = "linux", target_os = "freebsd")))]
-        anyhow::bail!("new-window command is not supported on this platform");
-        return Ok(());
+        anyhow::bail!("new-window is not supported on this platform (target {target})");
     }
     #[cfg(all(
         any(target_os = "linux", target_os = "macos"),

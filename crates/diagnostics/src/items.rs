@@ -264,7 +264,7 @@ impl StatusItemView for DiagnosticIndicator {
 
     fn hide_setting(&self, _: &App) -> Option<HideStatusItem> {
         Some(HideStatusItem::new(|settings| {
-            settings.diagnostics.get_or_insert_default().button = false;
+            settings.diagnostics.get_or_insert_default().button = Some(false);
         }))
     }
 }

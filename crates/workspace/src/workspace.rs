@@ -3305,24 +3305,29 @@ impl Workspace {
     }
 
     // spec §2.1 / §15.1：使用 project 现有 API 将绝对路径转换为 ProjectPath。
+    // Paths outside every existing worktree get a new (usually invisible) worktree,
+    // which is how files are opened from outside the project.
     pub fn project_path_for_path(
         project: Entity<Project>,
         abs_path: &Path,
-        _visible: bool,
+        visible: bool,
         cx: &mut App,
     ) -> Task<Result<(Entity<Worktree>, ProjectPath)>> {
-        let project_path = project.update(cx, |project, cx| {
-            project.project_path_for_absolute_path(abs_path, cx)
+        let entry = project.update(cx, |project, cx| {
+            project.worktree_store().update(cx, |worktree_store, cx| {
+                worktree_store.find_or_create_worktree(abs_path, visible, cx)
+            })
         });
         cx.spawn(async move |cx| {
-            let project_path = project_path.context("path not found in project")?;
-            let worktree_id = project_path.worktree_id;
-            let Some(worktree) = project
-                .read_with(cx, |project, cx| project.worktree_for_id(worktree_id, cx))
-            else {
-                return Err(anyhow!("worktree not found"));
-            };
-            Ok((worktree, project_path))
+            let (worktree, path) = entry.await?;
+            let worktree_id = worktree.read_with(cx, |worktree, _| worktree.id());
+            Ok((
+                worktree,
+                ProjectPath {
+                    worktree_id,
+                    path,
+                },
+            ))
         })
     }
 
@@ -4124,7 +4129,11 @@ impl Workspace {
                     .expect("There must be an active pane")
                     .clone()
             });
-            self.split_pane(old_pane_entity, SplitDirection::Right, window, cx).downgrade()
+            let new_pane = self.split_pane(old_pane_entity, SplitDirection::Right, window, cx);
+            // Without this the split target stays inactive, so the *next* readonly open
+            // still sees a terminal-only center pane and splits again, once per file.
+            self.set_active_pane(&new_pane, window, cx);
+            new_pane.downgrade()
         } else {
             self.last_active_center_pane.clone().unwrap_or_else(|| {
                 self.panes
@@ -4159,12 +4168,14 @@ impl Workspace {
         })
     }
 
-    /// §16.5 检查中心 pane 是否仅有 terminal 或为空（用于自动 split-right）
+    /// §16.5 检查中心 pane 是否仅有 terminal（用于自动 split-right）
     fn center_pane_only_has_terminals(&self, cx: &App) -> bool {
         let center_pane = self.active_pane.clone();
         let items: Vec<_> = center_pane.read(cx).items().cloned().collect();
+        // An empty pane has no terminal to preserve, so open into it directly.
+        // Splitting here would strand a permanently empty pane beside the file.
         if items.is_empty() {
-            return true;
+            return false;
         }
         // §16.5 Terminal 的 buffer_kind 为 None，Editor 为 Singleton/Multibuffer
         items.iter().all(|item| {
@@ -5288,6 +5299,7 @@ impl Workspace {
         cx.emit(Event::ActiveItemChanged);
         let active_entry = self.active_project_path(cx);
         self.project.update(cx, |project, cx| {
+            project.set_active_path(active_entry.as_ref(), cx);
         });
 
         if focus_changed && let Some(project_path) = &active_entry {

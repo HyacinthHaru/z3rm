@@ -897,7 +897,7 @@ impl CacheStore for IncrementalCompilationCache {
     }
 }
 
-#[cfg(all(test, feature = "z3rm-migration"))]
+#[cfg(test)]
 mod tests {
     use super::*;
     use extension::ExtensionHostProxy;
@@ -913,6 +913,9 @@ mod tests {
             cx.set_global(store);
             release_channel::init(semver::Version::new(0, 0, 0), cx);
             extension::init(cx);
+            // WasmHost reads ExtensionSettings while resolving writeable paths,
+            // and the settings store panics on an unregistered type.
+            ExtensionSettings::register(cx);
             gpui_tokio::init(cx);
         });
     }

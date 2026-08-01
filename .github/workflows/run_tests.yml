@@ -602,7 +602,7 @@ jobs:
       run: |
         rm -rf ./../.cargo
     timeout-minutes: 60
-  build_visual_tests_binary:
+  run_ui_regression_suite:
     needs:
     - orchestrate
     if: needs.orchestrate.outputs.run_tests == 'true' && github.event_name != 'merge_group'
@@ -621,8 +621,8 @@ jobs:
       with:
         cache: rust
         path: ~/.rustup
-    - name: run_tests::build_visual_tests_binary::cargo_build_visual_tests
-      run: cargo build -p zed --bin zed_visual_test_runner --features visual-tests
+    - name: run_tests::run_ui_regression_suite::cargo_test_ui_regression
+      run: cargo test -p z3rm --test ui_screenshot_regression
     - name: steps::cleanup_cargo_config
       if: always()
       run: |
@@ -898,7 +898,7 @@ jobs:
     - miri_scheduler
     - doctests
     - check_workspace_binaries
-    - build_visual_tests_binary
+    - run_ui_regression_suite
     - check_wasm
     - check_dependencies
     - check_docs
@@ -930,7 +930,7 @@ jobs:
         check_result "miri_scheduler" "$RESULT_MIRI_SCHEDULER"
         check_result "doctests" "$RESULT_DOCTESTS"
         check_result "check_workspace_binaries" "$RESULT_CHECK_WORKSPACE_BINARIES"
-        check_result "build_visual_tests_binary" "$RESULT_BUILD_VISUAL_TESTS_BINARY"
+        check_result "run_ui_regression_suite" "$RESULT_RUN_UI_REGRESSION_SUITE"
         check_result "check_wasm" "$RESULT_CHECK_WASM"
         check_result "check_dependencies" "$RESULT_CHECK_DEPENDENCIES"
         check_result "check_docs" "$RESULT_CHECK_DOCS"
@@ -952,7 +952,7 @@ jobs:
         RESULT_MIRI_SCHEDULER: ${{ needs.miri_scheduler.result }}
         RESULT_DOCTESTS: ${{ needs.doctests.result }}
         RESULT_CHECK_WORKSPACE_BINARIES: ${{ needs.check_workspace_binaries.result }}
-        RESULT_BUILD_VISUAL_TESTS_BINARY: ${{ needs.build_visual_tests_binary.result }}
+        RESULT_RUN_UI_REGRESSION_SUITE: ${{ needs.run_ui_regression_suite.result }}
         RESULT_CHECK_WASM: ${{ needs.check_wasm.result }}
         RESULT_CHECK_DEPENDENCIES: ${{ needs.check_dependencies.result }}
         RESULT_CHECK_DOCS: ${{ needs.check_docs.result }}

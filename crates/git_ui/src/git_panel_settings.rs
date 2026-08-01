@@ -96,26 +96,26 @@ impl ScrollbarVisibility for GitPanelScrollbarAccessor {
 
 impl Settings for GitPanelSettings {
     fn from_settings(_content: &settings::SettingsContent) -> Self {
-        // git_panel 字段已从 SettingsContent 中移除 (spec §16 Plan 16)
-        // 使用默认值
+        // git_panel 字段已从 SettingsContent 中移除 (spec §16 Plan 16)，
+        // 这里的常量必须与 assets/settings/default.json 里记录的产品默认值一致。
         Self {
             button: true,
             dock: DockPosition::Right,
-            default_width: px(240.),
+            default_width: px(360.),
             status_style: StatusStyle::Icon,
-            file_icons: true,
+            file_icons: false,
             folder_icons: true,
             scrollbar: ScrollbarSettings { show: None },
             fallback_branch_name: "main".to_string(),
             sort_by: GitPanelSortBy::Path,
-            group_by: GitPanelGroupBy::None,
-            collapse_untracked_diff: true,
+            group_by: GitPanelGroupBy::Status,
+            collapse_untracked_diff: false,
             tree_view: false,
-            diff_stats: false,
+            diff_stats: true,
             show_count_badge: false,
-            starts_open: true,
-            commit_title_max_length: 40,
-            entry_primary_click_action: GitPanelClickBehavior::FileDiff,
+            starts_open: false,
+            commit_title_max_length: 0,
+            entry_primary_click_action: GitPanelClickBehavior::ProjectDiff,
         }
     }
 }

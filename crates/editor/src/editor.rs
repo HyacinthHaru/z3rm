@@ -47,11 +47,7 @@ mod hover_links {
 mod task;
 // #[cfg(test)]
 // mod editor_block_comment_tests;
-// #[cfg(test)]
-// mod editor_tests;
-// §8.1 z3rm 迁移:editor::test 模块依赖已删除的 project::Project::test 旧签名。
-// 默认禁用,启用 z3rm-migration feature 才尝试编译,暴露迁移洞。
-#[cfg(all(test, feature = "z3rm-migration"))]
+#[cfg(any(test, feature = "test-support"))]
 pub mod test;
 #[cfg(test)]
 mod core_action_tests;
@@ -1755,13 +1751,19 @@ impl Editor {
     pub fn refresh_runnables(&mut self, _buffer_id: Option<text::BufferId>, _window: &mut Window, _cx: &mut Context<Self>) {
     }
 
-    /// Stub: splice inlays (inlay hints 模块已删除)
-    pub fn splice_inlays<T>(
+    pub fn splice_inlays(
         &mut self,
-        _ids_to_remove: &[InlayId],
-        _hints_to_insert: Vec<T>,
-        _cx: &mut Context<Self>,
+        ids_to_remove: &[InlayId],
+        inlays_to_insert: Vec<Inlay>,
+        cx: &mut Context<Self>,
     ) {
+        if ids_to_remove.is_empty() && inlays_to_insert.is_empty() {
+            return;
+        }
+        self.display_map.update(cx, |display_map, cx| {
+            display_map.splice_inlays(ids_to_remove, inlays_to_insert, cx)
+        });
+        cx.notify();
     }
 
     /// Stub: update visible edit prediction (edit prediction 模块已删除)
@@ -8441,7 +8443,7 @@ impl Editor {
 
         if !self.inline_value_cache.enabled {
             let inlays = std::mem::take(&mut self.inline_value_cache.inlays);
-            self.splice_inlays::<Inlay>(&inlays, Vec::new(), cx);
+            self.splice_inlays(&inlays, Vec::new(), cx);
             return;
         }
 

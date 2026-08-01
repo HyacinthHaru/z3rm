@@ -61,6 +61,144 @@ fn test_layout_split() {
     }
 }
 
+#[test]
+fn same_direction_splits_preserve_internal_pairing_and_geometry() {
+    let mut tree = LayoutTree::with_pane("node-1".to_string(), "pane-1".to_string());
+    tree.split("pane-1", "pane-2".to_string(), SplitDirection::TopBottom)
+        .expect("first split");
+    tree.split("pane-2", "pane-3".to_string(), SplitDirection::TopBottom)
+        .expect("second split");
+
+    assert_eq!(tree.pane_ids(), vec!["pane-1", "pane-2", "pane-3"]);
+    match &tree.root {
+        LayoutNode::Split {
+            direction,
+            children,
+            ratios,
+            ..
+        } => {
+            assert_eq!(*direction, SplitDirection::TopBottom);
+            assert_eq!(ratios, &[0.5, 0.5]);
+            match &children[1] {
+                LayoutNode::Split {
+                    direction,
+                    children,
+                    ratios,
+                    ..
+                } => {
+                    assert_eq!(*direction, SplitDirection::TopBottom);
+                    assert_eq!(children.len(), 2);
+                    assert_eq!(ratios, &[0.5, 0.5]);
+                }
+                node => panic!("expected paired child split, got {node:?}"),
+            }
+        }
+        node => panic!("expected root split, got {node:?}"),
+    }
+}
+
+#[test]
+fn closing_a_same_direction_split_restores_prior_geometry() {
+    let mut tree = LayoutTree::with_pane("node-1".to_string(), "pane-1".to_string());
+    tree.split("pane-1", "pane-2".to_string(), SplitDirection::TopBottom)
+        .expect("first split");
+    let before = tree.serialize(80, 24).expect("serialize two-pane layout");
+    tree.split("pane-2", "pane-3".to_string(), SplitDirection::TopBottom)
+        .expect("second split");
+
+    tree.remove_pane("pane-3").expect("close second split half");
+
+    assert_eq!(tree.pane_ids(), vec!["pane-1", "pane-2"]);
+    assert_eq!(
+        tree.serialize(80, 24).expect("serialize restored layout"),
+        before
+    );
+}
+
+#[test]
+fn nearest_same_direction_resize_preserves_outer_sibling_ratio() {
+    let mut tree = LayoutTree::with_pane("node-1".to_string(), "pane-1".to_string());
+    tree.split("pane-1", "pane-2".to_string(), SplitDirection::LeftRight)
+        .expect("first split");
+    tree.split("pane-2", "pane-3".to_string(), SplitDirection::LeftRight)
+        .expect("second split");
+
+    tree.resize_pane("pane-3", SplitDirection::LeftRight, 10.0)
+        .expect("resize nearest pair");
+
+    match &tree.root {
+        LayoutNode::Split {
+            children, ratios, ..
+        } => {
+            assert_eq!(ratios, &[0.5, 0.5]);
+            match &children[1] {
+                LayoutNode::Split { ratios, .. } => {
+                    assert!((ratios[0] - 0.05).abs() < 1e-6);
+                    assert!((ratios[1] - 0.95).abs() < 1e-6);
+                    assert!((ratios.iter().sum::<f32>() - 1.0).abs() < 1e-6);
+                }
+                node => panic!("expected paired child split, got {node:?}"),
+            }
+        }
+        node => panic!("expected root split, got {node:?}"),
+    }
+}
+
+#[test]
+fn alternating_split_depth_is_rejected_atomically() {
+    let mut tree = LayoutTree::with_pane("node-1".to_string(), "pane-0".to_string());
+    let mut focused = "pane-0".to_string();
+    for index in 1..=crate::layout::MAX_WIRE_LAYOUT_DEPTH {
+        let next = format!("pane-{index}");
+        let direction = if index % 2 == 0 {
+            SplitDirection::LeftRight
+        } else {
+            SplitDirection::TopBottom
+        };
+        tree.split(&focused, next.clone(), direction)
+            .expect("split within wire depth");
+        focused = next;
+    }
+    let before = tree.pane_ids();
+
+    let error = tree
+        .split(
+            &focused,
+            "too-deep".to_string(),
+            if crate::layout::MAX_WIRE_LAYOUT_DEPTH % 2 == 0 {
+                SplitDirection::TopBottom
+            } else {
+                SplitDirection::LeftRight
+            },
+        )
+        .expect_err("alternating split beyond wire depth must fail");
+
+    assert!(error.to_string().contains("wire depth"));
+    assert_eq!(tree.pane_ids(), before);
+    assert!(tree.root.find_pane("too-deep").is_none());
+}
+
+#[test]
+fn failed_split_leaves_layout_unchanged() {
+    let mut tree = LayoutTree::with_pane("node-1".to_string(), "pane-1".to_string());
+    let before = tree.serialize(80, 24).expect("serialize original layout");
+
+    assert!(
+        tree.split(
+            "missing-pane",
+            "pane-2".to_string(),
+            SplitDirection::LeftRight,
+        )
+        .is_err()
+    );
+
+    assert_eq!(
+        tree.serialize(80, 24)
+            .expect("serialize layout after error"),
+        before
+    );
+}
+
 /// §3.10 Layout tree: remove pane
 #[test]
 fn test_layout_remove_pane() {
@@ -151,6 +289,7 @@ fn test_session_attach_detach() {
         "client-1".to_string(),
         crate::session::AttachMode::Shared,
         crate::session::ClientRole::ReadWrite,
+        None,
     );
     assert_eq!(session.attached_client_count(), 1);
 
@@ -158,6 +297,7 @@ fn test_session_attach_detach() {
         "client-2".to_string(),
         crate::session::AttachMode::ReadOnly,
         crate::session::ClientRole::ReadOnly,
+        None,
     );
     assert_eq!(session.attached_client_count(), 2);
 
@@ -513,14 +653,14 @@ use crate::session::Session;
 /// §3.3 测试窗口添加到会话
 #[test]
 fn test_session_add_window() {
-    let mut session = Session::new("sess-1".to_string(), "test".to_string(), "/tmp".to_string());
+    let session = Session::new("sess-1".to_string(), "test".to_string(), "/tmp".to_string());
     assert_eq!(session.window_count(), 0);
 
-    session.add_window("win-1".to_string());
+    assert!(session.add_window("win-1".to_string()));
     assert_eq!(session.window_count(), 1);
     assert!(session.has_window("win-1"));
 
-    session.add_window("win-2".to_string());
+    assert!(session.add_window("win-2".to_string()));
     assert_eq!(session.window_count(), 2);
     assert!(session.has_window("win-2"));
 }
@@ -528,17 +668,20 @@ fn test_session_add_window() {
 /// §3.3 测试重复窗口 ID 不重复添加
 #[test]
 fn test_session_deduplicate_windows() {
-    let mut session = Session::new("sess-2".to_string(), "test".to_string(), "/tmp".to_string());
+    let session = Session::new("sess-2".to_string(), "test".to_string(), "/tmp".to_string());
 
-    session.add_window("win-1".to_string());
-    session.add_window("win-1".to_string()); // 重复
+    assert!(session.add_window("win-1".to_string()));
+    assert!(
+        !session.add_window("win-1".to_string()),
+        "a repeated window id must report that nothing was added"
+    );
     assert_eq!(session.window_count(), 1);
 }
 
 /// §3.3 测试从会话移除窗口
 #[test]
 fn test_session_remove_window() {
-    let mut session = Session::new("sess-3".to_string(), "test".to_string(), "/tmp".to_string());
+    let session = Session::new("sess-3".to_string(), "test".to_string(), "/tmp".to_string());
 
     session.add_window("win-1".to_string());
     session.add_window("win-2".to_string());
@@ -553,7 +696,7 @@ fn test_session_remove_window() {
 /// §3.3 测试获取窗口列表
 #[test]
 fn test_session_get_windows() {
-    let mut session = Session::new("sess-4".to_string(), "test".to_string(), "/tmp".to_string());
+    let session = Session::new("sess-4".to_string(), "test".to_string(), "/tmp".to_string());
 
     session.add_window("win-a".to_string());
     session.add_window("win-b".to_string());
@@ -564,20 +707,48 @@ fn test_session_get_windows() {
     assert!(windows.contains(&"win-b".to_string()));
 }
 
-/// §3.3 测试布局变更广播
+/// §3.3 测试布局变更广播: 每个 attached 连接 (即每个窗口) 都必须收到。
 #[test]
 fn test_session_broadcast_layout_change() {
     let mut session = Session::new("sess-5".to_string(), "test".to_string(), "/tmp".to_string());
 
-    session.add_window("win-1".to_string());
-    session.add_window("win-2".to_string());
-    session.add_window("win-3".to_string());
+    let mut receivers = Vec::new();
+    for (client_id, window_id) in [
+        ("client-1", "win-1"),
+        ("client-2", "win-2"),
+        ("client-3", "win-3"),
+    ] {
+        session.add_attached_client(
+            client_id.to_string(),
+            crate::session::AttachMode::Shared,
+            crate::session::ClientRole::ReadWrite,
+            Some(window_id.to_string()),
+        );
+        session.add_window(window_id.to_string());
+        let (sender, receiver) = tokio::sync::mpsc::unbounded_channel();
+        session.add_lifecycle_subscriber(client_id.to_string(), sender);
+        receivers.push(receiver);
+    }
 
-    let targets = session.broadcast_layout_change();
+    let targets = session.broadcast_layout_change(mux_protocol::LayoutTree { root: None });
     assert_eq!(targets.len(), 3);
     assert!(targets.contains(&"win-1".to_string()));
     assert!(targets.contains(&"win-2".to_string()));
     assert!(targets.contains(&"win-3".to_string()));
+
+    for mut receiver in receivers {
+        let envelope = receiver
+            .try_recv()
+            .expect("every connected window must receive the layout change");
+        assert!(matches!(
+            envelope.payload,
+            Some(mux_protocol::proto::envelope::Payload::Notification(
+                mux_protocol::Notification {
+                    event: Some(mux_protocol::proto::notification::Event::SessionLayoutChanged(_))
+                }
+            ))
+        ));
+    }
 }
 
 /// §3.3 测试新会话初始无窗口
@@ -590,4 +761,73 @@ fn test_session_new_has_no_windows() {
     );
     assert_eq!(session.window_count(), 0);
     assert!(session.get_windows().is_empty());
+}
+
+/// §3.3 窗口在最后一个引用它的 attached 客户端离开后才释放 (Plan 32)。
+///
+/// §15.4 的原地重连会在旧连接清理之前用同一个 window_id 建立新连接; 如果
+/// release 不看引用, 旧连接的清理就会把刚接上的窗口误删。
+#[test]
+fn test_session_release_window_waits_for_last_client() {
+    let mut session = Session::new(
+        "sess-release".to_string(),
+        "test".to_string(),
+        "/tmp".to_string(),
+    );
+
+    session.add_attached_client(
+        "client-old".to_string(),
+        crate::session::AttachMode::Shared,
+        crate::session::ClientRole::ReadWrite,
+        Some("win-1".to_string()),
+    );
+    session.add_attached_client(
+        "client-new".to_string(),
+        crate::session::AttachMode::Shared,
+        crate::session::ClientRole::ReadWrite,
+        Some("win-1".to_string()),
+    );
+    session.add_window("win-1".to_string());
+
+    assert_eq!(
+        session.remove_attached_client("client-old"),
+        Some("win-1".to_string()),
+        "removing a client reports the window it claimed"
+    );
+    assert!(
+        !session.release_window("win-1"),
+        "the reconnected client still claims win-1"
+    );
+    assert!(session.has_window("win-1"));
+
+    assert_eq!(
+        session.remove_attached_client("client-new"),
+        Some("win-1".to_string())
+    );
+    assert!(
+        session.release_window("win-1"),
+        "the last claimant left, so win-1 leaves the session"
+    );
+    assert!(!session.has_window("win-1"));
+    assert_eq!(session.window_count(), 0);
+}
+
+/// §3.3 没有声明窗口的连接 (CLI 一次性命令) 不影响窗口列表。
+#[test]
+fn test_session_client_without_window_leaves_windows_alone() {
+    let mut session = Session::new(
+        "sess-cli".to_string(),
+        "test".to_string(),
+        "/tmp".to_string(),
+    );
+    session.add_window("win-gui".to_string());
+    session.add_attached_client(
+        "client-cli".to_string(),
+        crate::session::AttachMode::Shared,
+        crate::session::ClientRole::ReadWrite,
+        None,
+    );
+
+    assert_eq!(session.remove_attached_client("client-cli"), None);
+    assert!(session.has_window("win-gui"));
 }

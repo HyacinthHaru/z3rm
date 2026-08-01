@@ -31,8 +31,15 @@
       "ctrl-shift-8": "mux_pane::FocusPane7",
       "ctrl-shift-9": "mux_pane::FocusPane8",
 
+      // Tab switching
+      "ctrl-alt-right": "mux_pane::NextTab",
+      "ctrl-alt-left": "mux_pane::PrevTab",
+
       // Mux session
+      "ctrl-alt-a": "mux::Attach",
       "ctrl-shift-d": "mux::Detach",
+      // §3.3 second window on the same session (Plan 32); ctrl-shift-n is NextTab
+      "ctrl-alt-n": "mux::NewWindow",
       "ctrl-alt-k": "mux::KillSession",
       "ctrl-alt-q": "mux::KillServer",
 

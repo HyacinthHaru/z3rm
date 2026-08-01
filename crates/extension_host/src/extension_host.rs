@@ -6,6 +6,8 @@ pub mod wasm_host;
 pub mod api;
 pub mod vdom_bridge;
 
+// Still pinned to pre-fork Zed APIs (NodeRuntime, LspAccess::ViaLspStore); reviving
+// it depends on deciding whether the WASM extension store stays at all.
 // #[cfg(test)]
 // mod extension_store_test;
 

@@ -130,10 +130,93 @@ pub fn default_socket_path() -> PathBuf {
     .join("mux.sock")
 }
 
+/// §16.1 环境变量覆盖 (测试 / 排障用), 优先于 settings.json。
+const CONNECT_TIMEOUT_ENV: &str = "Z3RM_MUX_CONNECT_TIMEOUT_MS";
+const DAEMON_STARTUP_TIMEOUT_ENV: &str = "Z3RM_MUX_DAEMON_STARTUP_TIMEOUT_MS";
+
+/// §16.1 spawn 之后等待 daemon 就绪的最小预算。
+const MIN_DAEMON_STARTUP_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// §16.1 单次连接尝试的超时预算 (`mux.connect_timeout_ms`, 默认 500ms)。
+///
+/// Read from settings.json rather than `SettingsStore`, because the connection
+/// path runs without an `App` handle: `ensure_daemon_running` is called from a
+/// detached startup task and again from the background reconnect watcher.
+pub fn connect_timeout() -> Duration {
+    if let Some(timeout) = env_duration(CONNECT_TIMEOUT_ENV) {
+        return timeout;
+    }
+    configured_mux_settings()
+        .unwrap_or_default()
+        .connect_timeout()
+}
+
+/// §16.1 读取 settings.json 里的 `mux` 配置块 (用户设置优先, 其次全局设置)。
+///
+/// Whichever file declares a `mux` block wins as a whole; per-field merging is
+/// `SettingsStore`'s job and is unavailable this early.
+fn configured_mux_settings() -> Option<settings::MuxSettingsContent> {
+    [paths::settings_file(), paths::global_settings_file()]
+        .into_iter()
+        .find_map(|path| {
+            let contents = std::fs::read_to_string(path).ok()?;
+            mux_settings_from_json(&contents)
+        })
+}
+
+/// §16.1 从 settings.json 文本中解析 `mux` 配置块。
+///
+/// Settings files are JSON with comments, and a syntax error elsewhere in the
+/// file must not make the daemon unreachable — every failure degrades to the
+/// documented defaults.
+fn mux_settings_from_json(contents: &str) -> Option<settings::MuxSettingsContent> {
+    let root: serde_json::Value = settings::parse_json_with_comments(contents).ok()?;
+    serde_json::from_value(root.get("mux")?.clone()).ok()
+}
+
+/// §16.1 spawn 之后等待 daemon 接受连接的上限。
+///
+/// Derived from the connect timeout so both move together when a user raises
+/// it for a slow machine, with a floor that preserves today's 5s budget at the
+/// 500ms default.
+fn daemon_startup_timeout(connect_timeout: Duration) -> Duration {
+    if let Some(timeout) = env_duration(DAEMON_STARTUP_TIMEOUT_ENV) {
+        return timeout;
+    }
+    (connect_timeout * 10).max(MIN_DAEMON_STARTUP_TIMEOUT)
+}
+
+fn env_duration(key: &str) -> Option<Duration> {
+    std::env::var(key)
+        .ok()?
+        .trim()
+        .parse::<u64>()
+        .ok()
+        .map(Duration::from_millis)
+}
+
+/// §16.1 带超时的连接尝试。
+///
+/// `mux::connect_local` has no timeout of its own, and §16.1 defines "connect
+/// timeout" as the signal to spawn a daemon — so the bound has to be enforced
+/// here rather than waiting indefinitely on an unresponsive socket.
+async fn connect_with_timeout(socket_path: Option<&Path>, timeout: Duration) -> Result<MuxDomain> {
+    let connect = std::pin::pin!(mux::connect_local(socket_path));
+    let deadline = std::pin::pin!(smol::Timer::after(timeout));
+    match futures::future::select(connect, deadline).await {
+        futures::future::Either::Left((result, _)) => result,
+        futures::future::Either::Right(_) => Err(anyhow::anyhow!(
+            "timed out connecting to mux socket after {:?}",
+            timeout
+        )),
+    }
+}
+
 pub async fn ensure_daemon_running() -> Result<MuxDomain> {
     // §3.2 先尝试连接默认路径; 失败则 spawn daemon 再重试。
+    let connect_timeout = connect_timeout();
     eprintln!("[z3rm] Attempting connect to default socket");
-    match mux::connect_local(None).await {
+    match connect_with_timeout(None, connect_timeout).await {
         Ok(domain) => {
             eprintln!("[z3rm] Connected to existing daemon");
             return Ok(domain);
@@ -148,21 +231,24 @@ pub async fn ensure_daemon_running() -> Result<MuxDomain> {
 
     // §16.1 Poll until the daemon accepts a real protocol connection. The
     // successful domain is returned directly, avoiding a throwaway I/O worker.
-    let domain = wait_for_socket(&default_socket_path(), Duration::from_secs(5)).await?;
+    let domain = wait_for_socket(
+        &default_socket_path(),
+        connect_timeout,
+        daemon_startup_timeout(connect_timeout),
+    )
+    .await?;
     eprintln!("[z3rm] Connected to daemon after spawn");
     Ok(domain)
 }
 
 /// 启动 z3rm-server daemon 进程 (§16.1)
-/// 先清理 stale socket（旧 daemon 已死但文件残留），避免新 daemon bind "Address already in use"。
+///
+/// §16.1 The socket is deliberately left in place: a connect timeout does not
+/// prove the old daemon is dead, and deleting a socket it is still listening on
+/// would let two daemons own the same path. Reclaiming a genuinely dead
+/// socket — and refusing to start when a live one is found — is the new
+/// daemon's job (`mux_server::bind_or_cleanup`).
 fn spawn_daemon() -> Result<()> {
-    let socket_path = default_socket_path();
-    if socket_path.exists() {
-        tracing::info!(path = %socket_path.display(), "removing stale socket before spawn");
-        if let Err(e) = std::fs::remove_file(&socket_path) {
-            tracing::warn!(error = %e, "stale socket removal failed");
-        }
-    }
     // 从可执行文件同目录查找 z3rm-server (dev build 支持)
     let server_in_same_dir = std::env::current_exe()
         .ok()
@@ -197,20 +283,27 @@ fn spawn_daemon() -> Result<()> {
 /// Poll until the daemon socket accepts a real protocol connection (§16.1).
 /// Connection attempts and delays are executor-neutral, so daemon cold start
 /// does not block GPUI's foreground executor.
-async fn wait_for_socket(socket_path: &Path, timeout: Duration) -> Result<MuxDomain> {
+///
+/// Each attempt is bounded by `connect_timeout` so one unresponsive socket
+/// cannot swallow the whole `startup_timeout` budget.
+async fn wait_for_socket(
+    socket_path: &Path,
+    connect_timeout: Duration,
+    startup_timeout: Duration,
+) -> Result<MuxDomain> {
     let start = std::time::Instant::now();
     let poll_interval = Duration::from_millis(100);
 
     loop {
-        if start.elapsed() > timeout {
+        if start.elapsed() > startup_timeout {
             return Err(anyhow::anyhow!(
                 "timed out waiting for daemon socket at {} ({:?})",
                 socket_path.display(),
-                timeout
+                startup_timeout
             ));
         }
 
-        match mux::connect_local(Some(socket_path)).await {
+        match connect_with_timeout(Some(socket_path), connect_timeout).await {
             Ok(domain) => {
                 tracing::info!(
                     path = %socket_path.display(),
@@ -340,4 +433,88 @@ pub async fn get_first_pane_id(domain: &MuxDomain) -> Result<Option<String>> {
     }
 
     Ok(pane_id)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// §16.1 `mux.connect_timeout_ms` must survive the comments Zed-style
+    /// settings files are allowed to contain.
+    #[test]
+    fn connect_timeout_is_read_from_settings_json() {
+        let contents = r#"{
+            // user settings
+            "theme": "One Dark",
+            "mux": {
+                "connect_timeout_ms": 1200,
+                "keep_alive": true
+            }
+        }"#;
+        let mux = mux_settings_from_json(contents).expect("mux block should parse");
+        assert_eq!(mux.connect_timeout(), Duration::from_millis(1200));
+    }
+
+    /// §16.1 A `mux` block without the key falls back to the documented default.
+    #[test]
+    fn missing_connect_timeout_falls_back_to_default() {
+        let mux = mux_settings_from_json(r#"{"mux": {"keep_alive": true}}"#)
+            .expect("mux block should parse");
+        assert_eq!(mux.connect_timeout(), Duration::from_millis(500));
+    }
+
+    /// Malformed or mux-less settings must not make the daemon unreachable.
+    #[test]
+    fn unusable_settings_yield_no_override() {
+        assert!(mux_settings_from_json(r#"{"theme": "One Dark"}"#).is_none());
+        assert!(mux_settings_from_json("{ this is not json").is_none());
+        assert_eq!(
+            mux_settings_from_json(r#"{"mux": {}}"#)
+                .expect("empty mux block should parse")
+                .connect_timeout(),
+            Duration::from_millis(500)
+        );
+    }
+
+    /// §16.1 The spawn-and-wait budget scales with the configured connect
+    /// timeout, and never drops below the 5s floor the default produces.
+    #[test]
+    fn startup_timeout_tracks_connect_timeout() {
+        assert_eq!(
+            daemon_startup_timeout(Duration::from_millis(500)),
+            Duration::from_secs(5)
+        );
+        assert_eq!(
+            daemon_startup_timeout(Duration::from_millis(100)),
+            Duration::from_secs(5)
+        );
+        assert_eq!(
+            daemon_startup_timeout(Duration::from_millis(2000)),
+            Duration::from_secs(20)
+        );
+    }
+
+    /// §16.1 A connect attempt against a path nobody listens on must fail
+    /// within the configured budget instead of hanging.
+    ///
+    /// This drives a real socket connect, so it runs on a real executor rather
+    /// than GPUI's deterministic one, which rejects the background I/O thread.
+    #[test]
+    fn connect_gives_up_after_the_timeout() {
+        let socket_path = std::env::temp_dir().join(format!(
+            "z3rm-absent-{}-connect-timeout.sock",
+            std::process::id()
+        ));
+        let started = std::time::Instant::now();
+        let result = smol::block_on(connect_with_timeout(
+            Some(&socket_path),
+            Duration::from_millis(200),
+        ));
+        assert!(result.is_err(), "connecting to a missing socket must fail");
+        assert!(
+            started.elapsed() < Duration::from_secs(5),
+            "connect must respect the timeout budget, took {:?}",
+            started.elapsed()
+        );
+    }
 }

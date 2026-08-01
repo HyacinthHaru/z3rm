@@ -2,7 +2,9 @@
 //!
 //! §3.3 客户端角色与权限控制测试 (Plan 33)
 
-use mux_server::session::{ClientRole, AttachedClient, AttachMode};
+use mux_protocol::request::Body as RequestBody;
+use mux_server::connection::{ConnectionTrust, pre_attach_role};
+use mux_server::session::{AttachMode, AttachedClient, ClientRole};
 
 // ============================================================
 // §3.3 ClientRole 枚举测试
@@ -74,8 +76,14 @@ fn test_admin_allows_all() {
 #[test]
 fn test_readwrite_allows_readwrite() {
     use mux_server::connection::check_permission;
-    assert!(check_permission(ClientRole::ReadWrite, ClientRole::ReadOnly));
-    assert!(check_permission(ClientRole::ReadWrite, ClientRole::ReadWrite));
+    assert!(check_permission(
+        ClientRole::ReadWrite,
+        ClientRole::ReadOnly
+    ));
+    assert!(check_permission(
+        ClientRole::ReadWrite,
+        ClientRole::ReadWrite
+    ));
     // ReadWrite 不能执行 Admin 操作
     assert!(!check_permission(ClientRole::ReadWrite, ClientRole::Admin));
 }
@@ -86,7 +94,10 @@ fn test_readonly_only_readonly() {
     use mux_server::connection::check_permission;
     assert!(check_permission(ClientRole::ReadOnly, ClientRole::ReadOnly));
     // ReadOnly 不能执行 ReadWrite 操作
-    assert!(!check_permission(ClientRole::ReadOnly, ClientRole::ReadWrite));
+    assert!(!check_permission(
+        ClientRole::ReadOnly,
+        ClientRole::ReadWrite
+    ));
     // ReadOnly 不能执行 Admin 操作
     assert!(!check_permission(ClientRole::ReadOnly, ClientRole::Admin));
 }
@@ -102,12 +113,22 @@ fn test_proto_role_mapping() {
     // 1 = READ_ONLY
     assert!(matches!(proto_role_to_client_role(1), ClientRole::ReadOnly));
     // 2 = READ_WRITE
-    assert!(matches!(proto_role_to_client_role(2), ClientRole::ReadWrite));
+    assert!(matches!(
+        proto_role_to_client_role(2),
+        ClientRole::ReadWrite
+    ));
     // 3 = ADMIN
     assert!(matches!(proto_role_to_client_role(3), ClientRole::Admin));
-    // 0 或其他值 = 默认 ReadWrite
-    assert!(matches!(proto_role_to_client_role(0), ClientRole::ReadWrite));
-    assert!(matches!(proto_role_to_client_role(99), ClientRole::ReadWrite));
+}
+
+/// §3.3 CLIENT_ROLE_UNSPECIFIED 与未知枚举值必须 fail-closed。
+/// 这个整数由对端提供,当成 ReadWrite 等于让客户端自选权限。
+#[test]
+fn test_proto_role_mapping_is_fail_closed() {
+    use mux_server::connection::proto_role_to_client_role;
+    assert_eq!(proto_role_to_client_role(0), ClientRole::ReadOnly);
+    assert_eq!(proto_role_to_client_role(99), ClientRole::ReadOnly);
+    assert_eq!(proto_role_to_client_role(-1), ClientRole::ReadOnly);
 }
 
 #[test]
@@ -139,16 +160,221 @@ fn test_permission_matrix() {
 
     // ReadOnly
     assert!(check_permission(ClientRole::ReadOnly, ClientRole::ReadOnly));
-    assert!(!check_permission(ClientRole::ReadOnly, ClientRole::ReadWrite));
+    assert!(!check_permission(
+        ClientRole::ReadOnly,
+        ClientRole::ReadWrite
+    ));
     assert!(!check_permission(ClientRole::ReadOnly, ClientRole::Admin));
 
     // ReadWrite
-    assert!(check_permission(ClientRole::ReadWrite, ClientRole::ReadOnly));
-    assert!(check_permission(ClientRole::ReadWrite, ClientRole::ReadWrite));
+    assert!(check_permission(
+        ClientRole::ReadWrite,
+        ClientRole::ReadOnly
+    ));
+    assert!(check_permission(
+        ClientRole::ReadWrite,
+        ClientRole::ReadWrite
+    ));
     assert!(!check_permission(ClientRole::ReadWrite, ClientRole::Admin));
 
     // Admin
     assert!(check_permission(ClientRole::Admin, ClientRole::ReadOnly));
     assert!(check_permission(ClientRole::Admin, ClientRole::ReadWrite));
     assert!(check_permission(ClientRole::Admin, ClientRole::Admin));
+}
+
+// ============================================================
+// §3.3 未 attach 连接的角色 (transport 信任 + 显式白名单)
+// ============================================================
+
+fn kill_session() -> RequestBody {
+    RequestBody::KillSession(mux_protocol::KillSessionRequest {
+        id: "session-1".to_string(),
+    })
+}
+
+fn shutdown() -> RequestBody {
+    RequestBody::Shutdown(mux_protocol::ShutdownRequest {})
+}
+
+fn list_recovery_candidates() -> RequestBody {
+    RequestBody::ListRecoveryCandidates(mux_protocol::ListRecoveryCandidatesRequest {})
+}
+
+fn confirm_recovery() -> RequestBody {
+    RequestBody::ConfirmRecovery(mux_protocol::ConfirmRecoveryRequest {
+        session_id: "session-1".to_string(),
+    })
+}
+
+fn send_input() -> RequestBody {
+    RequestBody::SendInput(mux_protocol::SendInputRequest {
+        pane_id: "pane-1".to_string(),
+        data: b"ls\n".to_vec(),
+    })
+}
+
+fn spawn_pane() -> RequestBody {
+    RequestBody::SpawnPane(mux_protocol::SpawnPaneRequest {
+        session_id: "session-1".to_string(),
+        tab_id: "tab-0".to_string(),
+        size: None,
+        command: None,
+        cwd: None,
+    })
+}
+
+fn read_file() -> RequestBody {
+    RequestBody::ReadFile(mux_protocol::ReadFileRequest {
+        path: "/etc/passwd".to_string(),
+        offset_line: None,
+        max_lines: None,
+    })
+}
+
+fn list_sessions() -> RequestBody {
+    RequestBody::ListSessions(mux_protocol::ListSessionsRequest {})
+}
+
+fn install_extension() -> RequestBody {
+    RequestBody::InstallExtension(mux_protocol::InstallExtensionRequest {
+        name: "demo".to_string(),
+        manifest: Vec::new(),
+        source: Vec::new(),
+    })
+}
+
+/// §3.3 attach 时未声明 identity 的默认角色由 transport 决定。
+/// 本地 socket 靠 §9 的 0600 ACL 保证同 UID;网络 transport 没有这个保证。
+#[test]
+fn test_attach_default_role_follows_transport_trust() {
+    assert_eq!(
+        ConnectionTrust::LocalSocket.attach_default_role(),
+        ClientRole::Admin
+    );
+    assert_eq!(
+        ConnectionTrust::Unauthenticated.attach_default_role(),
+        ClientRole::ReadOnly
+    );
+}
+
+/// §3.3 没有对端认证的 transport 上,未 attach 的连接一条写操作都拿不到。
+/// 这正是旧代码 `unwrap_or(ClientRole::Admin)` 的提权风险。
+#[test]
+fn test_unauthenticated_transport_never_grants_more_than_read_only() {
+    for body in [
+        kill_session(),
+        shutdown(),
+        list_recovery_candidates(),
+        confirm_recovery(),
+        send_input(),
+        spawn_pane(),
+        read_file(),
+        list_sessions(),
+        install_extension(),
+    ] {
+        assert_eq!(
+            pre_attach_role(ConnectionTrust::Unauthenticated, &body),
+            ClientRole::ReadOnly,
+            "unauthenticated transport must stay fail-closed for {body:?}"
+        );
+    }
+}
+
+/// §3.3 本地 socket 上的一次性 CLI 命令 (`z3rm kill` / `kill-server` /
+/// `send-keys`) 从不 attach,由显式白名单放行;白名单之外仍然是 ReadOnly。
+#[test]
+fn test_local_socket_pre_attach_whitelist() {
+    let trust = ConnectionTrust::LocalSocket;
+
+    assert_eq!(pre_attach_role(trust, &kill_session()), ClientRole::Admin);
+    assert_eq!(pre_attach_role(trust, &shutdown()), ClientRole::Admin);
+    assert_eq!(
+        pre_attach_role(trust, &list_recovery_candidates()),
+        ClientRole::Admin
+    );
+    assert_eq!(
+        pre_attach_role(trust, &confirm_recovery()),
+        ClientRole::Admin
+    );
+
+    assert_eq!(pre_attach_role(trust, &send_input()), ClientRole::ReadWrite);
+    assert_eq!(pre_attach_role(trust, &spawn_pane()), ClientRole::ReadWrite);
+
+    // 白名单之外的请求默认 fail-closed。
+    assert_eq!(
+        pre_attach_role(trust, &list_sessions()),
+        ClientRole::ReadOnly
+    );
+    assert_eq!(
+        pre_attach_role(trust, &install_extension()),
+        ClientRole::ReadOnly
+    );
+}
+
+/// §16.6 文件 RPC 永远不会因为"未 attach"而被提权:沙箱根来自 attach 的
+/// session cwd,所以未 attach 的连接读不到任何文件。
+#[test]
+fn test_file_requests_are_never_privileged_pre_attach() {
+    for trust in [
+        ConnectionTrust::LocalSocket,
+        ConnectionTrust::Unauthenticated,
+    ] {
+        assert_eq!(pre_attach_role(trust, &read_file()), ClientRole::ReadOnly);
+        assert_eq!(
+            pre_attach_role(
+                trust,
+                &RequestBody::ListDir(mux_protocol::ListDirRequest {
+                    path: "/".to_string(),
+                })
+            ),
+            ClientRole::ReadOnly
+        );
+        assert_eq!(
+            pre_attach_role(
+                trust,
+                &RequestBody::StatFile(mux_protocol::StatFileRequest {
+                    path: "/etc/shadow".to_string(),
+                })
+            ),
+            ClientRole::ReadOnly
+        );
+    }
+}
+
+/// §3.3 白名单授予的角色必须真的够用:否则 CLI 短命连接会被自己的
+/// 权限检查挡住。
+#[test]
+fn test_pre_attach_roles_satisfy_their_handlers() {
+    use mux_server::connection::check_permission;
+    let trust = ConnectionTrust::LocalSocket;
+
+    assert!(check_permission(
+        pre_attach_role(trust, &kill_session()),
+        ClientRole::Admin
+    ));
+    assert!(check_permission(
+        pre_attach_role(trust, &shutdown()),
+        ClientRole::Admin
+    ));
+    assert!(check_permission(
+        pre_attach_role(trust, &list_recovery_candidates()),
+        ClientRole::Admin
+    ));
+    assert!(check_permission(
+        pre_attach_role(trust, &confirm_recovery()),
+        ClientRole::Admin
+    ));
+    assert!(check_permission(
+        pre_attach_role(trust, &send_input()),
+        ClientRole::ReadWrite
+    ));
+    assert!(check_permission(
+        pre_attach_role(trust, &spawn_pane()),
+        ClientRole::ReadWrite
+    ));
+    assert!(check_permission(
+        pre_attach_role(trust, &read_file()),
+        ClientRole::ReadOnly
+    ));
 }

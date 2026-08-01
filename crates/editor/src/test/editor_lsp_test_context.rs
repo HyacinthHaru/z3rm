@@ -46,6 +46,10 @@ pub(crate) fn git_commit_lang() -> Arc<Language> {
 }
 
 impl EditorLspTestContext {
+    /// Blocks forever under z3rm: `new` awaits the fake language server, and
+    /// nothing calls `LanguageRegistry::create_fake_language_server` since the
+    /// LSP startup path was removed. Any test built on this context must stay
+    /// behind the `z3rm-migration` feature until that path comes back.
     pub async fn new(
         language: Language,
         capabilities: lsp::ServerCapabilities,
