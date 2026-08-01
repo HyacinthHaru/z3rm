@@ -133,6 +133,10 @@ pub struct MuxPaneView {
     notification_task: Option<Task<()>>,
     /// §3.3 client's known latest generation (for fetch_grid_update recovery)
     generation: u64,
+    /// §3.1 PTY bytes from PaneOutput accumulated for a single-frame flush.
+    /// apply_prepared_fetch_update clears this after a snapshot overwrite so a
+    /// later frame never replays bytes the authoritative grid already contains.
+    pending_output_bytes: Vec<u8>,
     /// §3.3 fetch dedup flag
     fetch_in_flight: bool,
     /// A dirty signal arrived while a fetch was in flight. Completion must
@@ -285,6 +289,7 @@ impl MuxPaneView {
             workspace,
             focus_handle,
             notification_task: None,
+            pending_output_bytes: Vec::new(),
             generation: 0,
             fetch_in_flight: false,
             fetch_pending: false,
@@ -320,14 +325,17 @@ impl MuxPaneView {
         let rx = self.domain.subscribe();
         let weak = cx.entity().downgrade();
 
-        // §3.1 server-canonical render path: PaneOutput and PaneDirty are both
-        // dirty signals that trigger fetch_grid_update. PTY bytes are never
-        // fed to the client terminal — the server owns the sole emulator.
+        // §3.1 exception render path: PaneOutput bytes feed the DisplayOnly
+        // terminal directly (primary render path). PaneDirty is a low-frequency
+        // correction signal that schedules a fetch_grid_update for reconnect and
+        // non-byte state (cursor style, alt-screen, scroll offset). Bytes are
+        // coalesced across an 8ms window and flushed once per frame.
         let task = cx.spawn(async move |_, cx| {
             let mut pending_dirty = false;
+            let mut pending_bytes = false;
 
             loop {
-                let notif = if !pending_dirty {
+                let notif = if !pending_dirty && !pending_bytes {
                     match rx.recv().await {
                         Ok(n) => n,
                         Err(_) => break,
@@ -347,20 +355,29 @@ impl MuxPaneView {
                                     &pane_id,
                                     n,
                                     &mut pending_dirty,
+                                    &mut pending_bytes,
                                     &weak,
                                     cx,
                                 ) {
                                     return;
                                 }
                             }
-                            Self::flush_pending(&weak, &mut pending_dirty, cx).await;
+                            Self::flush_pending(&weak, &mut pending_dirty, &mut pending_bytes, cx)
+                                .await;
                             continue;
                         }
                         Err(_) => break,
                     }
                 };
 
-                if !Self::accumulate_notification(&pane_id, notif, &mut pending_dirty, &weak, cx) {
+                if !Self::accumulate_notification(
+                    &pane_id,
+                    notif,
+                    &mut pending_dirty,
+                    &mut pending_bytes,
+                    &weak,
+                    cx,
+                ) {
                     break;
                 }
             }
@@ -373,6 +390,7 @@ impl MuxPaneView {
         pane_id: &str,
         notif: mux_protocol::Notification,
         pending_dirty: &mut bool,
+        pending_bytes: &mut bool,
         weak: &WeakEntity<Self>,
         cx: &mut AsyncApp,
     ) -> bool {
@@ -380,11 +398,22 @@ impl MuxPaneView {
             return true;
         };
         match event {
-            // §3.1: PaneOutput is a dirty signal only — bytes are never parsed.
+            // §3.1 exception: PaneOutput bytes feed the DisplayOnly terminal
+            // directly. Accumulated into the view's pending_output_bytes buffer
+            // for a single-frame flush, preserving total ordering.
             NotifEvent::PaneOutput(chunk) if chunk.pane_id == pane_id => {
-                *pending_dirty = true;
+                let data = chunk.data;
+                if !data.is_empty() {
+                    let _ = weak.update(cx, |view, _cx| {
+                        view.pending_output_bytes.extend_from_slice(&data);
+                    });
+                    *pending_bytes = true;
+                }
                 true
             }
+            // §3.3 PaneDirty is a low-frequency correction signal: cursor style,
+            // alt-screen switch, scroll offset, title. Triggers fetch_grid_update
+            // for authoritative state reconciliation (reconnect, non-byte changes).
             NotifEvent::PaneDirty(dirty) if dirty.pane_id == pane_id => {
                 *pending_dirty = true;
                 true
@@ -405,6 +434,9 @@ impl MuxPaneView {
                 });
                 true
             }
+            // §3.3 PaneBell: BEL (0x07) already arrived as PaneOutput bytes and
+            // was fed to the terminal. PaneBell is a visual/audio hint; schedule
+            // a fetch for any state that accompanied it.
             NotifEvent::PaneBell(bell) if bell.pane_id == pane_id => {
                 *pending_dirty = true;
                 true
@@ -413,13 +445,28 @@ impl MuxPaneView {
         }
     }
 
-    async fn flush_pending(weak: &WeakEntity<Self>, pending_dirty: &mut bool, cx: &mut AsyncApp) {
+    async fn flush_pending(
+        weak: &WeakEntity<Self>,
+        pending_dirty: &mut bool,
+        pending_bytes: &mut bool,
+        cx: &mut AsyncApp,
+    ) {
+        let bytes = std::mem::take(pending_bytes);
         let dirty = std::mem::take(pending_dirty);
-        if dirty {
-            let _ = weak.update(cx, |view, cx| {
+        let _ = weak.update(cx, |view, cx| {
+            if bytes {
+                let output = std::mem::take(&mut view.pending_output_bytes);
+                if !output.is_empty() {
+                    view.terminal.update(cx, |terminal, cx| {
+                        terminal.write_output(&output, cx);
+                    });
+                    cx.notify();
+                }
+            }
+            if dirty {
                 view.schedule_fetch(cx);
-            });
-        }
+            }
+        });
     }
     /// §3.3 Schedule a structured fetch. Full snapshots load every matching
     /// history page before returning to the GPUI thread, so partial checkpoints
@@ -514,6 +561,10 @@ impl MuxPaneView {
                 self.snapshot = snapshot;
                 self.history_cache = history_cache;
                 self.generation = generation;
+                // The authoritative snapshot already contains any bytes that
+                // were buffered; drop them so the next frame does not replay
+                // content the grid already holds.
+                self.pending_output_bytes.clear();
             }
         }
         cx.notify();
