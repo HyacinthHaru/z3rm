@@ -3,13 +3,13 @@ mod active_buffer_language;
 pub use active_buffer_language::ActiveBufferLanguage;
 use anyhow::Context as _;
 use editor::Editor;
+use file_finder::FileFinderSettings;
 use fuzzy::{StringMatch, StringMatchCandidate, match_strings};
 use gpui::{
     App, Context, DismissEvent, Entity, EventEmitter, FocusHandle, Focusable, ParentElement,
     Render, TaskExt, WeakEntity, Window, actions,
 };
 use language::{Buffer, LanguageMatcher, LanguageName, LanguageRegistry};
-use file_finder::FileFinderSettings;
 use picker::{Picker, PickerDelegate};
 use project::Project;
 use settings::Settings;
@@ -347,6 +347,7 @@ mod tests {
         cx.update(|cx| {
             let app_state = AppState::test(cx);
             settings::init(cx);
+            theme_settings::init(theme::LoadThemes::JustBase, cx);
             super::init(cx);
             editor::init(cx);
             app_state

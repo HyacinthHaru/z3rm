@@ -243,7 +243,12 @@ impl QuotaManager {
 
             evicted.push(id);
             freed += node_bytes;
-            info!(version_id = id, seq_no, freed_bytes = node_bytes, "gc: evicted node");
+            info!(
+                version_id = id,
+                seq_no,
+                freed_bytes = node_bytes,
+                "gc: evicted node"
+            );
         }
         // 已经真正删掉的节点不再是"候选"，否则候选集会无限增长。
         self.clear_gc_eligible(&evicted);
@@ -311,7 +316,9 @@ impl QuotaManager {
             )
             .context("gc: promote: reconstruct delta child")?;
             let content = rope_to_bytes(&rope);
-            let new_full_hash = blob_store.put(&content).context("gc: promote: store full")?;
+            let new_full_hash = blob_store
+                .put(&content)
+                .context("gc: promote: store full")?;
             // 在树中改写 child：full_content=新 hash, delta=None, depth=0；拿回旧 delta。
             let old_delta = tree.promote_to_full(child_id, new_full_hash);
             // 持久化改写后的 child 节点。
@@ -494,9 +501,27 @@ mod tests {
     fn orphan_branches_become_eligible_after_grace_period() {
         let tree = VersionTree::new();
         let path = [7u8; 32];
-        let root = tree.advance_head(path, 1, 1, None, Some([1u8; 32]), None, 0, SnapshotTrigger::Write);
+        let root = tree.advance_head(
+            path,
+            1,
+            1,
+            None,
+            Some([1u8; 32]),
+            None,
+            0,
+            SnapshotTrigger::Write,
+        );
         // parent 不是当前 HEAD → 旧 HEAD 变成 orphan（§4.4 分叉）。
-        tree.advance_head(path, 2, 2, None, Some([2u8; 32]), None, 0, SnapshotTrigger::Write);
+        tree.advance_head(
+            path,
+            2,
+            2,
+            None,
+            Some([2u8; 32]),
+            None,
+            0,
+            SnapshotTrigger::Write,
+        );
         assert!(tree.get_orphans().contains(&root));
 
         let quota = QuotaManager::new(u64::MAX);
@@ -506,14 +531,26 @@ mod tests {
 
         quota.set_grace_period(Duration::ZERO);
         quota.prune_orphan_branches(&tree, Instant::now());
-        assert!(quota.is_gc_eligible(root), "orphan must become a GC candidate");
+        assert!(
+            quota.is_gc_eligible(root),
+            "orphan must become a GC candidate"
+        );
     }
 
     #[test]
     fn git_commit_marks_only_pre_commit_deltas() {
         let tree = VersionTree::new();
         let path = [9u8; 32];
-        let base = tree.advance_head(path, 1, 1, None, Some([1u8; 32]), None, 0, SnapshotTrigger::Write);
+        let base = tree.advance_head(
+            path,
+            1,
+            1,
+            None,
+            Some([1u8; 32]),
+            None,
+            0,
+            SnapshotTrigger::Write,
+        );
         let delta = crate::version_tree::DeltaRef {
             hash: [2u8; 32],
             compressed_size: 4,
@@ -544,8 +581,13 @@ mod tests {
 
         assert_eq!(marked, 1);
         assert!(quota.is_gc_eligible(pre_commit));
-        assert!(!quota.is_gc_eligible(post_commit), "post-commit delta must be kept");
-        assert!(!quota.is_gc_eligible(base), "full snapshots are not delta garbage");
+        assert!(
+            !quota.is_gc_eligible(post_commit),
+            "post-commit delta must be kept"
+        );
+        assert!(
+            !quota.is_gc_eligible(base),
+            "full snapshots are not delta garbage"
+        );
     }
 }
-

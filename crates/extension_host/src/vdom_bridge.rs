@@ -9,9 +9,9 @@
 
 use anyhow::Result;
 use gpui::{
-    div, px, AnyElement, App, ClickEvent, ElementId, FocusHandle, Hsla, InteractiveElement,
-    IntoElement, KeyDownEvent, ParentElement, Role, SharedString, StatefulInteractiveElement,
-    Styled, Window,
+    AnyElement, App, ClickEvent, ElementId, FocusHandle, Hsla, InteractiveElement, IntoElement,
+    KeyDownEvent, ParentElement, Role, SharedString, StatefulInteractiveElement, Styled, Window,
+    div, px,
 };
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, HashMap, HashSet};
@@ -89,8 +89,7 @@ fn normalize_vdom_node(value: &mut serde_json::Value) {
 pub fn parse_vdom(value: &serde_json::Value) -> Result<VDomNode> {
     let mut normalized = value.clone();
     normalize_vdom_node(&mut normalized);
-    serde_json::from_value(normalized)
-        .map_err(|e| anyhow::anyhow!("VDOM parse error: {}", e))
+    serde_json::from_value(normalized).map_err(|e| anyhow::anyhow!("VDOM parse error: {}", e))
 }
 
 /// Flatten a VDOM tree into a text representation.
@@ -290,7 +289,9 @@ impl VDomRenderer {
     /// frame at once.
     pub fn render(&mut self, node: &VDomNode, cx: &mut App) -> AnyElement {
         let mut elements = self.render_frame(std::slice::from_ref(node), cx);
-        elements.pop().expect("render_frame returns one element per node")
+        elements
+            .pop()
+            .expect("render_frame returns one element per node")
     }
 
     /// Render a whole frame of top-level nodes in one pass, then evict cached
@@ -329,10 +330,7 @@ impl VDomRenderer {
         path: &mut ElementPath,
         cx: &mut App,
     ) -> AnyElement {
-        let click = node
-            .props
-            .get("onClick")
-            .and_then(CommandInvocation::parse);
+        let click = node.props.get("onClick").and_then(CommandInvocation::parse);
         let is_button = node.element_type == "button";
 
         // Only interactive nodes need a stateful element id. Plain containers
@@ -343,8 +341,8 @@ impl VDomRenderer {
             return element.into_any_element();
         }
 
-        let mut element = self
-            .style_and_fill(div().id(self.element_id(node, path)), node, path, cx);
+        let mut element =
+            self.style_and_fill(div().id(self.element_id(node, path)), node, path, cx);
         if let Some(label) = node
             .props
             .get("aria-label")
@@ -381,9 +379,7 @@ impl VDomRenderer {
                 dispatch(invocation.clone(), window, cx);
             });
         }
-        if is_button
-            && let (Some(invocation), Some(dispatch)) = (click, self.dispatch.clone())
-        {
+        if is_button && let (Some(invocation), Some(dispatch)) = (click, self.dispatch.clone()) {
             element = element.on_key_down(move |event: &KeyDownEvent, window, cx| {
                 if matches!(event.keystroke.key.as_str(), "enter" | "space") {
                     dispatch(invocation.clone(), window, cx);
@@ -539,7 +535,13 @@ impl VDomRenderer {
         container.into_any_element()
     }
 
-    fn style_and_fill<E>(&mut self, element: E, node: &VDomNode, path: &mut ElementPath, cx: &mut App) -> E
+    fn style_and_fill<E>(
+        &mut self,
+        element: E,
+        node: &VDomNode,
+        path: &mut ElementPath,
+        cx: &mut App,
+    ) -> E
     where
         E: Styled + ParentElement,
     {
@@ -709,7 +711,9 @@ fn apply_keystroke(current: &str, event: &KeyDownEvent) -> Option<String> {
         }
         _ => {
             let typed = event.keystroke.key_char.as_deref()?;
-            if typed.is_empty() || event.keystroke.modifiers.control || event.keystroke.modifiers.platform
+            if typed.is_empty()
+                || event.keystroke.modifiers.control
+                || event.keystroke.modifiers.platform
             {
                 return None;
             }
@@ -1006,7 +1010,11 @@ mod tests {
 
         // Next frame drops the meter but keeps the clock: only the meter is
         // evicted, the clock cache survives and repaints.
-        assert_eq!(cx.update(|cx| renderer.render_frame(&[clock.clone()], cx)).len(), 1);
+        assert_eq!(
+            cx.update(|cx| renderer.render_frame(&[clock.clone()], cx))
+                .len(),
+            1
+        );
         assert_eq!(
             renderer.display_list("meter"),
             None,

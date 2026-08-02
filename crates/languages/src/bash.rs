@@ -194,7 +194,8 @@ mod tests {
                   3
                 fi
                 "#
-                .unindent(),
+                .unindent()
+                .trim_end_matches('\n'),
             );
 
             buffer.edit([(0..buffer.len(), input)], None, cx);

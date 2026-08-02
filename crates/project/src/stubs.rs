@@ -8,7 +8,7 @@ use fs::Fs;
 use gpui::{App, Entity, Task};
 use serde::{Deserialize, Serialize};
 use text::Anchor;
-use worktree::ProjectEntryId;
+use worktree::{EntryKind, ProjectEntryId};
 
 pub type CompletionId = u64;
 
@@ -222,7 +222,6 @@ pub struct DiagnosticSummary {
     pub warning_count: usize,
     pub error_count: usize,
 }
-
 
 // ---------------------------------------------------------------------------
 // Bookmark store lives in the project crate's retained bookmark_store module.
@@ -638,7 +637,6 @@ impl DapStore {
     }
 }
 
-
 // ---------------------------------------------------------------------------
 // Project method stubs for APIs removed during dependency stripping
 // ---------------------------------------------------------------------------
@@ -655,7 +653,6 @@ use util::rel_path::RelPath;
 pub struct StackFrame {
     pub position: text::Point,
 }
-
 
 /// LSP integration was deleted during dependency stripping. Queries that would
 /// previously have consulted a language server must fail explicitly instead of
@@ -844,8 +841,9 @@ impl Project {
         version: Option<clock::Global>,
         cx: &mut gpui::Context<Self>,
     ) -> Task<anyhow::Result<Option<Blame>>> {
-        self.git_store
-            .update(cx, |git_store, cx| git_store.blame_buffer(buffer, version, cx))
+        self.git_store.update(cx, |git_store, cx| {
+            git_store.blame_buffer(buffer, version, cx)
+        })
     }
 
     pub fn references(
@@ -975,7 +973,6 @@ impl Project {
         OpenLspBufferHandle
     }
 
-
     pub fn task_store(&self) -> Entity<crate::task_store::TaskStore> {
         self.task_store_entity.clone()
     }
@@ -1056,12 +1053,11 @@ impl Project {
     }
 
     pub fn is_local(&self) -> bool {
-        true
+        self.remote_client.is_none()
     }
 
-
     pub fn remote_connection_options(&self) -> Option<remote::RemoteConnectionOptions> {
-        None
+        self.remote_connection_options.clone()
     }
 
     pub fn language_servers_running_disk_based_diagnostics(
@@ -1154,8 +1150,7 @@ impl Project {
     ) -> SearchResults<crate::search::SearchResult> {
         const MAX_SEARCH_RESULT_RANGES: usize = 100_000;
 
-        let (tx, rx) = async_channel::unbounded();
-        let search_tx = tx.clone();
+        let (search_tx, rx) = async_channel::unbounded();
         let worktree_store = self.worktree_store.clone();
         let buffer_store = self.buffer_store.clone();
         let scan_completed = worktree_store.read(cx).initial_scan_completed();
@@ -1164,6 +1159,7 @@ impl Project {
             .read(cx)
             .visible_worktrees_and_single_files(cx)
             .collect::<Vec<_>>();
+        let include_ignored = query.include_ignored();
         let opened_buffers = query.buffers().cloned();
 
         cx.spawn(async move |_, cx| {
@@ -1181,35 +1177,55 @@ impl Project {
                 return;
             }
 
+            if include_ignored && opened_buffers.is_none() {
+                for worktree in &worktrees {
+                    let expansion_tasks = worktree.update(cx, |worktree, cx| {
+                        worktree
+                            .snapshot()
+                            .directories(true, 0)
+                            .filter(|entry| {
+                                entry.is_ignored && entry.kind == EntryKind::UnloadedDir
+                            })
+                            .filter_map(|entry| worktree.expand_all_for_entry(entry.id, cx))
+                            .collect::<Vec<_>>()
+                    });
+
+                    for expansion_task in expansion_tasks {
+                        if let Err(error) = expansion_task.await {
+                            tracing::warn!(
+                                error = %error,
+                                "failed to expand ignored directory for search"
+                            );
+                        }
+                    }
+                }
+            }
+
             let mut candidates = Vec::new();
             if let Some(opened_buffers) = opened_buffers {
-                candidates.extend(
-                    opened_buffers
-                        .into_iter()
-                        .filter_map(|buffer| {
-                            let path = buffer.read_with(cx, |buffer, cx| {
-                                buffer.project_path(cx)
-                            })?;
-                            query.match_path(&path.path).then_some((Some(buffer), path))
-                        }),
-                );
+                candidates.extend(opened_buffers.into_iter().filter_map(|buffer| {
+                    let path = buffer.read_with(cx, |buffer, cx| buffer.project_path(cx))?;
+                    query.match_path(&path.path).then_some((Some(buffer), path))
+                }));
             } else {
                 for worktree in worktrees {
-                    let (worktree_id, snapshot) = worktree.read_with(cx, |worktree, _| {
-                        (worktree.id(), worktree.snapshot())
-                    });
-                    candidates.extend(snapshot.files(query.include_ignored(), 0).filter_map(
-                        |entry| {
-                            if query.match_path(&entry.path) {
-                                Some(ProjectPath {
-                                    worktree_id,
-                                    path: entry.path.clone(),
-                                })
-                            } else {
-                                None
-                            }
-                        },
-                    ).map(|path| (None, path)));
+                    let (worktree_id, snapshot) =
+                        worktree.read_with(cx, |worktree, _| (worktree.id(), worktree.snapshot()));
+                    candidates.extend(
+                        snapshot
+                            .files(query.include_ignored(), 0)
+                            .filter_map(|entry| {
+                                if query.match_path(&entry.path) {
+                                    Some(ProjectPath {
+                                        worktree_id,
+                                        path: entry.path.clone(),
+                                    })
+                                } else {
+                                    None
+                                }
+                            })
+                            .map(|path| (None, path)),
+                    );
                 }
             }
 
@@ -1223,9 +1239,7 @@ impl Project {
                     Some(buffer) => buffer,
                     None => {
                         match buffer_store
-                            .update(cx, |store, cx| {
-                                store.open_buffer(project_path.clone(), cx)
-                            })
+                            .update(cx, |store, cx| store.open_buffer(project_path.clone(), cx))
                             .await
                         {
                             Ok(buffer) => buffer,
@@ -1273,7 +1287,7 @@ impl Project {
         })
         .detach();
 
-        SearchResults { tx, rx }
+        SearchResults { rx }
     }
 
     /// Whether this local project can create terminal sessions.
@@ -1315,9 +1329,8 @@ impl Project {
     }
 
     pub fn is_remote(&self) -> bool {
-        false
+        self.remote_client.is_some()
     }
-
 
     /// Resolve a `ProjectPath` for an entry by locating its owning worktree.
     pub fn path_for_entry(&self, entry_id: ProjectEntryId, cx: &App) -> Option<crate::ProjectPath> {
@@ -1588,7 +1601,6 @@ impl Project {
 // Extension stubs (spec §8.2 M2)
 // ---------------------------------------------------------------------------
 
-
 /// Stub: VimModeSetting (vim_mode_setting crate 已删除)
 #[derive(Clone, Copy, Debug, Default, Serialize, Deserialize)]
 pub struct VimModeSetting(pub bool);
@@ -1666,11 +1678,7 @@ impl ShellBuilder {
         self.inner.command_label(command)
     }
 
-    pub fn build_no_quote(
-        self,
-        command: Option<String>,
-        args: &[String],
-    ) -> (String, Vec<String>) {
+    pub fn build_no_quote(self, command: Option<String>, args: &[String]) -> (String, Vec<String>) {
         self.inner.build_no_quote(command, args)
     }
 }
@@ -1721,14 +1729,12 @@ pub use settings::TerminalDockPosition;
 
 /// Search result stream shared by project and text-finder searches.
 pub struct SearchResults<T> {
-    pub tx: async_channel::Sender<T>,
     pub rx: async_channel::Receiver<T>,
 }
 
 impl<T> Clone for SearchResults<T> {
     fn clone(&self) -> Self {
         Self {
-            tx: self.tx.clone(),
             rx: self.rx.clone(),
         }
     }
@@ -1967,5 +1973,4 @@ mod stub_delegate_tests {
         }
         assert!(found, "project search must emit a matching buffer result");
     }
-
 }

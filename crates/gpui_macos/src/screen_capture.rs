@@ -10,13 +10,13 @@ use core_graphics::display::{
     CGDirectDisplayID, CGDisplayCopyDisplayMode, CGDisplayModeGetPixelHeight,
     CGDisplayModeGetPixelWidth, CGDisplayModeRelease,
 };
+use core_video::image_buffer::{CVImageBuffer, CVImageBufferRef};
 use ctor::ctor;
 use futures::channel::oneshot;
 use gpui::{
     DevicePixels, ForegroundExecutor, ScreenCaptureFrame, ScreenCaptureSource, ScreenCaptureStream,
     SharedString, SourceMetadata, size,
 };
-use core_video::image_buffer::{CVImageBuffer, CVImageBufferRef};
 use metal::NSInteger;
 use objc::{
     class,

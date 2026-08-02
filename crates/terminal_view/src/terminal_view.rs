@@ -1,13 +1,13 @@
 pub mod copy_mode;
+pub mod diff_view;
+pub mod file_viewer;
+pub mod mux_pane;
 mod persistence;
+pub mod settings_pane;
 pub mod terminal_element;
 pub mod terminal_panel;
 mod terminal_path_like_target;
 pub mod terminal_scrollbar;
-pub mod mux_pane;
-pub mod file_viewer;
-pub mod diff_view;
-pub mod settings_pane;
 
 use editor::{
     Editor, EditorSettings, actions::SelectAll, blink_manager::BlinkManager,
@@ -16,16 +16,16 @@ use editor::{
 use gpui::{
     Action, AnyElement, App, ClipboardEntry, DismissEvent, Entity, EventEmitter, ExternalPaths,
     FocusHandle, Focusable, Font, KeyContext, KeyDownEvent, Keystroke, MouseButton, MouseDownEvent,
-    Pixels, Point as GpuiPoint, Rems, Render, ScrollWheelEvent, Styled, Subscription, Task, TaskExt,
-    WeakEntity, actions, anchored, deferred, div,
+    Pixels, Point as GpuiPoint, Rems, Render, ScrollWheelEvent, Styled, Subscription, Task,
+    TaskExt, WeakEntity, actions, anchored, deferred, div,
 };
 use menu;
 use persistence::TerminalDb;
+use project::TaskId;
 use project::{Project, ProjectEntryId, search::SearchQuery};
 use schemars::JsonSchema;
 use serde::Deserialize;
 use settings::{Settings, SettingsStore, TerminalBell, TerminalBlink, WorkingDirectory};
-use workspace::settings_stubs::SeedQuerySetting;
 use std::{
     any::Any,
     cmp,
@@ -35,7 +35,6 @@ use std::{
     sync::Arc,
     time::Duration,
 };
-use project::TaskId;
 use terminal::{
     Clear, Copy, Event, HoveredWord, MaybeNavigationTarget, Modes, Paste, PasteText, Point, Range,
     ScrollLineDown, ScrollLineUp, ScrollPageDown, ScrollPageUp, ScrollToBottom, ScrollToTop,
@@ -52,6 +51,7 @@ use ui::{
     scrollbars::{self, ScrollbarVisibility},
 };
 use util::ResultExt;
+use workspace::settings_stubs::SeedQuerySetting;
 use workspace::{
     CloseActiveItem, DraggedSelection, DraggedTab, NewCenterTerminal, NewTerminal, Pane,
     ToolbarItemLocation, Workspace, WorkspaceId, delete_unloaded_items,
@@ -98,10 +98,7 @@ mod mux_scrollback_tests {
 
     #[test]
     fn locked_scroll_preserves_and_clamps_local_offset() {
-        assert_eq!(
-            resolve_mux_scrollback_offset(Some(12), 0, 8, true),
-            Some(8)
-        );
+        assert_eq!(resolve_mux_scrollback_offset(Some(12), 0, 8, true), Some(8));
     }
 
     #[test]
@@ -163,20 +160,17 @@ pub fn init(cx: &mut App) {
     // Only file_viewer and mux_pane paths remain.
     cx.observe_new(|workspace: &mut Workspace, _window, _cx| {
         // §16.6 file viewer: open a file read-only from command palette
-        workspace.register_action(
-            |workspace, action: &file_viewer::OpenFile, window, cx| {
-                let path = PathBuf::from(&action.path);
-                let abs_path = if path.is_absolute() {
-                    path
-                } else if let Some(worktree) = workspace.project().read(cx).worktrees(cx).next()
-                {
-                    worktree.read(cx).abs_path().join(&path)
-                } else {
-                    path
-                };
-                file_viewer::open_file_in_viewer(workspace, abs_path, window, cx);
-            },
-        );
+        workspace.register_action(|workspace, action: &file_viewer::OpenFile, window, cx| {
+            let path = PathBuf::from(&action.path);
+            let abs_path = if path.is_absolute() {
+                path
+            } else if let Some(worktree) = workspace.project().read(cx).worktrees(cx).next() {
+                worktree.read(cx).abs_path().join(&path)
+            } else {
+                path
+            };
+            file_viewer::open_file_in_viewer(workspace, abs_path, window, cx);
+        });
     })
     .detach();
 }
@@ -1009,7 +1003,6 @@ impl TerminalView {
         cx.notify();
     }
 
-
     /// §16.9 设置回滚偏移量
     pub fn set_scrollback_offset(&mut self, offset: Option<usize>, cx: &mut Context<Self>) {
         self.scrollback_offset = offset;
@@ -1588,7 +1581,8 @@ impl TerminalView {
             );
         if !intercepted {
             // 未被复制模式拦截 → 转发到 vi_motion (不发送到 PTY)
-            self.terminal.update(cx, |term, _| term.vi_motion(keystroke));
+            self.terminal
+                .update(cx, |term, _| term.vi_motion(keystroke));
         }
         cx.notify();
         true
@@ -2718,7 +2712,6 @@ mod tests {
         });
     }
 
-
     // No active entry, but a worktree, worktree is a file -> parent directory
     #[gpui::test]
     async fn no_active_entry_worktree_is_file(cx: &mut TestAppContext) {
@@ -2943,7 +2936,6 @@ mod tests {
 
         (project, workspace, window_handle)
     }
-
 
     /// Creates a file in the given worktree and returns its entry.
     async fn create_file_in_worktree(
@@ -3462,7 +3454,10 @@ mod tests {
     fn test_copy_mode_state_default() {
         let state = copy_mode::CopyModeState::default();
         assert!(!state.active, "copy mode should be inactive by default");
-        assert!(state.search_query.is_none(), "search_query should be None by default");
+        assert!(
+            state.search_query.is_none(),
+            "search_query should be None by default"
+        );
     }
 
     #[test]
@@ -3491,7 +3486,10 @@ mod tests {
 
         cx.update(|window, cx| {
             terminal.update(cx, |terminal, cx| {
-                terminal.write_output(b"needle one\r\nfiller\r\nneedle two\r\nneedle three\r\n", cx);
+                terminal.write_output(
+                    b"needle one\r\nfiller\r\nneedle two\r\nneedle three\r\n",
+                    cx,
+                );
                 terminal.sync(window, cx);
             });
         });
@@ -3523,7 +3521,10 @@ mod tests {
         sync_terminal(&terminal, &mut cx);
         terminal_view.read_with(&cx, |view, _| {
             let state = view.copy_mode_state();
-            assert_eq!(state.search_input, None, "enter must close the query buffer");
+            assert_eq!(
+                state.search_input, None,
+                "enter must close the query buffer"
+            );
             assert_eq!(state.search_query.as_deref(), Some("needle"));
             assert_eq!(state.match_count, 3);
             assert_eq!(state.search_error, None);
@@ -3584,9 +3585,15 @@ mod tests {
         cx.simulate_keystrokes("/ n e e d l e escape");
         terminal_view.read_with(&cx, |view, _| {
             let state = view.copy_mode_state();
-            assert_eq!(state.search_input, None, "escape must drop the query buffer");
+            assert_eq!(
+                state.search_input, None,
+                "escape must drop the query buffer"
+            );
             assert_eq!(state.search_query, None);
-            assert!(state.active, "escape in search input must stay in copy mode");
+            assert!(
+                state.active,
+                "escape in search input must stay in copy mode"
+            );
         });
 
         // The indicator is what makes the search visible to the user.

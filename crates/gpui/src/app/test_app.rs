@@ -373,9 +373,11 @@ impl<V: 'static + Render> TestAppWindow<V> {
     /// Get the window title.
     pub fn title(&self) -> Option<String> {
         let mut app = self.app.borrow_mut();
-        app.update_window_id(self.handle.window_id(), |_, window, _| window.window_title())
-            .ok()
-            .and_then(|title| (!title.is_empty()).then_some(title))
+        app.update_window_id(self.handle.window_id(), |_, window, _| {
+            window.window_title()
+        })
+        .ok()
+        .and_then(|title| (!title.is_empty()).then_some(title))
     }
 
     /// Simulate a keystroke.

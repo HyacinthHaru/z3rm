@@ -31,13 +31,8 @@ impl Editor {
     ) -> bool {
         let snapshot = target.buffer.read(cx).text_snapshot();
         let point = target.buffer_anchor.summary::<Point>(&snapshot);
-        BookmarkStore::find_bookmark(
-            bookmark_store.clone(),
-            target.buffer.clone(),
-            point,
-            cx,
-        )
-        .is_some()
+        BookmarkStore::find_bookmark(bookmark_store.clone(), target.buffer.clone(), point, cx)
+            .is_some()
     }
 
     pub fn set_show_bookmarks(&mut self, show_bookmarks: bool, cx: &mut Context<Self>) {
@@ -233,12 +228,7 @@ impl Editor {
                 "Enter bookmark label (Optional)",
                 Some(Box::new(move |label: String, _, cx| {
                     bookmark_store.update(cx, |store, cx| {
-                        store.toggle_bookmark(
-                            target.buffer,
-                            target.buffer_anchor,
-                            label,
-                            cx,
-                        );
+                        store.toggle_bookmark(target.buffer, target.buffer_anchor, label, cx);
                     });
                 })),
                 None,
@@ -257,12 +247,7 @@ impl Editor {
         if let Some(bookmark_store) = self.bookmark_store.clone() {
             bookmark_store.update(cx, |store, cx| {
                 for target in targets {
-                    store.toggle_bookmark(
-                        target.buffer,
-                        target.buffer_anchor,
-                        label.clone(),
-                        cx,
-                    );
+                    store.toggle_bookmark(target.buffer, target.buffer_anchor, label.clone(), cx);
                 }
             });
         }

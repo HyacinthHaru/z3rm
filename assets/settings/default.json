@@ -1,6 +1,7 @@
 {
   // z3rm 默认设置
   // 终端/多路复用器/UI chrome 设置
+  "buffer_font_size": 15,
 
   // === 项目设置 (ProjectSettingsContent - flattened) ===
   "excluded_paths": ["node_modules", ".git"],
@@ -20,6 +21,7 @@
 
   "all_languages": {
     "defaults": {
+      "auto_indent": "syntax_aware",
       "word_diff_enabled": true
     }
   },

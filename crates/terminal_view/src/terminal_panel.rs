@@ -550,7 +550,6 @@ impl TerminalPanel {
         let is_windows = project.path_style(cx).is_windows();
         let task = prepare_task_for_spawn(task, &task.shell, is_windows);
 
-
         if task.allow_concurrent_runs && task.use_new_terminal {
             return self.spawn_in_new_terminal(task, window, cx);
         }
@@ -1768,10 +1767,7 @@ mod tests {
         let item_count =
             terminal_panel.read_with(cx, |panel, cx| panel.active_pane.read(cx).items_len());
 
-        assert_eq!(
-            item_count, 5,
-            "Terminal panel should allow all 5 terminals"
-        );
+        assert_eq!(item_count, 5, "Terminal panel should allow all 5 terminals");
     }
 
     #[cfg(unix)]
@@ -2364,7 +2360,6 @@ mod tests {
             "Center pane should not gain a new terminal when panel is focused"
         );
     }
-
 
     pub fn init_test(cx: &mut TestAppContext) {
         cx.update(|cx| {

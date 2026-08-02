@@ -619,7 +619,14 @@ async fn dispatch_request(
         }
         RequestBody::ConfirmRecovery(request) => {
             if check_permission(role, ClientRole::Admin) {
-                match handle_confirm_recovery(request, sessions, db, server_settings, clipboard, extension_host) {
+                match handle_confirm_recovery(
+                    request,
+                    sessions,
+                    db,
+                    server_settings,
+                    clipboard,
+                    extension_host,
+                ) {
                     Ok(response) => response,
                     Err(error) => ResponseBody::Error(error.to_string()),
                 }
@@ -660,8 +667,15 @@ async fn dispatch_request(
         // §3.3 需要 ReadWrite 的 pane 操作 (Plan 33)
         RequestBody::SpawnPane(r) => {
             if check_permission(role, ClientRole::ReadWrite) {
-                handle_spawn_pane(r, sessions, server_settings, clipboard, extension_host, connection_client_id)
-                    .await?
+                handle_spawn_pane(
+                    r,
+                    sessions,
+                    server_settings,
+                    clipboard,
+                    extension_host,
+                    connection_client_id,
+                )
+                .await?
             } else {
                 ResponseBody::Error("permission denied: read-write required".to_string())
             }
@@ -2932,7 +2946,11 @@ async fn handle_install_extension(
             (true, String::new())
         }
         Err(err) => {
-            zlog::warn!("extension install rejected: name={} error={:#}", req.name, err);
+            zlog::warn!(
+                "extension install rejected: name={} error={:#}",
+                req.name,
+                err
+            );
             (false, format!("{err:#}"))
         }
     };
@@ -3775,7 +3793,10 @@ mod connection_unit_tests {
         )
         .await
         .expect("set_pane_title returns a response");
-        assert!(matches!(response, ResponseBody::Error(_)), "got {response:?}");
+        assert!(
+            matches!(response, ResponseBody::Error(_)),
+            "got {response:?}"
+        );
         assert_eq!(*pane.title.read(), String::new());
 
         // FocusPane must fail before changing the authoritative focus.
@@ -3790,7 +3811,10 @@ mod connection_unit_tests {
         )
         .await
         .expect("focus_pane returns a response");
-        assert!(matches!(response, ResponseBody::Error(_)), "got {response:?}");
+        assert!(
+            matches!(response, ResponseBody::Error(_)),
+            "got {response:?}"
+        );
         assert_eq!(sessions.read()[0].focused_pane, None);
 
         // ZoomPane must fail before flipping the zoom state.
@@ -3805,7 +3829,10 @@ mod connection_unit_tests {
         )
         .await
         .expect("zoom_pane returns a response");
-        assert!(matches!(response, ResponseBody::Error(_)), "got {response:?}");
+        assert!(
+            matches!(response, ResponseBody::Error(_)),
+            "got {response:?}"
+        );
         assert!(!pane.is_zoomed());
 
         // A pre-attach CLI socket (no client id) is still allowed to drive
@@ -4039,10 +4066,8 @@ mod connection_unit_tests {
     async fn install_extension_reports_failure_instead_of_an_empty_error() {
         let temp = tempfile::tempdir().unwrap();
         let sessions = Arc::new(parking_lot::RwLock::new(Vec::new()));
-        let host = crate::extension_host::ServerExtensionHost::start(
-            sessions,
-            temp.path().to_path_buf(),
-        );
+        let host =
+            crate::extension_host::ServerExtensionHost::start(sessions, temp.path().to_path_buf());
         let response = handle_install_extension(
             &mux_protocol::InstallExtensionRequest {
                 name: "z3rm-demo".to_string(),

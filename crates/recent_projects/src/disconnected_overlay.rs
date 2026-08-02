@@ -111,7 +111,6 @@ impl DisconnectedOverlay {
             return;
         };
 
-        let app_state = workspace.read(cx).app_state().clone();
         let paths = workspace
             .read(cx)
             .root_paths(cx)
@@ -123,7 +122,6 @@ impl DisconnectedOverlay {
             open_remote_project(
                 connection_options,
                 paths,
-                app_state,
                 OpenOptions {
                     requesting_window: Some(window_handle),
                     ..Default::default()

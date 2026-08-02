@@ -3995,9 +3995,7 @@ mod tests {
     use util::shell_builder::ShellBuilder;
 
     #[gpui::test]
-    async fn display_only_raw_pty_output_preserves_lf_cursor_column(
-        cx: &mut TestAppContext,
-    ) {
+    async fn display_only_raw_pty_output_preserves_lf_cursor_column(cx: &mut TestAppContext) {
         cx.update(|cx| {
             let settings_store = settings::SettingsStore::test(cx);
             cx.set_global(settings_store);
@@ -4375,9 +4373,7 @@ mod tests {
     }
 
     #[gpui::test]
-    async fn structured_snapshot_preserves_configured_history_capacity(
-        cx: &mut TestAppContext,
-    ) {
+    async fn structured_snapshot_preserves_configured_history_capacity(cx: &mut TestAppContext) {
         let terminal = cx.new(|cx| {
             TerminalBuilder::new_display_only(
                 SettingsCursorShape::default(),

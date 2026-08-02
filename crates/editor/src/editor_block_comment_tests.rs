@@ -1,6 +1,6 @@
-use crate::{ToggleBlockComments, ToggleComments};
-use crate::test::init_test;
 use crate::test::editor_test_context::EditorTestContext;
+use crate::test::init_test;
+use crate::{ToggleBlockComments, ToggleComments};
 use gpui::TestAppContext;
 use indoc::indoc;
 use language::{BlockCommentConfig, Language, LanguageConfig};

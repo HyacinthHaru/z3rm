@@ -610,7 +610,8 @@ fn activate_mux_session(
                     register_mux_window(window_id, domain.clone(), session_id.clone(), cx);
                     // The sidebar's tree is bound to one session, so switching
                     // rebinds it while keeping the user's chosen width.
-                    let Some(multi_workspace) = window.root::<workspace::MultiWorkspace>().flatten()
+                    let Some(multi_workspace) =
+                        window.root::<workspace::MultiWorkspace>().flatten()
                     else {
                         return;
                     };

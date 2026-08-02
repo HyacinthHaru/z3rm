@@ -400,7 +400,10 @@ fn toml_bool(table: &toml::value::Table, key: &str) -> Result<bool> {
     match table.get(key) {
         None => Ok(false),
         Some(toml::Value::Boolean(value)) => Ok(*value),
-        Some(other) => bail!("capability `{key}` must be a boolean, found {}", other.type_str()),
+        Some(other) => bail!(
+            "capability `{key}` must be a boolean, found {}",
+            other.type_str()
+        ),
     }
 }
 
@@ -508,15 +511,14 @@ pub fn parse_manifest_str(fallback_id: &str, text: &str) -> Result<ExtensionMani
 
 /// spec §5.3 从磁盘读取并解析 `extension.toml`。
 pub fn parse_manifest(path: &Path) -> Result<ExtensionManifest> {
-    let text = std::fs::read_to_string(path)
-        .with_context(|| format!("reading {}", path.display()))?;
+    let text =
+        std::fs::read_to_string(path).with_context(|| format!("reading {}", path.display()))?;
     let fallback_id = path
         .parent()
         .and_then(Path::file_name)
         .map(|name| name.to_string_lossy().into_owned())
         .unwrap_or_else(|| "unknown".to_string());
-    parse_manifest_str(&fallback_id, &text)
-        .with_context(|| format!("parsing {}", path.display()))
+    parse_manifest_str(&fallback_id, &text).with_context(|| format!("parsing {}", path.display()))
 }
 
 // ---------------------------------------------------------------------------
@@ -610,7 +612,9 @@ fn discover_extensions_for(
         for entry in entries {
             match entry {
                 Ok(entry) => directories.push(entry.path()),
-                Err(error) => tracing::warn!(path = %root.display(), %error, "failed to read extension directory entry"),
+                Err(error) => {
+                    tracing::warn!(path = %root.display(), %error, "failed to read extension directory entry")
+                }
             }
         }
         // read_dir 顺序依赖文件系统；排序让加载顺序（以及渲染顺序）稳定。
@@ -1528,8 +1532,8 @@ impl ExtensionRunner {
             if !activated {
                 return Ok(None);
             }
-            let rendered: String =
-                eval_checked(&ctx, "globalThis.__z3rm_render_views()").context("rendering views")?;
+            let rendered: String = eval_checked(&ctx, "globalThis.__z3rm_render_views()")
+                .context("rendering views")?;
             Ok::<_, anyhow::Error>(first_vdom(&rendered))
         });
 
@@ -1732,7 +1736,8 @@ impl LiveExtension {
     /// 列表而不是让它冒泡到 Rust，因此这里顺带扫描 "out of memory" 并记录内存
     /// 违规标志——否则被 JS 层吞掉的超限会静默继续。
     pub fn take_errors(&self) -> Result<Vec<String>> {
-        let json: String = self.run_js(|ctx| eval_checked(ctx, "globalThis.__z3rm_take_errors()"))?;
+        let json: String =
+            self.run_js(|ctx| eval_checked(ctx, "globalThis.__z3rm_take_errors()"))?;
         let errors: Vec<String> =
             serde_json::from_str(&json).context("parsing extension error list")?;
         if errors.iter().any(|error| error.contains("out of memory")) {
@@ -1986,7 +1991,10 @@ mod tests {
         assert!(!live.needs_render()?, "渲染后失效标志应清零");
 
         assert_eq!(live.emit_event("pane:focus", r#"{"title":"a"}"#)?, 1);
-        assert!(live.needs_render()?, "事件触发的 invalidate 必须被 Rust 观察到");
+        assert!(
+            live.needs_render()?,
+            "事件触发的 invalidate 必须被 Rust 观察到"
+        );
         Ok(())
     }
 
@@ -2194,7 +2202,9 @@ mod tests {
             "activate must succeed: {:?}",
             result.result
         );
-        let vdom = result.vdom_json.context("status-bar VDOM must be captured")?;
+        let vdom = result
+            .vdom_json
+            .context("status-bar VDOM must be captured")?;
         assert!(vdom.contains("status-bar"), "vdom={vdom}");
         assert!(vdom.contains("demo"), "vdom={vdom}");
         Ok(())
@@ -2371,10 +2381,7 @@ mod tests {
             }
         "#;
         let extension = runner.load_live("capability-bypass", source, "activate")?;
-        let denied: bool = extension
-            .render_all_views()
-            .map(|_| true)
-            .unwrap_or(true);
+        let denied: bool = extension.render_all_views().map(|_| true).unwrap_or(true);
         assert!(denied);
         assert!(bridge.calls().is_empty(), "Rust 侧必须在桥调用前拒绝");
         Ok(())
@@ -2712,9 +2719,7 @@ mod tests {
         );
 
         assert!(live.execute_command("z3rm.command-palette.open", "[]")?);
-        let vdom = live
-            .render_now()?
-            .context("打开后 palette 应产生 VDOM")?;
+        let vdom = live.render_now()?.context("打开后 palette 应产生 VDOM")?;
         assert!(vdom.contains("command-palette"), "vdom={vdom}");
         assert!(
             vdom.contains("z3rm.command-palette.open"),
@@ -2870,6 +2875,5 @@ mod tests {
             "the over-limit renderer must mark a memory violation"
         );
         Ok(())
-
     }
 }

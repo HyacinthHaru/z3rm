@@ -41,7 +41,10 @@ pub struct MuxSettingsContent {
 impl MuxSettingsContent {
     /// spec §16.1 已解析的 socket 连接超时。
     pub fn connect_timeout(&self) -> Duration {
-        Duration::from_millis(self.connect_timeout_ms.unwrap_or(DEFAULT_CONNECT_TIMEOUT_MS))
+        Duration::from_millis(
+            self.connect_timeout_ms
+                .unwrap_or(DEFAULT_CONNECT_TIMEOUT_MS),
+        )
     }
 }
 

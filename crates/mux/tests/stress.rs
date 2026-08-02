@@ -235,9 +235,7 @@ async fn wait_for_settled_generation(
             last = Some((generation, Instant::now()));
         }
         if Instant::now() >= deadline {
-            anyhow::bail!(
-                "timed out waiting for {what}; last generation was {generation}"
-            );
+            anyhow::bail!("timed out waiting for {what}; last generation was {generation}");
         }
         tokio::time::sleep(Duration::from_millis(100)).await;
     }
@@ -513,10 +511,7 @@ async fn scrollback_eviction_never_returns_out_of_range_rows() -> Result<()> {
 
     let probe = domain.fetch_scrollback(&pane_id, 0, 1, 0).await?;
     let total = probe.total_lines;
-    anyhow::ensure!(
-        total > 0,
-        "writing 50k lines produced no scrollback at all"
-    );
+    anyhow::ensure!(total > 0, "writing 50k lines produced no scrollback at all");
 
     // Ask for a window that runs off the end: the server must clamp rather than
     // invent rows.
@@ -608,9 +603,7 @@ async fn wait_for_dead_connection(domain: &MuxDomain, timeout: Duration) -> Resu
             return Ok(());
         }
         if Instant::now() >= deadline {
-            anyhow::bail!(
-                "connection still reports live {timeout:?} after the server was killed"
-            );
+            anyhow::bail!("connection still reports live {timeout:?} after the server was killed");
         }
         tokio::time::sleep(Duration::from_millis(20)).await;
     }
@@ -659,7 +652,9 @@ async fn killed_server_fails_loudly_and_fresh_instance_recovers() -> Result<()> 
     );
     let sessions = recovered.list_sessions().await?;
     anyhow::ensure!(
-        sessions.iter().any(|session| session.id == recovered_session),
+        sessions
+            .iter()
+            .any(|session| session.id == recovered_session),
         "replacement server does not list the session it just created"
     );
     anyhow::ensure!(
@@ -706,13 +701,22 @@ async fn malformed_frames_do_not_poison_the_server() -> Result<()> {
     );
 
     let garbage_frames: Vec<(&str, Vec<u8>)> = vec![
-        ("overlong varint prefix", vec![0xFF; mux_protocol::MAX_VARINT_LEN + 1]),
+        (
+            "overlong varint prefix",
+            vec![0xFF; mux_protocol::MAX_VARINT_LEN + 1],
+        ),
         (
             "declared length near i64::MAX with no payload",
             vec![0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0x7F],
         ),
-        ("valid prefix with corrupted payload", corrupt_payload(good_frame.clone())),
-        ("frame truncated mid-payload", good_frame[..good_frame.len() / 2].to_vec()),
+        (
+            "valid prefix with corrupted payload",
+            corrupt_payload(good_frame.clone()),
+        ),
+        (
+            "frame truncated mid-payload",
+            good_frame[..good_frame.len() / 2].to_vec(),
+        ),
     ];
 
     for (label, garbage) in garbage_frames {
@@ -892,13 +896,9 @@ async fn reconnect_recovers_authoritative_snapshot_after_missed_notifications() 
         .await?;
 
     // The flood is bounded, so it must settle to a fixed generation.
-    let settled_generation = wait_for_settled_generation(
-        &actor,
-        &p1,
-        Duration::from_secs(30),
-        "the flood to finish",
-    )
-    .await?;
+    let settled_generation =
+        wait_for_settled_generation(&actor, &p1, Duration::from_secs(30), "the flood to finish")
+            .await?;
     anyhow::ensure!(
         settled_generation >= stale_generation + 128,
         "flood advanced only {} generations past the stale checkpoint ({} → {}); \
@@ -1206,15 +1206,13 @@ async fn stalled_wire_consumer_does_not_stall_other_clients() -> Result<()> {
     // keep working, interleaving grid pulls and lifecycle churn.
     let mut previous = 0u64;
     for round in 0..40 {
-        let fetch = tokio::time::timeout(
-            Duration::from_secs(2),
-            live.fetch_grid_update(&flooded, 0),
-        )
-        .await
-        .with_context(|| {
-            format!("round {round}: grid fetch stalled behind a wedged connection")
-        })?
-        .with_context(|| format!("round {round}: grid fetch failed"))?;
+        let fetch =
+            tokio::time::timeout(Duration::from_secs(2), live.fetch_grid_update(&flooded, 0))
+                .await
+                .with_context(|| {
+                    format!("round {round}: grid fetch stalled behind a wedged connection")
+                })?
+                .with_context(|| format!("round {round}: grid fetch failed"))?;
         anyhow::ensure!(
             fetch.to_generation >= previous,
             "round {round}: generation went backwards: {previous} then {}",
@@ -1305,10 +1303,11 @@ async fn throughput_smoke_hundred_plus_operations() -> Result<()> {
 
     for pane in &panes {
         let op_started = Instant::now();
-        let response = tokio::time::timeout(Duration::from_secs(2), domain.fetch_grid_update(pane, 0))
-            .await
-            .context("fetch_grid_update stalled")?
-            .context("fetch_grid_update failed")?;
+        let response =
+            tokio::time::timeout(Duration::from_secs(2), domain.fetch_grid_update(pane, 0))
+                .await
+                .context("fetch_grid_update stalled")?
+                .context("fetch_grid_update failed")?;
         anyhow::ensure!(
             response.update.is_some(),
             "from-scratch fetch for a fresh pane returned no update"

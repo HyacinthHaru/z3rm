@@ -66,8 +66,7 @@ pub enum MuxPaneEvent {
 /// The extension host lives outside `terminal_view`, so the lookup is injected
 /// with [`MuxPaneView::set_extension_shortcut_resolver`]; without one no
 /// extension shortcut can match.
-pub type ExtensionShortcutResolver =
-    Arc<dyn Fn(&Keystroke) -> Option<SharedString> + Send + Sync>;
+pub type ExtensionShortcutResolver = Arc<dyn Fn(&Keystroke) -> Option<SharedString> + Send + Sync>;
 
 const HISTORY_PAGE_ROWS: u32 = 512;
 
@@ -78,7 +77,6 @@ struct HistoryCache {
     history_version: u64,
     cells: Arc<Vec<StructuredTerminalCell>>,
 }
-
 
 #[derive(Debug)]
 enum PreparedFetchUpdate {
@@ -401,13 +399,7 @@ impl MuxPaneView {
                     }
                 };
 
-                if !Self::accumulate_notification(
-                    &pane_id,
-                    notif,
-                    &mut pending_dirty,
-                    &weak,
-                    cx,
-                ) {
+                if !Self::accumulate_notification(&pane_id, notif, &mut pending_dirty, &weak, cx) {
                     break;
                 }
             }
@@ -429,9 +421,7 @@ impl MuxPaneView {
         match event {
             // PaneOutput is only a supplemental dirty signal. The byte payload
             // must never be parsed by the client.
-            NotifEvent::PaneOutput(chunk)
-                if chunk.pane_id == pane_id && !chunk.data.is_empty() =>
-            {
+            NotifEvent::PaneOutput(chunk) if chunk.pane_id == pane_id && !chunk.data.is_empty() => {
                 *pending_dirty = true;
                 true
             }
@@ -467,11 +457,7 @@ impl MuxPaneView {
         }
     }
 
-    async fn flush_pending(
-        weak: &WeakEntity<Self>,
-        pending_dirty: &mut bool,
-        cx: &mut AsyncApp,
-    ) {
+    async fn flush_pending(weak: &WeakEntity<Self>, pending_dirty: &mut bool, cx: &mut AsyncApp) {
         let dirty = std::mem::take(pending_dirty);
         if dirty {
             if let Err(error) = weak.update(cx, |view, cx| view.schedule_fetch(cx)) {
@@ -752,10 +738,7 @@ impl MuxPaneView {
 
     /// §16.7 Inject the extension global-shortcut lookup. Without it the
     /// extension step of the priority chain can never match.
-    pub fn set_extension_shortcut_resolver(
-        &mut self,
-        resolver: Option<ExtensionShortcutResolver>,
-    ) {
+    pub fn set_extension_shortcut_resolver(&mut self, resolver: Option<ExtensionShortcutResolver>) {
         self.extension_shortcuts = resolver;
     }
 
@@ -940,7 +923,6 @@ fn prefix_binding_for(
         .first()
         .map(|binding| binding.action().boxed_clone())
 }
-
 
 /// §3.1 keystroke → terminal byte sequence (xterm standard).
 /// Handles Ctrl-letter, Alt (ESC prefix), arrow keys, function keys.
@@ -1352,9 +1334,7 @@ fn structured_terminal_snapshot(
         );
     }
     if display_offset > history_size {
-        anyhow::bail!(
-            "mux display offset {display_offset} exceeds {history_size} history rows"
-        );
+        anyhow::bail!("mux display offset {display_offset} exceeds {history_size} history rows");
     }
     let expected_cells = mux_protocol::checked_grid_cell_count(cols, rows)
         .map_err(|message| anyhow::anyhow!("invalid mux grid dimensions: {message}"))?;
@@ -2606,16 +2586,18 @@ mod tests {
         let snapshot = history_snapshot(1, 2, 7);
         let mut accumulator = HistoryPageAccumulator::new(&snapshot)
             .unwrap_or_else(|error| panic!("create history accumulator: {error}"));
-        assert!(accumulator
-            .push(
-                FetchScrollbackResponse {
-                    lines: vec![history_row(0, &["A"]), history_row(1, &["B"])],
-                    total_lines: 2,
-                    scrollback_version: 7,
-                },
-                1,
-            )
-            .is_err());
+        assert!(
+            accumulator
+                .push(
+                    FetchScrollbackResponse {
+                        lines: vec![history_row(0, &["A"]), history_row(1, &["B"])],
+                        total_lines: 2,
+                        scrollback_version: 7,
+                    },
+                    1,
+                )
+                .is_err()
+        );
         assert_eq!(accumulator.next_row, 0);
         assert!(accumulator.cells.is_empty());
     }
@@ -2642,7 +2624,6 @@ mod tests {
 
         assert!(matching_history_cache(&changed, Some(&cache)).is_none());
     }
-
 
     #[test]
     fn prepared_update_generation_gate_rejects_before_commit() {

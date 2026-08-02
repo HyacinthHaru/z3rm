@@ -944,8 +944,14 @@ mod tests {
         let (unlimited_engine, unlimited_path) =
             engine_with_history(&directory, "unlimited", &unlimited, 128);
         assert!(unlimited_engine.quota().is_none(), "0 MB means no GC");
-        let unlimited_versions = unlimited_engine.list_versions(&unlimited_path).unwrap().len();
-        assert_eq!(unlimited_versions, 128, "unlimited quota retains everything");
+        let unlimited_versions = unlimited_engine
+            .list_versions(&unlimited_path)
+            .unwrap()
+            .len();
+        assert_eq!(
+            unlimited_versions, 128,
+            "unlimited quota retains everything"
+        );
 
         // Blobs are zstd-compressed, so a byte-exact threshold is not
         // predictable from the payload size; the smallest possible quota makes
@@ -956,7 +962,10 @@ mod tests {
             ..crate::config::SnapshotConfig::default()
         };
         let (tiny_engine, tiny_path) = engine_with_history(&directory, "tiny", &tiny, 128);
-        assert!(tiny_engine.quota().is_some(), "a non-zero quota installs GC");
+        assert!(
+            tiny_engine.quota().is_some(),
+            "a non-zero quota installs GC"
+        );
         let tiny_versions = tiny_engine.list_versions(&tiny_path).unwrap().len();
         assert!(
             tiny_versions < unlimited_versions,
@@ -1086,11 +1095,16 @@ mod tests {
             .unwrap();
 
         let versions = engine.list_versions(&path).unwrap();
-        assert_eq!(versions.last().expect("a version").2, SnapshotTrigger::Close);
+        assert_eq!(
+            versions.last().expect("a version").2,
+            SnapshotTrigger::Close
+        );
 
-        let rejected =
-            engine.record_change_with_trigger(&path, b"nope", SnapshotTrigger::Delete);
-        assert!(rejected.is_err(), "tombstones must go through record_delete");
+        let rejected = engine.record_change_with_trigger(&path, b"nope", SnapshotTrigger::Delete);
+        assert!(
+            rejected.is_err(),
+            "tombstones must go through record_delete"
+        );
     }
 
     /// §4.4 a file deletion must be versioned as a node with

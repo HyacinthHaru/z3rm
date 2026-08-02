@@ -1,5 +1,5 @@
 use super::*;
-use crate::stubs::{find_url_at, find_url_from_range, parse_zed_link};
+use crate::stubs::{find_url_at, find_url_from_range, is_zed_link};
 
 impl Editor {
     pub fn text_layout_details(
@@ -1155,7 +1155,8 @@ impl Editor {
                         Point::new(point.row, 0)
                             ..Point::new(
                                 point.row,
-                                multi_buffer_snapshot.line_len(multi_buffer::MultiBufferRow(point.row)),
+                                multi_buffer_snapshot
+                                    .line_len(multi_buffer::MultiBufferRow(point.row)),
                             ),
                     )
                     .collect::<String>(),
@@ -1174,11 +1175,8 @@ impl Editor {
             return;
         };
 
-        if parse_zed_link(&url, cx).is_some() {
-            window.dispatch_action(
-                Box::new(zed_actions::OpenZedUrl { url: url.into() }),
-                cx,
-            );
+        if is_zed_link(&url) {
+            window.dispatch_action(Box::new(zed_actions::OpenZedUrl { url: url.into() }), cx);
         } else {
             cx.open_url(&url);
         }
@@ -1810,7 +1808,7 @@ impl Editor {
                 match first_url_or_file {
                     Some(Either::Left(url)) => {
                         cx.update(|window, cx| {
-                            if parse_zed_link(&url, cx).is_some() {
+                            if is_zed_link(&url) {
                                 window.dispatch_action(
                                     Box::new(zed_actions::OpenZedUrl { url: url.into() }),
                                     cx,

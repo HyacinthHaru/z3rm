@@ -73,7 +73,8 @@ pub fn load_client_extensions(extensions_dir: &Path) -> Vec<LoadedExtension> {
         .into_iter()
         .map(|extension| {
             let runner = ExtensionRunner::for_manifest(&extension.manifest);
-            let result = runner.load_extension(&extension.manifest.id, &extension.source, "activate");
+            let result =
+                runner.load_extension(&extension.manifest.id, &extension.source, "activate");
             if result.result.is_ok() {
                 tracing::info!(id = %extension.manifest.id, "extension loaded successfully");
             } else {
@@ -408,7 +409,9 @@ impl HostBridge for MuxHostBridge {
                 // The mux protocol has no layout-apply request (§9 only exposes
                 // ResizeLayout), so this fails loudly instead of silently
                 // pretending the preset was restored.
-                bail!("mux.applyLayout is not supported: the mux protocol has no apply-layout request")
+                bail!(
+                    "mux.applyLayout is not supported: the mux protocol has no apply-layout request"
+                )
             }
             "settings.get" => {
                 let key = required_string(args, 0, method)?;
@@ -723,11 +726,10 @@ fn push_chrome_if_dirty(
 ) -> bool {
     let dirty = force
         || live_extensions.iter().any(|hosted| {
-            !hosted.suspended
-                && hosted.live.needs_render().unwrap_or_else(|error| {
-                    tracing::warn!(id = %hosted.live.id(), %error, "extension invalidation check failed");
-                    false
-                })
+            !hosted.suspended && hosted.live.needs_render().unwrap_or_else(|error| {
+            tracing::warn!(id = %hosted.live.id(), %error, "extension invalidation check failed");
+            false
+        })
         });
     if !dirty {
         return true;
@@ -762,8 +764,7 @@ impl ExtensionHostController {
 
     fn start_with_roots(&mut self, roots: Vec<std::path::PathBuf>, cx: &mut gpui::Context<Self>) {
         let (command_sender, command_receiver) = std::sync::mpsc::channel::<HostCommand>();
-        let (chrome_sender, chrome_receiver) =
-            futures::channel::mpsc::unbounded::<Vec<VDomNode>>();
+        let (chrome_sender, chrome_receiver) = futures::channel::mpsc::unbounded::<Vec<VDomNode>>();
 
         let host_thread = std::thread::Builder::new()
             .name("quickjs-ext-host".into())
@@ -894,9 +895,7 @@ impl ExtensionHostController {
     fn start_clock_task(&mut self, cx: &mut gpui::Context<Self>) {
         self.clock_task = Some(cx.spawn(async move |this, cx| {
             loop {
-                cx.background_executor()
-                    .timer(Duration::from_secs(1))
-                    .await;
+                cx.background_executor().timer(Duration::from_secs(1)).await;
                 if this
                     .update(cx, |this, _| this.send(HostCommand::Render))
                     .is_err()
@@ -1091,9 +1090,7 @@ impl ExtensionHostController {
 
     fn command_dispatch(this: gpui::WeakEntity<Self>) -> vdom_bridge::CommandDispatch {
         std::rc::Rc::new(
-            move |invocation: CommandInvocation,
-                  _window: &mut gpui::Window,
-                  cx: &mut gpui::App| {
+            move |invocation: CommandInvocation, _window: &mut gpui::Window, cx: &mut gpui::App| {
                 let arguments = match serde_json::to_string(&invocation.args) {
                     Ok(arguments) => arguments,
                     Err(error) => {
@@ -1206,7 +1203,10 @@ mod tests {
         let discovered =
             quickjs_runtime::discover_client_extensions(std::slice::from_ref(&directory));
 
-        assert!(discovered.is_empty(), "server-side extensions must be skipped");
+        assert!(
+            discovered.is_empty(),
+            "server-side extensions must be skipped"
+        );
         std::fs::remove_dir_all(directory)?;
         Ok(())
     }
@@ -1281,7 +1281,10 @@ mod tests {
             "z3rm-tab-bar",
             "z3rm-which-key",
         ] {
-            assert!(ids.contains(&expected), "{expected} did not activate: {ids:?}");
+            assert!(
+                ids.contains(&expected),
+                "{expected} did not activate: {ids:?}"
+            );
         }
 
         // Chrome must be non-empty on first paint: status-bar and tab-bar
@@ -1316,9 +1319,9 @@ mod tests {
             "#,
         )?;
 
-        let mut live_extensions = activate_extensions(
-            quickjs_runtime::discover_client_extensions(std::slice::from_ref(&root)),
-        );
+        let mut live_extensions = activate_extensions(quickjs_runtime::discover_client_extensions(
+            std::slice::from_ref(&root),
+        ));
         assert_eq!(live_extensions.len(), 1);
         assert!(
             !render_live_extensions(&mut live_extensions).is_empty(),
@@ -1370,9 +1373,9 @@ mod tests {
             "#,
         )?;
 
-        let mut live_extensions = activate_extensions(
-            quickjs_runtime::discover_client_extensions(std::slice::from_ref(&root)),
-        );
+        let mut live_extensions = activate_extensions(quickjs_runtime::discover_client_extensions(
+            std::slice::from_ref(&root),
+        ));
         assert_eq!(live_extensions.len(), 1);
         assert!(
             !live_extensions[0].suspended,
@@ -1748,19 +1751,29 @@ mod tests {
     /// Pump the foreground executor until `condition` holds. The extension host
     /// runs on a real OS thread, so simulated time cannot advance it; the loop
     /// yields wall clock between drains.
-    fn wait_for(cx: &mut gpui::TestAppContext, what: &str, mut condition: impl FnMut(&mut gpui::TestAppContext) -> bool) {
+    fn wait_for(
+        cx: &mut gpui::TestAppContext,
+        what: &str,
+        mut condition: impl FnMut(&mut gpui::TestAppContext) -> bool,
+    ) {
         let deadline = std::time::Instant::now() + Duration::from_secs(20);
         loop {
             cx.run_until_parked();
             if condition(cx) {
                 return;
             }
-            assert!(std::time::Instant::now() < deadline, "timed out waiting for {what}");
+            assert!(
+                std::time::Instant::now() < deadline,
+                "timed out waiting for {what}"
+            );
             std::thread::sleep(Duration::from_millis(10));
         }
     }
 
-    fn status_bar_text(cx: &mut gpui::TestAppContext, bar: &gpui::Entity<ExtensionStatusBar>) -> String {
+    fn status_bar_text(
+        cx: &mut gpui::TestAppContext,
+        bar: &gpui::Entity<ExtensionStatusBar>,
+    ) -> String {
         cx.read(|cx| {
             bar.read(cx)
                 .vdom_nodes()
@@ -1844,9 +1857,11 @@ mod tests {
         // The semantic button retains focus after the click, so Enter must
         // activate the same command through the keyboard path.
         window_cx.simulate_keystrokes("enter");
-        wait_for(cx, "the keyboard-activated command to re-render the chrome", |cx| {
-            status_bar_text(cx, &bar).contains("total=14")
-        });
+        wait_for(
+            cx,
+            "the keyboard-activated command to re-render the chrome",
+            |cx| status_bar_text(cx, &bar).contains("total=14"),
+        );
 
         std::fs::remove_dir_all(&root).expect("remove extension root");
     }
@@ -1872,9 +1887,7 @@ mod tests {
         )
         .expect("replacement server chrome must parse");
         assert_eq!(
-            server
-                .get(&key)
-                .and_then(|node| node.props.get("id")),
+            server.get(&key).and_then(|node| node.props.get("id")),
             Some(&serde_json::json!("new"))
         );
 
@@ -1906,10 +1919,7 @@ mod tests {
         let merged = merge_chrome_nodes(&[local], &server);
 
         assert_eq!(merged.len(), 2);
-        assert_eq!(
-            merged[0].props.get("id"),
-            Some(&serde_json::json!("local"))
-        );
+        assert_eq!(merged[0].props.get("id"), Some(&serde_json::json!("local")));
         assert_eq!(
             merged[1].props.get("id"),
             Some(&serde_json::json!("remote"))

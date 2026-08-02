@@ -27,7 +27,8 @@ use language::{Language, LanguageConfig, ToOffset as _};
 use notifications::status_toast::StatusToast;
 use project::Project;
 use settings::{
-    BaseKeymap, KeybindSource, KeymapFile, Settings as _, SettingsAssets, infer_json_indent_size,
+    BaseKeymap, KeybindSource, KeymapFile, Settings as _, SettingsAssets, SettingsStore,
+    infer_json_indent_size,
 };
 use ui::{
     ActiveTheme as _, App, Banner, BorrowAppContext, ColumnWidthConfig, ContextMenu,
@@ -3944,6 +3945,9 @@ mod tests {
         keymap_content: &str,
     ) -> (Arc<FakeFs>, Entity<KeymapEditor>, VisualTestContext) {
         cx.update(|cx| {
+            let settings_store = SettingsStore::test(cx);
+            cx.set_global(settings_store);
+            theme_settings::init(theme::LoadThemes::JustBase, cx);
             let _state = AppState::test(cx);
             editor::init(cx);
             cx.set_global(KeymapEventChannel::new());

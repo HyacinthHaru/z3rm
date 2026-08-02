@@ -362,11 +362,8 @@ fn parse_cli_args_lossy(args: &[String]) -> Result<Option<CliCommand>, String> {
         }
 
         "kill" => {
-            let values = parse_strict_options(
-                "kill",
-                &args[2..],
-                &[OptionSpec::value("-t", "--target")],
-            )?;
+            let values =
+                parse_strict_options("kill", &args[2..], &[OptionSpec::value("-t", "--target")])?;
             match option_value(&values, "-t") {
                 Some(target) => Ok(Some(CliCommand::KillSession {
                     target: target.to_string(),
@@ -411,9 +408,9 @@ fn parse_cli_args_lossy(args: &[String]) -> Result<Option<CliCommand>, String> {
                 ],
             )?;
             match (option_value(&values, "-t"), option_value(&values, "--ssh")) {
-                (Some(_), Some(_)) => Err(
-                    "attach accepts either -t <target> or --ssh <uri>, not both".to_string(),
-                ),
+                (Some(_), Some(_)) => {
+                    Err("attach accepts either -t <target> or --ssh <uri>, not both".to_string())
+                }
                 (_, Some(uri)) => Ok(Some(CliCommand::Ssh {
                     target: uri.to_string(),
                 })),
@@ -648,9 +645,10 @@ fn parse_cli_args_lossy(args: &[String]) -> Result<Option<CliCommand>, String> {
             )?;
             let parse_dimension = |flag: &str| -> Result<Option<u16>, String> {
                 match option_value(&values, flag) {
-                    Some(value) => value.parse::<u16>().map(Some).map_err(|_| {
-                        format!("invalid integer for {flag}: '{value}'")
-                    }),
+                    Some(value) => value
+                        .parse::<u16>()
+                        .map(Some)
+                        .map_err(|_| format!("invalid integer for {flag}: '{value}'")),
                     None => Ok(None),
                 }
             };
@@ -663,9 +661,7 @@ fn parse_cli_args_lossy(args: &[String]) -> Result<Option<CliCommand>, String> {
                 );
             }
             if !zoom && width.is_none() && height.is_none() {
-                return Err(
-                    "resize-pane requires -x <width>, -y <height>, or -Z".to_string(),
-                );
+                return Err("resize-pane requires -x <width>, -y <height>, or -Z".to_string());
             }
             Ok(Some(CliCommand::ResizePane {
                 target: option_value(&values, "-t").map(str::to_string),
@@ -687,8 +683,7 @@ fn parse_cli_args_lossy(args: &[String]) -> Result<Option<CliCommand>, String> {
         }
 
         "rename-window" => {
-            let (target, title) =
-                parse_target_and_positional("rename-window", &args[2..])?;
+            let (target, title) = parse_target_and_positional("rename-window", &args[2..])?;
             let title = match title {
                 Some(title) => title,
                 None => return Err("rename-window requires a title".to_string()),
@@ -1193,7 +1188,9 @@ mod tests {
             Some(CliCommand::NewSession { name, cwd }) => {
                 assert_eq!(name.as_deref(), Some("dev"));
                 assert_eq!(
-                    cwd.as_ref().map(|cwd| cwd.to_string_lossy().to_string()).as_deref(),
+                    cwd.as_ref()
+                        .map(|cwd| cwd.to_string_lossy().to_string())
+                        .as_deref(),
                     Some("/tmp/work")
                 );
             }
@@ -1209,7 +1206,10 @@ mod tests {
         ] {
             let error = parse_cli_args_from(&args(&arguments))
                 .expect_err("invalid new arguments must be rejected");
-            assert!(error.contains("new "), "error should name the command: {error}");
+            assert!(
+                error.contains("new "),
+                "error should name the command: {error}"
+            );
         }
     }
 
@@ -1311,8 +1311,8 @@ mod tests {
 
     #[test]
     fn resize_pane_requires_a_dimension_or_zoom() {
-        let parsed = parse_cli_args_from(&args(&["resize-pane", "-t", "dev", "-x", "100"]))
-            .expect("parse");
+        let parsed =
+            parse_cli_args_from(&args(&["resize-pane", "-t", "dev", "-x", "100"])).expect("parse");
         match parsed {
             Some(CliCommand::ResizePane {
                 target,
@@ -1339,7 +1339,10 @@ mod tests {
         ] {
             let error = parse_cli_args_from(&args(&arguments))
                 .expect_err("invalid resize-pane arguments must be rejected");
-            assert!(error.contains("resize-pane"), "error should name the command: {error}");
+            assert!(
+                error.contains("resize-pane"),
+                "error should name the command: {error}"
+            );
         }
     }
 
@@ -1365,9 +1368,8 @@ mod tests {
 
     #[test]
     fn rename_window_rejects_invalid_arguments() {
-        let parsed =
-            parse_cli_args_from(&args(&["rename-window", "-t", "dev:0.0", "build"]))
-                .expect("parse");
+        let parsed = parse_cli_args_from(&args(&["rename-window", "-t", "dev:0.0", "build"]))
+            .expect("parse");
         match parsed {
             Some(CliCommand::RenameWindow { target, title }) => {
                 assert_eq!(target.as_deref(), Some("dev:0.0"));
@@ -1385,7 +1387,10 @@ mod tests {
         ] {
             let error = parse_cli_args_from(&args(&arguments))
                 .expect_err("invalid rename-window arguments must be rejected");
-            assert!(error.contains("rename-window"), "error should name the command: {error}");
+            assert!(
+                error.contains("rename-window"),
+                "error should name the command: {error}"
+            );
         }
     }
 
@@ -1413,9 +1418,15 @@ mod tests {
     #[test]
     fn launch_intent_defers_unknown_arguments_to_cli_parser() {
         // 未知 flag / 多余位置参数不再是"静默 GUI 默认", 交给 CLI 解析层报错。
-        assert_eq!(parse_launch_intent_from(&args(&["attach", "--bogus"])), None);
+        assert_eq!(
+            parse_launch_intent_from(&args(&["attach", "--bogus"])),
+            None
+        );
         assert_eq!(parse_launch_intent_from(&args(&["attach", "dev"])), None);
-        assert_eq!(parse_launch_intent_from(&args(&["attach", "-t", "dev", "extra"])), None);
+        assert_eq!(
+            parse_launch_intent_from(&args(&["attach", "-t", "dev", "extra"])),
+            None
+        );
         assert_eq!(parse_launch_intent_from(&args(&["attach", "--ssh"])), None);
     }
 }

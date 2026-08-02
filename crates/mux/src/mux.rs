@@ -485,9 +485,7 @@ impl MuxDomain {
                             *offset += written;
                             *offset == frame.len()
                         }
-                        Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
-                            break
-                        }
+                        Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => break,
                         Err(error) => {
                             tracing::error!(error = %error, "socket write error");
                             break 'outer;
@@ -1263,8 +1261,7 @@ impl MuxDomain {
     ) -> Result<()> {
         let local_socket_path = self.local_socket_path.clone();
         let stream = connect_local_stream(local_socket_path.as_deref())?;
-        let (new_write_tx, new_write_rx) =
-            std::sync::mpsc::sync_channel(WRITE_QUEUE_CAPACITY);
+        let (new_write_tx, new_write_rx) = std::sync::mpsc::sync_channel(WRITE_QUEUE_CAPACITY);
         let io_inner = self.inner.clone();
 
         let old_pending = {
@@ -1291,10 +1288,7 @@ impl MuxDomain {
                     );
                 })
             {
-                return Err(anyhow::anyhow!(
-                    "failed to spawn mux I/O thread: {}",
-                    error
-                ));
+                return Err(anyhow::anyhow!("failed to spawn mux I/O thread: {}", error));
             }
 
             old_pending

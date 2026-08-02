@@ -4131,16 +4131,31 @@ pub(crate) fn all_projects(
     window: Option<&WindowHandle<MultiWorkspace>>,
     cx: &App,
 ) -> impl Iterator<Item = Entity<Project>> {
-    let mut seen_project_ids = std::collections::HashSet::new();
-    window
-        .and_then(|handle| handle.read(cx).ok())
+    let mut workspace_windows = cx
+        .windows()
         .into_iter()
-        .flat_map(|multi_workspace| {
-            multi_workspace
-                .workspaces()
-                .map(|workspace| workspace.read(cx).project().clone())
-                .collect::<Vec<_>>()
-        })
+        .filter_map(|window| window.downcast::<MultiWorkspace>())
+        .collect::<Vec<_>>();
+    if let Some(window) = window.copied()
+        && !workspace_windows.contains(&window)
+    {
+        workspace_windows.push(window);
+    }
+
+    let mut projects = Vec::new();
+    for window in workspace_windows {
+        if let Ok(multi_workspace) = window.read(cx) {
+            projects.extend(
+                multi_workspace
+                    .workspaces()
+                    .map(|workspace| workspace.read(cx).project().clone()),
+            );
+        }
+    }
+
+    let mut seen_project_ids = std::collections::HashSet::new();
+    projects
+        .into_iter()
         .filter(move |project| seen_project_ids.insert(project.entity_id()))
 }
 
@@ -5321,13 +5336,21 @@ pub mod test {
 
         project1
             .update(cx, |project, cx| {
-                project.find_or_create_worktree(std::path::Path::new("/workspace1/worktree_a"), true, cx)
+                project.find_or_create_worktree(
+                    std::path::Path::new("/workspace1/worktree_a"),
+                    true,
+                    cx,
+                )
             })
             .await
             .expect("Failed to create worktree_a");
         project1
             .update(cx, |project, cx| {
-                project.find_or_create_worktree(std::path::Path::new("/workspace1/worktree_b"), true, cx)
+                project.find_or_create_worktree(
+                    std::path::Path::new("/workspace1/worktree_b"),
+                    true,
+                    cx,
+                )
             })
             .await
             .expect("Failed to create worktree_b");
@@ -5344,7 +5367,11 @@ pub mod test {
 
         project2
             .update(cx, |project, cx| {
-                project.find_or_create_worktree(std::path::Path::new("/workspace2/worktree_c"), true, cx)
+                project.find_or_create_worktree(
+                    std::path::Path::new("/workspace2/worktree_c"),
+                    true,
+                    cx,
+                )
             })
             .await
             .expect("Failed to create worktree_c");
@@ -5486,7 +5513,11 @@ pub mod test {
 
         project1
             .update(cx, |project, cx| {
-                project.find_or_create_worktree(std::path::Path::new("/workspace1/worktree_a"), true, cx)
+                project.find_or_create_worktree(
+                    std::path::Path::new("/workspace1/worktree_a"),
+                    true,
+                    cx,
+                )
             })
             .await
             .expect("Failed to create worktree_a");
@@ -5533,7 +5564,11 @@ pub mod test {
 
         project2
             .update(&mut cx.cx, |project, cx| {
-                project.find_or_create_worktree(std::path::Path::new("/workspace2/worktree_b"), true, cx)
+                project.find_or_create_worktree(
+                    std::path::Path::new("/workspace2/worktree_b"),
+                    true,
+                    cx,
+                )
             })
             .await
             .expect("Failed to create worktree_b");
@@ -5701,7 +5736,11 @@ mod project_settings_update_tests {
 
     #[gpui::test]
     async fn test_updates_existing_settings_file(cx: &mut TestAppContext) {
-        let setup = init_test(cx, Some(r#"{ "tab_size": 2 }"#)).await;
+        let setup = init_test(
+            cx,
+            Some(r#"{ "all_languages": { "defaults": { "tab_size": 2 } } }"#),
+        )
+        .await;
 
         let entry = ProjectSettingsUpdateEntry {
             worktree_id: setup.worktree_id,
@@ -5888,7 +5927,11 @@ mod project_settings_update_tests {
 
     #[gpui::test]
     async fn test_reloads_conflicted_buffer(cx: &mut TestAppContext) {
-        let setup = init_test(cx, Some(r#"{ "tab_size": 2 }"#)).await;
+        let setup = init_test(
+            cx,
+            Some(r#"{ "all_languages": { "defaults": { "tab_size": 2 } } }"#),
+        )
+        .await;
 
         let buffer_store = setup
             .project
@@ -5911,7 +5954,7 @@ mod project_settings_update_tests {
             .fs
             .save(
                 "/project/.zed/settings.json".as_ref(),
-                &r#"{ "tab_size": 99 }"#.into(),
+                &r#"{ "all_languages": { "defaults": { "tab_size": 99 } } }"#.into(),
                 Default::default(),
             )
             .await

@@ -3,10 +3,10 @@
 
 use crate::layout::LayoutTree;
 use crate::pane::Pane;
-use std::collections::HashMap;
-use std::sync::Arc;
 use mux_protocol::proto::envelope::Payload as EnvelopePayload;
 use mux_protocol::{Envelope, Notification};
+use std::collections::HashMap;
+use std::sync::Arc;
 
 /// Optional daemon-side observer for lifecycle notifications.
 ///
@@ -248,7 +248,9 @@ impl Session {
         client_id: String,
         outbound_tx: tokio::sync::mpsc::UnboundedSender<Envelope>,
     ) {
-        self.lifecycle_subscribers.write().insert(client_id, outbound_tx);
+        self.lifecycle_subscribers
+            .write()
+            .insert(client_id, outbound_tx);
     }
 
     /// §3.4 退订 lifecycle 通知: detach / 断连 / steal 清场时调用。
@@ -378,7 +380,9 @@ impl Session {
 
     /// §3.3 检查窗口是否在会话中
     pub fn has_window(&self, window_id: &str) -> bool {
-        self.connected_windows.read().contains(&window_id.to_string())
+        self.connected_windows
+            .read()
+            .contains(&window_id.to_string())
     }
 
     /// §3.3 / §3.4 广播布局变更到所有连接的窗口 (Plan 32)。

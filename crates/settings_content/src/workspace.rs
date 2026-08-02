@@ -147,7 +147,9 @@ pub struct ItemSettingsContent {
 }
 
 /// Position of the close button within a tab.
-#[derive(Copy, Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema, MergeFrom)]
+#[derive(
+    Copy, Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema, MergeFrom,
+)]
 #[serde(rename_all = "lowercase")]
 pub enum ClosePosition {
     Left,
@@ -156,7 +158,9 @@ pub enum ClosePosition {
 }
 
 /// Which tab to activate after the current one is closed.
-#[derive(Copy, Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema, MergeFrom)]
+#[derive(
+    Copy, Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema, MergeFrom,
+)]
 #[serde(rename_all = "snake_case")]
 pub enum ActivateOnClose {
     #[default]
@@ -168,7 +172,9 @@ pub enum ActivateOnClose {
 }
 
 /// Which diagnostic severities to mark on a tab.
-#[derive(Copy, Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema, MergeFrom)]
+#[derive(
+    Copy, Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema, MergeFrom,
+)]
 #[serde(rename_all = "snake_case")]
 pub enum ShowDiagnostics {
     #[default]

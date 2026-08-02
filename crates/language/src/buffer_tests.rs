@@ -11,9 +11,7 @@ use pretty_assertions::assert_eq;
 use proto::deserialize_operation;
 use rand::prelude::*;
 use regex::RegexBuilder;
-use settings::SettingsStore;
-use settings::{AllLanguageSettingsContent, LanguageSettingsContent};
-use settings_content::LanguageFileTypeContent;
+use settings::{AllLanguageSettingsContent, LanguageSettingsContent, SettingsStore};
 use std::collections::BTreeSet;
 use std::{
     env,
@@ -278,19 +276,17 @@ async fn test_first_line_pattern(cx: &mut TestAppContext) {
 async fn test_language_for_file_with_custom_file_types(cx: &mut TestAppContext) {
     cx.update(|cx| {
         init_settings(cx, |settings| {
-            settings.file_types.extend([
-                LanguageFileTypeContent {
-                    extensions: vec!["js".into()],
-                },
-                LanguageFileTypeContent {
-                    extensions: vec!["*longer.ts".into(), "ecmascript".into()],
-                },
-                LanguageFileTypeContent {
-                    extensions: vec!["c".into(), "*.dev".into()],
-                },
-                LanguageFileTypeContent {
-                    extensions: vec!["Dockerfile".into(), "Dockerfile.*".into()],
-                },
+            settings.file_types.get_or_insert_default().0.extend([
+                ("TypeScript".into(), vec!["js".into()]),
+                (
+                    "JavaScript".into(),
+                    vec!["*longer.ts".into(), "ecmascript".into()],
+                ),
+                ("C++".into(), vec!["c".into(), "*.dev".into()]),
+                (
+                    "Dockerfile".into(),
+                    vec!["Dockerfile".into(), "Dockerfile.*".into()],
+                ),
             ]);
         })
     });

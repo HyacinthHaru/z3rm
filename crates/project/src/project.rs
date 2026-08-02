@@ -1,3 +1,4 @@
+pub mod bookmark_store;
 pub mod buffer_store;
 pub mod debounced_delay;
 pub mod environment;
@@ -6,11 +7,10 @@ pub mod manifest_tree;
 pub mod project_settings;
 pub mod search;
 pub mod search_history;
+pub mod stubs;
 pub mod toolchain_store;
 pub mod trusted_worktrees;
 pub mod worktree_store;
-pub mod stubs;
-pub mod bookmark_store;
 
 pub use stubs::*;
 
@@ -87,8 +87,8 @@ use worktree_store::{WorktreeStore, WorktreeStoreEvent};
 pub use buffer_store::ProjectTransaction;
 pub use fs::*;
 pub use language::Location;
-pub use toolchain_store::{ToolchainStore, Toolchains};
 pub use stubs::Shell;
+pub use toolchain_store::{ToolchainStore, Toolchains};
 const MAX_PROJECT_SEARCH_HISTORY_SIZE: usize = 500;
 
 #[derive(Clone, Copy, Debug)]
@@ -127,6 +127,8 @@ pub struct Project {
     git_store: Entity<GitStore>,
     worktree_store: Entity<WorktreeStore>,
     buffer_store: Entity<BufferStore>,
+    remote_client: Option<Entity<remote::RemoteClient>>,
+    remote_connection_options: Option<remote::RemoteConnectionOptions>,
     _subscriptions: Vec<gpui::Subscription>,
     buffers_needing_diff: HashSet<WeakEntity<Buffer>>,
     git_diff_debouncer: DebouncedDelay<Self>,
@@ -153,7 +155,9 @@ pub enum Event {
     WorktreeOrderChanged,
     ActiveEntryChanged(Option<ProjectEntryId>),
     DeletedEntry(WorktreeId, ProjectEntryId),
-    WorktreePathsChanged { old_worktree_paths: WorktreePaths },
+    WorktreePathsChanged {
+        old_worktree_paths: WorktreePaths,
+    },
     WorktreeUpdatedEntries(WorktreeId, UpdatedEntriesSet),
     Toast {
         notification_id: String,
@@ -162,13 +166,17 @@ pub enum Event {
     },
     /// Stub variants for deleted diagnostic/remote features (spec §8.2 M2)
     DiskBasedDiagnosticsStarted,
-    DiskBasedDiagnosticsFinished { language_server_id: lsp::LanguageServerId },
+    DiskBasedDiagnosticsFinished {
+        language_server_id: lsp::LanguageServerId,
+    },
     DiagnosticsUpdated {
         paths: Vec<Arc<util::rel_path::RelPath>>,
         language_server_id: lsp::LanguageServerId,
     },
     LanguageServerRemoved(lsp::LanguageServerId),
-    DisconnectedFromRemote { server_not_running: bool },
+    DisconnectedFromRemote {
+        server_not_running: bool,
+    },
     DisconnectedFromHost,
     LanguageNotFound(Entity<language::Buffer>),
     /// Stub variants for project_panel (spec §8.2 M3)
@@ -265,6 +273,8 @@ impl Project {
                 git_store,
                 worktree_store,
                 buffer_store,
+                remote_client: None,
+                remote_connection_options: None,
                 _subscriptions: vec![worktree_store_subscription],
                 buffers_needing_diff: HashSet::default(),
                 git_diff_debouncer: DebouncedDelay::new(),
@@ -286,9 +296,8 @@ impl Project {
                 task_store_entity: cx.new(|_| crate::task_store::TaskStore::default()),
                 dap_store_entity: cx.new(|_| stubs::DapStore::default()),
                 bookmark_store_entity,
-                breakpoint_store_entity: cx.new(|_| {
-                    stubs::debugger::breakpoint_store::BreakpointStore::default()
-                }),
+                breakpoint_store_entity: cx
+                    .new(|_| stubs::debugger::breakpoint_store::BreakpointStore::default()),
                 lsp_store_entity: cx.new(|_| stubs::lsp_store::LspStore::default()),
                 last_worktree_paths: WorktreePaths::default(),
             };
@@ -298,6 +307,126 @@ impl Project {
                     .add_local_worktree(worktree_path, true, cx)
                     .detach_and_log_err(cx);
             }
+
+            project
+        })
+    }
+    /// Constructs a project backed by a connected remote server.
+    pub fn remote(
+        remote: Entity<remote::RemoteClient>,
+        languages: Arc<LanguageRegistry>,
+        fs: Arc<dyn Fs>,
+        cx: &mut App,
+    ) -> Entity<Self> {
+        let (proto_client, path_style, connection_options) = remote.read_with(cx, |remote, _| {
+            (
+                remote.proto_client(),
+                remote.path_style(),
+                remote.connection_options(),
+            )
+        });
+
+        WorktreeStore::init(&proto_client);
+        WorktreeStore::init_remote(&proto_client);
+        BufferStore::init(&proto_client);
+        GitStore::init(&proto_client);
+        SettingsObserver::init(&proto_client);
+
+        cx.new(|cx| {
+            let worktree_store = cx.new(|cx| {
+                WorktreeStore::remote(
+                    false,
+                    proto_client.clone(),
+                    REMOTE_SERVER_PROJECT_ID,
+                    path_style,
+                    WorktreeIdCounter::get(cx),
+                )
+            });
+            let buffer_store = cx.new(|cx| {
+                BufferStore::remote(
+                    worktree_store.clone(),
+                    proto_client.clone(),
+                    REMOTE_SERVER_PROJECT_ID,
+                    cx,
+                )
+            });
+            let project_settings = cx.new(|cx| {
+                SettingsObserver::new_remote(
+                    fs.clone(),
+                    worktree_store.clone(),
+                    Some(proto_client.clone()),
+                    proto_client.is_via_collab(),
+                    cx,
+                )
+            });
+            let environment = cx.new(|cx| {
+                ProjectEnvironment::new(
+                    None,
+                    worktree_store.downgrade(),
+                    Some(remote.downgrade()),
+                    true,
+                    cx,
+                )
+            });
+            let git_store = cx.new(|cx| {
+                GitStore::remote(
+                    &worktree_store,
+                    buffer_store.clone(),
+                    proto_client.clone(),
+                    REMOTE_SERVER_PROJECT_ID,
+                    cx,
+                )
+            });
+            let worktree_store_subscription =
+                cx.subscribe(&worktree_store, Self::on_worktree_store_event);
+            let bookmark_store_entity = cx.new(|_| {
+                crate::bookmark_store::BookmarkStore::new(
+                    worktree_store.clone(),
+                    buffer_store.clone(),
+                )
+            });
+
+            let project = Self {
+                active_entry: None,
+                languages,
+                fs,
+                git_store,
+                worktree_store: worktree_store.clone(),
+                buffer_store,
+                remote_client: Some(remote.clone()),
+                remote_connection_options: Some(connection_options),
+                _subscriptions: vec![worktree_store_subscription],
+                buffers_needing_diff: HashSet::default(),
+                git_diff_debouncer: DebouncedDelay::new(),
+                search_history: SearchHistory::new(
+                    Some(MAX_PROJECT_SEARCH_HISTORY_SIZE),
+                    search_history::QueryInsertionBehavior::default(),
+                ),
+                search_included_history: SearchHistory::new(
+                    Some(MAX_PROJECT_SEARCH_HISTORY_SIZE),
+                    search_history::QueryInsertionBehavior::default(),
+                ),
+                search_excluded_history: SearchHistory::new(
+                    Some(MAX_PROJECT_SEARCH_HISTORY_SIZE),
+                    search_history::QueryInsertionBehavior::default(),
+                ),
+                environment,
+                settings_observer: project_settings,
+                toolchain_store: None,
+                task_store_entity: cx.new(|_| crate::task_store::TaskStore::default()),
+                dap_store_entity: cx.new(|_| stubs::DapStore::default()),
+                bookmark_store_entity,
+                breakpoint_store_entity: cx
+                    .new(|_| stubs::debugger::breakpoint_store::BreakpointStore::default()),
+                lsp_store_entity: cx.new(|_| stubs::lsp_store::LspStore::default()),
+                last_worktree_paths: WorktreePaths::default(),
+            };
+
+            proto_client.subscribe_to_entity(REMOTE_SERVER_PROJECT_ID, &cx.entity());
+            proto_client.subscribe_to_entity(REMOTE_SERVER_PROJECT_ID, &worktree_store);
+            proto_client.subscribe_to_entity(REMOTE_SERVER_PROJECT_ID, &project.buffer_store);
+            proto_client.subscribe_to_entity(REMOTE_SERVER_PROJECT_ID, &project.git_store);
+            proto_client.subscribe_to_entity(REMOTE_SERVER_PROJECT_ID, &project.settings_observer);
 
             project
         })
@@ -335,7 +464,6 @@ impl Project {
 
         project
     }
-
 
     pub fn fs(&self) -> &Arc<dyn Fs> {
         &self.fs
@@ -485,7 +613,8 @@ impl Project {
     fn emit_worktree_paths_changed(&mut self, cx: &mut Context<Self>) {
         let worktree_paths = self.worktree_store.read(cx).paths(cx);
         if worktree_paths != self.last_worktree_paths {
-            let old_worktree_paths = std::mem::replace(&mut self.last_worktree_paths, worktree_paths);
+            let old_worktree_paths =
+                std::mem::replace(&mut self.last_worktree_paths, worktree_paths);
             cx.emit(Event::WorktreePathsChanged { old_worktree_paths });
         }
     }
@@ -550,9 +679,9 @@ impl Project {
         false
     }
 
-    /// Stub: is_via_remote_server (remote 模块已删除)
+    /// Returns whether this project is backed by a connected remote server.
     pub fn is_via_remote_server(&self) -> bool {
-        false
+        self.remote_client.is_some()
     }
 
     pub fn project_path_git_status(
@@ -637,33 +766,32 @@ impl Project {
         false
     }
 
-fn shell_for_terminal_task(task: &SpawnInTerminal) -> util::shell::Shell {
-    let program = if !task.command.is_empty() {
-        Some(task.command.clone())
-    } else if !task.program.is_empty() {
-        Some(task.program.clone())
-    } else {
-        None
-    };
-
-    if let Some(program) = program {
-        return util::shell::Shell::WithArguments {
-            program,
-            args: task.args.clone(),
-            title_override: None,
+    fn shell_for_terminal_task(task: &SpawnInTerminal) -> util::shell::Shell {
+        let program = if !task.command.is_empty() {
+            Some(task.command.clone())
+        } else if !task.program.is_empty() {
+            Some(task.program.clone())
+        } else {
+            None
         };
-    }
 
-    match &task.shell {
-        Shell::System => util::shell::Shell::System,
-        Shell::Program(config) => util::shell::Shell::WithArguments {
-            program: config.program.clone(),
-            args: config.args.clone(),
-            title_override: None,
-        },
-    }
-}
+        if let Some(program) = program {
+            return util::shell::Shell::WithArguments {
+                program,
+                args: task.args.clone(),
+                title_override: None,
+            };
+        }
 
+        match &task.shell {
+            Shell::System => util::shell::Shell::System,
+            Shell::Program(config) => util::shell::Shell::WithArguments {
+                program: config.program.clone(),
+                args: config.args.clone(),
+                title_override: None,
+            },
+        }
+    }
 
     /// Create a terminal that runs a task and reports its exit status to the view.
     pub fn create_terminal_task(
@@ -673,14 +801,11 @@ fn shell_for_terminal_task(task: &SpawnInTerminal) -> util::shell::Shell {
     ) -> Task<anyhow::Result<gpui::Entity<terminal::Terminal>>> {
         let settings = terminal::terminal_settings::TerminalSettings::get_global(cx);
         let path_style = self.path_style(cx);
-        let working_directory = task
-            .cwd
-            .clone()
-            .or_else(|| {
-                task.working_directory
-                    .as_ref()
-                    .and_then(|path| self.absolute_path(path, cx))
-            });
+        let working_directory = task.cwd.clone().or_else(|| {
+            task.working_directory
+                .as_ref()
+                .and_then(|path| self.absolute_path(path, cx))
+        });
         let shell = Self::shell_for_terminal_task(&task);
         let command = if task.command.is_empty() {
             (!task.program.is_empty()).then(|| task.program.clone())
@@ -754,9 +879,9 @@ fn shell_for_terminal_task(task: &SpawnInTerminal) -> util::shell::Shell {
         visible: bool,
         cx: &mut Context<Self>,
     ) -> gpui::Task<anyhow::Result<gpui::Entity<Worktree>>> {
-        let task = self
-            .worktree_store
-            .update(cx, |store, cx| store.find_or_create_worktree(abs_path, visible, cx));
+        let task = self.worktree_store.update(cx, |store, cx| {
+            store.find_or_create_worktree(abs_path, visible, cx)
+        });
         cx.spawn(async move |_, _| {
             let (worktree, _rel) = task.await?;
             Ok(worktree)
@@ -801,7 +926,6 @@ fn shell_for_terminal_task(task: &SpawnInTerminal) -> util::shell::Shell {
             None => Task::ready(Err(anyhow::anyhow!("delete_entry unavailable"))),
         }
     }
-
 
     pub fn create_worktree(
         &mut self,
@@ -854,7 +978,9 @@ fn shell_for_terminal_task(task: &SpawnInTerminal) -> util::shell::Shell {
         fallback_branch_name: String,
         cx: &mut gpui::Context<Self>,
     ) -> Task<anyhow::Result<()>> {
-        self.git_store.read(cx).git_init(path, fallback_branch_name, cx)
+        self.git_store
+            .read(cx)
+            .git_init(path, fallback_branch_name, cx)
     }
 
     /// §16.6 Delegate git_config to GitStore. Returns the raw stdout string
@@ -1031,7 +1157,10 @@ mod z3rm_path_tests {
             .into(),
         };
         assert!(child.starts_with(&root), "child should start_with root");
-        assert!(!root.starts_with(&child), "root should not start_with child");
+        assert!(
+            !root.starts_with(&child),
+            "root should not start_with child"
+        );
     }
 
     #[test]

@@ -185,7 +185,10 @@ mod tests {
         write_repository(directory.path(), "1111111111111111111111111111111111111111");
 
         let tracker = GitCommitTracker::new(directory.path()).expect("git repository");
-        assert!(tracker.poll().is_none(), "baseline must not report a commit");
+        assert!(
+            tracker.poll().is_none(),
+            "baseline must not report a commit"
+        );
 
         write_repository(directory.path(), "2222222222222222222222222222222222222222");
 
@@ -193,7 +196,10 @@ mod tests {
             tracker.poll().as_deref(),
             Some("2222222222222222222222222222222222222222")
         );
-        assert!(tracker.poll().is_none(), "same commit must report only once");
+        assert!(
+            tracker.poll().is_none(),
+            "same commit must report only once"
+        );
     }
 
     #[test]

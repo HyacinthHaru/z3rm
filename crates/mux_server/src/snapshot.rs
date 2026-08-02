@@ -94,7 +94,9 @@ fn lock_for_shutdown<T>(mutex: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
     // Shutdown releases handles and joins the recorder on a best-effort
     // basis; a panic that poisoned the lock must not abort teardown, and the
     // guarded value is still valid to take.
-    mutex.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
+    mutex
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
 }
 
 fn stop_inner(inner: &WatchInner) {
@@ -707,7 +709,10 @@ fn start_git_commit_watch(
     let git_dir = tracker.git_dir().to_path_buf();
     let watch_session_id = session_id.to_string();
     match shadow_snapshot::watch_git_commits(tracker, move |commit| {
-        if command_tx.send(ShadowCommand::GitCommit { commit }).is_err() {
+        if command_tx
+            .send(ShadowCommand::GitCommit { commit })
+            .is_err()
+        {
             zlog::warn!(
                 "shadow git commit hook: recorder gone, session={}",
                 watch_session_id,

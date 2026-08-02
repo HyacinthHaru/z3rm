@@ -4,7 +4,7 @@ use std::sync::{Arc, Mutex};
 
 use anyhow::Result;
 use gpui::{
-    AtlasKey, AtlasTile, AtlasTextureId, AtlasTextureKind, Background, BackgroundTag, Bounds,
+    AtlasKey, AtlasTextureId, AtlasTextureKind, AtlasTile, Background, BackgroundTag, Bounds,
     DevicePixels, Hsla, MonochromeSprite, Path, PlatformAtlas, PlatformHeadlessRenderer, Point,
     PolychromeSprite, PrimitiveBatch, Quad, ScaledPixels, Scene, Size, SubpixelSprite, TileId,
     Underline,
@@ -74,11 +74,7 @@ impl SoftwareHeadlessRenderer {
                 }
                 PrimitiveBatch::Surfaces(range) => {
                     for surface in &scene.surfaces[range] {
-                        fill_bounds(
-                            &mut image,
-                            surface.bounds,
-                            Rgba([0, 0, 0, 0]),
-                        );
+                        fill_bounds(&mut image, surface.bounds, Rgba([0, 0, 0, 0]));
                     }
                 }
             }
@@ -267,27 +263,27 @@ fn draw_underline(image: &mut RgbaImage, underline: &Underline) {
     bounds.size.height.0 = underline.thickness.0.max(1.0);
     fill_bounds(image, bounds, hsla_to_rgba(underline.color));
 }
-fn draw_monochrome_sprite(
-    image: &mut RgbaImage,
-    sprite: &MonochromeSprite,
-    atlas: &SoftwareAtlas,
-) {
-    draw_coverage_sprite(image, sprite.bounds, sprite.color, sprite.tile.tile_id, atlas);
+fn draw_monochrome_sprite(image: &mut RgbaImage, sprite: &MonochromeSprite, atlas: &SoftwareAtlas) {
+    draw_coverage_sprite(
+        image,
+        sprite.bounds,
+        sprite.color,
+        sprite.tile.tile_id,
+        atlas,
+    );
 }
 
-fn draw_subpixel_sprite(
-    image: &mut RgbaImage,
-    sprite: &SubpixelSprite,
-    atlas: &SoftwareAtlas,
-) {
-    draw_coverage_sprite(image, sprite.bounds, sprite.color, sprite.tile.tile_id, atlas);
+fn draw_subpixel_sprite(image: &mut RgbaImage, sprite: &SubpixelSprite, atlas: &SoftwareAtlas) {
+    draw_coverage_sprite(
+        image,
+        sprite.bounds,
+        sprite.color,
+        sprite.tile.tile_id,
+        atlas,
+    );
 }
 
-fn draw_polychrome_sprite(
-    image: &mut RgbaImage,
-    sprite: &PolychromeSprite,
-    atlas: &SoftwareAtlas,
-) {
+fn draw_polychrome_sprite(image: &mut RgbaImage, sprite: &PolychromeSprite, atlas: &SoftwareAtlas) {
     let Some(tile) = atlas.tile_pixels(sprite.tile.tile_id) else {
         return;
     };
@@ -322,7 +318,9 @@ fn draw_sprite_pixels(
         AtlasTextureKind::Subpixel => 3,
         AtlasTextureKind::Polychrome => 4,
     };
-    let expected_bytes = source_width.saturating_mul(source_height).saturating_mul(channels);
+    let expected_bytes = source_width
+        .saturating_mul(source_height)
+        .saturating_mul(channels);
     if tile.bytes.len() < expected_bytes {
         if let Some(tint) = tint {
             fill_bounds(image, bounds, tint);
@@ -331,20 +329,21 @@ fn draw_sprite_pixels(
     }
 
     for y in 0..destination_height {
-        let source_y =
-            (y as usize * source_height / destination_height as usize) * source_width;
+        let source_y = (y as usize * source_height / destination_height as usize) * source_width;
         for x in 0..destination_width {
             let source_x = x as usize * source_width / destination_width as usize;
             let offset = (source_y + source_x) * channels;
             let sample = match tile.kind {
                 AtlasTextureKind::Monochrome => {
                     let coverage = tile.bytes[offset] as f32 / 255.0;
-                    tint.map(|color| Rgba([
-                        color[0],
-                        color[1],
-                        color[2],
-                        (color[3] as f32 * coverage).round() as u8,
-                    ]))
+                    tint.map(|color| {
+                        Rgba([
+                            color[0],
+                            color[1],
+                            color[2],
+                            (color[3] as f32 * coverage).round() as u8,
+                        ])
+                    })
                 }
                 AtlasTextureKind::Subpixel => tint.map(|color| {
                     let red = tile.bytes[offset] as f32 / 255.0;
@@ -375,7 +374,6 @@ fn draw_sprite_pixels(
         }
     }
 }
-
 
 #[derive(Clone, Copy)]
 enum Edge {
@@ -414,12 +412,8 @@ fn fill_edge(
 fn fill_bounds(image: &mut RgbaImage, bounds: Bounds<ScaledPixels>, color: Rgba<u8>) {
     let x0 = bounds.origin.x.0.floor().max(0.0) as u32;
     let y0 = bounds.origin.y.0.floor().max(0.0) as u32;
-    let x1 = (bounds.origin.x.0 + bounds.size.width.0)
-        .ceil()
-        .max(0.0) as u32;
-    let y1 = (bounds.origin.y.0 + bounds.size.height.0)
-        .ceil()
-        .max(0.0) as u32;
+    let x1 = (bounds.origin.x.0 + bounds.size.width.0).ceil().max(0.0) as u32;
+    let y1 = (bounds.origin.y.0 + bounds.size.height.0).ceil().max(0.0) as u32;
     let x1 = x1.min(image.width());
     let y1 = y1.min(image.height());
 
@@ -445,14 +439,11 @@ fn blend(base: Rgba<u8>, overlay: Rgba<u8>) -> Rgba<u8> {
         return Rgba([0, 0, 0, 0]);
     }
     Rgba([
-        ((overlay[0] as f32 * alpha + base[0] as f32 * base_alpha * (1.0 - alpha))
-            / output_alpha)
+        ((overlay[0] as f32 * alpha + base[0] as f32 * base_alpha * (1.0 - alpha)) / output_alpha)
             .round() as u8,
-        ((overlay[1] as f32 * alpha + base[1] as f32 * base_alpha * (1.0 - alpha))
-            / output_alpha)
+        ((overlay[1] as f32 * alpha + base[1] as f32 * base_alpha * (1.0 - alpha)) / output_alpha)
             .round() as u8,
-        ((overlay[2] as f32 * alpha + base[2] as f32 * base_alpha * (1.0 - alpha))
-            / output_alpha)
+        ((overlay[2] as f32 * alpha + base[2] as f32 * base_alpha * (1.0 - alpha)) / output_alpha)
             .round() as u8,
         (output_alpha * 255.0).round() as u8,
     ])
@@ -470,7 +461,7 @@ fn background_color(background: Background, bounds: Bounds<ScaledPixels>) -> Rgb
             let center_y = bounds.origin.y.0 + bounds.size.height.0 / 2.0;
             let extent = (bounds.size.width.0.abs() * dx.abs()
                 + bounds.size.height.0.abs() * dy.abs())
-                .max(1.0);
+            .max(1.0);
             let t = ((center_x * dx + center_y * dy) / extent + 0.5).clamp(0.0, 1.0);
             let left = hsla_to_rgba(from.color);
             let right = hsla_to_rgba(to.color);
@@ -566,7 +557,12 @@ mod tests {
         }
     }
 
-    fn render(renderer: &mut SoftwareHeadlessRenderer, scene: &Scene, width: u32, height: u32) -> RgbaImage {
+    fn render(
+        renderer: &mut SoftwareHeadlessRenderer,
+        scene: &Scene,
+        width: u32,
+        height: u32,
+    ) -> RgbaImage {
         renderer
             .render_scene_to_image(
                 scene,

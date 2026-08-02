@@ -96,6 +96,7 @@ pub struct SerializedMultiWorkspace {
 pub(crate) struct SerializedWorkspace {
     pub(crate) id: WorkspaceId,
     pub(crate) location: SerializedWorkspaceLocation,
+    pub(crate) remote_connection_options: Option<RemoteConnectionOptions>,
     pub(crate) paths: PathList,
     /// The workspace's main worktree paths at the time this workspace was saved.
     ///

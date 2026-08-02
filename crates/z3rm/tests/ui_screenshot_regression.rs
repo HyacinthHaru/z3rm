@@ -119,7 +119,9 @@ fn draw_frame(
         )?;
     let tree: serde_json::Value =
         serde_json::from_str(&a11y_json).context("a11y tree must be valid JSON")?;
-    let image = cx.capture_screenshot(window).context("capture screenshot")?;
+    let image = cx
+        .capture_screenshot(window)
+        .context("capture screenshot")?;
     Ok((image, tree))
 }
 
@@ -181,11 +183,7 @@ fn distinct_colors(image: &RgbaImage) -> usize {
 fn count_near_color(image: &RgbaImage, rgb: [u8; 3], tolerance: u8) -> usize {
     image
         .pixels()
-        .filter(|pixel| {
-            (0..3).all(|channel| {
-                pixel.0[channel].abs_diff(rgb[channel]) <= tolerance
-            })
-        })
+        .filter(|pixel| (0..3).all(|channel| pixel.0[channel].abs_diff(rgb[channel]) <= tolerance))
         .count()
 }
 
@@ -210,10 +208,7 @@ fn a11y_nodes(tree: &serde_json::Value) -> Vec<(String, &serde_json::Value)> {
         .unwrap_or_default()
 }
 
-fn a11y_nodes_with_role<'a>(
-    tree: &'a serde_json::Value,
-    role: &str,
-) -> Vec<&'a serde_json::Value> {
+fn a11y_nodes_with_role<'a>(tree: &'a serde_json::Value, role: &str) -> Vec<&'a serde_json::Value> {
     a11y_nodes(tree)
         .into_iter()
         .filter(|(node_role, _)| node_role == role)
@@ -404,11 +399,7 @@ fn serve_mock_mux(
     Ok(())
 }
 
-fn mock_response(
-    request: &Request,
-    snapshot: &FullGridSnapshot,
-    generation: u64,
-) -> Response {
+fn mock_response(request: &Request, snapshot: &FullGridSnapshot, generation: u64) -> Response {
     let body = match &request.body {
         Some(RequestBody::FetchGridUpdate(fetch)) => {
             Some(ResponseBody::GridUpdate(FetchGridUpdateResponse {
@@ -571,7 +562,9 @@ fn mux_pane_renders_terminal_grid_and_exposes_a11y_tree() -> Result<()> {
 
     let text_runs = a11y_text_run_values(&tree);
     assert!(
-        text_runs.iter().any(|value| value.contains(TERMINAL_MARKER)),
+        text_runs
+            .iter()
+            .any(|value| value.contains(TERMINAL_MARKER)),
         "a TextRun must carry the served grid text; got {text_runs:?}"
     );
     assert!(
@@ -602,9 +595,9 @@ fn mux_pane_renders_terminal_grid_and_exposes_a11y_tree() -> Result<()> {
     );
 
     assert!(
-        a11y_nodes(&tree).iter().any(|(_, node)| {
-            a11y_string_field(node, "label").as_deref() == Some("Terminal")
-        }),
+        a11y_nodes(&tree)
+            .iter()
+            .any(|(_, node)| { a11y_string_field(node, "label").as_deref() == Some("Terminal") }),
         "the mux pane root should expose its accessible terminal title"
     );
     assert_eq!(
@@ -796,10 +789,7 @@ fn cpu_meter_ops() -> Vec<DrawOp> {
     ]
 }
 
-fn open_chrome(
-    cx: &mut HeadlessAppContext,
-    node: VDomNode,
-) -> Result<WindowHandle<ChromeHarness>> {
+fn open_chrome(cx: &mut HeadlessAppContext, node: VDomNode) -> Result<WindowHandle<ChromeHarness>> {
     cx.open_window(size(px(560.0), px(80.0)), |_, cx| {
         cx.new(|_| ChromeHarness::new(node, vec![("cpu-meter", cpu_meter_ops())]))
     })
@@ -1016,7 +1006,10 @@ fn main() {
     let mut failed = Vec::new();
     let mut ran = 0;
     for (name, case) in cases {
-        if filter.as_deref().is_some_and(|filter| !name.contains(filter)) {
+        if filter
+            .as_deref()
+            .is_some_and(|filter| !name.contains(filter))
+        {
             continue;
         }
         ran += 1;

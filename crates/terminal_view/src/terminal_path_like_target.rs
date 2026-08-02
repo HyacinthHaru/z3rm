@@ -220,6 +220,7 @@ mod tests {
     use gpui::{AppContext as _, TestAppContext};
     use project::Project;
     use serde_json::json;
+    use settings::SettingsStore;
     use std::path::{Path, PathBuf};
     use terminal::{
         HoveredWord, Point, Range, TerminalBuilder,
@@ -228,7 +229,6 @@ mod tests {
     use util::path;
     use util::paths::PathStyle;
     use workspace::{AppState, MultiWorkspace};
-    use settings::SettingsStore;
 
     async fn init_test(
         app_cx: &mut TestAppContext,

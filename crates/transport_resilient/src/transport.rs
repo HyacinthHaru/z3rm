@@ -19,8 +19,8 @@ use tokio::net::UdpSocket;
 
 use super::crypto::{Direction, KEY_SIZE, PacketCodec};
 use super::packet::{
-    DATAGRAM_HEADER_LEN, DatagramHeader, MAX_FRAGMENT_PAYLOAD, MTU, Reassembler,
-    check_message_len, reassembly_timeout,
+    DATAGRAM_HEADER_LEN, DatagramHeader, MAX_FRAGMENT_PAYLOAD, MTU, Reassembler, check_message_len,
+    reassembly_timeout,
 };
 use super::rtt::{HeartbeatManager, RttEstimator, RttSnapshot, TimestampTracker};
 
@@ -143,7 +143,8 @@ impl UdpSession {
             // 空消息 (心跳) 仍然要占一个分片, 否则没有数据报可发。
             fragments.push(&[]);
         }
-        let fragment_count = u16::try_from(fragments.len()).context("fragment count overflows u16")?;
+        let fragment_count =
+            u16::try_from(fragments.len()).context("fragment count overflows u16")?;
 
         let now = Instant::now();
         let (message_id, timestamp, timestamp_reply) = {
@@ -272,7 +273,10 @@ impl UdpSession {
 
     /// §16.6 是否该补一个心跳包。
     pub fn needs_heartbeat(&self) -> bool {
-        self.state.lock().heartbeat.needs_heartbeat_at(Instant::now())
+        self.state
+            .lock()
+            .heartbeat
+            .needs_heartbeat_at(Instant::now())
     }
 
     /// §16.6 关联是否已超时 (40s 没收到任何认证通过的数据报)。
@@ -285,7 +289,10 @@ impl UdpSession {
 
     /// §16.6 距上次发送经过的时间。
     pub fn since_last_send(&self) -> std::time::Duration {
-        self.state.lock().heartbeat.since_last_send_at(Instant::now())
+        self.state
+            .lock()
+            .heartbeat
+            .since_last_send_at(Instant::now())
     }
 
     /// §16.6 距上次接收经过的时间。

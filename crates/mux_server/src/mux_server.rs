@@ -17,8 +17,8 @@ mod server_settings;
 pub mod clipboard;
 pub mod coalescing;
 pub mod dec2026;
-pub mod grid_sync;
 pub mod extension_host;
+pub mod grid_sync;
 pub mod layout;
 pub mod pane;
 pub mod persistence;
@@ -95,8 +95,7 @@ fn default_socket_name() -> Result<interprocess::local_socket::Name<'static>> {
     }
     #[cfg(unix)]
     {
-        let runtime_dir =
-            std::env::var("XDG_RUNTIME_DIR").unwrap_or_else(|_| "/tmp".to_string());
+        let runtime_dir = std::env::var("XDG_RUNTIME_DIR").unwrap_or_else(|_| "/tmp".to_string());
         let path = std::path::PathBuf::from(runtime_dir)
             .join("z3rm")
             .join("mux.sock");

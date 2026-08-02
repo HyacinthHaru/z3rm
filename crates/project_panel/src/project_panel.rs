@@ -1873,6 +1873,17 @@ impl ProjectPanel {
 
                 // Record the operation if the edit was applied
                 if new_entry.is_ok() {
+                    if let Some(old_entry) = edited_entry.as_ref()
+                        && let Some(workspace) = project_panel.workspace.upgrade()
+                    {
+                        workspace.update(cx, |workspace, cx| {
+                            workspace.rename_navigation_history(
+                                (worktree_id, old_entry.path.clone()).into(),
+                                new_project_path.clone(),
+                                cx,
+                            );
+                        });
+                    }
                     let operation = if let Some(old_entry) = edited_entry {
                         Change::Renamed((worktree_id, old_entry.path).into(), new_project_path)
                     } else {

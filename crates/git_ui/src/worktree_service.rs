@@ -622,7 +622,12 @@ fn maybe_propagate_worktree_trust(
             return;
         }
 
-        let worktree_store = new_workspace.read(cx).project().read(cx).worktree_store().clone();
+        let worktree_store = new_workspace
+            .read(cx)
+            .project()
+            .read(cx)
+            .worktree_store()
+            .clone();
         let paths_to_trust: HashSet<_> = paths
             .iter()
             .filter_map(|path| {
@@ -770,7 +775,6 @@ fn create_worktree_workspace_inner(
         );
         return Task::ready(Err(anyhow!("No git repositories found in the project")));
     }
-
 
     let worktree_name = action.worktree_name.clone();
     let branch_target = action.branch_target.clone();

@@ -1377,8 +1377,7 @@ impl SplittableEditor {
 
                     eprintln!(
                         "sync_lhs path={path:?} rhs={:?} lhs={:?}",
-                        rhs_context,
-                        lhs_context
+                        rhs_context, lhs_context
                     );
                     if let Some((prev_lhs_context, prev_rhs_range)) = paired_ranges.last_mut()
                         && prev_lhs_context.end >= lhs_context.start

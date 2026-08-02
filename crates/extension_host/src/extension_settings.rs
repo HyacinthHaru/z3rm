@@ -80,8 +80,7 @@ mod tests {
         let mut content = SettingsContent::default();
         content.extension.auto_install_extensions =
             HashMap::from_iter([(Arc::from("html"), true), (Arc::from("toml"), false)]);
-        content.extension.auto_update_extensions =
-            HashMap::from_iter([(Arc::from("html"), false)]);
+        content.extension.auto_update_extensions = HashMap::from_iter([(Arc::from("html"), false)]);
         content.extension.granted_capabilities = vec![
             ExtensionCapabilityContent::ProcessExec {
                 command: "ls".to_string(),

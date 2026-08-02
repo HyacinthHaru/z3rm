@@ -16,8 +16,8 @@
 use anyhow::{Context, Result};
 use mux::MuxDomain;
 use mux_protocol::proto::{
-    self, fetch_grid_update_response::Update as FetchUpdate, Cell, GridDiff, RowChange,
-    TerminalSize,
+    self, Cell, GridDiff, RowChange, TerminalSize,
+    fetch_grid_update_response::Update as FetchUpdate,
 };
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -64,9 +64,12 @@ fn snapshot_to_text_multi_row_no_trailing_newline() {
         cols: 2,
         rows: 3,
         cells: vec![
-            cell('a'), cell('b'),
-            cell('c'), cell('d'),
-            cell('e'), cell('f'),
+            cell('a'),
+            cell('b'),
+            cell('c'),
+            cell('d'),
+            cell('e'),
+            cell('f'),
         ],
         cursor: None,
         alternate_screen: false,
@@ -132,12 +135,17 @@ fn apply_diff_rejects_overlong_row() {
             cells: vec![cell('X'), cell('Y'), cell('Z'), cell('W')],
         }],
     };
-    let error = apply_diff_to_snapshot(&mut snap, &diff).expect_err("overlong row must be rejected");
+    let error =
+        apply_diff_to_snapshot(&mut snap, &diff).expect_err("overlong row must be rejected");
     assert!(
         error.to_string().contains("expected 2"),
         "error should name the expected width: {error}"
     );
-    assert_eq!(snapshot_to_text(&snap), "aa", "rejected diff must not mutate");
+    assert_eq!(
+        snapshot_to_text(&snap),
+        "aa",
+        "rejected diff must not mutate"
+    );
 }
 
 #[test]
@@ -164,7 +172,11 @@ fn apply_diff_rejects_out_of_bounds_row() {
         error.to_string().contains("outside 1 rows"),
         "error should name the row bound: {error}"
     );
-    assert_eq!(snapshot_to_text(&snap), "aa", "rejected diff must not mutate");
+    assert_eq!(
+        snapshot_to_text(&snap),
+        "aa",
+        "rejected diff must not mutate"
+    );
 }
 
 fn cell(ch: char) -> Cell {

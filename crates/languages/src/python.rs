@@ -75,7 +75,9 @@ enum ShellKind {
 impl ShellKind {
     /// 尝试对字符串进行 shell 引号转义 (spec §3.1 L1)
     fn try_quote(&self, s: &str) -> Option<String> {
-        // 简单实现：如果包含空格则用引号包裹
+        if s.contains('\0') {
+            return None;
+        }
         if s.contains([' ', '"', '\\', '$', '`', '!', ';', '|', '&', '(', ')']) {
             Some(format!("'{}'", s.replace('\'', "'\\''")))
         } else {

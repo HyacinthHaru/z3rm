@@ -265,40 +265,58 @@ impl<T: Sidebar> SidebarHandle for Entity<T> {
 pub struct ProjectGroupKey {
     host: Option<String>,
     path_list: PathList,
+    connection_options: Option<remote::RemoteConnectionOptions>,
 }
 
 impl ProjectGroupKey {
     pub fn new(host: Option<String>, path_list: PathList) -> Self {
-        Self { host, path_list }
+        Self {
+            host,
+            path_list,
+            connection_options: None,
+        }
+    }
+
+    pub fn with_remote_connection(
+        connection_options: remote::RemoteConnectionOptions,
+        path_list: PathList,
+    ) -> Self {
+        let host = remote::remote_connection_identity(&connection_options).persistence_key();
+        Self {
+            host: Some(host),
+            path_list,
+            connection_options: Some(connection_options),
+        }
     }
 
     pub fn host(&self) -> Option<&str> {
         self.host.as_deref()
     }
 
+    pub fn remote_connection_options(&self) -> Option<&remote::RemoteConnectionOptions> {
+        self.connection_options.as_ref()
+    }
+
     pub fn path_list(&self) -> &PathList {
         &self.path_list
     }
 
-    /// 根据项目当前 worktree 路径构造 key（本地项目 host 为 None）。
+    /// Constructs a key from the project's current worktree roots and remote identity.
     pub fn from_project(project: &Entity<Project>, cx: &App) -> Self {
-        Self::new(
-            None,
-            project
-                .read(cx)
-                .worktree_paths(cx)
-                .main_worktree_path_list()
-                .clone(),
-        )
+        let project = project.read(cx);
+        let path_list = project.worktree_paths(cx).main_worktree_path_list().clone();
+        project
+            .remote_connection_options()
+            .map(|options| Self::with_remote_connection(options, path_list.clone()))
+            .unwrap_or_else(|| Self::new(None, path_list))
     }
 
     pub fn from_worktree_paths(worktree_paths: WorktreePaths, host: Option<String>) -> Self {
         Self::new(host, worktree_paths.main_worktree_path_list().clone())
     }
 
-    /// Stub: matches (remote 已删除，始终返回 true)
     pub fn matches(&self, other: &ProjectGroupKey) -> bool {
-        self.path_list == other.path_list
+        self.host == other.host && self.path_list == other.path_list
     }
 }
 
@@ -1218,7 +1236,7 @@ impl MultiWorkspace {
         paths: PathList,
         connection_options: Option<remote::RemoteConnectionOptions>,
         provisional_project_group_key: Option<ProjectGroupKey>,
-        _connect_remote: impl FnOnce(
+        connect_remote: impl FnOnce(
             remote::RemoteConnectionOptions,
             &mut Window,
             &mut Context<Self>,
@@ -1230,10 +1248,27 @@ impl MultiWorkspace {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Task<Result<Entity<Workspace>>> {
-        if connection_options.is_some() {
-            return Task::ready(Err(anyhow::anyhow!(
-                "remote workspaces are not supported by this z3rm build"
-            )));
+        if let Some(connection_options) = connection_options {
+            let host = remote::remote_connection_identity(&connection_options).persistence_key();
+            if let Some(workspace) =
+                self.workspace_for_paths_excluding(&paths, Some(&host), excluding, cx)
+            {
+                if open_mode == OpenMode::Activate {
+                    self.activate(workspace.clone(), None, window, cx);
+                }
+                return Task::ready(Ok(workspace));
+            }
+
+            return self.find_or_create_remote_workspace(
+                paths,
+                connection_options,
+                connect_remote,
+                init,
+                open_mode,
+                None,
+                window,
+                cx,
+            );
         }
 
         self.find_or_create_local_workspace(
@@ -1252,7 +1287,7 @@ impl MultiWorkspace {
         paths: PathList,
         connection_options: Option<remote::RemoteConnectionOptions>,
         provisional_project_group_key: Option<ProjectGroupKey>,
-        _connect_remote: impl FnOnce(
+        connect_remote: impl FnOnce(
             remote::RemoteConnectionOptions,
             &mut Window,
             &mut Context<Self>,
@@ -1265,10 +1300,27 @@ impl MultiWorkspace {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Task<Result<Entity<Workspace>>> {
-        if connection_options.is_some() {
-            return Task::ready(Err(anyhow::anyhow!(
-                "remote workspaces are not supported by this z3rm build"
-            )));
+        if let Some(connection_options) = connection_options {
+            let host = remote::remote_connection_identity(&connection_options).persistence_key();
+            if let Some(workspace) =
+                self.workspace_for_paths_excluding(&paths, Some(&host), excluding, cx)
+            {
+                if open_mode == OpenMode::Activate {
+                    self.activate(workspace.clone(), source_workspace, window, cx);
+                }
+                return Task::ready(Ok(workspace));
+            }
+
+            return self.find_or_create_remote_workspace(
+                paths,
+                connection_options,
+                connect_remote,
+                init,
+                open_mode,
+                source_workspace,
+                window,
+                cx,
+            );
         }
 
         self.find_or_create_local_workspace_with_source_workspace(
@@ -1281,6 +1333,117 @@ impl MultiWorkspace {
             window,
             cx,
         )
+    }
+
+    fn find_or_create_remote_workspace(
+        &mut self,
+        paths: PathList,
+        connection_options: remote::RemoteConnectionOptions,
+        connect_remote: impl FnOnce(
+            remote::RemoteConnectionOptions,
+            &mut Window,
+            &mut Context<Self>,
+        ) -> Task<Result<Option<Entity<remote::RemoteClient>>>>
+        + 'static,
+        init: Option<Box<dyn FnOnce(&mut Workspace, &mut Window, &mut Context<Workspace>) + Send>>,
+        open_mode: OpenMode,
+        source_workspace: Option<WeakEntity<Workspace>>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Task<Result<Entity<Workspace>>> {
+        let requesting_window = if open_mode == OpenMode::NewWindow {
+            None
+        } else {
+            window.window_handle().downcast::<MultiWorkspace>()
+        };
+        let app_state = self.workspace().read(cx).app_state().clone();
+        let database = crate::persistence::WorkspaceDb::global(cx);
+
+        cx.spawn(async move |this, cx| {
+            let remote_client = this
+                .update_in(cx, |_, window, cx| {
+                    connect_remote(connection_options.clone(), window, cx)
+                })?
+                .await?
+                .ok_or_else(|| anyhow::anyhow!("remote connection was cancelled"))?;
+            let project = cx.update(|cx| {
+                Project::remote(
+                    remote_client,
+                    app_state.languages.clone(),
+                    app_state.fs.clone(),
+                    cx,
+                )
+            });
+
+            for path in paths.paths() {
+                let path = path.clone();
+                let worktree_task = project.update(cx, |project, cx| {
+                    project.worktree_store().update(cx, |worktree_store, cx| {
+                        worktree_store.create_worktree(path, true, cx)
+                    })
+                });
+                worktree_task.await?;
+            }
+
+            let remote_connection_id = database
+                .get_or_create_remote_connection(connection_options.clone())
+                .await?;
+            let serialized_workspace =
+                database.remote_workspace_for_roots(paths.paths(), remote_connection_id);
+            let workspace_id = match serialized_workspace {
+                Some(workspace) => workspace.id,
+                None => database.next_id().await?,
+            };
+
+            let mut init = init;
+            let workspace = if let Some(requesting_window) = requesting_window {
+                let project = project.clone();
+                let app_state = app_state.clone();
+                requesting_window.update(cx, |multi_workspace, window, cx| {
+                    let workspace = cx.new(|cx| {
+                        let mut workspace =
+                            Workspace::new(Some(workspace_id), project, app_state, window, cx);
+                        if let Some(init) = init.take() {
+                            init(&mut workspace, window, cx);
+                        }
+                        workspace
+                    });
+                    match open_mode {
+                        OpenMode::Activate => multi_workspace.activate(
+                            workspace.clone(),
+                            source_workspace,
+                            window,
+                            cx,
+                        ),
+                        OpenMode::Add => multi_workspace.add(workspace.clone(), window, cx),
+                        OpenMode::NewWindow => multi_workspace.add(workspace.clone(), window, cx),
+                    }
+                    workspace
+                })?
+            } else {
+                let project = project.clone();
+                let app_state = app_state.clone();
+                let window = cx.update(|cx| {
+                    let options = (app_state.build_window_options)(None, cx);
+                    cx.open_window(options, move |window, cx| {
+                        let workspace = cx.new(|cx| {
+                            let mut workspace =
+                                Workspace::new(Some(workspace_id), project, app_state, window, cx);
+                            if let Some(init) = init.take() {
+                                init(&mut workspace, window, cx);
+                            }
+                            workspace
+                        });
+                        cx.new(|cx| MultiWorkspace::new(workspace, window, cx))
+                    })
+                })?;
+                window.update(cx, |multi_workspace, _, _| {
+                    multi_workspace.workspace().clone()
+                })?
+            };
+
+            Ok(workspace)
+        })
     }
 
     /// Finds an existing workspace in this multi-workspace whose paths match,

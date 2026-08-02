@@ -6351,11 +6351,23 @@ pub fn outline(
 #[cfg(test)]
 mod tests {
     use crate::{
-        accesskit, AppContext as _, Bounds, Context, InteractiveElement as _, IntoElement,
-        ParentElement as _, Pixels, Render, StatefulInteractiveElement as _, Styled as _,
-        TestAppContext, Window, canvas, div, px, size,
+        AppContext as _, Bounds, Context, InteractiveElement as _, IntoElement, ParentElement as _,
+        Pixels, Render, StatefulInteractiveElement as _, Styled as _, TestAppContext, Window,
+        accesskit, canvas, div, px, size,
     };
-    use std::{cell::Cell, rc::Rc};
+    use std::{
+        cell::Cell,
+        rc::Rc,
+        sync::{LazyLock, Mutex, MutexGuard},
+    };
+
+    static HEADLESS_A11Y_ENV_LOCK: LazyLock<Mutex<()>> = LazyLock::new(|| Mutex::new(()));
+
+    fn headless_a11y_env_guard() -> MutexGuard<'static, ()> {
+        HEADLESS_A11Y_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
 
     struct RootView {
         explicit_size: bool,
@@ -6431,6 +6443,7 @@ mod tests {
     fn headless_a11y_env_var_activates_debug_tree() {
         // SAFETY: testenv isolation — this test is the only toucher of the
         // env var on its thread, and TestAppContext owns its own state.
+        let _headless_a11y_env_guard = headless_a11y_env_guard();
         unsafe {
             std::env::set_var("Z3RM_A11Y_BUILD_HEADLESS", "1");
         }
@@ -6474,6 +6487,7 @@ mod tests {
     /// terminal output scenario where PaneDirty fires every frame.
     #[test]
     fn headless_a11y_stress_rapid_draw_cycles() {
+        let _headless_a11y_env_guard = headless_a11y_env_guard();
         unsafe {
             std::env::set_var("Z3RM_A11Y_BUILD_HEADLESS", "1");
         }
@@ -6536,6 +6550,7 @@ mod tests {
 
     #[test]
     fn declarative_a11y_action_reaches_element_listener() {
+        let _headless_a11y_env_guard = headless_a11y_env_guard();
         unsafe {
             std::env::set_var("Z3RM_A11Y_BUILD_HEADLESS", "1");
         }
@@ -6554,15 +6569,18 @@ mod tests {
             .unwrap()
             .expect("a11y tree must be available under Z3RM_A11Y_BUILD_HEADLESS");
         let button_id = button_a11y_node_id(&tree_json);
-        let delivered = cx
-            .test_window(window.into())
-            .simulate_a11y_action(accesskit::ActionRequest {
-                target_tree: accesskit::TreeId::ROOT,
-                target_node: button_id,
-                action: accesskit::Action::Click,
-                data: None,
-            });
-        assert!(delivered, "TestWindow must preserve the AccessKit action callback");
+        let delivered =
+            cx.test_window(window.into())
+                .simulate_a11y_action(accesskit::ActionRequest {
+                    target_tree: accesskit::TreeId::ROOT,
+                    target_node: button_id,
+                    action: accesskit::Action::Click,
+                    data: None,
+                });
+        assert!(
+            delivered,
+            "TestWindow must preserve the AccessKit action callback"
+        );
         cx.run_until_parked();
         assert!(activated.get(), "declarative element listener must run");
         unsafe {
@@ -6602,6 +6620,7 @@ mod tests {
     fn a11y_semantic_action_reaches_registered_listener() {
         // SAFETY: testenv isolation — this test is the only toucher of the
         // env var on its thread, and TestAppContext owns its own state.
+        let _headless_a11y_env_guard = headless_a11y_env_guard();
         unsafe {
             std::env::set_var("Z3RM_A11Y_BUILD_HEADLESS", "1");
         }
@@ -6634,14 +6653,14 @@ mod tests {
         .unwrap();
 
         // Inject the semantic action through the preserved platform callback.
-        let delivered = cx
-            .test_window(window.into())
-            .simulate_a11y_action(accesskit::ActionRequest {
-                target_tree: accesskit::TreeId::ROOT,
-                target_node: button_id,
-                action: accesskit::Action::Click,
-                data: None,
-            });
+        let delivered =
+            cx.test_window(window.into())
+                .simulate_a11y_action(accesskit::ActionRequest {
+                    target_tree: accesskit::TreeId::ROOT,
+                    target_node: button_id,
+                    action: accesskit::Action::Click,
+                    data: None,
+                });
         assert!(
             delivered,
             "TestWindow must preserve the AccessKit action callback"
@@ -6667,6 +6686,7 @@ mod tests {
     fn a11y_click_action_dispatches_real_click_event() {
         // SAFETY: testenv isolation — this test is the only toucher of the
         // env var on its thread, and TestAppContext owns its own state.
+        let _headless_a11y_env_guard = headless_a11y_env_guard();
         unsafe {
             std::env::set_var("Z3RM_A11Y_BUILD_HEADLESS", "1");
         }
@@ -6686,14 +6706,14 @@ mod tests {
             .expect("a11y tree must be available under Z3RM_A11Y_BUILD_HEADLESS");
         let button_id = button_a11y_node_id(&tree_json);
 
-        let delivered = cx
-            .test_window(window.into())
-            .simulate_a11y_action(accesskit::ActionRequest {
-                target_tree: accesskit::TreeId::ROOT,
-                target_node: button_id,
-                action: accesskit::Action::Click,
-                data: None,
-            });
+        let delivered =
+            cx.test_window(window.into())
+                .simulate_a11y_action(accesskit::ActionRequest {
+                    target_tree: accesskit::TreeId::ROOT,
+                    target_node: button_id,
+                    action: accesskit::Action::Click,
+                    data: None,
+                });
         assert!(
             delivered,
             "TestWindow must preserve the AccessKit action callback"

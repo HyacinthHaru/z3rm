@@ -87,8 +87,7 @@ pub struct Pane {
     /// 避免 EOF 路径 + Exit 事件路径重复广播。
     exit_hook: parking_lot::Mutex<Option<Arc<dyn Fn() + Send + Sync>>>,
     /// §16.8 Daemon-side observer for pane notifications.
-    notification_hook:
-        parking_lot::Mutex<Option<Arc<dyn Fn(MuxNotification) + Send + Sync>>>,
+    notification_hook: parking_lot::Mutex<Option<Arc<dyn Fn(MuxNotification) + Send + Sync>>>,
     /// §16.6 Optional hook for ClipboardStore events from the emulator.
     clipboard_hook: parking_lot::Mutex<Option<Box<dyn Fn(String) + Send>>>,
 }
@@ -747,10 +746,7 @@ impl Pane {
     }
 
     /// Install or replace the daemon-side observer used by server extensions.
-    pub fn set_notification_hook(
-        &self,
-        hook: Arc<dyn Fn(MuxNotification) + Send + Sync>,
-    ) {
+    pub fn set_notification_hook(&self, hook: Arc<dyn Fn(MuxNotification) + Send + Sync>) {
         *self.notification_hook.lock() = Some(hook);
     }
 
@@ -1415,7 +1411,9 @@ mod tests {
                 if changed.title == "extension title"
         ));
         assert!(matches!(
-            notifications.get(1).and_then(|notification| notification.event.as_ref()),
+            notifications
+                .get(1)
+                .and_then(|notification| notification.event.as_ref()),
             Some(mux_protocol::notification::Event::PaneDirty(_))
         ));
     }

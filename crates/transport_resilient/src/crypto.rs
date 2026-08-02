@@ -224,7 +224,9 @@ impl PacketCodec {
             .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |current| {
                 (current <= MAX_SEQUENCE).then(|| current + 1)
             })
-            .map_err(|_| anyhow!("nonce sequence space exhausted; the session key must be rotated"))?;
+            .map_err(|_| {
+                anyhow!("nonce sequence space exhausted; the session key must be rotated")
+            })?;
 
         let counter = sequence | self.send_direction.nonce_bit();
         let counter_bytes = counter.to_be_bytes();

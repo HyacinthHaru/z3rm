@@ -2447,9 +2447,41 @@ impl Pane {
                     )
                 })?
                 .await?;
+            } else if can_save_as && is_singleton {
+                let suggested_name =
+                    cx.update(|_window, cx| item.suggested_filename(cx).to_string())?;
+                let workspace = pane.read_with(cx, |pane, _| pane.workspace.clone())?;
+                let paths = workspace.update_in(cx, |workspace, window, cx| {
+                    workspace.prompt_for_new_path(Some(suggested_name), window, cx)
+                })?;
+                let Some(path) = paths.await?.and_then(|paths| paths.into_iter().next()) else {
+                    return Ok(false);
+                };
+                let project_path = project
+                    .read_with(cx, |project, cx| project.find_project_path(&path, cx))
+                    .ok_or_else(|| anyhow::anyhow!("Save path is outside the project"))?;
+                pane.update_in(cx, |_, window, cx| {
+                    item.save_as(project.clone(), project_path, window, cx)
+                })?
+                .await?;
+                if should_format {
+                    pane.update_in(cx, |pane, window, cx| {
+                        pane.unpreview_item_if_preview(item.item_id());
+                        item.save(
+                            SaveOptions {
+                                format: true,
+                                autosave: false,
+                                force_format,
+                            },
+                            project,
+                            window,
+                            cx,
+                        )
+                    })?
+                    .await?;
+                }
             }
         }
-
         pane.update(cx, |_, cx| {
             cx.emit(Event::UserSavedItem {
                 item: item.downgrade_item(),
@@ -3250,7 +3282,6 @@ impl Pane {
     }
 
     fn render_tab_bar(&mut self, window: &mut Window, cx: &mut Context<Pane>) -> AnyElement {
-
         let focus_handle = self.focus_handle.clone();
 
         let navigate_backward = IconButton::new("navigate_backward", IconName::ArrowLeft)
@@ -4395,7 +4426,9 @@ impl Render for Pane {
                                         .debug_selector(|| "pane-content-unavailable".into())
                                         .items_center()
                                         .gap_1()
-                                        .child(Label::new("Workspace unavailable").color(Color::Muted))
+                                        .child(
+                                            Label::new("Workspace unavailable").color(Color::Muted),
+                                        )
                                         .child(
                                             Label::new("Reconnect to restore this pane")
                                                 .size(LabelSize::Small)
@@ -4730,6 +4763,21 @@ impl NavHistory {
         if let Some(path_for_item) = path_for_item {
             path_for_item.0 = project_path;
             path_for_item.1 = abs_path;
+        }
+    }
+
+    pub fn rename_path(
+        &mut self,
+        old_project_path: &ProjectPath,
+        new_project_path: ProjectPath,
+        abs_path: Option<PathBuf>,
+    ) {
+        let mut state = self.0.lock();
+        for (project_path, stored_abs_path) in state.paths_by_item.values_mut() {
+            if project_path == old_project_path {
+                *project_path = new_project_path.clone();
+                *stored_abs_path = abs_path.clone();
+            }
         }
     }
 

@@ -1538,10 +1538,7 @@ mod tests {
         cx.run_until_parked();
 
         picker.read_with(cx, |picker, _| {
-            assert_eq!(
-                picker.delegate.matches.len(),
-                MAX_SEARCH_RESULT_RANGES
-            );
+            assert_eq!(picker.delegate.matches.len(), MAX_SEARCH_RESULT_RANGES);
         });
     }
 
@@ -1565,13 +1562,17 @@ mod tests {
         )
         .unwrap();
 
-        let mut search = project.update(cx, |project, cx| project.search(query, cx));
+        let search = project.update(cx, |project, cx| project.search(query, cx));
+        cx.run_until_parked();
+        cx.background_executor.run_until_parked();
+        cx.run_until_parked();
         let async_cx = cx.to_async();
         let mut matches = Vec::new();
-        while let Ok(SearchResult::Buffer { buffer, ranges }) = search.rx.recv().await {
-            matches.extend(Delegate::process_search_result(&buffer, &ranges, &async_cx));
+        while let Ok(result) = search.rx.try_recv() {
+            if let SearchResult::Buffer { buffer, ranges } = result {
+                matches.extend(Delegate::process_search_result(&buffer, &ranges, &async_cx));
+            }
         }
-
         assert_eq!(matches.len(), expected_matches);
         assert!(matches.iter().all(|m| m.line_number == 1));
         assert!(

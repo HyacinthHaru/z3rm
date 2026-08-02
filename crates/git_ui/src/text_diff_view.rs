@@ -887,7 +887,9 @@ mod tests {
         let workspace = multi_workspace.read_with(cx, |mw, _| mw.workspace().clone());
 
         let buffer = project
-            .update(cx, |project, cx| project.open_local_buffer(file_path.as_ref(), cx))
+            .update(cx, |project, cx| {
+                project.open_local_buffer(file_path.as_ref(), cx)
+            })
             .await
             .unwrap();
 

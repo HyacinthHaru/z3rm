@@ -64,10 +64,7 @@ pub struct BookmarkStore {
 }
 
 impl BookmarkStore {
-    pub fn new(
-        worktree_store: Entity<WorktreeStore>,
-        buffer_store: Entity<BufferStore>,
-    ) -> Self {
+    pub fn new(worktree_store: Entity<WorktreeStore>, buffer_store: Entity<BufferStore>) -> Self {
         Self {
             buffer_store,
             worktree_store,
@@ -81,10 +78,7 @@ impl BookmarkStore {
             .map(Arc::<Path>::from)
     }
 
-    fn buffer_bookmarks_mut(
-        &mut self,
-        buffer: &Entity<Buffer>,
-    ) -> &mut BufferBookmarks {
+    fn buffer_bookmarks_mut(&mut self, buffer: &Entity<Buffer>) -> &mut BufferBookmarks {
         self.buffers
             .entry(buffer.entity_id())
             .or_insert_with(|| BufferBookmarks::new(buffer.clone()))
@@ -178,10 +172,15 @@ impl BookmarkStore {
         cx: &App,
     ) -> Option<text::Anchor> {
         let snapshot = buffer.read(cx).text_snapshot();
-        store.read(cx).buffer_bookmarks(&buffer)?.bookmarks.iter().find_map(|bookmark| {
-            let anchor = bookmark.anchor.anchor();
-            (anchor.summary::<Point>(&snapshot).row == point.row).then_some(anchor)
-        })
+        store
+            .read(cx)
+            .buffer_bookmarks(&buffer)?
+            .bookmarks
+            .iter()
+            .find_map(|bookmark| {
+                let anchor = bookmark.anchor.anchor();
+                (anchor.summary::<Point>(&snapshot).row == point.row).then_some(anchor)
+            })
     }
 
     pub fn all_bookmark_locations(
@@ -247,4 +246,3 @@ impl BookmarkStore {
         cx.notify();
     }
 }
-

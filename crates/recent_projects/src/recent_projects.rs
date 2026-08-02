@@ -11,7 +11,7 @@ use chrono::{DateTime, Utc};
 
 use fs::Fs;
 use remote::RemoteConnectionOptions;
-use remote_connection::connect_with_modal;
+use remote_connection::{connect_with_modal, dismiss_connection_modal};
 
 #[cfg(target_os = "windows")]
 mod wsl_picker;
@@ -303,7 +303,6 @@ pub fn init(cx: &mut App) {
                 cx,
             );
 
-            let app_state = workspace.app_state().clone();
             let window_handle = window.window_handle().downcast::<MultiWorkspace>();
 
             cx.spawn_in(window, async move |workspace, cx| {
@@ -332,11 +331,16 @@ pub fn init(cx: &mut App) {
 
                     let open_options = workspace::OpenOptions {
                         requesting_window,
+                        open_mode: if create_new_window {
+                            OpenMode::NewWindow
+                        } else {
+                            OpenMode::Activate
+                        },
                         ..Default::default()
                     };
 
                     if let Err(error) =
-                        open_remote_project(connection_options, vec![path.into()], app_state, open_options, cx)
+                        open_remote_project(connection_options, vec![path.into()], open_options, cx)
                             .await
                     {
                         let message = format!("Unable to open the WSL project: {error}");
@@ -362,7 +366,12 @@ pub fn init(cx: &mut App) {
                         Please note that Zed currently does not support opening network share folders inside wsl.
                     "#};
 
-                    let _ = cx.prompt(gpui::PromptLevel::Critical, "Invalid path", Some(&message), &["OK"]).await;
+                    if let Err(error) = cx
+                        .prompt(gpui::PromptLevel::Critical, "Invalid path", Some(&message), &["OK"])
+                        .await
+                    {
+                        log::error!("failed to show invalid WSL path error: {error}");
+                    }
                     return;
                 }
 
@@ -403,18 +412,21 @@ pub fn init(cx: &mut App) {
                     }
                     DefaultOpenBehavior::NewWindow => None,
                 };
+            let open_mode = if requesting_window.is_some() {
+                OpenMode::Activate
+            } else {
+                OpenMode::NewWindow
+            };
             let open_options = OpenOptions {
                 requesting_window,
+                open_mode,
                 ..Default::default()
             };
-
-            let app_state = workspace.app_state().clone();
 
             cx.spawn_in(window, async move |_, cx| {
                 if let Err(error) = open_remote_project(
                     RemoteConnectionOptions::Wsl(open_wsl.distro.clone()),
                     open_wsl.paths,
-                    app_state,
                     open_options,
                     cx,
                 )
@@ -793,7 +805,9 @@ impl RecentProjects {
                         workspace.update(cx, |workspace, cx| {
                             let project = workspace.project().clone();
                             project.update(cx, |project, cx| {
-                                project.remove_worktree(worktree_id, cx);
+                                project
+                                    .remove_worktree(worktree_id, cx)
+                                    .detach_and_log_err(cx);
                             });
                         });
                         picker.delegate.open_folders = get_open_folders(workspace.read(cx), cx);
@@ -1172,10 +1186,13 @@ impl PickerDelegate for RecentProjectsDelegate {
                 }
 
                 let key = key.clone();
-                if let Some(host) = key.host() {
+                if key.host().is_some() && key.remote_connection_options().is_none() {
                     if let Some(workspace) = self.workspace.upgrade() {
                         workspace.update(cx, |workspace, cx| {
-                            workspace.show_error(remote_recent_project_error(host), cx);
+                            workspace.show_error(
+                                "Remote project connection details are unavailable".to_string(),
+                                cx,
+                            );
                         });
                     }
                     cx.emit(DismissEvent);
@@ -1201,13 +1218,13 @@ impl PickerDelegate for RecentProjectsDelegate {
                                 .log_err();
                         } else {
                             let path_list = key.path_list().clone();
-                            let host = key.host();
+                            let connection_options = key.remote_connection_options().cloned();
                             if let Some(task) = handle
                                 .update(cx, |multi_workspace, window, cx| {
                                     let modal_workspace = multi_workspace.workspace().clone();
                                     multi_workspace.find_or_create_workspace(
                                         path_list,
-                                        None, // 来源: spec §2.1 — 远程连接已移除
+                                        connection_options,
                                         Some(key.clone()),
                                         move |options, window, cx| {
                                             connect_with_modal(
@@ -1301,7 +1318,9 @@ impl PickerDelegate for RecentProjectsDelegate {
                                 workspace.update(cx, |workspace, cx| {
                                     let project = workspace.project().clone();
                                     project.update(cx, |project, cx| {
-                                        project.remove_worktree(worktree_id, cx);
+                                        project
+                                            .remove_worktree(worktree_id, cx)
+                                            .detach_and_log_err(cx);
                                     });
                                 });
                                 picker.delegate.open_folders =
@@ -2158,7 +2177,6 @@ fn open_local_project(
         })
         .detach();
 }
-
 impl RecentProjectsDelegate {
     fn open_recent_projects(
         &mut self,
@@ -2178,6 +2196,21 @@ impl RecentProjectsDelegate {
         let candidate_workspace_id = candidate_workspace.workspace_id;
         let candidate_workspace_location = candidate_workspace.location.clone();
         let candidate_workspace_paths = candidate_workspace.paths.clone();
+        let candidate_remote_options = candidate_workspace.remote_connection_options.clone();
+        let open_options = OpenOptions {
+            requesting_window: if replace_current_window {
+                window.window_handle().downcast::<MultiWorkspace>()
+            } else {
+                None
+            },
+            open_mode: if replace_current_window {
+                OpenMode::Activate
+            } else {
+                OpenMode::NewWindow
+            },
+            visible: Some(OpenVisible::All),
+            ..Default::default()
+        };
 
         workspace.update(cx, |workspace, cx| {
             if workspace.database_id() == Some(candidate_workspace_id) {
@@ -2217,7 +2250,37 @@ impl RecentProjectsDelegate {
                     }
                 }
                 SerializedWorkspaceLocation::Remote(host) => {
-                    workspace.show_error(remote_recent_project_error(&host), cx);
+                    let Some(connection_options) = candidate_remote_options else {
+                        workspace.show_error(
+                            format!(
+                                "Cannot reopen remote project at {host}: connection details are unavailable"
+                            ),
+                            cx,
+                        );
+                        return;
+                    };
+                    let paths = candidate_workspace_paths.paths().to_vec();
+                    cx.spawn_in(window, async move |_, cx| {
+                        if let Err(error) =
+                            open_remote_project(connection_options, paths, open_options, cx).await
+                        {
+                            let message = format!("Unable to open the remote project: {error}");
+                            if let Err(prompt_error) = cx
+                                .prompt(
+                                    gpui::PromptLevel::Critical,
+                                    "Unable to open project",
+                                    Some(&message),
+                                    &["OK"],
+                                )
+                                .await
+                            {
+                                log::error!(
+                                    "failed to show remote project error: {prompt_error}"
+                                );
+                            }
+                        }
+                    })
+                    .detach();
                 }
             }
         });
@@ -2450,30 +2513,52 @@ impl RecentProjectsDelegate {
     }
 }
 
-fn remote_recent_project_error(host: &str) -> String {
-    format!(
-        "Cannot reopen remote project at {host}: remote project workspaces are not supported by this build"
-    )
-}
-
-/// Attempt to reopen a remote recent project through the canonical workspace
-/// path. Remote project workspaces are not available in this build, so the
-/// caller receives an explicit error instead of a false success.
-pub async fn open_remote_project(
-    _connection_options: RemoteConnectionOptions,
-    _paths: Vec<std::path::PathBuf>,
-    _app_state: std::sync::Arc<workspace::AppState>,
-    _open_options: workspace::OpenOptions,
-    _cx: &mut gpui::AsyncWindowContext,
-) -> anyhow::Result<()> {
-    anyhow::bail!("remote project reopening is not supported by this build")
-}
-
-/// Reports unsupported legacy remote and dev-container entry points instead of
-/// presenting a blank modal.
 pub struct RemoteServerProjects {
     focus_handle: gpui::FocusHandle,
     message: SharedString,
+}
+
+/// Reopens a remote recent project through the canonical workspace path.
+pub async fn open_remote_project(
+    connection_options: RemoteConnectionOptions,
+    paths: Vec<std::path::PathBuf>,
+    mut open_options: workspace::OpenOptions,
+    cx: &mut gpui::AsyncWindowContext,
+) -> anyhow::Result<()> {
+    let requesting_window = if let Some(window) = open_options.requesting_window.take() {
+        Some(window)
+    } else {
+        cx.update(|_, cx| {
+            cx.active_window()
+                .and_then(|window| window.downcast::<MultiWorkspace>())
+        })?
+    };
+    let Some(requesting_window) = requesting_window else {
+        anyhow::bail!("cannot open remote project without a workspace window");
+    };
+
+    let modal_workspace = requesting_window.update(cx, |multi_workspace, _, _| {
+        multi_workspace.workspace().clone()
+    })?;
+    let open_mode = open_options.open_mode;
+    let open_task = requesting_window.update(cx, |multi_workspace, window, cx| {
+        let modal_workspace = modal_workspace.clone();
+        multi_workspace.find_or_create_workspace(
+            PathList::new(&paths),
+            Some(connection_options),
+            None,
+            move |options, window, cx| connect_with_modal(&modal_workspace, options, window, cx),
+            &[],
+            None,
+            open_mode,
+            window,
+            cx,
+        )
+    })?;
+    let result = open_task.await;
+    dismiss_connection_modal(&modal_workspace, cx);
+    result?;
+    Ok(())
 }
 
 impl gpui::Focusable for RemoteServerProjects {
@@ -2625,9 +2710,7 @@ mod tests {
 
     fn remote_project_group(index: usize) -> ProjectGroupKey {
         ProjectGroupKey::new(
-            Some(
-                remote::RemoteConnectionIdentity::Mock { id: index as u64 }.persistence_key(),
-            ),
+            Some(remote::RemoteConnectionIdentity::Mock { id: index as u64 }.persistence_key()),
             PathList::new(&[PathBuf::from(format!(
                 "/this-window/remote-project-{index}"
             ))]),
@@ -2639,6 +2722,7 @@ mod tests {
         RecentWorkspace {
             workspace_id: WorkspaceId::from_i64(index as i64),
             location: SerializedWorkspaceLocation::Local,
+            remote_connection_options: None,
             paths: paths.clone(),
             identity_paths: paths,
             timestamp: Utc::now(),
@@ -2912,8 +2996,9 @@ mod tests {
                     .workspace()
                     .read(cx)
                     .active_modal::<RemoteServerProjects>(cx);
-                let modal = modal
-                    .expect("Dev container modal should be open after dispatching OpenDevContainer");
+                let modal = modal.expect(
+                    "Dev container modal should be open after dispatching OpenDevContainer",
+                );
                 assert!(
                     modal.read(cx).message.to_string().contains("Dev container"),
                     "unsupported dev container modal must explain the unavailable feature"
@@ -3126,64 +3211,6 @@ mod tests {
             state
         })
     }
-    #[test]
-    fn remote_recent_project_error_identifies_host() {
-        assert_eq!(
-            remote_recent_project_error("build-host"),
-            "Cannot reopen remote project at build-host: remote project workspaces are not supported by this build"
-        );
-    }
-
-    #[gpui::test]
-    async fn test_open_remote_project_returns_clear_error(cx: &mut TestAppContext) {
-        // Remote project workspaces are not available in this build; opening
-        // one must fail with a recoverable error rather than silently succeed.
-        let app_state = init_test(cx);
-        app_state
-            .fs
-            .as_fake()
-            .insert_tree("/local", json!({}))
-            .await;
-
-        cx.update(|cx| {
-            open_paths(
-                &[PathBuf::from("/local")],
-                app_state.clone(),
-                workspace::OpenOptions::default(),
-                cx,
-            )
-        })
-        .await
-        .unwrap();
-        cx.run_until_parked();
-
-        let window = cx.update(|cx| cx.windows()[0].downcast::<MultiWorkspace>().unwrap());
-        let open_task = window
-            .update(cx, |_, window, cx| {
-                cx.spawn_in(window, async move |_, cx| {
-                    open_remote_project(
-                        RemoteConnectionOptions::Wsl(remote::WslConnectionOptions {
-                            distro_name: "test-distro".into(),
-                            user: None,
-                        }),
-                        Vec::new(),
-                        app_state,
-                        workspace::OpenOptions::default(),
-                        cx,
-                    )
-                    .await
-                })
-            })
-            .unwrap();
-        cx.run_until_parked();
-
-        let error = open_task.await.unwrap_err();
-        assert!(
-            error.to_string().contains("not supported by this build"),
-            "remote open must return a clear error, got: {error}"
-        );
-    }
-
 
     #[gpui::test]
     async fn test_remote_project_group_confirm_does_not_create_local_workspace(

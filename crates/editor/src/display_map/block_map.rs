@@ -1509,7 +1509,8 @@ impl BlockMap {
                 let edit_for_current_boundary =
                     excerpt.patch.edit_for_old_position(current_boundary);
 
-                let spacer_at_end = if current_boundary.row == edit_for_current_boundary.old.end.row {
+                let spacer_at_end = if current_boundary.row == edit_for_current_boundary.old.end.row
+                {
                     let (delta_at_end, spacer_at_end) = determine_spacer(
                         &mut our_wrapper,
                         &mut companion_wrapper,

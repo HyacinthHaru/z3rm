@@ -93,7 +93,11 @@ async fn test_packet_loss_simulation() -> Result<()> {
         }),
     );
     let frame = mux_protocol::frame(&envelope)?;
-    anyhow::ensure!(frame.len() >= 4, "frame too small to split: {}", frame.len());
+    anyhow::ensure!(
+        frame.len() >= 4,
+        "frame too small to split: {}",
+        frame.len()
+    );
 
     // Deliver only the first segment: the second is "lost" for now.
     let split_at = frame.len() / 2;
@@ -125,7 +129,10 @@ async fn test_packet_loss_simulation() -> Result<()> {
                     assembled.len(),
                     "split frame must reassemble to exactly one frame"
                 );
-                assert_eq!(decoded, envelope, "reassembled frame must match what was sent");
+                assert_eq!(
+                    decoded, envelope,
+                    "reassembled frame must match what was sent"
+                );
                 return Ok(());
             }
             Err(_) => continue,

@@ -24,7 +24,6 @@ fn main() -> Result<()> {
     run()
 }
 
-
 /// 默认 socket 路径 (§16.1)。测试可用 Z3RM_MUX_SOCKET 覆盖。
 fn default_socket_path() -> PathBuf {
     if let Ok(p) = std::env::var("Z3RM_MUX_SOCKET") {

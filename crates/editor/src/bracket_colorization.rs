@@ -32,17 +32,20 @@ impl Editor {
         let multi_buffer_snapshot = self.buffer().read(cx).snapshot(cx);
 
         let visible_excerpts = self.visible_buffer_ranges(cx);
-        let excerpt_data: Vec<(BufferSnapshot, Range<BufferOffset>, ExcerptRange<text::Anchor>)> =
-            visible_excerpts
-                .into_iter()
-                .filter(|(buffer_snapshot, _, _)| {
-                    let Some(buffer) = self.buffer().read(cx).buffer(buffer_snapshot.remote_id())
-                    else {
-                        return false;
-                    };
-                    LanguageSettings::for_buffer(buffer.read(cx), cx).colorize_brackets
-                })
-                .collect();
+        let excerpt_data: Vec<(
+            BufferSnapshot,
+            Range<BufferOffset>,
+            ExcerptRange<text::Anchor>,
+        )> = visible_excerpts
+            .into_iter()
+            .filter(|(buffer_snapshot, _, _)| {
+                let Some(buffer) = self.buffer().read(cx).buffer(buffer_snapshot.remote_id())
+                else {
+                    return false;
+                };
+                LanguageSettings::for_buffer(buffer.read(cx), cx).colorize_brackets
+            })
+            .collect();
 
         let mut fetched_tree_sitter_chunks = excerpt_data
             .iter()
@@ -432,7 +435,6 @@ mod tests {
     }
     #[test]
     fn test_auto_bracket_colorization_mode_reorders_weak_palette() {
-
         let accents = vec![
             hsla(0.0, 1.0, 0.68, 1.0),
             hsla(0.02, 1.0, 0.68, 1.0),

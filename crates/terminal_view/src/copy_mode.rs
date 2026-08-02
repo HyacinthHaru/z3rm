@@ -158,10 +158,7 @@ fn dispatch_search_input_key(
 /// 因此单字符键名作为回退。带 control / platform / function 修饰的和弦不是
 /// 可打印输入，不得写进查询串。
 fn typed_text(keystroke: &Keystroke) -> Option<String> {
-    if keystroke.modifiers.control
-        || keystroke.modifiers.platform
-        || keystroke.modifiers.function
-    {
+    if keystroke.modifiers.control || keystroke.modifiers.platform || keystroke.modifiers.function {
         return None;
     }
     if let Some(key_char) = keystroke.key_char.as_ref() {

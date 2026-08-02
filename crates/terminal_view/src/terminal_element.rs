@@ -1,14 +1,14 @@
+use accesskit;
 use editor::{CursorLayout, EditorSettings, HighlightedRange, HighlightedRangeLine};
 use gpui::{
-    AbsoluteLength, AnyElement, App, AvailableSpace, Bounds, ContentMask, Context, DispatchPhase,
-    Element, ElementId, Entity, FocusHandle, Font, FontFeatures, FontStyle, FontWeight,
-    GlobalElementId, HighlightStyle, Hitbox, Hsla, InputHandler, InteractiveElement, Interactivity,
-    IntoElement, LayoutId, Length, ModifiersChangedEvent, MouseButton, MouseMoveEvent, Pixels,
-    Point as GpuiPoint, Role, Stateful, StatefulInteractiveElement, StrikethroughStyle, Styled,
-    TextRun, TextStyle, UTF16Selection, UnderlineStyle, WeakEntity, WhiteSpace, Window, div, fill,
-    point, px, relative, size, A11ySubtreeBuilder,
+    A11ySubtreeBuilder, AbsoluteLength, AnyElement, App, AvailableSpace, Bounds, ContentMask,
+    Context, DispatchPhase, Element, ElementId, Entity, FocusHandle, Font, FontFeatures, FontStyle,
+    FontWeight, GlobalElementId, HighlightStyle, Hitbox, Hsla, InputHandler, InteractiveElement,
+    Interactivity, IntoElement, LayoutId, Length, ModifiersChangedEvent, MouseButton,
+    MouseMoveEvent, Pixels, Point as GpuiPoint, Role, Stateful, StatefulInteractiveElement,
+    StrikethroughStyle, Styled, TextRun, TextStyle, UTF16Selection, UnderlineStyle, WeakEntity,
+    WhiteSpace, Window, div, fill, point, px, relative, size,
 };
-use accesskit;
 
 use itertools::Itertools;
 use language::CursorShape as EditorCursorShape;
@@ -107,9 +107,8 @@ fn snapped_cell_point(
     dimensions: &TerminalBounds,
     scale_factor: f32,
 ) -> GpuiPoint<Pixels> {
-    let snap = |value: Pixels| {
-        Pixels::from((f32::from(value) * scale_factor).round() / scale_factor)
-    };
+    let snap =
+        |value: Pixels| Pixels::from((f32::from(value) * scale_factor).round() / scale_factor);
     point(
         snap(origin.x + col as f32 * dimensions.cell_width()),
         snap(origin.y + line as f32 * dimensions.line_height()),
@@ -121,12 +120,10 @@ fn terminal_paint_origin(
     scroll_top: Pixels,
     scale_factor: f32,
 ) -> GpuiPoint<Pixels> {
-    let snap = |value: Pixels| {
-        Pixels::from((f32::from(value) * scale_factor).floor() / scale_factor)
-    };
+    let snap =
+        |value: Pixels| Pixels::from((f32::from(value) * scale_factor).floor() / scale_factor);
     point(snap(bounds_origin.x), snap(bounds_origin.y - scroll_top))
 }
-
 
 #[derive(Copy, Clone, Debug, Default)]
 pub struct LayoutPoint {
@@ -269,13 +266,7 @@ impl LayoutRect {
             dimensions,
             scale_factor,
         );
-        let bottom = snapped_cell_point(
-            origin,
-            self.point.line + 1,
-            col,
-            dimensions,
-            scale_factor,
-        );
+        let bottom = snapped_cell_point(origin, self.point.line + 1, col, dimensions, scale_factor);
         let size = point(end.x - start.x, bottom.y - start.y).into();
 
         window.paint_quad(fill(Bounds::new(start, size), self.color));
@@ -1466,11 +1457,8 @@ impl Element for TerminalElement {
         window.with_content_mask(Some(ContentMask { bounds }), |window| {
             let scroll_top = self.terminal_view.read(cx).scroll_top;
             let scale_factor = window.scale_factor();
-            let origin = terminal_paint_origin(
-                layout.dimensions.bounds.origin,
-                scroll_top,
-                scale_factor,
-            );
+            let origin =
+                terminal_paint_origin(layout.dimensions.bounds.origin, scroll_top, scale_factor);
 
             window.paint_quad(fill(bounds, layout.background_color));
 
@@ -1909,13 +1897,9 @@ fn build_terminal_line_runs(
 /// `value`, `character_lengths` and `word_starts` so platform text patterns
 /// can drive caret/review. Synthetic ids key off the parent node id + a
 /// `(line, chunk)` key, so they are stable frame-to-frame.
-fn push_terminal_line_text_runs(
-    builder: &mut A11ySubtreeBuilder,
-    runs: &[BatchedTextRun],
-) {
-    let runs = build_terminal_line_runs(runs, |line, chunk| {
-        builder.synthetic_node_id((line, chunk))
-    });
+fn push_terminal_line_text_runs(builder: &mut A11ySubtreeBuilder, runs: &[BatchedTextRun]) {
+    let runs =
+        build_terminal_line_runs(runs, |line, chunk| builder.synthetic_node_id((line, chunk)));
     for (id, node) in runs {
         builder.push_child(id, node);
     }
@@ -2777,18 +2761,26 @@ mod tests {
 
         // Screen row 0 while scrolled back 2: viewport row 2 is past the
         // 2-row viewport, so the cursor is hidden.
-        let scrolled_out =
-            DisplayCursor::from(Point::new(0, 0), 2);
+        let scrolled_out = DisplayCursor::from(Point::new(0, 0), 2);
         assert!(
-            TerminalElement::cursor_position(scrolled_out, dimensions, dimensions.bounds.origin, 1.0)
-                .is_none(),
+            TerminalElement::cursor_position(
+                scrolled_out,
+                dimensions,
+                dimensions.bounds.origin,
+                1.0
+            )
+            .is_none(),
             "cursor below the viewport must be hidden"
         );
 
         // History row -2 while scrolled back 2 is viewport row 0: visible.
         let visible_history = DisplayCursor::from(Point::new(-2, 0), 2);
-        let position =
-            TerminalElement::cursor_position(visible_history, dimensions, dimensions.bounds.origin, 1.0);
+        let position = TerminalElement::cursor_position(
+            visible_history,
+            dimensions,
+            dimensions.bounds.origin,
+            1.0,
+        );
         assert!(position.is_some(), "cursor inside the viewport must render");
         assert_eq!(position.unwrap().y, px(0.0));
     }
@@ -2871,9 +2863,8 @@ mod tests {
         );
         let scale_factor = 1.25;
         let scroll_top = px(0.4);
-        let snap_origin = |value: Pixels| {
-            Pixels::from((f32::from(value) * scale_factor).floor() / scale_factor)
-        };
+        let snap_origin =
+            |value: Pixels| Pixels::from((f32::from(value) * scale_factor).floor() / scale_factor);
         let paint_origin = point(
             snap_origin(dimensions.bounds.origin.x),
             snap_origin(dimensions.bounds.origin.y - scroll_top),
@@ -3070,7 +3061,13 @@ mod tests {
             .collect();
         assert_eq!(values, vec!["foo-bar", "baz"]);
         // Three runs on line 3 collapse to a single TextRun node.
-        assert_eq!(nodes.iter().filter(|(_, n)| n.value() == Some("foo-bar")).count(), 1);
+        assert_eq!(
+            nodes
+                .iter()
+                .filter(|(_, n)| n.value() == Some("foo-bar"))
+                .count(),
+            1
+        );
     }
 
     /// A single line longer than [`MAX_CHARS_PER_A11Y_RUN`] characters must
@@ -3090,27 +3087,29 @@ mod tests {
             .iter()
             .map(|(_, n)| n.value().map(str::len).unwrap_or(0))
             .sum();
-        assert_eq!(total, long.len(), "chunk values concatenate back to the line");
+        assert_eq!(
+            total,
+            long.len(),
+            "chunk values concatenate back to the line"
+        );
 
         // Chunk 0 has `next_on_line`, chunk 2 has `previous_on_line`, chunk 1
         // has both. The middle chunk must not be orphaned: it links both ways.
-        let has_next = |i: usize| {
-            nodes[i].1.next_on_line().is_some()
-        };
+        let has_next = |i: usize| nodes[i].1.next_on_line().is_some();
         let has_prev = |i: usize| nodes[i].1.previous_on_line().is_some();
-        assert!(has_next(0) && !has_prev(0), "first chunk links forward only");
+        assert!(
+            has_next(0) && !has_prev(0),
+            "first chunk links forward only"
+        );
         assert!(has_next(1) && has_prev(1), "middle chunk links both ways");
-        assert!(!has_next(2) && has_prev(2), "last chunk links backward only");
+        assert!(
+            !has_next(2) && has_prev(2),
+            "last chunk links backward only"
+        );
 
         // Chunks link to the neighbouring chunks' ids.
-        assert_eq!(
-            nodes[0].1.next_on_line(),
-            Some(fake_id(0, 1)),
-        );
-        assert_eq!(
-            nodes[2].1.previous_on_line(),
-            Some(fake_id(0, 1)),
-        );
+        assert_eq!(nodes[0].1.next_on_line(), Some(fake_id(0, 1)),);
+        assert_eq!(nodes[2].1.previous_on_line(), Some(fake_id(0, 1)),);
     }
 
     /// `character_lengths` and `word_starts` are the inputs the platform text
@@ -3136,10 +3135,13 @@ mod tests {
     fn a11y_trailing_blanks_are_trimmed_not_announced() {
         let runs = vec![
             a11y_run(0, "done.   "), // trailing spaces within a non-empty line
-            a11y_run(1, "   "), // entirely blank row
+            a11y_run(1, "   "),      // entirely blank row
         ];
         let nodes = build_terminal_line_runs(&runs, fake_id);
-        let values: Vec<&str> = nodes.iter().map(|(_, n)| n.value().unwrap_or_default()).collect();
+        let values: Vec<&str> = nodes
+            .iter()
+            .map(|(_, n)| n.value().unwrap_or_default())
+            .collect();
         assert_eq!(values, vec!["done.", ""]);
     }
 
@@ -3230,9 +3232,8 @@ mod cursor_geometry_tests {
         );
         let scale_factor = 1.25;
         let scroll_top = px(0.4);
-        let snap_origin = |value: Pixels| {
-            Pixels::from((f32::from(value) * scale_factor).floor() / scale_factor)
-        };
+        let snap_origin =
+            |value: Pixels| Pixels::from((f32::from(value) * scale_factor).floor() / scale_factor);
         let paint_origin = point(
             snap_origin(dimensions.bounds.origin.x),
             snap_origin(dimensions.bounds.origin.y - scroll_top),

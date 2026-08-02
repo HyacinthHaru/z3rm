@@ -1026,8 +1026,7 @@ pub fn split_display_range_by_lines(
 mod tests {
     use super::*;
     use crate::{
-        Buffer, DisplayMap, DisplayRow, FoldPlaceholder, MultiBuffer,
-        Inlay,
+        Buffer, DisplayMap, DisplayRow, FoldPlaceholder, Inlay, MultiBuffer,
         test::{editor_test_context::EditorTestContext, marked_display_snapshot},
     };
     use gpui::{AppContext as _, font, px};

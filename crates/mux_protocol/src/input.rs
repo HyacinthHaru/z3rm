@@ -442,7 +442,7 @@ pub fn handle_key_event(
             PrefixAction::DoubleTapLiteral => {
                 return KeyDispatchResult::SendLiteral {
                     bytes: key_bytes.to_vec(),
-                }
+                };
             }
             // §16.7 unmatched key after prefix: exit prefix mode and send the
             // key to the PTY (tmux parity). Passthrough here means "to PTY",
@@ -470,7 +470,7 @@ pub fn handle_key_event(
             machine.on_timeout();
             return KeyDispatchResult::SendLiteral {
                 bytes: key_bytes.to_vec(),
-            }
+            };
         }
         // §16.7 全屏应用 passthrough: 直接发送到 PTY
         return KeyDispatchResult::SendToPty {
@@ -700,10 +700,7 @@ mod tests {
         // 一次 PTY 读常常带回多条私有模式序列。只看第一条会漏掉 alt screen，
         // 全屏应用的按键就会被错误地当成普通输入处理。
         let output = b"\x1b[?2004h\x1b[?1049h";
-        assert_eq!(
-            detect_full_screen_enable(output),
-            FullScreenMode::AltScreen
-        );
+        assert_eq!(detect_full_screen_enable(output), FullScreenMode::AltScreen);
 
         let reversed = b"\x1b[?1049h\x1b[?2004h";
         assert_eq!(
@@ -852,10 +849,7 @@ mod tests {
 
         // 再次按下 prefix key (double-tap)
         let result = handle_key_event(b"\x02", true, false, &mut ctx);
-        assert_eq!(
-            result,
-            KeyDispatchResult::SendLiteral { bytes: vec![0x02] }
-        );
+        assert_eq!(result, KeyDispatchResult::SendLiteral { bytes: vec![0x02] });
     }
 
     #[test]
@@ -894,10 +888,7 @@ mod tests {
         };
 
         let result = handle_key_event(b"v", false, false, &mut ctx);
-        assert_eq!(
-            result,
-            KeyDispatchResult::SendToPty { bytes: vec![b'v'] }
-        );
+        assert_eq!(result, KeyDispatchResult::SendToPty { bytes: vec![b'v'] });
     }
 
     #[test]

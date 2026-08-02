@@ -1,6 +1,6 @@
 use collections::HashMap;
-use serde::{Deserialize, Serialize};
 use schemars::JsonSchema;
+use serde::{Deserialize, Serialize};
 use settings_macros::{MergeFrom, with_fallible_options};
 use std::path::PathBuf;
 use std::sync::Arc;

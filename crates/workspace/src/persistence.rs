@@ -1054,6 +1054,7 @@ impl WorkspaceDb {
 
         Some(SerializedWorkspace {
             id: workspace_id,
+            remote_connection_options: remote_connection_options.clone(),
             location: match remote_connection_options {
                 Some(options) => SerializedWorkspaceLocation::Remote(options.display_name()),
                 None => SerializedWorkspaceLocation::Local,
@@ -1157,6 +1158,7 @@ impl WorkspaceDb {
 
         Some(SerializedWorkspace {
             id: workspace_id,
+            remote_connection_options: remote_connection_options.clone(),
             location: match remote_connection_options {
                 Some(options) => SerializedWorkspaceLocation::Remote(options.display_name()),
                 None => SerializedWorkspaceLocation::Local,
@@ -1250,20 +1252,22 @@ impl WorkspaceDb {
 
         ret
     }
-
     pub(crate) async fn save_workspace(&self, workspace: SerializedWorkspace) {
         let paths = workspace.paths.serialize();
         let identity_paths = workspace.identity_paths.map(|paths| paths.serialize());
+        let remote_connection_id = match workspace.remote_connection_options.clone() {
+            Some(options) => match self.get_or_create_remote_connection(options).await {
+                Ok(id) => Some(id.0 as i64),
+                Err(error) => {
+                    log::error!("failed to persist remote workspace connection: {error:#}");
+                    return;
+                }
+            },
+            None => None,
+        };
         log::debug!("Saving workspace at location: {:?}", workspace.location);
         self.write(move |conn| {
             conn.with_savepoint("update_worktrees", || {
-                let remote_connection_id: Option<i64> = match workspace.location.clone() {
-                    SerializedWorkspaceLocation::Local => None,
-                    SerializedWorkspaceLocation::Remote(_name) => {
-                        // 规范 §8.2：远程连接已移除，跳过
-                        None
-                    }
-                };
 
                 // Clear out panes and pane_groups
                 conn.exec_bound(sql!(
@@ -1758,6 +1762,7 @@ impl WorkspaceDb {
                         location: SerializedWorkspaceLocation::Remote(
                             connection_options.display_name(),
                         ),
+                        remote_connection_options: Some(connection_options.clone()),
                         paths: paths.clone(),
                         identity_paths: identity_paths_hint.unwrap_or(paths),
                         timestamp,
@@ -1778,6 +1783,7 @@ impl WorkspaceDb {
                 result.push(RecentWorkspace {
                     workspace_id: id,
                     location: SerializedWorkspaceLocation::Local,
+                    remote_connection_options: None,
                     paths,
                     identity_paths,
                     timestamp,
@@ -1802,10 +1808,10 @@ impl WorkspaceDb {
         target: &RecentWorkspace,
     ) -> Result<Vec<WorkspaceId>> {
         let target_paths = &target.identity_paths;
-        let target_remote_connection = match &target.location {
-            SerializedWorkspaceLocation::Local => None,
-            SerializedWorkspaceLocation::Remote(_name) => None,
-        };
+        let target_remote_connection = target
+            .remote_connection_options
+            .as_ref()
+            .map(remote_connection_identity);
 
         let remote_connections = self.remote_connections()?;
 
@@ -2387,18 +2393,20 @@ VALUES {placeholders};"#
 pub struct RecentWorkspace {
     pub workspace_id: WorkspaceId,
     pub location: SerializedWorkspaceLocation,
+    pub remote_connection_options: Option<RemoteConnectionOptions>,
     pub paths: PathList,
     pub identity_paths: PathList,
     pub timestamp: DateTime<Utc>,
 }
 
-// 规范 §2.1 / §15.1：project::ProjectGroupKey 已删除；
-// RecentWorkspace 提供 project_group_key 方法 (stub: 返回本地 key)
-
 impl RecentWorkspace {
-    /// 返回 project group key (stub: 本地项目无 host)
     pub fn project_group_key(&self) -> crate::ProjectGroupKey {
-        crate::ProjectGroupKey::new(None, self.paths.clone())
+        self.remote_connection_options
+            .as_ref()
+            .map(|options| {
+                crate::ProjectGroupKey::with_remote_connection(options.clone(), self.paths.clone())
+            })
+            .unwrap_or_else(|| crate::ProjectGroupKey::new(None, self.paths.clone()))
     }
 }
 
@@ -2436,10 +2444,10 @@ fn dedupe_recent_workspaces(
         HashMap::default();
     let mut result: Vec<RecentWorkspace> = Vec::new();
     for workspace in workspaces {
-        let location_identity = match &workspace.location {
-            SerializedWorkspaceLocation::Local => None,
-            SerializedWorkspaceLocation::Remote(_name) => None,
-        };
+        let location_identity = workspace
+            .remote_connection_options
+            .as_ref()
+            .map(remote_connection_identity);
         let key = (location_identity, workspace.identity_paths.paths().to_vec());
         if let Some(&existing_index) = indices_by_key.get(&key) {
             if workspace.timestamp > result[existing_index].timestamp {

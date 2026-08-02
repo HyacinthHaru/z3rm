@@ -2,19 +2,18 @@
 //! These keep downstream crates (editor, picker, platform_title_bar) compiling.
 use super::*;
 
-
 use std::{ops::Range, sync::Arc};
 
-use schemars::JsonSchema;
+use crate::editor_settings::SnippetSortOrder;
 use collections::BTreeMap;
 use gpui::{App, Entity, SharedString, Task};
 use language::LanguageRegistry;
+use linkify::{LinkFinder, LinkKind};
+use markdown::Markdown;
+use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use text::{Anchor, Point};
-use util::paths::{normalize_lexically, PathWithPosition};
-use crate::editor_settings::SnippetSortOrder;
-use markdown::Markdown;
-use linkify::{LinkFinder, LinkKind};
+use util::paths::{PathWithPosition, normalize_lexically};
 
 // Types that were previously imported from project but no longer exist there.
 // Defined as stubs locally to keep the editor crate compiling.
@@ -42,7 +41,7 @@ pub struct LspFormatTarget;
 
 // Re-export project stub types that still exist.
 pub use project::{
-    DisableAiSettings, Hover, InlayHint, InlayHintLabel, InlayHintLabelPart,
+    DisableAiSettings, Hover as ProjectHover, InlayHint, InlayHintLabel, InlayHintLabelPart,
     InlayHintLabelPartTooltip, InlayHintTooltip, InlayId, InvalidationStrategy,
     LanguageServerToQuery, LocationLink, OpenLspBufferHandle, PrepareRenameResponse, TaskVariables,
 };
@@ -51,7 +50,6 @@ pub use project::{
 pub struct RefreshForServer;
 
 pub use project::lsp_store::FormatTrigger;
-
 
 // Re-export debugger session/breakpoint types from project
 pub use project::debugger::breakpoint_store::{
@@ -64,7 +62,11 @@ pub use project::debugger::session::{Session, SessionEvent};
 // ---------------------------------------------------------------------------
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
-pub enum RevealStrategy { #[default] InCenter, PreserveX }
+pub enum RevealStrategy {
+    #[default]
+    InCenter,
+    PreserveX,
+}
 
 #[derive(Clone, Debug)]
 pub struct DebugScenario;
@@ -86,7 +88,9 @@ pub struct RunnableTag;
 pub struct TaskContext;
 
 #[derive(Clone, Copy, Debug)]
-pub enum TaskSourceKind { Local }
+pub enum TaskSourceKind {
+    Local,
+}
 
 #[derive(Clone, Debug)]
 pub struct TaskTemplate;
@@ -105,7 +109,10 @@ pub enum Direction {
     Next,
 }
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
-pub enum CollaboratorId { Agent(u64), PeerId(PeerId) }
+pub enum CollaboratorId {
+    Agent(u64),
+    PeerId(PeerId),
+}
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
 pub struct ViewId(pub u64);
@@ -130,8 +137,12 @@ pub trait ProjectExt {
 }
 
 impl ProjectExt for Project {
-    fn is_remote(&self) -> bool { false }
-    fn is_via_remote_server(&self) -> bool { false }
+    fn is_remote(&self) -> bool {
+        Project::is_remote(self)
+    }
+    fn is_via_remote_server(&self) -> bool {
+        Project::is_via_remote_server(self)
+    }
 }
 
 pub trait ProjectLspStoreExt {
@@ -204,7 +215,13 @@ impl gpui::Action for RevealInFileManager {
     }
 }
 
-pub fn parse_zed_link(_link: &str, _cx: &App) -> Option<Location> { None }
+pub fn is_zed_link(link: &str) -> bool {
+    let link = link.trim_start();
+    let Some((scheme, remainder)) = link.split_once(':') else {
+        return false;
+    };
+    scheme.eq_ignore_ascii_case("zed") && remainder.starts_with("//")
+}
 
 // ---------------------------------------------------------------------------
 // Telemetry
@@ -226,11 +243,14 @@ pub trait CompletionProvider: Send + Sync {
         _selection: Option<&std::ops::Range<Anchor>>,
         _window: &mut Window,
         _cx: &mut gpui::Context<crate::Editor>,
-    ) {}
+    ) {
+    }
 }
 
 impl Clone for Box<dyn CompletionProvider> {
-    fn clone(&self) -> Self { self.clone_box() }
+    fn clone(&self) -> Self {
+        self.clone_box()
+    }
 }
 
 impl CompletionProvider for gpui::Entity<Project> {
@@ -251,13 +271,26 @@ pub struct Completion {
 }
 
 impl Completion {
-    pub fn is_snippet(&self) -> bool { false }
-    pub fn label(&self) -> Option<language::CodeLabel> { None }
-    pub fn kind(&self) -> Option<lsp::CompletionItemKind> { None }
+    pub fn is_snippet(&self) -> bool {
+        false
+    }
+    pub fn label(&self) -> Option<language::CodeLabel> {
+        None
+    }
+    pub fn kind(&self) -> Option<lsp::CompletionItemKind> {
+        None
+    }
 }
 
 #[derive(Clone, Copy, Debug)]
-pub enum CompletionIntent { Add, Replace, Compose, Complete, CompleteWithReplace, CompleteWithInsert }
+pub enum CompletionIntent {
+    Add,
+    Replace,
+    Compose,
+    Complete,
+    CompleteWithReplace,
+    CompleteWithInsert,
+}
 
 #[derive(Clone, Debug)]
 pub struct CompletionDisplayOptions;
@@ -273,10 +306,32 @@ pub enum CompletionSource {
     Lsp {
         server_id: lsp::LanguageServerId,
         insert_range: Option<std::ops::Range<Anchor>>,
-    }
+    },
 }
 
-pub fn split_words(_text: &str) -> Vec<String> { Vec::new() }
+pub fn split_words<'a>(text: &'a str) -> impl Iterator<Item = &'a str> + 'a {
+    let mut index = 0;
+    let mut codepoints = text.char_indices().peekable();
+
+    std::iter::from_fn(move || {
+        let start_index = index;
+        while let Some((new_index, codepoint)) = codepoints.next() {
+            index = new_index + codepoint.len_utf8();
+            let current_upper = codepoint.is_uppercase();
+            let next_upper = codepoints
+                .peek()
+                .is_some_and(|(_, next_codepoint)| next_codepoint.is_uppercase());
+
+            if !current_upper && next_upper {
+                return Some(&text[start_index..index]);
+            }
+        }
+
+        index = text.len();
+        (start_index < text.len()).then(|| &text[start_index..])
+    })
+    .flat_map(|word| word.split_inclusive('_'))
+}
 
 // ---------------------------------------------------------------------------
 // Code actions
@@ -287,7 +342,9 @@ pub trait CodeActionProvider: Send + Sync {
 }
 
 impl Clone for Box<dyn CodeActionProvider> {
-    fn clone(&self) -> Self { self.clone_box() }
+    fn clone(&self) -> Self {
+        self.clone_box()
+    }
 }
 
 impl CodeActionProvider for gpui::Entity<Project> {
@@ -377,14 +434,22 @@ impl CodeContextMenu {
 }
 
 #[derive(Clone, Copy, Debug, Default)]
-pub enum ContextMenuOrigin { #[default] Cursor, GutterIndicator(u32) }
+pub enum ContextMenuOrigin {
+    #[default]
+    Cursor,
+    GutterIndicator(u32),
+}
 #[derive(Clone, Debug, Default)]
 pub struct CompletionsMenu;
 
 impl CompletionsMenu {
-    pub fn visible(&self) -> bool { false }
+    pub fn visible(&self) -> bool {
+        false
+    }
 
-    pub fn primary_scroll_handle(&self) -> Option<gpui::ScrollHandle> { None }
+    pub fn primary_scroll_handle(&self) -> Option<gpui::ScrollHandle> {
+        None
+    }
 
     pub fn new_snippet_choices(
         _id: CompletionId,
@@ -407,7 +472,9 @@ pub struct CodeActionsMenu {
 }
 
 impl CodeActionsMenu {
-    pub fn visible(&self) -> bool { false }
+    pub fn visible(&self) -> bool {
+        false
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -418,10 +485,13 @@ impl CodeActionsMenu {
 pub struct SignatureHelpState;
 
 impl SignatureHelpState {
-    pub fn popover_mut(&mut self,
-    ) -> Option<&mut SignatureHelpPopover> { None }
+    pub fn popover_mut(&mut self) -> Option<&mut SignatureHelpPopover> {
+        None
+    }
 
-    pub fn has_multiple_signatures(&self) -> bool { false }
+    pub fn has_multiple_signatures(&self) -> bool {
+        false
+    }
 }
 
 #[derive(Clone, Debug, Default)]
@@ -442,31 +512,79 @@ impl SignatureHelpPopover {
 }
 
 #[derive(Clone, Copy, Debug)]
-pub enum SignatureHelpHiddenBy { Escape }
+pub enum SignatureHelpHiddenBy {
+    Escape,
+}
 
 #[derive(Clone, Debug, Default)]
-pub struct HoverState;
+pub struct HoverState {
+    pub position: Option<crate::DisplayPoint>,
+    pub symbol_range: Option<std::ops::Range<crate::Anchor>>,
+    pub content: Option<SharedString>,
+}
 
 impl HoverState {
-    pub fn focused(&self, _window: &Window, _cx: &gpui::Context<crate::Editor>) -> bool { false }
+    pub fn focused(&self, _window: &Window, _cx: &gpui::Context<crate::Editor>) -> bool {
+        false
+    }
+
+    pub fn visible(&self) -> bool {
+        self.content.is_some()
+    }
+
+    pub fn set(
+        &mut self,
+        position: crate::DisplayPoint,
+        symbol_range: std::ops::Range<crate::Anchor>,
+        content: impl Into<SharedString>,
+    ) {
+        self.position = Some(position);
+        self.symbol_range = Some(symbol_range);
+        self.content = Some(content.into());
+    }
+
+    pub fn clear(&mut self) -> bool {
+        let was_visible = self.visible();
+        self.position = None;
+        self.symbol_range = None;
+        self.content = None;
+        was_visible
+    }
 
     pub fn render(
         &self,
         _snapshot: &crate::DisplaySnapshot,
-        _rows: std::ops::Range<crate::DisplayRow>,
+        rows: std::ops::Range<crate::DisplayRow>,
         _max_size: gpui::Size<gpui::Pixels>,
         _text_layout_details: &crate::movement::TextLayoutDetails,
         _window: &mut Window,
-        _cx: &mut gpui::Context<crate::Editor>,
+        cx: &mut gpui::Context<crate::Editor>,
     ) -> Option<(crate::DisplayPoint, Vec<AnyElement>)> {
-        None
+        let (Some(position), Some(content)) = (self.position, self.content.clone()) else {
+            return None;
+        };
+        if !rows.contains(&position.row()) {
+            return None;
+        }
+
+        let popover = div()
+            .id("editor-hover-popover")
+            .max_w(px(480.))
+            .p_2()
+            .bg(cx.theme().colors().editor_background)
+            .border_1()
+            .border_color(cx.theme().colors().border)
+            .text_color(cx.theme().colors().text)
+            .child(content)
+            .into_any();
+        Some((position, vec![popover]))
     }
 }
 
 #[derive(Clone, Debug, Default)]
 pub struct HoveredLinkState {
     pub links: Vec<HoverLink>,
-    pub symbol_range: Option<std::ops::Range<Anchor>>,
+    pub symbol_range: Option<std::ops::Range<crate::Anchor>>,
 }
 
 #[derive(Clone, Debug)]
@@ -519,10 +637,8 @@ pub fn find_file(
     let line = buffer_snapshot
         .text_for_range(Point::new(point.row, 0)..Point::new(point.row, line_end))
         .collect::<String>();
-    let path_with_position = PathWithPosition::parse_str(path_at_position(
-        &line,
-        point.column as usize,
-    )?);
+    let path_with_position =
+        PathWithPosition::parse_str(path_at_position(&line, point.column as usize)?);
     if path_with_position.path.as_os_str().is_empty() {
         return None;
     }
@@ -544,8 +660,8 @@ pub fn find_file(
             let worktree = worktree.read(cx);
             let root = worktree.abs_path();
             candidate_paths.push(root.join(&path_with_position.path));
-            if let Some(relative_path) =
-                path_style.strip_prefix(&path_with_position.path, worktree.root_name().as_std_path())
+            if let Some(relative_path) = path_style
+                .strip_prefix(&path_with_position.path, worktree.root_name().as_std_path())
             {
                 candidate_paths.push(root.join(relative_path.as_std_path()));
             }
@@ -595,7 +711,11 @@ fn path_at_position(line: &str, column: usize) -> Option<&str> {
     if cursor == line.len() {
         cursor = cursor.saturating_sub(1);
     }
-    if line.as_bytes().get(cursor).is_some_and(|byte| is_path_boundary(*byte)) {
+    if line
+        .as_bytes()
+        .get(cursor)
+        .is_some_and(|byte| is_path_boundary(*byte))
+    {
         if cursor == 0 || is_path_boundary(line.as_bytes()[cursor - 1]) {
             return None;
         }
@@ -612,7 +732,10 @@ fn path_at_position(line: &str, column: usize) -> Option<&str> {
         end += 1;
     }
     let mut candidate = line.get(start..end)?.trim_matches(|character: char| {
-        matches!(character, '"' | '\'' | '`' | '<' | '>' | '[' | ']' | '{' | '}' | ',')
+        matches!(
+            character,
+            '"' | '\'' | '`' | '<' | '>' | '[' | ']' | '{' | '}' | ','
+        )
     });
     while candidate
         .as_bytes()
@@ -635,16 +758,23 @@ fn is_path_boundary(byte: u8) -> bool {
 pub fn find_url(text: &str) -> Option<String> {
     let mut finder = LinkFinder::new();
     finder.kinds(&[LinkKind::Url]);
-    finder.links(text).next().map(|link| link.as_str().to_owned())
+    finder
+        .links(text)
+        .next()
+        .map(|link| link.as_str().to_owned())
 }
 
-pub fn find_url_at(text: &str, offset: usize) -> Option<String> {
+pub fn find_url_range_at(text: &str, offset: usize) -> Option<(Range<usize>, String)> {
     let mut finder = LinkFinder::new();
     finder.kinds(&[LinkKind::Url]);
     finder
         .links(text)
         .find(|link| link.start() <= offset && offset <= link.end())
-        .map(|link| link.as_str().to_owned())
+        .map(|link| (link.start()..link.end(), link.as_str().to_owned()))
+}
+
+pub fn find_url_at(text: &str, offset: usize) -> Option<String> {
+    find_url_range_at(text, offset).map(|(_, url)| url)
 }
 
 pub fn find_url_from_range(text: &str, range: std::ops::Range<usize>) -> Option<String> {
@@ -662,26 +792,79 @@ pub fn find_url_from_range(text: &str, range: std::ops::Range<usize>) -> Option<
 }
 
 pub fn exclude_link_to_position(
-    _buffer: &Entity<Buffer>,
-    _position: &text::Anchor,
-    _location: &project::LocationLink,
-    _cx: &App,
+    buffer: &Entity<Buffer>,
+    position: &text::Anchor,
+    location: &project::LocationLink,
+    cx: &App,
 ) -> bool {
-    false
+    let target_range = &location.target_range;
+    if target_range.start.buffer_id != position.buffer_id {
+        return true;
+    }
+
+    let snapshot = buffer.read(cx).snapshot();
+    let position_right = position.bias_right(&snapshot);
+    position_right.cmp(&target_range.start, &snapshot).is_lt()
+        || position.cmp(&target_range.end, &snapshot).is_gt()
 }
 
-pub fn hide_hover(_editor: &mut crate::Editor, _cx: &mut gpui::Context<crate::Editor>) -> bool { false }
+pub fn hide_hover(editor: &mut crate::Editor, cx: &mut gpui::Context<crate::Editor>) -> bool {
+    let did_hide = editor.hover_state.clear();
+    editor.clear_background_highlights(crate::HighlightKey::HoverState, cx);
+    if did_hide {
+        cx.notify();
+    }
+    did_hide
+}
 
 pub fn hover_at(
-    _editor: &mut crate::Editor,
-    _point: Option<crate::DisplayPoint>,
+    editor: &mut crate::Editor,
+    point: Option<crate::DisplayPoint>,
     _event_position: Option<gpui::Point<gpui::Pixels>>,
-    _window: &mut Window,
-    _cx: &mut gpui::Context<crate::Editor>,
+    window: &mut Window,
+    cx: &mut gpui::Context<crate::Editor>,
 ) {
+    if !EditorSettings::get_global(cx).hover_popover_enabled {
+        hide_hover(editor, cx);
+        return;
+    }
+
+    let Some(point) = point else {
+        hide_hover(editor, cx);
+        return;
+    };
+
+    let snapshot = editor.snapshot(window, cx);
+    let buffer_snapshot = snapshot.buffer_snapshot();
+    let buffer_point = snapshot
+        .display_snapshot
+        .display_point_to_point(point, Bias::Left);
+    let line_start = Point::new(buffer_point.row, 0);
+    let line_end = Point::new(
+        buffer_point.row,
+        buffer_snapshot
+            .line_len(multi_buffer::MultiBufferRow(buffer_point.row)),
+    );
+    let line = buffer_snapshot
+        .text_for_range(line_start..line_end)
+        .collect::<String>();
+    let Some((url_range, url)) = find_url_range_at(&line, buffer_point.column as usize) else {
+        hide_hover(editor, cx);
+        return;
+    };
+
+    let line_offset = buffer_snapshot.point_to_offset(line_start);
+    let range = buffer_snapshot.anchor_before(line_offset + url_range.start)
+        ..buffer_snapshot.anchor_after(line_offset + url_range.end);
+    editor
+        .hover_state
+        .set(point, range, format!("Open URL: {url}"));
+    cx.notify();
 }
 
-pub fn hover_markdown_style(_cx: &App) -> TextStyle { TextStyle::default() }
+pub fn hover_markdown_style(_cx: &App) -> TextStyle {
+    TextStyle::default()
+}
 
 #[derive(Clone, Debug, Default)]
 pub struct CodeLensState;
@@ -746,7 +929,10 @@ impl Default for InlineValueCache {
 
 impl InlineValueCache {
     pub fn new(enabled: bool) -> Self {
-        Self { enabled, ..Default::default() }
+        Self {
+            enabled,
+            ..Default::default()
+        }
     }
 }
 
@@ -761,11 +947,31 @@ impl LspInlayHintData {
     pub fn remove_inlay_chunk_data(&mut self, _buffer_ids: &[language::BufferId]) {}
 }
 pub fn inlay_hint_settings(
-    _anchor: multi_buffer::Anchor,
-    _snapshot: &multi_buffer::MultiBufferSnapshot,
-    _cx: &App,
+    anchor: multi_buffer::Anchor,
+    snapshot: &multi_buffer::MultiBufferSnapshot,
+    cx: &App,
 ) -> InlayHintSettings {
-    InlayHintSettings::default()
+    let settings = snapshot
+        .anchor_to_buffer_anchor(anchor)
+        .map(|(_, buffer_snapshot)| {
+            language::language_settings::LanguageSettings::for_buffer_snapshot(
+                buffer_snapshot,
+                None,
+                cx,
+            )
+            .inlay_hints
+        })
+        .unwrap_or_else(|| {
+            language::language_settings::AllLanguageSettings::get_global(cx)
+                .defaults
+                .inlay_hints
+        });
+
+    InlayHintSettings {
+        enabled: settings.enabled,
+        show_value_hints: settings.show_value_hints,
+        toggle_on_modifiers_press: settings.toggle_on_modifiers_press,
+    }
 }
 
 #[derive(Clone, Copy, Debug, Default)]
@@ -854,10 +1060,7 @@ impl Clone for Box<dyn DiagnosticRenderer> {
     }
 }
 
-pub fn set_diagnostic_renderer(
-    renderer: Option<Box<dyn DiagnosticRenderer>>,
-    cx: &mut gpui::App,
-) {
+pub fn set_diagnostic_renderer(renderer: Option<Box<dyn DiagnosticRenderer>>, cx: &mut gpui::App) {
     if let Some(renderer) = renderer {
         cx.set_global(GlobalDiagnosticRenderer(Arc::from(renderer)));
     }
@@ -879,7 +1082,9 @@ pub enum CursorPopoverType {
     #[default]
     CodeContextMenu,
     EditPrediction,
-    Edit { display_mode: EditDisplayMode },
+    Edit {
+        display_mode: EditDisplayMode,
+    },
 }
 
 // ---------------------------------------------------------------------------
@@ -895,27 +1100,47 @@ impl EditPredictionRequestTrigger {
 }
 
 #[derive(Clone, Debug)]
-pub enum EditPredictionDelegate { None }
+pub enum EditPredictionDelegate {
+    None,
+}
 
 pub type EditPredictionDelegateHandle = Arc<dyn Any>;
 
 #[derive(Clone, Copy, Debug)]
-pub enum EditPredictionDiscardReason { Accepted, Rejected }
+pub enum EditPredictionDiscardReason {
+    Accepted,
+    Rejected,
+}
 
 #[derive(Clone, Copy, Debug)]
-pub enum EditPredictionGranularity { Char, Word, Line }
+pub enum EditPredictionGranularity {
+    Char,
+    Word,
+    Line,
+}
 
 #[derive(Clone, Copy, Debug)]
-pub enum SuggestionDisplayType { Inline, Popup }
+pub enum SuggestionDisplayType {
+    Inline,
+    Popup,
+}
 
 #[derive(Clone, Debug)]
 pub struct RegisteredEditPredictionDelegate;
 
 #[derive(Clone, Copy, Debug, Default)]
-pub enum MenuEditPredictionsPolicy { #[default] Disabled, ByProvider }
+pub enum MenuEditPredictionsPolicy {
+    #[default]
+    Disabled,
+    ByProvider,
+}
 
 #[derive(Clone, Copy, Debug, Default)]
-pub enum EditDisplayMode { #[default] Inline, TabAccept }
+pub enum EditDisplayMode {
+    #[default]
+    Inline,
+    TabAccept,
+}
 
 #[derive(Clone, Debug)]
 pub enum EditPredictionPreview {
@@ -935,21 +1160,29 @@ pub struct EditPredictionState {
     pub completion: CursorPopoverType,
 }
 
-pub fn make_suggestion_styles(_cx: &App) -> crate::EditPredictionStyles { crate::EditPredictionStyles { insertion: gpui::HighlightStyle::default(), whitespace: gpui::HighlightStyle::default() } }
+pub fn make_suggestion_styles(_cx: &App) -> crate::EditPredictionStyles {
+    crate::EditPredictionStyles {
+        insertion: gpui::HighlightStyle::default(),
+        whitespace: gpui::HighlightStyle::default(),
+    }
+}
 
 #[derive(Clone, Debug)]
-pub struct Snippet { pub text: SharedString }
+pub struct Snippet {
+    pub text: SharedString,
+}
 
 impl Snippet {
     pub fn parse(text: &str) -> anyhow::Result<Self> {
-        Ok(Self { text: SharedString::from(text) })
+        Ok(Self {
+            text: SharedString::from(text),
+        })
     }
 }
 
 // ---------------------------------------------------------------------------
 // Breakpoints (define missing variants/types not in project::stubs)
 // ---------------------------------------------------------------------------
-
 
 // Re-export BreakpointEditAction from project crate (must match project's type)
 pub use project::debugger::breakpoint_store::BreakpointEditAction;
@@ -968,7 +1201,9 @@ pub use project::debugger::breakpoint_store::BreakpointStore;
 pub struct VimModeSetting(pub bool);
 
 impl VimModeSetting {
-    pub fn try_get(_cx: &App) -> Option<Self> { None }
+    pub fn try_get(_cx: &App) -> Option<Self> {
+        None
+    }
 }
 
 pub use project::VariableName;
@@ -1013,7 +1248,12 @@ pub struct Inlay {
 
 impl std::fmt::Debug for Inlay {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("Inlay").field("id", &self.id).field("position", &self.position).field("text", &self.text.to_string()).field("content", &self.content).finish()
+        f.debug_struct("Inlay")
+            .field("id", &self.id)
+            .field("position", &self.position)
+            .field("text", &self.text.to_string())
+            .field("content", &self.content)
+            .finish()
     }
 }
 
@@ -1023,15 +1263,30 @@ impl Inlay {
     }
 
     pub fn mock_hint(id: usize, anchor: multi_buffer::Anchor, hint_text: &str) -> Self {
-        Self { id: project::InlayId::Hint(id as u64), position: anchor, text: text::Rope::from(hint_text), content: InlayContent::Label(gpui::SharedString::from(hint_text)) }
+        Self {
+            id: project::InlayId::Hint(id as u64),
+            position: anchor,
+            text: text::Rope::from(hint_text),
+            content: InlayContent::Label(gpui::SharedString::from(hint_text)),
+        }
     }
 
     pub fn edit_prediction(id: usize, anchor: multi_buffer::Anchor, pred_text: &str) -> Self {
-        Self { id: project::InlayId::EditPrediction(id as u64), position: anchor, text: text::Rope::from(pred_text), content: InlayContent::Label(gpui::SharedString::from(pred_text)) }
+        Self {
+            id: project::InlayId::EditPrediction(id as u64),
+            position: anchor,
+            text: text::Rope::from(pred_text),
+            content: InlayContent::Label(gpui::SharedString::from(pred_text)),
+        }
     }
 
     pub fn debugger(id: usize, anchor: multi_buffer::Anchor, text: String) -> Self {
-        Self { id: project::InlayId::DebuggerValue(id as u64), position: anchor, text: text::Rope::from(text.clone()), content: InlayContent::Label(gpui::SharedString::from(text)) }
+        Self {
+            id: project::InlayId::DebuggerValue(id as u64),
+            position: anchor,
+            text: text::Rope::from(text.clone()),
+            content: InlayContent::Label(gpui::SharedString::from(text)),
+        }
     }
 }
 
@@ -1052,8 +1307,27 @@ pub struct InlayHighlight {
 }
 
 #[cfg(test)]
+mod tests {
+    use super::split_words;
+
+    #[test]
+    fn split_words_separates_camel_case_and_underscores() {
+        fn split(text: &str) -> Vec<&str> {
+            split_words(text).collect()
+        }
+
+        assert_eq!(split("HelloWorld"), ["Hello", "World"]);
+        assert_eq!(split("hello_world"), ["hello_", "world"]);
+        assert_eq!(split("_hello_world_"), ["_", "hello_", "world_"]);
+        assert_eq!(split("Hello_World"), ["Hello_", "World"]);
+        assert_eq!(split("helloWOrld"), ["hello", "WOrld"]);
+        assert_eq!(split("helloworld"), ["helloworld"]);
+    }
+}
+
+#[cfg(test)]
 mod url_tests {
-    use super::{find_url, find_url_at, find_url_from_range};
+    use super::{find_url, find_url_at, find_url_from_range, find_url_range_at};
 
     #[test]
     fn finds_url_in_text() {
@@ -1081,5 +1355,26 @@ mod url_tests {
             Some("https://example.com"),
         );
         assert_eq!(find_url_at(text, 0), None);
+    }
+
+    #[test]
+    fn returns_byte_range_for_hovered_url() {
+        let text = "open https://example.com/path now";
+        let (range, url) = find_url_range_at(text, "open https://".len()).unwrap();
+        assert_eq!(url, "https://example.com/path");
+        assert_eq!(&text[range], "https://example.com/path");
+    }
+}
+
+#[cfg(test)]
+mod zed_link_tests {
+    use super::is_zed_link;
+
+    #[test]
+    fn recognizes_zed_urls() {
+        assert!(is_zed_link("zed://file/src/main.rs"));
+        assert!(is_zed_link("ZED://workspace/project"));
+        assert!(!is_zed_link("https://zed.dev"));
+        assert!(!is_zed_link("zed:file/src/main.rs"));
     }
 }

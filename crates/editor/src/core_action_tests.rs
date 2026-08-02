@@ -1,6 +1,6 @@
 use super::*;
-use gpui::{TestAppContext, WindowHandle};
-use settings::SettingsStore;
+use gpui::{TestAppContext, UpdateGlobal as _, WindowHandle};
+use settings::{InlayHintsSettingsContent, SettingsContent, SettingsStore};
 
 fn init(cx: &mut TestAppContext) {
     cx.update(|cx| {
@@ -16,6 +16,67 @@ fn init(cx: &mut TestAppContext) {
 fn editor_with_text(text: &str, cx: &mut TestAppContext) -> WindowHandle<Editor> {
     let buffer = cx.new(|cx| language::Buffer::local(text, cx));
     cx.add_window(|window, cx| Editor::for_buffer(buffer, None, window, cx))
+}
+
+#[gpui::test]
+fn inlay_hint_settings_preserve_language_defaults(cx: &mut TestAppContext) {
+    init(cx);
+    cx.update(|cx| {
+        SettingsStore::update_global(cx, |store, cx| {
+            store.update_user_settings(cx, &|settings: &mut SettingsContent| {
+                settings.project.all_languages.defaults.inlay_hints =
+                    Some(InlayHintsSettingsContent {
+                        show_value_hints: Some(true),
+                        ..Default::default()
+                    });
+            });
+        });
+    });
+    let buffer = cx.new(|cx| language::Buffer::local("value", cx));
+    let multi_buffer = cx.new(|cx| MultiBuffer::singleton(buffer, cx));
+    let settings = multi_buffer.read_with(cx, |multi_buffer, cx| {
+        let snapshot = multi_buffer.snapshot(cx);
+        inlay_hint_settings(
+            snapshot.anchor_before(MultiBufferOffset(0)),
+            &snapshot,
+            cx,
+        )
+    });
+
+    assert!(settings.show_value_hints);
+}
+
+#[gpui::test]
+async fn lsp_relevance_accepts_non_ignored_project_files(cx: &mut TestAppContext) {
+    init(cx);
+
+    let fs = project::FakeFs::new(cx.executor());
+    fs.insert_tree(
+        std::path::Path::new("/project"),
+        serde_json::json!({"main.rs": "fn main() {}\n"}),
+    )
+    .await;
+    let project =
+        project::Project::test(fs, [std::path::Path::new("/project")], cx).await;
+    let buffer = project
+        .update(cx, |project, cx| {
+            project.open_local_buffer(std::path::Path::new("/project/main.rs"), cx)
+        })
+        .await
+        .expect("project file should open");
+
+    let (editor, mut window_cx) = cx.add_window_view(|window, cx| {
+        crate::test::build_editor_with_project(
+            project.clone(),
+            MultiBuffer::build_from_buffer(buffer.clone(), cx),
+            window,
+            cx,
+        )
+    });
+    editor.update_in(window_cx, |editor, _, cx| {
+        let file = buffer.read(cx).file().cloned();
+        assert!(editor.is_lsp_relevant(file.as_ref(), cx));
+    });
 }
 
 #[gpui::test]

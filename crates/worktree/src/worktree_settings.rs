@@ -182,10 +182,9 @@ mod tests {
             project.file_scan_inclusions = Some(vec!["node_modules/some-package/dist".into()]);
         });
 
-        assert!(settings.is_path_always_included(
-            rel_path("node_modules/some-package/dist"),
-            false
-        ));
+        assert!(
+            settings.is_path_always_included(rel_path("node_modules/some-package/dist"), false)
+        );
         assert!(settings.is_path_always_included(rel_path("node_modules/some-package"), true));
         assert!(settings.is_path_always_included(rel_path("node_modules"), true));
         assert!(!settings.is_path_always_included(rel_path("target"), true));

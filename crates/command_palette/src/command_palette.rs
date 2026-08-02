@@ -65,6 +65,14 @@ pub fn normalize_action_query(input: &str) -> String {
     result
 }
 
+fn is_zed_link(input: &str) -> bool {
+    let input = input.trim_start();
+    let Some((scheme, remainder)) = input.split_once(':') else {
+        return false;
+    };
+    scheme.eq_ignore_ascii_case("zed") && remainder.starts_with("//")
+}
+
 impl CommandPalette {
     fn register(
         workspace: &mut Workspace,
@@ -456,7 +464,7 @@ impl PickerDelegate for CommandPaletteDelegate {
         let (mut tx, mut rx) = postage::dispatch::channel(1);
 
         let query_str = query.as_str();
-        let is_zed_link = false;
+        let is_zed_link_query = is_zed_link(query_str);
 
         let task = cx.background_spawn({
             let mut commands = self.all_commands.clone();
@@ -489,7 +497,7 @@ impl PickerDelegate for CommandPaletteDelegate {
                 )
                 .await;
 
-                let intercept_result = if is_zed_link {
+                let intercept_result = if is_zed_link_query {
                     CommandInterceptResult {
                         results: vec![CommandInterceptItem {
                             action: OpenZedUrl {
@@ -784,7 +792,7 @@ mod tests {
     use gpui::{TestAppContext, VisualTestContext};
     use language::Point;
     use project::Project;
-    use settings::KeymapFile;
+    use settings::{KeymapFile, SettingsStore};
     use workspace::{AppState, MultiWorkspace, Workspace};
 
     #[test]
@@ -850,6 +858,14 @@ mod tests {
             normalize_action_query("project_panel::ToggleFocus"),
             "project panel:ToggleFocus"
         );
+    }
+
+    #[test]
+    fn recognizes_zed_links_for_interception() {
+        assert!(is_zed_link("zed://file/src/main.rs"));
+        assert!(is_zed_link("ZED://workspace/project"));
+        assert!(!is_zed_link("https://zed.dev"));
+        assert!(!is_zed_link("zed:file/src/main.rs"));
     }
 
     #[gpui::test]
@@ -1032,6 +1048,8 @@ mod tests {
 
     fn init_test(cx: &mut TestAppContext) -> Arc<AppState> {
         cx.update(|cx| {
+            let settings_store = SettingsStore::test(cx);
+            cx.set_global(settings_store);
             let app_state = AppState::test(cx);
             theme_settings::init(theme::LoadThemes::JustBase, cx);
             editor::init(cx);

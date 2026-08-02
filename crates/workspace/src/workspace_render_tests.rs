@@ -7,12 +7,12 @@
 //! - `run_create_worktree_tasks` must drive the real worktree scan flow and
 //!   surface failures as workspace notifications rather than no-op'ing.
 
-use crate::item::test::TestItem;
 use crate::item::PreviewTabsSettings;
+use crate::item::test::TestItem;
 use crate::{BottomDockLayout, MultiWorkspace, TabBarSettings, WorkspaceSettings};
 use fs::{FakeFs, Fs};
 use gpui::{AppContext, TestAppContext};
-use project::{project_settings::ProjectSettings, Project, WorktreeSettings};
+use project::{Project, WorktreeSettings, project_settings::ProjectSettings};
 use serde_json::json;
 use settings::{Settings, SettingsStore};
 use util::path;
@@ -115,9 +115,7 @@ async fn test_pane_renders_content_with_dead_project_handle(cx: &mut TestAppCont
 }
 
 #[gpui::test]
-async fn test_pane_renders_fallback_when_empty_with_dead_project_handle(
-    cx: &mut TestAppContext,
-) {
+async fn test_pane_renders_fallback_when_empty_with_dead_project_handle(cx: &mut TestAppContext) {
     init_test(cx);
     let fs = FakeFs::new(cx.executor());
     fs.insert_tree("/root", json!({ "a.txt": "" })).await;

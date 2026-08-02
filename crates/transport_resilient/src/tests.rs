@@ -120,7 +120,11 @@ fn test_direction_nonce_spaces_are_disjoint() -> Result<()> {
         );
 
         // 若 (key, nonce) 复用, 同一明文在两端会产生逐字节相同的密文。
-        assert_ne!(from_client, from_server, "keystream reused in round {}", round);
+        assert_ne!(
+            from_client, from_server,
+            "keystream reused in round {}",
+            round
+        );
     }
     Ok(())
 }
@@ -212,12 +216,18 @@ fn test_replay_window_sliding_behaviour() {
     // 大跨度跳跃: 旧序列号全部落到窗口之外。
     assert!(window.mark(1000));
     assert_eq!(window.high_water(), 1000);
-    assert!(!window.mark(5), "sequence far behind the window must be rejected");
+    assert!(
+        !window.mark(5),
+        "sequence far behind the window must be rejected"
+    );
 
     let oldest_in_window = 1000 - (REPLAY_WINDOW_SIZE as u64 - 1);
     assert!(window.is_acceptable(oldest_in_window));
     assert!(window.mark(oldest_in_window));
-    assert!(!window.mark(oldest_in_window - 1), "one slot past the window");
+    assert!(
+        !window.mark(oldest_in_window - 1),
+        "one slot past the window"
+    );
 
     assert!(window.is_acceptable(1001));
     assert!(!window.is_acceptable(1000), "already accepted");
@@ -308,7 +318,10 @@ fn test_datagram_header_roundtrip() -> Result<()> {
 /// §16.6 非法头部必须被拒绝。
 #[test]
 fn test_datagram_header_rejects_invalid_fields() {
-    assert!(DatagramHeader::decode(&[0u8; 5]).is_err(), "truncated header");
+    assert!(
+        DatagramHeader::decode(&[0u8; 5]).is_err(),
+        "truncated header"
+    );
 
     let zero_count = fragment_header(1, 0, 0);
     assert!(DatagramHeader::decode(&zero_count.encode()).is_err());
@@ -555,10 +568,18 @@ fn test_rtt_estimator() {
     assert_eq!(estimator.samples(), 3);
 
     let srtt = estimator.srtt().as_millis();
-    assert!(srtt > 90 && srtt < 130, "SRTT={} out of expected range", srtt);
+    assert!(
+        srtt > 90 && srtt < 130,
+        "SRTT={} out of expected range",
+        srtt
+    );
 
     let rto = estimator.rto();
-    assert!(rto >= RTO_MIN && rto <= super::RTO_MAX, "RTO={:?} out of range", rto);
+    assert!(
+        rto >= RTO_MIN && rto <= super::RTO_MAX,
+        "RTO={:?} out of range",
+        rto
+    );
 
     // 非法采样不得污染估计器。
     let before = estimator.snapshot();
@@ -590,7 +611,10 @@ fn test_heartbeat_manager_timing() {
     assert!(!manager.needs_heartbeat_at(start + ACK_INTERVAL - Duration::from_millis(1)));
     assert!(manager.needs_heartbeat_at(start + ACK_INTERVAL));
 
-    assert!(!manager.association_expired_at(start + SERVER_ASSOCIATION_TIMEOUT - Duration::from_secs(1)));
+    assert!(
+        !manager
+            .association_expired_at(start + SERVER_ASSOCIATION_TIMEOUT - Duration::from_secs(1))
+    );
     assert!(manager.association_expired_at(start + SERVER_ASSOCIATION_TIMEOUT));
 
     // 只发不收无法让一个早已消失的对端"保持在线"。
@@ -614,7 +638,10 @@ fn test_timestamp_tracker() {
 
     assert_eq!(tracker.now16_at(epoch), 0);
     assert_eq!(tracker.now16_at(epoch + Duration::from_millis(1234)), 1234);
-    assert!(tracker.take_reply_at(epoch).is_none(), "nothing to echo yet");
+    assert!(
+        tracker.take_reply_at(epoch).is_none(),
+        "nothing to echo yet"
+    );
 
     tracker.record_peer_timestamp_at(1000, epoch + Duration::from_millis(500));
     // 回显值加上本端持有的 20ms, 把本端处理延迟从对端测得的 RTT 里扣掉。
@@ -623,13 +650,19 @@ fn test_timestamp_tracker() {
         Some(1020)
     );
     assert!(
-        tracker.take_reply_at(epoch + Duration::from_millis(521)).is_none(),
+        tracker
+            .take_reply_at(epoch + Duration::from_millis(521))
+            .is_none(),
         "each peer timestamp is echoed at most once"
     );
 
     // 持有太久的时间戳不再回显。
     tracker.record_peer_timestamp_at(2000, epoch);
-    assert!(tracker.take_reply_at(epoch + Duration::from_millis(2000)).is_none());
+    assert!(
+        tracker
+            .take_reply_at(epoch + Duration::from_millis(2000))
+            .is_none()
+    );
 
     assert_eq!(
         tracker.rtt_sample_at(1000, epoch + Duration::from_millis(1040)),
@@ -817,7 +850,10 @@ async fn test_roaming_requires_authentication() -> Result<()> {
     let received = timeout(TEST_TIMEOUT, server.recv_message()).await??;
     assert_eq!(received, b"establish the association");
     let client_port = client.local_addr()?.port();
-    assert_eq!(server.peer_addr().map(|addr| addr.port()), Some(client_port));
+    assert_eq!(
+        server.peer_addr().map(|addr| addr.port()),
+        Some(client_port)
+    );
 
     // 攻击者往同一个端口灌垃圾。
     let attacker = UdpSocket::bind(loopback()?).await?;
@@ -887,12 +923,18 @@ async fn test_rtt_is_measured_on_the_data_path() -> Result<()> {
     // 服务端回包时带上回显, 客户端由此得到第一个采样。
     server.send_message(b"pong").await?;
     timeout(TEST_TIMEOUT, client.recv_message()).await??;
-    assert!(client.rtt().samples >= 1, "client never recorded an RTT sample");
+    assert!(
+        client.rtt().samples >= 1,
+        "client never recorded an RTT sample"
+    );
 
     // 反向同理。
     client.send_message(b"ping again").await?;
     timeout(TEST_TIMEOUT, server.recv_message()).await??;
-    assert!(server.rtt().samples >= 1, "server never recorded an RTT sample");
+    assert!(
+        server.rtt().samples >= 1,
+        "server never recorded an RTT sample"
+    );
 
     let snapshot = client.rtt();
     assert!(snapshot.rto >= RTO_MIN && snapshot.rto <= super::RTO_MAX);
@@ -923,6 +965,7 @@ fn pane_output_envelope(data: Vec<u8>) -> Envelope {
             event: Some(proto::notification::Event::PaneOutput(PaneOutputChunk {
                 pane_id: "w1:p1".into(),
                 data,
+                output_sequence: 0,
             })),
         })),
     }

@@ -190,7 +190,10 @@ enum HostCommand {
         reply: tokio::sync::oneshot::Sender<Result<()>>,
     },
     /// §3.4 Deliver a server event to extension subscribers.
-    Emit { event: String, payload: String },
+    Emit {
+        event: String,
+        payload: String,
+    },
     /// Force a full chrome re-render and push.
     Render,
     ListIds(tokio::sync::oneshot::Sender<Vec<String>>),
@@ -298,8 +301,7 @@ impl ServerExtensionHost {
     /// a broken extension directory must not keep the daemon from booting.
     pub fn start(sessions: Sessions, user_extensions_dir: PathBuf) -> Arc<Self> {
         let (command_tx, command_rx) = mpsc::channel::<HostCommand>();
-        let (chrome_tx, mut chrome_rx) =
-            tokio::sync::mpsc::unbounded_channel::<Vec<ChromeView>>();
+        let (chrome_tx, mut chrome_rx) = tokio::sync::mpsc::unbounded_channel::<Vec<ChromeView>>();
         let bridge = Arc::new(ServerHostBridge::new(sessions.clone()));
         let thread_dir = user_extensions_dir.clone();
         let thread = match std::thread::Builder::new()
@@ -446,18 +448,11 @@ impl ServerExtensionHost {
                     "zoomed": event.zoomed,
                 }),
             ),
-            Event::ShellIntegrationChanged(event) => (
-                "shell:integration",
-                serde_json::json!({"cwd": event.cwd}),
-            ),
-            Event::PaneDirty(event) => (
-                "pane:dirty",
-                serde_json::json!({"paneId": event.pane_id}),
-            ),
-            Event::PaneBell(event) => (
-                "pane:bell",
-                serde_json::json!({"paneId": event.pane_id}),
-            ),
+            Event::ShellIntegrationChanged(event) => {
+                ("shell:integration", serde_json::json!({"cwd": event.cwd}))
+            }
+            Event::PaneDirty(event) => ("pane:dirty", serde_json::json!({"paneId": event.pane_id})),
+            Event::PaneBell(event) => ("pane:bell", serde_json::json!({"paneId": event.pane_id})),
             Event::PaneOutput(event) => (
                 "pane:output",
                 serde_json::json!({
@@ -540,7 +535,11 @@ impl ServerExtensionHost {
     /// surface).
     pub async fn loaded_extension_ids(&self) -> Vec<String> {
         let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
-        if self.command_tx.send(HostCommand::ListIds(reply_tx)).is_err() {
+        if self
+            .command_tx
+            .send(HostCommand::ListIds(reply_tx))
+            .is_err()
+        {
             return Vec::new();
         }
         reply_rx.await.unwrap_or_default()
@@ -630,7 +629,9 @@ fn host_thread_main(
                 }
             }
             HostCommand::Render => {
-                if push_chrome_if_dirty(&mut hosted, &chrome_tx, true, &mut published_views).is_err() {
+                if push_chrome_if_dirty(&mut hosted, &chrome_tx, true, &mut published_views)
+                    .is_err()
+                {
                     break;
                 }
                 continue;
@@ -749,9 +750,8 @@ fn install_on_host_thread(
             std::fs::remove_dir_all(&target)
                 .with_context(|| format!("removing previous install at {}", target.display()))?;
         }
-        std::fs::rename(&staged, &target).with_context(|| {
-            format!("moving staged extension to {}", target.display())
-        })?;
+        std::fs::rename(&staged, &target)
+            .with_context(|| format!("moving staged extension to {}", target.display()))?;
         tracing::info!(id = %manifest.id, path = %target.display(), "server extension installed");
         Ok(live)
     })();
@@ -783,18 +783,22 @@ fn extract_archive(archive: &[u8], target: &Path) -> Result<()> {
             .into_owned();
         // Declared size bounds the check; the 16 MiB compressed cap above
         // limits how much a lying header can still stream to disk.
-        let size = entry.header().entry_size().context("tar entry missing size")?;
+        let size = entry
+            .header()
+            .entry_size()
+            .context("tar entry missing size")?;
         extracted = extracted.saturating_add(size);
         if extracted > MAX_EXTRACTED_BYTES {
-            bail!(
-                "extension archive exceeds the {MAX_EXTRACTED_BYTES}-byte uncompressed limit"
-            );
+            bail!("extension archive exceeds the {MAX_EXTRACTED_BYTES}-byte uncompressed limit");
         }
         let unpacked = entry
             .unpack_in(target)
             .with_context(|| format!("unpacking {}", relative.display()))?;
         if !unpacked {
-            bail!("tar entry {} escapes the install directory", relative.display());
+            bail!(
+                "tar entry {} escapes the install directory",
+                relative.display()
+            );
         }
     }
     Ok(())
@@ -805,7 +809,12 @@ fn extract_archive(archive: &[u8], target: &Path) -> Result<()> {
 fn view_id_of(vdom_json: &str) -> String {
     serde_json::from_str::<serde_json::Value>(vdom_json)
         .ok()
-        .and_then(|value| value.get("id").and_then(serde_json::Value::as_str).map(str::to_owned))
+        .and_then(|value| {
+            value
+                .get("id")
+                .and_then(serde_json::Value::as_str)
+                .map(str::to_owned)
+        })
         .unwrap_or_else(|| "default".to_string())
 }
 
@@ -819,9 +828,9 @@ fn push_chrome_if_dirty(
     published_views: &mut BTreeSet<(String, String)>,
 ) -> Result<(), ()> {
     let stale_published_view = published_views.iter().any(|(extension_id, _)| {
-        !hosted.iter().any(|extension| {
-            !extension.suspended && extension.live.id() == extension_id
-        })
+        !hosted
+            .iter()
+            .any(|extension| !extension.suspended && extension.live.id() == extension_id)
     });
     let dirty = force
         || stale_published_view
@@ -845,10 +854,7 @@ fn push_chrome_if_dirty(
         match extension.live.render_all_views() {
             Ok(rendered) => {
                 for json in rendered {
-                    current_views.insert(
-                        (extension_id.clone(), view_id_of(&json)),
-                        json,
-                    );
+                    current_views.insert((extension_id.clone(), view_id_of(&json)), json);
                 }
             }
             Err(error) => {
@@ -946,7 +952,10 @@ mod tests {
     fn validate_extension_id_rejects_unsafe_names() {
         assert!(validate_extension_id("demo").is_ok());
         for bad in ["", ".", "..", "a/b", "a\\b", "a\x00b", "a\nb"] {
-            assert!(validate_extension_id(bad).is_err(), "{bad:?} must be rejected");
+            assert!(
+                validate_extension_id(bad).is_err(),
+                "{bad:?} must be rejected"
+            );
         }
         let long = "x".repeat(MAX_EXTENSION_ID_LEN + 1);
         assert!(validate_extension_id(&long).is_err());
@@ -957,7 +966,9 @@ mod tests {
         let (sessions, _rx) = sessions_with_subscriber();
         let bridge = ServerHostBridge::new(sessions);
 
-        let listed = bridge.call("mux.listSessions", &serde_json::json!([])).unwrap();
+        let listed = bridge
+            .call("mux.listSessions", &serde_json::json!([]))
+            .unwrap();
         assert_eq!(
             listed,
             serde_json::json!([{
@@ -969,9 +980,11 @@ mod tests {
             }])
         );
 
-        assert!(bridge
-            .call("mux.listSessions", &serde_json::json!([]))
-            .is_ok());
+        assert!(
+            bridge
+                .call("mux.listSessions", &serde_json::json!([]))
+                .is_ok()
+        );
         // Unknown method: fail closed with a contextual error.
         let error = bridge
             .call("process.spawn", &serde_json::json!([]))
@@ -1027,8 +1040,7 @@ mod tests {
         let (sessions, _rx) = sessions_with_subscriber();
         let host = ServerExtensionHost::start(sessions, temp.path().join("extensions"));
 
-        let client_manifest =
-            "id = \"client-only\"\nname = \"client-only\"\nversion = \"0.1.0\"\n\n[runtime]\nside = \"client\"\n";
+        let client_manifest = "id = \"client-only\"\nname = \"client-only\"\nversion = \"0.1.0\"\n\n[runtime]\nside = \"client\"\n";
         let request = mux_protocol::InstallExtensionRequest {
             name: "client-only".to_string(),
             manifest: client_manifest.as_bytes().to_vec(),
@@ -1113,9 +1125,11 @@ mod tests {
 
         let update = recv_chrome_for(&mut notifications, "late-ext").await;
         assert_eq!(update.view_id, "status-bar");
-        assert!(String::from_utf8(update.vdom_payload)
-            .unwrap()
-            .contains("late"));
+        assert!(
+            String::from_utf8(update.vdom_payload)
+                .unwrap()
+                .contains("late")
+        );
     }
 
     #[tokio::test]
@@ -1143,7 +1157,10 @@ mod tests {
 
         // Built-in server extensions from the repo root load alongside ours.
         assert!(
-            host.loaded_extension_ids().await.iter().any(|id| id == "server-demo"),
+            host.loaded_extension_ids()
+                .await
+                .iter()
+                .any(|id| id == "server-demo"),
             "server-demo not loaded"
         );
         // The extracted install replaced the staging directory on disk.
@@ -1170,7 +1187,10 @@ mod tests {
 
         // Throwing during activate must surface as an install error…
         let error = host
-            .install_extension(&install_request("bad-ext", "export function activate() { throw new Error('nope'); }"))
+            .install_extension(&install_request(
+                "bad-ext",
+                "export function activate() { throw new Error('nope'); }",
+            ))
             .await
             .unwrap_err();
         assert!(format!("{error:#}").contains("nope"));
@@ -1178,12 +1198,21 @@ mod tests {
         assert!(!temp.path().join("extensions/bad-ext").exists());
 
         // …and a subsequent good extension still installs.
-        host.install_extension(&install_request("good-ext", "export function activate(context) {}"))
-            .await
-            .unwrap();
+        host.install_extension(&install_request(
+            "good-ext",
+            "export function activate(context) {}",
+        ))
+        .await
+        .unwrap();
         let ids = host.loaded_extension_ids().await;
-        assert!(ids.iter().any(|id| id == "good-ext"), "good-ext not loaded: {ids:?}");
-        assert!(!ids.iter().any(|id| id == "bad-ext"), "bad-ext must not load: {ids:?}");
+        assert!(
+            ids.iter().any(|id| id == "good-ext"),
+            "good-ext not loaded: {ids:?}"
+        );
+        assert!(
+            !ids.iter().any(|id| id == "bad-ext"),
+            "bad-ext must not load: {ids:?}"
+        );
     }
 
     #[tokio::test]
@@ -1192,7 +1221,11 @@ mod tests {
         let extensions_dir = temp.path().join("extensions");
         let extension_dir = extensions_dir.join("boot-ext");
         std::fs::create_dir_all(&extension_dir).unwrap();
-        std::fs::write(extension_dir.join("extension.toml"), server_manifest("boot-ext")).unwrap();
+        std::fs::write(
+            extension_dir.join("extension.toml"),
+            server_manifest("boot-ext"),
+        )
+        .unwrap();
         std::fs::write(
             extension_dir.join("main.js"),
             "export function activate(context) {}",
@@ -1206,13 +1239,23 @@ mod tests {
             "id = \"gui-ext\"\nname = \"gui-ext\"\nversion = \"0.1.0\"\n\n[runtime]\nside = \"client\"\n",
         )
         .unwrap();
-        std::fs::write(client_dir.join("main.js"), "export function activate(context) {}").unwrap();
+        std::fs::write(
+            client_dir.join("main.js"),
+            "export function activate(context) {}",
+        )
+        .unwrap();
 
         let (sessions, _rx) = sessions_with_subscriber();
         let host = ServerExtensionHost::start(sessions, extensions_dir);
         let ids = host.loaded_extension_ids().await;
-        assert!(ids.iter().any(|id| id == "boot-ext"), "boot-ext not loaded: {ids:?}");
-        assert!(!ids.iter().any(|id| id == "gui-ext"), "client-only extension ran on server: {ids:?}");
+        assert!(
+            ids.iter().any(|id| id == "boot-ext"),
+            "boot-ext not loaded: {ids:?}"
+        );
+        assert!(
+            !ids.iter().any(|id| id == "gui-ext"),
+            "client-only extension ran on server: {ids:?}"
+        );
     }
     #[tokio::test]
     async fn lifecycle_notifications_reach_server_extensions() {
@@ -1239,7 +1282,11 @@ mod tests {
             .await
             .unwrap();
         let initial = recv_chrome_for(&mut subscriber, "event-ext").await;
-        assert!(String::from_utf8(initial.vdom_payload).unwrap().contains("initial"));
+        assert!(
+            String::from_utf8(initial.vdom_payload)
+                .unwrap()
+                .contains("initial")
+        );
 
         host.bind_sessions(&sessions);
         sessions
