@@ -32,7 +32,7 @@ impl Editor {
         let multi_buffer_snapshot = self.buffer().read(cx).snapshot(cx);
 
         let visible_excerpts = self.visible_buffer_ranges(cx);
-        let excerpt_data: Vec<(BufferSnapshot, Range<BufferOffset>, ExcerptRange<Anchor>)> =
+        let excerpt_data: Vec<(BufferSnapshot, Range<BufferOffset>, ExcerptRange<text::Anchor>)> =
             visible_excerpts
                 .into_iter()
                 .filter(|(buffer_snapshot, _, _)| {
@@ -53,7 +53,7 @@ impl Editor {
                     self.bracket_fetched_tree_sitter_chunks.get(&key).cloned()?,
                 ))
             })
-            .collect::<HashMap<Range<Anchor>, HashSet<Range<BufferRow>>>>();
+            .collect::<HashMap<Range<text::Anchor>, HashSet<Range<BufferRow>>>>();
 
         let accents_count = accents.len();
         let bracket_matches_by_accent = cx.background_spawn(async move {
@@ -331,19 +331,56 @@ fn background_contrast(foreground: Hsla, background: Hsla) -> f32 {
 }
 
 fn compute_bracket_ranges(
-    _multi_buffer_snapshot: &MultiBufferSnapshot,
-    _buffer_snapshot: &BufferSnapshot,
-    _buffer_range: Range<BufferOffset>,
-    _excerpt_range: ExcerptRange<Anchor>,
-    _fetched_chunks: &mut HashSet<Range<BufferRow>>,
-    _accents_count: usize,
+    multi_buffer_snapshot: &MultiBufferSnapshot,
+    buffer_snapshot: &BufferSnapshot,
+    buffer_range: Range<BufferOffset>,
+    excerpt_range: ExcerptRange<text::Anchor>,
+    fetched_chunks: &mut HashSet<Range<BufferRow>>,
+    accents_count: usize,
 ) -> Vec<(usize, Vec<Range<Anchor>>)> {
-    Vec::new()
+    let context = excerpt_range.context.to_offset(buffer_snapshot);
+
+    buffer_snapshot
+        .fetch_bracket_ranges(
+            buffer_range.start.0..buffer_range.end.0,
+            Some(fetched_chunks),
+        )
+        .into_iter()
+        .flat_map(|(chunk_range, pairs)| {
+            if fetched_chunks.insert(chunk_range) {
+                pairs
+            } else {
+                Vec::new()
+            }
+        })
+        .filter_map(|pair| {
+            let color_index = pair.color_index?;
+            let mut ranges = Vec::new();
+
+            if context.start <= pair.open_range.start && pair.open_range.end <= context.end {
+                let anchors = buffer_snapshot.anchor_range_inside(pair.open_range);
+                ranges.push(
+                    multi_buffer_snapshot.anchor_in_buffer(anchors.start)?
+                        ..multi_buffer_snapshot.anchor_in_buffer(anchors.end)?,
+                );
+            }
+
+            if context.start <= pair.close_range.start && pair.close_range.end <= context.end {
+                let anchors = buffer_snapshot.anchor_range_inside(pair.close_range);
+                ranges.push(
+                    multi_buffer_snapshot.anchor_in_buffer(anchors.start)?
+                        ..multi_buffer_snapshot.anchor_in_buffer(anchors.end)?,
+                );
+            }
+
+            Some((color_index % accents_count, ranges))
+        })
+        .collect()
 }
 
 // Frozen: most of these drive `EditorLspTestContext`, which cannot complete
 // while z3rm has no LSP startup path (see its doc comment).
-#[cfg(all(test, feature = "z3rm-migration"))]
+#[cfg(test)]
 mod tests {
     use std::{cmp, path::Path, sync::Arc, time::Duration};
 
@@ -351,20 +388,16 @@ mod tests {
     use crate::{
         DisplayPoint, EditorMode, EditorSnapshot, MoveToBeginning, MoveToEnd, MoveUp,
         display_map::{DisplayRow, ToDisplayPoint},
-        test::init_test,
-        test::{
-            editor_lsp_test_context::EditorLspTestContext, editor_test_context::EditorTestContext,
-        },
+        test::{editor_test_context::EditorTestContext, init_test},
     };
     use collections::HashSet;
     use fs::FakeFs;
     use gpui::{Rgba, UpdateGlobal as _, hsla};
     use indoc::indoc;
     use itertools::Itertools;
-    use language::{Capability, markdown_lang};
+    use language::{Capability, Language, markdown_lang};
     use languages::rust_lang;
     use multi_buffer::{MultiBuffer, PathKey};
-    use pretty_assertions::assert_eq;
     use project::Project;
     use rope::Point;
     use serde_json::json;
@@ -384,8 +417,22 @@ mod tests {
         hsla(0.0, 0.0, 0.12, 1.0)
     }
 
+    async fn editor_context_with_language(
+        language: Arc<Language>,
+        cx: &mut gpui::TestAppContext,
+    ) -> EditorTestContext {
+        let language_registry = Arc::new(language::LanguageRegistry::test(cx.executor()));
+        language_registry.add(language.clone());
+        let mut context = EditorTestContext::new(cx).await;
+        context.update_buffer(|buffer, cx| {
+            buffer.set_language_registry(language_registry);
+            buffer.set_language(Some(language), cx);
+        });
+        context
+    }
     #[test]
     fn test_auto_bracket_colorization_mode_reorders_weak_palette() {
+
         let accents = vec![
             hsla(0.0, 1.0, 0.68, 1.0),
             hsla(0.02, 1.0, 0.68, 1.0),
@@ -523,12 +570,7 @@ mod tests {
         init_test(cx, |language_settings| {
             language_settings.defaults.colorize_brackets = Some(true);
         });
-        let mut cx = EditorLspTestContext::new(
-            Arc::into_inner(rust_lang()).unwrap(),
-            lsp::ServerCapabilities::default(),
-            cx,
-        )
-        .await;
+        let mut cx = editor_context_with_language(rust_lang(), cx).await;
 
         cx.set_state(indoc! {r#"ˇuse std::{collections::HashMap, future::Future};
 
@@ -644,12 +686,7 @@ where
         init_test(cx, |language_settings| {
             language_settings.defaults.colorize_brackets = Some(true);
         });
-        let mut cx = EditorLspTestContext::new(
-            Arc::into_inner(markdown_lang()).unwrap(),
-            lsp::ServerCapabilities::default(),
-            cx,
-        )
-        .await;
+        let mut cx = editor_context_with_language(markdown_lang(), cx).await;
 
         cx.set_state(indoc! {r#"ˇ[LLM-powered features](./ai/overview.md), [bring and configure your own API keys](./ai/llm-providers.md#use-your-own-keys)"#});
         cx.executor().advance_clock(Duration::from_millis(100));
@@ -696,12 +733,7 @@ where
         init_test(cx, |language_settings| {
             language_settings.defaults.colorize_brackets = Some(true);
         });
-        let mut cx = EditorLspTestContext::new(
-            Arc::into_inner(markdown_lang()).unwrap(),
-            lsp::ServerCapabilities::default(),
-            cx,
-        )
-        .await;
+        let mut cx = editor_context_with_language(markdown_lang(), cx).await;
 
         let rows = 100;
         let footer = "1 hsla(207.80, 81.00%, 66.00%, 1.00)\n";
@@ -809,12 +841,7 @@ where
         init_test(cx, |language_settings| {
             language_settings.defaults.colorize_brackets = Some(true);
         });
-        let mut cx = EditorLspTestContext::new(
-            Arc::into_inner(rust_lang()).unwrap(),
-            lsp::ServerCapabilities::default(),
-            cx,
-        )
-        .await;
+        let mut cx = editor_context_with_language(rust_lang(), cx).await;
 
         cx.set_state(indoc! {r#"
 struct Foo<'a, T> {
@@ -949,12 +976,7 @@ fn process_data«1()1» «1{
         init_test(cx, |language_settings| {
             language_settings.defaults.colorize_brackets = Some(true);
         });
-        let mut cx = EditorLspTestContext::new(
-            Arc::into_inner(rust_lang()).unwrap(),
-            lsp::ServerCapabilities::default(),
-            cx,
-        )
-        .await;
+        let mut cx = editor_context_with_language(rust_lang(), cx).await;
 
         cx.set_state(&separate_with_comment_lines(
             indoc! {r#"
@@ -1049,7 +1071,7 @@ mod foo «1{
     fn process_data_2«2()2» «2{
         let map: Option«3<Vec«4<«5()5»>4»>3» = None;
     }
-    «3{«4{}4»}3»}2»}1»
+«3{«4{}4»}3»}2»}1»
 
 1 hsla(207.80, 81.00%, 66.00%, 1.00)
 2 hsla(29.00, 54.00%, 61.00%, 1.00)
@@ -1080,7 +1102,7 @@ mod foo «1{
     fn process_data_2«2()2» «2{
         let map: Option«3<Vec«4<«5()5»>4»>3» = None;
     }
-    «3{«4{}4»}3»}2»}1»
+«3{«4{}4»}3»}2»}1»
 
 1 hsla(207.80, 81.00%, 66.00%, 1.00)
 2 hsla(29.00, 54.00%, 61.00%, 1.00)
@@ -1113,7 +1135,7 @@ mod foo {
                 r#"    fn process_data_2() {
         let map: Option<Vec<()>> = None;
     }
-    {{}}}}
+{{}}}}
 
 "#,
                 comment_lines,
@@ -1141,7 +1163,7 @@ mod foo «1{
                 r#"    fn process_data_2() {
         let map: Option<Vec<()>> = None;
     }
-    {{}}}}1»
+{{}}}}1»
 
 1 hsla(207.80, 81.00%, 66.00%, 1.00)
 2 hsla(29.00, 54.00%, 61.00%, 1.00)
@@ -1161,12 +1183,7 @@ mod foo «1{
         init_test(cx, |language_settings| {
             language_settings.defaults.colorize_brackets = Some(true);
         });
-        let mut cx = EditorLspTestContext::new(
-            Arc::into_inner(rust_lang()).unwrap(),
-            lsp::ServerCapabilities::default(),
-            cx,
-        )
-        .await;
+        let mut cx = editor_context_with_language(rust_lang(), cx).await;
 
         // taken from r-a https://github.com/rust-lang/rust-analyzer/blob/d733c07552a2dc0ec0cc8f4df3f0ca969a93fd90/crates/ide/src/inlay_hints.rs#L81-L297
         cx.set_state(indoc! {r#"ˇ
@@ -1576,7 +1593,8 @@ mod foo «1{
 
         let project = Project::test(fs, [path!("/a").as_ref()], cx).await;
         let language_registry = project.read_with(cx, |project, _| project.languages().clone());
-        language_registry.add(rust_lang());
+        let rust_language = rust_lang();
+        language_registry.add(rust_language.clone());
 
         let buffer_1 = project
             .update(cx, |project, cx| {
@@ -1590,7 +1608,14 @@ mod foo «1{
             })
             .await
             .unwrap();
-
+        buffer_1.update(cx, |buffer, cx| {
+            buffer.set_language_registry(language_registry.clone());
+            buffer.set_language(Some(rust_language.clone()), cx);
+        });
+        buffer_2.update(cx, |buffer, cx| {
+            buffer.set_language_registry(language_registry.clone());
+            buffer.set_language(Some(rust_language.clone()), cx);
+        });
         let multi_buffer = cx.new(|cx| {
             let mut multi_buffer = MultiBuffer::new(Capability::ReadWrite);
             multi_buffer.set_excerpts_for_path(
@@ -1795,7 +1820,8 @@ mod foo «1{
 
         let project = Project::test(fs, [path!("/a").as_ref()], cx).await;
         let language_registry = project.read_with(cx, |project, _| project.languages().clone());
-        language_registry.add(rust_lang());
+        let rust_language = rust_lang();
+        language_registry.add(rust_language.clone());
 
         let buffer_1 = project
             .update(cx, |project, cx| {
@@ -1803,6 +1829,10 @@ mod foo «1{
             })
             .await
             .unwrap();
+        buffer_1.update(cx, |buffer, cx| {
+            buffer.set_language_registry(language_registry);
+            buffer.set_language(Some(rust_language), cx);
+        });
 
         let second_excerpt_start = buffer_1.read_with(cx, |buffer, _| {
             let text = buffer.text();
@@ -1866,12 +1896,7 @@ mod foo «1{
         init_test(cx, |language_settings| {
             language_settings.defaults.colorize_brackets = Some(true);
         });
-        let mut cx = EditorLspTestContext::new(
-            Arc::into_inner(rust_lang()).unwrap(),
-            lsp::ServerCapabilities::default(),
-            cx,
-        )
-        .await;
+        let mut cx = editor_context_with_language(rust_lang(), cx).await;
 
         // Generate a large function body. When folded, this collapses
         // to a single display line, making small_function visible on screen.

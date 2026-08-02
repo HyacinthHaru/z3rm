@@ -1115,7 +1115,7 @@ pub struct Editor {
     suppress_selection_callback: bool,
     applicable_language_settings: HashMap<Option<LanguageName>, LanguageSettings>,
     accent_data: Option<AccentData>,
-    bracket_fetched_tree_sitter_chunks: HashMap<Range<Anchor>, HashSet<Range<BufferRow>>>,
+    bracket_fetched_tree_sitter_chunks: HashMap<Range<text::Anchor>, HashSet<Range<BufferRow>>>,
     semantic_token_state: SemanticTokenState,
     pub(crate) refresh_matching_bracket_highlights_task: Task<()>,
     refresh_document_symbols_task: Shared<Task<()>>,
@@ -1728,9 +1728,25 @@ impl Editor {
         });
     }
 
-    /// Stub: visible_buffer_ranges (collaboration 模块已删除)
-    pub fn visible_buffer_ranges(&mut self, _cx: &App) -> Vec<(language::BufferSnapshot, Range<BufferOffset>, ExcerptRange<Anchor>)> {
-        Vec::new()
+    pub fn visible_buffer_ranges(
+        &mut self,
+        cx: &mut App,
+    ) -> Vec<(
+        language::BufferSnapshot,
+        Range<BufferOffset>,
+        ExcerptRange<text::Anchor>,
+    )> {
+        let display_snapshot = self.display_snapshot(cx);
+        let visible_range = self.multi_buffer_visible_range(&display_snapshot, cx);
+        display_snapshot
+            .buffer_snapshot()
+            .range_to_buffer_ranges(visible_range)
+            .into_iter()
+            .map(|(buffer, excerpt_visible_range, excerpt_range)| {
+                (buffer.clone(), excerpt_visible_range, excerpt_range)
+            })
+            .filter(|(_, excerpt_visible_range, _)| !excerpt_visible_range.is_empty())
+            .collect()
     }
 
     /// Stub: refresh inlay hints (inlay hints 模块已删除)
