@@ -50,6 +50,9 @@ mod task;
 #[cfg(any(test, feature = "test-support"))]
 pub mod test;
 #[cfg(test)]
+mod editor_block_comment_tests;
+
+#[cfg(test)]
 mod core_action_tests;
 
 mod clipboard;
@@ -169,7 +172,8 @@ use gpui::{
 use indent_guides::ActiveIndentGuidesState;
 use itertools::{Either, Itertools};
 use language::{
-    AutoindentMode, BracketPair, Buffer, BufferRow, Capability, CharKind, CodeLabel, CursorShape, HighlightedText,
+    AutoindentMode, BlockCommentConfig, BracketPair, Buffer, BufferRow, Capability, CharKind,
+    CodeLabel, CursorShape, HighlightedText,
     IndentSize, Language, LanguageAwareStyling, LanguageName,
     LocalFile, OffsetRangeExt, OutlineItem, Point, Selection, SelectionGoal, TextObject,
     TransactionId, TreeSitterOptions,
@@ -10730,11 +10734,331 @@ impl Editor {
     /// Stub: spawn_nearest_task
     pub fn spawn_nearest_task(&mut self, _action: &SpawnNearestTask, _window: &mut Window, _cx: &mut Context<Self>) {}
 
-    /// Stub: toggle_block_comments
-    pub fn toggle_block_comments(&mut self, _action: &ToggleBlockComments, _window: &mut Window, _cx: &mut Context<Self>) {}
+    pub fn toggle_block_comments(
+        &mut self,
+        _: &ToggleBlockComments,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if self.read_only(cx) {
+            return;
+        }
+        self.transact(window, cx, |this, _window, cx| {
+            let mut selections = this
+                .selections
+                .all::<MultiBufferPoint>(&this.display_snapshot(cx));
+            let mut edits = Vec::new();
+            let snapshot = this.buffer.read(cx).read(cx);
+            let empty_str: Arc<str> = Arc::default();
+            let mut markers_inserted = Vec::new();
 
-    /// Stub: toggle_comments
-    pub fn toggle_comments(&mut self, _action: &ToggleComments, _window: &mut Window, _cx: &mut Context<Self>) {}
+            for selection in &mut selections {
+                let start_point = selection.start;
+                let end_point = selection.end;
+
+                let Some(language) =
+                    snapshot.language_scope_at(Point::new(start_point.row, start_point.column))
+                else {
+                    continue;
+                };
+
+                let Some(BlockCommentConfig {
+                    start: comment_start,
+                    end: comment_end,
+                    ..
+                }) = language.block_comment()
+                else {
+                    continue;
+                };
+
+                let prefix_needle = comment_start.trim_end().as_bytes();
+                let suffix_needle = comment_end.trim_start().as_bytes();
+                if prefix_needle.is_empty() || suffix_needle.is_empty() {
+                    continue;
+                }
+
+                let region_start = Point::new(start_point.row, 0);
+                let region_end = Point::new(
+                    end_point.row,
+                    snapshot.line_len(MultiBufferRow(end_point.row)),
+                );
+                let region_bytes: Vec<u8> = snapshot
+                    .bytes_in_range(region_start..region_end)
+                    .flatten()
+                    .copied()
+                    .collect();
+
+                let region_start_offset = snapshot.point_to_offset(region_start);
+                let start_byte = snapshot.point_to_offset(start_point) - region_start_offset;
+                let end_byte = snapshot.point_to_offset(end_point) - region_start_offset;
+
+                let mut is_commented = false;
+                let mut prefix_range = start_point..start_point;
+                let mut suffix_range = end_point..end_point;
+
+                if let Some(prefix_pos) = region_bytes[..end_byte.min(region_bytes.len())]
+                    .windows(prefix_needle.len())
+                    .rposition(|window| window == prefix_needle)
+                {
+                    let after_prefix = prefix_pos + prefix_needle.len();
+                    if let Some(suffix_pos) = region_bytes[after_prefix..]
+                        .windows(suffix_needle.len())
+                        .position(|window| window == suffix_needle)
+                        .map(|position| position + after_prefix)
+                    {
+                        let suffix_end = suffix_pos + suffix_needle.len();
+                        let markers_surround = prefix_pos <= start_byte
+                            && suffix_end >= end_byte
+                            && start_byte < suffix_end;
+                        let selection_contains = start_byte <= prefix_pos
+                            && suffix_end <= end_byte
+                            && region_bytes[start_byte..prefix_pos]
+                                .iter()
+                                .all(|byte| byte.is_ascii_whitespace())
+                            && region_bytes[suffix_end..end_byte]
+                                .iter()
+                                .all(|byte| byte.is_ascii_whitespace());
+
+                        if markers_surround || selection_contains {
+                            is_commented = true;
+                            let prefix_point =
+                                snapshot.offset_to_point(region_start_offset + prefix_pos);
+                            let suffix_point =
+                                snapshot.offset_to_point(region_start_offset + suffix_pos);
+                            prefix_range = prefix_point
+                                ..Point::new(
+                                    prefix_point.row,
+                                    prefix_point.column + prefix_needle.len() as u32,
+                                );
+                            suffix_range = suffix_point
+                                ..Point::new(
+                                    suffix_point.row,
+                                    suffix_point.column + suffix_needle.len() as u32,
+                                );
+                        }
+                    }
+                }
+
+                if is_commented {
+                    if snapshot
+                        .bytes_in_range(prefix_range.end..snapshot.max_point())
+                        .flatten()
+                        .next()
+                        == Some(&b' ')
+                    {
+                        prefix_range.end.column += 1;
+                    }
+                    if suffix_range.start.column > 0 {
+                        let before =
+                            Point::new(suffix_range.start.row, suffix_range.start.column - 1);
+                        if snapshot
+                            .bytes_in_range(before..suffix_range.start)
+                            .flatten()
+                            .next()
+                            == Some(&b' ')
+                        {
+                            suffix_range.start.column -= 1;
+                        }
+                    }
+
+                    edits.push((prefix_range, empty_str.clone()));
+                    edits.push((suffix_range, empty_str.clone()));
+                } else {
+                    let prefix: Arc<str> = if comment_start.ends_with(' ') {
+                        comment_start.clone()
+                    } else {
+                        format!("{} ", comment_start).into()
+                    };
+                    let suffix: Arc<str> = if comment_end.starts_with(' ') {
+                        comment_end.clone()
+                    } else {
+                        format!(" {}", comment_end).into()
+                    };
+
+                    edits.push((start_point..start_point, prefix.clone()));
+                    edits.push((end_point..end_point, suffix.clone()));
+                    markers_inserted.push((
+                        selection.id,
+                        prefix.len(),
+                        suffix.len(),
+                        selection.is_empty(),
+                        end_point.row,
+                    ));
+                }
+            }
+
+            drop(snapshot);
+            this.buffer.update(cx, |buffer, cx| {
+                buffer.edit(edits, None, cx);
+            });
+
+            let mut selections = this
+                .selections
+                .all::<MultiBufferPoint>(&this.display_snapshot(cx));
+            for selection in &mut selections {
+                if let Some((_, prefix_len, suffix_len, was_empty, suffix_row)) =
+                    markers_inserted.iter().find(|(id, _, _, _, _)| *id == selection.id)
+                {
+                    if *was_empty {
+                        selection.start.column = selection
+                            .start
+                            .column
+                            .saturating_sub((*prefix_len + *suffix_len) as u32);
+                    } else {
+                        selection.start.column =
+                            selection.start.column.saturating_sub(*prefix_len as u32);
+                        if selection.end.row == *suffix_row {
+                            selection.end.column += *suffix_len as u32;
+                        }
+                    }
+                }
+            }
+            this.change_selections(Default::default(), _window, cx, |selections_collection| {
+                selections_collection.select(selections);
+            });
+        });
+    }
+
+    /// Toggle configured line comments for the selected lines.
+    pub fn toggle_comments(
+        &mut self,
+        action: &ToggleComments,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if self.read_only(cx) {
+            return;
+        }
+        self.transact(window, cx, |this, window, cx| {
+            let selections = this
+                .selections
+                .all::<MultiBufferPoint>(&this.display_snapshot(cx));
+            let snapshot = this.buffer.read(cx).read(cx);
+            let mut edits = Vec::new();
+            let mut selection_adjustments = Vec::new();
+
+            for selection in selections {
+                let start_row = selection.start.row;
+                let end_row = if selection.end.row > start_row && selection.end.column == 0 {
+                    selection.end.row.saturating_sub(1)
+                } else {
+                    selection.end.row
+                };
+                let language = snapshot
+                    .language_scope_at(Point::new(start_row, selection.start.column));
+                let Some(language) = language else {
+                    continue;
+                };
+                let Some(prefix) = language.line_comment_prefixes().first() else {
+                    continue;
+                };
+                let prefix = if action.ignore_indent {
+                    prefix.trim_end()
+                } else {
+                    prefix.as_ref()
+                };
+                if prefix.is_empty() {
+                    continue;
+                }
+
+                let mut line_ranges = Vec::new();
+                let mut all_commented = true;
+                for row in start_row..=end_row {
+                    if start_row != end_row && snapshot.is_line_blank(MultiBufferRow(row)) {
+                        continue;
+                    }
+                    let indent = if action.ignore_indent {
+                        0
+                    } else {
+                        snapshot.indent_size_for_line(MultiBufferRow(row)).len
+                    };
+                    let line_start = Point::new(row, indent);
+                    let line_end = Point::new(row, snapshot.line_len(MultiBufferRow(row)));
+                    let line = snapshot
+                        .bytes_in_range(line_start..line_end)
+                        .flatten()
+                        .copied()
+                        .collect::<Vec<_>>();
+                    if line.starts_with(prefix.as_bytes()) {
+                        let mut end_column = indent + prefix.len() as u32;
+                        if !action.ignore_indent {
+                            while snapshot
+                                .bytes_in_range(
+                                    Point::new(row, end_column)
+                                        ..Point::new(row, end_column.saturating_add(1)),
+                                )
+                                .flatten()
+                                .next()
+                                == Some(&b' ')
+                            {
+                                end_column += 1;
+                            }
+                        }
+                        line_ranges.push(Point::new(row, indent)..Point::new(row, end_column));
+                    } else {
+                        all_commented = false;
+                        line_ranges.push(Point::new(row, indent)..Point::new(row, indent));
+                    }
+                }
+
+                if all_commented && !line_ranges.is_empty() {
+                    edits.extend(
+                        line_ranges
+                            .into_iter()
+                            .map(|range| (range, Arc::<str>::default())),
+                    );
+                } else if !line_ranges.is_empty() {
+                    let insert_column = line_ranges
+                        .iter()
+                        .map(|range| range.start.column)
+                        .min()
+                        .unwrap_or(0);
+                    let prefix: Arc<str> = prefix.into();
+                    let prefix_len = prefix.len() as u32;
+                    edits.extend(line_ranges.into_iter().map(|range| {
+                        (
+                            Point::new(range.start.row, insert_column)
+                                ..Point::new(range.start.row, insert_column),
+                            prefix.clone(),
+                        )
+                    }));
+                    selection_adjustments.push((
+                        selection.id,
+                        start_row,
+                        end_row,
+                        insert_column,
+                        prefix_len,
+                    ));
+                }
+            }
+
+            drop(snapshot);
+            this.buffer.update(cx, |buffer, cx| {
+                buffer.edit(edits, None, cx);
+            });
+            let mut selections = this
+                .selections
+                .all::<MultiBufferPoint>(&this.display_snapshot(cx));
+            for selection in &mut selections {
+                if let Some((_, start_row, end_row, insert_column, prefix_len)) =
+                    selection_adjustments
+                        .iter()
+                        .find(|(id, _, _, _, _)| *id == selection.id)
+                {
+                    if (*start_row..=*end_row).contains(&selection.start.row)
+                        && selection.start.column
+                            >= insert_column.saturating_add(*prefix_len)
+                    {
+                        selection.start.column =
+                            selection.start.column.saturating_sub(*prefix_len);
+                    }
+                }
+            }
+            this.change_selections(Default::default(), window, cx, |collection| {
+                collection.select(selections);
+            });
+        });
+    }
 
     /// Stub: toggle_markdown_block_quote
     pub fn toggle_markdown_block_quote(&mut self, _action: &ToggleBlockQuote, _window: &mut Window, _cx: &mut Context<Self>) {}
