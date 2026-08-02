@@ -342,26 +342,17 @@ pub fn deploy_context_menu(
     cx.notify();
 }
 
-// Frozen: `EditorLspTestContext` cannot complete while z3rm has no LSP startup
-// path (see its doc comment).
-#[cfg(all(test, feature = "z3rm-migration"))]
+#[cfg(test)]
 mod tests {
     use super::*;
-    use crate::test::{editor_lsp_test_context::EditorLspTestContext, init_test};
+    use crate::test::{editor_test_context::EditorTestContext, init_test};
     use indoc::indoc;
 
     #[gpui::test]
     async fn test_mouse_context_menu(cx: &mut gpui::TestAppContext) {
         init_test(cx, |_| {});
 
-        let mut cx = EditorLspTestContext::new_rust(
-            lsp::ServerCapabilities {
-                hover_provider: Some(lsp::HoverProviderCapability::Simple(true)),
-                ..Default::default()
-            },
-            cx,
-        )
-        .await;
+        let mut cx = EditorTestContext::new(cx).await;
 
         cx.set_state(indoc! {"
             fn teˇst() {

@@ -336,28 +336,6 @@ impl Project {
         project
     }
 
-    /// Removed-feature stub: remote project support was deleted with collab.
-    /// Returns a local-mode Project so callers that still reference this
-    /// constructor get a usable entity instead of panicking. Remote-only
-    /// behavior is not reachable in the mux-first product.
-    pub fn remote(
-        _session: Arc<dyn remote::RemoteConnection>,
-        _client: Arc<stubs::Client>,
-        _node_runtime: (),
-        _user_store: (),
-        languages: Arc<language::LanguageRegistry>,
-        fs: Arc<dyn fs::Fs>,
-        is_read_only: bool,
-        cx: &mut Context<Self>,
-    ) -> Entity<Self> {
-        // Remote connection and collab client are unused for the local stub.
-        let env = None;
-        let mut project = Self::local(languages, fs, env, Vec::new(), cx);
-        if is_read_only {
-            tracing::warn!("Project::remote stub ignores is_read_only; remote mode is removed");
-        }
-        project
-    }
 
     pub fn fs(&self) -> &Arc<dyn Fs> {
         &self.fs

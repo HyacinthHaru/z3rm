@@ -84,20 +84,20 @@ impl Editor {
     }
 }
 
-// Frozen: `EditorLspTestContext` cannot complete while z3rm has no LSP startup
-// path (see its doc comment).
-#[cfg(all(test, feature = "z3rm-migration"))]
+#[cfg(test)]
 mod tests {
     use super::*;
-    use crate::test::{editor_lsp_test_context::EditorLspTestContext, init_test};
+    use crate::test::{editor_test_context::EditorTestContext, init_test};
     use indoc::indoc;
     use language::{BracketPair, BracketPairConfig, Language, LanguageConfig, LanguageMatcher};
+    use std::sync::Arc;
 
     #[gpui::test]
     async fn test_matching_bracket_highlights(cx: &mut gpui::TestAppContext) {
         init_test(cx, |_| {});
 
-        let mut cx = EditorLspTestContext::new(
+        let mut cx = EditorTestContext::new(cx).await;
+        let language = Arc::new(
             Language::new(
                 LanguageConfig {
                     name: "Rust".into(),
@@ -133,10 +133,9 @@ mod tests {
                 ("(" @open ")" @close)
                 "#})
             .unwrap(),
-            Default::default(),
-            cx,
-        )
-        .await;
+        );
+        cx.update_buffer(|buffer, cx| buffer.set_language(Some(language), cx));
+        cx.run_until_parked();
 
         // positioning cursor inside bracket highlights both
         cx.set_state(indoc! {r#"
