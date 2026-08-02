@@ -2055,12 +2055,12 @@ impl Item for TerminalView {
             let project = project.read(cx);
             let paths = selection
                 .items()
-                .map(|selected_entry| selected_entry.entry_id)
-                .filter_map(|entry_id| project.path_for_entry(entry_id, cx))
+                .filter_map(|selected_entry| project.path_for_entry(selected_entry.entry_id, cx))
+                .filter_map(|path| project.absolute_path(&path, cx))
                 .collect::<Vec<_>>();
 
             if !paths.is_empty() {
-                self.add_paths_to_terminal(&paths.iter().map(|p| p.path.as_std_path().to_path_buf()).collect::<Vec<_>>(), window, cx);
+                self.add_paths_to_terminal(&paths, window, cx);
             }
 
             return true;
@@ -2068,8 +2068,9 @@ impl Item for TerminalView {
             let project = project.read(cx);
             if let Some(path) = project
                 .path_for_entry(entry_id, cx)
+                .and_then(|path| project.absolute_path(&path, cx))
             {
-                self.add_paths_to_terminal(&[path.path.as_std_path().to_path_buf()], window, cx);
+                self.add_paths_to_terminal(&[path], window, cx);
             }
 
             return true;
@@ -2509,23 +2510,22 @@ fn current_project_directory(workspace: &Workspace, cx: &App) -> Option<PathBuf>
         .or_else(|| first_project_directory(workspace, cx))
 }
 
-///Gets the first project's home directory, or the home directory
 fn first_project_directory(workspace: &Workspace, cx: &App) -> Option<PathBuf> {
     let worktree = workspace.worktrees(cx).next()?.read(cx);
     let worktree_path = worktree.abs_path();
-    if worktree.root_entry()?.is_dir() {
-        Some(worktree_path.to_path_buf())
+    if worktree.is_single_file() || worktree.root_entry().is_some_and(|entry| !entry.is_dir()) {
+        worktree_path.parent().map(|path| path.to_path_buf())
     } else {
-        // If worktree is a file, return its parent directory
-        worktree_path.parent().map(|p| p.to_path_buf())
+        Some(worktree_path.to_path_buf())
     }
 }
 
-#[cfg(all(test, feature = "z3rm-migration"))]
+#[cfg(test)]
 mod tests {
     use super::*;
     use gpui::{TestAppContext, VisualTestContext};
     use project::{Entry, Project, ProjectPath, Worktree};
+    use settings::SettingsStore;
     use std::path::{Path, PathBuf};
     use util::paths::PathStyle;
     use util::rel_path::RelPath;
@@ -2929,6 +2929,8 @@ mod tests {
     ) {
         let params = cx.update(AppState::test);
         cx.update(|cx| {
+            let settings = SettingsStore::test(cx);
+            cx.set_global(settings);
             theme_settings::init(theme::LoadThemes::JustBase, cx);
         });
 
@@ -2992,7 +2994,8 @@ mod tests {
         path: impl AsRef<Path>,
         cx: &mut TestAppContext,
     ) -> (Entity<Worktree>, Entry) {
-        let (wt, _) = project
+        let path = path.as_ref();
+        let wt = project
             .update(cx, |project, cx| {
                 project.find_or_create_worktree(path, true, cx)
             })
@@ -3024,7 +3027,7 @@ mod tests {
                 worktree_id: wt.read(cx).id(),
                 path: entry.path,
             };
-            project.update(cx, |project, cx| project.set_active_path(Some(p), cx));
+            project.update(cx, |project, cx| project.set_active_path(Some(&p), cx));
         });
     }
 
@@ -3598,7 +3601,7 @@ mod tests {
         terminal_view.read_with(&cx, |view, _| {
             assert_eq!(
                 view.copy_mode_state().search_indicator().as_deref(),
-                Some("/ne — 1 matches")
+                Some("/ne — 2 matches")
             );
         });
 

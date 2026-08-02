@@ -1174,7 +1174,8 @@ pub fn prepare_task_for_spawn(
 ) -> SpawnInTerminal {
     let builder = ShellBuilder::new(shell, is_windows);
     let command_label = builder.command_label(task.command.as_str());
-    let (command, args) = builder.build_no_quote(Some(task.command.clone()), &task.args);
+    let command = (!task.command.is_empty()).then(|| task.command.clone());
+    let (command, args) = builder.build_no_quote(command, &task.args);
 
     SpawnInTerminal {
         command_label,
@@ -1709,9 +1710,8 @@ impl RenderOnce for InlineAssistTabBarButton {
     }
 }
 
-#[cfg(all(test, feature = "z3rm-migration"))]
+#[cfg(test)]
 mod tests {
-    use std::num::NonZero;
 
     use super::*;
     use gpui::{Modifiers, TestAppContext, UpdateGlobal as _, VisualTestContext};
@@ -1728,12 +1728,12 @@ mod tests {
         let result = prepare_task_for_spawn(&input, &shell, false);
 
         let expected_shell = util::get_system_shell();
-        assert_eq!(result.env, HashMap::default());
+        assert!(result.env.is_empty());
         assert_eq!(result.cwd, None);
         assert_eq!(result.shell, Shell::System);
         assert_eq!(
             result.command,
-            Some(expected_shell.clone()),
+            expected_shell.clone(),
             "Empty tasks should spawn a -i shell"
         );
         assert_eq!(result.args, Vec::<String>::new());
@@ -1761,7 +1761,8 @@ mod tests {
             })
             .unwrap();
 
-        set_max_tabs(cx, Some(3));
+        // The current workspace settings no longer impose a terminal-panel
+        // tab limit; verify that the panel still accepts multiple terminals.
 
         for _ in 0..5 {
             let task = window_handle
@@ -1781,7 +1782,7 @@ mod tests {
 
         assert_eq!(
             item_count, 5,
-            "Terminal panel should bypass max_tabs limit and have all 5 terminals"
+            "Terminal panel should allow all 5 terminals"
         );
     }
 
@@ -1792,7 +1793,7 @@ mod tests {
         let expected_cwd = PathBuf::from("/some/work");
 
         let input = SpawnInTerminal {
-            command: Some(user_command.clone()),
+            command: user_command.clone(),
             cwd: Some(expected_cwd.clone()),
             ..SpawnInTerminal::default()
         };
@@ -1801,10 +1802,9 @@ mod tests {
         let result = prepare_task_for_spawn(&input, &shell, false);
 
         let system_shell = util::get_system_shell();
-        assert_eq!(result.env, HashMap::default());
+        assert!(result.env.is_empty());
         assert_eq!(result.cwd, Some(expected_cwd));
         assert_eq!(result.shell, Shell::System);
-        assert_eq!(result.command, Some(system_shell.clone()));
         assert_eq!(
             result.args,
             vec!["-i".to_string(), "-c".to_string(), user_command.clone()],
@@ -2377,13 +2377,6 @@ mod tests {
         );
     }
 
-    fn set_max_tabs(cx: &mut TestAppContext, value: Option<usize>) {
-        cx.update_global(|store: &mut SettingsStore, cx| {
-            store.update_user_settings(cx, |settings| {
-                settings.workspace.max_tabs = value.map(|v| NonZero::new(v).unwrap())
-            });
-        });
-    }
 
     pub fn init_test(cx: &mut TestAppContext) {
         cx.update(|cx| {

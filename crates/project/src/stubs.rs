@@ -1411,13 +1411,18 @@ impl Project {
     pub fn active_project_directory(&self, cx: &App) -> Option<std::path::PathBuf> {
         self.active_entry
             .and_then(|entry_id| self.worktree_for_entry(entry_id, cx))
-            .map(|worktree| worktree.read(cx).abs_path().to_path_buf())
+            .and_then(|worktree| {
+                let worktree = worktree.read(cx);
+                (!worktree.is_single_file()).then(|| worktree.abs_path().to_path_buf())
+            })
             .or_else(|| {
                 self.worktree_store
                     .read(cx)
                     .visible_worktrees(cx)
-                    .next()
-                    .map(|worktree| worktree.read(cx).abs_path().to_path_buf())
+                    .find_map(|worktree| {
+                        let worktree = worktree.read(cx);
+                        (!worktree.is_single_file()).then(|| worktree.abs_path().to_path_buf())
+                    })
             })
     }
 
@@ -1791,49 +1796,35 @@ pub struct ShellConfig {
     pub args: Vec<String>,
 }
 
-/// Stub: ShellBuilder (task crate 已删除)
-#[derive(Debug, Clone)]
 pub struct ShellBuilder {
-    pub program: String,
-    pub args: Vec<String>,
+    inner: util::shell_builder::ShellBuilder,
 }
 
 impl ShellBuilder {
-    pub fn new(shell: &Shell, _is_windows: bool) -> Self {
-        let (program, args) = match shell {
-            Shell::System => (util::get_system_shell(), Vec::new()),
-            Shell::Program(config) => (config.program.clone(), config.args.clone()),
+    pub fn new(shell: &Shell, is_windows: bool) -> Self {
+        let shell = match shell {
+            Shell::System => util::shell::Shell::System,
+            Shell::Program(config) => util::shell::Shell::WithArguments {
+                program: config.program.clone(),
+                args: config.args.clone(),
+                title_override: None,
+            },
         };
-        Self { program, args }
+        Self {
+            inner: util::shell_builder::ShellBuilder::new(&shell, is_windows),
+        }
     }
 
-    /// 生成命令标签字符串
     pub fn command_label(&self, command: &str) -> String {
-        if command.is_empty() {
-            self.program.clone()
-        } else {
-            format!("{} {}", self.program, command)
-        }
+        self.inner.command_label(command)
     }
 
-    /// 构建命令和参数 (no shell quoting)
     pub fn build_no_quote(
-        &self,
+        self,
         command: Option<String>,
-        _args: &[String],
+        args: &[String],
     ) -> (String, Vec<String>) {
-        let mut all_args = self.args.clone();
-        if let Some(cmd) = command {
-            if !cmd.is_empty() {
-                all_args.push("-c".to_string());
-                all_args.push(cmd);
-                (self.program.clone(), all_args)
-            } else {
-                (self.program.clone(), all_args)
-            }
-        } else {
-            (self.program.clone(), all_args)
-        }
+        self.inner.build_no_quote(command, args)
     }
 }
 

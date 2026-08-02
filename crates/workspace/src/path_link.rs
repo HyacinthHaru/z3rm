@@ -303,9 +303,7 @@ fn possible_open_target_internal(
         background_path_checks.unwrap_or(BackgroundPathChecks::LocalFileSystem);
 
     let background_resolution_task = match background_path_checks {
-        // §15.1 Project::resolve_abs_path 已删除，远程路径解析分支已移除。
-        BackgroundPathChecks::ProjectPathResolution => Task::ready(open_target),
-        BackgroundPathChecks::LocalFileSystem => {
+        BackgroundPathChecks::ProjectPathResolution | BackgroundPathChecks::LocalFileSystem => {
             let fs_paths_to_check =
                 local_paths_to_check(&potential_paths, cwd, &worktree_candidates, cx);
             let fs = project.read(cx).fs().clone();

@@ -214,7 +214,7 @@ fn possibly_open_target(
     })
 }
 
-#[cfg(all(test, feature = "z3rm-migration"))]
+#[cfg(test)]
 mod tests {
     use super::*;
     use gpui::{AppContext as _, TestAppContext};
@@ -228,6 +228,7 @@ mod tests {
     use util::path;
     use util::paths::PathStyle;
     use workspace::{AppState, MultiWorkspace};
+    use settings::SettingsStore;
 
     async fn init_test(
         app_cx: &mut TestAppContext,
@@ -241,6 +242,8 @@ mod tests {
         let fs = app_cx.update(AppState::test).fs.as_fake().clone();
 
         app_cx.update(|cx| {
+            let settings = SettingsStore::test(cx);
+            cx.set_global(settings);
             theme_settings::init(theme::LoadThemes::JustBase, cx);
             editor::init(cx);
         });
