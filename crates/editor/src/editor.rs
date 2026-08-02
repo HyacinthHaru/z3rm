@@ -7438,7 +7438,9 @@ impl Editor {
         None
     }
 
-    /// Stub: perform_format (格式化功能已删除)
+    /// Formatting was deleted with LSP support; report an explicit recoverable
+    /// error instead of claiming success. The save flow surfaces it without
+    /// aborting the save (see `EditorItem::save`).
     fn perform_format(
         &mut self,
         _project: Entity<Project>,
@@ -7447,7 +7449,9 @@ impl Editor {
         _window: &mut Window,
         _cx: &mut Context<Self>,
     ) -> Task<Result<()>> {
-        Task::ready(Ok(()))
+        Task::ready(Err(anyhow::anyhow!(
+            "formatting is unavailable in this build (LSP support was removed)"
+        )))
     }
 
     fn organize_imports(

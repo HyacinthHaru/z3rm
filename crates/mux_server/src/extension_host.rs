@@ -841,20 +841,24 @@ fn push_chrome_if_dirty(
     // published key that disappeared; the client treats that as a tombstone.
     let mut current_views = BTreeMap::new();
     for extension in hosted.iter_mut().filter(|extension| !extension.suspended) {
+        let extension_id = extension.live.id().to_string();
         match extension.live.render_all_views() {
             Ok(rendered) => {
                 for json in rendered {
                     current_views.insert(
-                        (extension.live.id().to_string(), view_id_of(&json)),
+                        (extension_id.clone(), view_id_of(&json)),
                         json,
                     );
                 }
             }
             Err(error) => {
-                tracing::warn!(id = %extension.live.id(), %error, "server extension render failed");
+                tracing::warn!(id = %extension_id, %error, "server extension render failed");
             }
         }
         extension.note_resource_violations();
+        if extension.suspended {
+            current_views.retain(|(id, _), _| id != &extension_id);
+        }
     }
 
     let current_keys: BTreeSet<(String, String)> = current_views.keys().cloned().collect();

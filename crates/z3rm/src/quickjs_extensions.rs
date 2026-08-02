@@ -683,25 +683,33 @@ fn render_live_extensions(live_extensions: &mut [HostedExtension]) -> Vec<VDomNo
         if hosted.suspended {
             continue;
         }
-        let live_extension = &hosted.live;
-        match live_extension.render_all_views() {
+
+        let extension_id = hosted.live.id().to_string();
+        let mut rendered_nodes = Vec::new();
+        match hosted.live.render_all_views() {
             Ok(views) => {
                 for json in views {
                     match parse_vdom_json(&json) {
-                        Ok(node) => nodes.push(node),
+                        Ok(node) => rendered_nodes.push(node),
                         Err(error) => {
-                            tracing::warn!(id = %live_extension.id(), %error, "extension VDOM rejected")
+                            tracing::warn!(id = %extension_id, %error, "extension VDOM rejected")
                         }
                     }
                 }
             }
             Err(error) => {
-                tracing::warn!(id = %live_extension.id(), %error, "extension render failed")
+                tracing::warn!(id = %extension_id, %error, "extension render failed");
             }
         }
-        // Drains the internal error list, logs it, and suspends the extension
-        // on CPU/memory violations.
+
+        // Check violations before publishing this frame. If the extension
+        // exceeded a limit while rendering, its frame is discarded so native
+        // chrome can replace it immediately instead of displaying the last
+        // untrusted view.
         hosted.note_resource_violations();
+        if !hosted.suspended {
+            nodes.extend(rendered_nodes);
+        }
     }
     nodes
 }

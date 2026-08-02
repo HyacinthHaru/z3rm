@@ -418,7 +418,7 @@ pub fn init(cx: &mut App) {
             let app_state = workspace.app_state().clone();
 
             cx.spawn_in(window, async move |_, cx| {
-                open_remote_project(
+                if let Err(error) = open_remote_project(
                     RemoteConnectionOptions::Wsl(open_wsl.distro.clone()),
                     open_wsl.paths,
                     app_state,
@@ -426,6 +426,20 @@ pub fn init(cx: &mut App) {
                     cx,
                 )
                 .await
+                {
+                    let message = format!("Unable to open the WSL project: {error}");
+                    if let Err(prompt_error) = cx
+                        .prompt(
+                            gpui::PromptLevel::Critical,
+                            "Unable to open project",
+                            Some(&message),
+                            &["OK"],
+                        )
+                        .await
+                    {
+                        log::error!("failed to show WSL project error: {prompt_error}");
+                    }
+                }
             })
             .detach();
         });
@@ -3124,6 +3138,56 @@ mod tests {
         assert_eq!(
             remote_recent_project_error("build-host"),
             "Cannot reopen remote project at build-host: remote project workspaces are not supported by this build"
+        );
+    }
+
+    #[gpui::test]
+    async fn test_open_remote_project_returns_clear_error(cx: &mut TestAppContext) {
+        // Remote project workspaces are not available in this build; opening
+        // one must fail with a recoverable error rather than silently succeed.
+        let app_state = init_test(cx);
+        app_state
+            .fs
+            .as_fake()
+            .insert_tree("/local", json!({}))
+            .await;
+
+        cx.update(|cx| {
+            open_paths(
+                &[PathBuf::from("/local")],
+                app_state.clone(),
+                workspace::OpenOptions::default(),
+                cx,
+            )
+        })
+        .await
+        .unwrap();
+        cx.run_until_parked();
+
+        let window = cx.update(|cx| cx.windows()[0].downcast::<MultiWorkspace>().unwrap());
+        let open_task = window
+            .update(cx, |_, window, cx| {
+                cx.spawn_in(window, async move |_, cx| {
+                    open_remote_project(
+                        RemoteConnectionOptions::Wsl(remote::WslConnectionOptions {
+                            distro_name: "test-distro".into(),
+                            user: None,
+                        }),
+                        Vec::new(),
+                        app_state,
+                        workspace::OpenOptions::default(),
+                        cx,
+                    )
+                    .await
+                })
+            })
+            .unwrap();
+        cx.run_until_parked();
+
+        let error = open_task.await.unwrap_err();
+        assert!(
+            error.to_string().contains("not supported by this build"),
+            "remote open must return a clear error, got: {error}"
         );
     }
 

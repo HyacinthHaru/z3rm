@@ -776,6 +776,17 @@ impl Repository {
     }
 }
 
+/// LSP integration was deleted during dependency stripping. Queries that would
+/// previously have consulted a language server must fail explicitly instead of
+/// fabricating "no results" (which would silently claim, e.g., that a symbol
+/// has no definitions or references). Callers surface the error through their
+/// normal Task/Result plumbing; local buffer behavior is unaffected.
+fn lsp_unavailable<T>() -> gpui::Task<anyhow::Result<T>> {
+    gpui::Task::ready(Err(anyhow::anyhow!(
+        "language server support is unavailable in this build"
+    )))
+}
+
 impl Project {
     pub fn open_buffer_by_id(
         &mut self,
@@ -962,7 +973,7 @@ impl Project {
         _position: text::Anchor,
         _cx: &mut gpui::Context<Self>,
     ) -> Task<anyhow::Result<Option<Vec<Location>>>> {
-        Task::ready(Ok(None))
+        lsp_unavailable()
     }
 
     pub fn hover(
@@ -971,7 +982,7 @@ impl Project {
         _position: text::Anchor,
         _cx: &mut gpui::Context<Self>,
     ) -> Task<anyhow::Result<Option<Vec<super::Hover>>>> {
-        Task::ready(Ok(None))
+        lsp_unavailable()
     }
 
     pub fn document_highlights(
@@ -980,7 +991,7 @@ impl Project {
         _position: text::Anchor,
         _cx: &mut gpui::Context<Self>,
     ) -> Task<anyhow::Result<Vec<DocumentHighlight>>> {
-        Task::ready(Ok(Vec::new()))
+        lsp_unavailable()
     }
 
     pub fn definitions(
@@ -990,7 +1001,7 @@ impl Project {
         _kind: GotoDefinitionKind,
         _cx: &mut gpui::Context<Self>,
     ) -> Task<anyhow::Result<Option<Vec<LocationLink>>>> {
-        Task::ready(Ok(None))
+        lsp_unavailable()
     }
 
     pub fn declarations(
@@ -999,7 +1010,7 @@ impl Project {
         _position: text::Anchor,
         _cx: &mut gpui::Context<Self>,
     ) -> Task<anyhow::Result<Option<Vec<LocationLink>>>> {
-        Task::ready(Ok(None))
+        lsp_unavailable()
     }
 
     pub fn type_definitions(
@@ -1008,7 +1019,7 @@ impl Project {
         _position: text::Anchor,
         _cx: &mut gpui::Context<Self>,
     ) -> Task<anyhow::Result<Option<Vec<LocationLink>>>> {
-        Task::ready(Ok(None))
+        lsp_unavailable()
     }
 
     pub fn implementations(
@@ -1017,7 +1028,7 @@ impl Project {
         _position: text::Anchor,
         _cx: &mut gpui::Context<Self>,
     ) -> Task<anyhow::Result<Option<Vec<LocationLink>>>> {
-        Task::ready(Ok(None))
+        lsp_unavailable()
     }
 
     pub fn prepare_rename(
@@ -1026,7 +1037,7 @@ impl Project {
         _position: text::Anchor,
         _cx: &mut gpui::Context<Self>,
     ) -> Task<anyhow::Result<PrepareRenameResponse>> {
-        Task::ready(Ok(PrepareRenameResponse::InvalidPosition))
+        lsp_unavailable()
     }
 
     pub fn apply_code_action_kind(
@@ -1036,7 +1047,7 @@ impl Project {
         _only: bool,
         _cx: &mut gpui::Context<Self>,
     ) -> Task<anyhow::Result<()>> {
-        Task::ready(Ok(()))
+        lsp_unavailable()
     }
 
     pub fn supports_range_formatting(
@@ -1134,7 +1145,7 @@ impl Project {
         _range: Range<text::Anchor>,
         _cx: &mut gpui::Context<Self>,
     ) -> Task<anyhow::Result<Vec<InlayHint>>> {
-        Task::ready(Ok(Vec::new()))
+        lsp_unavailable()
     }
 
     pub fn visible_worktrees(&self, cx: &gpui::App) -> impl Iterator<Item = Entity<Worktree>> {
@@ -1690,7 +1701,7 @@ impl Project {
         _query: &str,
         _cx: &mut gpui::Context<Self>,
     ) -> gpui::Task<anyhow::Result<Vec<crate::lsp_store::SymbolLocation>>> {
-        gpui::Task::ready(Ok(Vec::new()))
+        lsp_unavailable()
     }
 }
 

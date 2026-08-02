@@ -115,6 +115,53 @@ async fn test_pane_renders_content_with_dead_project_handle(cx: &mut TestAppCont
 }
 
 #[gpui::test]
+async fn test_pane_renders_fallback_when_empty_with_dead_project_handle(
+    cx: &mut TestAppContext,
+) {
+    init_test(cx);
+    let fs = FakeFs::new(cx.executor());
+    fs.insert_tree("/root", json!({ "a.txt": "" })).await;
+    let project = Project::test(fs.clone(), [path!("/root").as_ref()], cx).await;
+
+    let (multi_workspace, cx) =
+        cx.add_window_view(|window, cx| MultiWorkspace::test_new(project, window, cx));
+    let workspace = multi_workspace.read_with(cx, |mw, _| mw.workspace().clone());
+    let pane = workspace.read_with(cx, |ws, _| ws.active_pane().clone());
+    cx.run_until_parked();
+
+    assert!(
+        cx.debug_bounds("pane-content").is_some(),
+        "pane placeholder must render while the project handle is live"
+    );
+
+    // Empty pane + dead project handle: the pane must render a non-empty,
+    // actionable fallback that reports the unavailable context instead of
+    // collapsing to a blank div.
+    let dead_project = {
+        let temp = Project::test(fs.clone(), [], cx).await;
+        temp.downgrade()
+    };
+    assert!(
+        dead_project.upgrade().is_none(),
+        "temporary project must be dropped"
+    );
+    pane.update(cx, |pane, cx| {
+        pane.set_project_for_test(dead_project);
+        cx.notify();
+    });
+    cx.run_until_parked();
+
+    assert!(
+        cx.debug_bounds("pane-content").is_some(),
+        "pane must keep rendering a placeholder while the project handle is unavailable"
+    );
+    assert!(
+        cx.debug_bounds("pane-content-unavailable").is_some(),
+        "the unavailable-context fallback must render when the project handle is gone"
+    );
+}
+
+#[gpui::test]
 async fn test_run_create_worktree_tasks_keeps_scanned_worktrees(cx: &mut TestAppContext) {
     init_test(cx);
     let fs = FakeFs::new(cx.executor());

@@ -589,6 +589,8 @@ impl MuxPaneView {
                 structured,
             } => {
                 validate_prepared_generation(self.generation, expected_generation)?;
+                let (previous_scrollback_offset, _) =
+                    self.terminal_view.read(cx).mux_scrollback_state();
                 self.terminal
                     .update(cx, |terminal, cx| {
                         terminal.apply_structured_snapshot(&structured, cx)
@@ -600,11 +602,17 @@ impl MuxPaneView {
                 let display_offset = usize::try_from(snapshot.display_offset)
                     .map_err(|_| anyhow::anyhow!("mux display offset exceeds client limits"))?;
                 self.snapshot = snapshot;
+                let history_rows = history_cache.history_size;
                 self.history_cache = history_cache;
                 self.generation = generation;
                 self.terminal_view.update(cx, |view, cx| {
                     view.update_scrollback_version(scrollback_version, cx);
-                    view.set_scrollback_offset((display_offset > 0).then_some(display_offset), cx);
+                    view.apply_mux_scrollback_offset(
+                        previous_scrollback_offset,
+                        display_offset,
+                        history_rows,
+                        cx,
+                    );
                 });
             }
         }

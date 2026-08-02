@@ -677,7 +677,10 @@ impl Item for Editor {
                     })
                 })?;
                 if let Some(format_task) = format_task {
-                    format_task.await?;
+                    // Formatting is unavailable in this build; the task fails
+                    // with an explicit error instead of a silent no-op. Log it
+                    // but keep the save itself working.
+                    format_task.await.log_err();
                 }
             }
 

@@ -86,7 +86,7 @@ pub async fn get_remote_version(session: &SshSession, server_path: &str) -> Resu
 
 /// §16.6 获取本地 z3rm-server 版本号。
 pub fn get_local_version() -> Option<&'static str> {
-    option_env!("ZERM_VERSION")
+    option_env!("Z3RM_VERSION").or(Some(env!("CARGO_PKG_VERSION")))
 }
 
 // ============================================================================

@@ -8,16 +8,22 @@ use std::path::PathBuf;
 fn main() -> Result<()> {
     let args: Vec<String> = std::env::args().collect();
 
-    // §16.12 解析 CLI 子命令
+    // The SSH installer probes this before deciding whether an existing
+    // daemon binary can be reused.
     match args.get(1).map(String::as_str) {
-        Some("status") => cmd_status(),
-        Some("kill") => cmd_kill(&args[2..]),
-        _ => {
-            // 默认行为: 运行 daemon
-            run()
+        Some("--version") | Some("-V") => {
+            println!("{}", env!("CARGO_PKG_VERSION"));
+            return Ok(());
         }
+        Some("status") => return cmd_status(),
+        Some("kill") => return cmd_kill(&args[2..]),
+        _ => {}
     }
+
+    // Default behavior: run the daemon.
+    run()
 }
+
 
 /// 默认 socket 路径 (§16.1)。测试可用 Z3RM_MUX_SOCKET 覆盖。
 fn default_socket_path() -> PathBuf {

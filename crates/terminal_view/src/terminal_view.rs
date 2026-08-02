@@ -79,6 +79,41 @@ fn viewport_line_for_point(point: Point, display_offset: usize) -> Option<usize>
     }
 }
 
+fn resolve_mux_scrollback_offset(
+    previous_offset: Option<usize>,
+    server_offset: usize,
+    history_rows: usize,
+    scroll_locked: bool,
+) -> Option<usize> {
+    if scroll_locked {
+        previous_offset.map(|offset| offset.min(history_rows))
+    } else {
+        (server_offset > 0).then_some(server_offset.min(history_rows))
+    }
+}
+
+#[cfg(test)]
+mod mux_scrollback_tests {
+    use super::resolve_mux_scrollback_offset;
+
+    #[test]
+    fn locked_scroll_preserves_and_clamps_local_offset() {
+        assert_eq!(
+            resolve_mux_scrollback_offset(Some(12), 0, 8, true),
+            Some(8)
+        );
+    }
+
+    #[test]
+    fn unlocked_scroll_follows_authoritative_offset() {
+        assert_eq!(
+            resolve_mux_scrollback_offset(Some(12), 3, 8, false),
+            Some(3)
+        );
+        assert_eq!(resolve_mux_scrollback_offset(Some(12), 0, 8, false), None);
+    }
+}
+
 const CURSOR_BLINK_INTERVAL: Duration = Duration::from_millis(500);
 
 /// Event to transmit the scroll from the element to the view
@@ -946,6 +981,34 @@ impl TerminalView {
     pub fn get_scrollback_offset(&self) -> Option<usize> {
         self.scrollback_offset
     }
+    /// Returns the local scroll state used while applying an authoritative mux snapshot.
+    pub fn mux_scrollback_state(&self) -> (Option<usize>, bool) {
+        (self.scrollback_offset, self.scroll_locked)
+    }
+
+    /// Reapply the local per-client scroll position after replacing the
+    /// display-only terminal with a mux snapshot.
+    pub fn apply_mux_scrollback_offset(
+        &mut self,
+        previous_offset: Option<usize>,
+        server_offset: usize,
+        history_rows: usize,
+        cx: &mut Context<Self>,
+    ) {
+        let offset = resolve_mux_scrollback_offset(
+            previous_offset,
+            server_offset,
+            history_rows,
+            self.scroll_locked,
+        );
+        self.scrollback_offset = offset;
+        if let Some(offset) = offset {
+            self.terminal
+                .update(cx, |terminal, _| terminal.scroll_to_display_offset(offset));
+        }
+        cx.notify();
+    }
+
 
     /// §16.9 设置回滚偏移量
     pub fn set_scrollback_offset(&mut self, offset: Option<usize>, cx: &mut Context<Self>) {
@@ -981,8 +1044,13 @@ impl TerminalView {
 
     /// §16.9 更新回滚版本 (缓存失效检测)
     pub fn update_scrollback_version(&mut self, version: (u64, u64), cx: &mut Context<Self>) {
-        // §16.9 如果版本变更, 清除缓存 (重置 offset)
-        if self.scrollback_version != Some(version) {
+        // The history version identifies the cached rows; a generation-only
+        // update changes the active screen but not the scrollback checkpoint.
+        let history_changed = self
+            .scrollback_version
+            .map(|(history_version, _)| history_version)
+            != Some(version.0);
+        if history_changed && !self.scroll_locked {
             self.scrollback_offset = None;
         }
         self.scrollback_version = Some(version);
@@ -993,8 +1061,6 @@ impl TerminalView {
         self.terminal.update(cx, |term, _| term.toggle_vi_mode());
         cx.notify();
     }
-
-    /// §16.9 切换滚动锁定 (Ctrl-Shift-S)
     fn toggle_scroll_lock(&mut self, _: &ToggleScrollLock, _: &mut Window, cx: &mut Context<Self>) {
         self.do_toggle_scroll_lock(cx);
     }

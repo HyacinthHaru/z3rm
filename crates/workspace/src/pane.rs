@@ -4384,7 +4384,25 @@ impl Render for Pane {
                                         }
                                     },
                                 ));
-                            if project.is_none() || has_worktrees || !self.should_display_welcome_page {
+                            // A dead project handle must not blank the pane content
+                            // area: render a non-empty, actionable placeholder that
+                            // visibly reports the unavailable context. The double-
+                            // click dispatch handler on the placeholder still works.
+                            if project.is_none() {
+                                placeholder.child(
+                                    v_flex()
+                                        .id("pane_unavailable_placeholder")
+                                        .debug_selector(|| "pane-content-unavailable".into())
+                                        .items_center()
+                                        .gap_1()
+                                        .child(Label::new("Workspace unavailable").color(Color::Muted))
+                                        .child(
+                                            Label::new("Reconnect to restore this pane")
+                                                .size(LabelSize::Small)
+                                                .color(Color::Muted),
+                                        ),
+                                )
+                            } else if has_worktrees || !self.should_display_welcome_page {
                                 placeholder
                             } else {
                                 if self.welcome_page.is_none() {

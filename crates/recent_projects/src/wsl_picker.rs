@@ -262,7 +262,22 @@ impl WslOpenModal {
 
         cx.emit(DismissEvent);
         cx.spawn_in(window, async move |_, cx| {
-            open_remote_project(connection_options, paths, app_state, open_options, cx).await
+            if let Err(error) =
+                open_remote_project(connection_options, paths, app_state, open_options, cx).await
+            {
+                let message = format!("Unable to open the WSL project: {error}");
+                if let Err(prompt_error) = cx
+                    .prompt(
+                        gpui::PromptLevel::Critical,
+                        "Unable to open project",
+                        Some(&message),
+                        &["OK"],
+                    )
+                    .await
+                {
+                    log::error!("failed to show WSL project error: {prompt_error}");
+                }
+            }
         })
         .detach();
     }

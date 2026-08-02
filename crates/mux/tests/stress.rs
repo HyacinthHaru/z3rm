@@ -17,8 +17,11 @@
 use anyhow::{Context, Result};
 use mux::{AttachMode, MuxDomain};
 use mux_protocol::proto;
+use mux_protocol::proto::envelope::Payload as EnvelopePayload;
+use mux_protocol::proto::request::Body as RequestBody;
 use mux_protocol::proto::split_node::SplitDirection;
-use std::collections::HashSet;
+use mux_protocol::{Envelope, Request};
+use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -164,6 +167,118 @@ async fn wait_for_generation(
             anyhow::bail!("timed out waiting for {what}; last generation was {generation}");
         }
         tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+}
+
+/// Render a grid update (diff or full snapshot) as plain text, row by row.
+/// Used to assert on the *content* the server hands back, not just the
+/// generation counter.
+fn grid_text(update: &proto::fetch_grid_update_response::Update) -> String {
+    use proto::fetch_grid_update_response::Update;
+    match update {
+        Update::Diff(diff) => {
+            let mut rows: std::collections::BTreeMap<u32, String> = Default::default();
+            for row_change in &diff.rows {
+                let line: String = row_change
+                    .cells
+                    .iter()
+                    .map(|cell| cell.char.clone())
+                    .collect();
+                rows.insert(row_change.row, line);
+            }
+            rows.into_values().collect::<Vec<_>>().join("\n")
+        }
+        Update::FullSnapshot(snapshot) => {
+            let cols = snapshot.cols as usize;
+            if cols == 0 {
+                return String::new();
+            }
+            let mut out = String::new();
+            for (i, cell) in snapshot.cells.iter().enumerate() {
+                out.push_str(&cell.char);
+                if (i + 1) % cols == 0 {
+                    out.push('\n');
+                }
+            }
+            out
+        }
+    }
+}
+
+/// Poll `fetch_grid_update(0)` until the generation holds still for 400ms,
+/// then return it. Used with bounded floods (`yes | head -n N; cat`) so the
+/// test can assert against a settled, deterministic end state instead of a
+/// racing wall clock.
+async fn wait_for_settled_generation(
+    domain: &MuxDomain,
+    pane_id: &str,
+    timeout: Duration,
+    what: &str,
+) -> Result<u64> {
+    let deadline = Instant::now() + timeout;
+    let mut last: Option<(u64, Instant)> = None;
+    loop {
+        let response = domain.fetch_grid_update(pane_id, 0).await?;
+        let generation = response.to_generation;
+        if let Some((previous, at)) = last {
+            if previous == generation {
+                // Same generation as the previous sample: this is the start of
+                // a stable run, not a fresh observation — keep the original
+                // timestamp so the window can actually elapse.
+                if at.elapsed() >= Duration::from_millis(400) {
+                    return Ok(generation);
+                }
+            } else {
+                last = Some((generation, Instant::now()));
+            }
+        } else {
+            last = Some((generation, Instant::now()));
+        }
+        if Instant::now() >= deadline {
+            anyhow::bail!(
+                "timed out waiting for {what}; last generation was {generation}"
+            );
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+}
+
+/// What a subscriber drain task has observed so far. Keyed so assertions can
+/// name exactly which notification was missed.
+#[derive(Default)]
+struct NotificationTally {
+    pane_dirty: HashMap<String, usize>,
+    pane_added: HashSet<String>,
+    layout_changed: usize,
+}
+
+/// Poll a `NotificationTally` until `predicate` holds or the deadline passes.
+/// Delivery across the wire is asynchronous; a direct `assert!` right after
+/// the triggering RPC would race the server's fan-out.
+async fn wait_for_tally(
+    tally: &Arc<parking_lot::Mutex<NotificationTally>>,
+    timeout: Duration,
+    mut predicate: impl FnMut(&NotificationTally) -> bool,
+    what: &str,
+) -> Result<()> {
+    let deadline = Instant::now() + timeout;
+    loop {
+        {
+            let observed = tally.lock();
+            if predicate(&observed) {
+                return Ok(());
+            }
+        }
+        if Instant::now() >= deadline {
+            let observed = tally.lock();
+            anyhow::bail!(
+                "timed out waiting for {what}; tally: dirty={:?} added={:?} layout_changed={}",
+                observed.pane_dirty,
+                observed.pane_added,
+                observed.layout_changed
+            );
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
     }
 }
 
@@ -711,5 +826,530 @@ async fn undrained_subscriber_does_not_stall_the_wire() -> Result<()> {
         drained > 0,
         "no notification was ever delivered while the channel was under pressure"
     );
+    Ok(())
+}
+
+/// §3.4 / §15.4 A client that was away while PaneDirty and lifecycle
+/// notifications happened must recover exclusively from authoritative state —
+/// the attach snapshot and generation-based grid fetches — never from
+/// notifications it never received.
+///
+/// Phase 1: the owner disconnects while a bounded flood runs and a new pane
+/// is spawned. The reconnecting client must (a) see the exact pane set the
+/// actor sees, and (b) get a full grid snapshot for its pre-disconnect
+/// generation — a partial merged diff or a NoChange for state that moved on
+/// would leave the UI stale forever.
+///
+/// Phase 2: an in-place reconnect while connected must re-register the
+/// subscriber pipeline (synthetic `SessionLayoutChanged`, then real lifecycle
+/// notifications) and keep converging on the same generation as the actor.
+#[tokio::test(flavor = "multi_thread")]
+async fn reconnect_recovers_authoritative_snapshot_after_missed_notifications() -> Result<()> {
+    let server = TestServer::spawn()?;
+    let actor = server.connect().await?;
+    let (session_id, tab_id) = open_session(&actor, "reconnect-snap").await?;
+
+    // Bounded flood with a settle point: the pane keeps producing output for
+    // a few seconds, then `cat` holds the pane open so the session survives.
+    // 200k lines ≈ 4.4 MB ≈ hundreds of grid generations.
+    let p1 = actor
+        .spawn_pane(
+            &session_id,
+            &tab_id,
+            size(80, 24),
+            Some(shell(
+                "/bin/sh",
+                &["-c", "yes z3rm-reconnect-marker | head -n 200000; cat"],
+            )),
+            Some(std::path::Path::new("/tmp")),
+        )
+        .await?;
+
+    // Owner attaches, samples the generation early in the flood, then
+    // disconnects — every later PaneDirty and lifecycle notification misses it.
+    let owner1 = server.connect().await?;
+    owner1.attach(&session_id, AttachMode::Shared).await?;
+    let stale_generation = wait_for_generation(
+        &owner1,
+        &p1,
+        |generation| generation > 0,
+        Duration::from_secs(10),
+        "the first flood generation",
+    )
+    .await?;
+    owner1.detach().await?;
+    drop(owner1);
+
+    // While the owner is away: a lifecycle change it will never hear about.
+    let p2 = actor
+        .spawn_pane(
+            &session_id,
+            &tab_id,
+            size(80, 24),
+            Some(shell("/bin/cat", &[])),
+            Some(std::path::Path::new("/tmp")),
+        )
+        .await?;
+
+    // The flood is bounded, so it must settle to a fixed generation.
+    let settled_generation = wait_for_settled_generation(
+        &actor,
+        &p1,
+        Duration::from_secs(30),
+        "the flood to finish",
+    )
+    .await?;
+    anyhow::ensure!(
+        settled_generation >= stale_generation + 128,
+        "flood advanced only {} generations past the stale checkpoint ({} → {}); \
+         the reconnect must be tested against a long absence",
+        settled_generation.saturating_sub(stale_generation),
+        stale_generation,
+        settled_generation,
+    );
+
+    // The reconnecting client recovers the missed lifecycle events from the
+    // authoritative attach snapshot.
+    let owner2 = server.connect().await?;
+    let attach = owner2.attach(&session_id, AttachMode::Shared).await?;
+    let seen: HashSet<String> = snapshot_pane_ids(
+        attach
+            .snapshot
+            .as_ref()
+            .context("attach returned no snapshot")?,
+    )
+    .into_iter()
+    .collect();
+    let expected: HashSet<String> = HashSet::from([p1.clone(), p2.clone()]);
+    anyhow::ensure!(
+        seen == expected,
+        "reconnecting client sees panes {seen:?}, expected {expected:?}"
+    );
+
+    // Authoritative grid recovery: fetching from the pre-disconnect generation
+    // must yield a full snapshot of the current state, not a partial diff.
+    let resync = owner2.fetch_grid_update(&p1, stale_generation).await?;
+    let update = resync
+        .update
+        .as_ref()
+        .context("stale-generation fetch returned no update")?;
+    anyhow::ensure!(
+        matches!(
+            update,
+            proto::fetch_grid_update_response::Update::FullSnapshot(_)
+        ),
+        "reconnect fetch since a stale generation must return a full snapshot, got {update:?}"
+    );
+    anyhow::ensure!(
+        resync.to_generation == settled_generation,
+        "reconnect full snapshot is generation {}, expected the settled generation {}",
+        resync.to_generation,
+        settled_generation,
+    );
+
+    // Both clients converge on the same authoritative grid.
+    let from_scratch = owner2.fetch_grid_update(&p1, 0).await?;
+    let text = grid_text(
+        from_scratch
+            .update
+            .as_ref()
+            .context("from-scratch fetch returned no update")?,
+    );
+    anyhow::ensure!(
+        text.contains("z3rm-reconnect-marker"),
+        "authoritative grid lost the flood content"
+    );
+    let actor_view = actor.fetch_grid_update(&p1, 0).await?;
+    anyhow::ensure!(
+        actor_view.to_generation == settled_generation,
+        "actor drifted from the settled generation: {} vs {}",
+        actor_view.to_generation,
+        settled_generation,
+    );
+
+    // Phase 2: in-place reconnect while connected. The synthetic
+    // SessionLayoutChanged must arrive, and a pane spawned afterwards must
+    // reach the reconnected subscriber through the fresh transport.
+    let tally = Arc::new(parking_lot::Mutex::new(NotificationTally::default()));
+    {
+        let rx = owner2.subscribe();
+        let tally = tally.clone();
+        tokio::spawn(async move {
+            while let Ok(notification) = rx.recv().await {
+                let mut observed = tally.lock();
+                match notification.event {
+                    Some(proto::notification::Event::PaneDirty(dirty)) => {
+                        *observed.pane_dirty.entry(dirty.pane_id).or_default() += 1;
+                    }
+                    Some(proto::notification::Event::PaneAdded(added)) => {
+                        observed.pane_added.insert(added.pane_id);
+                    }
+                    Some(proto::notification::Event::SessionLayoutChanged(_)) => {
+                        observed.layout_changed += 1;
+                    }
+                    _ => {}
+                }
+            }
+        });
+    }
+
+    owner2
+        .reconnect_local_in_place(&session_id, AttachMode::Shared)
+        .await
+        .context("in-place reconnect failed")?;
+    wait_for_tally(
+        &tally,
+        Duration::from_secs(10),
+        |observed| observed.layout_changed > 0,
+        "the synthetic SessionLayoutChanged after in-place reconnect",
+    )
+    .await?;
+
+    let p3 = actor
+        .spawn_pane(
+            &session_id,
+            &tab_id,
+            size(80, 24),
+            Some(shell("/bin/cat", &[])),
+            Some(std::path::Path::new("/tmp")),
+        )
+        .await?;
+    wait_for_tally(
+        &tally,
+        Duration::from_secs(10),
+        |observed| observed.pane_added.contains(&p3),
+        "PaneAdded for a pane spawned after the in-place reconnect",
+    )
+    .await?;
+
+    // The reconnected client and the actor still agree on everything.
+    let converged = owner2.fetch_grid_update(&p1, 0).await?;
+    anyhow::ensure!(
+        converged.to_generation == settled_generation,
+        "reconnected client drifted from the settled generation: {} vs {}",
+        converged.to_generation,
+        settled_generation,
+    );
+    let reattached = owner2.attach(&session_id, AttachMode::Shared).await?;
+    let seen: HashSet<String> = snapshot_pane_ids(
+        reattached
+            .snapshot
+            .as_ref()
+            .context("reattach returned no snapshot")?,
+    )
+    .into_iter()
+    .collect();
+    let expected: HashSet<String> = HashSet::from([p1, p2, p3]);
+    anyhow::ensure!(
+        seen == expected,
+        "after reconnect the client sees panes {seen:?}, expected {expected:?}"
+    );
+
+    owner2.kill_session(&session_id).await?;
+    Ok(())
+}
+
+/// §3.3 GridDiffRing wrap: a client whose checkpoint falls out of the ring — a
+/// slow consumer that stops fetching while output continues — must be handed a
+/// full snapshot. A merged diff built from only the surviving entries would
+/// silently skip intermediate generations and never converge.
+///
+/// The pane writes in place (`\rA`) so the cursor never moves: every
+/// generation is row-representable, so only ring retention decides between a
+/// diff and a full snapshot.
+#[tokio::test(flavor = "multi_thread")]
+async fn slow_consumer_wrapping_diff_ring_gets_full_snapshot() -> Result<()> {
+    let server = TestServer::spawn()?;
+    let domain = server.connect().await?;
+    let (session_id, tab_id) = open_session(&domain, "ring-wrap").await?;
+
+    let pane_id = domain
+        .spawn_pane(
+            &session_id,
+            &tab_id,
+            size(80, 24),
+            Some(shell(
+                "/bin/sh",
+                &["-c", "while :; do printf \"\\rA\"; done"],
+            )),
+            Some(std::path::Path::new("/tmp")),
+        )
+        .await?;
+
+    // Sample the generation once, then stop fetching — the slow consumer.
+    let stale = wait_for_generation(
+        &domain,
+        &pane_id,
+        |generation| generation > 0,
+        Duration::from_secs(10),
+        "the first generation",
+    )
+    .await?;
+
+    // Keep the server publishing until the ring has provably wrapped past the
+    // stale checkpoint: twice the documented 64-entry capacity, so the oldest
+    // retained entry is newer than the checkpoint regardless of scheduling.
+    let current = wait_for_generation(
+        &domain,
+        &pane_id,
+        |generation| generation >= stale + 128,
+        Duration::from_secs(30),
+        "the generation to advance 128 past the stale checkpoint",
+    )
+    .await?;
+
+    // The checkpoint fell out of the ring: the server must answer with a full
+    // snapshot, never a diff that omits the missing generations.
+    let resync = domain.fetch_grid_update(&pane_id, stale).await?;
+    anyhow::ensure!(
+        matches!(
+            resync.update,
+            Some(proto::fetch_grid_update_response::Update::FullSnapshot(_))
+        ),
+        "fetch since a wrapped generation must return a full snapshot, got {:?}",
+        resync.update,
+    );
+
+    // The snapshot reflects current state, and a from-scratch fetch agrees.
+    let from_scratch = domain.fetch_grid_update(&pane_id, 0).await?;
+    let text = grid_text(
+        from_scratch
+            .update
+            .as_ref()
+            .context("from-scratch fetch returned no update")?,
+    );
+    anyhow::ensure!(
+        text.contains('A'),
+        "full snapshot lost the in-place flood content"
+    );
+    anyhow::ensure!(
+        from_scratch.to_generation >= current,
+        "generation went backwards: {current} then {}",
+        from_scratch.to_generation
+    );
+
+    // A follow-up fetch from a fresh checkpoint must stay anchored: any
+    // update is either a full snapshot (from_generation 0) or a diff rooted
+    // exactly at the requested generation — never at an earlier one that
+    // would silently skip generations. (The flood is continuous, so a
+    // NoChange answer is a race between fetch and publish, not an invariant.)
+    let follow_up = domain
+        .fetch_grid_update(&pane_id, from_scratch.to_generation)
+        .await?;
+    anyhow::ensure!(
+        follow_up.to_generation >= from_scratch.to_generation,
+        "generation went backwards: {} then {}",
+        from_scratch.to_generation,
+        follow_up.to_generation
+    );
+    if follow_up.update.is_some() {
+        anyhow::ensure!(
+            follow_up.from_generation == 0
+                || follow_up.from_generation == from_scratch.to_generation,
+            "update anchored at generation {}, expected 0 (full snapshot) or {} (diff)",
+            follow_up.from_generation,
+            from_scratch.to_generation
+        );
+    }
+
+    domain.kill_session(&session_id).await?;
+    Ok(())
+}
+
+/// §3.1 / §9 A connection whose socket is never drained — a client that
+/// attaches and then stops reading while a pane floods output — must stall
+/// only itself. The server's write path for that connection queues frames, but
+/// shared session state (grid fetches, lifecycle RPCs, pane fan-out) must keep
+/// serving every other client with bounded per-op latency.
+#[tokio::test(flavor = "multi_thread")]
+async fn stalled_wire_consumer_does_not_stall_other_clients() -> Result<()> {
+    let server = TestServer::spawn()?;
+    let live = server.connect().await?;
+    let (session_id, tab_id) = open_session(&live, "wire-isolation").await?;
+
+    let flooded = live
+        .spawn_pane(
+            &session_id,
+            &tab_id,
+            size(80, 24),
+            Some(shell("/usr/bin/yes", &["z3rm-wire-flood"])),
+            Some(std::path::Path::new("/tmp")),
+        )
+        .await?;
+
+    // A raw connection that attaches to the session and then never reads a
+    // single byte. The server registers it as a pane subscriber; the flood
+    // fills its socket buffer and wedges its write loop.
+    let mut raw = UnixStream::connect(&server.socket_path)
+        .await
+        .context("raw client connect")?;
+    let attach_frame = mux_protocol::frame(&Envelope {
+        version: Some(mux_protocol::PROTOCOL_VERSION),
+        payload: Some(EnvelopePayload::Request(Request {
+            request_id: 1,
+            body: Some(RequestBody::Attach(proto::AttachRequest {
+                session_id: session_id.clone(),
+                mode: 1, // proto AttachMode::SHARED
+                window_id: String::new(),
+                identity: None,
+            })),
+        })),
+    })?;
+    raw.write_all(&attach_frame)
+        .await
+        .context("raw client attach")?;
+    // Give the flood time to fill the socket buffer and wedge the write loop.
+    // Not asserted against; the per-op timeouts below are the real bound.
+    tokio::time::sleep(Duration::from_millis(1000)).await;
+
+    // While the raw connection is wedged, the live client's RPC surface must
+    // keep working, interleaving grid pulls and lifecycle churn.
+    let mut previous = 0u64;
+    for round in 0..40 {
+        let fetch = tokio::time::timeout(
+            Duration::from_secs(2),
+            live.fetch_grid_update(&flooded, 0),
+        )
+        .await
+        .with_context(|| {
+            format!("round {round}: grid fetch stalled behind a wedged connection")
+        })?
+        .with_context(|| format!("round {round}: grid fetch failed"))?;
+        anyhow::ensure!(
+            fetch.to_generation >= previous,
+            "round {round}: generation went backwards: {previous} then {}",
+            fetch.to_generation
+        );
+        previous = fetch.to_generation;
+
+        let scratch = tokio::time::timeout(
+            Duration::from_secs(3),
+            live.spawn_pane(
+                &session_id,
+                &tab_id,
+                size(80, 24),
+                Some(shell("/bin/cat", &[])),
+                Some(std::path::Path::new("/tmp")),
+            ),
+        )
+        .await
+        .with_context(|| format!("round {round}: spawn stalled behind a wedged connection"))?
+        .with_context(|| format!("round {round}: spawn failed"))?;
+        tokio::time::timeout(Duration::from_secs(3), live.close_pane(&scratch))
+            .await
+            .with_context(|| format!("round {round}: close stalled behind a wedged connection"))?
+            .with_context(|| format!("round {round}: close failed"))?;
+    }
+
+    let sessions = tokio::time::timeout(Duration::from_secs(2), live.list_sessions())
+        .await
+        .context("list_sessions stalled behind a wedged connection")?
+        .context("list_sessions failed")?;
+    anyhow::ensure!(
+        sessions.iter().any(|session| session.id == session_id),
+        "session vanished while a connection was wedged"
+    );
+
+    // Letting the wedged connection go must release the server cleanly.
+    raw.shutdown().await.context("raw client shutdown")?;
+    drop(raw);
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    let after = tokio::time::timeout(Duration::from_secs(2), live.fetch_grid_update(&flooded, 0))
+        .await
+        .context("fetch after dropping the wedged connection timed out")?
+        .context("fetch after dropping the wedged connection failed")?;
+    anyhow::ensure!(
+        after.to_generation >= previous,
+        "generation went backwards after the wedged connection was dropped"
+    );
+
+    live.kill_session(&session_id).await?;
+    Ok(())
+}
+
+/// §15.5 A throughput/latency smoke check: 300 round trips (spawn, grid fetch,
+/// close) must all complete with correct results. The deterministic bound is
+/// per-op — every operation must finish inside its own timeout, so a slow
+/// machine fails the op, not a wall-clock average. The aggregate is measured
+/// and reported rather than asserted tightly.
+#[tokio::test(flavor = "multi_thread")]
+async fn throughput_smoke_hundred_plus_operations() -> Result<()> {
+    const PANE_COUNT: usize = 100;
+
+    let server = TestServer::spawn()?;
+    let domain = server.connect().await?;
+    let (session_id, tab_id) = open_session(&domain, "throughput-smoke").await?;
+
+    let started = Instant::now();
+    let mut latencies = Vec::with_capacity(PANE_COUNT * 3);
+    let mut panes = Vec::with_capacity(PANE_COUNT);
+
+    for _ in 0..PANE_COUNT {
+        let op_started = Instant::now();
+        let pane = tokio::time::timeout(
+            Duration::from_secs(10),
+            domain.spawn_pane(
+                &session_id,
+                &tab_id,
+                size(80, 24),
+                Some(shell("/bin/cat", &[])),
+                Some(std::path::Path::new("/tmp")),
+            ),
+        )
+        .await
+        .context("spawn_pane stalled")?
+        .context("spawn_pane failed")?;
+        latencies.push(op_started.elapsed());
+        panes.push(pane);
+    }
+
+    for pane in &panes {
+        let op_started = Instant::now();
+        let response = tokio::time::timeout(Duration::from_secs(2), domain.fetch_grid_update(pane, 0))
+            .await
+            .context("fetch_grid_update stalled")?
+            .context("fetch_grid_update failed")?;
+        anyhow::ensure!(
+            response.update.is_some(),
+            "from-scratch fetch for a fresh pane returned no update"
+        );
+        latencies.push(op_started.elapsed());
+    }
+
+    for pane in &panes {
+        let op_started = Instant::now();
+        tokio::time::timeout(Duration::from_secs(5), domain.close_pane(pane))
+            .await
+            .context("close_pane stalled")?
+            .context("close_pane failed")?;
+        latencies.push(op_started.elapsed());
+    }
+
+    let total = started.elapsed();
+    let ops = PANE_COUNT * 3;
+    let max_latency = latencies.iter().copied().max().unwrap_or_default();
+    eprintln!(
+        "throughput smoke: {ops} ops in {total:?} ({:.0} ops/s), max single-op latency {max_latency:?}",
+        ops as f64 / total.as_secs_f64()
+    );
+
+    // The deterministic bound: every op cleared its own timeout above, and the
+    // aggregate must clear a very generous floor (nothing quadratic or
+    // serialized behind a growing queue).
+    anyhow::ensure!(
+        total < Duration::from_secs(60),
+        "{ops} ops took {total:?}; the server's RPC path is not scaling"
+    );
+
+    // Lifecycle correctness after the mass churn: every pane spawned and
+    // closed again, leaving the session with no panes.
+    let attach = domain.attach(&session_id, AttachMode::Shared).await?;
+    let remaining = snapshot_pane_ids(attach.snapshot.as_ref().context("final snapshot")?);
+    anyhow::ensure!(
+        remaining.is_empty(),
+        "after spawning and closing {PANE_COUNT} panes the session still holds {remaining:?}"
+    );
+
+    domain.kill_session(&session_id).await?;
     Ok(())
 }

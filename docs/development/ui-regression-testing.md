@@ -54,6 +54,14 @@ The accessibility tree is the load-bearing half. It answers "did this element
 actually get rendered, with the right semantics" far more precisely than pixels
 do, and it is stable across machines.
 
+Linux is the exception: `gpui_platform`'s software renderer
+(`crates/gpui_platform/src/software_renderer.rs`) rasterizes scenes
+deterministically in-process, so exact pixels are a valid baseline there. The
+harness swatch case compares its framebuffer to a recorded digest on Linux, and
+`cargo test -p gpui_platform --features test-support --lib` holds byte-exact
+baselines for quads, borders, paint order, and sprite coverage without needing
+a window or display server at all.
+
 ## How the harness works
 
 `HeadlessAppContext` (`crates/gpui/src/app/headless_app_context.rs`) pairs a

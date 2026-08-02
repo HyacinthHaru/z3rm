@@ -504,3 +504,214 @@ fn hsla_to_rgba(color: Hsla) -> Rgba<u8> {
         (color.a.clamp(0.0, 1.0) * 255.0).round() as u8,
     ])
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use gpui::{
+        AtlasKey, BorderStyle, ContentMask, Corners, Edges, Point, RenderSvgParams, SharedString,
+        TransformationMatrix,
+    };
+
+    /// Solid sRGB colors that survive the `Hsla -> Rgba -> u8` round trip
+    /// exactly, so the assertions below are byte-exact baselines.
+    const GRAY: Hsla = Hsla {
+        h: 0.0,
+        s: 0.0,
+        l: 0.25,
+        a: 1.0,
+    };
+    const RED: Hsla = Hsla {
+        h: 0.0,
+        s: 1.0,
+        l: 0.5,
+        a: 1.0,
+    };
+    const GREEN: Hsla = Hsla {
+        h: 1.0 / 3.0,
+        s: 1.0,
+        l: 0.5,
+        a: 1.0,
+    };
+
+    const GRAY_RGBA: Rgba<u8> = Rgba([64, 64, 64, 255]);
+    const RED_RGBA: Rgba<u8> = Rgba([255, 0, 0, 255]);
+    const GREEN_RGBA: Rgba<u8> = Rgba([0, 255, 0, 255]);
+
+    fn quad(bounds: Bounds<ScaledPixels>, background: Hsla) -> Quad {
+        Quad {
+            order: 0,
+            bounds,
+            content_mask: ContentMask { bounds },
+            background: Background::from(background),
+            border_color: Hsla {
+                h: 0.0,
+                s: 0.0,
+                l: 0.0,
+                a: 0.0,
+            },
+            corner_radii: Corners::default(),
+            border_widths: Edges::default(),
+            border_style: BorderStyle::Solid,
+        }
+    }
+
+    fn bounds(x: f32, y: f32, w: f32, h: f32) -> Bounds<ScaledPixels> {
+        Bounds {
+            origin: Point::new(ScaledPixels(x), ScaledPixels(y)),
+            size: Size {
+                width: ScaledPixels(w),
+                height: ScaledPixels(h),
+            },
+        }
+    }
+
+    fn render(renderer: &mut SoftwareHeadlessRenderer, scene: &Scene, width: u32, height: u32) -> RgbaImage {
+        renderer
+            .render_scene_to_image(
+                scene,
+                Size {
+                    width: DevicePixels(width as i32),
+                    height: DevicePixels(height as i32),
+                },
+            )
+            .expect("software render must not fail")
+    }
+
+    #[test]
+    fn empty_scene_renders_transparent_frame() {
+        let mut scene = Scene::default();
+        scene.finish();
+        let image = render(&mut SoftwareHeadlessRenderer::new(), &scene, 4, 4);
+        assert_eq!((image.width(), image.height()), (4, 4));
+        assert!(
+            image.pixels().all(|pixel| pixel == &Rgba([0, 0, 0, 0])),
+            "empty scene must produce a fully transparent, non-blank-in-pixel-count frame"
+        );
+    }
+
+    #[test]
+    fn solid_quad_matches_exact_baseline() {
+        let mut scene = Scene::default();
+        scene.insert_primitive(quad(bounds(0.0, 0.0, 8.0, 8.0), GRAY));
+        scene.finish();
+        let image = render(&mut SoftwareHeadlessRenderer::new(), &scene, 8, 8);
+        assert!(
+            image.pixels().all(|pixel| pixel == &GRAY_RGBA),
+            "every pixel must be the quad color"
+        );
+    }
+
+    #[test]
+    fn overlapping_quads_respect_paint_order() {
+        let mut scene = Scene::default();
+        scene.insert_primitive(quad(bounds(0.0, 0.0, 8.0, 8.0), GRAY));
+        scene.insert_primitive(quad(bounds(2.0, 2.0, 4.0, 4.0), GREEN));
+        scene.finish();
+        let image = render(&mut SoftwareHeadlessRenderer::new(), &scene, 8, 8);
+        for y in 0..image.height() {
+            for x in 0..image.width() {
+                let inside = (2..6).contains(&x) && (2..6).contains(&y);
+                let expected = if inside { GREEN_RGBA } else { GRAY_RGBA };
+                assert_eq!(
+                    image.get_pixel(x, y),
+                    &expected,
+                    "pixel ({x}, {y}): later quad must paint over the earlier one"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn monochrome_sprite_coverage_maps_to_alpha() {
+        // A 2x2 glyph-shaped tile: fully covered on the left column, partially
+        // covered on the right, empty at the bottom. The renderer must turn
+        // coverage into alpha over the sprite's tint, not into a fabricated
+        // solid block.
+        let mut renderer = SoftwareHeadlessRenderer::new();
+        let atlas = renderer.sprite_atlas();
+        let key = AtlasKey::Svg(RenderSvgParams {
+            path: SharedString::from("software-renderer-test"),
+            size: Size {
+                width: DevicePixels(2),
+                height: DevicePixels(2),
+            },
+        });
+        let tile = atlas
+            .get_or_insert_with(&key, &mut || {
+                Ok(Some((
+                    Size {
+                        width: DevicePixels(2),
+                        height: DevicePixels(2),
+                    },
+                    Cow::Owned(vec![255, 127, 0, 0]),
+                )))
+            })
+            .expect("atlas insert must succeed")
+            .expect("tile must be built");
+
+        let mut scene = Scene::default();
+        scene.insert_primitive(MonochromeSprite {
+            order: 0,
+            pad: 0,
+            bounds: bounds(0.0, 0.0, 2.0, 2.0),
+            content_mask: ContentMask {
+                bounds: bounds(0.0, 0.0, 2.0, 2.0),
+            },
+            color: GREEN,
+            tile,
+            transformation: TransformationMatrix::unit(),
+        });
+        scene.finish();
+        let image = render(&mut renderer, &scene, 2, 2);
+
+        assert_eq!(image.get_pixel(0, 0), &GREEN_RGBA, "full coverage, opaque");
+        assert_eq!(
+            image.get_pixel(1, 0),
+            &Rgba([0, 255, 0, 127]),
+            "coverage 127/255 must yield 50% alpha"
+        );
+        assert_eq!(
+            image.get_pixel(0, 1),
+            &Rgba([0, 0, 0, 0]),
+            "zero coverage must stay transparent"
+        );
+        assert_eq!(
+            image.get_pixel(1, 1),
+            &Rgba([0, 0, 0, 0]),
+            "zero coverage must stay transparent"
+        );
+    }
+
+    #[test]
+    fn border_edges_paint_over_quad_fill() {
+        let mut scene = Scene::default();
+        let mut bordered = quad(bounds(0.0, 0.0, 8.0, 8.0), GRAY);
+        bordered.border_color = RED;
+        bordered.border_widths = Edges {
+            top: ScaledPixels(1.0),
+            right: ScaledPixels(0.0),
+            bottom: ScaledPixels(0.0),
+            left: ScaledPixels(0.0),
+        };
+        scene.insert_primitive(bordered);
+        scene.finish();
+        let image = render(&mut SoftwareHeadlessRenderer::new(), &scene, 8, 8);
+        for x in 0..8 {
+            assert_eq!(
+                image.get_pixel(x, 0),
+                &RED_RGBA,
+                "top border row must be the border color"
+            );
+        }
+        for y in 1..8 {
+            for x in 0..8 {
+                assert_eq!(
+                    image.get_pixel(x, y),
+                    &GRAY_RGBA,
+                    "fill below the border must stay the quad color"
+                );
+            }
+        }
+    }
+}
