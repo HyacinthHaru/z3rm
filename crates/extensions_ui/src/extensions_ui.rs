@@ -21,7 +21,6 @@ use gpui::{
 };
 use num_format::{Locale, ToFormattedString};
 use picker::{Picker, PickerDelegate};
-use project::DirectoryLister;
 use project::VimModeSetting;
 use release_channel::ReleaseChannel;
 use schemars::JsonSchema;

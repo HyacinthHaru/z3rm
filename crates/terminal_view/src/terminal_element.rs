@@ -1719,14 +1719,7 @@ impl InputHandler for TerminalInputHandler {
             view.commit_text(text, view_cx);
         });
 
-        self.workspace
-            .update(cx, |this, cx| {
-                window.invalidate_character_coordinates();
-                let project = this.project().read(cx);
-                let telemetry = project.client().telemetry().clone();
-                telemetry.log_edit_event("terminal", project.is_via_remote_server());
-            })
-            .ok();
+        window.invalidate_character_coordinates();
     }
 
     fn replace_and_mark_text_in_range(

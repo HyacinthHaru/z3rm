@@ -292,9 +292,6 @@ pub fn init(cx: &mut App) {
             .create_new_window
             .unwrap_or_else(|| default_open_in_new_window(cx));
         with_active_or_new_workspace(cx, move |workspace, window, cx| {
-            use gpui::PathPromptOptions;
-            use project::DirectoryLister;
-
             let paths = workspace.prompt_for_open_path(
                 PathPromptOptions {
                     files: true,
@@ -302,10 +299,6 @@ pub fn init(cx: &mut App) {
                     multiple: false,
                     prompt: None,
                 },
-                DirectoryLister::Local(
-                    workspace.project().clone(),
-                    workspace.app_state().fs.clone(),
-                ),
                 window,
                 cx,
             );

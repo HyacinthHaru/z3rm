@@ -4,9 +4,8 @@
 use std::{ops::Range, path::PathBuf, sync::Arc};
 
 use collections::BTreeMap;
-use extension::ExtensionProvides;
 use fs::Fs;
-use gpui::{App, Entity, SharedString, Task, TaskExt};
+use gpui::{App, Entity, Task};
 use serde::{Deserialize, Serialize};
 use text::Anchor;
 use worktree::ProjectEntryId;
@@ -224,15 +223,6 @@ pub struct DiagnosticSummary {
     pub error_count: usize,
 }
 
-// ---------------------------------------------------------------------------
-// Directory lister stub (spec §8.2 M2)
-// ---------------------------------------------------------------------------
-
-#[derive(Clone)]
-pub enum DirectoryLister {
-    Local(Arc<Project>, Arc<dyn Fs>),
-    Project(Arc<Project>),
-}
 
 // ---------------------------------------------------------------------------
 // Bookmark store lives in the project crate's retained bookmark_store module.
@@ -648,36 +638,6 @@ impl DapStore {
     }
 }
 
-#[derive(Default)]
-pub struct Client;
-
-#[derive(Default)]
-pub struct Telemetry;
-
-impl Client {
-    pub fn telemetry(&self) -> Arc<Telemetry> {
-        Arc::new(Telemetry)
-    }
-
-    /// Stub: read (client crate 已删除)
-    pub fn read(&self, _cx: &gpui::App) -> &Self {
-        self
-    }
-
-    /// Stub: shell (client crate 已删除)
-    pub fn shell(&self) -> Option<Arc<ShellConfig>> {
-        None
-    }
-
-    /// Stub: is_disconnected
-    pub fn is_disconnected(&self) -> bool {
-        true
-    }
-}
-
-impl Telemetry {
-    pub fn log_edit_event(&self, _name: &str, _is_via_ssh: bool) {}
-}
 
 // ---------------------------------------------------------------------------
 // Project method stubs for APIs removed during dependency stripping
@@ -696,85 +656,6 @@ pub struct StackFrame {
     pub position: text::Point,
 }
 
-/// Stub for deleted remote::RemoteConnectionOptions (spec §8.2 M2)
-#[derive(Clone, Debug)]
-pub struct RemoteConnectionOptionsStub;
-
-/// Stub for deleted git::Repository (spec §8.2 M2)
-#[derive(Clone, Debug)]
-pub struct Repository {
-    pub work_directory_abs_path: std::path::PathBuf,
-    pub id: u64,
-    pub branch: Option<String>,
-}
-
-impl Repository {
-    /// Stub: entity_id
-    pub fn entity_id(&self) -> gpui::EntityId {
-        gpui::EntityId::from(0)
-    }
-
-    /// Stub: read
-    pub fn read(&self, _cx: &gpui::App) -> &Self {
-        self
-    }
-
-    /// Stub: update — generic over context type for async callers
-    pub fn update<C, F, R>(&self, _cx: &mut C, f: F) -> R
-    where
-        F: FnOnce(&mut Self, &mut C) -> R,
-    {
-        // Stub: cannot mutate through Arc, call with dummy
-        let mut dummy = self.clone();
-        f(&mut dummy, _cx)
-    }
-
-    /// Stub: remove_worktree
-    pub fn remove_worktree(
-        &mut self,
-        _path: std::path::PathBuf,
-        _force: bool,
-    ) -> gpui::Task<anyhow::Result<()>> {
-        gpui::Task::ready(Err(anyhow::anyhow!("stub")))
-    }
-
-    /// Stub: default_branch
-    pub fn default_branch(
-        &mut self,
-        _include_remote_name: bool,
-    ) -> gpui::Task<anyhow::Result<String>> {
-        gpui::Task::ready(Err(anyhow::anyhow!("stub")))
-    }
-
-    /// Stub: worktrees
-    pub fn worktrees(&mut self) -> gpui::Task<anyhow::Result<Vec<git::repository::Worktree>>> {
-        gpui::Task::ready(Ok(Vec::new()))
-    }
-
-    /// Stub: status_for_path
-    pub fn status_for_path(
-        &self,
-        _path: &git::repository::RepoPath,
-    ) -> Option<crate::git_store::StatusEntry> {
-        None
-    }
-
-    /// Stub: project_path_to_repo_path
-    pub fn project_path_to_repo_path(
-        &self,
-        _path: &ProjectPath,
-        _cx: &gpui::App,
-    ) -> Option<git::repository::RepoPath> {
-        None
-    }
-
-    /// Stub: barrier
-    pub fn barrier(&mut self) -> futures::channel::oneshot::Receiver<()> {
-        let (tx, rx) = futures::channel::oneshot::channel();
-        tx.send(()).ok();
-        rx
-    }
-}
 
 /// LSP integration was deleted during dependency stripping. Queries that would
 /// previously have consulted a language server must fail explicitly instead of
@@ -1094,10 +975,6 @@ impl Project {
         OpenLspBufferHandle
     }
 
-    pub fn client(&self) -> &Client {
-        static CLIENT: std::sync::LazyLock<Client> = std::sync::LazyLock::new(Client::default);
-        &CLIENT
-    }
 
     pub fn task_store(&self) -> Entity<crate::task_store::TaskStore> {
         self.task_store_entity.clone()
@@ -1182,9 +1059,6 @@ impl Project {
         true
     }
 
-    pub fn remote_client(&self) -> Option<Arc<Client>> {
-        None
-    }
 
     pub fn remote_connection_options(&self) -> Option<remote::RemoteConnectionOptions> {
         None
@@ -1714,33 +1588,6 @@ impl Project {
 // Extension stubs (spec §8.2 M2)
 // ---------------------------------------------------------------------------
 
-/// Stub: ExtensionMetadata (cloud_api_types crate 已删除)
-#[derive(Clone, Debug, Serialize, Deserialize)]
-pub struct ExtensionMetadata {
-    pub id: Arc<str>,
-    pub dev: bool,
-    pub manifest: ExtensionMetadataManifest,
-    pub published_at: Option<String>,
-    pub download_count: u64,
-}
-
-#[derive(Clone, Debug, Serialize, Deserialize)]
-pub struct ExtensionMetadataManifest {
-    pub version: Arc<str>,
-    pub schema_version: Option<i32>,
-    pub wasm_api_version: Option<String>,
-    pub name: String,
-    pub description: Option<String>,
-    pub repository: Option<String>,
-    pub authors: Vec<String>,
-    pub provides_list: Vec<ExtensionProvides>,
-}
-
-impl ExtensionMetadataManifest {
-    pub fn provides(&self) -> &Vec<ExtensionProvides> {
-        &self.provides_list
-    }
-}
 
 /// Stub: VimModeSetting (vim_mode_setting crate 已删除)
 #[derive(Clone, Copy, Debug, Default, Serialize, Deserialize)]
