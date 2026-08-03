@@ -500,9 +500,15 @@ pub async fn run_cli_command(cmd: CliCommand) -> Result<()> {
 
         // §3.10 attach is handled by main as LaunchIntent::Gui (spawn GUI, exit).
         // This arm is a safety net if reached programmatically: print only, no RPC.
+        // `attach` opens a window, so main.rs intercepts it through
+        // `parse_launch_intent_from` before the CLI dispatcher ever sees it.
+        // Reaching here means that interception broke; printing a success
+        // message would hide it.
         CliCommand::Attach { target } => {
-            let label = target.as_deref().unwrap_or("default");
-            eprintln!("z3rm: attached to session '{}' in GUI window", label);
+            anyhow::bail!(
+                "attach reached the CLI dispatcher instead of launching a window (target: {})",
+                target.as_deref().unwrap_or("default")
+            );
         }
 
         CliCommand::Detach => {

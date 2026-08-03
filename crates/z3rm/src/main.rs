@@ -1014,12 +1014,42 @@ fn main() {
                 eprintln!("error: failed to locate z3rm executable: {error}");
                 std::process::exit(1);
             });
+            // The parent exits immediately, so anything the GUI writes on its
+            // way down has to land somewhere durable. Sending it to /dev/null
+            // makes a GUI that dies on startup indistinguishable from one that
+            // came up fine.
+            // Two independent append handles rather than one plus `try_clone`:
+            // both writers land in the same file without sharing a cursor.
+            let attach_log_path = paths::logs_dir().join("attach.log");
+            let open_attach_log = || {
+                std::fs::create_dir_all(paths::logs_dir()).and_then(|()| {
+                    std::fs::OpenOptions::new()
+                        .create(true)
+                        .append(true)
+                        .open(&attach_log_path)
+                })
+            };
+
             let mut command = std::process::Command::new(executable);
             command
                 .env("Z3RM_GUI_ATTACH", "1")
-                .stdin(std::process::Stdio::null())
-                .stdout(std::process::Stdio::null())
-                .stderr(std::process::Stdio::null());
+                .stdin(std::process::Stdio::null());
+            match (open_attach_log(), open_attach_log()) {
+                (Ok(stdout), Ok(stderr)) => {
+                    command
+                        .stdout(std::process::Stdio::from(stdout))
+                        .stderr(std::process::Stdio::from(stderr));
+                }
+                (Err(error), _) | (_, Err(error)) => {
+                    eprintln!(
+                        "warning: failed to open {}: {error}; GUI output will be discarded",
+                        attach_log_path.display()
+                    );
+                    command
+                        .stdout(std::process::Stdio::null())
+                        .stderr(std::process::Stdio::null());
+                }
+            }
             if let Some(target) = &target {
                 command.env("Z3RM_ATTACH_TARGET", target);
             }
@@ -1028,8 +1058,9 @@ fn main() {
                 std::process::exit(1);
             });
             eprintln!(
-                "z3rm: attached to session '{}' in GUI window",
-                target.as_deref().unwrap_or("default")
+                "z3rm: attached to session '{}' in GUI window (log: {})",
+                target.as_deref().unwrap_or("default"),
+                attach_log_path.display()
             );
             std::process::exit(0);
         }
