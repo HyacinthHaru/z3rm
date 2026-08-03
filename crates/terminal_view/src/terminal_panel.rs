@@ -1709,7 +1709,7 @@ impl RenderOnce for InlineAssistTabBarButton {
     }
 }
 
-#[cfg(all(test, feature = "z3rm-migration"))]
+#[cfg(test)]
 mod tests {
     use std::num::NonZero;
 
@@ -1728,12 +1728,11 @@ mod tests {
         let result = prepare_task_for_spawn(&input, &shell, false);
 
         let expected_shell = util::get_system_shell();
-        assert_eq!(result.env, HashMap::default());
+        assert_eq!(result.env, std::collections::HashMap::default());
         assert_eq!(result.cwd, None);
         assert_eq!(result.shell, Shell::System);
         assert_eq!(
-            result.command,
-            Some(expected_shell.clone()),
+            result.command, expected_shell,
             "Empty tasks should spawn a -i shell"
         );
         assert_eq!(result.args, Vec::<String>::new());
@@ -1743,6 +1742,9 @@ mod tests {
         );
     }
 
+    // Frozen: `max_tabs` was dropped from `WorkspaceSettingsContent`, so there
+    // is no limit left to bypass.
+    #[cfg(feature = "z3rm-migration")]
     #[gpui::test]
     async fn test_bypass_max_tabs_limit(cx: &mut TestAppContext) {
         cx.executor().allow_parking();
@@ -1792,7 +1794,7 @@ mod tests {
         let expected_cwd = PathBuf::from("/some/work");
 
         let input = SpawnInTerminal {
-            command: Some(user_command.clone()),
+            command: user_command.clone(),
             cwd: Some(expected_cwd.clone()),
             ..SpawnInTerminal::default()
         };
@@ -1801,10 +1803,10 @@ mod tests {
         let result = prepare_task_for_spawn(&input, &shell, false);
 
         let system_shell = util::get_system_shell();
-        assert_eq!(result.env, HashMap::default());
+        assert_eq!(result.env, std::collections::HashMap::default());
         assert_eq!(result.cwd, Some(expected_cwd));
         assert_eq!(result.shell, Shell::System);
-        assert_eq!(result.command, Some(system_shell.clone()));
+        assert_eq!(result.command, system_shell);
         assert_eq!(
             result.args,
             vec!["-i".to_string(), "-c".to_string(), user_command.clone()],
@@ -2377,6 +2379,7 @@ mod tests {
         );
     }
 
+    #[cfg(feature = "z3rm-migration")]
     fn set_max_tabs(cx: &mut TestAppContext, value: Option<usize>) {
         cx.update_global(|store: &mut SettingsStore, cx| {
             store.update_user_settings(cx, |settings| {
