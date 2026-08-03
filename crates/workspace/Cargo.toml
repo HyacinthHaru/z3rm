@@ -36,7 +36,7 @@ db.workspace = true
 dirs.workspace = true
 futures-lite.workspace = true
 futures.workspace = true
-fs = { workspace = true, features = ["test-support"] }
+fs.workspace = true
 git.workspace = true
 gpui.workspace = true
 mux_protocol.workspace = true
