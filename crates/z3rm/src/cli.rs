@@ -32,7 +32,9 @@ pub enum LaunchIntent {
 /// 询问 `argv` 是否表达 GUI 启动意图。
 /// 目前仅识别 `attach [-t target]`；`attach --ssh ...` 仍走 CLI 短路。
 pub fn parse_launch_intent_from(args: &[String]) -> Option<LaunchIntent> {
-    if args.len() < 2 || args[1] != "attach" {
+    // This runs before `parse_cli_args_from` normalizes aliases, so the tmux
+    // long form has to be recognized here too.
+    if args.len() < 2 || !matches!(args[1].as_str(), "attach" | "attach-session") {
         return None;
     }
     let rest = &args[2..];
@@ -117,7 +119,8 @@ out-of-scope variables expand to an empty string. Supported variables:\n\
     window_panes pane_id pane_index pane_title pane_active pane_width\n\
     pane_height pane_current_path pane_start_command pane_dead\n\
 \n\
-aliases: list-sessions = ls, kill-session = kill, list-windows = lsw\n\
+aliases: new-session = new, list-sessions = ls, kill-session = kill,\n\
+         attach-session = attach, detach-client = detach, list-windows = lsw\n\
 run 'z3rm extension --help' for marketplace commands\n"
     )
 }
@@ -139,7 +142,10 @@ pub fn parse_cli_args_from(args: &[String]) -> Result<Option<CliCommand>, String
     let mut normalized = args.to_vec();
     match normalized[1].as_str() {
         "list-sessions" => normalized[1] = "ls".to_string(),
+        "new-session" => normalized[1] = "new".to_string(),
         "kill-session" => normalized[1] = "kill".to_string(),
+        "attach-session" => normalized[1] = "attach".to_string(),
+        "detach-client" => normalized[1] = "detach".to_string(),
         "lsw" => normalized[1] = "list-windows".to_string(),
         _ => {}
     }
