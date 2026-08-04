@@ -890,9 +890,36 @@ impl settings::Settings for AllLanguageSettings {
                     .into(),
             });
 
-        // 文件类型映射: 当前设置结构为 Vec<LanguageFileTypeContent>,
-        // 不包含语言名称关联, 使用语言定义中的扩展名进行检测
-        let file_types: FxHashMap<Arc<str>, (GlobSet, Vec<String>)> = FxHashMap::default();
+        let mut file_types: FxHashMap<Arc<str>, (GlobSet, Vec<String>)> = FxHashMap::default();
+        for (language_name, patterns) in &all_languages.file_types {
+            let mut builder = GlobSetBuilder::new();
+            let mut compiled_patterns = Vec::with_capacity(patterns.len());
+            for pattern in patterns {
+                match Glob::new(pattern) {
+                    Ok(glob) => {
+                        builder.add(glob);
+                        compiled_patterns.push(pattern.clone());
+                    }
+                    Err(error) => {
+                        log::warn!(
+                            "Ignoring invalid `file_types` glob {pattern:?} for language \
+                             {language_name:?}: {error}"
+                        );
+                    }
+                }
+            }
+            match builder.build() {
+                Ok(glob_set) => {
+                    file_types.insert(
+                        Arc::from(language_name.as_str()),
+                        (glob_set, compiled_patterns),
+                    );
+                }
+                Err(error) => {
+                    log::warn!("Ignoring `file_types` for language {language_name:?}: {error}");
+                }
+            }
+        }
 
         Self {
             edit_predictions: EditPredictionSettings {

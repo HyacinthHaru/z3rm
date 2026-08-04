@@ -13,7 +13,6 @@ use rand::prelude::*;
 use regex::RegexBuilder;
 use settings::SettingsStore;
 use settings::{AllLanguageSettingsContent, LanguageSettingsContent};
-use settings_content::LanguageFileTypeContent;
 use std::collections::BTreeSet;
 use std::{
     env,
@@ -279,18 +278,16 @@ async fn test_language_for_file_with_custom_file_types(cx: &mut TestAppContext) 
     cx.update(|cx| {
         init_settings(cx, |settings| {
             settings.file_types.extend([
-                LanguageFileTypeContent {
-                    extensions: vec!["js".into()],
-                },
-                LanguageFileTypeContent {
-                    extensions: vec!["*longer.ts".into(), "ecmascript".into()],
-                },
-                LanguageFileTypeContent {
-                    extensions: vec!["c".into(), "*.dev".into()],
-                },
-                LanguageFileTypeContent {
-                    extensions: vec!["Dockerfile".into(), "Dockerfile.*".into()],
-                },
+                ("TypeScript".to_owned(), vec!["js".to_owned()]),
+                (
+                    "JavaScript".to_owned(),
+                    vec!["*longer.ts".to_owned(), "ecmascript".to_owned()],
+                ),
+                ("C++".to_owned(), vec!["c".to_owned(), "*.dev".to_owned()]),
+                (
+                    "Dockerfile".to_owned(),
+                    vec!["Dockerfile".to_owned(), "Dockerfile.*".to_owned()],
+                ),
             ]);
         })
     });

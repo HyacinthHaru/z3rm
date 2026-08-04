@@ -763,7 +763,7 @@ impl settings::Settings for ThemeSettings {
             buffer_font_size: clamp_font_size(
                 content
                     .buffer_font_size
-                    .unwrap_or_else(|| FontSize(14.0))
+                    .unwrap_or(FontSize(15.0))
                     .into_gpui(),
             ),
             buffer_line_height: content.buffer_line_height.unwrap_or_default().into(),

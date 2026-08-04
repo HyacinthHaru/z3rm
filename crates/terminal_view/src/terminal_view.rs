@@ -1894,10 +1894,11 @@ impl Item for TerminalView {
                 .items()
                 .map(|selected_entry| selected_entry.entry_id)
                 .filter_map(|entry_id| project.path_for_entry(entry_id, cx))
+                .filter_map(|project_path| project.absolute_path(&project_path, cx))
                 .collect::<Vec<_>>();
 
             if !paths.is_empty() {
-                self.add_paths_to_terminal(&paths.iter().map(|p| p.path.as_std_path().to_path_buf()).collect::<Vec<_>>(), window, cx);
+                self.add_paths_to_terminal(&paths, window, cx);
             }
 
             return true;
@@ -1905,8 +1906,9 @@ impl Item for TerminalView {
             let project = project.read(cx);
             if let Some(path) = project
                 .path_for_entry(entry_id, cx)
+                .and_then(|project_path| project.absolute_path(&project_path, cx))
             {
-                self.add_paths_to_terminal(&[path.path.as_std_path().to_path_buf()], window, cx);
+                self.add_paths_to_terminal(&[path], window, cx);
             }
 
             return true;
@@ -3552,9 +3554,10 @@ mod tests {
         });
         cx.simulate_keystrokes("enter");
         terminal_view.read_with(&cx, |view, _| {
+            // `needle one` contains `ne` twice.
             assert_eq!(
                 view.copy_mode_state().search_indicator().as_deref(),
-                Some("/ne — 1 matches")
+                Some("/ne — 2 matches")
             );
         });
 

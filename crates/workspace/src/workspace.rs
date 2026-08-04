@@ -1067,9 +1067,13 @@ impl AppState {
             cx.set_global(store);
         }
         let session = cx.new(|cx| AppSession::new(Session::test(), cx));
+        let fs = Self::test_fs(cx);
+        // Mirrors `main`, which publishes the same filesystem as a global so
+        // that code reaching for `<dyn Fs>::global` sees the fake one.
+        <dyn Fs>::set_global(fs.clone(), cx);
         Arc::new(Self {
             languages: Arc::new(LanguageRegistry::new(cx.background_executor().clone())),
-            fs: Self::test_fs(cx),
+            fs,
             build_window_options: |_, _| Default::default(),
             session,
             client: Arc::new(()),
@@ -1405,8 +1409,51 @@ impl Workspace {
                     }
                 }
 
+                project::Event::EntryRenamed {
+                    project_path,
+                    abs_path,
+                } => {
+                    for pane in this.panes.iter() {
+                        pane.update(cx, |pane, cx| {
+                            let renamed_items = pane
+                                .items()
+                                .filter(|item| item.project_path(cx).as_ref() == Some(project_path))
+                                .map(|item| item.item_id())
+                                .collect::<Vec<_>>();
+                            for item_id in renamed_items {
+                                pane.nav_history_mut().rename_item(
+                                    item_id,
+                                    project_path.clone(),
+                                    abs_path.clone(),
+                                );
+                            }
+                        });
+                    }
+                }
 
-
+                project::Event::Toast {
+                    notification_id,
+                    message,
+                    link,
+                } => {
+                    let message = message.clone();
+                    let link = link.clone();
+                    this.show_notification(
+                        NotificationId::named(notification_id.clone().into()),
+                        cx,
+                        |cx| {
+                            cx.new(|cx| {
+                                let notification = MessageNotification::new(message, cx);
+                                match link {
+                                    Some(link) => notification
+                                        .more_info_message("More info")
+                                        .more_info_url(link),
+                                    None => notification,
+                                }
+                            })
+                        },
+                    );
+                }
 
 
                 _ => {}
@@ -2656,6 +2703,14 @@ impl Workspace {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> oneshot::Receiver<Option<Vec<PathBuf>>> {
+        // The hook is moved out for the call because it borrows the workspace
+        // mutably, then put back so later prompts still see it.
+        if let Some(prompt) = self.on_prompt_for_open_path.take() {
+            let rx = prompt(self, window, cx);
+            self.on_prompt_for_open_path = Some(prompt);
+            return rx;
+        }
+
         let (tx, rx) = oneshot::channel();
         let abs_path = cx.prompt_for_paths(path_prompt_options);
 
@@ -2687,6 +2742,12 @@ impl Workspace {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> oneshot::Receiver<Option<Vec<PathBuf>>> {
+        if let Some(prompt) = self.on_prompt_for_new_path.take() {
+            let rx = prompt(self, suggested_name, window, cx);
+            self.on_prompt_for_new_path = Some(prompt);
+            return rx;
+        }
+
         let (tx, rx) = oneshot::channel();
         cx.spawn_in(window, async move |workspace, cx| {
             let abs_path = workspace.update(cx, |workspace, cx| {

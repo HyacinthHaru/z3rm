@@ -356,7 +356,8 @@ pub enum FileFinderWidthContent {
 pub struct FileFinderSettingsContent {
     pub file_icons: bool,
     pub modal_max_width: Option<FileFinderWidthContent>,
-    pub skip_focus_for_active_in_search: bool,
+    /// Default: true
+    pub skip_focus_for_active_in_search: Option<bool>,
 }
 
 /// 远程连接设置 (spec §16 Plan 16)
@@ -611,7 +612,9 @@ pub struct LanguageToSettingsMap {
     pub defaults: LanguageSettingsContent,
     pub languages: HashMap<String, LanguageSettingsContent>,
     pub edit_predictions: Option<EditPredictionSettingsContent>,
-    pub file_types: Vec<LanguageFileTypeContent>,
+    /// Maps a language name to the globs that should be associated with it,
+    /// e.g. `{"C++": ["c", "*.dev"]}`.
+    pub file_types: HashMap<String, Vec<String>>,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize, JsonSchema, MergeFrom)]
@@ -1049,12 +1052,6 @@ pub struct OpenAiCompatibleApiSettingsContent {
     pub model: Option<String>,
     pub api_url: Option<String>,
     pub prompt_format: Option<EditPredictionPromptFormatContent>,
-}
-
-/// 语言文件类型内容
-#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize, JsonSchema, MergeFrom)]
-pub struct LanguageFileTypeContent {
-    pub extensions: Vec<String>,
 }
 
 /// Git 托管提供者配置

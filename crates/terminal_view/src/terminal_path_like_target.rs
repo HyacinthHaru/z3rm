@@ -950,66 +950,12 @@ mod tests {
             )
         }
 
-        // https://github.com/zed-industries/zed/issues/34027
-        #[gpui::test]
-        async fn issue_34027_non_worktree_remote_file(cx: &mut TestAppContext) {
-            test_path_likes!(
-                cx,
-                vec![
-                    (
-                        path!("/"),
-                        json!({
-                            "file.txt": "",
-                        }),
-                    ),
-                    (
-                        path!("/test"),
-                        json!({
-                            "file.txt": "",
-                        }),
-                    ),
-                ],
-                vec![path!("/test")],
-                {
-                    // Note: Opening a non-worktree file adds that file as a single file worktree.
-                    test_remote!("file.txt", "/file.txt", "/", BackgroundPathResolution);
-                    test_remote!("/test/file.txt", "/test/file.txt", "/");
-                }
-            )
-        }
-
-        // https://github.com/zed-industries/zed/issues/39159
-        #[gpui::test]
-        async fn issue_39159_remote_absolute_path_outside_worktree(cx: &mut TestAppContext) {
-            test_path_likes!(
-                cx,
-                vec![
-                    (
-                        path!("/tmp"),
-                        json!({
-                            "a.txt": "",
-                        }),
-                    ),
-                    (
-                        path!("/code/project"),
-                        json!({
-                            "src": {
-                                "lib.rs": "",
-                            },
-                        }),
-                    ),
-                ],
-                vec![path!("/code/project")],
-                {
-                    test_remote!(
-                        "/tmp/a.txt",
-                        "/tmp/a.txt",
-                        "/code/project",
-                        BackgroundPathResolution
-                    );
-                }
-            )
-        }
+        // Zed issues 34027 and 39159 also had remote-project variants that
+        // resolved paths outside every worktree through
+        // `Project::resolve_abs_path`. That RPC went away with remote projects
+        // (spec §2.1, §15.1), so `BackgroundPathChecks::ProjectPathResolution`
+        // no longer resolves anything and those variants cannot be expressed.
+        // The local variants above still cover the resolution behavior.
 
         // See https://github.com/zed-industries/zed/issues/34027
         #[gpui::test]

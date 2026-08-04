@@ -530,7 +530,7 @@ impl Settings for EditorSettings {
                     settings::SeedQuerySetting::Surround => SeedQuerySetting::Surround,
                 },
             ),
-            use_smartcase_search: editor.use_smartcase_search.unwrap_or(true),
+            use_smartcase_search: editor.use_smartcase_search.unwrap_or(false),
             multi_cursor_modifier: editor.multi_cursor_modifier.map_or_else(
                 MultiCursorModifier::default,
                 |multi_cursor_modifier| match multi_cursor_modifier {
@@ -939,9 +939,9 @@ mod tests {
         );
         assert_eq!(
             settings.seed_search_query_from_cursor,
-            SeedQuerySetting::None
+            SeedQuerySetting::Surround
         );
-        assert!(settings.use_smartcase_search);
+        assert!(!settings.use_smartcase_search);
         assert_eq!(settings.multi_cursor_modifier, MultiCursorModifier::Alt);
         assert!(!settings.redact_private_values);
         assert_eq!(settings.expand_excerpt_lines, 3);
