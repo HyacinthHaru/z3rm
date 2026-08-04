@@ -96,6 +96,9 @@ workspace = true
 [dependencies.futures]
 workspace = true
 
+[dependencies.fuzzy]
+workspace = true
+
 [dependencies.git]
 workspace = true
 
