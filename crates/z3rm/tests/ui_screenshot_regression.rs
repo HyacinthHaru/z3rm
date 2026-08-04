@@ -269,6 +269,35 @@ fn draw_until(
     }
 }
 
+
+/// Like [`draw_until`], but the convergence test looks at pixels.
+///
+/// Image placements do not surface in the accessibility tree, so an
+/// image-bearing frame can only be recognized from the framebuffer.
+fn draw_until_pixels(
+    cx: &mut HeadlessAppContext,
+    window: AnyWindowHandle,
+    converged: impl Fn(&RgbaImage) -> bool,
+) -> Result<(RgbaImage, serde_json::Value)> {
+    let deadline = Instant::now() + CONVERGE_TIMEOUT;
+    loop {
+        cx.run_until_parked();
+        // The client coalesces PaneOutput behind a background timer; without
+        // advancing the clock that timer never fires and the bytes are never
+        // handed to the emulator.
+        cx.advance_clock(Duration::from_millis(20));
+        cx.run_until_parked();
+        let (image, tree) = draw_frame(cx, window)?;
+        if converged(&image) {
+            return Ok((image, tree));
+        }
+        if Instant::now() >= deadline {
+            return Ok((image, tree));
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
+}
+
 // ============================================================================
 // Mock mux server (§3.3 grid sync)
 // ============================================================================
@@ -346,8 +375,24 @@ impl MockGrid {
 /// request gets an empty (success) response so nothing the view does at startup
 /// — resize, focus, subscribe — is left hanging.
 fn serve_mock_mux(
+    stream: UnixStream,
+    grid: MockGrid,
+    stop: Arc<AtomicBool>,
+) -> Result<(), String> {
+    serve_mock_mux_with_output(stream, grid, Vec::new(), stop)
+}
+
+/// Same as [`serve_mock_mux`], plus a byte stream pushed as `PaneOutputChunk`
+/// once the client subscribes.
+///
+/// This is the §3.1 in-place render path: the server forwards raw PTY bytes and
+/// the client's DisplayOnly emulator parses them, which is the only way escape
+/// sequences the grid snapshot cannot express — image protocols among them —
+/// reach the renderer.
+fn serve_mock_mux_with_output(
     mut stream: UnixStream,
     grid: MockGrid,
+    pane_output: Vec<u8>,
     stop: Arc<AtomicBool>,
 ) -> Result<(), String> {
     stream
@@ -355,6 +400,7 @@ fn serve_mock_mux(
         .map_err(|error| format!("set mock mux read timeout: {error}"))?;
 
     let snapshot = grid.snapshot();
+    let mut pane_output_sent = false;
     let mut buffered: Vec<u8> = Vec::new();
     let mut chunk = [0u8; 8192];
 
@@ -377,6 +423,11 @@ fn serve_mock_mux(
             let Some(EnvelopePayload::Request(request)) = envelope.payload else {
                 continue;
             };
+            // The real server pushes PaneOutput to every attached client; it
+            // does not wait for a SubscribePaneOutput request, and the client
+            // never sends one. The first grid fetch is the point where the view
+            // is known to be listening.
+            let ready_for_output = matches!(&request.body, Some(RequestBody::FetchGridUpdate(_)));
             let response = mock_response(&request, &snapshot, grid.generation);
             let bytes = mux_protocol::frame(&Envelope {
                 version: Some(mux_protocol::PROTOCOL_VERSION),
@@ -389,6 +440,31 @@ fn serve_mock_mux(
                     return Ok(());
                 }
                 return Err(format!("mock mux write: {error}"));
+            }
+
+            if ready_for_output && !pane_output_sent && !pane_output.is_empty() {
+                pane_output_sent = true;
+                let notification = Envelope {
+                    version: Some(mux_protocol::PROTOCOL_VERSION),
+                    payload: Some(EnvelopePayload::Notification(
+                        mux_protocol::Notification {
+                            event: Some(mux_protocol::notification::Event::PaneOutput(
+                                mux_protocol::PaneOutputChunk {
+                                    pane_id: MOCK_PANE_ID.to_string(),
+                                    data: pane_output.clone(),
+                                },
+                            )),
+                        },
+                    )),
+                };
+                let bytes = mux_protocol::frame(&notification)
+                    .map_err(|error| format!("encode mock pane output: {error}"))?;
+                if let Err(error) = stream.write_all(&bytes) {
+                    if error.kind() == ErrorKind::BrokenPipe {
+                        return Ok(());
+                    }
+                    return Err(format!("mock mux write: {error}"));
+                }
             }
         }
     }
@@ -446,6 +522,13 @@ struct MockMuxServer {
 
 impl MockMuxServer {
     fn start(grid: MockGrid) -> Result<(Arc<MuxDomain>, Self)> {
+        Self::start_with_output(grid, Vec::new())
+    }
+
+    fn start_with_output(
+        grid: MockGrid,
+        pane_output: Vec<u8>,
+    ) -> Result<(Arc<MuxDomain>, Self)> {
         let (client, server) = UnixStream::pair().context("create mux socket pair")?;
         client
             .set_nonblocking(true)
@@ -456,7 +539,7 @@ impl MockMuxServer {
         let stop = Arc::new(AtomicBool::new(false));
         let thread = std::thread::spawn({
             let stop = stop.clone();
-            move || serve_mock_mux(server, grid, stop)
+            move || serve_mock_mux_with_output(server, grid, pane_output, stop)
         });
         Ok((
             domain,
@@ -486,6 +569,10 @@ impl Drop for MockMuxServer {
 // ============================================================================
 
 const TERMINAL_MARKER: &str = "Z3RM-HEADLESS-GRID";
+
+/// Pane id shared by the mock server and the view under test; a `PaneOutputChunk`
+/// addressed to any other pane is ignored by the client.
+const MOCK_PANE_ID: &str = "headless-pane";
 const TERMINAL_ACCENT_BG: u32 = 0x1e6fd9;
 const TERMINAL_ACCENT_FG: u32 = 0xffe680;
 
@@ -514,7 +601,7 @@ fn open_mux_pane(
     cx.open_window(size(px(720.0), px(320.0)), |window, cx| {
         cx.new(|cx| {
             MuxPaneView::new(
-                "headless-pane".to_string(),
+                MOCK_PANE_ID.to_string(),
                 domain,
                 WeakEntity::new_invalid(),
                 WeakEntity::new_invalid(),
@@ -964,6 +1051,51 @@ fn _app_type_is_used(_: &App) {}
 /// keeps tests on the main thread when it runs them one at a time. Owning the
 /// harness lets `cargo test` run this suite correctly without callers having to
 /// remember `--test-threads=1`.
+
+/// A kitty graphics sequence that draws a solid magenta block.
+///
+/// Magenta is far from anything the theme or the mock grid paints, so its
+/// presence in the framebuffer is unambiguous evidence that the image itself
+/// was rasterized rather than some incidental chrome.
+fn kitty_magenta_block(control: &str) -> Vec<u8> {
+    use base64::Engine as _;
+
+    let image = image::RgbaImage::from_pixel(32, 16, image::Rgba([255, 0, 255, 255]));
+    let mut png = Vec::new();
+    image
+        .write_to(&mut std::io::Cursor::new(&mut png), image::ImageFormat::Png)
+        .expect("encode test png");
+    let encoded = base64::engine::general_purpose::STANDARD.encode(&png);
+    format!("\x1b_G{control};{encoded}\x1b\\").into_bytes()
+}
+
+/// §3.1 / §11.2 The image protocols only work across the mux boundary because
+/// the server forwards raw PTY bytes and the client's DisplayOnly emulator
+/// parses them. Nothing in the grid snapshot can carry an image, so a
+/// regression that made the server filter escape sequences — or the client skip
+/// the graphics scan — would silently lose images while every grid test kept
+/// passing. This drives the whole path: mock server → PaneOutputChunk → socket
+/// → MuxPaneView → TerminalElement::paint_image.
+fn mux_pane_renders_kitty_image_from_pane_output() -> Result<()> {
+    let mut cx = headless_app()?;
+    let output = kitty_magenta_block("a=T,f=100,t=d,c=6,r=3");
+    let (domain, _server) = MockMuxServer::start_with_output(terminal_grid(), output)?;
+    cx.allow_parking();
+
+    let window = open_mux_pane(&mut cx, domain)?;
+    let (image, tree) = draw_until_pixels(&mut cx, window.into(), |image| {
+        count_near_color(image, [255, 0, 255], 24) > 200
+    })?;
+    save_frame("mux_pane_kitty_image", &image, &tree)?;
+
+    let magenta = count_near_color(&image, [255, 0, 255], 24);
+    assert!(
+        magenta > 200,
+        "the transmitted image must reach the framebuffer; magenta pixels: {magenta}"
+    );
+    Ok(())
+}
+
 fn main() {
     let cases: &[(&str, fn() -> Result<()>)] = &[
         (
@@ -981,6 +1113,10 @@ fn main() {
         (
             "extension_chrome_display_list_updates_without_touching_vdom",
             extension_chrome_display_list_updates_without_touching_vdom,
+        ),
+        (
+            "mux_pane_renders_kitty_image_from_pane_output",
+            mux_pane_renders_kitty_image_from_pane_output,
         ),
         (
             "headless_renderer_produces_real_pixels",

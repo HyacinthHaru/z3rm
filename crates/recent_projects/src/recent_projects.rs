@@ -3080,6 +3080,7 @@ mod tests {
     fn init_test(cx: &mut TestAppContext) -> Arc<AppState> {
         cx.update(|cx| {
             let state = AppState::test(cx);
+            theme_settings::init(theme::LoadThemes::JustBase, cx);
             crate::init(cx);
             editor::init(cx);
             state

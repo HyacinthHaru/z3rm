@@ -8,7 +8,6 @@ pub mod wasm_host;
 
 // Still pinned to pre-fork Zed APIs (NodeRuntime, LspAccess::ViaLspStore); reviving
 // it depends on deciding whether the WASM extension store stays at all.
-// #[cfg(test)]
 // mod extension_store_test;
 
 use anyhow::{Context as _, Result, bail};

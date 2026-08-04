@@ -45,8 +45,8 @@ mod hover_links {
     pub use crate::stubs::exclude_link_to_position;
 }
 mod task;
-// #[cfg(test)]
-// mod editor_block_comment_tests;
+#[cfg(test)]
+mod editor_block_comment_tests;
 #[cfg(any(test, feature = "test-support"))]
 pub mod test;
 #[cfg(test)]
@@ -10439,8 +10439,118 @@ impl Editor {
     /// Stub: spawn_nearest_task
     pub fn spawn_nearest_task(&mut self, _action: &SpawnNearestTask, _window: &mut Window, _cx: &mut Context<Self>) {}
 
-    /// Stub: toggle_block_comments
-    pub fn toggle_block_comments(&mut self, _action: &ToggleBlockComments, _window: &mut Window, _cx: &mut Context<Self>) {}
+    /// Wraps each selection in the language's block comment delimiters, or
+    /// unwraps it when the selection is already commented.
+    ///
+    /// An empty selection is treated as the caret sitting inside a candidate
+    /// comment: uncommenting looks outward for the nearest enclosing pair, and
+    /// commenting inserts an empty comment around the caret.
+    pub fn toggle_block_comments(
+        &mut self,
+        _action: &ToggleBlockComments,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if self.read_only(cx) {
+            return;
+        }
+        let buffer = self.buffer.read(cx).snapshot(cx);
+
+        let mut new_selections = Vec::new();
+        let mut edits = Vec::new();
+        // Selections are handled in document order, so each edit shifts every
+        // later one by the length it added or removed.
+        let mut delta: isize = 0;
+
+        for selection in self.selections.all_adjusted(&self.display_snapshot(cx)) {
+            let start = buffer.point_to_offset(selection.start);
+            let end = buffer.point_to_offset(selection.end);
+
+            let Some(config) = buffer
+                .language_scope_at(start)
+                .and_then(|scope| scope.block_comment().cloned())
+            else {
+                continue;
+            };
+            let (open, close) = (config.start.as_ref(), config.end.as_ref());
+
+            // Uncommenting has to consider text outside the selection: the
+            // caret may sit between the delimiters rather than around them.
+            let commented = enclosing_block_comment(&buffer, start.0..end.0, open, close);
+
+            // A caret stays a caret across the toggle; only a real selection
+            // grows or shrinks with the delimiters.
+            let caret = start == end;
+
+            let (range, new_text, select_start, select_end) = match commented {
+                Some(range) => {
+                    let inner = buffer
+                        .text_for_range(
+                            MultiBufferOffset(range.start + open.len())
+                                ..MultiBufferOffset(range.end - close.len()),
+                        )
+                        .collect::<String>();
+                    let end_offset = range.start + inner.len();
+                    if caret {
+                        let cursor = start
+                            .0
+                            .saturating_sub(open.len())
+                            .clamp(range.start, end_offset);
+                        (range.clone(), inner, cursor, cursor)
+                    } else {
+                        (range.clone(), inner, range.start, end_offset)
+                    }
+                }
+                None => {
+                    let inner = buffer.text_for_range(start..end).collect::<String>();
+                    let text = format!("{open}{inner}{close}");
+                    if caret {
+                        let cursor = start.0 + open.len();
+                        (start.0..end.0, text, cursor, cursor)
+                    } else {
+                        let end_offset = start.0 + text.len();
+                        (start.0..end.0, text, start.0, end_offset)
+                    }
+                }
+            };
+
+            new_selections.push((
+                selection.id,
+                selection.reversed,
+                (select_start as isize + delta) as usize,
+                (select_end as isize + delta) as usize,
+            ));
+            delta += new_text.len() as isize - (range.end - range.start) as isize;
+            edits.push((MultiBufferOffset(range.start)..MultiBufferOffset(range.end), new_text));
+        }
+
+        if edits.is_empty() {
+            return;
+        }
+
+        self.transact(window, cx, |this, window, cx| {
+            this.buffer.update(cx, |buffer, cx| {
+                buffer.edit(edits, None, cx);
+            });
+
+            let snapshot = this.buffer.read(cx).snapshot(cx);
+            let selections = new_selections
+                .into_iter()
+                .map(|(id, reversed, start, end)| Selection {
+                    start: snapshot.anchor_before(MultiBufferOffset(start)),
+                    end: snapshot.anchor_after(MultiBufferOffset(end)),
+                    goal: SelectionGoal::None,
+                    id,
+                    reversed,
+                })
+                .collect::<Vec<_>>();
+            this.change_selections(Default::default(), window, cx, |s| {
+                s.select_anchors(selections);
+            });
+
+            this.request_autoscroll(Autoscroll::fit(), cx);
+        });
+    }
 
     /// Stub: toggle_comments
     pub fn toggle_comments(&mut self, _action: &ToggleComments, _window: &mut Window, _cx: &mut Context<Self>) {}
@@ -11803,6 +11913,45 @@ impl RowRangeExt for Range<DisplayRow> {
 
 /// If select range has more than one line, we
 /// just point the cursor to range.start.
+/// Byte range of the block comment enclosing `range`, if any.
+///
+/// The caret case matters as much as the selection case: with an empty
+/// selection inside `/* x */` there is no delimiter within the range at all,
+/// so the search walks outward from the selection to the nearest `open` before
+/// it and `close` after it, and only accepts the pair when nothing else
+/// intervenes.
+fn enclosing_block_comment(
+    buffer: &MultiBufferSnapshot,
+    range: Range<usize>,
+    open: &str,
+    close: &str,
+) -> Option<Range<usize>> {
+    let text = buffer.text();
+    if range.end > text.len() {
+        return None;
+    }
+
+    // Selection already spans the delimiters.
+    if text.get(range.clone()).is_some_and(|selected| {
+        selected.starts_with(open) && selected.ends_with(close) && selected.len() >= open.len() + close.len()
+    }) {
+        return Some(range);
+    }
+
+    let before = text.get(..range.start)?;
+    let after = text.get(range.end..)?;
+    let start = before.rfind(open)?;
+    let close_at = after.find(close)?;
+    let end = range.end + close_at + close.len();
+
+    // A `close` between the opener and the selection means the opener belongs
+    // to an earlier comment, not this one.
+    if before.get(start + open.len()..)?.contains(close) {
+        return None;
+    }
+    Some(start..end)
+}
+
 fn collapse_multiline_range(range: Range<Point>) -> Range<Point> {
     if range.start.row == range.end.row {
         range

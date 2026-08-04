@@ -1207,12 +1207,10 @@ async fn stream_results_to_picker(
     imported_matches: ImportedMatches,
     cx: &mut AsyncApp,
 ) -> Option<SearchResults<SearchResult>> {
-    let search_results_clone = search_results.clone();
-    let mut results_stream = std::pin::pin!(
-        search_results_clone
-            .rx
-            .ready_chunks(SEARCH_RESULTS_BATCH_SIZE)
-    );
+    // Consumed in place: a SearchResults owns the only receiver, so cloning it
+    // could only ever hand back a stream the producer never writes to.
+    let SearchResults { rx } = search_results;
+    let mut results_stream = rx.ready_chunks(SEARCH_RESULTS_BATCH_SIZE);
 
     let cap = MAX_SEARCH_RESULT_RANGES;
     let mut total_matches = 0;
@@ -1281,7 +1279,10 @@ async fn stream_results_to_picker(
         // processed before taking out the search result stream. The cancel flag
         // just needs to stop the search.
         if text_finder_turning_into_project_search.load(Ordering::Relaxed) {
-            return Some(search_results);
+            // Hand the still-live stream to project search so the in-flight
+            // results are not thrown away when the view switches.
+            let rx = results_stream.into_inner();
+            return Some(SearchResults { rx });
         }
 
         smol::future::yield_now().await;

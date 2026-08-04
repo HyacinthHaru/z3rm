@@ -440,6 +440,9 @@ features = [ "test-support"]
 [dev-dependencies.image]
 workspace = true
 
+[dev-dependencies.base64]
+workspace = true
+
 [dev-dependencies.tempfile]
 workspace = true
 

@@ -1290,13 +1290,114 @@ impl Project {
     }
 
     /// 执行项目搜索
+    /// Streams every buffer that matches `query`, one message per file.
+    ///
+    /// Files are opened as buffers so that matches are anchors into live text:
+    /// a result stays valid after the user edits the file, which is what the
+    /// search view's incremental updates rely on.
     pub fn search(
         &mut self,
-        _query: crate::search::SearchQuery,
-        _cx: &mut gpui::Context<Self>,
+        query: crate::search::SearchQuery,
+        cx: &mut gpui::Context<Self>,
     ) -> SearchResults<crate::search::SearchResult> {
         let (tx, rx) = futures::channel::mpsc::unbounded();
-        SearchResults { tx, rx }
+
+        let include_ignored = query.include_ignored();
+        let worktree_store = self.worktree_store.clone();
+        let buffer_store = self.buffer_store.clone();
+        let worktrees: Vec<_> = worktree_store.read(cx).visible_worktrees(cx).collect();
+
+        cx.spawn({
+            let tx = tx.clone();
+            async move |_, cx| {
+                // Candidates can only be collected once the tree is known;
+                // scanning is asynchronous, so an early traversal sees nothing.
+                let mut scans = Vec::new();
+                for worktree in &worktrees {
+                    if let Some(scan) = worktree.read_with(cx, |worktree, _| {
+                        worktree.as_local().map(|local| local.scan_complete())
+                    }) {
+                        scans.push(scan);
+                    }
+                }
+                for scan in scans {
+                    scan.await;
+                }
+
+                // Ignored directories are scanned lazily, so their contents are
+                // invisible until expanded. Without this an include-ignored
+                // search silently misses everything under a gitignored folder.
+                if include_ignored {
+                    let mut expansions = Vec::new();
+                    for worktree in &worktrees {
+                        let ignored: Vec<ProjectEntryId> =
+                            worktree.read_with(cx, |worktree, _| {
+                                worktree
+                                    .entries(true, 0)
+                                    .filter(|entry| entry.is_dir() && entry.is_ignored)
+                                    .map(|entry| entry.id)
+                                    .collect()
+                            });
+                        for entry_id in ignored {
+                            let task = worktree.update(cx, |worktree, cx| {
+                                worktree.expand_all_for_entry(entry_id, cx)
+                            });
+                            if let Some(task) = task {
+                                expansions.push(task);
+                            }
+                        }
+                    }
+                    for expansion in expansions {
+                        expansion.await.ok();
+                    }
+                }
+
+                let mut candidates = Vec::new();
+                for worktree in &worktrees {
+                    let paths = worktree.read_with(cx, |worktree, _| {
+                        let worktree_id = worktree.id();
+                        worktree
+                            .files(include_ignored, 0)
+                            .filter(|entry| query.match_path(&entry.path))
+                            .map(|entry| crate::ProjectPath {
+                                worktree_id,
+                                path: entry.path.clone(),
+                            })
+                            .collect::<Vec<_>>()
+                    });
+                    candidates.extend(paths);
+                }
+
+                for path in candidates {
+                    let open = buffer_store
+                        .update(cx, |buffer_store, cx| buffer_store.open_buffer(path, cx));
+                    let Ok(buffer) = open.await else {
+                        continue;
+                    };
+                    let snapshot = buffer.read_with(cx, |buffer, _| buffer.snapshot());
+
+                    let matches = query.search(&snapshot, None).await;
+                    if matches.is_empty() {
+                        continue;
+                    }
+                    let ranges = matches
+                        .into_iter()
+                        .map(|range| {
+                            snapshot.anchor_before(range.start)..snapshot.anchor_after(range.end)
+                        })
+                        .collect();
+                    if tx
+                        .unbounded_send(crate::search::SearchResult::Buffer { buffer, ranges })
+                        .is_err()
+                    {
+                        return;
+                    }
+                }
+            }
+        })
+        .detach();
+
+        SearchResults { rx }
     }
 
     /// 是否支持终端
@@ -1729,20 +1830,16 @@ pub fn path_suffix(path: &std::path::Path, detail: usize) -> String {
 pub use settings::TerminalDockPosition;
 
 /// Stub: SearchResults (task crate 已删除)
+/// The receiving half of a search stream.
+///
+/// Only the receiver is handed out: the producing task owns the sole sender, so
+/// the channel closes when the search finishes and consumers can tell "no more
+/// results" from "still searching". Handing out a sender too would keep the
+/// channel open forever.
 pub struct SearchResults<T> {
-    pub tx: futures::channel::mpsc::UnboundedSender<T>,
     pub rx: futures::channel::mpsc::UnboundedReceiver<T>,
 }
 
-impl<T> Clone for SearchResults<T> {
-    fn clone(&self) -> Self {
-        let (tx2, rx2) = futures::channel::mpsc::unbounded();
-        SearchResults {
-            tx: self.tx.clone(),
-            rx: rx2,
-        }
-    }
-}
 
 /// Stub: Search alias for SearchQuery (task crate 已删除)
 pub type Search = crate::search::SearchQuery;
