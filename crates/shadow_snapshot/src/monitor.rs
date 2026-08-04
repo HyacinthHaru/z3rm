@@ -331,6 +331,13 @@ impl DebounceQueue {
 
     /// 记录一次变更。同路径重复记录会刷新 trigger 与到期时间，
     /// 于是持续写入的文件一直不会 flush，直到安静下来。
+    ///
+    /// 这里刻意不给 `Delete` 任何优先级。macOS 上 FSEvents 把一个路径的
+    /// create/modify/remove 标志合并成一批上报，notify 按标志顺序（而非时间
+    /// 顺序）展开，于是一次 `rm` 到达的是 `Created, Deleted, Modified`，而一次
+    /// "删了再建" 到达的是 `Deleted, Created, Modified`——两者的事件集合完全
+    /// 相同，任何基于顺序或优先级的规则都分不开。谁是权威只有文件系统自己知道，
+    /// 所以 trigger 只是提示，到期后由消费方按磁盘上的实际状态定夺。
     pub fn note(&mut self, path: PathBuf, trigger: SnapshotTrigger, now: Instant) {
         let due_at = if trigger == SnapshotTrigger::Close {
             now
@@ -751,6 +758,101 @@ mod tests {
         assert!(slow.flush_due(at_100ms).is_empty(), "500ms window is not");
         assert_eq!(slow.pending_count(), 1);
         assert_eq!(slow.flush_due(start + Duration::from_millis(501)).len(), 1);
+    }
+
+    /// 删除一个被监控的文件，watcher 层必须真的报出 `Deleted`。
+    ///
+    /// 这一层曾经被怀疑是丢删除的元凶。它不是：`notify` 和 `map_event_kind`
+    /// 都工作正常，删除总是出现在这一批事件里。锁住它，是为了让以后
+    /// `map_event_kind` 一旦漏掉 `Remove(_)`，在这里就炸，而不是等到影子快照
+    /// 少了一个墓碑版本才被发现。
+    ///
+    /// 真 watcher + 真文件系统，因此只能按墙钟轮询；20 秒远大于 FSEvents /
+    /// inotify 的上报延迟，只有真的没上报才会耗尽。
+    #[test]
+    fn watcher_reports_a_deleted_file() {
+        let directory = tempfile::tempdir().expect("temp directory");
+        // macOS 上 tempdir 给的是 `/var/...`，watcher 报的是 `/private/var/...`。
+        let root = directory
+            .path()
+            .canonicalize()
+            .expect("canonical temp directory");
+        let observed = Arc::new(Mutex::new(Vec::new()));
+        let monitor = Arc::new(Monitor::with_config(
+            root.clone(),
+            &SnapshotConfig::default(),
+            {
+                let observed = observed.clone();
+                move |event: FileEvent| {
+                    observed.lock().push((event.path, event.kind));
+                    Ok(SnapshotTrigger::Write)
+                }
+            },
+        ));
+        let watch_handle = monitor.watch_directory(root.clone()).expect("watch root");
+
+        let target = root.join("doomed.txt");
+        std::fs::write(&target, b"here\n").expect("seed file");
+
+        let saw = |kind: EventKind| {
+            observed
+                .lock()
+                .iter()
+                .any(|(path, observed_kind)| path == &target && *observed_kind == kind)
+        };
+        let wait_for = |kind: EventKind| {
+            let deadline = Instant::now() + Duration::from_secs(20);
+            while Instant::now() < deadline && !saw(kind) {
+                std::thread::sleep(Duration::from_millis(25));
+            }
+        };
+
+        wait_for(EventKind::Created);
+        assert!(
+            saw(EventKind::Created),
+            "the watcher never reported the file being created: {:?}",
+            observed.lock().as_slice(),
+        );
+
+        std::fs::remove_file(&target).expect("remove the watched file");
+        wait_for(EventKind::Deleted);
+        assert!(
+            saw(EventKind::Deleted),
+            "the watcher never reported the removal: {:?}",
+            observed.lock().as_slice(),
+        );
+
+        drop(watch_handle);
+    }
+
+    /// 一次 `rm` 在 macOS 上到达的事件序列是 `Created, Deleted, Modified`
+    /// ——FSEvents 按标志顺序而非时间顺序展开合并后的一批标志。队列因此会以
+    /// `Write` 收尾，即使文件已经不在了。
+    ///
+    /// 这是**刻意**的：一次"删了再建"到达的是 `Deleted, Created, Modified`，
+    /// 事件集合与前者完全相同，任何顺序或优先级规则都分不开这两种情况。
+    /// 消费方必须按磁盘上的实际状态定夺，所以这里锁死"后到者覆盖"的语义，
+    /// 免得以后有人在这一层加 Delete 优先级，把"删了再建"的新内容写成墓碑。
+    #[test]
+    fn debounce_keeps_the_last_trigger_even_after_a_delete() {
+        let start = Instant::now();
+        let mut queue = DebounceQueue::new(Duration::from_millis(50));
+        let path = PathBuf::from("/tmp/coalesced.txt");
+
+        for trigger in [
+            SnapshotTrigger::Write,
+            SnapshotTrigger::Delete,
+            SnapshotTrigger::Write,
+        ] {
+            queue.note(path.clone(), trigger, start);
+        }
+
+        let flushed = queue.flush_due(start + Duration::from_millis(51));
+        assert_eq!(
+            flushed,
+            vec![(path, SnapshotTrigger::Write)],
+            "the trigger is a hint, not an authority: the last event wins",
+        );
     }
 
     /// §4.7 file close → force flush：Close 事件不等 debounce 窗口。

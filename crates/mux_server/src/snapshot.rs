@@ -884,11 +884,20 @@ fn event_to_trigger(kind: EventKind, _session_id: &str) -> SnapshotTrigger {
 
 /// §4.4 Route one filesystem event to the matching engine API.
 ///
-/// Delete events are tombstoned via `record_delete`; every other trigger is
-/// a content change read from disk and recorded via `record_change`. Failures
-/// are logged, not fatal — a transient I/O error must not halt versioning for
-/// the rest of the worktree. Extracted from the recorder loop so the routing
-/// decision is unit-testable without a live fs watcher.
+/// Whether this is a delete is decided by reading the file, not by the incoming
+/// trigger. The trigger cannot carry that answer on macOS: FSEvents coalesces a
+/// path's create/modify/remove flags into one batch and notify emits them in
+/// flag order rather than chronological order, so a plain `rm` arrives as
+/// `Created, Deleted, Modified` and the debounce queue keeps the trailing
+/// `Modified`. The reverse shape (`Deleted, Created, Modified` for a
+/// remove-then-recreate) carries the identical set of kinds, so no ordering or
+/// priority rule over the events can separate the two cases — only the file
+/// itself can. Whatever is on disk when the debounce window closes is the state
+/// worth recording.
+///
+/// Failures are logged, not fatal — a transient I/O error must not halt
+/// versioning for the rest of the worktree. Extracted from the recorder loop so
+/// the routing decision is unit-testable without a live fs watcher.
 fn route_record_event(
     engine: &shadow_snapshot::ShadowSnapshotEngine,
     path: &Path,
@@ -905,17 +914,6 @@ fn route_record_event(
     path_index
         .entry(path_hash)
         .or_insert_with(|| path.to_path_buf());
-    if trigger == shadow_snapshot::SnapshotTrigger::Delete {
-        suppressed_writes.remove(&path_hash);
-        if let Err(error) = engine.record_delete(path) {
-            zlog::warn!(
-                "shadow snapshot delete failed: path={} error={}",
-                path.display(),
-                error,
-            );
-        }
-        return;
-    }
     match std::fs::read(path) {
         Ok(content) => {
             if suppressed_writes
@@ -926,6 +924,15 @@ fn route_record_event(
             {
                 return;
             }
+            // A Delete trigger on a path that still has content means the file
+            // was removed and recreated inside one debounce window. The content
+            // is what survived, so it is versioned as a write; recording it
+            // under `Delete` would label a content node as a tombstone.
+            let trigger = if trigger == shadow_snapshot::SnapshotTrigger::Delete {
+                shadow_snapshot::SnapshotTrigger::Write
+            } else {
+                trigger
+            };
             if let Err(error) = engine.record_change_with_trigger(path, &content, trigger) {
                 zlog::warn!(
                     "shadow snapshot record failed: path={} error={}",
@@ -934,12 +941,40 @@ fn route_record_event(
                 );
             }
         }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            suppressed_writes.remove(&path_hash);
+            record_tombstone(engine, path);
+        }
         Err(error) => {
             zlog::warn!(
                 "shadow snapshot read failed: path={} error={}",
                 path.display(),
                 error,
             );
+        }
+    }
+}
+
+/// §4.4 Tombstone a path that is gone from disk, unless there is nothing to
+/// tombstone.
+///
+/// A path with no recorded history has no content the tombstone could point
+/// back to — editor scratch files that appear and vanish inside one debounce
+/// window are the common case, and versioning them would list unrestorable
+/// files as changed. A path whose HEAD is already a tombstone was recorded as
+/// deleted before; FSEvents re-reports a removed path in later batches, and
+/// each repeat would otherwise append another empty node.
+fn record_tombstone(engine: &shadow_snapshot::ShadowSnapshotEngine, path: &Path) {
+    match engine.head_trigger(path) {
+        None | Some(shadow_snapshot::SnapshotTrigger::Delete) => {}
+        Some(_) => {
+            if let Err(error) = engine.record_delete(path) {
+                zlog::warn!(
+                    "shadow snapshot delete failed: path={} error={}",
+                    path.display(),
+                    error,
+                );
+            }
         }
     }
 }
@@ -1002,6 +1037,303 @@ mod tests {
             "delete must be versioned with trigger=Delete, got {:?}",
             last.2
         );
+    }
+
+    /// §4.4 the regression this file exists to prevent: on macOS a real `rm`
+    /// reaches the recorder carrying `Write`, because FSEvents replays the
+    /// path's create/modify flags alongside the remove and the debounce queue
+    /// keeps the trailing `Modified`. The file being gone is what decides it,
+    /// so a `Write` trigger on a missing path must still tombstone.
+    #[test]
+    fn route_record_event_tombstones_a_write_trigger_for_a_missing_file() {
+        let directory = tempfile::tempdir().unwrap();
+        let database = directory.path().join("missing.db");
+        let wal = directory.path().join("missing.wal");
+        let blobs = directory.path().join("missing-blobs");
+        std::fs::create_dir_all(&blobs).unwrap();
+        let engine = shadow_snapshot::ShadowSnapshotEngine::open(&database, &wal, &blobs).unwrap();
+
+        let path = directory.path().join("alpha.txt");
+        let mut suppressed_writes = std::collections::HashMap::new();
+        let mut path_index = std::collections::HashMap::new();
+        std::fs::write(&path, b"alpha one").unwrap();
+        route_record_event(
+            &engine,
+            &path,
+            shadow_snapshot::SnapshotTrigger::Write,
+            &mut suppressed_writes,
+            &mut path_index,
+        );
+        std::fs::remove_file(&path).unwrap();
+
+        route_record_event(
+            &engine,
+            &path,
+            shadow_snapshot::SnapshotTrigger::Write,
+            &mut suppressed_writes,
+            &mut path_index,
+        );
+
+        let versions = engine.list_versions(&path).unwrap();
+        assert_eq!(
+            versions.len(),
+            2,
+            "the write and the tombstone are both versions, got {versions:?}"
+        );
+        assert_eq!(
+            versions[1].2,
+            shadow_snapshot::SnapshotTrigger::Delete,
+            "a Write trigger for a file that is gone must be recorded as a delete, got {:?}",
+            versions[1].2
+        );
+    }
+
+    /// The mirror image, and the reason a "Delete always wins" debounce rule
+    /// would be wrong: FSEvents reports remove-then-recreate with the very same
+    /// set of event kinds, so the trigger can say `Delete` while the recreated
+    /// content is sitting on disk. That content is what must be versioned.
+    #[test]
+    fn route_record_event_records_content_when_a_delete_trigger_finds_a_live_file() {
+        let directory = tempfile::tempdir().unwrap();
+        let database = directory.path().join("recreated.db");
+        let wal = directory.path().join("recreated.wal");
+        let blobs = directory.path().join("recreated-blobs");
+        std::fs::create_dir_all(&blobs).unwrap();
+        let engine = shadow_snapshot::ShadowSnapshotEngine::open(&database, &wal, &blobs).unwrap();
+
+        let path = directory.path().join("beta.txt");
+        let mut suppressed_writes = std::collections::HashMap::new();
+        let mut path_index = std::collections::HashMap::new();
+        std::fs::write(&path, b"beta one").unwrap();
+        route_record_event(
+            &engine,
+            &path,
+            shadow_snapshot::SnapshotTrigger::Write,
+            &mut suppressed_writes,
+            &mut path_index,
+        );
+        std::fs::remove_file(&path).unwrap();
+        std::fs::write(&path, b"beta two").unwrap();
+
+        route_record_event(
+            &engine,
+            &path,
+            shadow_snapshot::SnapshotTrigger::Delete,
+            &mut suppressed_writes,
+            &mut path_index,
+        );
+
+        let versions = engine.list_versions(&path).unwrap();
+        assert_eq!(versions.len(), 2, "got {versions:?}");
+        assert_eq!(
+            versions[1].2,
+            shadow_snapshot::SnapshotTrigger::Write,
+            "a live file must be versioned as content, not as a tombstone: {versions:?}"
+        );
+        let newest = engine
+            .query_version_for_path(&path, versions[1].0)
+            .unwrap()
+            .expect("the newest version has content");
+        assert_eq!(
+            newest, b"beta two",
+            "the recreated content must be what got versioned, got {:?}",
+            String::from_utf8_lossy(&newest),
+        );
+    }
+
+    /// Reading the filesystem now decides delete-ness, so every transient file
+    /// that vanishes before its debounce window closes reaches the tombstone
+    /// path. A path the engine never versioned has no content to point back to,
+    /// so it must not become an unrestorable entry in `list_changed_files`.
+    #[test]
+    fn route_record_event_does_not_tombstone_a_path_without_history() {
+        let directory = tempfile::tempdir().unwrap();
+        let database = directory.path().join("transient.db");
+        let wal = directory.path().join("transient.wal");
+        let blobs = directory.path().join("transient-blobs");
+        std::fs::create_dir_all(&blobs).unwrap();
+        let engine = shadow_snapshot::ShadowSnapshotEngine::open(&database, &wal, &blobs).unwrap();
+
+        let scratch = directory.path().join("editor-scratch-4913");
+        let mut suppressed_writes = std::collections::HashMap::new();
+        let mut path_index = std::collections::HashMap::new();
+
+        route_record_event(
+            &engine,
+            &scratch,
+            shadow_snapshot::SnapshotTrigger::Write,
+            &mut suppressed_writes,
+            &mut path_index,
+        );
+
+        assert!(
+            engine.list_versions(&scratch).unwrap().is_empty(),
+            "a path that was never versioned must not gain a tombstone",
+        );
+    }
+
+    /// FSEvents re-reports a removed path in later batches, so the same delete
+    /// can reach the recorder repeatedly. Only the first one is a state change.
+    #[test]
+    fn route_record_event_tombstones_a_deleted_file_only_once() {
+        let directory = tempfile::tempdir().unwrap();
+        let database = directory.path().join("repeat.db");
+        let wal = directory.path().join("repeat.wal");
+        let blobs = directory.path().join("repeat-blobs");
+        std::fs::create_dir_all(&blobs).unwrap();
+        let engine = shadow_snapshot::ShadowSnapshotEngine::open(&database, &wal, &blobs).unwrap();
+
+        let path = directory.path().join("gamma.txt");
+        let mut suppressed_writes = std::collections::HashMap::new();
+        let mut path_index = std::collections::HashMap::new();
+        std::fs::write(&path, b"gamma").unwrap();
+        route_record_event(
+            &engine,
+            &path,
+            shadow_snapshot::SnapshotTrigger::Write,
+            &mut suppressed_writes,
+            &mut path_index,
+        );
+        std::fs::remove_file(&path).unwrap();
+
+        for _ in 0..4 {
+            route_record_event(
+                &engine,
+                &path,
+                shadow_snapshot::SnapshotTrigger::Delete,
+                &mut suppressed_writes,
+                &mut path_index,
+            );
+        }
+
+        let versions = engine.list_versions(&path).unwrap();
+        assert_eq!(
+            versions.len(),
+            2,
+            "repeated delete events must collapse to one tombstone, got {versions:?}"
+        );
+    }
+
+    /// Full pipeline on a real filesystem with a real watcher: `Monitor` →
+    /// trigger channel → `DebounceQueue` → `route_record_event`, wired exactly
+    /// as the recorder loop wires it. This is the shape the daemon runs and the
+    /// only place the FSEvents event ordering that caused the bug is actually
+    /// in play; the unit tests above pin the routing decision, this one proves
+    /// a real `rm` still reaches it as a tombstone.
+    #[test]
+    fn real_watcher_delete_reaches_the_engine_as_a_tombstone() {
+        let directory = tempfile::tempdir().expect("temp directory");
+        // macOS hands back `/var/...` while the watcher reports `/private/var/...`.
+        // Path hashes are computed from the string, so the test has to compare
+        // like for like or every lookup misses.
+        let root = directory
+            .path()
+            .canonicalize()
+            .expect("canonical temp directory");
+        let database = root.join("live.db");
+        let wal = root.join("live.wal");
+        let blobs = root.join("live-blobs");
+        std::fs::create_dir_all(&blobs).expect("blob dir");
+        let engine =
+            shadow_snapshot::ShadowSnapshotEngine::open(&database, &wal, &blobs).expect("engine");
+
+        let config = SnapshotConfig {
+            debounce: Duration::from_millis(100),
+            // The engine files live in the watched root, so ignore everything
+            // this test is not asserting on.
+            ignore_patterns: vec!["live.db".into(), "live.wal".into(), "live-blobs/".into()],
+            ..SnapshotConfig::default()
+        };
+        let (path_tx, path_rx) = mpsc::channel::<(PathBuf, SnapshotTrigger)>();
+        let monitor = Arc::new(Monitor::with_config(root.clone(), &config, {
+            let path_tx = path_tx.clone();
+            move |event: FileEvent| {
+                let trigger = event_to_trigger(event.kind, "watcher-delete-test");
+                path_tx
+                    .send((event.path, trigger))
+                    .context("test recorder channel closed")?;
+                Ok(trigger)
+            }
+        }));
+        let watch_handle = monitor
+            .watch_directory(root.clone())
+            .expect("install watcher");
+
+        let target = root.join("alpha.txt");
+        std::fs::write(&target, b"alpha one\n").expect("seed file");
+
+        // Wall-clock deadline: a real watcher plus a real debounce window, so
+        // every wait has to poll rather than assume a single pump is enough.
+        let deadline = std::time::Instant::now() + Duration::from_secs(20);
+        let mut debouncer = DebounceQueue::new(config.debounce);
+        let mut suppressed_writes = std::collections::HashMap::new();
+        let mut path_index = std::collections::HashMap::new();
+        let mut observed_triggers = Vec::new();
+        // Everything the recorder loop mutates is passed in rather than
+        // captured, so the polling loops below can still read it between pumps.
+        let pump = |debouncer: &mut DebounceQueue,
+                    suppressed_writes: &mut std::collections::HashMap<_, _>,
+                    path_index: &mut std::collections::HashMap<_, _>,
+                    observed_triggers: &mut Vec<(PathBuf, SnapshotTrigger)>| {
+            while let Ok((path, trigger)) = path_rx.try_recv() {
+                observed_triggers.push((path.clone(), trigger));
+                debouncer.note(path, trigger, std::time::Instant::now());
+            }
+            for (path, trigger) in debouncer.flush_due(std::time::Instant::now()) {
+                route_record_event(&engine, &path, trigger, suppressed_writes, path_index);
+            }
+        };
+
+        while std::time::Instant::now() < deadline
+            && engine.list_versions(&target).unwrap_or_default().is_empty()
+        {
+            pump(
+                &mut debouncer,
+                &mut suppressed_writes,
+                &mut path_index,
+                &mut observed_triggers,
+            );
+            std::thread::sleep(Duration::from_millis(25));
+        }
+        assert!(
+            !engine.list_versions(&target).unwrap_or_default().is_empty(),
+            "the initial write was never versioned; watcher triggers seen: {observed_triggers:?}",
+        );
+
+        std::fs::remove_file(&target).expect("delete the watched file");
+
+        let deadline = std::time::Instant::now() + Duration::from_secs(20);
+        let tombstoned = |engine: &shadow_snapshot::ShadowSnapshotEngine| {
+            engine
+                .list_versions(&target)
+                .unwrap_or_default()
+                .last()
+                .is_some_and(|version| version.2 == SnapshotTrigger::Delete)
+        };
+        while std::time::Instant::now() < deadline && !tombstoned(&engine) {
+            pump(
+                &mut debouncer,
+                &mut suppressed_writes,
+                &mut path_index,
+                &mut observed_triggers,
+            );
+            std::thread::sleep(Duration::from_millis(25));
+        }
+
+        let versions = engine.list_versions(&target).unwrap_or_default();
+        assert!(
+            tombstoned(&engine),
+            "deleting a watched file must leave a Delete version. versions={versions:?}, \
+             watcher triggers seen={observed_triggers:?}",
+        );
+        assert!(
+            observed_triggers
+                .iter()
+                .any(|(path, trigger)| path == &target && *trigger == SnapshotTrigger::Delete),
+            "the watcher itself must report the removal; it did not: {observed_triggers:?}",
+        );
+
+        drop(watch_handle);
     }
 
     #[test]

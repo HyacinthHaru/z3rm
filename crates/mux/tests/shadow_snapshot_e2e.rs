@@ -256,6 +256,41 @@ async fn wait_for_file_versions(
     }
 }
 
+/// 轮询 `list_file_versions` 直到 `path` 的最新版本是一个删除墓碑。
+///
+/// 不能改成"等版本数 +1":FSEvents 可能把同一次写入拆成两批上报,凭空多出一个
+/// write 版本就会让计数提前满足,于是断言撞上的是那个 write 而不是墓碑。
+/// 条件本身就是要等的东西,所以直接轮询条件。
+async fn wait_for_tombstone(
+    session: &ShadowSession,
+    path: &Path,
+    timeout: Duration,
+) -> Result<Vec<FileVersion>> {
+    let deadline = Instant::now() + timeout;
+    loop {
+        let response = session
+            .domain
+            .list_file_versions(&session.id, path.to_string_lossy().as_ref())
+            .await?;
+        if response
+            .versions
+            .last()
+            .is_some_and(|version| version.trigger == "delete")
+        {
+            return Ok(response.versions);
+        }
+        if Instant::now() >= deadline {
+            anyhow::bail!(
+                "timed out waiting for a delete tombstone on {}. \
+                 list_file_versions returned: {:?}",
+                path.display(),
+                response.versions,
+            );
+        }
+        tokio::time::sleep(POLL_INTERVAL).await;
+    }
+}
+
 /// 轮询磁盘直到 `path` 的内容等于 `expected`。
 ///
 /// §4.8 的 decline 在服务端是同步写回的,返回时文件应该已经落盘;留一小段轮询
@@ -378,19 +413,16 @@ async fn shadow_snapshot_rpc_round_trip() -> Result<()> {
     // ------------------------------------------------------------------
     // 3. list_file_versions → get_file_version → decline_file_version
     // ------------------------------------------------------------------
-    // 删除本身不产生新版本 (macOS 上 FSEvents 把这次删除报成了一次写,recorder
-    // 读不到文件,只留下一条 warn);这一步的作用是让服务端的路径解析落到正确的
-    // path hash 上。断言针对的仍然是前面两次写入留下的版本。
-    std::fs::remove_file(&alpha).context("delete alpha.txt")?;
-    let versions = wait_for_file_versions(&session, &alpha, 2, RECORD_TIMEOUT).await?;
+    // 两次写入的版本要在删除之前取,删除本身会再追加一个墓碑版本。
+    let written = wait_for_file_versions(&session, &alpha, 2, RECORD_TIMEOUT).await?;
     assert!(
-        versions
+        written
             .windows(2)
             .all(|pair| pair[0].seq_no < pair[1].seq_no),
-        "list_file_versions must be ordered by strictly increasing SeqNo: {versions:?}"
+        "list_file_versions must be ordered by strictly increasing SeqNo: {written:?}"
     );
 
-    let oldest = versions
+    let oldest = written
         .first()
         .cloned()
         .context("list_file_versions returned an empty version list")?;
@@ -414,7 +446,7 @@ async fn shadow_snapshot_rpc_round_trip() -> Result<()> {
         String::from_utf8_lossy(&oldest_content.content)
     );
 
-    let newest = versions
+    let newest = written
         .last()
         .cloned()
         .context("list_file_versions returned an empty version list")?;
@@ -432,6 +464,26 @@ async fn shadow_snapshot_rpc_round_trip() -> Result<()> {
         ALPHA_SECOND,
         "the newest shadow version must hold the second bytes written, got {:?}",
         String::from_utf8_lossy(&newest_content.content)
+    );
+
+    // §4.4 删除必须留下墓碑版本。这条曾经全程落空:macOS 上 FSEvents 把一个路径
+    // 的 create/modify/remove 标志合并成一批上报,notify 按标志顺序展开,于是一次
+    // `rm` 到达 recorder 的是 `Created, Deleted, Modified`,去抖队列保留了最后
+    // 那个 `Modified`,recorder 于是去读一个已经不存在的文件,只留下一条
+    // "read failed: No such file or directory" 的 warn。现在由磁盘上的实际状态
+    // 定夺,而不是由事件顺序定夺。
+    std::fs::remove_file(&alpha).context("delete alpha.txt")?;
+    let after_delete = wait_for_tombstone(&session, &alpha, RECORD_TIMEOUT).await?;
+    assert!(
+        after_delete.len() > written.len(),
+        "the tombstone must be a new version on top of the writes, not one of them: \
+         before={written:?} after={after_delete:?}"
+    );
+    assert!(
+        after_delete
+            .windows(2)
+            .all(|pair| pair[0].seq_no < pair[1].seq_no),
+        "the tombstone must keep SeqNo strictly increasing: {after_delete:?}"
     );
 
     // §4.8 decline 走 WAL-first 协议并真的把文件写回磁盘。

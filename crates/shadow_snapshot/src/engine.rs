@@ -671,6 +671,19 @@ impl ShadowSnapshotEngine {
         Ok(content_hash)
     }
 
+    /// The trigger on this path's current HEAD, or `None` when the path has no
+    /// recorded history at all.
+    ///
+    /// Callers routing filesystem events need to tell three states apart before
+    /// writing a tombstone: a path that was never versioned (nothing to point
+    /// back to), a path already tombstoned (the removal is recorded), and a
+    /// path with live content history. This is an O(1) in-memory lookup, unlike
+    /// `list_versions`, so it is cheap enough to consult per event.
+    pub fn head_trigger(&self, path: &Path) -> Option<SnapshotTrigger> {
+        let head = self.tree.get_head(&compute_path_hash(path))?;
+        self.tree.get_node(head).map(|node| node.trigger)
+    }
+
     /// List all versions of a file.
     pub fn list_versions(&self, path: &Path) -> Result<Vec<(VersionId, SeqNo, SnapshotTrigger)>> {
         let path_hash = compute_path_hash(path);
