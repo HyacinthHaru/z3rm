@@ -3945,6 +3945,7 @@ mod tests {
     ) -> (Arc<FakeFs>, Entity<KeymapEditor>, VisualTestContext) {
         cx.update(|cx| {
             let _state = AppState::test(cx);
+            theme_settings::init(theme::LoadThemes::JustBase, cx);
             editor::init(cx);
             cx.set_global(KeymapEventChannel::new());
         });
