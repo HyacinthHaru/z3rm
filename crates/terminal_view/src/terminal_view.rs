@@ -2443,7 +2443,7 @@ fn first_project_directory(workspace: &Workspace, cx: &App) -> Option<PathBuf> {
     }
 }
 
-#[cfg(all(test, feature = "z3rm-migration"))]
+#[cfg(test)]
 mod tests {
     use super::*;
     use gpui::{TestAppContext, VisualTestContext};
@@ -2641,6 +2641,9 @@ mod tests {
         });
     }
 
+    // Frozen: asserts `project.is_remote()`, but `Project::remote` is a stub
+    // that builds a local project because remote mode was removed.
+    #[cfg(feature = "z3rm-migration")]
     #[gpui::test]
     async fn remote_no_worktree_uses_remote_shell_default_cwd(
         cx: &mut TestAppContext,
@@ -2880,6 +2883,7 @@ mod tests {
         (project, workspace, window_handle)
     }
 
+    #[cfg(feature = "z3rm-migration")]
     async fn init_remote_test(
         cx: &mut TestAppContext,
         server_cx: &mut TestAppContext,
@@ -2987,9 +2991,9 @@ mod tests {
         path: impl AsRef<Path>,
         cx: &mut TestAppContext,
     ) -> (Entity<Worktree>, Entry) {
-        let (wt, _) = project
+        let wt = project
             .update(cx, |project, cx| {
-                project.find_or_create_worktree(path, true, cx)
+                project.find_or_create_worktree(path.as_ref(), true, cx)
             })
             .await
             .unwrap();
@@ -3019,7 +3023,7 @@ mod tests {
                 worktree_id: wt.read(cx).id(),
                 path: entry.path,
             };
-            project.update(cx, |project, cx| project.set_active_path(Some(p), cx));
+            project.update(cx, |project, cx| project.set_active_path(Some(&p), cx));
         });
     }
 

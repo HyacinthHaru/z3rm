@@ -347,6 +347,7 @@ mod tests {
         cx.update(|cx| {
             let app_state = AppState::test(cx);
             settings::init(cx);
+            theme_settings::init(theme::LoadThemes::JustBase, cx);
             super::init(cx);
             editor::init(cx);
             app_state

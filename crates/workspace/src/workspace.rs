@@ -1057,6 +1057,14 @@ impl AppState {
     #[cfg(feature = "test-support")]
     pub fn test(cx: &mut App) -> Arc<Self> {
         use session::Session;
+        // Anything built on an AppState reads settings somewhere, and a test
+        // that forgot to install the store panics deep inside unrelated code
+        // rather than at the missing setup. Callers that install their own
+        // store first keep it.
+        if cx.try_global::<settings::SettingsStore>().is_none() {
+            let store = settings::SettingsStore::test(cx);
+            cx.set_global(store);
+        }
         let session = cx.new(|cx| AppSession::new(Session::test(), cx));
         Arc::new(Self {
             languages: Arc::new(LanguageRegistry::new(cx.background_executor().clone())),

@@ -585,7 +585,7 @@ mod tests {
         cx.update(|cx| {
             let app_state = workspace::AppState::test(cx);
             settings::init(cx);
-            theme::init(theme::LoadThemes::JustBase, cx);
+            theme_settings::init(theme::LoadThemes::JustBase, cx);
             editor::init(cx);
             super::init(cx);
             app_state

@@ -204,7 +204,9 @@ mod tests {
                 cx,
             );
 
-            assert_eq!(buffer.text(), "if foo; then\n  1\n  \nelse\n  3\nfi");
+            // The unindented raw string keeps its trailing newline, so the
+            // result does too.
+            assert_eq!(buffer.text(), "if foo; then\n  1\n  \nelse\n  3\nfi\n");
             buffer
         });
     }
