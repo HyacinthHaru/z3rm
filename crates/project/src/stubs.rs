@@ -1324,6 +1324,34 @@ impl Project {
                     scan.await;
                 }
 
+                // Ignored directories are scanned lazily, so their contents are
+                // invisible until expanded. Without this an include-ignored
+                // search silently misses everything under a gitignored folder.
+                if include_ignored {
+                    let mut expansions = Vec::new();
+                    for worktree in &worktrees {
+                        let ignored: Vec<ProjectEntryId> =
+                            worktree.read_with(cx, |worktree, _| {
+                                worktree
+                                    .entries(true, 0)
+                                    .filter(|entry| entry.is_dir() && entry.is_ignored)
+                                    .map(|entry| entry.id)
+                                    .collect()
+                            });
+                        for entry_id in ignored {
+                            let task = worktree.update(cx, |worktree, cx| {
+                                worktree.expand_all_for_entry(entry_id, cx)
+                            });
+                            if let Some(task) = task {
+                                expansions.push(task);
+                            }
+                        }
+                    }
+                    for expansion in expansions {
+                        expansion.await.ok();
+                    }
+                }
+
                 let mut candidates = Vec::new();
                 for worktree in &worktrees {
                     let paths = worktree.read_with(cx, |worktree, _| {
@@ -1369,7 +1397,7 @@ impl Project {
         })
         .detach();
 
-        SearchResults { tx, rx }
+        SearchResults { rx }
     }
 
     /// 是否支持终端
@@ -1802,20 +1830,16 @@ pub fn path_suffix(path: &std::path::Path, detail: usize) -> String {
 pub use settings::TerminalDockPosition;
 
 /// Stub: SearchResults (task crate 已删除)
+/// The receiving half of a search stream.
+///
+/// Only the receiver is handed out: the producing task owns the sole sender, so
+/// the channel closes when the search finishes and consumers can tell "no more
+/// results" from "still searching". Handing out a sender too would keep the
+/// channel open forever.
 pub struct SearchResults<T> {
-    pub tx: futures::channel::mpsc::UnboundedSender<T>,
     pub rx: futures::channel::mpsc::UnboundedReceiver<T>,
 }
 
-impl<T> Clone for SearchResults<T> {
-    fn clone(&self) -> Self {
-        let (tx2, rx2) = futures::channel::mpsc::unbounded();
-        SearchResults {
-            tx: self.tx.clone(),
-            rx: rx2,
-        }
-    }
-}
 
 /// Stub: Search alias for SearchQuery (task crate 已删除)
 pub type Search = crate::search::SearchQuery;

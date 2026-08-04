@@ -511,7 +511,7 @@ async fn consume_search_stream(
     // The stream is consumed in place rather than through a clone: cloning a
     // SearchResults hands back a fresh receiver that the producer never sends
     // to, so a cloned stream yields nothing.
-    let SearchResults { tx, rx } = search_results;
+    let SearchResults { rx } = search_results;
     let mut matches = rx.ready_chunks(1024);
 
     let mut limit_reached = false;
@@ -590,7 +590,7 @@ async fn consume_search_stream(
     if project_search_turning_into_text_finder.load(Ordering::Relaxed) {
         project_search_turning_into_text_finder.store(false, Ordering::Relaxed); // reset
         let rx = matches.into_inner();
-        return Some(SearchResults { tx, rx });
+        return Some(SearchResults { rx });
     }
 
     project_search
