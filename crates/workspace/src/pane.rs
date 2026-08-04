@@ -4793,4 +4793,3 @@ impl Render for DraggedTab {
 }
 
 // #[cfg(test)]
-// mod tests;

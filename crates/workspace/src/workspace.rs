@@ -5,7 +5,8 @@ pub mod invalid_item_view;
 pub mod item;
 mod modal_layer;
 mod multi_workspace;
-// #[cfg(test)]
+// Frozen: needs AgentSettings (the AI crate is gone) plus Project::project_group_key
+// and DisableAiSettings::override_global, none of which survived the fork.
 // mod multi_workspace_tests;
 pub mod notifications;
 pub mod pane;

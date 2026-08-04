@@ -1,5 +1,5 @@
 use crate::ToggleBlockComments;
-use crate::editor_tests::init_test;
+use crate::test::init_test;
 use crate::test::editor_test_context::EditorTestContext;
 use gpui::TestAppContext;
 use indoc::indoc;
