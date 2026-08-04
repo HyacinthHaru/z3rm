@@ -562,13 +562,23 @@ async fn dispatch_request(
         RequestBody::FetchGridUpdate(r) => handle_fetch_grid_update(r, sessions).await?,
         RequestBody::FetchScrollback(r) => handle_fetch_scrollback(r, sessions).await?,
         RequestBody::SearchScrollback(r) => handle_search_scrollback(r, sessions).await?,
-        RequestBody::ListFileVersions(request) => {
-            handle_list_file_versions(request, sessions).await?
+        // §4 A shadow request can fail for perfectly ordinary reasons — the
+        // snapshot engine has not finished arming, the path is outside the
+        // worktree, the version id is stale. `?` here would tear down the whole
+        // connection over any of them, leaving the client with "connection
+        // closed" and no reason; these become Error bodies instead.
+        RequestBody::ListChangedFiles(request) => {
+            shadow_response(handle_list_changed_files(request, sessions).await)
         }
-        RequestBody::GetFileVersion(request) => handle_get_file_version(request, sessions).await?,
+        RequestBody::ListFileVersions(request) => {
+            shadow_response(handle_list_file_versions(request, sessions).await)
+        }
+        RequestBody::GetFileVersion(request) => {
+            shadow_response(handle_get_file_version(request, sessions).await)
+        }
         RequestBody::DeclineFileVersion(request) => {
             if check_permission(role, ClientRole::ReadWrite) {
-                handle_decline_file_version(request, sessions).await?
+                shadow_response(handle_decline_file_version(request, sessions).await)
             } else {
                 ResponseBody::Error("permission denied: read-write required".to_string())
             }
@@ -2491,6 +2501,14 @@ fn resolve_path_within_root(
     let suffix = candidate
         .strip_prefix(existing_ancestor)
         .context("resolving path suffix")?;
+    // §4 `PathBuf::join("")` appends a separator, so joining an empty suffix
+    // turns "/root/file.txt" into "/root/file.txt/". `Path` equality ignores
+    // the trailing separator, but `compute_path_hash` hashes the string — the
+    // two spellings hash differently and every version lookup for a file that
+    // still exists on disk misses.
+    if suffix.as_os_str().is_empty() {
+        return Ok(canonical_ancestor);
+    }
     Ok(canonical_ancestor.join(suffix))
 }
 
@@ -2558,6 +2576,36 @@ fn resolve_session_file_path(
         .context(format!(
             "path is outside the attached session worktree: {requested}"
         )))
+}
+
+/// §4 Turn a shadow-snapshot handler result into a response the client can read.
+fn shadow_response(result: anyhow::Result<ResponseBody>) -> ResponseBody {
+    match result {
+        Ok(body) => body,
+        Err(error) => ResponseBody::Error(format!("{error:#}")),
+    }
+}
+
+async fn handle_list_changed_files(
+    request: &mux_protocol::ListChangedFilesRequest,
+    sessions: &Arc<parking_lot::RwLock<Vec<crate::session::Session>>>,
+) -> anyhow::Result<ResponseBody> {
+    let (watch, _root) = snapshot_context_for_session(sessions, &request.session_id)?;
+    let changed = tokio::task::spawn_blocking(move || watch.list_changed_files())
+        .await
+        .context("joining shadow list-changed-files request")??;
+    Ok(ResponseBody::ChangedFiles(
+        mux_protocol::ListChangedFilesResponse {
+            files: changed
+                .into_iter()
+                .map(|change| mux_protocol::ChangedFile {
+                    path: change.path.to_string_lossy().into_owned(),
+                    version_count: change.version_count,
+                    latest_seq_no: change.latest_seq_no,
+                })
+                .collect(),
+        },
+    ))
 }
 
 async fn handle_list_file_versions(
@@ -3279,7 +3327,14 @@ mod connection_unit_tests {
                 size: Some(mux_protocol::TerminalSize { cols: 20, rows: 5 }),
                 cwd: None,
                 command: Some(mux_protocol::ShellCommand {
-                    program: "/bin/true".to_string(),
+                    // macOS ships `true` only under /usr/bin; hardcoding /bin
+                    // makes this fail as ENOENT instead of testing the fast
+                    // exit it is named for.
+                    program: ["/bin/true", "/usr/bin/true"]
+                        .into_iter()
+                        .find(|candidate| std::path::Path::new(candidate).exists())
+                        .unwrap_or("/usr/bin/true")
+                        .to_string(),
                     args: Vec::new(),
                     env: Default::default(),
                 }),

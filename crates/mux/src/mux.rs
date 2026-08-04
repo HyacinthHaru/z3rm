@@ -16,12 +16,13 @@ use std::time::Duration;
 // §9 从 mux_protocol 导入所有 protobuf 类型。
 use mux_protocol::{
     AttachResponse, DeclineFileVersionResponse, Envelope, FetchGridUpdateResponse,
-    FetchScrollbackResponse, GetFileVersionResponse, ListFileVersionsResponse, Notification,
-    PROTOCOL_VERSION, Request, Response, SessionInfo, SessionLayoutChanged, ShellCommand,
-    ShellIntegrationResponse, TerminalSize, attach_request::AttachMode as AttachMode_,
-    check_frame_len, envelope::Payload as EnvelopePayload, frame,
-    notification::Event as NotifEvent, parse_len_prefix, request::Body as RequestBody,
-    response::Body as ResponseBody, split_node::SplitDirection,
+    FetchScrollbackResponse, GetFileVersionResponse, ListChangedFilesResponse,
+    ListFileVersionsResponse, Notification, PROTOCOL_VERSION, Request, Response, SessionInfo,
+    SessionLayoutChanged, ShellCommand, ShellIntegrationResponse, TerminalSize,
+    attach_request::AttachMode as AttachMode_, check_frame_len,
+    envelope::Payload as EnvelopePayload, frame, notification::Event as NotifEvent,
+    parse_len_prefix, request::Body as RequestBody, response::Body as ResponseBody,
+    split_node::SplitDirection,
 };
 
 // §16.6 SSH 远程连接模块（Plan 19）。
@@ -1048,6 +1049,23 @@ impl MuxDomain {
     // §4 Shadow File Versions（crash-safe 文件系统版本控制）
     // ========================================================================
 
+    /// §4 列出指定会话内所有留有 shadow 版本的文件，按最新 SeqNo 从新到旧。
+    pub async fn list_changed_files(&self, session_id: &str) -> Result<ListChangedFilesResponse> {
+        let req = RequestBody::ListChangedFiles(mux_protocol::ListChangedFilesRequest {
+            session_id: session_id.to_string(),
+        });
+        let resp = self.send_request(req).await?;
+        match resp.body {
+            Some(ResponseBody::ChangedFiles(changed)) => Ok(changed),
+            // 影子快照被设置关掉、或会话没有可用工作目录时服务端回的是 Error；
+            // 落进下面的兜底分支会把原因换成一句无信息量的 "unexpected"。
+            Some(ResponseBody::Error(error)) => Err(anyhow::anyhow!(error)),
+            _ => Err(anyhow::anyhow!(
+                "unexpected response type for list_changed_files"
+            )),
+        }
+    }
+
     /// §4 列出指定会话内某路径的全部 shadow 版本。
     pub async fn list_file_versions(
         &self,
@@ -1061,6 +1079,7 @@ impl MuxDomain {
         let resp = self.send_request(req).await?;
         match resp.body {
             Some(ResponseBody::FileVersions(versions)) => Ok(versions),
+            Some(ResponseBody::Error(error)) => Err(anyhow::anyhow!(error)),
             _ => Err(anyhow::anyhow!(
                 "unexpected response type for list_file_versions"
             )),
@@ -1082,13 +1101,15 @@ impl MuxDomain {
         let resp = self.send_request(req).await?;
         match resp.body {
             Some(ResponseBody::FileVersionContent(content)) => Ok(content),
+            Some(ResponseBody::Error(error)) => Err(anyhow::anyhow!(error)),
             _ => Err(anyhow::anyhow!(
                 "unexpected response type for get_file_version"
             )),
         }
     }
 
-    /// §4.8 拒绝（撤销）指定版本，将文件回滚至前一版本。
+    /// §4.8 把文件还原成 `version_id` 那一版的内容，撤销此后的改动。
+    /// 传的是要还原到的版本，不是要丢弃的那一版。
     pub async fn decline_file_version(
         &self,
         session_id: &str,
@@ -1103,6 +1124,9 @@ impl MuxDomain {
         let resp = self.send_request(req).await?;
         match resp.body {
             Some(ResponseBody::DeclineFileVersion(resp)) => Ok(resp),
+            // §4.8 服务端刻意把还原失败编码成 Error 体而不是断开连接, 就是为了
+            // 让调用方看到原因; 落进兜底分支等于把那句原因扔了。
+            Some(ResponseBody::Error(error)) => Err(anyhow::anyhow!(error)),
             _ => Err(anyhow::anyhow!(
                 "unexpected response type for decline_file_version"
             )),

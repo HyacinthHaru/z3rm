@@ -39,7 +39,18 @@ pub struct FileVersion {
     pub trigger: SnapshotTrigger,
 }
 
+/// §4 One file that accumulated shadow versions during this session.
+#[derive(Debug, Clone)]
+pub struct FileChange {
+    pub path: PathBuf,
+    pub version_count: u64,
+    pub latest_seq_no: u64,
+}
+
 enum ShadowCommand {
+    ListChangedFiles {
+        reply: mpsc::Sender<Result<Vec<FileChange>>>,
+    },
     ListVersions {
         path: PathBuf,
         reply: mpsc::Sender<Result<Vec<FileVersion>>>,
@@ -123,6 +134,14 @@ impl SnapshotWatch {
         if !self.inner.session_id.is_empty() {
             zlog::info!("shadow snapshot stopped: session={}", self.inner.session_id);
         }
+    }
+
+    pub fn list_changed_files(&self) -> Result<Vec<FileChange>> {
+        let (reply, response) = mpsc::channel();
+        self.send_command(ShadowCommand::ListChangedFiles { reply })?;
+        response
+            .recv()
+            .context("shadow recorder stopped before listing changed files")?
     }
 
     pub fn list_versions(&self, path: PathBuf) -> Result<Vec<FileVersion>> {
@@ -510,6 +529,13 @@ pub fn start_with_config(
         .spawn(move || {
             let root = root_for_recorder;
             let config = recorder_config;
+            // Reverse index for `path_hash → path`. The engine stores only the
+            // hash, so both crash recovery and `ListChangedFiles` need this to
+            // name a file. Seeded by walking the worktree, then kept current by
+            // `route_record_event` as new paths are recorded — a file created
+            // after startup is otherwise unresolvable, and a deleted one has to
+            // stay resolvable because its versions outlive it on disk.
+            let mut path_index = build_path_hash_index(&root);
             let engine =
                 // §4.9 age-based FIFO GC bounded by the user's quota setting
                 // (`per_project_quota_mb`, 0 = unlimited). Without a quota,
@@ -520,9 +546,6 @@ pub fn start_with_config(
                 ) {
                     Ok(engine) => {
                         // §4.8: complete any Decline intents that crashed mid-restore.
-                        // Resolve path_hash by hashing every file under the session cwd
-                        // (no persistent reverse index yet; walk is bounded to one tree).
-                        let path_index = build_path_hash_index(&root);
                         match engine.recover_incomplete_restores(|path_hash| {
                             path_index.get(path_hash).cloned()
                         }) {
@@ -598,14 +621,20 @@ pub fn start_with_config(
 
                 while let Ok(command) = command_rx.try_recv() {
                     if let Some((path_hash, content_hash)) =
-                        handle_command(&engine, command, config.git_commit_hook)
+                        handle_command(&engine, command, config.git_commit_hook, &path_index)
                     {
                         suppressed_writes.insert(path_hash, (content_hash, now + suppression_ttl));
                     }
                 }
 
                 for (path, trigger) in debouncer.flush_due(std::time::Instant::now()) {
-                    route_record_event(&engine, &path, trigger, &mut suppressed_writes);
+                    route_record_event(
+                        &engine,
+                        &path,
+                        trigger,
+                        &mut suppressed_writes,
+                        &mut path_index,
+                    );
                 }
 
                 if path_disconnected {
@@ -737,8 +766,30 @@ fn handle_command(
     engine: &shadow_snapshot::ShadowSnapshotEngine,
     command: ShadowCommand,
     git_commit_hook: GitCommitHookMode,
+    path_index: &std::collections::HashMap<shadow_snapshot::PathHash, PathBuf>,
 ) -> Option<(shadow_snapshot::PathHash, shadow_snapshot::ContentHash)> {
     match command {
+        ShadowCommand::ListChangedFiles { reply } => {
+            // A summary whose path_hash is not in the index belongs to a file
+            // recorded by an earlier run of this session that no longer exists
+            // on disk. Naming it is impossible (the hash is one-way), so it is
+            // dropped rather than reported under a placeholder path.
+            let changed = engine
+                .list_path_summaries()
+                .into_iter()
+                .filter_map(|(path_hash, version_count, latest_seq_no)| {
+                    path_index.get(&path_hash).map(|path| FileChange {
+                        path: path.clone(),
+                        version_count,
+                        latest_seq_no,
+                    })
+                })
+                .collect();
+            if reply.send(Ok(changed)).is_err() {
+                zlog::warn!("shadow list-changed-files requester disconnected");
+            }
+            None
+        }
         ShadowCommand::ListVersions { path, reply } => {
             let result = engine.list_versions(&path).map(|versions| {
                 versions
@@ -846,8 +897,14 @@ fn route_record_event(
         shadow_snapshot::PathHash,
         (shadow_snapshot::ContentHash, std::time::Instant),
     >,
+    path_index: &mut std::collections::HashMap<shadow_snapshot::PathHash, PathBuf>,
 ) {
     let path_hash = shadow_snapshot::compute_path_hash(path);
+    // Record the mapping even for a delete: the versions survive the file, and
+    // `ListChangedFiles` can only name them through this index.
+    path_index
+        .entry(path_hash)
+        .or_insert_with(|| path.to_path_buf());
     if trigger == shadow_snapshot::SnapshotTrigger::Delete {
         suppressed_writes.remove(&path_hash);
         if let Err(error) = engine.record_delete(path) {
@@ -928,11 +985,13 @@ mod tests {
         let _ = engine.record_change(&target_file, b"alive").unwrap();
 
         let mut suppressed_writes = std::collections::HashMap::new();
+        let mut path_index = std::collections::HashMap::new();
         route_record_event(
             &engine,
             &target_file,
             shadow_snapshot::SnapshotTrigger::Delete,
             &mut suppressed_writes,
+            &mut path_index,
         );
 
         let versions = engine.list_versions(&target_file).unwrap();
@@ -960,12 +1019,14 @@ mod tests {
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
         let mut suppressed_writes =
             std::collections::HashMap::from([(path_hash, (content_hash, deadline))]);
+        let mut path_index = std::collections::HashMap::new();
 
         route_record_event(
             &engine,
             &path,
             shadow_snapshot::SnapshotTrigger::Write,
             &mut suppressed_writes,
+            &mut path_index,
         );
 
         assert!(engine.list_versions(&path).unwrap().is_empty());
@@ -976,6 +1037,7 @@ mod tests {
             &path,
             shadow_snapshot::SnapshotTrigger::Write,
             &mut suppressed_writes,
+            &mut path_index,
         );
         assert_eq!(engine.list_versions(&path).unwrap().len(), 1);
     }
@@ -995,16 +1057,130 @@ mod tests {
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
         let mut suppressed_writes =
             std::collections::HashMap::from([(path_hash, (declined_hash, deadline))]);
+        let mut path_index = std::collections::HashMap::new();
 
         route_record_event(
             &engine,
             &path,
             shadow_snapshot::SnapshotTrigger::Write,
             &mut suppressed_writes,
+            &mut path_index,
         );
 
         assert_eq!(engine.list_versions(&path).unwrap().len(), 1);
         assert!(suppressed_writes.is_empty());
+    }
+
+    /// §4 `ListChangedFiles` has to name files the engine only knows by hash.
+    /// Routing writes through `route_record_event` is what populates that
+    /// reverse index, so recording two files must make both listable with the
+    /// most recently touched one first.
+    #[test]
+    fn list_changed_files_names_paths_recorded_after_startup() {
+        let directory = tempfile::tempdir().unwrap();
+        let database = directory.path().join("changed.db");
+        let wal = directory.path().join("changed.wal");
+        let blobs = directory.path().join("changed-blobs");
+        std::fs::create_dir_all(&blobs).unwrap();
+        let engine = shadow_snapshot::ShadowSnapshotEngine::open(&database, &wal, &blobs).unwrap();
+
+        let first = directory.path().join("first.txt");
+        let second = directory.path().join("second.txt");
+        let mut suppressed_writes = std::collections::HashMap::new();
+        // The index starts empty on purpose: neither file existed when the
+        // recorder booted, which is exactly the case a startup-only walk misses.
+        let mut path_index = std::collections::HashMap::new();
+
+        std::fs::write(&first, b"one").unwrap();
+        route_record_event(
+            &engine,
+            &first,
+            shadow_snapshot::SnapshotTrigger::Write,
+            &mut suppressed_writes,
+            &mut path_index,
+        );
+        std::fs::write(&first, b"one edited").unwrap();
+        route_record_event(
+            &engine,
+            &first,
+            shadow_snapshot::SnapshotTrigger::Write,
+            &mut suppressed_writes,
+            &mut path_index,
+        );
+        std::fs::write(&second, b"two").unwrap();
+        route_record_event(
+            &engine,
+            &second,
+            shadow_snapshot::SnapshotTrigger::Write,
+            &mut suppressed_writes,
+            &mut path_index,
+        );
+
+        let (reply, response) = mpsc::channel();
+        let suppression = handle_command(
+            &engine,
+            ShadowCommand::ListChangedFiles { reply },
+            GitCommitHookMode::Skip,
+            &path_index,
+        );
+        assert!(suppression.is_none());
+        let changed = response.recv().unwrap().unwrap();
+
+        assert_eq!(changed.len(), 2, "both recorded files must be listed");
+        assert_eq!(changed[0].path, second, "newest SeqNo comes first");
+        assert_eq!(changed[0].version_count, 1);
+        assert_eq!(changed[1].path, first);
+        assert_eq!(changed[1].version_count, 2, "two writes, two versions");
+        assert!(changed[0].latest_seq_no > changed[1].latest_seq_no);
+    }
+
+    /// A deleted file keeps its versions, so it must stay listable — the index
+    /// entry is what makes the tombstone reachable for restore.
+    #[test]
+    fn list_changed_files_still_names_a_deleted_file() {
+        let directory = tempfile::tempdir().unwrap();
+        let database = directory.path().join("deleted.db");
+        let wal = directory.path().join("deleted.wal");
+        let blobs = directory.path().join("deleted-blobs");
+        std::fs::create_dir_all(&blobs).unwrap();
+        let engine = shadow_snapshot::ShadowSnapshotEngine::open(&database, &wal, &blobs).unwrap();
+
+        let path = directory.path().join("gone.txt");
+        let mut suppressed_writes = std::collections::HashMap::new();
+        let mut path_index = std::collections::HashMap::new();
+
+        std::fs::write(&path, b"here").unwrap();
+        route_record_event(
+            &engine,
+            &path,
+            shadow_snapshot::SnapshotTrigger::Write,
+            &mut suppressed_writes,
+            &mut path_index,
+        );
+        std::fs::remove_file(&path).unwrap();
+        route_record_event(
+            &engine,
+            &path,
+            shadow_snapshot::SnapshotTrigger::Delete,
+            &mut suppressed_writes,
+            &mut path_index,
+        );
+
+        let (reply, response) = mpsc::channel();
+        handle_command(
+            &engine,
+            ShadowCommand::ListChangedFiles { reply },
+            GitCommitHookMode::Skip,
+            &path_index,
+        );
+        let changed = response.recv().unwrap().unwrap();
+
+        assert_eq!(changed.len(), 1);
+        assert_eq!(changed[0].path, path);
+        assert_eq!(
+            changed[0].version_count, 2,
+            "the write and the tombstone are both versions"
+        );
     }
 
     #[test]

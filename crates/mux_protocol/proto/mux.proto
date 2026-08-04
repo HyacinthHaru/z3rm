@@ -495,16 +495,34 @@ message GetFileVersionResponse {
     bytes content = 1;
 }
 
-// §4.8 拒绝（撤销）某版本，将文件回滚至前一版本。
+// §4.8 撤销此后的改动：把文件的内容还原成 version_id 那一版。
+// 还原本身也会记为一个新版本（trigger=decline），历史不会被抹掉。
 message DeclineFileVersionRequest {
     string session_id = 1;
     string path = 2;        // UTF-8 文件路径
-    uint64 version_id = 3;  // §4.5 要拒绝的版本 ID
+    uint64 version_id = 3;  // §4.5 要还原到的版本 ID（不是要丢弃的那一版）
 }
 
 // §4.8 拒绝版本响应：restored 表示是否成功回滚。
 message DeclineFileVersionResponse {
     bool restored = 1;
+}
+
+// §4 某个文件在本 session 内累计的影子版本概况。
+message ChangedFile {
+    string path = 1;           // 绝对路径
+    uint64 version_count = 2;  // 该文件的版本数量
+    uint64 latest_seq_no = 3;  // §4.4 最新版本的单调序列号
+}
+
+// §4 列出本 session 内所有留有影子版本的文件。
+message ListChangedFilesRequest {
+    string session_id = 1;
+}
+
+// §4 变更文件列表响应，按 latest_seq_no 从新到旧排列。
+message ListChangedFilesResponse {
+    repeated ChangedFile files = 1;
 }
 
 // === Clipboard (server relay hub) ===
@@ -748,6 +766,7 @@ message Request {
         ResizeLayoutRequest resize_layout = 33;  // §16.9 server-owned layout ratios
         ListRecoveryCandidatesRequest list_recovery_candidates = 34;  // §3.6 recovery
         ConfirmRecoveryRequest confirm_recovery = 35;  // §3.6 recovery
+        ListChangedFilesRequest list_changed_files = 36;  // §4 shadow snapshot
     }
 }
 
@@ -777,5 +796,6 @@ message Response {
         DeclineFileVersionResponse decline_file_version = 21; // §4 shadow snapshot
         ListRecoveryCandidatesResponse recovery_candidates = 22;  // §3.6 recovery
         ConfirmRecoveryResponse recovery_confirmed = 23;  // §3.6 recovery
+        ListChangedFilesResponse changed_files = 24;  // §4 shadow snapshot
     }
 }

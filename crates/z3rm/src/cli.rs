@@ -106,6 +106,13 @@ commands (spec §3.10):\n\
                                      resize a pane, or toggle zoom with -Z\n\
     new-window [-t <session>]         create a new tab\n\
     rename-window -t <target> <title> set the pane title\n\
+    list-changes [-t <session>]      list files with shadow versions\n\
+    list-versions [-t <session>] <path>\n\
+                                     list a file's shadow versions\n\
+    show-version [-t <session>] <path> <version-id>\n\
+                                     write a shadow version to stdout\n\
+    restore [-t <session>] <path> <version-id>\n\
+                                     roll a file back to a shadow version\n\
 \n\
 capture-pane line numbers follow tmux: 0 is the first visible row, negative\n\
 numbers reach into history, and '-' is the far edge (history start for -S,\n\
@@ -224,7 +231,59 @@ fn is_mux_cli_command(command: &str) -> bool {
             | "resize-pane"
             | "new-window"
             | "rename-window"
+            | "list-changes"
+            | "list-versions"
+            | "show-version"
+            | "restore"
     )
+}
+
+/// §4 解析影子快照命令的 `-t <target>` 加固定数量位置参数。
+///
+/// 未知 flag 一律报错而不是当作路径吞掉: 拼错的选项若被当成文件名, 换来的会是
+/// 一句服务端的 "path not found", 排查起来比直接拒绝难得多。
+fn parse_shadow_options(
+    command: &str,
+    args: &[String],
+    positional_names: &[&str],
+) -> Result<(Option<String>, Vec<String>), String> {
+    let mut target = None;
+    let mut positionals = Vec::new();
+    let mut index = 0;
+    while index < args.len() {
+        match args[index].as_str() {
+            "-t" | "--target" => {
+                let value = args
+                    .get(index + 1)
+                    .filter(|value| !value.starts_with('-'))
+                    .ok_or_else(|| format!("{command} requires a value for -t"))?;
+                target = Some(value.clone());
+                index += 2;
+            }
+            option if option.starts_with('-') => {
+                return Err(format!("unsupported {command} option: {option}"));
+            }
+            value => {
+                positionals.push(value.to_string());
+                index += 1;
+            }
+        }
+    }
+    if positionals.len() != positional_names.len() {
+        return Err(format!(
+            "{command} requires exactly {} argument(s): {}",
+            positional_names.len(),
+            positional_names.join(" "),
+        ));
+    }
+    Ok((target, positionals))
+}
+
+/// §4 位置参数里的版本 ID。解析失败要说清是哪个值坏了。
+fn parse_version_id(command: &str, value: &str) -> Result<u64, String> {
+    value
+        .parse::<u64>()
+        .map_err(|_| format!("{command}: invalid version id '{value}'"))
 }
 
 /// 解析 `-t <target>` / `-F <format>` 这类"只有可选 target + 可选 format"的
@@ -747,6 +806,57 @@ fn parse_cli_args_lossy(args: &[String]) -> Result<Option<CliCommand>, String> {
             Ok(Some(CliCommand::RenameWindow { target, title }))
         }
 
+        "list-changes" => {
+            let (target, _) = parse_shadow_options("list-changes", &args[2..], &[])?;
+            Ok(Some(CliCommand::ListChanges { target }))
+        }
+
+        "list-versions" => {
+            let (target, positionals) =
+                parse_shadow_options("list-versions", &args[2..], &["<path>"])?;
+            let mut positionals = positionals.into_iter();
+            let path = positionals
+                .next()
+                .ok_or_else(|| "list-versions requires a path".to_string())?;
+            Ok(Some(CliCommand::ListVersions { target, path }))
+        }
+
+        "show-version" => {
+            let (target, positionals) =
+                parse_shadow_options("show-version", &args[2..], &["<path>", "<version-id>"])?;
+            let mut positionals = positionals.into_iter();
+            let path = positionals
+                .next()
+                .ok_or_else(|| "show-version requires a path".to_string())?;
+            let version_id = positionals
+                .next()
+                .ok_or_else(|| "show-version requires a version id".to_string())?;
+            let version_id = parse_version_id("show-version", &version_id)?;
+            Ok(Some(CliCommand::ShowVersion {
+                target,
+                path,
+                version_id,
+            }))
+        }
+
+        "restore" => {
+            let (target, positionals) =
+                parse_shadow_options("restore", &args[2..], &["<path>", "<version-id>"])?;
+            let mut positionals = positionals.into_iter();
+            let path = positionals
+                .next()
+                .ok_or_else(|| "restore requires a path".to_string())?;
+            let version_id = positionals
+                .next()
+                .ok_or_else(|| "restore requires a version id".to_string())?;
+            let version_id = parse_version_id("restore", &version_id)?;
+            Ok(Some(CliCommand::Restore {
+                target,
+                path,
+                version_id,
+            }))
+        }
+
         _ => Err(format!("unknown subcommand: {subcommand}")),
     }
 }
@@ -853,6 +963,88 @@ mod tests {
 
         assert!(parse_cli_args_from(&args(&["has-session"])).is_err());
         assert!(parse_cli_args_from(&args(&["has-session", "dev"])).is_err());
+    }
+
+    #[test]
+    fn list_changes_takes_only_an_optional_target() {
+        let parsed = parse_cli_args_from(&args(&["list-changes"])).expect("parse");
+        match parsed {
+            Some(CliCommand::ListChanges { target }) => assert_eq!(target, None),
+            other => panic!("unexpected parse result: {other:?}"),
+        }
+
+        let parsed = parse_cli_args_from(&args(&["list-changes", "-t", "dev"])).expect("parse");
+        match parsed {
+            Some(CliCommand::ListChanges { target }) => assert_eq!(target.as_deref(), Some("dev")),
+            other => panic!("unexpected parse result: {other:?}"),
+        }
+
+        assert!(parse_cli_args_from(&args(&["list-changes", "extra"])).is_err());
+    }
+
+    #[test]
+    fn list_versions_requires_exactly_one_path() {
+        let parsed = parse_cli_args_from(&args(&["list-versions", "-t", "dev", "src/main.rs"]))
+            .expect("parse");
+        match parsed {
+            Some(CliCommand::ListVersions { target, path }) => {
+                assert_eq!(target.as_deref(), Some("dev"));
+                assert_eq!(path, "src/main.rs");
+            }
+            other => panic!("unexpected parse result: {other:?}"),
+        }
+
+        assert!(parse_cli_args_from(&args(&["list-versions"])).is_err());
+        assert!(parse_cli_args_from(&args(&["list-versions", "a.rs", "b.rs"])).is_err());
+    }
+
+    #[test]
+    fn show_version_parses_path_and_version_id() {
+        let parsed =
+            parse_cli_args_from(&args(&["show-version", "src/main.rs", "42"])).expect("parse");
+        match parsed {
+            Some(CliCommand::ShowVersion {
+                target,
+                path,
+                version_id,
+            }) => {
+                assert_eq!(target, None);
+                assert_eq!(path, "src/main.rs");
+                assert_eq!(version_id, 42);
+            }
+            other => panic!("unexpected parse result: {other:?}"),
+        }
+
+        assert!(parse_cli_args_from(&args(&["show-version", "src/main.rs"])).is_err());
+        assert!(parse_cli_args_from(&args(&["show-version", "src/main.rs", "abc"])).is_err());
+    }
+
+    #[test]
+    fn restore_parses_path_and_version_id() {
+        let parsed = parse_cli_args_from(&args(&["restore", "-t", "dev", "src/main.rs", "7"]))
+            .expect("parse");
+        match parsed {
+            Some(CliCommand::Restore {
+                target,
+                path,
+                version_id,
+            }) => {
+                assert_eq!(target.as_deref(), Some("dev"));
+                assert_eq!(path, "src/main.rs");
+                assert_eq!(version_id, 7);
+            }
+            other => panic!("unexpected parse result: {other:?}"),
+        }
+
+        assert!(parse_cli_args_from(&args(&["restore", "src/main.rs"])).is_err());
+    }
+
+    /// 拼错的选项必须报错, 否则会被当成路径发给服务端换来一句无关的 not-found。
+    #[test]
+    fn shadow_commands_reject_unknown_options() {
+        assert!(parse_cli_args_from(&args(&["list-changes", "--sesion", "dev"])).is_err());
+        assert!(parse_cli_args_from(&args(&["list-versions", "-S", "a.rs"])).is_err());
+        assert!(parse_cli_args_from(&args(&["restore", "-t"])).is_err());
     }
 
     #[test]

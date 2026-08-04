@@ -147,6 +147,27 @@ pub enum CliCommand {
         target: Option<String>,
         title: String,
     },
+    /// §4 `z3rm list-changes [-t <session>]` — 列出本 session 留有影子版本的文件
+    ListChanges {
+        target: Option<String>,
+    },
+    /// §4 `z3rm list-versions [-t <session>] <path>` — 列出某文件的影子版本
+    ListVersions {
+        target: Option<String>,
+        path: String,
+    },
+    /// §4 `z3rm show-version [-t <session>] <path> <id>` — 把某版本内容写到 stdout
+    ShowVersion {
+        target: Option<String>,
+        path: String,
+        version_id: u64,
+    },
+    /// §4.8 `z3rm restore [-t <session>] <path> <id>` — 把文件回滚到指定版本
+    Restore {
+        target: Option<String>,
+        path: String,
+        version_id: u64,
+    },
 }
 
 fn current_pane_from_env() -> Option<String> {
@@ -761,6 +782,82 @@ pub async fn run_cli_command(cmd: CliCommand) -> Result<()> {
                 .await
                 .context("failed to set pane title")?;
             eprintln!("renamed window pane {} to '{}'", pane_id, title);
+        }
+        CliCommand::ListChanges { target } => {
+            let target = super::target::parse_target(&target)?;
+            let session_id = resolve_session_id(&domain, &target, &default_session).await?;
+            let changed = domain
+                .list_changed_files(&session_id)
+                .await
+                .context("failed to list changed files")?;
+            if changed.files.is_empty() {
+                println!("no shadow versions recorded");
+            } else {
+                for file in &changed.files {
+                    println!(
+                        "{}\t{} version(s)\tseq {}",
+                        file.path, file.version_count, file.latest_seq_no,
+                    );
+                }
+            }
+        }
+        CliCommand::ListVersions { target, path } => {
+            let target = super::target::parse_target(&target)?;
+            let session_id = resolve_session_id(&domain, &target, &default_session).await?;
+            let versions = domain
+                .list_file_versions(&session_id, &path)
+                .await
+                .with_context(|| format!("failed to list versions of {path}"))?;
+            if versions.versions.is_empty() {
+                println!("no shadow versions for {path}");
+            } else {
+                for version in &versions.versions {
+                    println!(
+                        "{}\tseq {}\t{}",
+                        version.version_id, version.seq_no, version.trigger,
+                    );
+                }
+            }
+        }
+        CliCommand::ShowVersion {
+            target,
+            path,
+            version_id,
+        } => {
+            use std::io::Write as _;
+            let target = super::target::parse_target(&target)?;
+            let session_id = resolve_session_id(&domain, &target, &default_session).await?;
+            let version = domain
+                .get_file_version(&session_id, &path, version_id)
+                .await
+                .with_context(|| format!("failed to read version {version_id} of {path}"))?;
+            // 影子快照存的是字节, 不保证是 UTF-8; 原样写出去才能让调用方拿它和
+            // 磁盘上的文件逐字节比对。内容通常不以换行结尾, 显式 flush 才能保证
+            // 最后一段不被留在缓冲区里。
+            let mut stdout = std::io::stdout();
+            stdout
+                .write_all(&version.content)
+                .context("failed to write version content to stdout")?;
+            stdout
+                .flush()
+                .context("failed to flush version content to stdout")?;
+        }
+        CliCommand::Restore {
+            target,
+            path,
+            version_id,
+        } => {
+            let target = super::target::parse_target(&target)?;
+            let session_id = resolve_session_id(&domain, &target, &default_session).await?;
+            let response = domain
+                .decline_file_version(&session_id, &path, version_id)
+                .await
+                .with_context(|| format!("failed to restore {path} to version {version_id}"))?;
+            anyhow::ensure!(
+                response.restored,
+                "server did not confirm the restore of {path} to version {version_id}"
+            );
+            eprintln!("restored {path} to version {version_id}");
         }
         CliCommand::Recover { target } => {
             if let Some(session_id) = target {
