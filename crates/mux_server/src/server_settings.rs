@@ -185,6 +185,16 @@ mod tests {
     use super::*;
     use std::io::Write;
 
+    /// §3.5 daemon 默认永不自动退出，直到被显式 kill —— 这是 tmux 用户的预期。
+    /// `0` 编码的就是"永远"，把它改成一个有限秒数会让 session 在闲置后无声消失。
+    #[test]
+    fn keep_alive_defaults_to_forever() {
+        assert_eq!(
+            DEFAULT_KEEP_ALIVE_SECONDS, 0,
+            "0 means never expire; a finite default would silently drop idle sessions"
+        );
+    }
+
     #[test]
     fn apply_file_updates_atomics() {
         let settings = ServerSettings {
