@@ -147,6 +147,14 @@ pub enum CliCommand {
         target: Option<String>,
         title: String,
     },
+    /// §12 `z3rm search-scrollback [-t <target>] [-n <max>] [-S <line>] [-f] <regex>`
+    SearchScrollback {
+        target: Option<String>,
+        pattern: String,
+        start: Option<CaptureLine>,
+        forward: bool,
+        max_results: u32,
+    },
     /// §4 `z3rm list-changes [-t <session>]` — 列出本 session 留有影子版本的文件
     ListChanges {
         target: Option<String>,
@@ -782,6 +790,35 @@ pub async fn run_cli_command(cmd: CliCommand) -> Result<()> {
                 .await
                 .context("failed to set pane title")?;
             eprintln!("renamed window pane {} to '{}'", pane_id, title);
+        }
+        CliCommand::SearchScrollback {
+            target,
+            pattern,
+            start,
+            forward,
+            max_results,
+        } => {
+            let target = super::target::parse_target(&target)?;
+            let pane_id = resolve_pane_id(&domain, &target, ResolveAccess::ReadOnly).await?;
+            let hits = super::search::search_scrollback(
+                &domain,
+                &pane_id,
+                &pattern,
+                super::search::SearchOptions {
+                    start,
+                    forward,
+                    max_results,
+                },
+            )
+            .await?;
+            // grep 式的 `行号:内容`, 行号沿用 capture-pane 的 tmux 模型, 调用方可以
+            // 直接拿它去 `capture-pane -S <line> -E <line>` 取上下文。
+            for hit in &hits {
+                println!("{}:{}", hit.line, hit.text.trim_end());
+            }
+            // grep 契约: 没有命中就退出非 0, 让调用方能直接 `search-scrollback ... ||`
+            // 分支, 而不必去数输出行数。
+            anyhow::ensure!(!hits.is_empty(), "no matches for {pattern}");
         }
         CliCommand::ListChanges { target } => {
             let target = super::target::parse_target(&target)?;

@@ -139,6 +139,9 @@ optional = true
 [dependencies.gpui_tokio]
 workspace = true
 
+[dependencies.regex]
+workspace = true
+
 [dependencies.rayon]
 workspace = true
 

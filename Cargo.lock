@@ -17005,6 +17005,7 @@ dependencies = [
  "quickjs_runtime",
  "rayon",
  "recent_projects",
+ "regex",
  "release_channel",
  "remote",
  "reqwest_client",

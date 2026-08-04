@@ -17,12 +17,12 @@ use std::time::Duration;
 use mux_protocol::{
     AttachResponse, DeclineFileVersionResponse, Envelope, FetchGridUpdateResponse,
     FetchScrollbackResponse, GetFileVersionResponse, ListChangedFilesResponse,
-    ListFileVersionsResponse, Notification, PROTOCOL_VERSION, Request, Response, SessionInfo,
-    SessionLayoutChanged, ShellCommand, ShellIntegrationResponse, TerminalSize,
-    attach_request::AttachMode as AttachMode_, check_frame_len,
-    envelope::Payload as EnvelopePayload, frame, notification::Event as NotifEvent,
-    parse_len_prefix, request::Body as RequestBody, response::Body as ResponseBody,
-    split_node::SplitDirection,
+    ListFileVersionsResponse, Notification, PROTOCOL_VERSION, Request, Response,
+    SearchScrollbackResponse, SessionInfo, SessionLayoutChanged, ShellCommand,
+    ShellIntegrationResponse, TerminalSize, attach_request::AttachMode as AttachMode_,
+    check_frame_len, envelope::Payload as EnvelopePayload, frame,
+    notification::Event as NotifEvent, parse_len_prefix, request::Body as RequestBody,
+    response::Body as ResponseBody, split_node::SplitDirection,
 };
 
 // §16.6 SSH 远程连接模块（Plan 19）。
@@ -972,6 +972,37 @@ impl MuxDomain {
             Some(ResponseBody::Scrollback(scrollback)) => Ok(scrollback),
             _ => Err(anyhow::anyhow!(
                 "unexpected response type for fetch_scrollback"
+            )),
+        }
+    }
+
+    /// §12 在 pane 的 scrollback 历史里做正则搜索。
+    ///
+    /// `from_line` 是历史行下标 (0 = 最旧)，`direction` 0 = 向更旧、1 = 向更新。
+    /// 只搜历史，可见区不在范围内。
+    pub async fn search_scrollback(
+        &self,
+        pane: &str,
+        regex: &str,
+        from_line: u32,
+        direction: u32,
+        max_results: u32,
+    ) -> Result<SearchScrollbackResponse> {
+        let req = RequestBody::SearchScrollback(mux_protocol::SearchScrollbackRequest {
+            pane_id: pane.to_string(),
+            regex: regex.to_string(),
+            from_line,
+            direction,
+            max_results,
+        });
+        let resp = self.send_request(req).await?;
+        match resp.body {
+            Some(ResponseBody::SearchScrollback(matches)) => Ok(matches),
+            // 服务端找不到 pane 时回的是 Error 体; 落进兜底分支会把 "pane not
+            // found" 换成一句无信息量的 "unexpected"。
+            Some(ResponseBody::Error(error)) => Err(anyhow::anyhow!(error)),
+            _ => Err(anyhow::anyhow!(
+                "unexpected response type for search_scrollback"
             )),
         }
     }

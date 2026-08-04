@@ -6,6 +6,7 @@ pub mod dispatch;
 pub mod format;
 pub mod keys;
 pub mod marketplace;
+pub mod search;
 pub mod target;
 
 pub use capture::CaptureLine;
@@ -72,6 +73,10 @@ pub fn parse_cli_args() -> Result<Option<CliCommand>, String> {
 /// from a real parse error and writes usage to stdout + exit(0).
 pub const HELP_REQUESTED: &str = "usage: z3rm <command> [args]";
 
+/// `search-scrollback -n` 的缺省上限。够一次 grep 用，又不至于让一个宽泛的正则
+/// 把整段历史倒进 agent 的上下文。
+const DEFAULT_SEARCH_RESULTS: u32 = 100;
+
 /// Return the full usage summary (spec §3.10 command table).
 pub fn format_usage() -> String {
     format!(
@@ -113,10 +118,19 @@ commands (spec §3.10):\n\
                                      write a shadow version to stdout\n\
     restore [-t <session>] <path> <version-id>\n\
                                      roll a file back to a shadow version\n\
+    search-scrollback [-t <target>] [-n <max>] [-S <line>] [-f] [--] <regex>\n\
+                                     search a pane's history and visible rows\n\
 \n\
 capture-pane line numbers follow tmux: 0 is the first visible row, negative\n\
 numbers reach into history, and '-' is the far edge (history start for -S,\n\
 visible end for -E).\n\
+\n\
+search-scrollback reports matches as '<line>:<text>' using those same numbers,\n\
+so a hit can be fed straight back to 'capture-pane -S <line> -E <line>' for\n\
+context. It searches history and visible rows. By default it walks backwards\n\
+from the newest line and reports the newest -n matches; -f walks forwards from\n\
+the oldest and reports the oldest -n. -S picks where that walk starts. Exit\n\
+status is non-zero when nothing matched, like grep.\n\
 \n\
 -F format strings use tmux syntax: '#{{name}}' substitutes a variable,\n\
 '#{{?name,yes,no}}' branches on it, and '##' is a literal '#'. Unknown or\n\
@@ -235,6 +249,7 @@ fn is_mux_cli_command(command: &str) -> bool {
             | "list-versions"
             | "show-version"
             | "restore"
+            | "search-scrollback"
     )
 }
 
@@ -323,8 +338,12 @@ fn parse_list_options(
 ///
 /// tmux 行号模型: `0` 是可见区第一行，负数进入历史，字面量 `-` 是这一侧的
 /// 极端边界 (`-S -` 取到历史最开头，`-E -` 取到可见区最后一行)。
-fn parse_capture_line(value: Option<&String>, flag: &str) -> Result<CaptureLine, String> {
-    let value = value.ok_or_else(|| format!("capture-pane requires a value for {flag}"))?;
+fn parse_capture_line(
+    command: &str,
+    value: Option<&String>,
+    flag: &str,
+) -> Result<CaptureLine, String> {
+    let value = value.ok_or_else(|| format!("{command} requires a value for {flag}"))?;
     if value == "-" {
         return Ok(CaptureLine::Edge);
     }
@@ -620,11 +639,19 @@ fn parse_cli_args_lossy(args: &[String]) -> Result<Option<CliCommand>, String> {
                         index += 1;
                     }
                     "-S" | "--start-line" | "--scrollback" => {
-                        start = Some(parse_capture_line(rest.get(index + 1), "-S")?);
+                        start = Some(parse_capture_line(
+                            "capture-pane",
+                            rest.get(index + 1),
+                            "-S",
+                        )?);
                         index += 2;
                     }
                     "-E" | "--end-line" => {
-                        end = Some(parse_capture_line(rest.get(index + 1), "-E")?);
+                        end = Some(parse_capture_line(
+                            "capture-pane",
+                            rest.get(index + 1),
+                            "-E",
+                        )?);
                         index += 2;
                     }
                     "-J" | "--join" => {
@@ -806,6 +833,81 @@ fn parse_cli_args_lossy(args: &[String]) -> Result<Option<CliCommand>, String> {
             Ok(Some(CliCommand::RenameWindow { target, title }))
         }
 
+        "search-scrollback" => {
+            let mut target = None;
+            let mut start = None;
+            let mut forward = false;
+            let mut max_results = DEFAULT_SEARCH_RESULTS;
+            let mut pattern = None;
+            let rest = &args[2..];
+            let mut index = 0;
+            let mut options_ended = false;
+            while index < rest.len() {
+                // 正则本身可能以 `-` 开头 (`-v`、`--foo`)。`--` 之后一律当字面量,
+                // 与 send-keys 的处理保持一致。
+                if options_ended || !rest[index].starts_with('-') || rest[index] == "-" {
+                    if pattern.is_some() {
+                        return Err("search-scrollback takes exactly one regex".to_string());
+                    }
+                    pattern = Some(rest[index].clone());
+                    index += 1;
+                    continue;
+                }
+                match rest[index].as_str() {
+                    "--" => {
+                        options_ended = true;
+                        index += 1;
+                    }
+                    "-t" | "--target" => {
+                        let value = rest
+                            .get(index + 1)
+                            .filter(|value| !value.starts_with('-'))
+                            .ok_or_else(|| {
+                                "search-scrollback requires a value for -t".to_string()
+                            })?;
+                        target = Some(value.clone());
+                        index += 2;
+                    }
+                    "-S" | "--start-line" => {
+                        start = Some(parse_capture_line(
+                            "search-scrollback",
+                            rest.get(index + 1),
+                            "-S",
+                        )?);
+                        index += 2;
+                    }
+                    "-n" | "--max-results" => {
+                        let value = rest.get(index + 1).ok_or_else(|| {
+                            "search-scrollback requires a value for -n".to_string()
+                        })?;
+                        max_results = value
+                            .parse::<u32>()
+                            .map_err(|_| format!("invalid integer for -n: '{value}'"))?;
+                        if max_results == 0 {
+                            return Err("search-scrollback -n must be at least 1".to_string());
+                        }
+                        index += 2;
+                    }
+                    "-f" | "--forward" => {
+                        forward = true;
+                        index += 1;
+                    }
+                    option => {
+                        return Err(format!("unsupported search-scrollback option: {option}"));
+                    }
+                }
+            }
+            let pattern =
+                pattern.ok_or_else(|| "search-scrollback requires a regex".to_string())?;
+            Ok(Some(CliCommand::SearchScrollback {
+                target,
+                pattern,
+                start,
+                forward,
+                max_results,
+            }))
+        }
+
         "list-changes" => {
             let (target, _) = parse_shadow_options("list-changes", &args[2..], &[])?;
             Ok(Some(CliCommand::ListChanges { target }))
@@ -963,6 +1065,82 @@ mod tests {
 
         assert!(parse_cli_args_from(&args(&["has-session"])).is_err());
         assert!(parse_cli_args_from(&args(&["has-session", "dev"])).is_err());
+    }
+
+    #[test]
+    fn search_scrollback_defaults_to_a_backward_whole_pane_search() {
+        let parsed = parse_cli_args_from(&args(&["search-scrollback", "error"])).expect("parse");
+        match parsed {
+            Some(CliCommand::SearchScrollback {
+                target,
+                pattern,
+                start,
+                forward,
+                max_results,
+            }) => {
+                assert_eq!(target, None);
+                assert_eq!(pattern, "error");
+                assert_eq!(start, None);
+                assert!(!forward);
+                assert_eq!(max_results, DEFAULT_SEARCH_RESULTS);
+            }
+            other => panic!("unexpected parse result: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn search_scrollback_parses_every_option() {
+        let parsed = parse_cli_args_from(&args(&[
+            "search-scrollback",
+            "-t",
+            "dev",
+            "-S",
+            "-50",
+            "-n",
+            "5",
+            "-f",
+            "warn.*ing",
+        ]))
+        .expect("parse");
+        match parsed {
+            Some(CliCommand::SearchScrollback {
+                target,
+                pattern,
+                start,
+                forward,
+                max_results,
+            }) => {
+                assert_eq!(target.as_deref(), Some("dev"));
+                assert_eq!(pattern, "warn.*ing");
+                assert_eq!(start, Some(CaptureLine::Line(-50)));
+                assert!(forward);
+                assert_eq!(max_results, 5);
+            }
+            other => panic!("unexpected parse result: {other:?}"),
+        }
+    }
+
+    /// 正则本身可能长得像一个选项; `--` 之后必须一律当字面量。
+    #[test]
+    fn search_scrollback_takes_a_hyphen_leading_regex_after_the_terminator() {
+        let parsed =
+            parse_cli_args_from(&args(&["search-scrollback", "--", "-v.*"])).expect("parse");
+        match parsed {
+            Some(CliCommand::SearchScrollback { pattern, .. }) => assert_eq!(pattern, "-v.*"),
+            other => panic!("unexpected parse result: {other:?}"),
+        }
+
+        assert!(parse_cli_args_from(&args(&["search-scrollback", "-v.*"])).is_err());
+    }
+
+    #[test]
+    fn search_scrollback_rejects_malformed_invocations() {
+        assert!(parse_cli_args_from(&args(&["search-scrollback"])).is_err());
+        assert!(parse_cli_args_from(&args(&["search-scrollback", "a", "b"])).is_err());
+        assert!(parse_cli_args_from(&args(&["search-scrollback", "-n", "0", "x"])).is_err());
+        assert!(parse_cli_args_from(&args(&["search-scrollback", "-n", "abc", "x"])).is_err());
+        assert!(parse_cli_args_from(&args(&["search-scrollback", "-S", "abc", "x"])).is_err());
+        assert!(parse_cli_args_from(&args(&["search-scrollback", "--bogus", "x"])).is_err());
     }
 
     #[test]

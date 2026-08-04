@@ -190,7 +190,10 @@ fn row_wraps(row: &[Cell]) -> bool {
         .is_some_and(|cell| cell.style.as_ref().is_some_and(|style| style.wrapline))
 }
 
-fn render_cells<'a>(cells: impl IntoIterator<Item = &'a Cell>, preserve_ansi: bool) -> String {
+pub(super) fn render_cells<'a>(
+    cells: impl IntoIterator<Item = &'a Cell>,
+    preserve_ansi: bool,
+) -> String {
     if !preserve_ansi {
         return cells.into_iter().map(cell_text).collect();
     }
