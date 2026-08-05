@@ -21,7 +21,7 @@ use anyhow::Context as _;
 use mux_protocol::Notification as MuxNotification;
 use parking_lot::Mutex;
 use portable_pty::{CommandBuilder, MasterPty, PtyPair, PtySize, PtySystem};
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::io::{Read, Write};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -61,6 +61,26 @@ pub struct Pane {
     pub zoomed: AtomicBool,
     /// §3.3 OSC 133 prompt marker 计数器。
     pub prompt_marker: AtomicU64,
+    /// §3.3 Absolute row id of viewport line 0, counted from pane start.
+    ///
+    /// Alacritty addresses scrollback as `0..history_size` with 0 = oldest, so
+    /// every eviction renumbers every row. This base is advanced by exactly the
+    /// number of rows the emulator pushed above the viewport, which makes
+    /// `absolute_row - (base - history_size)` a scrollback index that survives
+    /// scrolling. Only meaningful together with `row_addressing_epoch`.
+    viewport_top_absolute: AtomicU64,
+    /// §3.3 Generation of the absolute row numbering.
+    ///
+    /// Alacritty exposes scrollback growth but not how many rows it evicted, so
+    /// any movement whose size cannot be derived from that growth — reflow on
+    /// resize, rotation once scrollback is at capacity, RIS, a scrollback clear,
+    /// an alternate-screen switch — retires the numbering by bumping this.
+    /// Recorded rows then resolve to `Unavailable` instead of to a wrong row.
+    row_addressing_epoch: AtomicU64,
+    marker_sequence: AtomicU64,
+    /// §3.3 Recorded OSC 133 markers, oldest first, capped at
+    /// `MAX_RECORDED_SHELL_MARKERS`. Taken after `commit` and `term`.
+    shell_markers: parking_lot::Mutex<VecDeque<ShellMarker>>,
     scrollback_capacity: AtomicU64,
     history_version: AtomicU64,
     /// §3.1 PTY master (用于 resize / reader clone)。
@@ -121,6 +141,66 @@ fn min_fit(viewports: &HashMap<String, PaneViewport>) -> Option<PaneViewport> {
         })
 }
 
+/// §3.3 The four semantic markers OSC 133 defines for one shell command.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ShellMarkerKind {
+    /// `A` — the shell is about to draw a prompt.
+    PromptStart,
+    /// `B` — the prompt ended; the typed command line starts here.
+    CommandStart,
+    /// `C` — the command line ended; command output starts here.
+    OutputStart,
+    /// `D` — the command finished, optionally carrying its exit status.
+    CommandEnd,
+}
+
+impl ShellMarkerKind {
+    fn from_byte(byte: u8) -> Option<Self> {
+        match byte {
+            b'A' => Some(Self::PromptStart),
+            b'B' => Some(Self::CommandStart),
+            b'C' => Some(Self::OutputStart),
+            b'D' => Some(Self::CommandEnd),
+            _ => None,
+        }
+    }
+}
+
+/// §3.3 One OSC 133 marker recorded at the row the shell emitted it on.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ShellMarker {
+    /// 1-based and monotonic for the lifetime of the pane.
+    pub sequence: u64,
+    pub kind: ShellMarkerKind,
+    /// Row id in `Pane::viewport_top_absolute`'s numbering. Resolve it with
+    /// `Pane::locate_shell_marker` rather than interpreting it directly.
+    pub absolute_row: u64,
+    pub column: u32,
+    /// Exit status from `OSC 133 ; D ; <status>`. `None` when the shell omitted
+    /// it, when the status is unparsable, or for the other marker kinds.
+    pub exit_code: Option<i32>,
+    /// Row-numbering epoch the id belongs to.
+    pub epoch: u64,
+}
+
+/// §3.3 Where a recorded marker's row can be addressed right now.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ShellMarkerPosition {
+    /// Scrollback row, `0` = oldest, same addressing as `fetch_scrollback`.
+    History { index: u32 },
+    /// On-screen row, `0` = top of the viewport.
+    Viewport { line: u32 },
+    /// The row was evicted, or its id predates a reflow/reset/uncounted
+    /// rotation. Never guess a row here: a wrong row is worse than no row.
+    Unavailable,
+}
+
+/// Four markers per command, so this keeps roughly the last 256 commands. Sized
+/// against the 10 000-line default scrollback: 256 commands of output normally
+/// exceed that, so entries usually become unresolvable before they are dropped,
+/// and 1024 entries cost about 48 KiB per pane.
+const MAX_RECORDED_SHELL_MARKERS: usize = 1024;
+
 /// §3.10 Shell command (从 proto ShellCommand 转换)
 #[derive(Clone, Debug, Default)]
 pub struct ShellCommand {
@@ -141,15 +221,25 @@ pub(crate) struct PaneMetadataSnapshot {
 #[derive(Default)]
 struct HistoryMutationObserver {
     may_change: bool,
+    /// Set by the operations that discard or renumber scrollback wholesale, as
+    /// opposed to appending to it. Their size is not derivable from scrollback
+    /// growth, so they retire the absolute row numbering.
+    may_break_addressing: bool,
 }
 
 impl HistoryMutationObserver {
     fn reset(&mut self) {
         self.may_change = false;
+        self.may_break_addressing = false;
     }
 
     fn mark(&mut self) {
         self.may_change = true;
+    }
+
+    fn mark_addressing_break(&mut self) {
+        self.may_change = true;
+        self.may_break_addressing = true;
     }
 }
 
@@ -182,12 +272,17 @@ impl Handler for HistoryMutationObserver {
         self.mark();
     }
 
-    fn clear_screen(&mut self, _: ClearMode) {
-        self.mark();
+    fn clear_screen(&mut self, mode: ClearMode) {
+        // `ClearMode::Saved` is ED 3, which drops the whole scrollback.
+        if matches!(mode, ClearMode::Saved) {
+            self.mark_addressing_break();
+        } else {
+            self.mark();
+        }
     }
 
     fn reset_state(&mut self) {
-        self.mark();
+        self.mark_addressing_break();
     }
 
     fn reverse_index(&mut self) {
@@ -207,19 +302,197 @@ impl Handler for HistoryMutationObserver {
     }
 
     fn set_private_mode(&mut self, mode: PrivateMode) {
+        // DECCOLM reflows the grid and 1049 swaps to a grid with no scrollback;
+        // both renumber rows by an amount scrollback growth cannot express.
         if matches!(
             mode,
             PrivateMode::Named(
                 NamedPrivateMode::ColumnMode | NamedPrivateMode::SwapScreenAndSetRestoreCursor
             )
         ) {
-            self.mark();
+            self.mark_addressing_break();
         }
     }
 
     fn unset_private_mode(&mut self, mode: PrivateMode) {
         self.set_private_mode(mode);
     }
+}
+
+/// §3.3 One OSC sequence the mux consumes itself.
+#[derive(Debug)]
+enum OscEvent {
+    /// OSC 7 payload, the raw `file://HOST/PATH` URI.
+    Cwd(String),
+    /// OSC 133 marker plus the batch offset just past its terminator. The
+    /// emulator must be advanced exactly that far before the cursor is read,
+    /// otherwise the marker lands on whatever row the batch happened to end on.
+    ShellMarker {
+        kind: ShellMarkerKind,
+        exit_code: Option<i32>,
+        end_offset: usize,
+    },
+}
+
+/// Payload bytes kept for one OSC. Long enough for any real cwd path; a longer
+/// payload is dropped rather than buffered, so a hostile PTY cannot grow this.
+const MAX_OSC_PAYLOAD: usize = 4096;
+const MAX_OSC_NUMBER_DIGITS: u32 = 5;
+
+#[derive(Clone, Copy, Default, Eq, PartialEq)]
+enum OscScanState {
+    #[default]
+    Ground,
+    Escape,
+    Number,
+    Payload,
+    PayloadEscape,
+    Skip,
+    SkipEscape,
+}
+
+/// §3.3 Incremental scanner for the OSC sequences the mux consumes itself.
+///
+/// Alacritty's `Handler` has no hook for OSC 7 or OSC 133 — both fall into
+/// vte's `unhandled` path — so the read loop scans the same bytes. The state
+/// lives across PTY reads because a real PTY splits sequences at arbitrary byte
+/// boundaries; a scanner restarted per batch silently loses those markers.
+#[derive(Default)]
+struct OscScanner {
+    state: OscScanState,
+    number: u32,
+    digits: u32,
+    payload: Vec<u8>,
+    overflowed: bool,
+}
+
+impl OscScanner {
+    fn scan(&mut self, bytes: &[u8], events: &mut Vec<OscEvent>) {
+        let mut index = 0;
+        while index < bytes.len() {
+            let byte = bytes[index];
+            index += 1;
+            match self.state {
+                OscScanState::Ground => {
+                    if byte == 0x1b {
+                        self.state = OscScanState::Escape;
+                    }
+                }
+                OscScanState::Escape => match byte {
+                    b']' => self.start_sequence(),
+                    0x1b => {}
+                    _ => self.state = OscScanState::Ground,
+                },
+                OscScanState::Number => match byte {
+                    b'0'..=b'9' => {
+                        self.digits += 1;
+                        if self.digits > MAX_OSC_NUMBER_DIGITS {
+                            self.state = OscScanState::Skip;
+                        } else {
+                            self.number = self.number * 10 + u32::from(byte - b'0');
+                        }
+                    }
+                    b';' if self.digits > 0 && matches!(self.number, 7 | 133) => {
+                        self.state = OscScanState::Payload;
+                    }
+                    0x07 => self.state = OscScanState::Ground,
+                    0x1b => self.state = OscScanState::SkipEscape,
+                    _ => self.state = OscScanState::Skip,
+                },
+                OscScanState::Payload => match byte {
+                    0x07 => self.finish(index, events),
+                    0x1b => self.state = OscScanState::PayloadEscape,
+                    _ => {
+                        if self.payload.len() < MAX_OSC_PAYLOAD {
+                            self.payload.push(byte);
+                        } else {
+                            self.overflowed = true;
+                        }
+                    }
+                },
+                OscScanState::PayloadEscape => {
+                    if byte == b'\\' {
+                        self.finish(index, events);
+                    } else {
+                        // An ESC that is not ST aborts the OSC and starts a new
+                        // sequence, so re-dispatch this byte after the ESC.
+                        self.abort();
+                        self.state = OscScanState::Escape;
+                        index -= 1;
+                    }
+                }
+                OscScanState::Skip => match byte {
+                    0x07 => self.state = OscScanState::Ground,
+                    0x1b => self.state = OscScanState::SkipEscape,
+                    _ => {}
+                },
+                OscScanState::SkipEscape => {
+                    if byte == b'\\' {
+                        self.state = OscScanState::Ground;
+                    } else {
+                        self.state = OscScanState::Escape;
+                        index -= 1;
+                    }
+                }
+            }
+        }
+    }
+
+    fn start_sequence(&mut self) {
+        self.number = 0;
+        self.digits = 0;
+        self.payload.clear();
+        self.overflowed = false;
+        self.state = OscScanState::Number;
+    }
+
+    fn abort(&mut self) {
+        self.payload.clear();
+        self.overflowed = false;
+        self.state = OscScanState::Ground;
+    }
+
+    fn finish(&mut self, end_offset: usize, events: &mut Vec<OscEvent>) {
+        if !self.overflowed {
+            match self.number {
+                7 => {
+                    if let Ok(uri) = std::str::from_utf8(&self.payload) {
+                        events.push(OscEvent::Cwd(uri.to_string()));
+                    }
+                }
+                133 => {
+                    if let Some((kind, exit_code)) = parse_osc133_payload(&self.payload) {
+                        events.push(OscEvent::ShellMarker {
+                            kind,
+                            exit_code,
+                            end_offset,
+                        });
+                    }
+                }
+                _ => {}
+            }
+        }
+        self.abort();
+    }
+}
+
+/// Parse the parameters after `OSC 133 ;`. The first field is the marker
+/// letter; `D` may carry the command's exit status as its second field.
+fn parse_osc133_payload(payload: &[u8]) -> Option<(ShellMarkerKind, Option<i32>)> {
+    let mut fields = payload.split(|byte| *byte == b';');
+    let kind_field = fields.next()?;
+    let [kind_byte] = kind_field else {
+        return None;
+    };
+    let kind = ShellMarkerKind::from_byte(*kind_byte)?;
+    if kind != ShellMarkerKind::CommandEnd {
+        return Some((kind, None));
+    }
+    let exit_code = fields
+        .next()
+        .and_then(|field| std::str::from_utf8(field).ok())
+        .and_then(|field| field.trim().parse::<i32>().ok());
+    Some((kind, exit_code))
 }
 
 /// §3.3 PTY read-loop 本地状态: DEC-2026 同步延迟 + coalescing 通知节流。
@@ -229,6 +502,9 @@ struct ReadLoopState {
     terminal_processor: Processor<StdSyncHandler>,
     history_processor: Processor<StdSyncHandler>,
     history_observer: HistoryMutationObserver,
+    osc_scanner: OscScanner,
+    /// Reused so a batch without OSC 7 / OSC 133 allocates nothing.
+    osc_events: Vec<OscEvent>,
     /// BSU..ESU 同步窗口内累积了尚未发布的变更
     pending_sync: bool,
     /// Dirty rows accumulated across a DEC-2026 synchronized update window.
@@ -245,6 +521,8 @@ impl Default for ReadLoopState {
             terminal_processor: Processor::new(),
             history_processor: Processor::new(),
             history_observer: HistoryMutationObserver::default(),
+            osc_scanner: OscScanner::default(),
+            osc_events: Vec::new(),
             pending_sync: false,
             pending_dirty_rows: Vec::new(),
             pending_full_snapshot: false,
@@ -397,6 +675,12 @@ impl Pane {
             bracketed_paste_mode: AtomicBool::new(false),
             zoomed: AtomicBool::new(false),
             prompt_marker: AtomicU64::new(0),
+            viewport_top_absolute: AtomicU64::new(0),
+            // Epoch 0 is reserved so a default-constructed marker can never
+            // match a live pane's numbering.
+            row_addressing_epoch: AtomicU64::new(1),
+            marker_sequence: AtomicU64::new(0),
+            shell_markers: parking_lot::Mutex::new(VecDeque::new()),
             scrollback_capacity: AtomicU64::new(scrollback_lines as u64),
             // A random non-zero authority epoch prevents a client from reusing
             // cached history after the daemon reconstructs this pane.
@@ -518,6 +802,12 @@ impl Pane {
         coalescer.on_output(bytes.len());
         self.flush_pending_notify(state, coalescer);
 
+        // §3.3 OSC 7 / OSC 133 are scanned before the emulator consumes the
+        // batch: a marker belongs to the cursor row at its own byte offset, and
+        // one batch routinely spans a prompt, a command line and its output.
+        state.osc_events.clear();
+        state.osc_scanner.scan(bytes, &mut state.osc_events);
+
         let commit = self.commit.lock();
         let history_may_change = {
             state.history_observer.reset();
@@ -526,7 +816,13 @@ impl Pane {
                 .advance(&mut state.history_observer, bytes);
             state.history_observer.may_change
         };
-        let (render_state_changed, history_size_before, history_size_after) = {
+        let (
+            render_state_changed,
+            history_size_before,
+            history_size_after,
+            alt_screen_changed,
+            viewport_top,
+        ) = {
             let mut term = self.term.lock();
             let before = (
                 term.grid().cursor.point,
@@ -535,7 +831,13 @@ impl Pane {
                 modes_from_alacritty(*term.mode()),
             );
             let history_size_before = term.grid().history_size();
-            state.terminal_processor.advance(&mut *term, bytes);
+            let alt_screen_before = term.mode().contains(TermMode::ALT_SCREEN);
+            let viewport_top = self.advance_recording_markers(
+                &mut term,
+                bytes,
+                &state.osc_events,
+                &mut state.terminal_processor,
+            );
             let after = (
                 term.grid().cursor.point,
                 term.cursor_style(),
@@ -546,6 +848,8 @@ impl Pane {
                 before != after,
                 history_size_before,
                 term.grid().history_size(),
+                alt_screen_before != term.mode().contains(TermMode::ALT_SCREEN),
+                viewport_top,
             )
         };
         let (dirty_rows, fully_damaged) = self.collect_dirty_rows();
@@ -557,6 +861,14 @@ impl Pane {
         if history_changed {
             self.history_version.fetch_add(1, Ordering::AcqRel);
         }
+        self.commit_row_addressing(
+            viewport_top,
+            history_size_before,
+            history_size_after,
+            alt_screen_changed,
+            state.history_observer.may_break_addressing,
+            history_may_change && fully_damaged,
+        );
 
         let grid_changed = !dirty_rows.is_empty() || render_state_changed || history_changed;
         let should_broadcast_dirty = if in_sync && !transitions.ended() {
@@ -590,10 +902,146 @@ impl Pane {
 
         self.broadcast_pane_output(bytes);
         self.handle_pending_events();
-        self.parse_osc_sequences(bytes);
+        for event in &state.osc_events {
+            if let OscEvent::Cwd(uri) = event {
+                self.handle_osc7_cwd(uri);
+            }
+        }
         if should_broadcast_dirty {
             self.broadcast_pane_dirty();
         }
+    }
+
+    /// Feed one batch to the emulator, pausing at every OSC 133 marker so the
+    /// marker's row is read at the byte offset it arrived on, and return the
+    /// absolute row id of viewport line 0 afterwards.
+    ///
+    /// Rows pushed above the viewport are counted as scrollback growth, which
+    /// is exact until scrollback reaches capacity; from then on the emulator
+    /// evicts as many rows as it appends and reports neither, which
+    /// `commit_row_addressing` turns into a retired epoch rather than a drift.
+    fn advance_recording_markers(
+        &self,
+        term: &mut Term<PaneEventListener>,
+        bytes: &[u8],
+        events: &[OscEvent],
+        processor: &mut Processor<StdSyncHandler>,
+    ) -> u64 {
+        let mut viewport_top = self.viewport_top_absolute.load(Ordering::Acquire);
+        // The alternate grid has no scrollback of its own, so its size changes
+        // say nothing about rows leaving the primary viewport.
+        let primary_screen = !term.mode().contains(TermMode::ALT_SCREEN);
+        let mut history_size = term.grid().history_size();
+        let epoch = self.row_addressing_epoch.load(Ordering::Acquire);
+        let mut consumed = 0;
+
+        let mut advance_to = |term: &mut Term<PaneEventListener>,
+                              offset: usize,
+                              viewport_top: &mut u64,
+                              history_size: &mut usize| {
+            if offset > consumed {
+                processor.advance(&mut *term, &bytes[consumed..offset]);
+                consumed = offset;
+            }
+            let grown = term.grid().history_size();
+            if primary_screen && !term.mode().contains(TermMode::ALT_SCREEN) {
+                *viewport_top =
+                    viewport_top.saturating_add(grown.saturating_sub(*history_size) as u64);
+            }
+            *history_size = grown;
+        };
+
+        for event in events {
+            let OscEvent::ShellMarker {
+                kind,
+                exit_code,
+                end_offset,
+            } = event
+            else {
+                continue;
+            };
+            advance_to(
+                term,
+                (*end_offset).min(bytes.len()),
+                &mut viewport_top,
+                &mut history_size,
+            );
+            self.record_shell_marker(term, *kind, *exit_code, viewport_top, epoch);
+        }
+        advance_to(term, bytes.len(), &mut viewport_top, &mut history_size);
+        viewport_top
+    }
+
+    /// Publish the batch's absolute row base, retiring the numbering when the
+    /// batch moved rows by an amount the emulator does not report.
+    fn commit_row_addressing(
+        &self,
+        viewport_top: u64,
+        history_size_before: usize,
+        history_size_after: usize,
+        alt_screen_changed: bool,
+        addressing_break: bool,
+        history_rotated: bool,
+    ) {
+        let capacity = self.scrollback_capacity.load(Ordering::Acquire);
+        // At capacity every appended row silently evicts one, so scrollback
+        // growth stops reporting how far rows moved. The batch that first fills
+        // scrollback is included: it can append more rows than it grew by.
+        let rotated_at_capacity =
+            capacity != 0 && history_size_after as u64 == capacity && history_rotated;
+        if alt_screen_changed
+            || addressing_break
+            || rotated_at_capacity
+            || history_size_after < history_size_before
+        {
+            self.retire_row_addressing(viewport_top, history_size_after);
+        } else {
+            self.viewport_top_absolute
+                .store(viewport_top, Ordering::Release);
+        }
+    }
+
+    /// Retire every recorded row id. Re-anchoring the base past the current
+    /// scrollback keeps ids monotonic and keeps `base - history_size` pointing
+    /// at the oldest addressable row for markers recorded afterwards. Recorded
+    /// markers are kept — their kind and exit status stay meaningful — but the
+    /// epoch mismatch makes them resolve to `Unavailable`.
+    fn retire_row_addressing(&self, viewport_top: u64, history_size: usize) {
+        self.viewport_top_absolute.store(
+            viewport_top.saturating_add(history_size as u64),
+            Ordering::Release,
+        );
+        self.row_addressing_epoch.fetch_add(1, Ordering::AcqRel);
+    }
+
+    fn record_shell_marker(
+        &self,
+        term: &Term<PaneEventListener>,
+        kind: ShellMarkerKind,
+        exit_code: Option<i32>,
+        viewport_top: u64,
+        epoch: u64,
+    ) {
+        let cursor = term.grid().cursor.point;
+        let line = u64::try_from(cursor.line.0).unwrap_or(0);
+        let marker = ShellMarker {
+            sequence: self
+                .marker_sequence
+                .fetch_add(1, Ordering::AcqRel)
+                .saturating_add(1),
+            kind,
+            absolute_row: viewport_top.saturating_add(line),
+            column: u32::try_from(cursor.column.0).unwrap_or(u32::MAX),
+            exit_code,
+            epoch,
+        };
+        let mut markers = self.shell_markers.lock();
+        while markers.len() >= MAX_RECORDED_SHELL_MARKERS {
+            markers.pop_front();
+        }
+        markers.push_back(marker);
+        drop(markers);
+        self.prompt_marker.fetch_add(1, Ordering::SeqCst);
     }
 
     /// Publish one coherent grid generation after its structured state is in
@@ -813,6 +1261,12 @@ impl Pane {
                 scrolling_history: capacity,
                 ..TermConfig::default()
             });
+            // Shrinking the limit evicts the oldest rows without reporting how
+            // many, so recorded row ids cannot survive it.
+            self.retire_row_addressing(
+                self.viewport_top_absolute.load(Ordering::Acquire),
+                term.grid().history_size(),
+            );
             let all_rows = (0..term.screen_lines()).collect::<Vec<_>>();
             diff_from_dirty(&*term, &all_rows)
         };
@@ -973,6 +1427,12 @@ impl Pane {
         let diff = {
             let mut term = self.term.lock();
             term.resize(TermSize::new(cols_usize, rows_usize));
+            // Reflow moves recorded rows by an amount Alacritty does not
+            // report; §15 accepts losing marker positions across a resize.
+            self.retire_row_addressing(
+                self.viewport_top_absolute.load(Ordering::Acquire),
+                term.grid().history_size(),
+            );
             let all_rows = (0..term.screen_lines()).collect::<Vec<_>>();
             diff_from_dirty(&*term, &all_rows)
         };
@@ -1154,78 +1614,73 @@ impl Pane {
         self.prompt_marker.load(Ordering::SeqCst) as u32
     }
 
-    /// §3.3 扫描 PTY 输出中的 OSC 7 / OSC 133 序列。
-    ///
-    /// OSC 7: `ESC ] 7 ; file://HOST/PATH ST` — shell 报告当前工作目录。
-    /// OSC 133: `ESC ] 133 ; MARKER ST` — 语义 prompt 标记 (A=prompt start,
-    ///   B=command start, C=output start, D=command end)。
-    ///
-    /// ST (String Terminator) 可以是 BEL (0x07) 或 ESC \ (0x1b 0x5c)。
-    fn parse_osc_sequences(&self, bytes: &[u8]) {
-        let mut i = 0;
-        while i + 3 < bytes.len() {
-            // 寻找 OSC 引入: ESC ]
-            if bytes[i] != 0x1b || bytes[i + 1] != b']' {
-                i += 1;
-                continue;
-            }
-            i += 2;
-
-            // 解析 OSC 编号
-            let num_start = i;
-            while i < bytes.len() && bytes[i].is_ascii_digit() {
-                i += 1;
-            }
-            if i == num_start || i >= bytes.len() {
-                continue;
-            }
-            let osc_num: u32 = match std::str::from_utf8(&bytes[num_start..i]) {
-                Ok(s) => s.parse().unwrap_or(u32::MAX),
-                Err(_) => u32::MAX,
-            };
-
-            // OSC 7: 期望 ';' 后跟 URI
-            if osc_num == 7 {
-                if i < bytes.len() && bytes[i] == b';' {
-                    i += 1;
-                    let payload_start = i;
-                    let payload_end = self.find_osc_terminator(bytes, i);
-                    if let Some(end) = payload_end {
-                        if let Ok(uri) = std::str::from_utf8(&bytes[payload_start..end]) {
-                            self.handle_osc7_cwd(uri);
-                        }
-                        i = end;
-                    }
-                }
-                continue;
-            }
-
-            // OSC 133: 期望 ';' 后跟 marker 字符
-            if osc_num == 133 {
-                if i < bytes.len() && bytes[i] == b';' {
-                    i += 1;
-                    if i < bytes.len() {
-                        self.handle_osc133_marker(bytes[i]);
-                    }
-                }
-                continue;
-            }
-        }
+    /// §3.3 Recorded OSC 133 markers, oldest first.
+    pub fn shell_markers(&self) -> Vec<ShellMarker> {
+        self.shell_markers.lock().iter().copied().collect()
     }
 
-    /// 从 `start` 位置寻找 OSC 终止符 (BEL 或 ESC \), 返回 payload 结束位置。
-    fn find_osc_terminator(&self, bytes: &[u8], start: usize) -> Option<usize> {
-        let mut i = start;
-        while i < bytes.len() {
-            if bytes[i] == 0x07 {
-                return Some(i);
-            }
-            if bytes[i] == 0x1b && i + 1 < bytes.len() && bytes[i + 1] == 0x5c {
-                return Some(i);
-            }
-            i += 1;
+    /// §3.3 Current row-numbering epoch. A marker recorded under a different
+    /// epoch can no longer be resolved to a row.
+    pub fn row_addressing_epoch(&self) -> u64 {
+        self.row_addressing_epoch.load(Ordering::Acquire)
+    }
+
+    /// §3.3 Resolve one recorded marker to a row addressable right now.
+    pub fn locate_shell_marker(&self, marker: &ShellMarker) -> ShellMarkerPosition {
+        let _commit = self.commit.lock();
+        let (history_size, screen_lines) = self.row_addressing_extent();
+        self.resolve_shell_marker(marker, history_size, screen_lines)
+    }
+
+    /// §3.3 Every recorded marker paired with where it resolves right now.
+    pub fn shell_marker_positions(&self) -> Vec<(ShellMarker, ShellMarkerPosition)> {
+        let _commit = self.commit.lock();
+        let (history_size, screen_lines) = self.row_addressing_extent();
+        self.shell_markers
+            .lock()
+            .iter()
+            .map(|marker| {
+                (
+                    *marker,
+                    self.resolve_shell_marker(marker, history_size, screen_lines),
+                )
+            })
+            .collect()
+    }
+
+    fn row_addressing_extent(&self) -> (usize, usize) {
+        let term = self.term.lock();
+        (term.grid().history_size(), term.screen_lines())
+    }
+
+    fn resolve_shell_marker(
+        &self,
+        marker: &ShellMarker,
+        history_size: usize,
+        screen_lines: usize,
+    ) -> ShellMarkerPosition {
+        if marker.epoch != self.row_addressing_epoch.load(Ordering::Acquire) {
+            return ShellMarkerPosition::Unavailable;
         }
-        None
+        let viewport_top = self.viewport_top_absolute.load(Ordering::Acquire);
+        let oldest_row = viewport_top.saturating_sub(history_size as u64);
+        if marker.absolute_row < oldest_row {
+            return ShellMarkerPosition::Unavailable;
+        }
+        if marker.absolute_row < viewport_top {
+            return match u32::try_from(marker.absolute_row - oldest_row) {
+                Ok(index) => ShellMarkerPosition::History { index },
+                Err(_) => ShellMarkerPosition::Unavailable,
+            };
+        }
+        let line = marker.absolute_row - viewport_top;
+        if line >= screen_lines as u64 {
+            return ShellMarkerPosition::Unavailable;
+        }
+        match u32::try_from(line) {
+            Ok(line) => ShellMarkerPosition::Viewport { line },
+            Err(_) => ShellMarkerPosition::Unavailable,
+        }
     }
 
     /// §3.3 处理 OSC 7 URI: 提取 file:// 路径, 更新 pane cwd。
@@ -1252,14 +1707,6 @@ impl Pane {
             *self.cwd.write() = decoded;
             // 广播 ShellIntegrationChanged 到所有订阅者
             self.broadcast_shell_integration_changed();
-        }
-    }
-
-    /// §3.3 处理 OSC 133 marker: 递增 prompt marker 计数。
-    fn handle_osc133_marker(&self, marker: u8) {
-        // A = prompt start, B = command start, C = output start, D = command end
-        if matches!(marker, b'A' | b'B' | b'C' | b'D') {
-            self.prompt_marker.fetch_add(1, Ordering::SeqCst);
         }
     }
 
@@ -1794,6 +2241,372 @@ mod tests {
 
         assert_eq!(pane.client_viewport_count(), 1);
         assert_eq!(pane.get_generation(), generation);
+    }
+
+    fn spawn_marker_pane(id: &str, cols: u32, rows: u32, scrollback: usize) -> Arc<Pane> {
+        match Pane::spawn_with_session(
+            id.to_string(),
+            String::new(),
+            std::env::temp_dir().to_string_lossy().to_string(),
+            cols,
+            rows,
+            Some(ShellCommand {
+                program: "/bin/cat".to_string(),
+                ..Default::default()
+            }),
+            scrollback,
+        ) {
+            Ok(pane) => pane,
+            Err(error) => panic!("spawn {id}: {error}"),
+        }
+    }
+
+    /// Drives `process_pty_bytes` with the same persistent read-loop state a
+    /// real PTY reader thread owns, so batch splitting behaves as in production.
+    struct PtyFeed {
+        dec: Dec2026Parser,
+        coalescer: AdaptiveCoalescer,
+        state: ReadLoopState,
+    }
+
+    impl PtyFeed {
+        fn new() -> Self {
+            Self {
+                dec: Dec2026Parser::new(),
+                coalescer: AdaptiveCoalescer::new(),
+                state: ReadLoopState::default(),
+            }
+        }
+
+        fn feed(&mut self, pane: &Arc<Pane>, bytes: &[u8]) {
+            pane.process_pty_bytes(bytes, &mut self.dec, &mut self.coalescer, &mut self.state);
+        }
+    }
+
+    fn marker_of(pane: &Arc<Pane>, kind: ShellMarkerKind) -> ShellMarker {
+        match pane
+            .shell_markers()
+            .into_iter()
+            .find(|marker| marker.kind == kind)
+        {
+            Some(marker) => marker,
+            None => panic!(
+                "no {kind:?} marker recorded, got {:?}",
+                pane.shell_markers()
+            ),
+        }
+    }
+
+    /// §3.3 One shell command emits A/B/C/D at four different rows within a
+    /// single PTY batch. Collapsing the batch into one cursor read would put all
+    /// four on the row the batch ended on, which is what this pins down.
+    #[test]
+    fn one_command_records_each_marker_at_its_own_row_and_column() {
+        let pane = spawn_marker_pane("osc133-rows", 20, 6, 100);
+        let mut feed = PtyFeed::new();
+
+        feed.feed(
+            &pane,
+            b"\x1b]133;A\x07user@host$ \x1b]133;B\x07echo hi\r\n\
+              \x1b]133;C\x07hi\r\n\x1b]133;D;0\x07",
+        );
+
+        let markers = pane.shell_markers();
+        assert_eq!(markers.len(), 4, "recorded {markers:?}");
+        assert_eq!(
+            markers.iter().map(|m| m.kind).collect::<Vec<_>>(),
+            vec![
+                ShellMarkerKind::PromptStart,
+                ShellMarkerKind::CommandStart,
+                ShellMarkerKind::OutputStart,
+                ShellMarkerKind::CommandEnd,
+            ]
+        );
+        assert_eq!(
+            markers.iter().map(|m| m.sequence).collect::<Vec<_>>(),
+            vec![1, 2, 3, 4]
+        );
+        let positions = markers
+            .iter()
+            .map(|marker| (pane.locate_shell_marker(marker), marker.column))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            positions,
+            vec![
+                (ShellMarkerPosition::Viewport { line: 0 }, 0),
+                (ShellMarkerPosition::Viewport { line: 0 }, 11),
+                (ShellMarkerPosition::Viewport { line: 1 }, 0),
+                (ShellMarkerPosition::Viewport { line: 2 }, 0),
+            ]
+        );
+        assert_eq!(
+            pane.get_prompt_marker(),
+            4,
+            "the existing prompt marker counter must keep counting every marker"
+        );
+    }
+
+    /// §3.3 `OSC 133 ; D ; <status>` carries the command's exit status; the
+    /// previous scanner stopped at the marker letter and never read it.
+    #[test]
+    fn command_end_marker_records_its_exit_status_when_present() {
+        let pane = spawn_marker_pane("osc133-exit", 20, 6, 100);
+        let mut feed = PtyFeed::new();
+
+        feed.feed(&pane, b"\x1b]133;D;1\x07\x1b]133;D\x07\x1b]133;D;0\x07");
+        feed.feed(&pane, b"\x1b]133;D;not-a-number\x07\x1b]133;A\x07");
+
+        assert_eq!(
+            pane.shell_markers()
+                .iter()
+                .map(|marker| (marker.kind, marker.exit_code))
+                .collect::<Vec<_>>(),
+            vec![
+                (ShellMarkerKind::CommandEnd, Some(1)),
+                (ShellMarkerKind::CommandEnd, None),
+                (ShellMarkerKind::CommandEnd, Some(0)),
+                (ShellMarkerKind::CommandEnd, None),
+                (ShellMarkerKind::PromptStart, None),
+            ]
+        );
+    }
+
+    /// §3.3 A real PTY splits escape sequences at arbitrary byte boundaries. A
+    /// scanner restarted per batch drops those markers entirely.
+    #[test]
+    fn marker_split_across_pty_batches_is_still_recorded_at_its_row() {
+        let pane = spawn_marker_pane("osc133-split", 20, 6, 100);
+        let mut feed = PtyFeed::new();
+
+        feed.feed(&pane, b"ab\x1b]13");
+        assert!(
+            pane.shell_markers().is_empty(),
+            "an unterminated sequence must not record anything yet"
+        );
+        feed.feed(&pane, b"3;D;7\x1b");
+        assert!(pane.shell_markers().is_empty(), "ST is still incomplete");
+        feed.feed(&pane, b"\\cd");
+
+        let marker = marker_of(&pane, ShellMarkerKind::CommandEnd);
+        assert_eq!(marker.exit_code, Some(7));
+        assert_eq!(
+            (pane.locate_shell_marker(&marker), marker.column),
+            (ShellMarkerPosition::Viewport { line: 0 }, 2),
+            "the marker belongs to the cursor position after \"ab\", not after \"abcd\""
+        );
+        assert_eq!(pane.get_full_snapshot().cells[0].character, "a");
+        assert_eq!(pane.get_full_snapshot().cells[2].character, "c");
+    }
+
+    /// §3.3 Scrollback is addressed `0..history_size` with 0 = oldest, so every
+    /// row that scrolls off renumbers every row. The absolute id must survive
+    /// that and still name the same text.
+    #[test]
+    fn absolute_rows_convert_to_scrollback_indices_after_scrolling() {
+        let pane = spawn_marker_pane("osc133-scroll", 20, 3, 50);
+        let mut feed = PtyFeed::new();
+
+        feed.feed(&pane, b"\x1b]133;A\x07one\r\n");
+        feed.feed(&pane, b"\x1b]133;B\x07two\r\n");
+        feed.feed(&pane, b"three\r\nfour\r\nfive\r\n");
+
+        let prompt_start = marker_of(&pane, ShellMarkerKind::PromptStart);
+        let command_start = marker_of(&pane, ShellMarkerKind::CommandStart);
+        assert_eq!(
+            (
+                pane.locate_shell_marker(&prompt_start),
+                pane.locate_shell_marker(&command_start)
+            ),
+            (
+                ShellMarkerPosition::History { index: 0 },
+                ShellMarkerPosition::History { index: 1 }
+            )
+        );
+
+        let (lines, total, _) = pane.fetch_scrollback(0, 1, 10);
+        assert_eq!(total, 3);
+        assert_eq!(lines[0].cells[0].character, "o", "index 0 is the A row");
+        assert_eq!(lines[1].cells[0].character, "t", "index 1 is the B row");
+    }
+
+    /// §3.3 Once scrollback is at capacity Alacritty evicts as many rows as it
+    /// appends and reports neither, so the numbering is retired. A wrong row is
+    /// worse than no row.
+    #[test]
+    fn markers_become_unavailable_once_their_row_is_evicted() {
+        let pane = spawn_marker_pane("osc133-evict", 20, 2, 2);
+        let mut feed = PtyFeed::new();
+
+        feed.feed(&pane, b"\x1b]133;A\x07one\r\n");
+        let prompt_start = marker_of(&pane, ShellMarkerKind::PromptStart);
+        assert_eq!(
+            pane.locate_shell_marker(&prompt_start),
+            ShellMarkerPosition::Viewport { line: 0 }
+        );
+        let epoch = pane.row_addressing_epoch();
+
+        feed.feed(&pane, b"two\r\nthree\r\nfour\r\nfive\r\n");
+
+        assert_ne!(
+            pane.row_addressing_epoch(),
+            epoch,
+            "an uncounted rotation must retire the numbering"
+        );
+        assert_eq!(
+            pane.locate_shell_marker(&prompt_start),
+            ShellMarkerPosition::Unavailable
+        );
+        assert_eq!(
+            pane.shell_markers().len(),
+            1,
+            "the record itself survives so its kind and exit status stay readable"
+        );
+    }
+
+    /// §3.3 The eviction floor is the second guard, independent of the epoch: a
+    /// row older than the oldest surviving scrollback row has no index.
+    #[test]
+    fn rows_below_the_eviction_floor_resolve_to_unavailable() {
+        let pane = spawn_marker_pane("osc133-floor", 20, 4, 100);
+        let epoch = pane.row_addressing_epoch();
+        pane.viewport_top_absolute.store(1_000, Ordering::Release);
+        let marker = |absolute_row| ShellMarker {
+            sequence: 1,
+            kind: ShellMarkerKind::PromptStart,
+            absolute_row,
+            column: 0,
+            exit_code: None,
+            epoch,
+        };
+
+        assert_eq!(
+            pane.resolve_shell_marker(&marker(989), 10, 4),
+            ShellMarkerPosition::Unavailable,
+            "990 is the oldest surviving row"
+        );
+        assert_eq!(
+            pane.resolve_shell_marker(&marker(990), 10, 4),
+            ShellMarkerPosition::History { index: 0 }
+        );
+        assert_eq!(
+            pane.resolve_shell_marker(&marker(999), 10, 4),
+            ShellMarkerPosition::History { index: 9 }
+        );
+        assert_eq!(
+            pane.resolve_shell_marker(&marker(1_003), 10, 4),
+            ShellMarkerPosition::Viewport { line: 3 }
+        );
+        assert_eq!(
+            pane.resolve_shell_marker(&marker(1_004), 10, 4),
+            ShellMarkerPosition::Unavailable,
+            "past the last viewport row"
+        );
+    }
+
+    /// §15 Losing marker positions across a resize is accepted; silently
+    /// reporting the pre-reflow row is not.
+    #[test]
+    fn resize_retires_recorded_rows_instead_of_reflowing_them() {
+        let pane = spawn_marker_pane("osc133-resize", 20, 4, 100);
+        let mut feed = PtyFeed::new();
+
+        feed.feed(&pane, b"\x1b]133;A\x07prompt\r\nsecond\r\n");
+        let prompt_start = marker_of(&pane, ShellMarkerKind::PromptStart);
+        assert_eq!(
+            pane.locate_shell_marker(&prompt_start),
+            ShellMarkerPosition::Viewport { line: 0 }
+        );
+
+        if let Err(error) = pane.resize(10, 4) {
+            panic!("resize marker pane: {error}");
+        }
+
+        assert_eq!(
+            pane.locate_shell_marker(&prompt_start),
+            ShellMarkerPosition::Unavailable
+        );
+
+        feed.feed(&pane, b"\x1b]133;B\x07after\r\n");
+        let command_start = marker_of(&pane, ShellMarkerKind::CommandStart);
+        assert_eq!(
+            pane.locate_shell_marker(&command_start),
+            ShellMarkerPosition::Viewport { line: 2 },
+            "markers recorded after the resize address rows again"
+        );
+    }
+
+    /// §3.3 The alternate grid has no scrollback of its own, so its size changes
+    /// must not be read as rows leaving the primary viewport.
+    #[test]
+    fn alternate_screen_switch_retires_recorded_rows() {
+        let pane = spawn_marker_pane("osc133-alt", 20, 4, 100);
+        let mut feed = PtyFeed::new();
+
+        feed.feed(&pane, b"\x1b]133;A\x07prompt\r\n");
+        let prompt_start = marker_of(&pane, ShellMarkerKind::PromptStart);
+        let epoch = pane.row_addressing_epoch();
+
+        feed.feed(&pane, b"\x1b[?1049h");
+
+        assert_ne!(pane.row_addressing_epoch(), epoch);
+        assert_eq!(
+            pane.locate_shell_marker(&prompt_start),
+            ShellMarkerPosition::Unavailable
+        );
+    }
+
+    /// §3.3 OSC 7 shares the scanner with OSC 133, including the split-batch and
+    /// unrelated-OSC paths.
+    #[test]
+    fn osc7_cwd_survives_the_shared_scanner() {
+        let pane = spawn_marker_pane("osc7-cwd", 20, 4, 100);
+        let mut feed = PtyFeed::new();
+
+        feed.feed(&pane, b"\x1b]7;file://localhost/tmp/z3rm%20osc7\x07");
+        assert_eq!(pane.get_cwd(), "/tmp/z3rm osc7");
+
+        feed.feed(&pane, b"\x1b]7;file://localhost/tmp/split");
+        assert_eq!(pane.get_cwd(), "/tmp/z3rm osc7", "no ST yet");
+        feed.feed(&pane, b"-path\x1b\\");
+        assert_eq!(pane.get_cwd(), "/tmp/split-path");
+
+        // An unrelated OSC whose payload looks like a marker must not record one,
+        // and must not desynchronize the scanner for the next real sequence.
+        feed.feed(&pane, b"\x1b]0;133;A window title\x07\x1b]133;A\x07");
+        assert_eq!(
+            pane.shell_markers()
+                .iter()
+                .map(|marker| marker.kind)
+                .collect::<Vec<_>>(),
+            vec![ShellMarkerKind::PromptStart]
+        );
+        assert_eq!(pane.get_cwd(), "/tmp/split-path");
+    }
+
+    /// §3.3 A long-running pane must not accumulate markers without bound.
+    #[test]
+    fn recorded_markers_are_capped() {
+        let pane = spawn_marker_pane("osc133-cap", 20, 4, 100_000);
+        let mut feed = PtyFeed::new();
+
+        let mut batch = Vec::new();
+        for _ in 0..MAX_RECORDED_SHELL_MARKERS + 32 {
+            batch.extend_from_slice(b"\x1b]133;A\x07");
+        }
+        feed.feed(&pane, &batch);
+
+        let markers = pane.shell_markers();
+        assert_eq!(markers.len(), MAX_RECORDED_SHELL_MARKERS);
+        assert_eq!(
+            markers.iter().map(|marker| marker.sequence).min(),
+            Some(33),
+            "the oldest entries are the ones dropped"
+        );
+        assert_eq!(
+            pane.get_prompt_marker() as usize,
+            MAX_RECORDED_SHELL_MARKERS + 32,
+            "the counter still sees every marker"
+        );
     }
 
     /// §16.3 The Interactive tier depends on `write_input` publishing keyboard
