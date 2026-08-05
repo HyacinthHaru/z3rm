@@ -1171,9 +1171,17 @@ impl PickerDelegate for RecentProjectsDelegate {
                                     multi_workspace.activate(workspace, None, window, cx);
                                 })
                                 .log_err();
+                        } else if let Some(host) = key.host() {
+                            // A remote group has no local worktrees behind it, so
+                            // falling through to the local path would silently open
+                            // an empty workspace on the remote paths (spec §2.1
+                            // removed remote connections).
+                            log::warn!(
+                                "Cannot open project group on remote host {host}: \
+                                 remote workspaces are not supported by this z3rm build"
+                            );
                         } else {
                             let path_list = key.path_list().clone();
-                            let host = key.host();
                             if let Some(task) = handle
                                 .update(cx, |multi_workspace, window, cx| {
                                     let modal_workspace = multi_workspace.workspace().clone();

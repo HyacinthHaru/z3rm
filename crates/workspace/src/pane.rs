@@ -2400,7 +2400,6 @@ impl Pane {
                 }
             }
 
-            // §2.1 DirectoryLister/find_or_create_worktree 已移除；SaveAs 暂不支持。
             if can_save {
                 pane.update_in(cx, |pane, window, cx| {
                     pane.unpreview_item_if_preview(item.item_id());
@@ -2414,6 +2413,45 @@ impl Pane {
                         window,
                         cx,
                     )
+                })?
+                .await?;
+            } else if can_save_as && is_singleton {
+                let suggested_name = cx.update(|_, cx| item.suggested_filename(cx))?;
+                let new_paths = pane.update_in(cx, |pane, window, cx| {
+                    pane.workspace.update(cx, |workspace, cx| {
+                        workspace.prompt_for_new_path(Some(suggested_name.to_string()), window, cx)
+                    })
+                })??;
+                let Some(abs_path) = new_paths
+                    .await
+                    .ok()
+                    .flatten()
+                    .and_then(|paths| paths.into_iter().next())
+                else {
+                    return Ok(false);
+                };
+
+                let (_, project_path) = cx
+                    .update(|_, cx| {
+                        Workspace::project_path_for_path(project.clone(), &abs_path, true, cx)
+                    })?
+                    .await?;
+
+                let item_id = item.item_id();
+                pane.update_in(cx, |pane, window, cx| {
+                    // Saving onto a path some other tab already owns would leave
+                    // two items backed by the same file.
+                    if let Some(previous) = pane
+                        .item_for_path(project_path.clone(), cx)
+                        .filter(|previous| previous.item_id() != item_id)
+                    {
+                        pane.remove_item(previous.item_id(), false, false, window, cx);
+                    }
+                    pane.unpreview_item_if_preview(item_id);
+                })?;
+
+                pane.update_in(cx, |_, window, cx| {
+                    item.save_as(project, project_path, window, cx)
                 })?
                 .await?;
             }
@@ -4301,6 +4339,34 @@ impl Render for Pane {
                 |pane: &mut Self, action: &CloseMultibufferItems, window, cx| {
                     pane.close_multibuffer_items(action, window, cx)
                         .detach_and_log_err(cx)
+                },
+            ))
+            .on_action(cx.listener(
+                |pane: &mut Self, action: &RevealInProjectPanel, _window, cx| {
+                    let Some(project) = pane.project.upgrade() else {
+                        return;
+                    };
+                    let entry_id = action
+                        .entry_id
+                        .map(ProjectEntryId::from_proto)
+                        .or_else(|| {
+                            pane.active_item()?
+                                .project_entry_ids(cx)
+                                .first()
+                                .copied()
+                        })
+                        .filter(|entry_id| {
+                            project
+                                .read(cx)
+                                .worktree_for_entry(*entry_id, cx)
+                                .is_some_and(|worktree| worktree.read(cx).is_visible())
+                        });
+                    project.update(cx, |_, cx| match entry_id {
+                        Some(entry_id) => cx.emit(project::Event::RevealInProjectPanel(entry_id)),
+                        // Without a revealable entry the panel still has to come
+                        // to the front, otherwise the action looks like a no-op.
+                        None => cx.emit(project::Event::ActivateProjectPanel),
+                    });
                 },
             ))
             .on_action(cx.listener(|_, _: &menu::Cancel, window, cx| {

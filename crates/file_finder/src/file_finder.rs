@@ -78,7 +78,7 @@ impl Settings for FileFinderSettings {
                 Some(settings_content::FileFinderWidthContent::Full) => FileFinderWidth::Full,
                 None => FileFinderWidth::Small,
             },
-            skip_focus_for_active_in_search: cf.skip_focus_for_active_in_search,
+            skip_focus_for_active_in_search: cf.skip_focus_for_active_in_search.unwrap_or(true),
             include_ignored: None, // Smart mode default
         }
     }
@@ -1469,7 +1469,8 @@ impl FileFinderDelegate {
         let Some(m) = self.matches.get(self.selected_index()).cloned() else {
             return;
         };
-        let allow_preview = PreviewTabsSettings::get_global(cx).enable_preview_from_file_finder;
+        let allow_preview = dismiss_after_open
+            && PreviewTabsSettings::get_global(cx).enable_preview_from_file_finder;
         self.open_match(m, secondary, dismiss_after_open, allow_preview, window, cx);
     }
 
@@ -2234,7 +2235,7 @@ mod file_finder_settings_tests {
 
         assert!(!settings.file_icons);
         assert_eq!(settings.modal_max_width, FileFinderWidth::Small);
-        assert!(!settings.skip_focus_for_active_in_search);
+        assert!(settings.skip_focus_for_active_in_search);
         assert_eq!(settings.include_ignored, None);
     }
 

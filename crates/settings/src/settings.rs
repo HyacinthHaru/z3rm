@@ -62,7 +62,7 @@ pub use settings_content::{
     EditPredictionsMode, EncodingDisplayOptions, ExtensionsSettingsContent, FormatOnSave,
     Formatter, FormatterList, GitHostingProviderConfig, GitHostingProviderKind, IconThemeName,
     IndentGuideBackgroundColoring, IndentGuideColoring, IndentGuidesSettingsContent, InlayHintKind,
-    InlayHintsSettingsContent, JsxTagAutoCloseContent, LanguageFileTypeContent,
+    InlayHintsSettingsContent, JsxTagAutoCloseContent,
     LanguageSettingsContent, LanguageToSettingsMap, LineEndingSetting, LineIndicatorFormat,
     LspInsertMode, LspSettings, LspSettingsMap, ModifiersContent,
     OpenAiCompatibleApiSettingsContent, PrettierSettingsContent, REST_OF_LANGUAGE_SERVERS,

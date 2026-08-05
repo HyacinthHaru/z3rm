@@ -25,7 +25,7 @@ use language::{
     proto::serialize_anchor as serialize_text_anchor,
 };
 use lsp::DiagnosticSeverity;
-use multi_buffer::{BufferOffset, MultiBufferOffset, PathKey};
+use multi_buffer::{BufferOffset, MultiBufferOffset, MultiBufferRow, PathKey};
 use project::{
     File, Project, ProjectItem as _, ProjectPath, git_store::GitStore, lsp_store::FormatTrigger,
     project_settings::ProjectSettings, search::SearchQuery,
@@ -1455,22 +1455,19 @@ impl SearchableItem for Editor {
         let buffer_snapshot = snapshot.buffer_snapshot();
         match setting {
             SeedQuerySetting::None => String::new(),
-            SeedQuerySetting::Selection if !selection.is_empty() => buffer_snapshot
-                .text_for_range(selection.start..selection.end)
-                .collect(),
+            SeedQuerySetting::Selection | SeedQuerySetting::Surround if !selection.is_empty() => {
+                buffer_snapshot
+                    .text_for_range(selection.start..selection.end)
+                    .collect()
+            }
             SeedQuerySetting::Line => {
-                // Seed from current line text
-                // MultiBufferSnapshot lacks TextBufferSnapshot ToPoint/ToOffset traits,
-                // so we use surrounding_word with the selection anchor
-                let (range, kind) = buffer_snapshot
-                    .surrounding_word(selection.start, Some(CharScopeContext::Completion));
-                if kind == Some(CharKind::Word) {
-                    let text: String = buffer_snapshot.text_for_range(range).collect();
-                    if !text.trim().is_empty() {
-                        return text;
-                    }
-                }
-                String::new()
+                let row = MultiBufferRow(selection.start.row);
+                let line_start = Point::new(row.0, 0);
+                let line_end = Point::new(row.0, buffer_snapshot.line_len(row));
+                let text: String = buffer_snapshot
+                    .text_for_range(line_start..line_end)
+                    .collect();
+                text.trim().to_string()
             }
             SeedQuerySetting::Surround => {
                 let (range, kind) = buffer_snapshot
@@ -1483,7 +1480,7 @@ impl SearchableItem for Editor {
                 }
                 String::new()
             }
-            _ => String::new(),
+            SeedQuerySetting::Selection => String::new(),
         }
     }
 

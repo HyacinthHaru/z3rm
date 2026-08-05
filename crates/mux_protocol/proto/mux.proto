@@ -416,6 +416,50 @@ message SyncScrollbackNotification {
     uint32 scroll_offset = 2;
 }
 
+// === Shell commands (OSC 133, §3.3) ===
+
+// §3.10 列出 pane 里由 OSC 133 marker 划出的命令。
+message ListCommandsRequest {
+    string pane_id = 1;
+    // 只返回最近的 N 条; 0 = 全部仍被保留的。
+    uint32 max_results = 2;
+}
+
+// §3.3 一条命令的某一个 OSC 133 marker。
+//
+// 消息本身存在 = shell 发过这个 marker。行号是另一回事: 记下来的那一行可能
+// 已经被逐出 scrollback, 或者行号在一次 reflow / reset / 满容量回卷之后作废,
+// 这时 `line` 缺省。绝不在这种情况下猜一个行号 —— 错的行号比查不到糟得多。
+message CommandMarker {
+    optional int64 line = 1;  // tmux 行号: 0 = 可见区首行, 负数进历史
+    uint32 column = 2;        // marker 落下时光标所在列
+}
+
+// §3.10 一条 shell 命令: 四个 OSC 133 marker + 退出码。
+//
+// 真实 shell 不保证四个都发 (有的只发 A 和 D), 命令还在跑时也不会有 D, 所以
+// 每个 marker 都是可缺省的。退出码与行号相互独立: 行号不可用不影响退出码。
+message CommandRange {
+    // 稳定标识: 本命令第一个 marker 的 sequence。pane 生命周期内单调递增,
+    // 但不是"第几条命令" —— 被丢弃的旧 marker 无法回溯出命令计数。
+    uint64 id = 1;
+    CommandMarker prompt = 2;        // A: 提示符开始
+    CommandMarker command = 3;       // B: 命令行开始
+    CommandMarker output_start = 4;  // C: 输出开始
+    CommandMarker command_end = 5;   // D: 命令结束; 缺省 = 还在跑
+    optional int32 exit_code = 6;    // 只有 `OSC 133 ; D ; <status>` 才有
+}
+
+// §3.10 命令列表响应。
+message ListCommandsResponse {
+    repeated CommandRange commands = 1;
+    // 行号是相对这个 scrollback 大小换算出来的。
+    uint32 history_size = 2;
+    // 当前保留的 marker 总数。commands 为空而它不为 0, 说明 shell 只发了
+    // prompt start, 没有报告任何命令边界。
+    uint32 recorded_markers = 3;
+}
+
 // === File Fetch (for remote file viewer) ===
 
 // §3.10 读取远程/本地文件。
@@ -495,16 +539,34 @@ message GetFileVersionResponse {
     bytes content = 1;
 }
 
-// §4.8 拒绝（撤销）某版本，将文件回滚至前一版本。
+// §4.8 撤销此后的改动：把文件的内容还原成 version_id 那一版。
+// 还原本身也会记为一个新版本（trigger=decline），历史不会被抹掉。
 message DeclineFileVersionRequest {
     string session_id = 1;
     string path = 2;        // UTF-8 文件路径
-    uint64 version_id = 3;  // §4.5 要拒绝的版本 ID
+    uint64 version_id = 3;  // §4.5 要还原到的版本 ID（不是要丢弃的那一版）
 }
 
 // §4.8 拒绝版本响应：restored 表示是否成功回滚。
 message DeclineFileVersionResponse {
     bool restored = 1;
+}
+
+// §4 某个文件在本 session 内累计的影子版本概况。
+message ChangedFile {
+    string path = 1;           // 绝对路径
+    uint64 version_count = 2;  // 该文件的版本数量
+    uint64 latest_seq_no = 3;  // §4.4 最新版本的单调序列号
+}
+
+// §4 列出本 session 内所有留有影子版本的文件。
+message ListChangedFilesRequest {
+    string session_id = 1;
+}
+
+// §4 变更文件列表响应，按 latest_seq_no 从新到旧排列。
+message ListChangedFilesResponse {
+    repeated ChangedFile files = 1;
 }
 
 // === Clipboard (server relay hub) ===
@@ -748,6 +810,8 @@ message Request {
         ResizeLayoutRequest resize_layout = 33;  // §16.9 server-owned layout ratios
         ListRecoveryCandidatesRequest list_recovery_candidates = 34;  // §3.6 recovery
         ConfirmRecoveryRequest confirm_recovery = 35;  // §3.6 recovery
+        ListChangedFilesRequest list_changed_files = 36;  // §4 shadow snapshot
+        ListCommandsRequest list_commands = 37;  // §3.3 OSC 133 shell commands
     }
 }
 
@@ -777,5 +841,7 @@ message Response {
         DeclineFileVersionResponse decline_file_version = 21; // §4 shadow snapshot
         ListRecoveryCandidatesResponse recovery_candidates = 22;  // §3.6 recovery
         ConfirmRecoveryResponse recovery_confirmed = 23;  // §3.6 recovery
+        ListChangedFilesResponse changed_files = 24;  // §4 shadow snapshot
+        ListCommandsResponse commands = 25;  // §3.3 OSC 133 shell commands
     }
 }

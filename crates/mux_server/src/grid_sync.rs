@@ -627,7 +627,9 @@ fn row_from_history<T: EventListener>(
 /// §3.3 把 alacritty Term 的 dirty 行转成 GridDiff (row-level, aligned with dirty_lines)。
 ///
 /// `dirty` 是 `(行号, 该行 cells)` 的列表; 调用方负责先 `term.damage()` +
-/// `term.reset_damage()` 收集。viewport 坐标 (0 = 顶部可见行)。
+/// `term.reset_damage()` 收集。行号是 active screen 坐标 (0 = 屏幕顶行), 不含
+/// `display_offset` —— 和 `snapshot_from_term` 用同一套坐标, 客户端才能把 diff
+/// 直接贴到快照上; 滚动位置由快照里的 `display_offset` 单独带走。
 pub fn diff_from_dirty<T: EventListener>(term: &Term<T>, dirty_rows: &[usize]) -> GridDiff {
     let content = term.renderable_content();
     let colors = content.colors;
@@ -774,4 +776,653 @@ pub fn new_term(cols: u32, rows: u32) -> Term<VoidListener> {
     let size = TermSize::new(cols as usize, rows as usize);
     let config = TermConfig::default();
     Term::new(config, &size, VoidListener)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use alacritty_terminal::grid::Scroll;
+    use alacritty_terminal::vte::ansi::{Processor, StdSyncHandler};
+
+    fn term_with_output(cols: u32, rows: u32, bytes: &[u8]) -> Term<VoidListener> {
+        let mut term = new_term(cols, rows);
+        let mut processor = Processor::<StdSyncHandler>::new();
+        processor.advance(&mut term, bytes);
+        term
+    }
+
+    fn row_text(row: &RowChange) -> String {
+        row.cells
+            .iter()
+            .map(|cell| cell.character.as_str())
+            .collect()
+    }
+
+    fn snapshot_row_text(snapshot: &FullGridSnapshot, row: u32) -> String {
+        let cols = snapshot.cols as usize;
+        let start = row as usize * cols;
+        snapshot.cells[start..start + cols]
+            .iter()
+            .map(|cell| cell.character.as_str())
+            .collect()
+    }
+
+    fn first_cell(term: &Term<VoidListener>, line: i32, column: usize) -> Cell {
+        let colors = term.renderable_content().colors;
+        cell_from_alacritty(
+            &term.grid()[AlacPoint::new(Line(line), Column(column))],
+            colors,
+        )
+    }
+
+    fn dirty_row_numbers(diff: &GridDiff) -> Vec<u32> {
+        diff.rows.iter().map(|row| row.row).collect()
+    }
+
+    fn match_indices(matches: &[(u32, RowChange)]) -> Vec<u32> {
+        matches.iter().map(|(index, _)| *index).collect()
+    }
+
+    // ------------------------------------------------------------------
+    // diff_from_dirty
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn diff_from_dirty_emits_only_the_requested_rows_at_full_width() {
+        let term = term_with_output(4, 3, b"AA\r\nBB\r\nCC");
+
+        let diff = diff_from_dirty(&term, &[1]);
+
+        assert_eq!(dirty_row_numbers(&diff), vec![1]);
+        assert_eq!(
+            diff.rows[0].cells.len(),
+            4,
+            "row diff must carry every column, got {:?}",
+            row_text(&diff.rows[0])
+        );
+        assert_eq!(row_text(&diff.rows[0]), "BB  ");
+    }
+
+    #[test]
+    fn diff_from_dirty_without_dirty_rows_is_empty_not_a_full_grid() {
+        let term = term_with_output(4, 3, b"AA\r\nBB\r\nCC");
+
+        let diff = diff_from_dirty(&term, &[]);
+
+        assert_eq!(
+            dirty_row_numbers(&diff),
+            Vec::<u32>::new(),
+            "an empty dirty set must not degrade into a full-grid diff"
+        );
+    }
+
+    #[test]
+    fn diff_from_dirty_drops_out_of_range_rows_and_keeps_caller_order() {
+        let term = term_with_output(4, 3, b"AA\r\nBB\r\nCC");
+
+        let diff = diff_from_dirty(&term, &[2, 3, 99, 0]);
+
+        assert_eq!(dirty_row_numbers(&diff), vec![2, 0]);
+        assert_eq!(row_text(&diff.rows[0]), "CC  ");
+        assert_eq!(row_text(&diff.rows[1]), "AA  ");
+    }
+
+    #[test]
+    fn diff_from_dirty_rows_share_the_snapshot_coordinate_space_while_scrolled_back() {
+        let mut term = term_with_output(4, 2, b"L0\r\nL1\r\nL2\r\nL3");
+        term.scroll_display(Scroll::Delta(2));
+        let snapshot = snapshot_from_term(&term);
+        assert_eq!(
+            snapshot.display_offset, 2,
+            "test needs a scrolled-back viewport to be meaningful"
+        );
+
+        let diff = diff_from_dirty(&term, &[0, 1]);
+
+        // A client applies row diffs on top of the last full snapshot, so both
+        // must number rows identically even when the viewport is scrolled.
+        for row_change in &diff.rows {
+            assert_eq!(
+                row_text(row_change),
+                snapshot_row_text(&snapshot, row_change.row),
+                "row {} diverges between diff and snapshot",
+                row_change.row
+            );
+        }
+        assert_eq!(row_text(&diff.rows[0]), "L2  ");
+        assert_eq!(row_text(&diff.rows[1]), "L3  ");
+    }
+
+    // ------------------------------------------------------------------
+    // row_from_history / fetch_scrollback_from_term
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn history_index_zero_is_the_oldest_scrollback_line() {
+        let term = term_with_output(4, 2, b"A\r\nB\r\nC\r\nD\r\nE");
+        let history_size = term.grid().history_size();
+        assert_eq!(history_size, 3, "expected A/B/C to have scrolled off");
+
+        let oldest = row_from_history(&term, 0, history_size);
+        let middle = row_from_history(&term, 1, history_size);
+        let newest = row_from_history(&term, history_size - 1, history_size);
+
+        assert_eq!(row_text(&oldest), "A   ");
+        assert_eq!(row_text(&middle), "B   ");
+        assert_eq!(row_text(&newest), "C   ");
+        assert_eq!(oldest.row, 0);
+        assert_eq!(newest.row, 2);
+        assert_eq!(oldest.cells.len(), 4);
+    }
+
+    #[test]
+    fn history_index_maps_to_alacritty_line_index_minus_history_size() {
+        let term = term_with_output(4, 2, b"A\r\nB\r\nC\r\nD\r\nE");
+        let history_size = term.grid().history_size();
+
+        // Off-by-one here shifts the whole scrollback, so pin both ends
+        // directly against the alacritty grid rather than against text.
+        assert_eq!(
+            row_from_history(&term, 0, history_size).cells[0].character,
+            first_cell(&term, -(history_size as i32), 0).character
+        );
+        assert_eq!(
+            row_from_history(&term, history_size - 1, history_size).cells[0].character,
+            first_cell(&term, -1, 0).character
+        );
+    }
+
+    #[test]
+    fn history_rows_carry_cell_attributes_not_just_text() {
+        let term = term_with_output(4, 2, b"\x1b[1mA\x1b[0m\r\nB\r\nC\r\nD\r\nE");
+        let history_size = term.grid().history_size();
+
+        let oldest = row_from_history(&term, 0, history_size);
+
+        assert!(
+            oldest.cells[0].style.bold,
+            "scrollback line lost its bold attribute: {:?}",
+            oldest.cells[0].style
+        );
+    }
+
+    #[test]
+    fn fetch_scrollback_walks_older_and_newer_in_ascending_index_order() {
+        let term = term_with_output(4, 2, b"A\r\nB\r\nC\r\nD\r\nE");
+
+        let (newer, total) = fetch_scrollback_from_term(&term, 0, 1, 10);
+        assert_eq!(total, 3);
+        assert_eq!(
+            newer.iter().map(row_text).collect::<Vec<_>>(),
+            vec!["A   ", "B   ", "C   "]
+        );
+
+        let (older, _) = fetch_scrollback_from_term(&term, 2, 0, 2);
+        assert_eq!(
+            older.iter().map(row_text).collect::<Vec<_>>(),
+            vec!["B   ", "C   "]
+        );
+    }
+
+    #[test]
+    fn fetch_scrollback_returns_total_but_no_rows_for_degenerate_requests() {
+        let term = term_with_output(4, 2, b"A\r\nB\r\nC\r\nD\r\nE");
+
+        let (rows, total) = fetch_scrollback_from_term(&term, 0, 1, 0);
+        assert!(rows.is_empty(), "count == 0 must yield no rows");
+        assert_eq!(total, 3);
+
+        let (rows, total) = fetch_scrollback_from_term(&term, 99, 1, 10);
+        assert!(
+            rows.is_empty(),
+            "out-of-range from_line must yield no rows, got {:?}",
+            rows.iter().map(row_text).collect::<Vec<_>>()
+        );
+        assert_eq!(total, 3);
+
+        let empty = term_with_output(4, 2, b"A");
+        let (rows, total) = fetch_scrollback_from_term(&empty, 0, 1, 10);
+        assert!(rows.is_empty());
+        assert_eq!(total, 0);
+    }
+
+    // ------------------------------------------------------------------
+    // cell_from_alacritty
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn sgr_attributes_map_onto_cell_style() {
+        let term = term_with_output(4, 1, b"\x1b[1;2;3;4;7;8;9mX");
+
+        let cell = first_cell(&term, 0, 0);
+
+        assert_eq!(cell.character, "X");
+        assert!(cell.style.bold, "bold missing from {:?}", cell.style);
+        assert!(cell.style.dim, "dim missing from {:?}", cell.style);
+        assert!(cell.style.italic, "italic missing from {:?}", cell.style);
+        assert!(cell.style.reverse, "reverse missing from {:?}", cell.style);
+        assert!(cell.style.hidden, "hidden missing from {:?}", cell.style);
+        assert!(
+            cell.style.strikethrough,
+            "strikethrough missing from {:?}",
+            cell.style
+        );
+        assert_eq!(cell.style.underline, UnderlineStyle::Single);
+    }
+
+    #[test]
+    fn plain_cell_carries_no_attributes() {
+        let term = term_with_output(4, 1, b"X");
+
+        let cell = first_cell(&term, 0, 0);
+
+        assert!(!cell.style.bold, "unexpected style {:?}", cell.style);
+        assert!(!cell.style.italic, "unexpected style {:?}", cell.style);
+        assert!(!cell.style.reverse, "unexpected style {:?}", cell.style);
+        assert!(!cell.style.wrapline, "unexpected style {:?}", cell.style);
+        assert_eq!(cell.style.underline, UnderlineStyle::None);
+        assert_eq!(cell.zerowidth, "");
+        assert_eq!(cell.hyperlink, None);
+    }
+
+    #[test]
+    fn underline_variants_map_to_distinct_underline_styles() {
+        for (sequence, expected) in [
+            (b"\x1b[4mX".as_slice(), UnderlineStyle::Single),
+            (b"\x1b[4:2mX".as_slice(), UnderlineStyle::Double),
+            (b"\x1b[4:3mX".as_slice(), UnderlineStyle::Curly),
+            (b"\x1b[4:4mX".as_slice(), UnderlineStyle::Dotted),
+            (b"\x1b[4:5mX".as_slice(), UnderlineStyle::Dashed),
+            (b"\x1b[4m\x1b[24mX".as_slice(), UnderlineStyle::None),
+        ] {
+            let term = term_with_output(4, 1, sequence);
+            let cell = first_cell(&term, 0, 0);
+            assert_eq!(
+                cell.style.underline,
+                expected,
+                "sequence {:?} produced the wrong underline",
+                String::from_utf8_lossy(sequence)
+            );
+        }
+    }
+
+    #[test]
+    fn underline_color_resolves_through_the_default_palette() {
+        let term = term_with_output(4, 1, b"\x1b[4m\x1b[58;5;33mX");
+
+        let cell = first_cell(&term, 0, 0);
+
+        assert_eq!(cell.style.underline, UnderlineStyle::Single);
+        assert_eq!(cell.style.underline_color, Some(0x0087ff));
+    }
+
+    #[test]
+    fn named_indexed_and_rgb_colors_resolve_to_the_default_palette() {
+        let default_cell = first_cell(&term_with_output(4, 1, b"X"), 0, 0);
+        assert_eq!(default_cell.foreground, 0xdddddd);
+        assert_eq!(default_cell.background, 0x000000);
+
+        let named = first_cell(&term_with_output(4, 1, b"\x1b[31;44mX"), 0, 0);
+        assert_eq!(named.foreground, 0xcc5555);
+        assert_eq!(named.background, 0x5555cc);
+
+        let bright = first_cell(&term_with_output(4, 1, b"\x1b[91mX"), 0, 0);
+        assert_eq!(bright.foreground, 0xff7777);
+
+        // 196 sits in the 6x6x6 cube: (5,0,0) -> 0xff0000.
+        let indexed = first_cell(&term_with_output(4, 1, b"\x1b[38;5;196mX"), 0, 0);
+        assert_eq!(indexed.foreground, 0xff0000);
+
+        // 244 sits in the grayscale ramp: 12 * 10 + 8 = 128.
+        let grayscale = first_cell(&term_with_output(4, 1, b"\x1b[38;5;244mX"), 0, 0);
+        assert_eq!(grayscale.foreground, 0x808080);
+
+        let truecolor = first_cell(&term_with_output(4, 1, b"\x1b[38;2;18;52;86mX"), 0, 0);
+        assert_eq!(truecolor.foreground, 0x123456);
+    }
+
+    #[test]
+    fn osc_4_palette_override_beats_the_default_palette() {
+        let term = term_with_output(4, 1, b"\x1b]4;1;rgb:12/34/56\x1b\\\x1b[31mX");
+
+        let cell = first_cell(&term, 0, 0);
+
+        assert_eq!(
+            cell.foreground, 0x123456,
+            "OSC 4 override must win over the built-in xterm fallback"
+        );
+    }
+
+    #[test]
+    fn wide_char_occupies_two_cells_with_a_trailing_spacer() {
+        let term = term_with_output(4, 1, "漢".as_bytes());
+
+        let wide = first_cell(&term, 0, 0);
+        let spacer = first_cell(&term, 0, 1);
+
+        assert_eq!(wide.character, "漢");
+        assert!(wide.style.wide_char, "wide flag missing: {:?}", wide.style);
+        assert!(!wide.style.wide_char_spacer);
+        assert_eq!(spacer.character, " ");
+        assert!(
+            spacer.style.wide_char_spacer,
+            "spacer flag missing: {:?}",
+            spacer.style
+        );
+        assert!(!spacer.style.wide_char);
+    }
+
+    #[test]
+    fn wide_char_at_the_row_edge_emits_a_leading_spacer_and_wraps() {
+        let term = term_with_output(4, 2, "abc漢".as_bytes());
+
+        let leading_spacer = first_cell(&term, 0, 3);
+        let wide = first_cell(&term, 1, 0);
+
+        assert!(
+            leading_spacer.style.leading_wide_char_spacer,
+            "leading spacer flag missing: {:?}",
+            leading_spacer.style
+        );
+        assert_eq!(wide.character, "漢");
+        assert!(wide.style.wide_char, "wide flag missing: {:?}", wide.style);
+    }
+
+    #[test]
+    fn combining_marks_land_in_zerowidth_not_in_character() {
+        let term = term_with_output(4, 1, "e\u{0301}\u{0302}".as_bytes());
+
+        let cell = first_cell(&term, 0, 0);
+
+        assert_eq!(cell.character, "e");
+        assert_eq!(cell.zerowidth, "\u{0301}\u{0302}");
+    }
+
+    #[test]
+    fn wrapline_marks_only_the_final_cell_of_a_continued_row() {
+        let term = term_with_output(4, 3, b"ABCDE");
+
+        let diff = diff_from_dirty(&term, &[0, 1]);
+        let wrapped: Vec<bool> = diff.rows[0]
+            .cells
+            .iter()
+            .map(|cell| cell.style.wrapline)
+            .collect();
+
+        // `capture-pane -J` joins on this flag, so it must sit on the last
+        // column of the wrapped row and nowhere else.
+        assert_eq!(wrapped, vec![false, false, false, true]);
+        assert_eq!(row_text(&diff.rows[0]), "ABCD");
+        assert_eq!(row_text(&diff.rows[1]), "E   ");
+        assert!(
+            diff.rows[1].cells.iter().all(|cell| !cell.style.wrapline),
+            "continuation row must not be marked as wrapped"
+        );
+    }
+
+    #[test]
+    fn wrapline_survives_the_trip_into_scrollback() {
+        let term = term_with_output(4, 2, b"ABCDE\r\nF\r\nG\r\nH");
+        let history_size = term.grid().history_size();
+        assert!(history_size >= 2, "history_size was {history_size}");
+
+        let wrapped_row = row_from_history(&term, 0, history_size);
+
+        assert_eq!(row_text(&wrapped_row), "ABCD");
+        assert!(
+            wrapped_row.cells[3].style.wrapline,
+            "scrollback lost WRAPLINE: {:?}",
+            wrapped_row.cells[3].style
+        );
+    }
+
+    #[test]
+    fn osc_8_hyperlink_is_exported_with_id_and_uri() {
+        let term = term_with_output(
+            8,
+            1,
+            b"\x1b]8;id=link1;https://example.com\x1b\\Z\x1b]8;;\x1b\\Y",
+        );
+
+        let linked = first_cell(&term, 0, 0);
+        let plain = first_cell(&term, 0, 1);
+
+        assert_eq!(
+            linked.hyperlink,
+            Some(Hyperlink {
+                id: "link1".to_string(),
+                uri: "https://example.com".to_string(),
+            })
+        );
+        assert_eq!(plain.hyperlink, None);
+    }
+
+    // ------------------------------------------------------------------
+    // search_scrollback_from_term
+    // ------------------------------------------------------------------
+
+    fn term_with_search_history() -> Term<VoidListener> {
+        // History ends up as [one, two, three, two]; "five" stays on screen.
+        term_with_output(8, 2, b"one\r\ntwo\r\nthree\r\ntwo\r\nfour\r\nfive")
+    }
+
+    #[test]
+    fn search_direction_zero_walks_toward_older_lines() {
+        let term = term_with_search_history();
+        assert_eq!(term.grid().history_size(), 4);
+
+        let matches = search_scrollback_from_term(&term, "two", 3, 0, 10);
+
+        assert_eq!(match_indices(&matches), vec![3, 1]);
+        assert_eq!(matches[0].1.row, 3);
+        assert_eq!(
+            matches[0].1.cells.len(),
+            8,
+            "search hits must carry a full-width row"
+        );
+        assert_eq!(row_text(&matches[0].1), "two     ");
+    }
+
+    #[test]
+    fn search_direction_one_walks_toward_newer_lines() {
+        let term = term_with_search_history();
+
+        let matches = search_scrollback_from_term(&term, "two", 0, 1, 10);
+
+        assert_eq!(match_indices(&matches), vec![1, 3]);
+    }
+
+    #[test]
+    fn search_clamps_an_out_of_range_start_when_walking_older() {
+        let term = term_with_search_history();
+
+        let matches = search_scrollback_from_term(&term, "two", 999, 0, 10);
+
+        assert_eq!(match_indices(&matches), vec![3, 1]);
+    }
+
+    #[test]
+    fn search_past_the_newest_history_line_finds_nothing() {
+        let term = term_with_search_history();
+
+        let matches = search_scrollback_from_term(&term, "two", 999, 1, 10);
+
+        assert_eq!(match_indices(&matches), Vec::<u32>::new());
+    }
+
+    #[test]
+    fn search_truncates_at_max_results() {
+        let term = term_with_search_history();
+
+        assert_eq!(
+            match_indices(&search_scrollback_from_term(&term, "two", 3, 0, 1)),
+            vec![3]
+        );
+        assert_eq!(
+            match_indices(&search_scrollback_from_term(&term, "two", 0, 1, 1)),
+            vec![1]
+        );
+    }
+
+    #[test]
+    fn search_returns_empty_for_zero_max_results_or_empty_history() {
+        let term = term_with_search_history();
+        assert_eq!(
+            match_indices(&search_scrollback_from_term(&term, "two", 3, 0, 0)),
+            Vec::<u32>::new()
+        );
+
+        let no_history = term_with_output(8, 2, b"two");
+        assert_eq!(no_history.grid().history_size(), 0);
+        assert_eq!(
+            match_indices(&search_scrollback_from_term(&no_history, "two", 0, 0, 10)),
+            Vec::<u32>::new()
+        );
+    }
+
+    #[test]
+    fn search_returns_empty_for_an_invalid_regex() {
+        let term = term_with_search_history();
+
+        let matches = search_scrollback_from_term(&term, "two(", 0, 1, 10);
+
+        assert_eq!(match_indices(&matches), Vec::<u32>::new());
+    }
+
+    #[test]
+    fn search_matches_regex_syntax_not_just_literals() {
+        let term = term_with_search_history();
+
+        let matches = search_scrollback_from_term(&term, "^t(wo|hree)", 0, 1, 10);
+
+        assert_eq!(match_indices(&matches), vec![1, 2, 3]);
+    }
+
+    #[test]
+    fn search_does_not_report_lines_that_are_still_on_screen() {
+        let term = term_with_search_history();
+
+        let matches = search_scrollback_from_term(&term, "five", 0, 1, 10);
+
+        // The API is scrollback-only; the client searches the live viewport
+        // itself from the snapshot it already holds.
+        assert_eq!(match_indices(&matches), Vec::<u32>::new());
+    }
+
+    // ------------------------------------------------------------------
+    // GridDiffRing
+    // ------------------------------------------------------------------
+
+    fn diff_with_row(row: u32, character: &str) -> GridDiff {
+        GridDiff {
+            rows: vec![RowChange {
+                row,
+                cells: vec![Cell {
+                    character: character.to_string(),
+                    ..Default::default()
+                }],
+            }],
+        }
+    }
+
+    #[test]
+    fn ring_merges_rows_and_keeps_the_newest_content_per_row() {
+        let mut ring = GridDiffRing::new(8);
+        ring.push(1, diff_with_row(0, "a"));
+        ring.push(2, diff_with_row(1, "b"));
+        ring.push(3, diff_with_row(0, "c"));
+
+        match ring.fetch_update(1, 3, || build_empty_snapshot(1, 2)) {
+            GridUpdate::Diff {
+                from_generation,
+                to_generation,
+                diff,
+            } => {
+                assert_eq!((from_generation, to_generation), (1, 3));
+                assert_eq!(dirty_row_numbers(&diff), vec![1, 0]);
+                assert_eq!(row_text(&diff.rows[1]), "c");
+            }
+            update => panic!("expected merged diff, got {update:?}"),
+        }
+    }
+
+    #[test]
+    fn ring_falls_back_to_a_full_snapshot_when_needed_generations_were_evicted() {
+        let mut ring = GridDiffRing::new(2);
+        for generation in 1..=4 {
+            ring.push(generation, diff_with_row(0, "a"));
+        }
+        assert_eq!(ring.len(), 2, "ring must have dropped generations 1 and 2");
+
+        // A client at generation 1 still needs generation 2, which is gone.
+        match ring.fetch_update(1, 4, || build_empty_snapshot(1, 2)) {
+            GridUpdate::FullSnapshot { to_generation, .. } => assert_eq!(to_generation, 4),
+            update => panic!("expected full snapshot after eviction, got {update:?}"),
+        }
+
+        // A client at generation 2 needs only the retained 3 and 4.
+        match ring.fetch_update(2, 4, || build_empty_snapshot(1, 2)) {
+            GridUpdate::Diff { diff, .. } => assert_eq!(dirty_row_numbers(&diff), vec![0]),
+            update => panic!("expected diff at the retention boundary, got {update:?}"),
+        }
+    }
+
+    #[test]
+    fn ring_falls_back_to_a_full_snapshot_for_non_row_representable_generations() {
+        let mut ring = GridDiffRing::new(8);
+        ring.push(1, diff_with_row(0, "a"));
+        ring.push_requiring_full_snapshot(2, GridDiff::default());
+
+        match ring.fetch_update(1, 2, || build_empty_snapshot(1, 2)) {
+            GridUpdate::FullSnapshot { to_generation, .. } => assert_eq!(to_generation, 2),
+            update => panic!("expected full snapshot, got {update:?}"),
+        }
+    }
+
+    #[test]
+    fn ring_reports_no_change_only_when_the_client_is_current() {
+        let mut ring = GridDiffRing::new(8);
+        ring.push(1, diff_with_row(0, "a"));
+
+        match ring.fetch_update(1, 1, || build_empty_snapshot(1, 2)) {
+            GridUpdate::NoChange(generation) => assert_eq!(generation, 1),
+            update => panic!("expected NoChange, got {update:?}"),
+        }
+        match ring.fetch_update(0, 1, || build_empty_snapshot(1, 2)) {
+            GridUpdate::FullSnapshot { to_generation, .. } => assert_eq!(to_generation, 1),
+            update => panic!("expected full snapshot for a fresh client, got {update:?}"),
+        }
+        // A client ahead of the server (server restart, generation reset) must
+        // be resynchronized rather than handed a diff.
+        match ring.fetch_update(9, 1, || build_empty_snapshot(1, 2)) {
+            GridUpdate::FullSnapshot { to_generation, .. } => assert_eq!(to_generation, 1),
+            update => panic!("expected full snapshot for a stale-ahead client, got {update:?}"),
+        }
+    }
+
+    #[test]
+    fn snapshot_from_term_exports_dimensions_cursor_and_history() {
+        let term = term_with_output(4, 2, b"A\r\nB\r\nC");
+
+        let snapshot = snapshot_from_term(&term);
+
+        assert_eq!((snapshot.cols, snapshot.rows), (4, 2));
+        assert_eq!(snapshot.cells.len(), 8);
+        assert_eq!((snapshot.cursor.row, snapshot.cursor.col), (1, 1));
+        assert!(snapshot.cursor.visible);
+        assert!(!snapshot.alternate_screen);
+        assert_eq!(snapshot.history_size, 1);
+        assert_eq!(snapshot_row_text(&snapshot, 0), "B   ");
+        assert_ne!(snapshot.modes & mux_protocol::terminal_mode::SHOW_CURSOR, 0);
+    }
+
+    #[test]
+    fn build_empty_snapshot_sizes_the_cell_buffer_to_cols_times_rows() {
+        let snapshot = build_empty_snapshot(3, 4);
+
+        assert_eq!(snapshot.cells.len(), 12);
+        assert_eq!((snapshot.cols, snapshot.rows), (3, 4));
+        assert_eq!(snapshot.history_size, 0);
+        assert_ne!(snapshot.modes & mux_protocol::terminal_mode::SHOW_CURSOR, 0);
+    }
 }

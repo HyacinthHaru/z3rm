@@ -2862,12 +2862,22 @@ impl Editor {
     }
 
     pub fn new_in_workspace(
-        _workspace: &mut Workspace,
-        _window: &mut Window,
-        _cx: &mut Context<Workspace>,
+        workspace: &mut Workspace,
+        window: &mut Window,
+        cx: &mut Context<Workspace>,
     ) -> Task<Result<Entity<Editor>>> {
-        // 只读编辑器：project.create_buffer 签名不匹配，返回错误。
-        Task::ready(Err(anyhow!("new buffer creation disabled in read-only editor")))
+        let project = workspace.project().clone();
+        let create = project.update(cx, |project, cx| project.create_buffer(None, true, cx));
+
+        cx.spawn_in(window, async move |workspace, cx| {
+            let buffer = create.await?;
+            workspace.update_in(cx, |workspace, window, cx| {
+                let editor =
+                    cx.new(|cx| Editor::for_buffer(buffer, Some(project.clone()), window, cx));
+                workspace.add_item_to_active_pane(Box::new(editor.clone()), None, true, window, cx);
+                editor
+            })
+        })
     }
 
     fn new_file_vertical(
@@ -2898,12 +2908,29 @@ impl Editor {
     }
 
     fn new_file_in_direction(
-        _workspace: &mut Workspace,
-        _direction: SplitDirection,
-        _window: &mut Window,
-        _cx: &mut Context<Workspace>,
+        workspace: &mut Workspace,
+        direction: SplitDirection,
+        window: &mut Window,
+        cx: &mut Context<Workspace>,
     ) {
-        // 只读编辑器：project.create_buffer 签名不匹配，跳过。
+        let project = workspace.project().clone();
+        let create = project.update(cx, |project, cx| project.create_buffer(None, true, cx));
+
+        cx.spawn_in(window, async move |workspace, cx| {
+            let buffer = create.await?;
+            workspace.update_in(cx, move |workspace, window, cx| {
+                workspace.split_item(
+                    direction,
+                    Box::new(
+                        cx.new(|cx| Editor::for_buffer(buffer, Some(project.clone()), window, cx)),
+                    ),
+                    window,
+                    cx,
+                )
+            })?;
+            anyhow::Ok(())
+        })
+        .detach_and_prompt_err("Failed to create buffer", window, cx, |_, _, _| None);
     }
 
     pub fn leader_id(&self) -> Option<CollaboratorId> {

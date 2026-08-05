@@ -1218,9 +1218,12 @@ impl Project {
 
     pub fn remove_worktree(
         &mut self,
-        _worktree_id: WorktreeId,
-        _cx: &mut gpui::Context<Self>,
+        worktree_id: WorktreeId,
+        cx: &mut gpui::Context<Self>,
     ) -> Task<anyhow::Result<()>> {
+        self.worktree_store.update(cx, |worktree_store, cx| {
+            worktree_store.remove_worktree(worktree_id, cx);
+        });
         Task::ready(Ok(()))
     }
 
@@ -1405,14 +1408,32 @@ impl Project {
         true
     }
 
-    /// 当前活动项目目录
-    pub fn active_project_directory(&self, _cx: &App) -> Option<std::path::PathBuf> {
-        None
+    /// The root of the worktree owning the active entry, falling back to the
+    /// first worktree that is rooted at a directory. Worktrees rooted at a
+    /// single file have no usable directory and are skipped.
+    pub fn active_project_directory(&self, cx: &App) -> Option<std::path::PathBuf> {
+        self.active_entry()
+            .and_then(|entry_id| self.worktree_for_entry(entry_id, cx))
+            .into_iter()
+            .chain(self.worktrees(cx))
+            .find_map(|worktree| worktree.read(cx).root_dir())
+            .map(|root_dir| root_dir.to_path_buf())
     }
 
-    /// 当前活动项目目录 (const ref)
-    pub fn active_entry_directory(&self, _cx: &App) -> Option<std::path::PathBuf> {
-        None
+    /// The directory containing the active entry: the entry itself when it is a
+    /// directory, otherwise its parent.
+    pub fn active_entry_directory(&self, cx: &App) -> Option<std::path::PathBuf> {
+        let entry_id = self.active_entry()?;
+        let (worktree, entry) = self
+            .worktree_store
+            .read(cx)
+            .worktree_and_entry_for_id(entry_id, cx)?;
+        let abs_path = worktree.read(cx).absolutize(&entry.path);
+        if entry.is_dir() {
+            Some(abs_path)
+        } else {
+            abs_path.parent().map(std::path::Path::to_path_buf)
+        }
     }
 
     /// 是否远程项目
@@ -1483,8 +1504,20 @@ impl Project {
         new_path: crate::ProjectPath,
         cx: &mut gpui::Context<Self>,
     ) -> gpui::Task<anyhow::Result<worktree::CreatedEntry>> {
-        self.worktree_store
-            .update(cx, |store, cx| store.rename_entry(entry_id, new_path, cx))
+        let rename = self.worktree_store.update(cx, |store, cx| {
+            store.rename_entry(entry_id, new_path.clone(), cx)
+        });
+        cx.spawn(async move |this, cx| {
+            let created = rename.await?;
+            this.update(cx, |this, cx| {
+                let abs_path = this.absolute_path(&new_path, cx);
+                cx.emit(crate::Event::EntryRenamed {
+                    project_path: new_path,
+                    abs_path,
+                });
+            })?;
+            Ok(created)
+        })
     }
 
     /// Delete an entry, returning the trashed entry when trashing.

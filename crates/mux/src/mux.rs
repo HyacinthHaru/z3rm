@@ -15,13 +15,15 @@ use std::time::Duration;
 
 // §9 从 mux_protocol 导入所有 protobuf 类型。
 use mux_protocol::{
-    AttachResponse, DeclineFileVersionResponse, Envelope, FetchGridUpdateResponse,
-    FetchScrollbackResponse, GetFileVersionResponse, ListFileVersionsResponse, Notification,
-    PROTOCOL_VERSION, Request, Response, SessionInfo, SessionLayoutChanged, ShellCommand,
-    ShellIntegrationResponse, TerminalSize, attach_request::AttachMode as AttachMode_,
-    check_frame_len, envelope::Payload as EnvelopePayload, frame,
-    notification::Event as NotifEvent, parse_len_prefix, request::Body as RequestBody,
-    response::Body as ResponseBody, split_node::SplitDirection,
+    AttachResponse, ClipboardEntry, DeclineFileVersionResponse, Envelope, FetchGridUpdateResponse,
+    FetchScrollbackResponse, GetFileVersionResponse, ListChangedFilesResponse,
+    ListCommandsResponse, ListDirResponse, ListFileVersionsResponse, Notification,
+    PROTOCOL_VERSION, ReadFileResponse, Request, Response, SearchScrollbackResponse, SessionInfo,
+    SessionLayoutChanged, ShellCommand, ShellIntegrationResponse, StatFileResponse, TerminalSize,
+    attach_request::AttachMode as AttachMode_, check_frame_len,
+    envelope::Payload as EnvelopePayload, frame, notification::Event as NotifEvent,
+    parse_len_prefix, request::Body as RequestBody, response::Body as ResponseBody,
+    split_node::SplitDirection,
 };
 
 // §16.6 SSH 远程连接模块（Plan 19）。
@@ -975,6 +977,58 @@ impl MuxDomain {
         }
     }
 
+    /// §12 在 pane 的 scrollback 历史里做正则搜索。
+    ///
+    /// `from_line` 是历史行下标 (0 = 最旧)，`direction` 0 = 向更旧、1 = 向更新。
+    /// 只搜历史，可见区不在范围内。
+    pub async fn search_scrollback(
+        &self,
+        pane: &str,
+        regex: &str,
+        from_line: u32,
+        direction: u32,
+        max_results: u32,
+    ) -> Result<SearchScrollbackResponse> {
+        let req = RequestBody::SearchScrollback(mux_protocol::SearchScrollbackRequest {
+            pane_id: pane.to_string(),
+            regex: regex.to_string(),
+            from_line,
+            direction,
+            max_results,
+        });
+        let resp = self.send_request(req).await?;
+        match resp.body {
+            Some(ResponseBody::SearchScrollback(matches)) => Ok(matches),
+            Some(ResponseBody::Error(error)) => Err(anyhow::anyhow!(error)),
+            _ => Err(anyhow::anyhow!(
+                "unexpected response type for search_scrollback"
+            )),
+        }
+    }
+
+    /// §3.10 列出 pane 里由 OSC 133 marker 划出的命令。
+    ///
+    /// `max_results` 为 0 表示"全部仍被保留的", 否则只取最近的 N 条。行号是
+    /// tmux 模型 (可见区首行 0, 负数进历史), 缺省表示那一行已不可寻址 —— 退出
+    /// 码不受影响, 仍然准确。
+    pub async fn list_commands(
+        &self,
+        pane: &str,
+        max_results: u32,
+    ) -> Result<ListCommandsResponse> {
+        let request = RequestBody::ListCommands(mux_protocol::ListCommandsRequest {
+            pane_id: pane.to_string(),
+            max_results,
+        });
+        let response = self.send_request(request).await?;
+        match response.body {
+            Some(ResponseBody::Commands(commands)) => Ok(commands),
+            _ => Err(anyhow::anyhow!(
+                "unexpected response type for list_commands"
+            )),
+        }
+    }
+
     // ========================================================================
     // §9 Attach / Detach（§3.10）
     // ========================================================================
@@ -1048,6 +1102,21 @@ impl MuxDomain {
     // §4 Shadow File Versions（crash-safe 文件系统版本控制）
     // ========================================================================
 
+    /// §4 列出指定会话内所有留有 shadow 版本的文件，按最新 SeqNo 从新到旧。
+    pub async fn list_changed_files(&self, session_id: &str) -> Result<ListChangedFilesResponse> {
+        let req = RequestBody::ListChangedFiles(mux_protocol::ListChangedFilesRequest {
+            session_id: session_id.to_string(),
+        });
+        let resp = self.send_request(req).await?;
+        match resp.body {
+            Some(ResponseBody::ChangedFiles(changed)) => Ok(changed),
+            Some(ResponseBody::Error(error)) => Err(anyhow::anyhow!(error)),
+            _ => Err(anyhow::anyhow!(
+                "unexpected response type for list_changed_files"
+            )),
+        }
+    }
+
     /// §4 列出指定会话内某路径的全部 shadow 版本。
     pub async fn list_file_versions(
         &self,
@@ -1061,6 +1130,7 @@ impl MuxDomain {
         let resp = self.send_request(req).await?;
         match resp.body {
             Some(ResponseBody::FileVersions(versions)) => Ok(versions),
+            Some(ResponseBody::Error(error)) => Err(anyhow::anyhow!(error)),
             _ => Err(anyhow::anyhow!(
                 "unexpected response type for list_file_versions"
             )),
@@ -1082,13 +1152,15 @@ impl MuxDomain {
         let resp = self.send_request(req).await?;
         match resp.body {
             Some(ResponseBody::FileVersionContent(content)) => Ok(content),
+            Some(ResponseBody::Error(error)) => Err(anyhow::anyhow!(error)),
             _ => Err(anyhow::anyhow!(
                 "unexpected response type for get_file_version"
             )),
         }
     }
 
-    /// §4.8 拒绝（撤销）指定版本，将文件回滚至前一版本。
+    /// §4.8 把文件还原成 `version_id` 那一版的内容，撤销此后的改动。
+    /// 传的是要还原到的版本，不是要丢弃的那一版。
     pub async fn decline_file_version(
         &self,
         session_id: &str,
@@ -1103,9 +1175,104 @@ impl MuxDomain {
         let resp = self.send_request(req).await?;
         match resp.body {
             Some(ResponseBody::DeclineFileVersion(resp)) => Ok(resp),
+            Some(ResponseBody::Error(error)) => Err(anyhow::anyhow!(error)),
             _ => Err(anyhow::anyhow!(
                 "unexpected response type for decline_file_version"
             )),
+        }
+    }
+
+    // ========================================================================
+    // §16.6 服务端剪贴板中继
+    // ========================================================================
+
+    /// §16.6 读取服务端剪贴板。
+    ///
+    /// 剪贴板从来没被设置过时服务端回的是一条空 TEXT 条目而不是 `None`，所以
+    /// "没设置过"和"设置成了空文本"在协议上分不开; 调用方只能按空内容处理。
+    pub async fn get_clipboard(&self) -> Result<ClipboardEntry> {
+        let req = RequestBody::GetClipboard(mux_protocol::GetClipboardRequest {});
+        let resp = self.send_request(req).await?;
+        match resp.body {
+            Some(ResponseBody::Clipboard(clipboard)) => clipboard
+                .entry
+                .context("clipboard response carried no entry"),
+            Some(ResponseBody::Error(error)) => Err(anyhow::anyhow!(error)),
+            _ => Err(anyhow::anyhow!(
+                "unexpected response type for get_clipboard"
+            )),
+        }
+    }
+
+    /// §16.6 设置服务端剪贴板，并让服务端向所有 attach 的客户端 fan-out
+    /// `ClipboardChanged`。
+    ///
+    /// 服务端成功时回的是**空** `Error` 体 (proto: `non-empty = error`)，因此这里
+    /// 必须走 `empty_or_error_response`; 直接 `Some(Error(e)) => Err(e)` 会把每一次
+    /// 成功都变成一条错误信息为空的失败。
+    pub async fn set_clipboard(&self, entry: ClipboardEntry) -> Result<()> {
+        let req =
+            RequestBody::SetClipboard(mux_protocol::SetClipboardRequest { entry: Some(entry) });
+        Self::empty_or_error_response(self.send_request(req).await?)
+    }
+
+    // ========================================================================
+    // §16.6 会话 worktree 内的文件访问
+    // ========================================================================
+
+    /// §16.6 读取本连接已 attach 的会话 worktree 内的一个文件。
+    ///
+    /// 路径相对该会话的 cwd 解析，绝对路径必须落在 cwd 内，`..` 一律拒绝。没有
+    /// attach 过任何会话的连接没有 worktree 范围，服务端会直接拒绝而不是退化成
+    /// 整个文件系统。
+    ///
+    /// proto 上的 `offset_line` / `max_lines` 服务端并不实现 —— 总是整份文件，
+    /// 所以这里不暴露这两个参数,免得调用方以为能分页。
+    pub async fn read_file(&self, path: &str) -> Result<ReadFileResponse> {
+        let req = RequestBody::ReadFile(mux_protocol::ReadFileRequest {
+            path: path.to_string(),
+            offset_line: None,
+            max_lines: None,
+        });
+        let resp = self.send_request(req).await?;
+        match resp.body {
+            Some(ResponseBody::FileContent(content)) => Ok(content),
+            // 越界路径 / 读不到的文件服务端回的是 Error 体; 落进兜底分支会把原因
+            // 换成一句无信息量的 "unexpected"。
+            Some(ResponseBody::Error(error)) => Err(anyhow::anyhow!(error)),
+            _ => Err(anyhow::anyhow!("unexpected response type for read_file")),
+        }
+    }
+
+    /// §16.6 列出已 attach 会话 worktree 内某个目录的条目，目录在前、其余按名称。
+    ///
+    /// `is_modified` 的含义是"本 session 的影子快照给它记过版本"; 会话没有 armed
+    /// 的 watcher 时它恒为 false，那是"未知"而不是"未改过"。
+    pub async fn list_dir(&self, path: &str) -> Result<ListDirResponse> {
+        let req = RequestBody::ListDir(mux_protocol::ListDirRequest {
+            path: path.to_string(),
+        });
+        let resp = self.send_request(req).await?;
+        match resp.body {
+            Some(ResponseBody::DirListing(listing)) => Ok(listing),
+            Some(ResponseBody::Error(error)) => Err(anyhow::anyhow!(error)),
+            _ => Err(anyhow::anyhow!("unexpected response type for list_dir")),
+        }
+    }
+
+    /// §16.6 取已 attach 会话 worktree 内某个路径的元数据。
+    ///
+    /// 路径不存在不是错误：服务端回 `exists=false` 的类型化响应。只有路径越界或
+    /// stat 本身失败 (权限等) 才是 Error 体。
+    pub async fn stat_file(&self, path: &str) -> Result<StatFileResponse> {
+        let req = RequestBody::StatFile(mux_protocol::StatFileRequest {
+            path: path.to_string(),
+        });
+        let resp = self.send_request(req).await?;
+        match resp.body {
+            Some(ResponseBody::FileStat(stat)) => Ok(stat),
+            Some(ResponseBody::Error(error)) => Err(anyhow::anyhow!(error)),
+            _ => Err(anyhow::anyhow!("unexpected response type for stat_file")),
         }
     }
 

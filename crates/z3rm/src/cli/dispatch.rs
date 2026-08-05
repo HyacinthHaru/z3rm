@@ -6,9 +6,12 @@ use std::path::PathBuf;
 use std::time::Duration;
 
 use mux::MuxDomain;
-use mux_protocol::proto::{PaneInfo, ShellCommand, split_node::SplitDirection};
+use mux_protocol::proto::{
+    ClipboardEntry, PaneInfo, ShellCommand,
+    clipboard_entry::ClipboardContentType as ProtoClipboardContentType, split_node::SplitDirection,
+};
 
-use super::capture::{CaptureLine, CaptureOptions};
+use super::capture::{CaptureLine, CaptureOptions, CommandSelector};
 use super::format::{FormatScope, expand as expand_format};
 use super::keys::parse_keys;
 use super::target::Target;
@@ -112,6 +115,14 @@ pub enum CliCommand {
         end: Option<CaptureLine>,
         join_wrapped: bool,
         escape: bool,
+        /// §3.3 `--last-command` / `--command <n>`: 用 OSC 133 marker 算出
+        /// `-S`/`-E`，与显式给的行号互斥。
+        command: Option<CommandSelector>,
+    },
+    /// §3.3 `z3rm list-commands [-t <target>] [-n <max>]` — 列出 OSC 133 命令
+    ListCommands {
+        target: Option<String>,
+        max_results: u32,
     },
     /// `z3rm list-panes [-t <target>] [-F <format>]` — 列出 session 中的 pane
     ListPanes {
@@ -147,6 +158,117 @@ pub enum CliCommand {
         target: Option<String>,
         title: String,
     },
+    /// §12 `z3rm search-scrollback [-t <target>] [-n <max>] [-S <line>] [-f] <regex>`
+    SearchScrollback {
+        target: Option<String>,
+        pattern: String,
+        start: Option<CaptureLine>,
+        forward: bool,
+        max_results: u32,
+    },
+    /// §4 `z3rm list-changes [-t <session>]` — 列出本 session 留有影子版本的文件
+    ListChanges {
+        target: Option<String>,
+    },
+    /// §4 `z3rm list-versions [-t <session>] <path>` — 列出某文件的影子版本
+    ListVersions {
+        target: Option<String>,
+        path: String,
+    },
+    /// §4 `z3rm show-version [-t <session>] <path> <id>` — 把某版本内容写到 stdout
+    ShowVersion {
+        target: Option<String>,
+        path: String,
+        version_id: u64,
+    },
+    /// §4.8 `z3rm restore [-t <session>] <path> <id>` — 把文件回滚到指定版本
+    Restore {
+        target: Option<String>,
+        path: String,
+        version_id: u64,
+    },
+    /// §16.6 `z3rm show-buffer [-I]` — 把服务端剪贴板写到 stdout
+    ShowBuffer {
+        info: bool,
+    },
+    /// §16.6 `z3rm set-buffer [--type <type>] [--] <data> | -` — 设置服务端剪贴板
+    SetBuffer {
+        content_type: ClipboardContentType,
+        source: BufferSource,
+    },
+    /// §16.6 `z3rm list-dir [-t <session>] [<path>]` — 列出会话 worktree 内的目录
+    ListDir {
+        target: Option<String>,
+        path: String,
+    },
+    /// §16.6 `z3rm stat-file [-t <session>] <path>` — 会话 worktree 内某路径的元数据
+    StatFile {
+        target: Option<String>,
+        path: String,
+    },
+    /// §16.6 `z3rm show-file [-t <session>] <path>` — 把会话 worktree 内的文件写到 stdout
+    ShowFile {
+        target: Option<String>,
+        path: String,
+    },
+}
+
+/// §16.6 `set-buffer` 的内容来源。
+///
+/// 剪贴板存的是字节，而 argv 只能承载 UTF-8，所以二进制内容必须走 stdin。
+#[derive(Debug, PartialEq, Eq)]
+pub enum BufferSource {
+    /// 命令行上的字面文本。
+    Literal(String),
+    /// `-`：从 stdin 读原始字节。
+    Stdin,
+}
+
+/// §16.6 剪贴板内容类型的 CLI 拼写。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum ClipboardContentType {
+    #[default]
+    Text,
+    ImagePng,
+    FilePath,
+}
+
+impl ClipboardContentType {
+    pub fn parse(value: &str) -> Option<Self> {
+        match value {
+            "text" => Some(Self::Text),
+            "png" => Some(Self::ImagePng),
+            "path" => Some(Self::FilePath),
+            _ => None,
+        }
+    }
+
+    fn to_proto(self) -> i32 {
+        let proto = match self {
+            Self::Text => ProtoClipboardContentType::Text,
+            Self::ImagePng => ProtoClipboardContentType::ImagePng,
+            Self::FilePath => ProtoClipboardContentType::FilePath,
+        };
+        proto as i32
+    }
+
+    /// 服务端回来的是 proto 的 i32；未知值和 UNSPECIFIED 都退回 text，与
+    /// `mux_server` 的 `ClipboardContentType::from_proto_value` 保持一致。
+    fn from_proto(value: i32) -> Self {
+        match ProtoClipboardContentType::from_i32(value) {
+            Some(ProtoClipboardContentType::ImagePng) => Self::ImagePng,
+            Some(ProtoClipboardContentType::FilePath) => Self::FilePath,
+            _ => Self::Text,
+        }
+    }
+
+    fn label(self) -> &'static str {
+        match self {
+            Self::Text => "text",
+            Self::ImagePng => "png",
+            Self::FilePath => "path",
+        }
+    }
 }
 
 fn current_pane_from_env() -> Option<String> {
@@ -353,6 +475,48 @@ fn read_paste_buffer() -> Result<String> {
         anyhow::bail!("paste-buffer got an empty buffer on stdin");
     }
     Ok(buffer)
+}
+
+/// §16.6 `set-buffer -` 的载荷从 stdin 读原始字节。
+///
+/// stdin 是终端时直接报错 —— 否则命令会静默挂住等用户敲 EOF。空输入是合法的
+/// (清空剪贴板), 所以这里不像 `paste-buffer` 那样拒绝空缓冲。
+fn read_buffer_bytes() -> Result<Vec<u8>> {
+    use std::io::{IsTerminal, Read};
+
+    let mut stdin = std::io::stdin();
+    if stdin.is_terminal() {
+        anyhow::bail!(
+            "set-buffer - reads the buffer from stdin; pipe it in (e.g. `cat logo.png | z3rm set-buffer --type png -`)"
+        );
+    }
+    let mut buffer = Vec::new();
+    stdin
+        .read_to_end(&mut buffer)
+        .context("failed to read the clipboard buffer from stdin")?;
+    Ok(buffer)
+}
+
+/// §16.6 剪贴板条目上的 `origin_host` —— 内容是从哪台机器复制来的。
+///
+/// 沿用 server 侧 OSC 52 中继用的同一个来源 (`HOSTNAME`), 否则同一台机器上
+/// 两条路径写进去的标签对不上。
+fn clipboard_origin_host() -> String {
+    std::env::var("HOSTNAME").unwrap_or_else(|_| "z3rm-cli".to_string())
+}
+
+/// §16.6 ReadFile / ListDir / StatFile 的路径范围来自**本连接已 attach 的会话**,
+/// 没 attach 过的连接服务端一律拒绝。CLI 每条命令都是一条新连接, 所以必须先
+/// attach 一次。
+///
+/// 用 ReadOnly: 这三个 RPC 只需要 ReadOnly 角色, 而 attach 模式会给整条连接定
+/// 权限上限, 一条只读命令没有理由拿到写权限。
+async fn attach_for_file_access(domain: &MuxDomain, session_id: &str) -> Result<()> {
+    domain
+        .attach(session_id, mux::AttachMode::ReadOnly)
+        .await
+        .with_context(|| format!("failed to attach to session {session_id} for file access"))?;
+    Ok(())
 }
 
 /// 执行 CLI 命令。
@@ -580,9 +744,22 @@ pub async fn run_cli_command(cmd: CliCommand) -> Result<()> {
             end,
             join_wrapped,
             escape,
+            command,
         } => {
             let target = super::target::parse_target(&target)?;
             let pane_id = resolve_pane_id(&domain, &target, ResolveAccess::ReadOnly).await?;
+            let (start, end) = match command {
+                Some(selector) => {
+                    let listed = domain
+                        .list_commands(&pane_id, 0)
+                        .await
+                        .context("failed to list shell commands")?;
+                    let selected = super::capture::select_command(&listed.commands, selector)?;
+                    let (start, end) = super::capture::command_capture_lines(selected)?;
+                    (Some(start), end)
+                }
+                None => (start, end),
+            };
             let options = CaptureOptions {
                 start,
                 end,
@@ -596,6 +773,59 @@ pub async fn run_cli_command(cmd: CliCommand) -> Result<()> {
                 print!("{}", text);
             } else {
                 println!("{}", text);
+            }
+        }
+
+        CliCommand::ListCommands {
+            target,
+            max_results,
+        } => {
+            let target = super::target::parse_target(&target)?;
+            let pane_id = resolve_pane_id(&domain, &target, ResolveAccess::ReadOnly).await?;
+            let listed = domain
+                .list_commands(&pane_id, max_results)
+                .await
+                .context("failed to list shell commands")?;
+            // marker 有而命令没有, 说明 shell 只画提示符、不报告命令边界。
+            // 这与"什么都没跑过"是两回事, 得说清楚。
+            if listed.commands.is_empty() && listed.recorded_markers == 0 {
+                println!("no OSC 133 markers recorded: this shell has no shell integration");
+            } else if listed.commands.is_empty() {
+                println!(
+                    "no commands recorded: this shell emits only prompt starts \
+                     ({} marker(s)), never command boundaries",
+                    listed.recorded_markers,
+                );
+            } else {
+                let mut unaddressable = 0usize;
+                for command in &listed.commands {
+                    let (start, end) = match super::capture::command_output_span(command) {
+                        super::capture::CommandSpan::Located { start, end } => (
+                            start.to_string(),
+                            end.map_or_else(|| "-".to_string(), |end| end.to_string()),
+                        ),
+                        super::capture::CommandSpan::Unaddressable => {
+                            unaddressable += 1;
+                            ("?".to_string(), "?".to_string())
+                        }
+                        super::capture::CommandSpan::Unmarked => ("?".to_string(), "?".to_string()),
+                    };
+                    let status = match (&command.command_end, command.exit_code) {
+                        (Some(_), Some(code)) => format!("exit={code}"),
+                        (Some(_), None) => "done".to_string(),
+                        (None, _) => "running".to_string(),
+                    };
+                    println!("{}\t{}\t{}\t{}", command.id, status, start, end);
+                }
+                if unaddressable > 0 {
+                    eprintln!(
+                        "note: {unaddressable} of {} command(s) have no usable line numbers — \
+                         their rows left the scrollback or the numbering was retired by a \
+                         resize, a clear, or scrollback reaching capacity. Exit statuses are \
+                         unaffected.",
+                        listed.commands.len(),
+                    );
+                }
             }
         }
 
@@ -761,6 +991,226 @@ pub async fn run_cli_command(cmd: CliCommand) -> Result<()> {
                 .await
                 .context("failed to set pane title")?;
             eprintln!("renamed window pane {} to '{}'", pane_id, title);
+        }
+        CliCommand::SearchScrollback {
+            target,
+            pattern,
+            start,
+            forward,
+            max_results,
+        } => {
+            let target = super::target::parse_target(&target)?;
+            let pane_id = resolve_pane_id(&domain, &target, ResolveAccess::ReadOnly).await?;
+            let hits = super::search::search_scrollback(
+                &domain,
+                &pane_id,
+                &pattern,
+                super::search::SearchOptions {
+                    start,
+                    forward,
+                    max_results,
+                },
+            )
+            .await?;
+            // grep 式的 `行号:内容`, 行号沿用 capture-pane 的 tmux 模型, 调用方可以
+            // 直接拿它去 `capture-pane -S <line> -E <line>` 取上下文。
+            for hit in &hits {
+                println!("{}:{}", hit.line, hit.text.trim_end());
+            }
+            // grep 契约: 没有命中就退出非 0, 让调用方能直接 `search-scrollback ... ||`
+            // 分支, 而不必去数输出行数。
+            anyhow::ensure!(!hits.is_empty(), "no matches for {pattern}");
+        }
+        CliCommand::ListChanges { target } => {
+            let target = super::target::parse_target(&target)?;
+            let session_id = resolve_session_id(&domain, &target, &default_session).await?;
+            let changed = domain
+                .list_changed_files(&session_id)
+                .await
+                .context("failed to list changed files")?;
+            if changed.files.is_empty() {
+                println!("no shadow versions recorded");
+            } else {
+                for file in &changed.files {
+                    println!(
+                        "{}\t{} version(s)\tseq {}",
+                        file.path, file.version_count, file.latest_seq_no,
+                    );
+                }
+            }
+        }
+        CliCommand::ListVersions { target, path } => {
+            let target = super::target::parse_target(&target)?;
+            let session_id = resolve_session_id(&domain, &target, &default_session).await?;
+            let versions = domain
+                .list_file_versions(&session_id, &path)
+                .await
+                .with_context(|| format!("failed to list versions of {path}"))?;
+            if versions.versions.is_empty() {
+                println!("no shadow versions for {path}");
+            } else {
+                for version in &versions.versions {
+                    println!(
+                        "{}\tseq {}\t{}",
+                        version.version_id, version.seq_no, version.trigger,
+                    );
+                }
+            }
+        }
+        CliCommand::ShowVersion {
+            target,
+            path,
+            version_id,
+        } => {
+            use std::io::Write as _;
+            let target = super::target::parse_target(&target)?;
+            let session_id = resolve_session_id(&domain, &target, &default_session).await?;
+            let version = domain
+                .get_file_version(&session_id, &path, version_id)
+                .await
+                .with_context(|| format!("failed to read version {version_id} of {path}"))?;
+            // 影子快照存的是字节, 不保证是 UTF-8; 原样写出去才能让调用方拿它和
+            // 磁盘上的文件逐字节比对。内容通常不以换行结尾, 显式 flush 才能保证
+            // 最后一段不被留在缓冲区里。
+            let mut stdout = std::io::stdout();
+            stdout
+                .write_all(&version.content)
+                .context("failed to write version content to stdout")?;
+            stdout
+                .flush()
+                .context("failed to flush version content to stdout")?;
+        }
+        CliCommand::Restore {
+            target,
+            path,
+            version_id,
+        } => {
+            let target = super::target::parse_target(&target)?;
+            let session_id = resolve_session_id(&domain, &target, &default_session).await?;
+            let response = domain
+                .decline_file_version(&session_id, &path, version_id)
+                .await
+                .with_context(|| format!("failed to restore {path} to version {version_id}"))?;
+            anyhow::ensure!(
+                response.restored,
+                "server did not confirm the restore of {path} to version {version_id}"
+            );
+            eprintln!("restored {path} to version {version_id}");
+        }
+        CliCommand::ShowBuffer { info } => {
+            use std::io::Write as _;
+            let entry = domain
+                .get_clipboard()
+                .await
+                .context("failed to read the server clipboard")?;
+            if info {
+                let origin = if entry.origin_host.is_empty() {
+                    "-"
+                } else {
+                    entry.origin_host.as_str()
+                };
+                println!(
+                    "{}\t{}\t{} bytes",
+                    ClipboardContentType::from_proto(entry.content_type).label(),
+                    origin,
+                    entry.data.len(),
+                );
+            } else {
+                // 剪贴板存的是字节, 不保证是 UTF-8 也不保证以换行结尾; 原样写出去
+                // 再显式 flush, 否则最后一段会留在缓冲区里。
+                let mut stdout = std::io::stdout();
+                stdout
+                    .write_all(&entry.data)
+                    .context("failed to write the clipboard to stdout")?;
+                stdout
+                    .flush()
+                    .context("failed to flush the clipboard to stdout")?;
+            }
+        }
+        CliCommand::SetBuffer {
+            content_type,
+            source,
+        } => {
+            let data = match source {
+                BufferSource::Literal(text) => text.into_bytes(),
+                BufferSource::Stdin => read_buffer_bytes()?,
+            };
+            let byte_count = data.len();
+            domain
+                .set_clipboard(ClipboardEntry {
+                    content_type: content_type.to_proto(),
+                    data,
+                    origin_host: clipboard_origin_host(),
+                })
+                .await
+                .context("failed to set the server clipboard")?;
+            eprintln!(
+                "clipboard set ({byte_count} bytes, {})",
+                content_type.label()
+            );
+        }
+        CliCommand::ListDir { target, path } => {
+            let target = super::target::parse_target(&target)?;
+            let session_id = resolve_session_id(&domain, &target, &default_session).await?;
+            attach_for_file_access(&domain, &session_id).await?;
+            let listing = domain
+                .list_dir(&path)
+                .await
+                .with_context(|| format!("failed to list {path}"))?;
+            // 固定四列 `<kind> <size> <modified> <name>`, 便于 awk/grep。目录里
+            // 空无一物是合法结果, 不是错误, 所以这里不像 search-scrollback 那样
+            // 在空结果上退非 0。
+            for entry in &listing.entries {
+                println!(
+                    "{}\t{}\t{}\t{}",
+                    if entry.is_dir { "dir" } else { "file" },
+                    entry.size,
+                    if entry.is_modified { "modified" } else { "-" },
+                    entry.name,
+                );
+            }
+        }
+        CliCommand::StatFile { target, path } => {
+            let target = super::target::parse_target(&target)?;
+            let session_id = resolve_session_id(&domain, &target, &default_session).await?;
+            attach_for_file_access(&domain, &session_id).await?;
+            let stat = domain
+                .stat_file(&path)
+                .await
+                .with_context(|| format!("failed to stat {path}"))?;
+            println!("exists\t{}", stat.exists);
+            // 路径不存在时服务端把 is_dir 填成 false; 照着印 "file" 会把一个不
+            // 存在的路径描述成一个文件。
+            let kind = match (stat.exists, stat.is_dir) {
+                (false, _) => "-",
+                (true, true) => "dir",
+                (true, false) => "file",
+            };
+            println!("type\t{kind}");
+            println!("size\t{}", stat.size);
+            println!("modified\t{}", stat.modified_timestamp);
+            // `test -e` 契约: 路径不在 = 非 0 退出。服务端刻意把"不存在"编码成
+            // exists=false 而不是错误, 所以这个区分只能在这里做出来。
+            anyhow::ensure!(stat.exists, "no such path in the session worktree: {path}");
+        }
+        CliCommand::ShowFile { target, path } => {
+            use std::io::Write as _;
+            let target = super::target::parse_target(&target)?;
+            let session_id = resolve_session_id(&domain, &target, &default_session).await?;
+            attach_for_file_access(&domain, &session_id).await?;
+            let file = domain
+                .read_file(&path)
+                .await
+                .with_context(|| format!("failed to read {path}"))?;
+            // 二进制文件也要原样落到 stdout, 调用方才能拿它和磁盘上的文件逐字节
+            // 比对; 显式 flush 保证末尾不留在缓冲区。
+            let mut stdout = std::io::stdout();
+            stdout
+                .write_all(&file.content)
+                .context("failed to write the file to stdout")?;
+            stdout
+                .flush()
+                .context("failed to flush the file to stdout")?;
         }
         CliCommand::Recover { target } => {
             if let Some(session_id) = target {

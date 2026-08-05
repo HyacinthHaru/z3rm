@@ -96,6 +96,9 @@ workspace = true
 [dependencies.futures]
 workspace = true
 
+[dependencies.fuzzy]
+workspace = true
+
 [dependencies.git]
 workspace = true
 
@@ -119,6 +122,9 @@ features = [ "screen-capture", "font-kit", "wayland", "x11"]
 [dependencies.hdrhistogram]
 workspace = true
 
+[dependencies.imara-diff]
+workspace = true
+
 [dependencies.itertools]
 workspace = true
 
@@ -131,6 +137,9 @@ workspace = true
 optional = true
 
 [dependencies.gpui_tokio]
+workspace = true
+
+[dependencies.regex]
 workspace = true
 
 [dependencies.rayon]

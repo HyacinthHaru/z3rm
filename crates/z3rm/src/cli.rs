@@ -6,12 +6,14 @@ pub mod dispatch;
 pub mod format;
 pub mod keys;
 pub mod marketplace;
+pub mod search;
 pub mod target;
 
-pub use capture::CaptureLine;
+pub use capture::{CaptureLine, CommandSelector};
 pub use dispatch::CliCommand;
 pub use dispatch::SendKeysEncoding;
 pub use dispatch::run_cli_command;
+pub use dispatch::{BufferSource, ClipboardContentType};
 
 use std::path::PathBuf;
 
@@ -72,6 +74,10 @@ pub fn parse_cli_args() -> Result<Option<CliCommand>, String> {
 /// from a real parse error and writes usage to stdout + exit(0).
 pub const HELP_REQUESTED: &str = "usage: z3rm <command> [args]";
 
+/// `search-scrollback -n` 的缺省上限。够一次 grep 用，又不至于让一个宽泛的正则
+/// 把整段历史倒进 agent 的上下文。
+const DEFAULT_SEARCH_RESULTS: u32 = 100;
+
 /// Return the full usage summary (spec §3.10 command table).
 pub fn format_usage() -> String {
     format!(
@@ -96,6 +102,11 @@ commands (spec §3.10):\n\
     paste-buffer [-t <target>]       paste stdin into a pane\n\
     capture-pane [-t <target>] [-p] [-S <line>] [-E <line>] [-J] [-e]\n\
                                      capture pane contents\n\
+    capture-pane [-t <target>] [-p] [-J] [-e] --last-command\n\
+    capture-pane [-t <target>] [-p] [-J] [-e] --command <n>\n\
+                                     capture one shell command's output\n\
+    list-commands [-t <target>] [-n <max>]\n\
+                                     list shell commands seen via OSC 133\n\
     list-panes [-t <session>] [-F <format>]\n\
                                      list panes in a session\n\
     list-windows [-t <session>] [-F <format>]\n\
@@ -106,10 +117,56 @@ commands (spec §3.10):\n\
                                      resize a pane, or toggle zoom with -Z\n\
     new-window [-t <session>]         create a new tab\n\
     rename-window -t <target> <title> set the pane title\n\
+    list-changes [-t <session>]      list files with shadow versions\n\
+    list-versions [-t <session>] <path>\n\
+                                     list a file's shadow versions\n\
+    show-version [-t <session>] <path> <version-id>\n\
+                                     write a shadow version to stdout\n\
+    restore [-t <session>] <path> <version-id>\n\
+                                     roll a file back to a shadow version\n\
+    search-scrollback [-t <target>] [-n <max>] [-S <line>] [-f] [--] <regex>\n\
+                                     search a pane's history and visible rows\n\
+    list-dir [-t <session>] [<path>] list a directory in the session cwd\n\
+    stat-file [-t <session>] <path>  print metadata for a path in the session cwd\n\
+    show-file [-t <session>] <path>  write a file from the session cwd to stdout\n\
+    show-buffer [-I]                 write the server clipboard to stdout\n\
+    set-buffer [--type text|png|path] [--] <data>\n\
+    set-buffer [--type text|png|path] -\n\
+                                     set the server clipboard ('-' reads stdin)\n\
+\n\
+list-dir, stat-file and show-file resolve paths inside the target session's\n\
+working directory: relative paths are joined to it, absolute paths must stay\n\
+within it, and '..' is always rejected. list-dir defaults to the session cwd\n\
+and prints '<kind>\\t<size>\\t<modified|->\\t<name>', directories first.\n\
+stat-file always prints its four fields and exits non-zero when the path does\n\
+not exist, so it can be used like 'test -e'.\n\
+\n\
+The clipboard is a single server-global buffer shared by every session, so\n\
+show-buffer and set-buffer take no target. show-buffer writes the raw bytes;\n\
+-I prints '<type>\\t<origin-host>\\t<n> bytes' instead. An empty clipboard and a\n\
+clipboard explicitly set to empty are indistinguishable over the protocol.\n\
 \n\
 capture-pane line numbers follow tmux: 0 is the first visible row, negative\n\
 numbers reach into history, and '-' is the far edge (history start for -S,\n\
 visible end for -E).\n\
+\n\
+list-commands needs a shell that emits OSC 133 markers. It prints one tab\n\
+separated row per command: '<id>\\t<status>\\t<start>\\t<end>'. status is\n\
+'exit=<n>', 'done' (the shell reported an end but no status) or 'running'.\n\
+start and end are capture-pane line numbers for that command's output, '-' is\n\
+the visible end (still running), and '?' means the rows can no longer be\n\
+addressed - they left the scrollback, or a resize, a clear or scrollback\n\
+reaching capacity retired the line numbering. Exit statuses stay accurate\n\
+either way. capture-pane --command <id> takes an id from that first column;\n\
+--command <n> with n <= 0 counts back from the newest command, and\n\
+--last-command is --command 0.\n\
+\n\
+search-scrollback reports matches as '<line>:<text>' using those same numbers,\n\
+so a hit can be fed straight back to 'capture-pane -S <line> -E <line>' for\n\
+context. It searches history and visible rows. By default it walks backwards\n\
+from the newest line and reports the newest -n matches; -f walks forwards from\n\
+the oldest and reports the oldest -n. -S picks where that walk starts. Exit\n\
+status is non-zero when nothing matched, like grep.\n\
 \n\
 -F format strings use tmux syntax: '#{{name}}' substitutes a variable,\n\
 '#{{?name,yes,no}}' branches on it, and '##' is a literal '#'. Unknown or\n\
@@ -217,6 +274,7 @@ fn is_mux_cli_command(command: &str) -> bool {
             | "send-keys"
             | "paste-buffer"
             | "capture-pane"
+            | "list-commands"
             | "list-panes"
             | "list-windows"
             | "select-pane"
@@ -224,7 +282,73 @@ fn is_mux_cli_command(command: &str) -> bool {
             | "resize-pane"
             | "new-window"
             | "rename-window"
+            | "list-changes"
+            | "list-versions"
+            | "show-version"
+            | "restore"
+            | "search-scrollback"
+            | "show-buffer"
+            | "set-buffer"
+            | "list-dir"
+            | "stat-file"
+            | "show-file"
     )
+}
+
+/// §4 解析影子快照命令的 `-t <target>` 加固定数量位置参数。
+///
+/// 未知 flag 一律报错而不是当作路径吞掉: 拼错的选项若被当成文件名, 换来的会是
+/// 一句服务端的 "path not found", 排查起来比直接拒绝难得多。
+fn parse_target_and_positionals(
+    command: &str,
+    args: &[String],
+) -> Result<(Option<String>, Vec<String>), String> {
+    let mut target = None;
+    let mut positionals = Vec::new();
+    let mut index = 0;
+    while index < args.len() {
+        match args[index].as_str() {
+            "-t" | "--target" => {
+                let value = args
+                    .get(index + 1)
+                    .filter(|value| !value.starts_with('-'))
+                    .ok_or_else(|| format!("{command} requires a value for -t"))?;
+                target = Some(value.clone());
+                index += 2;
+            }
+            option if option.starts_with('-') => {
+                return Err(format!("unsupported {command} option: {option}"));
+            }
+            value => {
+                positionals.push(value.to_string());
+                index += 1;
+            }
+        }
+    }
+    Ok((target, positionals))
+}
+
+fn parse_shadow_options(
+    command: &str,
+    args: &[String],
+    positional_names: &[&str],
+) -> Result<(Option<String>, Vec<String>), String> {
+    let (target, positionals) = parse_target_and_positionals(command, args)?;
+    if positionals.len() != positional_names.len() {
+        return Err(format!(
+            "{command} requires exactly {} argument(s): {}",
+            positional_names.len(),
+            positional_names.join(" "),
+        ));
+    }
+    Ok((target, positionals))
+}
+
+/// §4 位置参数里的版本 ID。解析失败要说清是哪个值坏了。
+fn parse_version_id(command: &str, value: &str) -> Result<u64, String> {
+    value
+        .parse::<u64>()
+        .map_err(|_| format!("{command}: invalid version id '{value}'"))
 }
 
 /// 解析 `-t <target>` / `-F <format>` 这类"只有可选 target + 可选 format"的
@@ -260,12 +384,33 @@ fn parse_list_options(
     Ok((target, format))
 }
 
+/// 解析 `capture-pane --command <n>`。
+///
+/// `list-commands` 的 id 都是正数，所以 `n >= 1` 无歧义地指某一条具体命令；
+/// `n <= 0` 是相对最新一条往回数的偏移 (`0` 最新、`-1` 上一条)，与
+/// `--last-command` 同一套。
+fn parse_command_selector(value: &str) -> Result<CommandSelector, String> {
+    let number = value.parse::<i64>().map_err(|_| {
+        format!("invalid value for --command: '{value}' is neither a command id nor an offset")
+    })?;
+    if number >= 1 {
+        return Ok(CommandSelector::Id(number as u64));
+    }
+    u32::try_from(number.unsigned_abs())
+        .map(CommandSelector::Recent)
+        .map_err(|_| format!("--command offset {value} is too far back"))
+}
+
 /// 解析 capture-pane 的 `-S` / `-E` 行号。
 ///
 /// tmux 行号模型: `0` 是可见区第一行，负数进入历史，字面量 `-` 是这一侧的
 /// 极端边界 (`-S -` 取到历史最开头，`-E -` 取到可见区最后一行)。
-fn parse_capture_line(value: Option<&String>, flag: &str) -> Result<CaptureLine, String> {
-    let value = value.ok_or_else(|| format!("capture-pane requires a value for {flag}"))?;
+fn parse_capture_line(
+    command: &str,
+    value: Option<&String>,
+    flag: &str,
+) -> Result<CaptureLine, String> {
+    let value = value.ok_or_else(|| format!("{command} requires a value for {flag}"))?;
     if value == "-" {
         return Ok(CaptureLine::Edge);
     }
@@ -544,6 +689,7 @@ fn parse_cli_args_lossy(args: &[String]) -> Result<Option<CliCommand>, String> {
             let mut end = None;
             let mut join_wrapped = false;
             let mut escape = false;
+            let mut command = None;
             let rest = &args[2..];
             let mut index = 0;
             while index < rest.len() {
@@ -561,11 +707,19 @@ fn parse_cli_args_lossy(args: &[String]) -> Result<Option<CliCommand>, String> {
                         index += 1;
                     }
                     "-S" | "--start-line" | "--scrollback" => {
-                        start = Some(parse_capture_line(rest.get(index + 1), "-S")?);
+                        start = Some(parse_capture_line(
+                            "capture-pane",
+                            rest.get(index + 1),
+                            "-S",
+                        )?);
                         index += 2;
                     }
                     "-E" | "--end-line" => {
-                        end = Some(parse_capture_line(rest.get(index + 1), "-E")?);
+                        end = Some(parse_capture_line(
+                            "capture-pane",
+                            rest.get(index + 1),
+                            "-E",
+                        )?);
                         index += 2;
                     }
                     "-J" | "--join" => {
@@ -576,8 +730,25 @@ fn parse_cli_args_lossy(args: &[String]) -> Result<Option<CliCommand>, String> {
                         escape = true;
                         index += 1;
                     }
+                    "--last-command" => {
+                        command = Some(CommandSelector::Recent(0));
+                        index += 1;
+                    }
+                    "--command" => {
+                        let value = rest
+                            .get(index + 1)
+                            .ok_or_else(|| "capture-pane requires a value for --command")?;
+                        command = Some(parse_command_selector(value)?);
+                        index += 2;
+                    }
                     option => return Err(format!("unsupported capture-pane option: {option}")),
                 }
+            }
+            // 两种给法都在算 `-S`/`-E`，同时给就无从判断该听谁的。
+            if command.is_some() && (start.is_some() || end.is_some()) {
+                return Err(
+                    "capture-pane --command / --last-command already picks -S and -E".to_string(),
+                );
             }
             Ok(Some(CliCommand::CapturePane {
                 target,
@@ -586,6 +757,43 @@ fn parse_cli_args_lossy(args: &[String]) -> Result<Option<CliCommand>, String> {
                 end,
                 join_wrapped,
                 escape,
+                command,
+            }))
+        }
+
+        "list-commands" => {
+            let mut target = None;
+            let mut max_results = 0u32;
+            let rest = &args[2..];
+            let mut index = 0;
+            while index < rest.len() {
+                match rest[index].as_str() {
+                    "-t" | "--target" => {
+                        let value = rest
+                            .get(index + 1)
+                            .filter(|value| !value.starts_with('-'))
+                            .ok_or_else(|| "list-commands requires a value for -t".to_string())?;
+                        target = Some(value.clone());
+                        index += 2;
+                    }
+                    "-n" | "--max-results" => {
+                        let value = rest
+                            .get(index + 1)
+                            .ok_or_else(|| "list-commands requires a value for -n".to_string())?;
+                        max_results = value
+                            .parse::<u32>()
+                            .map_err(|_| format!("invalid integer for -n: '{value}'"))?;
+                        if max_results == 0 {
+                            return Err("list-commands -n must be at least 1".to_string());
+                        }
+                        index += 2;
+                    }
+                    option => return Err(format!("unsupported list-commands option: {option}")),
+                }
+            }
+            Ok(Some(CliCommand::ListCommands {
+                target,
+                max_results,
             }))
         }
 
@@ -747,6 +955,226 @@ fn parse_cli_args_lossy(args: &[String]) -> Result<Option<CliCommand>, String> {
             Ok(Some(CliCommand::RenameWindow { target, title }))
         }
 
+        "search-scrollback" => {
+            let mut target = None;
+            let mut start = None;
+            let mut forward = false;
+            let mut max_results = DEFAULT_SEARCH_RESULTS;
+            let mut pattern = None;
+            let rest = &args[2..];
+            let mut index = 0;
+            let mut options_ended = false;
+            while index < rest.len() {
+                // 正则本身可能以 `-` 开头 (`-v`、`--foo`)。`--` 之后一律当字面量,
+                // 与 send-keys 的处理保持一致。
+                if options_ended || !rest[index].starts_with('-') || rest[index] == "-" {
+                    if pattern.is_some() {
+                        return Err("search-scrollback takes exactly one regex".to_string());
+                    }
+                    pattern = Some(rest[index].clone());
+                    index += 1;
+                    continue;
+                }
+                match rest[index].as_str() {
+                    "--" => {
+                        options_ended = true;
+                        index += 1;
+                    }
+                    "-t" | "--target" => {
+                        let value = rest
+                            .get(index + 1)
+                            .filter(|value| !value.starts_with('-'))
+                            .ok_or_else(|| {
+                                "search-scrollback requires a value for -t".to_string()
+                            })?;
+                        target = Some(value.clone());
+                        index += 2;
+                    }
+                    "-S" | "--start-line" => {
+                        start = Some(parse_capture_line(
+                            "search-scrollback",
+                            rest.get(index + 1),
+                            "-S",
+                        )?);
+                        index += 2;
+                    }
+                    "-n" | "--max-results" => {
+                        let value = rest.get(index + 1).ok_or_else(|| {
+                            "search-scrollback requires a value for -n".to_string()
+                        })?;
+                        max_results = value
+                            .parse::<u32>()
+                            .map_err(|_| format!("invalid integer for -n: '{value}'"))?;
+                        if max_results == 0 {
+                            return Err("search-scrollback -n must be at least 1".to_string());
+                        }
+                        index += 2;
+                    }
+                    "-f" | "--forward" => {
+                        forward = true;
+                        index += 1;
+                    }
+                    option => {
+                        return Err(format!("unsupported search-scrollback option: {option}"));
+                    }
+                }
+            }
+            let pattern =
+                pattern.ok_or_else(|| "search-scrollback requires a regex".to_string())?;
+            Ok(Some(CliCommand::SearchScrollback {
+                target,
+                pattern,
+                start,
+                forward,
+                max_results,
+            }))
+        }
+
+        "list-changes" => {
+            let (target, _) = parse_shadow_options("list-changes", &args[2..], &[])?;
+            Ok(Some(CliCommand::ListChanges { target }))
+        }
+
+        "list-versions" => {
+            let (target, positionals) =
+                parse_shadow_options("list-versions", &args[2..], &["<path>"])?;
+            let mut positionals = positionals.into_iter();
+            let path = positionals
+                .next()
+                .ok_or_else(|| "list-versions requires a path".to_string())?;
+            Ok(Some(CliCommand::ListVersions { target, path }))
+        }
+
+        "show-version" => {
+            let (target, positionals) =
+                parse_shadow_options("show-version", &args[2..], &["<path>", "<version-id>"])?;
+            let mut positionals = positionals.into_iter();
+            let path = positionals
+                .next()
+                .ok_or_else(|| "show-version requires a path".to_string())?;
+            let version_id = positionals
+                .next()
+                .ok_or_else(|| "show-version requires a version id".to_string())?;
+            let version_id = parse_version_id("show-version", &version_id)?;
+            Ok(Some(CliCommand::ShowVersion {
+                target,
+                path,
+                version_id,
+            }))
+        }
+
+        "restore" => {
+            let (target, positionals) =
+                parse_shadow_options("restore", &args[2..], &["<path>", "<version-id>"])?;
+            let mut positionals = positionals.into_iter();
+            let path = positionals
+                .next()
+                .ok_or_else(|| "restore requires a path".to_string())?;
+            let version_id = positionals
+                .next()
+                .ok_or_else(|| "restore requires a version id".to_string())?;
+            let version_id = parse_version_id("restore", &version_id)?;
+            Ok(Some(CliCommand::Restore {
+                target,
+                path,
+                version_id,
+            }))
+        }
+
+        // §16.6 剪贴板是服务端全局的一份内容, 不属于任何会话, 所以这两条命令
+        // 没有 -t。
+        "show-buffer" => {
+            let mut info = false;
+            for option in &args[2..] {
+                match option.as_str() {
+                    "-I" | "--info" => info = true,
+                    option => return Err(format!("unsupported show-buffer option: {option}")),
+                }
+            }
+            Ok(Some(CliCommand::ShowBuffer { info }))
+        }
+
+        "set-buffer" => {
+            let mut content_type = ClipboardContentType::default();
+            let mut source = None;
+            let rest = &args[2..];
+            let mut index = 0;
+            let mut options_ended = false;
+            while index < rest.len() {
+                // 载荷本身可能以 `-` 开头。`--` 之后一律当字面量, 与 send-keys /
+                // search-scrollback 的处理保持一致; 单独的 `-` 是 stdin。
+                if options_ended || !rest[index].starts_with('-') {
+                    if source.is_some() {
+                        return Err("set-buffer takes exactly one payload".to_string());
+                    }
+                    source = Some(BufferSource::Literal(rest[index].clone()));
+                    index += 1;
+                    continue;
+                }
+                match rest[index].as_str() {
+                    "--" => {
+                        options_ended = true;
+                        index += 1;
+                    }
+                    "-" => {
+                        if source.is_some() {
+                            return Err("set-buffer takes exactly one payload".to_string());
+                        }
+                        source = Some(BufferSource::Stdin);
+                        index += 1;
+                    }
+                    "--type" => {
+                        let value = rest
+                            .get(index + 1)
+                            .ok_or_else(|| "set-buffer requires a value for --type".to_string())?;
+                        content_type = ClipboardContentType::parse(value).ok_or_else(|| {
+                            format!("unsupported set-buffer type '{value}': use text, png or path")
+                        })?;
+                        index += 2;
+                    }
+                    option => return Err(format!("unsupported set-buffer option: {option}")),
+                }
+            }
+            let source = source
+                .ok_or_else(|| "set-buffer requires a payload, or - to read stdin".to_string())?;
+            Ok(Some(CliCommand::SetBuffer {
+                content_type,
+                source,
+            }))
+        }
+
+        // §16.6 路径缺省是会话 cwd 本身 —— 服务端拒绝空路径, 所以这里补成 "."
+        // 而不是把空串发过去。
+        "list-dir" => {
+            let (target, positionals) = parse_target_and_positionals("list-dir", &args[2..])?;
+            if positionals.len() > 1 {
+                return Err("list-dir takes at most one path".to_string());
+            }
+            let path = positionals
+                .into_iter()
+                .next()
+                .unwrap_or_else(|| ".".to_string());
+            Ok(Some(CliCommand::ListDir { target, path }))
+        }
+
+        "stat-file" => {
+            let (target, positionals) = parse_shadow_options("stat-file", &args[2..], &["<path>"])?;
+            let path = positionals
+                .into_iter()
+                .next()
+                .ok_or_else(|| "stat-file requires a path".to_string())?;
+            Ok(Some(CliCommand::StatFile { target, path }))
+        }
+
+        "show-file" => {
+            let (target, positionals) = parse_shadow_options("show-file", &args[2..], &["<path>"])?;
+            let path = positionals
+                .into_iter()
+                .next()
+                .ok_or_else(|| "show-file requires a path".to_string())?;
+            Ok(Some(CliCommand::ShowFile { target, path }))
+        }
+
         _ => Err(format!("unknown subcommand: {subcommand}")),
     }
 }
@@ -856,6 +1284,276 @@ mod tests {
     }
 
     #[test]
+    fn search_scrollback_defaults_to_a_backward_whole_pane_search() {
+        let parsed = parse_cli_args_from(&args(&["search-scrollback", "error"])).expect("parse");
+        match parsed {
+            Some(CliCommand::SearchScrollback {
+                target,
+                pattern,
+                start,
+                forward,
+                max_results,
+            }) => {
+                assert_eq!(target, None);
+                assert_eq!(pattern, "error");
+                assert_eq!(start, None);
+                assert!(!forward);
+                assert_eq!(max_results, DEFAULT_SEARCH_RESULTS);
+            }
+            other => panic!("unexpected parse result: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn search_scrollback_parses_every_option() {
+        let parsed = parse_cli_args_from(&args(&[
+            "search-scrollback",
+            "-t",
+            "dev",
+            "-S",
+            "-50",
+            "-n",
+            "5",
+            "-f",
+            "warn.*ing",
+        ]))
+        .expect("parse");
+        match parsed {
+            Some(CliCommand::SearchScrollback {
+                target,
+                pattern,
+                start,
+                forward,
+                max_results,
+            }) => {
+                assert_eq!(target.as_deref(), Some("dev"));
+                assert_eq!(pattern, "warn.*ing");
+                assert_eq!(start, Some(CaptureLine::Line(-50)));
+                assert!(forward);
+                assert_eq!(max_results, 5);
+            }
+            other => panic!("unexpected parse result: {other:?}"),
+        }
+    }
+
+    /// 正则本身可能长得像一个选项; `--` 之后必须一律当字面量。
+    #[test]
+    fn search_scrollback_takes_a_hyphen_leading_regex_after_the_terminator() {
+        let parsed =
+            parse_cli_args_from(&args(&["search-scrollback", "--", "-v.*"])).expect("parse");
+        match parsed {
+            Some(CliCommand::SearchScrollback { pattern, .. }) => assert_eq!(pattern, "-v.*"),
+            other => panic!("unexpected parse result: {other:?}"),
+        }
+
+        assert!(parse_cli_args_from(&args(&["search-scrollback", "-v.*"])).is_err());
+    }
+
+    #[test]
+    fn search_scrollback_rejects_malformed_invocations() {
+        assert!(parse_cli_args_from(&args(&["search-scrollback"])).is_err());
+        assert!(parse_cli_args_from(&args(&["search-scrollback", "a", "b"])).is_err());
+        assert!(parse_cli_args_from(&args(&["search-scrollback", "-n", "0", "x"])).is_err());
+        assert!(parse_cli_args_from(&args(&["search-scrollback", "-n", "abc", "x"])).is_err());
+        assert!(parse_cli_args_from(&args(&["search-scrollback", "-S", "abc", "x"])).is_err());
+        assert!(parse_cli_args_from(&args(&["search-scrollback", "--bogus", "x"])).is_err());
+    }
+
+    #[test]
+    fn list_changes_takes_only_an_optional_target() {
+        let parsed = parse_cli_args_from(&args(&["list-changes"])).expect("parse");
+        match parsed {
+            Some(CliCommand::ListChanges { target }) => assert_eq!(target, None),
+            other => panic!("unexpected parse result: {other:?}"),
+        }
+
+        let parsed = parse_cli_args_from(&args(&["list-changes", "-t", "dev"])).expect("parse");
+        match parsed {
+            Some(CliCommand::ListChanges { target }) => assert_eq!(target.as_deref(), Some("dev")),
+            other => panic!("unexpected parse result: {other:?}"),
+        }
+
+        assert!(parse_cli_args_from(&args(&["list-changes", "extra"])).is_err());
+    }
+
+    #[test]
+    fn list_dir_defaults_to_the_session_cwd() {
+        let parsed = parse_cli_args_from(&args(&["list-dir"])).expect("parse");
+        match parsed {
+            Some(CliCommand::ListDir { target, path }) => {
+                assert_eq!(target, None);
+                // 服务端拒绝空路径, 所以缺省必须是一个真的能解析的路径。
+                assert_eq!(path, ".");
+            }
+            other => panic!("unexpected parse result: {other:?}"),
+        }
+
+        let parsed = parse_cli_args_from(&args(&["list-dir", "-t", "dev", "src"])).expect("parse");
+        match parsed {
+            Some(CliCommand::ListDir { target, path }) => {
+                assert_eq!(target.as_deref(), Some("dev"));
+                assert_eq!(path, "src");
+            }
+            other => panic!("unexpected parse result: {other:?}"),
+        }
+
+        assert!(parse_cli_args_from(&args(&["list-dir", "src", "crates"])).is_err());
+        assert!(parse_cli_args_from(&args(&["list-dir", "--bogus"])).is_err());
+    }
+
+    #[test]
+    fn stat_file_and_show_file_require_exactly_one_path() {
+        let parsed =
+            parse_cli_args_from(&args(&["stat-file", "-t", "dev", "src/main.rs"])).expect("parse");
+        match parsed {
+            Some(CliCommand::StatFile { target, path }) => {
+                assert_eq!(target.as_deref(), Some("dev"));
+                assert_eq!(path, "src/main.rs");
+            }
+            other => panic!("unexpected parse result: {other:?}"),
+        }
+
+        let parsed = parse_cli_args_from(&args(&["show-file", "src/main.rs"])).expect("parse");
+        match parsed {
+            Some(CliCommand::ShowFile { target, path }) => {
+                assert_eq!(target, None);
+                assert_eq!(path, "src/main.rs");
+            }
+            other => panic!("unexpected parse result: {other:?}"),
+        }
+
+        assert!(parse_cli_args_from(&args(&["stat-file"])).is_err());
+        assert!(parse_cli_args_from(&args(&["show-file"])).is_err());
+        assert!(parse_cli_args_from(&args(&["show-file", "a.rs", "b.rs"])).is_err());
+    }
+
+    #[test]
+    fn show_buffer_takes_only_the_info_switch() {
+        let parsed = parse_cli_args_from(&args(&["show-buffer"])).expect("parse");
+        match parsed {
+            Some(CliCommand::ShowBuffer { info }) => assert!(!info),
+            other => panic!("unexpected parse result: {other:?}"),
+        }
+
+        let parsed = parse_cli_args_from(&args(&["show-buffer", "-I"])).expect("parse");
+        match parsed {
+            Some(CliCommand::ShowBuffer { info }) => assert!(info),
+            other => panic!("unexpected parse result: {other:?}"),
+        }
+
+        // 剪贴板是服务端全局的一份, -t 没有意义, 静默忽略它会让人以为分会话。
+        assert!(parse_cli_args_from(&args(&["show-buffer", "-t", "dev"])).is_err());
+    }
+
+    #[test]
+    fn set_buffer_parses_payload_type_and_stdin() {
+        let parsed = parse_cli_args_from(&args(&["set-buffer", "hello"])).expect("parse");
+        match parsed {
+            Some(CliCommand::SetBuffer {
+                content_type,
+                source,
+            }) => {
+                assert_eq!(content_type, ClipboardContentType::Text);
+                assert_eq!(source, BufferSource::Literal("hello".to_string()));
+            }
+            other => panic!("unexpected parse result: {other:?}"),
+        }
+
+        let parsed =
+            parse_cli_args_from(&args(&["set-buffer", "--type", "png", "-"])).expect("parse");
+        match parsed {
+            Some(CliCommand::SetBuffer {
+                content_type,
+                source,
+            }) => {
+                assert_eq!(content_type, ClipboardContentType::ImagePng);
+                assert_eq!(source, BufferSource::Stdin);
+            }
+            other => panic!("unexpected parse result: {other:?}"),
+        }
+
+        // 载荷本身可以以 `-` 开头, 但只在 `--` 之后。
+        let parsed = parse_cli_args_from(&args(&["set-buffer", "--", "-n"])).expect("parse");
+        match parsed {
+            Some(CliCommand::SetBuffer { source, .. }) => {
+                assert_eq!(source, BufferSource::Literal("-n".to_string()));
+            }
+            other => panic!("unexpected parse result: {other:?}"),
+        }
+
+        assert!(parse_cli_args_from(&args(&["set-buffer"])).is_err());
+        assert!(parse_cli_args_from(&args(&["set-buffer", "a", "b"])).is_err());
+        assert!(parse_cli_args_from(&args(&["set-buffer", "--type", "gif", "x"])).is_err());
+        assert!(parse_cli_args_from(&args(&["set-buffer", "--type"])).is_err());
+        assert!(parse_cli_args_from(&args(&["set-buffer", "-n"])).is_err());
+    }
+
+    #[test]
+    fn list_versions_requires_exactly_one_path() {
+        let parsed = parse_cli_args_from(&args(&["list-versions", "-t", "dev", "src/main.rs"]))
+            .expect("parse");
+        match parsed {
+            Some(CliCommand::ListVersions { target, path }) => {
+                assert_eq!(target.as_deref(), Some("dev"));
+                assert_eq!(path, "src/main.rs");
+            }
+            other => panic!("unexpected parse result: {other:?}"),
+        }
+
+        assert!(parse_cli_args_from(&args(&["list-versions"])).is_err());
+        assert!(parse_cli_args_from(&args(&["list-versions", "a.rs", "b.rs"])).is_err());
+    }
+
+    #[test]
+    fn show_version_parses_path_and_version_id() {
+        let parsed =
+            parse_cli_args_from(&args(&["show-version", "src/main.rs", "42"])).expect("parse");
+        match parsed {
+            Some(CliCommand::ShowVersion {
+                target,
+                path,
+                version_id,
+            }) => {
+                assert_eq!(target, None);
+                assert_eq!(path, "src/main.rs");
+                assert_eq!(version_id, 42);
+            }
+            other => panic!("unexpected parse result: {other:?}"),
+        }
+
+        assert!(parse_cli_args_from(&args(&["show-version", "src/main.rs"])).is_err());
+        assert!(parse_cli_args_from(&args(&["show-version", "src/main.rs", "abc"])).is_err());
+    }
+
+    #[test]
+    fn restore_parses_path_and_version_id() {
+        let parsed = parse_cli_args_from(&args(&["restore", "-t", "dev", "src/main.rs", "7"]))
+            .expect("parse");
+        match parsed {
+            Some(CliCommand::Restore {
+                target,
+                path,
+                version_id,
+            }) => {
+                assert_eq!(target.as_deref(), Some("dev"));
+                assert_eq!(path, "src/main.rs");
+                assert_eq!(version_id, 7);
+            }
+            other => panic!("unexpected parse result: {other:?}"),
+        }
+
+        assert!(parse_cli_args_from(&args(&["restore", "src/main.rs"])).is_err());
+    }
+
+    /// 拼错的选项必须报错, 否则会被当成路径发给服务端换来一句无关的 not-found。
+    #[test]
+    fn shadow_commands_reject_unknown_options() {
+        assert!(parse_cli_args_from(&args(&["list-changes", "--sesion", "dev"])).is_err());
+        assert!(parse_cli_args_from(&args(&["list-versions", "-S", "a.rs"])).is_err());
+        assert!(parse_cli_args_from(&args(&["restore", "-t"])).is_err());
+    }
+
+    #[test]
     fn paste_buffer_takes_only_a_target() {
         let parsed = parse_cli_args_from(&args(&["paste-buffer", "-t", "dev"])).expect("parse");
         match parsed {
@@ -956,6 +1654,7 @@ mod tests {
                 print,
                 escape,
                 target,
+                command,
             }) => {
                 assert_eq!(start, Some(CaptureLine::Line(-100)));
                 assert_eq!(end, Some(CaptureLine::Edge));
@@ -963,6 +1662,7 @@ mod tests {
                 assert!(print);
                 assert!(!escape);
                 assert_eq!(target, None);
+                assert_eq!(command, None);
             }
             other => panic!("unexpected parse result: {other:?}"),
         }
@@ -983,6 +1683,126 @@ mod tests {
                 assert_eq!(start, Some(CaptureLine::Line(0)))
             }
             other => panic!("unexpected parse result: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn capture_pane_selects_a_command_by_offset_or_id() {
+        let parsed = parse_cli_args_from(&args(&[
+            "capture-pane",
+            "-t",
+            "dev",
+            "--last-command",
+            "-p",
+        ]))
+        .expect("parse");
+        match parsed {
+            Some(CliCommand::CapturePane {
+                target,
+                command,
+                print,
+                start,
+                end,
+                ..
+            }) => {
+                assert_eq!(target.as_deref(), Some("dev"));
+                assert_eq!(command, Some(CommandSelector::Recent(0)));
+                assert!(print);
+                assert_eq!(start, None);
+                assert_eq!(end, None);
+            }
+            other => panic!("unexpected parse result: {other:?}"),
+        }
+
+        // n <= 0 数的是"从最新往回第几条", 与 --last-command 同一套。
+        for (argument, expected) in [
+            ("0", CommandSelector::Recent(0)),
+            ("-1", CommandSelector::Recent(1)),
+            ("-12", CommandSelector::Recent(12)),
+            // list-commands 打印的 id 都 >= 1, 所以正数无歧义地指某一条命令。
+            ("1", CommandSelector::Id(1)),
+            ("41", CommandSelector::Id(41)),
+        ] {
+            let parsed = parse_cli_args_from(&args(&["capture-pane", "--command", argument]))
+                .expect("parse");
+            match parsed {
+                Some(CliCommand::CapturePane { command, .. }) => assert_eq!(
+                    command,
+                    Some(expected),
+                    "--command {argument} should select {expected:?}"
+                ),
+                other => panic!("unexpected parse result: {other:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn capture_pane_rejects_a_command_selector_mixed_with_line_numbers() {
+        // 两者都在决定 -S/-E, 同时给就无从判断听谁的。
+        for arguments in [
+            vec!["capture-pane", "--last-command", "-S", "-5"],
+            vec!["capture-pane", "-E", "3", "--command", "-1"],
+        ] {
+            let error = parse_cli_args_from(&args(&arguments))
+                .expect_err("mixing --command with -S/-E must be rejected");
+            assert!(error.contains("--command"), "{error}");
+        }
+
+        for arguments in [
+            vec!["capture-pane", "--command"],
+            vec!["capture-pane", "--command", "abc"],
+            vec!["capture-pane", "--command", "1.5"],
+        ] {
+            assert!(
+                parse_cli_args_from(&args(&arguments)).is_err(),
+                "arguments {arguments:?} must be rejected"
+            );
+        }
+    }
+
+    #[test]
+    fn list_commands_defaults_to_every_retained_command() {
+        let parsed = parse_cli_args_from(&args(&["list-commands"])).expect("parse");
+        match parsed {
+            Some(CliCommand::ListCommands {
+                target,
+                max_results,
+            }) => {
+                assert_eq!(target, None);
+                // 0 = 服务端保留多少给多少。
+                assert_eq!(max_results, 0);
+            }
+            other => panic!("unexpected parse result: {other:?}"),
+        }
+
+        let parsed =
+            parse_cli_args_from(&args(&["list-commands", "-t", "dev", "-n", "5"])).expect("parse");
+        match parsed {
+            Some(CliCommand::ListCommands {
+                target,
+                max_results,
+            }) => {
+                assert_eq!(target.as_deref(), Some("dev"));
+                assert_eq!(max_results, 5);
+            }
+            other => panic!("unexpected parse result: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn list_commands_rejects_malformed_invocations() {
+        for arguments in [
+            vec!["list-commands", "-n"],
+            vec!["list-commands", "-n", "0"],
+            vec!["list-commands", "-n", "abc"],
+            vec!["list-commands", "-t"],
+            vec!["list-commands", "--bogus"],
+            vec!["list-commands", "extra"],
+        ] {
+            assert!(
+                parse_cli_args_from(&args(&arguments)).is_err(),
+                "arguments {arguments:?} must be rejected"
+            );
         }
     }
 

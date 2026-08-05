@@ -4128,9 +4128,18 @@ pub(crate) fn all_projects(
     cx: &App,
 ) -> impl Iterator<Item = Entity<Project>> {
     let mut seen_project_ids = std::collections::HashSet::new();
+    // The originating window comes first so its settings files keep their
+    // position in the file list, but every other open workspace window
+    // contributes its projects too.
     window
-        .and_then(|handle| handle.read(cx).ok())
+        .copied()
         .into_iter()
+        .chain(
+            cx.windows()
+                .into_iter()
+                .filter_map(|handle| handle.downcast::<MultiWorkspace>()),
+        )
+        .filter_map(|handle| handle.read(cx).ok())
         .flat_map(|multi_workspace| {
             multi_workspace
                 .workspaces()
@@ -5697,7 +5706,11 @@ mod project_settings_update_tests {
 
     #[gpui::test]
     async fn test_updates_existing_settings_file(cx: &mut TestAppContext) {
-        let setup = init_test(cx, Some(r#"{ "tab_size": 2 }"#)).await;
+        let setup = init_test(
+            cx,
+            Some("{\n  \"all_languages\": {\n    \"defaults\": {\n      \"tab_size\": 2\n    }\n  }\n}"),
+        )
+        .await;
 
         let entry = ProjectSettingsUpdateEntry {
             worktree_id: setup.worktree_id,
@@ -5884,7 +5897,11 @@ mod project_settings_update_tests {
 
     #[gpui::test]
     async fn test_reloads_conflicted_buffer(cx: &mut TestAppContext) {
-        let setup = init_test(cx, Some(r#"{ "tab_size": 2 }"#)).await;
+        let setup = init_test(
+            cx,
+            Some("{\n  \"all_languages\": {\n    \"defaults\": {\n      \"tab_size\": 2\n    }\n  }\n}"),
+        )
+        .await;
 
         let buffer_store = setup
             .project
@@ -5907,7 +5924,8 @@ mod project_settings_update_tests {
             .fs
             .save(
                 "/project/.zed/settings.json".as_ref(),
-                &r#"{ "tab_size": 99 }"#.into(),
+                &"{\n  \"all_languages\": {\n    \"defaults\": {\n      \"tab_size\": 99\n    }\n  }\n}"
+                    .into(),
                 Default::default(),
             )
             .await
