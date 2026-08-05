@@ -13,6 +13,7 @@ pub use capture::CaptureLine;
 pub use dispatch::CliCommand;
 pub use dispatch::SendKeysEncoding;
 pub use dispatch::run_cli_command;
+pub use dispatch::{BufferSource, ClipboardContentType};
 
 use std::path::PathBuf;
 
@@ -120,6 +121,25 @@ commands (spec §3.10):\n\
                                      roll a file back to a shadow version\n\
     search-scrollback [-t <target>] [-n <max>] [-S <line>] [-f] [--] <regex>\n\
                                      search a pane's history and visible rows\n\
+    list-dir [-t <session>] [<path>] list a directory in the session cwd\n\
+    stat-file [-t <session>] <path>  print metadata for a path in the session cwd\n\
+    show-file [-t <session>] <path>  write a file from the session cwd to stdout\n\
+    show-buffer [-I]                 write the server clipboard to stdout\n\
+    set-buffer [--type text|png|path] [--] <data>\n\
+    set-buffer [--type text|png|path] -\n\
+                                     set the server clipboard ('-' reads stdin)\n\
+\n\
+list-dir, stat-file and show-file resolve paths inside the target session's\n\
+working directory: relative paths are joined to it, absolute paths must stay\n\
+within it, and '..' is always rejected. list-dir defaults to the session cwd\n\
+and prints '<kind>\\t<size>\\t<modified|->\\t<name>', directories first.\n\
+stat-file always prints its four fields and exits non-zero when the path does\n\
+not exist, so it can be used like 'test -e'.\n\
+\n\
+The clipboard is a single server-global buffer shared by every session, so\n\
+show-buffer and set-buffer take no target. show-buffer writes the raw bytes;\n\
+-I prints '<type>\\t<origin-host>\\t<n> bytes' instead. An empty clipboard and a\n\
+clipboard explicitly set to empty are indistinguishable over the protocol.\n\
 \n\
 capture-pane line numbers follow tmux: 0 is the first visible row, negative\n\
 numbers reach into history, and '-' is the far edge (history start for -S,\n\
@@ -250,6 +270,11 @@ fn is_mux_cli_command(command: &str) -> bool {
             | "show-version"
             | "restore"
             | "search-scrollback"
+            | "show-buffer"
+            | "set-buffer"
+            | "list-dir"
+            | "stat-file"
+            | "show-file"
     )
 }
 
@@ -257,10 +282,9 @@ fn is_mux_cli_command(command: &str) -> bool {
 ///
 /// 未知 flag 一律报错而不是当作路径吞掉: 拼错的选项若被当成文件名, 换来的会是
 /// 一句服务端的 "path not found", 排查起来比直接拒绝难得多。
-fn parse_shadow_options(
+fn parse_target_and_positionals(
     command: &str,
     args: &[String],
-    positional_names: &[&str],
 ) -> Result<(Option<String>, Vec<String>), String> {
     let mut target = None;
     let mut positionals = Vec::new();
@@ -284,6 +308,15 @@ fn parse_shadow_options(
             }
         }
     }
+    Ok((target, positionals))
+}
+
+fn parse_shadow_options(
+    command: &str,
+    args: &[String],
+    positional_names: &[&str],
+) -> Result<(Option<String>, Vec<String>), String> {
+    let (target, positionals) = parse_target_and_positionals(command, args)?;
     if positionals.len() != positional_names.len() {
         return Err(format!(
             "{command} requires exactly {} argument(s): {}",
@@ -959,6 +992,100 @@ fn parse_cli_args_lossy(args: &[String]) -> Result<Option<CliCommand>, String> {
             }))
         }
 
+        // §16.6 剪贴板是服务端全局的一份内容, 不属于任何会话, 所以这两条命令
+        // 没有 -t。
+        "show-buffer" => {
+            let mut info = false;
+            for option in &args[2..] {
+                match option.as_str() {
+                    "-I" | "--info" => info = true,
+                    option => return Err(format!("unsupported show-buffer option: {option}")),
+                }
+            }
+            Ok(Some(CliCommand::ShowBuffer { info }))
+        }
+
+        "set-buffer" => {
+            let mut content_type = ClipboardContentType::default();
+            let mut source = None;
+            let rest = &args[2..];
+            let mut index = 0;
+            let mut options_ended = false;
+            while index < rest.len() {
+                // 载荷本身可能以 `-` 开头。`--` 之后一律当字面量, 与 send-keys /
+                // search-scrollback 的处理保持一致; 单独的 `-` 是 stdin。
+                if options_ended || !rest[index].starts_with('-') {
+                    if source.is_some() {
+                        return Err("set-buffer takes exactly one payload".to_string());
+                    }
+                    source = Some(BufferSource::Literal(rest[index].clone()));
+                    index += 1;
+                    continue;
+                }
+                match rest[index].as_str() {
+                    "--" => {
+                        options_ended = true;
+                        index += 1;
+                    }
+                    "-" => {
+                        if source.is_some() {
+                            return Err("set-buffer takes exactly one payload".to_string());
+                        }
+                        source = Some(BufferSource::Stdin);
+                        index += 1;
+                    }
+                    "--type" => {
+                        let value = rest
+                            .get(index + 1)
+                            .ok_or_else(|| "set-buffer requires a value for --type".to_string())?;
+                        content_type = ClipboardContentType::parse(value).ok_or_else(|| {
+                            format!("unsupported set-buffer type '{value}': use text, png or path")
+                        })?;
+                        index += 2;
+                    }
+                    option => return Err(format!("unsupported set-buffer option: {option}")),
+                }
+            }
+            let source = source
+                .ok_or_else(|| "set-buffer requires a payload, or - to read stdin".to_string())?;
+            Ok(Some(CliCommand::SetBuffer {
+                content_type,
+                source,
+            }))
+        }
+
+        // §16.6 路径缺省是会话 cwd 本身 —— 服务端拒绝空路径, 所以这里补成 "."
+        // 而不是把空串发过去。
+        "list-dir" => {
+            let (target, positionals) = parse_target_and_positionals("list-dir", &args[2..])?;
+            if positionals.len() > 1 {
+                return Err("list-dir takes at most one path".to_string());
+            }
+            let path = positionals
+                .into_iter()
+                .next()
+                .unwrap_or_else(|| ".".to_string());
+            Ok(Some(CliCommand::ListDir { target, path }))
+        }
+
+        "stat-file" => {
+            let (target, positionals) = parse_shadow_options("stat-file", &args[2..], &["<path>"])?;
+            let path = positionals
+                .into_iter()
+                .next()
+                .ok_or_else(|| "stat-file requires a path".to_string())?;
+            Ok(Some(CliCommand::StatFile { target, path }))
+        }
+
+        "show-file" => {
+            let (target, positionals) = parse_shadow_options("show-file", &args[2..], &["<path>"])?;
+            let path = positionals
+                .into_iter()
+                .next()
+                .ok_or_else(|| "show-file requires a path".to_string())?;
+            Ok(Some(CliCommand::ShowFile { target, path }))
+        }
+
         _ => Err(format!("unknown subcommand: {subcommand}")),
     }
 }
@@ -1158,6 +1285,118 @@ mod tests {
         }
 
         assert!(parse_cli_args_from(&args(&["list-changes", "extra"])).is_err());
+    }
+
+    #[test]
+    fn list_dir_defaults_to_the_session_cwd() {
+        let parsed = parse_cli_args_from(&args(&["list-dir"])).expect("parse");
+        match parsed {
+            Some(CliCommand::ListDir { target, path }) => {
+                assert_eq!(target, None);
+                // 服务端拒绝空路径, 所以缺省必须是一个真的能解析的路径。
+                assert_eq!(path, ".");
+            }
+            other => panic!("unexpected parse result: {other:?}"),
+        }
+
+        let parsed = parse_cli_args_from(&args(&["list-dir", "-t", "dev", "src"])).expect("parse");
+        match parsed {
+            Some(CliCommand::ListDir { target, path }) => {
+                assert_eq!(target.as_deref(), Some("dev"));
+                assert_eq!(path, "src");
+            }
+            other => panic!("unexpected parse result: {other:?}"),
+        }
+
+        assert!(parse_cli_args_from(&args(&["list-dir", "src", "crates"])).is_err());
+        assert!(parse_cli_args_from(&args(&["list-dir", "--bogus"])).is_err());
+    }
+
+    #[test]
+    fn stat_file_and_show_file_require_exactly_one_path() {
+        let parsed =
+            parse_cli_args_from(&args(&["stat-file", "-t", "dev", "src/main.rs"])).expect("parse");
+        match parsed {
+            Some(CliCommand::StatFile { target, path }) => {
+                assert_eq!(target.as_deref(), Some("dev"));
+                assert_eq!(path, "src/main.rs");
+            }
+            other => panic!("unexpected parse result: {other:?}"),
+        }
+
+        let parsed = parse_cli_args_from(&args(&["show-file", "src/main.rs"])).expect("parse");
+        match parsed {
+            Some(CliCommand::ShowFile { target, path }) => {
+                assert_eq!(target, None);
+                assert_eq!(path, "src/main.rs");
+            }
+            other => panic!("unexpected parse result: {other:?}"),
+        }
+
+        assert!(parse_cli_args_from(&args(&["stat-file"])).is_err());
+        assert!(parse_cli_args_from(&args(&["show-file"])).is_err());
+        assert!(parse_cli_args_from(&args(&["show-file", "a.rs", "b.rs"])).is_err());
+    }
+
+    #[test]
+    fn show_buffer_takes_only_the_info_switch() {
+        let parsed = parse_cli_args_from(&args(&["show-buffer"])).expect("parse");
+        match parsed {
+            Some(CliCommand::ShowBuffer { info }) => assert!(!info),
+            other => panic!("unexpected parse result: {other:?}"),
+        }
+
+        let parsed = parse_cli_args_from(&args(&["show-buffer", "-I"])).expect("parse");
+        match parsed {
+            Some(CliCommand::ShowBuffer { info }) => assert!(info),
+            other => panic!("unexpected parse result: {other:?}"),
+        }
+
+        // 剪贴板是服务端全局的一份, -t 没有意义, 静默忽略它会让人以为分会话。
+        assert!(parse_cli_args_from(&args(&["show-buffer", "-t", "dev"])).is_err());
+    }
+
+    #[test]
+    fn set_buffer_parses_payload_type_and_stdin() {
+        let parsed = parse_cli_args_from(&args(&["set-buffer", "hello"])).expect("parse");
+        match parsed {
+            Some(CliCommand::SetBuffer {
+                content_type,
+                source,
+            }) => {
+                assert_eq!(content_type, ClipboardContentType::Text);
+                assert_eq!(source, BufferSource::Literal("hello".to_string()));
+            }
+            other => panic!("unexpected parse result: {other:?}"),
+        }
+
+        let parsed =
+            parse_cli_args_from(&args(&["set-buffer", "--type", "png", "-"])).expect("parse");
+        match parsed {
+            Some(CliCommand::SetBuffer {
+                content_type,
+                source,
+            }) => {
+                assert_eq!(content_type, ClipboardContentType::ImagePng);
+                assert_eq!(source, BufferSource::Stdin);
+            }
+            other => panic!("unexpected parse result: {other:?}"),
+        }
+
+        // 载荷本身可以以 `-` 开头, 但只在 `--` 之后。
+        let parsed = parse_cli_args_from(&args(&["set-buffer", "--", "-n"])).expect("parse");
+        match parsed {
+            Some(CliCommand::SetBuffer { source, .. }) => {
+                assert_eq!(source, BufferSource::Literal("-n".to_string()));
+            }
+            other => panic!("unexpected parse result: {other:?}"),
+        }
+
+        assert!(parse_cli_args_from(&args(&["set-buffer"])).is_err());
+        assert!(parse_cli_args_from(&args(&["set-buffer", "a", "b"])).is_err());
+        assert!(parse_cli_args_from(&args(&["set-buffer", "--type", "gif", "x"])).is_err());
+        assert!(parse_cli_args_from(&args(&["set-buffer", "--type"])).is_err());
+        assert!(parse_cli_args_from(&args(&["set-buffer", "-n"])).is_err());
     }
 
     #[test]

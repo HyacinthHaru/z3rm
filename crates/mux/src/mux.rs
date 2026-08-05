@@ -15,14 +15,15 @@ use std::time::Duration;
 
 // §9 从 mux_protocol 导入所有 protobuf 类型。
 use mux_protocol::{
-    AttachResponse, DeclineFileVersionResponse, Envelope, FetchGridUpdateResponse,
-    FetchScrollbackResponse, GetFileVersionResponse, ListChangedFilesResponse,
-    ListFileVersionsResponse, Notification, PROTOCOL_VERSION, Request, Response,
+    AttachResponse, ClipboardEntry, DeclineFileVersionResponse, Envelope, FetchGridUpdateResponse,
+    FetchScrollbackResponse, GetFileVersionResponse, ListChangedFilesResponse, ListDirResponse,
+    ListFileVersionsResponse, Notification, PROTOCOL_VERSION, ReadFileResponse, Request, Response,
     SearchScrollbackResponse, SessionInfo, SessionLayoutChanged, ShellCommand,
-    ShellIntegrationResponse, TerminalSize, attach_request::AttachMode as AttachMode_,
-    check_frame_len, envelope::Payload as EnvelopePayload, frame,
-    notification::Event as NotifEvent, parse_len_prefix, request::Body as RequestBody,
-    response::Body as ResponseBody, split_node::SplitDirection,
+    ShellIntegrationResponse, StatFileResponse, TerminalSize,
+    attach_request::AttachMode as AttachMode_, check_frame_len,
+    envelope::Payload as EnvelopePayload, frame, notification::Event as NotifEvent,
+    parse_len_prefix, request::Body as RequestBody, response::Body as ResponseBody,
+    split_node::SplitDirection,
 };
 
 // §16.6 SSH 远程连接模块（Plan 19）。
@@ -1161,6 +1162,100 @@ impl MuxDomain {
             _ => Err(anyhow::anyhow!(
                 "unexpected response type for decline_file_version"
             )),
+        }
+    }
+
+    // ========================================================================
+    // §16.6 服务端剪贴板中继
+    // ========================================================================
+
+    /// §16.6 读取服务端剪贴板。
+    ///
+    /// 剪贴板从来没被设置过时服务端回的是一条空 TEXT 条目而不是 `None`，所以
+    /// "没设置过"和"设置成了空文本"在协议上分不开; 调用方只能按空内容处理。
+    pub async fn get_clipboard(&self) -> Result<ClipboardEntry> {
+        let req = RequestBody::GetClipboard(mux_protocol::GetClipboardRequest {});
+        let resp = self.send_request(req).await?;
+        match resp.body {
+            Some(ResponseBody::Clipboard(clipboard)) => clipboard
+                .entry
+                .context("clipboard response carried no entry"),
+            Some(ResponseBody::Error(error)) => Err(anyhow::anyhow!(error)),
+            _ => Err(anyhow::anyhow!(
+                "unexpected response type for get_clipboard"
+            )),
+        }
+    }
+
+    /// §16.6 设置服务端剪贴板，并让服务端向所有 attach 的客户端 fan-out
+    /// `ClipboardChanged`。
+    ///
+    /// 服务端成功时回的是**空** `Error` 体 (proto: `non-empty = error`)，因此这里
+    /// 必须走 `empty_or_error_response`; 直接 `Some(Error(e)) => Err(e)` 会把每一次
+    /// 成功都变成一条错误信息为空的失败。
+    pub async fn set_clipboard(&self, entry: ClipboardEntry) -> Result<()> {
+        let req =
+            RequestBody::SetClipboard(mux_protocol::SetClipboardRequest { entry: Some(entry) });
+        Self::empty_or_error_response(self.send_request(req).await?)
+    }
+
+    // ========================================================================
+    // §16.6 会话 worktree 内的文件访问
+    // ========================================================================
+
+    /// §16.6 读取本连接已 attach 的会话 worktree 内的一个文件。
+    ///
+    /// 路径相对该会话的 cwd 解析，绝对路径必须落在 cwd 内，`..` 一律拒绝。没有
+    /// attach 过任何会话的连接没有 worktree 范围，服务端会直接拒绝而不是退化成
+    /// 整个文件系统。
+    ///
+    /// proto 上的 `offset_line` / `max_lines` 服务端并不实现 —— 总是整份文件，
+    /// 所以这里不暴露这两个参数,免得调用方以为能分页。
+    pub async fn read_file(&self, path: &str) -> Result<ReadFileResponse> {
+        let req = RequestBody::ReadFile(mux_protocol::ReadFileRequest {
+            path: path.to_string(),
+            offset_line: None,
+            max_lines: None,
+        });
+        let resp = self.send_request(req).await?;
+        match resp.body {
+            Some(ResponseBody::FileContent(content)) => Ok(content),
+            // 越界路径 / 读不到的文件服务端回的是 Error 体; 落进兜底分支会把原因
+            // 换成一句无信息量的 "unexpected"。
+            Some(ResponseBody::Error(error)) => Err(anyhow::anyhow!(error)),
+            _ => Err(anyhow::anyhow!("unexpected response type for read_file")),
+        }
+    }
+
+    /// §16.6 列出已 attach 会话 worktree 内某个目录的条目，目录在前、其余按名称。
+    ///
+    /// `is_modified` 的含义是"本 session 的影子快照给它记过版本"; 会话没有 armed
+    /// 的 watcher 时它恒为 false，那是"未知"而不是"未改过"。
+    pub async fn list_dir(&self, path: &str) -> Result<ListDirResponse> {
+        let req = RequestBody::ListDir(mux_protocol::ListDirRequest {
+            path: path.to_string(),
+        });
+        let resp = self.send_request(req).await?;
+        match resp.body {
+            Some(ResponseBody::DirListing(listing)) => Ok(listing),
+            Some(ResponseBody::Error(error)) => Err(anyhow::anyhow!(error)),
+            _ => Err(anyhow::anyhow!("unexpected response type for list_dir")),
+        }
+    }
+
+    /// §16.6 取已 attach 会话 worktree 内某个路径的元数据。
+    ///
+    /// 路径不存在不是错误：服务端回 `exists=false` 的类型化响应。只有路径越界或
+    /// stat 本身失败 (权限等) 才是 Error 体。
+    pub async fn stat_file(&self, path: &str) -> Result<StatFileResponse> {
+        let req = RequestBody::StatFile(mux_protocol::StatFileRequest {
+            path: path.to_string(),
+        });
+        let resp = self.send_request(req).await?;
+        match resp.body {
+            Some(ResponseBody::FileStat(stat)) => Ok(stat),
+            Some(ResponseBody::Error(error)) => Err(anyhow::anyhow!(error)),
+            _ => Err(anyhow::anyhow!("unexpected response type for stat_file")),
         }
     }
 
