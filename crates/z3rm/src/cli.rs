@@ -9,7 +9,7 @@ pub mod marketplace;
 pub mod search;
 pub mod target;
 
-pub use capture::CaptureLine;
+pub use capture::{CaptureLine, CommandSelector};
 pub use dispatch::CliCommand;
 pub use dispatch::SendKeysEncoding;
 pub use dispatch::run_cli_command;
@@ -102,6 +102,11 @@ commands (spec §3.10):\n\
     paste-buffer [-t <target>]       paste stdin into a pane\n\
     capture-pane [-t <target>] [-p] [-S <line>] [-E <line>] [-J] [-e]\n\
                                      capture pane contents\n\
+    capture-pane [-t <target>] [-p] [-J] [-e] --last-command\n\
+    capture-pane [-t <target>] [-p] [-J] [-e] --command <n>\n\
+                                     capture one shell command's output\n\
+    list-commands [-t <target>] [-n <max>]\n\
+                                     list shell commands seen via OSC 133\n\
     list-panes [-t <session>] [-F <format>]\n\
                                      list panes in a session\n\
     list-windows [-t <session>] [-F <format>]\n\
@@ -144,6 +149,17 @@ clipboard explicitly set to empty are indistinguishable over the protocol.\n\
 capture-pane line numbers follow tmux: 0 is the first visible row, negative\n\
 numbers reach into history, and '-' is the far edge (history start for -S,\n\
 visible end for -E).\n\
+\n\
+list-commands needs a shell that emits OSC 133 markers. It prints one tab\n\
+separated row per command: '<id>\\t<status>\\t<start>\\t<end>'. status is\n\
+'exit=<n>', 'done' (the shell reported an end but no status) or 'running'.\n\
+start and end are capture-pane line numbers for that command's output, '-' is\n\
+the visible end (still running), and '?' means the rows can no longer be\n\
+addressed - they left the scrollback, or a resize, a clear or scrollback\n\
+reaching capacity retired the line numbering. Exit statuses stay accurate\n\
+either way. capture-pane --command <id> takes an id from that first column;\n\
+--command <n> with n <= 0 counts back from the newest command, and\n\
+--last-command is --command 0.\n\
 \n\
 search-scrollback reports matches as '<line>:<text>' using those same numbers,\n\
 so a hit can be fed straight back to 'capture-pane -S <line> -E <line>' for\n\
@@ -258,6 +274,7 @@ fn is_mux_cli_command(command: &str) -> bool {
             | "send-keys"
             | "paste-buffer"
             | "capture-pane"
+            | "list-commands"
             | "list-panes"
             | "list-windows"
             | "select-pane"
@@ -365,6 +382,23 @@ fn parse_list_options(
         }
     }
     Ok((target, format))
+}
+
+/// 解析 `capture-pane --command <n>`。
+///
+/// `list-commands` 的 id 都是正数，所以 `n >= 1` 无歧义地指某一条具体命令；
+/// `n <= 0` 是相对最新一条往回数的偏移 (`0` 最新、`-1` 上一条)，与
+/// `--last-command` 同一套。
+fn parse_command_selector(value: &str) -> Result<CommandSelector, String> {
+    let number = value.parse::<i64>().map_err(|_| {
+        format!("invalid value for --command: '{value}' is neither a command id nor an offset")
+    })?;
+    if number >= 1 {
+        return Ok(CommandSelector::Id(number as u64));
+    }
+    u32::try_from(number.unsigned_abs())
+        .map(CommandSelector::Recent)
+        .map_err(|_| format!("--command offset {value} is too far back"))
 }
 
 /// 解析 capture-pane 的 `-S` / `-E` 行号。
@@ -655,6 +689,7 @@ fn parse_cli_args_lossy(args: &[String]) -> Result<Option<CliCommand>, String> {
             let mut end = None;
             let mut join_wrapped = false;
             let mut escape = false;
+            let mut command = None;
             let rest = &args[2..];
             let mut index = 0;
             while index < rest.len() {
@@ -695,8 +730,25 @@ fn parse_cli_args_lossy(args: &[String]) -> Result<Option<CliCommand>, String> {
                         escape = true;
                         index += 1;
                     }
+                    "--last-command" => {
+                        command = Some(CommandSelector::Recent(0));
+                        index += 1;
+                    }
+                    "--command" => {
+                        let value = rest
+                            .get(index + 1)
+                            .ok_or_else(|| "capture-pane requires a value for --command")?;
+                        command = Some(parse_command_selector(value)?);
+                        index += 2;
+                    }
                     option => return Err(format!("unsupported capture-pane option: {option}")),
                 }
+            }
+            // 两种给法都在算 `-S`/`-E`，同时给就无从判断该听谁的。
+            if command.is_some() && (start.is_some() || end.is_some()) {
+                return Err(
+                    "capture-pane --command / --last-command already picks -S and -E".to_string(),
+                );
             }
             Ok(Some(CliCommand::CapturePane {
                 target,
@@ -705,6 +757,43 @@ fn parse_cli_args_lossy(args: &[String]) -> Result<Option<CliCommand>, String> {
                 end,
                 join_wrapped,
                 escape,
+                command,
+            }))
+        }
+
+        "list-commands" => {
+            let mut target = None;
+            let mut max_results = 0u32;
+            let rest = &args[2..];
+            let mut index = 0;
+            while index < rest.len() {
+                match rest[index].as_str() {
+                    "-t" | "--target" => {
+                        let value = rest
+                            .get(index + 1)
+                            .filter(|value| !value.starts_with('-'))
+                            .ok_or_else(|| "list-commands requires a value for -t".to_string())?;
+                        target = Some(value.clone());
+                        index += 2;
+                    }
+                    "-n" | "--max-results" => {
+                        let value = rest
+                            .get(index + 1)
+                            .ok_or_else(|| "list-commands requires a value for -n".to_string())?;
+                        max_results = value
+                            .parse::<u32>()
+                            .map_err(|_| format!("invalid integer for -n: '{value}'"))?;
+                        if max_results == 0 {
+                            return Err("list-commands -n must be at least 1".to_string());
+                        }
+                        index += 2;
+                    }
+                    option => return Err(format!("unsupported list-commands option: {option}")),
+                }
+            }
+            Ok(Some(CliCommand::ListCommands {
+                target,
+                max_results,
             }))
         }
 
@@ -1565,6 +1654,7 @@ mod tests {
                 print,
                 escape,
                 target,
+                command,
             }) => {
                 assert_eq!(start, Some(CaptureLine::Line(-100)));
                 assert_eq!(end, Some(CaptureLine::Edge));
@@ -1572,6 +1662,7 @@ mod tests {
                 assert!(print);
                 assert!(!escape);
                 assert_eq!(target, None);
+                assert_eq!(command, None);
             }
             other => panic!("unexpected parse result: {other:?}"),
         }
@@ -1592,6 +1683,126 @@ mod tests {
                 assert_eq!(start, Some(CaptureLine::Line(0)))
             }
             other => panic!("unexpected parse result: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn capture_pane_selects_a_command_by_offset_or_id() {
+        let parsed = parse_cli_args_from(&args(&[
+            "capture-pane",
+            "-t",
+            "dev",
+            "--last-command",
+            "-p",
+        ]))
+        .expect("parse");
+        match parsed {
+            Some(CliCommand::CapturePane {
+                target,
+                command,
+                print,
+                start,
+                end,
+                ..
+            }) => {
+                assert_eq!(target.as_deref(), Some("dev"));
+                assert_eq!(command, Some(CommandSelector::Recent(0)));
+                assert!(print);
+                assert_eq!(start, None);
+                assert_eq!(end, None);
+            }
+            other => panic!("unexpected parse result: {other:?}"),
+        }
+
+        // n <= 0 数的是"从最新往回第几条", 与 --last-command 同一套。
+        for (argument, expected) in [
+            ("0", CommandSelector::Recent(0)),
+            ("-1", CommandSelector::Recent(1)),
+            ("-12", CommandSelector::Recent(12)),
+            // list-commands 打印的 id 都 >= 1, 所以正数无歧义地指某一条命令。
+            ("1", CommandSelector::Id(1)),
+            ("41", CommandSelector::Id(41)),
+        ] {
+            let parsed = parse_cli_args_from(&args(&["capture-pane", "--command", argument]))
+                .expect("parse");
+            match parsed {
+                Some(CliCommand::CapturePane { command, .. }) => assert_eq!(
+                    command,
+                    Some(expected),
+                    "--command {argument} should select {expected:?}"
+                ),
+                other => panic!("unexpected parse result: {other:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn capture_pane_rejects_a_command_selector_mixed_with_line_numbers() {
+        // 两者都在决定 -S/-E, 同时给就无从判断听谁的。
+        for arguments in [
+            vec!["capture-pane", "--last-command", "-S", "-5"],
+            vec!["capture-pane", "-E", "3", "--command", "-1"],
+        ] {
+            let error = parse_cli_args_from(&args(&arguments))
+                .expect_err("mixing --command with -S/-E must be rejected");
+            assert!(error.contains("--command"), "{error}");
+        }
+
+        for arguments in [
+            vec!["capture-pane", "--command"],
+            vec!["capture-pane", "--command", "abc"],
+            vec!["capture-pane", "--command", "1.5"],
+        ] {
+            assert!(
+                parse_cli_args_from(&args(&arguments)).is_err(),
+                "arguments {arguments:?} must be rejected"
+            );
+        }
+    }
+
+    #[test]
+    fn list_commands_defaults_to_every_retained_command() {
+        let parsed = parse_cli_args_from(&args(&["list-commands"])).expect("parse");
+        match parsed {
+            Some(CliCommand::ListCommands {
+                target,
+                max_results,
+            }) => {
+                assert_eq!(target, None);
+                // 0 = 服务端保留多少给多少。
+                assert_eq!(max_results, 0);
+            }
+            other => panic!("unexpected parse result: {other:?}"),
+        }
+
+        let parsed =
+            parse_cli_args_from(&args(&["list-commands", "-t", "dev", "-n", "5"])).expect("parse");
+        match parsed {
+            Some(CliCommand::ListCommands {
+                target,
+                max_results,
+            }) => {
+                assert_eq!(target.as_deref(), Some("dev"));
+                assert_eq!(max_results, 5);
+            }
+            other => panic!("unexpected parse result: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn list_commands_rejects_malformed_invocations() {
+        for arguments in [
+            vec!["list-commands", "-n"],
+            vec!["list-commands", "-n", "0"],
+            vec!["list-commands", "-n", "abc"],
+            vec!["list-commands", "-t"],
+            vec!["list-commands", "--bogus"],
+            vec!["list-commands", "extra"],
+        ] {
+            assert!(
+                parse_cli_args_from(&args(&arguments)).is_err(),
+                "arguments {arguments:?} must be rejected"
+            );
         }
     }
 

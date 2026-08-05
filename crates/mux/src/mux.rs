@@ -16,10 +16,10 @@ use std::time::Duration;
 // §9 从 mux_protocol 导入所有 protobuf 类型。
 use mux_protocol::{
     AttachResponse, ClipboardEntry, DeclineFileVersionResponse, Envelope, FetchGridUpdateResponse,
-    FetchScrollbackResponse, GetFileVersionResponse, ListChangedFilesResponse, ListDirResponse,
-    ListFileVersionsResponse, Notification, PROTOCOL_VERSION, ReadFileResponse, Request, Response,
-    SearchScrollbackResponse, SessionInfo, SessionLayoutChanged, ShellCommand,
-    ShellIntegrationResponse, StatFileResponse, TerminalSize,
+    FetchScrollbackResponse, GetFileVersionResponse, ListChangedFilesResponse,
+    ListCommandsResponse, ListDirResponse, ListFileVersionsResponse, Notification,
+    PROTOCOL_VERSION, ReadFileResponse, Request, Response, SearchScrollbackResponse, SessionInfo,
+    SessionLayoutChanged, ShellCommand, ShellIntegrationResponse, StatFileResponse, TerminalSize,
     attach_request::AttachMode as AttachMode_, check_frame_len,
     envelope::Payload as EnvelopePayload, frame, notification::Event as NotifEvent,
     parse_len_prefix, request::Body as RequestBody, response::Body as ResponseBody,
@@ -1004,6 +1004,29 @@ impl MuxDomain {
             Some(ResponseBody::Error(error)) => Err(anyhow::anyhow!(error)),
             _ => Err(anyhow::anyhow!(
                 "unexpected response type for search_scrollback"
+            )),
+        }
+    }
+
+    /// §3.10 列出 pane 里由 OSC 133 marker 划出的命令。
+    ///
+    /// `max_results` 为 0 表示"全部仍被保留的", 否则只取最近的 N 条。行号是
+    /// tmux 模型 (可见区首行 0, 负数进历史), 缺省表示那一行已不可寻址 —— 退出
+    /// 码不受影响, 仍然准确。
+    pub async fn list_commands(
+        &self,
+        pane: &str,
+        max_results: u32,
+    ) -> Result<ListCommandsResponse> {
+        let request = RequestBody::ListCommands(mux_protocol::ListCommandsRequest {
+            pane_id: pane.to_string(),
+            max_results,
+        });
+        let response = self.send_request(request).await?;
+        match response.body {
+            Some(ResponseBody::Commands(commands)) => Ok(commands),
+            _ => Err(anyhow::anyhow!(
+                "unexpected response type for list_commands"
             )),
         }
     }

@@ -11,7 +11,7 @@ use mux_protocol::proto::{
     clipboard_entry::ClipboardContentType as ProtoClipboardContentType, split_node::SplitDirection,
 };
 
-use super::capture::{CaptureLine, CaptureOptions};
+use super::capture::{CaptureLine, CaptureOptions, CommandSelector};
 use super::format::{FormatScope, expand as expand_format};
 use super::keys::parse_keys;
 use super::target::Target;
@@ -115,6 +115,14 @@ pub enum CliCommand {
         end: Option<CaptureLine>,
         join_wrapped: bool,
         escape: bool,
+        /// §3.3 `--last-command` / `--command <n>`: 用 OSC 133 marker 算出
+        /// `-S`/`-E`，与显式给的行号互斥。
+        command: Option<CommandSelector>,
+    },
+    /// §3.3 `z3rm list-commands [-t <target>] [-n <max>]` — 列出 OSC 133 命令
+    ListCommands {
+        target: Option<String>,
+        max_results: u32,
     },
     /// `z3rm list-panes [-t <target>] [-F <format>]` — 列出 session 中的 pane
     ListPanes {
@@ -736,9 +744,22 @@ pub async fn run_cli_command(cmd: CliCommand) -> Result<()> {
             end,
             join_wrapped,
             escape,
+            command,
         } => {
             let target = super::target::parse_target(&target)?;
             let pane_id = resolve_pane_id(&domain, &target, ResolveAccess::ReadOnly).await?;
+            let (start, end) = match command {
+                Some(selector) => {
+                    let listed = domain
+                        .list_commands(&pane_id, 0)
+                        .await
+                        .context("failed to list shell commands")?;
+                    let selected = super::capture::select_command(&listed.commands, selector)?;
+                    let (start, end) = super::capture::command_capture_lines(selected)?;
+                    (Some(start), end)
+                }
+                None => (start, end),
+            };
             let options = CaptureOptions {
                 start,
                 end,
@@ -752,6 +773,59 @@ pub async fn run_cli_command(cmd: CliCommand) -> Result<()> {
                 print!("{}", text);
             } else {
                 println!("{}", text);
+            }
+        }
+
+        CliCommand::ListCommands {
+            target,
+            max_results,
+        } => {
+            let target = super::target::parse_target(&target)?;
+            let pane_id = resolve_pane_id(&domain, &target, ResolveAccess::ReadOnly).await?;
+            let listed = domain
+                .list_commands(&pane_id, max_results)
+                .await
+                .context("failed to list shell commands")?;
+            // marker 有而命令没有, 说明 shell 只画提示符、不报告命令边界。
+            // 这与"什么都没跑过"是两回事, 得说清楚。
+            if listed.commands.is_empty() && listed.recorded_markers == 0 {
+                println!("no OSC 133 markers recorded: this shell has no shell integration");
+            } else if listed.commands.is_empty() {
+                println!(
+                    "no commands recorded: this shell emits only prompt starts \
+                     ({} marker(s)), never command boundaries",
+                    listed.recorded_markers,
+                );
+            } else {
+                let mut unaddressable = 0usize;
+                for command in &listed.commands {
+                    let (start, end) = match super::capture::command_output_span(command) {
+                        super::capture::CommandSpan::Located { start, end } => (
+                            start.to_string(),
+                            end.map_or_else(|| "-".to_string(), |end| end.to_string()),
+                        ),
+                        super::capture::CommandSpan::Unaddressable => {
+                            unaddressable += 1;
+                            ("?".to_string(), "?".to_string())
+                        }
+                        super::capture::CommandSpan::Unmarked => ("?".to_string(), "?".to_string()),
+                    };
+                    let status = match (&command.command_end, command.exit_code) {
+                        (Some(_), Some(code)) => format!("exit={code}"),
+                        (Some(_), None) => "done".to_string(),
+                        (None, _) => "running".to_string(),
+                    };
+                    println!("{}\t{}\t{}\t{}", command.id, status, start, end);
+                }
+                if unaddressable > 0 {
+                    eprintln!(
+                        "note: {unaddressable} of {} command(s) have no usable line numbers — \
+                         their rows left the scrollback or the numbering was retired by a \
+                         resize, a clear, or scrollback reaching capacity. Exit statuses are \
+                         unaffected.",
+                        listed.commands.len(),
+                    );
+                }
             }
         }
 

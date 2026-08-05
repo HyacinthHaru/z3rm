@@ -18,6 +18,7 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::sync::mpsc;
 
 // §3.3 客户端角色 (Plan 33)
+use crate::pane::{ShellMarker, ShellMarkerKind};
 use crate::session::ClientRole;
 
 /// §3.3 将 proto ClientRole 值映射为内部 ClientRole
@@ -562,6 +563,7 @@ async fn dispatch_request(
         RequestBody::FetchGridUpdate(r) => handle_fetch_grid_update(r, sessions).await?,
         RequestBody::FetchScrollback(r) => handle_fetch_scrollback(r, sessions).await?,
         RequestBody::SearchScrollback(r) => handle_search_scrollback(r, sessions).await?,
+        RequestBody::ListCommands(request) => handle_list_commands(request, sessions),
         // §4 A shadow request can fail for perfectly ordinary reasons — the
         // snapshot engine has not finished arming, the path is outside the
         // worktree, the version id is stale. `?` here would tear down the whole
@@ -2077,6 +2079,142 @@ async fn handle_search_scrollback(
     Ok(ResponseBody::Error("pane not found".to_string()))
 }
 
+/// §3.10 列出 pane 里由 OSC 133 marker 划出的命令。
+///
+/// 不返回 `Result`: 唯一的失败是找不到 pane, 用 `?` 会把整条连接拆掉, 客户端
+/// 只能看到一句 "connection closed"。
+fn handle_list_commands(
+    request: &ListCommandsRequest,
+    sessions: &Arc<parking_lot::RwLock<Vec<crate::session::Session>>>,
+) -> ResponseBody {
+    let pane = {
+        let sessions_r = sessions.read();
+        sessions_r
+            .iter()
+            .find_map(|session| session.panes.read().get(&request.pane_id).cloned())
+    };
+    let Some(pane) = pane else {
+        return ResponseBody::Error(format!("pane not found: {}", request.pane_id));
+    };
+
+    let (markers, history_size) = shell_marker_snapshot(&pane);
+    let recorded_markers = u32::try_from(markers.len()).unwrap_or(u32::MAX);
+    let mut commands = group_shell_markers(&markers);
+    let max_results = request.max_results as usize;
+    if max_results != 0 && commands.len() > max_results {
+        commands.drain(..commands.len() - max_results);
+    }
+    ResponseBody::Commands(ListCommandsResponse {
+        commands,
+        history_size,
+        recorded_markers,
+    })
+}
+
+/// §3.3 一个 pane 的全部 marker, 每个配上它此刻的 tmux 行号 (不可寻址时为 None)。
+///
+/// `shell_marker_positions` 与 scrollback 大小是两段独立的临界区。两者之间的
+/// 追加是无害的: 追加不动历史下标, 只让 tmux 行号更负一点, 而那正是更新的事实。
+/// 一次 addressing 作废则不然 —— 它在已解析出的下标底下重排了历史。所以这里
+/// 复查 epoch, 配不上的就报"没有行号", 而不是报一个错的行号。
+fn shell_marker_snapshot(pane: &crate::pane::Pane) -> (Vec<(ShellMarker, Option<i64>)>, u32) {
+    const ATTEMPTS: usize = 4;
+    for _ in 0..ATTEMPTS {
+        let epoch = pane.row_addressing_epoch();
+        let positions = pane.shell_marker_positions();
+        let (_, history_size, _) = pane.fetch_scrollback(0, 1, 0);
+        if pane.row_addressing_epoch() == epoch {
+            let located = positions
+                .into_iter()
+                .map(|(marker, position)| (marker, tmux_line(position, history_size)))
+                .collect();
+            return (located, history_size);
+        }
+    }
+    let (_, history_size, _) = pane.fetch_scrollback(0, 1, 0);
+    let markers = pane
+        .shell_markers()
+        .into_iter()
+        .map(|marker| (marker, None))
+        .collect();
+    (markers, history_size)
+}
+
+/// §3.10 把一个 marker 位置换算成 tmux 行号: 可见区首行是 0, 负数进历史。
+///
+/// 历史下标必然小于 scrollback 大小, 所以换算结果必然是负数。真出现非负值就
+/// 说明下标和 scrollback 大小配错了 —— 宁可说"不知道", 也不能交出一个看起来
+/// 像可见区行号的历史行号。
+fn tmux_line(position: crate::pane::ShellMarkerPosition, history_size: u32) -> Option<i64> {
+    match position {
+        crate::pane::ShellMarkerPosition::History { index } => {
+            Some(i64::from(index) - i64::from(history_size)).filter(|line| *line < 0)
+        }
+        crate::pane::ShellMarkerPosition::Viewport { line } => Some(i64::from(line)),
+        crate::pane::ShellMarkerPosition::Unavailable => None,
+    }
+}
+
+/// §3.3 OSC 133 在一条命令内部固定按 A → B → C → D 的顺序发送。
+fn marker_slot(kind: ShellMarkerKind) -> usize {
+    match kind {
+        ShellMarkerKind::PromptStart => 0,
+        ShellMarkerKind::CommandStart => 1,
+        ShellMarkerKind::OutputStart => 2,
+        ShellMarkerKind::CommandEnd => 3,
+    }
+}
+
+/// §3.10 把一串 marker 归拢成命令。
+///
+/// 一条命令内部 kind 严格递增, 所以一个不再前进的 kind 就是下一条命令的开始。
+/// shell 可以任意跳过 marker (有的只发 A 和 D), 命令还在跑时也不会有 D, 因此
+/// 一条命令就是两次"重新开始"之间到达的那些 marker, 缺谁都不影响其余的。
+fn group_shell_markers(markers: &[(ShellMarker, Option<i64>)]) -> Vec<CommandRange> {
+    let mut commands: Vec<CommandRange> = Vec::new();
+    let mut current: Option<(usize, CommandRange)> = None;
+    for (marker, line) in markers {
+        let slot = marker_slot(marker.kind);
+        let mut command = match current.take() {
+            Some((previous_slot, command)) if slot > previous_slot => command,
+            Some((_, finished)) => {
+                commands.push(finished);
+                CommandRange {
+                    id: marker.sequence,
+                    ..Default::default()
+                }
+            }
+            None => CommandRange {
+                id: marker.sequence,
+                ..Default::default()
+            },
+        };
+        let recorded = Some(CommandMarker {
+            line: *line,
+            column: marker.column,
+        });
+        match marker.kind {
+            ShellMarkerKind::PromptStart => command.prompt = recorded,
+            ShellMarkerKind::CommandStart => command.command = recorded,
+            ShellMarkerKind::OutputStart => command.output_start = recorded,
+            ShellMarkerKind::CommandEnd => {
+                command.command_end = recorded;
+                command.exit_code = marker.exit_code;
+            }
+        }
+        current = Some((slot, command));
+    }
+    if let Some((_, command)) = current {
+        commands.push(command);
+    }
+    // 只有一个 prompt start 的那些是"画了个提示符", 不是命令 —— zsh 每次重画
+    // 提示符都会发一个 A。丢掉它们, 列表里才只剩真的跑过的东西。
+    commands.retain(|command| {
+        command.command.is_some() || command.output_start.is_some() || command.command_end.is_some()
+    });
+    commands
+}
+
 async fn handle_fetch_grid_update(
     req: &FetchGridUpdateRequest,
     sessions: &Arc<parking_lot::RwLock<Vec<crate::session::Session>>>,
@@ -3046,6 +3184,194 @@ fn detect_binary(bytes: &[u8]) -> bool {
 #[cfg(test)]
 mod connection_unit_tests {
     use super::*;
+    use crate::pane::ShellMarkerPosition;
+
+    fn shell_marker(
+        sequence: u64,
+        kind: ShellMarkerKind,
+        column: u32,
+        exit_code: Option<i32>,
+    ) -> ShellMarker {
+        ShellMarker {
+            sequence,
+            kind,
+            absolute_row: sequence,
+            column,
+            exit_code,
+            epoch: 1,
+        }
+    }
+
+    #[test]
+    fn history_indices_become_negative_tmux_lines_and_viewport_rows_stay_put() {
+        assert_eq!(
+            tmux_line(ShellMarkerPosition::History { index: 0 }, 100),
+            Some(-100)
+        );
+        assert_eq!(
+            tmux_line(ShellMarkerPosition::History { index: 99 }, 100),
+            Some(-1)
+        );
+        assert_eq!(
+            tmux_line(ShellMarkerPosition::Viewport { line: 0 }, 100),
+            Some(0)
+        );
+        assert_eq!(tmux_line(ShellMarkerPosition::Unavailable, 100), None);
+        // 历史下标必然小于 scrollback 大小; 配错了宁可说"不知道", 也不能交出一个
+        // 看起来像可见区行号的历史行号。
+        assert_eq!(
+            tmux_line(ShellMarkerPosition::History { index: 7 }, 3),
+            None
+        );
+    }
+
+    #[test]
+    fn markers_group_into_one_command_per_a_to_d_run() {
+        let markers = [
+            (
+                shell_marker(1, ShellMarkerKind::PromptStart, 0, None),
+                Some(-9),
+            ),
+            (
+                shell_marker(2, ShellMarkerKind::CommandStart, 2, None),
+                Some(-9),
+            ),
+            (
+                shell_marker(3, ShellMarkerKind::OutputStart, 0, None),
+                Some(-8),
+            ),
+            (
+                shell_marker(4, ShellMarkerKind::CommandEnd, 0, Some(0)),
+                Some(-5),
+            ),
+            (
+                shell_marker(5, ShellMarkerKind::PromptStart, 0, None),
+                Some(-5),
+            ),
+            (
+                shell_marker(6, ShellMarkerKind::CommandStart, 2, None),
+                Some(-5),
+            ),
+            (
+                shell_marker(7, ShellMarkerKind::OutputStart, 0, None),
+                Some(-4),
+            ),
+            (
+                shell_marker(8, ShellMarkerKind::CommandEnd, 0, Some(1)),
+                Some(-1),
+            ),
+        ];
+        let commands = group_shell_markers(&markers);
+        assert_eq!(commands.len(), 2, "{commands:?}");
+        assert_eq!(commands[0].id, 1);
+        assert_eq!(commands[0].exit_code, Some(0));
+        assert_eq!(
+            commands[0].output_start.as_ref().and_then(|item| item.line),
+            Some(-8)
+        );
+        assert_eq!(commands[1].id, 5);
+        assert_eq!(commands[1].exit_code, Some(1));
+    }
+
+    /// 真实 shell 不保证四个 marker 都发, 命令还在跑时也没有 D。
+    #[test]
+    fn commands_survive_missing_markers() {
+        // 只发 A 和 D 的 shell。
+        let sparse = [
+            (
+                shell_marker(1, ShellMarkerKind::PromptStart, 0, None),
+                Some(-9),
+            ),
+            (
+                shell_marker(2, ShellMarkerKind::CommandEnd, 0, Some(2)),
+                Some(-6),
+            ),
+            (
+                shell_marker(3, ShellMarkerKind::PromptStart, 0, None),
+                Some(-6),
+            ),
+            (
+                shell_marker(4, ShellMarkerKind::CommandEnd, 0, None),
+                Some(-2),
+            ),
+        ];
+        let commands = group_shell_markers(&sparse);
+        assert_eq!(commands.len(), 2, "{commands:?}");
+        assert_eq!(commands[0].exit_code, Some(2));
+        assert!(commands[0].command.is_none());
+        assert!(commands[0].output_start.is_none());
+        // D 发了但没带状态码: 已结束, 状态未知。两者必须能区分。
+        assert!(commands[1].command_end.is_some());
+        assert_eq!(commands[1].exit_code, None);
+
+        // 还在跑: 有 A/B/C, 没有 D。
+        let running = [
+            (
+                shell_marker(1, ShellMarkerKind::PromptStart, 0, None),
+                Some(-3),
+            ),
+            (
+                shell_marker(2, ShellMarkerKind::CommandStart, 2, None),
+                Some(-3),
+            ),
+            (
+                shell_marker(3, ShellMarkerKind::OutputStart, 0, None),
+                Some(-2),
+            ),
+        ];
+        let commands = group_shell_markers(&running);
+        assert_eq!(commands.len(), 1, "{commands:?}");
+        assert!(commands[0].command_end.is_none());
+    }
+
+    /// zsh 每重画一次提示符就发一个 A。那不是命令, 不该占一行输出。
+    #[test]
+    fn bare_prompt_starts_are_not_commands() {
+        let markers = [
+            (
+                shell_marker(1, ShellMarkerKind::PromptStart, 0, None),
+                Some(-3),
+            ),
+            (
+                shell_marker(2, ShellMarkerKind::PromptStart, 0, None),
+                Some(-2),
+            ),
+            (
+                shell_marker(3, ShellMarkerKind::PromptStart, 0, None),
+                Some(-1),
+            ),
+            (
+                shell_marker(4, ShellMarkerKind::CommandStart, 2, None),
+                Some(-1),
+            ),
+        ];
+        let commands = group_shell_markers(&markers);
+        assert_eq!(commands.len(), 1, "{commands:?}");
+        assert_eq!(commands[0].id, 3);
+    }
+
+    /// 行号不可用不该影响退出码: 位置和状态是两件独立的事。
+    #[test]
+    fn an_unaddressable_command_keeps_its_exit_code() {
+        let markers = [
+            (shell_marker(1, ShellMarkerKind::PromptStart, 0, None), None),
+            (shell_marker(2, ShellMarkerKind::OutputStart, 0, None), None),
+            (
+                shell_marker(3, ShellMarkerKind::CommandEnd, 0, Some(127)),
+                None,
+            ),
+        ];
+        let commands = group_shell_markers(&markers);
+        assert_eq!(commands.len(), 1, "{commands:?}");
+        assert_eq!(commands[0].exit_code, Some(127));
+        assert!(
+            commands[0]
+                .output_start
+                .as_ref()
+                .is_some_and(|marker| marker.line.is_none()),
+            "the marker is recorded but carries no row: {commands:?}"
+        );
+    }
 
     #[test]
     fn take_session_returns_removed_session() {
