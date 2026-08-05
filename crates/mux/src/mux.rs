@@ -999,8 +999,6 @@ impl MuxDomain {
         let resp = self.send_request(req).await?;
         match resp.body {
             Some(ResponseBody::SearchScrollback(matches)) => Ok(matches),
-            // 服务端找不到 pane 时回的是 Error 体; 落进兜底分支会把 "pane not
-            // found" 换成一句无信息量的 "unexpected"。
             Some(ResponseBody::Error(error)) => Err(anyhow::anyhow!(error)),
             _ => Err(anyhow::anyhow!(
                 "unexpected response type for search_scrollback"
@@ -1112,8 +1110,6 @@ impl MuxDomain {
         let resp = self.send_request(req).await?;
         match resp.body {
             Some(ResponseBody::ChangedFiles(changed)) => Ok(changed),
-            // 影子快照被设置关掉、或会话没有可用工作目录时服务端回的是 Error；
-            // 落进下面的兜底分支会把原因换成一句无信息量的 "unexpected"。
             Some(ResponseBody::Error(error)) => Err(anyhow::anyhow!(error)),
             _ => Err(anyhow::anyhow!(
                 "unexpected response type for list_changed_files"
@@ -1179,8 +1175,6 @@ impl MuxDomain {
         let resp = self.send_request(req).await?;
         match resp.body {
             Some(ResponseBody::DeclineFileVersion(resp)) => Ok(resp),
-            // §4.8 服务端刻意把还原失败编码成 Error 体而不是断开连接, 就是为了
-            // 让调用方看到原因; 落进兜底分支等于把那句原因扔了。
             Some(ResponseBody::Error(error)) => Err(anyhow::anyhow!(error)),
             _ => Err(anyhow::anyhow!(
                 "unexpected response type for decline_file_version"
