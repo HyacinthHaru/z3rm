@@ -201,6 +201,140 @@ pub enum ShellMarkerPosition {
 /// and 1024 entries cost about 48 KiB per pane.
 const MAX_RECORDED_SHELL_MARKERS: usize = 1024;
 
+/// Rows of scrollback the emulator may hold above the configured capacity while
+/// a PTY batch is being parsed.
+///
+/// `Grid::increase_scroll_limit` clamps growth at the configured limit, so at
+/// capacity the emulator evicts exactly as many rows as it appends and reports
+/// neither — the distance rows moved becomes unobservable. Parsing against a
+/// raised limit and performing the eviction here instead keeps that distance
+/// equal to the scrollback growth, at the cost of holding at most this many
+/// extra rows while a batch is being parsed. Those rows come out of the spare
+/// capacity alacritty already keeps allocated, so this does not add memory.
+///
+/// Staying under alacritty's `MAX_CACHE_SIZE` (1000) spare-row cache is what
+/// keeps every raise/trim pair inside already-allocated storage:
+/// `Storage::initialize` reallocates only when the live length passes the raw
+/// buffer, and `Storage::shrink_lines` frees only when more than
+/// `MAX_CACHE_SIZE` rows sit unused. Crossing that line is not a small
+/// regression — a headroom of 8192 measured 6x slower on line-dense output,
+/// because every batch then pays a `rezero` plus a realloc and a truncate.
+/// The raised limit also caps the rows one step can append, so a trim never
+/// has more than this to give back.
+///
+/// The same value bounds the bytes per parse step. Scrolling driven by line
+/// feeds appends at most one row per byte, so a step this size cannot outgrow
+/// the headroom. `SU`/`DL` scroll by up to a screen height per sequence and can
+/// outrun that; those hit the saturation check in `RowAddressing::advance_to`
+/// and retire the numbering instead of drifting.
+const ROW_ADDRESSING_HEADROOM: usize = 960;
+
+/// Row-addressing bookkeeping for one PTY batch, threaded through the parse
+/// steps that `advance_recording_markers` splits the batch into.
+struct RowAddressing {
+    /// Absolute row id of viewport line 0, in `Pane::viewport_top_absolute`'s
+    /// numbering.
+    viewport_top: u64,
+    /// Scrollback rows the emulator holds, re-read after every parse step.
+    history_size: usize,
+    /// Configured scrollback capacity. The emulator is trimmed back to it by
+    /// every step that grew past it, and by `finish` before the batch ends, so
+    /// nothing outside the read loop ever sees more than this.
+    capacity: usize,
+    /// Bytes of the batch already handed to the emulator.
+    consumed: usize,
+    /// Whether the primary grid was active at the end of the last parse step.
+    /// The alternate grid has no scrollback of its own, so its size says nothing
+    /// about rows leaving the primary viewport.
+    primary_screen: bool,
+    /// Whether the primary grid currently carries the raised limit. Restoring
+    /// the configured limit is what performs the eviction, so the two track
+    /// each other.
+    headroom_granted: bool,
+    /// Set when a parse step filled the raised limit, which is the one case
+    /// where the emulator can still have evicted rows it did not report.
+    saturated: bool,
+}
+
+impl RowAddressing {
+    fn raised_limit(&self) -> usize {
+        self.capacity.saturating_add(ROW_ADDRESSING_HEADROOM)
+    }
+
+    /// Feed the batch up to `offset`, keeping `viewport_top` in step with the
+    /// rows the emulator pushed above the viewport.
+    fn advance_to(
+        &mut self,
+        term: &mut Term<PaneEventListener>,
+        processor: &mut Processor<StdSyncHandler>,
+        bytes: &[u8],
+        offset: usize,
+    ) {
+        let offset = offset.min(bytes.len());
+        while self.consumed < offset {
+            let primary_before = self.primary_screen;
+            if primary_before && !self.headroom_granted {
+                term.grid_mut().update_history(self.raised_limit());
+                self.headroom_granted = true;
+            }
+            // A step is capped at the rows the raised limit can still absorb,
+            // so line-feed scrolling cannot outgrow it mid-step. Batches
+            // shorter than that — every interactive one — are still fed whole,
+            // and so is anything arriving while a full-screen app holds the
+            // alternate grid, which has no scrollback to account for.
+            let room = if primary_before {
+                self.raised_limit().saturating_sub(self.history_size).max(1)
+            } else {
+                usize::MAX
+            };
+            let step_end = offset.min(self.consumed.saturating_add(room));
+            processor.advance(&mut *term, &bytes[self.consumed..step_end]);
+            self.consumed = step_end;
+
+            self.primary_screen = !term.mode().contains(TermMode::ALT_SCREEN);
+            if !self.primary_screen {
+                // The primary grid is now inactive and out of reach, so it keeps
+                // the raised limit until the batch that switches back settles it.
+                continue;
+            }
+            let grown = term.grid().history_size();
+            if primary_before {
+                if grown >= self.raised_limit() {
+                    self.saturated = true;
+                }
+                self.viewport_top = self
+                    .viewport_top
+                    .saturating_add(grown.saturating_sub(self.history_size) as u64);
+            }
+            self.history_size = grown;
+            if grown > self.capacity {
+                self.evict_down_to_capacity(term);
+            }
+        }
+    }
+
+    /// Restore the configured limit, which drops exactly the oldest rows above
+    /// it. Doing the eviction here rather than letting the emulator do it
+    /// silently is what keeps the movement measurable; only the oldest rows go,
+    /// so the viewport does not move and `viewport_top` still holds.
+    fn evict_down_to_capacity(&mut self, term: &mut Term<PaneEventListener>) {
+        term.grid_mut().update_history(self.capacity);
+        self.headroom_granted = false;
+        self.history_size = term.grid().history_size();
+    }
+
+    /// Hand the configured limit back before anything outside the read loop can
+    /// observe the grid, so the raised limit never outlives one batch. This runs
+    /// unconditionally on the primary grid rather than only when this batch
+    /// raised the limit, because a batch that switched to the alternate screen
+    /// leaves the primary grid raised and out of reach until one does.
+    fn finish(&mut self, term: &mut Term<PaneEventListener>) {
+        if self.primary_screen {
+            self.evict_down_to_capacity(term);
+        }
+    }
+}
+
 /// §3.10 Shell command (从 proto ShellCommand 转换)
 #[derive(Clone, Debug, Default)]
 pub struct ShellCommand {
@@ -821,7 +955,7 @@ impl Pane {
             history_size_before,
             history_size_after,
             alt_screen_changed,
-            viewport_top,
+            addressing,
         ) = {
             let mut term = self.term.lock();
             let before = (
@@ -832,7 +966,7 @@ impl Pane {
             );
             let history_size_before = term.grid().history_size();
             let alt_screen_before = term.mode().contains(TermMode::ALT_SCREEN);
-            let viewport_top = self.advance_recording_markers(
+            let addressing = self.advance_recording_markers(
                 &mut term,
                 bytes,
                 &state.osc_events,
@@ -849,7 +983,7 @@ impl Pane {
                 history_size_before,
                 term.grid().history_size(),
                 alt_screen_before != term.mode().contains(TermMode::ALT_SCREEN),
-                viewport_top,
+                addressing,
             )
         };
         let (dirty_rows, fully_damaged) = self.collect_dirty_rows();
@@ -862,12 +996,11 @@ impl Pane {
             self.history_version.fetch_add(1, Ordering::AcqRel);
         }
         self.commit_row_addressing(
-            viewport_top,
+            &addressing,
             history_size_before,
             history_size_after,
             alt_screen_changed,
             state.history_observer.may_break_addressing,
-            history_may_change && fully_damaged,
         );
 
         let grid_changed = !dirty_rows.is_empty() || render_state_changed || history_changed;
@@ -914,42 +1047,29 @@ impl Pane {
 
     /// Feed one batch to the emulator, pausing at every OSC 133 marker so the
     /// marker's row is read at the byte offset it arrived on, and return the
-    /// absolute row id of viewport line 0 afterwards.
+    /// batch's row-addressing bookkeeping.
     ///
-    /// Rows pushed above the viewport are counted as scrollback growth, which
-    /// is exact until scrollback reaches capacity; from then on the emulator
-    /// evicts as many rows as it appends and reports neither, which
-    /// `commit_row_addressing` turns into a retired epoch rather than a drift.
+    /// Rows pushed above the viewport are counted as scrollback growth. The
+    /// emulator would stop growing once scrollback reaches capacity, so the
+    /// batch is parsed against a raised limit and trimmed back down here; see
+    /// `ROW_ADDRESSING_HEADROOM`.
     fn advance_recording_markers(
         &self,
         term: &mut Term<PaneEventListener>,
         bytes: &[u8],
         events: &[OscEvent],
         processor: &mut Processor<StdSyncHandler>,
-    ) -> u64 {
-        let mut viewport_top = self.viewport_top_absolute.load(Ordering::Acquire);
-        // The alternate grid has no scrollback of its own, so its size changes
-        // say nothing about rows leaving the primary viewport.
-        let primary_screen = !term.mode().contains(TermMode::ALT_SCREEN);
-        let mut history_size = term.grid().history_size();
-        let epoch = self.row_addressing_epoch.load(Ordering::Acquire);
-        let mut consumed = 0;
-
-        let mut advance_to = |term: &mut Term<PaneEventListener>,
-                              offset: usize,
-                              viewport_top: &mut u64,
-                              history_size: &mut usize| {
-            if offset > consumed {
-                processor.advance(&mut *term, &bytes[consumed..offset]);
-                consumed = offset;
-            }
-            let grown = term.grid().history_size();
-            if primary_screen && !term.mode().contains(TermMode::ALT_SCREEN) {
-                *viewport_top =
-                    viewport_top.saturating_add(grown.saturating_sub(*history_size) as u64);
-            }
-            *history_size = grown;
+    ) -> RowAddressing {
+        let mut addressing = RowAddressing {
+            viewport_top: self.viewport_top_absolute.load(Ordering::Acquire),
+            history_size: term.grid().history_size(),
+            capacity: self.scrollback_capacity.load(Ordering::Acquire) as usize,
+            consumed: 0,
+            primary_screen: !term.mode().contains(TermMode::ALT_SCREEN),
+            headroom_granted: false,
+            saturated: false,
         };
+        let epoch = self.row_addressing_epoch.load(Ordering::Acquire);
 
         for event in events {
             let OscEvent::ShellMarker {
@@ -960,44 +1080,33 @@ impl Pane {
             else {
                 continue;
             };
-            advance_to(
-                term,
-                (*end_offset).min(bytes.len()),
-                &mut viewport_top,
-                &mut history_size,
-            );
-            self.record_shell_marker(term, *kind, *exit_code, viewport_top, epoch);
+            addressing.advance_to(term, processor, bytes, *end_offset);
+            self.record_shell_marker(term, *kind, *exit_code, addressing.viewport_top, epoch);
         }
-        advance_to(term, bytes.len(), &mut viewport_top, &mut history_size);
-        viewport_top
+        addressing.advance_to(term, processor, bytes, bytes.len());
+        addressing.finish(term);
+        addressing
     }
 
     /// Publish the batch's absolute row base, retiring the numbering when the
     /// batch moved rows by an amount the emulator does not report.
     fn commit_row_addressing(
         &self,
-        viewport_top: u64,
+        addressing: &RowAddressing,
         history_size_before: usize,
         history_size_after: usize,
         alt_screen_changed: bool,
         addressing_break: bool,
-        history_rotated: bool,
     ) {
-        let capacity = self.scrollback_capacity.load(Ordering::Acquire);
-        // At capacity every appended row silently evicts one, so scrollback
-        // growth stops reporting how far rows moved. The batch that first fills
-        // scrollback is included: it can append more rows than it grew by.
-        let rotated_at_capacity =
-            capacity != 0 && history_size_after as u64 == capacity && history_rotated;
         if alt_screen_changed
             || addressing_break
-            || rotated_at_capacity
+            || addressing.saturated
             || history_size_after < history_size_before
         {
-            self.retire_row_addressing(viewport_top, history_size_after);
+            self.retire_row_addressing(addressing.viewport_top, history_size_after);
         } else {
             self.viewport_top_absolute
-                .store(viewport_top, Ordering::Release);
+                .store(addressing.viewport_top, Ordering::Release);
         }
     }
 
@@ -2429,9 +2538,9 @@ mod tests {
         assert_eq!(lines[1].cells[0].character, "t", "index 1 is the B row");
     }
 
-    /// §3.3 Once scrollback is at capacity Alacritty evicts as many rows as it
-    /// appends and reports neither, so the numbering is retired. A wrong row is
-    /// worse than no row.
+    /// §3.3 A row that scrolled past the oldest scrollback row is gone, so it
+    /// has no index. A wrong row is worse than no row. The numbering itself
+    /// stays live: rotation at capacity is performed here, so it is counted.
     #[test]
     fn markers_become_unavailable_once_their_row_is_evicted() {
         let pane = spawn_marker_pane("osc133-evict", 20, 2, 2);
@@ -2447,19 +2556,43 @@ mod tests {
 
         feed.feed(&pane, b"two\r\nthree\r\nfour\r\nfive\r\n");
 
-        assert_ne!(
+        assert_eq!(
             pane.row_addressing_epoch(),
             epoch,
-            "an uncounted rotation must retire the numbering"
+            "rotation at capacity is counted, so it must not retire the numbering"
         );
         assert_eq!(
             pane.locate_shell_marker(&prompt_start),
-            ShellMarkerPosition::Unavailable
+            ShellMarkerPosition::Unavailable,
+            "\"one\" fell past the oldest surviving scrollback row"
         );
         assert_eq!(
             pane.shell_markers().len(),
             1,
             "the record itself survives so its kind and exit status stay readable"
+        );
+
+        // The surviving numbering must still address rows, not merely report
+        // Unavailable for everything. B names the row "six" is typed on, and
+        // that row must keep being named as the rotation moves it.
+        feed.feed(&pane, b"\x1b]133;B\x07six\r\n");
+        let command_start = marker_of(&pane, ShellMarkerKind::CommandStart);
+        assert_eq!(
+            pane.locate_shell_marker(&command_start),
+            ShellMarkerPosition::Viewport { line: 0 }
+        );
+        assert_eq!(pane.get_full_snapshot().cells[0].character, "s");
+
+        feed.feed(&pane, b"seven\r\n");
+        assert_eq!(
+            pane.locate_shell_marker(&command_start),
+            ShellMarkerPosition::History { index: 1 }
+        );
+        let (lines, total, _) = pane.fetch_scrollback(0, 1, 10);
+        assert_eq!(total, 2, "capacity is still honored");
+        assert_eq!(
+            lines[1].cells[0].character, "s",
+            "index 1 is the row the B marker named"
         );
     }
 
@@ -2606,6 +2739,173 @@ mod tests {
             pane.get_prompt_marker() as usize,
             MAX_RECORDED_SHELL_MARKERS + 32,
             "the counter still sees every marker"
+        );
+    }
+
+    /// §3.3 A long-lived pane spends nearly all its life with scrollback full,
+    /// so this is the case that decides whether recorded rows are worth
+    /// anything. Alacritty stops growing `history_size` there, which used to
+    /// make a marker unresolvable in the very batch that recorded it.
+    #[test]
+    fn markers_stay_addressable_after_scrollback_fills() {
+        let pane = spawn_marker_pane("osc133-full", 20, 4, 10);
+        let mut feed = PtyFeed::new();
+        for index in 0..40 {
+            feed.feed(&pane, format!("fill{index}\r\n").as_bytes());
+        }
+        let (_, total, _) = pane.fetch_scrollback(0, 1, 1);
+        assert_eq!(total, 10, "scrollback is at capacity");
+        let epoch = pane.row_addressing_epoch();
+
+        feed.feed(&pane, b"\x1b]133;A\x07$ \x1b]133;B\x07ls\r\n\x1b]133;C\x07");
+        let prompt_start = marker_of(&pane, ShellMarkerKind::PromptStart);
+        let output_start = marker_of(&pane, ShellMarkerKind::OutputStart);
+        assert_eq!(
+            pane.locate_shell_marker(&output_start),
+            ShellMarkerPosition::Viewport { line: 3 },
+            "the batch that scrolls must not invalidate the marker it just recorded"
+        );
+
+        feed.feed(&pane, b"a\r\nb\r\nc\r\n");
+        feed.feed(&pane, b"\x1b]133;D;0\x07");
+
+        assert_eq!(
+            pane.row_addressing_epoch(),
+            epoch,
+            "a plain command at full scrollback must not retire the numbering"
+        );
+        assert_eq!(
+            pane.locate_shell_marker(&output_start),
+            ShellMarkerPosition::Viewport { line: 0 },
+            "C names the first output row, which the three output lines pushed to the top"
+        );
+        assert_eq!(pane.get_full_snapshot().cells[0].character, "a");
+
+        assert_eq!(
+            pane.locate_shell_marker(&prompt_start),
+            ShellMarkerPosition::History { index: 9 },
+            "the prompt row rotated into scrollback rather than becoming unaddressable"
+        );
+        let (lines, _, _) = pane.fetch_scrollback(0, 1, 10);
+        assert_eq!(
+            lines[9].cells[0].character, "$",
+            "index 9 is the row the A marker named"
+        );
+        assert_eq!(
+            marker_of(&pane, ShellMarkerKind::CommandEnd).exit_code,
+            Some(0)
+        );
+    }
+
+    /// §3.3 With scrollback disabled every row that leaves the viewport is gone
+    /// at once. Reporting the viewport line it used to occupy would name
+    /// whatever text scrolled into that line since.
+    #[test]
+    fn disabled_scrollback_reports_no_row_rather_than_a_stale_one() {
+        let pane = spawn_marker_pane("osc133-nohistory", 20, 4, 0);
+        let mut feed = PtyFeed::new();
+
+        feed.feed(&pane, b"\x1b]133;A\x07zero\r\n");
+        let prompt_start = marker_of(&pane, ShellMarkerKind::PromptStart);
+        assert_eq!(
+            pane.locate_shell_marker(&prompt_start),
+            ShellMarkerPosition::Viewport { line: 0 }
+        );
+
+        feed.feed(&pane, b"x\r\ny\r\nz\r\nw\r\n");
+
+        assert_eq!(
+            pane.locate_shell_marker(&prompt_start),
+            ShellMarkerPosition::Unavailable,
+            "the \"zero\" row is gone; viewport line 0 now holds \"y\""
+        );
+        assert_eq!(pane.get_full_snapshot().cells[0].character, "y");
+        let (_, total, _) = pane.fetch_scrollback(0, 1, 10);
+        assert_eq!(total, 0, "no scrollback is retained");
+    }
+
+    /// A batch far larger than `ROW_ADDRESSING_HEADROOM` must stay counted:
+    /// the batch is fed in steps small enough that no step can append more rows
+    /// than the headroom holds.
+    #[test]
+    fn a_batch_longer_than_the_headroom_stays_counted() {
+        let pane = spawn_marker_pane("osc133-longbatch", 20, 4, 64);
+        let mut feed = PtyFeed::new();
+
+        feed.feed(&pane, b"\x1b]133;A\x07anchor\r\n");
+        let prompt_start = marker_of(&pane, ShellMarkerKind::PromptStart);
+        let epoch = pane.row_addressing_epoch();
+
+        let mut burst = Vec::new();
+        while burst.len() < 8192 {
+            burst.extend_from_slice(b"x\r\n");
+        }
+        let appended = burst.len() / 3;
+        assert!(appended > ROW_ADDRESSING_HEADROOM);
+        feed.feed(&pane, &burst);
+
+        assert_eq!(
+            pane.row_addressing_epoch(),
+            epoch,
+            "step splitting must keep a burst from saturating the headroom"
+        );
+        assert_eq!(
+            pane.locate_shell_marker(&prompt_start),
+            ShellMarkerPosition::Unavailable,
+            "the anchor row scrolled past the oldest surviving row"
+        );
+
+        feed.feed(&pane, b"\x1b]133;B\x07tail\r\n");
+        let command_start = marker_of(&pane, ShellMarkerKind::CommandStart);
+        assert_eq!(
+            pane.locate_shell_marker(&command_start),
+            ShellMarkerPosition::Viewport { line: 2 },
+            "B names the row \"tail\" is typed on, which one scroll moved up"
+        );
+        assert_eq!(pane.get_full_snapshot().cells[2 * 20].character, "t");
+
+        feed.feed(&pane, b"p\r\nq\r\nr\r\n");
+        assert_eq!(
+            pane.locate_shell_marker(&command_start),
+            ShellMarkerPosition::History { index: 63 }
+        );
+        let (lines, total, _) = pane.fetch_scrollback(0, 1, 64);
+        assert_eq!(total, 64, "capacity is honored after the burst");
+        assert_eq!(lines[63].cells[0].character, "t");
+    }
+
+    /// `SU` scrolls by up to a screen height per sequence, so enough of them in
+    /// one parse step can still outrun the headroom. That is the one remaining
+    /// case where the emulator evicts rows it does not report, and it must
+    /// retire the numbering rather than drift.
+    #[test]
+    fn a_scroll_burst_past_the_headroom_retires_the_numbering() {
+        let pane = spawn_marker_pane("osc133-saturate", 20, 60, 10);
+        let mut feed = PtyFeed::new();
+
+        feed.feed(&pane, b"\x1b]133;A\x07anchor\r\n");
+        let prompt_start = marker_of(&pane, ShellMarkerKind::PromptStart);
+        let epoch = pane.row_addressing_epoch();
+
+        let mut burst = String::new();
+        while burst.len() < ROW_ADDRESSING_HEADROOM {
+            burst.push_str("\x1b[60S");
+        }
+        feed.feed(&pane, burst.as_bytes());
+
+        assert_ne!(
+            pane.row_addressing_epoch(),
+            epoch,
+            "growth the emulator clamped away cannot be counted"
+        );
+        assert_eq!(
+            pane.locate_shell_marker(&prompt_start),
+            ShellMarkerPosition::Unavailable
+        );
+        let (_, total, _) = pane.fetch_scrollback(0, 1, 64);
+        assert_eq!(
+            total, 10,
+            "capacity is honored even when the numbering retires"
         );
     }
 
