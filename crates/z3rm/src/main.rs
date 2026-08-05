@@ -610,7 +610,8 @@ fn activate_mux_session(
                     register_mux_window(window_id, domain.clone(), session_id.clone(), cx);
                     // The sidebar's tree is bound to one session, so switching
                     // rebinds it while keeping the user's chosen width.
-                    let Some(multi_workspace) = window.root::<workspace::MultiWorkspace>().flatten()
+                    let Some(multi_workspace) =
+                        window.root::<workspace::MultiWorkspace>().flatten()
                     else {
                         return;
                     };
@@ -1080,7 +1081,10 @@ fn main() {
             let runtime =
                 tokio::runtime::Runtime::new().expect("failed to create tokio runtime for CLI");
             if let Err(error) = runtime.block_on(async { cli::run_cli_command(cmd).await }) {
-                eprintln!("error: {error}");
+                // `{error}` 只印最外层那句 context, 服务端给的真正原因全被吞掉:
+                // 一次越界路径会显示成 "failed to read <path>" 而不是 "path may
+                // not contain parent traversal"。`{error:#}` 把整条 anyhow 链印出来。
+                eprintln!("error: {error:#}");
                 std::process::exit(1);
             }
             std::process::exit(0);
