@@ -8085,12 +8085,9 @@ impl Repository {
                             .checkout_branch_in_worktree(branch_name, worktree_path, create)
                             .await
                     }
-                    RepositoryState::Remote(_) => {
-                        log::warn!(
-                            "checkout_branch_in_worktree not supported for remote repositories"
-                        );
-                        Ok(())
-                    }
+                    RepositoryState::Remote(_) => Err(anyhow!(
+                        "checking out a branch in a remote worktree is not supported"
+                    )),
                 }
             },
         )
@@ -9945,11 +9942,13 @@ impl Repository {
     }
 }
 
-// §8.1 z3rm 迁移洞:git_store tests 引用已删除的 project API
-//(git_scans_complete, 旧 ProjectPath 构造)。
-//完整迁移 (Plan 18 file viewer) 完成前用 z3rm-migration feature 跳过。
-//默认 (feature off) 时这些测试不编译,避免阻塞其他 project 测试。
-#[cfg(all(test, feature = "z3rm-migration"))]
+// §8.1 z3rm 迁移洞:git_store tests 曾引用已删除的 project API
+// (git_scans_complete,旧 ProjectPath 元组构造)。已迁移:
+// - git_scans_complete -> 下方 git_scans_complete helper,基于当前权威
+//   scan-complete API (Worktree::scan_complete + Repository::barrier)。
+// - ProjectPath 元组构造 -> 显式 .into() 转换。
+// 无用例依赖已删除行为,全部恢复为普通测试编译。
+#[cfg(test)]
 mod tests {
     use super::*;
     use crate::Project;
@@ -9957,7 +9956,7 @@ mod tests {
     use git::repository::{RepoPath, repo_path};
     use gpui::TestAppContext;
     use gpui::proptest::prelude::*;
-    use rand::{SeedableRng, rngs::StdRng};
+    use rand::{Rng, SeedableRng, rngs::StdRng};
     use serde_json::json;
     use settings::SettingsStore;
     use std::path::{Path, PathBuf};
@@ -9967,6 +9966,40 @@ mod tests {
             let settings_store = SettingsStore::test(cx);
             cx.set_global(settings_store);
         });
+    }
+
+    /// Waits until every worktree has finished its scan and the git store has
+    /// drained its pending jobs (status scans, commit data loads, ...).
+    ///
+    /// Replaces the removed `Project::git_scans_complete` API with the current
+    /// authoritative primitives: `Worktree::scan_complete` per local worktree,
+    /// then a `Repository::barrier` per repository (see worktree_service.rs for
+    /// the same pattern).
+    async fn git_scans_complete(project: &Entity<Project>, cx: &mut TestAppContext) {
+        project
+            .update(cx, |project, cx| {
+                let scans = project
+                    .worktrees(cx)
+                    .filter_map(|worktree| Some(worktree.read(cx).as_local()?.scan_complete()))
+                    .collect::<Vec<_>>();
+                futures::future::join_all(scans)
+            })
+            .await;
+
+        // Deliver the worktree-store events to the git store so repositories
+        // have been discovered and their initial scans scheduled before we
+        // enqueue the barriers.
+        cx.run_until_parked();
+
+        project
+            .update(cx, |project, cx| {
+                let barriers = project
+                    .repositories(cx)
+                    .into_iter()
+                    .map(|repository| repository.update(cx, |repository, _| repository.barrier()));
+                futures::future::join_all(barriers)
+            })
+            .await;
     }
 
     #[gpui::test]
@@ -9997,9 +10030,7 @@ mod tests {
         );
 
         let project = Project::test(fs.clone(), [Path::new("/project")], cx).await;
-        project
-            .update(cx, |project, cx| project.git_scans_complete(cx))
-            .await;
+        git_scans_complete(&project, cx).await;
 
         let worktree_id = project.read_with(cx, |project, cx| {
             project.worktrees(cx).next().unwrap().read(cx).id()
@@ -10008,7 +10039,7 @@ mod tests {
         // symlink file should not produce a base diff
         let symlink_buffer = project
             .update(cx, |project, cx| {
-                project.open_buffer((worktree_id, rel_path("agents.md")), cx)
+                project.open_buffer((worktree_id, rel_path("agents.md").into()).into(), cx)
             })
             .await
             .unwrap();
@@ -10028,7 +10059,7 @@ mod tests {
         // regular file should still produce a base diff
         let regular_buffer = project
             .update(cx, |project, cx| {
-                project.open_buffer((worktree_id, rel_path("target.txt")), cx)
+                project.open_buffer((worktree_id, rel_path("target.txt").into()).into(), cx)
             })
             .await
             .unwrap();
@@ -10329,9 +10360,7 @@ mod tests {
         fs.set_commit_data(Path::new("/project/.git"), commit_data);
 
         let project = Project::test(fs.clone(), [Path::new("/project")], cx).await;
-        project
-            .update(cx, |project, cx| project.git_scans_complete(cx))
-            .await;
+        git_scans_complete(&project, cx).await;
 
         let repository = project.read_with(cx, |project, cx| {
             project

@@ -626,14 +626,25 @@ impl MultiWorkspace {
         let project = workspace.read(cx).project().clone();
         cx.subscribe_in(&project, window, {
             let workspace = workspace.downgrade();
+            let project = project.clone();
             move |this, _project, event, _window, cx| match event {
                 project::Event::WorktreePathsChanged { old_worktree_paths } => {
                     if let Some(workspace) = workspace.upgrade() {
-                        // 规范 §2.1：Project::remote_connection_options 已随远程项目类型删除，
-                        // 本地工作区 host 固定为 None。
-                        let host: Option<String> = None;
-                        let old_key =
-                            ProjectGroupKey::from_worktree_paths(old_worktree_paths.clone(), host);
+                        let old_key = project
+                            .read(cx)
+                            .remote_connection_options()
+                            .map(|options| {
+                                ProjectGroupKey::with_remote_connection(
+                                    options,
+                                    old_worktree_paths.main_worktree_path_list().clone(),
+                                )
+                            })
+                            .unwrap_or_else(|| {
+                                ProjectGroupKey::from_worktree_paths(
+                                    old_worktree_paths.clone(),
+                                    None,
+                                )
+                            });
                         this.handle_project_group_key_change(&workspace, &old_key, cx);
                     }
                 }
