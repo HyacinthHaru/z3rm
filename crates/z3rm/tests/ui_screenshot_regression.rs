@@ -29,6 +29,7 @@
 use anyhow::{Context as _, Result};
 use assets::Assets;
 use extension_host::vdom_bridge::{DrawOp, VDomNode, VDomPalette, VDomRenderer};
+use extension_host::vdom_bridge::CommandInvocation;
 use gpui::{
     AnyWindowHandle, App, AppContext as _, Context, Entity, HeadlessAppContext, IntoElement,
     ParentElement as _, Render, Styled as _, WeakEntity, Window, WindowHandle, div, px, size,
@@ -36,8 +37,8 @@ use gpui::{
 use image::RgbaImage;
 use mux::MuxDomain;
 use mux_protocol::{
-    Cell, CellStyle, CursorState, Envelope, FetchGridUpdateResponse, FullGridSnapshot, Request,
-    Response, envelope::Payload as EnvelopePayload,
+    Cell, CellStyle, CursorState, Envelope, FetchGridUpdateResponse, FetchScrollbackResponse,
+    FullGridSnapshot, Request, Response, RowChange, envelope::Payload as EnvelopePayload,
     fetch_grid_update_response::Update as FetchUpdate, request::Body as RequestBody,
     response::Body as ResponseBody,
 };
@@ -289,6 +290,8 @@ struct MockGrid {
     accent_background: u32,
     accent_foreground: u32,
     generation: u64,
+    history: Vec<String>,
+    history_version: u64,
 }
 
 impl MockGrid {
@@ -335,8 +338,8 @@ impl MockGrid {
             }),
             alternate_screen: false,
             display_offset: 0,
-            history_size: 0,
-            history_version: 0,
+            history_size: u32::try_from(self.history.len()).expect("history fits u32"),
+            history_version: self.history_version,
             modes: None,
         }
     }
@@ -358,7 +361,6 @@ fn serve_mock_mux(
         .set_read_timeout(Some(Duration::from_millis(100)))
         .map_err(|error| format!("set mock mux read timeout: {error}"))?;
 
-    let snapshot = grid.snapshot();
     let mut buffered: Vec<u8> = Vec::new();
     let mut chunk = [0u8; 8192];
 
@@ -381,7 +383,7 @@ fn serve_mock_mux(
             let Some(EnvelopePayload::Request(request)) = envelope.payload else {
                 continue;
             };
-            let response = mock_response(&request, &snapshot, grid.generation);
+            let response = mock_response(&request, &grid);
             let bytes = mux_protocol::frame(&Envelope {
                 version: Some(mux_protocol::PROTOCOL_VERSION),
                 payload: Some(EnvelopePayload::Response(response)),
@@ -399,14 +401,57 @@ fn serve_mock_mux(
     Ok(())
 }
 
-fn mock_response(request: &Request, snapshot: &FullGridSnapshot, generation: u64) -> Response {
+fn mock_response(request: &Request, grid: &MockGrid) -> Response {
+    let generation = grid.generation;
     let body = match &request.body {
         Some(RequestBody::FetchGridUpdate(fetch)) => {
-            Some(ResponseBody::GridUpdate(FetchGridUpdateResponse {
-                from_generation: fetch.since_generation,
-                to_generation: generation,
-                update: Some(FetchUpdate::FullSnapshot(snapshot.clone())),
-                output_sequence: 0,
+            if fetch.since_generation == generation {
+                // Stable checkpoint / quiet refetch: the grid has not moved
+                // since the client's generation (§15.4).
+                Some(ResponseBody::GridUpdate(FetchGridUpdateResponse {
+                    from_generation: generation,
+                    to_generation: generation,
+                    update: None,
+                    output_sequence: 0,
+                }))
+            } else {
+                Some(ResponseBody::GridUpdate(FetchGridUpdateResponse {
+                    from_generation: fetch.since_generation,
+                    to_generation: generation,
+                    update: Some(FetchUpdate::FullSnapshot(grid.snapshot())),
+                    output_sequence: 0,
+                }))
+            }
+        }
+        Some(RequestBody::FetchScrollback(fetch)) => {
+            let from = fetch.from_line as usize;
+            let count = fetch.count as usize;
+            let lines = (from..from + count)
+                .map(|row| RowChange {
+                    row: row as u32,
+                    cells: grid
+                        .history
+                        .get(row)
+                        .map(|line| {
+                            let chars: Vec<char> = line.chars().collect();
+                            (0..grid.cols)
+                                .map(|col| Cell {
+                                    char: chars
+                                        .get(col as usize)
+                                        .copied()
+                                        .unwrap_or(' ')
+                                        .to_string(),
+                                    ..Default::default()
+                                })
+                                .collect()
+                        })
+                        .unwrap_or_default(),
+                })
+                .collect();
+            Some(ResponseBody::Scrollback(FetchScrollbackResponse {
+                lines,
+                total_lines: u32::try_from(grid.history.len()).expect("history fits u32"),
+                scrollback_version: grid.history_version,
             }))
         }
         // Empty body = success. Anything the view issues during startup that is
@@ -505,6 +550,35 @@ fn terminal_grid() -> MockGrid {
         accent_background: TERMINAL_ACCENT_BG,
         accent_foreground: TERMINAL_ACCENT_FG,
         generation: 9,
+        history: Vec::new(),
+        history_version: 0,
+    }
+}
+
+fn terminal_grid_with_history() -> MockGrid {
+    // The headless window is taller than a 12-row grid, and alacritty pulls
+    // history into the screen when the viewport grows, which would mask the
+    // semantic scroll. Serve more rows than the window can display so the
+    // history stays above the viewport until an action scrolls to it.
+    let mut lines = vec![format!("{TERMINAL_MARKER} row0")];
+    for row in 1..24 {
+        lines.push(format!("active row {row:02}"));
+    }
+    MockGrid {
+        cols: 60,
+        rows: 24,
+        lines,
+        accent_row: 2,
+        accent_background: TERMINAL_ACCENT_BG,
+        accent_foreground: TERMINAL_ACCENT_FG,
+        generation: 9,
+        history: vec![
+            "HIST-0 oldest".to_string(),
+            "HIST-1".to_string(),
+            "HIST-2".to_string(),
+            "HIST-3 newest".to_string(),
+        ],
+        history_version: 7,
     }
 }
 
@@ -694,9 +768,16 @@ struct ChromeHarness {
     renderer: VDomRenderer,
     node: VDomNode,
 }
-
 impl ChromeHarness {
     fn new(node: VDomNode, display_list: Vec<(&'static str, Vec<DrawOp>)>) -> Self {
+        Self::new_with_dispatch(node, display_list, None)
+    }
+
+    fn new_with_dispatch(
+        node: VDomNode,
+        display_list: Vec<(&'static str, Vec<DrawOp>)>,
+        dispatch: Option<extension_host::vdom_bridge::CommandDispatch>,
+    ) -> Self {
         let mut renderer = VDomRenderer::new();
         renderer.set_palette(VDomPalette {
             text: gpui::white(),
@@ -707,6 +788,9 @@ impl ChromeHarness {
         });
         for (region, ops) in display_list {
             renderer.set_display_list(region, ops);
+        }
+        if let Some(dispatch) = dispatch {
+            renderer.set_dispatch(dispatch);
         }
         Self { renderer, node }
     }
@@ -795,6 +879,65 @@ fn open_chrome(cx: &mut HeadlessAppContext, node: VDomNode) -> Result<WindowHand
     })
 }
 
+fn open_chrome_with_dispatch(
+    cx: &mut HeadlessAppContext,
+    node: VDomNode,
+    dispatch: extension_host::vdom_bridge::CommandDispatch,
+) -> Result<WindowHandle<ChromeHarness>> {
+    cx.open_window(size(px(560.0), px(80.0)), |_, cx| {
+        cx.new(|_| {
+            ChromeHarness::new_with_dispatch(
+                node,
+                vec![("cpu-meter", cpu_meter_ops())],
+                Some(dispatch),
+            )
+        })
+    })
+}
+
+
+fn extension_chrome_semantic_button_dispatches_command() -> Result<()> {
+    let mut cx = headless_app()?;
+    let dispatched = std::rc::Rc::new(std::cell::Cell::new(false));
+    let dispatch: extension_host::vdom_bridge::CommandDispatch = {
+        let dispatched = dispatched.clone();
+        std::rc::Rc::new(
+            move |invocation: CommandInvocation, _window: &mut Window, _cx: &mut App| {
+                dispatched.set(invocation.command == "z3rm.pane.split");
+            },
+        )
+    };
+    let window = open_chrome_with_dispatch(&mut cx, status_bar_vdom()?, dispatch)?;
+    draw_frame(&mut cx, window.into())?;
+    let (_, tree) = draw_frame(&mut cx, window.into())?;
+
+    let button = a11y_nodes_with_role(&tree, "Button")
+        .into_iter()
+        .next()
+        .context("status bar button missing from accessibility tree")?;
+    let node_id = button
+        .get("accesskit_id")
+        .and_then(serde_json::Value::as_str)
+        .context("status bar button missing AccessKit node id")?
+        .parse::<u64>()
+        .context("invalid AccessKit node id")?;
+    let delivered = cx.simulate_a11y_action(
+        window.into(),
+        gpui::accesskit::ActionRequest {
+            target_tree: gpui::accesskit::TreeId::ROOT,
+            target_node: gpui::accesskit::NodeId(node_id),
+            action: gpui::accesskit::Action::Click,
+            data: None,
+        },
+    )?;
+    assert!(delivered, "semantic Click must reach the window's accessibility action callback");
+    cx.run_until_parked();
+    assert!(
+        dispatched.get(),
+        "semantic Click must dispatch the VDOM button command"
+    );
+    Ok(())
+}
 fn extension_chrome_vdom_renders_status_bar() -> Result<()> {
     let mut cx = headless_app()?;
     let window = open_chrome(&mut cx, status_bar_vdom()?)?;
@@ -948,6 +1091,63 @@ impl Render for Swatch {
     }
 }
 
+fn terminal_semantic_scroll_actions_move_viewport() -> Result<()> {
+    let mut cx = headless_app()?;
+    let (domain, _server) = MockMuxServer::start(terminal_grid_with_history())?;
+    cx.allow_parking();
+
+    let window = open_mux_pane(&mut cx, domain)?;
+    let (_, tree) = draw_until(&mut cx, window.into(), |tree| {
+        a11y_text_run_values(tree)
+            .iter()
+            .any(|value| value.contains(TERMINAL_MARKER))
+    })?;
+
+    let terminal = a11y_nodes_with_role(&tree, "Terminal")
+        .into_iter()
+        .next()
+        .context("Terminal node missing from accessibility tree")?;
+    let node_id = terminal
+        .get("accesskit_id")
+        .and_then(serde_json::Value::as_str)
+        .context("Terminal node missing AccessKit id")?
+        .parse::<u64>()
+        .context("invalid AccessKit node id")?;
+    let request = |action: gpui::accesskit::Action| gpui::accesskit::ActionRequest {
+        target_tree: gpui::accesskit::TreeId::ROOT,
+        target_node: gpui::accesskit::NodeId(node_id),
+        action,
+        data: None,
+    };
+    let delivered = cx.simulate_a11y_action(window.into(), request(gpui::accesskit::Action::ScrollUp))?;
+    assert!(delivered, "ScrollUp must reach the terminal's accessibility action listener");
+    cx.run_until_parked();
+    let (_, tree) = draw_until(&mut cx, window.into(), |tree| {
+        a11y_text_run_values(tree)
+            .iter()
+            .any(|value| value.contains("HIST-3"))
+    })?;
+    let runs = a11y_text_run_values(&tree);
+    assert!(
+        runs.iter().any(|value| value.contains("HIST-3")),
+        "semantic ScrollUp must expose the newest history row: {runs:?}"
+    );
+    assert!(
+        !runs.iter().any(|value| value.contains("HIST-0")),
+        "a single semantic ScrollUp must not expose the oldest row: {runs:?}"
+    );
+
+    let delivered =
+        cx.simulate_a11y_action(window.into(), request(gpui::accesskit::Action::ScrollDown))?;
+    assert!(delivered, "ScrollDown must reach the terminal's accessibility action listener");
+    draw_until(&mut cx, window.into(), |tree| {
+        !a11y_text_run_values(tree)
+            .iter()
+            .any(|value| value.contains("HIST-3"))
+    })?;
+    Ok(())
+}
+
 fn headless_renderer_produces_real_pixels() -> Result<()> {
     // Guards the harness: a blank software or GPU frame makes every other
     // visual assertion meaningless.
@@ -993,8 +1193,16 @@ fn main() {
             extension_chrome_vdom_renders_status_bar,
         ),
         (
+            "extension_chrome_semantic_button_dispatches_command",
+            extension_chrome_semantic_button_dispatches_command,
+        ),
+        (
             "extension_chrome_display_list_updates_without_touching_vdom",
             extension_chrome_display_list_updates_without_touching_vdom,
+        ),
+        (
+            "terminal_semantic_scroll_actions_move_viewport",
+            terminal_semantic_scroll_actions_move_viewport,
         ),
         (
             "headless_renderer_produces_real_pixels",

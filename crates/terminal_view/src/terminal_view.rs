@@ -86,11 +86,16 @@ fn resolve_mux_scrollback_offset(
     scroll_locked: bool,
 ) -> Option<usize> {
     if scroll_locked {
-        previous_offset.map(|offset| offset.min(history_rows))
+        match previous_offset {
+            Some(offset) => Some(offset.min(history_rows)),
+            None => (server_offset > 0).then_some(server_offset.min(history_rows)),
+        }
     } else {
         (server_offset > 0).then_some(server_offset.min(history_rows))
     }
 }
+
+
 
 #[cfg(test)]
 mod mux_scrollback_tests {
@@ -108,6 +113,14 @@ mod mux_scrollback_tests {
             Some(3)
         );
         assert_eq!(resolve_mux_scrollback_offset(Some(12), 0, 8, false), None);
+    }
+
+    #[test]
+    fn locked_bottom_snapshot_reanchors_the_terminal() {
+        assert_eq!(resolve_mux_scrollback_offset(None, 4, 8, true), Some(4));
+        assert_eq!(resolve_mux_scrollback_offset(Some(2), 4, 8, true), Some(2));
+        assert_eq!(resolve_mux_scrollback_offset(None, 0, 8, true), None);
+        assert_eq!(resolve_mux_scrollback_offset(None, 4, 8, false), Some(4));
     }
 }
 

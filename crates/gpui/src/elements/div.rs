@@ -135,6 +135,16 @@ impl Interactivity {
             }));
     }
 
+    /// Bind the given callback to an accessibility action on this element,
+    /// the imperative API equivalent of [`InteractiveElement::on_a11y_action`].
+    pub fn on_a11y_action(
+        &mut self,
+        action: accesskit::Action,
+        listener: impl FnMut(Option<&accesskit::ActionData>, &mut Window, &mut App) + 'static,
+    ) {
+        self.a11y_action_listeners.push((action, Box::new(listener)));
+    }
+
     /// Bind the given callback to the mouse down event for any button, during the capture phase.
     /// The imperative API equivalent of [`InteractiveElement::capture_any_mouse_down`].
     ///

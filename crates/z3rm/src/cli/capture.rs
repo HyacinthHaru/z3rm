@@ -4,7 +4,7 @@
 use anyhow::{Context, Result};
 use mux::MuxDomain;
 use mux_protocol::proto::{
-    Cell, FullGridSnapshot, fetch_grid_update_response::Update as GridUpdateKind,
+    Cell, FetchGridUpdateResponse, FullGridSnapshot, fetch_grid_update_response::Update as GridUpdateKind,
 };
 
 /// `-S` / `-E` 接受的行号，遵循 tmux 的行号模型。
@@ -72,6 +72,13 @@ pub async fn capture_pane(
                 continue;
             }
             rows.extend(scrollback.lines.iter().map(|row| row.cells.clone()));
+        }
+        let checkpoint = domain
+            .fetch_grid_update(pane_id, grid.to_generation)
+            .await
+            .context("failed to validate capture grid checkpoint")?;
+        if !grid_checkpoint_is_stable(grid.to_generation, &checkpoint) {
+            continue;
         }
         if let Some((first, last)) = span.visible {
             rows.extend(visible_rows(snapshot, first, last));
@@ -163,6 +170,15 @@ fn scrollback_matches_snapshot(
         && scrollback.lines.iter().enumerate().all(|(index, row)| {
             row.row == from + index as u32 && row.cells.len() == columns as usize
         })
+}
+
+fn grid_checkpoint_is_stable(
+    generation: u64,
+    response: &FetchGridUpdateResponse,
+) -> bool {
+    response.from_generation == generation
+        && response.to_generation == generation
+        && response.update.is_none()
 }
 
 fn render_capture(rows: &[Vec<Cell>], join_wrapped: bool, preserve_ansi: bool) -> String {
@@ -599,5 +615,23 @@ mod tests {
         let mut narrow = valid;
         narrow.lines[1].cells.pop();
         assert!(!scrollback_matches_snapshot(&narrow, 7, 10, 2, 8, 2));
+    }
+
+    #[test]
+    fn capture_requires_an_unchanged_grid_checkpoint() {
+        let stable = FetchGridUpdateResponse {
+            from_generation: 9,
+            to_generation: 9,
+            output_sequence: 0,
+            update: None,
+        };
+        assert!(grid_checkpoint_is_stable(9, &stable));
+
+        let changed = FetchGridUpdateResponse {
+            to_generation: 10,
+            update: Some(GridUpdateKind::Diff(Default::default())),
+            ..stable
+        };
+        assert!(!grid_checkpoint_is_stable(9, &changed));
     }
 }

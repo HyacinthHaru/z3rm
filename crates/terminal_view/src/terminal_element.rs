@@ -15,9 +15,10 @@ use language::CursorShape as EditorCursorShape;
 use settings::Settings;
 use std::time::Instant;
 use terminal::{
-    Cell, Color, Content, CursorShape, IndexedCell, Modes, NamedColor, Point, Range, Terminal,
-    TerminalBounds, VisibleImage, is_app_chosen_exact_color as terminal_is_app_chosen_exact_color,
-    is_default_background_color, terminal_settings::TerminalSettings,
+    Cell, Color, Content, CursorShape, IndexedCell, Modes, NamedColor, Point, Range, ScrollLineDown,
+    ScrollLineUp, Terminal, TerminalBounds, VisibleImage,
+    is_app_chosen_exact_color as terminal_is_app_chosen_exact_color, is_default_background_color,
+    terminal_settings::TerminalSettings,
 };
 use theme::{ActiveTheme, Theme};
 use theme_settings::ThemeSettings;
@@ -869,6 +870,31 @@ impl TerminalElement {
                         .ok();
                 }
             });
+        }
+
+        // Screen-reader semantic actions: scroll the viewport one line at a
+        // time through the same handlers the keyboard bindings use.
+        {
+            let terminal_view = self.terminal_view.downgrade();
+            self.interactivity.on_a11y_action(
+                accesskit::Action::ScrollUp,
+                move |_data, window, cx| {
+                    terminal_view
+                        .update(cx, |view, cx| view.scroll_line_up(&ScrollLineUp, window, cx))
+                        .ok();
+                },
+            );
+            let terminal_view = self.terminal_view.downgrade();
+            self.interactivity.on_a11y_action(
+                accesskit::Action::ScrollDown,
+                move |_data, window, cx| {
+                    terminal_view
+                        .update(cx, |view, cx| {
+                            view.scroll_line_down(&ScrollLineDown, window, cx)
+                        })
+                        .ok();
+                },
+            );
         }
 
         // Mouse mode handlers:

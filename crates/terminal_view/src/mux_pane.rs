@@ -1037,10 +1037,21 @@ async fn prepare_fetch_update(
             })
         }
         Some(FetchUpdate::FullSnapshot(full)) => {
-            let history_cache = match matching_history_cache(&full, Some(&history_cache)) {
-                Some(cache) => cache.clone(),
-                None => fetch_history_checkpoint(domain, pane_id, &full).await?,
-            };
+            let (history_cache, fetched_history) =
+                match matching_history_cache(&full, Some(&history_cache)) {
+                    Some(cache) => (cache.clone(), false),
+                    // An empty history is trivially consistent, so committing it
+                    // needs neither page fetches nor a checkpoint round trip.
+                    None if full.history_size == 0 => (
+                        HistoryPageAccumulator::new(&full)
+                            .and_then(HistoryPageAccumulator::finish)?,
+                        false,
+                    ),
+                    None => (fetch_history_checkpoint(domain, pane_id, &full).await?, true),
+                };
+            if fetched_history {
+                confirm_grid_checkpoint(domain, pane_id, generation).await?;
+            }
             let structured = structured_terminal_snapshot(&full, &history_cache)
                 .map_err(PrepareFetchError::invalid)?;
             Ok(PreparedFetchUpdate::Snapshot {
@@ -1074,6 +1085,29 @@ async fn fetch_history_checkpoint(
         }
     }
     accumulator.finish()
+}
+
+async fn confirm_grid_checkpoint(
+    domain: &MuxDomain,
+    pane_id: &str,
+    generation: u64,
+) -> Result<(), PrepareFetchError> {
+    let response = domain
+        .fetch_grid_update(pane_id, generation)
+        .await
+        .map_err(classify_fetch_rpc_error)?;
+    validate_generation_envelope(generation, &response).map_err(PrepareFetchError::invalid)?;
+    if response.from_generation != generation
+        || response.to_generation != generation
+        || response.update.is_some()
+    {
+        return Err(PrepareFetchError::checkpoint_changed(anyhow::anyhow!(
+            "mux grid changed while history was being fetched: expected stable generation {generation}, got {} -> {}",
+            response.from_generation,
+            response.to_generation
+        )));
+    }
+    Ok(())
 }
 
 fn matching_history_cache<'a>(
@@ -1159,9 +1193,9 @@ impl HistoryPageAccumulator {
                 "mux history page requested {requested_count} rows with {remaining} remaining"
             )));
         }
-        if page.lines.len() > requested_count {
+        if page.lines.len() != requested_count {
             return Err(PrepareFetchError::invalid(anyhow::anyhow!(
-                "mux history page returned {} rows, requested {requested_count}",
+                "mux history page returned {} rows, expected {requested_count}",
                 page.lines.len()
             )));
         }
@@ -2075,6 +2109,39 @@ mod tests {
             )?;
         }
 
+        let checkpoint = read_test_envelope(&mut stream, "history checkpoint request")?;
+        let checkpoint = match checkpoint.payload {
+            Some(EnvelopePayload::Request(request)) => request,
+            payload => return Err(format!("expected history checkpoint request, got {payload:?}")),
+        };
+        let checkpoint_fetch = match checkpoint.body {
+            Some(RequestBody::FetchGridUpdate(fetch)) => fetch,
+            body => return Err(format!("expected history checkpoint grid request, got {body:?}")),
+        };
+        if checkpoint_fetch.pane_id != "history-pane"
+            || checkpoint_fetch.since_generation != 5
+        {
+            return Err(format!(
+                "unexpected history checkpoint request: {checkpoint_fetch:?}"
+            ));
+        }
+        write_test_envelope(
+            &mut stream,
+            &Envelope {
+                version: Some(mux_protocol::PROTOCOL_VERSION),
+                payload: Some(EnvelopePayload::Response(Response {
+                    request_id: checkpoint.request_id,
+                    body: Some(ResponseBody::GridUpdate(FetchGridUpdateResponse {
+                        from_generation: 5,
+                        to_generation: 5,
+                        output_sequence: 0,
+                        update: None,
+                    })),
+                })),
+            },
+            "history checkpoint response",
+        )?;
+
         let request = read_test_envelope(&mut stream, "cached history grid request")?;
         let request = match request.payload {
             Some(EnvelopePayload::Request(request)) => request,
@@ -2542,6 +2609,7 @@ mod tests {
         let cache = accumulator
             .finish()
             .unwrap_or_else(|error| panic!("finish history pages: {error}"));
+
         assert_eq!(cache.history_size, 3);
         assert_eq!(
             cache
@@ -2551,6 +2619,26 @@ mod tests {
                 .collect::<Vec<_>>(),
             vec!['A', 'a', 'B', 'b', 'C', 'c']
         );
+    }
+    #[test]
+    fn paged_history_rejects_short_pages() {
+        let snapshot = history_snapshot(1, 2, 7);
+        let mut accumulator = HistoryPageAccumulator::new(&snapshot)
+            .unwrap_or_else(|error| panic!("create history accumulator: {error}"));
+        assert!(
+            accumulator
+                .push(
+                    FetchScrollbackResponse {
+                        lines: vec![history_row(0, &["A"])],
+                        total_lines: 2,
+                        scrollback_version: 7,
+                    },
+                    2,
+                )
+                .is_err()
+        );
+        assert_eq!(accumulator.next_row, 0);
+        assert!(accumulator.cells.is_empty());
     }
 
     #[test]
