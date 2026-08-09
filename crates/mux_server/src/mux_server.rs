@@ -1,7 +1,7 @@
 // §3.1 mux_server — mux_server 守护进程库。
 // 管理 PTY、alacritty 终端模拟、layout 引擎、session 持久化。
 
-use anyhow::Result;
+use anyhow::{Context as _, Result};
 use interprocess::local_socket::tokio::Listener as LocalSocketListener;
 use sqlez::connection::Connection;
 use std::future::Future;
@@ -17,6 +17,7 @@ mod server_settings;
 pub mod clipboard;
 pub mod coalescing;
 pub mod dec2026;
+pub mod extension_host;
 pub mod grid_sync;
 pub mod layout;
 pub mod pane;
@@ -85,12 +86,12 @@ pub fn setup_logging() -> Result<()> {
 
 /// 默认 socket 路径: $XDG_RUNTIME_DIR/z3rm/mux.sock (Unix §16.1)
 /// 或 \\.\pipe\z3rm-mux (Windows)
-fn default_socket_name() -> interprocess::local_socket::Name<'static> {
+fn default_socket_name() -> Result<interprocess::local_socket::Name<'static>> {
     use interprocess::local_socket::{GenericFilePath, GenericNamespaced, prelude::*};
-    if let Ok(p) = std::env::var("Z3RM_MUX_SOCKET") {
-        return p
+    if let Ok(path) = std::env::var("Z3RM_MUX_SOCKET") {
+        return path
             .to_fs_name::<GenericFilePath>()
-            .expect("invalid socket path");
+            .map_err(|error| anyhow::anyhow!("invalid socket path: {error}"));
     }
     #[cfg(unix)]
     {
@@ -99,20 +100,19 @@ fn default_socket_name() -> interprocess::local_socket::Name<'static> {
             .join("z3rm")
             .join("mux.sock");
         if let Some(parent) = path.parent() {
-            if let Err(e) = std::fs::create_dir_all(parent) {
-                tracing::warn!(error = %e, "create_dir_all failed");
-            }
+            std::fs::create_dir_all(parent)
+                .with_context(|| format!("create socket directory {}", parent.display()))?;
         }
         path.to_string_lossy()
             .to_string()
             .to_fs_name::<GenericFilePath>()
-            .expect("invalid socket path")
+            .map_err(|error| anyhow::anyhow!("invalid socket path: {error}"))
     }
     #[cfg(windows)]
     {
         r"\\.\pipe\z3rm-mux"
             .to_ns_name::<GenericNamespaced>()
-            .expect("invalid pipe name")
+            .map_err(|error| anyhow::anyhow!("invalid pipe name: {error}"))
     }
 }
 
@@ -201,7 +201,7 @@ pub fn run() -> Result<()> {
         .build()?;
 
     rt.block_on(async {
-        let socket_name = default_socket_name();
+        let socket_name = default_socket_name()?;
         let listener = match bind_or_cleanup(&socket_name).await {
             Ok(l) => l,
             Err(e) => {
@@ -264,6 +264,13 @@ pub fn run() -> Result<()> {
         let sessions = std::sync::Arc::new(parking_lot::RwLock::new(Vec::new()));
         let db = std::sync::Arc::new(parking_lot::Mutex::new(db));
 
+        // §16.8 Server-side QuickJS extension host: dedicated OS thread;
+        // discovery/load failures log and never stop the daemon (§15.7).
+        let extension_host = extension_host::ServerExtensionHost::start(
+            sessions.clone(),
+            extension_host::default_user_extensions_dir(),
+        );
+
         let sessions_clone = sessions.clone();
         let db_clone = db.clone();
         let persist_handle = tokio::spawn(async move {
@@ -289,6 +296,7 @@ pub fn run() -> Result<()> {
             _db: db,
             _persist_handle: Some(persist_handle),
             clipboard,
+            extension_host,
             start_time: SystemTime::now(),
             server_settings: server_settings.clone(),
             // §3.5 active connection counter — drives the idle-shutdown timer.
@@ -309,7 +317,8 @@ pub struct Server {
     _persist_handle: Option<tokio::task::JoinHandle<()>>,
     // §16.6 服务器剪贴板
     clipboard: std::sync::Arc<clipboard::ServerClipboard>,
-    // §16.12 启动时间 (用于 status 计算运行时长)
+    // §16.8 服务端 QuickJS 扩展宿主 (专用线程)。
+    extension_host: std::sync::Arc<extension_host::ServerExtensionHost>,
     start_time: SystemTime,
     // §16.11 Shared server settings (env + server.json); hot-reloaded.
     // keep_alive_seconds is read live via AtomicU64 — not snapshotted at boot.
@@ -378,12 +387,13 @@ impl Server {
                     // §16.11 thread the live ServerSettings handle so new panes
                     // honor env + server.json scrollback (hot-reloaded) at spawn.
                     let server_settings = self.server_settings.clone();
+                    let extension_host = self.extension_host.clone();
                     let counter = self.active_connections.clone();
                     let done_tx = done_tx.clone();
                     let shutdown_state = shutdown_state.clone();
 
                     tokio::spawn(async move {
-                        match connection::handle_connection(stream, sessions, db, clipboard, server_settings, shutdown_state).await {
+                        match connection::handle_connection(stream, sessions, db, clipboard, server_settings, shutdown_state, extension_host).await {
                             Ok(()) => {
                                 zlog::info!("client disconnected");
                             }

@@ -1,5 +1,28 @@
 use std::collections::HashMap;
 use std::hash::Hash;
+use std::path::Path;
+
+/// Formats `path` as its last `detail + 1` normal path components joined by
+/// `/`. Used to disambiguate paths that share a basename: `/a/zed` and
+/// `/b/zed` both format as `zed` at detail 0, but become `a/zed` and `b/zed`
+/// at detail 1.
+///
+/// Never panics: the component count is saturated (`detail` cannot overflow),
+/// and paths without normal components (roots, `..`, empty paths) format as
+/// an empty string.
+pub fn path_suffix(path: &Path, detail: usize) -> String {
+    let mut components: Vec<_> = path
+        .components()
+        .rev()
+        .filter_map(|c| match c {
+            std::path::Component::Normal(s) => Some(s.to_string_lossy()),
+            _ => None,
+        })
+        .take(detail.saturating_add(1))
+        .collect();
+    components.reverse();
+    components.join("/")
+}
 
 /// Computes the minimum detail level needed for each item so that no two items
 /// share the same description. Items whose descriptions are unique at level 0
@@ -168,20 +191,6 @@ mod tests {
         // collide with each other and drive the detail to the full path.
         // The fix is to deduplicate before disambiguating.
 
-        fn path_suffix(path: &Path, detail: usize) -> String {
-            let mut components: Vec<_> = path
-                .components()
-                .rev()
-                .filter_map(|c| match c {
-                    std::path::Component::Normal(s) => Some(s.to_string_lossy()),
-                    _ => None,
-                })
-                .take(detail + 1)
-                .collect();
-            components.reverse();
-            components.join("/")
-        }
-
         let all_paths: Vec<&Path> = vec![
             Path::new("/Users/rtfeldman/code/worktrees/zed/focal-arrow/zed"),
             Path::new("/Users/rtfeldman/code/zed"),
@@ -198,5 +207,36 @@ mod tests {
         assert_eq!(path_suffix(all_paths[0], details[0]), "focal-arrow/zed");
         assert_eq!(path_suffix(all_paths[1], details[1]), "code/zed");
         assert_eq!(path_suffix(all_paths[2], details[2]), "roc");
+    }
+
+    #[test]
+    fn test_path_suffix_disambiguates_shared_basenames() {
+        // Two different parents with the same basename: detail 0 collides,
+        // detail 1 makes them distinguishable.
+        assert_eq!(path_suffix(Path::new("/a/zed"), 0), "zed");
+        assert_eq!(path_suffix(Path::new("/b/zed"), 0), "zed");
+        assert_eq!(path_suffix(Path::new("/a/zed"), 1), "a/zed");
+        assert_eq!(path_suffix(Path::new("/b/zed"), 1), "b/zed");
+    }
+
+    #[test]
+    fn test_path_suffix_handles_stale_and_odd_paths() {
+        // Roots and parent-only paths have no normal components.
+        assert_eq!(path_suffix(Path::new("/"), 0), "");
+        assert_eq!(path_suffix(Path::new("/"), 10), "");
+        assert_eq!(path_suffix(Path::new(".."), 0), "");
+        assert_eq!(path_suffix(Path::new("/.."), 1), "");
+
+        // Relative paths and paths with few components.
+        assert_eq!(path_suffix(Path::new("zed"), 5), "zed");
+        assert_eq!(path_suffix(Path::new("a/zed"), 2), "a/zed");
+        assert_eq!(path_suffix(Path::new("zed"), 0), "zed");
+
+        // Non-normal components (cur dir, trailing slashes) are skipped.
+        assert_eq!(path_suffix(Path::new("/a/./b/zed"), 2), "a/b/zed");
+        assert_eq!(path_suffix(Path::new("/a/b/zed/"), 1), "b/zed");
+
+        // A huge detail saturates instead of panicking or repeating.
+        assert_eq!(path_suffix(Path::new("/a/b/zed"), usize::MAX), "a/b/zed");
     }
 }

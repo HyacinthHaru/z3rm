@@ -66,8 +66,7 @@ pub enum MuxPaneEvent {
 /// The extension host lives outside `terminal_view`, so the lookup is injected
 /// with [`MuxPaneView::set_extension_shortcut_resolver`]; without one no
 /// extension shortcut can match.
-pub type ExtensionShortcutResolver =
-    Arc<dyn Fn(&Keystroke) -> Option<SharedString> + Send + Sync>;
+pub type ExtensionShortcutResolver = Arc<dyn Fn(&Keystroke) -> Option<SharedString> + Send + Sync>;
 
 const HISTORY_PAGE_ROWS: u32 = 512;
 
@@ -128,6 +127,23 @@ impl std::error::Error for PrepareFetchError {
     }
 }
 
+fn classify_fetch_rpc_error(error: anyhow::Error) -> PrepareFetchError {
+    let message = error.to_string();
+    let retryable = [
+        "connection closed",
+        "request timeout",
+        "mux write queue is full",
+        "mux write channel disconnected",
+    ]
+    .iter()
+    .any(|marker| message.contains(marker));
+    if retryable {
+        PrepareFetchError::checkpoint_changed(error)
+    } else {
+        PrepareFetchError::invalid(error)
+    }
+}
+
 /// §3.3 MuxPaneView — GPUI view for a mux_server pane.
 /// Wraps a DisplayOnly Terminal + TerminalView for GPU-accelerated rendering.
 pub struct MuxPaneView {
@@ -147,15 +163,14 @@ pub struct MuxPaneView {
     notification_task: Option<Task<()>>,
     /// §3.3 client's known latest generation (for fetch_grid_update recovery)
     generation: u64,
-    /// §3.1 PTY bytes from PaneOutput accumulated for a single-frame flush.
-    /// apply_prepared_fetch_update clears this after a snapshot overwrite so a
-    /// later frame never replays bytes the authoritative grid already contains.
-    pending_output_bytes: Vec<u8>,
     /// §3.3 fetch dedup flag
     fetch_in_flight: bool,
     /// A dirty signal arrived while a fetch was in flight. Completion must
     /// immediately pull again so a newer server generation cannot be stranded.
     fetch_pending: bool,
+    /// A delayed retry keeps a transient transport failure from permanently
+    /// stopping reconciliation without spinning the GPUI executor.
+    fetch_retry_task: Option<Task<()>>,
     /// §3.3 current grid snapshot (recovery path for reconnect)
     snapshot: FullGridSnapshot,
     /// Oldest-to-newest authoritative history for `snapshot`.
@@ -182,7 +197,8 @@ pub struct MuxPaneView {
 
 impl MuxPaneView {
     /// §3.3 Create view with DisplayOnly Terminal + TerminalView.
-    /// PaneOutputChunk bytes feed Terminal::write_output; keyboard goes to MuxDomain.
+    /// §3.1 structured snapshots populate the display-only emulator; raw PTY
+    /// bytes from PaneOutput are never parsed by this client.
     pub fn new(
         pane_id: String,
         domain: Arc<MuxDomain>,
@@ -315,10 +331,10 @@ impl MuxPaneView {
             workspace,
             focus_handle,
             notification_task: None,
-            pending_output_bytes: Vec::new(),
             generation: 0,
             fetch_in_flight: false,
             fetch_pending: false,
+            fetch_retry_task: None,
             snapshot,
             history_cache,
             zoomed: false,
@@ -338,33 +354,19 @@ impl MuxPaneView {
         view
     }
 
-    /// §3.4 Listen for PaneOutput (byte stream), PaneDirty, PaneRemoved notifications.
-    /// §3.1 exception: PaneOutput bytes are fed directly to the DisplayOnly terminal.
-    /// §3.3 adaptive coalescing: batch PaneOutput data and flush once per frame
-    /// to avoid excessive entity updates and repaints under high throughput.
-    /// §3.4 Listen for PaneOutput (byte stream), PaneDirty, PaneRemoved notifications.
-    /// §3.1 exception: PaneOutput bytes are fed directly to the DisplayOnly terminal.
-    /// After each batch flush, cx.notify() triggers MuxPaneView repaint so the
-    /// TerminalElement reads fresh terminal data on the next frame.
-    /// §3.3 debounce: PaneDirty → schedule_fetch is throttled to once per 16ms
-    /// (60fps). PaneOutput is the primary render path; PaneDirty only covers
-    /// non-bytes changes (cursor, title, alt-screen) that fetch_grid_update provides.
+    /// §3.1 PaneOutput is a lossy wakeup only. The server remains the sole VT
+    /// parser; every render-affecting change is pulled through the structured
+    /// grid snapshot/diff path.
     fn start_notification_listener(&mut self, cx: &mut Context<Self>) {
         let pane_id = self.pane_id.clone();
         let rx = self.domain.subscribe();
         let weak = cx.entity().downgrade();
 
-        // §3.1 exception render path: PaneOutput bytes feed the DisplayOnly
-        // terminal directly (primary render path). PaneDirty is a low-frequency
-        // correction signal that schedules a fetch_grid_update for reconnect and
-        // non-byte state (cursor style, alt-screen, scroll offset). Bytes are
-        // coalesced across an 8ms window and flushed once per frame.
         let task = cx.spawn(async move |_, cx| {
             let mut pending_dirty = false;
-            let mut pending_bytes = false;
 
             loop {
-                let notif = if !pending_dirty && !pending_bytes {
+                let notif = if !pending_dirty {
                     match rx.recv().await {
                         Ok(n) => n,
                         Err(_) => break,
@@ -384,29 +386,20 @@ impl MuxPaneView {
                                     &pane_id,
                                     n,
                                     &mut pending_dirty,
-                                    &mut pending_bytes,
                                     &weak,
                                     cx,
                                 ) {
                                     return;
                                 }
                             }
-                            Self::flush_pending(&weak, &mut pending_dirty, &mut pending_bytes, cx)
-                                .await;
+                            Self::flush_pending(&weak, &mut pending_dirty, cx).await;
                             continue;
                         }
                         Err(_) => break,
                     }
                 };
 
-                if !Self::accumulate_notification(
-                    &pane_id,
-                    notif,
-                    &mut pending_dirty,
-                    &mut pending_bytes,
-                    &weak,
-                    cx,
-                ) {
+                if !Self::accumulate_notification(&pane_id, notif, &mut pending_dirty, &weak, cx) {
                     break;
                 }
             }
@@ -419,7 +412,6 @@ impl MuxPaneView {
         pane_id: &str,
         notif: mux_protocol::Notification,
         pending_dirty: &mut bool,
-        pending_bytes: &mut bool,
         weak: &WeakEntity<Self>,
         cx: &mut AsyncApp,
     ) -> bool {
@@ -427,45 +419,36 @@ impl MuxPaneView {
             return true;
         };
         match event {
-            // §3.1 exception: PaneOutput bytes feed the DisplayOnly terminal
-            // directly. Accumulated into the view's pending_output_bytes buffer
-            // for a single-frame flush, preserving total ordering.
-            NotifEvent::PaneOutput(chunk) if chunk.pane_id == pane_id => {
-                let data = chunk.data;
-                if !data.is_empty() {
-                    let _ = weak.update(cx, |view, _cx| {
-                        view.pending_output_bytes.extend_from_slice(&data);
-                    });
-                    *pending_bytes = true;
-                }
+            // PaneOutput is only a supplemental dirty signal. The byte payload
+            // must never be parsed by the client.
+            NotifEvent::PaneOutput(chunk) if chunk.pane_id == pane_id && !chunk.data.is_empty() => {
+                *pending_dirty = true;
                 true
             }
-            // §3.3 PaneDirty is a low-frequency correction signal: cursor style,
-            // alt-screen switch, scroll offset, title. Triggers fetch_grid_update
-            // for authoritative state reconciliation (reconnect, non-byte changes).
             NotifEvent::PaneDirty(dirty) if dirty.pane_id == pane_id => {
                 *pending_dirty = true;
                 true
             }
             NotifEvent::PaneRemoved(removed) if removed.pane_id == pane_id => {
-                let _ = weak.update(cx, |view, cx| {
+                if let Err(error) = weak.update(cx, |view, cx| {
                     view.notification_task = None;
                     cx.emit(MuxPaneEvent::CloseRequested);
-                });
+                }) {
+                    tracing::debug!(error = %error, "MuxPaneView dropped after pane removal");
+                }
                 false
             }
             NotifEvent::PaneTitleChanged(changed) if changed.pane_id == pane_id => {
-                let _ = weak.update(cx, |view, cx| {
-                    view.terminal.update(cx, |t, cx| {
-                        t.write_output(format!("\x1b]2;{}\x07", changed.title).as_bytes(), cx);
+                if let Err(error) = weak.update(cx, |view, cx| {
+                    view.terminal.update(cx, |terminal, cx| {
+                        terminal.set_display_title(changed.title.clone(), cx);
                     });
                     cx.emit(MuxPaneEvent::TitleChanged);
-                });
+                }) {
+                    tracing::debug!(error = %error, "MuxPaneView dropped after pane title update");
+                }
                 true
             }
-            // §3.3 PaneBell: BEL (0x07) already arrived as PaneOutput bytes and
-            // was fed to the terminal. PaneBell is a visual/audio hint; schedule
-            // a fetch for any state that accompanied it.
             NotifEvent::PaneBell(bell) if bell.pane_id == pane_id => {
                 *pending_dirty = true;
                 true
@@ -474,43 +457,29 @@ impl MuxPaneView {
         }
     }
 
-    async fn flush_pending(
-        weak: &WeakEntity<Self>,
-        pending_dirty: &mut bool,
-        pending_bytes: &mut bool,
-        cx: &mut AsyncApp,
-    ) {
-        let bytes = std::mem::take(pending_bytes);
+    async fn flush_pending(weak: &WeakEntity<Self>, pending_dirty: &mut bool, cx: &mut AsyncApp) {
         let dirty = std::mem::take(pending_dirty);
-        let _ = weak.update(cx, |view, cx| {
-            if bytes {
-                let output = std::mem::take(&mut view.pending_output_bytes);
-                if !output.is_empty() {
-                    view.terminal.update(cx, |terminal, cx| {
-                        terminal.write_output(&output, cx);
-                    });
-                    cx.notify();
-                }
+        if dirty {
+            if let Err(error) = weak.update(cx, |view, cx| view.schedule_fetch(cx)) {
+                tracing::debug!(error = %error, "MuxPaneView dropped before grid fetch");
             }
-            if dirty {
-                view.schedule_fetch(cx);
-            }
-        });
+        }
     }
     /// §3.3 Schedule a structured fetch. Full snapshots load every matching
     /// history page before returning to the GPUI thread, so partial checkpoints
     /// can never mutate the renderer or advance the local generation.
     fn schedule_fetch(&mut self, cx: &mut Context<Self>) {
+        self.fetch_retry_task.take();
         if self.fetch_in_flight {
             self.fetch_pending = true;
             return;
         }
         self.fetch_in_flight = true;
         self.fetch_pending = false;
+        let since = self.generation;
 
         let pane_id = self.pane_id.clone();
         let domain = self.domain.clone();
-        let since = self.generation;
         let snapshot = self.snapshot.clone();
         let history_cache = self.history_cache.clone();
         let weak = cx.entity().downgrade();
@@ -526,6 +495,7 @@ impl MuxPaneView {
             .await;
             match weak.update(cx, |view, cx| {
                 view.fetch_in_flight = false;
+                let mut retry_later = false;
                 match result {
                     Ok(update) => {
                         if let Err(error) = view.apply_prepared_fetch_update(update, cx) {
@@ -539,6 +509,7 @@ impl MuxPaneView {
                     }
                     Err(error) => {
                         tracing::error!(pane_id = %pane_id, error = %error.source, "prepare grid update failed");
+                        retry_later = error.retry;
                         view.fetch_pending |= error.retry;
                         cx.emit(MuxPaneEvent::InputFailed {
                             message: SharedString::from(format!(
@@ -549,7 +520,11 @@ impl MuxPaneView {
                     }
                 }
                 if view.fetch_pending {
-                    view.schedule_fetch(cx);
+                    if retry_later {
+                        view.schedule_fetch_retry(cx);
+                    } else {
+                        view.schedule_fetch(cx);
+                    }
                 }
             }) {
                 Ok(()) => {}
@@ -557,6 +532,26 @@ impl MuxPaneView {
             }
         })
         .detach();
+    }
+
+    fn schedule_fetch_retry(&mut self, cx: &mut Context<Self>) {
+        if self.fetch_retry_task.is_some() {
+            return;
+        }
+        let weak = cx.entity().downgrade();
+        self.fetch_retry_task = Some(cx.spawn(async move |_, cx| {
+            cx.background_executor()
+                .timer(std::time::Duration::from_millis(100))
+                .await;
+            if let Err(error) = weak.update(cx, |view, cx| {
+                view.fetch_retry_task = None;
+                if view.fetch_pending {
+                    view.schedule_fetch(cx);
+                }
+            }) {
+                tracing::debug!(error = %error, "MuxPaneView dropped before fetch retry");
+            }
+        }));
     }
 
     fn apply_prepared_fetch_update(
@@ -580,6 +575,8 @@ impl MuxPaneView {
                 structured,
             } => {
                 validate_prepared_generation(self.generation, expected_generation)?;
+                let (previous_scrollback_offset, _) =
+                    self.terminal_view.read(cx).mux_scrollback_state();
                 self.terminal
                     .update(cx, |terminal, cx| {
                         terminal.apply_structured_snapshot(&structured, cx)
@@ -587,13 +584,22 @@ impl MuxPaneView {
                     .map_err(|error| {
                         anyhow::anyhow!("structured terminal import failed: {error}")
                     })?;
+                let scrollback_version = (snapshot.history_version, generation);
+                let display_offset = usize::try_from(snapshot.display_offset)
+                    .map_err(|_| anyhow::anyhow!("mux display offset exceeds client limits"))?;
                 self.snapshot = snapshot;
+                let history_rows = history_cache.history_size;
                 self.history_cache = history_cache;
                 self.generation = generation;
-                // The authoritative snapshot already contains any bytes that
-                // were buffered; drop them so the next frame does not replay
-                // content the grid already holds.
-                self.pending_output_bytes.clear();
+                self.terminal_view.update(cx, |view, cx| {
+                    view.update_scrollback_version(scrollback_version, cx);
+                    view.apply_mux_scrollback_offset(
+                        previous_scrollback_offset,
+                        display_offset,
+                        history_rows,
+                        cx,
+                    );
+                });
             }
         }
         cx.notify();
@@ -732,10 +738,7 @@ impl MuxPaneView {
 
     /// §16.7 Inject the extension global-shortcut lookup. Without it the
     /// extension step of the priority chain can never match.
-    pub fn set_extension_shortcut_resolver(
-        &mut self,
-        resolver: Option<ExtensionShortcutResolver>,
-    ) {
+    pub fn set_extension_shortcut_resolver(&mut self, resolver: Option<ExtensionShortcutResolver>) {
         self.extension_shortcuts = resolver;
     }
 
@@ -908,6 +911,7 @@ impl MuxPaneView {
 fn prefix_binding_for(
     keystroke: &Keystroke,
     window: &Window,
+
     cx: &App,
 ) -> Option<Box<dyn gpui::Action>> {
     let context_stack = window.context_stack();
@@ -1003,7 +1007,7 @@ async fn prepare_fetch_update(
     let response = domain
         .fetch_grid_update(pane_id, expected_generation)
         .await
-        .map_err(PrepareFetchError::invalid)?;
+        .map_err(classify_fetch_rpc_error)?;
     validate_generation_envelope(expected_generation, &response)
         .map_err(PrepareFetchError::invalid)?;
     let generation = response.to_generation;
@@ -1033,10 +1037,21 @@ async fn prepare_fetch_update(
             })
         }
         Some(FetchUpdate::FullSnapshot(full)) => {
-            let history_cache = match matching_history_cache(&full, Some(&history_cache)) {
-                Some(cache) => cache.clone(),
-                None => fetch_history_checkpoint(domain, pane_id, &full).await?,
-            };
+            let (history_cache, fetched_history) =
+                match matching_history_cache(&full, Some(&history_cache)) {
+                    Some(cache) => (cache.clone(), false),
+                    // An empty history is trivially consistent, so committing it
+                    // needs neither page fetches nor a checkpoint round trip.
+                    None if full.history_size == 0 => (
+                        HistoryPageAccumulator::new(&full)
+                            .and_then(HistoryPageAccumulator::finish)?,
+                        false,
+                    ),
+                    None => (fetch_history_checkpoint(domain, pane_id, &full).await?, true),
+                };
+            if fetched_history {
+                confirm_grid_checkpoint(domain, pane_id, generation).await?;
+            }
             let structured = structured_terminal_snapshot(&full, &history_cache)
                 .map_err(PrepareFetchError::invalid)?;
             Ok(PreparedFetchUpdate::Snapshot {
@@ -1063,13 +1078,36 @@ async fn fetch_history_checkpoint(
         let page = domain
             .fetch_scrollback(pane_id, accumulator.next_row, 1, count)
             .await
-            .map_err(PrepareFetchError::invalid)?;
-        let done = accumulator.push(page)?;
+            .map_err(classify_fetch_rpc_error)?;
+        let done = accumulator.push(page, count)?;
         if done {
             break;
         }
     }
     accumulator.finish()
+}
+
+async fn confirm_grid_checkpoint(
+    domain: &MuxDomain,
+    pane_id: &str,
+    generation: u64,
+) -> Result<(), PrepareFetchError> {
+    let response = domain
+        .fetch_grid_update(pane_id, generation)
+        .await
+        .map_err(classify_fetch_rpc_error)?;
+    validate_generation_envelope(generation, &response).map_err(PrepareFetchError::invalid)?;
+    if response.from_generation != generation
+        || response.to_generation != generation
+        || response.update.is_some()
+    {
+        return Err(PrepareFetchError::checkpoint_changed(anyhow::anyhow!(
+            "mux grid changed while history was being fetched: expected stable generation {generation}, got {} -> {}",
+            response.from_generation,
+            response.to_generation
+        )));
+    }
+    Ok(())
 }
 
 fn matching_history_cache<'a>(
@@ -1139,7 +1177,28 @@ impl HistoryPageAccumulator {
         })
     }
 
-    fn push(&mut self, page: FetchScrollbackResponse) -> Result<bool, PrepareFetchError> {
+    fn push(
+        &mut self,
+        page: FetchScrollbackResponse,
+        requested_count: u32,
+    ) -> Result<bool, PrepareFetchError> {
+        let requested_count = usize::try_from(requested_count).map_err(|_| {
+            PrepareFetchError::invalid(anyhow::anyhow!(
+                "mux history page count exceeds client limits"
+            ))
+        })?;
+        let remaining = self.history_size.saturating_sub(self.next_row as usize);
+        if requested_count == 0 || requested_count > remaining {
+            return Err(PrepareFetchError::invalid(anyhow::anyhow!(
+                "mux history page requested {requested_count} rows with {remaining} remaining"
+            )));
+        }
+        if page.lines.len() != requested_count {
+            return Err(PrepareFetchError::invalid(anyhow::anyhow!(
+                "mux history page returned {} rows, expected {requested_count}",
+                page.lines.len()
+            )));
+        }
         if page.scrollback_version != self.history_version {
             return Err(PrepareFetchError::checkpoint_changed(anyhow::anyhow!(
                 "mux history changed during pagination: expected version {}, got {}",
@@ -1147,7 +1206,12 @@ impl HistoryPageAccumulator {
                 page.scrollback_version
             )));
         }
-        if page.total_lines as usize != self.history_size {
+        let total_lines = usize::try_from(page.total_lines).map_err(|_| {
+            PrepareFetchError::invalid(anyhow::anyhow!(
+                "mux history total row count exceeds client limits"
+            ))
+        })?;
+        if total_lines != self.history_size {
             return Err(PrepareFetchError::checkpoint_changed(anyhow::anyhow!(
                 "mux history changed during pagination: expected {} rows, got {}",
                 self.history_size,
@@ -1257,6 +1321,13 @@ fn validate_generation_envelope(
     }
     match &response.update {
         Some(FetchUpdate::FullSnapshot(_)) => Ok(()),
+        Some(FetchUpdate::Diff(_)) if response.to_generation <= current_generation => {
+            anyhow::bail!(
+                "mux grid diff does not advance generation {} -> {}",
+                response.from_generation,
+                response.to_generation
+            )
+        }
         Some(FetchUpdate::Diff(_)) if response.from_generation == current_generation => Ok(()),
         Some(FetchUpdate::Diff(_)) => anyhow::bail!(
             "mux grid diff starts at generation {}, client is at {}",
@@ -1283,8 +1354,22 @@ fn structured_terminal_snapshot(
     snapshot: &FullGridSnapshot,
     history_cache: &HistoryCache,
 ) -> anyhow::Result<StructuredTerminalSnapshot> {
-    let cols = snapshot.cols as usize;
-    let rows = snapshot.rows as usize;
+    let cols = usize::try_from(snapshot.cols)
+        .map_err(|_| anyhow::anyhow!("mux grid columns exceed client limits"))?;
+    let rows = usize::try_from(snapshot.rows)
+        .map_err(|_| anyhow::anyhow!("mux grid rows exceed client limits"))?;
+    let history_size = usize::try_from(snapshot.history_size)
+        .map_err(|_| anyhow::anyhow!("mux history size exceeds client limits"))?;
+    let display_offset = usize::try_from(snapshot.display_offset)
+        .map_err(|_| anyhow::anyhow!("mux display offset exceeds client limits"))?;
+    if history_size > MAX_SCROLL_HISTORY_LINES {
+        anyhow::bail!(
+            "mux history has {history_size} rows, exceeding client limit {MAX_SCROLL_HISTORY_LINES}"
+        );
+    }
+    if display_offset > history_size {
+        anyhow::bail!("mux display offset {display_offset} exceeds {history_size} history rows");
+    }
     let expected_cells = mux_protocol::checked_grid_cell_count(cols, rows)
         .map_err(|message| anyhow::anyhow!("invalid mux grid dimensions: {message}"))?;
     if snapshot.cells.len() != expected_cells {
@@ -1312,7 +1397,11 @@ fn structured_terminal_snapshot(
         .cursor
         .as_ref()
         .map(|cursor| {
-            if cursor.row as usize >= rows || cursor.col as usize >= cols {
+            let cursor_row = usize::try_from(cursor.row)
+                .map_err(|_| anyhow::anyhow!("mux cursor row exceeds client limits"))?;
+            let cursor_col = usize::try_from(cursor.col)
+                .map_err(|_| anyhow::anyhow!("mux cursor column exceeds client limits"))?;
+            if cursor_row >= rows || cursor_col >= cols {
                 anyhow::bail!(
                     "mux cursor ({}, {}) is outside {}x{} grid",
                     cursor.col,
@@ -1330,7 +1419,11 @@ fn structured_terminal_snapshot(
                 _ => TerminalCursorShape::Block,
             };
             Ok(StructuredTerminalCursor {
-                point: terminal::Point::new(cursor.row as i32, cursor.col as usize),
+                point: terminal::Point::new(
+                    i32::try_from(cursor_row)
+                        .map_err(|_| anyhow::anyhow!("mux cursor row exceeds terminal limits"))?,
+                    cursor_col,
+                ),
                 shape,
                 visible: cursor.visible,
                 blinking: cursor.blinking,
@@ -1353,7 +1446,7 @@ fn structured_terminal_snapshot(
         rows,
         cells,
         history,
-        display_offset: snapshot.display_offset as usize,
+        display_offset,
         cursor,
         alternate_screen: snapshot.alternate_screen,
         modes,
@@ -1425,19 +1518,23 @@ pub fn apply_diff_to_snapshot(
     snapshot: &mut FullGridSnapshot,
     diff: &GridDiff,
 ) -> anyhow::Result<()> {
-    let cols = snapshot.cols as usize;
-    let rows = snapshot.rows as usize;
-    let expected_cells = cols
-        .checked_mul(rows)
-        .ok_or_else(|| anyhow::anyhow!("cached mux grid dimensions overflow"))?;
+    let cols = usize::try_from(snapshot.cols)
+        .map_err(|_| anyhow::anyhow!("cached mux grid columns exceed client limits"))?;
+    let rows = usize::try_from(snapshot.rows)
+        .map_err(|_| anyhow::anyhow!("cached mux grid rows exceed client limits"))?;
+    let expected_cells = mux_protocol::checked_grid_cell_count(cols, rows)
+        .map_err(|message| anyhow::anyhow!("invalid cached mux grid dimensions: {message}"))?;
     if snapshot.cells.len() != expected_cells {
         anyhow::bail!(
             "cached mux grid has {} cells, expected {expected_cells}",
             snapshot.cells.len()
         );
     }
+
     for row_change in &diff.rows {
-        if row_change.row as usize >= rows {
+        let row = usize::try_from(row_change.row)
+            .map_err(|_| anyhow::anyhow!("mux grid diff row exceeds client limits"))?;
+        if row >= rows {
             anyhow::bail!(
                 "mux grid diff row {} is outside {rows} rows",
                 row_change.row
@@ -1453,7 +1550,9 @@ pub fn apply_diff_to_snapshot(
     }
 
     for row_change in &diff.rows {
-        let row_start = row_change.row as usize * cols;
+        let row = usize::try_from(row_change.row)
+            .map_err(|_| anyhow::anyhow!("mux grid diff row exceeds client limits"))?;
+        let row_start = row * cols;
         snapshot.cells[row_start..row_start + cols].clone_from_slice(&row_change.cells);
     }
     Ok(())
@@ -1520,15 +1619,15 @@ impl Render for MuxPaneView {
             dispatch_context.add("PrefixMode");
         }
 
-        // §16.4 a11y: the TerminalElement child exposes Role::Terminal + TextRun
-        // synthetic children per visible line. The root div stays role-less to
-        // avoid a nested duplicate Terminal role in the a11y tree.
+        // §16.4 a11y: the root exposes the pane title as a labelled group,
+        // while the TerminalElement child owns the Terminal/TextRun tree.
 
         div()
             .size_full()
             .relative()
             .id("mux-pane-root")
             .track_focus(&self.focus_handle)
+            .role(gpui::Role::Group)
             .aria_label(self.terminal.read(cx).title(true))
             .key_context(dispatch_context)
             .bg(colors.editor_background)
@@ -1776,6 +1875,7 @@ mod tests {
                 body: Some(ResponseBody::GridUpdate(FetchGridUpdateResponse {
                     from_generation: 0,
                     to_generation: 7,
+                    output_sequence: 0,
                     update: Some(FetchUpdate::FullSnapshot(FullGridSnapshot {
                         cols: 5,
                         rows: 1,
@@ -1879,6 +1979,7 @@ mod tests {
                 body: Some(ResponseBody::GridUpdate(FetchGridUpdateResponse {
                     from_generation: from,
                     to_generation: to,
+                    output_sequence: 0,
                     update: Some(FetchUpdate::FullSnapshot(FullGridSnapshot {
                         cols: 2,
                         rows: 2,
@@ -1916,6 +2017,7 @@ mod tests {
                 body: Some(ResponseBody::GridUpdate(FetchGridUpdateResponse {
                     from_generation: 0,
                     to_generation: generation,
+                    output_sequence: 0,
                     update: Some(FetchUpdate::FullSnapshot(FullGridSnapshot {
                         cols: 1,
                         rows: 1,
@@ -2006,6 +2108,39 @@ mod tests {
                 "history page response",
             )?;
         }
+
+        let checkpoint = read_test_envelope(&mut stream, "history checkpoint request")?;
+        let checkpoint = match checkpoint.payload {
+            Some(EnvelopePayload::Request(request)) => request,
+            payload => return Err(format!("expected history checkpoint request, got {payload:?}")),
+        };
+        let checkpoint_fetch = match checkpoint.body {
+            Some(RequestBody::FetchGridUpdate(fetch)) => fetch,
+            body => return Err(format!("expected history checkpoint grid request, got {body:?}")),
+        };
+        if checkpoint_fetch.pane_id != "history-pane"
+            || checkpoint_fetch.since_generation != 5
+        {
+            return Err(format!(
+                "unexpected history checkpoint request: {checkpoint_fetch:?}"
+            ));
+        }
+        write_test_envelope(
+            &mut stream,
+            &Envelope {
+                version: Some(mux_protocol::PROTOCOL_VERSION),
+                payload: Some(EnvelopePayload::Response(Response {
+                    request_id: checkpoint.request_id,
+                    body: Some(ResponseBody::GridUpdate(FetchGridUpdateResponse {
+                        from_generation: 5,
+                        to_generation: 5,
+                        output_sequence: 0,
+                        update: None,
+                    })),
+                })),
+            },
+            "history checkpoint response",
+        )?;
 
         let request = read_test_envelope(&mut stream, "cached history grid request")?;
         let request = match request.payload {
@@ -2138,6 +2273,7 @@ mod tests {
                 snapshot,
                 history_cache,
                 structured,
+                ..
             } => {
                 assert_eq!(expected_generation, 0);
                 assert_eq!(generation, 5);
@@ -2449,24 +2585,31 @@ mod tests {
         let mut accumulator = HistoryPageAccumulator::new(&snapshot)
             .unwrap_or_else(|error| panic!("create history accumulator: {error}"));
         let first_done = accumulator
-            .push(FetchScrollbackResponse {
-                lines: vec![history_row(0, &["A", "a"]), history_row(1, &["B", "b"])],
-                total_lines: 3,
-                scrollback_version: 9,
-            })
+            .push(
+                FetchScrollbackResponse {
+                    lines: vec![history_row(0, &["A", "a"]), history_row(1, &["B", "b"])],
+                    total_lines: 3,
+                    scrollback_version: 9,
+                },
+                2,
+            )
             .unwrap_or_else(|error| panic!("append first history page: {error}"));
         assert!(!first_done);
         let second_done = accumulator
-            .push(FetchScrollbackResponse {
-                lines: vec![history_row(2, &["C", "c"])],
-                total_lines: 3,
-                scrollback_version: 9,
-            })
+            .push(
+                FetchScrollbackResponse {
+                    lines: vec![history_row(2, &["C", "c"])],
+                    total_lines: 3,
+                    scrollback_version: 9,
+                },
+                1,
+            )
             .unwrap_or_else(|error| panic!("append second history page: {error}"));
         assert!(second_done);
         let cache = accumulator
             .finish()
             .unwrap_or_else(|error| panic!("finish history pages: {error}"));
+
         assert_eq!(cache.history_size, 3);
         assert_eq!(
             cache
@@ -2476,6 +2619,26 @@ mod tests {
                 .collect::<Vec<_>>(),
             vec!['A', 'a', 'B', 'b', 'C', 'c']
         );
+    }
+    #[test]
+    fn paged_history_rejects_short_pages() {
+        let snapshot = history_snapshot(1, 2, 7);
+        let mut accumulator = HistoryPageAccumulator::new(&snapshot)
+            .unwrap_or_else(|error| panic!("create history accumulator: {error}"));
+        assert!(
+            accumulator
+                .push(
+                    FetchScrollbackResponse {
+                        lines: vec![history_row(0, &["A"])],
+                        total_lines: 2,
+                        scrollback_version: 7,
+                    },
+                    2,
+                )
+                .is_err()
+        );
+        assert_eq!(accumulator.next_row, 0);
+        assert!(accumulator.cells.is_empty());
     }
 
     #[test]
@@ -2501,9 +2664,30 @@ mod tests {
         for page in invalid_pages {
             let mut accumulator = HistoryPageAccumulator::new(&snapshot)
                 .unwrap_or_else(|error| panic!("create history accumulator: {error}"));
-            assert!(accumulator.push(page).is_err());
+            assert!(accumulator.push(page, 1).is_err());
             assert_eq!(accumulator.next_row, 0);
         }
+    }
+
+    #[test]
+    fn paged_history_rejects_more_rows_than_requested() {
+        let snapshot = history_snapshot(1, 2, 7);
+        let mut accumulator = HistoryPageAccumulator::new(&snapshot)
+            .unwrap_or_else(|error| panic!("create history accumulator: {error}"));
+        assert!(
+            accumulator
+                .push(
+                    FetchScrollbackResponse {
+                        lines: vec![history_row(0, &["A"]), history_row(1, &["B"])],
+                        total_lines: 2,
+                        scrollback_version: 7,
+                    },
+                    1,
+                )
+                .is_err()
+        );
+        assert_eq!(accumulator.next_row, 0);
+        assert!(accumulator.cells.is_empty());
     }
 
     #[test]
@@ -2525,6 +2709,7 @@ mod tests {
         assert!(matching_history_cache(&changed, Some(&cache)).is_none());
         changed = snapshot;
         changed.cols = 3;
+
         assert!(matching_history_cache(&changed, Some(&cache)).is_none());
     }
 
@@ -2547,9 +2732,15 @@ mod tests {
         let valid = FetchGridUpdateResponse {
             from_generation: 5,
             to_generation: 6,
+            output_sequence: 0,
             update: Some(FetchUpdate::Diff(GridDiff::default())),
         };
         assert!(validate_generation_envelope(5, &valid).is_ok());
+        let no_advance = FetchGridUpdateResponse {
+            to_generation: 5,
+            ..valid.clone()
+        };
+        assert!(validate_generation_envelope(5, &no_advance).is_err());
 
         let stale = FetchGridUpdateResponse {
             from_generation: 4,
@@ -2563,6 +2754,7 @@ mod tests {
         let valid = FetchGridUpdateResponse {
             from_generation: 5,
             to_generation: 5,
+            output_sequence: 0,
             update: None,
         };
         assert!(validate_generation_envelope(5, &valid).is_ok());
@@ -2579,6 +2771,7 @@ mod tests {
         let reset = FetchGridUpdateResponse {
             from_generation: 0,
             to_generation: 3,
+            output_sequence: 0,
             update: Some(FetchUpdate::FullSnapshot(FullGridSnapshot {
                 cols: 1,
                 rows: 1,

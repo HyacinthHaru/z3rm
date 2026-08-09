@@ -1,6 +1,7 @@
 {
   // z3rm 默认设置
   // 终端/多路复用器/UI chrome 设置
+  "buffer_font_size": 15,
 
   // === 项目设置 (ProjectSettingsContent - flattened) ===
   "excluded_paths": ["node_modules", ".git"],
@@ -20,6 +21,7 @@
 
   "all_languages": {
     "defaults": {
+      "auto_indent": "syntax_aware",
       "word_diff_enabled": true
     }
   },
@@ -30,22 +32,8 @@
     "auto_sync_to_remote": true,
     "auto_install_extensions": {},
     "auto_update_extensions": {},
-    "granted_capabilities": [
-      {
-        "kind": "process:exec",
-        "command": "*",
-        "args": ["**"]
-      },
-      {
-        "kind": "download_file",
-        "host": "*",
-        "path": ["**"]
-      },
-      {
-        "kind": "npm:install",
-        "package": "*"
-      }
-    ]
+    // 默认不授予任何能力（default-deny）：特权操作必须由用户显式授予。
+    "granted_capabilities": []
   },
 
   // === 工作区设置 (WorkspaceSettingsContent - flattened) ===

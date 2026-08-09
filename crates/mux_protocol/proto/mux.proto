@@ -264,6 +264,8 @@ message FetchGridUpdateResponse {
         GridDiff diff = 3;
         FullGridSnapshot full_snapshot = 4;
     }
+    // Highest PaneOutputChunk.output_sequence incorporated into this grid state.
+    uint64 output_sequence = 5;
 }
 
 // §3.3 网格行级差异。
@@ -362,6 +364,8 @@ message CursorState {
 message PaneOutputChunk {
     string pane_id = 1;
     bytes data = 2;
+    // Monotonic per-pane sequence. Gaps require an authoritative grid resync.
+    uint64 output_sequence = 3;
 }
 
 // §3.1 订阅 pane PTY 输出字节流 (in-place render-path).

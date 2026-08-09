@@ -41,19 +41,19 @@ pub fn parse_launch_intent_from(args: &[String]) -> Option<LaunchIntent> {
     }
     let rest = &args[2..];
     let mut target: Option<String> = None;
-    let mut i = 0;
-    while i < rest.len() {
-        match rest[i].as_str() {
+    let mut index = 0;
+    while index < rest.len() {
+        match rest[index].as_str() {
             "-t" | "--target" => {
-                if i + 1 >= rest.len() {
-                    // `attach -t` 缺值交给 CLI 解析层报错；GUI 意图跳过。
-                    return None;
-                }
-                target = Some(rest[i + 1].clone());
-                i += 2;
+                // `attach -t` 缺值或多余参数都交给 CLI 解析层报错，GUI 意图不抢先消费。
+                let value = rest.get(index + 1)?;
+                target = Some(value.clone());
+                index += 2;
             }
+            // `attach --ssh ...` 仍走 CLI 短路；缺值的 --ssh 也交给 CLI 报错。
             "--ssh" => return None,
-            _ => i += 1,
+            // 未知 flag / 位置参数让 CLI 解析层报错，而不是静默退回默认 session。
+            _ => return None,
         }
     }
     Some(LaunchIntent::Gui { target })
@@ -114,7 +114,7 @@ commands (spec §3.10):\n\
     select-pane -t <target>          focus a pane\n\
     kill-pane -t <target>            close a pane\n\
     resize-pane [-t <target>] [-x <W>] [-y <H>] [-Z]\n\
-                                     resize a pane, or toggle zoom with -Z\n\
+                                     resize a pane, or toggle zoom with -Z (requires -x, -y, or -Z)\n\
     new-window [-t <session>]         create a new tab\n\
     rename-window -t <target> <title> set the pane title\n\
     list-changes [-t <session>]      list files with shadow versions\n\
@@ -208,55 +208,78 @@ pub fn parse_cli_args_from(args: &[String]) -> Result<Option<CliCommand>, String
     }
 
     match normalized[1].as_str() {
-        "kill" if !has_option_value(&normalized[2..], "-t", "--target") => {
-            return Err("kill requires -t <target>".to_string());
-        }
-        "has-session" if !has_option_value(&normalized[2..], "-t", "--target") => {
-            return Err("has-session requires -t <target>".to_string());
-        }
-        "send-keys" if send_keys_payload_is_empty(&normalized[2..]) => {
-            return Err("send-keys requires at least one key".to_string());
-        }
-        "rename-window" if positional_after_target(&normalized[2..]).is_none() => {
-            return Err("rename-window requires a title".to_string());
-        }
-        "rename-session" if positional_after_target(&normalized[2..]).is_none() => {
-            return Err("rename-session requires a new session name".to_string());
-        }
         command if is_mux_cli_command(command) => {}
         command => return Err(format!("unknown CLI command: {command}")),
     }
     parse_cli_args_lossy(&normalized)
 }
 
-fn has_option_value(args: &[String], short: &str, long: &str) -> bool {
-    args.windows(2)
-        .any(|window| (window[0] == short || window[0] == long) && !window[1].starts_with('-'))
-}
-
-/// `-l` / `-H` 只切换编码方式，`-N` 带一个计数值，它们后面仍然必须有按键载荷。
-fn send_keys_payload_is_empty(args: &[String]) -> bool {
-    let mut i = 0;
-    while i < args.len() {
-        match args[i].as_str() {
-            "-t" | "--target" | "-N" => i += 2,
-            "-l" | "-H" => i += 1,
-            _ => return false,
+/// 严格解析只接受 `specs` 中声明的选项的命令。未知 flag、多余位置参数、
+/// 缺失的选项值一律报错，不会静默忽略。
+///
+/// 返回 `短名 -> 值` 的映射；布尔 flag 的值为 `None`。
+fn parse_strict_options(
+    command: &str,
+    args: &[String],
+    specs: &[OptionSpec],
+) -> Result<std::collections::HashMap<&'static str, Option<String>>, String> {
+    let mut values: std::collections::HashMap<&'static str, Option<String>> =
+        std::collections::HashMap::new();
+    let mut index = 0;
+    while index < args.len() {
+        let argument = args[index].as_str();
+        let Some(spec) = specs
+            .iter()
+            .find(|spec| argument == spec.short || argument == spec.long)
+        else {
+            return Err(format!("unsupported {command} option: {argument}"));
+        };
+        if spec.takes_value {
+            let value = args
+                .get(index + 1)
+                .filter(|value| !value.starts_with('-'))
+                .ok_or_else(|| format!("{command} requires a value for {argument}"))?;
+            values.insert(spec.short, Some(value.clone()));
+            index += 2;
+        } else {
+            values.insert(spec.short, None);
+            index += 1;
         }
     }
-    true
+    Ok(values)
 }
 
-/// 跳过 `-t <target>` 后的第一个位置参数 (rename-window 的标题 / rename-session 的新名字)。
-fn positional_after_target(args: &[String]) -> Option<&str> {
-    let mut i = 0;
-    while i < args.len() {
-        match args[i].as_str() {
-            "-t" | "--target" => i += 2,
-            _ => return Some(&args[i]),
+/// 取严格选项解析结果里某个带值选项的值。
+fn option_value<'a>(
+    values: &'a std::collections::HashMap<&'static str, Option<String>>,
+    short: &str,
+) -> Option<&'a str> {
+    values.get(short).and_then(|value| value.as_deref())
+}
+
+/// 单个选项的声明: 短名、长名、是否带值。
+struct OptionSpec {
+    short: &'static str,
+    long: &'static str,
+    takes_value: bool,
+}
+
+impl OptionSpec {
+    const fn value(short: &'static str, long: &'static str) -> Self {
+        Self {
+            short,
+            long,
+            takes_value: true,
         }
     }
-    None
+
+    const fn flag(short: &'static str, long: &'static str) -> Self {
+        Self {
+            short,
+            long,
+            takes_value: false,
+        }
+    }
 }
 
 fn is_mux_cli_command(command: &str) -> bool {
@@ -472,42 +495,30 @@ fn parse_cli_args_lossy(args: &[String]) -> Result<Option<CliCommand>, String> {
         }
 
         "new" => {
-            let mut name = None;
-            let mut cwd = None;
-            let rest = &args[2..];
-            for i in 0..rest.len() {
-                match rest[i].as_str() {
-                    "-s" | "--session-name" => {
-                        if i + 1 < rest.len() {
-                            name = Some(rest[i + 1].clone());
-                        }
-                    }
-                    "-c" | "--cwd" => {
-                        if i + 1 < rest.len() {
-                            cwd = Some(PathBuf::from(&rest[i + 1]));
-                        }
-                    }
-                    _ => {}
-                }
+            let values = parse_strict_options(
+                "new",
+                &args[2..],
+                &[
+                    OptionSpec::value("-s", "--session-name"),
+                    OptionSpec::value("-c", "--cwd"),
+                ],
+            )?;
+            if option_value(&values, "-s") == Some("") {
+                return Err("new requires a non-empty session name".to_string());
             }
-            Ok(Some(CliCommand::NewSession { name, cwd }))
+            Ok(Some(CliCommand::NewSession {
+                name: option_value(&values, "-s").map(str::to_string),
+                cwd: option_value(&values, "-c").map(PathBuf::from),
+            }))
         }
 
         "kill" => {
-            let mut target = None;
-            let rest = &args[2..];
-            for i in 0..rest.len() {
-                match rest[i].as_str() {
-                    "-t" | "--target" => {
-                        if i + 1 < rest.len() {
-                            target = Some(rest[i + 1].clone());
-                        }
-                    }
-                    _ => {}
-                }
-            }
-            match target {
-                Some(t) => Ok(Some(CliCommand::KillSession { target: t })),
+            let values =
+                parse_strict_options("kill", &args[2..], &[OptionSpec::value("-t", "--target")])?;
+            match option_value(&values, "-t") {
+                Some(target) => Ok(Some(CliCommand::KillSession {
+                    target: target.to_string(),
+                })),
                 None => Err("kill requires -t <target>".to_string()),
             }
         }
@@ -515,10 +526,14 @@ fn parse_cli_args_lossy(args: &[String]) -> Result<Option<CliCommand>, String> {
         "rename-session" => {
             let rest = &args[2..];
             let (target, name) = parse_target_and_positional("rename-session", rest)?;
-            match name {
-                Some(name) => Ok(Some(CliCommand::RenameSession { target, name })),
-                None => Err("rename-session requires a new session name".to_string()),
+            let name = match name {
+                Some(name) => name,
+                None => return Err("rename-session requires a new session name".to_string()),
+            };
+            if name.is_empty() {
+                return Err("rename-session requires a non-empty session name".to_string());
             }
+            Ok(Some(CliCommand::RenameSession { target, name }))
         }
 
         "has-session" => {
@@ -535,28 +550,25 @@ fn parse_cli_args_lossy(args: &[String]) -> Result<Option<CliCommand>, String> {
         "kill-server" => Ok(Some(CliCommand::KillServer)),
 
         "attach" => {
-            let mut target = None;
-            let mut ssh_uri = None;
-            let rest = &args[2..];
-            for i in 0..rest.len() {
-                match rest[i].as_str() {
-                    "-t" | "--target" => {
-                        if i + 1 < rest.len() {
-                            target = Some(rest[i + 1].clone());
-                        }
-                    }
-                    "--ssh" => {
-                        if i + 1 < rest.len() {
-                            ssh_uri = Some(rest[i + 1].clone());
-                        }
-                    }
-                    _ => {}
+            let values = parse_strict_options(
+                "attach",
+                &args[2..],
+                &[
+                    OptionSpec::value("-t", "--target"),
+                    OptionSpec::value("--ssh", "--ssh"),
+                ],
+            )?;
+            match (option_value(&values, "-t"), option_value(&values, "--ssh")) {
+                (Some(_), Some(_)) => {
+                    Err("attach accepts either -t <target> or --ssh <uri>, not both".to_string())
                 }
-            }
-            if let Some(uri) = ssh_uri {
-                Ok(Some(CliCommand::Ssh { target: uri }))
-            } else {
-                Ok(Some(CliCommand::Attach { target }))
+                (_, Some(uri)) => Ok(Some(CliCommand::Ssh {
+                    target: uri.to_string(),
+                })),
+                (Some(target), None) => Ok(Some(CliCommand::Attach {
+                    target: Some(target.to_string()),
+                })),
+                (None, None) => Ok(Some(CliCommand::Attach { target: None })),
             }
         }
 
@@ -591,31 +603,25 @@ fn parse_cli_args_lossy(args: &[String]) -> Result<Option<CliCommand>, String> {
         }
 
         "split-window" => {
-            let mut target = None;
-            let mut horizontal = false;
-            let mut command = None;
-            let rest = &args[2..];
-            for i in 0..rest.len() {
-                match rest[i].as_str() {
-                    "-t" | "--target" => {
-                        if i + 1 < rest.len() {
-                            target = Some(rest[i + 1].clone());
-                        }
-                    }
-                    "-h" | "--horizontal" => horizontal = true,
-                    "-v" | "--vertical" => {} // 默认就是垂直, 不需要处理
-                    "-c" | "--command" => {
-                        if i + 1 < rest.len() {
-                            command = Some(rest[i + 1].clone());
-                        }
-                    }
-                    _ => {}
-                }
+            let values = parse_strict_options(
+                "split-window",
+                &args[2..],
+                &[
+                    OptionSpec::value("-t", "--target"),
+                    OptionSpec::flag("-h", "--horizontal"),
+                    OptionSpec::flag("-v", "--vertical"),
+                    OptionSpec::value("-c", "--command"),
+                ],
+            )?;
+            let horizontal = values.contains_key("-h");
+            let vertical = values.contains_key("-v");
+            if horizontal && vertical {
+                return Err("split-window accepts either -h or -v, not both".to_string());
             }
             Ok(Some(CliCommand::SplitWindow {
-                target,
+                target: option_value(&values, "-t").map(str::to_string),
                 horizontal,
-                command,
+                command: option_value(&values, "-c").map(str::to_string),
             }))
         }
 
@@ -819,92 +825,60 @@ fn parse_cli_args_lossy(args: &[String]) -> Result<Option<CliCommand>, String> {
         }
 
         "select-pane" => {
-            let mut target = None;
-            let rest = &args[2..];
-            for i in 0..rest.len() {
-                match rest[i].as_str() {
-                    "-t" | "--target" => {
-                        if i + 1 < rest.len() {
-                            target = Some(rest[i + 1].clone());
-                        }
-                    }
-                    _ => {}
-                }
-            }
-            Ok(Some(CliCommand::SelectPane { target }))
+            let values = parse_strict_options(
+                "select-pane",
+                &args[2..],
+                &[OptionSpec::value("-t", "--target")],
+            )?;
+            Ok(Some(CliCommand::SelectPane {
+                target: option_value(&values, "-t").map(str::to_string),
+            }))
         }
 
         "kill-pane" => {
-            let mut target = None;
-            let rest = &args[2..];
-            for i in 0..rest.len() {
-                match rest[i].as_str() {
-                    "-t" | "--target" => {
-                        if i + 1 < rest.len() {
-                            target = Some(rest[i + 1].clone());
-                        }
-                    }
-                    _ => {}
-                }
-            }
-            Ok(Some(CliCommand::KillPane { target }))
+            let values = parse_strict_options(
+                "kill-pane",
+                &args[2..],
+                &[OptionSpec::value("-t", "--target")],
+            )?;
+            Ok(Some(CliCommand::KillPane {
+                target: option_value(&values, "-t").map(str::to_string),
+            }))
         }
 
         "resize-pane" => {
-            let mut target = None;
-            let mut width = None;
-            let mut height = None;
-            let mut zoom = false;
-            let rest = &args[2..];
-            let mut i = 0;
-            while i < rest.len() {
-                match rest[i].as_str() {
-                    "-t" | "--target" => {
-                        if i + 1 < rest.len() {
-                            target = Some(rest[i + 1].clone());
-                            i += 2;
-                        } else {
-                            i += 1;
-                        }
-                    }
-                    "-x" | "--width" => {
-                        if i + 1 < rest.len() {
-                            let n = rest[i + 1].parse::<u16>().map_err(|_| {
-                                format!("invalid integer for -x: '{}'", rest[i + 1])
-                            })?;
-                            width = Some(n);
-                            i += 2;
-                        } else {
-                            i += 1;
-                        }
-                    }
-                    "-y" | "--height" => {
-                        if i + 1 < rest.len() {
-                            let n = rest[i + 1].parse::<u16>().map_err(|_| {
-                                format!("invalid integer for -y: '{}'", rest[i + 1])
-                            })?;
-                            height = Some(n);
-                            i += 2;
-                        } else {
-                            i += 1;
-                        }
-                    }
-                    "-Z" | "--zoom" => {
-                        zoom = true;
-                        i += 1;
-                    }
-                    _ => {
-                        i += 1;
-                    }
+            let values = parse_strict_options(
+                "resize-pane",
+                &args[2..],
+                &[
+                    OptionSpec::value("-t", "--target"),
+                    OptionSpec::value("-x", "--width"),
+                    OptionSpec::value("-y", "--height"),
+                    OptionSpec::flag("-Z", "--zoom"),
+                ],
+            )?;
+            let parse_dimension = |flag: &str| -> Result<Option<u16>, String> {
+                match option_value(&values, flag) {
+                    Some(value) => value
+                        .parse::<u16>()
+                        .map(Some)
+                        .map_err(|_| format!("invalid integer for {flag}: '{value}'")),
+                    None => Ok(None),
                 }
-            }
+            };
+            let width = parse_dimension("-x")?;
+            let height = parse_dimension("-y")?;
+            let zoom = values.contains_key("-Z");
             if zoom && (width.is_some() || height.is_some()) {
                 return Err(
                     "resize-pane -Z toggles zoom and cannot be combined with -x/-y".to_string(),
                 );
             }
+            if !zoom && width.is_none() && height.is_none() {
+                return Err("resize-pane requires -x <width>, -y <height>, or -Z".to_string());
+            }
             Ok(Some(CliCommand::ResizePane {
-                target,
+                target: option_value(&values, "-t").map(str::to_string),
                 width,
                 height,
                 zoom,
@@ -912,46 +886,25 @@ fn parse_cli_args_lossy(args: &[String]) -> Result<Option<CliCommand>, String> {
         }
 
         "new-window" => {
-            let mut target = None;
-            let rest = &args[2..];
-            for i in 0..rest.len() {
-                match rest[i].as_str() {
-                    "-t" | "--target" => {
-                        if i + 1 < rest.len() {
-                            target = Some(rest[i + 1].clone());
-                        }
-                    }
-                    _ => {}
-                }
-            }
-            Ok(Some(CliCommand::NewWindow { target }))
+            let values = parse_strict_options(
+                "new-window",
+                &args[2..],
+                &[OptionSpec::value("-t", "--target")],
+            )?;
+            Ok(Some(CliCommand::NewWindow {
+                target: option_value(&values, "-t").map(str::to_string),
+            }))
         }
 
         "rename-window" => {
-            let mut target = None;
-            let rest = &args[2..];
-            let mut i = 0;
-            while i < rest.len() {
-                match rest[i].as_str() {
-                    "-t" | "--target" => {
-                        if i + 1 < rest.len() {
-                            target = Some(rest[i + 1].clone());
-                            i += 2;
-                        } else {
-                            i += 1;
-                        }
-                    }
-                    _ => {
-                        // 剩余第一个非 flag 参数是 title
-                        break;
-                    }
-                }
-            }
-            let title = if i < rest.len() {
-                rest[i].clone()
-            } else {
-                return Err("rename-window requires a title".to_string());
+            let (target, title) = parse_target_and_positional("rename-window", &args[2..])?;
+            let title = match title {
+                Some(title) => title,
+                None => return Err("rename-window requires a title".to_string()),
             };
+            if title.is_empty() {
+                return Err("rename-window requires a non-empty title".to_string());
+            }
             Ok(Some(CliCommand::RenameWindow { target, title }))
         }
 
@@ -2043,5 +1996,263 @@ mod tests {
             err.contains("unknown subcommand"),
             "error should name the condition: {err}"
         );
+    }
+
+    #[test]
+    fn new_rejects_unknown_options_and_missing_values() {
+        // `new` 无参数合法 (dispatch 生成默认名字); 带参数的必须严格校验。
+        assert!(matches!(
+            parse_cli_args_from(&args(&["new"])).expect("bare new is valid"),
+            Some(CliCommand::NewSession {
+                name: None,
+                cwd: None
+            })
+        ));
+        let parsed =
+            parse_cli_args_from(&args(&["new", "-s", "dev", "-c", "/tmp/work"])).expect("parse");
+        match parsed {
+            Some(CliCommand::NewSession { name, cwd }) => {
+                assert_eq!(name.as_deref(), Some("dev"));
+                assert_eq!(
+                    cwd.as_ref()
+                        .map(|cwd| cwd.to_string_lossy().to_string())
+                        .as_deref(),
+                    Some("/tmp/work")
+                );
+            }
+            other => panic!("unexpected parse result: {other:?}"),
+        }
+
+        for arguments in [
+            vec!["new", "-s"],
+            vec!["new", "-c"],
+            vec!["new", "--bogus"],
+            vec!["new", "-s", "dev", "extra"],
+            vec!["new", "-s", ""],
+        ] {
+            let error = parse_cli_args_from(&args(&arguments))
+                .expect_err("invalid new arguments must be rejected");
+            assert!(
+                error.contains("new "),
+                "error should name the command: {error}"
+            );
+        }
+    }
+
+    #[test]
+    fn attach_rejects_invalid_arguments() {
+        let parsed = parse_cli_args_from(&args(&["attach", "-t", "dev"])).expect("parse");
+        match parsed {
+            Some(CliCommand::Attach { target }) => assert_eq!(target.as_deref(), Some("dev")),
+            other => panic!("unexpected parse result: {other:?}"),
+        }
+        let parsed = parse_cli_args_from(&args(&["attach", "--ssh", "ssh://host"]))
+            .expect("parse ssh attach");
+        assert!(matches!(parsed, Some(CliCommand::Ssh { target }) if target == "ssh://host"));
+
+        for arguments in [
+            vec!["attach", "-t"],
+            vec!["attach", "--ssh"],
+            vec!["attach", "--bogus"],
+            vec!["attach", "dev"],
+            vec!["attach", "-t", "dev", "--ssh", "ssh://host"],
+        ] {
+            assert!(
+                parse_cli_args_from(&args(&arguments)).is_err(),
+                "arguments {arguments:?} must be rejected"
+            );
+        }
+    }
+
+    #[test]
+    fn split_window_parses_strictly() {
+        let parsed = parse_cli_args_from(&args(&[
+            "split-window",
+            "-t",
+            "dev:0.0",
+            "-h",
+            "-c",
+            "make test",
+        ]))
+        .expect("parse");
+        match parsed {
+            Some(CliCommand::SplitWindow {
+                target,
+                horizontal,
+                command,
+            }) => {
+                assert_eq!(target.as_deref(), Some("dev:0.0"));
+                assert!(horizontal);
+                assert_eq!(command.as_deref(), Some("make test"));
+            }
+            other => panic!("unexpected parse result: {other:?}"),
+        }
+        let parsed = parse_cli_args_from(&args(&["split-window", "-v"])).expect("parse");
+        match parsed {
+            Some(CliCommand::SplitWindow { horizontal, .. }) => assert!(!horizontal),
+            other => panic!("unexpected parse result: {other:?}"),
+        }
+
+        for arguments in [
+            vec!["split-window", "--bogus"],
+            vec!["split-window", "-t"],
+            vec!["split-window", "-c"],
+            vec!["split-window", "-h", "-v"],
+            vec!["split-window", "-t", "-v"],
+            vec!["split-window", "extra"],
+        ] {
+            assert!(
+                parse_cli_args_from(&args(&arguments)).is_err(),
+                "arguments {arguments:?} must be rejected"
+            );
+        }
+    }
+
+    #[test]
+    fn select_and_kill_pane_reject_invalid_arguments() {
+        let parsed = parse_cli_args_from(&args(&["select-pane", "-t", "%2"])).expect("parse");
+        match parsed {
+            Some(CliCommand::SelectPane { target }) => assert_eq!(target.as_deref(), Some("%2")),
+            other => panic!("unexpected parse result: {other:?}"),
+        }
+        let parsed = parse_cli_args_from(&args(&["kill-pane", "-t", "dev:0.1"])).expect("parse");
+        match parsed {
+            Some(CliCommand::KillPane { target }) => assert_eq!(target.as_deref(), Some("dev:0.1")),
+            other => panic!("unexpected parse result: {other:?}"),
+        }
+
+        for command in ["select-pane", "kill-pane"] {
+            for arguments in [
+                vec![command, "--bogus"],
+                vec![command, "-t"],
+                vec![command, "extra"],
+            ] {
+                assert!(
+                    parse_cli_args_from(&args(&arguments)).is_err(),
+                    "arguments {arguments:?} must be rejected"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn resize_pane_requires_a_dimension_or_zoom() {
+        let parsed =
+            parse_cli_args_from(&args(&["resize-pane", "-t", "dev", "-x", "100"])).expect("parse");
+        match parsed {
+            Some(CliCommand::ResizePane {
+                target,
+                width,
+                height,
+                zoom,
+            }) => {
+                assert_eq!(target.as_deref(), Some("dev"));
+                assert_eq!(width, Some(100));
+                assert_eq!(height, None);
+                assert!(!zoom);
+            }
+            other => panic!("unexpected parse result: {other:?}"),
+        }
+
+        // 无 -x/-y/-Z 的空调用过去是发给 daemon 的 no-op resize, 现在直接报错。
+        for arguments in [
+            vec!["resize-pane"],
+            vec!["resize-pane", "-t", "dev"],
+            vec!["resize-pane", "--bogus"],
+            vec!["resize-pane", "-x"],
+            vec!["resize-pane", "-y"],
+            vec!["resize-pane", "extra"],
+        ] {
+            let error = parse_cli_args_from(&args(&arguments))
+                .expect_err("invalid resize-pane arguments must be rejected");
+            assert!(
+                error.contains("resize-pane"),
+                "error should name the command: {error}"
+            );
+        }
+    }
+
+    #[test]
+    fn new_window_rejects_invalid_arguments() {
+        let parsed = parse_cli_args_from(&args(&["new-window", "-t", "dev"])).expect("parse");
+        match parsed {
+            Some(CliCommand::NewWindow { target }) => assert_eq!(target.as_deref(), Some("dev")),
+            other => panic!("unexpected parse result: {other:?}"),
+        }
+
+        for arguments in [
+            vec!["new-window", "--bogus"],
+            vec!["new-window", "-t"],
+            vec!["new-window", "extra"],
+        ] {
+            assert!(
+                parse_cli_args_from(&args(&arguments)).is_err(),
+                "arguments {arguments:?} must be rejected"
+            );
+        }
+    }
+
+    #[test]
+    fn rename_window_rejects_invalid_arguments() {
+        let parsed = parse_cli_args_from(&args(&["rename-window", "-t", "dev:0.0", "build"]))
+            .expect("parse");
+        match parsed {
+            Some(CliCommand::RenameWindow { target, title }) => {
+                assert_eq!(target.as_deref(), Some("dev:0.0"));
+                assert_eq!(title, "build");
+            }
+            other => panic!("unexpected parse result: {other:?}"),
+        }
+
+        for arguments in [
+            vec!["rename-window"],
+            vec!["rename-window", "-t", "dev"],
+            vec!["rename-window", "--bogus"],
+            vec!["rename-window", "-t", "dev", "New", "Extra"],
+            vec!["rename-window", "-t", "dev", ""],
+        ] {
+            let error = parse_cli_args_from(&args(&arguments))
+                .expect_err("invalid rename-window arguments must be rejected");
+            assert!(
+                error.contains("rename-window"),
+                "error should name the command: {error}"
+            );
+        }
+    }
+
+    #[test]
+    fn kill_rejects_unknown_options_and_extras() {
+        for arguments in [
+            vec!["kill", "--bogus", "-t", "dev"],
+            vec!["kill", "-t", "dev", "extra"],
+            vec!["kill", "-t"],
+        ] {
+            assert!(
+                parse_cli_args_from(&args(&arguments)).is_err(),
+                "arguments {arguments:?} must be rejected"
+            );
+        }
+    }
+
+    #[test]
+    fn rename_session_rejects_empty_name() {
+        let error = parse_cli_args_from(&args(&["rename-session", "-t", "dev", ""]))
+            .expect_err("empty name must be a parse error");
+        assert!(error.contains("non-empty"), "{error}");
+    }
+
+    #[test]
+    fn launch_intent_defers_unknown_arguments_to_cli_parser() {
+        // 未知 flag / 多余位置参数不再是"静默 GUI 默认", 交给 CLI 解析层报错。
+        assert_eq!(
+            parse_launch_intent_from(&args(&["attach", "--bogus"])),
+            None
+        );
+        assert_eq!(parse_launch_intent_from(&args(&["attach", "dev"])), None);
+        assert_eq!(
+            parse_launch_intent_from(&args(&["attach", "-t", "dev", "extra"])),
+            None
+        );
+        assert_eq!(parse_launch_intent_from(&args(&["attach", "--ssh"])), None);
     }
 }

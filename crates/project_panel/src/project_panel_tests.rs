@@ -6324,8 +6324,10 @@ async fn test_creating_excluded_entries(cx: &mut gpui::TestAppContext) {
     cx.update(|cx| {
         cx.update_global::<SettingsStore, _>(|store, cx| {
             store.update_user_settings(cx, |settings| {
-                settings.project.excluded_paths =
-                    Some(vec![PathBuf::from("excluded_dir"), PathBuf::from("**/.git")]);
+                settings.project.excluded_paths = Some(vec![
+                    PathBuf::from("excluded_dir"),
+                    PathBuf::from("**/.git"),
+                ]);
             });
         });
     });

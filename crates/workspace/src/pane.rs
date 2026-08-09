@@ -842,6 +842,13 @@ impl Pane {
         cx.notify();
     }
 
+    /// Test-only: replaces the project handle (e.g. with a dead weak handle)
+    /// to verify rendering degrades gracefully instead of blanking the pane.
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn set_project_for_test(&mut self, project: WeakEntity<Project>) {
+        self.project = project;
+    }
+
     pub fn nav_history_for_item<T: Item>(&self, item: &Entity<T>) -> ItemNavHistory {
         ItemNavHistory {
             history: self.nav_history.clone(),
@@ -2152,7 +2159,6 @@ impl Pane {
 
         cx.emit(Event::RemovedItem { item: item.clone() });
         if self.items.is_empty() {
-            item.deactivated(window, cx);
             if close_pane_if_empty {
                 self.update_toolbar(window, cx);
                 cx.emit(Event::Remove {
@@ -2259,9 +2265,34 @@ impl Pane {
         }
 
         if save_intent == SaveIntent::SaveAs {
-            is_dirty = true;
-            has_conflict = false;
-            can_save = false;
+            if !can_save_as {
+                return Err(anyhow::anyhow!("active item does not support Save As"));
+            }
+
+            let suggested_name =
+                cx.update(|_window, cx| item.suggested_filename(cx).to_string())?;
+            let workspace = pane.read_with(cx, |pane, _| pane.workspace.clone())?;
+            let paths = workspace.update_in(cx, |workspace, window, cx| {
+                workspace.prompt_for_new_path(Some(suggested_name), window, cx)
+            })?;
+            let Some(path) = paths.await?.and_then(|paths| paths.into_iter().next()) else {
+                return Ok(false);
+            };
+            let project_path = project
+                .read_with(cx, |project, cx| project.find_project_path(&path, cx))
+                .ok_or_else(|| anyhow::anyhow!("Save As path is outside the project"))?;
+
+            pane.update_in(cx, |_, window, cx| {
+                item.save_as(project.clone(), project_path, window, cx)
+            })?
+            .await?;
+            return pane.update(cx, |_, cx| {
+                cx.emit(Event::UserSavedItem {
+                    item: item.downgrade_item(),
+                    save_intent,
+                });
+                true
+            });
         }
 
         if save_intent == SaveIntent::Overwrite {
@@ -2456,7 +2487,6 @@ impl Pane {
                 .await?;
             }
         }
-
         pane.update(cx, |_, cx| {
             cx.emit(Event::UserSavedItem {
                 item: item.downgrade_item(),
@@ -3257,10 +3287,6 @@ impl Pane {
     }
 
     fn render_tab_bar(&mut self, window: &mut Window, cx: &mut Context<Pane>) -> AnyElement {
-        if self.workspace.upgrade().is_none() {
-            return gpui::Empty.into_any();
-        }
-
         let focus_handle = self.focus_handle.clone();
 
         let navigate_backward = IconButton::new("navigate_backward", IconName::ArrowLeft)
@@ -4214,9 +4240,11 @@ impl Render for Pane {
 
         let should_display_tab_bar = self.should_display_tab_bar.clone();
         let display_tab_bar = should_display_tab_bar(window, cx);
-        let Some(project) = self.project.upgrade() else {
-            return div().track_focus(&self.focus_handle(cx));
-        };
+        // A transient project handle loss must not blank the pane: the active
+        // item, toolbar, key bindings and focus target keep rendering, and
+        // only project-dependent bits (worktree presence, welcome page)
+        // degrade gracefully below.
+        let project = self.project.upgrade();
 
         v_flex()
             .key_context(key_context)
@@ -4380,7 +4408,11 @@ impl Render for Pane {
             })
             .child({
                 // §2.1 visible_worktrees 已移除，使用 worktrees 判断是否存在可见工作树。
-                let has_worktrees = project.read(cx).worktrees(cx).next().is_some();
+                // Guarded: without a live project handle the worktree state is
+                // unknown, which must not drop the whole pane content tree.
+                let has_worktrees = project
+                    .as_ref()
+                    .is_some_and(|project| project.read(cx).worktrees(cx).next().is_some());
                 // main content
                 div()
                     .flex_1()
@@ -4393,6 +4425,7 @@ impl Render for Pane {
                     .map(|div| {
                         if let Some(item) = self.active_item() {
                             div.id("pane_placeholder")
+                                .debug_selector(|| "pane-content".into())
                                 .v_flex()
                                 .size_full()
                                 .overflow_hidden()
@@ -4402,6 +4435,7 @@ impl Render for Pane {
                             let placeholder = div
                                 .id("pane_placeholder")
                                 .h_flex()
+                                .debug_selector(|| "pane-content".into())
                                 .size_full()
                                 .justify_center()
                                 .on_click(cx.listener(
@@ -4414,7 +4448,27 @@ impl Render for Pane {
                                         }
                                     },
                                 ));
-                            if has_worktrees || !self.should_display_welcome_page {
+                            // A dead project handle must not blank the pane content
+                            // area: render a non-empty, actionable placeholder that
+                            // visibly reports the unavailable context. The double-
+                            // click dispatch handler on the placeholder still works.
+                            if project.is_none() {
+                                placeholder.child(
+                                    v_flex()
+                                        .id("pane_unavailable_placeholder")
+                                        .debug_selector(|| "pane-content-unavailable".into())
+                                        .items_center()
+                                        .gap_1()
+                                        .child(
+                                            Label::new("Workspace unavailable").color(Color::Muted),
+                                        )
+                                        .child(
+                                            Label::new("Reconnect to restore this pane")
+                                                .size(LabelSize::Small)
+                                                .color(Color::Muted),
+                                        ),
+                                )
+                            } else if has_worktrees || !self.should_display_welcome_page {
                                 placeholder
                             } else {
                                 if self.welcome_page.is_none() {
@@ -4742,6 +4796,21 @@ impl NavHistory {
         if let Some(path_for_item) = path_for_item {
             path_for_item.0 = project_path;
             path_for_item.1 = abs_path;
+        }
+    }
+
+    pub fn rename_path(
+        &mut self,
+        old_project_path: &ProjectPath,
+        new_project_path: ProjectPath,
+        abs_path: Option<PathBuf>,
+    ) {
+        let mut state = self.0.lock();
+        for (project_path, stored_abs_path) in state.paths_by_item.values_mut() {
+            if project_path == old_project_path {
+                *project_path = new_project_path.clone();
+                *stored_abs_path = abs_path.clone();
+            }
         }
     }
 

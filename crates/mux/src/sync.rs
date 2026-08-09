@@ -258,16 +258,16 @@ pub async fn install_remote_extension(
     source: &[u8],
 ) -> Result<()> {
     // §16.6 构建 InstallExtensionRequest。
-    let body = RequestBody::InstallExtension(
-        mux_protocol::InstallExtensionRequest {
-            name: name.to_string(),
-            manifest: manifest.to_vec(),
-            source: source.to_vec(),
-        },
-    );
+    let body = RequestBody::InstallExtension(mux_protocol::InstallExtensionRequest {
+        name: name.to_string(),
+        manifest: manifest.to_vec(),
+        source: source.to_vec(),
+    });
 
     // §16.6 发送请求并等待响应。
-    let resp = domain.send_request(body).await
+    let resp = domain
+        .send_request(body)
+        .await
         .context("发送扩展安装请求失败")?;
 
     // §16.6 检查响应结果。
@@ -322,10 +322,7 @@ pub async fn sync_extensions_to_remote(domain: &MuxDomain, base_dir: &Path) -> R
             .with_context(|| format!("安装远程扩展失败: {}", ext.name))?;
     }
 
-    tracing::info!(
-        count = extensions.len(),
-        "扩展同步完成"
-    );
+    tracing::info!(count = extensions.len(), "扩展同步完成");
     Ok(())
 }
 
@@ -489,11 +486,7 @@ name = \"not-the-extension-name\"
             .collect();
         packed_paths.sort();
 
-        for expected in [
-            EXTENSION_MANIFEST,
-            "src/main.js",
-            "src/handlers/on_key.js",
-        ] {
+        for expected in [EXTENSION_MANIFEST, "src/main.js", "src/handlers/on_key.js"] {
             assert!(
                 packed_paths.iter().any(|path| path == expected),
                 "{expected} missing from archive: {packed_paths:?}"

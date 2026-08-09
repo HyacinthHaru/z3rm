@@ -182,12 +182,13 @@ impl Settings for ProjectPanelSettings {
             git_status: project_panel.git_status.unwrap_or(true),
             indent_size: project_panel.indent_size.unwrap_or(20.0),
             indent_guides: IndentGuidesSettings {
-                show: indent_guides
-                    .show
-                    .map_or_else(ShowIndentGuides::default, |show| match show {
+                show: indent_guides.show.map_or_else(
+                    ShowIndentGuides::default,
+                    |show| match show {
                         settings::ShowIndentGuides::Always => ShowIndentGuides::Always,
                         settings::ShowIndentGuides::Never => ShowIndentGuides::Never,
-                    }),
+                    },
+                ),
             },
             sticky_scroll: project_panel.sticky_scroll.unwrap_or(true),
             auto_reveal_entries: project_panel.auto_reveal_entries.unwrap_or(true),

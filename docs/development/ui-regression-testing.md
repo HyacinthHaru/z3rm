@@ -44,15 +44,23 @@ Pixel comparison across machines is dominated by font rasterization and GPU
 driver differences, which produce failures that say nothing about the code. The
 suite asserts on properties instead:
 
-- the framebuffer is not blank, and carries the colors the view asked for
 - the accessibility tree contains the expected roles (`Terminal` for a pane,
-  a `TextRun` per visible line)
+  `Button` and `TextInput` for extension chrome, and a `TextRun` per visible
+  line)
 - a display-list repaint changes the pixels without disturbing the surrounding
   VDOM tree
 
 The accessibility tree is the load-bearing half. It answers "did this element
 actually get rendered, with the right semantics" far more precisely than pixels
 do, and it is stable across machines.
+
+Linux is the exception: `gpui_platform`'s software renderer
+(`crates/gpui_platform/src/software_renderer.rs`) rasterizes scenes
+deterministically in-process, so exact pixels are a valid baseline there. The
+harness swatch case compares its framebuffer to a recorded digest on Linux, and
+`cargo test -p gpui_platform --features test-support --lib` holds byte-exact
+baselines for quads, borders, paint order, and sprite coverage without needing
+a window or display server at all.
 
 ## How the harness works
 

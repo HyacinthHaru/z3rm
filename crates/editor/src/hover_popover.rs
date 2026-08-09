@@ -9,12 +9,12 @@ pub fn diagnostics_markdown_style(_window: &Window, _cx: &App) -> markdown::Mark
     markdown::MarkdownStyle::default()
 }
 
-/// Stub: open_markdown_url (spec §8.2 M2)
+/// Opens a markdown link through the platform URL handler.
 pub fn open_markdown_url(
     _workspace: Option<gpui::Entity<workspace::Workspace>>,
-    _url: SharedString,
+    url: SharedString,
     _window: &mut Window,
-    _cx: &mut Context<Editor>,
+    cx: &mut Context<Editor>,
 ) {
-    // Markdown preview deleted; no-op stub
+    cx.open_url(&url);
 }

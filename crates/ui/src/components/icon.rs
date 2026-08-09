@@ -112,6 +112,20 @@ impl From<IconName> for Icon {
     }
 }
 
+pub fn git_hosting_provider_icon(provider_name: &str) -> IconName {
+    match provider_name {
+        "Bitbucket" => IconName::Bitbucket,
+        "Chromium" => IconName::Gerrit,
+        "Codeberg" => IconName::Codeberg,
+        "Forgejo Self-Hosted" => IconName::Forgejo,
+        "GitHub" => IconName::Github,
+        "GitLab" => IconName::Gitlab,
+        "Gitea" => IconName::Gitea,
+        "SourceHut" => IconName::Sourcehut,
+        _ => IconName::Link,
+    }
+}
+
 /// The source of an icon.
 #[derive(Clone)]
 enum IconSource {
@@ -337,5 +351,21 @@ impl Component for Icon {
                 )]),
             ])
             .into_any_element()
+    }
+}
+
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn git_hosting_provider_icons_match_known_hosts() {
+        assert_eq!(git_hosting_provider_icon("Bitbucket"), IconName::Bitbucket);
+        assert_eq!(git_hosting_provider_icon("Codeberg"), IconName::Codeberg);
+        assert_eq!(git_hosting_provider_icon("GitHub"), IconName::Github);
+        assert_eq!(git_hosting_provider_icon("GitLab"), IconName::Gitlab);
+        assert_eq!(git_hosting_provider_icon("SourceHut"), IconName::Sourcehut);
+        assert_eq!(git_hosting_provider_icon("unknown"), IconName::Link);
     }
 }

@@ -1420,6 +1420,18 @@ impl LocalWorktree {
                             new_repos.next();
                         }
                         Ordering::Equal => {
+                            // A change to a repository's git state is signaled by bumping
+                            // `git_dir_scan_id`, and the diff below detects it via `!=`. If the
+                            // value ever regresses (e.g. a rescan re-inserting the repository
+                            // with a fresh scan id of 0), a bump from the same cycle is wiped
+                            // out and the corresponding git update is silently lost.
+                            debug_assert!(
+                                new_repo.git_dir_scan_id >= old_repo.git_dir_scan_id,
+                                "git_dir_scan_id for repository at {:?} regressed from {} to {}",
+                                new_repo.work_directory_abs_path,
+                                old_repo.git_dir_scan_id,
+                                new_repo.git_dir_scan_id,
+                            );
                             if new_repo.git_dir_scan_id != old_repo.git_dir_scan_id
                                 || new_repo.work_directory_abs_path
                                     != old_repo.work_directory_abs_path
@@ -1976,7 +1988,7 @@ impl LocalWorktree {
                 anyhow::Ok(())
             })
             .await
-            .log_err();
+            .with_context(|| "Failed to copy external entries into worktree")?;
             let mut refresh = cx.read_entity(
                 &this.upgrade().with_context(|| "Dropped worktree")?,
                 |this, _| {
@@ -1993,7 +2005,7 @@ impl LocalWorktree {
                 anyhow::Ok(())
             })
             .await
-            .log_err();
+            .with_context(|| "Failed to wait for worktree refresh after copying entries")?;
 
             let this = this.upgrade().with_context(|| "Dropped worktree")?;
             Ok(cx.read_entity(&this, |this, _| {
@@ -2023,7 +2035,7 @@ impl LocalWorktree {
         entry_id: ProjectEntryId,
         cx: &Context<Worktree>,
     ) -> Option<Task<Result<()>>> {
-        let path = self.entry_for_id(entry_id).unwrap().path.clone();
+        let path = self.entry_for_id(entry_id)?.path.clone();
         let mut rx = self.add_path_prefix_to_scan(path);
         Some(cx.background_spawn(async move {
             rx.next().await;
@@ -3475,11 +3487,28 @@ impl BackgroundScannerState {
 
         let work_directory_id = work_dir_entry.id;
 
+        // A repository can be re-inserted when its `.git` entry is re-discovered, e.g.
+        // during a watcher-forced rescan. Carry the existing `git_dir_scan_id` forward
+        // in that case: the snapshot diff detects git changes by comparing scan ids, so
+        // resetting the id would wipe out a bump made earlier in the same scan cycle,
+        // silently dropping the corresponding git update. Deliberately don't bump the
+        // id here either: re-insertion is snapshot bookkeeping, not evidence that git
+        // state changed. It also happens on non-lossy paths (explicit refreshes,
+        // path-prefix scans) where we know nothing in `.git` changed, and a bump would
+        // trigger a spurious full reload of the repository's git state. Only
+        // `update_git_repositories` claims that git state changed, by stamping the
+        // current scan id.
+        let git_dir_scan_id = self
+            .snapshot
+            .git_repositories
+            .get(&work_directory_id)
+            .map_or(0, |existing_repository| existing_repository.git_dir_scan_id);
+
         let local_repository = LocalRepositoryEntry {
             work_directory_id,
             work_directory,
             work_directory_abs_path: work_directory_abs_path.as_path().into(),
-            git_dir_scan_id: 0,
+            git_dir_scan_id,
             dot_git_abs_path,
             common_dir_abs_path,
             repository_dir_abs_path,
@@ -4642,6 +4671,18 @@ impl BackgroundScanner {
             let snapshot = &self.state.lock().await.snapshot;
 
             let mut ranges_to_drop = SmallVec::<[Range<usize>; 4]>::new();
+            // On Windows, creating or deleting a file directly inside `.git`
+            // updates the directory's last-write time, so the watcher reports a
+            // bare `.git` Changed event alongside the file's own event. When the
+            // file event is filtered out (e.g. git's transient `index.lock`), the
+            // bare event carries no information either, so acting on it would
+            // turn every ignored lock file into a git rescan. Since a rescan's
+            // own `git diff` can take `index.lock`, that feeds back into an
+            // infinite loop of rescans. So bare `.git` events are deferred here
+            // and only rescanned when nothing in the batch explains them; a
+            // standalone bare event (macOS coalescing) still triggers a rescan.
+            let mut bare_dot_git_abs_paths = Vec::new();
+            let mut dot_git_dirs_with_ignored_events = Vec::new();
 
             for (ix, event) in events.iter().enumerate() {
                 let abs_path = SanitizedPath::new(&event.path);
@@ -4685,16 +4726,30 @@ impl BackgroundScanner {
                         log::debug!(
                             "ignoring event {abs_path:?} as it's in the .git directory among skipped files or directories"
                         );
+                        if !dot_git_dirs_with_ignored_events.contains(&dot_git_abs_path) {
+                            dot_git_dirs_with_ignored_events.push(dot_git_abs_path);
+                        }
                         skip_ix(&mut ranges_to_drop, ix);
                         continue;
                     }
+
                     if is_dot_git {
                         log::debug!(
                             "ignoring event {abs_path:?} for .git directory itself (kind: {:?})",
                             event.kind
                         );
+                        if !bare_dot_git_abs_paths.contains(&dot_git_abs_path) {
+                            bare_dot_git_abs_paths.push(dot_git_abs_path);
+                        }
                         skip_ix(&mut ranges_to_drop, ix);
                         continue;
+                    }
+
+                    if !dot_git_abs_paths.contains(&dot_git_abs_path) {
+                        log::debug!(
+                            "detected update within git repo at {dot_git_abs_path:?}: {abs_path:?}"
+                        );
+                        dot_git_abs_paths.push(dot_git_abs_path);
                     }
 
                     // New directories can appear under the `refs` tree at any time, e.g. when a
@@ -4714,12 +4769,30 @@ impl BackgroundScanner {
                         )
                         .await;
                     }
+                }
 
-                    if !dot_git_abs_paths.contains(&dot_git_abs_path) {
-                        log::debug!(
-                            "detected update within git repo at {dot_git_abs_path:?}: {abs_path:?}"
-                        );
-                        dot_git_abs_paths.push(dot_git_abs_path);
+                // A rescan event means the watcher lost sync and events under the
+                // rescanned path were dropped, possibly including events inside `.git`
+                // directories. Reload the git state of every repository with a git
+                // directory under the rescanned path, since changes there may have
+                // gone unseen.
+                if self.track_git_repositories && matches!(event.kind, Some(PathEventKind::Rescan))
+                {
+                    for repository in snapshot.git_repositories.values() {
+                        let affected_by_rescan = [
+                            &repository.dot_git_abs_path,
+                            &repository.common_dir_abs_path,
+                            &repository.repository_dir_abs_path,
+                        ]
+                        .iter()
+                        .any(|git_dir_abs_path| git_dir_abs_path.starts_with(abs_path.as_path()));
+                        let dot_git_abs_path = repository.dot_git_abs_path.to_path_buf();
+                        if affected_by_rescan && !dot_git_abs_paths.contains(&dot_git_abs_path) {
+                            log::debug!(
+                                "reloading git repo at {dot_git_abs_path:?} due to rescan of {abs_path:?}"
+                            );
+                            dot_git_abs_paths.push(dot_git_abs_path);
+                        }
                     }
                 }
 
@@ -4734,6 +4807,19 @@ impl BackgroundScanner {
                         work_dirs_needing_exclude_update
                             .push(repository.work_directory_abs_path.clone());
                     }
+                }
+            }
+
+            for dot_git_abs_path in bare_dot_git_abs_paths {
+                if dot_git_dirs_with_ignored_events.contains(&dot_git_abs_path) {
+                    log::debug!(
+                        "not reloading git repo at {dot_git_abs_path:?}: the bare .git event is explained by filtered events in the same batch"
+                    );
+                } else if !dot_git_abs_paths.contains(&dot_git_abs_path) {
+                    log::debug!(
+                        "detected update within git repo at {dot_git_abs_path:?}: bare .git directory event"
+                    );
+                    dot_git_abs_paths.push(dot_git_abs_path);
                 }
             }
 
@@ -6957,6 +7043,10 @@ fn decode_byte_full(
 mod tests {
     use super::*;
 
+    use fs::FakeFs;
+    use serde_json::json;
+    use util::path;
+
     /// reproduction of issue #50785
     fn build_pcm16_wav_bytes() -> Vec<u8> {
         let header: Vec<u8> = vec![
@@ -7049,6 +7139,38 @@ mod tests {
         );
     }
 
+    // Mimics binary formats that interleave short ASCII fragments with small
+    // length/type fields (as seen in some game/asset binary formats, e.g.
+    // Tibia-style OTBM maps): most high bytes are zero, matching UTF-16LE's
+    // null-byte pattern for ASCII, but the low bytes are mostly non-word
+    // "tag" values rather than real letters/digits/spaces.
+    fn build_tag_interleaved_binary_bytes() -> Vec<u8> {
+        let mut bytes = Vec::new();
+        let tags: [u8; 6] = [0xFE, 0xFF, 0x25, 0x2B, 0xA3, 0xC5];
+        let mut i = 0;
+        while bytes.len() < FILE_ANALYSIS_BYTES {
+            bytes.push(tags[i % tags.len()]);
+            bytes.push(0x00);
+            i += 1;
+        }
+        bytes.truncate(FILE_ANALYSIS_BYTES);
+        bytes
+    }
+
+    #[test]
+    fn test_tag_interleaved_binary_not_misdetected_as_utf16le() {
+        let bytes = build_tag_interleaved_binary_bytes();
+        assert_eq!(bytes.len(), FILE_ANALYSIS_BYTES);
+
+        let result = analyze_byte_content(&bytes);
+        assert_eq!(
+            result,
+            ByteContent::Binary,
+            "binary data with sparse non-word low bytes and null high bytes \
+             should not be misdetected as UTF-16LE text"
+        );
+    }
+
     #[test]
     fn test_utf16le_text_detected_as_utf16le() {
         let text = "Hello, world! This is a UTF-16 test string. ";
@@ -7064,6 +7186,30 @@ mod tests {
     #[test]
     fn test_utf16be_text_detected_as_utf16be() {
         let text = "Hello, world! This is a UTF-16 test string. ";
+        let mut bytes = Vec::new();
+        while bytes.len() < FILE_ANALYSIS_BYTES {
+            bytes.extend(text.encode_utf16().flat_map(|u| u.to_be_bytes()));
+        }
+        bytes.truncate(FILE_ANALYSIS_BYTES);
+
+        assert_eq!(analyze_byte_content(&bytes), ByteContent::Utf16Be);
+    }
+
+    #[test]
+    fn test_utf16le_cyrillic_text_detected_as_utf16le() {
+        let text = "Привет, мир! Это тестовая строка в UTF-16. ";
+        let mut bytes = Vec::new();
+        while bytes.len() < FILE_ANALYSIS_BYTES {
+            bytes.extend(text.encode_utf16().flat_map(|u| u.to_le_bytes()));
+        }
+        bytes.truncate(FILE_ANALYSIS_BYTES);
+
+        assert_eq!(analyze_byte_content(&bytes), ByteContent::Utf16Le);
+    }
+
+    #[test]
+    fn test_utf16be_greek_text_detected_as_utf16be() {
+        let text = "Γεια σου κόσμε! Αυτή είναι μια δοκιμαστική συμβολοσειρά. ";
         let mut bytes = Vec::new();
         while bytes.len() < FILE_ANALYSIS_BYTES {
             bytes.extend(text.encode_utf16().flat_map(|u| u.to_be_bytes()));
@@ -7094,5 +7240,105 @@ mod tests {
                 "{label} should be detected as Binary"
             );
         }
+    }
+
+    #[gpui::test]
+    async fn test_copy_external_entries_propagates_copy_failure(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let fs = FakeFs::new(cx.executor());
+        fs.insert_tree(
+            path!("/worktree"),
+            json!({
+                "target_dir": {},
+                "source.txt": "hello",
+            }),
+        )
+        .await;
+
+        let worktree = Worktree::local(
+            Arc::<Path>::from(Path::new(path!("/worktree"))),
+            true,
+            fs.clone(),
+            Arc::new(AtomicUsize::new(0)),
+            true,
+            WorktreeId::from_usize(1),
+            &mut cx.to_async(),
+        )
+        .await
+        .unwrap();
+
+        let result = worktree
+            .update(cx, |tree, cx| {
+                tree.copy_external_entries(
+                    RelPath::unix("target_dir").unwrap().into_arc(),
+                    vec![
+                        Arc::<Path>::from(Path::new(path!("/worktree/source.txt"))),
+                        Arc::<Path>::from(Path::new(path!("/worktree/missing.txt"))),
+                    ],
+                    cx,
+                )
+            })
+            .await;
+
+        let err = result.expect_err("copy failure should reach the caller");
+        let message = err.to_string();
+        assert!(
+            message.contains("missing.txt"),
+            "error should name the failing source: {message}"
+        );
+        assert!(
+            message.contains("Failed to copy"),
+            "error should carry copy context: {message}"
+        );
+
+        // Partial-copy semantics are preserved: the first file was copied
+        // before the later failure, and nothing was rolled back.
+        assert!(
+            fs.metadata(path!("/worktree/target_dir/source.txt").as_ref())
+                .await
+                .is_ok_and(|metadata| metadata.is_some()),
+            "successfully copied entries should remain after a later failure"
+        );
+    }
+
+    #[gpui::test]
+    async fn test_expand_all_for_entry_with_stale_id_is_harmless(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let fs = FakeFs::new(cx.executor());
+        fs.insert_tree(
+            path!("/worktree"),
+            json!({
+                "dir": {
+                    "nested": {
+                        "file.txt": "",
+                    },
+                },
+            }),
+        )
+        .await;
+
+        let worktree = Worktree::local(
+            Arc::<Path>::from(Path::new(path!("/worktree"))),
+            true,
+            fs.clone(),
+            Arc::new(AtomicUsize::new(0)),
+            true,
+            WorktreeId::from_usize(1),
+            &mut cx.to_async(),
+        )
+        .await
+        .unwrap();
+
+        // A stale entry id must not panic; expand_all_for_entry reports it via
+        // its existing `Option` contract instead.
+        let task = worktree.update(cx, |tree, cx| {
+            tree.expand_all_for_entry(ProjectEntryId::MAX, cx)
+        });
+        assert!(
+            task.is_none(),
+            "a stale entry id should not expand anything"
+        );
     }
 }

@@ -622,7 +622,12 @@ fn maybe_propagate_worktree_trust(
             return;
         }
 
-        let worktree_store = new_workspace.read(cx).project().read(cx).worktree_store().clone();
+        let worktree_store = new_workspace
+            .read(cx)
+            .project()
+            .read(cx)
+            .worktree_store()
+            .clone();
         let paths_to_trust: HashSet<_> = paths
             .iter()
             .filter_map(|path| {
@@ -757,7 +762,6 @@ fn create_worktree_workspace_inner(
         workspace.capture_state_for_worktree_switch(window, fallback_focused_dock, cx);
     let workspace_handle = workspace.weak_handle();
     let window_handle = window.window_handle().downcast::<MultiWorkspace>();
-    let remote_connection_options = project.read(cx).remote_connection_options();
 
     let (git_repos, non_git_paths) = classify_worktrees(project.read(cx), cx);
 
@@ -770,25 +774,6 @@ fn create_worktree_workspace_inner(
             cx,
         );
         return Task::ready(Err(anyhow!("No git repositories found in the project")));
-    }
-
-    if remote_connection_options.is_some() {
-        let is_disconnected = project
-            .read(cx)
-            .remote_client()
-            .is_some_and(|client| client.read(cx).is_disconnected());
-        if is_disconnected {
-            let toast_workspace = cx.entity();
-            show_error_toast(
-                toast_workspace,
-                "worktree create",
-                anyhow!("Cannot create worktree: remote connection is not active"),
-                cx,
-            );
-            return Task::ready(Err(anyhow!(
-                "Cannot create worktree: remote connection is not active"
-            )));
-        }
     }
 
     let worktree_name = action.worktree_name.clone();
@@ -831,7 +816,7 @@ fn create_worktree_workspace_inner(
             previous_state,
             workspace_handle.clone(),
             window_handle,
-            remote_connection_options,
+            None,
             activate,
             &mut cx,
         )
@@ -1209,7 +1194,7 @@ async fn open_worktree_workspace(
 
     new_workspace
         .update(cx, |workspace, cx| {
-            workspace.project().read(cx).wait_for_initial_scan()
+            workspace.project().read(cx).wait_for_initial_scan(cx)
         })
         .await;
 

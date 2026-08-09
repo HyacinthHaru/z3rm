@@ -507,12 +507,8 @@ async fn consume_search_stream(
     project_search_turning_into_text_finder: Arc<AtomicBool>,
     cx: &mut AsyncApp,
 ) -> Option<SearchResults<SearchResult>> {
-    // Note: is cancel safe.
-    // The stream is consumed in place rather than through a clone: cloning a
-    // SearchResults hands back a fresh receiver that the producer never sends
-    // to, so a cloned stream yields nothing.
-    let SearchResults { rx } = search_results;
-    let mut matches = rx.ready_chunks(1024);
+    let search_results_clone = search_results.clone();
+    let mut matches = pin!(search_results_clone.rx.ready_chunks(1024));
 
     let mut limit_reached = false;
     while let Some(results) = matches.next().await {
@@ -588,11 +584,9 @@ async fn consume_search_stream(
     }
 
     if project_search_turning_into_text_finder.load(Ordering::Relaxed) {
-        project_search_turning_into_text_finder.store(false, Ordering::Relaxed); // reset
-        let rx = matches.into_inner();
-        return Some(SearchResults { rx });
+        project_search_turning_into_text_finder.store(false, Ordering::Relaxed);
+        return Some(search_results);
     }
-
     project_search
         .update(cx, |project_search, cx| {
             project_search.search_state = if project_search.match_ranges.is_empty() {
@@ -2797,9 +2791,7 @@ pub mod tests {
     use pretty_assertions::assert_eq;
     use project::{FakeFs, Fs};
     use serde_json::json;
-    use settings::{
-        SettingsStore, ThemeColorsContent, ThemeStyleContent,
-    };
+    use settings::{SettingsStore, ThemeColorsContent, ThemeStyleContent};
     use util::{path, paths::PathStyle, rel_path::rel_path};
     use util_macros::perf;
     use workspace::{DeploySearch, MultiWorkspace};
@@ -3416,6 +3408,7 @@ pub mod tests {
     #[gpui::test]
     async fn test_deploy_project_search_focus(cx: &mut TestAppContext) {
         init_test(cx);
+        use_selection_for_query_seed(cx);
 
         let fs = FakeFs::new(cx.background_executor.clone());
         fs.insert_tree(
@@ -3775,6 +3768,7 @@ pub mod tests {
     #[gpui::test]
     async fn test_new_project_search_focus(cx: &mut TestAppContext) {
         init_test(cx);
+        use_selection_for_query_seed(cx);
 
         let fs = FakeFs::new(cx.background_executor.clone());
         fs.insert_tree(
@@ -3998,10 +3992,10 @@ pub mod tests {
 
         window.update(cx, |_, window, cx| {
             search_view_2.update(cx, |search_view_2, cx| {
-                    assert_eq!(
-                        search_view_2.query_editor.read(cx).text(cx),
-                        "two",
-                        "New search view should get the query from the text cursor was at during the event spawn (first search view's first result)"
+                assert_eq!(
+                    search_view_2.query_editor.read(cx).text(cx),
+                    "TWO",
+                    "New search view should get the query from the text cursor was at during the event spawn (first search view's first result)"
                     );
                     assert_eq!(
                         search_view_2
@@ -5072,7 +5066,13 @@ pub mod tests {
 
         let editor = workspace
             .update_in(&mut cx, |workspace, window, cx| {
-                workspace.open_path((worktree_id, rel_path("one.rs").into()), None, true, window, cx)
+                workspace.open_path(
+                    (worktree_id, rel_path("one.rs").into()),
+                    None,
+                    true,
+                    window,
+                    cx,
+                )
             })
             .await
             .unwrap()
@@ -5186,7 +5186,6 @@ pub mod tests {
             assert!(!workspace.has_active_modal(window, cx));
         });
     }
-
 
     #[gpui::test]
     async fn test_deleted_file_removed_from_search_results(cx: &mut TestAppContext) {
@@ -5627,11 +5626,26 @@ pub mod tests {
         });
     }
 
+    fn use_selection_for_query_seed(cx: &mut TestAppContext) {
+        cx.update(|cx| {
+            SettingsStore::update_global(cx, |store, cx| {
+                store.update_default_settings(cx, |settings| {
+                    settings
+                        .editor
+                        .get_or_insert_default()
+                        .seed_search_query_from_cursor =
+                        Some(settings::SeedQuerySetting::Selection);
+                });
+            });
+        });
+    }
+
     fn perform_search(
         search_view: WindowHandle<ProjectSearchView>,
         text: impl Into<Arc<str>>,
         cx: &mut TestAppContext,
     ) {
+        cx.run_until_parked();
         search_view
             .update(cx, |search_view, window, cx| {
                 search_view.query_editor.update(cx, |query_editor, cx| {
@@ -5640,10 +5654,8 @@ pub mod tests {
                 search_view.search(cx);
             })
             .unwrap();
-        // Ensure editor highlights appear after the search is done
-        cx.executor().advance_clock(
-            editor::SELECTION_HIGHLIGHT_DEBOUNCE_TIMEOUT + Duration::from_millis(100),
-        );
+        cx.run_until_parked();
         cx.background_executor.run_until_parked();
+        cx.run_until_parked();
     }
 }

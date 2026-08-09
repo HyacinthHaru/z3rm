@@ -161,6 +161,34 @@ impl HeadlessAppContext {
         app.update_window(window, f)
     }
 
+    /// Sends a deterministic AccessKit action through the platform callback.
+    ///
+    /// Headless tests use `TestPlatform`, so exposing this operation here keeps
+    /// semantic-action tests on the same production callback path as a real
+    /// accessibility adapter without exposing the test window implementation.
+    pub fn simulate_a11y_action(
+        &mut self,
+        window: AnyWindowHandle,
+        request: accesskit::ActionRequest,
+    ) -> Result<bool> {
+        let window_id = window.id;
+        let mut app = self.app.borrow_mut();
+        let Some(window) = app
+            .windows
+            .get_mut(window_id)
+            .and_then(|window| window.as_deref_mut())
+        else {
+            anyhow::bail!("window {:?} does not exist", window_id);
+        };
+        let Some(test_window) = window.platform_window.as_test() else {
+            anyhow::bail!(
+                "window {:?} is not backed by a test platform window",
+                window_id
+            );
+        };
+        Ok(test_window.simulate_a11y_action(request))
+    }
+
     /// Captures a screenshot from a window.
     ///
     /// Requires that the context was created with a renderer factory that

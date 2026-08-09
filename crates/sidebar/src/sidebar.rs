@@ -296,6 +296,13 @@ impl ListEntry {
             ListEntry::Pane { pane_id, .. } => format!("pane-{pane_id}").into(),
         }
     }
+    fn is_session(&self) -> bool {
+        matches!(self, ListEntry::Session { .. })
+    }
+
+    fn is_pane(&self) -> bool {
+        matches!(self, ListEntry::Pane { .. })
+    }
 
     fn request(&self) -> Option<SidebarRequest> {
         match self {
@@ -305,9 +312,7 @@ impl ListEntry {
             ListEntry::Tab { first_pane_id, .. } => first_pane_id
                 .as_ref()
                 .map(|pane_id| SidebarRequest::FocusPane(pane_id.to_string())),
-            ListEntry::Pane { pane_id, .. } => {
-                Some(SidebarRequest::FocusPane(pane_id.to_string()))
-            }
+            ListEntry::Pane { pane_id, .. } => Some(SidebarRequest::FocusPane(pane_id.to_string())),
         }
     }
 }
@@ -426,11 +431,7 @@ enum SelectionMove {
 
 /// Selection stays inside the visible rows: an empty list has no selection, and
 /// stepping past either end clamps instead of wrapping.
-fn move_selection(
-    current: Option<usize>,
-    length: usize,
-    movement: SelectionMove,
-) -> Option<usize> {
+fn move_selection(current: Option<usize>, length: usize, movement: SelectionMove) -> Option<usize> {
     let last = length.checked_sub(1)?;
     Some(match (movement, current) {
         (SelectionMove::First, _) => 0,
@@ -509,8 +510,8 @@ impl Sidebar {
     /// Pulls the authoritative session list (spec §3.3 push signal, pull data).
     fn refresh_sessions(&mut self, cx: &mut Context<Self>) {
         let domain = self.domain.clone();
-        self._refresh_task = Some(cx.spawn(async move |this, cx| {
-            match domain.list_sessions().await {
+        self._refresh_task = Some(cx.spawn(
+            async move |this, cx| match domain.list_sessions().await {
                 Ok(sessions) => {
                     if let Err(error) = this.update(cx, |this, cx| {
                         this.sessions = sessions;
@@ -522,8 +523,8 @@ impl Sidebar {
                 Err(error) => {
                     tracing::error!(%error, "sidebar failed to list mux sessions");
                 }
-            }
-        }));
+            },
+        ));
     }
 
     /// Maintains the tree from the lifecycle stream instead of re-attaching.
@@ -593,13 +594,20 @@ impl Sidebar {
         _window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let previous =
-            move_selection(self.selected_index, self.entries.len(), SelectionMove::Previous);
+        let previous = move_selection(
+            self.selected_index,
+            self.entries.len(),
+            SelectionMove::Previous,
+        );
         self.select(previous, cx);
     }
 
     fn select_first(&mut self, _: &SelectFirst, _window: &mut Window, cx: &mut Context<Self>) {
-        let first = move_selection(self.selected_index, self.entries.len(), SelectionMove::First);
+        let first = move_selection(
+            self.selected_index,
+            self.entries.len(),
+            SelectionMove::First,
+        );
         self.select(first, cx);
     }
 
@@ -691,7 +699,13 @@ impl Sidebar {
             }
         };
 
-        let focused_pane = matches!(entry, ListEntry::Pane { is_focused: true, .. });
+        let focused_pane = matches!(
+            entry,
+            ListEntry::Pane {
+                is_focused: true,
+                ..
+            }
+        );
         let label_color = if muted {
             Color::Disabled
         } else if focused_pane {
@@ -703,11 +717,11 @@ impl Sidebar {
         ListItem::new(entry.element_id())
             .indent_level(entry.indent_level())
             .toggle_state(selected)
-            .start_slot(
-                Icon::new(icon)
-                    .size(IconSize::Small)
-                    .color(if muted { Color::Disabled } else { Color::Muted }),
-            )
+            .start_slot(Icon::new(icon).size(IconSize::Small).color(if muted {
+                Color::Disabled
+            } else {
+                Color::Muted
+            }))
             .child(
                 h_flex()
                     .w_full()
@@ -741,12 +755,7 @@ impl Sidebar {
             .px_3()
             .py_2()
             .gap_2()
-            .child(
-                div()
-                    .min_w_0()
-                    .flex_1()
-                    .child(self.filter_editor.clone()),
-            )
+            .child(div().min_w_0().flex_1().child(self.filter_editor.clone()))
     }
 
     fn render_empty_state(&self, _cx: &App) -> impl IntoElement {
@@ -791,13 +800,68 @@ impl WorkspaceSidebar for Sidebar {
         SidebarSide::Left
     }
 
-    /// Opening the sidebar re-pulls the session list, which is the only part of
-    /// the tree the server does not push notifications for.
-    ///
-    /// Focus deliberately stays on the sidebar container so the arrow keys and
-    /// `menu::Confirm` work immediately; the filter is one `FocusFilter` away.
-    fn prepare_for_focus(&mut self, _window: &mut Window, cx: &mut Context<Self>) {
-        self.refresh_sessions(cx);
+    /// The mux sidebar has no separate thread-switcher popup. Focusing its
+    /// filter provides the same keyboard-first entry point while keeping the
+    /// native controls available without the extension host.
+    fn toggle_thread_switcher(
+        &mut self,
+        select_last: bool,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if select_last {
+            self.select_last(&SelectLast, window, cx);
+        }
+        let focus_handle = self.filter_editor.focus_handle(cx);
+        window.focus(&focus_handle, cx);
+    }
+
+    fn cycle_project(&mut self, forward: bool, window: &mut Window, cx: &mut Context<Self>) {
+        let session_indices: Vec<usize> = self
+            .entries
+            .iter()
+            .enumerate()
+            .filter_map(|(index, entry)| entry.is_session().then_some(index))
+            .collect();
+        let Some(current_position) = session_indices.iter().position(|index| {
+            matches!(
+                self.entries.get(*index),
+                Some(ListEntry::Session { session_id, .. })
+                    if session_id.as_ref() == self.session_id.as_str()
+            )
+        }) else {
+            return;
+        };
+        let target_position = if forward {
+            (current_position + 1) % session_indices.len()
+        } else {
+            (current_position + session_indices.len() - 1) % session_indices.len()
+        };
+        self.activate_entry(session_indices[target_position], window, cx);
+    }
+
+    fn cycle_thread(&mut self, forward: bool, window: &mut Window, cx: &mut Context<Self>) {
+        let pane_indices: Vec<usize> = self
+            .entries
+            .iter()
+            .enumerate()
+            .filter_map(|(index, entry)| entry.is_pane().then_some(index))
+            .collect();
+        let Some(current_position) = pane_indices.iter().position(|index| {
+            matches!(
+                self.entries.get(*index),
+                Some(ListEntry::Pane { pane_id, .. })
+                    if self.tree.focused_pane_id.as_deref() == Some(pane_id.as_ref())
+            )
+        }) else {
+            return;
+        };
+        let target_position = if forward {
+            (current_position + 1) % pane_indices.len()
+        } else {
+            (current_position + pane_indices.len() - 1) % pane_indices.len()
+        };
+        self.activate_entry(pane_indices[target_position], window, cx);
     }
 
     fn serialized_state(&self, _cx: &App) -> Option<String> {
@@ -942,7 +1006,10 @@ mod tests {
     #[test]
     fn builds_a_tree_for_the_current_session_only() {
         let tree = SessionTree::from_snapshot(&snapshot());
-        let sessions = vec![session("session-a", "work", 1), session("session-b", "spare", 0)];
+        let sessions = vec![
+            session("session-a", "work", 1),
+            session("session-b", "spare", 0),
+        ];
 
         let entries = build_entries(&sessions, "session-a", &tree);
 
@@ -990,7 +1057,10 @@ mod tests {
     #[test]
     fn filter_keeps_ancestors_and_descendants_of_a_match() {
         let tree = SessionTree::from_snapshot(&snapshot());
-        let sessions = vec![session("session-a", "work", 1), session("session-b", "spare", 0)];
+        let sessions = vec![
+            session("session-a", "work", 1),
+            session("session-b", "spare", 0),
+        ];
         let entries = build_entries(&sessions, "session-a", &tree);
 
         let filtered = filter_entries(&entries, "journal");
@@ -1006,7 +1076,10 @@ mod tests {
 
         let filtered = filter_entries(&entries, "editor");
 
-        assert_eq!(labels(&filtered), vec!["work", "  editor", "    vim", "    cargo watch"]);
+        assert_eq!(
+            labels(&filtered),
+            vec!["work", "  editor", "    vim", "    cargo watch"]
+        );
     }
 
     #[test]
@@ -1026,7 +1099,10 @@ mod tests {
     #[test]
     fn confirming_a_row_targets_the_right_mux_object() {
         let tree = SessionTree::from_snapshot(&snapshot());
-        let sessions = vec![session("session-a", "work", 1), session("session-b", "spare", 0)];
+        let sessions = vec![
+            session("session-a", "work", 1),
+            session("session-b", "spare", 0),
+        ];
         let entries = build_entries(&sessions, "session-a", &tree);
 
         assert_eq!(
@@ -1080,18 +1156,22 @@ mod tests {
                 title: "htop".to_string(),
             }))
         );
-        assert!(tree.apply_event(&Event::PaneZoomed(mux_protocol::PaneZoomed {
-            pane_id: "pane-4".to_string(),
-            zoomed: true,
-        })));
+        assert!(
+            tree.apply_event(&Event::PaneZoomed(mux_protocol::PaneZoomed {
+                pane_id: "pane-4".to_string(),
+                zoomed: true,
+            }))
+        );
 
         let entries = build_entries(&[session("s", "s", 1)], "s", &tree);
         assert!(labels(&entries).contains(&"    htop".to_string()));
 
-        assert!(tree.apply_event(&Event::PaneRemoved(mux_protocol::PaneRemoved {
-            pane_id: "pane-4".to_string(),
-            exit_code: 0,
-        })));
+        assert!(
+            tree.apply_event(&Event::PaneRemoved(mux_protocol::PaneRemoved {
+                pane_id: "pane-4".to_string(),
+                exit_code: 0,
+            }))
+        );
         assert!(!tree.contains_pane("pane-4"));
     }
 
@@ -1099,10 +1179,12 @@ mod tests {
     fn removing_the_last_pane_drops_its_tab() {
         let mut tree = SessionTree::from_snapshot(&snapshot());
 
-        assert!(tree.apply_event(&Event::PaneRemoved(mux_protocol::PaneRemoved {
-            pane_id: "pane-3".to_string(),
-            exit_code: 0,
-        })));
+        assert!(
+            tree.apply_event(&Event::PaneRemoved(mux_protocol::PaneRemoved {
+                pane_id: "pane-3".to_string(),
+                exit_code: 0,
+            }))
+        );
 
         assert!(!tree.tabs.iter().any(|tab| tab.id == "tab-2"));
     }
@@ -1121,13 +1203,11 @@ mod tests {
             }),
         };
 
-        assert!(
-            tree.apply_event(&Event::SessionLayoutChanged(
-                mux_protocol::SessionLayoutChanged {
-                    layout: Some(layout),
-                }
-            ))
-        );
+        assert!(tree.apply_event(&Event::SessionLayoutChanged(
+            mux_protocol::SessionLayoutChanged {
+                layout: Some(layout),
+            }
+        )));
 
         assert!(tree.contains_pane("pane-1"));
         assert!(!tree.contains_pane("pane-2"));
@@ -1149,18 +1229,22 @@ mod tests {
             "a bell for a pane this session does not own must be ignored"
         );
 
-        assert!(tree.apply_event(&Event::PaneFocused(mux_protocol::PaneFocused {
-            pane_id: "pane-1".to_string(),
-        })));
+        assert!(
+            tree.apply_event(&Event::PaneFocused(mux_protocol::PaneFocused {
+                pane_id: "pane-1".to_string(),
+            }))
+        );
         assert!(tree.bells.is_empty());
     }
 
     #[test]
     fn high_frequency_events_do_not_rebuild_the_tree() {
         let mut tree = SessionTree::from_snapshot(&snapshot());
-        assert!(!tree.apply_event(&Event::PaneDirty(mux_protocol::PaneDirty {
-            pane_id: "pane-1".to_string(),
-        })));
+        assert!(
+            !tree.apply_event(&Event::PaneDirty(mux_protocol::PaneDirty {
+                pane_id: "pane-1".to_string(),
+            }))
+        );
     }
 
     #[test]

@@ -30,7 +30,6 @@ use std::{ops::Range, time::Duration};
 use collections::{HashMap, HashSet};
 use editor::{MultiBufferSnapshot, PathKey, multibuffer_context_lines};
 use file_icons::FileIcons;
-use futures::StreamExt;
 use gpui::{
     AnyElement, AppContext, AsyncApp, ClickEvent, DismissEvent, EntityId, HighlightStyle,
     Modifiers, StyledText, Task, TextStyle, prelude::*,
@@ -38,7 +37,7 @@ use gpui::{
 use gpui::{Entity, FocusHandle, WeakEntity};
 use language::{Buffer, LanguageAwareStyling};
 use picker::{Picker, PickerDelegate};
-use project::{Project, ProjectPath, Search};
+use project::{Project, ProjectPath};
 use project::{SearchResults, search::SearchQuery, search::SearchResult};
 use settings::Settings;
 use smol::future::yield_now;
@@ -1210,13 +1209,24 @@ async fn stream_results_to_picker(
     // Consumed in place: a SearchResults owns the only receiver, so cloning it
     // could only ever hand back a stream the producer never writes to.
     let SearchResults { rx } = search_results;
-    let mut results_stream = rx.ready_chunks(SEARCH_RESULTS_BATCH_SIZE);
 
     let cap = MAX_SEARCH_RESULT_RANGES;
     let mut total_matches = 0;
 
     let mut clear_existing = matches!(imported_matches, ImportedMatches::No);
-    while let Some(results) = results_stream.next().await {
+    loop {
+        let first_result = match rx.recv().await {
+            Ok(result) => result,
+            Err(_) => break,
+        };
+        let mut results = Vec::with_capacity(SEARCH_RESULTS_BATCH_SIZE);
+        results.push(first_result);
+        while results.len() < SEARCH_RESULTS_BATCH_SIZE {
+            let Ok(result) = rx.try_recv() else {
+                break;
+            };
+            results.push(result);
+        }
         if cancel_flag.load(std::sync::atomic::Ordering::SeqCst) {
             break;
         }
@@ -1281,7 +1291,6 @@ async fn stream_results_to_picker(
         if text_finder_turning_into_project_search.load(Ordering::Relaxed) {
             // Hand the still-live stream to project search so the in-flight
             // results are not thrown away when the view switches.
-            let rx = results_stream.into_inner();
             return Some(SearchResults { rx });
         }
 
@@ -1539,10 +1548,7 @@ mod tests {
         cx.run_until_parked();
 
         picker.read_with(cx, |picker, _| {
-            assert_eq!(
-                picker.delegate.matches.len(),
-                MAX_SEARCH_RESULT_RANGES
-            );
+            assert_eq!(picker.delegate.matches.len(), MAX_SEARCH_RESULT_RANGES);
         });
     }
 
@@ -1566,13 +1572,17 @@ mod tests {
         )
         .unwrap();
 
-        let mut search = project.update(cx, |project, cx| project.search(query, cx));
+        let search = project.update(cx, |project, cx| project.search(query, cx));
+        cx.run_until_parked();
+        cx.background_executor.run_until_parked();
+        cx.run_until_parked();
         let async_cx = cx.to_async();
         let mut matches = Vec::new();
-        while let Ok(SearchResult::Buffer { buffer, ranges }) = search.rx.recv().await {
-            matches.extend(Delegate::process_search_result(&buffer, &ranges, &async_cx));
+        while let Ok(result) = search.rx.try_recv() {
+            if let SearchResult::Buffer { buffer, ranges } = result {
+                matches.extend(Delegate::process_search_result(&buffer, &ranges, &async_cx));
+            }
         }
-
         assert_eq!(matches.len(), expected_matches);
         assert!(matches.iter().all(|m| m.line_number == 1));
         assert!(

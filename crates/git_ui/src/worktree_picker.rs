@@ -1549,11 +1549,10 @@ pub async fn open_remote_worktree(
     };
 
     let new_project = cx.update(|_, cx| {
-        project::Project::local(
+        project::Project::remote(
+            session.clone(),
             app_state.languages.clone(),
             app_state.fs.clone(),
-            None,
-            paths.clone(),
             cx,
         )
     })?;

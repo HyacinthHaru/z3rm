@@ -4,12 +4,11 @@
 use std::{ops::Range, path::PathBuf, sync::Arc};
 
 use collections::BTreeMap;
-use extension::ExtensionProvides;
 use fs::Fs;
-use gpui::{App, Entity, SharedString, Task};
+use gpui::{App, Entity, Task};
 use serde::{Deserialize, Serialize};
 use text::Anchor;
-use worktree::ProjectEntryId;
+use worktree::{EntryKind, ProjectEntryId};
 
 pub type CompletionId = u64;
 
@@ -225,80 +224,7 @@ pub struct DiagnosticSummary {
 }
 
 // ---------------------------------------------------------------------------
-// Directory lister stub (spec §8.2 M2)
-// ---------------------------------------------------------------------------
-
-#[derive(Clone)]
-pub enum DirectoryLister {
-    Local(Arc<Project>, Arc<dyn Fs>),
-    Project(Arc<Project>),
-}
-
-// ---------------------------------------------------------------------------
-// Bookmark store
-// ---------------------------------------------------------------------------
-
-pub mod bookmark_store {
-    use super::*;
-    use std::ops::Range;
-
-    #[derive(Default)]
-    pub struct BookmarkStore;
-
-    impl BookmarkStore {
-        pub fn all_bookmark_locations(
-            _store: Entity<BookmarkStore>,
-            _cx: &mut gpui::AsyncApp,
-        ) -> Task<
-            anyhow::Result<
-                std::collections::HashMap<
-                    gpui::Entity<language::Buffer>,
-                    (Vec<std::ops::Range<text::Point>>),
-                >,
-            >,
-        > {
-            Task::ready(Ok(std::collections::HashMap::new()))
-        }
-
-        /// Stub: toggle bookmark (bookmark 模块已删除)
-        pub fn toggle_bookmark(
-            _buffer: Entity<language::Buffer>,
-            _anchor: text::Anchor,
-            _label: String,
-            _cx: &mut gpui::Context<Self>,
-        ) {
-        }
-
-        /// Stub: bookmarks for buffer (bookmark 模块已删除)
-        pub fn bookmarks_for_buffer(
-            _store: Entity<BookmarkStore>,
-            _buffer: &Entity<language::Buffer>,
-            _cx: &mut gpui::Context<Entity<BookmarkStore>>,
-        ) -> Task<anyhow::Result<Vec<text::Anchor>>> {
-            Task::ready(Ok(Vec::new()))
-        }
-
-        /// Stub: find bookmark (bookmark 模块已删除)
-        pub fn find_bookmark(
-            _store: Entity<BookmarkStore>,
-            _buffer: Entity<language::Buffer>,
-            _point: text::Point,
-            _cx: &gpui::App,
-        ) -> Option<text::Anchor> {
-            None
-        }
-
-        pub fn edit_bookmark(
-            &mut self,
-            _buffer: &Entity<language::Buffer>,
-            _anchor: text::Anchor,
-            _label: String,
-            _cx: &mut gpui::Context<Self>,
-        ) {
-        }
-    }
-}
-
+// Bookmark store lives in the project crate's retained bookmark_store module.
 // ---------------------------------------------------------------------------
 // Debugger
 // ---------------------------------------------------------------------------
@@ -593,6 +519,24 @@ pub mod lsp_store {
         ) -> Option<String> {
             None
         }
+
+        /// No LSP store exists; no inlay chunks can be applicable.
+        pub fn applicable_inlay_chunks(
+            &self,
+            _buffer: &Entity<language::Buffer>,
+            _ranges: &[Range<text::Anchor>],
+            _cx: &mut gpui::Context<Self>,
+        ) -> Vec<Range<language::BufferRow>> {
+            Vec::new()
+        }
+
+        /// No LSP store exists; nothing to invalidate.
+        pub fn invalidate_inlay_hints(
+            &self,
+            _for_buffers: &collections::HashSet<text::BufferId>,
+            _cx: &mut gpui::Context<Self>,
+        ) {
+        }
     }
 
     /// Stub: SymbolLocation (from lsp_store crate)
@@ -693,43 +637,12 @@ impl DapStore {
     }
 }
 
-#[derive(Default)]
-pub struct Client;
-
-#[derive(Default)]
-pub struct Telemetry;
-
-impl Client {
-    pub fn telemetry(&self) -> Arc<Telemetry> {
-        Arc::new(Telemetry)
-    }
-
-    /// Stub: read (client crate 已删除)
-    pub fn read(&self, _cx: &gpui::App) -> &Self {
-        self
-    }
-
-    /// Stub: shell (client crate 已删除)
-    pub fn shell(&self) -> Option<Arc<ShellConfig>> {
-        None
-    }
-
-    /// Stub: is_disconnected
-    pub fn is_disconnected(&self) -> bool {
-        true
-    }
-}
-
-impl Telemetry {
-    pub fn log_edit_event(&self, _name: &str, _is_via_ssh: bool) {}
-}
-
 // ---------------------------------------------------------------------------
 // Project method stubs for APIs removed during dependency stripping
 // ---------------------------------------------------------------------------
 
 use crate::{
-    Location, Project, ProjectPath, ProjectTransaction, Worktree, WorktreeId,
+    Location, Project, ProjectItem, ProjectPath, ProjectTransaction, Worktree, WorktreeId,
     bookmark_store::BookmarkStore, debugger::breakpoint_store::BreakpointStore,
 };
 use git::blame::Blame;
@@ -741,84 +654,15 @@ pub struct StackFrame {
     pub position: text::Point,
 }
 
-/// Stub for deleted remote::RemoteConnectionOptions (spec §8.2 M2)
-#[derive(Clone, Debug)]
-pub struct RemoteConnectionOptionsStub;
-
-/// Stub for deleted git::Repository (spec §8.2 M2)
-#[derive(Clone, Debug)]
-pub struct Repository {
-    pub work_directory_abs_path: std::path::PathBuf,
-    pub id: u64,
-    pub branch: Option<String>,
-}
-
-impl Repository {
-    /// Stub: entity_id
-    pub fn entity_id(&self) -> gpui::EntityId {
-        gpui::EntityId::from(0)
-    }
-
-    /// Stub: read
-    pub fn read(&self, _cx: &gpui::App) -> &Self {
-        self
-    }
-
-    /// Stub: update — generic over context type for async callers
-    pub fn update<C, F, R>(&self, _cx: &mut C, f: F) -> R
-    where
-        F: FnOnce(&mut Self, &mut C) -> R,
-    {
-        // Stub: cannot mutate through Arc, call with dummy
-        let mut dummy = self.clone();
-        f(&mut dummy, _cx)
-    }
-
-    /// Stub: remove_worktree
-    pub fn remove_worktree(
-        &mut self,
-        _path: std::path::PathBuf,
-        _force: bool,
-    ) -> gpui::Task<anyhow::Result<()>> {
-        gpui::Task::ready(Err(anyhow::anyhow!("stub")))
-    }
-
-    /// Stub: default_branch
-    pub fn default_branch(
-        &mut self,
-        _include_remote_name: bool,
-    ) -> gpui::Task<anyhow::Result<String>> {
-        gpui::Task::ready(Err(anyhow::anyhow!("stub")))
-    }
-
-    /// Stub: worktrees
-    pub fn worktrees(&mut self) -> gpui::Task<anyhow::Result<Vec<git::repository::Worktree>>> {
-        gpui::Task::ready(Ok(Vec::new()))
-    }
-
-    /// Stub: status_for_path
-    pub fn status_for_path(
-        &self,
-        _path: &git::repository::RepoPath,
-    ) -> Option<crate::git_store::StatusEntry> {
-        None
-    }
-
-    /// Stub: project_path_to_repo_path
-    pub fn project_path_to_repo_path(
-        &self,
-        _path: &ProjectPath,
-        _cx: &gpui::App,
-    ) -> Option<git::repository::RepoPath> {
-        None
-    }
-
-    /// Stub: barrier
-    pub fn barrier(&mut self) -> futures::channel::oneshot::Receiver<()> {
-        let (tx, rx) = futures::channel::oneshot::channel();
-        tx.send(()).ok();
-        rx
-    }
+/// LSP integration was deleted during dependency stripping. Queries that would
+/// previously have consulted a language server must fail explicitly instead of
+/// fabricating "no results" (which would silently claim, e.g., that a symbol
+/// has no definitions or references). Callers surface the error through their
+/// normal Task/Result plumbing; local buffer behavior is unaffected.
+fn lsp_unavailable<T>() -> gpui::Task<anyhow::Result<T>> {
+    gpui::Task::ready(Err(anyhow::anyhow!(
+        "language server support is unavailable in this build"
+    )))
 }
 
 impl Project {
@@ -885,11 +729,19 @@ impl Project {
 
     pub fn open_local_buffer_via_lsp(
         &mut self,
-        _uri: lsp::Uri,
+        uri: lsp::Uri,
         _server_id: LanguageServerId,
-        _cx: &mut gpui::Context<Self>,
+        cx: &mut gpui::Context<Self>,
     ) -> Task<anyhow::Result<Entity<language::Buffer>>> {
-        Task::ready(Err(anyhow::anyhow!("stub: open_local_buffer_via_lsp")))
+        let path = match uri.to_file_path() {
+            Ok(path) => path,
+            Err(_) => {
+                return Task::ready(Err(anyhow::anyhow!(
+                    "LSP location is not a local file URI: {uri}"
+                )));
+            }
+        };
+        self.open_local_buffer(&path, cx)
     }
 
     /// Resolves either an absolute path or a path prefixed with a visible
@@ -975,11 +827,12 @@ impl Project {
 
     pub fn reload_buffers(
         &mut self,
-        _buffers: collections::HashSet<Entity<language::Buffer>>,
-        _reload: bool,
-        _cx: &mut gpui::Context<Self>,
+        buffers: collections::HashSet<Entity<language::Buffer>>,
+        reload: bool,
+        cx: &mut gpui::Context<Self>,
     ) -> Task<anyhow::Result<ProjectTransaction>> {
-        Task::ready(Ok(ProjectTransaction::default()))
+        self.buffer_store
+            .update(cx, |store, cx| store.reload_buffers(buffers, reload, cx))
     }
 
     pub fn blame_buffer(
@@ -988,8 +841,9 @@ impl Project {
         version: Option<clock::Global>,
         cx: &mut gpui::Context<Self>,
     ) -> Task<anyhow::Result<Option<Blame>>> {
-        self.git_store
-            .update(cx, |git_store, cx| git_store.blame_buffer(buffer, version, cx))
+        self.git_store.update(cx, |git_store, cx| {
+            git_store.blame_buffer(buffer, version, cx)
+        })
     }
 
     pub fn references(
@@ -998,7 +852,7 @@ impl Project {
         _position: text::Anchor,
         _cx: &mut gpui::Context<Self>,
     ) -> Task<anyhow::Result<Option<Vec<Location>>>> {
-        Task::ready(Ok(None))
+        lsp_unavailable()
     }
 
     pub fn hover(
@@ -1007,7 +861,7 @@ impl Project {
         _position: text::Anchor,
         _cx: &mut gpui::Context<Self>,
     ) -> Task<anyhow::Result<Option<Vec<super::Hover>>>> {
-        Task::ready(Ok(None))
+        lsp_unavailable()
     }
 
     pub fn document_highlights(
@@ -1016,7 +870,7 @@ impl Project {
         _position: text::Anchor,
         _cx: &mut gpui::Context<Self>,
     ) -> Task<anyhow::Result<Vec<DocumentHighlight>>> {
-        Task::ready(Ok(Vec::new()))
+        lsp_unavailable()
     }
 
     pub fn definitions(
@@ -1026,7 +880,7 @@ impl Project {
         _kind: GotoDefinitionKind,
         _cx: &mut gpui::Context<Self>,
     ) -> Task<anyhow::Result<Option<Vec<LocationLink>>>> {
-        Task::ready(Ok(None))
+        lsp_unavailable()
     }
 
     pub fn declarations(
@@ -1035,7 +889,7 @@ impl Project {
         _position: text::Anchor,
         _cx: &mut gpui::Context<Self>,
     ) -> Task<anyhow::Result<Option<Vec<LocationLink>>>> {
-        Task::ready(Ok(None))
+        lsp_unavailable()
     }
 
     pub fn type_definitions(
@@ -1044,7 +898,7 @@ impl Project {
         _position: text::Anchor,
         _cx: &mut gpui::Context<Self>,
     ) -> Task<anyhow::Result<Option<Vec<LocationLink>>>> {
-        Task::ready(Ok(None))
+        lsp_unavailable()
     }
 
     pub fn implementations(
@@ -1053,7 +907,7 @@ impl Project {
         _position: text::Anchor,
         _cx: &mut gpui::Context<Self>,
     ) -> Task<anyhow::Result<Option<Vec<LocationLink>>>> {
-        Task::ready(Ok(None))
+        lsp_unavailable()
     }
 
     pub fn prepare_rename(
@@ -1062,7 +916,7 @@ impl Project {
         _position: text::Anchor,
         _cx: &mut gpui::Context<Self>,
     ) -> Task<anyhow::Result<PrepareRenameResponse>> {
-        Task::ready(Ok(PrepareRenameResponse::InvalidPosition))
+        lsp_unavailable()
     }
 
     pub fn apply_code_action_kind(
@@ -1072,7 +926,7 @@ impl Project {
         _only: bool,
         _cx: &mut gpui::Context<Self>,
     ) -> Task<anyhow::Result<()>> {
-        Task::ready(Ok(()))
+        lsp_unavailable()
     }
 
     pub fn supports_range_formatting(
@@ -1107,7 +961,9 @@ impl Project {
     ) {
     }
 
-    pub fn reveal_path(&mut self, _path: &std::path::Path, _cx: &mut gpui::Context<Self>) {}
+    pub fn reveal_path(&mut self, path: &std::path::Path, cx: &mut gpui::Context<Self>) {
+        cx.reveal_path(path);
+    }
 
     pub fn register_buffer_with_language_servers(
         &mut self,
@@ -1115,11 +971,6 @@ impl Project {
         _cx: &mut gpui::Context<Self>,
     ) -> OpenLspBufferHandle {
         OpenLspBufferHandle
-    }
-
-    pub fn client(&self) -> &Client {
-        static CLIENT: std::sync::LazyLock<Client> = std::sync::LazyLock::new(Client::default);
-        &CLIENT
     }
 
     pub fn task_store(&self) -> Entity<crate::task_store::TaskStore> {
@@ -1136,6 +987,10 @@ impl Project {
 
     pub fn breakpoint_store(&self) -> Entity<BreakpointStore> {
         self.breakpoint_store_entity.clone()
+    }
+
+    pub fn lsp_store(&self) -> Entity<crate::stubs::lsp_store::LspStore> {
+        self.lsp_store_entity.clone()
     }
 
     pub fn active_debug_session(
@@ -1164,7 +1019,7 @@ impl Project {
         _range: Range<text::Anchor>,
         _cx: &mut gpui::Context<Self>,
     ) -> Task<anyhow::Result<Vec<InlayHint>>> {
-        Task::ready(Ok(Vec::new()))
+        lsp_unavailable()
     }
 
     pub fn visible_worktrees(&self, cx: &gpui::App) -> impl Iterator<Item = Entity<Worktree>> {
@@ -1198,15 +1053,11 @@ impl Project {
     }
 
     pub fn is_local(&self) -> bool {
-        true
-    }
-
-    pub fn remote_client(&self) -> Option<Arc<Client>> {
-        None
+        self.remote_client.is_none()
     }
 
     pub fn remote_connection_options(&self) -> Option<remote::RemoteConnectionOptions> {
-        None
+        self.remote_connection_options.clone()
     }
 
     pub fn language_servers_running_disk_based_diagnostics(
@@ -1303,107 +1154,149 @@ impl Project {
         query: crate::search::SearchQuery,
         cx: &mut gpui::Context<Self>,
     ) -> SearchResults<crate::search::SearchResult> {
-        let (tx, rx) = futures::channel::mpsc::unbounded();
+        const MAX_SEARCH_RESULT_RANGES: usize = 100_000;
 
-        let include_ignored = query.include_ignored();
+        let (search_tx, rx) = async_channel::unbounded();
         let worktree_store = self.worktree_store.clone();
         let buffer_store = self.buffer_store.clone();
-        let worktrees: Vec<_> = worktree_store.read(cx).visible_worktrees(cx).collect();
+        let scan_completed = worktree_store.read(cx).initial_scan_completed();
+        let wait_for_scan = worktree_store.read(cx).wait_for_initial_scan();
+        let worktrees = worktree_store
+            .read(cx)
+            .visible_worktrees_and_single_files(cx)
+            .collect::<Vec<_>>();
+        let include_ignored = query.include_ignored();
+        let opened_buffers = query.buffers().cloned();
 
-        cx.spawn({
-            let tx = tx.clone();
-            async move |_, cx| {
-                // Candidates can only be collected once the tree is known;
-                // scanning is asynchronous, so an early traversal sees nothing.
-                let mut scans = Vec::new();
+        cx.spawn(async move |_, cx| {
+            let send = |result: crate::search::SearchResult| async {
+                search_tx.send(result).await.is_ok()
+            };
+
+            if !scan_completed {
+                if !send(crate::search::SearchResult::WaitingForScan).await {
+                    return;
+                }
+                wait_for_scan.await;
+            }
+            if !send(crate::search::SearchResult::Searching).await {
+                return;
+            }
+
+            if include_ignored && opened_buffers.is_none() {
                 for worktree in &worktrees {
-                    if let Some(scan) = worktree.read_with(cx, |worktree, _| {
-                        worktree.as_local().map(|local| local.scan_complete())
-                    }) {
-                        scans.push(scan);
-                    }
-                }
-                for scan in scans {
-                    scan.await;
-                }
-
-                // Ignored directories are scanned lazily, so their contents are
-                // invisible until expanded. Without this an include-ignored
-                // search silently misses everything under a gitignored folder.
-                if include_ignored {
-                    let mut expansions = Vec::new();
-                    for worktree in &worktrees {
-                        let ignored: Vec<ProjectEntryId> =
-                            worktree.read_with(cx, |worktree, _| {
-                                worktree
-                                    .entries(true, 0)
-                                    .filter(|entry| entry.is_dir() && entry.is_ignored)
-                                    .map(|entry| entry.id)
-                                    .collect()
-                            });
-                        for entry_id in ignored {
-                            let task = worktree.update(cx, |worktree, cx| {
-                                worktree.expand_all_for_entry(entry_id, cx)
-                            });
-                            if let Some(task) = task {
-                                expansions.push(task);
-                            }
-                        }
-                    }
-                    for expansion in expansions {
-                        expansion.await.ok();
-                    }
-                }
-
-                let mut candidates = Vec::new();
-                for worktree in &worktrees {
-                    let paths = worktree.read_with(cx, |worktree, _| {
-                        let worktree_id = worktree.id();
+                    let expansion_tasks = worktree.update(cx, |worktree, cx| {
                         worktree
-                            .files(include_ignored, 0)
-                            .filter(|entry| query.match_path(&entry.path))
-                            .map(|entry| crate::ProjectPath {
-                                worktree_id,
-                                path: entry.path.clone(),
+                            .snapshot()
+                            .directories(true, 0)
+                            .filter(|entry| {
+                                entry.is_ignored && entry.kind == EntryKind::UnloadedDir
                             })
+                            .filter_map(|entry| worktree.expand_all_for_entry(entry.id, cx))
                             .collect::<Vec<_>>()
                     });
-                    candidates.extend(paths);
-                }
 
-                for path in candidates {
-                    let open = buffer_store
-                        .update(cx, |buffer_store, cx| buffer_store.open_buffer(path, cx));
-                    let Ok(buffer) = open.await else {
-                        continue;
-                    };
-                    let snapshot = buffer.read_with(cx, |buffer, _| buffer.snapshot());
-
-                    let matches = query.search(&snapshot, None).await;
-                    if matches.is_empty() {
-                        continue;
-                    }
-                    let ranges = matches
-                        .into_iter()
-                        .map(|range| {
-                            snapshot.anchor_before(range.start)..snapshot.anchor_after(range.end)
-                        })
-                        .collect();
-                    if tx
-                        .unbounded_send(crate::search::SearchResult::Buffer { buffer, ranges })
-                        .is_err()
-                    {
-                        return;
+                    for expansion_task in expansion_tasks {
+                        if let Err(error) = expansion_task.await {
+                            tracing::warn!(
+                                error = %error,
+                                "failed to expand ignored directory for search"
+                            );
+                        }
                     }
                 }
             }
+
+            let mut candidates = Vec::new();
+            if let Some(opened_buffers) = opened_buffers {
+                candidates.extend(opened_buffers.into_iter().filter_map(|buffer| {
+                    let path = buffer.read_with(cx, |buffer, cx| buffer.project_path(cx))?;
+                    query.match_path(&path.path).then_some((Some(buffer), path))
+                }));
+            } else {
+                for worktree in worktrees {
+                    let (worktree_id, snapshot) =
+                        worktree.read_with(cx, |worktree, _| (worktree.id(), worktree.snapshot()));
+                    candidates.extend(
+                        snapshot
+                            .files(query.include_ignored(), 0)
+                            .filter_map(|entry| {
+                                if query.match_path(&entry.path) {
+                                    Some(ProjectPath {
+                                        worktree_id,
+                                        path: entry.path.clone(),
+                                    })
+                                } else {
+                                    None
+                                }
+                            })
+                            .map(|path| (None, path)),
+                    );
+                }
+            }
+
+            let mut total_ranges = 0;
+            for (opened_buffer, project_path) in candidates {
+                if total_ranges >= MAX_SEARCH_RESULT_RANGES {
+                    break;
+                }
+
+                let buffer = match opened_buffer {
+                    Some(buffer) => buffer,
+                    None => {
+                        match buffer_store
+                            .update(cx, |store, cx| store.open_buffer(project_path.clone(), cx))
+                            .await
+                        {
+                            Ok(buffer) => buffer,
+                            Err(error) => {
+                                tracing::warn!(
+                                    path = ?project_path.path,
+                                    error = %error,
+                                    "failed to load project search buffer"
+                                );
+                                continue;
+                            }
+                        }
+                    }
+                };
+
+                let snapshot = buffer.read_with(cx, |buffer, _| buffer.snapshot());
+                let offsets = query.search(&snapshot, None).await;
+                if offsets.is_empty() {
+                    continue;
+                }
+
+                let remaining = MAX_SEARCH_RESULT_RANGES - total_ranges;
+                let ranges = offsets
+                    .into_iter()
+                    .take(remaining)
+                    .map(|range| {
+                        snapshot.anchor_after(range.start)..snapshot.anchor_before(range.end)
+                    })
+                    .collect::<Vec<_>>();
+                total_ranges += ranges.len();
+
+                if !send(crate::search::SearchResult::Buffer { buffer, ranges }).await {
+                    return;
+                }
+
+                if total_ranges >= MAX_SEARCH_RESULT_RANGES {
+                    if !send(crate::search::SearchResult::LimitReached).await {
+                        return;
+                    }
+                    break;
+                }
+            }
+
+            ()
         })
         .detach();
 
         SearchResults { rx }
     }
 
-    /// 是否支持终端
+    /// Whether this local project can create terminal sessions.
     pub fn supports_terminal(&self, _cx: &App) -> bool {
         true
     }
@@ -1436,9 +1329,8 @@ impl Project {
         }
     }
 
-    /// 是否远程项目
     pub fn is_remote(&self) -> bool {
-        false
+        self.remote_client.is_some()
     }
 
     /// Resolve a `ProjectPath` for an entry by locating its owning worktree.
@@ -1635,34 +1527,66 @@ impl Project {
         }))
     }
 
-    /// 获取 buffer (stub)
+    /// Return a loaded buffer by its stable identifier.
     pub fn buffer_for_id(
-        &mut self,
+        &self,
         buffer_id: text::BufferId,
-        cx: &mut gpui::Context<Self>,
+        cx: &gpui::App,
     ) -> Option<gpui::Entity<language::Buffer>> {
         self.buffer_store.read(cx).get(buffer_id)
     }
 
-    /// 获取脏 buffers (stub)
-    pub fn dirty_buffers(&self, _cx: &App) -> impl Iterator<Item = crate::ProjectPath> {
-        std::iter::empty()
+    /// Return project paths for open buffers with unsaved changes.
+    pub fn dirty_buffers(&self, cx: &App) -> impl Iterator<Item = crate::ProjectPath> {
+        let paths = self
+            .buffer_store
+            .read(cx)
+            .buffers()
+            .filter_map(|buffer| {
+                let buffer = buffer.read(cx);
+                if !buffer.is_dirty() {
+                    return None;
+                }
+                let file = buffer.file()?;
+                Some(crate::ProjectPath {
+                    worktree_id: file.worktree_id(cx),
+                    path: file.path().clone(),
+                })
+            })
+            .collect::<Vec<_>>();
+        paths.into_iter()
     }
 
-    /// WSL 互操作性检查 (stub)
     pub fn is_via_wsl_with_host_interop(&self, _cx: &App) -> bool {
         false
     }
 
-    /// 下载文件 (stub)
+    /// Copy a local project file to a destination selected by the user.
     pub fn download_file(
         &mut self,
-        _worktree_id: worktree::WorktreeId,
-        _entry_path: crate::ProjectPath,
-        _destination_path: PathBuf,
-        _cx: &mut gpui::Context<Self>,
+        worktree_id: worktree::WorktreeId,
+        entry_path: crate::ProjectPath,
+        destination_path: PathBuf,
+        cx: &mut gpui::Context<Self>,
     ) -> gpui::Task<anyhow::Result<()>> {
-        gpui::Task::ready(Err(anyhow::anyhow!("stub: download_file")))
+        if entry_path.worktree_id != worktree_id {
+            return gpui::Task::ready(Err(anyhow::anyhow!(
+                "download path belongs to worktree {}, expected {}",
+                entry_path.worktree_id,
+                worktree_id
+            )));
+        }
+        let Some(source_path) = self.absolute_path(&entry_path, cx) else {
+            return gpui::Task::ready(Err(anyhow::anyhow!(
+                "project entry does not exist: {}",
+                entry_path.path.as_std_path().display()
+            )));
+        };
+        let fs = self.fs.clone();
+        gpui::AppContext::background_spawn(cx, async move {
+            fs.copy_file(&source_path, &destination_path, fs::CopyOptions::default())
+                .await
+        })
     }
 
     pub fn move_worktree(
@@ -1682,41 +1606,13 @@ impl Project {
         _query: &str,
         _cx: &mut gpui::Context<Self>,
     ) -> gpui::Task<anyhow::Result<Vec<crate::lsp_store::SymbolLocation>>> {
-        gpui::Task::ready(Ok(Vec::new()))
+        lsp_unavailable()
     }
 }
 
 // ---------------------------------------------------------------------------
 // Extension stubs (spec §8.2 M2)
 // ---------------------------------------------------------------------------
-
-/// Stub: ExtensionMetadata (cloud_api_types crate 已删除)
-#[derive(Clone, Debug, Serialize, Deserialize)]
-pub struct ExtensionMetadata {
-    pub id: Arc<str>,
-    pub dev: bool,
-    pub manifest: ExtensionMetadataManifest,
-    pub published_at: Option<String>,
-    pub download_count: u64,
-}
-
-#[derive(Clone, Debug, Serialize, Deserialize)]
-pub struct ExtensionMetadataManifest {
-    pub version: Arc<str>,
-    pub schema_version: Option<i32>,
-    pub wasm_api_version: Option<String>,
-    pub name: String,
-    pub description: Option<String>,
-    pub repository: Option<String>,
-    pub authors: Vec<String>,
-    pub provides_list: Vec<ExtensionProvides>,
-}
-
-impl ExtensionMetadataManifest {
-    pub fn provides(&self) -> &Vec<ExtensionProvides> {
-        &self.provides_list
-    }
-}
 
 /// Stub: VimModeSetting (vim_mode_setting crate 已删除)
 #[derive(Clone, Copy, Debug, Default, Serialize, Deserialize)]
@@ -1772,49 +1668,31 @@ pub struct ShellConfig {
     pub args: Vec<String>,
 }
 
-/// Stub: ShellBuilder (task crate 已删除)
-#[derive(Debug, Clone)]
 pub struct ShellBuilder {
-    pub program: String,
-    pub args: Vec<String>,
+    inner: util::shell_builder::ShellBuilder,
 }
 
 impl ShellBuilder {
-    pub fn new(shell: &Shell, _is_windows: bool) -> Self {
-        let (program, args) = match shell {
-            Shell::System => (util::get_system_shell(), Vec::new()),
-            Shell::Program(config) => (config.program.clone(), config.args.clone()),
+    pub fn new(shell: &Shell, is_windows: bool) -> Self {
+        let shell = match shell {
+            Shell::System => util::shell::Shell::System,
+            Shell::Program(config) => util::shell::Shell::WithArguments {
+                program: config.program.clone(),
+                args: config.args.clone(),
+                title_override: None,
+            },
         };
-        Self { program, args }
+        Self {
+            inner: util::shell_builder::ShellBuilder::new(&shell, is_windows),
+        }
     }
 
-    /// 生成命令标签字符串
     pub fn command_label(&self, command: &str) -> String {
-        if command.is_empty() {
-            self.program.clone()
-        } else {
-            format!("{} {}", self.program, command)
-        }
+        self.inner.command_label(command)
     }
 
-    /// 构建命令和参数 (no shell quoting)
-    pub fn build_no_quote(
-        &self,
-        command: Option<String>,
-        _args: &[String],
-    ) -> (String, Vec<String>) {
-        let mut all_args = self.args.clone();
-        if let Some(cmd) = command {
-            if !cmd.is_empty() {
-                all_args.push("-c".to_string());
-                all_args.push(cmd);
-                (self.program.clone(), all_args)
-            } else {
-                (self.program.clone(), all_args)
-            }
-        } else {
-            (self.program.clone(), all_args)
-        }
+    pub fn build_no_quote(self, command: Option<String>, args: &[String]) -> (String, Vec<String>) {
+        self.inner.build_no_quote(command, args)
     }
 }
 
@@ -1851,28 +1729,21 @@ impl Breadcrumbs {
     }
 }
 
-/// Stub: path_suffix (from project crate, 已删除)
-pub fn path_suffix(path: &std::path::Path, detail: usize) -> String {
-    let _ = detail;
-    path.file_name()
-        .map(|n| n.to_string_lossy().to_string())
-        .unwrap_or_else(|| path.to_string_lossy().to_string())
-}
-
 /// Stub: TerminalDockPosition re-export from settings
 pub use settings::TerminalDockPosition;
 
-/// Stub: SearchResults (task crate 已删除)
-/// The receiving half of a search stream.
-///
-/// Only the receiver is handed out: the producing task owns the sole sender, so
-/// the channel closes when the search finishes and consumers can tell "no more
-/// results" from "still searching". Handing out a sender too would keep the
-/// channel open forever.
+/// Search result stream shared by project and text-finder searches.
 pub struct SearchResults<T> {
-    pub rx: futures::channel::mpsc::UnboundedReceiver<T>,
+    pub rx: async_channel::Receiver<T>,
 }
 
+impl<T> Clone for SearchResults<T> {
+    fn clone(&self) -> Self {
+        Self {
+            rx: self.rx.clone(),
+        }
+    }
+}
 
 /// Stub: Search alias for SearchQuery (task crate 已删除)
 pub type Search = crate::search::SearchQuery;
@@ -1900,8 +1771,11 @@ mod stub_delegate_tests {
         cx: &mut TestAppContext,
     ) -> (Arc<FakeFs>, gpui::Entity<Project>, worktree::WorktreeId) {
         let fs = FakeFs::new(cx.executor());
-        fs.insert_tree(Path::new("/project"), json!({ "dir": {} }))
-            .await;
+        fs.insert_tree(
+            Path::new("/project"),
+            json!({ "dir": {}, "search.txt": "hello needle world\n" }),
+        )
+        .await;
         // Build the Project synchronously (Project::test needs &mut App, which we
         // obtain via cx.update), then add the worktree with an awaitable task.
         let project = cx.update(|cx| {
@@ -2076,5 +1950,32 @@ mod stub_delegate_tests {
             result.is_err(),
             "create_entry in unknown worktree must error"
         );
+    }
+    #[gpui::test]
+    async fn test_project_search_stream_returns_matching_buffer(cx: &mut TestAppContext) {
+        init_test(cx);
+        let (_fs, project, _worktree_id) = setup_project(cx).await;
+        let query = crate::search::SearchQuery::text(
+            "needle",
+            false,
+            true,
+            false,
+            util::paths::PathMatcher::default(),
+            util::paths::PathMatcher::default(),
+            false,
+            None,
+        )
+        .expect("valid text query");
+        let results = project.update(cx, |project, cx| project.search(query, cx));
+
+        let mut found = false;
+        while let Ok(result) = results.rx.recv().await {
+            if let crate::search::SearchResult::Buffer { ranges, .. } = result {
+                assert!(!ranges.is_empty(), "matching buffers must contain ranges");
+                found = true;
+                break;
+            }
+        }
+        assert!(found, "project search must emit a matching buffer result");
     }
 }

@@ -65,9 +65,7 @@ pub(crate) fn update_test_editor_settings(
     use settings::SettingsStore;
     cx.update(|cx| {
         SettingsStore::update_global(cx, |store, cx| {
-            store.update_user_settings(cx, |settings| {
-                f(settings.editor.get_or_insert_default())
-            });
+            store.update_user_settings(cx, |settings| f(settings.editor.get_or_insert_default()));
         })
     })
 }

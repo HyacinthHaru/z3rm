@@ -122,6 +122,7 @@ pub async fn handle_connection(
     clipboard: Arc<crate::clipboard::ServerClipboard>,
     server_settings: Arc<crate::server_settings::ServerSettings>,
     shutdown_state: Arc<crate::ShutdownState>,
+    extension_host: Arc<crate::extension_host::ServerExtensionHost>,
 ) -> anyhow::Result<()> {
     let (reader, writer) = tokio::io::split(stream);
 
@@ -153,6 +154,7 @@ pub async fn handle_connection(
         let client_role = client_role.clone();
         let connection_client_id = connection_client_id.clone();
         let shutdown_state = shutdown_state.clone();
+        let extension_host = extension_host.clone();
         let forward_tasks = forward_tasks.clone();
         tokio::spawn(async move {
             let mut reader = reader;
@@ -186,6 +188,7 @@ pub async fn handle_connection(
                     &client_role,
                     &connection_client_id,
                     &shutdown_state,
+                    &extension_host,
                     &forward_tasks,
                     trust,
                 )
@@ -464,6 +467,7 @@ async fn dispatch_envelope(
     client_role: &Arc<parking_lot::Mutex<Option<ClientRole>>>,
     connection_client_id: &Arc<parking_lot::Mutex<Option<String>>>,
     shutdown_state: &Arc<crate::ShutdownState>,
+    extension_host: &Arc<crate::extension_host::ServerExtensionHost>,
     forward_tasks: &Arc<parking_lot::Mutex<Vec<tokio::task::JoinHandle<()>>>>,
     trust: ConnectionTrust,
 ) -> anyhow::Result<()> {
@@ -487,6 +491,7 @@ async fn dispatch_envelope(
                 client_role,
                 connection_client_id,
                 shutdown_state,
+                extension_host,
                 &forward_tasks,
                 trust,
             )
@@ -515,10 +520,12 @@ async fn dispatch_request(
     client_role: &Arc<parking_lot::Mutex<Option<ClientRole>>>,
     connection_client_id: &Arc<parking_lot::Mutex<Option<String>>>,
     shutdown_state: &Arc<crate::ShutdownState>,
+    extension_host: &Arc<crate::extension_host::ServerExtensionHost>,
     forward_tasks: &Arc<parking_lot::Mutex<Vec<tokio::task::JoinHandle<()>>>>,
     trust: ConnectionTrust,
 ) -> anyhow::Result<()> {
     let request_id = req.request_id;
+    extension_host.bind_sessions(sessions);
 
     let body = match &req.body {
         Some(b) => b,
@@ -554,6 +561,7 @@ async fn dispatch_request(
                 outbound_tx,
                 forward_tasks,
                 trust,
+                extension_host,
             )
             .await?
         }
@@ -580,7 +588,7 @@ async fn dispatch_request(
         }
         RequestBody::DeclineFileVersion(request) => {
             if check_permission(role, ClientRole::ReadWrite) {
-                shadow_response(handle_decline_file_version(request, sessions).await)
+                handle_decline_file_version(request, sessions, connection_client_id).await?
             } else {
                 ResponseBody::Error("permission denied: read-write required".to_string())
             }
@@ -623,7 +631,14 @@ async fn dispatch_request(
         }
         RequestBody::ConfirmRecovery(request) => {
             if check_permission(role, ClientRole::Admin) {
-                match handle_confirm_recovery(request, sessions, db, server_settings, clipboard) {
+                match handle_confirm_recovery(
+                    request,
+                    sessions,
+                    db,
+                    server_settings,
+                    clipboard,
+                    extension_host,
+                ) {
                     Ok(response) => response,
                     Err(error) => ResponseBody::Error(error.to_string()),
                 }
@@ -634,28 +649,28 @@ async fn dispatch_request(
 
         RequestBody::KillSession(r) => {
             if check_permission(role, ClientRole::Admin) {
-                handle_kill_session(r, sessions).await?
+                handle_kill_session(r, sessions, connection_client_id).await?
             } else {
                 ResponseBody::Error("permission denied: admin required".to_string())
             }
         }
         RequestBody::RenameSession(r) => {
             if check_permission(role, ClientRole::Admin) {
-                handle_rename_session(r, sessions).await?
+                handle_rename_session(r, sessions, connection_client_id).await?
             } else {
                 ResponseBody::Error("permission denied: admin required".to_string())
             }
         }
         RequestBody::InstallExtension(r) => {
             if check_permission(role, ClientRole::Admin) {
-                handle_install_extension(r).await?
+                handle_install_extension(r, extension_host).await?
             } else {
                 ResponseBody::Error("permission denied: admin required".to_string())
             }
         }
         RequestBody::NewWindow(r) => {
             if check_permission(role, ClientRole::Admin) {
-                handle_new_window(r, sessions).await?
+                handle_new_window(r, sessions, connection_client_id).await?
             } else {
                 ResponseBody::Error("permission denied: admin required".to_string())
             }
@@ -664,14 +679,31 @@ async fn dispatch_request(
         // §3.3 需要 ReadWrite 的 pane 操作 (Plan 33)
         RequestBody::SpawnPane(r) => {
             if check_permission(role, ClientRole::ReadWrite) {
-                handle_spawn_pane(r, sessions, server_settings, clipboard).await?
+                handle_spawn_pane(
+                    r,
+                    sessions,
+                    server_settings,
+                    clipboard,
+                    extension_host,
+                    connection_client_id,
+                )
+                .await?
             } else {
                 ResponseBody::Error("permission denied: read-write required".to_string())
             }
         }
         RequestBody::SplitPane(r) => {
             if check_permission(role, ClientRole::ReadWrite) {
-                handle_split_pane(r, sessions, outbound_tx, server_settings, clipboard).await?
+                handle_split_pane(
+                    r,
+                    sessions,
+                    outbound_tx,
+                    server_settings,
+                    clipboard,
+                    extension_host,
+                    connection_client_id,
+                )
+                .await?
             } else {
                 ResponseBody::Error("permission denied: read-write required".to_string())
             }
@@ -685,7 +717,7 @@ async fn dispatch_request(
         }
         RequestBody::FocusPane(r) => {
             if check_permission(role, ClientRole::ReadWrite) {
-                handle_focus_pane(r, sessions, outbound_tx).await?
+                handle_focus_pane(r, sessions, outbound_tx, connection_client_id).await?
             } else {
                 ResponseBody::Error("permission denied: read-write required".to_string())
             }
@@ -699,7 +731,7 @@ async fn dispatch_request(
         }
         RequestBody::ResizeLayout(r) => {
             if check_permission(role, ClientRole::ReadWrite) {
-                handle_resize_layout(r, sessions, outbound_tx).await?
+                handle_resize_layout(r, sessions, outbound_tx, connection_client_id).await?
             } else {
                 ResponseBody::Error("permission denied: read-write required".to_string())
             }
@@ -715,21 +747,21 @@ async fn dispatch_request(
         }
         RequestBody::Paste(r) => {
             if check_permission(role, ClientRole::ReadWrite) {
-                handle_paste(r, sessions).await?
+                handle_paste(r, sessions, connection_client_id).await?
             } else {
                 ResponseBody::Error("permission denied: read-write required".to_string())
             }
         }
         RequestBody::SetClipboard(r) => {
             if check_permission(role, ClientRole::ReadWrite) {
-                handle_set_clipboard(r, sessions, clipboard).await?
+                handle_set_clipboard(r, sessions, clipboard, connection_client_id).await?
             } else {
                 ResponseBody::Error("permission denied: read-write required".to_string())
             }
         }
         RequestBody::SetPaneTitle(r) => {
             if check_permission(role, ClientRole::ReadWrite) {
-                handle_set_pane_title(r, sessions).await?
+                handle_set_pane_title(r, sessions, connection_client_id).await?
             } else {
                 ResponseBody::Error("permission denied: read-write required".to_string())
             }
@@ -763,7 +795,7 @@ async fn dispatch_request(
         // §3.3 Pane zoom 和 shell integration
         RequestBody::ZoomPane(r) => {
             if check_permission(role, ClientRole::ReadWrite) {
-                handle_zoom_pane(r, sessions, outbound_tx).await?
+                handle_zoom_pane(r, sessions, outbound_tx, connection_client_id).await?
             } else {
                 ResponseBody::Error("permission denied: read-write required".to_string())
             }
@@ -776,6 +808,7 @@ async fn dispatch_request(
         }
     };
 
+    extension_host.bind_sessions(sessions);
     // §9 把 Response 通过 outbound channel 写回客户端
     send_response(
         outbound_tx,
@@ -972,6 +1005,7 @@ fn handle_confirm_recovery(
     db: &Arc<parking_lot::Mutex<Connection>>,
     server_settings: &Arc<crate::server_settings::ServerSettings>,
     clipboard: &Arc<crate::clipboard::ServerClipboard>,
+    extension_host: &Arc<crate::extension_host::ServerExtensionHost>,
 ) -> anyhow::Result<ResponseBody> {
     let candidate = {
         let connection = db.lock();
@@ -1063,6 +1097,10 @@ fn handle_confirm_recovery(
         install_pane_clipboard_hook(pane, sessions, clipboard);
         install_pane_exit_hook(pane, sessions, candidate.id.clone(), pane.id.clone());
     }
+    // §16.8 The recovered session and its panes were created inside this
+    // handler, so dispatch's start-of-request bind never saw them; bind now so
+    // the extension host observes the session layout change that follows.
+    extension_host.bind_sessions(sessions);
     broadcast_layout_changed(sessions, &candidate.id);
 
     Ok(ResponseBody::RecoveryConfirmed(ConfirmRecoveryResponse {
@@ -1112,7 +1150,11 @@ fn validate_recovered_session(session: &crate::session::Session) -> anyhow::Resu
 async fn handle_kill_session(
     req: &KillSessionRequest,
     sessions: &Arc<parking_lot::RwLock<Vec<crate::session::Session>>>,
+    connection_client_id: &Arc<parking_lot::Mutex<Option<String>>>,
 ) -> anyhow::Result<ResponseBody> {
+    if let Err(message) = ensure_mutation_allowed(sessions, connection_client_id) {
+        return Ok(ResponseBody::Error(message));
+    }
     if let Some(session) = take_session(sessions, &req.id) {
         if let Some(watch) = session.snapshot_watch.as_ref() {
             watch.stop();
@@ -1143,6 +1185,7 @@ async fn handle_attach(
     outbound_tx: &mpsc::UnboundedSender<Envelope>,
     forward_tasks: &Arc<parking_lot::Mutex<Vec<tokio::task::JoinHandle<()>>>>,
     trust: ConnectionTrust,
+    extension_host: &Arc<crate::extension_host::ServerExtensionHost>,
 ) -> anyhow::Result<ResponseBody> {
     let mut sessions_w = sessions.write();
     let target_session = sessions_w
@@ -1261,6 +1304,10 @@ async fn handle_attach(
     // read/write loop exits, after which broadcast_lifecycle prunes it.
     // Re-attach of the same client_id replaces the prior sender idempotently.
     session.add_lifecycle_subscriber(client_id.clone(), outbound_tx.clone());
+
+    // The startup render can race attach; repaint after this subscriber is
+    // registered so server-owned chrome is available on every new connection.
+    extension_host.request_render();
 
     // §3.3 窗口在这里才真正加入会话 (Plan 32): 只有 attach 才带连接身份, 也只有
     // 绑定了连接身份的窗口才能在断连时被精确释放。注册在 lifecycle 订阅之后,
@@ -1422,7 +1469,11 @@ fn register_pane_with_session_subscribers(
 async fn handle_new_window(
     req: &NewWindowRequest,
     sessions: &Arc<parking_lot::RwLock<Vec<crate::session::Session>>>,
+    connection_client_id: &Arc<parking_lot::Mutex<Option<String>>>,
 ) -> anyhow::Result<ResponseBody> {
+    if let Err(message) = ensure_mutation_allowed(sessions, connection_client_id) {
+        return Ok(ResponseBody::Error(message));
+    }
     let window_id = format!("win-{}-{}", std::process::id(), nanoid::nanoid!());
 
     let sessions_r = sessions.read();
@@ -1452,7 +1503,12 @@ async fn handle_spawn_pane(
     sessions: &Arc<parking_lot::RwLock<Vec<crate::session::Session>>>,
     server_settings: &Arc<crate::server_settings::ServerSettings>,
     clipboard: &Arc<crate::clipboard::ServerClipboard>,
+    extension_host: &Arc<crate::extension_host::ServerExtensionHost>,
+    connection_client_id: &Arc<parking_lot::Mutex<Option<String>>>,
 ) -> anyhow::Result<ResponseBody> {
+    if let Err(message) = ensure_mutation_allowed(sessions, connection_client_id) {
+        return Ok(ResponseBody::Error(message));
+    }
     let pane_id = nanoid::nanoid!();
 
     // §3.1 转换 ShellCommand → pane::ShellCommand
@@ -1564,6 +1620,13 @@ async fn handle_spawn_pane(
         }
     }
 
+    // §16.8 Re-bind the extension host before the new pane can emit anything:
+    // the pane's notification hook is only installed by bind_sessions, which
+    // ran at dispatch start while this pane did not exist yet. Without this,
+    // pane-level events (title/output/dirty) from the fresh PTY would miss the
+    // host until the next request's bind.
+    extension_host.bind_sessions(sessions);
+
     zlog::info!("pane spawned: id={} session={}", pane_id, req.session_id);
 
     // Publish existence before installing the exit hook. If the command has
@@ -1594,7 +1657,12 @@ async fn handle_split_pane(
     outbound_tx: &mpsc::UnboundedSender<Envelope>,
     server_settings: &Arc<crate::server_settings::ServerSettings>,
     clipboard: &Arc<crate::clipboard::ServerClipboard>,
+    extension_host: &Arc<crate::extension_host::ServerExtensionHost>,
+    connection_client_id: &Arc<parking_lot::Mutex<Option<String>>>,
 ) -> anyhow::Result<ResponseBody> {
+    if let Err(message) = ensure_mutation_allowed(sessions, connection_client_id) {
+        return Ok(ResponseBody::Error(message));
+    }
     let direction = match req.direction {
         1 => crate::layout::SplitDirection::LeftRight,
         2 => crate::layout::SplitDirection::TopBottom,
@@ -1683,6 +1751,10 @@ async fn handle_split_pane(
             // 由 lifecycle helper 重新获取读锁单次发送, 避免嵌套写锁的死锁。
             let session_id_for_broadcast = session.id.clone();
             drop(sessions_w);
+            // §16.8 The new pane did not exist when dispatch's bind_sessions
+            // ran; re-bind before the PaneAdded fan-out so the extension host
+            // receives pane-level events from the fresh pane from the start.
+            extension_host.bind_sessions(sessions);
             broadcast_pane_added(
                 sessions,
                 &session_id_for_broadcast,
@@ -1719,10 +1791,8 @@ async fn handle_close_pane(
     _outbound_tx: &mpsc::UnboundedSender<Envelope>,
     connection_client_id: &Arc<parking_lot::Mutex<Option<String>>>,
 ) -> anyhow::Result<ResponseBody> {
-    if !client_still_attached(sessions, connection_client_id) {
-        return Ok(ResponseBody::Error(
-            "client not attached (kicked or detached)".to_string(),
-        ));
+    if let Err(message) = ensure_mutation_allowed(sessions, connection_client_id) {
+        return Ok(ResponseBody::Error(message));
     }
 
     let mut removed = false;
@@ -1758,7 +1828,11 @@ async fn handle_focus_pane(
     req: &FocusPaneRequest,
     sessions: &Arc<parking_lot::RwLock<Vec<crate::session::Session>>>,
     _outbound_tx: &mpsc::UnboundedSender<Envelope>,
+    connection_client_id: &Arc<parking_lot::Mutex<Option<String>>>,
 ) -> anyhow::Result<ResponseBody> {
+    if let Err(message) = ensure_mutation_allowed(sessions, connection_client_id) {
+        return Ok(ResponseBody::Error(message));
+    }
     let session_id = {
         let mut sessions = sessions.write();
         let Some(session) = sessions
@@ -1799,6 +1873,9 @@ async fn handle_resize_pane(
     sessions: &Arc<parking_lot::RwLock<Vec<crate::session::Session>>>,
     connection_client_id: &Arc<parking_lot::Mutex<Option<String>>>,
 ) -> anyhow::Result<ResponseBody> {
+    if let Err(message) = ensure_mutation_allowed(sessions, connection_client_id) {
+        return Ok(ResponseBody::Error(message));
+    }
     let Some(pane) = find_pane(sessions, &req.pane_id) else {
         return Ok(ResponseBody::Error("pane not found".to_string()));
     };
@@ -1817,7 +1894,11 @@ async fn handle_resize_layout(
     req: &mux_protocol::ResizeLayoutRequest,
     sessions: &Arc<parking_lot::RwLock<Vec<crate::session::Session>>>,
     _outbound_tx: &mpsc::UnboundedSender<Envelope>,
+    connection_client_id: &Arc<parking_lot::Mutex<Option<String>>>,
 ) -> anyhow::Result<ResponseBody> {
+    if let Err(message) = ensure_mutation_allowed(sessions, connection_client_id) {
+        return Ok(ResponseBody::Error(message));
+    }
     let direction = match req.direction {
         1 => crate::layout::SplitDirection::LeftRight,
         2 => crate::layout::SplitDirection::TopBottom,
@@ -1875,10 +1956,8 @@ async fn handle_send_input(
     _outbound_tx: &mpsc::UnboundedSender<Envelope>,
     connection_client_id: &Arc<parking_lot::Mutex<Option<String>>>,
 ) -> anyhow::Result<ResponseBody> {
-    if !client_still_attached(sessions, connection_client_id) {
-        return Ok(ResponseBody::Error(
-            "client not attached (kicked or detached)".to_string(),
-        ));
+    if let Err(message) = ensure_mutation_allowed(sessions, connection_client_id) {
+        return Ok(ResponseBody::Error(message));
     }
     let Some(pane) = find_pane(sessions, &req.pane_id) else {
         return Ok(ResponseBody::Error(format!(
@@ -1929,7 +2008,11 @@ async fn handle_send_input(
 async fn handle_paste(
     req: &PasteRequest,
     sessions: &Arc<parking_lot::RwLock<Vec<crate::session::Session>>>,
+    connection_client_id: &Arc<parking_lot::Mutex<Option<String>>>,
 ) -> anyhow::Result<ResponseBody> {
+    if let Err(message) = ensure_mutation_allowed(sessions, connection_client_id) {
+        return Ok(ResponseBody::Error(message));
+    }
     let Some(pane) = find_pane(sessions, &req.pane_id) else {
         return Ok(ResponseBody::Error(format!(
             "pane not found: {}",
@@ -1945,7 +2028,11 @@ async fn handle_set_clipboard(
     req: &SetClipboardRequest,
     sessions: &Arc<parking_lot::RwLock<Vec<crate::session::Session>>>,
     clipboard: &Arc<crate::clipboard::ServerClipboard>,
+    connection_client_id: &Arc<parking_lot::Mutex<Option<String>>>,
 ) -> anyhow::Result<ResponseBody> {
+    if let Err(message) = ensure_mutation_allowed(sessions, connection_client_id) {
+        return Ok(ResponseBody::Error(message));
+    }
     // §16.6 从 proto 消息转换并设置剪贴板
     let entry = match &req.entry {
         Some(proto_entry) => crate::clipboard::ClipboardEntry::from_proto(proto_entry),
@@ -2223,7 +2310,7 @@ async fn handle_fetch_grid_update(
     for session in sessions_r.iter() {
         let panes = session.panes.clone();
         if let Some(pane) = panes.read().get(&req.pane_id) {
-            let update = pane.fetch_grid_update(req.since_generation);
+            let (update, output_sequence) = pane.fetch_grid_update(req.since_generation);
             let resp = match update {
                 crate::grid_sync::GridUpdate::Diff {
                     from_generation,
@@ -2242,6 +2329,7 @@ async fn handle_fetch_grid_update(
                             })
                             .collect(),
                     })),
+                    output_sequence,
                 },
                 crate::grid_sync::GridUpdate::FullSnapshot {
                     to_generation,
@@ -2276,11 +2364,13 @@ async fn handle_fetch_grid_update(
                             modes: Some(snapshot.modes),
                         },
                     )),
+                    output_sequence,
                 },
                 crate::grid_sync::GridUpdate::NoChange(current_gen) => FetchGridUpdateResponse {
                     from_generation: current_gen,
                     to_generation: current_gen,
                     update: None,
+                    output_sequence,
                 },
             };
             return Ok(ResponseBody::GridUpdate(resp));
@@ -2533,6 +2623,29 @@ fn client_still_attached(
         }
     }
     false
+}
+
+/// §3.3 Shared pre-mutation attachment guard for every mutating RPC handler.
+///
+/// `client_still_attached` already encodes the two allowed pre-attach shapes:
+/// a connection whose id is `None` (tmux-style one-shot CLI commands such as
+/// `send-keys` / `split-window` driven by `$Z3RM_PANE`, and voluntary-detach
+/// sockets whose id was cleared) and a connection whose id is registered with
+/// some session. The only failing shape is a connection whose id is set but
+/// registered with no session anymore — a steal-kicked or otherwise stale
+/// client. Every mutating handler MUST gate on this helper before touching
+/// server state or fanning out any notification, so a kicked client gets
+/// `ResponseBody::Error` instead of silently driving a session it no longer
+/// belongs to.
+fn ensure_mutation_allowed(
+    sessions: &Arc<parking_lot::RwLock<Vec<crate::session::Session>>>,
+    connection_client_id: &Arc<parking_lot::Mutex<Option<String>>>,
+) -> Result<(), String> {
+    if client_still_attached(sessions, connection_client_id) {
+        Ok(())
+    } else {
+        Err("client not attached (kicked or detached)".to_string())
+    }
 }
 
 fn broadcast_layout_changed(
@@ -2788,7 +2901,11 @@ async fn handle_get_file_version(
 async fn handle_decline_file_version(
     request: &mux_protocol::DeclineFileVersionRequest,
     sessions: &Arc<parking_lot::RwLock<Vec<crate::session::Session>>>,
+    connection_client_id: &Arc<parking_lot::Mutex<Option<String>>>,
 ) -> anyhow::Result<ResponseBody> {
+    if let Err(message) = ensure_mutation_allowed(sessions, connection_client_id) {
+        return Ok(ResponseBody::Error(message));
+    }
     let (watch, root) = snapshot_context_for_session(sessions, &request.session_id)?;
     let path = resolve_path_within_root(&root, &request.path)?;
     let version_id = request.version_id;
@@ -2996,27 +3113,38 @@ async fn handle_stat_file(
     }
 }
 
-/// §16.8 / §16.12 InstallExtension: server 端没有 extension host。
+/// §16.8 / §16.12 InstallExtension: validate and load a server-side extension
+/// on the daemon's extension host.
 ///
-/// QuickJS runtime 只在 client 侧 (`crates/quickjs_runtime`), daemon 既不能
-/// 执行也不能校验 server-side 扩展; 真正的安装逻辑在
-/// `crates/z3rm/src/cli/marketplace.rs`。这里返回 `success=false` 的类型化
-/// 响应而不是空 `Error` —— 空 `Error` 在客户端等价于成功, 会让
-/// `mux::sync_extensions_to_remote` 把一次没发生的安装报成成功。
+/// The response is always the typed `ExtensionInstalled` — an empty `Error`
+/// body reads as success on the client and would make
+/// `mux::sync_extensions_to_remote` report an install that never happened.
+/// Validation failures (bad manifest, client-only side, unsafe archive) come
+/// back as `success=false` with the underlying error.
 async fn handle_install_extension(
     req: &mux_protocol::InstallExtensionRequest,
+    extension_host: &Arc<crate::extension_host::ServerExtensionHost>,
 ) -> anyhow::Result<ResponseBody> {
-    zlog::warn!(
-        "extension install rejected: name={} (mux_server has no extension host)",
-        req.name
-    );
+    let result = extension_host.install_extension(req).await;
+    let (success, error) = match &result {
+        Ok(()) => {
+            zlog::info!("extension installed: name={}", req.name);
+            (true, String::new())
+        }
+        Err(err) => {
+            zlog::warn!(
+                "extension install rejected: name={} error={:#}",
+                req.name,
+                err
+            );
+            (false, format!("{err:#}"))
+        }
+    };
     Ok(ResponseBody::ExtensionInstalled(
         mux_protocol::InstallExtensionResponse {
             name: req.name.clone(),
-            success: false,
-            error: "mux_server has no extension host: server-side extension install is not \
-                    supported"
-                .to_string(),
+            success,
+            error,
         },
     ))
 }
@@ -3025,7 +3153,11 @@ async fn handle_install_extension(
 async fn handle_rename_session(
     req: &mux_protocol::RenameSessionRequest,
     sessions: &Arc<parking_lot::RwLock<Vec<crate::session::Session>>>,
+    connection_client_id: &Arc<parking_lot::Mutex<Option<String>>>,
 ) -> anyhow::Result<ResponseBody> {
+    if let Err(message) = ensure_mutation_allowed(sessions, connection_client_id) {
+        return Ok(ResponseBody::Error(message));
+    }
     let mut sessions_w = sessions.write();
     let session = sessions_w
         .iter_mut()
@@ -3045,7 +3177,11 @@ async fn handle_rename_session(
 async fn handle_set_pane_title(
     req: &mux_protocol::SetPaneTitleRequest,
     sessions: &Arc<parking_lot::RwLock<Vec<crate::session::Session>>>,
+    connection_client_id: &Arc<parking_lot::Mutex<Option<String>>>,
 ) -> anyhow::Result<ResponseBody> {
+    if let Err(message) = ensure_mutation_allowed(sessions, connection_client_id) {
+        return Ok(ResponseBody::Error(message));
+    }
     let sessions_r = sessions.read();
     let mut matched_session_id: Option<String> = None;
     let mut matched_pane: Option<std::sync::Arc<crate::pane::Pane>> = None;
@@ -3093,7 +3229,11 @@ async fn handle_zoom_pane(
     req: &mux_protocol::ZoomPaneRequest,
     sessions: &Arc<parking_lot::RwLock<Vec<crate::session::Session>>>,
     outbound_tx: &mpsc::UnboundedSender<Envelope>,
+    connection_client_id: &Arc<parking_lot::Mutex<Option<String>>>,
 ) -> anyhow::Result<ResponseBody> {
+    if let Err(message) = ensure_mutation_allowed(sessions, connection_client_id) {
+        return Ok(ResponseBody::Error(message));
+    }
     let mut matched_session_id: Option<String> = None;
     let mut pane_found = false;
 
@@ -3373,6 +3513,27 @@ mod connection_unit_tests {
         );
     }
 
+    /// Handler fixture: a live extension host (spawn/split bind it to the
+    /// session before fanning out) and an unattached connection id mirroring
+    /// a pre-attach one-shot CLI socket. The `TempDir` keeps the extension
+    /// directory alive for the duration of the test.
+    fn handler_fixture(
+        sessions: &Arc<parking_lot::RwLock<Vec<crate::session::Session>>>,
+    ) -> (
+        tempfile::TempDir,
+        Arc<crate::extension_host::ServerExtensionHost>,
+        Arc<parking_lot::Mutex<Option<String>>>,
+    ) {
+        let extensions_dir = tempfile::tempdir().expect("temp dir");
+        let host = crate::extension_host::ServerExtensionHost::start(
+            sessions.clone(),
+            extensions_dir.path().join("extensions"),
+        );
+        let unattached: Arc<parking_lot::Mutex<Option<String>>> =
+            Arc::new(parking_lot::Mutex::new(None));
+        (extensions_dir, host, unattached)
+    }
+
     #[test]
     fn take_session_returns_removed_session() {
         let sessions = Arc::new(parking_lot::RwLock::new(vec![
@@ -3556,9 +3717,17 @@ mod connection_unit_tests {
             }),
         };
 
-        let error = handle_spawn_pane(&request, &sessions, &settings, &clipboard)
-            .await
-            .expect_err("missing session must fail before child spawn");
+        let (_extensions_dir, extension_host, unattached) = handler_fixture(&sessions);
+        let error = handle_spawn_pane(
+            &request,
+            &sessions,
+            &settings,
+            &clipboard,
+            &extension_host,
+            &unattached,
+        )
+        .await
+        .expect_err("missing session must fail before child spawn");
 
         assert_eq!(error.to_string(), "session not found: missing");
     }
@@ -3598,6 +3767,7 @@ mod connection_unit_tests {
         let settings = crate::server_settings::ServerSettings::load();
         let clipboard = Arc::new(crate::clipboard::ServerClipboard::new());
         let (outbound, _notifications) = mpsc::unbounded_channel();
+        let (_extensions_dir, extension_host, unattached) = handler_fixture(&sessions);
 
         let error = handle_split_pane(
             &SplitPaneRequest {
@@ -3614,6 +3784,8 @@ mod connection_unit_tests {
             &outbound,
             &settings,
             &clipboard,
+            &extension_host,
+            &unattached,
         )
         .await
         .expect_err("split spawn must fail");
@@ -3645,6 +3817,7 @@ mod connection_unit_tests {
         let sessions = Arc::new(parking_lot::RwLock::new(vec![session]));
         let settings = crate::server_settings::ServerSettings::load();
         let clipboard = Arc::new(crate::clipboard::ServerClipboard::new());
+        let (_extensions_dir, extension_host, unattached) = handler_fixture(&sessions);
 
         let response = handle_spawn_pane(
             &SpawnPaneRequest {
@@ -3668,6 +3841,8 @@ mod connection_unit_tests {
             &sessions,
             &settings,
             &clipboard,
+            &extension_host,
+            &unattached,
         )
         .await
         .expect("spawn fast-exit pane");
@@ -3737,6 +3912,7 @@ mod connection_unit_tests {
         let sessions = Arc::new(parking_lot::RwLock::new(vec![session]));
         let settings = crate::server_settings::ServerSettings::load();
         let clipboard = Arc::new(crate::clipboard::ServerClipboard::new());
+        let (_extensions_dir, extension_host, unattached) = handler_fixture(&sessions);
 
         let mut pane_ids = Vec::new();
         for tab_id in ["tab-1", "tab-2"] {
@@ -3755,6 +3931,8 @@ mod connection_unit_tests {
                 &sessions,
                 &settings,
                 &clipboard,
+                &extension_host,
+                &unattached,
             )
             .await
             .expect("spawn tab pane");
@@ -3948,6 +4126,115 @@ mod connection_unit_tests {
         // no worktree either — it must not fall back to the whole filesystem.
         let stranger = Arc::new(parking_lot::Mutex::new(Some("client-2".to_string())));
         assert!(resolve_session_file_path(&sessions, &stranger, "file.txt").is_err());
+    }
+
+    /// §3.3 A steal-kicked connection (client id set but no session
+    /// membership) must be rejected with `ResponseBody::Error` before any
+    /// mutation or notification, while a pre-attach CLI socket (id `None`)
+    /// keeps driving panes by target — the detached-CLI contract.
+    #[tokio::test]
+    async fn kicked_client_is_rejected_before_pane_mutation() {
+        let directory = tempfile::tempdir().expect("temp directory");
+        let pane = crate::pane::Pane::spawn(
+            "kicked-pane".to_string(),
+            directory.path().to_string_lossy().into_owned(),
+            20,
+            5,
+            None,
+        )
+        .expect("spawn test pane");
+        let mut session = crate::session::Session::new(
+            "session-1".to_string(),
+            "session-1".to_string(),
+            "/tmp".to_string(),
+        );
+        session.panes.write().insert(pane.id.clone(), pane.clone());
+        session.add_attached_client(
+            "client-1".to_string(),
+            crate::session::AttachMode::Shared,
+            ClientRole::ReadWrite,
+            None,
+        );
+        let sessions = Arc::new(parking_lot::RwLock::new(vec![session]));
+
+        // Simulate a steal kick: the connection keeps its client id but the
+        // session no longer lists it.
+        sessions.write()[0].remove_attached_client("client-1");
+        let kicked: Arc<parking_lot::Mutex<Option<String>>> =
+            Arc::new(parking_lot::Mutex::new(Some("client-1".to_string())));
+
+        // SetPaneTitle must fail before touching the pane title.
+        let response = handle_set_pane_title(
+            &mux_protocol::SetPaneTitleRequest {
+                pane_id: "kicked-pane".to_string(),
+                title: "should-not-stick".to_string(),
+            },
+            &sessions,
+            &kicked,
+        )
+        .await
+        .expect("set_pane_title returns a response");
+        assert!(
+            matches!(response, ResponseBody::Error(_)),
+            "got {response:?}"
+        );
+        assert_eq!(*pane.title.read(), String::new());
+
+        // FocusPane must fail before changing the authoritative focus.
+        let (outbound, _notifications) = mpsc::unbounded_channel();
+        let response = handle_focus_pane(
+            &FocusPaneRequest {
+                pane_id: "kicked-pane".to_string(),
+            },
+            &sessions,
+            &outbound,
+            &kicked,
+        )
+        .await
+        .expect("focus_pane returns a response");
+        assert!(
+            matches!(response, ResponseBody::Error(_)),
+            "got {response:?}"
+        );
+        assert_eq!(sessions.read()[0].focused_pane, None);
+
+        // ZoomPane must fail before flipping the zoom state.
+        let response = handle_zoom_pane(
+            &mux_protocol::ZoomPaneRequest {
+                pane_id: "kicked-pane".to_string(),
+                zoom: true,
+            },
+            &sessions,
+            &outbound,
+            &kicked,
+        )
+        .await
+        .expect("zoom_pane returns a response");
+        assert!(
+            matches!(response, ResponseBody::Error(_)),
+            "got {response:?}"
+        );
+        assert!(!pane.is_zoomed());
+
+        // A pre-attach CLI socket (no client id) is still allowed to drive
+        // the pane by target — the detached/pre-attach CLI contract.
+        let pre_attach: Arc<parking_lot::Mutex<Option<String>>> =
+            Arc::new(parking_lot::Mutex::new(None));
+        let response = handle_set_pane_title(
+            &mux_protocol::SetPaneTitleRequest {
+                pane_id: "kicked-pane".to_string(),
+                title: "cli-title".to_string(),
+            },
+            &sessions,
+            &pre_attach,
+        )
+        .await
+        .expect("pre-attach set_pane_title returns a response");
+        assert!(
+            matches!(response, ResponseBody::Error(_)),
+            "got {response:?}"
+        );
+        assert_eq!(*pane.title.read(), "cli-title");
     }
 
     #[test]
@@ -4158,11 +4445,18 @@ mod connection_unit_tests {
 
     #[tokio::test]
     async fn install_extension_reports_failure_instead_of_an_empty_error() {
-        let response = handle_install_extension(&mux_protocol::InstallExtensionRequest {
-            name: "z3rm-demo".to_string(),
-            manifest: Vec::new(),
-            source: Vec::new(),
-        })
+        let temp = tempfile::tempdir().unwrap();
+        let sessions = Arc::new(parking_lot::RwLock::new(Vec::new()));
+        let host =
+            crate::extension_host::ServerExtensionHost::start(sessions, temp.path().to_path_buf());
+        let response = handle_install_extension(
+            &mux_protocol::InstallExtensionRequest {
+                name: "z3rm-demo".to_string(),
+                manifest: Vec::new(),
+                source: Vec::new(),
+            },
+            &host,
+        )
         .await
         .expect("install handler");
 
@@ -4222,6 +4516,14 @@ mod connection_unit_tests {
         let sessions = Arc::new(parking_lot::RwLock::new(Vec::new()));
         let settings = crate::server_settings::ServerSettings::load();
         let clipboard = Arc::new(crate::clipboard::ServerClipboard::new());
+        let (_extensions_dir, extension_host) = {
+            let extensions_dir = tempfile::tempdir().expect("temp dir");
+            let host = crate::extension_host::ServerExtensionHost::start(
+                sessions.clone(),
+                extensions_dir.path().join("extensions"),
+            );
+            (extensions_dir, host)
+        };
 
         let listed = handle_list_recovery_candidates(&sessions, &database)
             .expect("list recovery candidates");
@@ -4241,6 +4543,7 @@ mod connection_unit_tests {
             &database,
             &settings,
             &clipboard,
+            &extension_host,
         )
         .expect("confirm recovery");
         match response {

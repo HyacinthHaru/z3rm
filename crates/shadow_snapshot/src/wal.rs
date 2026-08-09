@@ -46,14 +46,60 @@ pub struct Wal {
 }
 
 impl Wal {
-    /// 创建或打开 WAL 文件
+    /// 创建或打开 WAL 文件。
+    ///
+    /// 打开前先做旋转崩溃恢复:`checkpoint` 把日志原子 rename 到
+    /// `<wal>.old` 后才会创建新的空日志,崩溃可能留下"规范路径缺失或为
+    /// 空、归档仍持有完整旧日志"的状态。此时必须把归档恢复到规范路径,
+    /// 让 replay 看到全部条目,而不是静默以空日志启动。规范路径与归档
+    /// 同时有数据是意外状态,打开失败关闭(不丢弃任何一份)。
     pub fn open<P: AsRef<Path>>(path: P) -> io::Result<Self> {
         let path = path.as_ref().to_path_buf();
+        Self::recover_rotated_log(&path)?;
         let file = OpenOptions::new().create(true).append(true).open(&path)?;
         Ok(Self {
             path,
             file: Mutex::new(BufWriter::new(file)),
         })
+    }
+
+    /// 旋转崩溃恢复(见 [`Wal::open`] 文档)。
+    ///
+    /// 只处理两种崩溃窗口:规范路径缺失 + 归档有数据,规范路径为空 +
+    /// 归档有数据。两种情况都通过原子 rename 把归档恢复到规范路径;
+    /// 恢复幂等,崩溃后重开会再次恢复,无需 fsync 父目录。两边都有数据
+    /// 是意外状态,返回 `InvalidData` 失败关闭。归档路径被目录等非文件
+    /// 占住时不动它——那不是可恢复的旋转状态,下次 checkpoint 的 rename
+    /// 会失败并报错。
+    fn recover_rotated_log(path: &Path) -> io::Result<()> {
+        let archive_path = Self::archive_path(path);
+        let archive_len = match std::fs::metadata(&archive_path) {
+            Ok(meta) if meta.is_file() => Some(meta.len()),
+            Ok(_) => return Ok(()),
+            Err(error) if error.kind() == io::ErrorKind::NotFound => None,
+            Err(error) => return Err(error),
+        };
+        let canonical_len = match std::fs::metadata(path) {
+            Ok(meta) if meta.is_file() => Some(meta.len()),
+            Ok(_) => return Ok(()),
+            Err(error) if error.kind() == io::ErrorKind::NotFound => None,
+            Err(error) => return Err(error),
+        };
+        match (
+            canonical_len.is_some_and(|len| len > 0),
+            archive_len.is_some_and(|len| len > 0),
+        ) {
+            (false, true) => std::fs::rename(&archive_path, path)?,
+            (true, true) => {
+                return Err(invalid_data(format!(
+                    "WAL rotation state is ambiguous: both {} and {} contain records",
+                    path.display(),
+                    archive_path.display()
+                )));
+            }
+            _ => {}
+        }
+        Ok(())
     }
 
     /// 追加一条 WAL 记录
@@ -75,24 +121,87 @@ impl Wal {
         Ok(())
     }
 
-    /// Checkpoint：flush 后截断已持久化的 WAL 部分
+    /// Checkpoint：把 WAL 原子旋转为空,前提是每条既有条目都已在上游
+    /// (SQLite / blob store) 持久化。
     ///
-    /// MemTable flush 到 SQLite 后调用，清除已处理的 WAL 条目。
+    /// 先 flush + fsync 既有条目,再把整份日志原子 rename 到 `<wal>.old`,
+    /// 最后在规范路径创建新的空日志并 fsync 父目录。旧文件从不原地截断,
+    /// 因此崩溃在任意一点都只会留下"规范路径仍是旧的有效日志"或"新的
+    /// 有效空日志"(旧日志整份在归档中)——绝不会出现部分截断的日志。
+    /// 旋转持久化后归档被删除;删除失败只留下一个陈旧文件(下次旋转的
+    /// rename 会原子覆盖),记录日志而不让 checkpoint 失败。
+    ///
+    /// 必须与 `append` 串行执行(内部锁保证):旋转期间并发 append 会写进
+    /// 已归档的旧 inode,导致条目从规范路径丢失。
     pub fn checkpoint(&self) -> io::Result<()> {
         let mut file = self.file.lock();
+
+        // 1. 先让既有条目全部落盘,再动路径。
         file.flush()?;
         file.get_ref().sync_all()?;
-        // 截断文件：已处理的 WAL 条目被清除
-        file.get_ref().set_len(0)?;
+
+        // 2. 原子旋转:把整份日志 rename 到固定归档名。rename 是原子元数据
+        // 操作,崩溃只会留下"规范路径仍是旧日志"或"旧日志整份在归档"两种
+        // 状态。归档路径被目录占住(或其它 I/O 错误)时旋转失败,旧日志
+        // 原封不动。
+        let archive_path = Self::archive_path(&self.path);
+        match std::fs::rename(&self.path, &archive_path) {
+            Ok(()) => {}
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                // 上次旋转崩溃后规范路径尚未重建;归档仍持旧日志,这里只需
+                // 创建新的空日志——旧条目早已全部持久化。
+            }
+            Err(error) => return Err(error),
+        }
+
+        // 3. 在规范路径创建新的空日志,并把写句柄换到新 inode——否则后续
+        // append 会写进已归档的旧 inode。
+        let new_file = OpenOptions::new()
+            .create(true)
+            .append(true)
+            .truncate(true)
+            .open(&self.path)?;
+        *file = BufWriter::new(new_file);
+        file.flush()?;
         file.get_ref().sync_all()?;
+
+        // 4. fsync 父目录,让 rename 与新日志的创建持久化。
+        if let Some(parent) = self.path.parent().filter(|p| !p.as_os_str().is_empty()) {
+            File::open(parent)?.sync_all()?;
+        }
+        drop(file);
+
+        // 5. 新空日志已持久,归档不再承担恢复职责。
+        match std::fs::remove_file(&archive_path) {
+            Ok(()) => {}
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+            Err(error) => tracing::warn!(
+                path = %archive_path.display(),
+                error = %error,
+                "shadow WAL: stale archive cleanup failed"
+            ),
+        }
         Ok(())
+    }
+
+    /// 归档路径:`<wal>.old`。固定名称,下次旋转的 rename 会原子覆盖旧归档。
+    fn archive_path(path: &Path) -> std::path::PathBuf {
+        let mut name = path.as_os_str().to_os_string();
+        name.push(".old");
+        std::path::PathBuf::from(name)
     }
 
     /// Replay：从头读取所有 WAL 条目
     ///
     /// 崩溃恢复时调用，重建 MemTable。
     pub fn replay(&self) -> io::Result<Vec<WalEntry>> {
-        let file = File::open(&self.path)?;
+        let file = match File::open(&self.path) {
+            Ok(file) => file,
+            // 打开句柄存活期间规范路径被移除(外部干扰或异常状态)时,
+            // WAL 等价于空日志,而不是损坏状态。
+            Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(Vec::new()),
+            Err(error) => return Err(error),
+        };
         let mut reader = BufReader::new(file);
         let mut entries = Vec::new();
 
@@ -349,11 +458,163 @@ mod tests {
         let entries = wal.replay().unwrap();
         assert_eq!(entries.len(), 3);
 
-        // Checkpoint 截断
+        // Checkpoint 旋转清空
         wal.checkpoint().unwrap();
 
         let entries = wal.replay().unwrap();
         assert_eq!(entries.len(), 0);
+    }
+
+    /// 崩溃点 1:checkpoint 的 rename 已生效、fresh file 尚未创建(规范路径
+    /// 缺失)。正常的 `Wal::open` 必须恢复归档,replay 看到全部旧条目——
+    /// 而不是像旧行为那样创建一个空日志,静默丢掉归档里的条目。
+    #[test]
+    fn open_recovers_archived_log_after_crash_before_fresh_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("crash-missing.wal");
+        let archive = Wal::archive_path(&path);
+
+        let wal = Wal::open(&path).unwrap();
+        for i in 1..=3 {
+            wal.append(&make_entry(i)).unwrap();
+        }
+        wal.commit().unwrap();
+        drop(wal);
+
+        // 崩溃窗口:rename 已生效,fresh file 尚未创建。
+        std::fs::rename(&path, &archive).unwrap();
+        assert!(!path.exists(), "canonical path missing after crashed rotation");
+
+        // 通过普通 open 恢复:归档移回规范路径,replay 看到全部条目。
+        let reopened = Wal::open(&path).unwrap();
+        let entries = reopened.replay().unwrap();
+        assert_eq!(entries.len(), 3, "recovery must restore the archived log");
+        assert_eq!(entries[0].seq_no, 1);
+        assert_eq!(entries[2].seq_no, 3);
+        assert!(
+            !archive.exists(),
+            "archive must be restored into the canonical path"
+        );
+    }
+
+    /// 崩溃点 2:fresh 空文件已创建、归档尚未删除(规范路径存在但为空)。
+    /// 恢复必须把归档移回规范路径,不能静默偏好空文件。
+    #[test]
+    fn open_recovers_archived_log_when_canonical_is_empty() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("crash-empty.wal");
+        let archive = Wal::archive_path(&path);
+
+        let wal = Wal::open(&path).unwrap();
+        for i in 1..=3 {
+            wal.append(&make_entry(i)).unwrap();
+        }
+        wal.commit().unwrap();
+        drop(wal);
+
+        // 崩溃窗口:rename 已生效,fresh 空文件已创建,归档尚未删除。
+        std::fs::rename(&path, &archive).unwrap();
+        std::fs::write(&path, b"").unwrap();
+
+        let reopened = Wal::open(&path).unwrap();
+        let entries = reopened.replay().unwrap();
+        assert_eq!(
+            entries.len(),
+            3,
+            "recovery must not prefer the empty canonical file"
+        );
+        assert_eq!(entries[0].seq_no, 1);
+        assert!(!archive.exists());
+    }
+
+    /// 规范路径与归档同时有数据是意外状态:打开失败关闭,绝不丢弃任何
+    /// 一份日志。
+    #[test]
+    fn open_fails_closed_when_canonical_and_archive_both_have_data() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("ambiguous.wal");
+
+        let wal = Wal::open(&path).unwrap();
+        wal.append(&make_entry(1)).unwrap();
+        wal.commit().unwrap();
+        drop(wal);
+
+        let archive = Wal::archive_path(&path);
+        let archived = Wal::open(&archive).unwrap();
+        archived.append(&make_entry(2)).unwrap();
+        archived.commit().unwrap();
+        drop(archived);
+
+        let error = Wal::open(&path).expect_err("ambiguous rotation state must fail closed");
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+    }
+
+    /// A blocked rotation target must fail the checkpoint and leave the old
+    /// WAL untouched and fully replayable; appends must keep working on the
+    /// same handle.
+    #[test]
+    fn checkpoint_failure_keeps_old_wal_replayable() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("blocked.wal");
+        let wal = Wal::open(&path).unwrap();
+        for i in 1..=3 {
+            wal.append(&make_entry(i)).unwrap();
+        }
+        wal.commit().unwrap();
+
+        // 归档路径被目录占住:旋转 rename 必须失败,旧日志原封不动。
+        let archive = Wal::archive_path(&path);
+        std::fs::create_dir(&archive).unwrap();
+        wal.checkpoint()
+            .expect_err("blocked rotation must fail the checkpoint");
+
+        let entries = wal.replay().unwrap();
+        assert_eq!(entries.len(), 3, "failed checkpoint must keep the old log");
+
+        // 同一句柄继续追加,落到规范路径的新内容。
+        wal.append(&make_entry(4)).unwrap();
+        wal.commit().unwrap();
+        assert_eq!(wal.replay().unwrap().len(), 4);
+    }
+
+    /// A successful rotation leaves a fresh empty canonical log, drops the
+    /// archive, and keeps appending on the same handle.
+    #[test]
+    fn rotation_continues_appending_and_drops_archive() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("rotate.wal");
+        let wal = Wal::open(&path).unwrap();
+        for i in 1..=3 {
+            wal.append(&make_entry(i)).unwrap();
+        }
+        wal.commit().unwrap();
+
+        wal.checkpoint().unwrap();
+        assert!(wal.replay().unwrap().is_empty());
+        assert!(
+            !Wal::archive_path(&path).exists(),
+            "rotation must drop the archive"
+        );
+
+        wal.append(&make_entry(4)).unwrap();
+        wal.commit().unwrap();
+        let entries = wal.replay().unwrap();
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].seq_no, 4);
+    }
+
+    /// A missing canonical log at replay time is an empty WAL, not an error
+    /// (live-handle file removal or rotation edge cases).
+    #[test]
+    fn replay_missing_log_is_an_empty_wal() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("missing.wal");
+        let wal = Wal::open(&path).unwrap();
+        wal.append(&make_entry(1)).unwrap();
+        wal.commit().unwrap();
+
+        std::fs::remove_file(&path).unwrap();
+        assert!(wal.replay().unwrap().is_empty());
     }
 
     #[test]

@@ -80,10 +80,7 @@ pub async fn fetch_registry(
         .context("failed to fetch marketplace registry")?;
 
     if !response.status().is_success() {
-        bail!(
-            "marketplace registry request failed: {}",
-            response.status()
-        );
+        bail!("marketplace registry request failed: {}", response.status());
     }
 
     let mut body_bytes = Vec::new();
@@ -108,10 +105,7 @@ pub async fn download_extension(
         .context("failed to download extension")?;
 
     if !response.status().is_success() {
-        bail!(
-            "extension download failed: {}",
-            response.status()
-        );
+        bail!("extension download failed: {}", response.status());
     }
 
     let mut body_bytes = Vec::new();
@@ -156,7 +150,7 @@ pub fn marketplace_entry_to_metadata(entry: &MarketplaceEntry) -> ExtensionMetad
 #[cfg(test)]
 mod tests {
     use super::*;
-    use http_client::{http, FakeHttpClient};
+    use http_client::{FakeHttpClient, http};
     use std::io::Write;
 
     fn make_registry_json(entries: Vec<MarketplaceEntry>) -> String {
@@ -304,13 +298,19 @@ mod tests {
             let body = tar_bytes_clone2.clone();
             async move { Ok(http::Response::new(AsyncBody::from(body))) }
         });
-        let result =
-            download_extension(fake2.as_ref(), "https://example.com/ext.tar.gz", "wrong_checksum").await;
+        let result = download_extension(
+            fake2.as_ref(),
+            "https://example.com/ext.tar.gz",
+            "wrong_checksum",
+        )
+        .await;
         assert!(result.is_err());
-        assert!(result
-            .unwrap_err()
-            .to_string()
-            .contains("checksum mismatch"));
+        assert!(
+            result
+                .unwrap_err()
+                .to_string()
+                .contains("checksum mismatch")
+        );
     }
 
     #[test]

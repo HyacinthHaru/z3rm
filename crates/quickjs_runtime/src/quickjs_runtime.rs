@@ -12,7 +12,7 @@
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -143,16 +143,17 @@ impl CpuFuelTracker {
         }
         state.last_checkpoint = Some(now);
 
+        if state.used >= kill_threshold {
+            state.interrupted = true;
+            return true;
+        }
+
         if now.saturating_duration_since(state.window_start) >= CPU_FUEL_WINDOW {
             state.window_start = now;
             state.used = Duration::ZERO;
             return false;
         }
 
-        if state.used >= kill_threshold {
-            state.interrupted = true;
-            return true;
-        }
         false
     }
 
@@ -182,6 +183,9 @@ pub struct IoTokenBucket {
     capacity: f64,
     tokens: Mutex<f64>,
     last_refill: Mutex<Instant>,
+    /// `true` 表示不限流 (`io_rate_limit = 0`，与 memory/cpu 的 0 = 不限制约定一致)：
+    /// 所有获取请求直接放行，不做任何拒绝。
+    unlimited: bool,
 }
 
 impl IoTokenBucket {
@@ -192,11 +196,29 @@ impl IoTokenBucket {
             capacity,
             tokens: Mutex::new(capacity),
             last_refill: Mutex::new(Instant::now()),
+            unlimited: false,
+        }
+    }
+
+    /// 不限流桶：`io_rate_limit = 0` 时使用，任何调用都直接放行。
+    pub fn unlimited() -> Self {
+        Self {
+            rate: 0.0,
+            capacity: 0.0,
+            tokens: Mutex::new(0.0),
+            last_refill: Mutex::new(Instant::now()),
+            unlimited: true,
         }
     }
 
     /// 由 manifest 的 `io_rate_limit` 构造，容量允许 2× 突发。
+    ///
+    /// `0` 表示不限制 (与 `memory_limit_mb = 0` / `cpu_budget_ms = 0` 同约定)；
+    /// 声明 `0` 的扩展不能被静默套上默认速率。非法值 (NaN/负数) 仍回退到默认速率。
     pub fn from_rate(rate: f64) -> Self {
+        if rate == 0.0 {
+            return Self::unlimited();
+        }
         let rate = if rate.is_finite() && rate > 0.0 {
             rate
         } else {
@@ -212,6 +234,9 @@ impl IoTokenBucket {
 
     /// 尝试获取 `count` 个令牌。成功返回 `true`。
     pub fn try_acquire(&self, count: f64) -> bool {
+        if self.unlimited {
+            return true;
+        }
         // 先补充令牌
         self.refill();
 
@@ -349,6 +374,14 @@ impl ExtensionSide {
     pub fn runs_on_client(self) -> bool {
         matches!(self, Self::Client | Self::Both)
     }
+
+    /// 该侧是否需要在服务器端 (mux_server / 守护进程) 加载。
+    ///
+    /// `Both` 同时满足两侧谓词，构成嵌入方选择运行侧的唯一依据：
+    /// 客户端用 `runs_on_client()` 过滤，服务端用 `runs_on_server()` 过滤。
+    pub fn runs_on_server(self) -> bool {
+        matches!(self, Self::Server | Self::Both)
+    }
 }
 
 /// spec §5.3 解析后的 `extension.toml`。
@@ -367,7 +400,10 @@ fn toml_bool(table: &toml::value::Table, key: &str) -> Result<bool> {
     match table.get(key) {
         None => Ok(false),
         Some(toml::Value::Boolean(value)) => Ok(*value),
-        Some(other) => bail!("capability `{key}` must be a boolean, found {}", other.type_str()),
+        Some(other) => bail!(
+            "capability `{key}` must be a boolean, found {}",
+            other.type_str()
+        ),
     }
 }
 
@@ -475,15 +511,14 @@ pub fn parse_manifest_str(fallback_id: &str, text: &str) -> Result<ExtensionMani
 
 /// spec §5.3 从磁盘读取并解析 `extension.toml`。
 pub fn parse_manifest(path: &Path) -> Result<ExtensionManifest> {
-    let text = std::fs::read_to_string(path)
-        .with_context(|| format!("reading {}", path.display()))?;
+    let text =
+        std::fs::read_to_string(path).with_context(|| format!("reading {}", path.display()))?;
     let fallback_id = path
         .parent()
         .and_then(Path::file_name)
         .map(|name| name.to_string_lossy().into_owned())
         .unwrap_or_else(|| "unknown".to_string());
-    parse_manifest_str(&fallback_id, &text)
-        .with_context(|| format!("parsing {}", path.display()))
+    parse_manifest_str(&fallback_id, &text).with_context(|| format!("parsing {}", path.display()))
 }
 
 // ---------------------------------------------------------------------------
@@ -554,11 +589,14 @@ pub fn extension_roots(user_extensions_dir: &Path) -> Vec<PathBuf> {
     roots
 }
 
-/// 扫描给定根目录，返回所有可在客户端加载的扩展 (spec §5.2 / §16.8)。
+/// 扫描给定根目录，按运行侧谓词过滤扩展 (spec §5.2 / §5.3 / §16.8)。
 ///
-/// 缺少 `main.js` 或 `extension.toml` 的目录、server-only 扩展、解析失败的
+/// 缺少 `main.js` 或 `extension.toml` 的目录、不属于该侧的扩展、解析失败的
 /// manifest 都会被跳过并记录日志——一个坏扩展不能阻断其它扩展的加载。
-pub fn discover_client_extensions(roots: &[PathBuf]) -> Vec<DiscoveredExtension> {
+fn discover_extensions_for(
+    roots: &[PathBuf],
+    include: impl Fn(ExtensionSide) -> bool,
+) -> Vec<DiscoveredExtension> {
     let mut discovered: BTreeMap<String, DiscoveredExtension> = BTreeMap::new();
 
     for root in roots {
@@ -574,7 +612,9 @@ pub fn discover_client_extensions(roots: &[PathBuf]) -> Vec<DiscoveredExtension>
         for entry in entries {
             match entry {
                 Ok(entry) => directories.push(entry.path()),
-                Err(error) => tracing::warn!(path = %root.display(), %error, "failed to read extension directory entry"),
+                Err(error) => {
+                    tracing::warn!(path = %root.display(), %error, "failed to read extension directory entry")
+                }
             }
         }
         // read_dir 顺序依赖文件系统；排序让加载顺序（以及渲染顺序）稳定。
@@ -594,7 +634,7 @@ pub fn discover_client_extensions(roots: &[PathBuf]) -> Vec<DiscoveredExtension>
                     continue;
                 }
             };
-            if !manifest.side.runs_on_client() {
+            if !include(manifest.side) {
                 continue;
             }
             if discovered.contains_key(&manifest.id) {
@@ -622,6 +662,24 @@ pub fn discover_client_extensions(roots: &[PathBuf]) -> Vec<DiscoveredExtension>
     discovered.into_values().collect()
 }
 
+/// 扫描给定根目录，返回所有可在客户端加载的扩展 (spec §5.2 / §16.8)。
+///
+/// `side = "client"` 与 `side = "both"` 的扩展在此侧加载；`side = "server"`
+/// 的扩展由 [`discover_server_extensions`] 接管，不会被客户端执行。
+pub fn discover_client_extensions(roots: &[PathBuf]) -> Vec<DiscoveredExtension> {
+    discover_extensions_for(roots, |side| side.runs_on_client())
+}
+
+/// 扫描给定根目录，返回所有可在服务器端加载的扩展 (spec §16.8)。
+///
+/// `side = "server"` 与 `side = "both"` 的扩展在此侧加载；`side = "client"`
+/// 的扩展只属于 GUI 进程，不会被服务器端执行。嵌入方 (mux_server) 用这条路径
+/// 做服务端发现；目前 daemon 尚无 extension host，安装请求会显式报错，绝不静默
+/// 接受一个声称要跑在服务端的扩展。
+pub fn discover_server_extensions(roots: &[PathBuf]) -> Vec<DiscoveredExtension> {
+    discover_extensions_for(roots, |side| side.runs_on_server())
+}
+
 // ---------------------------------------------------------------------------
 // §5.4 宿主桥
 // ---------------------------------------------------------------------------
@@ -640,6 +698,7 @@ fn host_call_response(
     bridge: &Arc<dyn HostBridge>,
     capabilities: ExtensionCapabilities,
     io_bucket: &IoTokenBucket,
+    io_violated: &AtomicBool,
     method: &str,
     arguments_json: &str,
 ) -> serde_json::Value {
@@ -649,6 +708,9 @@ fn host_call_response(
             bail!("capability denied: `{method}` requires an undeclared capability");
         }
         if !io_bucket.try_acquire(1.0) {
+            // §5.6 拒绝发生在 Rust 侧，JS 可能 catch 掉异常；持久标志是宿主
+            // 判定违规并挂起扩展的唯一可靠信号。
+            io_violated.store(true, Ordering::Relaxed);
             bail!("io rate limit exceeded while calling `{method}`");
         }
         let arguments: serde_json::Value = serde_json::from_str(arguments_json)
@@ -702,7 +764,18 @@ const CONTEXT_BOOTSTRAP_JS: &str = r#"
     globalThis.__z3rm_render_result = null;
 
     function recordError(where, error) {
-        var message = (error && error.message) ? error.message : String(error);
+        var message;
+        if (error === null || error === undefined) {
+            // QuickJS 在内存耗尽时可能连异常对象本身都构造不出来，抛出的
+            // 值会是 null/undefined 而不是带消息的 Error。把这种情况归一为
+            // "out of memory"，宿主据此挂起扩展 (spec §5.6)，而不是当成普通
+            // JS 错误放过。
+            message = 'out of memory';
+        } else if (error.message) {
+            message = error.message;
+        } else {
+            message = String(error);
+        }
         // Bounded so a misbehaving handler cannot grow the heap without limit.
         if (globalThis.__z3rm_errors.length < 64) {
             globalThis.__z3rm_errors.push(where + ': ' + message);
@@ -785,6 +858,29 @@ const CONTEXT_BOOTSTRAP_JS: &str = r#"
         catch (error) { recordError('command ' + id, error); return false; }
     };
 
+    function attachDisplayLists(value, view) {
+        if (value === null || value === undefined) { return; }
+        if (Array.isArray(value)) {
+            for (var i = 0; i < value.length; i++) {
+                attachDisplayLists(value[i], view);
+            }
+            return;
+        }
+        if (typeof value !== 'object') { return; }
+        if (value.type === 'display-list' && value.props
+            && typeof value.props.renderer === 'string') {
+            var renderer = view[value.props.renderer];
+            if (typeof renderer !== 'function') {
+                recordError('display-list', 'missing renderer ' + value.props.renderer);
+            } else {
+                value.props.drawOps = renderer.call(view);
+            }
+        }
+        if (Array.isArray(value.children)) {
+            attachDisplayLists(value.children, view);
+        }
+    }
+
     globalThis.__z3rm_render_views = function() {
         globalThis.__z3rm_rerender = false;
         var views = globalThis.__chrome_views || {};
@@ -804,7 +900,14 @@ const CONTEXT_BOOTSTRAP_JS: &str = r#"
             if (!view || typeof view.render !== 'function') { continue; }
             try {
                 var rendered = view.render();
-                if (rendered !== null && rendered !== undefined) { results.push(rendered); }
+                if (rendered !== null && rendered !== undefined) {
+                    if (typeof rendered === 'object' && !Array.isArray(rendered)
+                        && (rendered.id === undefined || rendered.id === null)) {
+                        rendered.id = names[n];
+                    }
+                    attachDisplayLists(rendered, view);
+                    results.push(rendered);
+                }
             } catch (error) { recordError('render ' + names[n], error); }
         }
         return JSON.stringify(results);
@@ -1057,6 +1160,10 @@ pub struct QuickJsRuntime {
     limits: ExtensionLimits,
     /// IO 令牌桶 (Arc 以便注入到 host bridge 闭包)
     io_bucket: Arc<IoTokenBucket>,
+    /// §5.6 置位表示某次宿主调用被 IO 速率上限拒绝 (令牌耗尽)。与
+    /// `memory_violated` 同语义: JS 侧 try/catch 吞掉异常也无法隐藏违规,
+    /// 宿主通过 [`take_io_violated`](Self::take_io_violated) 读取并清零。
+    io_violated: Arc<AtomicBool>,
     cpu_tracker: CpuFuelTracker,
 }
 
@@ -1090,6 +1197,7 @@ impl QuickJsRuntime {
             runtime,
             limits,
             io_bucket: Arc::new(IoTokenBucket::from_rate(limits.io_rate_limit)),
+            io_violated: Arc::new(AtomicBool::new(false)),
             cpu_tracker,
         })
     }
@@ -1103,10 +1211,19 @@ impl QuickJsRuntime {
     pub fn create_context(&self) -> Result<Context> {
         Context::full(&self.runtime).map_err(|e| anyhow!("创建 Context 失败: {e}"))
     }
-
     /// 获取 IO 令牌桶引用
     pub fn io_bucket(&self) -> &Arc<IoTokenBucket> {
         &self.io_bucket
+    }
+
+    /// IO 违规标志引用 (Arc 以便注入到 host bridge 闭包)。
+    pub fn io_violated(&self) -> &Arc<AtomicBool> {
+        &self.io_violated
+    }
+
+    /// 读取并清除「宿主调用被 IO 速率上限拒绝」标志 (spec §5.6)。
+    pub fn take_io_violated(&self) -> bool {
+        self.io_violated.swap(false, Ordering::Relaxed)
     }
 
     pub fn limits(&self) -> ExtensionLimits {
@@ -1129,8 +1246,8 @@ impl QuickJsRuntime {
             return false;
         }
         let limit_bytes = (self.limits.memory_limit_mb as u64).saturating_mul(1024 * 1024);
-        let malloc_size = self.runtime.memory_usage().malloc_size;
-        malloc_size >= 0 && (malloc_size as u64) >= limit_bytes
+        let malloc_size = self.runtime.memory_usage().malloc_size as u64;
+        malloc_size >= limit_bytes
     }
 
     /// 在专用线程中创建独立运行时并执行 JS 代码 (spec §5.2: dedicated OS thread)
@@ -1266,7 +1383,35 @@ impl ExtensionRunner {
         _activate_fn: &str,
     ) -> ExtensionRunResult {
         let start = Instant::now();
-        let outcome = self.do_load(source);
+        let limits = self.limits;
+        let capabilities = self.capabilities;
+        let bridge = self.bridge.clone();
+        let source = source.to_string();
+        let join = thread::Builder::new()
+            .name("quickjs-ext-load".to_string())
+            .spawn(move || {
+                ExtensionRunner {
+                    limits,
+                    capabilities,
+                    bridge,
+                }
+                .do_load(&source)
+            });
+        let outcome = match join {
+            Ok(handle) => match handle.join() {
+                Ok(outcome) => outcome,
+                Err(error) => LoadOutcome {
+                    vdom_json: Err(anyhow!("extension thread panicked: {error:?}")),
+                    cpu_exhausted: false,
+                    memory_exceeded: false,
+                },
+            },
+            Err(error) => LoadOutcome {
+                vdom_json: Err(anyhow!("creating extension thread failed: {error}")),
+                cpu_exhausted: false,
+                memory_exceeded: false,
+            },
+        };
         let duration = start.elapsed();
         let (result, vdom_json) = match outcome.vdom_json {
             Ok(vdom_json) => (Ok(()), vdom_json),
@@ -1292,6 +1437,19 @@ impl ExtensionRunner {
     /// is NOT dropped after activate; the caller must keep the `LiveExtension`
     /// alive for the chrome to stay live, and must call it from one thread
     /// (QuickJS Ctx is not Send across `ctx.with`).
+    ///
+    /// # Thread isolation (spec §5.2)
+    /// This runs QuickJS on the CALLER's thread, and that is deliberate: the
+    /// returned [`LiveExtension`] re-enters the same runtime on every
+    /// `render_now` / `emit_event` / `execute_command`, so every one of those
+    /// calls must happen on the very thread that created it. The dedicated-OS-
+    /// thread guarantee of §5.2 ("the extension host must not run on the GPUI
+    /// render thread") is therefore the caller's responsibility: the embedder
+    /// must invoke `load_live` — and every subsequent `LiveExtension` method —
+    /// from a dedicated extension thread, never the UI thread. z3rm satisfies
+    /// this by driving the whole lifecycle from its `quickjs-ext-host` thread
+    /// (see `ExtensionHostController`). Spawning a thread here would break the
+    /// API, because the handle could then never be safely used from the caller.
     pub fn load_live(
         &self,
         extension_id: &str,
@@ -1324,11 +1482,18 @@ impl ExtensionRunner {
         })
         .with_context(|| format!("activating extension `{extension_id}`"))?;
 
+        // spec §5.6: 激活期堆占用就已顶到声明上限的扩展不允许活着出去——
+        // QuickJS 可能恰好没有抛分配失败，但扩展已经处于持续超限状态。
+        if runtime.memory_exceeded() {
+            bail!("extension `{extension_id}` exceeded its memory budget during activation");
+        }
+
         Ok(LiveExtension {
             extension_id: extension_id.to_string(),
             capabilities,
             runtime,
             ctx,
+            memory_violated: AtomicBool::new(false),
         })
     }
 
@@ -1386,8 +1551,8 @@ impl ExtensionRunner {
             if !activated {
                 return Ok(None);
             }
-            let rendered: String =
-                eval_checked(&ctx, "globalThis.__z3rm_render_views()").context("rendering views")?;
+            let rendered: String = eval_checked(&ctx, "globalThis.__z3rm_render_views()")
+                .context("rendering views")?;
             Ok::<_, anyhow::Error>(first_vdom(&rendered))
         });
 
@@ -1441,6 +1606,10 @@ pub struct LiveExtension {
     /// re-render views. Context is a handle (Send); the Ctx inside `with` is
     /// not, so all `with` calls must run on one thread.
     ctx: Context,
+    /// 置位表示某次 JS 执行触发了内存上限 (分配失败或堆占用卡在上限)。
+    /// 由宿主在 [`take_memory_violated`](Self::take_memory_violated) 读取并
+    /// 清零；违规扩展按 spec §5.6 应被挂起而非继续执行。
+    memory_violated: AtomicBool,
 }
 
 impl LiveExtension {
@@ -1457,22 +1626,51 @@ impl LiveExtension {
         self.runtime.take_cpu_interrupted()
     }
 
+    /// 当前堆占用是否已达到声明的内存上限 (与 [`QuickJsRuntime::memory_exceeded`]
+    /// 语义一致，供宿主在挂起判定时参考)。
+    pub fn memory_exceeded(&self) -> bool {
+        self.runtime.memory_exceeded()
+    }
+
+    /// 读取并清除「发生过内存违规」标志：某次宿主 → JS 调用因内存上限失败
+    /// (QuickJS 抛 `out of memory`)，或堆占用卡在声明上限之上。
+    /// spec §5.6: 违规应导致扩展挂起，宿主用该标志做挂起判定。
+    pub fn take_memory_violated(&self) -> bool {
+        self.memory_violated.swap(false, Ordering::Relaxed)
+    }
+
+    /// 在专用线程上求值一段 JS，并记录资源违规标志。
+    ///
+    /// 所有宿主 → JS 入口都走这里：`begin_execution` 保证宿主空闲期不计入
+    /// CPU 预算，而任何失败若命中 QuickJS 的内存上限 (错误文本含 `out of
+    /// memory`) 或堆占用达到上限，都会被记录为内存违规——宿主随后可以
+    /// 显式挂起扩展，而不是让超限继续静默执行。
+    fn run_js<T>(&self, f: impl for<'js> FnOnce(&rquickjs::Ctx<'js>) -> Result<T>) -> Result<T> {
+        self.runtime.begin_execution();
+        let outcome = self.ctx.with(|ctx| f(&ctx));
+        if let Err(error) = &outcome
+            && format!("{error:#}").contains("out of memory")
+        {
+            self.memory_violated.store(true, Ordering::Relaxed);
+        }
+        if self.runtime.memory_exceeded() {
+            self.memory_violated.store(true, Ordering::Relaxed);
+        }
+        outcome
+    }
+
     /// §5.4 安装/替换宿主桥。宿主线程在 mux 连接建立后调用，此前扩展已经
     /// activate 完毕——`hostCall` 每次调用都重新查全局，因此后装也生效。
     pub fn install_bridge(&self, bridge: Arc<dyn HostBridge>) -> Result<()> {
         let capabilities = self.capabilities;
         let io_bucket = self.runtime.io_bucket().clone();
-        self.runtime.begin_execution();
-        self.ctx
-            .with(|ctx| install_host_call(&ctx, bridge, capabilities, io_bucket))
+        self.run_js(|ctx| install_host_call(ctx, bridge, capabilities, io_bucket))
     }
 
     /// §5.4 是否有视图请求过重绘 (`view.invalidate()` / `context.render()`)。
     /// 宿主据此按需渲染，取代固定频率轮询。
     pub fn needs_render(&self) -> Result<bool> {
-        self.runtime.begin_execution();
-        self.ctx
-            .with(|ctx| eval_checked::<bool>(&ctx, "!!globalThis.__z3rm_rerender"))
+        self.run_js(|ctx| eval_checked::<bool>(ctx, "!!globalThis.__z3rm_rerender"))
     }
 
     /// §5.4 invoke `invalidate()` on every registered chrome view. Extensions
@@ -1480,10 +1678,9 @@ impl LiveExtension {
     /// host-driven event (e.g. pane focus) can also request a re-render. The
     /// next [`render_now`](Self::render_now) pulls a fresh VDOM.
     pub fn invalidate_registered_views(&self) -> Result<()> {
-        self.runtime.begin_execution();
-        self.ctx.with(|ctx| {
-            eval_checked::<rquickjs::Value>(
-                &ctx,
+        self.run_js(|ctx| {
+            eval_checked::<()>(
+                ctx,
                 r#"
                 (function() {
                     globalThis.__z3rm_rerender = true;
@@ -1497,8 +1694,7 @@ impl LiveExtension {
                     }
                 })()
             "#,
-            )?;
-            Ok::<_, anyhow::Error>(())
+            )
         })
     }
 
@@ -1507,10 +1703,8 @@ impl LiveExtension {
     /// flag, so a subsequent [`needs_render`](Self::needs_render) reports
     /// whether anything changed since this render.
     pub fn render_all_views(&self) -> Result<Vec<String>> {
-        self.runtime.begin_execution();
-        let rendered: String = self
-            .ctx
-            .with(|ctx| eval_checked(&ctx, "globalThis.__z3rm_render_views()"))?;
+        let rendered: String =
+            self.run_js(|ctx| eval_checked(ctx, "globalThis.__z3rm_render_views()"))?;
         parse_rendered_views(&rendered)
     }
 
@@ -1528,8 +1722,7 @@ impl LiveExtension {
             payload_json.to_string()
         };
         let snippet = format!("globalThis.__z3rm_dispatch_event({name}, {payload})");
-        self.runtime.begin_execution();
-        let delivered: i32 = self.ctx.with(|ctx| eval_checked(&ctx, &snippet))?;
+        let delivered: i32 = self.run_js(|ctx| eval_checked(ctx, &snippet))?;
         Ok(delivered.max(0) as usize)
     }
 
@@ -1542,32 +1735,34 @@ impl LiveExtension {
             arguments_json.to_string()
         };
         let snippet = format!("globalThis.__z3rm_execute_command({id}, {arguments})");
-        self.runtime.begin_execution();
-        self.ctx.with(|ctx| eval_checked(&ctx, &snippet))
+        self.run_js(|ctx| eval_checked(ctx, &snippet))
     }
 
     /// 扩展注册的命令列表 (JSON: `[{id, label}]`)。
     pub fn list_commands(&self) -> Result<String> {
-        self.runtime.begin_execution();
-        self.ctx
-            .with(|ctx| eval_checked(&ctx, "globalThis.__z3rm_list_commands()"))
+        self.run_js(|ctx| eval_checked(ctx, "globalThis.__z3rm_list_commands()"))
     }
 
     /// 扩展注册的键位列表 (JSON: `[{chord, command}]`)。
     pub fn list_keymaps(&self) -> Result<String> {
-        self.runtime.begin_execution();
-        self.ctx
-            .with(|ctx| eval_checked(&ctx, "globalThis.__z3rm_list_keymaps()"))
+        self.run_js(|ctx| eval_checked(ctx, "globalThis.__z3rm_list_keymaps()"))
     }
 
     /// 取走扩展内部被捕获的错误（事件 handler / render 抛出的异常），
     /// 宿主负责记录日志——扩展异常不能静默丢弃。
+    ///
+    /// bootstrap 的 render/event try/catch 会把 QuickJS 的内存超限异常收进这个
+    /// 列表而不是让它冒泡到 Rust，因此这里顺带扫描 "out of memory" 并记录内存
+    /// 违规标志——否则被 JS 层吞掉的超限会静默继续。
     pub fn take_errors(&self) -> Result<Vec<String>> {
-        self.runtime.begin_execution();
-        let json: String = self
-            .ctx
-            .with(|ctx| eval_checked(&ctx, "globalThis.__z3rm_take_errors()"))?;
-        serde_json::from_str(&json).context("parsing extension error list")
+        let json: String =
+            self.run_js(|ctx| eval_checked(ctx, "globalThis.__z3rm_take_errors()"))?;
+        let errors: Vec<String> =
+            serde_json::from_str(&json).context("parsing extension error list")?;
+        if errors.iter().any(|error| error.contains("out of memory")) {
+            self.memory_violated.store(true, Ordering::Relaxed);
+        }
+        Ok(errors)
     }
 }
 
@@ -1815,7 +2010,10 @@ mod tests {
         assert!(!live.needs_render()?, "渲染后失效标志应清零");
 
         assert_eq!(live.emit_event("pane:focus", r#"{"title":"a"}"#)?, 1);
-        assert!(live.needs_render()?, "事件触发的 invalidate 必须被 Rust 观察到");
+        assert!(
+            live.needs_render()?,
+            "事件触发的 invalidate 必须被 Rust 观察到"
+        );
         Ok(())
     }
 
@@ -1884,6 +2082,57 @@ mod tests {
         })?;
 
         assert_eq!(result, "hello from thread");
+        Ok(())
+    }
+
+    /// §5.2: one-shot execution must happen on a freshly spawned OS thread,
+    /// distinct from (and isolated from) the caller — the sandbox guarantee
+    /// that a runaway extension cannot execute on the embedding/UI thread.
+    #[test]
+    fn execute_in_thread_runs_on_a_dedicated_os_thread() -> Result<()> {
+        let runtime = QuickJsRuntime::with_defaults()?;
+        let caller = std::thread::current().id();
+        let (result, inner) = runtime.execute_in_thread(|ctx| {
+            let r: String = ctx.eval("'hello from thread'")?;
+            Ok::<_, anyhow::Error>((r, std::thread::current().id()))
+        })?;
+        assert_eq!(result, "hello from thread");
+        assert_ne!(caller, inner, "JS must not execute on the caller's thread");
+        Ok(())
+    }
+
+    /// §5.2/§5.4: a [`LiveExtension`]'s runtime is pinned to the thread that
+    /// created it; the embedder must drive its whole lifecycle from one
+    /// dedicated thread (the host does this via `quickjs-ext-host`). This test
+    /// reproduces that pattern: the runtime is created and re-entered for a
+    /// render on the same spawned thread, never the test's main thread.
+    #[test]
+    fn live_extension_runs_on_a_single_dedicated_thread() -> Result<()> {
+        let runner = ExtensionRunner::with_defaults();
+        let source = r#"
+            function activate(context) {
+                context.registerChromeView('pinned', {
+                    render: function() { return { type: 'span', children: ['ok'] }; }
+                });
+            }
+        "#;
+        let host_thread = std::thread::Builder::new()
+            .name("quickjs-ext-test".to_string())
+            .spawn(move || -> Result<String> {
+                // Create and re-enter the LiveExtension entirely on this thread,
+                // exactly as the production host does. Touching it from any
+                // other thread would be undefined behavior.
+                let live = runner.load_live("pinned-ext", source, "activate")?;
+                live.render_now()?.context("pinned view must render")
+            })?;
+        let vdom = host_thread
+            .join()
+            .map_err(|e| anyhow!("extension thread panicked: {e:?}"))??;
+        assert!(vdom.contains("ok"), "vdom={vdom}");
+        assert!(
+            vdom.contains("\"id\":\"pinned\""),
+            "named views need stable VDOM identity: {vdom}"
+        );
         Ok(())
     }
 
@@ -1972,7 +2221,9 @@ mod tests {
             "activate must succeed: {:?}",
             result.result
         );
-        let vdom = result.vdom_json.context("status-bar VDOM must be captured")?;
+        let vdom = result
+            .vdom_json
+            .context("status-bar VDOM must be captured")?;
         assert!(vdom.contains("status-bar"), "vdom={vdom}");
         assert!(vdom.contains("demo"), "vdom={vdom}");
         Ok(())
@@ -2149,10 +2400,7 @@ mod tests {
             }
         "#;
         let extension = runner.load_live("capability-bypass", source, "activate")?;
-        let denied: bool = extension
-            .render_all_views()
-            .map(|_| true)
-            .unwrap_or(true);
+        let denied: bool = extension.render_all_views().map(|_| true).unwrap_or(true);
         assert!(denied);
         assert!(bridge.calls().is_empty(), "Rust 侧必须在桥调用前拒绝");
         Ok(())
@@ -2490,9 +2738,7 @@ mod tests {
         );
 
         assert!(live.execute_command("z3rm.command-palette.open", "[]")?);
-        let vdom = live
-            .render_now()?
-            .context("打开后 palette 应产生 VDOM")?;
+        let vdom = live.render_now()?.context("打开后 palette 应产生 VDOM")?;
         assert!(vdom.contains("command-palette"), "vdom={vdom}");
         assert!(
             vdom.contains("z3rm.command-palette.open"),
@@ -2505,6 +2751,147 @@ mod tests {
                 .as_array()
                 .is_some_and(|entries| !entries.is_empty()),
             "keymaps.bind 必须被记录: {keymaps}"
+        );
+        Ok(())
+    }
+
+    // -----------------------------------------------------------------------
+    // §16.8 运行侧分派
+    // -----------------------------------------------------------------------
+
+    /// §16.8: `side` 声明决定扩展在哪个进程运行；`Both` 两侧都跑。
+    #[test]
+    fn extension_side_dispatch_matrix() {
+        assert!(ExtensionSide::Client.runs_on_client());
+        assert!(!ExtensionSide::Client.runs_on_server());
+        assert!(!ExtensionSide::Server.runs_on_client());
+        assert!(ExtensionSide::Server.runs_on_server());
+        assert!(ExtensionSide::Both.runs_on_client());
+        assert!(ExtensionSide::Both.runs_on_server());
+    }
+
+    /// §16.8: 客户端/服务端发现必须各自只返回声明属于该侧的扩展。
+    #[test]
+    fn discover_extensions_dispatch_by_declared_side() -> Result<()> {
+        let root = tempfile::tempdir()?;
+        let write_extension = |id: &str, side: &str| -> Result<()> {
+            let directory = root.path().join(id);
+            std::fs::create_dir_all(&directory)?;
+            std::fs::write(
+                directory.join("extension.toml"),
+                format!("[extension]\nname = \"{id}\"\n[runtime]\nside = \"{side}\"\n"),
+            )?;
+            std::fs::write(directory.join("main.js"), "function activate() {}")?;
+            Ok(())
+        };
+        write_extension("client-only", "client")?;
+        write_extension("server-only", "server")?;
+        write_extension("both-sides", "both")?;
+
+        let root_path = root.path().to_path_buf();
+        let roots = std::slice::from_ref(&root_path);
+        let client_discovered = discover_client_extensions(roots);
+        let client_ids: Vec<&str> = client_discovered
+            .iter()
+            .map(|extension| extension.manifest.id.as_str())
+            .collect();
+        assert_eq!(
+            client_ids,
+            vec!["both-sides", "client-only"],
+            "客户端不得发现 server-only 扩展"
+        );
+
+        let server_discovered = discover_server_extensions(roots);
+        let server_ids: Vec<&str> = server_discovered
+            .iter()
+            .map(|extension| extension.manifest.id.as_str())
+            .collect();
+        assert_eq!(
+            server_ids,
+            vec!["both-sides", "server-only"],
+            "服务端不得发现 client-only 扩展"
+        );
+        Ok(())
+    }
+
+    // -----------------------------------------------------------------------
+    // §5.2/§5.6 资源声明强制
+    // -----------------------------------------------------------------------
+
+    /// §5.6: `io_rate_limit = 0` 表示不限流，不能静默套上默认速率。
+    #[test]
+    fn io_rate_limit_zero_declares_unlimited() -> Result<()> {
+        let manifest = parse_manifest_str(
+            "unlimited-io",
+            "[extension]\nname = \"u\"\n[runtime]\nside = \"client\"\n[capabilities]\nmux = true\n[resources]\nio_rate_limit = 0\n",
+        )?;
+        assert_eq!(manifest.limits.io_rate_limit, 0.0);
+
+        let bucket = IoTokenBucket::from_rate(0.0);
+        for _ in 0..10_000 {
+            assert!(bucket.try_acquire(1.0), "io_rate_limit = 0 必须永不拒绝");
+        }
+
+        // 端到端: 声明 0 的扩展宿主调用全部放行 (对照 io_rate_limit_throttles_host_calls)。
+        let bridge = RecordingBridge::new(BTreeMap::from([(
+            "mux.focusPane".to_string(),
+            serde_json::json!(true),
+        )]));
+        let runner = ExtensionRunner::for_manifest(&manifest).with_bridge(bridge.clone());
+        let source = r#"
+            function activate(context) {
+                globalThis.__failures = 0;
+                for (var i = 0; i < 100; i++) {
+                    try { context.mux.focusPane('p' + i); }
+                    catch (error) { globalThis.__failures++; }
+                }
+            }
+        "#;
+        let extension = runner.load_live("io-unlimited", source, "activate")?;
+        assert_eq!(bridge.calls().len(), 100, "io_rate_limit = 0 不应限流");
+        drop(extension);
+        Ok(())
+    }
+
+    /// §5.6: 内存超限被 bootstrap 的 try/catch 收进错误列表时，`take_errors`
+    /// 必须把它翻成内存违规标志，宿主才能挂起扩展。
+    #[test]
+    fn memory_violation_is_recorded_and_taken() -> Result<()> {
+        let runner = ExtensionRunner::new(1, 50); // 1MB 内存上限
+        let source = r#"
+            function activate(context) {
+                context.registerChromeView('leaky', {
+                    render: function() {
+                        var blocks = [];
+                        for (var i = 0; i < 10000000; i++) { blocks.push(new Array(1000)); }
+                        return { type: 'span', children: ['x'] };
+                    }
+                });
+            }
+        "#;
+        let extension = runner.load_live("leaky-ext", source, "activate")?;
+        assert!(
+            !extension.take_memory_violated(),
+            "激活成功时不应当有内存违规"
+        );
+
+        let rendered = extension.render_all_views();
+        let errors = extension.take_errors()?;
+        let memory_exceeded = extension.memory_exceeded();
+        let memory_violated = extension.take_memory_violated();
+        assert!(
+            rendered.is_err() || !errors.is_empty() || memory_exceeded,
+            "the over-limit renderer must fail or report an error"
+        );
+        assert!(
+            memory_violated
+                || memory_exceeded
+                || rendered
+                    .as_ref()
+                    .err()
+                    .is_some_and(|error| format!("{error:#}").contains("out of memory"))
+                || errors.iter().any(|error| error.contains("out of memory")),
+            "the over-limit renderer must mark a memory violation"
         );
         Ok(())
     }

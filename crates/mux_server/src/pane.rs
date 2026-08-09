@@ -51,6 +51,9 @@ pub struct Pane {
     pub term: Arc<parking_lot::Mutex<Term<PaneEventListener>>>,
     /// §3.3 generation counter (每次 grid-affecting 变化递增)。
     pub generation: AtomicU64,
+    /// Monotonic sequence for raw PaneOutput byte batches. Read/written under
+    /// `commit` so fetch_grid_update can return an atomic grid/byte-stream fence.
+    output_sequence: AtomicU64,
     /// §3.3 grid diff ring (默认 64 entries)。
     pub grid_diff_ring: Arc<parking_lot::RwLock<GridDiffRing>>,
     pub alive: AtomicBool,
@@ -103,6 +106,8 @@ pub struct Pane {
     /// session.panes 中清理。该字段用 Mutex<Option<...>> 以支持一次性 take,
     /// 避免 EOF 路径 + Exit 事件路径重复广播。
     exit_hook: parking_lot::Mutex<Option<Arc<dyn Fn() + Send + Sync>>>,
+    /// §16.8 Daemon-side observer for pane notifications.
+    notification_hook: parking_lot::Mutex<Option<Arc<dyn Fn(MuxNotification) + Send + Sync>>>,
     /// §16.6 Optional hook for ClipboardStore events from the emulator.
     clipboard_hook: parking_lot::Mutex<Option<Box<dyn Fn(String) + Send>>>,
 }
@@ -354,7 +359,7 @@ pub(crate) struct PaneMetadataSnapshot {
 
 #[derive(Default)]
 struct HistoryMutationObserver {
-    may_change: bool,
+    may_rotate: bool,
     /// Set by the operations that discard or renumber scrollback wholesale, as
     /// opposed to appending to it. Their size is not derivable from scrollback
     /// growth, so they retire the absolute row numbering.
@@ -363,55 +368,49 @@ struct HistoryMutationObserver {
 
 impl HistoryMutationObserver {
     fn reset(&mut self) {
-        self.may_change = false;
+        self.may_rotate = false;
         self.may_break_addressing = false;
     }
 
-    fn mark(&mut self) {
-        self.may_change = true;
+    fn mark_rotation(&mut self) {
+        self.may_rotate = true;
     }
 
     fn mark_addressing_break(&mut self) {
-        self.may_change = true;
         self.may_break_addressing = true;
     }
 }
 
 impl Handler for HistoryMutationObserver {
-    fn input(&mut self, _: char) {
-        self.mark();
-    }
+    fn input(&mut self, _: char) {}
 
     fn linefeed(&mut self) {
-        self.mark();
+        self.mark_rotation();
     }
 
     fn newline(&mut self) {
-        self.mark();
+        self.mark_rotation();
     }
 
     fn scroll_up(&mut self, _: usize) {
-        self.mark();
+        self.mark_rotation();
     }
 
     fn scroll_down(&mut self, _: usize) {
-        self.mark();
+        self.mark_rotation();
     }
 
     fn insert_blank_lines(&mut self, _: usize) {
-        self.mark();
+        self.mark_rotation();
     }
 
     fn delete_lines(&mut self, _: usize) {
-        self.mark();
+        self.mark_rotation();
     }
 
     fn clear_screen(&mut self, mode: ClearMode) {
-        // `ClearMode::Saved` is ED 3, which drops the whole scrollback.
         if matches!(mode, ClearMode::Saved) {
             self.mark_addressing_break();
-        } else {
-            self.mark();
         }
     }
 
@@ -420,20 +419,14 @@ impl Handler for HistoryMutationObserver {
     }
 
     fn reverse_index(&mut self) {
-        self.mark();
+        self.mark_rotation();
     }
 
-    fn set_color(&mut self, _: usize, _: Rgb) {
-        self.mark();
-    }
+    fn set_color(&mut self, _: usize, _: Rgb) {}
 
-    fn reset_color(&mut self, _: usize) {
-        self.mark();
-    }
+    fn reset_color(&mut self, _: usize) {}
 
-    fn decaln(&mut self) {
-        self.mark();
-    }
+    fn decaln(&mut self) {}
 
     fn set_private_mode(&mut self, mode: PrivateMode) {
         // DECCOLM reflows the grid and 1049 swaps to a grid with no scrollback;
@@ -802,6 +795,7 @@ impl Pane {
             command: command_str,
             term: Arc::new(parking_lot::Mutex::new(term)),
             generation: AtomicU64::new(0),
+            output_sequence: AtomicU64::new(0),
             grid_diff_ring: Arc::new(parking_lot::RwLock::new(GridDiffRing::new(64))),
             alive: AtomicBool::new(true),
             cols: AtomicU64::new(cols as u64),
@@ -833,6 +827,7 @@ impl Pane {
             }),
             exit_hook: parking_lot::Mutex::new(None),
             clipboard_hook: parking_lot::Mutex::new(None),
+            notification_hook: parking_lot::Mutex::new(None),
         });
 
         // §3.1 启动 PTY read loop — 后台线程持续读取 PTY 输出, 喂给 alacritty,
@@ -943,17 +938,16 @@ impl Pane {
         state.osc_scanner.scan(bytes, &mut state.osc_events);
 
         let commit = self.commit.lock();
-        let history_may_change = {
-            state.history_observer.reset();
-            state
-                .history_processor
-                .advance(&mut state.history_observer, bytes);
-            state.history_observer.may_change
-        };
+        state.history_observer.reset();
+        state
+            .history_processor
+            .advance(&mut state.history_observer, bytes);
         let (
             render_state_changed,
             history_size_before,
             history_size_after,
+            cursor_row_unchanged,
+            modes_after,
             alt_screen_changed,
             addressing,
         ) = {
@@ -982,16 +976,27 @@ impl Pane {
                 before != after,
                 history_size_before,
                 term.grid().history_size(),
+                before.0.line == after.0.line,
+                after.3,
                 alt_screen_before != term.mode().contains(TermMode::ALT_SCREEN),
                 addressing,
             )
         };
-        let (dirty_rows, fully_damaged) = self.collect_dirty_rows();
-        // Full-capacity scrolls keep history_size unchanged. VTE observer state
-        // identifies batches capable of changing history/layout/palette, while
-        // Alacritty full damage confirms the change escaped a local row diff.
+        self.set_bracketed_paste_mode(
+            modes_after & mux_protocol::terminal_mode::BRACKETED_PASTE != 0,
+        );
+        let (dirty_rows, _fully_damaged) = self.collect_dirty_rows();
+        // A VTE scroll can rotate a full history ring without changing its
+        // length. Ordinary input and color changes do not invalidate the
+        // history checkpoint; only a size change, a possible rotation at the
+        // configured capacity, or an operation that readdresses rows does.
+        let history_capacity = self.scrollback_capacity.load(Ordering::Acquire);
         let history_changed = history_size_before != history_size_after
-            || (history_size_after != 0 && history_may_change && fully_damaged);
+            || (history_capacity > 0
+                && history_size_after as u64 >= history_capacity
+                && cursor_row_unchanged
+                && state.history_observer.may_rotate)
+            || (history_size_after != 0 && state.history_observer.may_break_addressing);
         if history_changed {
             self.history_version.fetch_add(1, Ordering::AcqRel);
         }
@@ -1031,9 +1036,13 @@ impl Pane {
         } else {
             false
         };
+        // Advance the raw-byte fence only after the authoritative emulator and
+        // generation ring include this entire PTY batch. fetch_grid_update takes
+        // the same commit lock, so its fence is an atomic grid/stream checkpoint.
+        let output_sequence = self.advance_output_sequence();
         drop(commit);
 
-        self.broadcast_pane_output(bytes);
+        self.broadcast_pane_output(bytes, output_sequence);
         self.handle_pending_events();
         for event in &state.osc_events {
             if let OscEvent::Cwd(uri) = event {
@@ -1215,12 +1224,13 @@ impl Pane {
         self.flush_pending_notify(state, coalescer);
     }
 
-    fn broadcast_pane_output(&self, bytes: &[u8]) {
+    fn broadcast_pane_output(&self, bytes: &[u8], output_sequence: u64) {
         self.broadcast_notification(MuxNotification {
             event: Some(mux_protocol::notification::Event::PaneOutput(
                 mux_protocol::PaneOutputChunk {
                     pane_id: self.id.clone(),
                     data: bytes.to_vec(),
+                    output_sequence,
                 },
             )),
         });
@@ -1280,6 +1290,9 @@ impl Pane {
     }
 
     fn broadcast_notification(&self, notification: MuxNotification) {
+        if let Some(hook) = self.notification_hook.lock().clone() {
+            hook(notification.clone());
+        }
         self.subscribers
             .write()
             .retain(|_client_id, subscriber| subscriber.send(notification.clone()).is_ok());
@@ -1295,6 +1308,11 @@ impl Pane {
 
     pub fn remove_subscriber(&self, client_id: &str) {
         self.subscribers.write().remove(client_id);
+    }
+
+    /// Install or replace the daemon-side observer used by server extensions.
+    pub fn set_notification_hook(&self, hook: Arc<dyn Fn(MuxNotification) + Send + Sync>) {
+        *self.notification_hook.lock() = Some(hook);
     }
 
     /// Drain Alacritty side effects. Grid-affecting state is compared around
@@ -1354,6 +1372,17 @@ impl Pane {
 
     pub fn get_generation(&self) -> u64 {
         self.generation.load(Ordering::Acquire)
+    }
+
+    /// Advance while holding `commit`; saturate instead of wrapping so a
+    /// multi-year daemon can never make an old sequence appear new again.
+    fn advance_output_sequence(&self) -> u64 {
+        self.output_sequence
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |current| {
+                Some(current.saturating_add(1))
+            })
+            .map(|previous| previous.saturating_add(1))
+            .unwrap_or(u64::MAX)
     }
 
     /// §16.11 Apply hot-reloaded scrollback capacity to the authoritative grid.
@@ -1428,17 +1457,20 @@ impl Pane {
     }
 
     /// Fetch one generation checkpoint while excluding every publisher. The
-    /// full-snapshot closure uses the same committed terminal state as `current`.
-    pub fn fetch_grid_update(&self, since_generation: u64) -> grid_sync::GridUpdate {
+    /// returned output sequence is an atomic fence: the grid state incorporates
+    /// every PaneOutput batch through that sequence.
+    pub fn fetch_grid_update(&self, since_generation: u64) -> (grid_sync::GridUpdate, u64) {
         let _commit = self.commit.lock();
         let ring = self.grid_diff_ring.read();
         let current = self.generation.load(Ordering::Acquire);
-        ring.fetch_update(since_generation, current, || {
+        let output_sequence = self.output_sequence.load(Ordering::Acquire);
+        let update = ring.fetch_update(since_generation, current, || {
             let term = self.term.lock();
             let mut snapshot = snapshot_from_term(&*term);
             snapshot.history_version = self.history_version.load(Ordering::Acquire);
             snapshot
-        })
+        });
+        (update, output_sequence)
     }
 
     /// §3.3 get_full_snapshot — 当前 grid 完整快照。
@@ -1911,6 +1943,46 @@ mod tests {
     }
 
     #[test]
+    fn daemon_notification_hook_receives_emulator_events() {
+        let pane = match Pane::spawn(
+            "notification-hook-pane".to_string(),
+            std::env::temp_dir().to_string_lossy().to_string(),
+            20,
+            5,
+            Some(ShellCommand {
+                program: "/bin/cat".to_string(),
+                ..Default::default()
+            }),
+        ) {
+            Ok(pane) => pane,
+            Err(error) => panic!("spawn notification hook pane: {error}"),
+        };
+        let notifications = Arc::new(Mutex::new(Vec::new()));
+        let captured = notifications.clone();
+        pane.set_notification_hook(Arc::new(move |notification| {
+            captured.lock().push(notification);
+        }));
+
+        pane.events
+            .lock()
+            .push(AlacEvent::Title("extension title".to_string()));
+        pane.handle_pending_events();
+
+        let notifications = notifications.lock();
+        assert!(matches!(
+            notifications.first().and_then(|notification| notification.event.as_ref()),
+            Some(mux_protocol::notification::Event::PaneTitleChanged(changed))
+                if changed.title == "extension title"
+        ));
+        assert!(matches!(
+            notifications
+                .get(1)
+                .and_then(|notification| notification.event.as_ref()),
+            Some(mux_protocol::notification::Event::PaneDirty(_))
+        ));
+    }
+
+    #[test]
     fn subscriber_registration_replaces_and_removes_by_client_id() {
         let pane = match Pane::spawn(
             "subscriber-lifecycle-pane".to_string(),
@@ -1980,12 +2052,16 @@ mod tests {
         let mut state = ReadLoopState::default();
 
         pane.process_pty_bytes(b"baseline", &mut dec, &mut coalescer, &mut state);
+        let (_, baseline_output_sequence) = pane.fetch_grid_update(0);
+        assert_eq!(baseline_output_sequence, 1);
         assert_eq!(pane.get_generation(), 1);
 
         pane.process_pty_bytes(b"\x1b[?1h\x1b[?2004h", &mut dec, &mut coalescer, &mut state);
 
         assert_eq!(pane.get_generation(), 2);
-        match pane.fetch_grid_update(1) {
+        let (update, output_sequence) = pane.fetch_grid_update(1);
+        assert_eq!(output_sequence, 2);
+        match update {
             grid_sync::GridUpdate::FullSnapshot { snapshot, .. } => {
                 assert_ne!(snapshot.modes & mux_protocol::terminal_mode::APP_CURSOR, 0);
                 assert_ne!(
@@ -2059,13 +2135,45 @@ mod tests {
         pane.process_pty_bytes(b"\x1b[?1h", &mut dec, &mut coalescer, &mut state);
 
         assert_eq!(pane.get_scrollback_version(), history_version);
-        match pane.fetch_grid_update(generation) {
+        match pane.fetch_grid_update(generation).0 {
             grid_sync::GridUpdate::FullSnapshot { snapshot, .. } => {
                 assert_eq!(snapshot.history_version, history_version);
                 assert_ne!(snapshot.modes & mux_protocol::terminal_mode::APP_CURSOR, 0);
             }
             update => panic!("expected mode-only full snapshot, got {update:?}"),
         }
+    }
+
+    #[test]
+    fn visible_input_does_not_advance_history_version() {
+        let pane = match Pane::spawn_with_session(
+            "visible-input-history-pane".to_string(),
+            String::new(),
+            std::env::temp_dir().to_string_lossy().to_string(),
+            4,
+            2,
+            Some(ShellCommand {
+                program: "/bin/cat".to_string(),
+                ..Default::default()
+            }),
+            10,
+        ) {
+            Ok(pane) => pane,
+            Err(error) => panic!("spawn visible input history test pane: {error}"),
+        };
+        let _ = pane.collect_dirty_rows();
+        let mut dec = Dec2026Parser::new();
+        let mut coalescer = AdaptiveCoalescer::new();
+        let mut state = ReadLoopState::default();
+
+        pane.process_pty_bytes(b"A\r\nB\r\n", &mut dec, &mut coalescer, &mut state);
+        let history_version = pane.get_scrollback_version();
+        let generation = pane.get_generation();
+
+        pane.process_pty_bytes(b"xy", &mut dec, &mut coalescer, &mut state);
+
+        assert_eq!(pane.get_scrollback_version(), history_version);
+        assert!(pane.get_generation() > generation);
     }
 
     #[test]
@@ -2276,7 +2384,7 @@ mod tests {
         record_viewport(&pane, "second-client", 60, 20);
         assert!(pane.get_generation() > baseline);
 
-        match pane.fetch_grid_update(baseline) {
+        match pane.fetch_grid_update(baseline).0 {
             grid_sync::GridUpdate::FullSnapshot { snapshot, .. } => {
                 assert_eq!((snapshot.cols, snapshot.rows), (60, 20));
             }

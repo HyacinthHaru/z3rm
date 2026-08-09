@@ -81,6 +81,15 @@ pub struct TabBarSettingsContent {
     /// Whether to show the tab bar. Default: true
     pub show: bool,
 
+    /// Whether to show the navigation history buttons. Default: true
+    pub show_nav_history_buttons: Option<bool>,
+
+    /// Whether to show the tab bar buttons. Default: true
+    pub show_tab_bar_buttons: Option<bool>,
+
+    /// Whether to show the pinned tabs in a separate row. Default: false
+    pub show_pinned_tabs_in_separate_row: Option<bool>,
+
     /// Whether to show the middle click to close tab behavior. Default: true
     pub middle_click_to_close: bool,
 
@@ -147,7 +156,9 @@ pub struct ItemSettingsContent {
 }
 
 /// Position of the close button within a tab.
-#[derive(Copy, Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema, MergeFrom)]
+#[derive(
+    Copy, Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema, MergeFrom,
+)]
 #[serde(rename_all = "lowercase")]
 pub enum ClosePosition {
     Left,
@@ -156,7 +167,9 @@ pub enum ClosePosition {
 }
 
 /// Which tab to activate after the current one is closed.
-#[derive(Copy, Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema, MergeFrom)]
+#[derive(
+    Copy, Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema, MergeFrom,
+)]
 #[serde(rename_all = "snake_case")]
 pub enum ActivateOnClose {
     #[default]
@@ -168,7 +181,9 @@ pub enum ActivateOnClose {
 }
 
 /// Which diagnostic severities to mark on a tab.
-#[derive(Copy, Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema, MergeFrom)]
+#[derive(
+    Copy, Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema, MergeFrom,
+)]
 #[serde(rename_all = "snake_case")]
 pub enum ShowDiagnostics {
     #[default]

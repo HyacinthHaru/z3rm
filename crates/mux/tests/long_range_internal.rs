@@ -414,18 +414,27 @@ async fn test_grid_sync_generation_100_ops() -> Result<()> {
         );
 
         if resp.to_generation > last_gen {
-            // Got new data — verify it's a valid update
+            // The generation advanced, so the fetch must carry the matching
+            // update: a bare NoChange here would let the client cache a stale
+            // grid forever, since fetch(since=to_generation) would then
+            // answer NoChange for state that moved on.
             match &resp.update {
                 Some(FetchUpdate::FullSnapshot(s)) => {
                     assert_eq!(s.cols, 80);
                     assert_eq!(s.rows, 24);
                 }
                 Some(FetchUpdate::Diff(d)) => {
-                    // Diff should have at least one row change
-                    assert!(!d.rows.is_empty() || resp.to_generation == last_gen);
+                    assert!(
+                        !d.rows.is_empty(),
+                        "generation advanced {last_gen} -> {} but the diff carries no rows",
+                        resp.to_generation
+                    );
                 }
                 None => {
-                    // No change is valid if generation didn't increase
+                    anyhow::bail!(
+                        "generation advanced {last_gen} -> {} but fetch returned no update",
+                        resp.to_generation
+                    );
                 }
             }
             last_gen = resp.to_generation;
@@ -471,13 +480,25 @@ async fn test_resize_storm_100_ops() -> Result<()> {
         domain.resize_pane(&pane_id, cols, rows).await?;
 
         if i % 10 == 0 {
-            // Periodically verify grid reflects new size
-            tokio::time::sleep(Duration::from_millis(50)).await;
-            let resp = domain.fetch_grid_update(&pane_id, 0).await?;
-            if let Some(FetchUpdate::FullSnapshot(snapshot)) = resp.update {
-                assert_eq!(snapshot.cols, cols, "cols mismatch at resize {i}");
-                assert_eq!(snapshot.rows, rows, "rows mismatch at resize {i}");
-            }
+            // The resize RPC is acknowledged before this point, so a since-0
+            // fetch must return a FullSnapshot at the new size. Silently
+            // skipping None/Diff here used to let a broken resize pass.
+            let deadline = Instant::now() + Duration::from_secs(5);
+            let snapshot = loop {
+                let resp = domain.fetch_grid_update(&pane_id, 0).await?;
+                match resp.update {
+                    Some(FetchUpdate::FullSnapshot(snapshot)) => break snapshot,
+                    None | Some(FetchUpdate::Diff(_)) => {
+                        anyhow::ensure!(
+                            Instant::now() < deadline,
+                            "fetch(since=0) never returned a FullSnapshot at resize {i}"
+                        );
+                        tokio::time::sleep(Duration::from_millis(20)).await;
+                    }
+                }
+            };
+            assert_eq!(snapshot.cols, cols, "cols mismatch at resize {i}");
+            assert_eq!(snapshot.rows, rows, "rows mismatch at resize {i}");
         }
     }
 
@@ -699,13 +720,35 @@ async fn test_scrollback_fetch_100_ops() -> Result<()> {
     }
     tokio::time::sleep(Duration::from_millis(1000)).await;
 
-    // Ops 81-100: Fetch scrollback at various offsets
-    for i in 0..20 {
+    // Ops 81-100: Fetch scrollback at various offsets. Fetches must succeed —
+    // swallowing an error here used to let a broken scrollback path pass.
+    let first = domain.fetch_scrollback(&pane_id, 0, 0, 16).await?;
+    assert!(
+        first.total_lines > 0,
+        "scrollback must retain the {} echoed lines",
+        80
+    );
+    for i in 0..20u32 {
         let from_line = i * 5;
-        let resp = domain.fetch_scrollback(&pane_id, from_line, 0, 10).await;
-        // Scrollback fetch may fail if not implemented yet — that's OK for now
-        if let Ok(scrollback) = resp {
-            assert!(scrollback.total_lines > 0 || scrollback.lines.is_empty());
+        let resp = domain
+            .fetch_scrollback(&pane_id, from_line, 0, 10)
+            .await
+            .with_context(|| format!("scrollback fetch failed at offset {from_line}"))?;
+        assert_eq!(
+            resp.total_lines, first.total_lines,
+            "total_lines moved while the pane was idle"
+        );
+        assert!(
+            resp.lines.len() <= 10,
+            "asked for at most 10 rows at offset {from_line}, got {}",
+            resp.lines.len()
+        );
+        if from_line < first.total_lines {
+            assert!(
+                !resp.lines.is_empty(),
+                "fetching 10 rows from in-range offset {from_line} returned nothing (total {})",
+                first.total_lines
+            );
         }
     }
 

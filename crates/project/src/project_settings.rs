@@ -527,9 +527,7 @@ impl Settings for ProjectSettings {
                 button: true,
                 request_timeout: DEFAULT_LSP_REQUEST_TIMEOUT_SECS,
                 notifications: LspNotificationSettings {
-                    dismiss_timeout_ms: Some(
-                        lsp_notifications.dismiss_timeout_ms.unwrap_or(5000),
-                    ),
+                    dismiss_timeout_ms: Some(lsp_notifications.dismiss_timeout_ms.unwrap_or(5000)),
                 },
                 semantic_token_rules: settings::SemanticTokenRules::default(),
             },
@@ -545,14 +543,18 @@ impl Settings for ProjectSettings {
                     update_debounce_ms: inline_diagnostics.update_debounce_ms.unwrap_or(150),
                     padding: inline_diagnostics.padding.unwrap_or(4),
                     min_column: inline_diagnostics.min_column.unwrap_or(0),
-                    max_severity: inline_diagnostics.max_severity.map(|severity| match severity {
-                        settings::DiagnosticSeverityContent::Off => DiagnosticSeverity::Off,
-                        settings::DiagnosticSeverityContent::Error => DiagnosticSeverity::Error,
-                        settings::DiagnosticSeverityContent::Warning => DiagnosticSeverity::Warning,
-                        settings::DiagnosticSeverityContent::Info => DiagnosticSeverity::Info,
-                        settings::DiagnosticSeverityContent::Hint
-                        | settings::DiagnosticSeverityContent::All => DiagnosticSeverity::Hint,
-                    }),
+                    max_severity: inline_diagnostics
+                        .max_severity
+                        .map(|severity| match severity {
+                            settings::DiagnosticSeverityContent::Off => DiagnosticSeverity::Off,
+                            settings::DiagnosticSeverityContent::Error => DiagnosticSeverity::Error,
+                            settings::DiagnosticSeverityContent::Warning => {
+                                DiagnosticSeverity::Warning
+                            }
+                            settings::DiagnosticSeverityContent::Info => DiagnosticSeverity::Info,
+                            settings::DiagnosticSeverityContent::Hint
+                            | settings::DiagnosticSeverityContent::All => DiagnosticSeverity::Hint,
+                        }),
                 },
             },
             git: GitSettings {
@@ -1173,7 +1175,10 @@ mod tests {
         assert!(settings.session.trust_all_worktrees);
         assert_eq!(settings.load_direnv, DirenvSettings::ShellHook);
         assert_eq!(
-            settings.global_lsp_settings.notifications.dismiss_timeout_ms,
+            settings
+                .global_lsp_settings
+                .notifications
+                .dismiss_timeout_ms,
             Some(0)
         );
     }
@@ -1229,7 +1234,10 @@ mod tests {
         assert!(!settings.session.trust_all_worktrees);
         assert_eq!(settings.load_direnv, DirenvSettings::Disabled);
         assert_eq!(
-            settings.global_lsp_settings.notifications.dismiss_timeout_ms,
+            settings
+                .global_lsp_settings
+                .notifications
+                .dismiss_timeout_ms,
             Some(5000)
         );
     }

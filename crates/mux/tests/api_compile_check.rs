@@ -45,6 +45,7 @@ fn test_grid_update_response() {
     let update1 = FetchGridUpdateResponse {
         from_generation: 1,
         to_generation: 2,
+        output_sequence: 0,
         update: Some(fetch_grid_update_response::Update::Diff(diff)),
     };
     assert!(matches!(
@@ -72,6 +73,7 @@ fn test_grid_update_response() {
     let update2 = FetchGridUpdateResponse {
         from_generation: 100,
         to_generation: 105,
+        output_sequence: 0,
         update: Some(fetch_grid_update_response::Update::FullSnapshot(snapshot)),
     };
     assert!(matches!(

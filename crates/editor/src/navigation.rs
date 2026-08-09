@@ -1,5 +1,5 @@
 use super::*;
-use crate::stubs::parse_zed_link;
+use crate::stubs::{find_url_at, find_url_from_range, is_zed_link};
 
 impl Editor {
     pub fn text_layout_details(
@@ -1133,8 +1133,53 @@ impl Editor {
         self.go_to_definition_of_kind(GotoDefinitionKind::Type, true, window, cx)
     }
 
-    pub fn open_url(&mut self, _: &OpenUrl, _window: &mut Window, _cx: &mut Context<Self>) {
-        // 只读编辑器下禁用 URL 打开。
+    pub fn open_url(&mut self, _: &OpenUrl, window: &mut Window, cx: &mut Context<Self>) {
+        let multi_buffer_snapshot = self.buffer.read(cx).snapshot(cx);
+        let selection = self.selections.newest_anchor();
+        let head = selection.head();
+        let tail = selection.tail();
+        let (text, selected) = if head != tail {
+            let start = head.to_offset(&multi_buffer_snapshot);
+            let end = tail.to_offset(&multi_buffer_snapshot);
+            (
+                multi_buffer_snapshot
+                    .text_for_range(start.min(end)..start.max(end))
+                    .collect::<String>(),
+                true,
+            )
+        } else {
+            let point = head.to_point(&multi_buffer_snapshot);
+            (
+                multi_buffer_snapshot
+                    .text_for_range(
+                        Point::new(point.row, 0)
+                            ..Point::new(
+                                point.row,
+                                multi_buffer_snapshot
+                                    .line_len(multi_buffer::MultiBufferRow(point.row)),
+                            ),
+                    )
+                    .collect::<String>(),
+                false,
+            )
+        };
+
+        let url = if selected {
+            find_url_from_range(&text, 0..text.len())
+        } else {
+            let point = head.to_point(&multi_buffer_snapshot);
+            find_url_at(&text, point.column as usize)
+        };
+
+        let Some(url) = url else {
+            return;
+        };
+
+        if is_zed_link(&url) {
+            window.dispatch_action(Box::new(zed_actions::OpenZedUrl { url: url.into() }), cx);
+        } else {
+            cx.open_url(&url);
+        }
     }
 
     pub fn open_selected_filename(
@@ -1158,7 +1203,7 @@ impl Editor {
         let project = self.project.clone();
 
         cx.spawn_in(window, async move |_, cx| {
-            let result = find_file(&buffer, project, buffer_position, cx);
+            let result = cx.update(|_, cx| find_file(&buffer, project, buffer_position, cx))?;
 
             if let Some((_, file_target)) = result {
                 let item = workspace
@@ -1763,7 +1808,7 @@ impl Editor {
                 match first_url_or_file {
                     Some(Either::Left(url)) => {
                         cx.update(|window, cx| {
-                            if parse_zed_link(&url, cx).is_some() {
+                            if is_zed_link(&url) {
                                 window.dispatch_action(
                                     Box::new(zed_actions::OpenZedUrl { url: url.into() }),
                                     cx,

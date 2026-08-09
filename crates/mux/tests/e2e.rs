@@ -593,7 +593,7 @@ async fn e2e_bogus_pane_mutations_return_errors() -> Result<()> {
 
 /// 等待一条满足 `matches` 的通知,或超时失败。
 async fn wait_for_notification<T>(
-    notifications: &async_channel::Receiver<proto::Notification>,
+    notifications: &mux::NotificationReceiver,
     description: &str,
     timeout: Duration,
     mut matches: impl FnMut(&proto::notification::Event) -> Option<T>,

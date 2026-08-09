@@ -278,6 +278,20 @@ thread_local! {
     static CURRENT_ELEMENT_ARENA: Cell<Option<*const RefCell<Arena>>> = const { Cell::new(None) };
 }
 
+/// Whether a window draw is currently in progress on this thread.
+///
+/// This holds exactly while an `ElementArenaScope` is active: nested scopes
+/// restore the previous (still set) arena pointer, so `CURRENT_ELEMENT_ARENA`
+/// is `Some` from the outermost draw's start to its end.
+///
+/// The `on_request_frame` callback uses this to defer draw requests that
+/// arrive re-entrantly while a draw is already on the stack (e.g. via nested
+/// message pumping in the Windows window procedure), instead of running a
+/// nested draw or panicking on the already-borrowed App.
+fn draw_in_progress() -> bool {
+    CURRENT_ELEMENT_ARENA.with(|current| current.get().is_some())
+}
+
 /// Allocates an element in the current arena. Uses the app-specific arena if one
 /// is active (during draw), otherwise falls back to the thread-local ELEMENT_ARENA.
 pub(crate) fn with_element_arena<R>(f: impl FnOnce(&mut Arena) -> R) -> R {
@@ -293,52 +307,122 @@ pub(crate) fn with_element_arena<R>(f: impl FnOnce(&mut Arena) -> R) -> R {
     })
 }
 
-/// RAII guard that sets CURRENT_ELEMENT_ARENA for the duration of a draw operation.
-/// When dropped, restores the previous arena (supporting nested draws).
+/// Scope guard that sets CURRENT_ELEMENT_ARENA for the duration of a draw
+/// operation and tracks the arena's scope depth, so that a nested draw's
+/// `ArenaClearNeeded::clear` is deferred rather than freeing memory the outer
+/// draw still references (see `Arena::clear`).
+///
+/// Call [`ElementArenaScope::exit`] with the same arena that was entered to
+/// obtain the [`ArenaClearNeeded`] token the draw now owes; requiring `exit`
+/// makes it impossible to request a clear before the scope has ended. The
+/// scope's teardown — restoring the thread-local and balancing `begin_scope`
+/// with `end_scope` — happens in `Drop`, so the arena's scope depth stays
+/// balanced on every path, including when a panic unwinds a draw before `exit`
+/// is reached. (If teardown lived only in `exit`, such a panic would leave the
+/// scope depth permanently elevated and defer every future clear, leaking
+/// memory unboundedly.)
 pub(crate) struct ElementArenaScope {
+    /// The entered arena: compared against the argument in `exit`, and
+    /// dereferenced in `Drop` to end its scope (see the SAFETY note there).
+    entered: *const RefCell<Arena>,
     previous: Option<*const RefCell<Arena>>,
+    exited: bool,
 }
 
 impl ElementArenaScope {
     /// Enter a scope where element allocations use the given arena.
     pub(crate) fn enter(arena: &RefCell<Arena>) -> Self {
+        arena.borrow_mut().begin_scope();
         let previous = CURRENT_ELEMENT_ARENA.with(|current| {
             let prev = current.get();
             current.set(Some(arena as *const RefCell<Arena>));
             prev
         });
-        Self { previous }
+        Self {
+            entered: arena as *const RefCell<Arena>,
+            previous,
+            exited: false,
+        }
+    }
+
+    /// End the scope: restores the previously-current arena and ends the
+    /// arena's clear-deferral scope. Returns the token for the arena clear the
+    /// draw now owes; producing it here makes it impossible to request a clear
+    /// before the scope has ended (which would be silently deferred forever).
+    ///
+    /// Panics if passed a different arena than was entered: ending the scope
+    /// of the wrong arena would unbalance two arenas' scope depths, allowing
+    /// one of them to clear while a draw still references its memory.
+    pub(crate) fn exit(mut self, arena: &RefCell<Arena>) -> ArenaClearNeeded {
+        assert!(
+            std::ptr::eq(self.entered, arena),
+            "ElementArenaScope::exit called with a different arena than was entered"
+        );
+        self.exited = true;
+        // Teardown (restoring the thread-local and ending the arena's
+        // clear-deferral scope) runs in `Drop`, which fires both here — `self`
+        // is dropped as `exit` returns, before the token reaches the caller —
+        // and when a panic unwinds the draw before `exit` is reached.
+        ArenaClearNeeded::new(arena)
     }
 }
 
 impl Drop for ElementArenaScope {
     fn drop(&mut self) {
+        // Teardown lives here (rather than in `exit`) so it runs exactly once on
+        // every path: `exit` consumes and drops the guard on the normal path,
+        // and unwinding drops it on the panic path. Balancing `begin_scope` here
+        // keeps the arena's scope depth correct even when a draw panics; if this
+        // only happened in `exit`, a panic between `enter` and `exit` would leave
+        // the depth elevated and defer every future clear.
         CURRENT_ELEMENT_ARENA.with(|current| {
             current.set(self.previous);
         });
+        // SAFETY: `entered` came from a `&RefCell<Arena>` in `enter`, and the
+        // arena (owned by the `App` being drawn) outlives this guard on both the
+        // normal and unwinding paths, since the guard is a local of the draw.
+        unsafe { &*self.entered }.borrow_mut().end_scope();
+        if !self.exited && !std::thread::panicking() {
+            debug_assert!(false, "ElementArenaScope dropped without calling exit()");
+            log::error!(
+                "ElementArenaScope dropped without calling exit(); \
+                 the arena clear for this draw was never requested"
+            );
+        }
     }
 }
 
 /// Returned when the element arena has been used and so must be cleared before the next draw.
 #[must_use]
 pub struct ArenaClearNeeded {
+    /// Identity of the arena that was drawn into. Only ever compared against
+    /// another pointer in `clear`; never dereferenced.
     arena: *const RefCell<Arena>,
 }
 
 impl ArenaClearNeeded {
-    /// Create a new ArenaClearNeeded that will clear the given arena.
-    pub(crate) fn new(arena: &RefCell<Arena>) -> Self {
+    /// Create a new ArenaClearNeeded token for the App whose arena was drawn
+    /// into. Private: the only way to obtain one is [`ElementArenaScope::exit`].
+    fn new(arena: &RefCell<Arena>) -> Self {
         Self {
             arena: arena as *const RefCell<Arena>,
         }
     }
 
-    /// Clear the element arena.
-    pub fn clear(self) {
-        // SAFETY: The arena pointer is valid because ArenaClearNeeded is created
-        // at the end of draw() and must be cleared before the next draw.
-        let arena_cell = unsafe { &*self.arena };
-        arena_cell.borrow_mut().clear();
+    /// Clear the element arena of the App the draw ran against. If an enclosing
+    /// draw is still in progress (this draw was nested inside it), the clear is
+    /// deferred to the enclosing draw's own `ArenaClearNeeded` so that its live
+    /// allocations aren't freed.
+    ///
+    /// Panics if passed a different App than the draw ran against, since
+    /// clearing another App's arena could free memory its draws still
+    /// reference.
+    pub fn clear(self, cx: &mut App) {
+        assert!(
+            std::ptr::eq(self.arena, &cx.element_arena),
+            "ArenaClearNeeded::clear called with a different App than the draw ran against"
+        );
+        cx.element_arena.borrow_mut().clear();
     }
 }
 
@@ -1470,7 +1554,34 @@ impl Window {
             let needs_present = needs_present.clone();
             let next_frame_callbacks = next_frame_callbacks.clone();
             let input_rate_tracker = input_rate_tracker.clone();
+            let mut deferred_force_render = false;
             move |request_frame_options| {
+                // This must be checked before anything else: if this request
+                // arrived re-entrantly while a draw is on this thread's stack
+                // (e.g. via a nested message pump in the Windows window
+                // procedure), drawing would nest draws, and even touching the
+                // App would panic on its already-mutable borrow. Skip instead;
+                // the platform leaves the window invalidated (or re-invalidates
+                // it), so a fresh request arrives once the in-progress draw
+                // unwinds. Remember force_render so the deferred frame still
+                // bypasses the view cache.
+                //
+                // Returning here skips `complete_frame`, which on Wayland would
+                // stall the window's frame callbacks (no `surface.commit()`) —
+                // but calling it would hit the App borrow panic above, and this
+                // branch is unreachable there in practice: only Windows pumps
+                // platform events (and thus requests frames) mid-draw.
+                if draw_in_progress() {
+                    log::debug!("deferring re-entrant window draw request");
+                    deferred_force_render |= request_frame_options.force_render;
+                    return;
+                }
+                // Take the deferred flag first: `||` short-circuits, and leaving
+                // the flag set when this request already forces a render would
+                // force a second, redundant render on the next frame.
+                let force_render =
+                    mem::take(&mut deferred_force_render) || request_frame_options.force_render;
+
                 let thermal_state = handle
                     .update(&mut cx, |_, _, cx| cx.thermal_state())
                     .log_err();
@@ -1478,7 +1589,7 @@ impl Window {
                 // Throttle frame rate based on conditions:
                 // - Thermal pressure (Serious/Critical): cap to ~60fps
                 // - Inactive window (not focused): cap to ~30fps to save energy
-                let min_frame_interval = if !request_frame_options.force_render
+                let min_frame_interval = if !force_render
                     && !request_frame_options.require_presentation
                     && next_frame_callbacks.borrow().is_empty()
                 {
@@ -1496,6 +1607,8 @@ impl Window {
                     if let Some(last_frame) = last_frame_time.get()
                         && now.duration_since(last_frame) < min_interval
                     {
+                        // Don't lose a pending forced render to throttling.
+                        deferred_force_render |= force_render;
                         // Must still complete the frame on platforms that require it.
                         // On Wayland, `surface.frame()` was already called to request the
                         // next frame callback, so we must call `surface.commit()` (via
@@ -1526,18 +1639,18 @@ impl Window {
                     || needs_present.get()
                     || (active.get() && input_rate_tracker.borrow_mut().is_high_rate());
 
-                if invalidator.is_dirty() || request_frame_options.force_render {
+                if invalidator.is_dirty() || force_render {
                     measure("frame duration", || {
                         handle
                             .update(&mut cx, |_, window, cx| {
-                                if request_frame_options.force_render {
+                                if force_render {
                                     // Bypass cached view reuse so we don't replay stale
                                     // atlas tile references after a GPU device recovery.
                                     window.refresh();
                                 }
                                 let arena_clear_needed = window.draw(cx);
                                 window.present();
-                                arena_clear_needed.clear();
+                                arena_clear_needed.clear(cx);
                             })
                             .log_err();
                     })
@@ -2646,7 +2759,7 @@ impl Window {
 
         // Set up the per-App arena for element allocation during this draw.
         // This ensures that multiple test Apps have isolated arenas.
-        let _arena_scope = ElementArenaScope::enter(&cx.element_arena);
+        let arena_scope = ElementArenaScope::enter(&cx.element_arena);
 
         self.invalidate_entities();
         cx.entities.clear_accessed();
@@ -2747,7 +2860,9 @@ impl Window {
             });
         }
 
-        ArenaClearNeeded::new(&cx.element_arena)
+        // Exit the scope to obtain the arena-clear token this draw owes; the
+        // scope's teardown itself happens in `ElementArenaScope::drop`.
+        arena_scope.exit(&cx.element_arena)
     }
 
     fn record_entities_accessed(&mut self, cx: &mut App) {
@@ -4744,7 +4859,7 @@ impl Window {
 
     fn dispatch_key_event(&mut self, event: &dyn Any, cx: &mut App) {
         if self.invalidator.is_dirty() {
-            self.draw(cx).clear();
+            self.draw(cx).clear(cx);
         }
 
         let node_id = self.focus_node_id_in_rendered_frame(self.focus);
@@ -6350,11 +6465,72 @@ pub fn outline(
 
 #[cfg(test)]
 mod tests {
+
     use crate::{
-        AppContext as _, Bounds, Context, IntoElement, ParentElement as _, Pixels, Render,
-        Styled as _, TestAppContext, Window, canvas, div, px, size,
+        AppContext as _, Bounds, Context, FocusHandle, InteractiveElement as _, IntoElement,
+        ParentElement as _, Pixels, Render, StatefulInteractiveElement as _, Styled as _,
+        TestAppContext, Window, WindowOptions, accesskit, canvas, div, px, size,
     };
-    use std::{cell::Cell, rc::Rc};
+    use std::{
+        cell::Cell,
+        rc::Rc,
+        sync::{LazyLock, Mutex, MutexGuard},
+    };
+
+    static HEADLESS_A11Y_ENV_LOCK: LazyLock<Mutex<()>> = LazyLock::new(|| Mutex::new(()));
+
+    fn headless_a11y_env_guard() -> MutexGuard<'static, ()> {
+        HEADLESS_A11Y_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
+    struct EmptyView;
+
+    impl Render for EmptyView {
+        fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
+            div()
+        }
+    }
+
+    struct OpensWindowOnPaint {
+        opened: Rc<Cell<bool>>,
+    }
+
+    impl Render for OpensWindowOnPaint {
+        fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
+            let opened = self.opened.clone();
+            div()
+                .size_full()
+                .child(canvas(
+                    |_, _, _| {},
+                    move |_, _, _window, cx| {
+                        if !opened.replace(true) {
+                            cx.open_window(WindowOptions::default(), |_, cx| cx.new(|_| EmptyView))
+                                .unwrap();
+                        }
+                    },
+                ))
+                .child(div().child("after"))
+        }
+    }
+
+    #[test]
+    fn test_window_opened_during_draw_defers_arena_clear() {
+        let mut cx = TestAppContext::single();
+
+        let opened = Rc::new(Cell::new(false));
+        let window = cx.add_window({
+            let opened = opened.clone();
+            move |_, _| OpensWindowOnPaint { opened }
+        });
+
+        assert!(opened.get());
+        assert_eq!(cx.windows().len(), 2);
+
+        cx.update_window(window.into(), |_, window, cx| window.draw(cx).clear(cx))
+            .unwrap();
+    }
 
     struct RootView {
         explicit_size: bool,
@@ -6393,7 +6569,7 @@ mod tests {
 
         let viewport_size = cx
             .update_window(window.into(), |_, window, cx| {
-                window.draw(cx).clear();
+                window.draw(cx).clear(cx);
                 window.viewport_size()
             })
             .unwrap();
@@ -6414,7 +6590,7 @@ mod tests {
         });
 
         cx.update_window(window.into(), |_, window, cx| {
-            window.draw(cx).clear();
+            window.draw(cx).clear(cx);
         })
         .unwrap();
 
@@ -6430,6 +6606,7 @@ mod tests {
     fn headless_a11y_env_var_activates_debug_tree() {
         // SAFETY: testenv isolation — this test is the only toucher of the
         // env var on its thread, and TestAppContext owns its own state.
+        let _headless_a11y_env_guard = headless_a11y_env_guard();
         unsafe {
             std::env::set_var("Z3RM_A11Y_BUILD_HEADLESS", "1");
         }
@@ -6440,7 +6617,7 @@ mod tests {
         });
         let json = cx
             .update_window(window.into(), |_, window, cx| {
-                window.draw(cx).clear();
+                window.draw(cx).clear(cx);
                 window.debug_a11y_tree_json()
             })
             .unwrap();
@@ -6473,6 +6650,7 @@ mod tests {
     /// terminal output scenario where PaneDirty fires every frame.
     #[test]
     fn headless_a11y_stress_rapid_draw_cycles() {
+        let _headless_a11y_env_guard = headless_a11y_env_guard();
         unsafe {
             std::env::set_var("Z3RM_A11Y_BUILD_HEADLESS", "1");
         }
@@ -6484,12 +6662,231 @@ mod tests {
         for _ in 0..100 {
             let json = cx
                 .update_window(window.into(), |_, window, cx| {
-                    window.draw(cx).clear();
+                    window.draw(cx).clear(cx);
                     window.debug_a11y_tree_json()
                 })
                 .unwrap();
             assert!(json.is_some(), "a11y tree must be available every frame");
         }
+        unsafe {
+            std::env::remove_var("Z3RM_A11Y_BUILD_HEADLESS");
+        }
+    }
+
+    struct ActionRootView {
+        clicked: Rc<Cell<bool>>,
+    }
+
+    impl Render for ActionRootView {
+        fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+            let clicked = self.clicked.clone();
+            div().size_full().child(
+                div()
+                    .id("a11y-button")
+                    .role(accesskit::Role::Button)
+                    .w(px(100.))
+                    .h(px(40.))
+                    .on_click(move |_event, _window, _app| clicked.set(true)),
+            )
+        }
+    }
+
+    struct DeclarativeActionRootView {
+        activated: Rc<Cell<bool>>,
+    }
+
+    impl Render for DeclarativeActionRootView {
+        fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+            let activated = self.activated.clone();
+            div().size_full().child(
+                div()
+                    .id("declarative-a11y-button")
+                    .role(accesskit::Role::Button)
+                    .w(px(100.))
+                    .h(px(40.))
+                    .on_a11y_action(accesskit::Action::Click, move |_data, _window, _cx| {
+                        activated.set(true)
+                    }),
+            )
+        }
+    }
+
+    #[test]
+    fn declarative_a11y_action_reaches_element_listener() {
+        let _headless_a11y_env_guard = headless_a11y_env_guard();
+        unsafe {
+            std::env::set_var("Z3RM_A11Y_BUILD_HEADLESS", "1");
+        }
+        let mut cx = TestAppContext::single();
+        let activated = Rc::new(Cell::new(false));
+        let window = cx.add_window({
+            let activated = activated.clone();
+            move |_, _| DeclarativeActionRootView { activated }
+        });
+
+        let tree_json = cx
+            .update_window(window.into(), |_, window, cx| {
+                window.draw(cx).clear(cx);
+                window.debug_a11y_tree_json()
+            })
+            .unwrap()
+            .expect("a11y tree must be available under Z3RM_A11Y_BUILD_HEADLESS");
+        let button_id = button_a11y_node_id(&tree_json);
+        let delivered =
+            cx.test_window(window.into())
+                .simulate_a11y_action(accesskit::ActionRequest {
+                    target_tree: accesskit::TreeId::ROOT,
+                    target_node: button_id,
+                    action: accesskit::Action::Click,
+                    data: None,
+                });
+        assert!(
+            delivered,
+            "TestWindow must preserve the AccessKit action callback"
+        );
+        cx.run_until_parked();
+        assert!(activated.get(), "declarative element listener must run");
+        unsafe {
+            std::env::remove_var("Z3RM_A11Y_BUILD_HEADLESS");
+        }
+    }
+
+    /// Extracts the `accesskit::NodeId` the built tree assigned to the
+    /// Button node from a `debug_a11y_tree_json` dump. Using the identity
+    /// the tree actually produced (rather than a re-derived guess) makes the
+    /// semantic-action tests verify stable node identity end to end.
+    fn button_a11y_node_id(tree_json: &str) -> accesskit::NodeId {
+        let parsed: serde_json::Value =
+            serde_json::from_str(tree_json).expect("a11y tree JSON must parse");
+        let nodes = parsed["nodes"]
+            .as_object()
+            .expect("a11y tree JSON must contain a nodes object");
+        for node in nodes.values() {
+            if node["aria"]["role"].as_str() == Some("Button") {
+                let id = node["accesskit_id"]
+                    .as_str()
+                    .expect("node must carry an accesskit_id");
+                return accesskit::NodeId(id.parse().expect("accesskit_id must be a u64"));
+            }
+        }
+        panic!("a11y tree must contain a Button node");
+    }
+
+    /// §15.12 Semantic actions: `TestWindow::a11y_init` must preserve the
+    /// AccessKit action callback (it was previously dropped), so a screen
+    /// reader action can be injected deterministically. The injected request
+    /// must travel through the production callback into
+    /// `Window::handle_a11y_action` and invoke the listener registered with
+    /// `Window::on_a11y_action` for the exact node id the built tree
+    /// produced — stable node identity, not an inspection-only path.
+    #[test]
+    fn a11y_semantic_action_reaches_registered_listener() {
+        // SAFETY: testenv isolation — this test is the only toucher of the
+        // env var on its thread, and TestAppContext owns its own state.
+        let _headless_a11y_env_guard = headless_a11y_env_guard();
+        unsafe {
+            std::env::set_var("Z3RM_A11Y_BUILD_HEADLESS", "1");
+        }
+        let mut cx = TestAppContext::single();
+        let window = cx.add_window(|_, _| ActionRootView {
+            clicked: Rc::new(Cell::new(false)),
+        });
+
+        // Draw once so the in-memory a11y builder produces the tree, then
+        // read the node id the tree assigned to the button. Registering the
+        // listener after the last draw matters: `begin_frame` clears
+        // `action_listeners` at the start of each frame.
+        let tree_json = cx
+            .update_window(window.into(), |_, window, cx| {
+                window.draw(cx).clear(cx);
+                window.debug_a11y_tree_json()
+            })
+            .unwrap()
+            .expect("a11y tree must be available under Z3RM_A11Y_BUILD_HEADLESS");
+        let button_id = button_a11y_node_id(&tree_json);
+        cx.run_until_parked();
+
+        let action_received = Rc::new(Cell::new(false));
+        cx.update_window(window.into(), |_, window, _cx| {
+            window.on_a11y_action(button_id, accesskit::Action::Click, {
+                let action_received = action_received.clone();
+                move |_data, _window, _cx| action_received.set(true)
+            });
+        })
+        .unwrap();
+
+        // Inject the semantic action through the preserved platform callback.
+        let delivered =
+            cx.test_window(window.into())
+                .simulate_a11y_action(accesskit::ActionRequest {
+                    target_tree: accesskit::TreeId::ROOT,
+                    target_node: button_id,
+                    action: accesskit::Action::Click,
+                    data: None,
+                });
+        assert!(
+            delivered,
+            "TestWindow must preserve the AccessKit action callback"
+        );
+        // Pump the GPUI dispatcher so the production action channel task
+        // delivers the request to `Window::handle_a11y_action`.
+        cx.run_until_parked();
+
+        assert!(
+            action_received.get(),
+            "a11y action must reach the listener registered for node {button_id:?}"
+        );
+        unsafe {
+            std::env::remove_var("Z3RM_A11Y_BUILD_HEADLESS");
+        }
+    }
+
+    /// §15.12 Built-in action handling: with no listener registered for a
+    /// node, `Action::Click` must still produce the real GPUI event effect —
+    /// synthesized mouse down/up at the node's bounds center — firing the
+    /// element's actual click handler.
+    #[test]
+    fn a11y_click_action_dispatches_real_click_event() {
+        // SAFETY: testenv isolation — this test is the only toucher of the
+        // env var on its thread, and TestAppContext owns its own state.
+        let _headless_a11y_env_guard = headless_a11y_env_guard();
+        unsafe {
+            std::env::set_var("Z3RM_A11Y_BUILD_HEADLESS", "1");
+        }
+        let mut cx = TestAppContext::single();
+        let clicked = Rc::new(Cell::new(false));
+        let window = cx.add_window({
+            let clicked = clicked.clone();
+            move |_, _| ActionRootView { clicked }
+        });
+
+        let tree_json = cx
+            .update_window(window.into(), |_, window, cx| {
+                window.draw(cx).clear(cx);
+                window.debug_a11y_tree_json()
+            })
+            .unwrap()
+            .expect("a11y tree must be available under Z3RM_A11Y_BUILD_HEADLESS");
+        let button_id = button_a11y_node_id(&tree_json);
+
+        let delivered =
+            cx.test_window(window.into())
+                .simulate_a11y_action(accesskit::ActionRequest {
+                    target_tree: accesskit::TreeId::ROOT,
+                    target_node: button_id,
+                    action: accesskit::Action::Click,
+                    data: None,
+                });
+        assert!(
+            delivered,
+            "TestWindow must preserve the AccessKit action callback"
+        );
+        cx.run_until_parked();
+
+        assert!(
+            clicked.get(),
+            "a11y Click must dispatch a real mouse click to the element at the node's bounds"
+        );
         unsafe {
             std::env::remove_var("Z3RM_A11Y_BUILD_HEADLESS");
         }

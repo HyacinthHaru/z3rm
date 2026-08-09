@@ -192,14 +192,21 @@ fn possibly_open_target(
                             active_editor
                                 .downgrade()
                                 .update_in(cx, |editor, window, cx| {
-                                    editor.go_to_singleton_buffer_point(
-                                        language::Point::new(
-                                            row.saturating_sub(1),
-                                            col.saturating_sub(1),
-                                        ),
-                                        window,
-                                        cx,
-                                    )
+                                    if let Some(buffer) =
+                                        editor.buffer().read(cx).as_singleton()
+                                    {
+                                        // The external row/column counts characters,
+                                        // not bytes; convert so the cursor lands at the
+                                        // right UTF-8 byte point on non-ASCII lines.
+                                        let point = buffer
+                                            .read(cx)
+                                            .snapshot()
+                                            .point_from_external_input(
+                                                row.saturating_sub(1),
+                                                col.saturating_sub(1),
+                                            );
+                                        editor.go_to_singleton_buffer_point(point, window, cx);
+                                    }
                                 })
                                 .log_err();
                         }
@@ -220,6 +227,7 @@ mod tests {
     use gpui::{AppContext as _, TestAppContext};
     use project::Project;
     use serde_json::json;
+    use settings::SettingsStore;
     use std::path::{Path, PathBuf};
     use terminal::{
         HoveredWord, Point, Range, TerminalBuilder,
@@ -241,6 +249,8 @@ mod tests {
         let fs = app_cx.update(AppState::test).fs.as_fake().clone();
 
         app_cx.update(|cx| {
+            let settings = SettingsStore::test(cx);
+            cx.set_global(settings);
             theme_settings::init(theme::LoadThemes::JustBase, cx);
             editor::init(cx);
         });

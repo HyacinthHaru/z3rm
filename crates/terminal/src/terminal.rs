@@ -1137,6 +1137,7 @@ impl TerminalBuilder {
             term,
             term_config: config,
             output_processor: Processor::<StdSyncHandler>::new(),
+            output_previous_byte_was_cr: false,
             title_override: None,
             events: VecDeque::with_capacity(10),
             last_content: Content {
@@ -1415,6 +1416,7 @@ impl TerminalBuilder {
                 term,
                 term_config: config,
                 output_processor: Processor::<StdSyncHandler>::new(),
+                output_previous_byte_was_cr: false,
                 title_override: terminal_title_override,
                 events: VecDeque::with_capacity(10), //Should never get this high.
                 last_content: Default::default(),
@@ -1600,6 +1602,9 @@ pub struct Terminal {
     term: Arc<AlacrittyTermLock>,
     term_config: AlacrittyTermConfig,
     output_processor: Processor<StdSyncHandler>,
+    /// Streaming LF normalization state for non-PTY injected output. PTY bytes
+    /// use `write_pty_output` and bypass normalization entirely.
+    output_previous_byte_was_cr: bool,
     events: VecDeque<InternalEvent>,
     /// This is only used for mouse mode cell change detection
     last_mouse: Option<(Point, SelectionSide)>,
@@ -2067,10 +2072,21 @@ impl Terminal {
         self.last_content.terminal_bounds = bounds;
         let term = self.term.clone();
         let mut term = term.lock_unfair();
-        apply_structured_snapshot(&mut term, snapshot, bounds);
+        let history_capacity = self
+            .template
+            .max_scroll_history_lines
+            .unwrap_or(DEFAULT_SCROLL_HISTORY_LINES)
+            .min(MAX_SCROLL_HISTORY_LINES);
+        apply_structured_snapshot(&mut term, snapshot, bounds, history_capacity);
         term.selection = None;
         self.last_content = make_content(&term, &self.last_content, &self.image_placements);
         drop(term);
+
+        // A snapshot is a parser checkpoint as well as a grid checkpoint. Any
+        // partial escape sequence buffered by the incremental byte path belongs
+        // to the pre-snapshot stream and must not mutate the replacement grid.
+        self.output_processor = Processor::<StdSyncHandler>::new();
+        self.output_previous_byte_was_cr = false;
 
         self.selection_head = None;
         self.selection_phase = SelectionPhase::Ended;
@@ -2130,18 +2146,30 @@ impl Terminal {
         apply_config(&self.term, &self.term_config);
     }
 
+    /// Inject non-PTY output, normalizing lone LF to CRLF across call boundaries.
     pub fn write_output(&mut self, bytes: &[u8], cx: &mut Context<Self>) {
-        // Inject bytes directly into the terminal emulator and refresh the UI.
-        // This bypasses the PTY/event loop for display-only terminals.
-        let mut previous_byte_was_cr = false;
-        let converted = convert_lf_to_crlf(bytes, &mut previous_byte_was_cr);
+        let converted = convert_lf_to_crlf(bytes, &mut self.output_previous_byte_was_cr);
+        self.write_emulator_bytes(&converted, cx);
+    }
 
+    /// Inject an authoritative PTY byte stream verbatim.
+    ///
+    /// The mux server and this DisplayOnly renderer must parse exactly the same
+    /// bytes. Applying LF→CRLF normalization here would change cursor columns
+    /// (`LF` preserves the column while `CRLF` resets it), causing glyph/cursor
+    /// divergence from the server-owned grid.
+    pub fn write_pty_output(&mut self, bytes: &[u8], cx: &mut Context<Self>) {
+        self.output_previous_byte_was_cr = bytes.last().is_some_and(|byte| *byte == b'\r');
+        self.write_emulator_bytes(bytes, cx);
+    }
+
+    fn write_emulator_bytes(&mut self, bytes: &[u8], cx: &mut Context<Self>) {
         // vte 会整段丢弃 APC 和未知 OSC, 所以图形协议必须在字节进入模拟器
         // 之前单独扫一遍。
-        let graphics_events = self.graphics_scanner.feed(&converted);
+        let graphics_events = self.graphics_scanner.feed(bytes);
 
         let mut term = self.term.lock();
-        self.output_processor.advance(&mut *term, &converted);
+        self.output_processor.advance(&mut *term, bytes);
         drop(term);
         if !graphics_events.is_empty() {
             self.apply_graphics_events(graphics_events, cx);
@@ -2951,8 +2979,18 @@ impl Terminal {
                     };
 
                     if selection_type == Some(SelectionType::Simple) && e.modifiers.shift {
-                        self.events
-                            .push_back(InternalEvent::UpdateSelection(position));
+                        if self.last_content.selection.is_some() {
+                            // Shift+click extends the existing selection to this point.
+                            self.events
+                                .push_back(InternalEvent::UpdateSelection(position));
+                        } else {
+                            // With no selection yet, Shift is the escape hatch for
+                            // selecting text while an app has mouse tracking enabled,
+                            // so anchor a selection here for the drag to extend.
+                            self.events.push_back(InternalEvent::SetSelection(Some(
+                                Selection::new(SelectionType::Simple, point, side),
+                            )));
+                        }
                         return;
                     }
 
@@ -3163,6 +3201,14 @@ impl Terminal {
                 .as_ref()
                 .map(|process| process.cwd.clone()),
             TerminalType::DisplayOnly => None,
+        }
+    }
+
+    /// Set the title supplied by a server-authoritative display-only pane.
+    pub fn set_display_title(&mut self, title: String, cx: &mut Context<Self>) {
+        if self.title_override.as_deref() != Some(title.as_str()) {
+            self.title_override = Some(title);
+            cx.notify();
         }
     }
 
@@ -3958,6 +4004,32 @@ mod tests {
     use util::shell::{Shell, ShellKind};
     use util::shell_builder::ShellBuilder;
 
+    #[gpui::test]
+    async fn display_only_raw_pty_output_preserves_lf_cursor_column(cx: &mut TestAppContext) {
+        cx.update(|cx| {
+            let settings_store = settings::SettingsStore::test(cx);
+            cx.set_global(settings_store);
+        });
+        let terminal = cx.new(|cx| {
+            TerminalBuilder::new_display_only(
+                SettingsCursorShape::default(),
+                AlternateScroll::On,
+                None,
+                0,
+                cx.background_executor(),
+                PathStyle::local(),
+            )
+            .subscribe(cx)
+        });
+
+        terminal.update(cx, |terminal, cx| {
+            terminal.write_pty_output(b"abc\nX", cx);
+            let cursor = terminal.term.lock().grid().cursor.point;
+            assert_eq!(cursor.line.0, 1);
+            assert_eq!(cursor.column.0, 4);
+        });
+    }
+
     #[test]
     fn test_init_command_startup_marker_commands_do_not_contain_marker() {
         let marker_id = 42;
@@ -4307,6 +4379,51 @@ mod tests {
             assert_eq!(term.grid()[Line(-1)][Column(0)].c, 'T');
             assert_eq!(term.grid()[Line(0)][Column(0)].c, 'X');
             assert_eq!(term.grid()[Line(1)][Column(0)].c, 'Y');
+        });
+    }
+
+    #[gpui::test]
+    async fn structured_snapshot_preserves_configured_history_capacity(cx: &mut TestAppContext) {
+        let terminal = cx.new(|cx| {
+            TerminalBuilder::new_display_only(
+                SettingsCursorShape::default(),
+                AlternateScroll::On,
+                Some(10),
+                0,
+                cx.background_executor(),
+                PathStyle::local(),
+            )
+            .subscribe(cx)
+        });
+        let cell = |character| StructuredTerminalCell {
+            character,
+            ..Default::default()
+        };
+        let snapshot = StructuredTerminalSnapshot {
+            cols: 1,
+            rows: 2,
+            cells: vec![cell('X'), cell('Y')],
+            history: Vec::new(),
+            display_offset: 0,
+            cursor: None,
+            alternate_screen: false,
+            modes: Modes::NONE,
+        };
+        terminal
+            .update(cx, |terminal, cx| {
+                terminal.apply_structured_snapshot(&snapshot, cx)
+            })
+            .unwrap_or_else(|error| panic!("apply empty-history snapshot: {error}"));
+
+        terminal.update(cx, |terminal, cx| {
+            terminal.write_pty_output(b"A\nB\nC\n", cx);
+        });
+
+        terminal.read_with(cx, |terminal, _cx| {
+            assert!(
+                terminal.total_lines() > 2,
+                "structured snapshot must retain the configured scrollback capacity"
+            );
         });
     }
 
@@ -4754,6 +4871,114 @@ mod tests {
                 "a deliberate drag should start a selection"
             );
             assert!(terminal.selection_phase == SelectionPhase::Selecting);
+        });
+    }
+
+    /// With mouse tracking active (e.g. htop), Shift is the escape hatch to
+    /// select terminal text. Shift+drag must start a selection rather than being
+    /// swallowed as a "extend existing selection" no-op. Regression test for #60254.
+    #[gpui::test]
+    async fn test_terminal_shift_drag_selects_while_mouse_tracking(cx: &mut TestAppContext) {
+        // `?1002h` enables button-event mouse tracking, `?1006h` selects SGR encoding.
+        let terminal = init_ctrl_click_hyperlink_test(cx, b"\x1b[?1002h\x1b[?1006hhello world\r\n");
+
+        terminal.update(cx, |terminal, cx| {
+            assert!(
+                terminal.last_content.mode.intersects(Modes::MOUSE_MODE),
+                "mouse tracking should be active"
+            );
+
+            let shift = Modifiers {
+                shift: true,
+                ..Modifiers::none()
+            };
+            terminal.mouse_down(
+                &MouseDownEvent {
+                    button: MouseButton::Left,
+                    position: point(px(50.0), px(10.0)),
+                    modifiers: shift,
+                    click_count: 1,
+                    first_mouse: true,
+                },
+                cx,
+            );
+
+            // With no selection yet, the shift press must anchor a new selection
+            // so the following drag has something to extend.
+            assert!(
+                terminal
+                    .events
+                    .iter()
+                    .any(|event| matches!(event, InternalEvent::SetSelection(Some(_)))),
+                "shift+click with no existing selection should anchor a selection"
+            );
+            terminal.events.clear();
+
+            let region = terminal.last_content.terminal_bounds.bounds;
+            terminal.mouse_drag(
+                &MouseMoveEvent {
+                    position: point(px(90.0), px(10.0)),
+                    pressed_button: Some(MouseButton::Left),
+                    modifiers: shift,
+                },
+                region,
+                cx,
+            );
+
+            assert!(
+                terminal
+                    .events
+                    .iter()
+                    .any(|event| matches!(event, InternalEvent::UpdateSelection(_))),
+                "shift+drag should extend the selection while mouse tracking is active"
+            );
+            assert!(terminal.selection_phase == SelectionPhase::Selecting);
+        });
+    }
+
+    /// Shift+click with a selection already on screen must keep extending it
+    /// (the behavior added in #25143), not re-anchor a fresh one.
+    #[gpui::test]
+    async fn test_terminal_shift_click_extends_existing_selection(cx: &mut TestAppContext) {
+        let terminal = init_ctrl_click_hyperlink_test(cx, b"hello world\r\n");
+
+        terminal.update(cx, |terminal, cx| {
+            // A visible selection, as a sync would have populated in production.
+            terminal.last_content.selection = Some(SelectionRange {
+                start: Point::new(0, 0),
+                end: Point::new(0, 5),
+                is_block: false,
+            });
+            terminal.events.clear();
+
+            terminal.mouse_down(
+                &MouseDownEvent {
+                    button: MouseButton::Left,
+                    position: point(px(90.0), px(10.0)),
+                    modifiers: Modifiers {
+                        shift: true,
+                        ..Modifiers::none()
+                    },
+                    click_count: 1,
+                    first_mouse: true,
+                },
+                cx,
+            );
+
+            assert!(
+                terminal
+                    .events
+                    .iter()
+                    .any(|event| matches!(event, InternalEvent::UpdateSelection(_))),
+                "shift+click with an existing selection should extend it"
+            );
+            assert!(
+                !terminal
+                    .events
+                    .iter()
+                    .any(|event| matches!(event, InternalEvent::SetSelection(Some(_)))),
+                "shift+click should extend, not re-anchor, an existing selection"
+            );
         });
     }
 

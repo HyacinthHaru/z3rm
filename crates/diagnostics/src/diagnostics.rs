@@ -878,7 +878,9 @@ impl Item for ProjectDiagnosticsEditor {
         _window: &mut Window,
         _: &mut Context<Self>,
     ) -> Task<Result<()>> {
-        unreachable!()
+        Task::ready(Err(anyhow::anyhow!(
+            "saving the project diagnostics view under a new path is unsupported"
+        )))
     }
 
     fn reload(

@@ -1846,7 +1846,6 @@ async fn test_query_history(cx: &mut gpui::TestAppContext) {
         initial_history.is_empty(),
         "Should have no history before opening any files"
     );
-
     let history_after_first =
         open_close_queried_buffer("sec", 1, "second.rs", &workspace, cx).await;
     assert_eq!(
@@ -2930,6 +2929,16 @@ async fn test_keep_opened_file_on_top_of_search_results_and_select_next_one(
 ) {
     let app_state = init_test(cx);
 
+    cx.update(|cx| {
+        let settings = FileFinderSettings::get_global(cx).clone();
+        FileFinderSettings::override_global(
+            FileFinderSettings {
+                skip_focus_for_active_in_search: true,
+                ..settings
+            },
+            cx,
+        );
+    });
     app_state
         .fs
         .as_fake()
@@ -3098,6 +3107,16 @@ async fn test_setting_auto_select_first_and_select_active_file(cx: &mut TestAppC
 async fn test_non_separate_history_items(cx: &mut TestAppContext) {
     let app_state = init_test(cx);
 
+    cx.update(|cx| {
+        let settings = FileFinderSettings::get_global(cx).clone();
+        FileFinderSettings::override_global(
+            FileFinderSettings {
+                skip_focus_for_active_in_search: true,
+                ..settings
+            },
+            cx,
+        );
+    });
     app_state
         .fs
         .as_fake()
@@ -4430,7 +4449,6 @@ async fn open_close_queried_buffer(
         cx,
     )
     .await;
-
     cx.dispatch_action(workspace::CloseActiveItem {
         save_intent: None,
         close_pinned: false,
@@ -4483,6 +4501,14 @@ pub(crate) fn init_test(cx: &mut TestAppContext) -> Arc<AppState> {
         // `Settings::get_global` below reads through it.
         let settings_store = SettingsStore::test(cx);
         cx.set_global(settings_store);
+        cx.update_global::<SettingsStore, _>(|store, cx| {
+            store.update_user_settings(cx, |settings| {
+                settings
+                    .preview_tabs
+                    .get_or_insert_default()
+                    .enable_preview_from_file_finder = Some(false);
+            });
+        });
         let state = AppState::test(cx);
         theme_settings::init(theme::LoadThemes::JustBase, cx);
         super::init(cx);

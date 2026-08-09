@@ -637,11 +637,10 @@ mod tests {
             timestamp: Instant::now(),
         };
 
-        let detecting = Monitor::with_config(
-            directory.path(),
-            &SnapshotConfig::default(),
-            |_event| Ok(SnapshotTrigger::Write),
-        );
+        let detecting =
+            Monitor::with_config(directory.path(), &SnapshotConfig::default(), |_event| {
+                Ok(SnapshotTrigger::Write)
+            });
         assert_eq!(detecting.handle_event(event()).unwrap(), None);
 
         let permissive = Monitor::with_config(

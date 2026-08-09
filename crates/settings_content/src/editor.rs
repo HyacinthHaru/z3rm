@@ -481,7 +481,9 @@ pub struct DragAndDropSelectionContent {
 }
 
 /// How to highlight the current line in the editor.
-#[derive(Copy, Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema, MergeFrom)]
+#[derive(
+    Copy, Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema, MergeFrom,
+)]
 #[serde(rename_all = "snake_case")]
 pub enum CurrentLineHighlight {
     /// Highlight the gutter area of the current line.
@@ -496,7 +498,9 @@ pub enum CurrentLineHighlight {
 }
 
 /// Whether the editor will scroll beyond the last line.
-#[derive(Copy, Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema, MergeFrom)]
+#[derive(
+    Copy, Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema, MergeFrom,
+)]
 #[serde(rename_all = "snake_case")]
 pub enum ScrollBeyondLastLine {
     /// The editor will scroll beyond the last line by up to one page.
@@ -509,7 +513,9 @@ pub enum ScrollBeyondLastLine {
 }
 
 /// Which diagnostic indicators to show in the scrollbar.
-#[derive(Copy, Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema, MergeFrom)]
+#[derive(
+    Copy, Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema, MergeFrom,
+)]
 #[serde(rename_all = "snake_case")]
 pub enum ScrollbarDiagnostics {
     /// Do not show any diagnostics.
@@ -526,7 +532,9 @@ pub enum ScrollbarDiagnostics {
 }
 
 /// When to show the minimap in the editor.
-#[derive(Copy, Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema, MergeFrom)]
+#[derive(
+    Copy, Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema, MergeFrom,
+)]
 #[serde(rename_all = "snake_case")]
 pub enum ShowMinimap {
     /// Follow the editor's own heuristics.
@@ -539,7 +547,9 @@ pub enum ShowMinimap {
 }
 
 /// Where to show the minimap in the editor.
-#[derive(Copy, Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema, MergeFrom)]
+#[derive(
+    Copy, Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema, MergeFrom,
+)]
 #[serde(rename_all = "snake_case")]
 pub enum DisplayIn {
     /// Show the minimap in the active editor only.
@@ -550,7 +560,9 @@ pub enum DisplayIn {
 }
 
 /// When to show the minimap thumb.
-#[derive(Copy, Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema, MergeFrom)]
+#[derive(
+    Copy, Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema, MergeFrom,
+)]
 #[serde(rename_all = "snake_case")]
 pub enum MinimapThumb {
     /// Always show the thumb.
@@ -561,7 +573,9 @@ pub enum MinimapThumb {
 }
 
 /// How the minimap thumb border is drawn.
-#[derive(Copy, Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema, MergeFrom)]
+#[derive(
+    Copy, Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema, MergeFrom,
+)]
 #[serde(rename_all = "snake_case")]
 pub enum MinimapThumbBorder {
     /// Draw a border on every side of the thumb.
@@ -582,7 +596,9 @@ pub enum MinimapThumbBorder {
 }
 
 /// Whether line numbers are relative to the cursor line.
-#[derive(Copy, Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema, MergeFrom)]
+#[derive(
+    Copy, Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema, MergeFrom,
+)]
 #[serde(rename_all = "snake_case")]
 pub enum RelativeLineNumbers {
     /// Show absolute line numbers.
@@ -595,7 +611,9 @@ pub enum RelativeLineNumbers {
 }
 
 /// When to populate a new search's query based on the text under the cursor.
-#[derive(Copy, Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema, MergeFrom)]
+#[derive(
+    Copy, Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema, MergeFrom,
+)]
 #[serde(rename_all = "snake_case")]
 pub enum SeedQuerySetting {
     /// Never populate the search query from the cursor.
@@ -611,7 +629,9 @@ pub enum SeedQuerySetting {
 }
 
 /// The modifier that adds a cursor when held during a click.
-#[derive(Copy, Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema, MergeFrom)]
+#[derive(
+    Copy, Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema, MergeFrom,
+)]
 #[serde(rename_all = "snake_case")]
 pub enum MultiCursorModifier {
     /// Use alt (option on macOS).
@@ -622,7 +642,9 @@ pub enum MultiCursorModifier {
 }
 
 /// What a double click in a multibuffer does.
-#[derive(Copy, Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema, MergeFrom)]
+#[derive(
+    Copy, Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema, MergeFrom,
+)]
 #[serde(rename_all = "snake_case")]
 pub enum DoubleClickInMultibuffer {
     /// Select the word under the cursor.
@@ -633,7 +655,9 @@ pub enum DoubleClickInMultibuffer {
 }
 
 /// What to do when go-to-definition finds no definition.
-#[derive(Copy, Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema, MergeFrom)]
+#[derive(
+    Copy, Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema, MergeFrom,
+)]
 #[serde(rename_all = "snake_case")]
 pub enum GoToDefinitionFallback {
     /// Fall back to the code lens.
@@ -650,7 +674,9 @@ pub enum GoToDefinitionFallback {
 }
 
 /// How to scroll the target into view after a go-to-definition.
-#[derive(Copy, Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema, MergeFrom)]
+#[derive(
+    Copy, Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema, MergeFrom,
+)]
 #[serde(rename_all = "snake_case")]
 pub enum GoToDefinitionScrollStrategy {
     /// Center the target in the viewport.
@@ -665,7 +691,9 @@ pub enum GoToDefinitionScrollStrategy {
 }
 
 /// How to sort snippets against other completion entries.
-#[derive(Copy, Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema, MergeFrom)]
+#[derive(
+    Copy, Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema, MergeFrom,
+)]
 #[serde(rename_all = "snake_case")]
 pub enum SnippetSortOrder {
     /// Sort by fuzzy match relevance.
@@ -678,7 +706,9 @@ pub enum SnippetSortOrder {
 }
 
 /// The maximum severity of diagnostics to render in the editor.
-#[derive(Copy, Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema, MergeFrom)]
+#[derive(
+    Copy, Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema, MergeFrom,
+)]
 #[serde(rename_all = "snake_case")]
 pub enum DiagnosticSeverityContent {
     /// Render no diagnostics.
@@ -697,7 +727,9 @@ pub enum DiagnosticSeverityContent {
 }
 
 /// Whether to show code lens.
-#[derive(Copy, Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema, MergeFrom)]
+#[derive(
+    Copy, Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema, MergeFrom,
+)]
 #[serde(rename_all = "snake_case")]
 pub enum CodeLens {
     /// Show code lens inline.
@@ -708,7 +740,9 @@ pub enum CodeLens {
 }
 
 /// How to render document colors reported by the language server.
-#[derive(Copy, Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema, MergeFrom)]
+#[derive(
+    Copy, Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema, MergeFrom,
+)]
 #[serde(rename_all = "snake_case")]
 pub enum DocumentColorsRenderMode {
     /// Render a color swatch as an inlay hint.
@@ -725,7 +759,9 @@ pub enum DocumentColorsRenderMode {
 }
 
 /// Which side of a completion entry the detail text is aligned to.
-#[derive(Copy, Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema, MergeFrom)]
+#[derive(
+    Copy, Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema, MergeFrom,
+)]
 #[serde(rename_all = "snake_case")]
 pub enum CompletionDetailAlignment {
     /// Align the detail text to the left.
@@ -736,7 +772,9 @@ pub enum CompletionDetailAlignment {
 }
 
 /// Which kinds of entries the completion menu shows.
-#[derive(Copy, Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema, MergeFrom)]
+#[derive(
+    Copy, Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema, MergeFrom,
+)]
 #[serde(rename_all = "snake_case")]
 pub enum CompletionMenuItemKind {
     /// Show every completion kind.
@@ -751,7 +789,9 @@ pub enum CompletionMenuItemKind {
 }
 
 /// How to lay out a diff.
-#[derive(Copy, Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema, MergeFrom)]
+#[derive(
+    Copy, Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema, MergeFrom,
+)]
 #[serde(rename_all = "snake_case")]
 pub enum DiffViewStyle {
     /// Show deletions and insertions in a single column.

@@ -1,3 +1,4 @@
+pub mod bookmark_store;
 pub mod buffer_store;
 pub mod debounced_delay;
 pub mod environment;
@@ -6,10 +7,11 @@ pub mod manifest_tree;
 pub mod project_settings;
 pub mod search;
 pub mod search_history;
+pub mod stubs;
 pub mod toolchain_store;
 pub mod trusted_worktrees;
 pub mod worktree_store;
-pub mod stubs;
+
 pub use stubs::*;
 
 use buffer_diff::BufferDiff;
@@ -85,8 +87,8 @@ use worktree_store::{WorktreeStore, WorktreeStoreEvent};
 pub use buffer_store::ProjectTransaction;
 pub use fs::*;
 pub use language::Location;
-pub use toolchain_store::{ToolchainStore, Toolchains};
 pub use stubs::Shell;
+pub use toolchain_store::{ToolchainStore, Toolchains};
 const MAX_PROJECT_SEARCH_HISTORY_SIZE: usize = 500;
 
 #[derive(Clone, Copy, Debug)]
@@ -125,6 +127,8 @@ pub struct Project {
     git_store: Entity<GitStore>,
     worktree_store: Entity<WorktreeStore>,
     buffer_store: Entity<BufferStore>,
+    remote_client: Option<Entity<remote::RemoteClient>>,
+    remote_connection_options: Option<remote::RemoteConnectionOptions>,
     _subscriptions: Vec<gpui::Subscription>,
     buffers_needing_diff: HashSet<WeakEntity<Buffer>>,
     git_diff_debouncer: DebouncedDelay<Self>,
@@ -134,12 +138,13 @@ pub struct Project {
     environment: Entity<ProjectEnvironment>,
     settings_observer: Entity<SettingsObserver>,
     toolchain_store: Option<Entity<ToolchainStore>>,
-    /// Inert store entities for removed features (task/debugger/bookmarks/breakpoints).
+    /// Inert store entities for removed features (task/debugger/bookmarks/breakpoints/LSP).
     /// Created once at construction so callers get a valid handle instead of a panic.
     task_store_entity: Entity<crate::task_store::TaskStore>,
     dap_store_entity: Entity<stubs::DapStore>,
-    bookmark_store_entity: Entity<stubs::bookmark_store::BookmarkStore>,
+    bookmark_store_entity: Entity<crate::bookmark_store::BookmarkStore>,
     breakpoint_store_entity: Entity<stubs::debugger::breakpoint_store::BreakpointStore>,
+    lsp_store_entity: Entity<stubs::lsp_store::LspStore>,
     last_worktree_paths: WorktreePaths,
 }
 
@@ -150,13 +155,15 @@ pub enum Event {
     WorktreeOrderChanged,
     ActiveEntryChanged(Option<ProjectEntryId>),
     DeletedEntry(WorktreeId, ProjectEntryId),
+WorktreePathsChanged {
+        old_worktree_paths: WorktreePaths,
+    },
     /// An entry moved to `project_path`. Consumers that cache paths per open
     /// item (navigation history) have to rewrite their entry.
     EntryRenamed {
         project_path: ProjectPath,
         abs_path: Option<PathBuf>,
     },
-    WorktreePathsChanged { old_worktree_paths: WorktreePaths },
     WorktreeUpdatedEntries(WorktreeId, UpdatedEntriesSet),
     Toast {
         notification_id: String,
@@ -165,13 +172,17 @@ pub enum Event {
     },
     /// Stub variants for deleted diagnostic/remote features (spec §8.2 M2)
     DiskBasedDiagnosticsStarted,
-    DiskBasedDiagnosticsFinished { language_server_id: lsp::LanguageServerId },
+    DiskBasedDiagnosticsFinished {
+        language_server_id: lsp::LanguageServerId,
+    },
     DiagnosticsUpdated {
         paths: Vec<Arc<util::rel_path::RelPath>>,
         language_server_id: lsp::LanguageServerId,
     },
     LanguageServerRemoved(lsp::LanguageServerId),
-    DisconnectedFromRemote { server_not_running: bool },
+    DisconnectedFromRemote {
+        server_not_running: bool,
+    },
     DisconnectedFromHost,
     LanguageNotFound(Entity<language::Buffer>),
     /// Stub variants for project_panel (spec §8.2 M3)
@@ -254,6 +265,13 @@ impl Project {
             let worktree_store_subscription =
                 cx.subscribe(&worktree_store, Self::on_worktree_store_event);
 
+            let bookmark_store_entity = cx.new(|_| {
+                crate::bookmark_store::BookmarkStore::new(
+                    worktree_store.clone(),
+                    buffer_store.clone(),
+                )
+            });
+
             let mut project = Self {
                 active_entry: None,
                 languages,
@@ -261,6 +279,8 @@ impl Project {
                 git_store,
                 worktree_store,
                 buffer_store,
+                remote_client: None,
+                remote_connection_options: None,
                 _subscriptions: vec![worktree_store_subscription],
                 buffers_needing_diff: HashSet::default(),
                 git_diff_debouncer: DebouncedDelay::new(),
@@ -279,10 +299,12 @@ impl Project {
                 environment,
                 settings_observer: project_settings,
                 toolchain_store: None,
-            task_store_entity: cx.new(|_| crate::task_store::TaskStore::default()),
-            dap_store_entity: cx.new(|_| stubs::DapStore::default()),
-            bookmark_store_entity: cx.new(|_| stubs::bookmark_store::BookmarkStore::default()),
-            breakpoint_store_entity: cx.new(|_| stubs::debugger::breakpoint_store::BreakpointStore::default()),
+                task_store_entity: cx.new(|_| crate::task_store::TaskStore::default()),
+                dap_store_entity: cx.new(|_| stubs::DapStore::default()),
+                bookmark_store_entity,
+                breakpoint_store_entity: cx
+                    .new(|_| stubs::debugger::breakpoint_store::BreakpointStore::default()),
+                lsp_store_entity: cx.new(|_| stubs::lsp_store::LspStore::default()),
                 last_worktree_paths: WorktreePaths::default(),
             };
 
@@ -291,6 +313,126 @@ impl Project {
                     .add_local_worktree(worktree_path, true, cx)
                     .detach_and_log_err(cx);
             }
+
+            project
+        })
+    }
+    /// Constructs a project backed by a connected remote server.
+    pub fn remote(
+        remote: Entity<remote::RemoteClient>,
+        languages: Arc<LanguageRegistry>,
+        fs: Arc<dyn Fs>,
+        cx: &mut App,
+    ) -> Entity<Self> {
+        let (proto_client, path_style, connection_options) = remote.read_with(cx, |remote, _| {
+            (
+                remote.proto_client(),
+                remote.path_style(),
+                remote.connection_options(),
+            )
+        });
+
+        WorktreeStore::init(&proto_client);
+        WorktreeStore::init_remote(&proto_client);
+        BufferStore::init(&proto_client);
+        GitStore::init(&proto_client);
+        SettingsObserver::init(&proto_client);
+
+        cx.new(|cx| {
+            let worktree_store = cx.new(|cx| {
+                WorktreeStore::remote(
+                    false,
+                    proto_client.clone(),
+                    REMOTE_SERVER_PROJECT_ID,
+                    path_style,
+                    WorktreeIdCounter::get(cx),
+                )
+            });
+            let buffer_store = cx.new(|cx| {
+                BufferStore::remote(
+                    worktree_store.clone(),
+                    proto_client.clone(),
+                    REMOTE_SERVER_PROJECT_ID,
+                    cx,
+                )
+            });
+            let project_settings = cx.new(|cx| {
+                SettingsObserver::new_remote(
+                    fs.clone(),
+                    worktree_store.clone(),
+                    Some(proto_client.clone()),
+                    proto_client.is_via_collab(),
+                    cx,
+                )
+            });
+            let environment = cx.new(|cx| {
+                ProjectEnvironment::new(
+                    None,
+                    worktree_store.downgrade(),
+                    Some(remote.downgrade()),
+                    true,
+                    cx,
+                )
+            });
+            let git_store = cx.new(|cx| {
+                GitStore::remote(
+                    &worktree_store,
+                    buffer_store.clone(),
+                    proto_client.clone(),
+                    REMOTE_SERVER_PROJECT_ID,
+                    cx,
+                )
+            });
+            let worktree_store_subscription =
+                cx.subscribe(&worktree_store, Self::on_worktree_store_event);
+            let bookmark_store_entity = cx.new(|_| {
+                crate::bookmark_store::BookmarkStore::new(
+                    worktree_store.clone(),
+                    buffer_store.clone(),
+                )
+            });
+
+            let project = Self {
+                active_entry: None,
+                languages,
+                fs,
+                git_store,
+                worktree_store: worktree_store.clone(),
+                buffer_store,
+                remote_client: Some(remote.clone()),
+                remote_connection_options: Some(connection_options),
+                _subscriptions: vec![worktree_store_subscription],
+                buffers_needing_diff: HashSet::default(),
+                git_diff_debouncer: DebouncedDelay::new(),
+                search_history: SearchHistory::new(
+                    Some(MAX_PROJECT_SEARCH_HISTORY_SIZE),
+                    search_history::QueryInsertionBehavior::default(),
+                ),
+                search_included_history: SearchHistory::new(
+                    Some(MAX_PROJECT_SEARCH_HISTORY_SIZE),
+                    search_history::QueryInsertionBehavior::default(),
+                ),
+                search_excluded_history: SearchHistory::new(
+                    Some(MAX_PROJECT_SEARCH_HISTORY_SIZE),
+                    search_history::QueryInsertionBehavior::default(),
+                ),
+                environment,
+                settings_observer: project_settings,
+                toolchain_store: None,
+                task_store_entity: cx.new(|_| crate::task_store::TaskStore::default()),
+                dap_store_entity: cx.new(|_| stubs::DapStore::default()),
+                bookmark_store_entity,
+                breakpoint_store_entity: cx
+                    .new(|_| stubs::debugger::breakpoint_store::BreakpointStore::default()),
+                lsp_store_entity: cx.new(|_| stubs::lsp_store::LspStore::default()),
+                last_worktree_paths: WorktreePaths::default(),
+            };
+
+            proto_client.subscribe_to_entity(REMOTE_SERVER_PROJECT_ID, &cx.entity());
+            proto_client.subscribe_to_entity(REMOTE_SERVER_PROJECT_ID, &worktree_store);
+            proto_client.subscribe_to_entity(REMOTE_SERVER_PROJECT_ID, &project.buffer_store);
+            proto_client.subscribe_to_entity(REMOTE_SERVER_PROJECT_ID, &project.git_store);
+            proto_client.subscribe_to_entity(REMOTE_SERVER_PROJECT_ID, &project.settings_observer);
 
             project
         })
@@ -326,29 +468,6 @@ impl Project {
             }
         }
 
-        project
-    }
-
-    /// Removed-feature stub: remote project support was deleted with collab.
-    /// Returns a local-mode Project so callers that still reference this
-    /// constructor get a usable entity instead of panicking. Remote-only
-    /// behavior is not reachable in the mux-first product.
-    pub fn remote(
-        _session: Arc<dyn remote::RemoteConnection>,
-        _client: Arc<stubs::Client>,
-        _node_runtime: (),
-        _user_store: (),
-        languages: Arc<language::LanguageRegistry>,
-        fs: Arc<dyn fs::Fs>,
-        is_read_only: bool,
-        cx: &mut Context<Self>,
-    ) -> Entity<Self> {
-        // Remote connection and collab client are unused for the local stub.
-        let env = None;
-        let mut project = Self::local(languages, fs, env, Vec::new(), cx);
-        if is_read_only {
-            tracing::warn!("Project::remote stub ignores is_read_only; remote mode is removed");
-        }
         project
     }
 
@@ -500,7 +619,8 @@ impl Project {
     fn emit_worktree_paths_changed(&mut self, cx: &mut Context<Self>) {
         let worktree_paths = self.worktree_store.read(cx).paths(cx);
         if worktree_paths != self.last_worktree_paths {
-            let old_worktree_paths = std::mem::replace(&mut self.last_worktree_paths, worktree_paths);
+            let old_worktree_paths =
+                std::mem::replace(&mut self.last_worktree_paths, worktree_paths);
             cx.emit(Event::WorktreePathsChanged { old_worktree_paths });
         }
     }
@@ -565,9 +685,9 @@ impl Project {
         false
     }
 
-    /// Stub: is_via_remote_server (remote 模块已删除)
+    /// Returns whether this project is backed by a connected remote server.
     pub fn is_via_remote_server(&self) -> bool {
-        false
+        self.remote_client.is_some()
     }
 
     pub fn project_path_git_status(
@@ -603,54 +723,159 @@ impl Project {
             .update(cx, |store, cx| store.open_buffer(path, cx))
     }
 
-    /// Stub: create_terminal_shell (task crate 已删除)
+    /// Create an interactive terminal using the configured shell.
     pub fn create_terminal_shell(
         &self,
-        _working_directory: Option<std::path::PathBuf>,
-        _cx: &mut Context<Self>,
+        working_directory: Option<std::path::PathBuf>,
+        cx: &mut Context<Self>,
     ) -> Task<anyhow::Result<gpui::Entity<terminal::Terminal>>> {
-        Task::ready(Err(anyhow::anyhow!("stub: terminal creation disabled")))
+        let settings = terminal::terminal_settings::TerminalSettings::get_global(cx);
+        let path_style = self.path_style(cx);
+        let builder = terminal::TerminalBuilder::new(
+            working_directory,
+            None,
+            settings.shell.clone(),
+            settings.env.clone(),
+            settings.cursor_shape,
+            settings.alternate_scroll,
+            settings.max_scroll_history_lines,
+            settings.path_hyperlink_regexes.clone(),
+            settings.path_hyperlink_timeout_ms,
+            false,
+            0,
+            None,
+            cx,
+            Vec::new(),
+            path_style,
+        );
+        cx.spawn(async move |_, cx| {
+            let builder = builder.await?;
+            Ok(cx.new(|cx| builder.subscribe(cx)))
+        })
     }
 
-    /// Stub: clone_terminal (task crate 已删除)
+    /// Clone an existing terminal, preserving its shell and terminal settings.
     pub fn clone_terminal(
         &self,
-        _terminal: &gpui::Entity<terminal::Terminal>,
-        _cx: &mut Context<Self>,
-        _working_directory: Option<std::path::PathBuf>,
+        terminal: &gpui::Entity<terminal::Terminal>,
+        cx: &mut Context<Self>,
+        working_directory: Option<std::path::PathBuf>,
     ) -> Task<anyhow::Result<gpui::Entity<terminal::Terminal>>> {
-        Task::ready(Err(anyhow::anyhow!("stub: terminal clone disabled")))
+        let builder = terminal.read(cx).clone_builder(cx, working_directory);
+        cx.spawn(async move |_, cx| {
+            let builder = builder.await?;
+            Ok(cx.new(|cx| builder.subscribe(cx)))
+        })
     }
 
-    /// Stub: is_via_collab (collab 已删除)
     pub fn is_via_collab(&self) -> bool {
         false
     }
 
-    /// Stub: create_terminal_task (task crate 已删除)
+    fn shell_for_terminal_task(task: &SpawnInTerminal) -> util::shell::Shell {
+        let program = if !task.command.is_empty() {
+            Some(task.command.clone())
+        } else if !task.program.is_empty() {
+            Some(task.program.clone())
+        } else {
+            None
+        };
+
+        if let Some(program) = program {
+            return util::shell::Shell::WithArguments {
+                program,
+                args: task.args.clone(),
+                title_override: None,
+            };
+        }
+
+        match &task.shell {
+            Shell::System => util::shell::Shell::System,
+            Shell::Program(config) => util::shell::Shell::WithArguments {
+                program: config.program.clone(),
+                args: config.args.clone(),
+                title_override: None,
+            },
+        }
+    }
+
+    /// Create a terminal that runs a task and reports its exit status to the view.
     pub fn create_terminal_task(
         &mut self,
-        _task: SpawnInTerminal,
-        _cx: &mut Context<Self>,
+        task: SpawnInTerminal,
+        cx: &mut Context<Self>,
     ) -> Task<anyhow::Result<gpui::Entity<terminal::Terminal>>> {
-        Task::ready(Err(anyhow::anyhow!("stub: terminal task disabled")))
+        let settings = terminal::terminal_settings::TerminalSettings::get_global(cx);
+        let path_style = self.path_style(cx);
+        let working_directory = task.cwd.clone().or_else(|| {
+            task.working_directory
+                .as_ref()
+                .and_then(|path| self.absolute_path(path, cx))
+        });
+        let shell = Self::shell_for_terminal_task(&task);
+        let command = if task.command.is_empty() {
+            (!task.program.is_empty()).then(|| task.program.clone())
+        } else {
+            Some(task.command.clone())
+        };
+
+        let (completion_tx, completion_rx) = async_channel::unbounded();
+        let spawned_task = terminal::SpawnInTerminal {
+            command,
+            args: task.args.clone(),
+            label: task.label.clone(),
+            full_label: task.full_label.clone(),
+            command_label: task.command_label.clone(),
+            hide: terminal::HideStrategy::Never,
+            show_summary: task.show_summary,
+            show_command: task.show_command,
+            id: task.id,
+            show_rerun: task.show_rerun,
+        };
+        let task_state = terminal::TaskState {
+            status: terminal::TaskStatus::Running,
+            completion_rx,
+            spawned_task,
+        };
+        let mut env = settings.env.clone();
+        env.extend(task.env);
+        let builder = terminal::TerminalBuilder::new(
+            working_directory,
+            Some(task_state),
+            shell,
+            env,
+            settings.cursor_shape,
+            settings.alternate_scroll,
+            settings.max_scroll_history_lines,
+            settings.path_hyperlink_regexes.clone(),
+            settings.path_hyperlink_timeout_ms,
+            false,
+            0,
+            Some(completion_tx),
+            cx,
+            Vec::new(),
+            path_style,
+        );
+        cx.spawn(async move |_, cx| {
+            let builder = builder.await?;
+            Ok(cx.new(|cx| builder.subscribe(cx)))
+        })
     }
 
-    /// Stub: create_local_terminal (task crate 已删除)
+    /// Local projects use the same configured shell as their regular terminal.
     pub fn create_local_terminal(
         &mut self,
-        _cx: &mut Context<Self>,
+        cx: &mut Context<Self>,
     ) -> Task<anyhow::Result<gpui::Entity<terminal::Terminal>>> {
-        Task::ready(Err(anyhow::anyhow!("stub: local terminal disabled")))
+        self.create_terminal_shell(None, cx)
     }
 
-    /// Stub: try_windows_path_to_wsl
     pub fn try_windows_path_to_wsl(
         &mut self,
-        _path: &std::path::Path,
+        path: &std::path::Path,
         _cx: &mut Context<Self>,
     ) -> gpui::Task<anyhow::Result<std::path::PathBuf>> {
-        gpui::Task::ready(Err(anyhow::anyhow!("stub: try_windows_path_to_wsl")))
+        gpui::Task::ready(Ok(path.to_path_buf()))
     }
 
     /// §8.2 Delegate to WorktreeStore::find_or_create_worktree.
@@ -660,23 +885,23 @@ impl Project {
         visible: bool,
         cx: &mut Context<Self>,
     ) -> gpui::Task<anyhow::Result<gpui::Entity<Worktree>>> {
-        let task = self
-            .worktree_store
-            .update(cx, |store, cx| store.find_or_create_worktree(abs_path, visible, cx));
+        let task = self.worktree_store.update(cx, |store, cx| {
+            store.find_or_create_worktree(abs_path, visible, cx)
+        });
         cx.spawn(async move |_, _| {
             let (worktree, _rel) = task.await?;
             Ok(worktree)
         })
     }
 
-    /// Stub: is_read_only
     pub fn is_read_only(&self, _cx: &App) -> bool {
         false
     }
 
-    /// Stub: wait_for_initial_scan
-    pub fn wait_for_initial_scan(&self) -> gpui::Task<()> {
-        gpui::Task::ready(())
+    /// Wait until all visible worktrees have completed their initial scan.
+    pub fn wait_for_initial_scan(&self, cx: &App) -> gpui::Task<()> {
+        let wait = self.worktree_store.read(cx).wait_for_initial_scan();
+        cx.background_spawn(wait)
     }
 
     /// Delete a project path via its worktree entry.
@@ -707,7 +932,6 @@ impl Project {
             None => Task::ready(Err(anyhow::anyhow!("delete_entry unavailable"))),
         }
     }
-
 
     pub fn create_worktree(
         &mut self,
@@ -760,7 +984,9 @@ impl Project {
         fallback_branch_name: String,
         cx: &mut gpui::Context<Self>,
     ) -> Task<anyhow::Result<()>> {
-        self.git_store.read(cx).git_init(path, fallback_branch_name, cx)
+        self.git_store
+            .read(cx)
+            .git_init(path, fallback_branch_name, cx)
     }
 
     /// §16.6 Delegate git_config to GitStore. Returns the raw stdout string
@@ -937,7 +1163,10 @@ mod z3rm_path_tests {
             .into(),
         };
         assert!(child.starts_with(&root), "child should start_with root");
-        assert!(!root.starts_with(&child), "root should not start_with child");
+        assert!(
+            !root.starts_with(&child),
+            "root should not start_with child"
+        );
     }
 
     #[test]
@@ -968,5 +1197,27 @@ mod z3rm_path_tests {
         let proto = original.to_proto();
         let recovered = ProjectPath::from_proto(proto).expect("round trip");
         assert_eq!(original, recovered);
+    }
+    #[test]
+    fn prepared_terminal_task_uses_prepared_executable_and_arguments() {
+        let task = SpawnInTerminal {
+            command: "/bin/bash".to_string(),
+            args: vec![
+                "-i".to_string(),
+                "-c".to_string(),
+                "printf task".to_string(),
+            ],
+            shell: Shell::System,
+            ..Default::default()
+        };
+        let shell = Project::shell_for_terminal_task(&task);
+        assert_eq!(
+            shell,
+            util::shell::Shell::WithArguments {
+                program: "/bin/bash".to_string(),
+                args: task.args.clone(),
+                title_override: None,
+            }
+        );
     }
 }

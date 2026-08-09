@@ -68,7 +68,7 @@ impl ExtensionStatusBar {
 
 impl Render for ExtensionStatusBar {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl gpui::IntoElement {
-        use gpui::{div, ParentElement, Styled};
+        use gpui::{ParentElement, Styled, div};
 
         let colors = cx.theme().colors();
         self.renderer.set_palette(VDomPalette {
@@ -81,8 +81,12 @@ impl Render for ExtensionStatusBar {
 
         let mut container = div().flex().flex_row().gap(gpui::px(8.0));
         let nodes = std::mem::take(&mut self.vdom_nodes);
-        for node in &nodes {
-            container = container.child(self.renderer.render(node, cx));
+        // One frame = one GPUI render pass over every top-level node, so the
+        // renderer can evict display-list regions that vanished from the VDOM
+        // (§5.4 bounded native-side display-list cache).
+        let elements = self.renderer.render_frame(&nodes, cx);
+        for element in elements {
+            container = container.child(element);
         }
         self.vdom_nodes = nodes;
 

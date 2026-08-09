@@ -36,6 +36,13 @@ impl From<bool> for PaddedBool32 {
     }
 }
 
+impl PaddedBool32 {
+    /// The stored 32-bit value (`0` for false, `1` for true).
+    pub fn as_u32(&self) -> u32 {
+        self.0
+    }
+}
+
 #[derive(Default)]
 #[expect(missing_docs)]
 pub struct Scene {

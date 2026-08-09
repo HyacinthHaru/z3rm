@@ -3,6 +3,12 @@
 
 pub use gpui::Platform;
 
+#[cfg(feature = "test-support")]
+mod software_renderer;
+
+#[cfg(feature = "test-support")]
+use software_renderer::SoftwareHeadlessRenderer;
+
 use std::rc::Rc;
 
 /// Returns a background executor for the current platform.
@@ -71,7 +77,7 @@ pub fn current_headless_renderer() -> Option<Box<dyn gpui::PlatformHeadlessRende
 
     #[cfg(not(target_os = "macos"))]
     {
-        None
+        Some(Box::new(SoftwareHeadlessRenderer::new()))
     }
 }
 

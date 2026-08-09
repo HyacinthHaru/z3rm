@@ -40,6 +40,7 @@ export function activate(context) {
                     {
                         type: 'display-list',
                         props: { id: 'clock', renderer: 'renderClock' },
+                        style: { width: '48px', height: '18px' },
                         children: [],
                     },
                 ],

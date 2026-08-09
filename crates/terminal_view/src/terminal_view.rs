@@ -1,12 +1,12 @@
 pub mod copy_mode;
+pub mod diff_view;
+pub mod file_viewer;
+pub mod mux_pane;
 mod persistence;
+pub mod settings_pane;
 pub mod terminal_element;
 mod terminal_path_like_target;
 pub mod terminal_scrollbar;
-pub mod mux_pane;
-pub mod file_viewer;
-pub mod diff_view;
-pub mod settings_pane;
 
 use editor::{
     Editor, EditorSettings, actions::SelectAll, blink_manager::BlinkManager,
@@ -15,16 +15,16 @@ use editor::{
 use gpui::{
     Action, AnyElement, App, ClipboardEntry, DismissEvent, Entity, EventEmitter, ExternalPaths,
     FocusHandle, Focusable, Font, KeyContext, KeyDownEvent, Keystroke, MouseButton, MouseDownEvent,
-    Pixels, Point as GpuiPoint, Rems, Render, ScrollWheelEvent, Styled, Subscription, Task, TaskExt,
-    WeakEntity, actions, anchored, deferred, div,
+    Pixels, Point as GpuiPoint, Rems, Render, ScrollWheelEvent, Styled, Subscription, Task,
+    TaskExt, WeakEntity, actions, anchored, deferred, div,
 };
 use menu;
 use persistence::TerminalDb;
+use project::TaskId;
 use project::{Project, ProjectEntryId, search::SearchQuery};
 use schemars::JsonSchema;
 use serde::Deserialize;
 use settings::{Settings, SettingsStore, TerminalBell, TerminalBlink, WorkingDirectory};
-use workspace::settings_stubs::SeedQuerySetting;
 use std::{
     any::Any,
     cmp,
@@ -34,7 +34,6 @@ use std::{
     sync::Arc,
     time::Duration,
 };
-use project::TaskId;
 use terminal::{
     Clear, Copy, Event, HoveredWord, MaybeNavigationTarget, Modes, Paste, PasteText, Point, Range,
     ScrollLineDown, ScrollLineUp, ScrollPageDown, ScrollPageUp, ScrollToBottom, ScrollToTop,
@@ -50,6 +49,7 @@ use ui::{
     scrollbars::{self, ScrollbarVisibility},
 };
 use util::ResultExt;
+use workspace::settings_stubs::SeedQuerySetting;
 use workspace::{
     CloseActiveItem, DraggedSelection, DraggedTab, NewCenterTerminal, NewTerminal, Pane,
     ToolbarItemLocation, Workspace, WorkspaceId, delete_unloaded_items,
@@ -74,6 +74,51 @@ fn viewport_line_for_point(point: Point, display_offset: usize) -> Option<usize>
         None
     } else {
         usize::try_from(line).ok()
+    }
+}
+
+fn resolve_mux_scrollback_offset(
+    previous_offset: Option<usize>,
+    server_offset: usize,
+    history_rows: usize,
+    scroll_locked: bool,
+) -> Option<usize> {
+    if scroll_locked {
+        match previous_offset {
+            Some(offset) => Some(offset.min(history_rows)),
+            None => (server_offset > 0).then_some(server_offset.min(history_rows)),
+        }
+    } else {
+        (server_offset > 0).then_some(server_offset.min(history_rows))
+    }
+}
+
+
+
+#[cfg(test)]
+mod mux_scrollback_tests {
+    use super::resolve_mux_scrollback_offset;
+
+    #[test]
+    fn locked_scroll_preserves_and_clamps_local_offset() {
+        assert_eq!(resolve_mux_scrollback_offset(Some(12), 0, 8, true), Some(8));
+    }
+
+    #[test]
+    fn unlocked_scroll_follows_authoritative_offset() {
+        assert_eq!(
+            resolve_mux_scrollback_offset(Some(12), 3, 8, false),
+            Some(3)
+        );
+        assert_eq!(resolve_mux_scrollback_offset(Some(12), 0, 8, false), None);
+    }
+
+    #[test]
+    fn locked_bottom_snapshot_reanchors_the_terminal() {
+        assert_eq!(resolve_mux_scrollback_offset(None, 4, 8, true), Some(4));
+        assert_eq!(resolve_mux_scrollback_offset(Some(2), 4, 8, true), Some(2));
+        assert_eq!(resolve_mux_scrollback_offset(None, 0, 8, true), None);
+        assert_eq!(resolve_mux_scrollback_offset(None, 4, 8, false), Some(4));
     }
 }
 
@@ -126,20 +171,17 @@ pub fn init(cx: &mut App) {
     // Only file_viewer and mux_pane paths remain.
     cx.observe_new(|workspace: &mut Workspace, _window, _cx| {
         // §16.6 file viewer: open a file read-only from command palette
-        workspace.register_action(
-            |workspace, action: &file_viewer::OpenFile, window, cx| {
-                let path = PathBuf::from(&action.path);
-                let abs_path = if path.is_absolute() {
-                    path
-                } else if let Some(worktree) = workspace.project().read(cx).worktrees(cx).next()
-                {
-                    worktree.read(cx).abs_path().join(&path)
-                } else {
-                    path
-                };
-                file_viewer::open_file_in_viewer(workspace, abs_path, window, cx);
-            },
-        );
+        workspace.register_action(|workspace, action: &file_viewer::OpenFile, window, cx| {
+            let path = PathBuf::from(&action.path);
+            let abs_path = if path.is_absolute() {
+                path
+            } else if let Some(worktree) = workspace.project().read(cx).worktrees(cx).next() {
+                worktree.read(cx).abs_path().join(&path)
+            } else {
+                path
+            };
+            file_viewer::open_file_in_viewer(workspace, abs_path, window, cx);
+        });
     })
     .detach();
 }
@@ -768,6 +810,10 @@ impl TerminalView {
 
         max_scroll_top_in_lines as f32 * line_height
     }
+    fn sync_scrollback_offset_from_terminal(&mut self, cx: &App) {
+        let display_offset = self.terminal.read(cx).last_content().display_offset;
+        self.scrollback_offset = (display_offset > 0).then_some(display_offset);
+    }
 
     fn scroll_wheel(&mut self, event: &ScrollWheelEvent, cx: &mut Context<Self>) {
         let terminal_content = self.terminal.read(cx).last_content();
@@ -790,6 +836,8 @@ impl TerminalView {
                 TerminalSettings::get_global(cx).scroll_multiplier.max(0.01),
             )
         });
+        self.sync_scrollback_offset_from_terminal(cx);
+        cx.notify();
     }
 
     fn is_alt_screen(&self, cx: &App) -> bool {
@@ -817,6 +865,7 @@ impl TerminalView {
         }
 
         self.terminal.update(cx, |term, _| term.scroll_line_up());
+        self.sync_scrollback_offset_from_terminal(cx);
         cx.notify();
     }
 
@@ -837,6 +886,7 @@ impl TerminalView {
         }
 
         self.terminal.update(cx, |term, _| term.scroll_line_down());
+        self.sync_scrollback_offset_from_terminal(cx);
         cx.notify();
     }
 
@@ -867,6 +917,7 @@ impl TerminalView {
                     .update(cx, |term, _| term.scroll_up_by(visible_content_lines));
             }
         }
+        self.sync_scrollback_offset_from_terminal(cx);
         cx.notify();
     }
 
@@ -877,6 +928,7 @@ impl TerminalView {
         }
 
         self.terminal.update(cx, |term, _| term.scroll_page_down());
+        self.sync_scrollback_offset_from_terminal(cx);
         let terminal = self.terminal.read(cx);
         if terminal.last_content().display_offset < terminal.viewport_lines() {
             self.scroll_top = self.max_scroll_top(cx);
@@ -891,6 +943,7 @@ impl TerminalView {
         }
 
         self.terminal.update(cx, |term, _| term.scroll_to_top());
+        self.sync_scrollback_offset_from_terminal(cx);
         cx.notify();
     }
 
@@ -901,6 +954,7 @@ impl TerminalView {
         }
 
         self.terminal.update(cx, |term, _| term.scroll_to_bottom());
+        self.sync_scrollback_offset_from_terminal(cx);
         if self.block_below_cursor.is_some() {
             self.scroll_top = self.max_scroll_top(cx);
         }
@@ -910,6 +964,33 @@ impl TerminalView {
     /// §16.9 获取回滚偏移量
     pub fn get_scrollback_offset(&self) -> Option<usize> {
         self.scrollback_offset
+    }
+    /// Returns the local scroll state used while applying an authoritative mux snapshot.
+    pub fn mux_scrollback_state(&self) -> (Option<usize>, bool) {
+        (self.scrollback_offset, self.scroll_locked)
+    }
+
+    /// Reapply the local per-client scroll position after replacing the
+    /// display-only terminal with a mux snapshot.
+    pub fn apply_mux_scrollback_offset(
+        &mut self,
+        previous_offset: Option<usize>,
+        server_offset: usize,
+        history_rows: usize,
+        cx: &mut Context<Self>,
+    ) {
+        let offset = resolve_mux_scrollback_offset(
+            previous_offset,
+            server_offset,
+            history_rows,
+            self.scroll_locked,
+        );
+        self.scrollback_offset = offset;
+        if let Some(offset) = offset {
+            self.terminal
+                .update(cx, |terminal, _| terminal.scroll_to_display_offset(offset));
+        }
+        cx.notify();
     }
 
     /// §16.9 设置回滚偏移量
@@ -946,8 +1027,13 @@ impl TerminalView {
 
     /// §16.9 更新回滚版本 (缓存失效检测)
     pub fn update_scrollback_version(&mut self, version: (u64, u64), cx: &mut Context<Self>) {
-        // §16.9 如果版本变更, 清除缓存 (重置 offset)
-        if self.scrollback_version != Some(version) {
+        // The history version identifies the cached rows; a generation-only
+        // update changes the active screen but not the scrollback checkpoint.
+        let history_changed = self
+            .scrollback_version
+            .map(|(history_version, _)| history_version)
+            != Some(version.0);
+        if history_changed && !self.scroll_locked {
             self.scrollback_offset = None;
         }
         self.scrollback_version = Some(version);
@@ -958,8 +1044,6 @@ impl TerminalView {
         self.terminal.update(cx, |term, _| term.toggle_vi_mode());
         cx.notify();
     }
-
-    /// §16.9 切换滚动锁定 (Ctrl-Shift-S)
     fn toggle_scroll_lock(&mut self, _: &ToggleScrollLock, _: &mut Window, cx: &mut Context<Self>) {
         self.do_toggle_scroll_lock(cx);
     }
@@ -1487,7 +1571,8 @@ impl TerminalView {
             );
         if !intercepted {
             // 未被复制模式拦截 → 转发到 vi_motion (不发送到 PTY)
-            self.terminal.update(cx, |term, _| term.vi_motion(keystroke));
+            self.terminal
+                .update(cx, |term, _| term.vi_motion(keystroke));
         }
         cx.notify();
         true
@@ -2348,15 +2433,13 @@ fn current_project_directory(workspace: &Workspace, cx: &App) -> Option<PathBuf>
         .or_else(|| first_project_directory(workspace, cx))
 }
 
-///Gets the first project's home directory, or the home directory
 fn first_project_directory(workspace: &Workspace, cx: &App) -> Option<PathBuf> {
     let worktree = workspace.worktrees(cx).next()?.read(cx);
     let worktree_path = worktree.abs_path();
-    if worktree.root_entry()?.is_dir() {
-        Some(worktree_path.to_path_buf())
+    if worktree.is_single_file() || worktree.root_entry().is_some_and(|entry| !entry.is_dir()) {
+        worktree_path.parent().map(|path| path.to_path_buf())
     } else {
-        // If worktree is a file, return its parent directory
-        worktree_path.parent().map(|p| p.to_path_buf())
+        Some(worktree_path.to_path_buf())
     }
 }
 
@@ -2365,7 +2448,7 @@ mod tests {
     use super::*;
     use gpui::{TestAppContext, VisualTestContext};
     use project::{Entry, Project, ProjectPath, Worktree};
-    use remote::RemoteClient;
+    use settings::SettingsStore;
     use std::path::{Path, PathBuf};
     use util::paths::PathStyle;
     use util::rel_path::RelPath;
@@ -2576,7 +2659,6 @@ mod tests {
             assert_eq!(default_working_directory(workspace, cx), None);
         });
     }
-
     // No active entry, but a worktree, worktree is a file -> parent directory
     #[gpui::test]
     async fn no_active_entry_worktree_is_file(cx: &mut TestAppContext) {
@@ -2787,6 +2869,8 @@ mod tests {
     ) {
         let params = cx.update(AppState::test);
         cx.update(|cx| {
+            let settings = SettingsStore::test(cx);
+            cx.set_global(settings);
             theme_settings::init(theme::LoadThemes::JustBase, cx);
         });
 
@@ -2858,7 +2942,6 @@ mod tests {
 
         (project, workspace)
     }
-
     /// Creates a file in the given worktree and returns its entry.
     async fn create_file_in_worktree(
         worktree: Entity<Worktree>,
@@ -2908,6 +2991,7 @@ mod tests {
         path: impl AsRef<Path>,
         cx: &mut TestAppContext,
     ) -> (Entity<Worktree>, Entry) {
+
         let wt = project
             .update(cx, |project, cx| {
                 project.find_or_create_worktree(path.as_ref(), true, cx)
@@ -3417,7 +3501,10 @@ mod tests {
     fn test_copy_mode_state_default() {
         let state = copy_mode::CopyModeState::default();
         assert!(!state.active, "copy mode should be inactive by default");
-        assert!(state.search_query.is_none(), "search_query should be None by default");
+        assert!(
+            state.search_query.is_none(),
+            "search_query should be None by default"
+        );
     }
 
     #[test]
@@ -3446,7 +3533,10 @@ mod tests {
 
         cx.update(|window, cx| {
             terminal.update(cx, |terminal, cx| {
-                terminal.write_output(b"needle one\r\nfiller\r\nneedle two\r\nneedle three\r\n", cx);
+                terminal.write_output(
+                    b"needle one\r\nfiller\r\nneedle two\r\nneedle three\r\n",
+                    cx,
+                );
                 terminal.sync(window, cx);
             });
         });
@@ -3478,7 +3568,10 @@ mod tests {
         sync_terminal(&terminal, &mut cx);
         terminal_view.read_with(&cx, |view, _| {
             let state = view.copy_mode_state();
-            assert_eq!(state.search_input, None, "enter must close the query buffer");
+            assert_eq!(
+                state.search_input, None,
+                "enter must close the query buffer"
+            );
             assert_eq!(state.search_query.as_deref(), Some("needle"));
             assert_eq!(state.match_count, 3);
             assert_eq!(state.search_error, None);
@@ -3539,9 +3632,15 @@ mod tests {
         cx.simulate_keystrokes("/ n e e d l e escape");
         terminal_view.read_with(&cx, |view, _| {
             let state = view.copy_mode_state();
-            assert_eq!(state.search_input, None, "escape must drop the query buffer");
+            assert_eq!(
+                state.search_input, None,
+                "escape must drop the query buffer"
+            );
             assert_eq!(state.search_query, None);
-            assert!(state.active, "escape in search input must stay in copy mode");
+            assert!(
+                state.active,
+                "escape in search input must stay in copy mode"
+            );
         });
 
         // The indicator is what makes the search visible to the user.

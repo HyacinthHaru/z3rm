@@ -36,7 +36,7 @@ use collections::{HashMap, IndexMap};
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use settings_macros::{MergeFrom, with_fallible_options};
-use std::num::NonZeroU32;
+use std::{num::NonZeroU32, sync::Arc};
 
 /// 定义设置覆盖结构体，每个字段为 `Option<Box<SettingsContent>>`，
 /// 同时生成 `OVERRIDE_KEYS` 和 `get_by_key` 方法。
@@ -221,7 +221,9 @@ pub struct DiagnosticsSettingsContent {
 
 /// LSP 拉取式诊断设置 (spec §16 Plan 16)
 #[with_fallible_options]
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema, MergeFrom)]
+#[derive(
+    Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema, MergeFrom,
+)]
 #[serde(default)]
 pub struct LspPullDiagnosticsSettingsContent {
     /// 是否向语言服务器拉取诊断
@@ -237,7 +239,9 @@ pub struct LspPullDiagnosticsSettingsContent {
 
 /// 内联诊断设置 (spec §16 Plan 16)
 #[with_fallible_options]
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema, MergeFrom)]
+#[derive(
+    Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema, MergeFrom,
+)]
 #[serde(default)]
 pub struct InlineDiagnosticsSettingsContent {
     /// 是否显示内联诊断
@@ -268,7 +272,9 @@ pub struct InlineDiagnosticsSettingsContent {
 
 /// 会话恢复设置 (spec §16 Plan 16)
 #[with_fallible_options]
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema, MergeFrom)]
+#[derive(
+    Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema, MergeFrom,
+)]
 #[serde(default)]
 pub struct SessionSettingsContent {
     /// 重启后是否恢复未保存的缓冲区。为 true 时关闭应用不再询问是否保存。
@@ -288,7 +294,9 @@ pub struct SessionSettingsContent {
 /// 仅包含 z3rm 中仍有消费方的字段; 其余 `GlobalLspSettings` 字段随 LSP 子系统一起
 /// 被裁剪, 暂不暴露为用户设置。
 #[with_fallible_options]
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema, MergeFrom)]
+#[derive(
+    Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema, MergeFrom,
+)]
 #[serde(default)]
 pub struct GlobalLspSettingsContent {
     /// 语言服务器通知设置
@@ -297,7 +305,9 @@ pub struct GlobalLspSettingsContent {
 
 /// 语言服务器通知设置 (spec §16 Plan 16)
 #[with_fallible_options]
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema, MergeFrom)]
+#[derive(
+    Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema, MergeFrom,
+)]
 #[serde(default)]
 pub struct LspNotificationSettingsContent {
     /// 自动消除语言服务器通知的超时毫秒数, 0 表示不自动消除
@@ -308,8 +318,18 @@ pub struct LspNotificationSettingsContent {
 
 /// direnv 配置加载方式 (spec §16 Plan 16)
 #[derive(
-    Copy, Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema, MergeFrom,
-    strum::VariantArray, strum::VariantNames,
+    Copy,
+    Clone,
+    Debug,
+    Default,
+    PartialEq,
+    Eq,
+    Serialize,
+    Deserialize,
+    JsonSchema,
+    MergeFrom,
+    strum::VariantArray,
+    strum::VariantNames,
 )]
 #[serde(rename_all = "snake_case")]
 pub enum LoadDirenv {
@@ -612,9 +632,32 @@ pub struct LanguageToSettingsMap {
     pub defaults: LanguageSettingsContent,
     pub languages: HashMap<String, LanguageSettingsContent>,
     pub edit_predictions: Option<EditPredictionSettingsContent>,
-    /// Maps a language name to the globs that should be associated with it,
-    /// e.g. `{"C++": ["c", "*.dev"]}`.
-    pub file_types: HashMap<String, Vec<String>>,
+    pub file_types: Option<FileTypeMap>,
+}
+
+/// Maps language names to additional filename and extension patterns.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[serde(transparent)]
+pub struct FileTypeMap(pub HashMap<Arc<str>, Vec<String>>);
+
+impl merge_from::MergeFrom for FileTypeMap {
+    fn merge_from(&mut self, other: &Self) {
+        for (language, patterns) in &other.0 {
+            self.0
+                .entry(language.clone())
+                .or_default()
+                .extend(patterns.iter().cloned());
+        }
+    }
+}
+
+impl<'a> IntoIterator for &'a FileTypeMap {
+    type Item = (&'a Arc<str>, &'a Vec<String>);
+    type IntoIter = std::collections::hash_map::Iter<'a, Arc<str>, Vec<String>>;
+
+    fn into_iter(self) -> Self::IntoIter {
+        self.0.iter()
+    }
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize, JsonSchema, MergeFrom)]

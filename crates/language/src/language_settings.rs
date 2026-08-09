@@ -891,32 +891,26 @@ impl settings::Settings for AllLanguageSettings {
             });
 
         let mut file_types: FxHashMap<Arc<str>, (GlobSet, Vec<String>)> = FxHashMap::default();
-        for (language_name, patterns) in &all_languages.file_types {
-            let mut builder = GlobSetBuilder::new();
-            let mut compiled_patterns = Vec::with_capacity(patterns.len());
+        for (language, patterns) in all_languages.file_types.iter().flatten() {
+            let mut builder = globset::GlobSetBuilder::new();
             for pattern in patterns {
-                match Glob::new(pattern) {
+                match globset::Glob::new(pattern) {
                     Ok(glob) => {
                         builder.add(glob);
-                        compiled_patterns.push(pattern.clone());
                     }
                     Err(error) => {
-                        log::warn!(
-                            "Ignoring invalid `file_types` glob {pattern:?} for language \
-                             {language_name:?}: {error}"
+                        log::error!(
+                            "invalid file type pattern for language {language}: {pattern:?}: {error}"
                         );
                     }
                 }
             }
             match builder.build() {
                 Ok(glob_set) => {
-                    file_types.insert(
-                        Arc::from(language_name.as_str()),
-                        (glob_set, compiled_patterns),
-                    );
+                    file_types.insert(language.clone(), (glob_set, patterns.clone()));
                 }
                 Err(error) => {
-                    log::warn!("Ignoring `file_types` for language {language_name:?}: {error}");
+                    log::error!("failed to build file type patterns for {language}: {error}");
                 }
             }
         }

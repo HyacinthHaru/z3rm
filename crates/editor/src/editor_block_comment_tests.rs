@@ -1,6 +1,7 @@
-use crate::ToggleBlockComments;
-use crate::test::init_test;
+
 use crate::test::editor_test_context::EditorTestContext;
+use crate::test::init_test;
+use crate::{ToggleBlockComments, ToggleComments};
 use gpui::TestAppContext;
 use indoc::indoc;
 use language::{BlockCommentConfig, Language, LanguageConfig};
@@ -13,6 +14,7 @@ async fn setup_rust_context(cx: &mut TestAppContext) -> EditorTestContext {
     let rust_language = Arc::new(Language::new(
         LanguageConfig {
             name: "Rust".into(),
+            line_comments: vec!["// ".into()],
             block_comment: Some(BlockCommentConfig {
                 start: "/* ".into(),
                 prefix: "".into(),
@@ -290,4 +292,38 @@ async fn test_toggle_block_comments_cursor_inside_unicode_comment(cx: &mut TestA
     });
 
     cx.assert_editor_state("√√√ˇ");
+}
+
+#[gpui::test]
+async fn test_toggle_line_comments_roundtrip(cx: &mut TestAppContext) {
+    let mut cx = setup_rust_context(cx).await;
+
+    cx.set_state(indoc! {"
+        fn main() {
+            «let x = 1;
+            let y = 2;ˇ»
+        }
+    "});
+
+    cx.update_editor(|editor, window, cx| {
+        editor.toggle_comments(&ToggleComments::default(), window, cx);
+    });
+
+    cx.assert_editor_state(indoc! {"
+        fn main() {
+            «// let x = 1;
+            // let y = 2;ˇ»
+        }
+    "});
+
+    cx.update_editor(|editor, window, cx| {
+        editor.toggle_comments(&ToggleComments::default(), window, cx);
+    });
+
+    cx.assert_editor_state(indoc! {"
+        fn main() {
+            «let x = 1;
+            let y = 2;ˇ»
+        }
+    "});
 }

@@ -9,18 +9,16 @@ use picker::{
     Picker, PickerDelegate,
     highlighted_match_with_paths::{HighlightedMatch, HighlightedMatchWithPaths},
 };
-use remote::RemoteConnectionOptions;
-use settings::Settings;
 use ui::{ButtonLike, KeyBinding, ListItem, ListItemSpacing, Tooltip, prelude::*};
 use util::{ResultExt, paths::PathExt};
 use workspace::{
-    MultiWorkspace, OpenMode, OpenOptions, ProjectGroupKey, RecentWorkspace,
-    SerializedWorkspaceLocation, Workspace, WorkspaceDb, notifications::DetachAndPromptErr,
+    MultiWorkspace, OpenMode, OpenOptions, OpenVisible, ProjectGroupKey, RecentWorkspace,
+    SerializedWorkspaceLocation, Workspace, WorkspaceDb,
 };
 
 use zed_actions::OpenRemote;
 
-use crate::{highlights_for_path, icon_for_remote_connection, open_remote_project};
+use crate::{highlights_for_path, icon_for_remote_connection};
 
 pub struct SidebarRecentProjects {
     pub picker: Entity<Picker<SidebarRecentProjectsDelegate>>,
@@ -228,19 +226,44 @@ impl PickerDelegate for SidebarRecentProjectsDelegate {
         let Some(recent_workspace) = self.workspaces.get(hit.candidate_id) else {
             return;
         };
-
         let Some(workspace) = self.workspace.upgrade() else {
             return;
         };
 
-        match &recent_workspace.location {
-            SerializedWorkspaceLocation::Local => {
-                if let Some(handle) = window.window_handle().downcast::<MultiWorkspace>() {
-                    let paths = recent_workspace.paths.paths().to_vec();
+        let workspace_id = recent_workspace.workspace_id;
+        let location = recent_workspace.location.clone();
+        let paths = recent_workspace.paths.paths().to_vec();
+        let remote_connection_options = recent_workspace.remote_connection_options.clone();
+        let open_options = OpenOptions {
+            requesting_window: window.window_handle().downcast::<MultiWorkspace>(),
+            open_mode: OpenMode::Activate,
+            visible: Some(OpenVisible::All),
+            ..Default::default()
+        };
+
+        workspace.update(cx, |workspace, cx| {
+            if workspace.database_id() == Some(workspace_id) {
+                return;
+            }
+
+            match location {
+                SerializedWorkspaceLocation::Local => {
+                    let Some(handle) = window.window_handle().downcast::<MultiWorkspace>() else {
+                        workspace.show_error(
+                            "Cannot reopen local project without a workspace window",
+                            cx,
+                        );
+                        return;
+                    };
                     cx.defer(move |cx| {
                         if let Some(task) = handle
                             .update(cx, |multi_workspace, window, cx| {
-                                multi_workspace.open_project(paths, OpenMode::Activate, window, cx)
+                                multi_workspace.open_project(
+                                    paths,
+                                    OpenMode::Activate,
+                                    window,
+                                    cx,
+                                )
                             })
                             .log_err()
                         {
@@ -248,26 +271,41 @@ impl PickerDelegate for SidebarRecentProjectsDelegate {
                         }
                     });
                 }
-            }
-            SerializedWorkspaceLocation::Remote(_host) => {
-                // Remote project reopening stubbed (spec §8.2 M3)
-                let workspace = workspace.clone();
-                let paths = recent_workspace.paths.paths().to_vec();
-                workspace.update(cx, |workspace, cx| {
-                    let app_state = workspace.app_state().clone();
-                    let replace_window = window.window_handle().downcast::<MultiWorkspace>();
-                    let open_options = OpenOptions {
-                        requesting_window: replace_window,
-                        ..Default::default()
+                SerializedWorkspaceLocation::Remote(host) => {
+                    let Some(connection_options) = remote_connection_options else {
+                        workspace.show_error(
+                            format!(
+                                "Cannot reopen remote project at {host}: connection details are unavailable"
+                            ),
+                            cx,
+                        );
+                        return;
                     };
                     cx.spawn_in(window, async move |_, cx| {
-                        // Stub: remote project no longer supported
-                        let _ = (paths, app_state, open_options);
+                        if let Err(error) =
+                            crate::open_remote_project(connection_options, paths, open_options, cx)
+                                .await
+                        {
+                            let message = format!("Unable to open the remote project: {error}");
+                            if let Err(prompt_error) = cx
+                                .prompt(
+                                    gpui::PromptLevel::Critical,
+                                    "Unable to open project",
+                                    Some(&message),
+                                    &["OK"],
+                                )
+                                .await
+                            {
+                                log::error!(
+                                    "failed to show remote project error: {prompt_error}"
+                                );
+                            }
+                        }
                     })
                     .detach();
-                });
+                }
             }
-        }
+        });
         cx.emit(DismissEvent);
     }
 

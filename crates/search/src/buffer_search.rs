@@ -1848,6 +1848,7 @@ mod tests {
     use settings::{SearchSettingsContent, SettingsStore};
     use unindent::Unindent as _;
     use util_macros::perf;
+    use workspace::settings_stubs::SeedQuerySetting;
     #[cfg(target_os = "macos")]
     use workspace::{AppState, MultiWorkspace, Workspace};
 
@@ -2303,7 +2304,7 @@ mod tests {
 
         // search_suggested should restore default options
         search_bar.update_in(cx, |search_bar, window, cx| {
-            search_bar.search_suggested(None, window, cx);
+            search_bar.search_suggested(Some(SeedQuerySetting::Line), window, cx);
             assert_eq!(search_bar.search_options, SearchOptions::NONE)
         });
 
@@ -2334,7 +2335,7 @@ mod tests {
 
         // defaults should still include whole word
         search_bar.update_in(cx, |search_bar, window, cx| {
-            search_bar.search_suggested(None, window, cx);
+            search_bar.search_suggested(Some(SeedQuerySetting::Line), window, cx);
             assert_eq!(
                 search_bar.search_options,
                 SearchOptions::CASE_SENSITIVE | SearchOptions::WHOLE_WORD
@@ -3157,7 +3158,7 @@ mod tests {
                     replace_enabled: true,
                     selection_search_enabled: false,
                 },
-                None,
+                Some(SeedQuerySetting::Selection),
                 window,
                 cx,
             );

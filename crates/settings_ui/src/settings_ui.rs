@@ -49,7 +49,8 @@ use workspace::{
     client_side_decorations,
 };
 use zed_actions::{
-    OpenProjectSettings, OpenSettings, OpenSettingsAt, OpenSettingsAtTarget, OpenSettingsPage,
+    OpenProjectSettings, OpenSettings, OpenSettingsAt, OpenSettingsAtTarget, OpenSettingsFile,
+    OpenSettingsPage,
 };
 
 use crate::components::{
@@ -418,6 +419,9 @@ pub fn init(cx: &mut App) {
     let queue = ProjectSettingsUpdateQueue::new(cx);
     cx.set_global(queue);
 
+    cx.on_action(|_: &OpenSettingsFile, cx| {
+        open_settings_editor_at_target(None, Some(SettingsFileTarget::User), None, cx);
+    });
     cx.on_action(|_: &OpenSettings, cx| {
         open_settings_editor(None, None, None, cx);
     });
@@ -5326,13 +5330,21 @@ pub mod test {
 
         project1
             .update(cx, |project, cx| {
-                project.find_or_create_worktree(std::path::Path::new("/workspace1/worktree_a"), true, cx)
+                project.find_or_create_worktree(
+                    std::path::Path::new("/workspace1/worktree_a"),
+                    true,
+                    cx,
+                )
             })
             .await
             .expect("Failed to create worktree_a");
         project1
             .update(cx, |project, cx| {
-                project.find_or_create_worktree(std::path::Path::new("/workspace1/worktree_b"), true, cx)
+                project.find_or_create_worktree(
+                    std::path::Path::new("/workspace1/worktree_b"),
+                    true,
+                    cx,
+                )
             })
             .await
             .expect("Failed to create worktree_b");
@@ -5349,7 +5361,11 @@ pub mod test {
 
         project2
             .update(cx, |project, cx| {
-                project.find_or_create_worktree(std::path::Path::new("/workspace2/worktree_c"), true, cx)
+                project.find_or_create_worktree(
+                    std::path::Path::new("/workspace2/worktree_c"),
+                    true,
+                    cx,
+                )
             })
             .await
             .expect("Failed to create worktree_c");
@@ -5491,7 +5507,11 @@ pub mod test {
 
         project1
             .update(cx, |project, cx| {
-                project.find_or_create_worktree(std::path::Path::new("/workspace1/worktree_a"), true, cx)
+                project.find_or_create_worktree(
+                    std::path::Path::new("/workspace1/worktree_a"),
+                    true,
+                    cx,
+                )
             })
             .await
             .expect("Failed to create worktree_a");
@@ -5538,7 +5558,11 @@ pub mod test {
 
         project2
             .update(&mut cx.cx, |project, cx| {
-                project.find_or_create_worktree(std::path::Path::new("/workspace2/worktree_b"), true, cx)
+                project.find_or_create_worktree(
+                    std::path::Path::new("/workspace2/worktree_b"),
+                    true,
+                    cx,
+                )
             })
             .await
             .expect("Failed to create worktree_b");

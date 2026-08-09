@@ -9,12 +9,12 @@
 
 use anyhow::Result;
 use gpui::{
-    div, px, AnyElement, App, ClickEvent, ElementId, FocusHandle, Hsla, InteractiveElement,
-    IntoElement, KeyDownEvent, ParentElement, SharedString, StatefulInteractiveElement, Styled,
-    Window,
+    AnyElement, App, ClickEvent, ElementId, FocusHandle, Hsla, InteractiveElement, IntoElement,
+    KeyDownEvent, ParentElement, Role, SharedString, StatefulInteractiveElement, Styled, Window,
+    div, px,
 };
 use serde::{Deserialize, Serialize};
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::rc::Rc;
 
 /// A VDOM node — the JSON structure extensions return from render() calls.
@@ -44,7 +44,7 @@ pub struct VDomNode {
     pub children: Vec<VDomChild>,
 }
 
-/// A VDOM child — either a text string or a nested element node.
+/// A VDOM child — either text, a scalar rendered as text, or a nested element.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(untagged)]
 pub enum VDomChild {
@@ -54,13 +54,42 @@ pub enum VDomChild {
     Node(VDomNode),
 }
 
+fn normalize_vdom_node(value: &mut serde_json::Value) {
+    let serde_json::Value::Object(properties) = value else {
+        return;
+    };
+    let Some(serde_json::Value::Array(children)) = properties.get_mut("children") else {
+        return;
+    };
+
+    let mut normalized = Vec::with_capacity(children.len());
+    for mut child in std::mem::take(children) {
+        match child {
+            serde_json::Value::Null => {}
+            serde_json::Value::Number(number) => {
+                normalized.push(serde_json::Value::String(number.to_string()));
+            }
+            serde_json::Value::Bool(boolean) => {
+                normalized.push(serde_json::Value::String(boolean.to_string()));
+            }
+            _ => {
+                normalize_vdom_node(&mut child);
+                normalized.push(child);
+            }
+        }
+    }
+    *children = normalized;
+}
+
 /// Parse a VDOM JSON value into a VDomNode tree.
 ///
-/// Extensions return `serde_json::Value` from QuickJS; this validates
-/// and converts to typed VDomNode for the renderer.
+/// QuickJS extensions commonly put numbers, booleans, or null in `children`.
+/// Normalize those JavaScript scalar semantics before deserializing the typed
+/// tree; null children are ignored and other scalars render as text.
 pub fn parse_vdom(value: &serde_json::Value) -> Result<VDomNode> {
-    serde_json::from_value(value.clone())
-        .map_err(|e| anyhow::anyhow!("VDOM parse error: {}", e))
+    let mut normalized = value.clone();
+    normalize_vdom_node(&mut normalized);
+    serde_json::from_value(normalized).map_err(|e| anyhow::anyhow!("VDOM parse error: {}", e))
 }
 
 /// Flatten a VDOM tree into a text representation.
@@ -148,9 +177,9 @@ pub enum DrawOp {
         x: f32,
         #[serde(default)]
         y: f32,
-        #[serde(default)]
+        #[serde(default, alias = "w")]
         width: f32,
-        #[serde(default)]
+        #[serde(default, alias = "h")]
         height: f32,
         #[serde(default)]
         color: Option<String>,
@@ -202,6 +231,12 @@ pub type CommandDispatch = Rc<dyn Fn(CommandInvocation, &mut Window, &mut App)>;
 pub struct VDomRenderer {
     palette: VDomPalette,
     display_lists: BTreeMap<SharedString, Vec<DrawOp>>,
+    /// Display-list region ids present in the frame currently being rendered.
+    /// [`render_frame`](Self::render_frame) uses this to evict cached ops for
+    /// regions that disappeared from the VDOM, keeping native-side
+    /// display-list state bounded by what extensions actually render (§5.4
+    /// cache discipline, §5.2 per-extension resource limits).
+    seen_display_regions: HashSet<SharedString>,
     focus_handles: HashMap<SharedString, FocusHandle>,
     dispatch: Option<CommandDispatch>,
 }
@@ -217,6 +252,7 @@ impl VDomRenderer {
         Self {
             palette: VDomPalette::default(),
             display_lists: BTreeMap::new(),
+            seen_display_regions: HashSet::new(),
             focus_handles: HashMap::new(),
             dispatch: None,
         }
@@ -245,8 +281,38 @@ impl VDomRenderer {
     }
 
     /// Convert a VDOM tree into a GPUI element tree.
+    ///
+    /// Single-node convenience: renders the node as a one-node frame, evicting
+    /// display-list regions that are not part of it. Embedders that render
+    /// several top-level nodes per GPUI frame must use
+    /// [`render_frame`](Self::render_frame) so the eviction sees the whole
+    /// frame at once.
     pub fn render(&mut self, node: &VDomNode, cx: &mut App) -> AnyElement {
-        self.render_node(node, &mut ElementPath::root(), cx)
+        let mut elements = self.render_frame(std::slice::from_ref(node), cx);
+        elements
+            .pop()
+            .expect("render_frame returns one element per node")
+    }
+
+    /// Render a whole frame of top-level nodes in one pass, then evict cached
+    /// display-list ops for regions that did not appear anywhere in the frame.
+    ///
+    /// §5.4 requires the native side to cache display lists so ticking widgets
+    /// repaint without full VDOM reconciliation; a cache is only bounded if
+    /// entries for regions that disappeared are dropped. Without this an
+    /// extension that cycles region ids (or stops rendering a region) would
+    /// grow the native-side cache without limit (§5.2 per-extension resource
+    /// limits). Regions that appear again later simply repopulate the cache
+    /// from their `drawOps` on the next frame.
+    pub fn render_frame(&mut self, nodes: &[VDomNode], cx: &mut App) -> Vec<AnyElement> {
+        let mut elements = Vec::with_capacity(nodes.len());
+        for node in nodes {
+            elements.push(self.render_node(node, &mut ElementPath::root(), cx));
+        }
+        self.display_lists
+            .retain(|region, _| self.seen_display_regions.contains(region));
+        self.seen_display_regions.clear();
+        elements
     }
 
     fn render_node(&mut self, node: &VDomNode, path: &mut ElementPath, cx: &mut App) -> AnyElement {
@@ -264,27 +330,60 @@ impl VDomRenderer {
         path: &mut ElementPath,
         cx: &mut App,
     ) -> AnyElement {
-        let click = node
-            .props
-            .get("onClick")
-            .and_then(CommandInvocation::parse);
+        let click = node.props.get("onClick").and_then(CommandInvocation::parse);
         let is_button = node.element_type == "button";
 
-        // Only id'd elements can carry click handlers in GPUI, and an id costs
-        // a stateful element, so plain nodes stay stateless.
+        // Only interactive nodes need a stateful element id. Plain containers
+        // remain stateless while buttons expose keyboard and accessibility
+        // semantics equivalent to a native control.
         if click.is_none() && !is_button {
             let element = self.style_and_fill(div(), node, path, cx);
             return element.into_any_element();
         }
 
-        let element = div().id(self.element_id(node, path));
-        let mut element = self.style_and_fill(element, node, path, cx);
-        if is_button {
-            element = element.cursor_pointer();
+        let mut element =
+            self.style_and_fill(div().id(self.element_id(node, path)), node, path, cx);
+        if let Some(label) = node
+            .props
+            .get("aria-label")
+            .or_else(|| node.props.get("ariaLabel"))
+            .and_then(|value| value.as_str())
+        {
+            element = element.aria_label(SharedString::from(label.to_owned()));
         }
-        if let (Some(invocation), Some(dispatch)) = (click, self.dispatch.clone()) {
+
+        let button_focus_handle = if is_button {
+            Some(
+                self.focus_handles
+                    .entry(self.element_key(node, path).into())
+                    .or_insert_with(|| cx.focus_handle())
+                    .clone(),
+            )
+        } else {
+            None
+        };
+        if let Some(focus_handle) = button_focus_handle.as_ref() {
+            element = element
+                .role(Role::Button)
+                .tab_stop(true)
+                .track_focus(focus_handle)
+                .cursor_pointer();
+        }
+
+        if let (Some(invocation), Some(dispatch)) = (click.clone(), self.dispatch.clone()) {
+            let focus_handle = button_focus_handle.clone();
             element = element.on_click(move |_event: &ClickEvent, window, cx| {
+                if let Some(focus_handle) = focus_handle.as_ref() {
+                    window.focus(focus_handle, cx);
+                }
                 dispatch(invocation.clone(), window, cx);
+            });
+        }
+        if is_button && let (Some(invocation), Some(dispatch)) = (click, self.dispatch.clone()) {
+            element = element.on_key_down(move |event: &KeyDownEvent, window, cx| {
+                if matches!(event.keystroke.key.as_str(), "enter" | "space") {
+                    dispatch(invocation.clone(), window, cx);
+                }
             });
         }
         element.into_any_element()
@@ -293,7 +392,12 @@ impl VDomRenderer {
     /// A text field driven entirely by the extension: the displayed value comes
     /// from `props.value` and every edit is dispatched through `onChange`, so
     /// the extension stays the single owner of the text.
-    fn render_input(&mut self, node: &VDomNode, path: &mut ElementPath, cx: &mut App) -> AnyElement {
+    fn render_input(
+        &mut self,
+        node: &VDomNode,
+        path: &mut ElementPath,
+        cx: &mut App,
+    ) -> AnyElement {
         let id: SharedString = self.element_key(node, path).into();
         let focus_handle = self
             .focus_handles
@@ -304,13 +408,13 @@ impl VDomRenderer {
         let value = node
             .props
             .get("value")
-            .and_then(|v| v.as_str())
+            .and_then(|value| value.as_str())
             .unwrap_or_default()
             .to_string();
         let placeholder = node
             .props
             .get("placeholder")
-            .and_then(|v| v.as_str())
+            .and_then(|value| value.as_str())
             .unwrap_or_default()
             .to_string();
         let change = node
@@ -327,6 +431,8 @@ impl VDomRenderer {
 
         let mut element = div()
             .id(ElementId::Name(id))
+            .role(Role::TextInput)
+            .tab_stop(true)
             .track_focus(&focus_handle)
             .border_1()
             .border_color(self.palette.border)
@@ -336,6 +442,14 @@ impl VDomRenderer {
             } else {
                 self.palette.text
             });
+        if let Some(aria_label) = node
+            .props
+            .get("aria-label")
+            .or_else(|| node.props.get("ariaLabel"))
+            .and_then(|value| value.as_str())
+        {
+            element = element.aria_label(SharedString::from(aria_label.to_owned()));
+        }
         element = apply_styles(element, node, &self.palette);
 
         if let (Some(invocation), Some(dispatch)) = (change, self.dispatch.clone()) {
@@ -354,17 +468,30 @@ impl VDomRenderer {
 
     /// Paint the draw ops the host collected for this region. Positions are
     /// absolute within the region so ops never disturb sibling layout.
-    fn render_display_list(&self, node: &VDomNode) -> AnyElement {
+    fn render_display_list(&mut self, node: &VDomNode) -> AnyElement {
         let region_id = node
             .props
             .get("id")
             .and_then(|v| v.as_str())
             .unwrap_or_default();
+        // Presence alone keeps the region alive for this frame: even a node
+        // without fresh drawOps (renderer threw) must not be evicted while it
+        // is still part of the VDOM.
+        self.seen_display_regions
+            .insert(SharedString::from(region_id.to_string()));
+        if let Some(value) = node.props.get("drawOps") {
+            match parse_display_list(value) {
+                Ok(ops) => self.set_display_list(region_id.to_string(), ops),
+                Err(error) => {
+                    tracing::warn!(region_id, %error, "extension display list rejected");
+                    self.display_lists.remove(region_id);
+                }
+            }
+        }
         let mut container = apply_styles(div().relative(), node, &self.palette);
         let Some(ops) = self.display_lists.get(region_id) else {
             return container.into_any_element();
         };
-
         for op in ops {
             match op {
                 DrawOp::DrawText { text, x, y, color } => {
@@ -408,7 +535,13 @@ impl VDomRenderer {
         container.into_any_element()
     }
 
-    fn style_and_fill<E>(&mut self, element: E, node: &VDomNode, path: &mut ElementPath, cx: &mut App) -> E
+    fn style_and_fill<E>(
+        &mut self,
+        element: E,
+        node: &VDomNode,
+        path: &mut ElementPath,
+        cx: &mut App,
+    ) -> E
     where
         E: Styled + ParentElement,
     {
@@ -578,7 +711,9 @@ fn apply_keystroke(current: &str, event: &KeyDownEvent) -> Option<String> {
         }
         _ => {
             let typed = event.keystroke.key_char.as_deref()?;
-            if typed.is_empty() || event.keystroke.modifiers.control || event.keystroke.modifiers.platform
+            if typed.is_empty()
+                || event.keystroke.modifiers.control
+                || event.keystroke.modifiers.platform
             {
                 return None;
             }
@@ -635,6 +770,19 @@ mod tests {
             VDomChild::Text(t) => assert_eq!(t, "hello"),
             other => panic!("expected text child, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn parse_javascript_scalar_children() {
+        let json = serde_json::json!({
+            "type": "div",
+            "children": [0, false, null, "text"]
+        });
+        let node = parse_vdom(&json).expect("parse scalar children");
+        assert_eq!(node.children.len(), 3);
+        assert!(matches!(&node.children[0], VDomChild::Text(text) if text == "0"));
+        assert!(matches!(&node.children[1], VDomChild::Text(text) if text == "false"));
+        assert!(matches!(&node.children[2], VDomChild::Text(text) if text == "text"));
     }
 
     #[test]
@@ -761,6 +909,24 @@ mod tests {
     }
 
     #[test]
+    fn display_list_accepts_spec_short_rectangle_dimensions() {
+        let json = serde_json::json!([
+            { "op": "fillRect", "x": 1, "y": 2, "w": 30, "h": 4 }
+        ]);
+        let ops = parse_display_list(&json).expect("parse display list");
+        assert_eq!(
+            ops,
+            vec![DrawOp::FillRect {
+                x: 1.0,
+                y: 2.0,
+                width: 30.0,
+                height: 4.0,
+                color: None,
+            }]
+        );
+    }
+
+    #[test]
     fn renderer_stores_display_lists_by_region_id() {
         let mut renderer = VDomRenderer::new();
         assert_eq!(renderer.display_list("clock"), None);
@@ -774,6 +940,121 @@ mod tests {
             }],
         );
         assert_eq!(renderer.display_list("clock").map(<[DrawOp]>::len), Some(1));
+    }
+
+    fn display_list_node(id: &str) -> VDomNode {
+        VDomNode {
+            element_type: "display-list".into(),
+            props: [
+                ("id".to_string(), serde_json::json!(id)),
+                (
+                    "drawOps".to_string(),
+                    serde_json::json!([
+                        { "op": "drawText", "text": "t", "x": 0, "y": 0 }
+                    ]),
+                ),
+            ]
+            .into_iter()
+            .collect(),
+            style: BTreeMap::new(),
+            children: Vec::new(),
+        }
+    }
+
+    /// §5.4: a display-list region that stops appearing in the VDOM must be
+    /// evicted from the native cache — otherwise a ticking extension that
+    /// cycles region ids grows the renderer's state without bound (§5.2).
+    #[gpui::test]
+    fn render_frame_evicts_regions_missing_from_the_frame(cx: &mut gpui::TestAppContext) {
+        let mut renderer = VDomRenderer::new();
+        let clock = display_list_node("clock");
+
+        // Frame 1 renders the clock region: ops are cached.
+        let elements = cx.update(|cx| renderer.render_frame(&[clock.clone()], cx));
+        assert_eq!(elements.len(), 1);
+        assert_eq!(renderer.display_list("clock").map(<[DrawOp]>::len), Some(1));
+
+        // Frame 2 no longer contains the clock: its cached ops must be gone.
+        let empty = VDomNode {
+            element_type: "div".into(),
+            props: BTreeMap::new(),
+            style: BTreeMap::new(),
+            children: Vec::new(),
+        };
+        cx.update(|cx| renderer.render_frame(&[empty], cx));
+        assert_eq!(
+            renderer.display_list("clock"),
+            None,
+            "regions absent from the frame must be evicted"
+        );
+    }
+
+    /// §5.4: regions that keep rendering survive eviction, and a frame with
+    /// several top-level nodes evicts only what the whole frame dropped.
+    #[gpui::test]
+    fn render_frame_keeps_regions_still_rendered_and_evicts_per_frame(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let mut renderer = VDomRenderer::new();
+        let clock = display_list_node("clock");
+        let meter = display_list_node("meter");
+
+        // Both regions in one multi-node frame.
+        assert_eq!(
+            cx.update(|cx| renderer.render_frame(&[clock.clone(), meter.clone()], cx))
+                .len(),
+            2
+        );
+        assert_eq!(renderer.display_list("clock").map(<[DrawOp]>::len), Some(1));
+        assert_eq!(renderer.display_list("meter").map(<[DrawOp]>::len), Some(1));
+
+        // Next frame drops the meter but keeps the clock: only the meter is
+        // evicted, the clock cache survives and repaints.
+        assert_eq!(
+            cx.update(|cx| renderer.render_frame(&[clock.clone()], cx))
+                .len(),
+            1
+        );
+        assert_eq!(
+            renderer.display_list("meter"),
+            None,
+            "dropped region must be evicted"
+        );
+        assert_eq!(
+            renderer.display_list("clock").map(<[DrawOp]>::len),
+            Some(1),
+            "still-rendered region must keep its cache"
+        );
+
+        // The region reappears: the cache repopulates from the new drawOps.
+        assert_eq!(
+            cx.update(|cx| renderer.render_frame(&[clock.clone(), meter.clone()], cx))
+                .len(),
+            2
+        );
+        assert_eq!(renderer.display_list("meter").map(<[DrawOp]>::len), Some(1));
+    }
+
+    /// §5.4: the single-node `render()` entry treats its node as a frame, so
+    /// stale regions are evicted there too.
+    #[gpui::test]
+    fn render_evicts_stale_regions_as_a_single_node_frame(cx: &mut gpui::TestAppContext) {
+        let mut renderer = VDomRenderer::new();
+        cx.update(|cx| renderer.render(&display_list_node("clock"), cx));
+        assert_eq!(renderer.display_list("clock").map(<[DrawOp]>::len), Some(1));
+
+        let plain = VDomNode {
+            element_type: "span".into(),
+            props: BTreeMap::new(),
+            style: BTreeMap::new(),
+            children: Vec::new(),
+        };
+        cx.update(|cx| renderer.render(&plain, cx));
+        assert_eq!(
+            renderer.display_list("clock"),
+            None,
+            "stale region must be evicted by the next single-node frame"
+        );
     }
 
     #[test]

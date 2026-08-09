@@ -2,8 +2,8 @@
 //!
 //! 以下类型已从 settings crate 移除，在此定义以保持 workspace crate 编译。
 
-use serde::{Deserialize, Serialize};
 use schemars::JsonSchema;
+use serde::{Deserialize, Serialize};
 
 /// 侧边栏位置 (原 settings::SidebarSide)
 #[derive(Copy, Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
@@ -92,14 +92,15 @@ pub enum CliDefaultOpenBehavior {
 #[derive(Copy, Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 pub struct Milliseconds(pub u64);
 
-
 /// 自动保存设置 (原 settings::AutosaveSetting)
 #[derive(Copy, Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum AutosaveSetting {
     #[default]
     Never,
-    AfterDelay { milliseconds: Milliseconds },
+    AfterDelay {
+        milliseconds: Milliseconds,
+    },
     OnFocusChange,
     OnWindowChange,
     OnChange,
@@ -217,17 +218,9 @@ impl CloseWindowWhenNoItems {
 #[serde(tag = "kind")]
 pub enum ExtensionCapabilityContent {
     #[serde(rename = "process_exec")]
-    ProcessExec {
-        command: String,
-        args: Vec<String>,
-    },
+    ProcessExec { command: String, args: Vec<String> },
     #[serde(rename = "download_file")]
-    DownloadFile {
-        host: String,
-        path: String,
-    },
+    DownloadFile { host: String, path: String },
     #[serde(rename = "npm_install_package")]
-    NpmInstallPackage {
-        package: String,
-    },
+    NpmInstallPackage { package: String },
 }

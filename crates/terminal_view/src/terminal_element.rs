@@ -1,23 +1,24 @@
+use accesskit;
 use editor::{CursorLayout, EditorSettings, HighlightedRange, HighlightedRangeLine};
 use gpui::{
-    AbsoluteLength, AnyElement, App, AvailableSpace, Bounds, ContentMask, Context, DispatchPhase,
-    Element, ElementId, Entity, FocusHandle, Font, FontFeatures, FontStyle, FontWeight,
-    GlobalElementId, HighlightStyle, Hitbox, Hsla, InputHandler, InteractiveElement, Interactivity,
-    IntoElement, LayoutId, Length, ModifiersChangedEvent, MouseButton, MouseMoveEvent, Pixels,
-    Point as GpuiPoint, Role, Stateful, StatefulInteractiveElement, StrikethroughStyle, Styled,
-    TextRun, TextStyle, UTF16Selection, UnderlineStyle, WeakEntity, WhiteSpace, Window, div, fill,
-    point, px, relative, size, A11ySubtreeBuilder,
+    A11ySubtreeBuilder, AbsoluteLength, AnyElement, App, AvailableSpace, Bounds, ContentMask,
+    Context, DispatchPhase, Element, ElementId, Entity, FocusHandle, Font, FontFeatures, FontStyle,
+    FontWeight, GlobalElementId, HighlightStyle, Hitbox, Hsla, InputHandler, InteractiveElement,
+    Interactivity, IntoElement, LayoutId, Length, ModifiersChangedEvent, MouseButton,
+    MouseMoveEvent, Pixels, Point as GpuiPoint, Role, Stateful, StatefulInteractiveElement,
+    StrikethroughStyle, Styled, TextRun, TextStyle, UTF16Selection, UnderlineStyle, WeakEntity,
+    WhiteSpace, Window, div, fill, point, px, relative, size,
 };
-use accesskit;
 
 use itertools::Itertools;
 use language::CursorShape as EditorCursorShape;
 use settings::Settings;
 use std::time::Instant;
 use terminal::{
-    Cell, Color, Content, CursorShape, IndexedCell, Modes, NamedColor, Point, Range, Terminal,
-    TerminalBounds, VisibleImage, is_app_chosen_exact_color as terminal_is_app_chosen_exact_color,
-    is_default_background_color, terminal_settings::TerminalSettings,
+    Cell, Color, Content, CursorShape, IndexedCell, Modes, NamedColor, Point, Range, ScrollLineDown,
+    ScrollLineUp, Terminal, TerminalBounds, VisibleImage,
+    is_app_chosen_exact_color as terminal_is_app_chosen_exact_color, is_default_background_color,
+    terminal_settings::TerminalSettings,
 };
 use theme::{ActiveTheme, Theme};
 use theme_settings::ThemeSettings;
@@ -73,6 +74,56 @@ impl DisplayCursor {
     pub fn col(&self) -> usize {
         self.col
     }
+}
+
+/// Whether a standalone terminal's grid should be pinned to the bottom of its
+/// available height.
+///
+/// Full-screen TUI apps (vim, opencode) run on the alternate screen and never
+/// scroll, so they must anchor to the bottom regardless of the scroll state;
+/// primary-screen content anchors only when it is scrolled to the bottom and
+/// the bottom row is actually occupied (otherwise the leftover padding stays
+/// below the grid and the prompt remains at the top).
+fn should_anchor_to_bottom(content: &Content) -> bool {
+    content.mode.contains(Modes::ALT_SCREEN)
+        || (content.scrolled_to_bottom && content.bottom_row_occupied)
+}
+
+/// Converts a grid (line, col) to a pixel position, quantized to the
+/// device-pixel grid.
+///
+/// Every terminal grid painter — glyph runs, background rects, kitty graphics
+/// overlays, and the cursor — must use this same quantization so that a cell's
+/// cursor lands on the exact pixel boundary as its glyph. Quantizing in device
+/// space (rounding the device-pixel position, then converting back to logical
+/// pixels) keeps the grid stable across fractional cell metrics and HiDPI
+/// scale factors. A plain `.floor()` in logical pixels (the historical cursor
+/// behavior) quantizes to a different boundary than the window's device-pixel
+/// snapping and can leave the cursor up to a pixel away from the character it
+/// covers.
+fn snapped_cell_point(
+    origin: GpuiPoint<Pixels>,
+    line: i32,
+    col: usize,
+    dimensions: &TerminalBounds,
+    scale_factor: f32,
+) -> GpuiPoint<Pixels> {
+    let snap =
+        |value: Pixels| Pixels::from((f32::from(value) * scale_factor).round() / scale_factor);
+    point(
+        snap(origin.x + col as f32 * dimensions.cell_width()),
+        snap(origin.y + line as f32 * dimensions.line_height()),
+    )
+}
+
+fn terminal_paint_origin(
+    bounds_origin: GpuiPoint<Pixels>,
+    scroll_top: Pixels,
+    scale_factor: f32,
+) -> GpuiPoint<Pixels> {
+    let snap =
+        |value: Pixels| Pixels::from((f32::from(value) * scale_factor).floor() / scale_factor);
+    point(snap(bounds_origin.x), snap(bounds_origin.y - scroll_top))
 }
 
 #[derive(Copy, Clone, Debug, Default)]
@@ -156,9 +207,12 @@ impl BatchedTextRun {
         window: &mut Window,
         cx: &mut App,
     ) {
-        let pos = GpuiPoint::new(
-            origin.x + self.start_point.column as f32 * dimensions.cell_width,
-            origin.y + self.start_point.line as f32 * dimensions.line_height,
+        let pos = snapped_cell_point(
+            origin,
+            self.start_point.line,
+            self.start_point.column.max(0) as usize,
+            dimensions,
+            window.scale_factor(),
         );
 
         window
@@ -203,20 +257,20 @@ impl LayoutRect {
         dimensions: &TerminalBounds,
         window: &mut Window,
     ) {
-        let position = {
-            let layout_point = self.point;
-            point(
-                (origin.x + layout_point.column as f32 * dimensions.cell_width).floor(),
-                origin.y + layout_point.line as f32 * dimensions.line_height,
-            )
-        };
-        let size = point(
-            (dimensions.cell_width * self.num_of_cells as f32).ceil(),
-            dimensions.line_height,
-        )
-        .into();
+        let scale_factor = window.scale_factor();
+        let col = self.point.column.max(0) as usize;
+        let start = snapped_cell_point(origin, self.point.line, col, dimensions, scale_factor);
+        let end = snapped_cell_point(
+            origin,
+            self.point.line,
+            col + self.num_of_cells,
+            dimensions,
+            scale_factor,
+        );
+        let bottom = snapped_cell_point(origin, self.point.line + 1, col, dimensions, scale_factor);
+        let size = point(end.x - start.x, bottom.y - start.y).into();
 
-        window.paint_quad(fill(Bounds::new(position, size), self.color));
+        window.paint_quad(fill(Bounds::new(start, size), self.color));
     }
 }
 
@@ -553,16 +607,28 @@ impl TerminalElement {
         (rects, batched_runs)
     }
 
-    /// Computes the cursor position based on the cursor point and terminal dimensions.
+    /// Computes the cursor position relative to the paint origin.
+    ///
+    /// The position is quantized to device pixels via [`snapped_cell_point`]
+    /// so the cursor shares the exact pixel boundary with the glyph in the
+    /// same cell, including when the terminal is partially scrolled.
     fn cursor_position(
         cursor_point: DisplayCursor,
         size: TerminalBounds,
+        paint_origin: GpuiPoint<Pixels>,
+        scale_factor: f32,
     ) -> Option<GpuiPoint<Pixels>> {
         if cursor_point.line() < size.num_lines() as i32 {
-            // When on pixel boundaries round the origin down
+            let snapped = snapped_cell_point(
+                paint_origin,
+                cursor_point.line(),
+                cursor_point.col(),
+                &size,
+                scale_factor,
+            );
             Some(point(
-                (cursor_point.col() as f32 * size.cell_width()).floor(),
-                (cursor_point.line() as f32 * size.line_height()).floor(),
+                snapped.x - paint_origin.x,
+                snapped.y - paint_origin.y,
             ))
         } else {
             None
@@ -804,6 +870,31 @@ impl TerminalElement {
                         .ok();
                 }
             });
+        }
+
+        // Screen-reader semantic actions: scroll the viewport one line at a
+        // time through the same handlers the keyboard bindings use.
+        {
+            let terminal_view = self.terminal_view.downgrade();
+            self.interactivity.on_a11y_action(
+                accesskit::Action::ScrollUp,
+                move |_data, window, cx| {
+                    terminal_view
+                        .update(cx, |view, cx| view.scroll_line_up(&ScrollLineUp, window, cx))
+                        .ok();
+                },
+            );
+            let terminal_view = self.terminal_view.downgrade();
+            self.interactivity.on_a11y_action(
+                accesskit::Action::ScrollDown,
+                move |_data, window, cx| {
+                    terminal_view
+                        .update(cx, |view, cx| {
+                            view.scroll_line_down(&ScrollLineDown, window, cx)
+                        })
+                        .ok();
+                },
+            );
         }
 
         // Mouse mode handlers:
@@ -1077,7 +1168,7 @@ impl Element for TerminalElement {
                     if matches!(self.terminal_view.read(cx).mode, TerminalMode::Standalone) {
                         let should_anchor_to_bottom = {
                             let content = self.terminal.read(cx).last_content();
-                            content.scrolled_to_bottom && content.bottom_row_occupied
+                            should_anchor_to_bottom(content)
                         };
                         let scale_factor = window.scale_factor();
                         let line_height_pixels = px(line_height);
@@ -1151,6 +1242,12 @@ impl Element for TerminalElement {
                     });
 
                 let scroll_top = self.terminal_view.read(cx).scroll_top;
+                let paint_origin = terminal_paint_origin(
+                    dimensions.bounds.origin,
+                    scroll_top,
+                    window.scale_factor(),
+                );
+
                 let hyperlink_tooltip = hover_tooltip.map(|hover_tooltip| {
                     let offset = dimensions.bounds.origin - point(px(0.), scroll_top);
                     let mut element = div()
@@ -1281,12 +1378,16 @@ impl Element for TerminalElement {
                 } else {
                     cursor_text.width.max(dimensions.cell_width())
                 };
-
-                let ime_cursor_bounds = TerminalElement::cursor_position(cursor_point, dimensions)
-                    .map(|cursor_position| Bounds {
-                        origin: cursor_position,
-                        size: size(cursor_width.ceil(), dimensions.line_height),
-                    });
+                let ime_cursor_bounds = TerminalElement::cursor_position(
+                    cursor_point,
+                    dimensions,
+                    paint_origin,
+                    window.scale_factor(),
+                )
+                .map(|cursor_position| Bounds {
+                    origin: cursor_position,
+                    size: size(cursor_width.ceil(), dimensions.line_height),
+                });
 
                 let cursor = if let CursorShape::Hidden = cursor.shape {
                     None
@@ -1381,14 +1482,11 @@ impl Element for TerminalElement {
         let paint_start = Instant::now();
         window.with_content_mask(Some(ContentMask { bounds }), |window| {
             let scroll_top = self.terminal_view.read(cx).scroll_top;
+            let scale_factor = window.scale_factor();
+            let origin =
+                terminal_paint_origin(layout.dimensions.bounds.origin, scroll_top, scale_factor);
 
             window.paint_quad(fill(bounds, layout.background_color));
-            let origin = layout.dimensions.bounds.origin - GpuiPoint::new(px(0.), scroll_top);
-            let scale_factor = window.scale_factor();
-            let snap_px = |value: Pixels| {
-                Pixels::from((f32::from(value) * scale_factor).floor() / scale_factor)
-            };
-            let origin = point(snap_px(origin.x), snap_px(origin.y));
 
             let marked_text_cloned: Option<String> = {
                 let ime_state = &self.terminal_view.read(cx).ime_state;
@@ -1479,9 +1577,12 @@ impl Element for TerminalElement {
                         let cell_width = layout.dimensions.cell_width;
                         let line_height = layout.dimensions.line_height;
                         let image_bounds = Bounds {
-                            origin: point(
-                                origin.x + (visible.column as f32 * cell_width),
-                                origin.y + (visible.row as f32 * line_height),
+                            origin: snapped_cell_point(
+                                origin,
+                                visible.row,
+                                visible.column,
+                                &layout.dimensions,
+                                scale_factor,
                             ),
                             size: size(
                                 visible.columns as f32 * cell_width,
@@ -1632,14 +1733,7 @@ impl InputHandler for TerminalInputHandler {
             view.commit_text(text, view_cx);
         });
 
-        self.workspace
-            .update(cx, |this, cx| {
-                window.invalidate_character_coordinates();
-                let project = this.project().read(cx);
-                let telemetry = project.client().telemetry().clone();
-                telemetry.log_edit_event("terminal", project.is_via_remote_server());
-            })
-            .ok();
+        window.invalidate_character_coordinates();
     }
 
     fn replace_and_mark_text_in_range(
@@ -1829,13 +1923,9 @@ fn build_terminal_line_runs(
 /// `value`, `character_lengths` and `word_starts` so platform text patterns
 /// can drive caret/review. Synthetic ids key off the parent node id + a
 /// `(line, chunk)` key, so they are stable frame-to-frame.
-fn push_terminal_line_text_runs(
-    builder: &mut A11ySubtreeBuilder,
-    runs: &[BatchedTextRun],
-) {
-    let runs = build_terminal_line_runs(runs, |line, chunk| {
-        builder.synthetic_node_id((line, chunk))
-    });
+fn push_terminal_line_text_runs(builder: &mut A11ySubtreeBuilder, runs: &[BatchedTextRun]) {
+    let runs =
+        build_terminal_line_runs(runs, |line, chunk| builder.synthetic_node_id((line, chunk)));
     for (id, node) in runs {
         builder.push_child(id, node);
     }
@@ -2654,6 +2744,212 @@ mod tests {
     }
 
     #[test]
+    fn display_cursor_maps_screen_and_history_lines_to_viewport_rows() {
+        use terminal::Point;
+
+        // Normal screen (display_offset = 0): the absolute grid line is the
+        // viewport row, so the cursor sits on the row that contains its cell.
+        let cursor = DisplayCursor::from(Point::new(0, 3), 0);
+        assert_eq!((cursor.line(), cursor.col()), (0, 3));
+        let cursor = DisplayCursor::from(Point::new(9, 0), 0);
+        assert_eq!((cursor.line(), cursor.col()), (9, 0));
+
+        // Scrolled back 2 rows: the viewport starts at absolute line -2, so a
+        // history row and a screen row map to distinct viewport rows, and the
+        // cursor lands on the same row as the cell it covers. The display
+        // offset is applied exactly once — a second application would shift
+        // the cursor off its cell by the scroll amount.
+        let history_cursor = DisplayCursor::from(Point::new(-2, 1), 2);
+        assert_eq!((history_cursor.line(), history_cursor.col()), (0, 1));
+        let screen_cursor = DisplayCursor::from(Point::new(0, 1), 2);
+        assert_eq!((screen_cursor.line(), screen_cursor.col()), (2, 1));
+
+        // A cursor on a screen row scrolled out of view maps past the viewport
+        // bottom; cursor_position must reject it so history never renders a
+        // cursor over its own scrollback.
+        let below_viewport = DisplayCursor::from(Point::new(1, 0), 2);
+        assert_eq!(below_viewport.line(), 3);
+    }
+
+    #[test]
+    fn cursor_position_hides_cursor_scrolled_out_of_viewport() {
+        let line_height = px(18.2);
+        let cell_width = px(8.4);
+        let dimensions = TerminalBounds::new(
+            line_height,
+            cell_width,
+            Bounds {
+                origin: point(px(10.0), px(10.0)),
+                size: size(px(84.0), px(36.4)), // 2 rows
+            },
+        );
+        assert_eq!(dimensions.num_lines(), 2);
+
+        // Screen row 0 while scrolled back 2: viewport row 2 is past the
+        // 2-row viewport, so the cursor is hidden.
+        let scrolled_out = DisplayCursor::from(Point::new(0, 0), 2);
+        assert!(
+            TerminalElement::cursor_position(
+                scrolled_out,
+                dimensions,
+                dimensions.bounds.origin,
+                1.0
+            )
+            .is_none(),
+            "cursor below the viewport must be hidden"
+        );
+
+        // History row -2 while scrolled back 2 is viewport row 0: visible.
+        let visible_history = DisplayCursor::from(Point::new(-2, 0), 2);
+        let position = TerminalElement::cursor_position(
+            visible_history,
+            dimensions,
+            dimensions.bounds.origin,
+            1.0,
+        );
+        assert!(position.is_some(), "cursor inside the viewport must render");
+        assert_eq!(position.unwrap().y, px(0.0));
+    }
+
+    #[test]
+    fn cursor_and_glyphs_share_device_pixel_boundaries() {
+        // Fractional cell metrics at 1.25x scale: col*cell_width and
+        // line*line_height are not whole device pixels, so a logical-pixel
+        // floor (the historical cursor quantization) lands the cursor on a
+        // different boundary than the glyphs.
+        let line_height = px(18.2);
+        let cell_width = px(8.4);
+        let origin = point(px(10.0), px(10.0)); // already device-snapped
+        let scale_factor = 1.25;
+        let dimensions = TerminalBounds::new(
+            line_height,
+            cell_width,
+            Bounds {
+                origin,
+                size: size(px(84.0), px(182.0)),
+            },
+        );
+
+        // col=3, line=2: abs x = 10 + 3*8.4 = 35.2 -> 44.0 device px
+        // (integral); abs y = 10 + 2*18.2 = 46.4 -> 58.0 device px (integral).
+        let snapped = snapped_cell_point(origin, 2, 3, &dimensions, scale_factor);
+        assert_eq!(snapped, point(px(35.2), px(46.4)));
+        assert_eq!(f32::from(snapped.x * scale_factor), 44.0);
+        assert_eq!(f32::from(snapped.y * scale_factor), 58.0);
+
+        // The cursor uses the same quantization as the glyph run for its cell.
+        let cursor = TerminalElement::cursor_position(
+            DisplayCursor::from(Point::new(2, 3), 0),
+            dimensions,
+            origin,
+            scale_factor,
+        )
+        .unwrap();
+        assert_eq!(
+            cursor,
+            point(snapped.x - origin.x, snapped.y - origin.y),
+            "cursor must match the glyph boundary"
+        );
+
+        // Regression: the old code floored in logical pixels
+        // (floor(3*8.4)=25.0, floor(2*18.2)=36.0), which is a different
+        // boundary than the device grid.
+        assert_ne!(cursor, point(px(25.0), px(36.0)));
+
+        // col=2, line=0: abs x = 10 + 2*8.4 = 26.8 -> 33.5 device px rounds up
+        // to 34, so the snapped position is 27.2 logical px, not the raw 26.8.
+        let snapped = snapped_cell_point(origin, 0, 2, &dimensions, scale_factor);
+        assert_eq!(snapped.x, px(27.2));
+        assert_eq!(f32::from(snapped.x * scale_factor), 34.0);
+
+        // Every cell boundary in a row lands on a device pixel, so no column
+        // (or the cursor on it) jitters between two pixels at this scale.
+        for col in 0..10 {
+            let snapped = snapped_cell_point(origin, 1, col, &dimensions, scale_factor);
+            let device_x = f32::from(snapped.x * scale_factor);
+            let boundary_x = snapped.x;
+            assert!(
+                (device_x - device_x.round()).abs() < 1e-3,
+                "col {col} boundary {boundary_x:?} is not device-integral"
+            );
+        }
+    }
+
+    #[test]
+    fn cursor_and_glyphs_share_boundaries_after_fractional_scroll() {
+        let line_height = px(18.2);
+        let cell_width = px(8.4);
+        let dimensions = TerminalBounds::new(
+            line_height,
+            cell_width,
+            Bounds {
+                origin: point(px(10.0), px(10.0)),
+                size: size(px(84.0), px(182.0)),
+            },
+        );
+        let scale_factor = 1.25;
+        let scroll_top = px(0.4);
+        let snap_origin =
+            |value: Pixels| Pixels::from((f32::from(value) * scale_factor).floor() / scale_factor);
+        let paint_origin = point(
+            snap_origin(dimensions.bounds.origin.x),
+            snap_origin(dimensions.bounds.origin.y - scroll_top),
+        );
+        let glyph = snapped_cell_point(paint_origin, 2, 3, &dimensions, scale_factor);
+        let cursor = TerminalElement::cursor_position(
+            DisplayCursor::from(Point::new(2, 3), 0),
+            dimensions,
+            paint_origin,
+            scale_factor,
+        )
+        .unwrap();
+        let cursor = paint_origin + cursor;
+
+        assert_eq!(
+            cursor, glyph,
+            "cursor and glyph must share a device-pixel boundary after scrolling"
+        );
+    }
+
+    #[test]
+    fn standalone_anchor_keeps_alternate_screen_pinned_to_bottom() {
+        // Full-screen TUI apps run on the alternate screen: they never scroll
+        // and may not occupy the bottom row, but the grid must still be pinned
+        // to the bottom of the available height (upstream condition restored).
+        let alt_screen = Content {
+            mode: Modes::ALT_SCREEN,
+            ..Content::default()
+        };
+        assert!(should_anchor_to_bottom(&alt_screen));
+
+        // Primary screen: anchor only when scrolled to bottom AND the bottom
+        // row is occupied.
+        let scrolled_with_content = Content {
+            scrolled_to_bottom: true,
+            bottom_row_occupied: true,
+            ..Content::default()
+        };
+        assert!(should_anchor_to_bottom(&scrolled_with_content));
+
+        // Scrolled to bottom but the last row is empty: keep the padding below
+        // the grid so the prompt stays at the top.
+        let scrolled_with_empty_bottom = Content {
+            scrolled_to_bottom: true,
+            bottom_row_occupied: false,
+            ..Content::default()
+        };
+        assert!(!should_anchor_to_bottom(&scrolled_with_empty_bottom));
+
+        // Scrolled back into history: never anchor.
+        let scrolled_up = Content {
+            scrolled_to_bottom: false,
+            bottom_row_occupied: true,
+            ..Content::default()
+        };
+        assert!(!should_anchor_to_bottom(&scrolled_up));
+    }
+
+    #[test]
     fn test_unified_filtering_works_for_both_modes() {
         // This test proves that the unified screen-position filtering approach
         // works for BOTH positive line numbers (Inline mode) and negative line
@@ -2791,7 +3087,13 @@ mod tests {
             .collect();
         assert_eq!(values, vec!["foo-bar", "baz"]);
         // Three runs on line 3 collapse to a single TextRun node.
-        assert_eq!(nodes.iter().filter(|(_, n)| n.value() == Some("foo-bar")).count(), 1);
+        assert_eq!(
+            nodes
+                .iter()
+                .filter(|(_, n)| n.value() == Some("foo-bar"))
+                .count(),
+            1
+        );
     }
 
     /// A single line longer than [`MAX_CHARS_PER_A11Y_RUN`] characters must
@@ -2811,27 +3113,29 @@ mod tests {
             .iter()
             .map(|(_, n)| n.value().map(str::len).unwrap_or(0))
             .sum();
-        assert_eq!(total, long.len(), "chunk values concatenate back to the line");
+        assert_eq!(
+            total,
+            long.len(),
+            "chunk values concatenate back to the line"
+        );
 
         // Chunk 0 has `next_on_line`, chunk 2 has `previous_on_line`, chunk 1
         // has both. The middle chunk must not be orphaned: it links both ways.
-        let has_next = |i: usize| {
-            nodes[i].1.next_on_line().is_some()
-        };
+        let has_next = |i: usize| nodes[i].1.next_on_line().is_some();
         let has_prev = |i: usize| nodes[i].1.previous_on_line().is_some();
-        assert!(has_next(0) && !has_prev(0), "first chunk links forward only");
+        assert!(
+            has_next(0) && !has_prev(0),
+            "first chunk links forward only"
+        );
         assert!(has_next(1) && has_prev(1), "middle chunk links both ways");
-        assert!(!has_next(2) && has_prev(2), "last chunk links backward only");
+        assert!(
+            !has_next(2) && has_prev(2),
+            "last chunk links backward only"
+        );
 
         // Chunks link to the neighbouring chunks' ids.
-        assert_eq!(
-            nodes[0].1.next_on_line(),
-            Some(fake_id(0, 1)),
-        );
-        assert_eq!(
-            nodes[2].1.previous_on_line(),
-            Some(fake_id(0, 1)),
-        );
+        assert_eq!(nodes[0].1.next_on_line(), Some(fake_id(0, 1)),);
+        assert_eq!(nodes[2].1.previous_on_line(), Some(fake_id(0, 1)),);
     }
 
     /// `character_lengths` and `word_starts` are the inputs the platform text
@@ -2857,10 +3161,13 @@ mod tests {
     fn a11y_trailing_blanks_are_trimmed_not_announced() {
         let runs = vec![
             a11y_run(0, "done.   "), // trailing spaces within a non-empty line
-            a11y_run(1, "   "), // entirely blank row
+            a11y_run(1, "   "),      // entirely blank row
         ];
         let nodes = build_terminal_line_runs(&runs, fake_id);
-        let values: Vec<&str> = nodes.iter().map(|(_, n)| n.value().unwrap_or_default()).collect();
+        let values: Vec<&str> = nodes
+            .iter()
+            .map(|(_, n)| n.value().unwrap_or_default())
+            .collect();
         assert_eq!(values, vec!["done.", ""]);
     }
 
@@ -2931,5 +3238,45 @@ mod tests {
             .filter_map(|(_, n)| n.value())
             .any(|v| v.contains("日本"));
         assert!(has_unicode, "unicode text must appear in a11y nodes");
+    }
+}
+#[cfg(test)]
+mod cursor_geometry_tests {
+    use super::*;
+
+    #[test]
+    fn cursor_and_glyphs_share_boundaries_after_fractional_scroll() {
+        let line_height = px(18.2);
+        let cell_width = px(8.4);
+        let dimensions = TerminalBounds::new(
+            line_height,
+            cell_width,
+            Bounds {
+                origin: point(px(10.0), px(10.0)),
+                size: size(px(84.0), px(182.0)),
+            },
+        );
+        let scale_factor = 1.25;
+        let scroll_top = px(0.4);
+        let snap_origin =
+            |value: Pixels| Pixels::from((f32::from(value) * scale_factor).floor() / scale_factor);
+        let paint_origin = point(
+            snap_origin(dimensions.bounds.origin.x),
+            snap_origin(dimensions.bounds.origin.y - scroll_top),
+        );
+        let glyph = snapped_cell_point(paint_origin, 2, 3, &dimensions, scale_factor);
+        let cursor = TerminalElement::cursor_position(
+            DisplayCursor::from(Point::new(2, 3), 0),
+            dimensions,
+            paint_origin,
+            scale_factor,
+        )
+        .unwrap();
+        let cursor = paint_origin + cursor;
+
+        assert_eq!(
+            cursor, glyph,
+            "cursor and glyph must share a device-pixel boundary after scrolling"
+        );
     }
 }

@@ -24,11 +24,12 @@
 //!
 //! See `docs/development/ui-regression-testing.md`.
 
-#![cfg(all(target_os = "macos", unix))]
+#![cfg(all(unix, any(target_os = "macos", target_os = "linux")))]
 
 use anyhow::{Context as _, Result};
 use assets::Assets;
 use extension_host::vdom_bridge::{DrawOp, VDomNode, VDomPalette, VDomRenderer};
+use extension_host::vdom_bridge::CommandInvocation;
 use gpui::{
     AnyWindowHandle, App, AppContext as _, Context, Entity, HeadlessAppContext, IntoElement,
     ParentElement as _, Render, Styled as _, WeakEntity, Window, WindowHandle, div, px, size,
@@ -36,8 +37,8 @@ use gpui::{
 use image::RgbaImage;
 use mux::MuxDomain;
 use mux_protocol::{
-    Cell, CellStyle, CursorState, Envelope, FetchGridUpdateResponse, FullGridSnapshot, Request,
-    Response, envelope::Payload as EnvelopePayload,
+    Cell, CellStyle, CursorState, Envelope, FetchGridUpdateResponse, FetchScrollbackResponse,
+    FullGridSnapshot, Request, Response, RowChange, envelope::Payload as EnvelopePayload,
     fetch_grid_update_response::Update as FetchUpdate, request::Body as RequestBody,
     response::Body as ResponseBody,
 };
@@ -77,9 +78,9 @@ fn init_process_env() {
     });
 }
 
-/// Build a headless app with a real platform text system (so glyph metrics and
-/// rasterization match the shipping app), real embedded fonts, and a real GPU
-/// renderer for screenshot capture.
+/// Build a headless app with the shipping platform text system and embedded
+/// fonts. macOS uses the Metal renderer; Linux uses the deterministic software
+/// renderer so screenshots are reproducible without a display server.
 fn headless_app() -> Result<HeadlessAppContext> {
     init_process_env();
 
@@ -110,7 +111,7 @@ fn draw_frame(
 ) -> Result<(RgbaImage, serde_json::Value)> {
     let a11y_json = cx
         .update_window(window, |_, window, cx| {
-            window.draw(cx).clear();
+            window.draw(cx).clear(cx);
             window.debug_a11y_tree_json()
         })?
         .context(
@@ -119,7 +120,9 @@ fn draw_frame(
         )?;
     let tree: serde_json::Value =
         serde_json::from_str(&a11y_json).context("a11y tree must be valid JSON")?;
-    let image = cx.capture_screenshot(window).context("capture screenshot")?;
+    let image = cx
+        .capture_screenshot(window)
+        .context("capture screenshot")?;
     Ok((image, tree))
 }
 
@@ -158,6 +161,15 @@ fn save_frame(name: &str, image: &RgbaImage, tree: &serde_json::Value) -> Result
     Ok(())
 }
 
+fn image_digest(image: &RgbaImage) -> u64 {
+    let mut digest = 0xcbf29ce484222325u64;
+    for byte in image.as_raw() {
+        digest ^= u64::from(*byte);
+        digest = digest.wrapping_mul(0x100000001b3);
+    }
+    digest
+}
+
 /// Number of distinct RGB triples in the frame. A blank or single-fill frame
 /// collapses to 1-2, which is the failure mode this guards against.
 fn distinct_colors(image: &RgbaImage) -> usize {
@@ -172,11 +184,7 @@ fn distinct_colors(image: &RgbaImage) -> usize {
 fn count_near_color(image: &RgbaImage, rgb: [u8; 3], tolerance: u8) -> usize {
     image
         .pixels()
-        .filter(|pixel| {
-            (0..3).all(|channel| {
-                pixel.0[channel].abs_diff(rgb[channel]) <= tolerance
-            })
-        })
+        .filter(|pixel| (0..3).all(|channel| pixel.0[channel].abs_diff(rgb[channel]) <= tolerance))
         .count()
 }
 
@@ -201,10 +209,7 @@ fn a11y_nodes(tree: &serde_json::Value) -> Vec<(String, &serde_json::Value)> {
         .unwrap_or_default()
 }
 
-fn a11y_nodes_with_role<'a>(
-    tree: &'a serde_json::Value,
-    role: &str,
-) -> Vec<&'a serde_json::Value> {
+fn a11y_nodes_with_role<'a>(tree: &'a serde_json::Value, role: &str) -> Vec<&'a serde_json::Value> {
     a11y_nodes(tree)
         .into_iter()
         .filter(|(node_role, _)| node_role == role)
@@ -272,8 +277,10 @@ fn draw_until(
 
 /// Like [`draw_until`], but the convergence test looks at pixels.
 ///
-/// Image placements do not surface in the accessibility tree, so an
-/// image-bearing frame can only be recognized from the framebuffer.
+/// The framebuffer is the ground truth for the async grid-update path: the
+/// updated grid's accent row only reaches the screen after the dirty signal
+/// triggered a follow-up fetch, so the frame that converges is the frame that
+/// proves the pull happened.
 fn draw_until_pixels(
     cx: &mut HeadlessAppContext,
     window: AnyWindowHandle,
@@ -282,9 +289,9 @@ fn draw_until_pixels(
     let deadline = Instant::now() + CONVERGE_TIMEOUT;
     loop {
         cx.run_until_parked();
-        // The client coalesces PaneOutput behind a background timer; without
-        // advancing the clock that timer never fires and the bytes are never
-        // handed to the emulator.
+        // MuxPaneView coalesces the PaneOutput dirty signal behind a background
+        // timer; without advancing the clock that timer never fires and the
+        // follow-up grid fetch is never scheduled.
         cx.advance_clock(Duration::from_millis(20));
         cx.run_until_parked();
         let (image, tree) = draw_frame(cx, window)?;
@@ -292,7 +299,12 @@ fn draw_until_pixels(
             return Ok((image, tree));
         }
         if Instant::now() >= deadline {
-            return Ok((image, tree));
+            anyhow::bail!(
+                "frame never converged within {:?}; distinct colors: {}, roles seen: {:?}",
+                CONVERGE_TIMEOUT,
+                distinct_colors(&image),
+                a11y_role_summary(&tree)
+            );
         }
         std::thread::sleep(Duration::from_millis(20));
     }
@@ -314,6 +326,8 @@ struct MockGrid {
     accent_background: u32,
     accent_foreground: u32,
     generation: u64,
+    history: Vec<String>,
+    history_version: u64,
 }
 
 impl MockGrid {
@@ -360,8 +374,8 @@ impl MockGrid {
             }),
             alternate_screen: false,
             display_offset: 0,
-            history_size: 0,
-            history_version: 0,
+            history_size: u32::try_from(self.history.len()).expect("history fits u32"),
+            history_version: self.history_version,
             modes: None,
         }
     }
@@ -369,29 +383,32 @@ impl MockGrid {
 
 /// Serve mux requests on `stream` until the peer disconnects or `stop` is set.
 ///
-/// `FetchGridUpdate` always answers with the same full snapshot: the view may
-/// refetch after a resize, and re-sending the authoritative snapshot is exactly
-/// what a real server does on a generation mismatch (§15.4). Every other
-/// request gets an empty (success) response so nothing the view does at startup
-/// — resize, focus, subscribe — is left hanging.
+/// `FetchGridUpdate` returns the current full snapshot when the caller is stale
+/// and `NoChange` at the current generation, including the history-checkpoint
+/// confirmation fetch. Scrollback requests page through the matching history
+/// fixture. Every other request gets an empty success response so nothing the
+/// view does at startup is left hanging.
 fn serve_mock_mux(
     stream: UnixStream,
     grid: MockGrid,
     stop: Arc<AtomicBool>,
 ) -> Result<(), String> {
-    serve_mock_mux_with_output(stream, grid, Vec::new(), stop)
+    serve_mock_mux_with_output(stream, grid, None, Vec::new(), stop)
 }
 
-/// Same as [`serve_mock_mux`], plus a byte stream pushed as `PaneOutputChunk`
-/// once the client subscribes.
+/// Same as [`serve_mock_mux`], plus the post-fetch story that exercises the
+/// §3.1 push-signal / §3.3 pull-data contract: one nonempty `PaneOutputChunk`
+/// (sequence 1) is pushed right after the first grid fetch, and `updated_grid`
+/// — when given — becomes the authoritative full grid for a stale follow-up
+/// fetch, the way a real server reports its post-output state.
 ///
-/// This is the §3.1 in-place render path: the server forwards raw PTY bytes and
-/// the client's DisplayOnly emulator parses them, which is the only way escape
-/// sequences the grid snapshot cannot express — image protocols among them —
-/// reach the renderer.
+/// PaneOutput is a lossy dirty signal only: the client never parses the byte
+/// payload, so the mock never has to make that payload meaningful. The renderer
+/// changes exclusively through the structured grid snapshot path.
 fn serve_mock_mux_with_output(
     mut stream: UnixStream,
     grid: MockGrid,
+    updated_grid: Option<MockGrid>,
     pane_output: Vec<u8>,
     stop: Arc<AtomicBool>,
 ) -> Result<(), String> {
@@ -400,6 +417,9 @@ fn serve_mock_mux_with_output(
         .map_err(|error| format!("set mock mux read timeout: {error}"))?;
 
     let snapshot = grid.snapshot();
+    let updated = updated_grid.as_ref().map(MockGrid::snapshot);
+    let updated_generation = updated_grid.as_ref().map_or(0, |grid| grid.generation);
+    let mut fetches_served = 0u64;
     let mut pane_output_sent = false;
     let mut buffered: Vec<u8> = Vec::new();
     let mut chunk = [0u8; 8192];
@@ -427,8 +447,29 @@ fn serve_mock_mux_with_output(
             // does not wait for a SubscribePaneOutput request, and the client
             // never sends one. The first grid fetch is the point where the view
             // is known to be listening.
-            let ready_for_output = matches!(&request.body, Some(RequestBody::FetchGridUpdate(_)));
-            let response = mock_response(&request, &snapshot, grid.generation);
+            let is_grid_fetch = matches!(&request.body, Some(RequestBody::FetchGridUpdate(_)));
+            // The first fetch is answered with the initial grid (generation 9,
+            // output fence 0 — no chunk is part of that state yet). The stale
+            // follow-up fetch triggered by the chunk is answered with the
+            // authoritative updated grid (generation 10, output fence 1).
+            let (served_snapshot, served_history, served_generation, served_fence) =
+                match (&updated, updated_grid.as_ref(), fetches_served) {
+                    (Some(_), Some(_), 0) => (&snapshot, grid.history.as_slice(), grid.generation, 0),
+                    (Some(updated), Some(updated_grid), _) => (
+                        updated,
+                        updated_grid.history.as_slice(),
+                        updated_generation,
+                        1,
+                    ),
+                    _ => (&snapshot, grid.history.as_slice(), grid.generation, 0),
+                };
+            let response = mock_response(
+                &request,
+                served_snapshot,
+                served_history,
+                served_generation,
+                served_fence,
+            );
             let bytes = mux_protocol::frame(&Envelope {
                 version: Some(mux_protocol::PROTOCOL_VERSION),
                 payload: Some(EnvelopePayload::Response(response)),
@@ -442,7 +483,11 @@ fn serve_mock_mux_with_output(
                 return Err(format!("mock mux write: {error}"));
             }
 
-            if ready_for_output && !pane_output_sent && !pane_output.is_empty() {
+            if is_grid_fetch {
+                fetches_served += 1;
+            }
+
+            if is_grid_fetch && fetches_served == 1 && !pane_output_sent && !pane_output.is_empty() {
                 pane_output_sent = true;
                 let notification = Envelope {
                     version: Some(mux_protocol::PROTOCOL_VERSION),
@@ -452,6 +497,9 @@ fn serve_mock_mux_with_output(
                                 mux_protocol::PaneOutputChunk {
                                     pane_id: MOCK_PANE_ID.to_string(),
                                     data: pane_output.clone(),
+                                    // First emitted chunk for this pane, so the
+                                    // per-pane monotonic sequence starts at 1.
+                                    output_sequence: 1,
                                 },
                             )),
                         },
@@ -474,14 +522,40 @@ fn serve_mock_mux_with_output(
 fn mock_response(
     request: &Request,
     snapshot: &FullGridSnapshot,
+    history: &[String],
     generation: u64,
+    output_sequence: u64,
 ) -> Response {
     let body = match &request.body {
         Some(RequestBody::FetchGridUpdate(fetch)) => {
             Some(ResponseBody::GridUpdate(FetchGridUpdateResponse {
                 from_generation: fetch.since_generation,
                 to_generation: generation,
-                update: Some(FetchUpdate::FullSnapshot(snapshot.clone())),
+                // Highest PaneOutputChunk.output_sequence incorporated into the
+                // returned grid state: 0 before any chunk was emitted, 1 once
+                // the pane's first chunk is part of the state.
+                output_sequence,
+                update: (fetch.since_generation != generation)
+                    .then(|| FetchUpdate::FullSnapshot(snapshot.clone())),
+            }))
+        }
+        Some(RequestBody::FetchScrollback(fetch)) => {
+            let from = fetch.from_line as usize;
+            let count = fetch.count as usize;
+            let indices = if history.is_empty() || count == 0 || from >= history.len() {
+                0..0
+            } else if fetch.direction == 0 {
+                from.saturating_sub(count.saturating_sub(1))..from.saturating_add(1)
+            } else {
+                from..from.saturating_add(count).min(history.len())
+            };
+            let lines = indices
+                .map(|row| mock_history_row(row, &history[row], snapshot.cols))
+                .collect();
+            Some(ResponseBody::Scrollback(FetchScrollbackResponse {
+                lines,
+                total_lines: u32::try_from(history.len()).unwrap_or(u32::MAX),
+                scrollback_version: snapshot.history_version,
             }))
         }
         // Empty body = success. Anything the view issues during startup that is
@@ -491,6 +565,23 @@ fn mock_response(
     Response {
         request_id: request.request_id,
         body,
+    }
+}
+
+fn mock_history_row(row: usize, text: &str, cols: u32) -> RowChange {
+    let cells = text
+        .chars()
+        .chain(std::iter::repeat(' '))
+        .take(cols as usize)
+        .map(|character| Cell {
+            char: character.to_string(),
+            foreground: 0xd0d0d0,
+            ..Default::default()
+        })
+        .collect();
+    RowChange {
+        row: u32::try_from(row).unwrap_or(u32::MAX),
+        cells,
     }
 }
 
@@ -522,11 +613,15 @@ struct MockMuxServer {
 
 impl MockMuxServer {
     fn start(grid: MockGrid) -> Result<(Arc<MuxDomain>, Self)> {
-        Self::start_with_output(grid, Vec::new())
+        Self::start_with_output(grid, None, Vec::new())
     }
 
+    /// Like [`Self::start`], plus the optional post-fetch story: an updated
+    /// authoritative grid served on follow-up fetches and a `PaneOutputChunk`
+    /// pushed after the first fetch. See [`serve_mock_mux_with_output`].
     fn start_with_output(
         grid: MockGrid,
+        updated_grid: Option<MockGrid>,
         pane_output: Vec<u8>,
     ) -> Result<(Arc<MuxDomain>, Self)> {
         let (client, server) = UnixStream::pair().context("create mux socket pair")?;
@@ -539,7 +634,7 @@ impl MockMuxServer {
         let stop = Arc::new(AtomicBool::new(false));
         let thread = std::thread::spawn({
             let stop = stop.clone();
-            move || serve_mock_mux_with_output(server, grid, pane_output, stop)
+            move || serve_mock_mux_with_output(server, grid, updated_grid, pane_output, stop)
         });
         Ok((
             domain,
@@ -591,6 +686,35 @@ fn terminal_grid() -> MockGrid {
         accent_background: TERMINAL_ACCENT_BG,
         accent_foreground: TERMINAL_ACCENT_FG,
         generation: 9,
+        history: Vec::new(),
+        history_version: 0,
+    }
+}
+
+fn terminal_grid_with_history() -> MockGrid {
+    // The headless window is taller than a 12-row grid, and alacritty pulls
+    // history into the screen when the viewport grows, which would mask the
+    // semantic scroll. Serve more rows than the window can display so the
+    // history stays above the viewport until an action scrolls to it.
+    let mut lines = vec![format!("{TERMINAL_MARKER} row0")];
+    for row in 1..24 {
+        lines.push(format!("active row {row:02}"));
+    }
+    MockGrid {
+        cols: 60,
+        rows: 24,
+        lines,
+        accent_row: 2,
+        accent_background: TERMINAL_ACCENT_BG,
+        accent_foreground: TERMINAL_ACCENT_FG,
+        generation: 9,
+        history: vec![
+            "HIST-0 oldest".to_string(),
+            "HIST-1".to_string(),
+            "HIST-2".to_string(),
+            "HIST-3 newest".to_string(),
+        ],
+        history_version: 7,
     }
 }
 
@@ -625,6 +749,13 @@ fn mux_pane_renders_terminal_grid_and_exposes_a11y_tree() -> Result<()> {
     })?;
     save_frame("mux_pane_terminal_grid", &image, &tree)?;
 
+    #[cfg(target_os = "linux")]
+    assert_eq!(
+        image_digest(&image),
+        0x9295b034f2e44153,
+        "Linux mux screenshot baseline changed; inspect target/ui_screenshots/mux_pane_terminal_grid.png"
+    );
+
     // --- a11y structure (§16.4) ---
     let terminals = a11y_nodes_with_role(&tree, "Terminal");
     assert!(
@@ -641,7 +772,9 @@ fn mux_pane_renders_terminal_grid_and_exposes_a11y_tree() -> Result<()> {
 
     let text_runs = a11y_text_run_values(&tree);
     assert!(
-        text_runs.iter().any(|value| value.contains(TERMINAL_MARKER)),
+        text_runs
+            .iter()
+            .any(|value| value.contains(TERMINAL_MARKER)),
         "a TextRun must carry the served grid text; got {text_runs:?}"
     );
     assert!(
@@ -671,18 +804,11 @@ fn mux_pane_renders_terminal_grid_and_exposes_a11y_tree() -> Result<()> {
         text_runs.len()
     );
 
-    // KNOWN GAP (§16.4): `MuxPaneView::render` puts `.aria_label(pane title)`
-    // on the root div, but `Styled::aria_label` alone leaves `a11y_role()` at
-    // `None`, and GPUI drops role-less elements from the tree. The pane title
-    // therefore never reaches assistive technology, and the focusable pane root
-    // contributes no tab stop. Pinned here so a fix is noticed.
     assert!(
-        !a11y_nodes(&tree)
+        a11y_nodes(&tree)
             .iter()
-            .any(|(_, node)| a11y_string_field(node, "label")
-                .is_some_and(|label| label != "terminal output")),
-        "the pane title is exposed now — replace this with a positive assertion \
-         and update docs/development/ui-regression-testing.md"
+            .any(|(_, node)| { a11y_string_field(node, "label").as_deref() == Some("Terminal") }),
+        "the mux pane root should expose its accessible terminal title"
     );
     assert_eq!(
         tree.get("frame")
@@ -778,9 +904,16 @@ struct ChromeHarness {
     renderer: VDomRenderer,
     node: VDomNode,
 }
-
 impl ChromeHarness {
     fn new(node: VDomNode, display_list: Vec<(&'static str, Vec<DrawOp>)>) -> Self {
+        Self::new_with_dispatch(node, display_list, None)
+    }
+
+    fn new_with_dispatch(
+        node: VDomNode,
+        display_list: Vec<(&'static str, Vec<DrawOp>)>,
+        dispatch: Option<extension_host::vdom_bridge::CommandDispatch>,
+    ) -> Self {
         let mut renderer = VDomRenderer::new();
         renderer.set_palette(VDomPalette {
             text: gpui::white(),
@@ -791,6 +924,9 @@ impl ChromeHarness {
         });
         for (region, ops) in display_list {
             renderer.set_display_list(region, ops);
+        }
+        if let Some(dispatch) = dispatch {
+            renderer.set_dispatch(dispatch);
         }
         Self { renderer, node }
     }
@@ -873,15 +1009,71 @@ fn cpu_meter_ops() -> Vec<DrawOp> {
     ]
 }
 
-fn open_chrome(
-    cx: &mut HeadlessAppContext,
-    node: VDomNode,
-) -> Result<WindowHandle<ChromeHarness>> {
+fn open_chrome(cx: &mut HeadlessAppContext, node: VDomNode) -> Result<WindowHandle<ChromeHarness>> {
     cx.open_window(size(px(560.0), px(80.0)), |_, cx| {
         cx.new(|_| ChromeHarness::new(node, vec![("cpu-meter", cpu_meter_ops())]))
     })
 }
 
+fn open_chrome_with_dispatch(
+    cx: &mut HeadlessAppContext,
+    node: VDomNode,
+    dispatch: extension_host::vdom_bridge::CommandDispatch,
+) -> Result<WindowHandle<ChromeHarness>> {
+    cx.open_window(size(px(560.0), px(80.0)), |_, cx| {
+        cx.new(|_| {
+            ChromeHarness::new_with_dispatch(
+                node,
+                vec![("cpu-meter", cpu_meter_ops())],
+                Some(dispatch),
+            )
+        })
+    })
+}
+
+
+fn extension_chrome_semantic_button_dispatches_command() -> Result<()> {
+    let mut cx = headless_app()?;
+    let dispatched = std::rc::Rc::new(std::cell::Cell::new(false));
+    let dispatch: extension_host::vdom_bridge::CommandDispatch = {
+        let dispatched = dispatched.clone();
+        std::rc::Rc::new(
+            move |invocation: CommandInvocation, _window: &mut Window, _cx: &mut App| {
+                dispatched.set(invocation.command == "z3rm.pane.split");
+            },
+        )
+    };
+    let window = open_chrome_with_dispatch(&mut cx, status_bar_vdom()?, dispatch)?;
+    draw_frame(&mut cx, window.into())?;
+    let (_, tree) = draw_frame(&mut cx, window.into())?;
+
+    let button = a11y_nodes_with_role(&tree, "Button")
+        .into_iter()
+        .next()
+        .context("status bar button missing from accessibility tree")?;
+    let node_id = button
+        .get("accesskit_id")
+        .and_then(serde_json::Value::as_str)
+        .context("status bar button missing AccessKit node id")?
+        .parse::<u64>()
+        .context("invalid AccessKit node id")?;
+    let delivered = cx.simulate_a11y_action(
+        window.into(),
+        gpui::accesskit::ActionRequest {
+            target_tree: gpui::accesskit::TreeId::ROOT,
+            target_node: gpui::accesskit::NodeId(node_id),
+            action: gpui::accesskit::Action::Click,
+            data: None,
+        },
+    )?;
+    assert!(delivered, "semantic Click must reach the window's accessibility action callback");
+    cx.run_until_parked();
+    assert!(
+        dispatched.get(),
+        "semantic Click must dispatch the VDOM button command"
+    );
+    Ok(())
+}
 fn extension_chrome_vdom_renders_status_bar() -> Result<()> {
     let mut cx = headless_app()?;
     let window = open_chrome(&mut cx, status_bar_vdom()?)?;
@@ -890,6 +1082,13 @@ fn extension_chrome_vdom_renders_status_bar() -> Result<()> {
     draw_frame(&mut cx, window.into())?;
     let (image, tree) = draw_frame(&mut cx, window.into())?;
     save_frame("extension_chrome_status_bar", &image, &tree)?;
+
+    #[cfg(target_os = "linux")]
+    assert_eq!(
+        image_digest(&image),
+        0x1ceb2b6e4d850ada,
+        "Linux extension screenshot baseline changed; inspect target/ui_screenshots/extension_chrome_status_bar.png"
+    );
 
     let colors = distinct_colors(&image);
     assert!(
@@ -934,26 +1133,28 @@ fn extension_chrome_vdom_renders_status_bar() -> Result<()> {
         "expected rasterized label glyphs in the status bar, found {glyph_pixels}"
     );
 
-    // KNOWN GAP (§5.4 / §16.4): `vdom_bridge` never calls `Styled::role`, and
-    // GPUI only emits an AccessKit node for elements whose `a11y_role()` is
-    // `Some`. Every button, input and label the bridge produces is therefore
-    // invisible to assistive technology — the whole chrome collapses to the
-    // bare Window root. This assertion pins the current behaviour so the gap
-    // cannot be forgotten, and fails the moment the bridge starts emitting
-    // roles (at which point it should be replaced with positive assertions
-    // for Role::Button / Role::TextInput).
     let roles = a11y_role_summary(&tree);
-    assert_eq!(
-        roles,
-        vec!["Window".to_string()],
-        "extension chrome a11y expectations changed. If vdom_bridge now sets \
-         roles, replace this with positive Role::Button / Role::TextInput \
-         assertions and update docs/development/ui-regression-testing.md"
+    assert!(
+        roles.iter().any(|role| role == "Button"),
+        "extension button must be exposed to assistive technology: {roles:?}"
     );
     assert!(
-        a11y_text_run_values(&tree).is_empty(),
-        "chrome label text is not exposed as TextRun today; if it is now, \
-         update this test and the docs"
+        roles.iter().any(|role| role == "TextInput"),
+        "extension input must be exposed to assistive technology: {roles:?}"
+    );
+    assert_eq!(
+        a11y_nodes_with_role(&tree, "Button").len(),
+        1,
+        "the status bar fixture contains one semantic button"
+    );
+    assert_eq!(
+        a11y_nodes_with_role(&tree, "TextInput").len(),
+        1,
+        "the status bar fixture contains one semantic text input"
+    );
+    assert!(
+        roles.iter().any(|role| role == "Window"),
+        "the accessibility tree must retain its window root: {roles:?}"
     );
 
     Ok(())
@@ -1026,15 +1227,77 @@ impl Render for Swatch {
     }
 }
 
+fn terminal_semantic_scroll_actions_move_viewport() -> Result<()> {
+    let mut cx = headless_app()?;
+    let (domain, _server) = MockMuxServer::start(terminal_grid_with_history())?;
+    cx.allow_parking();
+
+    let window = open_mux_pane(&mut cx, domain)?;
+    let (_, tree) = draw_until(&mut cx, window.into(), |tree| {
+        a11y_text_run_values(tree)
+            .iter()
+            .any(|value| value.contains(TERMINAL_MARKER))
+    })?;
+
+    let terminal = a11y_nodes_with_role(&tree, "Terminal")
+        .into_iter()
+        .next()
+        .context("Terminal node missing from accessibility tree")?;
+    let node_id = terminal
+        .get("accesskit_id")
+        .and_then(serde_json::Value::as_str)
+        .context("Terminal node missing AccessKit id")?
+        .parse::<u64>()
+        .context("invalid AccessKit node id")?;
+    let request = |action: gpui::accesskit::Action| gpui::accesskit::ActionRequest {
+        target_tree: gpui::accesskit::TreeId::ROOT,
+        target_node: gpui::accesskit::NodeId(node_id),
+        action,
+        data: None,
+    };
+    let delivered = cx.simulate_a11y_action(window.into(), request(gpui::accesskit::Action::ScrollUp))?;
+    assert!(delivered, "ScrollUp must reach the terminal's accessibility action listener");
+    cx.run_until_parked();
+    let (_, tree) = draw_until(&mut cx, window.into(), |tree| {
+        a11y_text_run_values(tree)
+            .iter()
+            .any(|value| value.contains("HIST-3"))
+    })?;
+    let runs = a11y_text_run_values(&tree);
+    assert!(
+        runs.iter().any(|value| value.contains("HIST-3")),
+        "semantic ScrollUp must expose the newest history row: {runs:?}"
+    );
+    assert!(
+        !runs.iter().any(|value| value.contains("HIST-0")),
+        "a single semantic ScrollUp must not expose the oldest row: {runs:?}"
+    );
+
+    let delivered =
+        cx.simulate_a11y_action(window.into(), request(gpui::accesskit::Action::ScrollDown))?;
+    assert!(delivered, "ScrollDown must reach the terminal's accessibility action listener");
+    draw_until(&mut cx, window.into(), |tree| {
+        !a11y_text_run_values(tree)
+            .iter()
+            .any(|value| value.contains("HIST-3"))
+    })?;
+    Ok(())
+}
+
 fn headless_renderer_produces_real_pixels() -> Result<()> {
-    // Guards the harness: if the Metal headless renderer silently degrades to a
-    // blank surface, every other assertion in this file becomes meaningless.
+    // Guards the harness: a blank software or GPU frame makes every other
+    // visual assertion meaningless.
     let mut cx = headless_app()?;
     let window = cx.open_window(size(px(100.0), px(100.0)), |_, cx| cx.new(|_| Swatch))?;
     let (image, _) = draw_frame(&mut cx, window.into())?;
     save_screenshot("harness_swatch", &image)?;
-
     let green = count_near_color(&image, [0, 255, 0], 2);
+    #[cfg(target_os = "linux")]
+    assert_eq!(
+        image_digest(&image),
+        0x473a8a51de9b6d25,
+        "Linux swatch screenshot baseline changed; inspect target/ui_screenshots/harness_swatch.png"
+    );
     assert!(
         green > 1_000,
         "expected a solid green swatch in the framebuffer, found {green} pixels"
@@ -1052,46 +1315,66 @@ fn _app_type_is_used(_: &App) {}
 /// harness lets `cargo test` run this suite correctly without callers having to
 /// remember `--test-threads=1`.
 
-/// A kitty graphics sequence that draws a solid magenta block.
-///
-/// Magenta is far from anything the theme or the mock grid paints, so its
-/// presence in the framebuffer is unambiguous evidence that the image itself
-/// was rasterized rather than some incidental chrome.
-fn kitty_magenta_block(control: &str) -> Vec<u8> {
-    use base64::Engine as _;
+/// Magenta accent background for the updated grid: far from anything the theme
+/// or the initial grid paints, so its presence in the framebuffer is
+/// unambiguous evidence that the updated snapshot was rasterized rather than
+/// some incidental chrome.
+const UPDATED_ACCENT_BG: u32 = 0xff00ff;
 
-    let image = image::RgbaImage::from_pixel(32, 16, image::Rgba([255, 0, 255, 255]));
-    let mut png = Vec::new();
-    image
-        .write_to(&mut std::io::Cursor::new(&mut png), image::ImageFormat::Png)
-        .expect("encode test png");
-    let encoded = base64::engine::general_purpose::STANDARD.encode(&png);
-    format!("\x1b_G{control};{encoded}\x1b\\").into_bytes()
-}
+/// Text marker unique to the updated grid, so the a11y tree can prove the
+/// follow-up fetch's snapshot replaced the initial one.
+const UPDATED_MARKER: &str = "Z3RM-PUSH-SYNC";
 
-/// §3.1 / §11.2 The image protocols only work across the mux boundary because
-/// the server forwards raw PTY bytes and the client's DisplayOnly emulator
-/// parses them. Nothing in the grid snapshot can carry an image, so a
-/// regression that made the server filter escape sequences — or the client skip
-/// the graphics scan — would silently lose images while every grid test kept
-/// passing. This drives the whole path: mock server → PaneOutputChunk → socket
-/// → MuxPaneView → TerminalElement::paint_image.
-fn mux_pane_renders_kitty_image_from_pane_output() -> Result<()> {
+/// §3.1 / §3.3 PaneOutput is a lossy dirty signal, never a byte stream for the
+/// client to parse: the server stays the sole VT parser, and every
+/// render-affecting change is pulled through the structured grid snapshot
+/// path. This drives the whole contract: mock server → PaneOutputChunk
+/// (sequence 1) → socket → MuxPaneView dirty signal → follow-up
+/// FetchGridUpdate → authoritative updated grid (generation 10, output
+/// fence 1) → framebuffer + a11y tree. The chunk payload is deliberately
+/// opaque — a client that tried to render it would change nothing, because
+/// only the pulled snapshot reaches the renderer.
+fn pane_output_dirty_signal_pulls_authoritative_grid() -> Result<()> {
     let mut cx = headless_app()?;
-    let output = kitty_magenta_block("a=T,f=100,t=d,c=6,r=3");
-    let (domain, _server) = MockMuxServer::start_with_output(terminal_grid(), output)?;
+    let output = b"opaque bytes the client must never parse\n".to_vec();
+    let updated = MockGrid {
+        cols: 60,
+        rows: 12,
+        lines: vec![
+            format!("{UPDATED_MARKER} row0"),
+            "updated second line".to_string(),
+            "updated third line 0123456789".to_string(),
+            "updated magenta accent row".to_string(),
+        ],
+        accent_row: 3,
+        accent_background: UPDATED_ACCENT_BG,
+        accent_foreground: 0xffffff,
+        generation: 10,
+        history: Vec::new(),
+        history_version: 0,
+    };
+    let (domain, _server) = MockMuxServer::start_with_output(terminal_grid(), Some(updated), output)?;
     cx.allow_parking();
 
     let window = open_mux_pane(&mut cx, domain)?;
     let (image, tree) = draw_until_pixels(&mut cx, window.into(), |image| {
         count_near_color(image, [255, 0, 255], 24) > 200
     })?;
-    save_frame("mux_pane_kitty_image", &image, &tree)?;
+    save_frame("mux_pane_dirty_signal_grid_update", &image, &tree)?;
 
     let magenta = count_near_color(&image, [255, 0, 255], 24);
     assert!(
         magenta > 200,
-        "the transmitted image must reach the framebuffer; magenta pixels: {magenta}"
+        "the updated grid's accent row must reach the framebuffer; magenta pixels: {magenta}"
+    );
+    let runs = a11y_text_run_values(&tree);
+    assert!(
+        runs.iter().any(|value| value.contains(UPDATED_MARKER)),
+        "the dirty signal must pull the authoritative updated grid; runs: {runs:?}"
+    );
+    assert!(
+        !runs.iter().any(|value| value.contains(TERMINAL_MARKER)),
+        "the updated grid must replace the initial one; runs: {runs:?}"
     );
     Ok(())
 }
@@ -1111,12 +1394,20 @@ fn main() {
             extension_chrome_vdom_renders_status_bar,
         ),
         (
+            "extension_chrome_semantic_button_dispatches_command",
+            extension_chrome_semantic_button_dispatches_command,
+        ),
+        (
             "extension_chrome_display_list_updates_without_touching_vdom",
             extension_chrome_display_list_updates_without_touching_vdom,
         ),
         (
-            "mux_pane_renders_kitty_image_from_pane_output",
-            mux_pane_renders_kitty_image_from_pane_output,
+            "terminal_semantic_scroll_actions_move_viewport",
+            terminal_semantic_scroll_actions_move_viewport,
+        ),
+        (
+            "pane_output_dirty_signal_pulls_authoritative_grid",
+            pane_output_dirty_signal_pulls_authoritative_grid,
         ),
         (
             "headless_renderer_produces_real_pixels",
@@ -1128,7 +1419,10 @@ fn main() {
     let mut failed = Vec::new();
     let mut ran = 0;
     for (name, case) in cases {
-        if filter.as_deref().is_some_and(|filter| !name.contains(filter)) {
+        if filter
+            .as_deref()
+            .is_some_and(|filter| !name.contains(filter))
+        {
             continue;
         }
         ran += 1;

@@ -16,20 +16,20 @@
 //! a synchronous [`quickjs_runtime::HostBridge`] that blocks the extension
 //! thread on the async `MuxDomain` RPC with a short timeout.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::future::Future;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::{Context as _, Result, anyhow, bail};
-use extension_host::vdom_bridge::{self, CommandInvocation, VDomNode};
+use extension_host::vdom_bridge::{self, CommandInvocation, VDomChild, VDomNode};
 use futures::StreamExt as _;
 use gpui::{AppContext as _, Global};
 use parking_lot::Mutex;
 use quickjs_runtime::{
-    DiscoveredExtension, ExtensionRunResult, ExtensionRunner, ExtensionSide, HostBridge,
-    LiveExtension,
+    DiscoveredExtension, ExtensionCapabilities, ExtensionLimits, ExtensionRunResult,
+    ExtensionRunner, ExtensionSide, FilesystemAccess, HostBridge, LiveExtension,
 };
 
 /// §5.4 Upper bound on a single blocking mux RPC issued from the extension
@@ -73,7 +73,8 @@ pub fn load_client_extensions(extensions_dir: &Path) -> Vec<LoadedExtension> {
         .into_iter()
         .map(|extension| {
             let runner = ExtensionRunner::for_manifest(&extension.manifest);
-            let result = runner.load_extension(&extension.manifest.id, &extension.source, "activate");
+            let result =
+                runner.load_extension(&extension.manifest.id, &extension.source, "activate");
             if result.result.is_ok() {
                 tracing::info!(id = %extension.manifest.id, "extension loaded successfully");
             } else {
@@ -124,6 +125,35 @@ fn parse_vdom_json(json: &str) -> Result<VDomNode> {
 }
 
 /// §5.5 Publish collected VDOM into the app-global chrome state so freshly
+
+/// Keep client-side QuickJS chrome and server-rendered chrome in one display
+/// order. Server views are keyed by extension and view so an update replaces
+/// the previous render instead of accumulating duplicate nodes.
+fn merge_chrome_nodes(
+    local_nodes: &[VDomNode],
+    server_nodes: &BTreeMap<(String, String), VDomNode>,
+) -> Vec<VDomNode> {
+    let mut merged = Vec::with_capacity(local_nodes.len() + server_nodes.len());
+    merged.extend(local_nodes.iter().cloned());
+    merged.extend(server_nodes.values().cloned());
+    merged
+}
+
+fn apply_server_chrome_node(
+    server_nodes: &mut BTreeMap<(String, String), VDomNode>,
+    update: mux_protocol::ExtensionChromeUpdate,
+) -> Result<()> {
+    let key = (update.extension_id, update.view_id);
+    if update.vdom_payload.is_empty() {
+        server_nodes.remove(&key);
+        return Ok(());
+    }
+    let json = std::str::from_utf8(&update.vdom_payload)
+        .context("server extension VDOM payload is not UTF-8")?;
+    let node = parse_vdom_json(json).context("server extension VDOM rejected")?;
+    server_nodes.insert(key, node);
+    Ok(())
+}
 /// created status bars inherit it.
 fn publish_vdom(cx: &mut gpui::App, nodes: Vec<VDomNode>) {
     if cx.try_global::<AcceptedVdom>().is_none() {
@@ -379,7 +409,9 @@ impl HostBridge for MuxHostBridge {
                 // The mux protocol has no layout-apply request (§9 only exposes
                 // ResizeLayout), so this fails loudly instead of silently
                 // pretending the preset was restored.
-                bail!("mux.applyLayout is not supported: the mux protocol has no apply-layout request")
+                bail!(
+                    "mux.applyLayout is not supported: the mux protocol has no apply-layout request"
+                )
             }
             "settings.get" => {
                 let key = required_string(args, 0, method)?;
@@ -553,6 +585,284 @@ fn notification_events(
 }
 
 // ---------------------------------------------------------------------------
+// §5.6 First-install consent store
+//
+// Extensions only run after the user approved what their manifest asks for
+// (browser-extension style). Consent is keyed by extension id plus the exact
+// policy fingerprint of the security-relevant manifest fields, so an update
+// that changes capabilities, limits, side or version re-prompts. Each record
+// stores an explicit Approved/Denied state — there is no sentinel value — and
+// legacy or malformed records fail closed into pending, never activating.
+// ---------------------------------------------------------------------------
+
+/// §5.6 The user's decision for one exact policy fingerprint.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ConsentState {
+    Approved,
+    Denied,
+}
+
+/// §5.6 One persisted first-install consent decision. The record is keyed by
+/// extension id plus the exact policy fingerprint that was decided, so it only
+/// ever matches the manifest it was made against: a changed manifest
+/// re-prompts regardless of the prior Approved/Denied state.
+///
+/// The record is serializable through [`Self::to_json`] / [`Self::from_json`]
+/// as `{"id", "policy_fingerprint", "state"}` with an explicit
+/// `"approved"/"denied"` state — no sentinel values.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ConsentRecord {
+    pub id: String,
+    pub policy_fingerprint: String,
+    pub state: ConsentState,
+}
+
+impl ConsentRecord {
+    pub fn approved(id: impl Into<String>, policy_fingerprint: impl Into<String>) -> Self {
+        Self {
+            id: id.into(),
+            policy_fingerprint: policy_fingerprint.into(),
+            state: ConsentState::Approved,
+        }
+    }
+
+    pub fn denied(id: impl Into<String>, policy_fingerprint: impl Into<String>) -> Self {
+        Self {
+            id: id.into(),
+            policy_fingerprint: policy_fingerprint.into(),
+            state: ConsentState::Denied,
+        }
+    }
+
+    fn state_name(state: ConsentState) -> &'static str {
+        match state {
+            ConsentState::Approved => "approved",
+            ConsentState::Denied => "denied",
+        }
+    }
+
+    fn to_json(&self) -> serde_json::Value {
+        serde_json::json!({
+            "id": self.id,
+            "policy_fingerprint": self.policy_fingerprint,
+            "state": Self::state_name(self.state),
+        })
+    }
+
+    /// Parse a record from its JSON shape. Returns `None` for any record that
+    /// does not carry the explicit state and policy fingerprint the current
+    /// format requires — including legacy records that stored a bare numeric
+    /// fingerprint — so such records fail closed into pending.
+    fn from_json(value: &serde_json::Value) -> Option<ConsentRecord> {
+        let id = value.get("id")?.as_str()?.to_string();
+        let policy_fingerprint = value.get("policy_fingerprint")?.as_str()?.to_string();
+        let state = match value.get("state")?.as_str()? {
+            "approved" => ConsentState::Approved,
+            "denied" => ConsentState::Denied,
+            _ => return None,
+        };
+        Some(ConsentRecord {
+            id,
+            policy_fingerprint,
+            state,
+        })
+    }
+}
+
+/// §5.6 One extension waiting for the user's first-install decision.
+#[derive(Debug, Clone)]
+pub struct PendingApproval {
+    pub id: String,
+    pub version: String,
+    pub capabilities_summary: String,
+    pub policy_fingerprint: String,
+}
+
+fn consent_file_path() -> PathBuf {
+    paths::config_dir().join("extension-consent.json")
+}
+
+/// Load consent records as `id → ConsentRecord`. An absent or corrupt file is
+/// treated as empty (fail closed: nothing runs unapproved, nothing crashes).
+/// Records that do not carry the explicit state and policy fingerprint the
+/// current format requires — including legacy records that stored a bare
+/// numeric fingerprint — are skipped and fall through to pending.
+fn load_consent_records(path: &Path) -> HashMap<String, ConsentRecord> {
+    let text = match std::fs::read_to_string(path) {
+        Ok(text) => text,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return HashMap::new(),
+        Err(error) => {
+            tracing::warn!(
+                path = %path.display(),
+                %error,
+                "extension consent file unreadable; treating as empty"
+            );
+            return HashMap::new();
+        }
+    };
+    let value: serde_json::Value = match serde_json::from_str(&text) {
+        Ok(value) => value,
+        Err(error) => {
+            tracing::warn!(
+                path = %path.display(),
+                %error,
+                "extension consent file corrupt; treating as empty"
+            );
+            return HashMap::new();
+        }
+    };
+    let Some(records) = value.as_array() else {
+        tracing::warn!(
+            path = %path.display(),
+            "extension consent file is not an array; treating as empty"
+        );
+        return HashMap::new();
+    };
+    let mut consented = HashMap::new();
+    for record in records {
+        let Some(record) = ConsentRecord::from_json(record) else {
+            tracing::warn!(
+                path = %path.display(),
+                %record,
+                "skipping malformed extension consent record"
+            );
+            continue;
+        };
+        consented.insert(record.id.clone(), record);
+    }
+    consented
+}
+
+/// Persist consent records as `[{"id", "policy_fingerprint", "state"}]`,
+/// sorted by id for stable output. Writes are temp-file + rename so a crash
+/// mid-write cannot corrupt the store. Errors are returned to the caller:
+/// pending and host state must not be mutated when the store could not be
+/// written.
+fn save_consent_records(path: &Path, records: &HashMap<String, ConsentRecord>) -> Result<()> {
+    let mut ids: Vec<&String> = records.keys().collect();
+    ids.sort();
+    let records: Vec<serde_json::Value> = ids.iter().map(|id| records[*id].to_json()).collect();
+    let serialized = serde_json::to_string_pretty(&records)
+        .context("serializing extension consent records failed")?;
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)
+            .with_context(|| format!("creating consent directory {}", parent.display()))?;
+    }
+    let temporary = path.with_extension("json.tmp");
+    std::fs::write(&temporary, serialized)
+        .with_context(|| format!("writing extension consent file {}", temporary.display()))?;
+    std::fs::rename(&temporary, path)
+        .with_context(|| format!("committing extension consent file {}", path.display()))?;
+    Ok(())
+}
+
+/// §5.6 Canonical policy fingerprint: the exact serialized policy tuple the
+/// consent decision covers — id, version, runtime side, capabilities and
+/// resource limits — as canonical JSON (objects built from `BTreeMap`, so key
+/// order is deterministic). Fingerprints are never hashed, so they cannot
+/// collide: two manifests share a fingerprint iff their entire policy tuple
+/// is byte-identical, and any change re-prompts.
+fn consent_fingerprint(extension: &DiscoveredExtension) -> String {
+    let manifest = &extension.manifest;
+    let payload = serde_json::Value::Object(BTreeMap::from([
+        ("id".into(), serde_json::Value::String(manifest.id.clone())),
+        (
+            "version".into(),
+            serde_json::Value::String(manifest.version.clone()),
+        ),
+        ("side".into(), serde_json::Value::String(side_name(manifest.side).into())),
+        ("capabilities".into(), capabilities_json(&manifest.capabilities)),
+        ("limits".into(), limits_json(&manifest.limits)),
+    ]).into_iter().collect());
+    payload.to_string()
+}
+
+/// Canonical JSON for the resource-limit tuple of a manifest.
+fn limits_json(limits: &ExtensionLimits) -> serde_json::Value {
+    serde_json::Value::Object(BTreeMap::from([
+        ("memory_limit_mb".into(), serde_json::json!(limits.memory_limit_mb)),
+        ("cpu_budget_ms".into(), serde_json::json!(limits.cpu_budget_ms)),
+        ("io_rate_limit".into(), serde_json::json!(limits.io_rate_limit)),
+    ]).into_iter().collect())
+}
+
+fn side_name(side: ExtensionSide) -> &'static str {
+    match side {
+        ExtensionSide::Client => "client",
+        ExtensionSide::Server => "server",
+        ExtensionSide::Both => "both",
+    }
+}
+
+fn capabilities_json(capabilities: &ExtensionCapabilities) -> serde_json::Value {
+    serde_json::Value::Object(BTreeMap::from([
+        ("terminal".into(), serde_json::json!(capabilities.terminal)),
+        ("mux".into(), serde_json::json!(capabilities.mux)),
+        ("workspace".into(), serde_json::json!(capabilities.workspace)),
+        ("settings".into(), serde_json::json!(capabilities.settings)),
+        ("network".into(), serde_json::json!(capabilities.network)),
+        (
+            "process_spawn".into(),
+            serde_json::json!(capabilities.process_spawn),
+        ),
+        (
+            "filesystem".into(),
+            serde_json::json!(filesystem_name(capabilities.filesystem)),
+        ),
+    ]).into_iter().collect())
+}
+
+fn filesystem_name(access: FilesystemAccess) -> &'static str {
+    match access {
+        FilesystemAccess::None => "none",
+        FilesystemAccess::Cwd => "cwd",
+        FilesystemAccess::Home => "home",
+    }
+}
+
+/// Human-readable capability list for the first-install prompt.
+fn capabilities_summary(capabilities: &ExtensionCapabilities) -> String {
+    let mut granted: Vec<&str> = Vec::new();
+    if capabilities.terminal {
+        granted.push("terminal");
+    }
+    if capabilities.mux {
+        granted.push("mux");
+    }
+    if capabilities.workspace {
+        granted.push("workspace");
+    }
+    if capabilities.settings {
+        granted.push("settings");
+    }
+    if capabilities.network {
+        granted.push("network");
+    }
+    if capabilities.process_spawn {
+        granted.push("process spawn");
+    }
+    match capabilities.filesystem {
+        FilesystemAccess::None => {}
+        FilesystemAccess::Cwd => granted.push("filesystem (working directory)"),
+        FilesystemAccess::Home => granted.push("filesystem (home directory)"),
+    }
+    if granted.is_empty() {
+        "none".to_string()
+    } else {
+        granted.join(", ")
+    }
+}
+
+fn pending_approval_for(extension: &DiscoveredExtension) -> PendingApproval {
+    PendingApproval {
+        id: extension.manifest.id.clone(),
+        version: extension.manifest.version.clone(),
+        capabilities_summary: capabilities_summary(&extension.manifest.capabilities),
+        policy_fingerprint: consent_fingerprint(extension),
+    }
+}
+
+// ---------------------------------------------------------------------------
 // §5.2 Dedicated-thread extension host actor.
 //
 // Owns LiveExtensions on a single std::thread, satisfying the §5.2
@@ -574,6 +884,10 @@ enum HostCommand {
     },
     /// Force a full re-render regardless of invalidation state.
     Render,
+    /// §5.6 The user approved these pending extensions: activate them.
+    Approve { ids: Vec<String> },
+    /// §5.6 The user denied these pending extensions: drop them.
+    Deny { ids: Vec<String> },
     Shutdown,
 }
 
@@ -582,10 +896,26 @@ pub struct ExtensionHostController {
     host_thread: Option<std::thread::JoinHandle<()>>,
     /// Applies chrome the host thread pushes; replaces the old 1Hz poll.
     chrome_task: Option<gpui::Task<()>>,
+    /// Invalidates display-list clock views without running on the render thread.
+    clock_task: Option<gpui::Task<()>>,
     /// Forwards mux notifications into the extensions as events.
     mux_task: Option<gpui::Task<()>>,
     status_bars:
         parking_lot::Mutex<Vec<gpui::WeakEntity<crate::extension_status_bar::ExtensionStatusBar>>>,
+    /// Last local render and authoritative server views are kept separately so
+    /// either source can update without duplicating the other.
+    local_chrome: Vec<VDomNode>,
+    server_chrome: BTreeMap<(String, String), VDomNode>,
+    /// §5.6 Extensions waiting for the user's first-install decision.
+    pending_approvals: Vec<PendingApproval>,
+    /// Applies the host's pending-approval pushes; mirrors `chrome_task`.
+    pending_task: Option<gpui::Task<()>>,
+    /// §5.6 Controller-global prompt claim: at most one window may present
+    /// the first-install prompt for the pending batch at a time.
+    prompt_claimed: bool,
+    /// Consent store location. Defaults to the config dir; tests redirect it
+    /// so they never touch (or share) the real user's consent file.
+    consent_file: PathBuf,
 }
 
 pub struct GlobalHostController(pub gpui::Entity<ExtensionHostController>);
@@ -603,12 +933,38 @@ impl HostedExtension {
     /// §5.6 "Resource limits are enforced at runtime — exceeding them results
     /// in extension suspension." Suspension lasts for the process lifetime;
     /// the chrome falls back to the native GPUI baseline (§5.1).
+    ///
+    /// Called after every host → extension interaction (render and each
+    /// command), so a runaway handler is suspended before the next command
+    /// even if nothing requested a re-render.
     fn note_resource_violations(&mut self) {
+        // Extensions report internally caught exceptions (render/event
+        // handlers) through the error list; drain it here on every path so
+        // nothing is silently dropped. "out of memory" in that list is a
+        // resource violation the JS layer swallowed — it must suspend too.
+        match self.live.take_errors() {
+            Ok(errors) => {
+                for error in errors {
+                    tracing::warn!(id = %self.live.id(), %error, "extension reported an error");
+                }
+            }
+            Err(error) => {
+                tracing::warn!(id = %self.live.id(), %error, "draining extension errors failed");
+            }
+        }
         if self.live.take_cpu_interrupted() {
             self.suspended = true;
             tracing::error!(
                 id = %self.live.id(),
                 "extension exceeded its CPU budget and was suspended"
+            );
+            return;
+        }
+        if self.live.take_memory_violated() {
+            self.suspended = true;
+            tracing::error!(
+                id = %self.live.id(),
+                "extension exceeded its memory budget and was suspended"
             );
         }
     }
@@ -622,33 +978,33 @@ fn render_live_extensions(live_extensions: &mut [HostedExtension]) -> Vec<VDomNo
         if hosted.suspended {
             continue;
         }
-        let live_extension = &hosted.live;
-        match live_extension.render_all_views() {
+
+        let extension_id = hosted.live.id().to_string();
+        let mut rendered_nodes = Vec::new();
+        match hosted.live.render_all_views() {
             Ok(views) => {
                 for json in views {
                     match parse_vdom_json(&json) {
-                        Ok(node) => nodes.push(node),
+                        Ok(node) => rendered_nodes.push(node),
                         Err(error) => {
-                            tracing::warn!(id = %live_extension.id(), %error, "extension VDOM rejected")
+                            tracing::warn!(id = %extension_id, %error, "extension VDOM rejected")
                         }
                     }
                 }
             }
             Err(error) => {
-                tracing::warn!(id = %live_extension.id(), %error, "extension render failed")
+                tracing::warn!(id = %extension_id, %error, "extension render failed");
             }
         }
-        match live_extension.take_errors() {
-            Ok(errors) => {
-                for error in errors {
-                    tracing::warn!(id = %live_extension.id(), %error, "extension reported an error");
-                }
-            }
-            Err(error) => {
-                tracing::warn!(id = %live_extension.id(), %error, "draining extension errors failed")
-            }
-        }
+
+        // Check violations before publishing this frame. If the extension
+        // exceeded a limit while rendering, its frame is discarded so native
+        // chrome can replace it immediately instead of displaying the last
+        // untrusted view.
         hosted.note_resource_violations();
+        if !hosted.suspended {
+            nodes.extend(rendered_nodes);
+        }
     }
     nodes
 }
@@ -662,16 +1018,18 @@ fn push_chrome_if_dirty(
 ) -> bool {
     let dirty = force
         || live_extensions.iter().any(|hosted| {
-            !hosted.suspended
-                && hosted.live.needs_render().unwrap_or_else(|error| {
-                    tracing::warn!(id = %hosted.live.id(), %error, "extension invalidation check failed");
-                    false
-                })
+            !hosted.suspended && hosted.live.needs_render().unwrap_or_else(|error| {
+            tracing::warn!(id = %hosted.live.id(), %error, "extension invalidation check failed");
+            false
+        })
         });
     if !dirty {
         return true;
     }
-    let nodes = render_live_extensions(live_extensions);
+    let mut nodes = render_live_extensions(live_extensions);
+    // §5.6 Suspension must not be silent: every chrome push appends a
+    // synthetic notice per suspended extension after the live chrome.
+    nodes.extend(suspension_notices(live_extensions));
     match sender.unbounded_send(nodes) {
         Ok(()) => true,
         Err(error) => {
@@ -681,14 +1039,39 @@ fn push_chrome_if_dirty(
     }
 }
 
+/// §5.6 Synthetic chrome nodes announcing suspended extensions, appended
+/// after the live chrome so the user sees why an extension's views vanished.
+fn suspension_notices(live_extensions: &[HostedExtension]) -> Vec<VDomNode> {
+    live_extensions
+        .iter()
+        .filter(|hosted| hosted.suspended)
+        .map(|hosted| VDomNode {
+            element_type: "div".to_string(),
+            props: BTreeMap::new(),
+            style: BTreeMap::new(),
+            children: vec![VDomChild::Text(format!(
+                "{} suspended (resource limit)",
+                hosted.live.id()
+            ))],
+        })
+        .collect()
+}
+
 impl ExtensionHostController {
     pub fn new() -> Self {
         Self {
             command_sender: None,
             host_thread: None,
             chrome_task: None,
+            clock_task: None,
             mux_task: None,
             status_bars: parking_lot::Mutex::new(Vec::new()),
+            local_chrome: Vec::new(),
+            server_chrome: BTreeMap::new(),
+            pending_approvals: Vec::new(),
+            pending_task: None,
+            prompt_claimed: false,
+            consent_file: consent_file_path(),
         }
     }
 
@@ -698,8 +1081,10 @@ impl ExtensionHostController {
 
     fn start_with_roots(&mut self, roots: Vec<std::path::PathBuf>, cx: &mut gpui::Context<Self>) {
         let (command_sender, command_receiver) = std::sync::mpsc::channel::<HostCommand>();
-        let (chrome_sender, chrome_receiver) =
-            futures::channel::mpsc::unbounded::<Vec<VDomNode>>();
+        let (chrome_sender, chrome_receiver) = futures::channel::mpsc::unbounded::<Vec<VDomNode>>();
+        let (pending_sender, pending_receiver) =
+            futures::channel::mpsc::unbounded::<Vec<PendingApproval>>();
+        let consent_file = self.consent_file.clone();
 
         let host_thread = std::thread::Builder::new()
             .name("quickjs-ext-host".into())
@@ -708,7 +1093,45 @@ impl ExtensionHostController {
                 if discovered.is_empty() {
                     tracing::warn!(?roots, "no client extensions found");
                 }
-                let mut live_extensions = activate_extensions(discovered);
+                // §5.6 Split by consent: an extension activates only when its
+                // policy fingerprint matches a stored Approved record exactly,
+                // and is suppressed only by an exact Denied record. A manifest
+                // that differs from either prior decision — or a legacy/
+                // malformed record that failed to load — lands in pending and
+                // runs nothing until the user decides again.
+                let consent = load_consent_records(&consent_file);
+                let mut pending: Vec<DiscoveredExtension> = Vec::new();
+                let mut consented: Vec<DiscoveredExtension> = Vec::new();
+                for extension in discovered {
+                    let fingerprint = consent_fingerprint(&extension);
+                    match consent.get(&extension.manifest.id) {
+                        Some(record)
+                            if record.state == ConsentState::Approved
+                                && record.policy_fingerprint == fingerprint =>
+                        {
+                            consented.push(extension);
+                        }
+                        Some(record)
+                            if record.state == ConsentState::Denied
+                                && record.policy_fingerprint == fingerprint =>
+                        {
+                            tracing::info!(
+                                id = %extension.manifest.id,
+                                "extension stays disabled: the user denied this exact manifest"
+                            );
+                        }
+                        _ => pending.push(extension),
+                    }
+                }
+                if !pending.is_empty()
+                    && pending_sender
+                        .unbounded_send(pending.iter().map(pending_approval_for).collect())
+                        .is_err()
+                {
+                    return;
+                }
+                let mut live_extensions = activate_extensions(consented);
+                let mut installed_bridge: Option<Arc<dyn HostBridge>> = None;
 
                 // First paint: extensions register their chrome during
                 // activate, so publish it before waiting for any event.
@@ -721,8 +1144,10 @@ impl ExtensionHostController {
                         Ok(command) => command,
                         Err(_) => break,
                     };
+                    let mut force_render = false;
                     match command {
                         HostCommand::InstallBridge(bridge) => {
+                            installed_bridge = Some(bridge.clone());
                             for hosted in live_extensions.iter().filter(|hosted| !hosted.suspended) {
                                 if let Err(error) = hosted.live.install_bridge(bridge.clone()) {
                                     tracing::warn!(id = %hosted.live.id(), %error, "installing mux bridge failed");
@@ -750,14 +1175,53 @@ impl ExtensionHostController {
                             }
                             continue;
                         }
+                        HostCommand::Approve { ids } => {
+                            let (approved, remaining): (Vec<DiscoveredExtension>, Vec<DiscoveredExtension>) =
+                                std::mem::take(&mut pending)
+                                    .into_iter()
+                                    .partition(|extension| ids.contains(&extension.manifest.id));
+                            pending = remaining;
+                            if !approved.is_empty() {
+                                let existing = live_extensions.len();
+                                live_extensions.extend(activate_extensions(approved));
+                                // A bridge installed before the approval must
+                                // reach the newly activated extensions too.
+                                if let Some(bridge) = &installed_bridge {
+                                    for hosted in &live_extensions[existing..] {
+                                        if let Err(error) = hosted.live.install_bridge(bridge.clone()) {
+                                            tracing::warn!(id = %hosted.live.id(), %error, "installing mux bridge into approved extension failed");
+                                        }
+                                    }
+                                }
+                                force_render = true;
+                            }
+                        }
+                        HostCommand::Deny { ids } => {
+                            pending.retain(|extension| !ids.contains(&extension.manifest.id));
+                        }
                         HostCommand::Shutdown => break,
                     }
                     // §5.6 A runaway handler is suspended before the next
                     // command, even if nothing requested a re-render.
+                    let suspended_before = live_extensions
+                        .iter()
+                        .filter(|hosted| hosted.suspended)
+                        .count();
                     for hosted in live_extensions.iter_mut() {
                         hosted.note_resource_violations();
                     }
-                    if !push_chrome_if_dirty(&mut live_extensions, &chrome_sender, false) {
+                    let newly_suspended = live_extensions
+                        .iter()
+                        .filter(|hosted| hosted.suspended)
+                        .count()
+                        > suspended_before;
+                    // §5.6 Force the push when a suspension first occurs so
+                    // the user notice appears without waiting for invalidation.
+                    if !push_chrome_if_dirty(
+                        &mut live_extensions,
+                        &chrome_sender,
+                        force_render || newly_suspended,
+                    ) {
                         break;
                     }
                 }
@@ -768,6 +1232,8 @@ impl ExtensionHostController {
                 self.command_sender = Some(command_sender.clone());
                 self.host_thread = Some(host_thread);
                 self.start_chrome_task(chrome_receiver, cx);
+                self.start_pending_task(pending_receiver, cx);
+                self.start_clock_task(cx);
                 self.start_mux_task(cx);
             }
             Err(error) => {
@@ -778,6 +1244,36 @@ impl ExtensionHostController {
 
     /// §5.5 Apply chrome pushed by the host thread. Event driven: the task
     /// parks on the channel instead of polling on a timer.
+    fn publish_chrome(&mut self, cx: &mut gpui::Context<Self>) {
+        let nodes = merge_chrome_nodes(&self.local_chrome, &self.server_chrome);
+        self.status_bars.lock().retain(|status_bar| {
+            let Some(status_bar) = status_bar.upgrade() else {
+                return false;
+            };
+            let nodes_for_bar = nodes.clone();
+            status_bar.update(cx, |status_bar, cx| {
+                status_bar.set_vdom_nodes(nodes_for_bar, cx);
+            });
+            true
+        });
+        publish_vdom(cx, nodes);
+    }
+
+    fn apply_local_chrome(&mut self, nodes: Vec<VDomNode>, cx: &mut gpui::Context<Self>) {
+        self.local_chrome = nodes;
+        self.publish_chrome(cx);
+    }
+
+    fn apply_server_chrome_update(
+        &mut self,
+        update: mux_protocol::ExtensionChromeUpdate,
+        cx: &mut gpui::Context<Self>,
+    ) -> Result<()> {
+        apply_server_chrome_node(&mut self.server_chrome, update)?;
+        self.publish_chrome(cx);
+        Ok(())
+    }
+
     fn start_chrome_task(
         &mut self,
         mut chrome_receiver: futures::channel::mpsc::UnboundedReceiver<Vec<VDomNode>>,
@@ -786,18 +1282,134 @@ impl ExtensionHostController {
         self.chrome_task = Some(cx.spawn(async move |this, cx| {
             while let Some(nodes) = chrome_receiver.next().await {
                 let update = this.update(cx, |this, cx| {
-                    this.status_bars.lock().retain(|status_bar| {
-                        let Some(status_bar) = status_bar.upgrade() else {
-                            return false;
-                        };
-                        status_bar
-                            .update(cx, |status_bar, cx| status_bar.set_vdom_nodes(nodes.clone(), cx));
-                        true
-                    });
-                    publish_vdom(cx, nodes);
+                    this.apply_local_chrome(nodes, cx);
                 });
                 if let Err(error) = update {
                     tracing::debug!(%error, "extension controller dropped while applying chrome");
+                    break;
+                }
+            }
+        }));
+    }
+
+    /// §5.6 Apply pending-approval lists the host thread pushes, mirroring
+    /// the chrome channel: the task parks on the channel, and each push
+    /// replaces the controller's view of what awaits the user's decision.
+    fn start_pending_task(
+        &mut self,
+        mut pending_receiver: futures::channel::mpsc::UnboundedReceiver<Vec<PendingApproval>>,
+        cx: &mut gpui::Context<Self>,
+    ) {
+        self.pending_task = Some(cx.spawn(async move |this, cx| {
+            while let Some(approvals) = pending_receiver.next().await {
+                let update = this.update(cx, |this, cx| {
+                    this.apply_pending_approvals(approvals, cx);
+                });
+                if let Err(error) = update {
+                    tracing::debug!(%error, "extension controller dropped while applying pending approvals");
+                    break;
+                }
+            }
+        }));
+    }
+
+    fn apply_pending_approvals(
+        &mut self,
+        approvals: Vec<PendingApproval>,
+        cx: &mut gpui::Context<Self>,
+    ) {
+        self.pending_approvals = approvals;
+        cx.notify();
+    }
+
+    /// §5.6 Extensions waiting for the user's first-install decision.
+    pub fn pending_approvals(&self) -> Vec<PendingApproval> {
+        self.pending_approvals.clone()
+    }
+
+    /// §5.6 Record consent for the given pending extensions (keyed by the
+    /// approved manifest's policy fingerprint) and tell the host to activate
+    /// them. The proposed record set is persisted *before* pending entries are
+    /// removed, observers are notified, or host commands are sent: on a write
+    /// or rename failure the error is returned and pending/host state is left
+    /// untouched.
+    pub fn approve_extensions(&mut self, ids: &[String], cx: &mut gpui::Context<Self>) -> Result<()> {
+        let mut records = load_consent_records(&self.consent_file);
+        let mut approved = Vec::new();
+        for approval in &self.pending_approvals {
+            if ids.contains(&approval.id) {
+                records.insert(
+                    approval.id.clone(),
+                    ConsentRecord::approved(&approval.id, &approval.policy_fingerprint),
+                );
+                approved.push(approval.id.clone());
+            }
+        }
+        if approved.is_empty() {
+            return Ok(());
+        }
+        save_consent_records(&self.consent_file, &records)?;
+        self.pending_approvals
+            .retain(|approval| !ids.contains(&approval.id));
+        self.send(HostCommand::Approve { ids: approved });
+        cx.notify();
+        Ok(())
+    }
+
+    /// §5.6 Record an explicit denial of the given pending extensions' exact
+    /// policy fingerprints so those manifests are never re-prompted, and tell
+    /// the host to drop them. Persistence happens first, exactly as in
+    /// [`Self::approve_extensions`]: on failure the error is returned and
+    /// pending/host state is left untouched.
+    pub fn deny_extensions(&mut self, ids: &[String]) -> Result<()> {
+        let mut records = load_consent_records(&self.consent_file);
+        let mut denied = Vec::new();
+        for approval in &self.pending_approvals {
+            if ids.contains(&approval.id) {
+                records.insert(
+                    approval.id.clone(),
+                    ConsentRecord::denied(&approval.id, &approval.policy_fingerprint),
+                );
+                denied.push(approval.id.clone());
+            }
+        }
+        if denied.is_empty() {
+            return Ok(());
+        }
+        save_consent_records(&self.consent_file, &records)?;
+        self.pending_approvals
+            .retain(|approval| !ids.contains(&approval.id));
+        self.send(HostCommand::Deny { ids: denied });
+        Ok(())
+    }
+
+    /// §5.6 Atomically claim the right to prompt for the pending approvals.
+    /// Returns false when another prompt already owns the claim; the claimant
+    /// must release it once the prompt resolves — including on cancellation,
+    /// error, or persistence failure — so a later check can prompt again.
+    pub fn claim_pending_prompt(&mut self, _cx: &mut gpui::Context<Self>) -> bool {
+        if self.prompt_claimed {
+            return false;
+        }
+        self.prompt_claimed = true;
+        true
+    }
+
+    /// §5.6 Release the prompt claim. Does not notify: a dismissed or failed
+    /// prompt must not immediately re-prompt; the pending queue stays pending
+    /// until the next pending push, window, or restart surfaces it again.
+    pub fn release_pending_prompt(&mut self, _cx: &mut gpui::Context<Self>) {
+        self.prompt_claimed = false;
+    }
+
+    fn start_clock_task(&mut self, cx: &mut gpui::Context<Self>) {
+        self.clock_task = Some(cx.spawn(async move |this, cx| {
+            loop {
+                cx.background_executor().timer(Duration::from_secs(1)).await;
+                if this
+                    .update(cx, |this, _| this.send(HostCommand::Render))
+                    .is_err()
+                {
                     break;
                 }
             }
@@ -845,9 +1457,80 @@ impl ExtensionHostController {
                 tracing::debug!(%error, "extension controller dropped before the mux bridge was installed");
                 return;
             }
+            if let Some(snapshot) = domain.last_attached_snapshot() {
+                {
+                    let mut bridge_state = state.lock();
+                    for tab in &snapshot.tabs {
+                        for pane in &tab.panes {
+                            bridge_state
+                                .pane_tabs
+                                .insert(pane.id.clone(), tab.id.clone());
+                            bridge_state
+                                .pane_titles
+                                .insert(pane.id.clone(), pane.title.clone());
+                        }
+                    }
+                    if !snapshot.focused_pane_id.is_empty() {
+                        bridge_state.focused_pane = Some(snapshot.focused_pane_id.clone());
+                    }
+                }
+
+                if !snapshot.focused_pane_id.is_empty() {
+                    let hydration = mux_protocol::Notification {
+                        event: Some(mux_protocol::notification::Event::PaneFocused(
+                            mux_protocol::PaneFocused {
+                                pane_id: snapshot.focused_pane_id,
+                            },
+                        )),
+                    };
+                    for (event, payload) in notification_events(&hydration, &state) {
+                        let payload = match serde_json::to_string(&payload) {
+                            Ok(payload) => payload,
+                            Err(error) => {
+                                tracing::warn!(
+                                    %event,
+                                    %error,
+                                    "serializing initial extension focus failed"
+                                );
+                                continue;
+                            }
+                        };
+                        if let Err(error) =
+                            this.read_with(cx, |this, _| this.emit_event(&event, &payload))
+                        {
+                            tracing::debug!(
+                                %error,
+                                "extension host dropped before initial focus hydration"
+                            );
+                            return;
+                        }
+                    }
+                }
+            }
 
             let notifications = domain.subscribe();
+
             while let Ok(notification) = notifications.recv().await {
+                let server_update = match notification.event.as_ref() {
+                    Some(mux_protocol::notification::Event::ExtensionChrome(update)) => {
+                        Some(update.clone())
+                    }
+                    _ => None,
+                };
+                if let Some(update) = server_update {
+                    let applied = this.update(cx, |this, cx| {
+                        if let Err(error) = this.apply_server_chrome_update(update, cx) {
+                            tracing::warn!(%error, "server extension chrome update rejected");
+                        }
+                    });
+                    if let Err(error) = applied {
+                        tracing::debug!(
+                            %error,
+                            "extension controller dropped; ending server chrome forwarding"
+                        );
+                        return;
+                    }
+                }
                 for (event, payload) in notification_events(&notification, &state) {
                     let payload = match serde_json::to_string(&payload) {
                         Ok(payload) => payload,
@@ -917,9 +1600,7 @@ impl ExtensionHostController {
 
     fn command_dispatch(this: gpui::WeakEntity<Self>) -> vdom_bridge::CommandDispatch {
         std::rc::Rc::new(
-            move |invocation: CommandInvocation,
-                  _window: &mut gpui::Window,
-                  cx: &mut gpui::App| {
+            move |invocation: CommandInvocation, _window: &mut gpui::Window, cx: &mut gpui::App| {
                 let arguments = match serde_json::to_string(&invocation.args) {
                     Ok(arguments) => arguments,
                     Err(error) => {
@@ -991,6 +1672,7 @@ mod tests {
     use super::*;
     use crate::extension_status_bar::ExtensionStatusBar;
     use extension_host::vdom_bridge::{self, VDomChild};
+    use futures::FutureExt as _;
 
     fn loaded_with_vdom(id: &str, json: Option<&str>) -> LoadedExtension {
         let result = ExtensionRunResult {
@@ -1032,7 +1714,10 @@ mod tests {
         let discovered =
             quickjs_runtime::discover_client_extensions(std::slice::from_ref(&directory));
 
-        assert!(discovered.is_empty(), "server-side extensions must be skipped");
+        assert!(
+            discovered.is_empty(),
+            "server-side extensions must be skipped"
+        );
         std::fs::remove_dir_all(directory)?;
         Ok(())
     }
@@ -1107,7 +1792,10 @@ mod tests {
             "z3rm-tab-bar",
             "z3rm-which-key",
         ] {
-            assert!(ids.contains(&expected), "{expected} did not activate: {ids:?}");
+            assert!(
+                ids.contains(&expected),
+                "{expected} did not activate: {ids:?}"
+            );
         }
 
         // Chrome must be non-empty on first paint: status-bar and tab-bar
@@ -1142,9 +1830,9 @@ mod tests {
             "#,
         )?;
 
-        let mut live_extensions = activate_extensions(
-            quickjs_runtime::discover_client_extensions(std::slice::from_ref(&root)),
-        );
+        let mut live_extensions = activate_extensions(quickjs_runtime::discover_client_extensions(
+            std::slice::from_ref(&root),
+        ));
         assert_eq!(live_extensions.len(), 1);
         assert!(
             !render_live_extensions(&mut live_extensions).is_empty(),
@@ -1159,6 +1847,60 @@ mod tests {
         );
         live_extensions[0].note_resource_violations();
         assert!(live_extensions[0].suspended, "CPU violation must suspend");
+        assert!(
+            render_live_extensions(&mut live_extensions).is_empty(),
+            "a suspended extension must stop contributing chrome"
+        );
+
+        std::fs::remove_dir_all(root)?;
+        Ok(())
+    }
+
+    /// §5.6: an extension that blows its memory budget must be suspended, and
+    /// the rest of the chrome must keep rendering. The OOM is caught by the
+    /// bootstrap's render try/catch, so the violation must be detected through
+    /// the drained error list rather than a Rust-level render failure.
+    #[test]
+    fn runaway_memory_extension_is_suspended_and_stops_rendering() -> Result<()> {
+        let root = temporary_extension_dir("memory-runaway-root")?;
+        let extension = root.join("memory-runaway");
+        std::fs::create_dir_all(&extension)?;
+        std::fs::write(
+            extension.join("extension.toml"),
+            "[extension]\nname = \"memory-runaway\"\n[runtime]\nside = \"client\"\n[resources]\nmemory_limit_mb = 1\n",
+        )?;
+        std::fs::write(
+            extension.join("main.js"),
+            r#"
+            function activate(context) {
+                context.registerChromeView('memory-runaway', {
+                    render: function() {
+                        var blocks = [];
+                        for (var i = 0; i < 10000000; i++) { blocks.push(new Array(1000)); }
+                        return { type: 'span', children: ['alive'] };
+                    }
+                });
+            }
+            "#,
+        )?;
+
+        let mut live_extensions = activate_extensions(quickjs_runtime::discover_client_extensions(
+            std::slice::from_ref(&root),
+        ));
+        assert_eq!(live_extensions.len(), 1);
+        assert!(
+            !live_extensions[0].suspended,
+            "a healthy extension must not be suspended before the violation"
+        );
+
+        // First paint: the runaway render hits the 1MB ceiling; the OOM is
+        // swallowed by the JS try/catch but must still suspend the extension.
+        let nodes = render_live_extensions(&mut live_extensions);
+        assert!(nodes.is_empty(), "OOM 的渲染不得产生 chrome");
+        assert!(
+            live_extensions[0].suspended,
+            "memory violation must suspend the extension"
+        );
         assert!(
             render_live_extensions(&mut live_extensions).is_empty(),
             "a suspended extension must stop contributing chrome"
@@ -1520,19 +2262,29 @@ mod tests {
     /// Pump the foreground executor until `condition` holds. The extension host
     /// runs on a real OS thread, so simulated time cannot advance it; the loop
     /// yields wall clock between drains.
-    fn wait_for(cx: &mut gpui::TestAppContext, what: &str, mut condition: impl FnMut(&mut gpui::TestAppContext) -> bool) {
+    fn wait_for(
+        cx: &mut gpui::TestAppContext,
+        what: &str,
+        mut condition: impl FnMut(&mut gpui::TestAppContext) -> bool,
+    ) {
         let deadline = std::time::Instant::now() + Duration::from_secs(20);
         loop {
             cx.run_until_parked();
             if condition(cx) {
                 return;
             }
-            assert!(std::time::Instant::now() < deadline, "timed out waiting for {what}");
+            assert!(
+                std::time::Instant::now() < deadline,
+                "timed out waiting for {what}"
+            );
             std::thread::sleep(Duration::from_millis(10));
         }
     }
 
-    fn status_bar_text(cx: &mut gpui::TestAppContext, bar: &gpui::Entity<ExtensionStatusBar>) -> String {
+    fn status_bar_text(
+        cx: &mut gpui::TestAppContext,
+        bar: &gpui::Entity<ExtensionStatusBar>,
+    ) -> String {
         cx.read(|cx| {
             bar.read(cx)
                 .vdom_nodes()
@@ -1585,10 +2337,22 @@ mod tests {
             "probe extension was not discovered under {}",
             root.display()
         );
+        // §5.6 consent gate: pre-approve the probe so this test exercises the
+        // chrome click loop rather than the first-install prompt. The consent
+        // file lives next to the temp root so the real user's store is never
+        // touched and parallel tests cannot race on it.
+        let consent_file = root.join("extension-consent.json");
+        let mut consent_records = HashMap::new();
+        consent_records.insert(
+            "click-probe".to_string(),
+            ConsentRecord::approved("click-probe", consent_fingerprint(&discovered[0])),
+        );
+        save_consent_records(&consent_file, &consent_records).expect("write consent records");
 
         let host = cx.update(|cx| {
             cx.new(|cx| {
                 let mut host = ExtensionHostController::new();
+                host.consent_file = consent_file.clone();
                 host.start_with_roots(vec![root.clone()], cx);
                 host
             })
@@ -1613,6 +2377,606 @@ mod tests {
             status_bar_text(cx, &bar).contains("total=7")
         });
 
+        // The semantic button retains focus after the click, so Enter must
+        // activate the same command through the keyboard path.
+        window_cx.simulate_keystrokes("enter");
+        wait_for(
+            cx,
+            "the keyboard-activated command to re-render the chrome",
+            |cx| status_bar_text(cx, &bar).contains("total=14"),
+        );
+
         std::fs::remove_dir_all(&root).expect("remove extension root");
+    }
+
+    #[test]
+    fn server_chrome_update_replaces_and_removes_view() {
+        let mut server = BTreeMap::new();
+        let key = ("server-ext".to_string(), "status".to_string());
+        let update = |_id: &str, payload: Vec<u8>| mux_protocol::ExtensionChromeUpdate {
+            extension_id: key.0.clone(),
+            view_id: key.1.clone(),
+            vdom_payload: payload,
+        };
+
+        apply_server_chrome_node(
+            &mut server,
+            update("old", br#"{"type":"span","props":{"id":"old"}}"#.to_vec()),
+        )
+        .expect("initial server chrome must parse");
+        apply_server_chrome_node(
+            &mut server,
+            update("new", br#"{"type":"span","props":{"id":"new"}}"#.to_vec()),
+        )
+        .expect("replacement server chrome must parse");
+        assert_eq!(
+            server.get(&key).and_then(|node| node.props.get("id")),
+            Some(&serde_json::json!("new"))
+        );
+
+        apply_server_chrome_node(&mut server, update("removed", Vec::new()))
+            .expect("server chrome removal must succeed");
+        assert!(server.is_empty());
+    }
+
+    #[test]
+    fn server_chrome_nodes_merge_after_local_nodes() {
+        let local = VDomNode {
+            element_type: "span".into(),
+            props: [("id".to_string(), serde_json::json!("local"))]
+                .into_iter()
+                .collect(),
+            style: Default::default(),
+            children: vec![VDomChild::Text("local".into())],
+        };
+        let remote = VDomNode {
+            element_type: "span".into(),
+            props: [("id".to_string(), serde_json::json!("remote"))]
+                .into_iter()
+                .collect(),
+            style: Default::default(),
+            children: vec![VDomChild::Text("remote".into())],
+        };
+        let mut server = BTreeMap::new();
+        server.insert(("server-ext".to_string(), "status".to_string()), remote);
+        let merged = merge_chrome_nodes(&[local], &server);
+
+        assert_eq!(merged.len(), 2);
+        assert_eq!(merged[0].props.get("id"), Some(&serde_json::json!("local")));
+        assert_eq!(
+            merged[1].props.get("id"),
+            Some(&serde_json::json!("remote"))
+        );
+    }
+
+    // ------------------------------------------------------------------
+    // §5.6 consent gate + suspension notice
+    // ------------------------------------------------------------------
+
+    /// A minimal chrome extension rendering one identifiable span, so tests
+    /// can observe which extensions actually activated and rendered.
+    fn write_probe_extension(root: &Path, id: &str, capabilities_toml: &str) {
+        let directory = root.join(id);
+        std::fs::create_dir_all(&directory).expect("create extension directory");
+        std::fs::write(
+            directory.join("extension.toml"),
+            format!(
+                "[extension]\nname = \"{id}\"\nversion = \"1.0.0\"\n[runtime]\nside = \"client\"\n{capabilities_toml}"
+            ),
+        )
+        .expect("write manifest");
+        std::fs::write(
+            directory.join("main.js"),
+            format!(
+                r#"
+                function activate(context) {{
+                    context.registerChromeView('{id}', {{
+                        render: function() {{ return {{ type: 'span', children: ['{id}-chrome'] }}; }}
+                    }});
+                }}
+                "#
+            ),
+        )
+        .expect("write extension source");
+    }
+
+    fn start_consent_host(
+        cx: &mut gpui::TestAppContext,
+        root: &Path,
+        consent_file: &Path,
+    ) -> gpui::Entity<ExtensionHostController> {
+        let root = root.to_path_buf();
+        let consent_file = consent_file.to_path_buf();
+        cx.update(|cx| {
+            cx.new(|cx| {
+                let mut host = ExtensionHostController::new();
+                host.consent_file = consent_file;
+                host.start_with_roots(vec![root], cx);
+                host
+            })
+        })
+    }
+
+    fn chrome_text(
+        cx: &mut gpui::TestAppContext,
+        host: &gpui::Entity<ExtensionHostController>,
+    ) -> String {
+        cx.read(|cx| {
+            host.read(cx)
+                .local_chrome
+                .iter()
+                .map(|node| vdom_bridge::vdom_to_text(node, 0))
+                .collect::<String>()
+        })
+    }
+
+    /// §5.6 An unconsented extension must not activate: it shows up as a
+    /// pending approval, contributes no chrome, and only renders after the
+    /// user approves it.
+    #[gpui::test]
+    fn unconsented_extension_is_pending_not_activated(cx: &mut gpui::TestAppContext) {
+        cx.background_executor.allow_parking();
+        let root = temporary_extension_dir("consent-pending").expect("create extension root");
+        write_probe_extension(&root, "probe", "[capabilities]\nmux = true\n");
+        write_probe_extension(&root, "canary", "");
+
+        // Pre-consent only the canary; the probe must wait for the user.
+        let consent_file = root.join("extension-consent.json");
+        let discovered =
+            quickjs_runtime::discover_client_extensions(std::slice::from_ref(&root));
+        let canary = discovered
+            .iter()
+            .find(|extension| extension.manifest.id == "canary")
+            .expect("canary discovered");
+        let mut records = HashMap::new();
+        records.insert(
+            "canary".to_string(),
+            ConsentRecord::approved("canary", consent_fingerprint(canary)),
+        );
+        save_consent_records(&consent_file, &records).expect("write consent records");
+
+        let host = start_consent_host(cx, &root, &consent_file);
+
+        wait_for(cx, "the probe to land in pending approvals", |cx| {
+            cx.read(|cx| {
+                let pending = host.read(cx).pending_approvals();
+                pending.len() == 1 && pending[0].id == "probe"
+            })
+        });
+        cx.read(|cx| {
+            let approval = &host.read(cx).pending_approvals()[0];
+            assert_eq!(approval.version, "1.0.0", "approval carries the version");
+            assert_eq!(
+                approval.capabilities_summary, "mux",
+                "approval carries the capability list the prompt shows"
+            );
+        });
+
+        // The consented canary renders; the pending probe contributes nothing.
+        wait_for(cx, "the canary chrome", |cx| {
+            chrome_text(cx, &host).contains("canary-chrome")
+        });
+        assert!(
+            !chrome_text(cx, &host).contains("probe-chrome"),
+            "an unconsented extension must not render"
+        );
+
+        // Approving activates the probe and persists its consent.
+        cx.update(|cx| {
+            host.update(cx, |host, cx| {
+                host.approve_extensions(&["probe".to_string()], cx)
+                    .expect("approve persists")
+            })
+        });
+        wait_for(cx, "the probe chrome after approval", |cx| {
+            chrome_text(cx, &host).contains("probe-chrome")
+        });
+        let probe = discovered
+            .iter()
+            .find(|extension| extension.manifest.id == "probe")
+            .expect("probe discovered");
+        let records = load_consent_records(&consent_file);
+        let record = records
+            .get("probe")
+            .expect("approval must persist a consent record");
+        assert_eq!(
+            record.state,
+            ConsentState::Approved,
+            "approval must persist the approved state"
+        );
+        assert_eq!(
+            record.policy_fingerprint, consent_fingerprint(probe),
+            "approval must persist the exact approved policy fingerprint"
+        );
+
+        std::fs::remove_dir_all(root).expect("remove extension root");
+    }
+
+    /// §5.6 Consent survives a restart: an approved extension activates
+    /// immediately on the next start without landing in pending approvals.
+    #[gpui::test]
+    fn consent_persists_across_restart(cx: &mut gpui::TestAppContext) {
+        cx.background_executor.allow_parking();
+        let root = temporary_extension_dir("consent-restart").expect("create extension root");
+        write_probe_extension(&root, "probe", "");
+        let consent_file = root.join("extension-consent.json");
+
+        let host = start_consent_host(cx, &root, &consent_file);
+        wait_for(cx, "the probe to land in pending approvals", |cx| {
+            cx.read(|cx| host.read(cx).pending_approvals().len() == 1)
+        });
+        cx.update(|cx| {
+            host.update(cx, |host, cx| {
+                host.approve_extensions(&["probe".to_string()], cx)
+                    .expect("approve persists")
+            })
+        });
+        wait_for(cx, "the probe chrome after approval", |cx| {
+            chrome_text(cx, &host).contains("probe-chrome")
+        });
+
+        // Restart: a fresh controller over the same roots and consent store
+        // must activate the probe without prompting again.
+        let restarted = start_consent_host(cx, &root, &consent_file);
+        wait_for(cx, "the probe chrome after restart", |cx| {
+            chrome_text(cx, &restarted).contains("probe-chrome")
+        });
+        cx.read(|cx| {
+            assert!(
+                restarted.read(cx).pending_approvals().is_empty(),
+                "consented extensions must not re-prompt after restart"
+            );
+        });
+
+        std::fs::remove_dir_all(root).expect("remove extension root");
+    }
+
+    /// §5.6 A denied extension records an explicit Denied decision: it renders
+    /// nothing and the exact same manifest is never re-prompted on later starts.
+    #[gpui::test]
+    fn denied_extension_not_reprompted(cx: &mut gpui::TestAppContext) {
+        cx.background_executor.allow_parking();
+        let root = temporary_extension_dir("consent-deny").expect("create extension root");
+        write_probe_extension(&root, "probe", "");
+        write_probe_extension(&root, "canary", "");
+
+        let consent_file = root.join("extension-consent.json");
+        let discovered =
+            quickjs_runtime::discover_client_extensions(std::slice::from_ref(&root));
+        let canary = discovered
+            .iter()
+            .find(|extension| extension.manifest.id == "canary")
+            .expect("canary discovered");
+        let mut records = HashMap::new();
+        records.insert(
+            "canary".to_string(),
+            ConsentRecord::approved("canary", consent_fingerprint(canary)),
+        );
+        save_consent_records(&consent_file, &records).expect("write consent records");
+
+        let host = start_consent_host(cx, &root, &consent_file);
+        wait_for(cx, "the probe to land in pending approvals", |cx| {
+            cx.read(|cx| host.read(cx).pending_approvals().len() == 1)
+        });
+        cx.update(|cx| {
+            host.update(cx, |host, _| {
+                host.deny_extensions(&["probe".to_string()])
+                    .expect("deny persists")
+            })
+        });
+        cx.read(|cx| {
+            assert!(
+                host.read(cx).pending_approvals().is_empty(),
+                "denying removes the approval"
+            );
+            let records = load_consent_records(&consent_file);
+            let record = records
+                .get("probe")
+                .expect("denial must persist a consent record");
+            assert_eq!(
+                record.state,
+                ConsentState::Denied,
+                "denial must persist the denied state"
+            );
+        });
+
+        // Restart: the denied manifest must not re-prompt and must not render,
+        // while the consented canary still paints.
+        let restarted = start_consent_host(cx, &root, &consent_file);
+        wait_for(cx, "the canary chrome after restart", |cx| {
+            chrome_text(cx, &restarted).contains("canary-chrome")
+        });
+        cx.read(|cx| {
+            assert!(
+                restarted.read(cx).pending_approvals().is_empty(),
+                "a denied extension must not be re-prompted"
+            );
+        });
+        assert!(
+            !chrome_text(cx, &restarted).contains("probe-chrome"),
+            "a denied extension must not render"
+        );
+
+        std::fs::remove_dir_all(root).expect("remove extension root");
+    }
+
+    /// §5.6 A denied extension whose manifest later changes (capabilities,
+    /// version, limits, side) must be re-prompted, not silently suppressed by
+    /// an id-wide sentinel. The decision is keyed by the exact policy that was
+    /// decided; a different policy invalidates it regardless of prior allow/deny.
+    #[gpui::test]
+    fn denied_manifest_change_reprompts(cx: &mut gpui::TestAppContext) {
+        cx.background_executor.allow_parking();
+        let root = temporary_extension_dir("consent-deny-reprompt").expect("create extension root");
+        write_probe_extension(&root, "probe", "");
+
+        let consent_file = root.join("extension-consent.json");
+        let host = start_consent_host(cx, &root, &consent_file);
+        wait_for(cx, "the probe to land in pending approvals", |cx| {
+            cx.read(|cx| host.read(cx).pending_approvals().len() == 1)
+        });
+        let denied_fingerprint = cx.read(|cx| {
+            host.read(cx).pending_approvals()[0]
+                .policy_fingerprint
+                .clone()
+        });
+        cx.update(|cx| {
+            host.update(cx, |host, _| {
+                host.deny_extensions(&["probe".to_string()])
+                    .expect("deny persists")
+            })
+        });
+        cx.read(|_cx| {
+            let records = load_consent_records(&consent_file);
+            let record = records.get("probe").expect("denial persisted");
+            assert_eq!(
+                record.state,
+                ConsentState::Denied,
+                "denial must persist the denied state"
+            );
+            assert_eq!(
+                record.policy_fingerprint, denied_fingerprint,
+                "denial must persist the exact decided policy fingerprint"
+            );
+        });
+
+        // Change the manifest: capabilities and version both differ. The new
+        // policy fingerprint must not match the denied one, so the extension
+        // re-enters pending approvals on the next start instead of staying
+        // silently disabled.
+        let probe_dir = root.join("probe");
+        std::fs::write(
+            probe_dir.join("extension.toml"),
+            "[extension]\nname = \"probe\"\nversion = \"2.0.0\"\n[runtime]\nside = \"client\"\n[capabilities]\nmux = true\n",
+        )
+        .expect("rewrite manifest with changed policy");
+
+        let restarted = start_consent_host(cx, &root, &consent_file);
+        wait_for(cx, "the changed probe to re-enter pending approvals", |cx| {
+            cx.read(|cx| {
+                let pending = restarted.read(cx).pending_approvals();
+                pending.len() == 1 && pending[0].id == "probe"
+            })
+        });
+        cx.read(|_cx| {
+            let record = load_consent_records(&consent_file)
+                .get("probe")
+                .expect("the prior denial record is still present")
+                .clone();
+            assert_eq!(
+                record.state,
+                ConsentState::Denied,
+                "the prior denial record must remain denied"
+            );
+        });
+        assert!(
+            !chrome_text(cx, &restarted).contains("probe-chrome"),
+            "a re-prompted (still undecided) extension must not render"
+        );
+
+        std::fs::remove_dir_all(root).expect("remove extension root");
+    }
+
+    /// §5.6 An approved extension whose manifest later changes must be
+    /// re-prompted: the stored approval names the exact policy that was
+    /// decided, and a manifest with a different fingerprint is pending again
+    /// instead of silently activating under the stale approval.
+    #[gpui::test]
+    fn approved_manifest_change_reprompts(cx: &mut gpui::TestAppContext) {
+        cx.background_executor.allow_parking();
+        let root = temporary_extension_dir("consent-approve-reprompt").expect("create extension root");
+        write_probe_extension(&root, "probe", "");
+
+        let consent_file = root.join("extension-consent.json");
+        let host = start_consent_host(cx, &root, &consent_file);
+        wait_for(cx, "the probe to land in pending approvals", |cx| {
+            cx.read(|cx| host.read(cx).pending_approvals().len() == 1)
+        });
+        cx.update(|cx| {
+            host.update(cx, |host, cx| {
+                host.approve_extensions(&["probe".to_string()], cx)
+                    .expect("approve persists")
+            })
+        });
+        wait_for(cx, "the probe chrome after approval", |cx| {
+            chrome_text(cx, &host).contains("probe-chrome")
+        });
+
+        // Change the manifest: capabilities and version both differ from what
+        // was approved, so the stored approval must no longer match.
+        let probe_dir = root.join("probe");
+        std::fs::write(
+            probe_dir.join("extension.toml"),
+            "[extension]\nname = \"probe\"\nversion = \"2.0.0\"\n[runtime]\nside = \"client\"\n[capabilities]\nmux = true\n",
+        )
+        .expect("rewrite manifest with changed policy");
+
+        // Restart: the changed manifest must not auto-activate under the stale
+        // approval; it re-enters pending approvals until the user decides again.
+        let restarted = start_consent_host(cx, &root, &consent_file);
+        wait_for(cx, "the changed probe to re-enter pending approvals", |cx| {
+            cx.read(|cx| {
+                let pending = restarted.read(cx).pending_approvals();
+                pending.len() == 1 && pending[0].id == "probe"
+            })
+        });
+        assert!(
+            !chrome_text(cx, &restarted).contains("probe-chrome"),
+            "a manifest changed since approval must not auto-activate"
+        );
+
+        std::fs::remove_dir_all(root).expect("remove extension root");
+    }
+
+    /// §5.6 A persistence failure during approve/deny must surface as an error
+    /// and must not activate the extension nor drop it from pending approvals.
+    /// Saving is atomic and fallible; the controller refuses to mutate pending
+    /// state or notify the host when the store cannot be written.
+    #[gpui::test]
+    fn persistence_failure_keeps_pending_and_blocks_activation(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        cx.background_executor.allow_parking();
+        let root = temporary_extension_dir("consent-persist-fail").expect("create extension root");
+        write_probe_extension(&root, "probe", "");
+
+        // Make the consent store unwritable: a file (not a directory) at the
+        // parent path so the atomic temp-file + rename commit cannot succeed.
+        let blocker = root.join("blocker");
+        std::fs::write(&blocker, "block").expect("write blocker file");
+        let consent_file = blocker.join("extension-consent.json");
+
+        let host = start_consent_host(cx, &root, &consent_file);
+        wait_for(cx, "the probe to land in pending approvals", |cx| {
+            cx.read(|cx| host.read(cx).pending_approvals().len() == 1)
+        });
+
+        let approve_result = cx.update(|cx| {
+            host.update(cx, |host, cx| {
+                host.approve_extensions(&["probe".to_string()], cx)
+            })
+        });
+        assert!(
+            approve_result.is_err(),
+            "approve must return an error when the consent store is unwritable"
+        );
+        cx.read(|cx| {
+            assert_eq!(
+                host.read(cx).pending_approvals().len(),
+                1,
+                "a failed approve must leave pending approvals intact"
+            );
+        });
+        // Give the host thread a beat; nothing must activate.
+        wait_for(cx, "no activation occurs", |cx| {
+            !chrome_text(cx, &host).contains("probe-chrome")
+        });
+        assert!(
+            !chrome_text(cx, &host).contains("probe-chrome"),
+            "an extension whose consent could not be persisted must not activate"
+        );
+
+        std::fs::remove_dir_all(root).expect("remove extension root");
+    }
+
+    /// §5.6 The prompt claim is global to the controller so two workspaces
+    /// cannot race the same pending batch: only one caller can claim at a
+    /// time, and releasing makes the batch claimable again.
+    #[gpui::test]
+    fn prompt_claim_is_global_and_releasable(cx: &mut gpui::TestAppContext) {
+        cx.background_executor.allow_parking();
+        let root = temporary_extension_dir("consent-claim").expect("create extension root");
+        write_probe_extension(&root, "probe", "");
+        let consent_file = root.join("extension-consent.json");
+
+        let host = start_consent_host(cx, &root, &consent_file);
+        wait_for(cx, "the probe to land in pending approvals", |cx| {
+            cx.read(|cx| host.read(cx).pending_approvals().len() == 1)
+        });
+
+        let first_claim = cx.update(|cx| {
+            host.update(cx, |host, cx| host.claim_pending_prompt(cx))
+        });
+        assert!(first_claim, "the first claimant must succeed");
+        let second_claim = cx.update(|cx| {
+            host.update(cx, |host, cx| host.claim_pending_prompt(cx))
+        });
+        assert!(
+            !second_claim,
+            "a second claimant must be refused while the prompt is in flight"
+        );
+        cx.update(|cx| host.update(cx, |host, cx| host.release_pending_prompt(cx)));
+        let third_claim = cx.update(|cx| {
+            host.update(cx, |host, cx| host.claim_pending_prompt(cx))
+        });
+        assert!(
+            third_claim,
+            "releasing the claim must make the pending batch claimable again"
+        );
+
+        std::fs::remove_dir_all(root).expect("remove extension root");
+    }
+
+    /// §5.6 Suspension must notify the user: once an extension violates a
+    /// resource limit, the next forced chrome push carries a synthetic notice
+    /// naming it (reuses the runaway CPU setup).
+    #[test]
+    fn suspended_extension_notice_in_chrome() -> Result<()> {
+        let root = temporary_extension_dir("suspended-notice-root")?;
+        let extension = root.join("runaway");
+        std::fs::create_dir_all(&extension)?;
+        std::fs::write(
+            extension.join("extension.toml"),
+            "[extension]\nname = \"runaway\"\n[runtime]\nside = \"client\"\n[resources]\ncpu_budget_ms = 1\n",
+        )?;
+        std::fs::write(
+            extension.join("main.js"),
+            r#"
+            function activate(context) {
+                context.registerChromeView('runaway', {
+                    render: function() { return { type: 'span', children: ['alive'] }; }
+                });
+                context.on('spin', function() { while (true) {} });
+            }
+            "#,
+        )?;
+
+        let mut live_extensions = activate_extensions(quickjs_runtime::discover_client_extensions(
+            std::slice::from_ref(&root),
+        ));
+        assert_eq!(live_extensions.len(), 1);
+        assert!(
+            !render_live_extensions(&mut live_extensions).is_empty(),
+            "a healthy extension must render"
+        );
+        assert!(
+            live_extensions[0].live.emit_event("spin", "null").is_err(),
+            "the runaway handler must be interrupted"
+        );
+        live_extensions[0].note_resource_violations();
+        assert!(live_extensions[0].suspended, "CPU violation must suspend");
+
+        // The forced push after suspension must carry the user-visible notice.
+        let (sender, mut receiver) = futures::channel::mpsc::unbounded::<Vec<VDomNode>>();
+        assert!(push_chrome_if_dirty(&mut live_extensions, &sender, true));
+        let nodes = futures::StreamExt::next(&mut receiver)
+            .now_or_never()
+            .flatten()
+            .context("forced chrome push never arrived")?;
+        let text = nodes
+            .iter()
+            .map(|node| vdom_bridge::vdom_to_text(node, 0))
+            .collect::<String>();
+        assert!(
+            text.contains("suspended"),
+            "status bar vdom text must announce the suspension: {text}"
+        );
+        assert!(
+            text.contains("runaway"),
+            "the notice must name the suspended extension: {text}"
+        );
+
+        std::fs::remove_dir_all(root)?;
+        Ok(())
     }
 }

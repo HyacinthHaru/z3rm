@@ -284,15 +284,14 @@ pub trait Item: Focusable + EventEmitter<Self::Event> + Render + Sized {
     }
     fn clone_on_split(
         &self,
-        workspace_id: Option<WorkspaceId>,
-        window: &mut Window,
-        cx: &mut Context<Self>,
+        _workspace_id: Option<WorkspaceId>,
+        _window: &mut Window,
+        _cx: &mut Context<Self>,
     ) -> Task<Option<Entity<Self>>>
     where
         Self: Sized,
     {
-        _ = (workspace_id, window, cx);
-        unimplemented!("clone_on_split() must be implemented if can_split() returns true")
+        Task::ready(None)
     }
     fn is_dirty(&self, _: &App) -> bool {
         false
@@ -322,7 +321,7 @@ pub trait Item: Focusable + EventEmitter<Self::Event> + Render + Sized {
         _window: &mut Window,
         _cx: &mut Context<Self>,
     ) -> Task<Result<()>> {
-        unimplemented!("save() must be implemented if can_save() returns true")
+        Task::ready(Err(anyhow::anyhow!("item does not support saving")))
     }
     fn save_as(
         &mut self,
@@ -331,7 +330,7 @@ pub trait Item: Focusable + EventEmitter<Self::Event> + Render + Sized {
         _window: &mut Window,
         _cx: &mut Context<Self>,
     ) -> Task<Result<()>> {
-        unimplemented!("save_as() must be implemented if can_save() returns true")
+        Task::ready(Err(anyhow::anyhow!("item does not support Save As")))
     }
     fn reload(
         &mut self,
@@ -339,7 +338,7 @@ pub trait Item: Focusable + EventEmitter<Self::Event> + Render + Sized {
         _window: &mut Window,
         _cx: &mut Context<Self>,
     ) -> Task<Result<()>> {
-        unimplemented!("reload() must be implemented if can_save() returns true")
+        Task::ready(Err(anyhow::anyhow!("item does not support reloading")))
     }
 
     fn act_as_type<'a>(

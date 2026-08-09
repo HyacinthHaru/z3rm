@@ -14,7 +14,7 @@ pub use settings::{RegisterSetting, Settings};
 
 /// 工作区设置 (spec §16 Plan 16)
 /// 原 settings 字段已大幅精简，保留向后兼容桩值
-#[derive(RegisterSetting)]
+#[derive(Clone, RegisterSetting)]
 pub struct WorkspaceSettings {
     pub active_pane_modifiers: ActivePanelModifiers,
     pub bottom_dock_layout: BottomDockLayout,
@@ -75,11 +75,11 @@ pub struct TabBarSettings {
     pub show_active_item: bool,
     /// 关闭按钮显示方式
     pub show_close_button: settings::ShowCloseButton,
-    /// 导航历史按钮 (向后兼容桩)
+    /// 导航历史按钮
     pub show_nav_history_buttons: bool,
-    /// Tab 栏按钮 (向后兼容桩)
+    /// Tab 栏按钮
     pub show_tab_bar_buttons: bool,
-    /// 固定标签单独行 (向后兼容桩)
+    /// 固定标签单独行
     pub show_pinned_tabs_in_separate_row: bool,
 }
 
@@ -93,10 +93,12 @@ impl Settings for TabBarSettings {
             mouse_scroll_to_switch: tab_bar.mouse_scroll_to_switch,
             show_active_item: tab_bar.show_active_item,
             show_close_button: tab_bar.show_close_button,
-            // 向后兼容桩字段 (spec §16 Plan 16)
-            show_nav_history_buttons: true,
-            show_tab_bar_buttons: true,
-            show_pinned_tabs_in_separate_row: false,
+            // 未配置时回退到与 assets/settings/default.json 一致的产品默认值
+            show_nav_history_buttons: tab_bar.show_nav_history_buttons.unwrap_or(true),
+            show_tab_bar_buttons: tab_bar.show_tab_bar_buttons.unwrap_or(true),
+            show_pinned_tabs_in_separate_row: tab_bar
+                .show_pinned_tabs_in_separate_row
+                .unwrap_or(false),
         }
     }
 }
@@ -229,5 +231,115 @@ impl Settings for StatusBarSettings {
             cursor_position_button: status_bar.cursor_position_button,
             line_endings_button: status_bar.line_endings_button,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use settings::{MergeFromTrait as _, RootUserSettings as _, Settings, SettingsContent};
+
+    use super::TabBarSettings;
+
+    fn parse_default_settings() -> SettingsContent {
+        <settings::UserSettingsContent as settings::RootUserSettings>::parse_json_with_comments(
+            settings::default_settings().as_ref(),
+        )
+        .expect("assets/settings/default.json should parse")
+        .content
+        .as_ref()
+        .clone()
+    }
+
+    /// Guards the JSON shape written in `assets/settings/default.json`: every
+    /// tab_bar key there has to deserialize into the typed schema shape, and
+    /// the values have to agree with the fallbacks `from_settings` applies when
+    /// the key is absent.
+    #[test]
+    fn test_default_json_tab_bar_section_matches_fallbacks() {
+        let content = parse_default_settings();
+        let tab_bar = content
+            .tab_bar
+            .as_ref()
+            .expect("assets/settings/default.json should define a `tab_bar` section");
+
+        // The typed schema shape: shipped defaults deserialize into the fields.
+        assert_eq!(tab_bar.show_nav_history_buttons, Some(true));
+        assert_eq!(tab_bar.show_tab_bar_buttons, Some(true));
+        assert_eq!(tab_bar.show_pinned_tabs_in_separate_row, Some(false));
+
+        let from_default_json = TabBarSettings::from_settings(&content);
+        let from_fallbacks = TabBarSettings::from_settings(&SettingsContent::default());
+
+        assert_eq!(
+            from_default_json.show_nav_history_buttons,
+            from_fallbacks.show_nav_history_buttons,
+            "tab_bar.show_nav_history_buttons in default.json disagrees with the Rust fallback"
+        );
+        assert_eq!(
+            from_default_json.show_tab_bar_buttons,
+            from_fallbacks.show_tab_bar_buttons,
+            "tab_bar.show_tab_bar_buttons in default.json disagrees with the Rust fallback"
+        );
+        assert_eq!(
+            from_default_json.show_pinned_tabs_in_separate_row,
+            from_fallbacks.show_pinned_tabs_in_separate_row,
+            "tab_bar.show_pinned_tabs_in_separate_row in default.json disagrees with the Rust fallback"
+        );
+        assert!(from_fallbacks.show_nav_history_buttons);
+        assert!(from_fallbacks.show_tab_bar_buttons);
+        assert!(!from_fallbacks.show_pinned_tabs_in_separate_row);
+    }
+
+    /// Each of the three tab-bar toggles changes the resulting `TabBarSettings`
+    /// on its own, while the other two keep their shipped defaults.
+    #[test]
+    fn test_tab_bar_toggles_change_independently() {
+        let content: SettingsContent = settings::parse_json_with_comments(
+            r#"{ "tab_bar": { "show_nav_history_buttons": false } }"#,
+        )
+        .expect("settings should parse");
+        let settings = TabBarSettings::from_settings(&content);
+        assert!(!settings.show_nav_history_buttons);
+        assert!(settings.show_tab_bar_buttons);
+        assert!(!settings.show_pinned_tabs_in_separate_row);
+
+        let content: SettingsContent = settings::parse_json_with_comments(
+            r#"{ "tab_bar": { "show_tab_bar_buttons": false } }"#,
+        )
+        .expect("settings should parse");
+        let settings = TabBarSettings::from_settings(&content);
+        assert!(settings.show_nav_history_buttons);
+        assert!(!settings.show_tab_bar_buttons);
+        assert!(!settings.show_pinned_tabs_in_separate_row);
+
+        let content: SettingsContent = settings::parse_json_with_comments(
+            r#"{ "tab_bar": { "show_pinned_tabs_in_separate_row": true } }"#,
+        )
+        .expect("settings should parse");
+        let settings = TabBarSettings::from_settings(&content);
+        assert!(settings.show_nav_history_buttons);
+        assert!(settings.show_tab_bar_buttons);
+        assert!(settings.show_pinned_tabs_in_separate_row);
+    }
+
+    /// A user who overrides one tab-bar key must keep the shipped defaults for
+    /// the sibling keys from `default.json`, which only holds if the nested
+    /// `Option`s merge recursively instead of being replaced wholesale.
+    #[test]
+    fn test_user_override_merges_into_default_json_tab_bar() {
+        let mut merged = parse_default_settings();
+
+        let user: SettingsContent = settings::parse_json_with_comments(
+            r#"{ "tab_bar": { "show_tab_bar_buttons": false } }"#,
+        )
+        .expect("user settings should parse");
+        merged.merge_from(&user);
+
+        let settings = TabBarSettings::from_settings(&merged);
+
+        assert!(!settings.show_tab_bar_buttons);
+        // Sibling keys defined only in default.json survive the merge.
+        assert!(settings.show_nav_history_buttons);
+        assert!(!settings.show_pinned_tabs_in_separate_row);
     }
 }

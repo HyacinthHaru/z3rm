@@ -14,6 +14,7 @@ use editor::{Editor, EditorElement, EditorStyle};
 use extension::ExtensionProvides;
 use extension_host::{ExtensionManifest, ExtensionMetadata, ExtensionOperation, ExtensionStore};
 use fuzzy::{StringMatch, StringMatchCandidate, match_strings};
+use git::{GitHostingProviderRegistry, parse_git_remote_url};
 use gpui::{
     Action, Anchor, App, ClipboardItem, Context, DismissEvent, Entity, EventEmitter, Focusable,
     InteractiveElement, KeyContext, ParentElement, Point, Render, Styled, Task, TaskExt, TextStyle,
@@ -21,7 +22,6 @@ use gpui::{
 };
 use num_format::{Locale, ToFormattedString};
 use picker::{Picker, PickerDelegate};
-use project::DirectoryLister;
 use project::VimModeSetting;
 use release_channel::ReleaseChannel;
 use schemars::JsonSchema;
@@ -410,6 +410,7 @@ struct ExtensionCardButtons {
 
 pub struct ExtensionsPage {
     workspace: WeakEntity<Workspace>,
+    provider_registry: Arc<GitHostingProviderRegistry>,
     list: UniformListScrollHandle,
     is_fetching_extensions: bool,
     fetch_failed: bool,
@@ -469,9 +470,11 @@ impl ExtensionsPage {
             cx.subscribe(&query_editor, Self::on_query_change).detach();
 
             let scroll_handle = UniformListScrollHandle::new();
+            let provider_registry = GitHostingProviderRegistry::default_global(cx);
 
             let mut this = Self {
                 workspace: workspace.weak_handle(),
+                provider_registry,
                 list: scroll_handle,
                 is_fetching_extensions: false,
                 fetch_failed: false,
@@ -495,6 +498,12 @@ impl ExtensionsPage {
             );
             this
         })
+    }
+
+    fn get_repository_icon(&self, repository_url: &str) -> IconName {
+        parse_git_remote_url(Arc::clone(&self.provider_registry), repository_url)
+            .map(|(provider, _)| ui::git_hosting_provider_icon(provider.name().as_str()))
+            .unwrap_or(IconName::Link)
     }
 
     fn on_extension_installed(
@@ -739,6 +748,10 @@ impl ExtensionsPage {
         let status = Self::extension_status(&extension.id, cx);
 
         let repository_url = extension.repository.clone();
+        let repository_icon = repository_url
+            .as_deref()
+            .map(|url| self.get_repository_icon(url))
+            .unwrap_or(IconName::Link);
 
         let can_configure = !extension.context_servers.is_empty();
 
@@ -851,7 +864,7 @@ impl ExtensionsPage {
                     .children(repository_url.map(|repository_url| {
                         IconButton::new(
                             SharedString::from(format!("repository-{}", extension.id)),
-                            IconName::Github,
+                            repository_icon,
                         )
                         .icon_color(Color::Accent)
                         .icon_size(IconSize::Small)
@@ -879,6 +892,10 @@ impl ExtensionsPage {
         let buttons = self.buttons_for_entry(extension, &status, has_dev_extension, cx);
         let version = extension.manifest.version.clone();
         let repository_url = extension.manifest.repository.clone();
+        let repository_icon = repository_url
+            .as_deref()
+            .map(|url| self.get_repository_icon(url))
+            .unwrap_or(IconName::Link);
         let authors = extension.manifest.authors.clone();
 
         let installed_version = match status {
@@ -988,28 +1005,25 @@ impl ExtensionsPage {
                         h_flex()
                             .gap_1()
                             .flex_shrink_0()
-                            .child({
-                                let repo_url_for_tooltip = repository_url.clone();
-
+                            .children(repository_url.map(|repository_url| {
+                                let repository_url_for_tooltip = repository_url.clone();
                                 IconButton::new(
                                     SharedString::from(format!("repository-{}", extension.id)),
-                                    IconName::Github,
+                                    repository_icon,
                                 )
                                 .icon_size(IconSize::Small)
                                 .tooltip(move |_, cx| {
                                     Tooltip::with_meta(
                                         "Visit Extension Repository",
                                         None,
-                                        repo_url_for_tooltip.clone().unwrap_or_default(),
+                                        repository_url_for_tooltip.clone(),
                                         cx,
                                     )
                                 })
-                                .on_click(cx.listener(
-                                    move |_, _, _, cx| {
-                                        cx.open_url(&repository_url.as_ref().unwrap().clone());
-                                    },
-                                ))
-                            })
+                                .on_click(cx.listener(move |_, _, _, cx| {
+                                    cx.open_url(&repository_url);
+                                }))
+                            }))
                             .child(
                                 PopoverMenu::new(SharedString::from(format!(
                                     "more-{}",

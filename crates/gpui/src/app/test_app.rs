@@ -372,12 +372,12 @@ impl<V: 'static + Render> TestAppWindow<V> {
 
     /// Get the window title.
     pub fn title(&self) -> Option<String> {
-        let app = self.app.borrow();
-        app.read_window(&self.handle, |_, _cx| {
-            // TODO: expose title through Window API
-            None
+        let mut app = self.app.borrow_mut();
+        app.update_window_id(self.handle.window_id(), |_, window, _| {
+            window.window_title()
         })
-        .unwrap()
+        .ok()
+        .and_then(|title| (!title.is_empty()).then_some(title))
     }
 
     /// Simulate a keystroke.
@@ -486,7 +486,7 @@ impl<V: 'static + Render> TestAppWindow<V> {
         let mut app = self.app.borrow_mut();
         let any_handle: AnyWindowHandle = self.handle.into();
         app.update_window(any_handle, |_, window, cx| {
-            window.draw(cx).clear();
+            window.draw(cx).clear(cx);
         })
         .unwrap();
     }
@@ -555,6 +555,23 @@ mod tests {
 
         drop(window);
         app.update(|cx| cx.shutdown());
+    }
+
+    #[test]
+    fn test_window_title_round_trip() {
+        let mut app = TestApp::new();
+        let window = app.open_window_with_options(
+            WindowOptions {
+                titlebar: Some(crate::TitlebarOptions {
+                    title: Some("Test title".into()),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            },
+            Counter::new,
+        );
+
+        assert_eq!(window.title(), Some("Test title".to_string()));
     }
 
     #[test]

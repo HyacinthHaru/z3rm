@@ -805,7 +805,9 @@ impl Item for BufferDiagnosticsEditor {
         _window: &mut Window,
         _cx: &mut Context<Self>,
     ) -> Task<Result<()>> {
-        unreachable!()
+        Task::ready(Err(anyhow::anyhow!(
+            "saving a single-buffer diagnostics view under a new path is unsupported"
+        )))
     }
 
     fn set_nav_history(

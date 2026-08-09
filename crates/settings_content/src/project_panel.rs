@@ -190,8 +190,18 @@ pub struct ProjectPanelIndentGuidesSettings {
 
 /// Which side of the window a dockable panel attaches to.
 #[derive(
-    Copy, Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema, MergeFrom,
-    strum::VariantArray, strum::VariantNames,
+    Copy,
+    Clone,
+    Debug,
+    Default,
+    PartialEq,
+    Eq,
+    Serialize,
+    Deserialize,
+    JsonSchema,
+    MergeFrom,
+    strum::VariantArray,
+    strum::VariantNames,
 )]
 #[serde(rename_all = "snake_case")]
 pub enum DockSide {
@@ -202,8 +212,18 @@ pub enum DockSide {
 
 /// Spacing between entries in the project panel.
 #[derive(
-    Copy, Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema, MergeFrom,
-    strum::VariantArray, strum::VariantNames,
+    Copy,
+    Clone,
+    Debug,
+    Default,
+    PartialEq,
+    Eq,
+    Serialize,
+    Deserialize,
+    JsonSchema,
+    MergeFrom,
+    strum::VariantArray,
+    strum::VariantNames,
 )]
 #[serde(rename_all = "snake_case")]
 pub enum ProjectPanelEntrySpacing {
@@ -216,8 +236,18 @@ pub enum ProjectPanelEntrySpacing {
 
 /// When to show indent guides in the project panel.
 #[derive(
-    Copy, Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema, MergeFrom,
-    strum::VariantArray, strum::VariantNames,
+    Copy,
+    Clone,
+    Debug,
+    Default,
+    PartialEq,
+    Eq,
+    Serialize,
+    Deserialize,
+    JsonSchema,
+    MergeFrom,
+    strum::VariantArray,
+    strum::VariantNames,
 )]
 #[serde(rename_all = "snake_case")]
 pub enum ShowIndentGuides {
@@ -231,8 +261,18 @@ pub enum ShowIndentGuides {
 /// Distinct from [`crate::ShowDiagnostics`], which additionally carries the
 /// `inline` and `on_hover` presentations that only apply to editor tabs.
 #[derive(
-    Copy, Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema, MergeFrom,
-    strum::VariantArray, strum::VariantNames,
+    Copy,
+    Clone,
+    Debug,
+    Default,
+    PartialEq,
+    Eq,
+    Serialize,
+    Deserialize,
+    JsonSchema,
+    MergeFrom,
+    strum::VariantArray,
+    strum::VariantNames,
 )]
 #[serde(rename_all = "snake_case")]
 pub enum ProjectPanelShowDiagnostics {
@@ -247,8 +287,18 @@ pub enum ProjectPanelShowDiagnostics {
 
 /// How to group sibling entries in the project panel.
 #[derive(
-    Copy, Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema, MergeFrom,
-    strum::VariantArray, strum::VariantNames,
+    Copy,
+    Clone,
+    Debug,
+    Default,
+    PartialEq,
+    Eq,
+    Serialize,
+    Deserialize,
+    JsonSchema,
+    MergeFrom,
+    strum::VariantArray,
+    strum::VariantNames,
 )]
 #[serde(rename_all = "snake_case")]
 pub enum ProjectPanelSortMode {
@@ -263,8 +313,18 @@ pub enum ProjectPanelSortMode {
 
 /// How to compare sibling entry names in the project panel.
 #[derive(
-    Copy, Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema, MergeFrom,
-    strum::VariantArray, strum::VariantNames,
+    Copy,
+    Clone,
+    Debug,
+    Default,
+    PartialEq,
+    Eq,
+    Serialize,
+    Deserialize,
+    JsonSchema,
+    MergeFrom,
+    strum::VariantArray,
+    strum::VariantNames,
 )]
 #[serde(rename_all = "snake_case")]
 pub enum ProjectPanelSortOrder {
