@@ -973,6 +973,99 @@ fn watch_themes(fs: Arc<dyn Fs>, cx: &mut App) {
     .detach()
 }
 
+/// §5.6 Present the first-install consent prompt for the controller's current
+/// pending approvals, unless another window already claimed the batch.
+///
+/// Prompt results are handled exactly: `Ok(0)` approves, `Ok(1)` denies;
+/// cancellation, an error, or any other value releases the claim and leaves
+/// the requests pending. Approve/deny persistence errors are surfaced to the
+/// user and also leave the requests pending.
+fn check_pending_consent_prompt(
+    host: &gpui::Entity<quickjs_extensions::ExtensionHostController>,
+    window: &mut gpui::Window,
+    cx: &mut gpui::Context<workspace::Workspace>,
+) {
+    let pending = host.read(cx).pending_approvals();
+    if pending.is_empty() {
+        return;
+    }
+    // Only one prompt may own the pending batch process-wide; the claim is
+    // made atomically on the controller, so a second workspace cannot race.
+    if !host.update(cx, |host, cx| host.claim_pending_prompt(cx)) {
+        return;
+    }
+    let details = pending
+        .iter()
+        .map(|approval| {
+            format!(
+                "{} v{} — capabilities: {}",
+                approval.id, approval.version, approval.capabilities_summary
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+    let ids: Vec<String> = pending.iter().map(|approval| approval.id.clone()).collect();
+    let host = host.clone();
+    window.spawn(cx, async move |cx| {
+        let answer = cx
+            .prompt(
+                gpui::PromptLevel::Info,
+                "New extension wants to run",
+                Some(&details),
+                &["Allow", "Deny"],
+            )
+            .await;
+        match answer {
+            Ok(0) => {
+                if let Err(error) = apply_prompt_decision(&host, cx, true, &ids) {
+                    tracing::error!(%error, "approving extensions failed; requests stay pending");
+                    surface_consent_error(cx, "Could not approve extension", &error);
+                }
+            }
+            Ok(1) => {
+                if let Err(error) = apply_prompt_decision(&host, cx, false, &ids) {
+                    tracing::error!(%error, "denying extensions failed; requests stay pending");
+                    surface_consent_error(cx, "Could not deny extension", &error);
+                }
+            }
+            // Cancellation, a prompt error, or an unexpected button index:
+            // no decision was made — release the claim and keep the requests
+            // pending so a later check can present them again.
+            _ => {}
+        }
+        host.update(cx, |host, cx| host.release_pending_prompt(cx));
+    })
+    .detach();
+}
+
+/// Apply the user's prompt decision on the controller. The controller
+/// persists the proposed consent records before touching pending state or
+/// sending host commands, so a persistence error propagates here with
+/// pending/host state unchanged.
+fn apply_prompt_decision(
+    host: &gpui::Entity<quickjs_extensions::ExtensionHostController>,
+    cx: &mut gpui::AsyncWindowContext,
+    approve: bool,
+    ids: &[String],
+) -> anyhow::Result<()> {
+    host.update(cx, |host, cx| {
+        if approve {
+            host.approve_extensions(ids, cx)
+        } else {
+            host.deny_extensions(ids)
+        }
+    })
+}
+
+/// §5.6 Surface a failed consent persistence to the user as an error toast.
+fn surface_consent_error(cx: &mut gpui::AsyncWindowContext, action: &str, error: &anyhow::Error) {
+    if let Err(error) = cx.update(|_window, cx| {
+        daemon::show_daemon_error(cx, format!("{action}: {error}"));
+    }) {
+        tracing::debug!(%error, "window closed before the consent error toast could be shown");
+    }
+}
+
 // ============================================================================
 // §16.1 main: GPUI 应用启动 → daemon → window
 // ============================================================================
@@ -1326,12 +1419,30 @@ fn main() {
                     let host = cx
                         .try_global::<quickjs_extensions::GlobalHostController>()
                         .map(|host| host.0.clone());
-                    if let Some(host) = host {
+                    if let Some(host) = &host {
                         host.update(cx, |host, cx| host.add_status_bar(ext_status.downgrade(), cx));
                     }
                     workspace.status_bar().update(cx, |sb, cx| {
                         sb.add_right_item(ext_status, window, cx);
                     });
+
+                    // §5.6 First-install consent prompt: extensions the user has
+                    // not approved yet surface as `pending_approvals` on the
+                    // host controller. Present them browser-extension style and
+                    // let nothing run until the user decides. Ownership of the
+                    // prompt is a controller-global claim, so two workspaces
+                    // can never race the same pending batch.
+                    if let Some(host) = &host {
+                        cx.observe_in(&host, window, |_workspace, host, window, cx| {
+                            check_pending_consent_prompt(&host, window, cx);
+                        })
+                        .detach();
+                        // The host may already hold pending approvals from
+                        // before this workspace existed; the observer only
+                        // fires on notifications, so run the same check once
+                        // now to reach pre-existing requests.
+                        check_pending_consent_prompt(host, window, cx);
+                    }
 
                     // §15.7 Register mux_pane action handlers on every workspace.
                     workspace
