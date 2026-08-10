@@ -1343,14 +1343,94 @@ impl MuxDomain {
     /// attach 过任何会话的连接没有 worktree 范围，服务端会直接拒绝而不是退化成
     /// 整个文件系统。
     ///
-    /// proto 上的 `offset_line` / `max_lines` 服务端并不实现 —— 总是整份文件，
-    /// 所以这里不暴露这两个参数,免得调用方以为能分页。
+    /// The compatibility API still returns one aggregate buffer, but obtains it
+    /// through bounded byte pages so no individual response contains a large file.
     pub async fn read_file(&self, path: &str) -> Result<ReadFileResponse> {
-        let req = RequestBody::ReadFile(mux_protocol::ReadFileRequest {
+        let mut offset_bytes = 0;
+        let mut result = ReadFileResponse::default();
+        let mut first_page = true;
+        loop {
+            let page = self
+                .read_file_page(
+                    path,
+                    offset_bytes,
+                    mux_protocol::DEFAULT_READ_FILE_PAGE_BYTES,
+                )
+                .await?;
+            if first_page {
+                result.is_binary = page.is_binary;
+                result.encoding = page.encoding.clone();
+                result.total_lines = page.total_lines;
+                result.total_bytes = page.total_bytes;
+                first_page = false;
+            } else {
+                anyhow::ensure!(
+                    page.is_binary == result.is_binary && page.encoding == result.encoding,
+                    "read_file metadata changed while paging {path}"
+                );
+                anyhow::ensure!(
+                    page.total_bytes == result.total_bytes,
+                    "read_file size changed while paging {path}: {} became {} bytes",
+                    result.total_bytes,
+                    page.total_bytes
+                );
+            }
+            result.content.extend_from_slice(&page.content);
+
+            let Some(next_offset_bytes) = page.next_offset_bytes else {
+                return Ok(result);
+            };
+            offset_bytes = next_offset_bytes;
+        }
+    }
+
+    /// Read one bounded byte page from a file.
+    pub async fn read_file_page(
+        &self,
+        path: &str,
+        offset_bytes: u64,
+        max_bytes: u32,
+    ) -> Result<ReadFileResponse> {
+        anyhow::ensure!(
+            (1..=mux_protocol::MAX_READ_FILE_PAGE_BYTES).contains(&max_bytes),
+            "max_bytes must be between 1 and {}",
+            mux_protocol::MAX_READ_FILE_PAGE_BYTES
+        );
+        let page = self
+            .send_read_file_request(mux_protocol::ReadFileRequest {
+                path: path.to_string(),
+                offset_line: None,
+                max_lines: None,
+                offset_bytes: Some(offset_bytes),
+                max_bytes: Some(max_bytes),
+            })
+            .await?;
+        validate_read_file_byte_page(path, &page, offset_bytes, max_bytes)?;
+        Ok(page)
+    }
+
+    /// Read one page delimited by logical LF-terminated lines.
+    pub async fn read_file_lines(
+        &self,
+        path: &str,
+        offset_line: u32,
+        max_lines: u32,
+    ) -> Result<ReadFileResponse> {
+        self.send_read_file_request(mux_protocol::ReadFileRequest {
             path: path.to_string(),
-            offset_line: None,
-            max_lines: None,
-        });
+            offset_line: Some(offset_line),
+            max_lines: Some(max_lines),
+            offset_bytes: None,
+            max_bytes: None,
+        })
+        .await
+    }
+
+    async fn send_read_file_request(
+        &self,
+        request: mux_protocol::ReadFileRequest,
+    ) -> Result<ReadFileResponse> {
+        let req = RequestBody::ReadFile(request);
         let resp = self.send_request(req).await?;
         match resp.body {
             Some(ResponseBody::FileContent(content)) => Ok(content),
@@ -1538,6 +1618,57 @@ impl MuxDomain {
     }
 }
 
+fn validate_read_file_byte_page(
+    path: &str,
+    page: &ReadFileResponse,
+    requested_offset: u64,
+    max_bytes: u32,
+) -> Result<()> {
+    anyhow::ensure!(
+        page.content.len() <= max_bytes as usize,
+        "read_file returned {} bytes for {path}, exceeding the requested page size of {max_bytes}",
+        page.content.len()
+    );
+    anyhow::ensure!(
+        page.offset_bytes == requested_offset,
+        "read_file returned byte offset {} while {requested_offset} was requested for {path}",
+        page.offset_bytes
+    );
+    anyhow::ensure!(
+        page.offset_bytes <= page.total_bytes,
+        "read_file returned offset {} beyond the {} byte file {path}",
+        page.offset_bytes,
+        page.total_bytes
+    );
+    let page_end = page
+        .offset_bytes
+        .checked_add(page.content.len() as u64)
+        .with_context(|| format!("read_file byte offset overflow for {path}"))?;
+    anyhow::ensure!(
+        page_end <= page.total_bytes,
+        "read_file page for {path} ends at {page_end}, beyond {} bytes",
+        page.total_bytes
+    );
+    match page.next_offset_bytes {
+        Some(next_offset) => {
+            anyhow::ensure!(
+                next_offset == page_end,
+                "read_file returned a discontinuous next offset {next_offset} for {path}; expected {page_end}"
+            );
+            anyhow::ensure!(
+                next_offset > page.offset_bytes && next_offset < page.total_bytes,
+                "read_file returned an invalid continuation offset {next_offset} for {path}"
+            );
+        }
+        None => anyhow::ensure!(
+            page_end == page.total_bytes,
+            "read_file ended early at byte {page_end} of {} for {path}",
+            page.total_bytes
+        ),
+    }
+    Ok(())
+}
+
 /// Subscriber-side handle to a `MuxDomain` notification stream.
 ///
 /// Wraps the bounded ordinary queue with a per-pane coalesced dirty latch:
@@ -1607,6 +1738,61 @@ impl NotificationReceiver {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn read_file_byte_page(
+        offset_bytes: u64,
+        content: &[u8],
+        next_offset_bytes: Option<u64>,
+        total_bytes: u64,
+    ) -> ReadFileResponse {
+        ReadFileResponse {
+            content: content.to_vec(),
+            is_binary: true,
+            encoding: "binary".to_string(),
+            offset_line: 0,
+            next_offset_line: None,
+            total_lines: 0,
+            offset_bytes,
+            next_offset_bytes,
+            total_bytes,
+        }
+    }
+
+    #[test]
+    fn read_file_byte_page_validation_accepts_contiguous_pages() {
+        let first = read_file_byte_page(0, b"abcd", Some(4), 6);
+        validate_read_file_byte_page("file", &first, 0, 4).expect("first page");
+
+        let last = read_file_byte_page(4, b"ef", None, 6);
+        validate_read_file_byte_page("file", &last, 4, 4).expect("last page");
+    }
+
+    #[test]
+    fn read_file_byte_page_validation_rejects_gaps_and_truncation() {
+        let skipped = read_file_byte_page(0, b"ab", Some(3), 4);
+        assert!(validate_read_file_byte_page("file", &skipped, 0, 2).is_err());
+
+        let truncated = read_file_byte_page(0, b"ab", None, 4);
+        assert!(validate_read_file_byte_page("file", &truncated, 0, 2).is_err());
+
+        let empty_continuation = read_file_byte_page(0, b"", Some(0), 4);
+        assert!(validate_read_file_byte_page("file", &empty_continuation, 0, 2).is_err());
+    }
+
+    #[test]
+    fn read_file_byte_page_validation_rejects_oversized_or_out_of_range_pages() {
+        let oversized = read_file_byte_page(0, b"abc", Some(3), 4);
+        assert!(validate_read_file_byte_page("file", &oversized, 0, 2).is_err());
+
+        let wrong_offset = read_file_byte_page(2, b"ab", None, 4);
+        assert!(validate_read_file_byte_page("file", &wrong_offset, 0, 2).is_err());
+
+        let past_end = read_file_byte_page(5, b"", None, 4);
+        assert!(validate_read_file_byte_page("file", &past_end, 5, 2).is_err());
+
+        let content_past_end = read_file_byte_page(3, b"ab", None, 4);
+        assert!(validate_read_file_byte_page("file", &content_past_end, 3, 2).is_err());
+    }
 
     #[test]
     fn lifecycle_blocks_while_byte_stream_drops_and_dirty_latches() {

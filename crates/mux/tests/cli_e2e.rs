@@ -716,7 +716,7 @@ fn session_worktree(env: &CliEnv, session_name: &str) -> Result<PathBuf> {
 #[test]
 fn cli_file_commands_walk_the_session_worktree() -> Result<()> {
     let env = CliEnv::spawn()?;
-    session_worktree(&env, "files")?;
+    let worktree = session_worktree(&env, "files")?;
 
     // 不给路径就是会话 cwd 本身。目录在前，其余按名称。
     let (code, stdout, stderr) = env.run(&["list-dir", "-t", "files"])?;
@@ -767,6 +767,14 @@ fn cli_file_commands_walk_the_session_worktree() -> Result<()> {
     let (code, stdout, stderr) = env.run_raw(&["show-file", "-t", "files", "payload.bin"], None)?;
     assert_eq!(code, 0, "stderr={stderr}");
     assert_eq!(stdout, vec![0x00u8, 0x01, 0xff, 0x00]);
+
+    let large = (0..mux_protocol::DEFAULT_READ_FILE_PAGE_BYTES as usize * 2 + 19)
+        .map(|index| (index % 251) as u8)
+        .collect::<Vec<_>>();
+    std::fs::write(worktree.join("large.bin"), &large)?;
+    let (code, stdout, stderr) = env.run_raw(&["show-file", "-t", "files", "large.bin"], None)?;
+    assert_eq!(code, 0, "stderr={stderr}");
+    assert_eq!(stdout, large, "show-file must concatenate every byte page");
 
     Ok(())
 }

@@ -471,6 +471,10 @@ message ReadFileRequest {
     string path = 1;
     optional uint32 offset_line = 2;
     optional uint32 max_lines = 3;
+    // Byte pagination is used for binary files and for streaming the CLI.
+    // It is mutually exclusive with offset_line/max_lines.
+    optional uint64 offset_bytes = 4;
+    optional uint32 max_bytes = 5;
 }
 
 // §3.10 文件内容响应。
@@ -478,6 +482,12 @@ message ReadFileResponse {
     bytes content = 1;
     bool is_binary = 2;
     string encoding = 3;  // "utf-8", "binary", etc.
+    uint32 offset_line = 4;
+    optional uint32 next_offset_line = 5;
+    uint32 total_lines = 6;
+    uint64 offset_bytes = 7;
+    optional uint64 next_offset_bytes = 8;
+    uint64 total_bytes = 9;
 }
 
 // §3.10 列出目录。

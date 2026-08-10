@@ -545,7 +545,9 @@ mod tests {
         archived.commit().unwrap();
         drop(archived);
 
-        let error = Wal::open(&path).expect_err("ambiguous rotation state must fail closed");
+        let error = Wal::open(&path)
+            .err()
+            .expect("ambiguous rotation state must fail closed");
         assert_eq!(error.kind(), io::ErrorKind::InvalidData);
     }
 

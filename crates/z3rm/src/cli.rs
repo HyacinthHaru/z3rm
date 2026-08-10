@@ -329,9 +329,14 @@ fn parse_target_and_positionals(
     let mut target = None;
     let mut positionals = Vec::new();
     let mut index = 0;
+    let mut parse_options = true;
     while index < args.len() {
         match args[index].as_str() {
-            "-t" | "--target" => {
+            "--" if parse_options => {
+                parse_options = false;
+                index += 1;
+            }
+            "-t" | "--target" if parse_options => {
                 let value = args
                     .get(index + 1)
                     .filter(|value| !value.starts_with('-'))
@@ -339,7 +344,7 @@ fn parse_target_and_positionals(
                 target = Some(value.clone());
                 index += 2;
             }
-            option if option.starts_with('-') => {
+            option if parse_options && option.starts_with('-') => {
                 return Err(format!("unsupported {command} option: {option}"));
             }
             value => {
@@ -1496,6 +1501,34 @@ mod tests {
         }
 
         assert!(parse_cli_args_from(&args(&["restore", "src/main.rs"])).is_err());
+    }
+
+    #[test]
+    fn shadow_commands_accept_dash_prefixed_paths_after_double_dash() {
+        let parsed =
+            parse_cli_args_from(&args(&["list-versions", "--", "-draft.rs"])).expect("parse");
+        match parsed {
+            Some(CliCommand::ListVersions { target, path }) => {
+                assert_eq!(target, None);
+                assert_eq!(path, "-draft.rs");
+            }
+            other => panic!("unexpected parse result: {other:?}"),
+        }
+
+        let parsed = parse_cli_args_from(&args(&["restore", "-t", "dev", "--", "-draft.rs", "7"]))
+            .expect("parse");
+        match parsed {
+            Some(CliCommand::Restore {
+                target,
+                path,
+                version_id,
+            }) => {
+                assert_eq!(target.as_deref(), Some("dev"));
+                assert_eq!(path, "-draft.rs");
+                assert_eq!(version_id, 7);
+            }
+            other => panic!("unexpected parse result: {other:?}"),
+        }
     }
 
     /// 拼错的选项必须报错, 否则会被当成路径发给服务端换来一句无关的 not-found。

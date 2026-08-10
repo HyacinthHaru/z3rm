@@ -146,6 +146,48 @@ async fn read_file_rpc_contract() -> Result<()> {
     assert!(binary.is_binary, "NUL bytes must flip is_binary");
     assert_eq!(binary.encoding, "binary");
 
+    std::fs::write(root.join("lines.txt"), b"zero\none\ntwo\nthree")?;
+    let first_lines = domain
+        .read_file_lines("lines.txt", 0, 2)
+        .await
+        .context("first line page")?;
+    assert_eq!(first_lines.content, b"zero\none\n");
+    assert_eq!(first_lines.next_offset_line, Some(2));
+    assert_eq!(first_lines.total_lines, 4);
+    let last_lines = domain
+        .read_file_lines("lines.txt", 2, 2)
+        .await
+        .context("last line page")?;
+    assert_eq!(last_lines.content, b"two\nthree");
+    assert_eq!(last_lines.next_offset_line, None);
+    assert!(
+        domain.read_file_lines("lines.txt", 0, 0).await.is_err(),
+        "a zero-sized page cannot provide a continuation"
+    );
+
+    let large_binary = (0..mux_protocol::DEFAULT_READ_FILE_PAGE_BYTES as usize * 2 + 17)
+        .map(|index| (index % 251) as u8)
+        .collect::<Vec<_>>();
+    std::fs::write(root.join("large.bin"), &large_binary)?;
+    let first_bytes = domain
+        .read_file_page("large.bin", 0, mux_protocol::DEFAULT_READ_FILE_PAGE_BYTES)
+        .await
+        .context("first byte page")?;
+    assert_eq!(
+        first_bytes.content.len(),
+        mux_protocol::DEFAULT_READ_FILE_PAGE_BYTES as usize
+    );
+    assert_eq!(
+        first_bytes.next_offset_bytes,
+        Some(mux_protocol::DEFAULT_READ_FILE_PAGE_BYTES as u64)
+    );
+    assert_eq!(first_bytes.total_bytes, large_binary.len() as u64);
+    let assembled = domain
+        .read_file("large.bin")
+        .await
+        .context("aggregate paged file")?;
+    assert_eq!(assembled.content, large_binary);
+
     // 不存在的文件是错误 (和 StatFile 不同)，而且原因要活着传到调用方。
     let missing = domain
         .read_file("no-such-file.txt")

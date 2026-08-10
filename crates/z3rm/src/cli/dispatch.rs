@@ -1215,16 +1215,41 @@ pub async fn run_cli_command(cmd: CliCommand) -> Result<()> {
             let target = super::target::parse_target(&target)?;
             let session_id = resolve_session_id(&domain, &target, &default_session).await?;
             attach_for_file_access(&domain, &session_id).await?;
-            let file = domain
-                .read_file(&path)
-                .await
-                .with_context(|| format!("failed to read {path}"))?;
             // 二进制文件也要原样落到 stdout, 调用方才能拿它和磁盘上的文件逐字节
-            // 比对; 显式 flush 保证末尾不留在缓冲区。
+            // 比对。逐页写出避免 CLI 为大文件保留一份完整的内存副本。
             let mut stdout = std::io::stdout();
-            stdout
-                .write_all(&file.content)
-                .context("failed to write the file to stdout")?;
+            let mut offset_bytes = 0;
+            let mut expected_total_bytes = None;
+            loop {
+                let page = domain
+                    .read_file_page(
+                        &path,
+                        offset_bytes,
+                        mux_protocol::DEFAULT_READ_FILE_PAGE_BYTES,
+                    )
+                    .await
+                    .with_context(|| format!("failed to read {path}"))?;
+                if let Some(expected_total_bytes) = expected_total_bytes {
+                    anyhow::ensure!(
+                        page.total_bytes == expected_total_bytes,
+                        "read_file size changed while paging {path}: {expected_total_bytes} became {} bytes",
+                        page.total_bytes
+                    );
+                } else {
+                    expected_total_bytes = Some(page.total_bytes);
+                }
+                stdout
+                    .write_all(&page.content)
+                    .context("failed to write the file to stdout")?;
+                let Some(next_offset_bytes) = page.next_offset_bytes else {
+                    break;
+                };
+                anyhow::ensure!(
+                    next_offset_bytes > offset_bytes,
+                    "read_file returned a non-advancing byte page for {path}"
+                );
+                offset_bytes = next_offset_bytes;
+            }
             stdout
                 .flush()
                 .context("failed to flush the file to stdout")?;

@@ -229,6 +229,8 @@ fn read_file() -> RequestBody {
         path: "/etc/passwd".to_string(),
         offset_line: None,
         max_lines: None,
+        offset_bytes: None,
+        max_bytes: None,
     })
 }
 

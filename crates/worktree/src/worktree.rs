@@ -51,7 +51,6 @@ use settings::{Settings, SettingsLocation, SettingsStore};
 use smallvec::{SmallVec, smallvec};
 use std::{
     any::Any,
-    borrow::Borrow as _,
     cmp::Ordering,
     collections::hash_map,
     convert::TryFrom,
@@ -3806,7 +3805,7 @@ impl File {
 
     pub fn from_dyn(file: Option<&Arc<dyn language::File>>) -> Option<&Self> {
         file.and_then(|f| {
-            let f: &dyn language::File = f.borrow();
+            let f: &dyn language::File = std::borrow::Borrow::borrow(f);
             let f: &dyn Any = f;
             f.downcast_ref()
         })
@@ -7242,10 +7241,17 @@ mod tests {
         }
     }
 
+    fn init_test(cx: &mut gpui::TestAppContext) {
+        cx.update(|cx| {
+            let settings_store = SettingsStore::test(cx);
+            cx.set_global(settings_store);
+            WorktreeSettings::register(cx);
+        });
+    }
+
     #[gpui::test]
-    async fn test_copy_external_entries_propagates_copy_failure(
-        cx: &mut gpui::TestAppContext,
-    ) {
+    async fn test_copy_external_entries_propagates_copy_failure(cx: &mut gpui::TestAppContext) {
+        init_test(cx);
         let fs = FakeFs::new(cx.executor());
         fs.insert_tree(
             path!("/worktree"),
@@ -7276,13 +7282,14 @@ mod tests {
                         Arc::<Path>::from(Path::new(path!("/worktree/source.txt"))),
                         Arc::<Path>::from(Path::new(path!("/worktree/missing.txt"))),
                     ],
+                    fs.clone(),
                     cx,
                 )
             })
             .await;
 
         let err = result.expect_err("copy failure should reach the caller");
-        let message = err.to_string();
+        let message = format!("{err:#}");
         assert!(
             message.contains("missing.txt"),
             "error should name the failing source: {message}"
@@ -7303,9 +7310,8 @@ mod tests {
     }
 
     #[gpui::test]
-    async fn test_expand_all_for_entry_with_stale_id_is_harmless(
-        cx: &mut gpui::TestAppContext,
-    ) {
+    async fn test_expand_all_for_entry_with_stale_id_is_harmless(cx: &mut gpui::TestAppContext) {
+        init_test(cx);
         let fs = FakeFs::new(cx.executor());
         fs.insert_tree(
             path!("/worktree"),
