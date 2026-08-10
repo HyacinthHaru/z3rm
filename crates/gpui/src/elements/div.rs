@@ -272,7 +272,10 @@ impl Interactivity {
     ) {
         self.mouse_down_listeners
             .push(Box::new(move |event, phase, hitbox, window, cx| {
-                if phase == DispatchPhase::Capture && !hitbox.contains(&window.mouse_position()) {
+                if phase == DispatchPhase::Capture
+                    && !window.has_active_prompt()
+                    && !hitbox.contains(&window.mouse_position())
+                {
                     (listener)(event, window, cx)
                 }
             }));
@@ -4123,7 +4126,7 @@ mod tests {
     use super::*;
     use crate::{
         AnyWindowHandle, AppContext as _, Context, InputEvent, Keystroke, MouseMoveEvent,
-        TestAppContext, util::FluentBuilder as _,
+        TestAppContext, canvas, util::FluentBuilder as _,
     };
     use std::{cell::Cell, rc::Weak};
 

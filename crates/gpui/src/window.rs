@@ -5341,6 +5341,10 @@ impl Window {
         });
     }
 
+    pub(crate) fn has_active_prompt(&self) -> bool {
+        self.prompt.is_some()
+    }
+
     /// Present a platform dialog.
     /// The provided message will be presented, along with buttons for each answer.
     /// When a button is clicked, the returned Receiver will receive the index of the clicked button.

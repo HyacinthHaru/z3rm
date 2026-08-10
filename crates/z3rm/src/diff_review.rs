@@ -15,7 +15,7 @@ use gpui::{
 use imara_diff::{Algorithm, diff, intern::InternedInput};
 use std::any::TypeId;
 use std::ops::Range;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use ui::prelude::*;
 use workspace::{
@@ -31,6 +31,7 @@ pub struct DiffReview {
     pub previous_content: SharedString,
     /// Current content (from disk)
     pub current_content: SharedString,
+    current_file_exists: bool,
     /// Whether the diff has been resolved (accept/decline)
     pub resolved: bool,
     /// Tab title for the workspace item ("Diff: <file_name>")
@@ -58,6 +59,14 @@ impl RestoreTarget {
     }
 }
 
+fn read_current_content(path: &Path) -> std::io::Result<(String, bool)> {
+    match std::fs::read_to_string(path) {
+        Ok(current) => Ok((current, true)),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok((String::new(), false)),
+        Err(error) => Err(error),
+    }
+}
+
 /// §16.6 Events emitted by DiffReview
 #[derive(Clone, Debug)]
 pub enum DiffReviewEvent {
@@ -77,6 +86,17 @@ impl DiffReview {
         restore_target: Option<RestoreTarget>,
         cx: &mut Context<Self>,
     ) -> Self {
+        Self::new_with_current_file_state(file_path, previous, current, true, restore_target, cx)
+    }
+
+    fn new_with_current_file_state(
+        file_path: PathBuf,
+        previous: String,
+        current: String,
+        current_file_exists: bool,
+        restore_target: Option<RestoreTarget>,
+        cx: &mut Context<Self>,
+    ) -> Self {
         let file_name = file_path
             .file_name()
             .and_then(|n| n.to_str())
@@ -87,6 +107,7 @@ impl DiffReview {
             file_path,
             previous_content: previous.into(),
             current_content: current.into(),
+            current_file_exists,
             resolved: false,
             title,
             restore_target,
@@ -113,14 +134,27 @@ impl DiffReview {
         cx.spawn(async move |cx| {
             let current = smol::unblock({
                 let path = path.clone();
-                move || std::fs::read_to_string(&path)
+                move || read_current_content(&path)
             })
             .await
-            .map_err(|e| anyhow::anyhow!("failed to read {}: {}", path.display(), e))?;
-            let entity =
-                cx.new(|cx| DiffReview::new(path.clone(), prev, current, restore_target, cx));
+            .map_err(|error| anyhow::anyhow!("failed to read {}: {}", path.display(), error))?;
+            let (current, current_file_exists) = current;
+            let entity = cx.new(|cx| {
+                DiffReview::new_with_current_file_state(
+                    path.clone(),
+                    prev,
+                    current,
+                    current_file_exists,
+                    restore_target,
+                    cx,
+                )
+            });
             Ok(entity)
         })
+    }
+
+    pub fn is_deleted(&self) -> bool {
+        !self.current_file_exists
     }
 
     /// §16.6 Accept the current version (dismiss diff, file stays).
@@ -155,6 +189,8 @@ impl DiffReview {
                 this.decline_pending = false;
                 match result {
                     Ok(response) if response.restored => {
+                        this.current_content = this.previous_content.clone();
+                        this.current_file_exists = true;
                         this.resolved = true;
                         cx.emit(DiffReviewEvent::Declined);
                     }
@@ -275,7 +311,17 @@ impl Render for DiffReview {
             .py_2()
             .border_b_1()
             .border_color(colors.border)
-            .child(SharedString::from(format!("Diff: {}", file_name)))
+            .child(
+                div()
+                    .flex()
+                    .flex_row()
+                    .items_center()
+                    .gap_2()
+                    .child(SharedString::from(format!("Diff: {}", file_name)))
+                    .when(self.is_deleted(), |this| {
+                        this.child(Label::new("Deleted").color(Color::Error))
+                    }),
+            )
             .child(
                 div()
                     .flex()
@@ -527,6 +573,53 @@ mod tests {
     fn empty_current_content_is_all_removals(cx: &mut gpui::TestAppContext) {
         let lines = summarize(cx, "alpha\nbeta\n", "");
         assert_eq!(lines, vec!["-alpha", "-beta"]);
+    }
+
+    #[test]
+    fn current_content_reader_distinguishes_deleted_and_empty_files() {
+        let directory = tempfile::tempdir().expect("create temporary directory");
+        let missing_path = directory.path().join("deleted.txt");
+        assert_eq!(
+            read_current_content(&missing_path).expect("read missing file state"),
+            (String::new(), false)
+        );
+
+        let empty_path = directory.path().join("empty.txt");
+        std::fs::write(&empty_path, "").expect("write empty file");
+        assert_eq!(
+            read_current_content(&empty_path).expect("read empty file state"),
+            (String::new(), true)
+        );
+    }
+
+    #[gpui::test]
+    fn deleted_file_review_has_empty_current_side(cx: &mut gpui::TestAppContext) {
+        let review = cx.new(|cx| {
+            DiffReview::new_with_current_file_state(
+                PathBuf::from("deleted.txt"),
+                "alpha\nbeta\n".to_string(),
+                String::new(),
+                false,
+                None,
+                cx,
+            )
+        });
+        cx.read(|cx| {
+            let review = review.read(cx);
+            assert!(review.is_deleted());
+            assert_eq!(review.current_content.as_ref(), "");
+            assert_eq!(
+                review
+                    .line_diff()
+                    .iter()
+                    .map(|line| match line {
+                        DiffLine::Removed(text) => format!("-{text}"),
+                        other => format!("{other:?}"),
+                    })
+                    .collect::<Vec<_>>(),
+                vec!["-alpha", "-beta"]
+            );
+        });
     }
 
     #[gpui::test]

@@ -162,6 +162,27 @@ impl ChangedFileSelectorDelegate {
     }
 }
 
+fn unfiltered_matches(candidates: Vec<StringMatchCandidate>) -> Vec<StringMatch> {
+    candidates
+        .into_iter()
+        .map(|candidate| StringMatch {
+            candidate_id: candidate.id,
+            string: candidate.string,
+            positions: Vec::new(),
+            score: 0.0,
+        })
+        .collect()
+}
+
+fn version_count_label(version_count: u64) -> String {
+    let noun = if version_count == 1 {
+        "version"
+    } else {
+        "versions"
+    };
+    format!("{version_count} {noun}")
+}
+
 impl PickerDelegate for ChangedFileSelectorDelegate {
     type ListItem = ListItem;
 
@@ -206,16 +227,7 @@ impl PickerDelegate for ChangedFileSelectorDelegate {
 
         cx.spawn_in(window, async move |this, cx| {
             let matches = if query.is_empty() {
-                candidates
-                    .into_iter()
-                    .enumerate()
-                    .map(|(index, candidate)| StringMatch {
-                        candidate_id: index,
-                        string: candidate.string,
-                        positions: Vec::new(),
-                        score: 0.0,
-                    })
-                    .collect()
+                unfiltered_matches(candidates)
             } else {
                 match_strings(
                     &candidates,
@@ -287,9 +299,7 @@ impl PickerDelegate for ChangedFileSelectorDelegate {
                     path_match.string.clone(),
                     path_match.positions.clone(),
                 ))
-                .end_slot(
-                    Label::new(format!("{} versions", file.version_count)).color(Color::Muted),
-                ),
+                .end_slot(Label::new(version_count_label(file.version_count)).color(Color::Muted)),
         )
     }
 }
@@ -463,6 +473,27 @@ pub fn unified_diff(previous: &str, current: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn unfiltered_matches_preserve_candidate_ids() {
+        let matches = unfiltered_matches(vec![
+            StringMatchCandidate::new(7, "first"),
+            StringMatchCandidate::new(42, "second"),
+        ]);
+        assert_eq!(
+            matches
+                .into_iter()
+                .map(|candidate| candidate.candidate_id)
+                .collect::<Vec<_>>(),
+            vec![7, 42]
+        );
+    }
+
+    #[test]
+    fn version_count_uses_the_correct_noun() {
+        assert_eq!(version_count_label(1), "1 version");
+        assert_eq!(version_count_label(2), "2 versions");
+    }
 
     #[test]
     fn unified_diff_marks_additions_and_removals() {

@@ -13,6 +13,7 @@ use mux_protocol::{
 use prost::Message;
 use sqlez::connection::Connection;
 use std::collections::HashSet;
+use std::io::Read as _;
 use std::sync::Arc;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::sync::mpsc;
@@ -2954,24 +2955,205 @@ async fn handle_read_file(
         Ok((path, _snapshot_watch)) => path,
         Err(error) => return Ok(ResponseBody::Error(format!("read_file: {error:#}"))),
     };
-    match std::fs::read(&path) {
-        Ok(bytes) => {
-            // Binary detection: check for null bytes in first 8KB (same heuristic
-            // as shadow_snapshot Monitor — ELF/PE/Mach-O magic or > 10% null).
-            let is_binary = detect_binary(&bytes);
-            let encoding = if is_binary {
-                "binary".to_string()
-            } else {
-                "utf-8".to_string()
-            };
-            Ok(ResponseBody::FileContent(mux_protocol::ReadFileResponse {
-                content: bytes,
-                is_binary,
-                encoding,
-            }))
-        }
+    match std::fs::File::open(&path) {
+        Ok(mut file) => match (|| -> anyhow::Result<_> {
+            let total_bytes = file.metadata()?.len();
+            let response = read_file_response(req, &mut file, total_bytes)?;
+            anyhow::ensure!(
+                file.metadata()?.len() == total_bytes,
+                "file size changed while reading"
+            );
+            Ok(response)
+        })() {
+            Ok(response) => Ok(ResponseBody::FileContent(response)),
+            Err(error) => Ok(ResponseBody::Error(format!("read_file: {error:#}"))),
+        },
         Err(e) => Ok(ResponseBody::Error(format!("read_file: {}", e))),
     }
+}
+
+fn read_file_response(
+    req: &mux_protocol::ReadFileRequest,
+    file: &mut (impl std::io::Read + std::io::Seek),
+    total_bytes: u64,
+) -> anyhow::Result<mux_protocol::ReadFileResponse> {
+    let line_page_requested = req.offset_line.is_some() || req.max_lines.is_some();
+    let byte_page_requested = req.offset_bytes.is_some() || req.max_bytes.is_some();
+    anyhow::ensure!(
+        !(line_page_requested && byte_page_requested),
+        "line and byte pagination cannot be combined"
+    );
+
+    file.seek(std::io::SeekFrom::Start(0))?;
+    let mut prefix = Vec::with_capacity(8192);
+    (&mut *file).take(8192).read_to_end(&mut prefix)?;
+    let is_binary = detect_binary(&prefix);
+    let encoding = if is_binary { "binary" } else { "utf-8" }.to_string();
+
+    if byte_page_requested {
+        let max_bytes = req
+            .max_bytes
+            .unwrap_or(mux_protocol::DEFAULT_READ_FILE_PAGE_BYTES);
+        anyhow::ensure!(max_bytes > 0, "max_bytes must be at least 1");
+        anyhow::ensure!(
+            max_bytes <= mux_protocol::MAX_READ_FILE_PAGE_BYTES,
+            "max_bytes exceeds the per-page limit of {}",
+            mux_protocol::MAX_READ_FILE_PAGE_BYTES
+        );
+
+        let offset_bytes = req.offset_bytes.unwrap_or(0);
+        anyhow::ensure!(
+            offset_bytes <= total_bytes,
+            "offset_bytes is beyond the end of the file"
+        );
+        let start = offset_bytes;
+        let page_bytes = total_bytes.saturating_sub(start).min(max_bytes as u64) as usize;
+        file.seek(std::io::SeekFrom::Start(start))?;
+        let mut content = Vec::with_capacity(page_bytes);
+        (&mut *file)
+            .take(page_bytes as u64)
+            .read_to_end(&mut content)?;
+        anyhow::ensure!(
+            content.len() == page_bytes,
+            "file changed while reading byte page"
+        );
+        let end = start + page_bytes as u64;
+        let next_offset_bytes = (end < total_bytes).then_some(end);
+        return Ok(mux_protocol::ReadFileResponse {
+            content,
+            is_binary,
+            encoding,
+            offset_line: 0,
+            next_offset_line: None,
+            total_lines: 0,
+            offset_bytes,
+            next_offset_bytes,
+            total_bytes,
+        });
+    }
+
+    if line_page_requested {
+        let max_lines = req
+            .max_lines
+            .unwrap_or(mux_protocol::DEFAULT_READ_FILE_PAGE_LINES);
+        anyhow::ensure!(max_lines > 0, "max_lines must be at least 1");
+        anyhow::ensure!(
+            max_lines <= mux_protocol::MAX_READ_FILE_PAGE_LINES,
+            "max_lines exceeds the per-page limit of {}",
+            mux_protocol::MAX_READ_FILE_PAGE_LINES
+        );
+
+        file.seek(std::io::SeekFrom::Start(0))?;
+        let offset_line = req.offset_line.unwrap_or(0);
+        let (content, total_lines, start) = read_line_page(
+            std::io::BufReader::new(file),
+            total_bytes,
+            offset_line,
+            max_lines,
+        )?;
+        let returned_lines = max_lines.min(total_lines.saturating_sub(offset_line));
+        let next_offset_line = (offset_line.saturating_add(returned_lines) < total_lines)
+            .then_some(offset_line.saturating_add(returned_lines));
+        return Ok(mux_protocol::ReadFileResponse {
+            content,
+            is_binary,
+            encoding,
+            offset_line,
+            next_offset_line,
+            total_lines,
+            offset_bytes: start,
+            next_offset_bytes: None,
+            total_bytes,
+        });
+    }
+
+    // Neither pagination mode means a legacy request. The size check preserves
+    // old clients without allowing them to force an oversized allocation/frame.
+    anyhow::ensure!(
+        total_bytes < mux_protocol::MAX_FRAME_PAYLOAD as u64,
+        "legacy full-file request exceeds the frame limit; use pagination"
+    );
+    file.seek(std::io::SeekFrom::Start(0))?;
+    let mut content = Vec::with_capacity(total_bytes as usize);
+    (&mut *file)
+        .take(mux_protocol::MAX_FRAME_PAYLOAD as u64)
+        .read_to_end(&mut content)?;
+    anyhow::ensure!(
+        content.len() as u64 == total_bytes,
+        "file changed while reading legacy response"
+    );
+    Ok(mux_protocol::ReadFileResponse {
+        total_lines: u32::try_from(logical_line_count(&content)).unwrap_or(u32::MAX),
+        content,
+        is_binary,
+        encoding,
+        offset_line: 0,
+        next_offset_line: None,
+        offset_bytes: 0,
+        next_offset_bytes: None,
+        total_bytes,
+    })
+}
+
+fn read_line_page(
+    mut reader: impl std::io::BufRead,
+    expected_bytes: u64,
+    offset_line: u32,
+    max_lines: u32,
+) -> anyhow::Result<(Vec<u8>, u32, u64)> {
+    let page_end_line = u64::from(offset_line) + u64::from(max_lines);
+    let mut current_line = 0u64;
+    let mut absolute_offset = 0u64;
+    let mut page_start = None;
+    let mut content = Vec::new();
+    let mut saw_byte = false;
+    let mut last_byte = None;
+
+    loop {
+        let consumed = {
+            let buffer = reader.fill_buf()?;
+            if buffer.is_empty() {
+                break;
+            }
+            for byte in buffer {
+                if current_line == u64::from(offset_line) && page_start.is_none() {
+                    page_start = Some(absolute_offset);
+                }
+                if current_line >= u64::from(offset_line) && current_line < page_end_line {
+                    anyhow::ensure!(
+                        content.len() < mux_protocol::MAX_READ_FILE_PAGE_BYTES as usize,
+                        "requested line page exceeds the byte limit of {}; use byte pagination",
+                        mux_protocol::MAX_READ_FILE_PAGE_BYTES
+                    );
+                    content.push(*byte);
+                }
+                saw_byte = true;
+                last_byte = Some(*byte);
+                absolute_offset = absolute_offset.saturating_add(1);
+                if *byte == b'\n' {
+                    current_line = current_line.saturating_add(1);
+                }
+            }
+            buffer.len()
+        };
+        reader.consume(consumed);
+    }
+
+    anyhow::ensure!(
+        absolute_offset == expected_bytes,
+        "file changed while reading line page"
+    );
+    let total_lines = current_line + u64::from(saw_byte && last_byte != Some(b'\n'));
+    let total_lines = u32::try_from(total_lines)
+        .map_err(|_| anyhow::anyhow!("file has more than {} logical lines", u32::MAX))?;
+    Ok((content, total_lines, page_start.unwrap_or(expected_bytes)))
+}
+
+fn logical_line_count(bytes: &[u8]) -> usize {
+    if bytes.is_empty() {
+        return 0;
+    }
+    bytes.iter().filter(|byte| **byte == b'\n').count() + usize::from(bytes.last() != Some(&b'\n'))
 }
 
 /// §16.6 ListDir: 列出 attach 会话 worktree 内某个目录的条目。
@@ -3325,6 +3507,186 @@ fn detect_binary(bytes: &[u8]) -> bool {
 mod connection_unit_tests {
     use super::*;
     use crate::pane::ShellMarkerPosition;
+
+    fn read_file_request() -> mux_protocol::ReadFileRequest {
+        mux_protocol::ReadFileRequest {
+            path: "file.txt".to_string(),
+            offset_line: None,
+            max_lines: None,
+            offset_bytes: None,
+            max_bytes: None,
+        }
+    }
+
+    fn read_file_page_for_test(
+        request: &mux_protocol::ReadFileRequest,
+        bytes: &[u8],
+    ) -> anyhow::Result<mux_protocol::ReadFileResponse> {
+        let mut cursor = std::io::Cursor::new(bytes);
+        read_file_response(request, &mut cursor, bytes.len() as u64)
+    }
+
+    #[test]
+    fn read_file_line_pages_preserve_boundaries() {
+        let bytes = b"zero\none\ntwo\nthree";
+        let first = read_file_page_for_test(
+            &mux_protocol::ReadFileRequest {
+                offset_line: Some(0),
+                max_lines: Some(2),
+                ..read_file_request()
+            },
+            bytes,
+        )
+        .expect("first page");
+        assert_eq!(first.content, b"zero\none\n");
+        assert_eq!(first.offset_line, 0);
+        assert_eq!(first.next_offset_line, Some(2));
+        assert_eq!(first.total_lines, 4);
+
+        let last = read_file_page_for_test(
+            &mux_protocol::ReadFileRequest {
+                offset_line: first.next_offset_line,
+                max_lines: Some(2),
+                ..read_file_request()
+            },
+            bytes,
+        )
+        .expect("last page");
+        assert_eq!(last.content, b"two\nthree");
+        assert_eq!(last.next_offset_line, None);
+
+        let past_end = read_file_page_for_test(
+            &mux_protocol::ReadFileRequest {
+                offset_line: Some(9),
+                max_lines: Some(2),
+                ..read_file_request()
+            },
+            bytes,
+        )
+        .expect("past-end page");
+        assert!(past_end.content.is_empty());
+        assert_eq!(past_end.offset_line, 9);
+        assert_eq!(past_end.next_offset_line, None);
+    }
+
+    #[test]
+    fn read_file_byte_pages_bound_payloads() {
+        let bytes = b"0123456789";
+        let page = read_file_page_for_test(
+            &mux_protocol::ReadFileRequest {
+                offset_bytes: Some(3),
+                max_bytes: Some(4),
+                ..read_file_request()
+            },
+            bytes,
+        )
+        .expect("byte page");
+        assert_eq!(page.content, b"3456");
+        assert_eq!(page.offset_bytes, 3);
+        assert_eq!(page.next_offset_bytes, Some(7));
+        assert_eq!(page.total_bytes, 10);
+
+        let last = read_file_page_for_test(
+            &mux_protocol::ReadFileRequest {
+                offset_bytes: page.next_offset_bytes,
+                max_bytes: Some(4),
+                ..read_file_request()
+            },
+            bytes,
+        )
+        .expect("last byte page");
+        assert_eq!(last.content, b"789");
+        assert_eq!(last.next_offset_bytes, None);
+
+        let past_end = read_file_page_for_test(
+            &mux_protocol::ReadFileRequest {
+                offset_bytes: Some(11),
+                max_bytes: Some(4),
+                ..read_file_request()
+            },
+            bytes,
+        )
+        .expect_err("byte offsets beyond EOF must be rejected");
+        assert!(past_end.to_string().contains("beyond the end"));
+    }
+
+    #[test]
+    fn read_file_rejects_degenerate_or_mixed_pages() {
+        let zero_lines = read_file_page_for_test(
+            &mux_protocol::ReadFileRequest {
+                offset_line: Some(0),
+                max_lines: Some(0),
+                ..read_file_request()
+            },
+            b"text",
+        )
+        .expect_err("zero line pages cannot advance");
+        assert!(zero_lines.to_string().contains("max_lines"));
+
+        let zero_bytes = read_file_page_for_test(
+            &mux_protocol::ReadFileRequest {
+                offset_bytes: Some(0),
+                max_bytes: Some(0),
+                ..read_file_request()
+            },
+            b"text",
+        )
+        .expect_err("zero byte pages cannot advance");
+        assert!(zero_bytes.to_string().contains("max_bytes"));
+
+        let mixed = read_file_page_for_test(
+            &mux_protocol::ReadFileRequest {
+                offset_line: Some(0),
+                max_lines: Some(1),
+                offset_bytes: Some(0),
+                max_bytes: Some(1),
+                ..read_file_request()
+            },
+            b"text",
+        )
+        .expect_err("pagination modes are exclusive");
+        assert!(mixed.to_string().contains("cannot be combined"));
+    }
+
+    #[test]
+    fn read_file_sparse_file_stays_bounded() {
+        let mut file = tempfile::tempfile().expect("temp file");
+        let total_bytes = mux_protocol::MAX_FRAME_PAYLOAD as u64 * 2;
+        file.set_len(total_bytes).expect("make sparse file");
+
+        let page = read_file_response(
+            &mux_protocol::ReadFileRequest {
+                offset_bytes: Some(total_bytes - 3),
+                max_bytes: Some(16),
+                ..read_file_request()
+            },
+            &mut file,
+            total_bytes,
+        )
+        .expect("tail page");
+        assert_eq!(page.content, vec![0; 3]);
+        assert_eq!(page.total_bytes, total_bytes);
+        assert_eq!(page.next_offset_bytes, None);
+
+        let error = read_file_response(&read_file_request(), &mut file, total_bytes)
+            .expect_err("legacy request must not allocate a huge sparse file");
+        assert!(error.to_string().contains("frame limit"));
+    }
+
+    #[test]
+    fn read_file_line_page_rejects_an_oversized_line() {
+        let bytes = vec![b'x'; mux_protocol::MAX_READ_FILE_PAGE_BYTES as usize + 1];
+        let error = read_file_page_for_test(
+            &mux_protocol::ReadFileRequest {
+                offset_line: Some(0),
+                max_lines: Some(1),
+                ..read_file_request()
+            },
+            &bytes,
+        )
+        .expect_err("one logical line must not bypass the byte cap");
+        assert!(error.to_string().contains("byte limit"));
+    }
 
     fn shell_marker(
         sequence: u64,

@@ -21,8 +21,8 @@ use std::sync::{Arc, mpsc};
 use anyhow::{Context as _, Result, bail};
 use mux_protocol::{ExtensionChromeUpdate, Notification};
 use quickjs_runtime::{
-    DiscoveredExtension, ExtensionRunner, HostBridge, LiveExtension, discover_server_extensions,
-    extension_roots, parse_manifest_str,
+    DiscoveredExtension, ExtensionManifest, ExtensionRunner, HostBridge, LiveExtension,
+    discover_server_extensions, extension_roots, parse_manifest_str,
 };
 
 type Sessions = Arc<parking_lot::RwLock<Vec<crate::session::Session>>>;
@@ -185,7 +185,7 @@ impl HostBridge for ServerHostBridge {
 enum HostCommand {
     /// Extract + load (or replace) an extension, answering on `reply`.
     Install {
-        id: String,
+        manifest: ExtensionManifest,
         archive: Vec<u8>,
         reply: tokio::sync::oneshot::Sender<Result<()>>,
     },
@@ -233,6 +233,14 @@ impl HostedExtension {
             tracing::error!(
                 id = %self.live.id(),
                 "server extension exceeded its memory budget and was suspended"
+            );
+            return;
+        }
+        if self.live.take_io_violated() {
+            self.suspended = true;
+            tracing::error!(
+                id = %self.live.id(),
+                "server extension exceeded its IO rate limit and was suspended"
             );
         }
     }
@@ -494,11 +502,17 @@ impl ServerExtensionHost {
             );
         }
         validate_extension_id(&manifest.id)?;
+        if manifest.id != name {
+            bail!(
+                "extension manifest id `{}` does not match request name `{name}`",
+                manifest.id
+            );
+        }
 
         let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
         self.command_tx
             .send(HostCommand::Install {
-                id: manifest.id.clone(),
+                manifest,
                 archive: request.source.clone(),
                 reply: reply_tx,
             })
@@ -605,24 +619,34 @@ fn host_thread_main(
             Err(_) => break,
         };
         match command {
-            HostCommand::Install { id, archive, reply } => {
-                let result =
-                    install_on_host_thread(user_extensions_dir, &id, &archive, bridge.clone())
-                        .and_then(|live| {
-                            // Replace any previous instance of the same id.
-                            hosted.retain(|extension| extension.live.id() != live.id());
-                            hosted.push(HostedExtension {
-                                live,
-                                suspended: false,
-                            });
-                            Ok(())
-                        });
+            HostCommand::Install {
+                manifest,
+                archive,
+                reply,
+            } => {
+                let id = manifest.id.clone();
+                let result = install_on_host_thread(
+                    user_extensions_dir,
+                    &manifest,
+                    &archive,
+                    bridge.clone(),
+                )
+                .map(|live| {
+                    // Replace any previous instance of the same id.
+                    hosted.retain(|extension| extension.live.id() != live.id());
+                    hosted.push(HostedExtension {
+                        live,
+                        suspended: false,
+                    });
+                });
                 if reply.send(result).is_err() {
                     tracing::debug!(id = %id, "extension install caller dropped before reply");
                 }
             }
             HostCommand::Emit { event, payload } => {
-                for extension in hosted.iter().filter(|extension| !extension.suspended) {
+                for extension in hosted.iter().filter(|extension| {
+                    !extension.suspended && extension.live.capabilities().allows_host_event(&event)
+                }) {
                     if let Err(error) = extension.live.emit_event(&event, &payload) {
                         tracing::warn!(id = %extension.live.id(), %event, %error, "server extension emit failed");
                     }
@@ -697,10 +721,11 @@ fn activate_discovered(
 /// previously installed version stays live until the new one activates.
 fn install_on_host_thread(
     user_extensions_dir: &Path,
-    id: &str,
+    expected_manifest: &ExtensionManifest,
     archive: &[u8],
     bridge: Arc<ServerHostBridge>,
 ) -> Result<LiveExtension> {
+    let id = &expected_manifest.id;
     std::fs::create_dir_all(user_extensions_dir)
         .with_context(|| format!("creating {}", user_extensions_dir.display()))?;
     let staging_root = user_extensions_dir.join(".staging");
@@ -727,6 +752,7 @@ fn install_on_host_thread(
             .with_context(|| format!("reading {}", manifest_path.display()))?;
         let manifest = parse_manifest_str(id, &manifest_text)
             .with_context(|| format!("parsing {}", manifest_path.display()))?;
+        validate_extension_id(&manifest.id)?;
         // Defense in depth: the request pre-validated the shipped manifest,
         // but the on-disk copy is what actually loads.
         if !manifest.side.runs_on_server() {
@@ -734,6 +760,9 @@ fn install_on_host_thread(
                 "on-disk manifest for `{id}` declares runtime side `{:?}`; refusing to run it on the server",
                 manifest.side
             );
+        }
+        if &manifest != expected_manifest {
+            bail!("archive manifest for `{id}` does not match the request manifest");
         }
         let source_path = staged.join("main.js");
         let source = std::fs::read_to_string(&source_path)
@@ -997,6 +1026,41 @@ mod tests {
         assert!(error.to_string().contains("mux.sendInput"));
     }
 
+    #[test]
+    fn io_limit_violation_suspends_server_extension() -> Result<()> {
+        let (sessions, _rx) = sessions_with_subscriber();
+        let manifest = parse_manifest_str(
+            "io-runaway",
+            "id = \"io-runaway\"\nname = \"io-runaway\"\nversion = \"0.1.0\"\n\n[runtime]\nside = \"server\"\n\n[capabilities]\nmux = true\n\n[resources]\nio_rate_limit = 1\n",
+        )?;
+        let bridge = Arc::new(ServerHostBridge::new(sessions));
+        let live = ExtensionRunner::for_manifest(&manifest)
+            .with_bridge(bridge)
+            .load_live(
+                "io-runaway",
+                r#"
+                    export function activate(context) {
+                        for (let index = 0; index < 3; index++) {
+                            try { context.mux.listSessions(); } catch (_) {}
+                        }
+                    }
+                "#,
+                "activate",
+            )?;
+        let mut hosted = HostedExtension {
+            live,
+            suspended: false,
+        };
+
+        hosted.note_resource_violations();
+
+        assert!(
+            hosted.suspended,
+            "an IO violation caught by JavaScript must suspend the extension"
+        );
+        Ok(())
+    }
+
     /// tar's own `Builder` refuses to emit `..` paths, so a traversal archive
     /// must be forged by hand — exactly the situation the daemon faces from a
     /// malicious peer.
@@ -1054,6 +1118,57 @@ mod tests {
         );
         // Nothing was extracted for a rejected install.
         assert!(!temp.path().join("extensions/client-only").exists());
+    }
+
+    #[tokio::test]
+    async fn install_rejects_an_archive_with_a_different_manifest() {
+        let temp = tempfile::tempdir().unwrap();
+        let (sessions, _rx) = sessions_with_subscriber();
+        let host = ServerExtensionHost::start(sessions, temp.path().join("extensions"));
+        let requested_manifest = server_manifest("requested");
+        let archive_manifest = server_manifest("substituted");
+        let request = mux_protocol::InstallExtensionRequest {
+            name: "requested".to_string(),
+            manifest: requested_manifest.into_bytes(),
+            source: pack_archive(&[
+                ("extension.toml", &archive_manifest),
+                ("main.js", "export function activate(context) {}"),
+            ]),
+        };
+
+        let error = host.install_extension(&request).await.unwrap_err();
+
+        assert!(
+            format!("{error:#}").contains("does not match"),
+            "unexpected error: {error:#}"
+        );
+        assert!(!temp.path().join("extensions/requested").exists());
+        assert!(!temp.path().join("extensions/substituted").exists());
+    }
+
+    #[tokio::test]
+    async fn install_rejects_a_manifest_with_a_different_request_name() {
+        let temp = tempfile::tempdir().unwrap();
+        let (sessions, _rx) = sessions_with_subscriber();
+        let host = ServerExtensionHost::start(sessions, temp.path().join("extensions"));
+        let manifest = server_manifest("manifest-id");
+        let request = mux_protocol::InstallExtensionRequest {
+            name: "request-name".to_string(),
+            manifest: manifest.as_bytes().to_vec(),
+            source: pack_archive(&[
+                ("extension.toml", &manifest),
+                ("main.js", "export function activate(context) {}"),
+            ]),
+        };
+
+        let error = host.install_extension(&request).await.unwrap_err();
+
+        assert!(
+            format!("{error:#}").contains("does not match request name"),
+            "unexpected error: {error:#}"
+        );
+        assert!(!temp.path().join("extensions/manifest-id").exists());
+        assert!(!temp.path().join("extensions/request-name").exists());
     }
 
     #[tokio::test]

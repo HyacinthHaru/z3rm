@@ -966,6 +966,14 @@ impl HostedExtension {
                 id = %self.live.id(),
                 "extension exceeded its memory budget and was suspended"
             );
+            return;
+        }
+        if self.live.take_io_violated() {
+            self.suspended = true;
+            tracing::error!(
+                id = %self.live.id(),
+                "extension exceeded its IO rate limit and was suspended"
+            );
         }
     }
 }
@@ -1155,7 +1163,10 @@ impl ExtensionHostController {
                             }
                         }
                         HostCommand::Emit { event, payload } => {
-                            for hosted in live_extensions.iter().filter(|hosted| !hosted.suspended) {
+                            for hosted in live_extensions.iter().filter(|hosted| {
+                                !hosted.suspended
+                                    && hosted.live.capabilities().allows_host_event(&event)
+                            }) {
                                 if let Err(error) = hosted.live.emit_event(&event, &payload) {
                                     tracing::warn!(id = %hosted.live.id(), %event, %error, "extension emit failed");
                                 }

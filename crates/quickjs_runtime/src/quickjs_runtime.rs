@@ -335,6 +335,24 @@ impl ExtensionCapabilities {
         }
     }
 
+    /// Host-originated events are gated independently from the JavaScript
+    /// subscription helper so direct access to its handler registry cannot
+    /// bypass the manifest.
+    pub fn allows_host_event(self, event: &str) -> bool {
+        match event {
+            "pane:output" | "pane:dirty" | "pane:bell" | "shell:integration" => self.terminal,
+            "clipboard" => self.mux,
+            _ if event.starts_with("pane:")
+                || event.starts_with("tab:")
+                || event.starts_with("session:")
+                || event.starts_with("window:") =>
+            {
+                self.mux
+            }
+            _ => true,
+        }
+    }
+
     fn to_json(self) -> serde_json::Value {
         serde_json::json!({
             "terminal": self.terminal,
@@ -385,7 +403,7 @@ impl ExtensionSide {
 }
 
 /// spec §5.3 解析后的 `extension.toml`。
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct ExtensionManifest {
     pub id: String,
     pub name: String,
@@ -730,9 +748,18 @@ fn install_host_call(
     bridge: Arc<dyn HostBridge>,
     capabilities: ExtensionCapabilities,
     io_bucket: Arc<IoTokenBucket>,
+    io_violated: Arc<AtomicBool>,
 ) -> Result<()> {
     let function = Function::new(ctx.clone(), move |method: String, arguments: String| {
-        host_call_response(&bridge, capabilities, &io_bucket, &method, &arguments).to_string()
+        host_call_response(
+            &bridge,
+            capabilities,
+            &io_bucket,
+            &io_violated,
+            &method,
+            &arguments,
+        )
+        .to_string()
     })
     .catch(ctx)
     .map_err(|error| anyhow!("creating __z3rm_host_call failed: {error}"))?;
@@ -1183,7 +1210,11 @@ impl QuickJsRuntime {
 
         // 内存限制 (spec §5.2: 64MB per extension)
         if limits.memory_limit_mb > 0 {
-            runtime.set_memory_limit(limits.memory_limit_mb * 1024 * 1024);
+            let memory_limit_bytes = limits
+                .memory_limit_mb
+                .checked_mul(1024 * 1024)
+                .context("extension memory limit is too large")?;
+            runtime.set_memory_limit(memory_limit_bytes);
         }
 
         // CPU fuel 中断器 (spec §5.2: 50ms/second budget)
@@ -1462,12 +1493,13 @@ impl ExtensionRunner {
         let script_source = to_script_source(source);
         let bridge = self.bridge.clone();
         let io_bucket = runtime.io_bucket().clone();
+        let io_violated = runtime.io_violated().clone();
         let capabilities = self.capabilities;
 
         runtime.begin_execution();
         ctx.with(|ctx| {
             if let Some(bridge) = bridge {
-                install_host_call(&ctx, bridge, capabilities, io_bucket)?;
+                install_host_call(&ctx, bridge, capabilities, io_bucket, io_violated)?;
             }
             eval_checked::<rquickjs::Value>(&ctx, &script_source)
                 .context("evaluating extension source")?;
@@ -1533,12 +1565,13 @@ impl ExtensionRunner {
         let script_source = to_script_source(source);
         let bridge = self.bridge.clone();
         let io_bucket = runtime.io_bucket().clone();
+        let io_violated = runtime.io_violated().clone();
         let capabilities = self.capabilities;
 
         runtime.begin_execution();
         let vdom_json = context.with(|ctx| {
             if let Some(bridge) = bridge {
-                install_host_call(&ctx, bridge, capabilities, io_bucket)?;
+                install_host_call(&ctx, bridge, capabilities, io_bucket, io_violated)?;
             }
             eval_checked::<rquickjs::Value>(&ctx, &script_source)
                 .context("evaluating extension source")?;
@@ -1626,6 +1659,13 @@ impl LiveExtension {
         self.runtime.take_cpu_interrupted()
     }
 
+    /// Whether a host call exceeded the declared IO rate limit since the last
+    /// check. Hosts use this to suspend an extension even when its JavaScript
+    /// catches the rejected call.
+    pub fn take_io_violated(&self) -> bool {
+        self.runtime.take_io_violated()
+    }
+
     /// 当前堆占用是否已达到声明的内存上限 (与 [`QuickJsRuntime::memory_exceeded`]
     /// 语义一致，供宿主在挂起判定时参考)。
     pub fn memory_exceeded(&self) -> bool {
@@ -1664,7 +1704,8 @@ impl LiveExtension {
     pub fn install_bridge(&self, bridge: Arc<dyn HostBridge>) -> Result<()> {
         let capabilities = self.capabilities;
         let io_bucket = self.runtime.io_bucket().clone();
-        self.run_js(|ctx| install_host_call(ctx, bridge, capabilities, io_bucket))
+        let io_violated = self.runtime.io_violated().clone();
+        self.run_js(|ctx| install_host_call(ctx, bridge, capabilities, io_bucket, io_violated))
     }
 
     /// §5.4 是否有视图请求过重绘 (`view.invalidate()` / `context.render()`)。
@@ -1825,6 +1866,34 @@ impl Default for JsExecutionContext {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn host_events_require_their_manifest_capabilities() {
+        let none = ExtensionCapabilities::default();
+        assert!(!none.allows_host_event("pane:output"));
+        assert!(!none.allows_host_event("pane:focus"));
+
+        let terminal = ExtensionCapabilities {
+            terminal: true,
+            ..ExtensionCapabilities::default()
+        };
+        assert!(terminal.allows_host_event("pane:output"));
+        assert!(!terminal.allows_host_event("pane:focus"));
+
+        let mux = ExtensionCapabilities {
+            mux: true,
+            ..ExtensionCapabilities::default()
+        };
+        assert!(mux.allows_host_event("pane:focus"));
+        assert!(!mux.allows_host_event("pane:output"));
+        assert!(none.allows_host_event("extension:custom"));
+    }
+
+    #[test]
+    fn oversized_memory_limit_is_rejected() {
+        let result = QuickJsRuntime::with_limits(ExtensionLimits::new(usize::MAX, 50, 100.0));
+        assert!(result.is_err());
+    }
 
     /// 记录调用的假宿主桥，用来断言 JS → Rust 参数传递与能力拦截。
     struct RecordingBridge {
@@ -2427,7 +2496,11 @@ mod tests {
         "#;
         let extension = runner.load_live("io-limit", source, "activate")?;
         assert_eq!(bridge.calls().len(), 4, "只应放行容量内的调用");
-        drop(extension);
+        assert!(
+            extension.take_io_violated(),
+            "JS 捕获限流异常后，宿主仍必须能观察到违规"
+        );
+        assert!(!extension.take_io_violated(), "读取违规标志后必须清零");
         Ok(())
     }
 

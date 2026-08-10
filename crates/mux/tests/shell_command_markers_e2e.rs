@@ -23,6 +23,7 @@ const PANE_ROWS: u32 = 12;
 struct TestServer {
     child: std::process::Child,
     socket_path: PathBuf,
+    bashrc_path: Option<PathBuf>,
     _tmp: TempDir,
 }
 
@@ -30,9 +31,24 @@ impl TestServer {
     /// `scrollback_lines` 直接决定"到容量之后行号作废"这个悬崖出现得多快，
     /// 开小才能在一条测试里走到它。
     fn spawn(scrollback_lines: u32) -> Result<Self> {
+        Self::spawn_with_shell(scrollback_lines, None)
+    }
+
+    fn spawn_with_shell(scrollback_lines: u32, shell: Option<&str>) -> Result<Self> {
         let tmp = tempfile::tempdir().context("create temp dir")?;
         let socket_path = tmp.path().join("mux.sock");
         let db_path = tmp.path().join("mux.db");
+        let integration_path = tmp.path().join("shell-integration");
+        let bashrc_path = if shell == Some("/bin/bash") {
+            let home = tmp.path().join("home");
+            std::fs::create_dir_all(&home).context("create isolated shell home")?;
+            let bashrc = home.join(".bashrc");
+            std::fs::write(&bashrc, "export Z3RM_TEST_RC_SOURCED=yes\nPS1='z3rm$ '\n")
+                .context("write isolated user bashrc")?;
+            Some(bashrc)
+        } else {
+            None
+        };
 
         let exe = std::env::var("Z3RM_SERVER_BIN").ok().unwrap_or_else(|| {
             let manifest = std::env::var("CARGO_MANIFEST_DIR")
@@ -50,14 +66,24 @@ impl TestServer {
             "z3rm-server".to_string()
         });
 
-        let child = std::process::Command::new(&exe)
+        let mut server_command = std::process::Command::new(&exe);
+        server_command
             .env("Z3RM_MUX_SOCKET", &socket_path)
             .env("Z3RM_MUX_DB", &db_path)
             .env("Z3RM_SCROLLBACK_LINES", scrollback_lines.to_string())
+            .env("Z3RM_SHELL_INTEGRATION_DIR", &integration_path)
             .env("RUST_LOG", "off")
             .stdin(std::process::Stdio::null())
             .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null());
+        if let Some(shell) = shell {
+            server_command
+                .env("SHELL", shell)
+                .env("HOME", tmp.path().join("home"))
+                .env_remove("ZDOTDIR")
+                .env_remove("PROMPT_COMMAND");
+        }
+        let child = server_command
             .spawn()
             .with_context(|| format!("failed to spawn z3rm-server at {exe}"))?;
 
@@ -79,6 +105,7 @@ impl TestServer {
         Ok(Self {
             child,
             socket_path,
+            bashrc_path,
             _tmp: tmp,
         })
     }
@@ -87,6 +114,31 @@ impl TestServer {
         mux::connect_local(Some(self.socket_path.as_path()))
             .await
             .context("connect_local failed")
+    }
+}
+
+async fn wait_for_running_command(
+    domain: &MuxDomain,
+    pane_id: &str,
+    minimum: usize,
+    timeout: Duration,
+) -> Result<Vec<proto::CommandRange>> {
+    let deadline = Instant::now() + timeout;
+    loop {
+        let listed = domain.list_commands(pane_id, 0).await?;
+        if listed.commands.len() >= minimum
+            && listed.commands[minimum - 1].output_start.is_some()
+            && listed.commands[minimum - 1].command_end.is_none()
+        {
+            return Ok(listed.commands);
+        }
+        if Instant::now() >= deadline {
+            anyhow::bail!(
+                "timeout waiting for running command {minimum} in {pane_id}: {:?}",
+                listed.commands
+            );
+        }
+        std::thread::sleep(Duration::from_millis(50));
     }
 }
 
@@ -205,6 +257,106 @@ async fn read_lines(domain: &MuxDomain, pane_id: &str, from: i64, to: i64) -> Re
 
 fn marker_line(marker: &Option<proto::CommandMarker>) -> Option<i64> {
     marker.as_ref().and_then(|marker| marker.line)
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn default_bash_emits_markers_and_preserves_shell_behavior() -> Result<()> {
+    if !std::path::Path::new("/bin/bash").is_file() {
+        return Ok(());
+    }
+
+    let server = TestServer::spawn_with_shell(2_000, Some("/bin/bash"))?;
+    let bashrc_path = server
+        .bashrc_path
+        .clone()
+        .context("bash test server has no isolated bashrc")?;
+    let original_bashrc = std::fs::read_to_string(&bashrc_path)?;
+    let domain = server.connect().await?;
+    let worktree = tempfile::tempdir().context("create worktree")?;
+    let session_id = domain
+        .create_session("default-bash-markers", worktree.path())
+        .await?;
+    let attached = domain.attach(&session_id, AttachMode::Shared).await?;
+    let tab_id = attached
+        .snapshot
+        .as_ref()
+        .and_then(|snapshot| snapshot.tabs.first())
+        .map(|tab| tab.id.clone())
+        .context("attach snapshot has no tabs")?;
+    let pane_id = domain
+        .spawn_pane(
+            &session_id,
+            &tab_id,
+            proto::TerminalSize {
+                cols: PANE_COLS,
+                rows: PANE_ROWS,
+            },
+            None,
+            Some(worktree.path()),
+        )
+        .await?;
+
+    domain
+        .send_input(&pane_id, b"printf 'rc:%s\\n' \"$Z3RM_TEST_RC_SOURCED\"\r")
+        .await?;
+    wait_for_commands(&domain, &pane_id, 1, Duration::from_secs(20)).await?;
+    domain.send_input(&pane_id, b"false\r").await?;
+    wait_for_commands(&domain, &pane_id, 2, Duration::from_secs(20)).await?;
+    domain
+        .send_input(&pane_id, b"z3rm_command_that_does_not_exist\r")
+        .await?;
+    wait_for_commands(&domain, &pane_id, 3, Duration::from_secs(20)).await?;
+    domain.send_input(&pane_id, b"sleep 30\r").await?;
+    wait_for_running_command(&domain, &pane_id, 4, Duration::from_secs(20)).await?;
+    domain.send_input(&pane_id, &[0x03]).await?;
+    wait_for_commands(&domain, &pane_id, 4, Duration::from_secs(20)).await?;
+    domain
+        .send_input(&pane_id, b"printf 'after-interrupt\\n'\r")
+        .await?;
+    let commands = wait_for_commands(&domain, &pane_id, 5, Duration::from_secs(20)).await?;
+
+    assert_eq!(
+        commands
+            .iter()
+            .take(5)
+            .map(|command| command.exit_code)
+            .collect::<Vec<_>>(),
+        vec![Some(0), Some(1), Some(127), Some(130), Some(0)],
+        "default bash integration must preserve command statuses: {commands:?}"
+    );
+    assert!(
+        commands
+            .iter()
+            .take(5)
+            .all(|command| command.prompt.is_some()
+                && command.command.is_some()
+                && command.output_start.is_some()
+                && command.command_end.is_some()),
+        "default bash commands must have complete OSC 133 ranges: {commands:?}"
+    );
+    let first = &commands[0];
+    let first_start = marker_line(&first.output_start).context("first output start")?;
+    let first_end = marker_line(&first.command_end).context("first command end")?;
+    let first_end = if first
+        .command_end
+        .as_ref()
+        .is_some_and(|marker| marker.column == 0)
+    {
+        first_end - 1
+    } else {
+        first_end
+    };
+    assert!(
+        read_lines(&domain, &pane_id, first_start, first_end)
+            .await?
+            .iter()
+            .any(|line| line.contains("rc:yes")),
+        "the managed rcfile must source the user's bashrc"
+    );
+    assert_eq!(std::fs::read_to_string(&bashrc_path)?, original_bashrc);
+
+    domain.kill_session(&session_id).await?;
+    Ok(())
 }
 
 #[tokio::test(flavor = "multi_thread")]

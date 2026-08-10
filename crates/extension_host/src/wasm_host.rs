@@ -936,7 +936,7 @@ mod tests {
                 http_client: FakeHttpClient::with_200_response(),
                 node_runtime: NodeRuntime::unavailable(),
                 proxy: Arc::new(ExtensionHostProxy::default()),
-                fs: FakeFs::new(cx.background_executor()),
+                fs: FakeFs::new(cx.background_executor().clone()),
                 work_dir: PathBuf::from("/work"),
                 granted_capabilities: ExtensionSettings::get_global(cx)
                     .granted_capabilities
@@ -981,7 +981,7 @@ mod tests {
 
     fn spawn_main_thread_message_loop(
         cx: &mut TestAppContext,
-        rx: mpsc::UnboundedReceiver<MainThreadCall>,
+        mut rx: mpsc::UnboundedReceiver<MainThreadCall>,
     ) -> Task<()> {
         cx.update(|cx| {
             cx.spawn(async move |cx| {

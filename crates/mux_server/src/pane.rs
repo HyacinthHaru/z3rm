@@ -749,7 +749,7 @@ impl Pane {
         } else {
             // 默认: $SHELL, 若未设置则 /bin/sh
             let shell = std::env::var("SHELL").unwrap_or_else(|_| "/bin/sh".to_string());
-            CommandBuilder::new(shell)
+            crate::shell_integration::default_shell_command(&shell)
         };
 
         // §3.1 设置 cwd
