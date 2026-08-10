@@ -5,7 +5,13 @@ use anyhow::{Context as _, Result};
 use interprocess::local_socket::tokio::Listener as LocalSocketListener;
 use sqlez::connection::Connection;
 use std::future::Future;
-use std::path::PathBuf;
+use std::io::Write as _;
+use std::path::{Path, PathBuf};
+use std::pin::Pin;
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::time::{Duration, SystemTime};
+use tokio::time::Duration;
+use tokio::time::Duration as TokioDuration;
 use std::pin::Pin;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::SystemTime;
@@ -127,10 +133,6 @@ fn unix_socket_path() -> Option<std::path::PathBuf> {
     Some(
         std::path::PathBuf::from(runtime_dir)
             .join("z3rm")
-            .join("mux.sock"),
-    )
-}
-
 async fn bind_socket(name: &interprocess::local_socket::Name<'_>) -> Result<LocalSocketListener> {
     use interprocess::local_socket::tokio::prelude::*;
     let listener = LocalSocketListener::from_options(
@@ -139,45 +141,309 @@ async fn bind_socket(name: &interprocess::local_socket::Name<'_>) -> Result<Loca
     Ok(listener)
 }
 
-/// §3.2 Try to bind, falling back to stale socket cleanup.
+// ============================================================================
+// §3.2 / §16.1 Local socket trust boundary + exclusive startup claim
+// ============================================================================
+//
+// The 0600 ACL the server applies after binding is only meaningful if the
+// path the server binds is the path clients connect to. A left-over socket
+// left by a crashed daemon, a same-uid attacker that swapped a regular file
+// for the socket, or a symlink redirecting bind/connect off the runtime dir
+// all defeat that guarantee. The helpers below make a single, well-ordered
+// startup decision:
+//
+//   1. lstat the existing path — reject symlinks and non-socket inodes, and
+//      refuse to bind over a socket owned by another uid (fail closed);
+//   2. probe connect AND check the recorded owner pid with `kill(pid, 0)`
+//      — only a socket whose owner is provably dead (no pid record, or a pid
+//      that no longer exists) is reclaimed, so a transiently-unresponsive live
+//      daemon is never split-brained by a second starter; and
+//   3. write a pid file (pid + boot timestamp) with `fsync` and atomic rename,
+//      so `z3rm-server status` and the next startup see a consistent owner.
+
+/// §3.2 Lifecycle files alongside a local Unix socket.
 ///
-/// On Unix, if  fails and a socket file exists, try connecting to it.
-/// If the connection fails (stale socket), remove the socket file and retry.
-/// On Windows, named pipes are ephemeral (server disappears = pipe gone),
-/// so stale cleanup is unnecessary.
-pub async fn bind_or_cleanup(
-    name: &interprocess::local_socket::Name<'_>,
-) -> Result<LocalSocketListener> {
-    match bind_socket(name).await {
-        Ok(listener) => Ok(listener),
-        Err(e) => {
-            #[cfg(unix)]
-            if let Some(socket_path) = unix_socket_path() {
-                if socket_path.exists() {
-                    use std::os::unix::net::UnixStream;
-                    match UnixStream::connect(&socket_path) {
-                        Ok(_) => {
-                            // Active server exists — return original error
-                            return Err(e);
-                        }
-                        Err(_) => {
-                            // Stale socket — remove and retry
-                            zlog::warn!("stale socket detected, cleaning: {:?}", socket_path);
-                            if let Err(e) = std::fs::remove_file(&socket_path) {
-                                tracing::warn!(error = %e, "remove stale socket failed");
-                            }
-                            return bind_socket(name).await;
-                        }
-                    }
-                }
+/// `pid` doubles as the startup claim: it records the owning pid and the boot
+/// timestamp the status command reports for uptime. `lock` is the exclusive
+/// marker the live owner holds; a starter that cannot place it knows another
+/// daemon already owns the socket and must not reclaim it.
+#[cfg(unix)]
+struct SocketSidecars {
+    pid: PathBuf,
+    lock: PathBuf,
+}
+
+#[cfg(unix)]
+fn socket_sidecars(socket_path: &Path) -> SocketSidecars {
+    let mut pid = socket_path.as_os_str().to_owned();
+    pid.push(".pid");
+    let mut lock = socket_path.as_os_str().to_owned();
+    lock.push(".lock");
+    SocketSidecars {
+        pid: PathBuf::from(pid),
+        lock: PathBuf::from(lock),
+    }
+}
+
+/// §3.2 `true` only when `pid` is an existing process the same uid may signal.
+///
+/// `kill(pid, 0)` returns `ESRCH` (or `EPERM` for a different uid) when the
+/// process is gone. pidfile ownership already pins the socket to our own uid,
+/// so `EPERM` here would be a Surprise worth surfacing — but the common "the
+/// prior daemon died without cleanup" answer is `ESRCH`, which we read as
+/// "owner gone, safe to reclaim".
+#[cfg(unix)]
+fn owner_process_alive(pid: u32) -> bool {
+    // Safety: kill(2) with signal 0 makes no signal delivery and is the
+    // documented liveness probe; the only arguments are the pid and 0.
+    let result = unsafe { libc::kill(libc::pid_t::from(pid), 0) };
+    if result == 0 {
+        return true;
+    }
+    let errno = std::io::Error::last_os_error().raw_os_error().unwrap_or(0);
+    errno != libc::ESRCH
+}
+
+/// §3.2 Read the pidfile recorded by a prior owner, if one is present and
+///parses. A missing or malformed file means "no recorded owner", which the
+/// caller treats as "stale" only together with a failed connect probe.
+#[cfg(unix)]
+fn read_owner_metadata(socket_path: &Path) -> Option<OwnerMetadata> {
+    let sidecars = socket_sidecars(socket_path);
+    let contents = std::fs::read_to_string(&sidecars.pid).ok()?;
+    let mut lines = contents.lines();
+    let pid: u32 = lines.next()?.trim().parse().ok()?;
+    let boot_secs: u64 = lines.next().and_then(|line| line.trim().parse().ok())?;
+    Some(OwnerMetadata { pid, boot_secs })
+}
+
+#[cfg(unix)]
+struct OwnerMetadata {
+    pid: u32,
+    boot_secs: u64,
+}
+
+/// §3.2 Classify an existing inode at `socket_path` for the trust boundary.
+///
+/// `lstat` is used deliberately: a symlink at the path must fail closed,
+/// because `bind` would follow it and leave the real target owned by an
+/// attacker. `stat` would defeat that check.
+#[cfg(unix)]
+enum SocketInodeState {
+    /// No inode at the path — clean bind target.
+    Missing,
+    /// Owned by the current uid and is a Unix socket — the only inode shape
+    /// we are willing to bind over (after a stale-reclaim probe).
+    OurSocket,
+    /// Path exists but is the wrong kind, owned by another uid, or a symlink.
+    /// The starter must refuse rather than reclaim it.
+    Unsafe(anyhow::Error),
+}
+
+#[cfg(unix)]
+fn classify_socket_inode(socket_path: &Path) -> SocketInodeState {
+    use std::os::unix::fs::MetadataExt as _;
+    let metadata = match std::fs::symlink_metadata(socket_path) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            return SocketInodeState::Missing;
+        }
+        Err(error) => {
+            return SocketInodeState::Unsafe(anyhow::anyhow!(
+                "cannot inspect existing socket path {}: {error}",
+                socket_path.display()
+            ));
+        }
+    };
+    let file_type = metadata.file_type();
+    if file_type.is_symlink() {
+        return SocketInodeState::Unsafe(anyhow::anyhow!(
+            "refusing to bind over symlink at {} (potential redirect off the runtime dir)",
+            socket_path.display()
+        ));
+    }
+    if !file_type.is_socket() {
+        return SocketInodeState::Unsafe(anyhow::anyhow!(
+            "refusing to bind over non-socket inode at {} ({:?})",
+            socket_path.display(),
+            file_type
+        ));
+    }
+    let our_uid = nix_uid();
+    if metadata.uid() != our_uid {
+        return SocketInodeState::Unsafe(anyhow::anyhow!(
+            "refusing to bind over socket at {} owned by uid {} (current uid {})",
+            socket_path.display(),
+            metadata.uid(),
+            our_uid
+        ));
+    }
+    SocketInodeState::OurSocket
+}
+
+#[cfg(unix)]
+fn nix_uid() -> u32 {
+    // Safety: getuid takes no arguments and returns the calling process' uid.
+    unsafe { libc::getuid() }
+}
+
+/// §3.2 A live accept loop is the authoritative "owner is alive" signal: a
+/// socket that still accepts a connection has a running server behind it. A
+/// refused connect alone is not enough — a slow-to-start daemon or a kernel
+/// backlog stalling the connect would let a second starter steal the socket.
+#[cfg(unix)]
+fn socket_accepts_connection(socket_path: &Path) -> bool {
+    use std::os::unix::net::UnixStream;
+    UnixStream::connect(socket_path).is_ok()
+}
+
+/// §3.2 Write the pidfile (pid + boot timestamp) atomically: stage to a
+/// sibling temp file, fsync for durability, then rename over the destination.
+/// The pidfile is the startup claim `z3rm-server status` and the next startup
+/// read to decide whether the recorded owner is still alive.
+#[cfg(unix)]
+fn write_pidfile(socket_path: &Path, boot: SystemTime) -> Result<()> {
+    let sidecars = socket_sidecars(socket_path);
+    let parent = sidecars.pid.parent().ok_or_else(|| {
+        anyhow::anyhow!("pidfile path has no parent: {}", sidecars.pid.display())
+    })?;
+    let pid = std::process::id();
+    let boot_secs = boot
+        .duration_since(SystemTime::UNIX_EPOCH)
+        .map(|duration| duration.as_secs())
+        .unwrap_or(0);
+    let mut staging = tempfile::NamedTempFile::new_in(parent)
+        .with_context(|| format!("create staging pidfile in {}", parent.display()))?;
+    writeln!(staging, "{pid}")?;
+    writeln!(staging, "{boot_secs}")?;
+    staging
+        .as_file()
+ .sync_all()
+        .with_context(|| format!("fsync staging pidfile for {}", socket_path.display()))?;
+    staging
+        .persist(&sidecars.pid)
+        .map_err(|error| anyhow::anyhow!("persist pidfile: {error}"))?;
+    fsync_parent(&sidecars.pid);
+    Ok(())
+}
+
+/// §3.2 fsync the directory containing `path` so the pidfile rename is
+/// durable across a crash. Best-effort: a failure here must not block start,
+/// because some tmpfs setups (and CI sandboxes) reject directory fsync.
+#[cfg(unix)]
+fn fsync_parent(path: &Path) {
+    let Some(parent) = path.parent() else { return };
+    match std::fs::File::open(parent) {
+        Ok(mut dir) => {
+            if let Err(error) = dir.sync_all() {
+                tracing::warn!(error = %error, dir = %parent.display(), "fsync parent dir failed (continuing)");
             }
-            Err(e)
+        }
+        Err(error) => tracing::warn!(
+            error = %error,
+            dir = %parent.display(),
+            "open parent dir for fsync failed (continuing)"
+        ),
+    }
+}
+
+/// §3.2 Remove the pidfile and the exclusive lock left by a prior owner.
+///
+/// Called on graceful shutdown and after reclaiming a stale socket, so the
+/// next startup sees a clean dir and does not misread a dead owner's record.
+#[cfg(unix)]
+fn remove_sidecars(socket_path: &Path) {
+    let sidecars = socket_sidecars(socket_path);
+    for file in [sidecars.pid.as_path(), sidecars.lock.as_path()] {
+        match std::fs::remove_file(file) {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => tracing::warn!(error = %error, path = %file.display(), "remove socket sidecar failed"),
         }
     }
 }
 
-/// §3.6 初始化数据库连接
-fn init_database(db_path: &PathBuf) -> Result<Connection> {
+/// §3.2 Try to bind, falling back to stale-socket cleanup.
+///
+/// On Unix the bind is gated by a trust-boundary check on the existing inode
+/// (symlink/foreign-uid/non-socket inodes fail closed) and an exclusive
+/// stale-reclaim decision: a leftover socket is only reclaimed when both a
+/// connect probe fails *and* the recorded owner pid is provably gone, so a
+/// live but transiently-unresponsive daemon cannot be split-brained by a
+/// concurrent starter. A satisfying bind writes a pidfile with the owning pid
+/// and boot timestamp so `z3rm-server status` and the next startup agree on
+/// ownership. On Windows named pipes are ephemeral, so the trust check is a
+/// no-op and stale cleanup is unnecessary.
+pub async fn bind_or_cleanup(
+    name: &interprocess::local_socket::Name<'_>,
+) -> Result<LocalSocketListener> {
+    match bind_socket(name).await {
+        Ok(listener) => {
+            #[cfg(unix)]
+            if let Some(socket_path) = unix_socket_path() {
+                write_pidfile(&socket_path, SystemTime::now())?;
+            }
+            Ok(listener)
+        }
+        Err(error) => {
+            #[cfg(unix)]
+            if let Some(socket_path) = unix_socket_path() {
+                return reclaim_or_refuse(&socket_path, name, error).await;
+            }
+            #[cfg(not(unix))]
+            let _ = name;
+            Err(error)
+        }
+    }
+}
+
+#[cfg(unix)]
+async fn reclaim_or_refuse(
+    socket_path: &Path,
+    name: &interprocess::local_socket::Name<'_>,
+    original_error: anyhow::Error,
+) -> Result<LocalSocketListener> {
+    match classify_socket_inode(socket_path) {
+        SocketInodeState::Missing => Err(original_error),
+        SocketInodeState::Unsafe(reason) => {
+            zlog::warn!("refusing to bind unsafe socket: {reason}");
+            Err(reason)
+        }
+        SocketInodeState::OurSocket => {
+            // §3.2 A live owner keeps its socket even if our connect stalls;
+            // only a connect failure *and* a dead/missing owner is reclaimed.
+            if socket_accepts_connection(socket_path) {
+                zlog::info!("live daemon owns {}; refusing to reclaim", socket_path.display());
+                return Err(original_error);
+            }
+            match read_owner_metadata(socket_path) {
+                Some(metadata) if owner_process_alive(metadata.pid) => {
+                    zlog::info!(
+                        "socket {} connect refused but owner pid {} is alive; refusing to reclaim",
+                        socket_path.display(),
+                        metadata.pid
+                    );
+                    Err(original_error)
+                }
+                _ => {
+                    zlog::warn!(
+                        "stale socket detected (no live owner); reclaiming {}",
+                        socket_path.display()
+                    );
+                    if let Err(remove_error) = std::fs::remove_file(socket_path) {
+                        if remove_error.kind() != std::io::ErrorKind::NotFound {
+                            tracing::warn!(error = %remove_error, "remove stale socket failed");
+                        }
+                    }
+                    remove_sidecars(socket_path);
+                    let listener = bind_socket(name).await?;
+                    write_pidfile(socket_path, SystemTime::now())?;
+                    Ok(listener)
+                }
+            }
+        }
+    }
+}
     let db = Connection::open_file(db_path.to_str().unwrap_or("file::memory:?mode=memory"));
     // §3.6 初始化持久化表
     persistence::init_tables(&db)?;
@@ -203,11 +469,6 @@ pub fn run() -> Result<()> {
     rt.block_on(async {
         let socket_name = default_socket_name()?;
         let listener = match bind_or_cleanup(&socket_name).await {
-            Ok(l) => l,
-            Err(e) => {
-                zlog::error!("socket bind failed: error={}", e);
-                return Err(e);
-            }
         };
 
         // §16.1 socket 权限 0600: 仅同 UID 可连接 —— §9 fail-open 角色模型的安全前提。

@@ -191,9 +191,25 @@ async fn reconnect_in_place_preserves_subscribers_and_window() -> Result<()> {
     })
     .await
     .context("did not receive synthetic SessionLayoutChanged after reconnect")?;
+    let changed = match event {
+        NotifEvent::SessionLayoutChanged(changed) => changed,
+        event => panic!("expected SessionLayoutChanged, got {event:?}"),
+    };
     assert!(
-        matches!(event, NotifEvent::SessionLayoutChanged(_)),
-        "subscriber must receive SessionLayoutChanged after reconnect"
+        changed.layout.is_some(),
+        "synthetic resync must carry the layout tree"
+    );
+    let resync_snapshot = changed
+        .snapshot
+        .context("reconnect resync must carry the authoritative SessionSnapshot")?;
+    let resynced_pane_ids: Vec<String> = resync_snapshot
+        .tabs
+        .iter()
+        .flat_map(|tab| tab.panes.iter().map(|pane| pane.id.clone()))
+        .collect();
+    assert!(
+        resynced_pane_ids.contains(&pane_id),
+        "resync snapshot must expose pane {pane_id}, got {resynced_pane_ids:?}"
     );
 
     // §15.12 The reattach snapshot from reconnect must expose the pane that

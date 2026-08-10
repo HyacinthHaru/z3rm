@@ -675,9 +675,6 @@ impl LspAdapter for RustLspAdapter {
         mut original: InitializeParams,
         cx: &App,
     ) -> Result<InitializeParams> {
-        // enable_lsp_tasks 字段已从 LspSettings 移除 (spec §16 Plan 16)
-        let enable_lsp_tasks = false;
-
         let mut experimental = json!({
             "commands": {
                 "commands": [
@@ -688,22 +685,6 @@ impl LspAdapter for RustLspAdapter {
                 ]
             }
         });
-
-        if enable_lsp_tasks {
-            merge_json_value_into(
-                json!({
-                    "runnables": {
-                        "kinds": [ "cargo", "shell" ],
-                    },
-                    "commands": {
-                        "commands": [
-                            "rust-analyzer.runSingle",
-                        ]
-                    }
-                }),
-                &mut experimental,
-            );
-        }
 
         if let Some(original_experimental) = &mut original.capabilities.experimental {
             merge_json_value_into(experimental, original_experimental);
@@ -721,10 +702,6 @@ impl LspAdapter for RustLspAdapter {
     ) -> Option<ClientCommand> {
         match command_name {
             "rust-analyzer.showReferences" => Some(ClientCommand::ShowLocations),
-            "rust-analyzer.runSingle" => {
-                // lsp_ext_command 模块已删除 (lsp_store 已移除)
-                None
-            }
             _ => None,
         }
     }

@@ -656,6 +656,16 @@ async fn dispatch_request(
                 ResponseBody::Error("permission denied: admin required".to_string())
             }
         }
+        // §16.9 Server chrome actions: a click on chrome the daemon rendered.
+        // Treated like a session mutation (ReadWrite): attached clients act,
+        // pre-attach one-shot CLI connections cannot (they fall to ReadOnly).
+        RequestBody::ExtensionChromeAction(r) => {
+            if check_permission(role, ClientRole::ReadWrite) {
+                handle_extension_chrome_action(r, extension_host).await?
+            } else {
+                ResponseBody::Error("permission denied: read-write access required".to_string())
+            }
+        }
         RequestBody::NewWindow(r) => {
             if check_permission(role, ClientRole::Admin) {
                 handle_new_window(r, sessions, connection_client_id).await?
@@ -956,7 +966,9 @@ fn handle_list_recovery_candidates(
                     id: candidate.id,
                     name: candidate.name,
                     cwd: candidate.cwd,
-                    metadata_complete: candidate.metadata_complete,
+                    // 类型化 cutover 后所有候选都携带完整 tab/pane 元数据;
+                    // 旧格式行在扫描阶段就被拒绝, 不会以 incomplete 候选发布。
+                    metadata_complete: true,
                     pane_ids: candidate.layout.pane_ids(),
                 })
                 .collect(),
@@ -1005,11 +1017,6 @@ fn handle_confirm_recovery(
                 anyhow::anyhow!("recovery candidate not found: {}", request.session_id)
             })?
     };
-    anyhow::ensure!(
-        candidate.metadata_complete,
-        "recovery candidate {} lacks complete pane metadata",
-        candidate.id
-    );
     anyhow::ensure!(
         !sessions
             .read()
@@ -1251,6 +1258,7 @@ async fn handle_attach(
             event: Some(mux_protocol::notification::Event::SessionLayoutChanged(
                 mux_protocol::SessionLayoutChanged {
                     layout: Some(mux_protocol::LayoutTree { root: None }),
+                    snapshot: None,
                 },
             )),
         };
@@ -2963,6 +2971,42 @@ async fn handle_install_extension(
     ))
 }
 
+/// §16.9 ExtensionChromeAction: route a click/change from server-rendered
+/// chrome back to the authoritative daemon-side extension host. The daemon
+/// validates the extension is loaded, not suspended, and the view id was
+/// actually published to clients; any failure returns `accepted=false` with
+/// a contextual error.
+async fn handle_extension_chrome_action(
+    req: &mux_protocol::ExtensionChromeActionRequest,
+    extension_host: &Arc<crate::extension_host::ServerExtensionHost>,
+) -> anyhow::Result<ResponseBody> {
+    let result = extension_host.execute_chrome_action(req).await;
+    let (accepted, error) = match &result {
+        Ok(()) => {
+            zlog::debug!(
+                "chrome action accepted: extension={} view={} command={}",
+                req.extension_id,
+                req.view_id,
+                req.command
+            );
+            (true, String::new())
+        }
+        Err(err) => {
+            zlog::warn!(
+                "chrome action rejected: extension={} view={} command={} error={:#}",
+                req.extension_id,
+                req.view_id,
+                req.command,
+                err
+            );
+            (false, format!("{err:#}"))
+        }
+    };
+    Ok(ResponseBody::ExtensionChromeActionResult(
+        mux_protocol::ExtensionChromeActionResponse { accepted, error },
+    ))
+}
+
 /// §3.10 RenameSession: 更新 session 名称。
 async fn handle_rename_session(
     req: &mux_protocol::RenameSessionRequest,
@@ -4029,6 +4073,7 @@ mod connection_unit_tests {
                 event: Some(mux_protocol::notification::Event::SessionLayoutChanged(
                     mux_protocol::SessionLayoutChanged {
                         layout: Some(layout_tree_to_proto(&layout)),
+                        snapshot: None,
                     },
                 )),
             })),
@@ -4196,6 +4241,175 @@ mod connection_unit_tests {
             pane.command.is_none(),
             "recovery must not rerun persisted command: {:?}",
             pane.command
+        );
+    }
+
+    /// §3.7/§15.4 恢复必须重建保存时的精确布局树 (节点 ID、比例、方向、焦点),
+    /// 且恢复后的 wire 投影与保存时的投影逐字节一致。
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn confirmed_recovery_restores_exact_multi_level_layout_projection() {
+        let connection = Connection::open_memory(Some("exact_multi_level_recovery"));
+        crate::persistence::init_tables(&connection).expect("initialize persistence tables");
+        let database = Arc::new(parking_lot::Mutex::new(connection));
+
+        let mut spawned = Vec::new();
+        for id in ["pane-1", "pane-2", "pane-3"] {
+            spawned.push(
+                crate::pane::Pane::spawn(
+                    id.to_string(),
+                    std::env::temp_dir().to_string_lossy().to_string(),
+                    80,
+                    24,
+                    Some(crate::pane::ShellCommand {
+                        program: "/bin/cat".to_string(),
+                        ..Default::default()
+                    }),
+                )
+                .expect("spawn original pane"),
+            );
+        }
+        let mut layout = crate::layout::LayoutTree::with_pane(
+            "node-1".to_string(),
+            "pane-1".to_string(),
+        );
+        layout
+            .split(
+                "pane-1",
+                "pane-2".to_string(),
+                crate::layout::SplitDirection::LeftRight,
+            )
+            .expect("split left-right");
+        layout
+            .resize_pane("pane-1", crate::layout::SplitDirection::LeftRight, 0.2)
+            .expect("resize outer split");
+        layout
+            .split(
+                "pane-2",
+                "pane-3".to_string(),
+                crate::layout::SplitDirection::TopBottom,
+            )
+            .expect("split top-bottom");
+        layout
+            .resize_pane("pane-2", crate::layout::SplitDirection::TopBottom, 0.1)
+            .expect("resize inner split");
+        let saved_projection = layout_tree_to_proto(&layout).encode_to_vec();
+
+        let mut original = crate::session::Session::new(
+            "recover-exact".to_string(),
+            "recover-exact".to_string(),
+            "/tmp".to_string(),
+        );
+        for pane in &spawned {
+            original.panes.write().insert(pane.id.clone(), pane.clone());
+        }
+        original.add_tab("tab-1".to_string(), "shell".to_string());
+        original.tabs.get_mut("tab-1").expect("tab").pane_ids = vec![
+            "pane-1".to_string(),
+            "pane-2".to_string(),
+            "pane-3".to_string(),
+        ];
+        original.layout = layout.clone();
+        original.focused_tab = Some("tab-1".to_string());
+        original.set_focused_pane("pane-3".to_string());
+        let persisted = Arc::new(parking_lot::RwLock::new(vec![original]));
+        crate::persistence::snapshot_sessions(&persisted, &database)
+            .expect("persist exact layout candidate");
+        drop(persisted);
+        drop(spawned);
+
+        let sessions = Arc::new(parking_lot::RwLock::new(Vec::new()));
+        let settings = crate::server_settings::ServerSettings::load();
+        let clipboard = Arc::new(crate::clipboard::ServerClipboard::new());
+        let (_extensions_dir, extension_host) = {
+            let extensions_dir = tempfile::tempdir().expect("temp dir");
+            let host = crate::extension_host::ServerExtensionHost::start(
+                sessions.clone(),
+                extensions_dir.path().join("extensions"),
+            );
+            (extensions_dir, host)
+        };
+
+        let response = handle_confirm_recovery(
+            &ConfirmRecoveryRequest {
+                session_id: "recover-exact".to_string(),
+            },
+            &sessions,
+            &database,
+            &settings,
+            &clipboard,
+            &extension_host,
+        )
+        .expect("confirm exact layout recovery");
+        match response {
+            ResponseBody::RecoveryConfirmed(recovered) => {
+                assert_eq!(
+                    recovered.pane_ids,
+                    vec!["pane-1", "pane-2", "pane-3"]
+                );
+            }
+            response => panic!("expected recovery confirmation, got {response:?}"),
+        }
+
+        let sessions = sessions.read();
+        assert_eq!(sessions.len(), 1);
+        let recovered = &sessions[0];
+        assert_eq!(
+            recovered.layout.root, layout.root,
+            "restored tree must be the exact saved tree"
+        );
+        assert_eq!(recovered.focused_tab.as_deref(), Some("tab-1"));
+        assert_eq!(recovered.focused_pane.as_deref(), Some("pane-3"));
+        assert_eq!(
+            recovered.layout.pane_ids(),
+            vec!["pane-1", "pane-2", "pane-3"]
+        );
+        assert_eq!(
+            layout_tree_to_proto(&recovered.layout).encode_to_vec(),
+            saved_projection,
+            "restored layout projection must match the saved projection"
+        );
+    }
+
+    /// 损坏的持久化行在确认恢复时必须报错, 且不得把任何 session 发布到
+    /// live registry。
+    #[tokio::test]
+    async fn corrupt_persisted_row_confirm_fails_without_publishing_session() {
+        let connection = Connection::open_memory(Some("corrupt_confirm_no_publish"));
+        crate::persistence::init_tables(&connection).expect("initialize persistence tables");
+        let mut insert = sqlez::statement::Statement::prepare(
+            &connection,
+            "INSERT INTO sessions (id, name, cwd, layout_snapshot, last_snapshot_timestamp) VALUES (?, ?, ?, ?, ?)",
+        )
+        .expect("prepare corrupt row insert");
+        insert.bind("corrupt", 1).expect("bind id");
+        insert.bind("corrupt", 2).expect("bind name");
+        insert.bind("/tmp", 3).expect("bind cwd");
+        insert
+            .bind(r#"{"version":2,"layout":{"nodes":[{"type":"split","id":"root","direction":"LeftRight","children":[1,2],"ratios":[0.0,1.0]},{"type":"pane","id":"n1","pane_id":"pane-1"},{"type":"pane","id":"n2","pane_id":"pane-2"}]},"tabs":[{"id":"tab-1","title":"shell","pane_ids":["pane-1","pane-2"]}],"panes":[{"id":"pane-1","cwd":"/tmp","title":"cat","cols":80,"rows":24},{"id":"pane-2","cwd":"/tmp","title":"cat","cols":80,"rows":24}],"focused_tab":"tab-1","focused_pane":"pane-1"}"#, 4)
+            .expect("bind corrupt layout");
+        insert.bind(&0_i64, 5).expect("bind timestamp");
+        insert.exec().expect("insert corrupt row");
+        let database = Arc::new(parking_lot::Mutex::new(connection));
+        let settings = crate::server_settings::ServerSettings::load();
+        let clipboard = Arc::new(crate::clipboard::ServerClipboard::new());
+        let (_extensions_dir, extension_host, _unattached) = handler_fixture(&sessions);
+
+        let error = handle_confirm_recovery(
+            &ConfirmRecoveryRequest {
+                session_id: "corrupt".to_string(),
+            },
+            &sessions,
+            &database,
+            &settings,
+            &clipboard,
+            &extension_host,
+        )
+        .expect_err("corrupt persisted layout must fail confirmation");
+        assert!(!error.to_string().is_empty());
+        assert!(
+            sessions.read().is_empty(),
+            "a rejected candidate must never publish a session"
         );
     }
 }

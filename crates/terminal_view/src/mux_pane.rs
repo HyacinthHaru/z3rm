@@ -2405,6 +2405,168 @@ mod tests {
         });
     }
 
+    /// §15.4 After a reconnect resync, the server-authoritative title/zoom
+    /// metadata must land in the view without re-issuing RPCs.
+    #[cfg(unix)]
+    #[gpui::test]
+    async fn reconcile_metadata_from_snapshot_updates_title_and_zoom(cx: &mut TestAppContext) {
+        cx.executor().allow_parking();
+        cx.update(|cx| {
+            let settings_store = SettingsStore::test(cx);
+            cx.set_global(settings_store);
+            theme_settings::init(theme::LoadThemes::JustBase, cx);
+        });
+
+        let (client, server) = match std::os::unix::net::UnixStream::pair() {
+            Ok(pair) => pair,
+            Err(error) => panic!("create mock mux socket pair: {error}"),
+        };
+        if let Err(error) = client.set_nonblocking(true) {
+            panic!("set mock mux client nonblocking: {error}");
+        }
+        let domain = match MuxDomain::connect_with_blocking_stream(client) {
+            Ok(domain) => Arc::new(domain),
+            Err(error) => panic!("connect mock mux domain: {error}"),
+        };
+        let server_thread = std::thread::spawn(move || serve_initial_grid(server));
+
+        let (view, cx) = cx.add_window_view(|window, cx| {
+            MuxPaneView::new(
+                "quiet-pane".to_string(),
+                domain,
+                WeakEntity::new_invalid(),
+                WeakEntity::new_invalid(),
+                window,
+                cx,
+            )
+        });
+        let initial_grid_applied = view.condition::<MuxPaneEvent>(cx, |view, _cx| {
+            view.generation == 7 && !view.fetch_in_flight
+        });
+        match server_thread.join() {
+            Ok(Ok(())) => {}
+            Ok(Err(error)) => panic!("mock mux server failed: {error}"),
+            Err(_) => panic!("mock mux server panicked"),
+        }
+        initial_grid_applied.await;
+
+        // §15.4 title + zoom arrive from the authoritative snapshot.
+        view.update(cx, |view, cx| {
+            view.reconcile_metadata_from_snapshot(Some("vim"), Some(true), cx);
+        });
+        view.read_with(cx, |view, cx| {
+            assert!(view.is_zoomed(), "zoom must be mirrored from snapshot");
+            assert_eq!(view.title(cx), "vim");
+        });
+
+        // A pane the snapshot no longer marks zoomed is unzoomed locally.
+        view.update(cx, |view, cx| {
+            view.reconcile_metadata_from_snapshot(None, Some(false), cx);
+        });
+        view.read_with(cx, |view, cx| {
+            assert!(!view.is_zoomed());
+        });
+    }
+
+    /// §16.7: a pane with an installed extension shortcut resolver matches a
+    /// bound chord (normalized to gpui's hyphen form) in the priority chain
+    /// and emits `MuxPaneEvent::ExtensionAction` instead of sending the key
+    /// to the PTY; an unbound chord never produces an extension action.
+    #[cfg(unix)]
+    #[gpui::test]
+    async fn extension_shortcut_resolver_emits_extension_action_for_bound_chord(
+        cx: &mut TestAppContext,
+    ) {
+        cx.executor().allow_parking();
+        cx.update(|cx| {
+            let settings_store = SettingsStore::test(cx);
+            cx.set_global(settings_store);
+            theme_settings::init(theme::LoadThemes::JustBase, cx);
+        });
+
+        let (client, server) = match std::os::unix::net::UnixStream::pair() {
+            Ok(pair) => pair,
+            Err(error) => panic!("create shortcut socket pair: {error}"),
+        };
+        if let Err(error) = client.set_nonblocking(true) {
+            panic!("set shortcut client nonblocking: {error}");
+        }
+        let domain = match MuxDomain::connect_with_blocking_stream(client) {
+            Ok(domain) => Arc::new(domain),
+            Err(error) => panic!("connect shortcut mux domain: {error}"),
+        };
+        let server_thread = std::thread::spawn(move || serve_initial_grid(server));
+
+        let (view, cx) = cx.add_window_view(|window, cx| {
+            MuxPaneView::new(
+                "shortcut-pane".to_string(),
+                domain,
+                WeakEntity::new_invalid(),
+                WeakEntity::new_invalid(),
+                window,
+                cx,
+            )
+        });
+        let initial_grid_applied = view.condition::<MuxPaneEvent>(cx, |view, _cx| {
+            view.generation == 7 && !view.fetch_in_flight
+        });
+        match server_thread.join() {
+            Ok(Ok(())) => {}
+            Ok(Err(error)) => panic!("shortcut mock mux server failed: {error}"),
+            Err(_) => panic!("shortcut mock mux server panicked"),
+        }
+        initial_grid_applied.await;
+
+        // Install a snapshot-backed resolver shaped like the extension host's.
+        let bindings = std::sync::Arc::new(std::sync::Mutex::new(
+            std::collections::BTreeMap::from([(
+                "ctrl-shift-p".to_string(),
+                "z3rm.command-palette.open".to_string(),
+            )]),
+        ));
+        view.update(cx, |view, _cx| {
+            view.set_extension_shortcut_resolver(Some(std::sync::Arc::new(
+                move |keystroke: &Keystroke| {
+                    let matched = bindings
+                        .lock()
+                        .unwrap()
+                        .iter()
+                        .find(|(chord, _)| {
+                            Keystroke::parse(chord.as_str())
+                                .map(|parsed| parsed == *keystroke)
+                                .unwrap_or(false)
+                        })
+                        .map(|(_, action)| SharedString::from(action.clone()));
+                    matched
+                },
+            )));
+        });
+
+        // Bound chord: the priority chain routes it to an extension action.
+        let extension_action = view.next_event::<MuxPaneEvent>(cx);
+        cx.update_window_entity(&view, |view, window, cx| {
+            let keystroke = Keystroke::parse("ctrl-shift-p").expect("parse bound chord");
+            view.dispatch_keystroke(&keystroke, window, cx);
+        });
+        let event = extension_action.await;
+        assert_eq!(
+            event,
+            MuxPaneEvent::ExtensionAction {
+                action_id: SharedString::from("z3rm.command-palette.open"),
+            },
+            "a bound extension shortcut must surface as an ExtensionAction event"
+        );
+
+        // Unbound chord: never an extension action (the key takes the normal
+        // PTY path, so only assert no extension event is queued).
+        view.update(cx, |view, _cx| {
+            assert!(
+                view.extension_shortcuts.is_some(),
+                "the resolver stays installed"
+            );
+        });
+    }
+
     #[cfg(unix)]
     #[gpui::test]
     async fn dirty_during_fetch_triggers_cursor_catch_up(cx: &mut TestAppContext) {

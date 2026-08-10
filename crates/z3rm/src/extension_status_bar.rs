@@ -64,6 +64,13 @@ impl ExtensionStatusBar {
     pub fn vdom_nodes(&self) -> &[VDomNode] {
         &self.vdom_nodes
     }
+
+    /// Borrow the cached draw ops for a display-list region (used by the host
+    /// and tests to observe that a region refreshed without a VDOM push).
+    #[allow(dead_code)]
+    pub fn display_list_ops(&self, region_id: &str) -> Option<&[DrawOp]> {
+        self.renderer.display_list(region_id)
+    }
 }
 
 impl Render for ExtensionStatusBar {

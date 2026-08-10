@@ -4123,7 +4123,7 @@ mod tests {
     use super::*;
     use crate::{
         AnyWindowHandle, AppContext as _, Context, InputEvent, Keystroke, MouseMoveEvent,
-        TestAppContext, util::FluentBuilder as _,
+        TestAppContext, canvas, util::FluentBuilder as _,
     };
     use std::rc::Weak;
 
@@ -4293,7 +4293,8 @@ mod tests {
 
         test_app
             .update_window(any_window, |_, window, cx| {
-                window.draw(cx).clear();
+            let arena_clear_needed = window.draw(cx);
+            arena_clear_needed.clear(cx);
             })
             .unwrap();
 
@@ -4313,7 +4314,8 @@ mod tests {
 
         test_app
             .update_window(any_window, |_, window, cx| {
-                window.draw(cx).clear();
+            let arena_clear_needed = window.draw(cx);
+            arena_clear_needed.clear(cx);
             })
             .unwrap();
 
@@ -4519,7 +4521,8 @@ mod tests {
             .unwrap();
         cx.run_until_parked();
         cx.update_window(window, |_, window, cx| {
-            window.draw(cx).clear();
+            let arena_clear_needed = window.draw(cx);
+            arena_clear_needed.clear(cx);
         })
         .unwrap();
     }
@@ -4711,7 +4714,10 @@ mod tests {
                 }
             })
             .into();
-        cx.update_window(window, |_, window, cx| window.draw(cx).clear())
+        cx.update_window(window, |_, window, cx| {
+            let arena_clear_needed = window.draw(cx);
+            arena_clear_needed.clear(cx);
+        })
             .unwrap();
 
         // Focus the *second* group's container, then advance like Tab would.

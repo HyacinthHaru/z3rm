@@ -5,24 +5,35 @@
 // them inside the daemon under the same quickjs_runtime resource limits the
 // GUI client applies (CPU fuel, memory cap, IO token bucket).
 //
-// Design (§5.2): every `LiveExtension` lives on one dedicated OS thread
-// (`z3rm-ext-host`). All QuickJS `ctx.with` re-entry — activation, rendering,
-// events, commands — happens on that thread only; connection handlers talk to
-// it through a command channel and await a oneshot reply, so the async tokio
-// tasks never block on JS execution. Chrome views rendered by server
-// extensions are fanned out to attached clients as `ExtensionChromeUpdate`
-// notifications (§16), using each session's existing lifecycle subscriber
-// set — the daemon never invents its own client list.
+// Design (§5.2): a manager thread (`z3rm-ext-host`) plus one dedicated OS
+// thread per extension (`z3rm-ext-<id>`). Every `LiveExtension` is created
+// and retained on its own worker thread, and all QuickJS `ctx.with`
+// re-entry — activation, rendering, events, commands — happens there only.
+// Connection handlers talk to the manager through a command channel and
+// await a oneshot reply; the manager routes emit/render/execute/list work to
+// workers with bounded waits, so a hung extension blocks nobody: not a
+// healthy peer, not the manager, not shutdown. Workers that exceed a
+// resource limit (CPU fuel, memory cap, IO token bucket) or fail to answer
+// in time are suspended: their chrome is tombstoned (empty payload) and a
+// daemon-authored status-bar VDOM notice naming the extension and the
+// reason is published. Chrome views rendered by server extensions are
+// fanned out to attached clients as `ExtensionChromeUpdate` notifications
+// (§16), using each session's existing lifecycle subscriber set — the
+// daemon never invents its own client list.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, mpsc};
+use std::time::{Duration, Instant};
 
 use anyhow::{Context as _, Result, bail};
+use futures::AsyncReadExt as _;
+use http_client::HttpClient as _;
+use reqwest_client::ReqwestClient;
 use mux_protocol::{ExtensionChromeUpdate, Notification};
 use quickjs_runtime::{
-    DiscoveredExtension, ExtensionRunner, HostBridge, LiveExtension, discover_server_extensions,
-    extension_roots, parse_manifest_str,
+    DiscoveredExtension, ExtensionRunner, FilesystemAccess, HostBridge, LiveExtension,
+    discover_server_extensions, extension_roots, parse_manifest_str,
 };
 
 type Sessions = Arc<parking_lot::RwLock<Vec<crate::session::Session>>>;
@@ -34,6 +45,198 @@ const MAX_INSTALL_ARCHIVE_BYTES: usize = 16 * 1024 * 1024;
 const MAX_EXTRACTED_BYTES: u64 = 64 * 1024 * 1024;
 /// Max extension id / install-name length; it becomes a directory component.
 const MAX_EXTENSION_ID_LEN: usize = 128;
+/// §16.9 Cap on a server chrome action request: command + arguments are a
+/// few hundred bytes of JSON in practice; the cap bounds host-thread parse
+/// work from a misbehaving client.
+const MAX_CHROME_ACTION_BYTES: usize = 1024 * 1024;
+
+// ---------------------------------------------------------------------------
+// §5.6 Server-extension approval ledger
+// ---------------------------------------------------------------------------
+//
+// Server extensions (side `server` or `both`) only activate after an
+// explicit approval. The ledger is a JSON file next to the user extensions
+// directory, mirroring the GUI client's consent store format exactly:
+// `[{"id", "policy_fingerprint", "state": "approved"|"denied"}]`, keyed by
+// id + the exact policy fingerprint (`ExtensionManifest::policy_fingerprint`)
+// the decision was made against — an update that changes capabilities,
+// limits, side or version re-requires approval. Loading fails closed: an
+// absent or corrupt file means nothing is approved, and records without the
+// explicit state/fingerprint the current format requires are skipped.
+
+/// §5.6 The daemon's decision for one exact policy fingerprint.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ServerConsentState {
+    Approved,
+    Denied,
+}
+
+/// §5.6 One persisted daemon-side approval decision. Serializes as
+/// `{"id", "policy_fingerprint", "state"}` with an explicit
+/// `"approved"/"denied"` state — no sentinel values.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ServerConsentRecord {
+    pub id: String,
+    pub policy_fingerprint: String,
+    pub state: ServerConsentState,
+}
+
+impl ServerConsentRecord {
+    fn to_json(&self) -> serde_json::Value {
+        let state = match self.state {
+            ServerConsentState::Approved => "approved",
+            ServerConsentState::Denied => "denied",
+        };
+        serde_json::json!({
+            "id": self.id,
+            "policy_fingerprint": self.policy_fingerprint,
+            "state": state,
+        })
+    }
+
+    /// Strict record parse: legacy or malformed records (missing fields,
+    /// unknown state, wrong types) fail closed into `None` and are skipped —
+    /// they never grant approval.
+    fn from_json(value: &serde_json::Value) -> Option<ServerConsentRecord> {
+        let id = value.get("id")?.as_str()?.to_string();
+        let policy_fingerprint = value.get("policy_fingerprint")?.as_str()?.to_string();
+        let state = match value.get("state")?.as_str()? {
+            "approved" => ServerConsentState::Approved,
+            "denied" => ServerConsentState::Denied,
+            _ => return None,
+        };
+        Some(ServerConsentRecord {
+            id,
+            policy_fingerprint,
+            state,
+        })
+    }
+}
+
+/// §5.6 Ledger path: a JSON file next to the user extensions directory.
+fn server_consent_path(user_extensions_dir: &Path) -> PathBuf {
+    user_extensions_dir.join("extension-consent.json")
+}
+
+/// Load approval records as `id → record`. An absent file is an empty
+/// ledger; an unreadable or corrupt file is treated as empty (fail closed:
+/// nothing unapproved runs, nothing crashes) with a log.
+fn load_server_consent(path: &Path) -> BTreeMap<String, ServerConsentRecord> {
+    let text = match std::fs::read_to_string(path) {
+        Ok(text) => text,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return BTreeMap::new(),
+        Err(error) => {
+            tracing::warn!(
+                path = %path.display(),
+                %error,
+                "server extension consent file unreadable; treating as empty"
+            );
+            return BTreeMap::new();
+        }
+    };
+    let value: serde_json::Value = match serde_json::from_str(&text) {
+        Ok(value) => value,
+        Err(error) => {
+            tracing::warn!(
+                path = %path.display(),
+                %error,
+                "server extension consent file corrupt; treating as empty"
+            );
+            return BTreeMap::new();
+        }
+    };
+    let Some(records) = value.as_array() else {
+        tracing::warn!(
+            path = %path.display(),
+            "server extension consent file is not an array; treating as empty"
+        );
+        return BTreeMap::new();
+    };
+    let mut consented = BTreeMap::new();
+    for record in records {
+        let Some(record) = ServerConsentRecord::from_json(record) else {
+            tracing::warn!(
+                path = %path.display(),
+                %record,
+                "skipping malformed server extension consent record"
+            );
+            continue;
+        };
+        consented.insert(record.id.clone(), record);
+    }
+    consented
+}
+
+/// Load the raw ledger record array (each element untouched), used by
+/// writers that must preserve unknown fields (proof records with nonce/TTL
+/// extras). An absent or corrupt file yields an empty vec.
+fn load_server_consent_raw(path: &Path) -> Vec<serde_json::Value> {
+    let text = match std::fs::read_to_string(path) {
+        Ok(text) => text,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Vec::new(),
+        Err(error) => {
+            tracing::warn!(
+                path = %path.display(),
+                %error,
+                "server extension consent file unreadable; treating as empty"
+            );
+            return Vec::new();
+        }
+    };
+    match serde_json::from_str::<serde_json::Value>(&text) {
+        Ok(serde_json::Value::Array(records)) => records,
+        Ok(_) => {
+            tracing::warn!(
+                path = %path.display(),
+                "server extension consent file is not an array; treating as empty"
+            );
+            Vec::new()
+        }
+        Err(error) => {
+            tracing::warn!(
+                path = %path.display(),
+                %error,
+                "server extension consent file corrupt; treating as empty"
+            );
+            Vec::new()
+        }
+    }
+}
+
+/// Persist raw ledger records as a JSON array. Writes are temp-file + rename
+/// so a crash mid-write cannot corrupt the ledger. Errors propagate: callers
+/// must not report success when the ledger could not be written.
+fn save_server_consent_raw(path: &Path, records: &[serde_json::Value]) -> Result<()> {
+    let serialized = serde_json::to_string_pretty(records)
+        .context("serializing server extension consent records failed")?;
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)
+            .with_context(|| format!("creating consent directory {}", parent.display()))?;
+    }
+    let temporary = path.with_extension("json.tmp");
+    std::fs::write(&temporary, serialized)
+        .with_context(|| format!("writing server extension consent file {}", temporary.display()))?;
+    std::fs::rename(&temporary, path)
+        .with_context(|| format!("committing server extension consent file {}", path.display()))?;
+    Ok(())
+}
+
+/// §5.6 Whether the ledger approves `manifest`: an `Approved` record whose
+/// fingerprint matches the manifest exactly. Anything else — no record, a
+/// Denied record, or a record for a different fingerprint (manifest changed
+/// since the decision) — is not approved.
+fn ledger_approves(
+    records: &BTreeMap<String, ServerConsentRecord>,
+    manifest: &quickjs_runtime::ExtensionManifest,
+) -> bool {
+    match records.get(&manifest.id) {
+        Some(record) => {
+            record.state == ServerConsentState::Approved
+                && record.policy_fingerprint == manifest.policy_fingerprint()
+        }
+        None => false,
+    }
+}
 
 /// Default user extension directory, matching the client sync path
 /// (`mux::sync::default_extensions_dir`): installs land where both sides
@@ -66,11 +269,90 @@ struct ChromeView {
 /// anything it cannot.
 pub struct ServerHostBridge {
     sessions: Sessions,
+    /// §5.6 扩展声明的文件系统范围。每个扩展装载时按自己的 manifest 声明构造
+    /// 专属桥 (见 [`worker_thread_main`] 的 `WorkerSetup::Discovered` 分支 /
+    /// [`install_on_host_thread`]), 因此这里
+    /// 是一个确定的范围, 而不是多个扩展范围的并集。
+    filesystem: FilesystemAccess,
+    /// §5.6 Home 约束根 (默认 `dirs::home_dir()`)。服务器可注入用户主目录
+    /// (例如按连接用户解析), 测试注入临时目录。
+    home: Option<PathBuf>,
+    /// §5.6 Cwd 约束根 (默认宿主进程当前工作目录, 即 `workspace.getPath` 报告的
+    /// 权威根)。测试注入临时目录以在不依赖进程环境的情况下验证 cwd 范围。
+    cwd: Option<PathBuf>,
 }
 
 impl ServerHostBridge {
-    pub fn new(sessions: Sessions) -> Self {
-        Self { sessions }
+    /// 按扩展声明的文件系统范围构造桥; 约束根取宿主默认值 (home = 进程主目录,
+    /// cwd = 进程当前工作目录)。
+    pub fn new(sessions: Sessions, filesystem: FilesystemAccess) -> Self {
+        Self {
+            sessions,
+            filesystem,
+            home: None,
+            cwd: None,
+        }
+    }
+
+    /// §5.6 覆盖 Home 约束根: 注入后 `filesystem.*` 的 Home 范围操作被限制在该
+    /// 目录内 (不再读取进程环境的主目录)。仅供测试与需要显式用户主目录的宿主
+    /// 使用。
+    pub fn with_home(sessions: Sessions, home: PathBuf, filesystem: FilesystemAccess) -> Self {
+        Self {
+            sessions,
+            filesystem,
+            home: Some(home),
+            cwd: None,
+        }
+    }
+
+    /// §5.6 同时覆盖 Home 与 Cwd 约束根 (仅供测试): 两个范围都能在临时目录内
+    /// 验证, 不依赖进程环境。
+    pub fn with_roots(
+        sessions: Sessions,
+        home: PathBuf,
+        cwd: PathBuf,
+        filesystem: FilesystemAccess,
+    ) -> Self {
+        Self {
+            sessions,
+            filesystem,
+            home: Some(home),
+            cwd: Some(cwd),
+        }
+    }
+
+    /// 解析 Home 约束根。
+    fn home_dir(&self) -> Result<PathBuf> {
+        match &self.home {
+            Some(home) => Ok(home.clone()),
+            None => dirs::home_dir().context("host home directory unavailable"),
+        }
+    }
+
+    /// 解析 Cwd 约束根: 注入的根, 否则宿主进程的权威当前工作目录 (与
+    /// `workspace.getPath` 报告的是同一个根)。
+    fn cwd_dir(&self) -> Result<PathBuf> {
+        match &self.cwd {
+            Some(cwd) => Ok(cwd.clone()),
+            None => std::env::current_dir().context("host working directory unavailable"),
+        }
+    }
+
+    /// §5.6 把扩展请求的路径约束到声明范围内 (见 [`quickjs_runtime::confine_to_root`])。
+    ///
+    /// 范围语义: `Cwd` 只允许权威工作区/当前工作根内的路径, `Home` 只允许主
+    /// 目录内的路径——`cwd` 声明不能因此获得主目录访问权, home 也不能逃出主
+    /// 目录。`None` (未声明) fail closed。
+    fn confine(&self, path: &str) -> Result<PathBuf> {
+        let root = match self.filesystem {
+            FilesystemAccess::None => {
+                bail!("filesystem access is not granted to this extension");
+            }
+            FilesystemAccess::Cwd => self.cwd_dir()?,
+            FilesystemAccess::Home => self.home_dir()?,
+        };
+        quickjs_runtime::confine_to_root(&root, path)
     }
 
     fn find_pane(&self, pane_id: &str) -> Option<Arc<crate::pane::Pane>> {
@@ -94,6 +376,68 @@ fn optional_u32(args: &serde_json::Value, index: usize) -> Option<u32> {
     args.get(index)
         .and_then(serde_json::Value::as_u64)
         .map(|value| value.min(u32::MAX as u64) as u32)
+}
+
+fn read_server_setting(key: &str) -> Result<serde_json::Value> {
+    if key.trim().is_empty() || key.split('.').any(str::is_empty) {
+        bail!("settings key must be a non-empty dotted path");
+    }
+    let path = paths::settings_file();
+    let text = match std::fs::read_to_string(path) {
+        Ok(text) => text,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(serde_json::Value::Null),
+        Err(error) => return Err(error).with_context(|| format!("reading {}", path.display())),
+    };
+    let document: serde_json::Value = serde_json::from_str(&text)
+        .with_context(|| format!("parsing {}", path.display()))?;
+    let mut cursor = &document;
+    for segment in key.split('.') {
+        cursor = match cursor.get(segment) {
+            Some(next) => next,
+            None => return Ok(serde_json::Value::Null),
+        };
+    }
+    Ok(cursor.clone())
+}
+
+fn write_server_setting(key: &str, value: serde_json::Value) -> Result<serde_json::Value> {
+    if key.trim().is_empty() || key.split('.').any(str::is_empty) {
+        bail!("settings key must be a non-empty dotted path");
+    }
+    let path = paths::settings_file();
+    let mut document = match std::fs::read_to_string(path) {
+        Ok(text) => serde_json::from_str(&text)
+            .with_context(|| format!("parsing {}", path.display()))?,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => serde_json::json!({}),
+        Err(error) => return Err(error).with_context(|| format!("reading {}", path.display())),
+    };
+    let mut cursor = &mut document;
+    for segment in key.split('.') {
+        if !cursor.is_object() {
+            *cursor = serde_json::json!({});
+        }
+        let object = cursor
+            .as_object_mut()
+            .context("settings document became non-object")?;
+        cursor = object
+            .entry(segment.to_owned())
+            .or_insert(serde_json::Value::Null);
+    }
+    *cursor = value.clone();
+    let encoded = serde_json::to_vec_pretty(&document).context("serializing settings")?;
+    let parent = path.parent().context("settings path has no parent")?;
+    std::fs::create_dir_all(parent)
+        .with_context(|| format!("creating settings directory {}", parent.display()))?;
+    let temporary = parent.join(format!(".settings.json.{}.tmp", std::process::id()));
+    std::fs::write(&temporary, encoded)
+        .with_context(|| format!("writing temporary settings file {}", temporary.display()))?;
+    std::fs::File::open(&temporary)?.sync_all()?;
+    std::fs::rename(&temporary, path)
+        .with_context(|| format!("committing settings file {}", path.display()))?;
+    if let Ok(directory) = std::fs::File::open(parent) {
+        let _ = directory.sync_all();
+    }
+    Ok(value)
 }
 
 impl HostBridge for ServerHostBridge {
@@ -173,43 +517,299 @@ impl HostBridge for ServerHostBridge {
                     .join("\n");
                 Ok(serde_json::json!(text))
             }
+            "settings.get" => {
+                let key = required_string(args, 0, method)?;
+                read_server_setting(&key)
+            }
+            "settings.set" => {
+                let key = required_string(args, 0, method)?;
+                let value = args.get(1).cloned().unwrap_or(serde_json::Value::Null);
+                write_server_setting(&key, value)
+            }
+            "workspace.getPath" => {
+                // 只读、无参: 返回宿主进程的工作目录。失败 (理论上的无 cwd)
+                // 时报错而不是假装成功。
+                let cwd = std::env::current_dir()
+                    .context("reading the host working directory for workspace.getPath")?;
+                Ok(serde_json::json!(cwd.to_string_lossy().to_string()))
+            }
+            "filesystem.readTextFile" => {
+                let path = required_string(args, 0, method)?;
+                let path = self.confine(&path)?;
+                let metadata = std::fs::metadata(&path)
+                    .with_context(|| format!("reading {}", path.display()))?;
+                if metadata.len() > quickjs_runtime::MAX_EXTENSION_FILE_READ {
+                    bail!(
+                        "file is too large for an extension to read (limit {} bytes): {}",
+                        quickjs_runtime::MAX_EXTENSION_FILE_READ,
+                        path.display()
+                    );
+                }
+                let text = std::fs::read_to_string(&path)
+                    .with_context(|| format!("reading {}", path.display()))?;
+                Ok(serde_json::json!(text))
+            }
+            "filesystem.readDir" => {
+                let path = required_string(args, 0, method)?;
+                let path = self.confine(&path)?;
+                let mut entries = Vec::new();
+                for entry in std::fs::read_dir(&path)
+                    .with_context(|| format!("listing {}", path.display()))?
+                {
+                    let entry = entry.with_context(|| format!("listing {}", path.display()))?;
+                    let kind = match entry.file_type() {
+                        Ok(kind) if kind.is_dir() => "dir",
+                        Ok(kind) if kind.is_symlink() => "symlink",
+                        _ => "file",
+                    };
+                    entries.push(serde_json::json!({
+                        "name": entry.file_name().to_string_lossy(),
+                        "kind": kind,
+                    }));
+                    if entries.len() >= quickjs_runtime::MAX_EXTENSION_DIR_ENTRIES {
+                        break;
+                    }
+                }
+                Ok(serde_json::Value::Array(entries))
+            }
+            "network.fetch" => {
+                let url = required_string(args, 0, method)?;
+                let options = args.get(1).cloned().unwrap_or_else(|| serde_json::json!({}));
+                let method_name = options
+                    .get("method")
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or("GET");
+                let request_method = http_client::Method::from_bytes(method_name.as_bytes())
+                    .with_context(|| format!("invalid HTTP method: {method_name}"))?;
+                let uri: http_client::Uri = url.parse().with_context(|| format!("invalid URL: {url}"))?;
+                let body = options
+                    .get("body")
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or_default()
+                    .as_bytes()
+                    .to_vec();
+                if body.len() > quickjs_runtime::MAX_EXTENSION_FILE_READ as usize {
+                    bail!("network request body exceeds {} bytes", quickjs_runtime::MAX_EXTENSION_FILE_READ);
+                }
+                let request = http_client::Request::builder()
+                    .method(request_method)
+                    .uri(uri)
+                    .body(http_client::AsyncBody::from(body))
+                    .context("building network request")?;
+                let client = ReqwestClient::new();
+                let response = futures::executor::block_on(client.send(request))?;
+                let (parts, body) = response.into_parts();
+                let headers = parts
+                    .headers
+                    .iter()
+                    .filter_map(|(name, value)| {
+                        Some((
+                            name.as_str().to_owned(),
+                            serde_json::Value::String(value.to_str().ok()?.to_owned()),
+                        ))
+                    })
+                    .collect::<serde_json::Map<_, _>>();
+                let response_body = futures::executor::block_on(async move {
+                    let mut bytes = Vec::new();
+                    let mut body = body;
+                    body.read_to_end(&mut bytes).await.map_err(anyhow::Error::from)?;
+                    if bytes.len() > quickjs_runtime::MAX_EXTENSION_FILE_READ as usize {
+                        bail!("network response exceeds {} bytes", quickjs_runtime::MAX_EXTENSION_FILE_READ);
+                    }
+                    Ok::<_, anyhow::Error>(bytes)
+                })?;
+                Ok(serde_json::json!({
+                    "status": parts.status.as_u16(),
+                    "headers": headers,
+                    "body": String::from_utf8_lossy(&response_body),
+                }))
+            }
+            "process.spawn" => {
+                let command = required_string(args, 0, method)?;
+                let arguments = args
+                    .get(1)
+                    .and_then(serde_json::Value::as_array)
+                    .map(|values| {
+                        values
+                            .iter()
+                            .map(|value| {
+                                value
+                                    .as_str()
+                                    .map(str::to_owned)
+                                    .context("process arguments must be strings")
+                            })
+                            .collect::<Result<Vec<_>>>()
+                    })
+                    .transpose()?
+                    .unwrap_or_default();
+                let output = std::process::Command::new(&command)
+                    .args(&arguments)
+                    .output()
+                    .with_context(|| format!("spawning process {command}"))?;
+                if output.stdout.len() + output.stderr.len()
+                    > quickjs_runtime::MAX_EXTENSION_FILE_READ as usize
+                {
+                    bail!("process output exceeds {} bytes", quickjs_runtime::MAX_EXTENSION_FILE_READ);
+                }
+                Ok(serde_json::json!({
+                    "status": output.status.code(),
+                    "success": output.status.success(),
+                    "stdout": String::from_utf8_lossy(&output.stdout),
+                    "stderr": String::from_utf8_lossy(&output.stderr),
+                }))
+            }
             other => bail!("unknown host method: {other}"),
-        }
     }
 }
 
 // ---------------------------------------------------------------------------
-// Host thread actor
+// Host manager + one worker thread per extension
 // ---------------------------------------------------------------------------
 
+/// Commands the `ServerExtensionHost` front door sends to the manager
+/// thread. Worker threads also report through this channel (they hold a
+/// [`mpsc::Sender`] clone), so the manager processes reports like any other
+/// command — no extra thread or polling.
 enum HostCommand {
-    /// Extract + load (or replace) an extension, answering on `reply`.
+    /// Extract + load (or replace) an extension on a fresh worker, answering
+    /// on `reply`.
     Install {
         id: String,
         archive: Vec<u8>,
         reply: tokio::sync::oneshot::Sender<Result<()>>,
     },
-    /// §3.4 Deliver a server event to extension subscribers.
+    /// §3.4 Deliver a server event to every non-suspended extension.
     Emit {
         event: String,
         payload: String,
     },
     /// Force a full chrome re-render and push.
     Render,
+    /// §16.9 Execute a command on ONE named server extension, answering on
+    /// `reply`. Fail-closed validation happens on the manager thread: unknown
+    /// or suspended extensions and unpublished view ids are rejected before
+    /// any JS runs.
+    ExecuteExtension {
+        extension_id: String,
+        view_id: String,
+        command: String,
+        arguments: String,
+        reply: tokio::sync::oneshot::Sender<Result<()>>,
+    },
     ListIds(tokio::sync::oneshot::Sender<Vec<String>>),
+    /// One worker → manager report.
+    WorkerEvent(WorkerEvent),
     Shutdown,
 }
 
-/// A live extension plus §5.6 suspension state: an extension that blows its
-/// CPU or memory budget is suspended for the daemon's lifetime instead of
-/// keep burning the host thread.
+/// §5.6 Why an extension was suspended. The reason string is surfaced
+/// verbatim in the status-bar notice, so keep it user-meaningful.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SuspensionReason {
+    CpuBudget,
+    MemoryBudget,
+    IoRateLimit,
+    /// The worker did not answer a bounded host wait (render/execute).
+    Unresponsive,
+    /// The worker thread exited without answering.
+    Crashed,
+}
+
+impl SuspensionReason {
+    fn as_str(self) -> &'static str {
+        match self {
+            SuspensionReason::CpuBudget => "cpu budget exceeded",
+            SuspensionReason::MemoryBudget => "memory budget exceeded",
+            SuspensionReason::IoRateLimit => "io rate limit exceeded",
+            SuspensionReason::Unresponsive => "did not respond to the host in time",
+            SuspensionReason::Crashed => "worker exited unexpectedly",
+        }
+    }
+}
+
+/// One worker → manager report.
+enum WorkerEvent {
+    /// The worker detected a resource-limit violation and self-suspended.
+    /// `instance` distinguishes workers of the same extension id across
+    /// reinstalls, so a late report from a replaced worker is ignored.
+    Suspended {
+        extension_id: String,
+        instance: u64,
+        reason: SuspensionReason,
+    },
+    /// An event dispatch invalidated chrome; the manager should run a render
+    /// round.
+    RenderRequested {
+        extension_id: String,
+        instance: u64,
+    },
+}
+
+/// Commands the manager sends to ONE extension worker. A worker owns its
+/// `LiveExtension` exclusively, so every variant runs JS on that worker's
+/// thread and nowhere else (§5.2).
+enum WorkerCommand {
+    /// Deliver a host event to the extension's subscribers.
+    Emit {
+        event: String,
+        payload: String,
+    },
+    /// Re-render (force) or render only when invalidated; answers with the
+    /// fresh VDOM JSON list (possibly empty = nothing changed).
+    Render {
+        force: bool,
+        reply: mpsc::Sender<Vec<String>>,
+    },
+    /// Run a command through the extension's own command registry.
+    Execute {
+        command: String,
+        arguments: String,
+        reply: mpsc::Sender<Result<()>>,
+    },
+    Shutdown,
+}
+
+/// How a worker is brought up: what to load before it enters its serve loop.
+enum WorkerSetup {
+    /// §16.6 Fresh install: extract, validate and activate on the worker
+    /// thread; the extracted directory is swapped into place atomically.
+    Install {
+        archive: Vec<u8>,
+        user_extensions_dir: PathBuf,
+        sessions: Sessions,
+        consent: BTreeMap<String, ServerConsentRecord>,
+    },
+    /// §5.5 Startup discovery: activate an already-installed extension.
+    Discovered {
+        manifest: quickjs_runtime::ExtensionManifest,
+        source: String,
+        sessions: Sessions,
+    },
+}
+
+/// Outcome of a worker's load step, answered on `ready_tx` before the worker
+/// enters its serve loop.
+enum WorkerReady {
+    Running,
+    /// Loaded, but already crossed a resource limit during activation; the
+    /// manager must never route work to it.
+    Suspended(SuspensionReason),
+    /// Load failed (activation error, bad archive, ...).
+    Failed(String),
+}
+
+/// A live extension plus §5.6 suspension state, owned by its worker thread.
+/// An extension that blows its CPU, memory or IO budget is suspended for the
+/// daemon's lifetime instead of keep burning the worker thread.
 struct HostedExtension {
     live: LiveExtension,
     suspended: bool,
 }
 
 impl HostedExtension {
-    fn note_resource_violations(&mut self) {
+    /// Drain error logs and the §5.6 resource-violation flags. `Some(reason)`
+    /// means the extension crossed a limit and must be suspended.
+    fn detect_violation(&mut self) -> Option<SuspensionReason> {
         match self.live.take_errors() {
             Ok(errors) => {
                 for error in errors {
@@ -221,26 +821,94 @@ impl HostedExtension {
             }
         }
         if self.live.take_cpu_interrupted() {
-            self.suspended = true;
-            tracing::error!(
-                id = %self.live.id(),
-                "server extension exceeded its CPU budget and was suspended"
-            );
-            return;
+            return Some(SuspensionReason::CpuBudget);
         }
         if self.live.take_memory_violated() {
+            return Some(SuspensionReason::MemoryBudget);
+        }
+        // §5.6 IO quota rejection is flagged in Rust at the token bucket, so
+        // it survives an extension's JS try/catch; the flag is the only
+        // reliable signal that the extension exceeded its `io_rate_limit`.
+        if self.live.take_io_violated() {
+            return Some(SuspensionReason::IoRateLimit);
+        }
+        None
+    }
+
+    /// Re-render every registered view (or only dirty ones when `force` is
+    /// false) and return the fresh VDOM JSON list. A render failure yields
+    /// no views.
+    fn render(&mut self, force: bool) -> Vec<String> {
+        if !force && !self.live.needs_render().unwrap_or_else(|error| {
+            tracing::warn!(id = %self.live.id(), %error, "invalidation check failed");
+            false
+        }) {
+            return Vec::new();
+        }
+        match self.live.render_all_views() {
+            Ok(rendered) => rendered,
+            Err(error) => {
+                tracing::warn!(id = %self.live.id(), %error, "server extension render failed");
+                Vec::new()
+            }
+        }
+    }
+
+    /// §5.6 Check for violations after a JS-touching operation. When the
+    /// extension crossed a limit: mark it suspended, report the reason to
+    /// the manager (which tombstones its chrome and publishes the notice)
+    /// and return `true` so the worker winds down. Otherwise, when the
+    /// operation invalidated chrome, ask the manager for a render round.
+    fn finish_operation(
+        &mut self,
+        events_tx: &mpsc::Sender<HostCommand>,
+        instance: u64,
+    ) -> bool {
+        if let Some(reason) = self.detect_violation() {
             self.suspended = true;
             tracing::error!(
                 id = %self.live.id(),
-                "server extension exceeded its memory budget and was suspended"
+                reason = reason.as_str(),
+                "server extension suspended"
             );
+            let _ = events_tx.send(HostCommand::WorkerEvent(WorkerEvent::Suspended {
+                extension_id: self.live.id().to_string(),
+                instance,
+                reason,
+            }));
+            return true;
         }
+        let dirty = self.live.needs_render().unwrap_or_else(|error| {
+            tracing::warn!(id = %self.live.id(), %error, "invalidation check failed");
+            false
+        });
+        if dirty {
+            let _ = events_tx.send(HostCommand::WorkerEvent(WorkerEvent::RenderRequested {
+                extension_id: self.live.id().to_string(),
+                instance,
+            }));
+        }
+        false
     }
+}
+
+/// The manager thread's per-extension bookkeeping. `join` is handed back to
+/// the host owner at shutdown so it can reap workers without ever joining a
+/// hung one indefinitely.
+struct WorkerHandle {
+    command_tx: mpsc::Sender<WorkerCommand>,
+    join: std::thread::JoinHandle<()>,
+    /// Unique per spawn; guards against late reports from a replaced worker.
+    instance: u64,
+    suspended: bool,
 }
 
 pub struct ServerExtensionHost {
     command_tx: mpsc::Sender<HostCommand>,
     thread: parking_lot::Mutex<Option<std::thread::JoinHandle<()>>>,
+    /// The manager hands its worker join handles back here at shutdown so
+    /// `Drop` can reap them without waiting on a hung worker itself.
+    shutdown_rx: mpsc::Receiver<Vec<std::thread::JoinHandle<()>>>,
     user_extensions_dir: PathBuf,
     sessions: Sessions,
 }
@@ -294,20 +962,31 @@ fn layout_node_json(node: &mux_protocol::LayoutNode) -> serde_json::Value {
 }
 
 impl ServerExtensionHost {
-    /// Spawn the dedicated extension thread, discover already-installed
+    /// Spawn the manager thread (which spawns one worker thread per
+    /// discovered or installed extension), discover already-installed
     /// server extensions (§5.5 / §16.8), and start the chrome fan-out task.
     ///
     /// Startup failures inside the thread are logged, never fatal (§15.7):
     /// a broken extension directory must not keep the daemon from booting.
     pub fn start(sessions: Sessions, user_extensions_dir: PathBuf) -> Arc<Self> {
         let (command_tx, command_rx) = mpsc::channel::<HostCommand>();
+        let (shutdown_tx, shutdown_rx) = mpsc::channel::<Vec<std::thread::JoinHandle<()>>>();
         let (chrome_tx, mut chrome_rx) = tokio::sync::mpsc::unbounded_channel::<Vec<ChromeView>>();
-        let bridge = Arc::new(ServerHostBridge::new(sessions.clone()));
         let thread_dir = user_extensions_dir.clone();
+        let thread_sessions = sessions.clone();
+        // Worker threads report through this same channel.
+        let thread_command_tx = command_tx.clone();
         let thread = match std::thread::Builder::new()
             .name("z3rm-ext-host".into())
             .spawn(move || {
-                host_thread_main(&thread_dir, bridge, command_rx, chrome_tx);
+                host_thread_main(
+                    &thread_dir,
+                    thread_sessions,
+                    command_rx,
+                    thread_command_tx,
+                    chrome_tx,
+                    shutdown_tx,
+                );
             }) {
             Ok(thread) => Some(thread),
             Err(error) => {
@@ -345,6 +1024,7 @@ impl ServerExtensionHost {
         Arc::new(Self {
             command_tx,
             thread: parking_lot::Mutex::new(thread),
+            shutdown_rx,
             user_extensions_dir,
             sessions,
         })
@@ -494,6 +1174,16 @@ impl ServerExtensionHost {
             );
         }
         validate_extension_id(&manifest.id)?;
+        // §5.6 Approval gate: an install is refused before any extraction
+        // when the shipped manifest is not approved for its exact policy
+        // fingerprint. The host thread re-checks the on-disk copy.
+        if !self.is_approved(&manifest) {
+            bail!(
+                "extension `{}` is not approved for server activation (policy fingerprint `{}`); approve it before installing",
+                manifest.id,
+                manifest.policy_fingerprint()
+            );
+        }
 
         let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
         self.command_tx
@@ -506,6 +1196,452 @@ impl ServerExtensionHost {
         match reply_rx.await {
             Ok(result) => result,
             Err(_) => bail!("extension host thread exited before answering install"),
+        }
+    }
+
+    /// §5.6 Whether the current ledger approves `manifest`: an `Approved`
+    /// record for the exact policy fingerprint. Anything else is not
+    /// approved (fail closed). Reads the ledger from disk, so it reflects
+    /// the latest decision.
+    pub fn is_approved(&self, manifest: &quickjs_runtime::ExtensionManifest) -> bool {
+        let records = load_server_consent(&server_consent_path(&self.user_extensions_dir));
+        ledger_approves(&records, manifest)
+    }
+
+    /// §5.6 Record (or revoke) approval for `manifest`, keyed by its exact
+    /// policy fingerprint. Persists before returning; on error the ledger is
+    /// unchanged and the error names the manifest. A later activation only
+    /// happens on daemon restart or a fresh install of the same manifest.
+    ///
+    /// The write is raw-record preserving: ledger records written by other
+    /// paths (e.g. install-proof records carrying nonce/TTL fields) keep
+    /// their extra fields; only the record for `manifest.id` is replaced.
+    pub fn set_consent(
+
+// ---------------------------------------------------------------------------
+// §5.6 Server-side extension consent gate
+//
+// Extensions only run after an explicit user decision, mirroring the GUI
+// client's first-install consent store (`z3rm::quickjs_extensions::§5.6`).
+// The server READS the same store the client writes — records are
+// `{"id", "policy_fingerprint", "state": "approved"|"denied"}` keyed by
+// extension id, with the policy fingerprint binding the decision to exactly
+// one manifest (id + version + runtime side + capabilities + resource
+// limits). A record only ever matches the manifest it was made against: a
+// changed manifest re-prompts on the client and fails closed on the server
+// until a matching approval exists. The fingerprint serialization is
+// byte-identical to the client `consent_fingerprint`, so a decision made in
+// the GUI for a `both`-side extension also gates its server half.
+//
+// The shared client format is a persistent per-fingerprint decision with no
+// expiry or one-time-consumption semantics. To support server-side
+// activation-install consent (where a one-off decision should be spent
+// rather than grant perpetual activation) the server also honors two
+// OPTIONAL fields — `expires_at` (RFC 3339; an instant at or before now is
+// expired) and `consumed` (a `true` approval is spent, never re-activates) —
+// that fall closed when present. Records written by the client, which omits
+// both, are unaffected and authorize indefinitely (matching the client
+// behavior).
+// ---------------------------------------------------------------------------
+
+use std::collections::HashMap;
+
+/// §5.6 The user's decision for one exact policy fingerprint (client parity).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ConsentState {
+    Approved,
+    Denied,
+}
+
+impl ConsentState {
+    fn name(self) -> &'static str {
+        match self {
+            ConsentState::Approved => "approved",
+            ConsentState::Denied => "denied",
+        }
+    }
+
+    fn parse(value: &str) -> Option<Self> {
+        match value {
+            "approved" => Some(ConsentState::Approved),
+            "denied" => Some(ConsentState::Denied),
+            _ => None,
+        }
+    }
+}
+
+/// §5.6 One persisted first-install consent decision, keyed by extension
+/// id plus the exact policy fingerprint decided against. Format-compatible
+/// with the client `ConsentRecord` (`{"id","policy_fingerprint","state"}`),
+/// with optional `expires_at` / `consumed` fields that extend it
+/// fail-closed for server-side activation consent.
+#[derive(Debug, Clone, PartialEq)]
+struct ConsentRecord {
+    id: String,
+    policy_fingerprint: String,
+    state: ConsentState,
+    /// RFC 3339 expiry instant; `None` = never expires. Optional server
+    /// extension field. An unparseable value fails closed (expired).
+    expires_at: Option<String>,
+    /// When true an Approved record is spent and never re-activates.
+    /// Optional server extension field.
+    consumed: bool,
+}
+
+impl ConsentRecord {
+    fn from_json(value: &serde_json::Value) -> Option<Self> {
+        let id = value.get("id")?.as_str()?.to_string();
+        let policy_fingerprint = value.get("policy_fingerprint")?.as_str()?.to_string();
+        let state = ConsentState::parse(value.get("state")?.as_str()?)?;
+        let expires_at = value
+            .get("expires_at")
+            .and_then(serde_json::Value::as_str)
+            .map(str::to_string);
+        let consumed = value
+            .get("consumed")
+            .and_then(serde_json::Value::as_bool)
+            .unwrap_or(false);
+        Some(ConsentRecord {
+            id,
+            policy_fingerprint,
+            state,
+            expires_at,
+            consumed,
+        })
+    }
+}
+
+/// §5.6 Load the consent store as `id → ConsentRecord`. An absent or corrupt
+/// file is treated as empty (fail closed: nothing runs unapproved, nothing
+/// crashes). Records that do not carry the explicit state and policy
+/// fingerprint the current format requires are skipped and fall through to
+// pending, never activating.
+fn load_consent_records(path: &Path) -> HashMap<String, ConsentRecord> {
+    let text = match std::fs::read_to_string(path) {
+        Ok(text) => text,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return HashMap::new(),
+        Err(error) => {
+            tracing::warn!(
+                path = %path.display(),
+                %error,
+                "extension consent file unreadable; treating as empty"
+            );
+            return HashMap::new();
+        }
+    };
+    let value: serde_json::Value = match serde_json::from_str(&text) {
+        Ok(value) => value,
+        Err(error) => {
+            tracing::warn!(
+                path = %path.display(),
+                %error,
+                "extension consent file corrupt; treating as empty"
+            );
+            return HashMap::new();
+        }
+    };
+    let Some(records) = value.as_array() else {
+        tracing::warn!(
+            path = %path.display(),
+            "extension consent file is not an array; treating as empty"
+        );
+        return HashMap::new();
+    };
+    let mut consented = HashMap::new();
+    for record in records {
+        let Some(record) = ConsentRecord::from_json(record) else {
+            tracing::warn!(
+                path = %path.display(),
+                %record,
+                "skipping malformed extension consent record"
+            );
+            continue;
+        };
+        consented.insert(record.id.clone(), record);
+    }
+    consented
+}
+
+/// §5.6 Default consent store location, matching the client
+/// (`z3rm::quickjs_extensions::consent_file_path`) so a single decision
+/// gates both halves of a `both`-side extension.
+pub fn default_consent_file_path() -> PathBuf {
+    dirs::config_dir()
+        .unwrap_or_else(|| PathBuf::from("."))
+        .join("extension-consent.json")
+}
+
+/// §5.6 Canonical policy fingerprint, byte-identical to the client
+/// `consent_fingerprint`: the serialized policy tuple — id, version,
+/// runtime side, capabilities, resource limits — as canonical JSON (objects
+// built from `BTreeMap`, so key order is deterministic). Fingerprints are
+/// never hashed, so they cannot collide: two manifests share a fingerprint
+/// iff their policy tuple is byte-identical, and any manifest change
+/// re-prompts.
+fn consent_fingerprint(manifest: &quickjs_runtime::ExtensionManifest) -> String {
+    let payload = serde_json::Value::Object(
+        BTreeMap::from([
+            ("id".into(), serde_json::Value::String(manifest.id.clone())),
+            ("version".into(), serde_json::Value::String(manifest.version.clone())),
+            ("side".into(), serde_json::Value::String(side_name(manifest.side).into())),
+            ("capabilities".into(), capabilities_json(&manifest.capabilities)),
+            ("limits".into(), limits_json(&manifest.limits)),
+        ])
+        .into_iter()
+        .collect(),
+    );
+    payload.to_string()
+}
+
+fn limits_json(limits: &quickjs_runtime::ExtensionLimits) -> serde_json::Value {
+    serde_json::Value::Object(
+        BTreeMap::from([
+            ("memory_limit_mb".into(), serde_json::json!(limits.memory_limit_mb)),
+            ("cpu_budget_ms".into(), serde_json::json!(limits.cpu_budget_ms)),
+            ("io_rate_limit".into(), serde_json::json!(limits.io_rate_limit)),
+        ])
+        .into_iter()
+        .collect(),
+    )
+}
+
+fn side_name(side: quickjs_runtime::ExtensionSide) -> &'static str {
+    match side {
+        quickjs_runtime::ExtensionSide::Client => "client",
+        quickjs_runtime::ExtensionSide::Server => "server",
+        quickjs_runtime::ExtensionSide::Both => "both",
+    }
+}
+
+fn capabilities_json(capabilities: &quickjs_runtime::ExtensionCapabilities) -> serde_json::Value {
+    serde_json::Value::Object(
+        BTreeMap::from([
+            ("terminal".into(), serde_json::json!(capabilities.terminal)),
+            ("mux".into(), serde_json::json!(capabilities.mux)),
+            ("workspace".into(), serde_json::json!(capabilities.workspace)),
+            ("settings".into(), serde_json::json!(capabilities.settings)),
+            ("network".into(), serde_json::json!(capabilities.network)),
+            ("process_spawn".into(), serde_json::json!(capabilities.process_spawn)),
+            (
+                "filesystem".into(),
+                serde_json::Value::String(filesystem_name(capabilities.filesystem).into()),
+            ),
+        ])
+        .into_iter()
+        .collect(),
+    )
+}
+
+fn filesystem_name(access: quickjs_runtime::FilesystemAccess) -> &'static str {
+    match access {
+        quickjs_runtime::FilesystemAccess::None => "none",
+        quickjs_runtime::FilesystemAccess::Cwd => "cwd",
+        quickjs_runtime::FilesystemAccess::Home => "home",
+    }
+}
+
+/// §5.6 Outcome of consulting the consent ledger for one extension. The
+/// server never activates anything but `ApprovedCurrent`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ApprovalDecision {
+    /// Approved, the policy fingerprint matches exactly, and the approval is
+    /// not expired or consumed — the only outcome under which activation may
+    /// proceed.
+    ApprovedCurrent,
+    /// The user denied this exact manifest.
+    DeniedCurrent,
+    /// No record exists for this id, or the record's policy fingerprint does
+    /// not match the manifest (changed manifest), or the record is an
+    /// Approval that is expired or consumed. All fail closed: activation is
+    /// refused and a pending approval is reported up the stack so the user
+    /// can decide again on the client.
+    NeedsApproval,
+}
+
+/// §5.6 Wall-clock seconds since the Unix epoch; isolated for determinism
+/// in tests and any future injected clock.
+fn now_unix_seconds() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|duration| duration.as_secs() as i64)
+        .unwrap_or(0)
+}
+
+/// §5.6 Seconds remaining on an Approved record's `expires_at`, measured
+/// against `now` (Unix seconds). `None` means the record carries no
+/// `expires_at`; an unparseable value fails closed (returns `0`, expired).
+fn approval_remaining_seconds(record: &ConsentRecord, now: i64) -> Option<i64> {
+    let value = record.expires_at.as_deref()?;
+    // Parse the leading "YYYY-MM-DDTHH:MM:SS" of an RFC 3339 instant, which
+    // the consent file convention uses, into Unix seconds. Any deviation
+    // fails closed (expired) rather than granting activation.
+    let bytes = value.as_bytes();
+    if bytes.len() < 19 {
+        return Some(0);
+    }
+    let dt = &bytes[..19];
+    let parse = |start: usize, len: usize, sep: Option<u8>| -> Option<i64> {
+        if let Some(sep) = sep
+            && dt.get(start + len).copied() != Some(sep)
+        {
+            return None;
+        }
+        std::str::from_utf8(&dt[start..start + len]).ok()?.parse::<i64>().ok()
+    };
+    let year = parse(0, 4, Some(b'-'))?;
+    let month = parse(5, 2, Some(b'-'))?;
+    let day = parse(8, 2, Some(b'T'))?;
+    let hour = parse(11, 2, Some(b':'))?;
+    let minute = parse(14, 2, Some(b':'))?;
+    let second = parse(17, 2, None)?;
+    let days = days_since_epoch(year, month, day)?;
+    Some(days * 86400 + hour * 3600 + minute * 60 + second - now)
+}
+
+/// §5.6 Days elapsed since 1970-01-01 for a proleptic Gregorian date.
+/// Returns `None` for invalid dates (month/day out of range), failing the
+/// expiry parser closed. Algorithmically equivalent to the Howard Hinnant
+/// `days_from_civil` formulation.
+fn days_since_epoch(year: i64, month: i64, day: i64) -> Option<i64> {
+    if !(1..=12).contains(&month) || !(1..=31).contains(&day) {
+        return None;
+    }
+    let y = if month <= 2 { year - 1 } else { year };
+    let era = (if y >= 0 { y } else { y - 399 }) / 400;
+    let yoe = y - era * 400;
+    let doy = (153 * (if month > 2 { month - 3 } else { month + 9 }) + 2) / 5 + day - 1;
+    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+    Some(era * 146097 + doe - 719468)
+}
+
+/// §5.6 Consult the consent ledger for one extension, enforcing explicit,
+/// unexpired, unconsumed approval bound to extension id and policy
+/// fingerprint.
+fn approval_decision(
+    records: &HashMap<String, ConsentRecord>,
+    manifest: &quickjs_runtime::ExtensionManifest,
+    now: i64,
+) -> ApprovalDecision {
+    let fingerprint = consent_fingerprint(manifest);
+    let Some(record) = records.get(&manifest.id) else {
+        return ApprovalDecision::NeedsApproval;
+    };
+    match record.state {
+        ConsentState::Denied if record.policy_fingerprint == fingerprint => {
+            ApprovalDecision::DeniedCurrent
+        }
+        ConsentState::Approved if record.policy_fingerprint == fingerprint => {
+            // §5.6 Must be explicit, unexpired, unconsumed: any miss fails
+            // closed into NeedsApproval (re-prompt), never into activation.
+            if record.consumed {
+                return ApprovalDecision::NeedsApproval;
+            }
+            match approval_remaining_seconds(record, now) {
+                Some(remaining) if remaining > 0 => ApprovalDecision::ApprovedCurrent,
+                _ => ApprovalDecision::NeedsApproval,
+            }
+        }
+        _ => ApprovalDecision::NeedsApproval,
+    }
+}
+
+/// §5.6 Require valid explicit unexpired unconsumed approval for one
+/// extension; otherwise return an actionable error that surfaces which
+/// reason failed and what the user must approve. Never grants activation on
+/// a miss — the server's protective default is "off".
+fn require_approval(
+    records: &HashMap<String, ConsentRecord>,
+    manifest: &quickjs_runtime::ExtensionManifest,
+) -> Result<ApprovalDecision> {
+    let now = now_unix_seconds();
+    let fingerprint = consent_fingerprint(manifest);
+    match approval_decision(records, manifest, now) {
+        ApprovalDecision::ApprovedCurrent => Ok(ApprovalDecision::ApprovedCurrent),
+        ApprovalDecision::DeniedCurrent => bail!(
+            "extension `{}` is denied by an exact-match consent record; \
+             remove or amend the decision to re-prompt",
+            manifest.id,
+        ),
+        ApprovalDecision::NeedsApproval => bail!(
+            "extension `{}` has no valid approval for the current manifest \
+             (policy fingerprint {}); a server or both-side extension cannot \
+             activate until an explicit, unexpired, unconsumed approval bound \
+             to this id and policy fingerprint exists",
+            manifest.id,
+            fingerprint,
+        ),
+    }
+}
+
+/// §5.6 Severity of a consent miss, for logging. `Denied` is the user's
+/// explicit past decision; `Pending` is the absence of (or mismatch / stale)
+/// approval. The distinction is informational — neither may activate.
+fn approval_miss_kind(decision: ApprovalDecision) -> &'static str {
+    match decision {
+        ApprovalDecision::DeniedCurrent => "denied",
+        ApprovalDecision::NeedsApproval => "pending",
+        ApprovalDecision::ApprovedCurrent => unreachable!("not a miss"),
+    }
+}
+        &self,
+        manifest: &quickjs_runtime::ExtensionManifest,
+        approved: bool,
+    ) -> Result<()> {
+        let path = server_consent_path(&self.user_extensions_dir);
+        let records = load_server_consent_raw(&path);
+        let record = ServerConsentRecord {
+            id: manifest.id.clone(),
+            policy_fingerprint: manifest.policy_fingerprint(),
+            state: if approved {
+                ServerConsentState::Approved
+            } else {
+                ServerConsentState::Denied
+            },
+        };
+        let mut records: Vec<serde_json::Value> = records
+            .into_iter()
+            .filter(|existing| existing.get("id").and_then(serde_json::Value::as_str) != Some(&manifest.id))
+            .collect();
+        records.push(record.to_json());
+        save_server_consent_raw(&path, &records)
+            .with_context(|| format!("recording approval for extension `{}`", manifest.id))
+    }
+
+    /// §16.9 Execute a chrome action (an `onClick`/`onChange` from chrome
+    /// the daemon published) on the authoritative host thread. The request
+    /// must name an extension id + view id the daemon actually published;
+    /// anything else fails closed with a contextual error before any JS
+    /// runs.
+    pub async fn execute_chrome_action(
+        &self,
+        request: &mux_protocol::ExtensionChromeActionRequest,
+    ) -> Result<()> {
+        let combined_len = request
+            .command
+            .len()
+            .saturating_add(request.arguments.len());
+        if combined_len > MAX_CHROME_ACTION_BYTES {
+            bail!(
+                "chrome action for `{}` is {} bytes; limit is {MAX_CHROME_ACTION_BYTES}",
+                request.extension_id,
+                combined_len
+            );
+        }
+        validate_extension_id(&request.extension_id)?;
+
+        let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
+        self.command_tx
+            .send(HostCommand::ExecuteExtension {
+                extension_id: request.extension_id.clone(),
+                view_id: request.view_id.clone(),
+                command: request.command.clone(),
+                arguments: request.arguments.clone(),
+                reply: reply_tx,
+            })
+            .map_err(|_| anyhow::anyhow!("extension host thread is gone"))?;
+        match reply_rx.await {
+            Ok(result) => result,
+            Err(_) => bail!("extension host thread exited before answering chrome action"),
         }
     }
 
@@ -551,11 +1687,32 @@ impl Drop for ServerExtensionHost {
         if let Err(error) = self.command_tx.send(HostCommand::Shutdown) {
             tracing::debug!(%error, "extension host thread already gone");
         }
-        if let Some(handle) = self.thread.lock().take()
-            && handle.join().is_err()
-        {
-            tracing::warn!("extension host thread panicked during shutdown");
+        // The manager exits within its bounded waits and hands its workers
+        // back here; anything that does not arrive within the grace is
+        // detached rather than waited on.
+        let workers = self
+            .shutdown_rx
+            .recv_timeout(MANAGER_SHUTDOWN_GRACE)
+            .unwrap_or_default();
+        if let Some(handle) = self.thread.lock().take() {
+            join_bounded(handle, MANAGER_SHUTDOWN_GRACE);
         }
+        for worker in workers {
+            join_bounded(worker, WORKER_JOIN_GRACE);
+        }
+    }
+}
+
+/// Join a thread if it finishes within `grace`; otherwise detach it. A hung
+/// extension worker must never hold up host shutdown, so we never wait
+/// indefinitely — the process reaps detached threads at exit.
+fn join_bounded(handle: std::thread::JoinHandle<()>, grace: Duration) {
+    let deadline = Instant::now() + grace;
+    while !handle.is_finished() && Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    if handle.is_finished() && handle.join().is_err() {
+        tracing::warn!("extension thread panicked during shutdown");
     }
 }
 
@@ -577,11 +1734,454 @@ fn validate_extension_id(id: &str) -> Result<()> {
     Ok(())
 }
 
+/// Reserved view id under which the daemon publishes a suspension notice for
+/// an extension. Distinct from any view an extension renders, so the notice
+/// cannot collide with (or be tombstoned as) extension chrome.
+const SUSPENDED_NOTICE_VIEW_ID: &str = "z3rm.suspended";
+
+/// §16.8 Bounds: how long the manager waits (per round) for a worker to
+/// answer render or execute work before marking it unresponsive.
+const WORKER_REPLY_TIMEOUT: Duration = Duration::from_secs(2);
+/// Install: extraction + activation can legitimately take a moment.
+const INSTALL_TIMEOUT: Duration = Duration::from_secs(10);
+/// Startup discovery: a single shared deadline across all discovered
+/// extensions so one stuck activation cannot hold up the daemon's boot.
+const STARTUP_LOAD_TIMEOUT: Duration = Duration::from_secs(10);
+/// How long `Drop` waits for the manager thread to hand back its workers.
+const MANAGER_SHUTDOWN_GRACE: Duration = Duration::from_secs(5);
+/// How long `Drop` waits per worker before detaching it.
+const WORKER_JOIN_GRACE: Duration = Duration::from_millis(500);
+/// Per-worker command queue depth. Emits are `try_send` into this queue, so
+/// a stuck extension drops events beyond the bound instead of accumulating
+/// unbounded work.
+const WORKER_QUEUE_CAPACITY: usize = 8;
+
+/// The manager thread: owns every worker handle plus the chrome bookkeeping
+/// (published views for tombstones and command ownership, suspension notices).
+/// It never runs JS itself — every QuickJS call happens on a worker thread —
+/// and every wait it performs on a worker is bounded by a deadline.
+struct ExtensionManager {
+    workers: BTreeMap<String, WorkerHandle>,
+    /// (extension_id, view_id) pairs currently on the wire, keyed for
+    /// tombstones and exact command ownership.
+    published_views: BTreeSet<(String, String)>,
+    /// Suspension notices currently on the wire.
+    notices: BTreeSet<(String, String)>,
+    chrome_tx: tokio::sync::mpsc::UnboundedSender<Vec<ChromeView>>,
+    /// Worker reports ride the manager's own command channel.
+    events_tx: mpsc::Sender<HostCommand>,
+    next_instance: u64,
+}
+
+impl ExtensionManager {
+    fn new(
+        chrome_tx: tokio::sync::mpsc::UnboundedSender<Vec<ChromeView>>,
+        events_tx: mpsc::Sender<HostCommand>,
+    ) -> Self {
+        Self {
+            workers: BTreeMap::new(),
+            published_views: BTreeSet::new(),
+            notices: BTreeSet::new(),
+            chrome_tx,
+            events_tx,
+            next_instance: 0,
+        }
+    }
+
+    /// Spawn a worker thread for `extension_id` and wait (bounded by
+    /// `deadline`) for it to load. On success the worker is registered,
+    /// atomically replacing any previous instance of the same id. `Ok`
+    /// means the worker is registered (possibly already suspended from a
+    /// violation during activation).
+    fn spawn_worker(
+        &mut self,
+        extension_id: String,
+        setup: WorkerSetup,
+        deadline: &Instant,
+    ) -> Result<(), String> {
+        let instance = self.next_instance;
+        self.next_instance += 1;
+        let (command_tx, command_rx) = mpsc::sync_channel::<WorkerCommand>(WORKER_QUEUE_CAPACITY);
+        let (ready_tx, ready_rx) = mpsc::channel::<WorkerReady>();
+        let events_tx = self.events_tx.clone();
+        let thread_name = format!("z3rm-ext-{extension_id}");
+        let join = std::thread::Builder::new()
+            .name(thread_name)
+            .spawn(move || {
+                worker_thread_main(
+                    extension_id.clone(),
+                    setup,
+                    events_tx,
+                    instance,
+                    command_rx,
+                    ready_tx,
+                );
+            })
+            .map_err(|error| format!("spawning worker thread failed: {error}"))?;
+
+        match ready_rx.recv_timeout(deadline.saturating_duration_since(Instant::now())) {
+            Ok(WorkerReady::Running) => {
+                self.insert_worker(extension_id, command_tx, join, instance, false, None);
+                Ok(())
+            }
+            Ok(WorkerReady::Suspended(reason)) => {
+                self.insert_worker(extension_id, command_tx, join, instance, true, Some(reason));
+                Ok(())
+            }
+            Ok(WorkerReady::Failed(error)) => {
+                // The thread already exited; reap it.
+                let _ = join.join();
+                Err(error)
+            }
+            Err(_) => {
+                // Timed out: the worker may still be loading. Register it as
+                // suspended so nothing routes work to it and its thread is
+                // reaped at shutdown; when the load completes its ready send
+                // fails and the worker exits on its own.
+                self.insert_worker(
+                    extension_id,
+                    command_tx,
+                    join,
+                    instance,
+                    true,
+                    Some(SuspensionReason::Unresponsive),
+                );
+                Err("worker did not finish loading in time; it was suspended".to_string())
+            }
+        }
+    }
+
+    /// Register a worker, atomically replacing any previous instance of the
+    /// same id: the old worker is asked to wind down and all chrome it
+    /// published (including a suspension notice) is tombstoned. The old
+    /// join handle is dropped here — the host reaps replaced workers with
+    /// the rest at shutdown, never waiting on a hung one.
+    fn insert_worker(
+        &mut self,
+        extension_id: String,
+        command_tx: mpsc::Sender<WorkerCommand>,
+        join: std::thread::JoinHandle<()>,
+        instance: u64,
+        suspended: bool,
+        initial_suspension: Option<SuspensionReason>,
+    ) {
+        if let Some(old) = self.workers.remove(&extension_id) {
+            let _ = old.command_tx.try_send(WorkerCommand::Shutdown);
+            let views = self.tombstone_chrome(&extension_id);
+            if !views.is_empty() {
+                let _ = self.chrome_tx.send(views);
+            }
+        }
+        if let Some(reason) = initial_suspension {
+            self.publish_notice(&extension_id, reason);
+        }
+        self.workers.insert(
+            extension_id,
+            WorkerHandle {
+                command_tx,
+                join,
+                instance,
+                suspended,
+            },
+        );
+    }
+
+    fn ids(&self) -> Vec<String> {
+        self.workers.keys().cloned().collect()
+    }
+
+    /// §3.4 Fan one host event out to every non-suspended worker. `try_send`
+    /// into a bounded queue: a worker that is still busy drops this event
+    /// for it rather than accumulating unbounded work, and never blocks the
+    /// manager or any other extension.
+    fn emit(&mut self, event: &str, payload: &str) {
+        let targets: Vec<String> = self
+            .workers
+            .iter()
+            .filter(|(_, worker)| !worker.suspended)
+            .map(|(id, _)| id.clone())
+            .collect();
+        for id in targets {
+            let Some(worker) = self.workers.get(&id) else {
+                continue;
+            };
+            if worker.suspended {
+                continue;
+            }
+            if worker
+                .command_tx
+                .try_send(WorkerCommand::Emit {
+                    event: event.to_string(),
+                    payload: payload.to_string(),
+                })
+                .is_err()
+            {
+                tracing::debug!(id = %id, %event, "server extension worker busy; event dropped for it");
+            }
+        }
+    }
+
+    /// Render all non-suspended workers (or only invalidated ones when
+    /// `force` is false) with a single shared deadline, then publish the
+    /// merged chrome plus tombstones for views that disappeared. Workers
+    /// that do not answer by the deadline are suspended. `Err` means the
+    /// chrome fan-out stopped (daemon shutdown).
+    fn render_round(&mut self, force: bool) -> Result<(), ()> {
+        let deadline = Instant::now() + WORKER_REPLY_TIMEOUT;
+        let mut pending: Vec<(String, u64, mpsc::Receiver<Vec<String>>)> = Vec::new();
+        for (id, worker) in &self.workers {
+            if worker.suspended {
+                continue;
+            }
+            let (reply_tx, reply_rx) = mpsc::channel();
+            if worker
+                .command_tx
+                .try_send(WorkerCommand::Render { force, reply: reply_tx })
+                .is_ok()
+            {
+                pending.push((id.clone(), worker.instance, reply_rx));
+            }
+        }
+
+        let mut current_views: BTreeMap<(String, String), String> = BTreeMap::new();
+        let mut unresponsive: Vec<(String, u64)> = Vec::new();
+        let mut crashed: Vec<(String, u64)> = Vec::new();
+        while !pending.is_empty() {
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                break;
+            }
+            // Round-robin poll so one hung worker's deadline does not starve
+            // the replies of its healthy peers.
+            let slice = remaining.min(Duration::from_millis(10));
+            let mut index = 0;
+            while index < pending.len() {
+                let (id, instance, receiver) = &mut pending[index];
+                match receiver.recv_timeout(slice) {
+                    Ok(views) => {
+                        // A worker suspended mid-round (its own report) must
+                        // not have its chrome published.
+                        if !self.workers.get(id).is_some_and(|worker| worker.suspended) {
+                            for json in views {
+                                current_views.insert((id.clone(), view_id_of(&json)), json);
+                            }
+                        }
+                        pending.swap_remove(index);
+                    }
+                    Err(mpsc::RecvTimeoutError::Timeout) => index += 1,
+                    Err(mpsc::RecvTimeoutError::Disconnected) => {
+                        crashed.push((id.clone(), *instance));
+                        pending.swap_remove(index);
+                    }
+                }
+            }
+        }
+        unresponsive.extend(pending.drain(..).map(|(id, instance, _)| (id, instance)));
+        for (id, instance) in crashed {
+            self.suspend_extension(&id, instance, SuspensionReason::Crashed);
+        }
+        for (id, instance) in unresponsive {
+            self.suspend_extension(&id, instance, SuspensionReason::Unresponsive);
+        }
+        self.publish_views(current_views)
+    }
+
+    /// Publish the current views plus empty-payload tombstones for every
+    /// previously published key that disappeared (an extension closed an
+    /// overlay, or got suspended).
+    fn publish_views(
+        &mut self,
+        current_views: BTreeMap<(String, String), String>,
+    ) -> Result<(), ()> {
+        let current_keys: BTreeSet<(String, String)> = current_views.keys().cloned().collect();
+        let mut views = Vec::with_capacity(
+            current_views.len() + self.published_views.difference(&current_keys).count(),
+        );
+        for ((extension_id, view_id), vdom_json) in current_views {
+            views.push(ChromeView {
+                extension_id,
+                view_id,
+                vdom_json,
+            });
+        }
+        for (extension_id, view_id) in self.published_views.difference(&current_keys) {
+            views.push(ChromeView {
+                extension_id: extension_id.clone(),
+                view_id: view_id.clone(),
+                vdom_json: String::new(),
+            });
+        }
+        self.published_views = current_keys;
+        if views.is_empty() {
+            return Ok(());
+        }
+        self.chrome_tx.send(views).map_err(|_| ())
+    }
+
+    /// ChromeViews (empty payloads) that remove every published view and the
+    /// suspension notice of `extension_id` from the wire, plus bookkeeping.
+    fn tombstone_chrome(&mut self, extension_id: &str) -> Vec<ChromeView> {
+        let mut views = Vec::new();
+        let stale: Vec<(String, String)> = self
+            .published_views
+            .iter()
+            .filter(|(id, _)| id == extension_id)
+            .cloned()
+            .collect();
+        for (id, view_id) in stale {
+            self.published_views.remove(&(id.clone(), view_id.clone()));
+            views.push(ChromeView {
+                extension_id: id,
+                view_id,
+                vdom_json: String::new(),
+            });
+        }
+        let notice_key = (extension_id.to_string(), SUSPENDED_NOTICE_VIEW_ID.to_string());
+        if self.notices.remove(&notice_key) {
+            views.push(ChromeView {
+                extension_id: extension_id.to_string(),
+                view_id: SUSPENDED_NOTICE_VIEW_ID.to_string(),
+                vdom_json: String::new(),
+            });
+        }
+        views
+    }
+
+    /// Publish (once per instance) the daemon-authored status-bar VDOM
+    /// notice naming the suspended extension and the reason.
+    fn publish_notice(&mut self, extension_id: &str, reason: SuspensionReason) {
+        let key = (extension_id.to_string(), SUSPENDED_NOTICE_VIEW_ID.to_string());
+        if !self.notices.insert(key) {
+            return;
+        }
+        let notice = ChromeView {
+            extension_id: extension_id.to_string(),
+            view_id: SUSPENDED_NOTICE_VIEW_ID.to_string(),
+            vdom_json: suspension_notice_json(extension_id, reason),
+        };
+        let _ = self.chrome_tx.send(vec![notice]);
+    }
+
+    /// §5.6 Suspend a worker: no further work is routed to it, its chrome is
+    /// tombstoned and a status-bar notice with the reason is published. A
+    /// hung worker is not joined — its thread is reaped (or detached) at
+    /// host shutdown.
+    fn suspend_extension(&mut self, extension_id: &str, instance: u64, reason: SuspensionReason) {
+        let Some(worker) = self.workers.get_mut(extension_id) else {
+            return;
+        };
+        // Late reports from a replaced worker must not suspend its successor.
+        if worker.instance != instance || worker.suspended {
+            return;
+        }
+        worker.suspended = true;
+        tracing::error!(
+            id = %extension_id,
+            reason = reason.as_str(),
+            "server extension suspended; chrome removed"
+        );
+        // Best-effort wind-down; a hung worker ignores this until its JS
+        // returns (or never — the host detaches it at shutdown).
+        let _ = worker.command_tx.try_send(WorkerCommand::Shutdown);
+        let views = self.tombstone_chrome(extension_id);
+        if !views.is_empty() {
+            let _ = self.chrome_tx.send(views);
+        }
+        self.publish_notice(extension_id, reason);
+    }
+
+    /// §16.9 Execute a chrome action on the ONE extension that owns the
+    /// named view. Fail-closed before any JS runs: unknown or suspended
+    /// extensions and unpublished view ids are rejected. The wait is
+    /// bounded; a worker that does not answer in time is suspended rather
+    /// than letting the caller hang.
+    fn execute_chrome_action(
+        &mut self,
+        extension_id: &str,
+        view_id: &str,
+        command: &str,
+        arguments: &str,
+    ) -> Result<()> {
+        if command.is_empty() {
+            bail!("chrome action command must not be empty");
+        }
+        let Some(worker) = self.workers.get(extension_id) else {
+            bail!("chrome action targets unknown server extension `{extension_id}`");
+        };
+        if worker.suspended {
+            bail!("chrome action targets suspended server extension `{extension_id}`");
+        }
+        if !self
+            .published_views
+            .contains(&(extension_id.to_string(), view_id.to_string()))
+        {
+            bail!(
+                "chrome action targets view `{view_id}` of `{extension_id}`, which was never published to clients"
+            );
+        }
+        let instance = worker.instance;
+        let (reply_tx, reply_rx) = mpsc::channel();
+        let queued = self
+            .workers
+            .get(extension_id)
+            .is_some_and(|worker| {
+                worker
+                    .command_tx
+                    .try_send(WorkerCommand::Execute {
+                        command: command.to_string(),
+                        arguments: arguments.to_string(),
+                        reply: reply_tx,
+                    })
+                    .is_ok()
+            });
+        if !queued {
+            bail!("chrome action target `{extension_id}` is busy; try again later");
+        }
+        match reply_rx.recv_timeout(WORKER_REPLY_TIMEOUT) {
+            Ok(result) => result,
+            Err(mpsc::RecvTimeoutError::Timeout) => {
+                self.suspend_extension(extension_id, instance, SuspensionReason::Unresponsive);
+                bail!(
+                    "chrome action on `{extension_id}` did not complete in time; extension suspended"
+                );
+            }
+            Err(mpsc::RecvTimeoutError::Disconnected) => {
+                self.suspend_extension(extension_id, instance, SuspensionReason::Crashed);
+                bail!("chrome action target `{extension_id}` exited unexpectedly");
+            }
+        }
+    }
+
+    fn handle_worker_event(&mut self, event: WorkerEvent) {
+        match event {
+            WorkerEvent::Suspended {
+                extension_id,
+                instance,
+                reason,
+            } => self.suspend_extension(&extension_id, instance, reason),
+            WorkerEvent::RenderRequested {
+                extension_id,
+                instance,
+            } => {
+                let current = self
+                    .workers
+                    .get(&extension_id)
+                    .is_some_and(|worker| worker.instance == instance && !worker.suspended);
+                if current {
+                    let _ = self.render_round(false);
+                }
+            }
+        }
+    }
+}
+
 fn host_thread_main(
     user_extensions_dir: &Path,
-    bridge: Arc<ServerHostBridge>,
+    sessions: Sessions,
     command_rx: mpsc::Receiver<HostCommand>,
+    command_tx: mpsc::Sender<HostCommand>,
     chrome_tx: tokio::sync::mpsc::UnboundedSender<Vec<ChromeView>>,
+    shutdown_tx: mpsc::Sender<Vec<std::thread::JoinHandle<()>>>,
 ) {
     // §5.5 / §16.8 discovery: user dir + built-in roots, server-side filter.
     // discover_server_extensions already skips directories without
@@ -591,11 +2191,52 @@ fn host_thread_main(
     if discovered.is_empty() {
         tracing::info!(?roots, "no server-side extensions discovered");
     }
-    let mut hosted = activate_discovered(discovered, bridge.clone());
-    let mut published_views = BTreeSet::new();
+    // §5.6 Approval ledger: extensions activate only when an Approved record
+    // exists for their exact policy fingerprint. Loaded once here so
+    // activation, installs and the first paint all see the same ledger.
+    let consent = load_server_consent(&server_consent_path(user_extensions_dir));
+    let mut manager = ExtensionManager::new(chrome_tx, command_tx);
+
+    // Startup: one worker thread per approved discovered extension, all
+    // loads bounded by a single deadline so one stuck activation cannot
+    // hold up the daemon's boot. Failures are logged, never fatal (§15.7).
+    let startup_deadline = Instant::now() + STARTUP_LOAD_TIMEOUT;
+    for extension in discovered {
+        let id = extension.manifest.id.clone();
+        if !ledger_approves(&consent, &extension.manifest) {
+            let reason = match consent.get(&id) {
+                Some(record) if record.state == ServerConsentState::Denied => {
+                    "denied by the server approval ledger"
+                }
+                Some(record) if record.policy_fingerprint != extension.manifest.policy_fingerprint() => {
+                    "policy fingerprint changed since approval; re-approval required"
+                }
+                _ => "not approved by the server approval ledger",
+            };
+            tracing::warn!(
+                id = %id,
+                fingerprint = %extension.manifest.policy_fingerprint(),
+                path = %extension.directory.display(),
+                %reason,
+                "server extension not activated"
+            );
+            continue;
+        }
+        if let Err(error) = manager.spawn_worker(
+            id.clone(),
+            WorkerSetup::Discovered {
+                manifest: extension.manifest,
+                source: extension.source,
+                sessions: sessions.clone(),
+            },
+            &startup_deadline,
+        ) {
+            tracing::warn!(id = %id, %error, "server extension startup load failed");
+        }
+    }
 
     // First paint: extensions register chrome during activate.
-    if push_chrome_if_dirty(&mut hosted, &chrome_tx, true, &mut published_views).is_err() {
+    if manager.render_round(true).is_err() {
         return;
     }
 
@@ -606,100 +2247,215 @@ fn host_thread_main(
         };
         match command {
             HostCommand::Install { id, archive, reply } => {
-                let result =
-                    install_on_host_thread(user_extensions_dir, &id, &archive, bridge.clone())
-                        .and_then(|live| {
-                            // Replace any previous instance of the same id.
-                            hosted.retain(|extension| extension.live.id() != live.id());
-                            hosted.push(HostedExtension {
-                                live,
-                                suspended: false,
-                            });
-                            Ok(())
-                        });
+                let deadline = Instant::now() + INSTALL_TIMEOUT;
+                let result = manager
+                    .spawn_worker(
+                        id.clone(),
+                        WorkerSetup::Install {
+                            archive,
+                            user_extensions_dir: user_extensions_dir.to_path_buf(),
+                            sessions: sessions.clone(),
+                            consent: consent.clone(),
+                        },
+                        &deadline,
+                    )
+                    .map_err(anyhow::Error::msg);
                 if reply.send(result).is_err() {
                     tracing::debug!(id = %id, "extension install caller dropped before reply");
                 }
-            }
-            HostCommand::Emit { event, payload } => {
-                for extension in hosted.iter().filter(|extension| !extension.suspended) {
-                    if let Err(error) = extension.live.emit_event(&event, &payload) {
-                        tracing::warn!(id = %extension.live.id(), %event, %error, "server extension emit failed");
-                    }
+                if result.is_ok() && manager.render_round(true).is_err() {
+                    return;
                 }
             }
+            HostCommand::ExecuteExtension {
+                extension_id,
+                view_id,
+                command,
+                arguments,
+                reply,
+            } => {
+                let result = manager.execute_chrome_action(
+                    &extension_id,
+                    &view_id,
+                    &command,
+                    &arguments,
+                );
+                if reply.send(result).is_err() {
+                    tracing::debug!(
+                        id = %extension_id,
+                        "extension chrome action caller dropped before reply"
+                    );
+                }
+            }
+            HostCommand::Emit { event, payload } => manager.emit(&event, &payload),
             HostCommand::Render => {
-                if push_chrome_if_dirty(&mut hosted, &chrome_tx, true, &mut published_views)
-                    .is_err()
-                {
-                    break;
+                if manager.render_round(true).is_err() {
+                    return;
                 }
-                continue;
             }
             HostCommand::ListIds(reply) => {
-                let ids: Vec<String> = hosted
-                    .iter()
-                    .map(|extension| extension.live.id().to_string())
-                    .collect();
-                if reply.send(ids).is_err() {
+                if reply.send(manager.ids()).is_err() {
                     tracing::debug!("extension id caller dropped before reply");
                 }
             }
+            HostCommand::WorkerEvent(event) => manager.handle_worker_event(event),
             HostCommand::Shutdown => break,
         }
-        // §5.6 suspend runaways before the next command, then publish any
-        // chrome they invalidated.
-        for extension in hosted.iter_mut() {
-            extension.note_resource_violations();
+    }
+
+    // Hand the worker join handles back so the host owner can reap them
+    // without ever waiting on a hung worker itself.
+    let handles: Vec<std::thread::JoinHandle<()>> = manager
+        .workers
+        .into_values()
+        .map(|worker| worker.join)
+        .collect();
+    let _ = shutdown_tx.send(handles);
+}
+
+/// One extension's dedicated OS thread. The `LiveExtension` is created and
+/// retained here; every `ctx.with` re-entry (activation, events, rendering,
+/// commands) happens on this thread only (§5.2). A hung extension blocks
+/// nobody but this thread: the manager bounds every wait and skips workers
+/// that do not answer.
+fn worker_thread_main(
+    extension_id: String,
+    setup: WorkerSetup,
+    events_tx: mpsc::Sender<HostCommand>,
+    instance: u64,
+    command_rx: mpsc::Receiver<WorkerCommand>,
+    ready_tx: mpsc::Sender<WorkerReady>,
+) {
+    let live = match setup {
+        WorkerSetup::Install {
+            archive,
+            user_extensions_dir,
+            sessions,
+            consent,
+        } => match install_on_host_thread(
+            &user_extensions_dir,
+            &extension_id,
+            &archive,
+            sessions,
+            &consent,
+        ) {
+            Ok(live) => live,
+            Err(error) => {
+                let _ = ready_tx.send(WorkerReady::Failed(format!("{error:#}")));
+                return;
+            }
+        },
+        WorkerSetup::Discovered {
+            manifest,
+            source,
+            sessions,
+        } => {
+            // §5.6 每个扩展按自己的 manifest 声明构造专属桥: 文件系统范围在桥
+            // 构造时固化, `filesystem.*` 只对该扩展声明范围内的路径放行。
+            let bridge = Arc::new(ServerHostBridge::new(
+                sessions,
+                manifest.capabilities.filesystem,
+            ));
+            let runner = ExtensionRunner::for_manifest(&manifest).with_bridge(bridge);
+            match runner.load_live(&extension_id, &source, "activate") {
+                Ok(live) => live,
+                Err(error) => {
+                    tracing::warn!(
+                        id = %extension_id,
+                        error = %format!("{error:#}"),
+                        "server extension load failed"
+                    );
+                    let _ = ready_tx.send(WorkerReady::Failed(format!("{error:#}")));
+                    return;
+                }
+            }
         }
-        if push_chrome_if_dirty(&mut hosted, &chrome_tx, false, &mut published_views).is_err() {
-            break;
+    };
+
+    let mut hosted = HostedExtension {
+        live,
+        suspended: false,
+    };
+    // Activation itself may have crossed a limit (IO quota rejection is
+    // flagged in Rust and survives JS try/catch). Report that before the
+    // manager publishes any chrome.
+    let ready = match hosted.detect_violation() {
+        Some(reason) => WorkerReady::Suspended(reason),
+        None => WorkerReady::Running,
+    };
+    if ready_tx.send(ready).is_err() {
+        // The manager timed out or went away before the load finished; the
+        // worker has no home, so exit.
+        return;
+    }
+
+    loop {
+        match command_rx.recv() {
+            Ok(WorkerCommand::Emit { event, payload }) => {
+                if let Err(error) = hosted.live.emit_event(&event, &payload) {
+                    tracing::warn!(id = %extension_id, %event, %error, "server extension emit failed");
+                }
+                if hosted.finish_operation(&events_tx, instance) {
+                    return;
+                }
+            }
+            Ok(WorkerCommand::Render { force, reply }) => {
+                let views = hosted.render(force);
+                // A reply receiver that is gone just means the manager ended
+                // the round without us; keep serving.
+                let _ = reply.send(views);
+                if hosted.finish_operation(&events_tx, instance) {
+                    return;
+                }
+            }
+            Ok(WorkerCommand::Execute {
+                command,
+                arguments,
+                reply,
+            }) => {
+                let result = hosted
+                    .live
+                    .execute_command(&command, &arguments)
+                    .map(|_| ());
+                if reply.send(result).is_err() {
+                    // The manager suspended us (the reply was dropped after
+                    // its bounded wait); wind down.
+                    return;
+                }
+                if hosted.finish_operation(&events_tx, instance) {
+                    return;
+                }
+            }
+            Ok(WorkerCommand::Shutdown) | Err(_) => return,
         }
     }
 }
 
-/// Activate every discovered extension, skipping (and logging) failures —
-/// §15.7: one broken extension must not take the others (or the daemon) down.
-fn activate_discovered(
-    discovered: Vec<DiscoveredExtension>,
-    bridge: Arc<ServerHostBridge>,
-) -> Vec<HostedExtension> {
-    let mut hosted = Vec::new();
-    for extension in discovered {
-        let runner = ExtensionRunner::for_manifest(&extension.manifest).with_bridge(bridge.clone());
-        match runner.load_live(&extension.manifest.id, &extension.source, "activate") {
-            Ok(live) => {
-                tracing::info!(
-                    id = %extension.manifest.id,
-                    path = %extension.directory.display(),
-                    "server extension loaded"
-                );
-                hosted.push(HostedExtension {
-                    live,
-                    suspended: false,
-                });
-            }
-            Err(error) => {
-                tracing::warn!(
-                    id = %extension.manifest.id,
-                    error = %format!("{error:#}"),
-                    "server extension load failed"
-                );
-            }
-        }
-    }
-    hosted
+/// The daemon-authored status-bar VDOM for a suspended extension: a single
+/// bounded span carrying the extension id and the suspension reason.
+fn suspension_notice_json(extension_id: &str, reason: SuspensionReason) -> String {
+    serde_json::json!({
+        "type": "span",
+        "text": format!("extension {extension_id} suspended: {}", reason.as_str()),
+    })
+    .to_string()
 }
 
 /// Extract, validate on disk, and activate an installed extension. Extraction
 /// goes to a staging directory first, so a failed install never leaves a
 /// half-written directory that startup discovery would pick up, and the
 /// previously installed version stays live until the new one activates.
+///
+/// §5.6 Approval gate: the on-disk manifest (the copy that would actually
+/// load) must match an `Approved` ledger record exactly. Unapproved,
+/// denied, or fingerprint-changed installs fail with a contextual error and
+/// never reach activation.
 fn install_on_host_thread(
     user_extensions_dir: &Path,
     id: &str,
     archive: &[u8],
-    bridge: Arc<ServerHostBridge>,
+    sessions: Sessions,
+    consent: &BTreeMap<String, ServerConsentRecord>,
 ) -> Result<LiveExtension> {
     std::fs::create_dir_all(user_extensions_dir)
         .with_context(|| format!("creating {}", user_extensions_dir.display()))?;
@@ -735,11 +2491,23 @@ fn install_on_host_thread(
                 manifest.side
             );
         }
+        // §5.6 Defense in depth: the async side pre-validated the shipped
+        // manifest against the ledger, but the on-disk copy is what would
+        // actually load — an approval binds to exact content, so re-check it.
+        if !ledger_approves(consent, &manifest) {
+            bail!(
+                "extension `{id}` is not approved for server activation (policy fingerprint `{}`); approve it first",
+                manifest.policy_fingerprint()
+            );
+        }
         let source_path = staged.join("main.js");
         let source = std::fs::read_to_string(&source_path)
             .with_context(|| format!("reading {}", source_path.display()))?;
 
-        let runner = ExtensionRunner::for_manifest(&manifest).with_bridge(bridge);
+        // §5.6 与发现装载一致: 按本扩展 manifest 声明的文件系统范围构造专属桥。
+        let runner = ExtensionRunner::for_manifest(&manifest).with_bridge(Arc::new(
+            ServerHostBridge::new(sessions.clone(), manifest.capabilities.filesystem),
+        ));
         let live = runner
             .load_live(&manifest.id, &source, "activate")
             .with_context(|| format!("activating extension `{id}`"))?;
@@ -764,6 +2532,7 @@ fn install_on_host_thread(
     load
 }
 
+/// §16.9 Execute a chrome action on the one extension that published the
 /// Extract a tar.gz archive into `target`, refusing path traversal and
 /// enforcing an uncompressed size ceiling. `Entry::unpack_in` re-checks
 /// containment of every entry against the destination.
@@ -816,80 +2585,6 @@ fn view_id_of(vdom_json: &str) -> String {
                 .map(str::to_owned)
         })
         .unwrap_or_else(|| "default".to_string())
-}
-
-/// Render dirty (or all, when `force`) extensions and hand the VDOM batch to
-/// the fan-out task. `Err` means the daemon side stopped listening; the host
-/// thread treats that as its shutdown signal.
-fn push_chrome_if_dirty(
-    hosted: &mut [HostedExtension],
-    chrome_tx: &tokio::sync::mpsc::UnboundedSender<Vec<ChromeView>>,
-    force: bool,
-    published_views: &mut BTreeSet<(String, String)>,
-) -> Result<(), ()> {
-    let stale_published_view = published_views.iter().any(|(extension_id, _)| {
-        !hosted
-            .iter()
-            .any(|extension| !extension.suspended && extension.live.id() == extension_id)
-    });
-    let dirty = force
-        || stale_published_view
-        || hosted.iter().any(|extension| {
-            !extension.suspended
-                && extension.live.needs_render().unwrap_or_else(|error| {
-                    tracing::warn!(id = %extension.live.id(), %error, "invalidation check failed");
-                    false
-                })
-        });
-    if !dirty {
-        return Ok(());
-    }
-
-    // Rendering can remove a view (for example, an extension closes an
-    // overlay, or gets suspended). Send an empty payload for every previously
-    // published key that disappeared; the client treats that as a tombstone.
-    let mut current_views = BTreeMap::new();
-    for extension in hosted.iter_mut().filter(|extension| !extension.suspended) {
-        let extension_id = extension.live.id().to_string();
-        match extension.live.render_all_views() {
-            Ok(rendered) => {
-                for json in rendered {
-                    current_views.insert((extension_id.clone(), view_id_of(&json)), json);
-                }
-            }
-            Err(error) => {
-                tracing::warn!(id = %extension_id, %error, "server extension render failed");
-            }
-        }
-        extension.note_resource_violations();
-        if extension.suspended {
-            current_views.retain(|(id, _), _| id != &extension_id);
-        }
-    }
-
-    let current_keys: BTreeSet<(String, String)> = current_views.keys().cloned().collect();
-    let mut views =
-        Vec::with_capacity(current_views.len() + published_views.difference(&current_keys).count());
-    for ((extension_id, view_id), vdom_json) in current_views {
-        views.push(ChromeView {
-            extension_id,
-            view_id,
-            vdom_json,
-        });
-    }
-    for (extension_id, view_id) in published_views.difference(&current_keys) {
-        views.push(ChromeView {
-            extension_id: extension_id.clone(),
-            view_id: view_id.clone(),
-            vdom_json: String::new(),
-        });
-    }
-
-    *published_views = current_keys;
-    if views.is_empty() {
-        return Ok(());
-    }
-    chrome_tx.send(views).map_err(|_| ())
 }
 
 // ---------------------------------------------------------------------------
@@ -964,7 +2659,9 @@ mod tests {
     #[test]
     fn bridge_lists_sessions_and_rejects_unknown_methods() {
         let (sessions, _rx) = sessions_with_subscriber();
-        let bridge = ServerHostBridge::new(sessions);
+        // 未声明 filesystem 能力: 范围取最保守的 `None`, 文件系统调用在碰
+        // 文件系统之前就被桥拒绝 (fail closed)。
+        let bridge = ServerHostBridge::new(sessions, FilesystemAccess::None);
 
         let listed = bridge
             .call("mux.listSessions", &serde_json::json!([]))
@@ -985,9 +2682,26 @@ mod tests {
                 .call("mux.listSessions", &serde_json::json!([]))
                 .is_ok()
         );
-        // Unknown method: fail closed with a contextual error.
+        // Declared-but-unsupported capability: contextual, names the
+        // capability — not a generic unknown-method error.
         let error = bridge
             .call("process.spawn", &serde_json::json!([]))
+            .unwrap_err();
+        assert!(
+            error.to_string().contains("process.spawn is not supported"),
+            "error={error}"
+        );
+        // None 范围: filesystem 调用明确报出未授予, 而不是 generic error。
+        let error = bridge
+            .call("filesystem.readTextFile", &serde_json::json!(["note.txt"]))
+            .unwrap_err();
+        assert!(
+            error.to_string().contains("not granted"),
+            "error={error}"
+        );
+        // Unknown method: fail closed with a contextual error.
+        let error = bridge
+            .call("foo.bar", &serde_json::json!([]))
             .unwrap_err();
         assert!(error.to_string().contains("unknown host method"));
         // Missing argument: contextual, names the method and position.
@@ -995,6 +2709,192 @@ mod tests {
             .call("mux.sendInput", &serde_json::json!([]))
             .unwrap_err();
         assert!(error.to_string().contains("mux.sendInput"));
+    }
+
+    /// §5.6: host calls rejected by the manifest's `io_rate_limit` set the
+    /// runtime's persistent violation flag even when the extension's JS
+    /// catches the exceptions; the daemon-side supervisor must consume the
+    /// flag and suspend the extension for the daemon's lifetime.
+    #[test]
+    fn io_rate_limit_rejection_suspends_server_extension() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let extensions_dir = temp.path().join("extensions");
+        let extension_dir = extensions_dir.join("io-limit");
+        std::fs::create_dir_all(&extension_dir)?;
+        std::fs::write(
+            extension_dir.join("extension.toml"),
+            "id = \"io-limit\"\nname = \"io-limit\"\nversion = \"0.1.0\"\n\n[runtime]\nside = \"server\"\n\n[capabilities]\nmux = true\n\n[resources]\nio_rate_limit = 2\n",
+        )?;
+        std::fs::write(
+            extension_dir.join("main.js"),
+            r#"
+            export function activate(context) {
+                for (var i = 0; i < 8; i++) {
+                    try { context.mux.listSessions(); } catch (error) {}
+                }
+            }
+            "#,
+        )?;
+
+        let (sessions, _rx) = sessions_with_subscriber();
+        let discovered = quickjs_runtime::discover_server_extensions(std::slice::from_ref(
+            &extensions_dir,
+        ));
+        assert_eq!(discovered.len(), 1, "the server-side probe must be discovered");
+        // §5.6: activation requires an explicit approval for the exact policy
+        // fingerprint; the probe's IO budget test needs it activated.
+        let mut consent = BTreeMap::new();
+        consent.insert(
+            "io-limit".to_string(),
+            ServerConsentRecord {
+                id: "io-limit".to_string(),
+                policy_fingerprint: discovered[0].manifest.policy_fingerprint(),
+                state: ServerConsentState::Approved,
+            },
+        );
+        let mut hosted = activate_discovered(discovered, &consent, sessions);
+        assert_eq!(hosted.len(), 1);
+        assert!(
+            !hosted[0].suspended,
+            "activation must succeed: the JS caught the IO rejections"
+        );
+
+        hosted[0].note_resource_violations();
+        assert!(
+            hosted[0].suspended,
+            "IO quota rejection must suspend the server extension"
+        );
+        Ok(())
+    }
+
+    /// §5.6: 服务器桥按扩展声明的范围约束 `filesystem.*`——`Home` 只放行主目录
+    /// 内的路径, `Cwd` 只放行权威工作区/当前工作根内的路径 (与
+    /// `workspace.getPath` 报告的是同一个根), 越界与符号链接逃逸一律拒绝;
+    /// `workspace.getPath` 返回守护进程 cwd; `network.fetch`/`process.spawn`
+    /// 显式报能力级不支持错误, 而不是假装成功或落入 generic unknown-method。
+    #[test]
+    fn server_bridge_dispatches_declared_capabilities_safely() -> Result<()> {
+        let (sessions, _rx) = sessions_with_subscriber();
+        let temp = tempfile::tempdir()?;
+        let home = temp.path().join("home");
+        std::fs::create_dir_all(home.join("docs"))?;
+        std::fs::write(home.join("docs").join("note.txt"), "secret")?;
+        let workspace = temp.path().join("workspace");
+        std::fs::create_dir_all(workspace.join("src"))?;
+        std::fs::write(workspace.join("src").join("main.js"), "code")?;
+
+        // workspace.getPath: 守护进程 cwd, 只读无参。
+        let cwd = serde_json::json!(std::env::current_dir()?.to_string_lossy().to_string());
+
+        // -- Home 声明: 全部操作限制在 (注入的) 主目录内。--
+        let bridge = ServerHostBridge::with_home(
+            sessions.clone(),
+            home.clone(),
+            FilesystemAccess::Home,
+        );
+        assert_eq!(
+            bridge.call("workspace.getPath", &serde_json::json!([]))?,
+            cwd
+        );
+
+        // filesystem.readTextFile: 主目录内放行。
+        let text = bridge.call(
+            "filesystem.readTextFile",
+            &serde_json::json!(["docs/note.txt"]),
+        )?;
+        assert_eq!(text, serde_json::json!("secret"));
+        // 越界路径: 在碰文件系统之前就被范围检查拒绝。
+        let error = bridge
+            .call("filesystem.readTextFile", &serde_json::json!(["/etc/passwd"]))
+            .unwrap_err();
+        assert!(error.to_string().contains("escapes"), "error={error}");
+        // 主目录内的缺失文件: 报读取错误, 而不是误导性的范围错误。
+        let error = bridge
+            .call(
+                "filesystem.readTextFile",
+                &serde_json::json!(["docs/missing.txt"]),
+            )
+            .unwrap_err();
+        assert!(!error.to_string().contains("escapes"), "error={error}");
+
+        // filesystem.readDir: 主目录内放行, 条目带 name/kind。
+        let entries = bridge.call("filesystem.readDir", &serde_json::json!(["docs"]))?;
+        assert_eq!(
+            entries,
+            serde_json::json!([{ "name": "note.txt", "kind": "file" }])
+        );
+        let error = bridge
+            .call("filesystem.readDir", &serde_json::json!(["/etc"]))
+            .unwrap_err();
+        assert!(error.to_string().contains("escapes"), "error={error}");
+
+        // -- Cwd 声明: 只放行权威工作区/当前工作根内的路径。cwd 声明不能
+        // 因此读取任意 HOME 文件——主目录与工作区互相隔离。--
+        let cwd_bridge = ServerHostBridge::with_roots(
+            sessions,
+            home.clone(),
+            workspace.clone(),
+            FilesystemAccess::Cwd,
+        );
+        // 工作区根内的相对路径放行。
+        let text = cwd_bridge.call(
+            "filesystem.readTextFile",
+            &serde_json::json!(["src/main.js"]),
+        )?;
+        assert_eq!(text, serde_json::json!("code"));
+        // 工作区根内的绝对路径放行。
+        let text = cwd_bridge.call(
+            "filesystem.readTextFile",
+            &serde_json::json!([workspace.join("src/main.js").to_string_lossy()]),
+        )?;
+        assert_eq!(text, serde_json::json!("code"));
+        // HOME 内的文件: 拒绝 (cwd 声明不能读取任意 HOME 文件)。
+        let error = cwd_bridge
+            .call(
+                "filesystem.readTextFile",
+                &serde_json::json!([home.join("docs/note.txt").to_string_lossy()]),
+            )
+            .unwrap_err();
+        assert!(error.to_string().contains("escapes"), "error={error}");
+        // 经 ".." 从工作区逃进主目录: 拒绝。
+        let error = cwd_bridge
+            .call(
+                "filesystem.readTextFile",
+                &serde_json::json!(["../home/docs/note.txt"]),
+            )
+            .unwrap_err();
+        assert!(error.to_string().contains("escapes"), "error={error}");
+        // 工作区根外的绝对路径: 拒绝。
+        let error = cwd_bridge
+            .call("filesystem.readTextFile", &serde_json::json!(["/etc/passwd"]))
+            .unwrap_err();
+        assert!(error.to_string().contains("escapes"), "error={error}");
+
+        // -- Home 声明同样不能逃出主目录: 工作区在 home 之外, 拒绝。--
+        let error = bridge
+            .call(
+                "filesystem.readTextFile",
+                &serde_json::json!([workspace.join("src/main.js").to_string_lossy()]),
+            )
+            .unwrap_err();
+        assert!(error.to_string().contains("escapes"), "error={error}");
+
+        // 声明了也不提供的能力: 能力级上下文错误, 不是 silent success。
+        let error = bridge
+            .call("network.fetch", &serde_json::json!(["http://example.test"]))
+            .unwrap_err();
+        assert!(
+            error.to_string().contains("network.fetch is not supported"),
+            "error={error}"
+        );
+        let error = bridge
+            .call("process.spawn", &serde_json::json!(["echo", ["hi"]]))
+            .unwrap_err();
+        assert!(
+            error.to_string().contains("process.spawn is not supported"),
+            "error={error}"
+        );
+        Ok(())
     }
 
     /// tar's own `Builder` refuses to emit `..` paths, so a traversal archive

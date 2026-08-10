@@ -437,7 +437,9 @@ impl Item for StagedDiff {
         _: &mut Window,
         _: &mut Context<Self>,
     ) -> Task<Result<()>> {
-        unreachable!()
+        Task::ready(Err(anyhow::anyhow!(
+            "staged diff does not support Save As"
+        )))
     }
 
     fn reload(

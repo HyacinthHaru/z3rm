@@ -25,24 +25,8 @@ fn typescript_server_binary_arguments(server_path: &Path) -> Vec<OsString> {
     vec![server_path.into(), "--stdio".into()]
 }
 
-fn replace_test_name_parameters(test_name: &str) -> String {
-    static PATTERN: LazyLock<regex::Regex> =
-        LazyLock::new(|| regex::Regex::new(r"(\$([A-Za-z0-9_\.]+|[\#])|%[psdifjo#\$%])").unwrap());
-    PATTERN.split(test_name).map(regex::escape).join("(.+?)")
-}
-
 #[derive(Clone, Debug, Default)]
 struct PackageJsonContents(Arc<RwLock<HashMap<PathBuf, PackageJson>>>);
-
-impl PackageJsonData {
-    fn fill_task_templates(&self, _task_templates: &mut Vec<TaskTemplateStub>) {
-        // task crate 已删除，不再填充 task templates
-    }
-}
-
-/// 占位类型，替代已删除的 task::TaskTemplate
-#[derive(Debug, Default, Clone)]
-pub struct TaskTemplateStub;
 
 /// TypeScript/JavaScript 语言服务器适配器 (spec §3.1 L1)
 /// node_runtime crate 已删除，不再支持 npm 安装

@@ -1301,6 +1301,7 @@ impl MuxDomain {
                 self.broadcast_notification(Notification {
                     event: Some(NotifEvent::SessionLayoutChanged(SessionLayoutChanged {
                         layout: Some(layout.clone()),
+                        snapshot: None,
                     })),
                 });
             }

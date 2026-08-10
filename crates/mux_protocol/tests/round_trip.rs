@@ -255,6 +255,89 @@ fn test_shadow_file_version_envelope_round_trip() {
     assert_eq!(req.path, "/tmp/notes.md");
 }
 
+// §15.4 验证 SessionLayoutChanged 的 snapshot 字段往返: 重连合成广播携带
+// 完整权威快照, 普通布局 delta 保持 snapshot 缺省 (None), 双向兼容。
+#[test]
+fn session_layout_changed_snapshot_round_trip() {
+    let snapshot = SessionSnapshot {
+        tabs: vec![TabInfo {
+            id: "tab-1".to_string(),
+            title: "editor".to_string(),
+            panes: vec![PaneInfo {
+                id: "pane-1".to_string(),
+                title: "vim".to_string(),
+                generation: 7,
+                zoomed: true,
+                ..Default::default()
+            }],
+        }],
+        focused_pane_id: "pane-1".to_string(),
+        focused_tab_id: "tab-1".to_string(),
+        session_id: "session-1".to_string(),
+        ..Default::default()
+    };
+    let with_snapshot = Notification {
+        event: Some(proto::notification::Event::SessionLayoutChanged(
+            SessionLayoutChanged {
+                layout: Some(LayoutTree {
+                    root: Some(LayoutNode {
+                        id: "root".to_string(),
+                        node: Some(proto::layout_node::Node::Pane(PaneLeaf {
+                            pane_id: "pane-1".to_string(),
+                        })),
+                    }),
+                }),
+                snapshot: Some(snapshot),
+            },
+        )),
+    };
+
+    let framed = frame(&Envelope {
+        version: Some(PROTOCOL_VERSION),
+        payload: Some(proto::envelope::Payload::Notification(with_snapshot)),
+    })
+    .expect("frame snapshot-carrying layout change");
+    let (decoded, consumed) = unframe(&framed).expect("unframe snapshot-carrying layout change");
+    assert_eq!(consumed, framed.len());
+    let changed = match decoded.payload {
+        Some(proto::envelope::Payload::Notification(Notification {
+            event: Some(proto::notification::Event::SessionLayoutChanged(changed)),
+        })) => changed,
+        payload => panic!("expected SessionLayoutChanged, got {payload:?}"),
+    };
+    let decoded_snapshot = changed
+        .snapshot
+        .expect("reconnect resync must carry the snapshot");
+    assert_eq!(decoded_snapshot.focused_pane_id, "pane-1");
+    assert_eq!(decoded_snapshot.tabs[0].panes[0].generation, 7);
+    assert!(decoded_snapshot.tabs[0].panes[0].zoomed);
+
+    // §15.4 ordinary server layout notifications keep the field absent, so a
+    // reconnect resync stays distinguishable from a plain layout delta.
+    let delta_only = SessionLayoutChanged {
+        layout: Some(LayoutTree { root: None }),
+        snapshot: None,
+    };
+    let mut encoded = Vec::new();
+    delta_only
+        .encode(&mut encoded)
+        .expect("encode layout-only change");
+    let decoded = SessionLayoutChanged::decode(encoded.as_slice())
+        .expect("decode layout-only change");
+    assert!(decoded.snapshot.is_none(), "layout delta must stay snapshot-free");
+
+    // Old peers that never set the field decode as None too (wire default).
+    let legacy = SessionLayoutChanged {
+        layout: Some(LayoutTree { root: None }),
+        snapshot: None,
+    };
+    assert_eq!(
+        legacy.snapshot,
+        None,
+        "unset snapshot field defaults to None on the wire"
+    );
+}
+
 #[test]
 fn recovery_messages_round_trip() {
     let request = Request {

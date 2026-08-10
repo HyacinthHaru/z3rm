@@ -1206,12 +1206,134 @@ mod tests {
         assert!(tree.apply_event(&Event::SessionLayoutChanged(
             mux_protocol::SessionLayoutChanged {
                 layout: Some(layout),
+                // §15.4 ordinary server layout notifications stay pure deltas.
+                snapshot: None,
             }
         )));
 
         assert!(tree.contains_pane("pane-1"));
         assert!(!tree.contains_pane("pane-2"));
         assert!(!tree.contains_pane("pane-3"));
+    }
+
+    /// §15.4 A reconnect resync carries the authoritative snapshot; the tree
+    /// must be replaced wholesale — stale panes/tabs pruned, focus, titles
+    /// and zoom reconciled — instead of only pruning against the layout.
+    #[test]
+    fn snapshot_resync_replaces_the_tree_and_drops_zombies() {
+        let mut tree = SessionTree::from_snapshot(&snapshot());
+        // A pane created while the connection was down must not survive the
+        // resync: the reconnect snapshot is authoritative (spec §15.4).
+        assert!(tree.apply_event(&Event::PaneAdded(mux_protocol::PaneAdded {
+            pane_id: "pane-9".to_string(),
+            tab_id: "tab-9".to_string(),
+        })));
+        assert!(tree.contains_pane("pane-9"));
+
+        // The reconnected snapshot: tab-2 is gone, focus moved to pane-1 and
+        // pane-2 is zoomed with a refreshed title.
+        let resynced = SessionSnapshot {
+            tabs: vec![TabInfo {
+                id: "tab-1".to_string(),
+                title: "editor".to_string(),
+                panes: vec![
+                    PaneInfo {
+                        id: "pane-1".to_string(),
+                        title: "vim".to_string(),
+                        is_alive: true,
+                        ..Default::default()
+                    },
+                    PaneInfo {
+                        id: "pane-2".to_string(),
+                        title: "cargo watch".to_string(),
+                        is_alive: true,
+                        zoomed: true,
+                        ..Default::default()
+                    },
+                ],
+            }],
+            focused_pane_id: "pane-1".to_string(),
+            ..Default::default()
+        };
+        assert!(tree.apply_event(&Event::SessionLayoutChanged(
+            mux_protocol::SessionLayoutChanged {
+                layout: None,
+                snapshot: Some(resynced),
+            }
+        )));
+
+        assert!(!tree.contains_pane("pane-9"), "zombie pane must be pruned");
+        assert!(
+            !tree.tabs.iter().any(|tab| tab.id == "tab-9"),
+            "zombie tab must be pruned"
+        );
+        assert!(
+            !tree.contains_pane("pane-3"),
+            "panes of a tab dropped on the server must go too"
+        );
+        assert!(tree.contains_pane("pane-1"));
+        assert_eq!(tree.focused_pane_id.as_deref(), Some("pane-1"));
+        let pane_2 = tree
+            .tabs
+            .iter()
+            .flat_map(|tab| tab.panes.iter())
+            .find(|pane| pane.id == "pane-2")
+            .expect("pane-2 must survive the resync");
+        assert!(pane_2.zoomed, "zoom metadata must be reconciled");
+        assert_eq!(pane_2.title, "cargo watch");
+
+        // §15.4 at-least-once: a second identical resync is a no-op.
+        assert!(!tree.apply_event(&Event::SessionLayoutChanged(
+            mux_protocol::SessionLayoutChanged {
+                layout: None,
+                snapshot: Some(resynced),
+            }
+        )));
+    }
+
+    /// §15.4 Bell latches survive a resync for panes still present and are
+    /// dropped for panes the snapshot no longer contains.
+    #[test]
+    fn snapshot_resync_keeps_bells_for_surviving_panes() {
+        let mut tree = SessionTree::from_snapshot(&snapshot());
+        assert!(tree.apply_event(&Event::PaneBell(mux_protocol::PaneBell {
+            pane_id: "pane-1".to_string(),
+        })));
+        assert!(tree.apply_event(&Event::PaneBell(mux_protocol::PaneBell {
+            pane_id: "pane-9".to_string(),
+        })));
+
+        let resynced = SessionSnapshot {
+            tabs: vec![TabInfo {
+                id: "tab-1".to_string(),
+                title: "editor".to_string(),
+                panes: vec![
+                    PaneInfo {
+                        id: "pane-1".to_string(),
+                        title: "vim".to_string(),
+                        is_alive: true,
+                        ..Default::default()
+                    },
+                    PaneInfo {
+                        id: "pane-2".to_string(),
+                        title: "cargo watch".to_string(),
+                        is_alive: true,
+                        ..Default::default()
+                    },
+                ],
+            }],
+            focused_pane_id: "pane-2".to_string(),
+            ..Default::default()
+        };
+        assert!(tree.apply_event(&Event::SessionLayoutChanged(
+            mux_protocol::SessionLayoutChanged {
+                layout: None,
+                snapshot: Some(resynced),
+            }
+        )));
+
+        assert!(tree.bells.contains("pane-1"));
+        assert!(!tree.bells.contains("pane-9"));
     }
 
     #[test]

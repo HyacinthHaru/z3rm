@@ -10,7 +10,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use blake3::Hasher as Blake3Hasher;
 use rope::Rope;
 
@@ -320,6 +320,32 @@ impl ShadowSnapshotEngine {
             Ok(_) => {}
             Err(error) => tracing::warn!(error = %error, "shadow GC run failed"),
         }
+    }
+
+    /// §4 WAL checkpoint：把 WAL 原子旋转为空,前提是每条既有条目都已
+    /// 持久化到 SQLite / blob store。
+    ///
+    /// 必须在单写 watcher 处理线程上调用(即调用 `record_change` /
+    /// `record_delete` / `decline` 的同一线程):每个引擎操作都在返回前把
+    /// 自己的 SQLite 节点落盘,因此写线程安静下来后,WAL 里只剩已完整持久化
+    /// 的工作,可以安全旋转掉。这个入口既是显式 snapshot/checkpoint 命令,
+    /// 也是优雅关停的最后一步——recorder 线程退出前调用它,并把错误向上
+    /// 传播给关停路径。
+    ///
+    /// Decline 还原的 `DeclineDone` 完成标记还缺失时,该操作未完整持久化
+    /// (§4.8 崩溃恢复依赖 WAL 里的意图),checkpoint 拒绝截断;先调用
+    /// `recover_incomplete_restores`。
+    pub fn checkpoint(&self) -> Result<()> {
+        let pending = crate::decline::DeclineProtocol::recover(&self.wal)
+            .context("shadow checkpoint: scanning for incomplete restores")?;
+        anyhow::ensure!(
+            pending.is_empty(),
+            "shadow checkpoint refused: {} decline restore(s) still incomplete",
+            pending.len()
+        );
+        self.wal
+            .checkpoint()
+            .context("shadow WAL checkpoint failed")
     }
 
     /// Record a file change. Called by the file watcher.
@@ -725,6 +751,7 @@ impl ShadowSnapshotEngine {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::path::PathBuf;
     use tempfile::TempDir;
 
     /// Assert that `decline()` writes the restored file content to disk AND
@@ -1415,6 +1442,263 @@ mod tests {
         assert_eq!(
             engine.query_version(version).unwrap().unwrap(),
             [0xfe, 0x01, 0x81]
+        );
+    }
+
+    /// §4 checkpoint:after every prior entry is persisted to SQLite, the
+    /// checkpoint rotates the WAL empty; subsequent writes continue from the
+    /// same sequence; a restart rebuilds all versions and SeqNo stays
+    /// monotonic across checkpoint + restart.
+    #[test]
+    fn engine_checkpoint_preserves_history_and_monotonicity_across_restart() {
+        let dir = TempDir::new().unwrap();
+        let db = dir.path().join("ckpt.db");
+        let wal_path = dir.path().join("ckpt.wal");
+        let blobs = dir.path().join("ckpt-blobs");
+        std::fs::create_dir_all(&blobs).unwrap();
+        let path = dir.path().join("doc.txt");
+
+        let max_seq_before_checkpoint = {
+            let engine = ShadowSnapshotEngine::open(&db, &wal_path, &blobs).unwrap();
+            engine.record_change(&path, b"v1").unwrap();
+            engine.record_change(&path, b"v2").unwrap();
+            assert_eq!(engine.wal.replay().unwrap().len(), 2);
+
+            engine.checkpoint().unwrap();
+            assert!(
+                engine.wal.replay().unwrap().is_empty(),
+                "checkpoint must rotate the WAL empty"
+            );
+            assert!(
+                !dir.path().join("ckpt.wal.old").exists(),
+                "rotation archive must be cleaned up"
+            );
+
+            // Checkpoint 之后继续写入:序列号接着推进。
+            let v3 = engine.record_change(&path, b"v3").unwrap();
+            let v3_node = engine.get_version_node(v3).unwrap();
+            v3_node.seq_no
+        };
+
+        // 重启:三个版本全部重建,WAL 只剩 checkpoint 后的条目。
+        let engine = ShadowSnapshotEngine::open(&db, &wal_path, &blobs).unwrap();
+        let versions = engine.list_versions(&path).unwrap();
+        assert_eq!(versions.len(), 3, "checkpoint must not lose persisted history");
+        assert_eq!(
+            engine
+                .query_version(versions.last().expect("v3 version").0)
+                .unwrap()
+                .unwrap(),
+            b"v3"
+        );
+
+        // SeqNo 跨 checkpoint + 重启严格单调。
+        let v4 = engine.record_change(&path, b"v4").unwrap();
+        let v4_node = engine.get_version_node(v4).unwrap();
+        assert!(
+            v4_node.seq_no > max_seq_before_checkpoint,
+            "SeqNo must stay monotonic across checkpoint and restart ({} > {})",
+            v4_node.seq_no,
+            max_seq_before_checkpoint
+        );
+    }
+
+    /// A decline restore whose DeclineDone marker is still missing is not
+    /// fully persisted (§4.8); checkpoint must refuse to truncate its intent
+    /// away, and succeed once recovery completes it.
+    #[test]
+    fn engine_checkpoint_refuses_pending_decline_intent() {
+        let dir = TempDir::new().unwrap();
+        let db = dir.path().join("pending.db");
+        let wal_path = dir.path().join("pending.wal");
+        let blobs = dir.path().join("pending-blobs");
+        std::fs::create_dir_all(&blobs).unwrap();
+        let path = dir.path().join("declined.txt");
+        let path_hash = compute_path_hash(&path);
+
+        // 直接向 WAL 注入一条 Decline 意图(无 DeclineDone),复刻崩溃后、
+        // recover_incomplete_restores 尚未运行的窗口。
+        let content_hash = {
+            let storage = Arc::new(StorageEngine::open(&db).unwrap());
+            let blob_store = BlobStore::new(storage, blobs.clone());
+            blob_store.put(b"restored content").unwrap()
+        };
+        {
+            let wal = Wal::open(&wal_path).unwrap();
+            wal.append(&WalEntry {
+                seq_no: 7,
+                path_hash,
+                parent_id: None,
+                content_ref: Some(content_hash),
+                delta_ref: None,
+                trigger: SnapshotTrigger::Decline,
+            })
+            .unwrap();
+            wal.commit().unwrap();
+        }
+
+        let engine = ShadowSnapshotEngine::open(&db, &wal_path, &blobs).unwrap();
+        let error = engine
+            .checkpoint()
+            .expect_err("pending decline must block the checkpoint");
+        assert!(
+            error.to_string().contains("decline"),
+            "error must name the incomplete restore: {error:#}"
+        );
+
+        // 恢复完成后 checkpoint 放行,并把 WAL 旋转为空。
+        let completed = engine
+            .recover_incomplete_restores(|_| Some(path.clone()))
+            .unwrap();
+        assert_eq!(completed, 1);
+        engine.checkpoint().unwrap();
+        assert!(engine.wal.replay().unwrap().is_empty());
+    }
+
+    /// A checkpoint that cannot rotate (blocked archive path) must surface
+    /// its error to the caller — the graceful-shutdown path — and leave the
+    /// WAL fully replayable.
+    #[test]
+    fn engine_checkpoint_surfaces_rotation_failure() {
+        let dir = TempDir::new().unwrap();
+        let db = dir.path().join("fail.db");
+        let wal_path = dir.path().join("fail.wal");
+        let blobs = dir.path().join("fail-blobs");
+        std::fs::create_dir_all(&blobs).unwrap();
+        let path = dir.path().join("doc.txt");
+        let engine = ShadowSnapshotEngine::open(&db, &wal_path, &blobs).unwrap();
+        engine.record_change(&path, b"v1").unwrap();
+
+        std::fs::create_dir(dir.path().join("fail.wal.old")).unwrap();
+
+        let error = engine
+            .checkpoint()
+            .expect_err("blocked rotation must fail the checkpoint");
+        assert!(
+            error.to_string().contains("checkpoint"),
+            "error must name the failing checkpoint: {error:#}"
+        );
+        assert_eq!(
+            engine.wal.replay().unwrap().len(),
+            1,
+            "a failed checkpoint must leave the WAL replayable"
+        );
+    }
+
+    /// 构造旋转崩溃窗口重启场景:通过引擎记录 v1,再直接向 WAL 注入一条
+    /// seq_no 10_000 的完整快照条目(内容已入 blob store,但节点从未写入
+    /// SQLite——复刻 `write_node` 失败后 WAL 残留的条目)。返回数据库 /
+    /// WAL / blob 路径、被注入路径与注入内容,供两种崩溃窗口的重启测试
+    /// 使用。
+    fn engine_with_wal_only_entry(
+        directory: &TempDir,
+        name: &str,
+    ) -> (PathBuf, PathBuf, PathBuf, PathBuf, Vec<u8>) {
+        let database = directory.path().join(format!("{name}.db"));
+        let wal_path = directory.path().join(format!("{name}.wal"));
+        let blobs = directory.path().join(format!("{name}-blobs"));
+        std::fs::create_dir_all(&blobs).unwrap();
+        let path = directory.path().join("note.txt");
+
+        let v1 = {
+            let engine = ShadowSnapshotEngine::open(&database, &wal_path, &blobs).unwrap();
+            engine.record_change(&path, b"hello\n").unwrap()
+        };
+
+        let wal_only_content = b"hello\nworld\n".to_vec();
+        let content_hash = {
+            let storage = Arc::new(StorageEngine::open(&database).unwrap());
+            let blob_store = BlobStore::new(storage, blobs.clone());
+            blob_store.put(&wal_only_content).unwrap()
+        };
+        let wal = Wal::open(&wal_path).unwrap();
+        wal.append(&WalEntry {
+            seq_no: 10_000,
+            path_hash: compute_path_hash(&path),
+            parent_id: Some(v1),
+            content_ref: Some(content_hash),
+            delta_ref: None,
+            trigger: SnapshotTrigger::Write,
+        })
+        .unwrap();
+        wal.commit().unwrap();
+        drop(wal);
+
+        (database, wal_path, blobs, path, wal_only_content)
+    }
+
+    /// 崩溃点 1:checkpoint 的 rename 已生效、fresh file 尚未创建(规范
+    /// 路径缺失)。引擎重启必须通过 `Wal::open` 恢复归档并回放,把
+    /// WAL-only 节点重建回树与 SQLite;下次写入的 SeqNo 继续高于回放过
+    /// 的最大值。
+    #[test]
+    fn engine_restart_recovers_archived_wal_after_rotation_crash() {
+        let directory = TempDir::new().unwrap();
+        let (database, wal_path, blobs, path, wal_only_content) =
+            engine_with_wal_only_entry(&directory, "crash-missing");
+
+        std::fs::rename(
+            &wal_path,
+            directory.path().join("crash-missing.wal.old"),
+        )
+        .unwrap();
+        assert!(!wal_path.exists());
+
+        let engine = ShadowSnapshotEngine::open(&database, &wal_path, &blobs).unwrap();
+        let versions = engine.list_versions(&path).unwrap();
+        assert_eq!(
+            versions.len(),
+            2,
+            "archived WAL must restore the unpersisted node"
+        );
+        let recovered_id = versions
+            .iter()
+            .find(|(_, seq, _)| *seq == 10_000)
+            .expect("wal-only version recovered")
+            .0;
+        assert_eq!(
+            engine.query_version(recovered_id).unwrap().unwrap(),
+            wal_only_content,
+            "recovered node must read back its full snapshot content"
+        );
+
+        // 下次写入必须高于回放后的最大 seq_no。
+        engine.record_change(&path, b"hello\nworld!\n").unwrap();
+        let after = engine.list_versions(&path).unwrap();
+        let max_seq = after.iter().map(|(_, seq, _)| *seq).max().unwrap();
+        assert!(
+            max_seq > 10_000,
+            "seq allocator must advance past replayed max"
+        );
+    }
+
+    /// 崩溃点 2:rename 已生效、fresh 空文件已创建、归档尚未删除(规范
+    /// 路径存在但为空)。引擎重启不得静默偏好空文件,必须把归档恢复
+    /// 回来并回放 WAL-only 节点。
+    #[test]
+    fn engine_restart_recovers_archived_wal_when_empty_canonical_exists() {
+        let directory = TempDir::new().unwrap();
+        let (database, wal_path, blobs, path, wal_only_content) =
+            engine_with_wal_only_entry(&directory, "crash-empty");
+
+        std::fs::rename(&wal_path, directory.path().join("crash-empty.wal.old")).unwrap();
+        std::fs::write(&wal_path, b"").unwrap();
+
+        let engine = ShadowSnapshotEngine::open(&database, &wal_path, &blobs).unwrap();
+        let versions = engine.list_versions(&path).unwrap();
+        assert_eq!(
+            versions.len(),
+            2,
+            "recovery must not prefer the empty canonical file"
+        );
+        let recovered_id = versions
+            .iter()
+            .find(|(_, seq, _)| *seq == 10_000)
+            .expect("wal-only version recovered")
+            .0;
+        assert_eq!(
+            engine.query_version(recovered_id).unwrap().unwrap(),
+            wal_only_content
         );
     }
 }

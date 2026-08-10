@@ -20,7 +20,7 @@ use fs::{Fs, RealFs};
 use futures::StreamExt as _;
 use gpui::{
     App, AppContext as _, Application, BorrowAppContext as _, Context, Entity, Global, TaskExt,
-    Window,
+    WeakEntity, Window,
 };
 use gpui_platform;
 use parking_lot::Mutex;
@@ -162,6 +162,65 @@ fn focus_adjacent_mux_pane(
     focus_mux_workspace_pane(panes[index].clone(), window, cx);
 }
 
+// ============================================================================
+// §16.7 Extension shortcuts: MuxPaneView resolver installation + event routing
+// ============================================================================
+
+/// §16.7 Build a pane view with the extension shortcut resolver installed so
+/// declared extension keybindings can match in the pane's priority chain.
+/// Without a host (or before any keymap report lands) the resolver is
+/// absent and the pane behaves exactly as it did before — native core
+/// commands never depend on the extension host.
+fn new_mux_pane_view(
+    pane_id: String,
+    domain: Arc<mux::MuxDomain>,
+    workspace: WeakEntity<workspace::Workspace>,
+    project: WeakEntity<project::Project>,
+    window: &mut Window,
+    cx: &mut Context<terminal_view::mux_pane::MuxPaneView>,
+) -> terminal_view::mux_pane::MuxPaneView {
+    let mut view = terminal_view::mux_pane::MuxPaneView::new(
+        pane_id,
+        domain,
+        workspace,
+        project,
+        window,
+        cx,
+    );
+    if let Some(host) = cx.try_global::<quickjs_extensions::GlobalHostController>() {
+        view.set_extension_shortcut_resolver(Some(host.read(cx).extension_shortcut_resolver()));
+    }
+    view
+}
+
+/// §16.7 Route every `MuxPaneEvent::ExtensionAction` the pane emits to the
+/// extension host, which dispatches it to the owning extension through the
+/// command registry. A pane that never matches an extension shortcut emits
+/// nothing; without a host the route is a logged no-op.
+fn subscribe_mux_pane_extension_actions(
+    view: &Entity<terminal_view::mux_pane::MuxPaneView>,
+    cx: &mut App,
+) {
+    cx.subscribe(view, |_, event, cx| {
+        if let terminal_view::mux_pane::MuxPaneEvent::ExtensionAction { action_id } = event {
+            route_extension_action(action_id.as_ref(), cx);
+        }
+    })
+    .detach();
+}
+
+/// §16.7 Dispatch one extension action id through the host's command
+/// registry; owner resolution happens inside `execute_command`. A missing
+/// host is a no-op — the id comes from an extension keymap, so there is
+/// nothing to do natively (and native core commands never arrive here).
+fn route_extension_action(action_id: &str, cx: &mut App) {
+    let Some(host) = cx.try_global::<quickjs_extensions::GlobalHostController>() else {
+        tracing::debug!(action_id, "extension host absent; extension action dropped");
+        return;
+    };
+    host.read(cx).execute_command(action_id, "");
+}
+
 fn apply_mux_layout_to_workspace(
     workspace: &mut workspace::Workspace,
     layout: &workspace::layout_projection::LayoutTree,
@@ -189,8 +248,8 @@ fn apply_mux_layout_to_workspace(
         existing,
         |workspace, window, cx| workspace.add_pane_for_layout(window, cx),
         |workspace, pane, pane_id, window, cx| {
-            let item: Box<dyn workspace::ItemHandle> = Box::new(cx.new(|cx| {
-                terminal_view::mux_pane::MuxPaneView::new(
+            let view = cx.new(|cx| {
+                new_mux_pane_view(
                     pane_id,
                     domain.clone(),
                     workspace.weak_handle(),
@@ -198,7 +257,9 @@ fn apply_mux_layout_to_workspace(
                     window,
                     cx,
                 )
-            }));
+            });
+            subscribe_mux_pane_extension_actions(&view, cx);
+            let item: Box<dyn workspace::ItemHandle> = Box::new(view);
             workspace.add_item(pane.clone(), item, None, true, true, window, cx);
         },
         window,
@@ -216,9 +277,16 @@ fn apply_mux_layout_to_workspace(
 /// server-minted window id. That is what makes window teardown precise: closing
 /// the window closes exactly one connection, and the server releases exactly
 /// that window's session membership — including when the process crashes.
-struct MuxWindow {
+///
+/// §16.6 For a remote (`attach --ssh`) window, `ssh_session` additionally
+/// owns the SSH ControlMaster + socket forward: it must stay alive as long as
+/// the window renders, so it lives here and dies only when the binding is
+/// removed. The type parameter exists so the carry-over contract (rebinding a
+/// window must not drop the session) is testable without a live tunnel.
+struct MuxWindow<T = mux::SshSession> {
     domain: Arc<mux::MuxDomain>,
     session_id: String,
+    ssh_session: Option<T>,
 }
 
 /// §3.3 Client-side view of which windows share which session (Plan 32).
@@ -265,19 +333,50 @@ impl MuxWindows {
     }
 }
 
+/// §3.3 Rebind `window_id` to a new (domain, session) binding.
+///
+/// Any SSH session held for the window is carried across the swap: switching
+/// sessions must not tear down the tunnel, which dies only when the window
+/// binding is removed (`take_mux_window`). Generic over the held resource so
+/// the carry-over contract is unit-testable without a live SSH tunnel.
+fn rebind_mux_window<T>(
+    windows: &mut std::collections::HashMap<gpui::WindowId, MuxWindow<T>>,
+    window_id: gpui::WindowId,
+    domain: Arc<mux::MuxDomain>,
+    session_id: String,
+    ssh_session: Option<T>,
+) {
+    let held = windows
+        .get_mut(&window_id)
+        .and_then(|existing| existing.ssh_session.take());
+    windows.insert(
+        window_id,
+        MuxWindow {
+            domain,
+            session_id,
+            ssh_session: held.or(ssh_session),
+        },
+    );
+}
+
 fn register_mux_window(
     window_id: gpui::WindowId,
     domain: Arc<mux::MuxDomain>,
     session_id: String,
+    ssh_session: Option<mux::SshSession>,
     cx: &mut App,
 ) {
     if cx.try_global::<MuxWindows>().is_none() {
         cx.set_global(MuxWindows::default());
     }
     cx.update_global::<MuxWindows, ()>(|windows, _| {
-        windows
-            .windows
-            .insert(window_id, MuxWindow { domain, session_id });
+        rebind_mux_window(
+            &mut windows.windows,
+            window_id,
+            domain,
+            session_id,
+            ssh_session,
+        );
     });
 }
 
@@ -373,8 +472,8 @@ fn install_snapshot_panes(
                 snapshot.focused_pane.as_deref(),
                 |workspace, window, cx| workspace.add_pane_for_layout(window, cx),
                 |workspace, pane, pane_id, window, cx| {
-                    let item: Box<dyn workspace::ItemHandle> = Box::new(cx.new(|cx| {
-                        terminal_view::mux_pane::MuxPaneView::new(
+                    let view = cx.new(|cx| {
+                        new_mux_pane_view(
                             pane_id,
                             domain.clone(),
                             workspace.weak_handle(),
@@ -382,7 +481,9 @@ fn install_snapshot_panes(
                             window,
                             cx,
                         )
-                    }));
+                    });
+                    subscribe_mux_pane_extension_actions(&view, cx);
+                    let item: Box<dyn workspace::ItemHandle> = Box::new(view);
                     workspace.add_item(pane.clone(), item, None, true, true, window, cx);
                 },
                 window,
@@ -421,8 +522,8 @@ fn install_snapshot_panes(
                 snapshot.pane_ids.clone()
             };
             for (index, pane_id) in pane_ids.into_iter().enumerate() {
-                let item: Box<dyn workspace::ItemHandle> = Box::new(cx.new(|cx| {
-                    terminal_view::mux_pane::MuxPaneView::new(
+                let view = cx.new(|cx| {
+                    new_mux_pane_view(
                         pane_id,
                         domain.clone(),
                         workspace.weak_handle(),
@@ -430,7 +531,9 @@ fn install_snapshot_panes(
                         window,
                         cx,
                     )
-                }));
+                });
+                subscribe_mux_pane_extension_actions(&view, cx);
+                let item: Box<dyn workspace::ItemHandle> = Box::new(view);
                 workspace.add_item(pane.clone(), item, None, index == 0, true, window, cx);
             }
         }
@@ -450,7 +553,7 @@ async fn open_mux_window(
 ) -> anyhow::Result<gpui::WindowHandle<workspace::MultiWorkspace>> {
     let attach_response = domain.create_and_attach_window(&session_id).await?;
     let snapshot = MuxSnapshot::from_attach(&attach_response);
-    open_mux_window_with_snapshot(domain, session_id, snapshot, app_state, cx).await
+    open_mux_window_with_snapshot(domain, session_id, snapshot, app_state, None, cx).await
 }
 
 /// §3.3 Open a window for a session this domain has already attached to.
@@ -462,6 +565,7 @@ async fn open_mux_window_with_snapshot(
     session_id: String,
     snapshot: MuxSnapshot,
     app_state: Arc<workspace::AppState>,
+    ssh_session: Option<mux::SshSession>,
     cx: &mut gpui::AsyncApp,
 ) -> anyhow::Result<gpui::WindowHandle<workspace::MultiWorkspace>> {
     let open_result = cx
@@ -490,6 +594,7 @@ async fn open_mux_window_with_snapshot(
             window_handle.window_id(),
             domain.clone(),
             session_id.clone(),
+            ssh_session,
             cx,
         );
     });
@@ -607,7 +712,7 @@ fn activate_mux_session(
                     }
                 })?;
                 cx.update(|window, cx| {
-                    register_mux_window(window_id, domain.clone(), session_id.clone(), cx);
+                    register_mux_window(window_id, domain.clone(), session_id.clone(), None, cx);
                     // The sidebar's tree is bound to one session, so switching
                     // rebinds it while keeping the user's chosen width.
                     let Some(multi_workspace) =
@@ -1095,15 +1200,17 @@ fn main() {
         paths::set_custom_data_dir(data_dir);
     }
 
-    // §3.10 `attach` is the only mux CLI command that opens a GUI. The CLI
-    // process still returns immediately: it launches a fresh GUI process with
-    // the target carried in environment variables, prints confirmation, and exits.
+    // §3.10 / §16.6 `attach` (local or `--ssh`) is the mux CLI command that
+    // opens a GUI. The CLI process still returns immediately: it launches a
+    // fresh GUI process with the target / SSH URI carried in environment
+    // variables (never argv, and never echoed to the user), prints a
+    // confirmation, and exits.
     let attach_target = if std::env::var_os("Z3RM_GUI_ATTACH").is_some() {
         std::env::var("Z3RM_ATTACH_TARGET").ok()
     } else if startup_open_url.is_some() {
         None
     } else {
-        if let Some(cli::LaunchIntent::Gui { target }) = cli::parse_launch_intent_from(&args) {
+        if let Some(intent) = cli::parse_launch_intent_from(&args) {
             let executable = std::env::current_exe().unwrap_or_else(|error| {
                 eprintln!("error: failed to locate z3rm executable: {error}");
                 std::process::exit(1);
@@ -1114,18 +1221,33 @@ fn main() {
                 .stdin(std::process::Stdio::null())
                 .stdout(std::process::Stdio::null())
                 .stderr(std::process::Stdio::null());
-            if let Some(target) = &target {
-                command.env("Z3RM_ATTACH_TARGET", target);
+            match intent {
+                cli::LaunchIntent::Gui { target } => {
+                    if let Some(target) = &target {
+                        command.env("Z3RM_ATTACH_TARGET", target);
+                    }
+                    command.spawn().unwrap_or_else(|error| {
+                        eprintln!("error: failed to launch z3rm GUI: {error}");
+                        std::process::exit(1);
+                    });
+                    eprintln!(
+                        "z3rm: attached to session '{}' in GUI window",
+                        target.as_deref().unwrap_or("default")
+                    );
+                    std::process::exit(0);
+                }
+                cli::LaunchIntent::Ssh { uri } => {
+                    // §16.6 The URI rides in the child's environment only: it
+                    // must not appear in argv or in the launcher's output.
+                    command.env("Z3RM_SSH_URI", &uri);
+                    command.spawn().unwrap_or_else(|error| {
+                        eprintln!("error: failed to launch z3rm GUI: {error}");
+                        std::process::exit(1);
+                    });
+                    eprintln!("z3rm: connecting to remote mux_server in a GUI window");
+                    std::process::exit(0);
+                }
             }
-            command.spawn().unwrap_or_else(|error| {
-                eprintln!("error: failed to launch z3rm GUI: {error}");
-                std::process::exit(1);
-            });
-            eprintln!(
-                "z3rm: attached to session '{}' in GUI window",
-                target.as_deref().unwrap_or("default")
-            );
-            std::process::exit(0);
         }
 
         let cli_cmd = match cli::parse_cli_args_from(&args) {
@@ -1160,6 +1282,14 @@ fn main() {
             }
             std::process::exit(0);
         }
+        None
+    };
+
+    // §16.6 SSH attach URI, carried from the CLI launcher via the child's
+    // environment. Only present in the GUI child process; never logged.
+    let ssh_uri = if std::env::var_os("Z3RM_GUI_ATTACH").is_some() {
+        std::env::var("Z3RM_SSH_URI").ok()
+    } else {
         None
     };
 
@@ -1351,10 +1481,42 @@ fn main() {
         zlog_settings::init(cx);
 
         // §16.1 daemon 自动启动 → 连接 → session → pane → 窗口
+        // §16.6 `attach --ssh <uri>` 不启动本地 daemon: connect_ssh 建立隧道,
+        // 返回的 SshSession 由窗口持有 (见 MuxWindow), 直到窗口关闭才释放。
         cx.spawn(async move |cx| {
-            eprintln!("[z3rm] Starting daemon connection flow");
-            let domain = Arc::new(daemon::ensure_daemon_running().await?);
+            eprintln!("[z3rm] Starting mux connection flow");
+            let (domain, ssh_session) = match ssh_uri {
+                Some(uri) => {
+                    let (domain, session) = mux::connect_ssh(&uri)
+                        .await
+                        .context("failed to connect via SSH. Ensure the remote host has an OpenSSH client and is reachable.")?;
+                    (Arc::new(domain), Some(session))
+                }
+                None => (Arc::new(daemon::ensure_daemon_running().await?), None),
+            };
             eprintln!("[z3rm] Daemon connected");
+
+            // §16.12 Push the user's server-side extensions to the mux
+            // server (SSH tunnel or local daemon) so path/git-installed
+            // extensions are available remotely too. Fire-and-forget: a
+            // sync failure must never block the attach, and validation
+            // stays server-side — the install endpoint rejects bad
+            // manifests, client-only sides, and unsafe archives (§16.6).
+            {
+                let sync_domain = domain.clone();
+                let sync_dir = paths::extensions_dir().clone();
+                cx.spawn(async move |_| {
+                    if let Err(error) =
+                        mux::sync_extensions_to_remote(&sync_domain, &sync_dir).await
+                    {
+                        tracing::warn!(
+                            %error,
+                            "syncing local extensions to the mux server failed; extensions still run locally"
+                        );
+                    }
+                })
+                .detach();
+            }
 
             // §3.10 GUI attach target: 命令行 `attach [-t target]` 把目标 session
             // 携带过来, 优先解析；target 为空时退回到默认 session。
@@ -1389,14 +1551,22 @@ fn main() {
             });
 
             // §3.8/§15.12 Start daemon connection watcher for automatic
+        go_to_line::init(cx);
+        encoding_selector::init(cx);
             // authoritative reconnect. Pass the active session_id so the
             // watcher can reattach and broadcast a synthetic layout
             // notification after the swap.
-            let domain_for_watch = domain.clone();
-            let session_for_watch = session_id.clone();
-            cx.update(|cx| {
-                daemon::watch_daemon_connection(domain_for_watch, session_for_watch, cx).detach();
-            });
+            // §16.6 The watcher is local-daemon machinery: an SSH window's
+            // connection is the tunnel itself, which the SshSession owns —
+            // there is no local daemon to watch or restart.
+            if ssh_session.is_none() {
+                let domain_for_watch = domain.clone();
+                let session_for_watch = session_id.clone();
+                cx.update(|cx| {
+                    daemon::watch_daemon_connection(domain_for_watch, session_for_watch, cx)
+                        .detach();
+                });
+            }
 
             // §1.1 spec: terminal 是默认 center pane item.
             // 任何新 Workspace 如果 active pane 为空, 自动 spawn terminal pane。
@@ -1458,9 +1628,11 @@ fn main() {
                                     Ok(new_pane_id) => {
                                         if let Err(e) = window_handle.update(cx, |_, window, cx| {
                                             if let Err(e) = weak_workspace.update(cx, |workspace, cx| {
-                                                let item: Box<dyn workspace::ItemHandle> = Box::new(cx.new(|cx| {
-                                                    terminal_view::mux_pane::MuxPaneView::new(new_pane_id, domain, workspace.weak_handle(), workspace.project().downgrade(), window, cx)
-                                                }));
+                                                let view = cx.new(|cx| {
+                                                    new_mux_pane_view(new_pane_id, domain, workspace.weak_handle(), workspace.project().downgrade(), window, cx)
+                                                });
+                                                subscribe_mux_pane_extension_actions(&view, cx);
+                                                let item: Box<dyn workspace::ItemHandle> = Box::new(view);
                                                 workspace.split_item(workspace::SplitDirection::Right, item, window, cx);
                                             }) {
                                                 tracing::debug!(error = %e, "workspace dropped during mux_pane::SplitRight handler");
@@ -1492,9 +1664,11 @@ fn main() {
                                     Ok(new_pane_id) => {
                                         if let Err(e) = window_handle.update(cx, |_, window, cx| {
                                             if let Err(e) = weak_workspace.update(cx, |workspace, cx| {
-                                                let item: Box<dyn workspace::ItemHandle> = Box::new(cx.new(|cx| {
-                                                    terminal_view::mux_pane::MuxPaneView::new(new_pane_id, domain, workspace.weak_handle(), workspace.project().downgrade(), window, cx)
-                                                }));
+                                                let view = cx.new(|cx| {
+                                                    new_mux_pane_view(new_pane_id, domain, workspace.weak_handle(), workspace.project().downgrade(), window, cx)
+                                                });
+                                                subscribe_mux_pane_extension_actions(&view, cx);
+                                                let item: Box<dyn workspace::ItemHandle> = Box::new(view);
                                                 workspace.split_item(workspace::SplitDirection::Down, item, window, cx);
                                             }) {
                                                 tracing::debug!(error = %e, "workspace dropped during mux_pane::SplitDown handler");
@@ -1686,9 +1860,11 @@ fn main() {
                                         if let Err(error) = window_handle.update(cx, |_, window, cx| {
                                             if let Err(error) = weak_workspace.update(cx, |workspace, cx| {
                                                 let pane = workspace.active_pane().clone();
-                                                let item: Box<dyn workspace::ItemHandle> = Box::new(cx.new(|cx| {
-                                                    terminal_view::mux_pane::MuxPaneView::new(new_pane_id, domain, workspace.weak_handle(), workspace.project().downgrade(), window, cx)
-                                                }));
+                                                let view = cx.new(|cx| {
+                                                    new_mux_pane_view(new_pane_id, domain, workspace.weak_handle(), workspace.project().downgrade(), window, cx)
+                                                });
+                                                subscribe_mux_pane_extension_actions(&view, cx);
+                                                let item: Box<dyn workspace::ItemHandle> = Box::new(view);
                                                 workspace.add_item(pane, item, None, true, true, window, cx);
                                             }) {
                                                 tracing::debug!(%error, "workspace dropped during mux_pane::NewTab handler");
@@ -1960,9 +2136,11 @@ fn main() {
                                 workspace.active_pane().update(cx, |pane, _| {
                                     pane.set_should_display_welcome_page(false);
                                 });
-                                let item: Box<dyn ItemHandle> = Box::new(cx.new(|cx| {
-                                    terminal_view::mux_pane::MuxPaneView::new(pane_id, domain, workspace.weak_handle(), workspace.project().downgrade(), window, cx)
-                                }));
+                                let view = cx.new(|cx| {
+                                    new_mux_pane_view(pane_id, domain, workspace.weak_handle(), workspace.project().downgrade(), window, cx)
+                                });
+                                subscribe_mux_pane_extension_actions(&view, cx);
+                                let item: Box<dyn ItemHandle> = Box::new(view);
                                 let pane = workspace.active_pane().clone();
                                 workspace.add_item(pane, item, None, true, true, window, cx);
                             }) {
@@ -2004,6 +2182,7 @@ fn main() {
                 session_id,
                 snapshot,
                 app_state.clone(),
+                ssh_session,
                 cx,
             )
             .await?;
@@ -2115,6 +2294,77 @@ mod tests {
             vec!["win-1".to_string()]
         );
         assert!(windows.session_window_ids("session-2").is_empty());
+    }
+
+    /// §3.3 / §16.6 Swapping a window's binding (sidebar session switch) must
+    /// carry any held SSH session across the swap: the tunnel keeps the
+    /// window's remote connection alive and is released only when the window
+    /// owner itself is removed (window close -> `take_mux_window`).
+    #[test]
+    fn rebinding_a_window_preserves_the_held_ssh_session_until_removed() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::sync::Arc;
+
+        /// Stand-in for `mux::SshSession`: counts drops so the carry-over
+        /// contract is observable without a live SSH tunnel.
+        struct SessionProbe(Arc<AtomicUsize>);
+
+        impl Drop for SessionProbe {
+            fn drop(&mut self) {
+                self.0.fetch_add(1, Ordering::SeqCst);
+            }
+        }
+
+        /// A domain over an EOF-only stream: the mux I/O thread exits
+        /// immediately and the domain is never used for requests here.
+        fn dummy_domain() -> Arc<mux::MuxDomain> {
+            Arc::new(
+                mux::MuxDomain::connect_with_blocking_stream(std::io::Cursor::new(Vec::new()))
+                    .expect("dummy domain"),
+            )
+        }
+
+        let drops = Arc::new(AtomicUsize::new(0));
+        let window_id = gpui::WindowId::from(1u64);
+        let mut windows: std::collections::HashMap<gpui::WindowId, super::MuxWindow<SessionProbe>> =
+            std::collections::HashMap::new();
+
+        super::rebind_mux_window(
+            &mut windows,
+            window_id,
+            dummy_domain(),
+            "session-1".to_string(),
+            Some(SessionProbe(drops.clone())),
+        );
+
+        // Session switch in the same window: the held session must survive.
+        super::rebind_mux_window(
+            &mut windows,
+            window_id,
+            dummy_domain(),
+            "session-2".to_string(),
+            None,
+        );
+        assert_eq!(
+            drops.load(Ordering::SeqCst),
+            0,
+            "a session switch must not drop the held SSH session"
+        );
+        assert_eq!(
+            windows.get(&window_id).map(|binding| binding.session_id.as_str()),
+            Some("session-2"),
+            "the new binding must win"
+        );
+        assert_eq!(windows.len(), 1, "rebinding must not leak window slots");
+
+        // Removing the window owner (what take_mux_window does on close)
+        // releases the session.
+        windows.remove(&window_id);
+        assert_eq!(
+            drops.load(Ordering::SeqCst),
+            1,
+            "removing the window owner must drop the SSH session"
+        );
     }
 
     #[test]

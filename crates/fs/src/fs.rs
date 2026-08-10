@@ -1080,25 +1080,43 @@ impl Fs for RealFs {
             log::warn!("Failed to watch {}:\n{e}", path.display());
         }
 
-        // Check if path is a symlink and follow the target parent
-        if let Some(mut target) = self.read_link(path).await.ok() {
-            log::trace!("watch symlink {path:?} -> {target:?}");
-            // Check if symlink target is relative path, if so make it absolute
-            if target.is_relative()
-                && let Some(parent) = path.parent()
-            {
-                target = parent.join(target);
-                if let Ok(canonical) = self.canonicalize(&target).await {
-                    target = SanitizedPath::new(&canonical).as_path().to_path_buf();
+        match self.read_link(path).await {
+            Ok(mut target) => {
+                log::trace!("watch symlink {path:?} -> {target:?}");
+                // Check if symlink target is relative path, if so make it absolute
+                if target.is_relative()
+                    && let Some(parent) = path.parent()
+                {
+                    target = parent.join(target);
+                    if let Ok(canonical) = self.canonicalize(&target).await {
+                        target = SanitizedPath::new(&canonical).as_path().to_path_buf();
+                    }
+                }
+                if let Err(e) = watcher.add(&target) {
+                    log::warn!(
+                        "Failed to watch symlink target {} of {}:\n{e}",
+                        target.display(),
+                        path.display(),
+                    );
+                }
+                // Skipped for poll watchers: PollWatcher::watch() recursively scans
+                // at registration, blocking on large virtual filesystem mounts
+                if let Some(parent) = target.parent()
+                    && !fs_watcher::requires_poll_watcher(parent)
+                {
+                    if let Err(e) = watcher.add(parent) {
+                        log::warn!(
+                            "Failed to watch parent {} of symlink target {} (path {}):\n{e}",
+                            parent.display(),
+                            target.display(),
+                            path.display(),
+                        );
+                    }
                 }
             }
-            watcher.add(&target).ok();
-            // Skipped for poll watchers: PollWatcher::watch() recursively scans
-            // at registration, blocking on large virtual filesystem mounts
-            if let Some(parent) = target.parent()
-                && !fs_watcher::requires_poll_watcher(parent)
-            {
-                watcher.add(parent).log_err();
+            Err(e) => {
+                // Not a symlink or unreadable — no symlink target to watch.
+                log::trace!("watch: {path:?} is not a symlink or unreadable: {e}");
             }
         }
 

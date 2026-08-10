@@ -2,7 +2,9 @@
 // generation counter、session 生命周期等核心功能。
 
 use crate::grid_sync::{GridDiff, GridDiffRing};
-use crate::layout::{LayoutNode, LayoutTree, SplitDirection};
+use crate::layout::{
+    LayoutNode, LayoutTree, PersistedLayoutNode, PersistedLayoutTree, SplitDirection,
+};
 use std::io::Write;
 
 /// §3.3 Grid diff ring: push + overflow
@@ -102,17 +104,14 @@ fn closing_a_same_direction_split_restores_prior_geometry() {
     let mut tree = LayoutTree::with_pane("node-1".to_string(), "pane-1".to_string());
     tree.split("pane-1", "pane-2".to_string(), SplitDirection::TopBottom)
         .expect("first split");
-    let before = tree.serialize(80, 24).expect("serialize two-pane layout");
+    let before = tree.root.clone();
     tree.split("pane-2", "pane-3".to_string(), SplitDirection::TopBottom)
         .expect("second split");
 
     tree.remove_pane("pane-3").expect("close second split half");
 
     assert_eq!(tree.pane_ids(), vec!["pane-1", "pane-2"]);
-    assert_eq!(
-        tree.serialize(80, 24).expect("serialize restored layout"),
-        before
-    );
+    assert_eq!(tree.root, before);
 }
 
 #[test]
@@ -181,7 +180,7 @@ fn alternating_split_depth_is_rejected_atomically() {
 #[test]
 fn failed_split_leaves_layout_unchanged() {
     let mut tree = LayoutTree::with_pane("node-1".to_string(), "pane-1".to_string());
-    let before = tree.serialize(80, 24).expect("serialize original layout");
+    let before = tree.root.clone();
 
     assert!(
         tree.split(
@@ -192,11 +191,7 @@ fn failed_split_leaves_layout_unchanged() {
         .is_err()
     );
 
-    assert_eq!(
-        tree.serialize(80, 24)
-            .expect("serialize layout after error"),
-        before
-    );
+    assert_eq!(tree.root, before);
 }
 
 /// §3.10 Layout tree: remove pane
@@ -235,19 +230,327 @@ fn test_layout_resize_pane() {
     }
 }
 
-/// §3.10 Layout tree: serialize/deserialize
+/// §3.7 类型化 layout 持久化: 多层混合轴向树精确 round-trip (节点 ID、比例、方向)。
 #[test]
-fn test_layout_serialize() {
-    let tree = LayoutTree::with_pane("root".to_string(), "pane-1".to_string());
-    let serialized = tree.serialize(80, 24).expect("serialize failed");
+fn persisted_layout_round_trips_exact_mixed_axis_tree() {
+    let mut tree = LayoutTree::with_pane("node-1".to_string(), "pane-1".to_string());
+    tree.split("pane-1", "pane-2".to_string(), SplitDirection::LeftRight)
+        .expect("split left-right");
+    tree.resize_pane("pane-1", SplitDirection::LeftRight, 0.2)
+        .expect("resize outer split");
+    tree.split("pane-2", "pane-3".to_string(), SplitDirection::TopBottom)
+        .expect("split top-bottom");
+    tree.resize_pane("pane-2", SplitDirection::TopBottom, 0.1)
+        .expect("resize inner split");
 
-    // tmux 风格: <checksum>,WxH,xoff,yoff,paneid
-    assert!(serialized.ends_with(",80x24,0,0,pane-1"));
-    let (checksum, _body) = serialized.split_once(',').expect("checksum prefix");
-    let _checksum: u32 = checksum.parse().expect("checksum should be a number");
+    let encoded = serde_json::to_string(&tree).expect("encode typed layout");
+    let decoded: LayoutTree = serde_json::from_str(&encoded).expect("decode typed layout");
+
+    assert_eq!(decoded.root, tree.root, "tree must round-trip exactly");
+    match &decoded.root {
+        LayoutNode::Split {
+            direction,
+            ratios,
+            children,
+            ..
+        } => {
+            assert_eq!(*direction, SplitDirection::LeftRight);
+            assert_eq!(ratios, &[0.7, 0.3]);
+            match &children[1] {
+                LayoutNode::Split {
+                    direction,
+                    ratios,
+                    ..
+                } => {
+                    assert_eq!(*direction, SplitDirection::TopBottom);
+                    assert_eq!(ratios, &[0.6, 0.4]);
+                }
+                node => panic!("expected nested split, got {node:?}"),
+            }
+        }
+        node => panic!("expected root split, got {node:?}"),
+    }
 }
 
-/// §3.10 Layout tree: collect pane IDs
+/// §3.7 空布局占位根必须 round-trip, 但不能混入真实布局。
+#[test]
+fn persisted_layout_round_trips_empty_root_only_as_sole_node() {
+    let empty = LayoutTree::empty();
+    let encoded = serde_json::to_string(&empty).expect("encode empty layout");
+    let decoded: LayoutTree = serde_json::from_str(&encoded).expect("decode empty layout");
+    assert!(decoded.is_empty_root());
+
+    let persisted = PersistedLayoutTree {
+        nodes: vec![
+            PersistedLayoutNode::Split {
+                id: "root".to_string(),
+                direction: SplitDirection::LeftRight,
+                children: vec![1, 2],
+                ratios: vec![0.5, 0.5],
+            },
+            PersistedLayoutNode::Pane {
+                id: "node-1".to_string(),
+                pane_id: "pane-1".to_string(),
+            },
+            PersistedLayoutNode::Pane {
+                id: "empty-placeholder".to_string(),
+                pane_id: String::new(),
+            },
+        ],
+    };
+    let error = LayoutTree::from_persisted(&persisted)
+        .expect_err("empty placeholder inside a real layout must be rejected");
+    assert!(error.to_string().contains("pane id must not be empty"));
+}
+
+/// §3.7 持久化比例必须是有限正数: 零或负数比例视为损坏。
+#[test]
+fn persisted_layout_rejects_non_positive_ratios() {
+    let zero_ratio = PersistedLayoutTree {
+        nodes: vec![
+            PersistedLayoutNode::Split {
+                id: "root".to_string(),
+                direction: SplitDirection::LeftRight,
+                children: vec![1, 2],
+                ratios: vec![0.0, 1.0],
+            },
+            PersistedLayoutNode::Pane {
+                id: "node-1".to_string(),
+                pane_id: "pane-1".to_string(),
+            },
+            PersistedLayoutNode::Pane {
+                id: "node-2".to_string(),
+                pane_id: "pane-2".to_string(),
+            },
+        ],
+    };
+    let error = LayoutTree::from_persisted(&zero_ratio)
+        .expect_err("zero ratio must be rejected");
+    assert!(error.to_string().contains("finite and positive"));
+
+    let negative_ratio = PersistedLayoutTree {
+        nodes: vec![
+            PersistedLayoutNode::Split {
+                id: "root".to_string(),
+                direction: SplitDirection::LeftRight,
+                children: vec![1, 2],
+                ratios: vec![-0.5, 1.5],
+            },
+            PersistedLayoutNode::Pane {
+                id: "node-1".to_string(),
+                pane_id: "pane-1".to_string(),
+            },
+            PersistedLayoutNode::Pane {
+                id: "node-2".to_string(),
+                pane_id: "pane-2".to_string(),
+            },
+        ],
+    };
+    let error = LayoutTree::from_persisted(&negative_ratio)
+        .expect_err("negative ratio must be rejected");
+    assert!(error.to_string().contains("finite and positive"));
+}
+
+/// §3.7 持久化节点 ID 必须全局唯一。
+#[test]
+fn persisted_layout_rejects_duplicate_node_ids() {
+    let duplicated = PersistedLayoutTree {
+        nodes: vec![
+            PersistedLayoutNode::Split {
+                id: "root".to_string(),
+                direction: SplitDirection::LeftRight,
+                children: vec![1, 2],
+                ratios: vec![0.5, 0.5],
+            },
+            PersistedLayoutNode::Pane {
+                id: "root".to_string(),
+                pane_id: "pane-1".to_string(),
+            },
+            PersistedLayoutNode::Pane {
+                id: "node-2".to_string(),
+                pane_id: "pane-2".to_string(),
+            },
+        ],
+    };
+    let error = LayoutTree::from_persisted(&duplicated)
+        .expect_err("duplicate node id must be rejected");
+    assert!(error.to_string().contains("duplicate persisted node id"));
+}
+
+/// §3.7 持久化 pane ID 必须全局唯一。
+#[test]
+fn persisted_layout_rejects_duplicate_pane_ids() {
+    let duplicated = PersistedLayoutTree {
+        nodes: vec![
+            PersistedLayoutNode::Split {
+                id: "root".to_string(),
+                direction: SplitDirection::LeftRight,
+                children: vec![1, 2],
+                ratios: vec![0.5, 0.5],
+            },
+            PersistedLayoutNode::Pane {
+                id: "node-1".to_string(),
+                pane_id: "pane-1".to_string(),
+            },
+            PersistedLayoutNode::Pane {
+                id: "node-2".to_string(),
+                pane_id: "pane-1".to_string(),
+            },
+        ],
+    };
+    let error = LayoutTree::from_persisted(&duplicated)
+        .expect_err("duplicate pane id must be rejected");
+    assert!(error.to_string().contains("duplicate persisted pane id"));
+}
+
+/// §3.7 子索引必须落在节点表范围内。
+#[test]
+fn persisted_layout_rejects_out_of_bounds_child_index() {
+    let escaped = PersistedLayoutTree {
+        nodes: vec![
+            PersistedLayoutNode::Split {
+                id: "root".to_string(),
+                direction: SplitDirection::LeftRight,
+                children: vec![1, 3],
+                ratios: vec![0.5, 0.5],
+            },
+            PersistedLayoutNode::Pane {
+                id: "node-1".to_string(),
+                pane_id: "pane-1".to_string(),
+            },
+            PersistedLayoutNode::Pane {
+                id: "node-2".to_string(),
+                pane_id: "pane-2".to_string(),
+            },
+        ],
+    };
+    let error = LayoutTree::from_persisted(&escaped)
+        .expect_err("out-of-bounds child index must be rejected");
+    assert!(error.to_string().contains("out of bounds"));
+}
+
+/// §3.7 前序不变量: 子索引必须大于父索引 (拒绝自引用与环)。
+#[test]
+fn persisted_layout_rejects_backward_child_index() {
+    let cyclic = PersistedLayoutTree {
+        nodes: vec![
+            PersistedLayoutNode::Split {
+                id: "root".to_string(),
+                direction: SplitDirection::LeftRight,
+                children: vec![0, 1],
+                ratios: vec![0.5, 0.5],
+            },
+            PersistedLayoutNode::Pane {
+                id: "node-1".to_string(),
+                pane_id: "pane-1".to_string(),
+            },
+        ],
+    };
+    let error = LayoutTree::from_persisted(&cyclic)
+        .expect_err("self-referencing child index must be rejected");
+    assert!(error.to_string().contains("strictly increasing"));
+}
+
+/// §3.7 每个非根节点必须恰好被一个 split 引用。
+#[test]
+fn persisted_layout_rejects_disconnected_nodes() {
+    let orphaned = PersistedLayoutTree {
+        nodes: vec![
+            PersistedLayoutNode::Split {
+                id: "root".to_string(),
+                direction: SplitDirection::LeftRight,
+                children: vec![1],
+                ratios: vec![1.0],
+            },
+            PersistedLayoutNode::Pane {
+                id: "node-1".to_string(),
+                pane_id: "pane-1".to_string(),
+            },
+            PersistedLayoutNode::Pane {
+                id: "node-2".to_string(),
+                pane_id: "pane-2".to_string(),
+            },
+        ],
+    };
+    let error = LayoutTree::from_persisted(&orphaned)
+        .expect_err("unreferenced node must be rejected");
+    assert!(error.to_string().contains("single tree"));
+}
+
+/// §3.7 方向交替的深度受 wire 深度上限约束 (§3.10 MAX_LAYOUT_WIRE_DEPTH)。
+#[test]
+fn persisted_layout_rejects_wire_depth_overflow() {
+    let mut nodes = Vec::new();
+    let mut child = 1usize;
+    for level in 0..=crate::layout::MAX_WIRE_LAYOUT_DEPTH {
+        let direction = if level % 2 == 0 {
+            SplitDirection::LeftRight
+        } else {
+            SplitDirection::TopBottom
+        };
+        let pane_index = child + 1;
+        nodes.push(PersistedLayoutNode::Split {
+            id: format!("node-{level}"),
+            direction,
+            children: vec![child, pane_index],
+            ratios: vec![0.5, 0.5],
+        });
+        nodes.push(PersistedLayoutNode::Pane {
+            id: format!("node-{level}-left"),
+            pane_id: format!("pane-{level}-left"),
+        });
+        child = pane_index;
+    }
+    nodes.push(PersistedLayoutNode::Pane {
+        id: "node-deep-right".to_string(),
+        pane_id: "pane-deep".to_string(),
+    });
+    let deep = PersistedLayoutTree { nodes };
+
+    let error = LayoutTree::from_persisted(&deep)
+        .expect_err("alternating layout beyond wire depth must be rejected");
+    assert!(error.to_string().contains("wire depth"));
+}
+
+/// §3.7 同向链深度受内部深度上限约束。
+#[test]
+fn persisted_layout_rejects_internal_depth_overflow() {
+    let mut nodes = Vec::new();
+    let mut child = 1usize;
+    for level in 0..crate::layout::MAX_INTERNAL_LAYOUT_DEPTH {
+        let pane_index = child + 1;
+        nodes.push(PersistedLayoutNode::Split {
+            id: format!("node-{level}"),
+            direction: SplitDirection::TopBottom,
+            children: vec![child, pane_index],
+            ratios: vec![0.5, 0.5],
+        });
+        nodes.push(PersistedLayoutNode::Pane {
+            id: format!("node-{level}-left"),
+            pane_id: format!("pane-{level}-left"),
+        });
+        child = pane_index;
+    }
+    nodes.push(PersistedLayoutNode::Pane {
+        id: "node-deep-right".to_string(),
+        pane_id: "pane-deep".to_string(),
+    });
+    let deep = PersistedLayoutTree { nodes };
+
+    let error = LayoutTree::from_persisted(&deep)
+        .expect_err("chain beyond internal depth must be rejected");
+    assert!(error.to_string().contains("internal maximum"));
+}
+
+/// §3.7 空节点表不是合法布局。
+#[test]
+fn persisted_layout_rejects_empty_node_list() {
+    let error = LayoutTree::from_persisted(&PersistedLayoutTree { nodes: Vec::new() })
+        .expect_err("empty node list must be rejected");
+    assert!(error.to_string().contains("no nodes"));
+}
+
+/// §3.7 Layout tree: collect pane IDs
 #[test]
 fn test_layout_pane_ids() {
     let mut tree = LayoutTree::with_pane("n1".to_string(), "p1".to_string());

@@ -563,6 +563,25 @@ message InstallExtensionResponse {
     string error = 3;
 }
 
+// §16.9 服务端扩展 chrome 交互：客户端把服务端渲染视图上的 onClick/onChange
+// 描述符回传给权威服务端宿主执行，而不是在客户端运行时执行。
+//
+// 客户端只允许转发它确实收到过的 (extension_id, view_id) —— 即
+// ExtensionChromeUpdate 键控的视图；服务端校验扩展已加载、未挂起且该视图
+// 已发布 (published_views) 后才派发，否则 fail closed 并返回上下文错误。
+message ExtensionChromeActionRequest {
+    string extension_id = 1;
+    string view_id = 2;
+    string command = 3;
+    string arguments = 4;  // JSON 数组，转发给扩展注册的命令
+}
+
+// §16.9 服务端扩展 chrome 交互响应。
+message ExtensionChromeActionResponse {
+    bool accepted = 1;
+    string error = 2;
+}
+
 // === Notifications (server → client push) ===
 
 // §9 / §16 服务端主动推送通知。
@@ -616,8 +635,12 @@ message TabTitleChanged {
 }
 
 // §9 会话布局变更通知。
+// §15.4 可选完整权威快照: 仅客户端 in-place 重连后的合成广播携带,
+// 用于区分「重连全量对账」与普通布局 delta。普通服务端布局通知保持
+// snapshot 缺省 (None), 向前兼容 (field 2 为增量新增)。
 message SessionLayoutChanged {
     LayoutTree layout = 1;
+    SessionSnapshot snapshot = 2;
 }
 
 // §16 剪贴板变更通知。
@@ -752,6 +775,7 @@ message Request {
         ResizeLayoutRequest resize_layout = 33;  // §16.9 server-owned layout ratios
         ListRecoveryCandidatesRequest list_recovery_candidates = 34;  // §3.6 recovery
         ConfirmRecoveryRequest confirm_recovery = 35;  // §3.6 recovery
+        ExtensionChromeActionRequest extension_chrome_action = 38;  // §16.9
     }
 }
 
@@ -781,5 +805,6 @@ message Response {
         DeclineFileVersionResponse decline_file_version = 21; // §4 shadow snapshot
         ListRecoveryCandidatesResponse recovery_candidates = 22;  // §3.6 recovery
         ConfirmRecoveryResponse recovery_confirmed = 23;  // §3.6 recovery
+        ExtensionChromeActionResponse extension_chrome_action_result = 26;  // §16.9
     }
 }

@@ -95,10 +95,6 @@ pub enum CliCommand {
         target: Option<String>,
     },
     /// `z3rm detach` — 断开当前 client
-    /// `z3rm attach --ssh <ssh://uri>` — 通过 SSH 隧道连接到远程 mux_server
-    Ssh {
-        target: String,
-    },
     Detach,
     /// `z3rm recover [--list | -t <session>]` — list or explicitly confirm recovery.
     Recover {
@@ -375,15 +371,8 @@ fn read_paste_buffer() -> Result<String> {
 /// 执行 CLI 命令。
 /// 来源: spec §3.10
 pub async fn run_cli_command(cmd: CliCommand) -> Result<()> {
-    // §16.6 SSH 远程连接不经过本地 daemon，直接建立 SSH 隧道后返回。
-    if let CliCommand::Ssh { target } = cmd {
-        let (_domain, _session) = mux::connect_ssh(&target)
-            .await
-            .context("failed to connect via SSH. Ensure the remote host has an OpenSSH client and is reachable.")?;
-        eprintln!("connected to remote mux_server via SSH ({})", target);
-        return Ok(());
-    }
-
+    // §16.6 `attach --ssh <uri>` 不再出现在这里: 它是 GUI 启动意图
+    // (LaunchIntent::Ssh), 由 main.rs 转交给 GUI 子进程持有 SshSession。
     // §3.10 CLI must never hang on a wedged daemon socket.
     let domain = tokio::time::timeout(Duration::from_secs(5), mux::connect_local(None))
         .await
@@ -399,9 +388,6 @@ pub async fn run_cli_command(cmd: CliCommand) -> Result<()> {
     };
 
     match cmd {
-        CliCommand::Ssh { .. } => {
-            // Already handled above (early return before connect_local).
-        }
         CliCommand::ListSessions { format } => {
             let sessions = domain
                 .list_sessions()

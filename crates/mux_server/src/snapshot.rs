@@ -54,6 +54,11 @@ enum ShadowCommand {
         version_id: u64,
         reply: mpsc::Sender<Result<()>>,
     },
+    /// §4 WAL checkpoint: rotate the WAL on the recorder (single-writer)
+    /// thread after every prior entry is persisted. The reply carries the
+    /// rotation result; also the mechanism the stop path uses for the final
+    /// graceful-shutdown checkpoint.
+    Checkpoint { reply: mpsc::Sender<Result<()>> },
     /// §4.9 a git commit landed on the watched worktree; the recorder marks
     /// pre-commit deltas gc-eligible on its own (single-writer) thread.
     GitCommit { commit: String },
@@ -100,6 +105,37 @@ fn lock_for_shutdown<T>(mutex: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
 }
 
 fn stop_inner(inner: &WatchInner) {
+    // Graceful shutdown: run one final WAL checkpoint on the recorder thread
+    // BEFORE the channels are dropped, so the loop is guaranteed to still be
+    // alive and the command is serialized with any still-queued work. The
+    // reply is awaited before teardown proceeds. Failures are logged —
+    // teardown must not abort on a checkpoint error, and the WAL entries
+    // remain on disk either way.
+    {
+        let sender = lock_for_shutdown(&inner.command_sender);
+        if let Some(sender) = sender.as_ref() {
+            let (reply, response) = mpsc::channel();
+            if sender.send(ShadowCommand::Checkpoint { reply }).is_ok() {
+                match response.recv() {
+                    Ok(Ok(())) => {}
+                    Ok(Err(error)) => zlog::warn!(
+                        "shadow final checkpoint failed: session={} error={}",
+                        inner.session_id,
+                        error,
+                    ),
+                    Err(_) => zlog::warn!(
+                        "shadow recorder exited before final checkpoint: session={}",
+                        inner.session_id,
+                    ),
+                }
+            } else {
+                zlog::warn!(
+                    "shadow final checkpoint not sent: recorder already stopped, session={}",
+                    inner.session_id,
+                );
+            }
+        }
+    }
     if let Some(handle) = lock_for_shutdown(&inner.watch_handle).take() {
         drop(handle);
     }
@@ -157,6 +193,19 @@ impl SnapshotWatch {
         response
             .recv()
             .context("shadow recorder stopped before restoring version")?
+    }
+
+    /// §4 WAL checkpoint: rotate the WAL on the recorder thread after all
+    /// prior entries are persisted. Also the mechanism [`SnapshotWatch::stop`]
+    /// uses for the final graceful-shutdown checkpoint. Errors (including a
+    /// refusal while a decline restore is still incomplete) propagate to the
+    /// caller.
+    pub fn checkpoint(&self) -> Result<()> {
+        let (reply, response) = mpsc::channel();
+        self.send_command(ShadowCommand::Checkpoint { reply })?;
+        response
+            .recv()
+            .context("shadow recorder stopped before checkpoint")?
     }
 
     fn send_command(&self, command: ShadowCommand) -> Result<()> {
@@ -787,6 +836,14 @@ fn handle_command(
             }
             suppression
         }
+        ShadowCommand::Checkpoint { reply } => {
+            // Rotate the WAL only after every prior entry is persisted; the
+            // engine refuses while a decline restore is incomplete (§4.8).
+            if reply.send(engine.checkpoint()).is_err() {
+                zlog::warn!("shadow checkpoint requester disconnected");
+            }
+            None
+        }
         ShadowCommand::GitCommit { commit } => {
             // §4.9 Clear marks pre-commit deltas gc-eligible; Keep records the
             // boundary but retains everything. Skip never reaches here (no
@@ -807,13 +864,37 @@ fn handle_command(
 
 /// Build path_hash → PathBuf index for decline recovery by walking the session cwd.
 /// Matches `shadow_snapshot::compute_path_hash` (blake3 of path.to_string_lossy).
+///
+/// Traversal errors (permission denied, broken symlink, etc.) are logged with
+/// the offending path and root so they cannot be mistaken for a clean omission,
+/// but do not halt indexing — remaining entries are still collected.
 fn build_path_hash_index(root: &Path) -> std::collections::HashMap<[u8; 32], PathBuf> {
     let mut index = std::collections::HashMap::new();
-    for entry in walkdir::WalkDir::new(root)
-        .follow_links(false)
-        .into_iter()
-        .filter_map(|e| e.ok())
-    {
+    for entry in walkdir::WalkDir::new(root).follow_links(false).into_iter() {
+        let entry = match entry {
+            Ok(entry) => entry,
+            Err(error) => {
+                // Do NOT silently drop traversal errors. Each one is at least
+                // distinctive in the log so a permission failure is observable
+                // and cannot be confused with "this directory is simply empty".
+                match error.path() {
+                    Some(path) => zlog::warn!(
+                        "shadow snapshot walkdir error: root={} path={} depth={} error={}",
+                        root.display(),
+                        path.display(),
+                        error.depth(),
+                        error,
+                    ),
+                    None => zlog::warn!(
+                        "shadow snapshot walkdir error: root={} depth={} error={}",
+                        root.display(),
+                        error.depth(),
+                        error,
+                    ),
+                }
+                continue;
+            }
+        };
         if !entry.file_type().is_file() {
             continue;
         }
@@ -1010,6 +1091,171 @@ mod tests {
 
         assert_eq!(engine.list_versions(&path).unwrap().len(), 1);
         assert!(suppressed_writes.is_empty());
+    }
+
+    /// A checkpoint command must reach the recorder's engine, rotate the WAL,
+    /// and carry the result back through the reply channel.
+    #[test]
+    fn handle_command_checkpoint_rotates_wal() {
+        let directory = tempfile::tempdir().unwrap();
+        let database = directory.path().join("command-checkpoint.db");
+        let wal_path = directory.path().join("command-checkpoint.wal");
+        let blobs = directory.path().join("command-checkpoint-blobs");
+        std::fs::create_dir_all(&blobs).unwrap();
+        let engine = shadow_snapshot::ShadowSnapshotEngine::open(&database, &wal_path, &blobs)
+            .unwrap();
+        let path = directory.path().join("checked.txt");
+        engine.record_change(&path, b"v1").unwrap();
+
+        let (reply, response) = mpsc::channel();
+        let suppression = handle_command(
+            &engine,
+            ShadowCommand::Checkpoint { reply },
+            GitCommitHookMode::Skip,
+        );
+        assert!(suppression.is_none(), "checkpoint must not suppress writes");
+        assert!(
+            response.recv().unwrap().is_ok(),
+            "checkpoint reply must be Ok"
+        );
+
+        let wal = shadow_snapshot::Wal::open(&wal_path).unwrap();
+        assert!(
+            wal.replay().unwrap().is_empty(),
+            "checkpoint command must rotate the WAL"
+        );
+    }
+
+    /// 在 recorder 空闲时直接向该会话的 WAL 追加两条已持久化风格的条目,
+    /// 供命令 / 关停测试观察 checkpoint 是否真正旋转。会话目录与 WAL 在
+    /// `$LOCAL_DATA`,不在被 watch 的 cwd 下,不会触发 fs 事件。
+    fn seed_wal_entries(session_id: &str) {
+        let wal_path = session_shadow_dir(session_id).join("wal.bin");
+        let wal = shadow_snapshot::Wal::open(&wal_path).unwrap();
+        for seq in 1..=2u64 {
+            wal.append(&shadow_snapshot::WalEntry {
+                seq_no: seq,
+                path_hash: [seq as u8; 32],
+                parent_id: None,
+                content_ref: None,
+                delta_ref: None,
+                trigger: shadow_snapshot::SnapshotTrigger::Write,
+            })
+            .unwrap();
+        }
+        wal.commit().unwrap();
+    }
+
+    /// 清理该会话的存储目录,让测试从确定性的空状态开始(会话 id 是测试
+    /// 专用,目录里只可能有先前失败运行留下的残留)。
+    fn reset_session_dir(session_id: &str) {
+        let dir = session_shadow_dir(session_id);
+        if dir.exists() {
+            std::fs::remove_dir_all(&dir).unwrap();
+        }
+    }
+
+    /// 用真实 fs watcher 启动一个会话的 snapshot 子系统。
+    fn armed_watch(session_id: &str, cwd: &str) -> Arc<SnapshotWatch> {
+        start_with_config(session_id, cwd, SnapshotConfig::default(), |monitor, root| {
+            monitor.watch_directory(root)
+        })
+        .expect("start succeeds")
+        .expect("watch armed")
+    }
+
+    /// §4 explicit checkpoint command: rotates the WAL on the recorder thread
+    /// and surfaces success to the caller.
+    #[test]
+    fn checkpoint_command_rotates_wal_and_replies() {
+        let directory = tempfile::tempdir().expect("temp directory");
+        let cwd = directory.path().to_str().expect("utf-8 cwd").to_string();
+        let session_id = "checkpoint-command-test";
+        reset_session_dir(session_id);
+        let watch = armed_watch(session_id, &cwd);
+
+        seed_wal_entries(session_id);
+        watch.checkpoint().expect("explicit checkpoint must succeed");
+
+        let wal_path = session_shadow_dir(session_id).join("wal.bin");
+        let wal = shadow_snapshot::Wal::open(&wal_path).unwrap();
+        assert!(
+            wal.replay().unwrap().is_empty(),
+            "checkpoint command must rotate the WAL empty"
+        );
+    }
+
+    /// A checkpoint that cannot rotate (blocked archive path) must surface
+    /// its error to the command caller and leave the WAL fully replayable.
+    #[test]
+    fn checkpoint_command_surfaces_rotation_failure() {
+        let directory = tempfile::tempdir().expect("temp directory");
+        let cwd = directory.path().to_str().expect("utf-8 cwd").to_string();
+        let session_id = "checkpoint-failure-test";
+        reset_session_dir(session_id);
+        let watch = armed_watch(session_id, &cwd);
+
+        seed_wal_entries(session_id);
+        std::fs::create_dir(session_shadow_dir(session_id).join("wal.bin.old")).unwrap();
+
+        let error = watch.checkpoint().expect_err("blocked rotation must surface");
+        assert!(
+            error.to_string().contains("checkpoint"),
+            "error must name the failing checkpoint: {error:#}"
+        );
+
+        let wal_path = session_shadow_dir(session_id).join("wal.bin");
+        let wal = shadow_snapshot::Wal::open(&wal_path).unwrap();
+        assert_eq!(
+            wal.replay().unwrap().len(),
+            2,
+            "a failed checkpoint must leave the WAL replayable"
+        );
+    }
+
+    /// Graceful shutdown runs a final checkpoint on the recorder thread
+    /// before the channels are torn down: after stop() returns, the WAL is
+    /// rotated empty.
+    #[test]
+    fn stop_runs_final_checkpoint_and_rotates_wal() {
+        let directory = tempfile::tempdir().expect("temp directory");
+        let cwd = directory.path().to_str().expect("utf-8 cwd").to_string();
+        let session_id = "stop-checkpoint-test";
+        reset_session_dir(session_id);
+        let watch = armed_watch(session_id, &cwd);
+
+        seed_wal_entries(session_id);
+        watch.stop();
+
+        let wal_path = session_shadow_dir(session_id).join("wal.bin");
+        let wal = shadow_snapshot::Wal::open(&wal_path).unwrap();
+        assert!(
+            wal.replay().unwrap().is_empty(),
+            "stop must run the final checkpoint and rotate the WAL"
+        );
+    }
+
+    /// A final checkpoint that cannot rotate must not abort teardown and must
+    /// not discard the WAL: stop() still completes, entries stay replayable.
+    #[test]
+    fn stop_with_blocked_rotation_preserves_wal_and_completes() {
+        let directory = tempfile::tempdir().expect("temp directory");
+        let cwd = directory.path().to_str().expect("utf-8 cwd").to_string();
+        let session_id = "stop-blocked-checkpoint-test";
+        reset_session_dir(session_id);
+        let watch = armed_watch(session_id, &cwd);
+
+        seed_wal_entries(session_id);
+        std::fs::create_dir(session_shadow_dir(session_id).join("wal.bin.old")).unwrap();
+        watch.stop();
+
+        let wal_path = session_shadow_dir(session_id).join("wal.bin");
+        let wal = shadow_snapshot::Wal::open(&wal_path).unwrap();
+        assert_eq!(
+            wal.replay().unwrap().len(),
+            2,
+            "a failed final checkpoint must not discard the WAL"
+        );
     }
 
     #[test]

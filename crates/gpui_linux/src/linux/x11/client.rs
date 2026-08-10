@@ -454,8 +454,13 @@ impl X11Client {
         let compositor_gpu = detect_compositor_gpu(&xcb_connection, screen);
 
         let xcb_connection = Rc::new(xcb_connection);
-
-        let ximc = X11rbClient::init(Rc::clone(&xcb_connection), x_root_index, None).ok();
+        let ximc = match X11rbClient::init(Rc::clone(&xcb_connection), x_root_index, None) {
+            Ok(client) => Some(client),
+            Err(err) => {
+                log::warn!("XIM init failed, input method support disabled: {err}");
+                None
+            }
+        };
         let xim_handler = if ximc.is_some() {
             Some(XimHandler::new())
         } else {

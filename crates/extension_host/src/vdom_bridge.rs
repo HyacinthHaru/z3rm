@@ -16,6 +16,105 @@ use gpui::{
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::rc::Rc;
+use serde_json::Value;
+
+/// §5.2/§5.4 Upper bounds on native VDOM resources enforced at parse and
+/// render boundaries. An extension (or a server chrome update) that exceeds a
+/// bound is rejected before the native side walks the structure recursively,
+/// so a pathological tree cannot overflow the host thread stack or allocate a
+/// phased element tree that never reaches the live caches. Bounds are checked
+/// again at render time so a manually constructed [`VDomNode`] tree that
+/// skipped the parser path is still fail-closed.
+const MAX_VDOM_NODES: usize = 4_096;
+const MAX_VDOM_DEPTH: usize = 128;
+const MAX_DISPLAY_LIST_OPS: usize = 4_096;
+
+/// §5.2 Upper bound on the serialized size of one VDOM/display-list payload
+/// crossing the JSON boundary (extension render output, server chrome
+/// updates). Checked by the embedding crate before `serde_json::from_str` so
+/// an oversized string is rejected without a full parse.
+pub const MAX_VDOM_PAYLOAD_BYTES: usize = 256 * 1024;
+
+/// Bounded scalar-coercion of children before serde takes over. Mirrors
+/// JavaScript semantics (null dropped, numbers/booleans -> text). The
+/// recursion is safe because [`count_vdom`] already rejected any tree nested
+/// past [`MAX_VDOM_DEPTH`], so the call stack used here is bounded.
+fn normalize_vdom_node_bounded(value: &mut Value) -> Result<()> {
+    let Some(properties) = value.as_object_mut() else {
+        return Ok(());
+    };
+    let Some(children) = properties
+        .get_mut("children")
+        .and_then(Value::as_array_mut)
+    else {
+        return Ok(());
+    };
+
+    let mut normalized = Vec::with_capacity(children.len().min(MAX_VDOM_NODES));
+    for mut child in std::mem::take(children) {
+        match child {
+            Value::Null => {}
+            Value::Number(number) => normalized.push(Value::String(number.to_string())),
+            Value::Bool(boolean) => normalized.push(Value::String(boolean.to_string())),
+            _ => {
+                normalize_vdom_node_bounded(&mut child)?;
+                normalized.push(child);
+            }
+        }
+    }
+    *children = normalized;
+    Ok(())
+}
+
+/// Count nodes and verify the depth/nodes bounds with an explicit stack so a
+/// deeply nested extension tree fails closed without relying on the host
+/// thread's call stack.
+fn count_vdom(value: &Value) -> Result<(usize, usize)> {
+    let mut nodes = 0usize;
+    let mut max_depth = 0usize;
+    let mut stack: Vec<(&Value, usize)> = vec![(value, 1)];
+    while let Some((node, depth)) = stack.pop() {
+        nodes += 1;
+        if nodes > MAX_VDOM_NODES {
+            anyhow::bail!("VDOM node count exceeds limit of {MAX_VDOM_NODES}");
+        }
+        if depth > MAX_VDOM_DEPTH {
+            anyhow::bail!("VDOM nesting depth exceeds limit of {MAX_VDOM_DEPTH}");
+        }
+        max_depth = max_depth.max(depth);
+        if let Some(children) = node.get("children").and_then(Value::as_array) {
+            for child in children {
+                if child.is_object() {
+                    stack.push((child, depth + 1));
+                }
+            }
+        }
+    }
+    Ok((nodes, max_depth))
+}
+
+/// §5.4 Verify the typed tree respects the bounds. Runs at render entry so a
+/// [`VDomNode`] constructed by other code or deserialized from a trusted
+/// source is still fail-closed before recursive rendering.
+fn validate_typed_vdom(node: &VDomNode) -> Result<()> {
+    let mut nodes = 0usize;
+    let mut stack: Vec<(&VDomNode, usize)> = vec![(node, 1)];
+    while let Some((current, depth)) = stack.pop() {
+        nodes += 1;
+        if nodes > MAX_VDOM_NODES {
+            anyhow::bail!("VDOM node count exceeds limit of {MAX_VDOM_NODES}");
+        }
+        if depth > MAX_VDOM_DEPTH {
+            anyhow::bail!("VDOM nesting depth exceeds limit of {MAX_VDOM_DEPTH}");
+        }
+        for child in &current.children {
+            if let VDomChild::Node(node) = child {
+                stack.push((node, depth + 1));
+            }
+        }
+    }
+    Ok(())
+}
 
 /// A VDOM node — the JSON structure extensions return from render() calls.
 ///
@@ -54,41 +153,21 @@ pub enum VDomChild {
     Node(VDomNode),
 }
 
-fn normalize_vdom_node(value: &mut serde_json::Value) {
-    let serde_json::Value::Object(properties) = value else {
-        return;
-    };
-    let Some(serde_json::Value::Array(children)) = properties.get_mut("children") else {
-        return;
-    };
-
-    let mut normalized = Vec::with_capacity(children.len());
-    for mut child in std::mem::take(children) {
-        match child {
-            serde_json::Value::Null => {}
-            serde_json::Value::Number(number) => {
-                normalized.push(serde_json::Value::String(number.to_string()));
-            }
-            serde_json::Value::Bool(boolean) => {
-                normalized.push(serde_json::Value::String(boolean.to_string()));
-            }
-            _ => {
-                normalize_vdom_node(&mut child);
-                normalized.push(child);
-            }
-        }
-    }
-    *children = normalized;
-}
-
 /// Parse a VDOM JSON value into a VDomNode tree.
 ///
 /// QuickJS extensions commonly put numbers, booleans, or null in `children`.
 /// Normalize those JavaScript scalar semantics before deserializing the typed
 /// tree; null children are ignored and other scalars render as text.
+///
+/// §5.2/§5.4 resource bounds are enforced up front with an explicit stack
+/// (node count, nesting depth) before any recursive normalization or
+/// deserialization runs, so an oversized tree fails closed instead of
+/// overflowing the host thread that parses it.
 pub fn parse_vdom(value: &serde_json::Value) -> Result<VDomNode> {
+    let (nodes, depth) = count_vdom(value)?;
+    tracing::trace!(nodes, depth, "parsing extension VDOM");
     let mut normalized = value.clone();
-    normalize_vdom_node(&mut normalized);
+    normalize_vdom_node_bounded(&mut normalized)?;
     serde_json::from_value(normalized).map_err(|e| anyhow::anyhow!("VDOM parse error: {}", e))
 }
 
@@ -123,22 +202,55 @@ pub fn vdom_to_text(node: &VDomNode, depth: usize) -> String {
 /// Extensions describe interactions declaratively — `props.onClick` and
 /// `props.onChange` name a registered command rather than carrying a JS
 /// closure, so the descriptor survives the JSON boundary.
+/// §5.7 Provenance of a chrome interaction: which extension (and which of
+/// its views) the click came from.
+///
+/// `None` means the descriptor was produced by a client-side extension.
+/// `Some` is stamped by the client at merge time onto chrome *received from
+/// the server* (`ExtensionChromeUpdate`), naming the exact
+/// `extension_id`/`view_id` the update was keyed under — the identity the
+/// server validated when it published the view. The stamp **overwrites** any
+/// origin an extension ships in its own VDOM, so no extension can forge
+/// another extension's provenance.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct CommandOrigin {
+    /// Origin side: only `"server"` is honored; unknown sides are dropped
+    /// (fail closed) and never degrade to client-side routing.
+    pub side: String,
+    /// Server-side extension id that rendered the chrome.
+    pub extension_id: String,
+    /// View id the chrome update was published under.
+    pub view_id: String,
+}
+
+impl CommandOrigin {
+    pub const SERVER_SIDE: &'static str = "server";
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub struct CommandInvocation {
     /// Registered command id to execute.
     pub command: String,
     /// Positional arguments forwarded to the command.
     pub args: Vec<serde_json::Value>,
+    /// Provenance of the interaction; `None` for client chrome, `Some`
+    /// (side `"server"`) for chrome received from the server.
+    pub origin: Option<CommandOrigin>,
 }
 
 impl CommandInvocation {
     /// Parse `{ "command": "...", "args": [...] }`. A bare string is accepted
     /// as shorthand for a no-argument invocation.
+    ///
+    /// An `origin` key that is present but does not parse as a `"server"`
+    /// origin makes the whole invocation unparseable (`None`): a malformed
+    /// or forged origin must never degrade into client-side routing.
     pub fn parse(value: &serde_json::Value) -> Option<Self> {
         if let Some(command) = value.as_str() {
             return Some(Self {
                 command: command.to_string(),
                 args: Vec::new(),
+                origin: None,
             });
         }
         let command = value.get("command")?.as_str()?.to_string();
@@ -147,7 +259,61 @@ impl CommandInvocation {
             Some(other) => vec![other.clone()],
             None => Vec::new(),
         };
-        Some(Self { command, args })
+        let origin = match value.get("origin") {
+            None => None,
+            Some(origin) => {
+                let origin: CommandOrigin = serde_json::from_value(origin.clone()).ok()?;
+                if origin.side != CommandOrigin::SERVER_SIDE {
+                    return None;
+                }
+                Some(origin)
+            }
+        };
+        Some(Self {
+            command,
+            args,
+            origin,
+        })
+    }
+}
+
+/// §5.7 Stamp server provenance onto every interactive descriptor in a
+/// server-rendered chrome tree: each `onClick`/`onChange` object gains an
+/// `origin` naming the server extension and view that rendered it. String
+/// shorthand descriptors are rewritten to objects so they carry the stamp
+/// too.
+///
+/// Any origin the extension itself shipped is overwritten (spoof
+/// protection): the stamped identity is the one the server validated when
+/// publishing the view. The walk is iterative (explicit stack) and visits at
+/// most the tree's nodes, so it stays within the VDOM bounds the parser and
+/// renderer already enforce.
+pub fn stamp_server_origin(node: &mut VDomNode, extension_id: &str, view_id: &str) {
+    let origin = serde_json::json!({
+        "side": CommandOrigin::SERVER_SIDE,
+        "extension_id": extension_id,
+        "view_id": view_id,
+    });
+    let mut stack = vec![node];
+    while let Some(current) = stack.pop() {
+        for key in ["onClick", "onChange"] {
+            let Some(descriptor) = current.props.get_mut(key) else {
+                continue;
+            };
+            if let serde_json::Value::String(command) = descriptor {
+                *descriptor = serde_json::json!({
+                    "command": command,
+                    "origin": origin,
+                });
+            } else if let serde_json::Value::Object(object) = descriptor {
+                object.insert("origin".to_string(), origin.clone());
+            }
+        }
+        for child in &mut current.children {
+            if let VDomChild::Node(child) = child {
+                stack.push(child);
+            }
+        }
     }
 }
 
@@ -190,7 +356,16 @@ pub enum DrawOp {
 ///
 /// Unknown ops are rejected rather than skipped: a typo in an op name would
 /// otherwise silently paint nothing, which is far harder to diagnose.
+///
+/// §5.2/§5.4 the op count is bounded *before* deserialization so a renderer
+/// that emits a pathological array is rejected without first allocating the
+/// whole op vector.
 pub fn parse_display_list(value: &serde_json::Value) -> Result<Vec<DrawOp>> {
+    if let Some(ops) = value.as_array()
+        && ops.len() > MAX_DISPLAY_LIST_OPS
+    {
+        anyhow::bail!("display list exceeds limit of {MAX_DISPLAY_LIST_OPS} draw ops");
+    }
     serde_json::from_value(value.clone())
         .map_err(|e| anyhow::anyhow!("display list parse error: {}", e))
 }
@@ -307,6 +482,13 @@ impl VDomRenderer {
     pub fn render_frame(&mut self, nodes: &[VDomNode], cx: &mut App) -> Vec<AnyElement> {
         let mut elements = Vec::with_capacity(nodes.len());
         for node in nodes {
+            // §5.2/§5.4 fail closed at the render boundary too: a tree that
+            // was constructed natively (bypassing the parser) still cannot
+            // drive unbounded recursive element construction.
+            if let Err(error) = validate_typed_vdom(node) {
+                tracing::warn!(%error, "extension VDOM rejected at render");
+                continue;
+            }
             elements.push(self.render_node(node, &mut ElementPath::root(), cx));
         }
         self.display_lists
@@ -845,6 +1027,7 @@ mod tests {
             Some(CommandInvocation {
                 command: "z3rm.command-palette.select".into(),
                 args: vec![serde_json::Value::String("entry-1".into())],
+                origin: None,
             })
         );
 
@@ -854,6 +1037,7 @@ mod tests {
             Some(CommandInvocation {
                 command: "z3rm.command-palette.close".into(),
                 args: Vec::new(),
+                origin: None,
             })
         );
 
@@ -864,6 +1048,106 @@ mod tests {
         );
 
         assert_eq!(CommandInvocation::parse(&serde_json::json!({})), None);
+    }
+
+    #[test]
+    fn origin_parses_only_for_server_side() {
+        let server_origin = serde_json::json!({
+            "command": "status.toggle",
+            "args": [],
+            "origin": {
+                "side": "server",
+                "extension_id": "status",
+                "view_id": "main",
+            },
+        });
+        let parsed = CommandInvocation::parse(&server_origin).expect("server origin parses");
+        assert_eq!(parsed.command, "status.toggle");
+        assert_eq!(
+            parsed.origin,
+            Some(CommandOrigin {
+                side: CommandOrigin::SERVER_SIDE.to_string(),
+                extension_id: "status".to_string(),
+                view_id: "main".to_string(),
+            })
+        );
+
+        // A malformed or foreign origin must not degrade into an unmarked
+        // invocation: the click is dropped entirely (fail closed).
+        for forged in [
+            serde_json::json!({ "command": "x", "origin": "server" }),
+            serde_json::json!({ "command": "x", "origin": { "side": "client" } }),
+            serde_json::json!({ "command": "x", "origin": { "side": "server" } }),
+            serde_json::json!({ "command": "x", "origin": { "side": "other", "extension_id": "e", "view_id": "v" } }),
+        ] {
+            assert_eq!(
+                CommandInvocation::parse(&forged),
+                None,
+                "forged origin {forged} must be rejected"
+            );
+        }
+    }
+
+    #[test]
+    fn stamp_server_origin_marks_every_interaction_and_overwrites_forgery() {
+        let mut node: VDomNode = serde_json::from_value(serde_json::json!({
+            "type": "div",
+            "props": { "onClick": { "command": "outer.act", "args": [1] } },
+            "children": [
+                { "type": "button", "props": { "onClick": "short.hand" } },
+                {
+                    "type": "div",
+                    "props": {
+                        "onChange": { "command": "inner.change", "args": [] },
+                        "onClick": {
+                            "command": "forged.act",
+                            "origin": { "side": "server", "extension_id": "evil", "view_id": "x" },
+                        },
+                    },
+                },
+            ],
+        }))
+        .expect("fixture VDOM");
+
+        stamp_server_origin(&mut node, "status", "main");
+
+        let click = |node: &VDomNode| {
+            CommandInvocation::parse(node.props.get("onClick").unwrap()).expect("parses")
+        };
+        assert_eq!(click(&node).command, "outer.act");
+        assert_eq!(
+            click(&node).origin.as_ref().map(|origin| origin.extension_id.as_str()),
+            Some("status"),
+            "every stamped interaction names the real server extension"
+        );
+
+        let VDomChild::Node(button) = &node.children[0] else {
+            panic!("expected a button child");
+        };
+        let shorthand = click(button);
+        assert_eq!(shorthand.command, "short.hand");
+        assert_eq!(
+            shorthand.origin,
+            Some(CommandOrigin {
+                side: CommandOrigin::SERVER_SIDE.to_string(),
+                extension_id: "status".to_string(),
+                view_id: "main".to_string(),
+            }),
+            "string shorthand descriptors are rewritten to carry the stamp"
+        );
+
+        let VDomChild::Node(inner) = &node.children[1] else {
+            panic!("expected an inner child");
+        };
+        let forged = click(inner);
+        assert_eq!(forged.command, "forged.act");
+        assert_eq!(
+            forged.origin.as_ref().map(|origin| origin.extension_id.as_str()),
+            Some("status"),
+            "an extension-supplied origin is overwritten, never honored"
+        );
+        let change = CommandInvocation::parse(inner.props.get("onChange").unwrap()).expect("parses");
+        assert_eq!(change.origin.as_ref().map(|origin| origin.view_id.as_str()), Some("main"));
     }
 
     #[test]
@@ -959,6 +1243,170 @@ mod tests {
             style: BTreeMap::new(),
             children: Vec::new(),
         }
+    }
+
+    /// §5.2: a VDOM tree nested beyond the depth budget must fail closed at
+    /// parse time instead of walking the host thread's call stack.
+    #[test]
+    fn parse_vdom_rejects_excessive_nesting() {
+        let mut value = serde_json::json!({ "type": "div" });
+        // Wrap until the innermost node sits one level past the budget.
+        for _ in 0..=MAX_VDOM_DEPTH {
+            let mut object = serde_json::Map::new();
+            object.insert("type".into(), serde_json::json!("div"));
+            object.insert("children".into(), serde_json::json!([value]));
+            value = serde_json::Value::Object(object);
+        }
+        let error = parse_vdom(&value).unwrap_err();
+        let message = format!("{error:#}");
+        assert!(
+            message.contains("nesting depth"),
+            "expected depth rejection, got: {message}"
+        );
+    }
+
+    /// §5.2: a tree at exactly the depth budget still parses, so the bound is
+    /// an inclusive ceiling rather than a shrinking of valid chrome.
+    #[test]
+    fn parse_vdom_accepts_maximum_nesting() {
+        let mut value = serde_json::json!({ "type": "div" });
+        for _ in 0..(MAX_VDOM_DEPTH - 1) {
+            let mut object = serde_json::Map::new();
+            object.insert("type".into(), serde_json::json!("div"));
+            object.insert("children".into(), serde_json::json!([value]));
+            value = serde_json::Value::Object(object);
+        }
+        let node = parse_vdom(&value).expect("depth at the budget must parse");
+        assert_eq!(node.element_type, "div");
+    }
+
+    /// §5.2: an extension that emits more nodes than the budget is rejected
+    /// wholesale rather than partially accepted into the live caches.
+    #[test]
+    fn parse_vdom_rejects_excessive_node_count() {
+        let children: Vec<Value> = (0..=MAX_VDOM_NODES)
+            .map(|_| serde_json::json!({ "type": "span" }))
+            .collect();
+        let value = serde_json::json!({ "type": "div", "children": children });
+        let error = parse_vdom(&value).unwrap_err();
+        let message = format!("{error:#}");
+        assert!(
+            message.contains("node count"),
+            "expected node-count rejection, got: {message}"
+        );
+    }
+
+    /// §5.2: a tree at the node-count ceiling still parses.
+    #[test]
+    fn parse_vdom_accepts_maximum_node_count() {
+        let children: Vec<Value> = (0..MAX_VDOM_NODES.saturating_sub(1))
+            .map(|_| serde_json::json!({ "type": "span" }))
+            .collect();
+        let value = serde_json::json!({ "type": "div", "children": children });
+        let node = parse_vdom(&value).expect("node count at the budget must parse");
+        assert_eq!(node.children.len(), MAX_VDOM_NODES - 1);
+    }
+
+    /// §5.2: a display list beyond the op budget is rejected before any op
+    /// vector is allocated.
+    #[test]
+    fn parse_display_list_rejects_excessive_ops() {
+        let ops: Vec<Value> = (0..=MAX_DISPLAY_LIST_OPS)
+            .map(|_| serde_json::json!({ "op": "drawText", "text": "t", "x": 0, "y": 0 }))
+            .collect();
+        let value = serde_json::Value::Array(ops);
+        let error = parse_display_list(&value).unwrap_err();
+        let message = format!("{error:#}");
+        assert!(
+            message.contains("draw ops"),
+            "expected op-count rejection, got: {message}"
+        );
+    }
+
+    /// §5.2: a display list at exactly the op budget still parses.
+    #[test]
+    fn parse_display_list_accepts_maximum_ops() {
+        let ops: Vec<Value> = (0..MAX_DISPLAY_LIST_OPS)
+            .map(|_| serde_json::json!({ "op": "drawText", "text": "t", "x": 0, "y": 0 }))
+            .collect();
+        let value = serde_json::Value::Array(ops);
+        let parsed = parse_display_list(&value).expect("op count at the budget must parse");
+        assert_eq!(parsed.len(), MAX_DISPLAY_LIST_OPS);
+    }
+
+    /// §5.2: an oversized drawOps payload on a region leaves the region's
+    /// previous cache alone and does not disturb sibling regions rendered in
+    /// the same frame.
+    #[gpui::test]
+    fn oversized_draw_ops_leave_cached_regions_untouched(cx: &mut gpui::TestAppContext) {
+        let mut renderer = VDomRenderer::new();
+        let clock = display_list_node("clock");
+        cx.update(|cx| renderer.render(&clock, cx));
+        assert_eq!(renderer.display_list("clock").map(<[DrawOp]>::len), Some(1));
+
+        let oversized = VDomNode {
+            element_type: "display-list".into(),
+            props: [
+                ("id".to_string(), serde_json::json!("clock")),
+                (
+                    "drawOps".to_string(),
+                    serde_json::Value::Array(
+                        (0..=MAX_DISPLAY_LIST_OPS)
+                            .map(|_| {
+                                serde_json::json!({
+                                    "op": "drawText", "text": "t", "x": 0, "y": 0
+                                })
+                            })
+                            .collect(),
+                    ),
+                ),
+            ]
+            .into_iter()
+            .collect(),
+            style: BTreeMap::new(),
+            children: Vec::new(),
+        };
+        let elements = cx.update(|cx| renderer.render(&oversized, cx));
+        assert_eq!(elements.len(), 1, "region still paints (empty) after rejection");
+        assert_eq!(
+            renderer.display_list("clock"),
+            None,
+            "rejected draw ops must not be cached"
+        );
+
+        // The next valid frame repopulates the cache: rejection never wedged
+        // the region permanently.
+        cx.update(|cx| renderer.render(&clock, cx));
+        assert_eq!(renderer.display_list("clock").map(<[DrawOp]>::len), Some(1));
+    }
+
+    /// §5.2: a natively constructed tree past the bounds is skipped at render
+    /// time while valid siblings in the same frame still paint.
+    #[gpui::test]
+    fn render_frame_skips_oversized_typed_tree(cx: &mut gpui::TestAppContext) {
+        let mut renderer = VDomRenderer::new();
+        let clock = display_list_node("clock");
+        let mut deep = VDomNode {
+            element_type: "div".into(),
+            props: BTreeMap::new(),
+            style: BTreeMap::new(),
+            children: Vec::new(),
+        };
+        for _ in 0..=MAX_VDOM_DEPTH {
+            deep = VDomNode {
+                element_type: "div".into(),
+                props: BTreeMap::new(),
+                style: BTreeMap::new(),
+                children: vec![VDomChild::Node(deep)],
+            };
+        }
+        let elements = cx.update(|cx| renderer.render_frame(&[clock.clone(), deep], cx));
+        assert_eq!(elements.len(), 1, "oversized tree must be skipped");
+        assert_eq!(
+            renderer.display_list("clock").map(<[DrawOp]>::len),
+            Some(1),
+            "valid sibling's cache survives the rejection"
+        );
     }
 
     /// §5.4: a display-list region that stops appearing in the VDOM must be

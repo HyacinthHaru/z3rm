@@ -504,7 +504,9 @@ impl Item for ProjectDiff {
         _window: &mut Window,
         _: &mut Context<Self>,
     ) -> Task<Result<()>> {
-        unreachable!()
+        Task::ready(Err(anyhow::anyhow!(
+            "project diff does not support Save As"
+        )))
     }
 
     fn reload(

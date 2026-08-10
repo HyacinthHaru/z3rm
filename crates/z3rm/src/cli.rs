@@ -17,26 +17,32 @@ use std::path::PathBuf;
 
 /// z3rm 启动意图 — GUI 模式 vs RPC 模式。
 ///
-/// `z3rm attach [-t target]`（不带 `--ssh`）不再走 RPC attach 然后 exit(0)，
-/// 而是标记为 GUI 启动意图：main.rs 不会在此处 `exit(0)`，而把目标 session 名字
-/// /ID 推入进程环境，进入与 GUI 启动相同的 daemon 流程。`attach --ssh` 必须保持
-/// 原行为（建立 SSH 隧道后退出），不属于 GUI 意图。
+/// `z3rm attach [-t target]` 与 `z3rm attach --ssh <uri>` 都不再走 RPC
+/// 短路后 exit(0)：main.rs 把目标 session / SSH URI 推入子进程环境，子进程
+/// 进入 GUI 启动流程 —— 本地 attach 走 daemon 流程，SSH attach 走
+/// `mux::connect_ssh` 隧道并由 GUI 窗口持有 `SshSession` 直到窗口关闭。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum LaunchIntent {
     /// Launch GUI and attach the requested session.
     /// `target` 是原始 target 字符串（如 `"dev"`、`"dev:0.1"`），由运行时解析；
     /// `None` 表示 "默认/最近使用的 session"。
     Gui { target: Option<String> },
+    /// Launch GUI attached to a remote mux_server over an SSH tunnel.
+    /// URI 只通过子进程环境传递，不进入 argv，也不出现在用户可见输出里。
+    Ssh { uri: String },
 }
 
 /// 询问 `argv` 是否表达 GUI 启动意图。
-/// 目前仅识别 `attach [-t target]`；`attach --ssh ...` 仍走 CLI 短路。
+///
+/// 识别 `attach [-t target]` 与 `attach --ssh <uri>`；缺值、`-t`/`--ssh`
+/// 混用、未知 flag 等情况让 CLI 解析层报错，GUI 意图不抢先消费。
 pub fn parse_launch_intent_from(args: &[String]) -> Option<LaunchIntent> {
     if args.len() < 2 || args[1] != "attach" {
         return None;
     }
     let rest = &args[2..];
     let mut target: Option<String> = None;
+    let mut ssh_uri: Option<String> = None;
     let mut index = 0;
     while index < rest.len() {
         match rest[index].as_str() {
@@ -46,13 +52,25 @@ pub fn parse_launch_intent_from(args: &[String]) -> Option<LaunchIntent> {
                 target = Some(value.clone());
                 index += 2;
             }
-            // `attach --ssh ...` 仍走 CLI 短路；缺值的 --ssh 也交给 CLI 报错。
-            "--ssh" => return None,
+            "--ssh" => {
+                // 缺值或像 flag 一样的值 (如 `attach --ssh --target dev`)
+                // 交给 CLI 解析层报错，GUI 意图不抢先消费。
+                let value = rest
+                    .get(index + 1)
+                    .filter(|value| !value.starts_with('-'))?;
+                ssh_uri = Some(value.clone());
+                index += 2;
+            }
             // 未知 flag / 位置参数让 CLI 解析层报错，而不是静默退回默认 session。
             _ => return None,
         }
     }
-    Some(LaunchIntent::Gui { target })
+    match (target, ssh_uri) {
+        // `-t` 与 `--ssh` 混用是用户错误，交给 CLI 解析层报错。
+        (Some(_), Some(_)) => None,
+        (_, Some(uri)) => Some(LaunchIntent::Ssh { uri }),
+        (target, None) => Some(LaunchIntent::Gui { target }),
+    }
 }
 
 pub fn parse_launch_intent() -> Option<LaunchIntent> {
@@ -84,7 +102,7 @@ commands (spec §3.10):\n\
     has-session -t <target>          exit 0 if the session exists\n\
     kill-server                      gracefully shut down mux_server\n\
     attach [-t <target>]             attach to a session (opens GUI)\n\
-    attach --ssh <ssh://uri>         connect via SSH tunnel to remote mux_server\n\
+    attach --ssh <ssh://uri>         attach to a remote mux_server over SSH (opens GUI)\n\
     detach                           detach the current client\n\
     recover [--list | -t <session>]  list or confirm persisted session recovery\n\
     split-window [-t <target>] [-h|-v] [-c <command>]\n\
@@ -411,9 +429,13 @@ fn parse_cli_args_lossy(args: &[String]) -> Result<Option<CliCommand>, String> {
                 (Some(_), Some(_)) => {
                     Err("attach accepts either -t <target> or --ssh <uri>, not both".to_string())
                 }
-                (_, Some(uri)) => Ok(Some(CliCommand::Ssh {
-                    target: uri.to_string(),
-                })),
+                // §16.6 `attach --ssh <uri>` 是 GUI 启动意图, main.rs 在 CLI
+                // 解析前消费; 能走到这里说明是程序化调用 —— 显式报错,
+                // 而不是静默成功/丢弃 (曾经是连接后打印再退出的短路路径)。
+                (_, Some(_)) => Err(
+                    "attach --ssh <uri> launches the GUI; it cannot run as a standalone CLI command"
+                        .to_string(),
+                ),
                 (Some(target), None) => Ok(Some(CliCommand::Attach {
                     target: Some(target.to_string()),
                 })),
@@ -1042,10 +1064,25 @@ mod tests {
     }
 
     #[test]
-    fn launch_intent_attach_ssh_is_not_gui_intent() {
-        // attach --ssh 必须保留 CLI 短路逻辑，不应被当作 GUI 意图拦截。
+    fn launch_intent_attach_ssh_is_gui_intent() {
+        // §16.6 attach --ssh 是 GUI 启动意图: URI 由 main.rs 放入子进程环境,
+        // 子进程 GUI 建立隧道并持有 SshSession, 而不是 CLI 短路后丢弃。
         let intent = parse_launch_intent_from(&args(&["attach", "--ssh", "ssh://host"]));
-        assert_eq!(intent, None);
+        assert_eq!(
+            intent,
+            Some(LaunchIntent::Ssh {
+                uri: "ssh://host".into()
+            })
+        );
+
+        // 带用户名的 URI 也原样携带。
+        let intent = parse_launch_intent_from(&args(&["attach", "--ssh", "ssh://alice@host:2222"]));
+        assert_eq!(
+            intent,
+            Some(LaunchIntent::Ssh {
+                uri: "ssh://alice@host:2222".into()
+            })
+        );
     }
 
     #[test]
@@ -1220,9 +1257,6 @@ mod tests {
             Some(CliCommand::Attach { target }) => assert_eq!(target.as_deref(), Some("dev")),
             other => panic!("unexpected parse result: {other:?}"),
         }
-        let parsed = parse_cli_args_from(&args(&["attach", "--ssh", "ssh://host"]))
-            .expect("parse ssh attach");
-        assert!(matches!(parsed, Some(CliCommand::Ssh { target }) if target == "ssh://host"));
 
         for arguments in [
             vec!["attach", "-t"],
@@ -1236,6 +1270,16 @@ mod tests {
                 "arguments {arguments:?} must be rejected"
             );
         }
+
+        // §16.6 `attach --ssh` 由 GUI 启动侧消费 (parse_launch_intent_from);
+        // 通用 CLI 解析绝不能把它解析成可成功执行的命令 —— 显式报错,
+        // 不存在成功报告的丢弃路径。
+        let error = parse_cli_args_from(&args(&["attach", "--ssh", "ssh://host"]))
+            .expect_err("attach --ssh must not parse as a one-shot CLI command");
+        assert!(
+            error.contains("--ssh"),
+            "error should name the flag: {error}"
+        );
     }
 
     #[test]
@@ -1428,5 +1472,15 @@ mod tests {
             None
         );
         assert_eq!(parse_launch_intent_from(&args(&["attach", "--ssh"])), None);
+        // `--ssh` 吞掉像 flag 一样的值会让 CLI 报 "requires a value"。
+        assert_eq!(
+            parse_launch_intent_from(&args(&["attach", "--ssh", "--target", "dev"])),
+            None
+        );
+        // `-t` 与 `--ssh` 混用是用户错误: GUI 意图不抢先消费, 交给 CLI 报错。
+        assert_eq!(
+            parse_launch_intent_from(&args(&["attach", "-t", "dev", "--ssh", "ssh://host"])),
+            None
+        );
     }
 }

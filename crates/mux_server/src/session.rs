@@ -395,6 +395,7 @@ impl Session {
             event: Some(mux_protocol::notification::Event::SessionLayoutChanged(
                 mux_protocol::SessionLayoutChanged {
                     layout: Some(layout),
+                    snapshot: None,
                 },
             )),
         });

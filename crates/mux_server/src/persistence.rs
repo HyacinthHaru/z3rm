@@ -7,12 +7,13 @@ use sqlez::statement::Statement;
 use std::sync::Arc;
 use std::time::Duration;
 
-const RECOVERY_FORMAT_VERSION: u32 = 1;
+const RECOVERY_FORMAT_VERSION: u32 = 2;
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
 struct PersistedSessionState {
     version: u32,
-    layout: String,
+    /// §3.7 类型化布局树 (前序节点表), 重建时校验结构不变量。
+    layout: crate::layout::LayoutTree,
     tabs: Vec<PersistedTab>,
     panes: Vec<PersistedPane>,
     focused_tab: Option<String>,
@@ -33,8 +34,6 @@ pub struct PersistedPane {
     pub title: String,
     pub cols: u32,
     pub rows: u32,
-    /// Informational only. Recovery always starts a fresh default shell.
-    pub prior_command: Option<String>,
 }
 
 // §3.6 SQLite schema: session 元数据表
@@ -43,23 +42,8 @@ CREATE TABLE IF NOT EXISTS sessions (
     id TEXT PRIMARY KEY,
     name TEXT NOT NULL,
     cwd TEXT NOT NULL,
-    layout_snapshot TEXT,  -- §3.7 序列化 layout tree
+    layout_snapshot TEXT,  -- §3.7 类型化 layout tree JSON 信封
     last_snapshot_timestamp INTEGER NOT NULL  -- Unix 毫秒
-)
-"#;
-
-// §3.6 布局节点表 (可选: 用于更细粒度恢复)
-const LAYOUT_NODES_SQL: &str = r#"
-CREATE TABLE IF NOT EXISTS layout_nodes (
-    session_id TEXT NOT NULL,
-    node_id TEXT NOT NULL,
-    node_type TEXT NOT NULL,  -- 'pane' 或 'split'
-    pane_id TEXT,             -- 仅 pane 节点有值
-    direction TEXT,           -- 仅 split 节点: 'H' 或 'V'
-    ratio REAL,               -- §3.7 尺寸比例
-    parent_node_id TEXT,      -- §3.7 父节点 ID
-    PRIMARY KEY (session_id, node_id),
-    FOREIGN KEY (session_id) REFERENCES sessions(id)
 )
 "#;
 
@@ -70,8 +54,6 @@ pub fn init_tables(conn: &Connection) -> anyhow::Result<()> {
     wal.exec()?;
     let mut stmt = Statement::prepare(conn, SCHEMA_SQL)?;
     stmt.exec()?;
-    let mut stmt2 = Statement::prepare(conn, LAYOUT_NODES_SQL)?;
-    stmt2.exec()?;
     Ok(())
 }
 
@@ -91,7 +73,7 @@ pub async fn persist_loop(
 
 fn persisted_session_state(
     session: &crate::session::Session,
-    layout: String,
+    layout: crate::layout::LayoutTree,
 ) -> anyhow::Result<PersistedSessionState> {
     let mut tabs = session
         .tabs
@@ -113,7 +95,6 @@ fn persisted_session_state(
             title: pane.get_title(),
             cols: pane.get_cols(),
             rows: pane.get_rows(),
-            prior_command: pane.command.clone(),
         })
         .collect::<Vec<_>>();
     pane_metadata.sort_by(|left, right| left.id.cmp(&right.id));
@@ -186,19 +167,9 @@ pub(crate) fn snapshot_sessions(
                       VALUES (?, ?, ?, ?, ?)";
 
     for session in &*sessions_r {
-        // §3.7 序列化 layout tree (tmux 风格绝对 cell 计数)。
-        // container 尺寸取自任一 constituent pane —— session 不单独记录窗口尺寸;
-        // ratios 决定相对切分, 绝对值只影响 WxH 数字, 结构 round-trip 不受影响。
-        let (cols, rows) = {
-            let panes = session.panes.read();
-            panes
-                .values()
-                .next()
-                .map(|p| (p.get_cols(), p.get_rows()))
-                .unwrap_or((80, 24))
-        };
-        let layout = session.layout.serialize(cols, rows)?;
-        let persisted_state = persisted_session_state(session, layout)?;
+        // §3.7 类型化 layout tree 直接入 JSON 信封: 保留节点 ID 与精确比例,
+        // 恢复时重建出与保存时完全一致的树。
+        let persisted_state = persisted_session_state(session, session.layout.clone())?;
         let layout_snapshot = serde_json::to_string(&persisted_state)?;
 
         let mut stmt = Statement::prepare(&*conn, upsert_sql)?;
@@ -216,7 +187,6 @@ pub(crate) fn snapshot_sessions(
 pub fn delete_session(conn: &Connection, session_id: &str) -> anyhow::Result<()> {
     conn.exec("BEGIN IMMEDIATE")?()?;
     let result = (|| {
-        conn.exec_bound::<&str>("DELETE FROM layout_nodes WHERE session_id = ?")?(session_id)?;
         conn.exec_bound::<&str>("DELETE FROM sessions WHERE id = ?")?(session_id)?;
         conn.exec("COMMIT")?()?;
         anyhow::Ok(())
@@ -241,7 +211,6 @@ pub struct RecoveryCandidate {
     pub panes: Vec<PersistedPane>,
     pub focused_tab: Option<String>,
     pub focused_pane: Option<String>,
-    pub metadata_complete: bool,
 }
 
 #[derive(Clone, Debug)]
@@ -250,25 +219,24 @@ pub struct RecoveryScan {
     pub rejected: Vec<String>,
 }
 
-fn decode_persisted_state(
-    session_id: &str,
-    value: &str,
-) -> anyhow::Result<(crate::layout::LayoutTree, Option<PersistedSessionState>)> {
-    if let Ok(state) = serde_json::from_str::<PersistedSessionState>(value) {
-        anyhow::ensure!(
-            state.version == RECOVERY_FORMAT_VERSION,
-            "unsupported recovery format {} for session {session_id}",
-            state.version
-        );
-        let layout = crate::layout::LayoutTree::deserialize(&state.layout).map_err(|error| {
-            anyhow::anyhow!("invalid persisted layout for session {session_id}: {error}")
-        })?;
-        return Ok((layout, Some(state)));
-    }
-    let layout = crate::layout::LayoutTree::deserialize(value).map_err(|error| {
+/// §3.7 解码持久化行: 先核对信封版本, 再解析类型化 layout (反序列化本身会
+/// 执行完整结构校验)。旧格式行 (tmux 风格字符串 / 旧 version) 以明确错误
+/// 拒绝, 绝不静默降级。
+fn decode_persisted_state(session_id: &str, value: &str) -> anyhow::Result<PersistedSessionState> {
+    let parsed: serde_json::Value = serde_json::from_str(value).map_err(|error| {
         anyhow::anyhow!("invalid persisted layout for session {session_id}: {error}")
     })?;
-    Ok((layout, None))
+    let version = parsed
+        .get("version")
+        .and_then(|version| version.as_u64())
+        .unwrap_or(0) as u32;
+    anyhow::ensure!(
+        version == RECOVERY_FORMAT_VERSION,
+        "unsupported recovery format {version} for session {session_id}"
+    );
+    serde_json::from_value(parsed).map_err(|error| {
+        anyhow::anyhow!("invalid persisted layout for session {session_id}: {error}")
+    })
 }
 
 pub fn recovery_candidates(conn: &Connection) -> anyhow::Result<RecoveryScan> {
@@ -293,98 +261,86 @@ pub fn recovery_candidates(conn: &Connection) -> anyhow::Result<RecoveryScan> {
                 !layout_snapshot.is_empty(),
                 "session {id} has no persisted layout"
             );
-            let (layout, state) = decode_persisted_state(&id, &layout_snapshot)?;
+            let state = decode_persisted_state(&id, &layout_snapshot)?;
+            let layout = state.layout.clone();
             let pane_ids = layout.pane_ids();
             anyhow::ensure!(
                 !pane_ids.is_empty() && pane_ids.iter().all(|pane_id| !pane_id.is_empty()),
                 "persisted layout for session {id} has no recoverable panes"
             );
-            let (tabs, panes, focused_tab, focused_pane, metadata_complete) = match state {
-                Some(state) => {
-                    let mut persisted_panes = state
-                        .panes
-                        .iter()
-                        .map(|pane| pane.id.clone())
-                        .collect::<Vec<_>>();
-                    persisted_panes.sort();
-                    anyhow::ensure!(
-                        persisted_panes.windows(2).all(|ids| ids[0] != ids[1]),
-                        "persisted pane metadata for session {id} contains duplicate pane ids"
-                    );
-                    anyhow::ensure!(
-                        state.panes.iter().all(|pane| {
-                            !pane.id.is_empty()
-                                && mux_protocol::checked_grid_cell_count(
-                                    pane.cols as usize,
-                                    pane.rows as usize,
-                                )
-                                .is_ok()
-                        }),
-                        "persisted pane metadata for session {id} contains an invalid pane size"
-                    );
-                    let mut layout_panes = pane_ids.clone();
-                    layout_panes.sort();
-                    anyhow::ensure!(
-                        layout_panes == persisted_panes,
-                        "persisted pane metadata for session {id} does not match its layout"
-                    );
-                    let mut tab_ids = state.tabs.iter().map(|tab| &tab.id).collect::<Vec<_>>();
-                    tab_ids.sort();
-                    anyhow::ensure!(
-                        tab_ids.iter().all(|tab_id| !tab_id.is_empty())
-                            && tab_ids.windows(2).all(|ids| ids[0] != ids[1]),
-                        "persisted tab metadata for session {id} contains invalid tab ids"
-                    );
-                    anyhow::ensure!(
-                        state
-                            .tabs
-                            .iter()
-                            .flat_map(|tab| &tab.pane_ids)
-                            .all(|pane_id| persisted_panes.binary_search(pane_id).is_ok()),
-                        "persisted tab metadata for session {id} references an unknown pane"
-                    );
-                    anyhow::ensure!(
-                        persisted_panes.iter().all(|pane_id| {
-                            state.tabs.iter().any(|tab| tab.pane_ids.contains(pane_id))
-                        }),
-                        "persisted pane metadata for session {id} contains an unassigned pane"
-                    );
-                    if let Some(focused_tab) = &state.focused_tab {
-                        anyhow::ensure!(
-                            state.tabs.iter().any(|tab| &tab.id == focused_tab),
-                            "persisted session {id} has an invalid focused tab"
-                        );
-                    }
-                    if let Some(focused_pane) = &state.focused_pane {
-                        anyhow::ensure!(
-                            persisted_panes.binary_search(focused_pane).is_ok(),
-                            "persisted session {id} has an invalid focused pane"
-                        );
-                    }
-                    (
-                        state
-                            .tabs
-                            .into_iter()
-                            .map(|tab| (tab.id, tab.title, tab.pane_ids))
-                            .collect(),
-                        state.panes,
-                        state.focused_tab,
-                        state.focused_pane,
-                        true,
-                    )
-                }
-                None => (Vec::new(), Vec::new(), None, None, false),
-            };
+            let mut persisted_panes = state
+                .panes
+                .iter()
+                .map(|pane| pane.id.clone())
+                .collect::<Vec<_>>();
+            persisted_panes.sort();
+            anyhow::ensure!(
+                persisted_panes.windows(2).all(|ids| ids[0] != ids[1]),
+                "persisted pane metadata for session {id} contains duplicate pane ids"
+            );
+            anyhow::ensure!(
+                state.panes.iter().all(|pane| {
+                    !pane.id.is_empty()
+                        && mux_protocol::checked_grid_cell_count(
+                            pane.cols as usize,
+                            pane.rows as usize,
+                        )
+                        .is_ok()
+                }),
+                "persisted pane metadata for session {id} contains an invalid pane size"
+            );
+            let mut layout_panes = pane_ids.clone();
+            layout_panes.sort();
+            anyhow::ensure!(
+                layout_panes == persisted_panes,
+                "persisted pane metadata for session {id} does not match its layout"
+            );
+            let mut tab_ids = state.tabs.iter().map(|tab| &tab.id).collect::<Vec<_>>();
+            tab_ids.sort();
+            anyhow::ensure!(
+                tab_ids.iter().all(|tab_id| !tab_id.is_empty())
+                    && tab_ids.windows(2).all(|ids| ids[0] != ids[1]),
+                "persisted tab metadata for session {id} contains invalid tab ids"
+            );
+            anyhow::ensure!(
+                state
+                    .tabs
+                    .iter()
+                    .flat_map(|tab| &tab.pane_ids)
+                    .all(|pane_id| persisted_panes.binary_search(pane_id).is_ok()),
+                "persisted tab metadata for session {id} references an unknown pane"
+            );
+            anyhow::ensure!(
+                persisted_panes.iter().all(|pane_id| {
+                    state.tabs.iter().any(|tab| tab.pane_ids.contains(pane_id))
+                }),
+                "persisted pane metadata for session {id} contains an unassigned pane"
+            );
+            if let Some(focused_tab) = &state.focused_tab {
+                anyhow::ensure!(
+                    state.tabs.iter().any(|tab| &tab.id == focused_tab),
+                    "persisted session {id} has an invalid focused tab"
+                );
+            }
+            if let Some(focused_pane) = &state.focused_pane {
+                anyhow::ensure!(
+                    persisted_panes.binary_search(focused_pane).is_ok(),
+                    "persisted session {id} has an invalid focused pane"
+                );
+            }
             anyhow::Ok(RecoveryCandidate {
                 id,
                 name,
                 cwd,
                 layout,
-                tabs,
-                panes,
-                focused_tab,
-                focused_pane,
-                metadata_complete,
+                tabs: state
+                    .tabs
+                    .into_iter()
+                    .map(|tab| (tab.id, tab.title, tab.pane_ids))
+                    .collect(),
+                panes: state.panes,
+                focused_tab: state.focused_tab,
+                focused_pane: state.focused_pane,
             })
         })();
         match validation {
@@ -423,28 +379,36 @@ mod tests {
     }
 
     fn raw_layout(pane_id: &str) -> String {
-        crate::layout::LayoutTree::with_pane(format!("{pane_id}-node"), pane_id.to_string())
-            .serialize(80, 24)
-            .expect("serialize test layout")
+        let layout = crate::layout::LayoutTree::with_pane(
+            format!("{pane_id}-node"),
+            pane_id.to_string(),
+        );
+        serde_json::to_string(&layout).expect("serialize test layout")
+    }
+
+    fn persisted_pane(id: &str) -> PersistedPane {
+        PersistedPane {
+            id: id.to_string(),
+            cwd: "/tmp".to_string(),
+            title: "cat".to_string(),
+            cols: 80,
+            rows: 24,
+        }
     }
 
     fn envelope_json(pane_id: &str) -> String {
         serde_json::to_string(&PersistedSessionState {
             version: RECOVERY_FORMAT_VERSION,
-            layout: raw_layout(pane_id),
+            layout: crate::layout::LayoutTree::with_pane(
+                format!("{pane_id}-node"),
+                pane_id.to_string(),
+            ),
             tabs: vec![PersistedTab {
                 id: "tab-1".to_string(),
                 title: "shell".to_string(),
                 pane_ids: vec![pane_id.to_string()],
             }],
-            panes: vec![PersistedPane {
-                id: pane_id.to_string(),
-                cwd: "/tmp".to_string(),
-                title: "cat".to_string(),
-                cols: 80,
-                rows: 24,
-                prior_command: Some("/bin/cat".to_string()),
-            }],
+            panes: vec![persisted_pane(pane_id)],
             focused_tab: Some("tab-1".to_string()),
             focused_pane: Some(pane_id.to_string()),
         })
@@ -477,14 +441,16 @@ mod tests {
         assert_eq!(scan.candidates.len(), 1);
         assert_eq!(scan.candidates[0].id, "keep");
         assert_eq!(scan.candidates[0].layout.pane_ids(), vec!["keep-pane"]);
-        assert!(scan.candidates[0].metadata_complete);
         assert_eq!(scan.candidates[0].panes[0].id, "keep-pane");
         assert_eq!(scan.candidates[0].tabs[0].0, "tab-1");
     }
 
+    /// 旧格式裸 layout 行 (tmux 风格字符串, 无 JSON 信封) 在类型化 cutover
+    /// 后不再被当作 "incomplete candidate", 而是带错误信息拒绝 —— 绝不静默
+    /// 降级成单 pane 布局。
     #[test]
-    fn legacy_layout_without_metadata_is_rejected_as_incomplete() {
-        let connection = Connection::open_memory(Some("legacy_incomplete_recovery"));
+    fn legacy_raw_layout_row_is_rejected_after_typed_cutover() {
+        let connection = Connection::open_memory(Some("legacy_rejected_after_cutover"));
         init_tables(&connection).expect("initialize persistence tables");
         insert_session_row(
             &connection,
@@ -495,11 +461,34 @@ mod tests {
         );
         let scan = recovery_candidates(&connection).expect("scan recovery candidates");
 
-        assert!(scan.rejected.is_empty());
-        assert_eq!(scan.candidates.len(), 1);
-        assert_eq!(scan.candidates[0].id, "legacy");
-        assert!(!scan.candidates[0].metadata_complete);
-        assert!(scan.candidates[0].panes.is_empty());
+        assert!(scan.candidates.is_empty());
+        assert_eq!(scan.rejected.len(), 1);
+        assert!(
+            scan.rejected[0].contains("unsupported recovery format"),
+            "unexpected rejection: {}",
+            scan.rejected[0]
+        );
+    }
+
+    #[test]
+    fn unsupported_recovery_format_version_is_rejected() {
+        let connection = Connection::open_memory(Some("unsupported_recovery_version"));
+        init_tables(&connection).expect("initialize persistence tables");
+        let mut envelope = serde_json::from_str::<serde_json::Value>(&envelope_json("pane-1"))
+            .expect("decode test recovery envelope");
+        envelope["version"] = serde_json::Value::from(1u32);
+        insert_session_row(
+            &connection,
+            "old-format",
+            "old-format",
+            "/tmp",
+            &serde_json::to_string(&envelope).expect("encode stale version envelope"),
+        );
+
+        let scan = recovery_candidates(&connection).expect("scan recovery candidates");
+        assert!(scan.candidates.is_empty());
+        assert_eq!(scan.rejected.len(), 1);
+        assert!(scan.rejected[0].contains("unsupported recovery format"));
     }
 
     #[test]
@@ -539,7 +528,22 @@ mod tests {
     fn empty_session_is_not_published_as_a_recovery_candidate() {
         let connection = Connection::open_memory(Some("empty_recovery_candidate"));
         init_tables(&connection).expect("initialize persistence tables");
-        insert_session_row(&connection, "empty", "empty", "/tmp", &raw_layout(""));
+        let empty_envelope = serde_json::to_string(&PersistedSessionState {
+            version: RECOVERY_FORMAT_VERSION,
+            layout: crate::layout::LayoutTree::empty(),
+            tabs: Vec::new(),
+            panes: Vec::new(),
+            focused_tab: None,
+            focused_pane: None,
+        })
+        .expect("encode empty session envelope");
+        insert_session_row(
+            &connection,
+            "empty",
+            "empty",
+            "/tmp",
+            &empty_envelope,
+        );
 
         let scan = recovery_candidates(&connection).expect("scan recovery candidates");
         assert!(scan.candidates.is_empty());
@@ -592,17 +596,115 @@ mod tests {
         assert!(scan.rejected.is_empty());
         assert_eq!(scan.candidates.len(), 1);
         let candidate = &scan.candidates[0];
-        assert!(candidate.metadata_complete);
         assert_eq!(candidate.panes.len(), 1);
         assert_eq!(candidate.panes[0].id, "pane-1");
-        assert!(
-            candidate.panes[0]
-                .prior_command
-                .as_deref()
-                .unwrap()
-                .starts_with("/bin/cat")
-        );
         assert_eq!(candidate.focused_pane.as_deref(), Some("pane-1"));
         assert_eq!(candidate.tabs[0].2, vec!["pane-1"]);
+        let live = sessions.read();
+        assert_eq!(
+            candidate.layout.root, live[0].layout.root,
+            "snapshotted layout must round-trip the exact tree"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn multi_level_layout_and_focus_round_trip_through_recovery_scan() {
+        let connection = Connection::open_memory(Some("multi_level_recovery_round_trip"));
+        init_tables(&connection).expect("initialize persistence tables");
+
+        let mut layout = crate::layout::LayoutTree::with_pane(
+            "node-1".to_string(),
+            "pane-1".to_string(),
+        );
+        layout
+            .split(
+                "pane-1",
+                "pane-2".to_string(),
+                crate::layout::SplitDirection::LeftRight,
+            )
+            .expect("split left-right");
+        layout
+            .resize_pane("pane-1", crate::layout::SplitDirection::LeftRight, 0.2)
+            .expect("resize outer split");
+        layout
+            .split(
+                "pane-2",
+                "pane-3".to_string(),
+                crate::layout::SplitDirection::TopBottom,
+            )
+            .expect("split top-bottom");
+        layout
+            .resize_pane("pane-2", crate::layout::SplitDirection::TopBottom, 0.1)
+            .expect("resize inner split");
+
+        let envelope = serde_json::to_string(&PersistedSessionState {
+            version: RECOVERY_FORMAT_VERSION,
+            layout: layout.clone(),
+            tabs: vec![PersistedTab {
+                id: "tab-1".to_string(),
+                title: "shell".to_string(),
+                pane_ids: vec![
+                    "pane-1".to_string(),
+                    "pane-2".to_string(),
+                    "pane-3".to_string(),
+                ],
+            }],
+            panes: vec![
+                persisted_pane("pane-1"),
+                persisted_pane("pane-2"),
+                persisted_pane("pane-3"),
+            ],
+            focused_tab: Some("tab-1".to_string()),
+            focused_pane: Some("pane-3".to_string()),
+        })
+        .expect("encode multi-level recovery envelope");
+        insert_session_row(
+            &connection,
+            "multi",
+            "multi",
+            "/tmp",
+            &envelope,
+        );
+
+        let scan = recovery_candidates(&connection).expect("scan recovery candidates");
+        assert!(scan.rejected.is_empty(), "rejections: {:?}", scan.rejected);
+        assert_eq!(scan.candidates.len(), 1);
+        let candidate = &scan.candidates[0];
+        assert_eq!(
+            candidate.layout.root, layout.root,
+            "multi-level mixed-axis tree must round-trip exactly"
+        );
+        assert_eq!(candidate.focused_tab.as_deref(), Some("tab-1"));
+        assert_eq!(candidate.focused_pane.as_deref(), Some("pane-3"));
+        assert_eq!(
+            candidate.layout.pane_ids(),
+            vec!["pane-1", "pane-2", "pane-3"]
+        );
+    }
+
+    /// 过期布局引用不在 pane 元数据里的 pane → 候选被拒绝, 不会带病发布。
+    #[test]
+    fn stale_persisted_layout_referencing_unknown_pane_is_rejected() {
+        let connection = Connection::open_memory(Some("stale_persisted_layout"));
+        init_tables(&connection).expect("initialize persistence tables");
+        let mut envelope = serde_json::from_str::<serde_json::Value>(&envelope_json("pane-1"))
+            .expect("decode test recovery envelope");
+        envelope["layout"] = serde_json::from_str::<serde_json::Value>(
+            &raw_layout("ghost-pane"),
+        )
+        .expect("encode stale layout");
+        insert_session_row(
+            &connection,
+            "stale",
+            "stale",
+            "/tmp",
+            &serde_json::to_string(&envelope).expect("encode stale envelope"),
+        );
+
+        let scan = recovery_candidates(&connection).expect("scan recovery candidates");
+        assert!(scan.candidates.is_empty());
+        assert_eq!(scan.rejected.len(), 1);
+        assert!(scan.rejected[0].contains("does not match its layout"));
     }
 }

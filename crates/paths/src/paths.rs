@@ -343,7 +343,6 @@ pub const GLOBAL_AGENTS_FILE_DISPLAY: &str =
 pub const GLOBAL_AGENTS_FILE_DISPLAY: &str =
     const_format::concatcp!("~/.config/", APP_NAME_LOWERCASE, "/AGENTS.md");
 
-/// Returns the path to the extensions directory.
 ///
 /// This is where installed extensions are stored.
 pub fn extensions_dir() -> &'static PathBuf {

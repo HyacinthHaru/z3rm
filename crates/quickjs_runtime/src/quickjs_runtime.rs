@@ -42,6 +42,11 @@ const IO_TOKEN_BUCKET_DEFAULT_RATE: f64 = 100.0; // 每秒补充令牌数
 /// 桶容量 = 速率 × 该系数，允许短时突发。
 const IO_TOKEN_BUCKET_BURST_FACTOR: f64 = 2.0;
 
+/// `filesystem.readTextFile` 单文件读取上限: 有界分配, 拒绝巨型文件。
+pub const MAX_EXTENSION_FILE_READ: u64 = 1024 * 1024;
+/// `filesystem.readDir` 单目录条目上限: 防止恶意目录撑爆宿主。
+pub const MAX_EXTENSION_DIR_ENTRIES: usize = 1000;
+
 /// 环境变量：覆盖内置扩展搜索路径 (平台 PATH 分隔符分隔多个目录)。
 pub const BUILTIN_EXTENSIONS_ENV: &str = "Z3RM_EXTENSIONS_DIR";
 
@@ -348,6 +353,46 @@ impl ExtensionCapabilities {
     }
 }
 
+/// §5.6 把扩展请求的路径约束在声明的文件系统范围内，返回规范化的绝对路径。
+///
+/// `root` 是声明范围对应的约束根: [`FilesystemAccess::Home`] 传主目录,
+/// [`FilesystemAccess::Cwd`] 传宿主权威工作区/当前工作根 (即 `workspace.getPath`
+/// 报告的根)。同一个入口服务两个范围, 防止路径约束逻辑漂移。
+///
+/// - 相对路径锚定到 `root`；
+/// - 整条路径 `canonicalize` 解析符号链接——链内任何一环指向范围外即拒绝
+///   (规范路径会暴露真实位置)；
+/// - 尾段不存在时 (如读取缺失文件) 解析最近存在的父目录再挂回尾段；
+/// - 约束判定用 `starts_with` 做组件级比较 (不是前缀字符串比较), 根目录的
+///   兄弟目录无法绕过。
+///
+/// 约束根由调用方 (各宿主桥) 按声明范围解析, 以便服务器/测试注入不同的根。
+/// 桥实现共享这个唯一入口, 防止两套路径约束逻辑漂移。
+pub fn confine_to_root(root: &Path, path: &str) -> Result<PathBuf> {
+    let root = root.canonicalize().unwrap_or_else(|_| root.to_path_buf());
+    let candidate = if Path::new(path).is_absolute() {
+        PathBuf::from(path)
+    } else {
+        root.join(path)
+    };
+    let canonical = match candidate.canonicalize() {
+        Ok(canonical) => canonical,
+        // 尾段缺失: 解析最近存在的父目录再挂回尾段, 让读取报 NotFound 而非
+        // 误导性的 "path not accessible"。
+        Err(_) => match (candidate.parent(), candidate.file_name()) {
+            (Some(parent), Some(name)) => parent
+                .canonicalize()
+                .map(|parent| parent.join(name))
+                .unwrap_or(candidate),
+            _ => candidate,
+        },
+    };
+    if !canonical.starts_with(&root) {
+        bail!("path escapes the declared filesystem scope: {path}");
+    }
+    Ok(canonical)
+}
+
 // ---------------------------------------------------------------------------
 // §16.8 / §5.3 extension.toml manifest
 // ---------------------------------------------------------------------------
@@ -506,6 +551,66 @@ pub fn parse_manifest_str(fallback_id: &str, text: &str) -> Result<ExtensionMani
         sync,
         capabilities,
         limits,
+    })
+}
+
+impl ExtensionManifest {
+    /// §5.6 Canonical policy fingerprint: the exact serialized policy tuple
+    /// this manifest's approval covers — id, version, runtime side,
+    /// capabilities and resource limits — as canonical JSON (objects built
+    /// from `BTreeMap`, so key order is deterministic). Fingerprints are
+    /// never hashed, so they cannot collide: two manifests share a
+    /// fingerprint iff their entire policy tuple is byte-identical, and any
+    /// change invalidates the prior approval.
+    ///
+    /// This is the single source of truth for both embedding sides: the GUI
+    /// client's consent store and the daemon's server-extension approval
+    /// ledger must compute byte-identical fingerprints so one approval
+    /// format covers both. `serde_json::Value` numbers format like the
+    /// client store expects (integers without a fractional part, f64 with
+    /// `serde_json`'s default shortest representation).
+    pub fn policy_fingerprint(&self) -> String {
+        let payload = serde_json::json!({
+            "id": self.id,
+            "version": self.version,
+            "side": manifest_side_name(self.side),
+            "capabilities": manifest_capabilities_json(&self.capabilities),
+            "limits": manifest_limits_json(&self.limits),
+        });
+        payload.to_string()
+    }
+}
+
+/// Canonical side name used by [`ExtensionManifest::policy_fingerprint`].
+fn manifest_side_name(side: ExtensionSide) -> &'static str {
+    match side {
+        ExtensionSide::Client => "client",
+        ExtensionSide::Server => "server",
+        ExtensionSide::Both => "both",
+    }
+}
+
+/// Canonical JSON for the capability tuple of a manifest. Field order is
+/// fixed by the literal and the shape must not drift from the client consent
+/// store format (approval records outlive code changes).
+fn manifest_capabilities_json(capabilities: &ExtensionCapabilities) -> serde_json::Value {
+    serde_json::json!({
+        "terminal": capabilities.terminal,
+        "mux": capabilities.mux,
+        "workspace": capabilities.workspace,
+        "settings": capabilities.settings,
+        "network": capabilities.network,
+        "process_spawn": capabilities.process_spawn,
+        "filesystem": capabilities.filesystem.as_str(),
+    })
+}
+
+/// Canonical JSON for the resource-limit tuple of a manifest.
+fn manifest_limits_json(limits: &ExtensionLimits) -> serde_json::Value {
+    serde_json::json!({
+        "memory_limit_mb": limits.memory_limit_mb,
+        "cpu_budget_ms": limits.cpu_budget_ms,
+        "io_rate_limit": limits.io_rate_limit,
     })
 }
 
@@ -698,6 +803,7 @@ fn host_call_response(
     bridge: &Arc<dyn HostBridge>,
     capabilities: ExtensionCapabilities,
     io_bucket: &IoTokenBucket,
+    io_violated: &AtomicBool,
     method: &str,
     arguments_json: &str,
 ) -> serde_json::Value {
@@ -707,6 +813,9 @@ fn host_call_response(
             bail!("capability denied: `{method}` requires an undeclared capability");
         }
         if !io_bucket.try_acquire(1.0) {
+            // §5.6 拒绝发生在 Rust 侧，JS 可能 catch 掉异常；持久标志是宿主
+            // 判定违规并挂起扩展的唯一可靠信号。
+            io_violated.store(true, Ordering::Relaxed);
             bail!("io rate limit exceeded while calling `{method}`");
         }
         let arguments: serde_json::Value = serde_json::from_str(arguments_json)
@@ -726,9 +835,11 @@ fn install_host_call(
     bridge: Arc<dyn HostBridge>,
     capabilities: ExtensionCapabilities,
     io_bucket: Arc<IoTokenBucket>,
+    io_violated: Arc<AtomicBool>,
 ) -> Result<()> {
     let function = Function::new(ctx.clone(), move |method: String, arguments: String| {
-        host_call_response(&bridge, capabilities, &io_bucket, &method, &arguments).to_string()
+        host_call_response(&bridge, capabilities, &io_bucket, &io_violated, &method, &arguments)
+            .to_string()
     })
     .catch(ctx)
     .map_err(|error| anyhow!("creating __z3rm_host_call failed: {error}"))?;
@@ -902,6 +1013,10 @@ const CONTEXT_BOOTSTRAP_JS: &str = r#"
                         rendered.id = names[n];
                     }
                     attachDisplayLists(rendered, view);
+                    // §5.4 keep the last rendered VDOM so the display-list
+                    // refresh entry can re-invoke only renderer methods
+                    // without re-running render().
+                    view.__z3rm_last_render = rendered;
                     results.push(rendered);
                 }
             } catch (error) { recordError('render ' + names[n], error); }
@@ -909,9 +1024,54 @@ const CONTEXT_BOOTSTRAP_JS: &str = r#"
         return JSON.stringify(results);
     };
 
+    // §5.4 Re-invoke only the display-list renderer methods on the last
+    // rendered chrome. Unlike __z3rm_render_views this never re-runs view
+    // render() bodies and never touches the invalidation flag, so a ticking
+    // clock refreshes its draw ops without invalidating the surrounding VDOM.
+    // One renderer throwing drops just its region; other regions still tick.
+    function refreshDisplayLists(value, view, out) {
+        if (value === null || value === undefined) { return; }
+        if (Array.isArray(value)) {
+            for (var i = 0; i < value.length; i++) {
+                refreshDisplayLists(value[i], view, out);
+            }
+            return;
+        }
+        if (typeof value !== 'object') { return; }
+        if (value.type === 'display-list' && value.props
+            && typeof value.props.renderer === 'string') {
+            var renderer = view[value.props.renderer];
+            if (typeof renderer !== 'function') {
+                recordError('display-list', 'missing renderer ' + value.props.renderer);
+            } else {
+                try {
+                    value.props.drawOps = renderer.call(view);
+                    out.push({ region: value.props.id || '', ops: value.props.drawOps });
+                } catch (error) {
+                    recordError('display-list ' + value.props.id, error);
+                }
+            }
+        }
+        if (Array.isArray(value.children)) {
+            refreshDisplayLists(value.children, view, out);
+        }
+    }
+
+    globalThis.__z3rm_refresh_display_lists = function() {
+        var views = globalThis.__chrome_views || {};
+        var results = [];
+        var names = Object.keys(views);
+        for (var i = 0; i < names.length; i++) {
+            var view = views[names[i]];
+            if (!view || !view.__z3rm_last_render) { continue; }
+            refreshDisplayLists(view.__z3rm_last_render, view, results);
+        }
+        return JSON.stringify(results);
+    };
+
     globalThis.__z3rm_list_commands = function() {
         return JSON.stringify(globalThis.__z3rm_command_order.map(function(id) {
-            return { id: id, label: globalThis.__z3rm_commands[id].label };
+            return { id: id, command: globalThis.__z3rm_commands[id].label };
         }));
     };
 
@@ -1038,6 +1198,38 @@ const CONTEXT_BOOTSTRAP_JS: &str = r#"
             }
         },
 
+        workspace: {
+            getPath: function() {
+                requireCapability('workspace');
+                return hostCall('workspace.getPath', []);
+            }
+        },
+
+        filesystem: {
+            readTextFile: function(path) {
+                requireCapability('filesystem');
+                return hostCall('filesystem.readTextFile', [path]);
+            },
+            readDir: function(path) {
+                requireCapability('filesystem');
+                return hostCall('filesystem.readDir', [path]);
+            }
+        },
+
+        network: {
+            fetch: function(url, options) {
+                requireCapability('network');
+                return hostCall('network.fetch', [url, options]);
+            }
+        },
+
+        process: {
+            spawn: function(command, args) {
+                requireCapability('process_spawn');
+                return hostCall('process.spawn', [command, args]);
+            }
+        },
+
         commands: {
             register: function(id, handler, options) {
                 if (typeof handler !== 'function') {
@@ -1156,6 +1348,10 @@ pub struct QuickJsRuntime {
     limits: ExtensionLimits,
     /// IO 令牌桶 (Arc 以便注入到 host bridge 闭包)
     io_bucket: Arc<IoTokenBucket>,
+    /// §5.6 置位表示某次宿主调用被 IO 速率上限拒绝 (令牌耗尽)。与
+    /// `memory_violated` 同语义: JS 侧 try/catch 吞掉异常也无法隐藏违规,
+    /// 宿主通过 [`take_io_violated`](Self::take_io_violated) 读取并清零。
+    io_violated: Arc<AtomicBool>,
     cpu_tracker: CpuFuelTracker,
 }
 
@@ -1189,6 +1385,7 @@ impl QuickJsRuntime {
             runtime,
             limits,
             io_bucket: Arc::new(IoTokenBucket::from_rate(limits.io_rate_limit)),
+            io_violated: Arc::new(AtomicBool::new(false)),
             cpu_tracker,
         })
     }
@@ -1205,6 +1402,16 @@ impl QuickJsRuntime {
     /// 获取 IO 令牌桶引用
     pub fn io_bucket(&self) -> &Arc<IoTokenBucket> {
         &self.io_bucket
+    }
+
+    /// IO 违规标志引用 (Arc 以便注入到 host bridge 闭包)。
+    pub fn io_violated(&self) -> &Arc<AtomicBool> {
+        &self.io_violated
+    }
+
+    /// 读取并清除「宿主调用被 IO 速率上限拒绝」标志 (spec §5.6)。
+    pub fn take_io_violated(&self) -> bool {
+        self.io_violated.swap(false, Ordering::Relaxed)
     }
 
     pub fn limits(&self) -> ExtensionLimits {
@@ -1443,12 +1650,13 @@ impl ExtensionRunner {
         let script_source = to_script_source(source);
         let bridge = self.bridge.clone();
         let io_bucket = runtime.io_bucket().clone();
+        let io_violated = runtime.io_violated().clone();
         let capabilities = self.capabilities;
 
         runtime.begin_execution();
         ctx.with(|ctx| {
             if let Some(bridge) = bridge {
-                install_host_call(&ctx, bridge, capabilities, io_bucket)?;
+                install_host_call(&ctx, bridge, capabilities, io_bucket, io_violated)?;
             }
             eval_checked::<rquickjs::Value>(&ctx, &script_source)
                 .context("evaluating extension source")?;
@@ -1514,12 +1722,13 @@ impl ExtensionRunner {
         let script_source = to_script_source(source);
         let bridge = self.bridge.clone();
         let io_bucket = runtime.io_bucket().clone();
+        let io_violated = runtime.io_violated().clone();
         let capabilities = self.capabilities;
 
         runtime.begin_execution();
         let vdom_json = context.with(|ctx| {
             if let Some(bridge) = bridge {
-                install_host_call(&ctx, bridge, capabilities, io_bucket)?;
+                install_host_call(&ctx, bridge, capabilities, io_bucket, io_violated)?;
             }
             eval_checked::<rquickjs::Value>(&ctx, &script_source)
                 .context("evaluating extension source")?;
@@ -1566,6 +1775,38 @@ fn parse_rendered_views(rendered: &str) -> Result<Vec<String>> {
     values
         .into_iter()
         .map(|value| serde_json::to_string(&value).context("re-serializing extension VDOM"))
+        .collect()
+}
+
+/// §5.4 One display-list refresh result: the region id and the fresh draw ops
+/// JSON produced by re-invoking only the registered renderer method.
+#[derive(Debug, Clone, PartialEq)]
+pub struct DisplayListRegion {
+    pub region_id: String,
+    pub ops_json: String,
+}
+
+fn parse_display_list_regions(rendered: &str) -> Result<Vec<DisplayListRegion>> {
+    let values: Vec<serde_json::Value> = serde_json::from_str(rendered)
+        .context("extension display list refresh output is not a JSON array")?;
+    values
+        .into_iter()
+        .map(|value| {
+            let region_id = value
+                .get("region")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or_default()
+                .to_string();
+            let ops = value
+                .get("ops")
+                .ok_or_else(|| anyhow::anyhow!("display list region {region_id:?} missing ops"))?;
+            let ops_json =
+                serde_json::to_string(ops).context("re-serializing display list draw ops")?;
+            Ok(DisplayListRegion {
+                region_id,
+                ops_json,
+            })
+        })
         .collect()
 }
 
@@ -1620,6 +1861,13 @@ impl LiveExtension {
         self.memory_violated.swap(false, Ordering::Relaxed)
     }
 
+    /// §5.6 读取并清除「宿主调用被 IO 速率上限拒绝」标志：某次宿主调用因
+    /// 令牌耗尽被拒绝 (即使扩展 JS 用 try/catch 吞掉了异常)。宿主在违规
+    /// 判定时读取并清零，据此挂起扩展。
+    pub fn take_io_violated(&self) -> bool {
+        self.runtime.take_io_violated()
+    }
+
     /// 在专用线程上求值一段 JS，并记录资源违规标志。
     ///
     /// 所有宿主 → JS 入口都走这里：`begin_execution` 保证宿主空闲期不计入
@@ -1645,7 +1893,8 @@ impl LiveExtension {
     pub fn install_bridge(&self, bridge: Arc<dyn HostBridge>) -> Result<()> {
         let capabilities = self.capabilities;
         let io_bucket = self.runtime.io_bucket().clone();
-        self.run_js(|ctx| install_host_call(ctx, bridge, capabilities, io_bucket))
+        let io_violated = self.runtime.io_violated().clone();
+        self.run_js(|ctx| install_host_call(ctx, bridge, capabilities, io_bucket, io_violated))
     }
 
     /// §5.4 是否有视图请求过重绘 (`view.invalidate()` / `context.render()`)。
@@ -1692,6 +1941,19 @@ impl LiveExtension {
     /// §5.4 便捷入口：返回首个非空 VDOM (status-bar 优先)。
     pub fn render_now(&self) -> Result<Option<String>> {
         Ok(self.render_all_views()?.into_iter().next())
+    }
+
+    /// §5.4 Re-invoke only the registered display-list renderer methods on the
+    /// last rendered chrome, returning one entry per refreshed region.
+    ///
+    /// Unlike [`render_all_views`](Self::render_all_views) this neither
+    /// re-runs view `render()` bodies nor clears the invalidation flag, so a
+    /// ticking clock refreshes its draw ops without invalidating the
+    /// surrounding chrome tree (§5.4 display-list pattern).
+    pub fn refresh_display_lists(&self) -> Result<Vec<DisplayListRegion>> {
+        let rendered: String =
+            self.run_js(|ctx| eval_checked(ctx, "globalThis.__z3rm_refresh_display_lists()"))?;
+        parse_display_list_regions(&rendered)
     }
 
     /// §3.4 把宿主事件投递给扩展的订阅者，返回被调用的 handler 数量。
@@ -1998,6 +2260,70 @@ mod tests {
         Ok(())
     }
 
+    /// §5.4: a display-list refresh must re-invoke only the registered
+    /// renderer method — never the view's render() — and must not touch the
+    /// invalidation flag, so a ticking clock repaints without invalidating
+    /// the surrounding chrome.
+    #[test]
+    fn display_list_refresh_reinvokes_only_renderer_methods() -> Result<()> {
+        let runner = ExtensionRunner::with_defaults();
+        let source = r#"
+            var renders = 0;
+            var ticks = 0;
+            function activate(context) {
+                context.registerChromeView('status-bar', {
+                    render: function() {
+                        renders++;
+                        // A second render() would replace the display-list
+                        // region with a plain div: a refresh that re-ran
+                        // render() would return no regions at all.
+                        if (renders > 1) {
+                            return { type: 'div', children: ['re-rendered'] };
+                        }
+                        return {
+                            type: 'display-list',
+                            props: { id: 'clock', renderer: 'renderClock' }
+                        };
+                    },
+                    renderClock: function() {
+                        ticks++;
+                        return [{ op: 'drawText', text: String(ticks), x: 0, y: 0 }];
+                    }
+                });
+            }
+        "#;
+        let live = runner.load_live("clock-ext", source, "activate")?;
+        live.render_all_views()?;
+
+        // First refresh: the renderer method ran once and its ops came back.
+        let regions = live.refresh_display_lists()?;
+        assert_eq!(regions.len(), 1, "clock region must refresh: {regions:?}");
+        assert_eq!(regions[0].region_id, "clock");
+        assert!(
+            regions[0].ops_json.contains("\"1\""),
+            "first tick must be visible: {}",
+            regions[0].ops_json
+        );
+
+        // Second refresh: renderClock ticks again (ops change) while render()
+        // must not have re-run (the cached VDOM still holds the region).
+        let regions = live.refresh_display_lists()?;
+        assert_eq!(regions.len(), 1, "render() must not run on refresh: {regions:?}");
+        assert!(
+            regions[0].ops_json.contains("\"2\""),
+            "second tick must be visible: {}",
+            regions[0].ops_json
+        );
+
+        // §5.4 refresh must not set the invalidation flag.
+        assert!(
+            !live.needs_render()?,
+            "display-list refresh must not invalidate the chrome tree"
+        );
+        Ok(())
+    }
+
+    /// 扩展加载与激活: 一次性 load_extension 应成功并回报时长。
     #[test]
     fn test_extension_runner_basic() -> Result<()> {
         let runner = ExtensionRunner::with_defaults();
@@ -2387,6 +2713,172 @@ mod tests {
         Ok(())
     }
 
+    /// §5.6: 文件系统路径约束必须锚定相对路径、解析符号链接并拒绝一切越界。
+    /// 同一个入口服务 `Home` 与 `Cwd` 两个声明范围——根可以是主目录, 也可以
+    /// 是权威工作区/当前工作根。
+    #[test]
+    fn confine_to_root_anchors_relative_paths_and_denies_escapes() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let home = temp.path().join("home");
+        std::fs::create_dir_all(home.join("docs"))?;
+        std::fs::write(home.join("docs").join("note.txt"), "secret")?;
+        // 兄弟目录: 组件级 starts_with 必须拒绝, 前缀字符串比较会误放行。
+        let sibling = temp.path().join("home-other");
+        std::fs::create_dir_all(&sibling)?;
+
+        // 相对路径锚定到主目录。
+        assert_eq!(
+            confine_to_root(&home, "docs/note.txt")?,
+            home.join("docs").join("note.txt").canonicalize()?
+        );
+        // 主目录内的绝对路径直接放行。
+        let note = home.join("docs").join("note.txt");
+        assert_eq!(
+            confine_to_root(&home, &note.to_string_lossy())?,
+            note.canonicalize()?
+        );
+        // 主目录外的绝对路径拒绝。
+        let error = confine_to_root(&home, "/etc/passwd").unwrap_err();
+        assert!(error.to_string().contains("escapes"), "error={error}");
+        // 兄弟目录拒绝 (不是字符串前缀匹配)。
+        let error = confine_to_root(&home, &sibling.join("x").to_string_lossy()).unwrap_err();
+        assert!(error.to_string().contains("escapes"), "error={error}");
+        // 相对路径经 ".." 逃逸到主目录外拒绝。
+        let error = confine_to_root(&home, "../home-other/x").unwrap_err();
+        assert!(error.to_string().contains("escapes"), "error={error}");
+        // 缺失文件的尾段: 解析最近存在的父目录, 返回主目录内的绝对路径
+        // (之后读取报 NotFound, 而不是误导性的拒绝)。
+        assert_eq!(
+            confine_to_root(&home, "docs/missing.txt")?,
+            home.join("docs").join("missing.txt")
+        );
+        // 符号链接逃逸: 主目录内的链接指向外部文件, canonicalize 必须暴露
+        // 真实位置并拒绝。
+        #[cfg(unix)]
+        {
+            std::os::unix::fs::symlink("/etc/passwd", home.join("docs").join("leak"))?;
+            let error = confine_to_root(&home, "docs/leak").unwrap_err();
+            assert!(error.to_string().contains("escapes"), "error={error}");
+        }
+        // Cwd 声明同样走这个入口: 根换成工作区目录后, 主目录与工作区互相
+        // 隔离——工作区根内的路径放行, 主目录内的路径拒绝 (cwd 声明不能
+        // 读取任意 HOME 文件)。
+        let workspace = temp.path().join("workspace");
+        std::fs::create_dir_all(workspace.join("src"))?;
+        std::fs::write(workspace.join("src").join("main.js"), "code")?;
+        assert_eq!(
+            confine_to_root(&workspace, "src/main.js")?,
+            workspace.join("src").join("main.js").canonicalize()?
+        );
+        let error = confine_to_root(&workspace, &note.to_string_lossy()).unwrap_err();
+        assert!(error.to_string().contains("escapes"), "error={error}");
+        let error = confine_to_root(&workspace, "../home/docs/note.txt").unwrap_err();
+        assert!(error.to_string().contains("escapes"), "error={error}");
+        Ok(())
+    }
+
+    /// §5.6: 声明的 workspace/filesystem/network/process_spawn 调用必须真正
+    /// 落到宿主桥上 (而不是 "declared but unreachable"), 参数原样传递, 返回值
+    /// 回到扩展可见。
+    #[test]
+    fn declared_capabilities_reach_the_host_bridge() -> Result<()> {
+        let bridge = RecordingBridge::new(BTreeMap::from([
+            ("workspace.getPath".to_string(), serde_json::json!("/work")),
+            (
+                "filesystem.readTextFile".to_string(),
+                serde_json::json!("file contents"),
+            ),
+            (
+                "filesystem.readDir".to_string(),
+                serde_json::json!([{ "name": "a.txt", "kind": "file" }]),
+            ),
+            (
+                "network.fetch".to_string(),
+                serde_json::json!({ "status": 200 }),
+            ),
+            ("process.spawn".to_string(), serde_json::json!("pid-1")),
+        ]));
+        let runner = ExtensionRunner::with_defaults().with_bridge(bridge.clone());
+        let source = r#"
+            function activate(context) {
+                context.registerChromeView('caps', {
+                    render: function() {
+                        return {
+                            type: 'span',
+                            children: [
+                                context.workspace.getPath() + '|' +
+                                context.filesystem.readTextFile('/home/u/note.txt') + '|' +
+                                String(context.filesystem.readDir('/home/u').length) + '|' +
+                                String(context.network.fetch('https://example.test/api', { method: 'GET' }).status) + '|' +
+                                context.process.spawn('echo', ['hello'])
+                            ]
+                        };
+                    }
+                });
+            }
+        "#;
+        let extension = runner.load_live("declared-caps", source, "activate")?;
+        let vdom = extension.render_now()?.context("caps vdom")?;
+        assert!(
+            vdom.contains("/work|file contents|1|200|pid-1"),
+            "声明能力的返回值必须一路回到扩展: vdom={vdom}"
+        );
+
+        let calls = bridge.calls();
+        let methods = calls
+            .iter()
+            .map(|(method, _)| method.as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            methods,
+            vec![
+                "workspace.getPath",
+                "filesystem.readTextFile",
+                "filesystem.readDir",
+                "network.fetch",
+                "process.spawn",
+            ],
+        );
+        assert_eq!(calls[1].1, serde_json::json!(["/home/u/note.txt"]));
+        assert_eq!(calls[2].1, serde_json::json!(["/home/u"]));
+        assert_eq!(
+            calls[3].1,
+            serde_json::json!(["https://example.test/api", { "method": "GET" }])
+        );
+        assert_eq!(calls[4].1, serde_json::json!(["echo", ["hello"]]));
+        Ok(())
+    }
+
+    /// §5.6: 未声明的能力在 JS 侧 requireCapability 拒绝; 绕过 JS 直接调用
+    /// `__z3rm_host_call` 也在 Rust 侧 (allows) 被拒——桥永远收不到调用。
+    #[test]
+    fn undeclared_capabilities_are_denied_before_the_bridge() -> Result<()> {
+        let bridge = RecordingBridge::new(BTreeMap::from([(
+            "workspace.getPath".to_string(),
+            serde_json::json!("leaked"),
+        )]));
+        let runner = ExtensionRunner::with_defaults()
+            .with_capabilities(ExtensionCapabilities::default())
+            .with_bridge(bridge.clone());
+        let source = r#"
+            function activate(context) {
+                var errors = [];
+                try { context.workspace.getPath(); } catch (e) { errors.push(String(e)); }
+                try { context.filesystem.readTextFile('/tmp/x'); } catch (e) { errors.push(String(e)); }
+                try { context.network.fetch('http://example.test'); } catch (e) { errors.push(String(e)); }
+                try { context.process.spawn('echo'); } catch (e) { errors.push(String(e)); }
+                // 绕过 JS 检查直接打底层: Rust 侧必须仍然拒绝。
+                var raw = JSON.parse(globalThis.__z3rm_host_call('workspace.getPath', '[]'));
+                if (raw.ok) { throw new Error('raw bypass unexpectedly succeeded'); }
+                globalThis.__errors = errors;
+            }
+        "#;
+        let extension = runner.load_live("undeclared-caps", source, "activate")?;
+        drop(extension);
+        assert_eq!(bridge.calls().len(), 0, "未声明的调用不得到达桥");
+        Ok(())
+    }
+
     /// §5.6: io_rate_limit 必须真正限制宿主调用频率。
     #[test]
     fn io_rate_limit_throttles_host_calls() -> Result<()> {
@@ -2409,6 +2901,54 @@ mod tests {
         let extension = runner.load_live("io-limit", source, "activate")?;
         assert_eq!(bridge.calls().len(), 4, "只应放行容量内的调用");
         drop(extension);
+        Ok(())
+    }
+
+    /// §5.6: 一次被 IO 速率上限拒绝的宿主调用必须置位持久违规标志，即使
+    /// 扩展的 JS 用 try/catch 吞掉了异常——拒绝发生在 Rust 侧 (令牌桶),
+    /// 只有该标志能证明违规，宿主据此挂起扩展。
+    #[test]
+    fn io_rate_limit_rejection_sets_io_violated_flag() -> Result<()> {
+        let bridge = RecordingBridge::new(BTreeMap::from([(
+            "mux.focusPane".to_string(),
+            serde_json::json!(true),
+        )]));
+        let runner = ExtensionRunner::with_limits(ExtensionLimits::new(64, 50, 2.0))
+            .with_bridge(bridge.clone());
+
+        // 容量内的调用不置位违规标志。
+        let source = r#"
+            function activate(context) {
+                for (var i = 0; i < 4; i++) {
+                    try { context.mux.focusPane('p' + i); } catch (error) {}
+                }
+            }
+        "#;
+        let within = runner.load_live("io-within-limit", source, "activate")?;
+        assert_eq!(bridge.calls().len(), 4, "容量内调用必须放行");
+        assert!(
+            !within.take_io_violated(),
+            "容量内调用不得置位违规标志"
+        );
+
+        // 超过容量: 第 5 次起被拒绝，且异常被 JS 吞掉——只有持久标志能证明。
+        let source = r#"
+            function activate(context) {
+                for (var i = 0; i < 8; i++) {
+                    try { context.mux.focusPane('p' + i); } catch (error) {}
+                }
+            }
+        "#;
+        let over = runner.load_live("io-over-limit", source, "activate")?;
+        assert_eq!(bridge.calls().len(), 8, "两次激活合计应放行 4 + 4 次调用");
+        assert!(
+            over.take_io_violated(),
+            "被拒绝的宿主调用必须置位持久 IO 违规标志"
+        );
+        assert!(
+            !over.take_io_violated(),
+            "take_io_violated 必须像 memory_violated 一样读取后清零"
+        );
         Ok(())
     }
 

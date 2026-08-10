@@ -889,7 +889,9 @@ impl RemoteClient {
                     } else {
                         log::error!("proxy process terminated unexpectedly: {exit_code}");
                         this.update(cx, |this, cx| {
-                            this.reconnect(cx).ok();
+                            this.reconnect(cx)
+                                .context("failed to start reconnect after proxy process exited unexpectedly")
+                                .log_err();
                         })?;
                     }
                 }
@@ -899,7 +901,9 @@ impl RemoteClient {
                         error
                     );
                     this.update(cx, |this, cx| {
-                        this.reconnect(cx).ok();
+                        this.reconnect(cx)
+                            .context("failed to start reconnect after io task died with error")
+                            .log_err();
                     })?;
                 }
             }

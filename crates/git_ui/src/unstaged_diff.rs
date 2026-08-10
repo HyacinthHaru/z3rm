@@ -511,7 +511,9 @@ impl Item for UnstagedDiff {
         _: &mut Window,
         _: &mut Context<Self>,
     ) -> Task<Result<()>> {
-        unreachable!()
+        Task::ready(Err(anyhow::anyhow!(
+            "unstaged diff does not support Save As"
+        )))
     }
 
     fn reload(

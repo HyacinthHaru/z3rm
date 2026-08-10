@@ -75,6 +75,8 @@ pub struct Arena {
     valid: Rc<Cell<bool>>,
     current_chunk_index: usize,
     chunk_size: NonZeroUsize,
+    scope_depth: usize,
+    clear_pending: bool,
 }
 
 impl Drop for Arena {
@@ -92,6 +94,8 @@ impl Arena {
             valid: Rc::new(Cell::new(true)),
             current_chunk_index: 0,
             chunk_size,
+            scope_depth: 0,
+            clear_pending: false,
         }
     }
 
@@ -100,6 +104,30 @@ impl Arena {
     }
 
     pub fn clear(&mut self) {
+        if self.scope_depth > 0 {
+            self.clear_pending = true;
+            return;
+        }
+        self.clear_now();
+    }
+
+    pub(crate) fn begin_scope(&mut self) {
+        self.scope_depth = self
+            .scope_depth
+            .checked_add(1)
+            .expect("element arena scope depth overflow");
+    }
+
+    pub(crate) fn end_scope(&mut self) {
+        assert!(self.scope_depth > 0, "element arena scope depth underflow");
+        self.scope_depth -= 1;
+        if self.scope_depth == 0 && self.clear_pending {
+            self.clear_pending = false;
+            self.clear_now();
+        }
+    }
+
+    fn clear_now(&mut self) {
         self.valid.set(false);
         self.valid = Rc::new(Cell::new(true));
         self.elements.clear();

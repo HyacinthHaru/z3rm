@@ -24,12 +24,13 @@ use std::time::Duration;
 
 use anyhow::{Context as _, Result, anyhow, bail};
 use extension_host::vdom_bridge::{self, CommandInvocation, VDomChild, VDomNode};
-use futures::StreamExt as _;
-use gpui::{AppContext as _, Global};
+use futures::{AsyncReadExt as _, StreamExt as _};
+use http_client::HttpClient as _;
+use reqwest_client::ReqwestClient;
 use parking_lot::Mutex;
 use quickjs_runtime::{
-    DiscoveredExtension, ExtensionCapabilities, ExtensionLimits, ExtensionRunResult,
-    ExtensionRunner, ExtensionSide, FilesystemAccess, HostBridge, LiveExtension,
+    DiscoveredExtension, ExtensionCapabilities, ExtensionRunResult, ExtensionRunner,
+    ExtensionSide, FilesystemAccess, HostBridge, LiveExtension,
 };
 
 /// §5.4 Upper bound on a single blocking mux RPC issued from the extension
@@ -119,6 +120,16 @@ pub fn collect_status_bar_vdom(loaded: &[LoadedExtension]) -> Vec<VDomNode> {
 }
 
 fn parse_vdom_json(json: &str) -> Result<VDomNode> {
+    // §5.2 bound the serialized payload before serde allocates a parse tree;
+    // an oversized payload is rejected wholesale rather than partially
+    // accepted into the live chrome caches.
+    if json.len() > vdom_bridge::MAX_VDOM_PAYLOAD_BYTES {
+        bail!(
+            "extension VDOM payload of {} bytes exceeds limit of {}",
+            json.len(),
+            vdom_bridge::MAX_VDOM_PAYLOAD_BYTES
+        );
+    }
     let value: serde_json::Value =
         serde_json::from_str(json).context("extension VDOM JSON invalid")?;
     vdom_bridge::parse_vdom(&value).context("extension VDOM parse failed")
@@ -143,14 +154,22 @@ fn apply_server_chrome_node(
     server_nodes: &mut BTreeMap<(String, String), VDomNode>,
     update: mux_protocol::ExtensionChromeUpdate,
 ) -> Result<()> {
-    let key = (update.extension_id, update.view_id);
+    let extension_id = update.extension_id;
+    let view_id = update.view_id;
+    let key = (extension_id.clone(), view_id.clone());
     if update.vdom_payload.is_empty() {
         server_nodes.remove(&key);
         return Ok(());
     }
     let json = std::str::from_utf8(&update.vdom_payload)
         .context("server extension VDOM payload is not UTF-8")?;
-    let node = parse_vdom_json(json).context("server extension VDOM rejected")?;
+    let mut node = parse_vdom_json(json).context("server extension VDOM rejected")?;
+    // §5.7 Stamp provenance: every onClick/onChange descriptor in this tree
+    // is bound to the (extension_id, view_id) the daemon published the view
+    // under. Clicks on this chrome route back to the daemon's host thread —
+    // never to client-side extensions. The stamp overwrites any origin the
+    // extension itself shipped.
+    vdom_bridge::stamp_server_origin(&mut node, &extension_id, &view_id);
     server_nodes.insert(key, node);
     Ok(())
 }
@@ -221,11 +240,53 @@ struct MuxBridgeState {
 pub struct MuxHostBridge {
     domain: Arc<mux::MuxDomain>,
     state: Arc<Mutex<MuxBridgeState>>,
+    /// §5.6 扩展声明的文件系统范围: 桥按声明范围构造 (每个扩展装载时拿到自己
+    /// 的桥), `filesystem.*` 只对该范围 (home 或权威工作根) 内的路径放行。
+    filesystem: FilesystemAccess,
+    /// §5.6 Home 约束根 (默认 `dirs::home_dir()`); 测试注入临时目录。
+    home: Option<PathBuf>,
+    /// §5.6 Cwd 约束根 (默认宿主进程当前工作目录, 即 `workspace.getPath` 报告
+    /// 的权威根); 测试注入临时目录。
+    cwd: Option<PathBuf>,
 }
 
 impl MuxHostBridge {
-    fn new(domain: Arc<mux::MuxDomain>, state: Arc<Mutex<MuxBridgeState>>) -> Self {
-        Self { domain, state }
+    fn new(
+        domain: Arc<mux::MuxDomain>,
+        state: Arc<Mutex<MuxBridgeState>>,
+        filesystem: FilesystemAccess,
+    ) -> Self {
+        Self {
+            domain,
+            state,
+            filesystem,
+            home: None,
+            cwd: None,
+        }
+    }
+
+    /// §5.6 把扩展请求的路径约束到声明范围内 (见
+    /// [`quickjs_runtime::confine_to_root`])。
+    ///
+    /// 范围语义与服务器桥一致: `Cwd` 只允许权威工作区/当前工作根内的路径,
+    /// `Home` 只允许主目录内的路径——`cwd` 声明不能因此获得主目录访问权, home
+    /// 也不能逃出主目录。`None` (未声明) fail closed。
+    fn confine(&self, path: &str) -> Result<PathBuf> {
+        let root = match self.filesystem {
+            FilesystemAccess::None => {
+                bail!("filesystem access is not granted to this extension");
+            }
+            FilesystemAccess::Cwd => match &self.cwd {
+                Some(cwd) => cwd.clone(),
+                None => std::env::current_dir()
+                    .context("host working directory unavailable")?,
+            },
+            FilesystemAccess::Home => match &self.home {
+                Some(home) => home.clone(),
+                None => dirs::home_dir().context("host home directory unavailable")?,
+            },
+        };
+        quickjs_runtime::confine_to_root(&root, path)
     }
 
     fn run<T>(&self, future: impl Future<Output = Result<T>>) -> Result<T> {
@@ -417,9 +478,141 @@ impl HostBridge for MuxHostBridge {
                 let key = required_string(args, 0, method)?;
                 read_setting(&key)
             }
-            "settings.set" => bail!(
-                "settings.set is not supported yet: writing settings requires the GPUI settings store"
-            ),
+            "settings.set" => {
+                let key = required_string(args, 0, method)?;
+                let value = args.get(1).cloned().unwrap_or(serde_json::Value::Null);
+                write_setting(&key, value)
+            }
+            "workspace.getPath" => {
+                let cwd = std::env::current_dir()
+                    .context("reading the host working directory for workspace.getPath")?;
+                Ok(serde_json::json!(cwd.to_string_lossy().to_string()))
+            }
+            "filesystem.readTextFile" => {
+                let path = required_string(args, 0, method)?;
+                let path = self.confine(&path)?;
+                let metadata = std::fs::metadata(&path)
+                    .with_context(|| format!("reading {}", path.display()))?;
+                if metadata.len() > quickjs_runtime::MAX_EXTENSION_FILE_READ {
+                    bail!(
+                        "file is too large for an extension to read (limit {} bytes): {}",
+                        quickjs_runtime::MAX_EXTENSION_FILE_READ,
+                        path.display()
+                    );
+                }
+                let text = std::fs::read_to_string(&path)
+                    .with_context(|| format!("reading {}", path.display()))?;
+                Ok(serde_json::json!(text))
+            }
+            "filesystem.readDir" => {
+                let path = required_string(args, 0, method)?;
+                let path = self.confine(&path)?;
+                let mut entries = Vec::new();
+                for entry in std::fs::read_dir(&path)
+                    .with_context(|| format!("listing {}", path.display()))?
+                {
+                    let entry = entry.with_context(|| format!("listing {}", path.display()))?;
+                    let kind = match entry.file_type() {
+                        Ok(kind) if kind.is_dir() => "dir",
+                        Ok(kind) if kind.is_symlink() => "symlink",
+                        _ => "file",
+                    };
+                    entries.push(serde_json::json!({
+                        "name": entry.file_name().to_string_lossy(),
+                        "kind": kind,
+                    }));
+                    if entries.len() >= quickjs_runtime::MAX_EXTENSION_DIR_ENTRIES {
+                        break;
+                    }
+                }
+                Ok(serde_json::Value::Array(entries))
+            }
+            "network.fetch" => {
+                let url = required_string(args, 0, method)?;
+                let options = args.get(1).cloned().unwrap_or_else(|| serde_json::json!({}));
+                let method_name = options
+                    .get("method")
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or("GET");
+                let request_method = http_client::Method::from_bytes(method_name.as_bytes())
+                    .with_context(|| format!("invalid HTTP method: {method_name}"))?;
+                let uri: http_client::Uri = url.parse().with_context(|| format!("invalid URL: {url}"))?;
+                let body = options
+                    .get("body")
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or_default()
+                    .as_bytes()
+                    .to_vec();
+                if body.len() > quickjs_runtime::MAX_EXTENSION_FILE_READ as usize {
+                    bail!("network request body exceeds {} bytes", quickjs_runtime::MAX_EXTENSION_FILE_READ);
+                }
+                let request = http_client::Request::builder()
+                    .method(request_method)
+                    .uri(uri)
+                    .body(http_client::AsyncBody::from(body))
+                    .context("building network request")?;
+                let client = ReqwestClient::new();
+                let response = self.run(client.send(request))?;
+                let (parts, body) = response.into_parts();
+                let headers = parts
+                    .headers
+                    .iter()
+                    .filter_map(|(name, value)| {
+                        Some((
+                            name.as_str().to_owned(),
+                            serde_json::Value::String(value.to_str().ok()?.to_owned()),
+                        ))
+                    })
+                    .collect::<serde_json::Map<_, _>>();
+                let response_body = self.run(async move {
+                    let mut bytes = Vec::new();
+                    let mut body = body;
+                    body.read_to_end(&mut bytes).await.map_err(anyhow::Error::from)?;
+                    if bytes.len() > quickjs_runtime::MAX_EXTENSION_FILE_READ as usize {
+                        bail!("network response exceeds {} bytes", quickjs_runtime::MAX_EXTENSION_FILE_READ);
+                    }
+                    Ok::<_, anyhow::Error>(bytes)
+                })?;
+                Ok(serde_json::json!({
+                    "status": parts.status.as_u16(),
+                    "headers": headers,
+                    "body": String::from_utf8_lossy(&response_body),
+                }))
+            }
+            "process.spawn" => {
+                let command = required_string(args, 0, method)?;
+                let arguments = args
+                    .get(1)
+                    .and_then(serde_json::Value::as_array)
+                    .map(|values| {
+                        values
+                            .iter()
+                            .map(|value| {
+                                value
+                                    .as_str()
+                                    .map(str::to_owned)
+                                    .context("process arguments must be strings")
+                            })
+                            .collect::<Result<Vec<_>>>()
+                    })
+                    .transpose()?
+                    .unwrap_or_default();
+                let output = std::process::Command::new(&command)
+                    .args(&arguments)
+                    .output()
+                    .with_context(|| format!("spawning process {command}"))?;
+                if output.stdout.len() + output.stderr.len()
+                    > quickjs_runtime::MAX_EXTENSION_FILE_READ as usize
+                {
+                    bail!("process output exceeds {} bytes", quickjs_runtime::MAX_EXTENSION_FILE_READ);
+                }
+                Ok(serde_json::json!({
+                    "status": output.status.code(),
+                    "success": output.status.success(),
+                    "stdout": String::from_utf8_lossy(&output.stdout),
+                    "stderr": String::from_utf8_lossy(&output.stderr),
+                }))
+            }
             other => bail!("unknown host method: {other}"),
         }
     }
@@ -447,6 +640,47 @@ fn read_setting(key: &str) -> Result<serde_json::Value> {
         }
     }
     Ok(cursor.clone())
+}
+/// §5.6 `settings.set`: update one dotted JSON key atomically.
+fn write_setting(key: &str, value: serde_json::Value) -> Result<serde_json::Value> {
+    if key.trim().is_empty() || key.split('.').any(str::is_empty) {
+        bail!("settings key must be a non-empty dotted path");
+    }
+    let path = paths::settings_file();
+    let mut document = match std::fs::read_to_string(path) {
+        Ok(text) => serde_json::from_str(&text)
+            .with_context(|| format!("parsing {}", path.display()))?,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => serde_json::json!({}),
+        Err(error) => return Err(error).with_context(|| format!("reading {}", path.display())),
+    };
+    let mut cursor = &mut document;
+    for segment in key.split('.') {
+        if !cursor.is_object() {
+            *cursor = serde_json::json!({});
+        }
+        let object = cursor
+            .as_object_mut()
+            .context("settings document became non-object")?;
+        cursor = object
+            .entry(segment.to_owned())
+            .or_insert(serde_json::Value::Null);
+    }
+    *cursor = value.clone();
+
+    let encoded = serde_json::to_vec_pretty(&document).context("serializing settings")?;
+    let parent = path.parent().context("settings path has no parent")?;
+    std::fs::create_dir_all(parent)
+        .with_context(|| format!("creating settings directory {}", parent.display()))?;
+    let temporary = parent.join(format!(".settings.json.{}.tmp", std::process::id()));
+    std::fs::write(&temporary, encoded)
+        .with_context(|| format!("writing temporary settings file {}", temporary.display()))?;
+    std::fs::File::open(&temporary)?.sync_all()?;
+    std::fs::rename(&temporary, path)
+        .with_context(|| format!("committing settings file {}", path.display()))?;
+    if let Ok(directory) = std::fs::File::open(parent) {
+        let _ = directory.sync_all();
+    }
+    Ok(value)
 }
 
 // ---------------------------------------------------------------------------
@@ -756,68 +990,12 @@ fn save_consent_records(path: &Path, records: &HashMap<String, ConsentRecord>) -
     Ok(())
 }
 
-/// §5.6 Canonical policy fingerprint: the exact serialized policy tuple the
-/// consent decision covers — id, version, runtime side, capabilities and
-/// resource limits — as canonical JSON (objects built from `BTreeMap`, so key
-/// order is deterministic). Fingerprints are never hashed, so they cannot
-/// collide: two manifests share a fingerprint iff their entire policy tuple
-/// is byte-identical, and any change re-prompts.
+/// §5.6 Canonical policy fingerprint: delegates to the shared
+/// [`quickjs_runtime::ExtensionManifest::policy_fingerprint`] so the client
+/// consent store and the daemon approval ledger always compute byte-identical
+/// fingerprints from one implementation.
 fn consent_fingerprint(extension: &DiscoveredExtension) -> String {
-    let manifest = &extension.manifest;
-    let payload = serde_json::Value::Object(BTreeMap::from([
-        ("id".into(), serde_json::Value::String(manifest.id.clone())),
-        (
-            "version".into(),
-            serde_json::Value::String(manifest.version.clone()),
-        ),
-        ("side".into(), serde_json::Value::String(side_name(manifest.side).into())),
-        ("capabilities".into(), capabilities_json(&manifest.capabilities)),
-        ("limits".into(), limits_json(&manifest.limits)),
-    ]));
-    payload.to_string()
-}
-
-/// Canonical JSON for the resource-limit tuple of a manifest.
-fn limits_json(limits: &ExtensionLimits) -> serde_json::Value {
-    serde_json::Value::Object(BTreeMap::from([
-        ("memory_limit_mb".into(), serde_json::json!(limits.memory_limit_mb)),
-        ("cpu_budget_ms".into(), serde_json::json!(limits.cpu_budget_ms)),
-        ("io_rate_limit".into(), serde_json::json!(limits.io_rate_limit)),
-    ]))
-}
-
-fn side_name(side: ExtensionSide) -> &'static str {
-    match side {
-        ExtensionSide::Client => "client",
-        ExtensionSide::Server => "server",
-        ExtensionSide::Both => "both",
-    }
-}
-
-fn capabilities_json(capabilities: &ExtensionCapabilities) -> serde_json::Value {
-    serde_json::Value::Object(BTreeMap::from([
-        ("terminal".into(), serde_json::json!(capabilities.terminal)),
-        ("mux".into(), serde_json::json!(capabilities.mux)),
-        ("workspace".into(), serde_json::json!(capabilities.workspace)),
-        ("settings".into(), serde_json::json!(capabilities.settings)),
-        ("network".into(), serde_json::json!(capabilities.network)),
-        (
-            "process_spawn".into(),
-            serde_json::json!(capabilities.process_spawn),
-        ),
-        (
-            "filesystem".into(),
-            serde_json::json!(filesystem_name(capabilities.filesystem)),
-        ),
-    ]))
-}
-
-fn filesystem_name(access: FilesystemAccess) -> &'static str {
-    match access {
-        FilesystemAccess::None => "none",
-        FilesystemAccess::Cwd => "cwd",
-        FilesystemAccess::Home => "home",
-    }
+    extension.manifest.policy_fingerprint()
 }
 
 /// Human-readable capability list for the first-install prompt.
@@ -872,18 +1050,31 @@ fn pending_approval_for(extension: &DiscoveredExtension) -> PendingApproval {
 // ---------------------------------------------------------------------------
 
 enum HostCommand {
-    /// §5.4 Install the mux bridge once the daemon connection exists.
-    InstallBridge(Arc<dyn HostBridge>),
+    /// §5.4 Install the mux bridge once the daemon connection exists. The
+    /// bridge is built per extension with its declared filesystem scope, so
+    /// the command carries the connection parts rather than one shared bridge.
+    InstallBridge {
+        domain: Arc<mux::MuxDomain>,
+        state: Arc<Mutex<MuxBridgeState>>,
+    },
     Emit {
         event: String,
         payload: String,
     },
+    /// §16.7 Execute a command on exactly the extension that owns it. The
+    /// client-side registry resolves `owner` before the message is sent; the
+    /// host thread never broadcasts a command to other runtimes.
     ExecuteCommand {
+        owner: Option<String>,
         command: String,
         arguments: String,
     },
     /// Force a full re-render regardless of invalidation state.
     Render,
+    /// §5.4 Re-invoke only the display-list renderer methods; the resulting
+    /// draw ops refresh the cached regions without re-rendering or
+    /// re-serializing the full VDOM.
+    RenderDisplayLists,
     /// §5.6 The user approved these pending extensions: activate them.
     Approve { ids: Vec<String> },
     /// §5.6 The user denied these pending extensions: drop them.
@@ -896,10 +1087,19 @@ pub struct ExtensionHostController {
     host_thread: Option<std::thread::JoinHandle<()>>,
     /// Applies chrome the host thread pushes; replaces the old 1Hz poll.
     chrome_task: Option<gpui::Task<()>>,
+    /// Applies display-list refreshes the host thread pushes; mirrors
+    /// `chrome_task` so ticking regions repaint without VDOM reconciliation.
+    display_list_task: Option<gpui::Task<()>>,
     /// Invalidates display-list clock views without running on the render thread.
     clock_task: Option<gpui::Task<()>>,
     /// Forwards mux notifications into the extensions as events.
     mux_task: Option<gpui::Task<()>>,
+    /// §16.9 The mux connection used to route server-chrome clicks back to
+    /// the authoritative daemon-side extension host. `None` until
+    /// `start_mux_task` observes the domain; without it a server-chrome
+    /// action is logged and dropped (fail closed) — never executed against
+    /// client-side extensions.
+    mux_domain: Option<Arc<mux::MuxDomain>>,
     status_bars:
         parking_lot::Mutex<Vec<gpui::WeakEntity<crate::extension_status_bar::ExtensionStatusBar>>>,
     /// Last local render and authoritative server views are kept separately so
@@ -910,6 +1110,15 @@ pub struct ExtensionHostController {
     pending_approvals: Vec<PendingApproval>,
     /// Applies the host's pending-approval pushes; mirrors `chrome_task`.
     pending_task: Option<gpui::Task<()>>,
+    /// §16.7 Client-side command ownership (id -> owning extension) plus the
+    /// normalized chord -> action keymaps the pane resolvers read.
+    commands: CommandRegistry,
+    /// §16.7 Chord -> action snapshot shared with every MuxPaneView
+    /// shortcut resolver; refreshed whenever activation reports land.
+    keymap_snapshot: Arc<Mutex<BTreeMap<String, String>>>,
+    /// Applies registry reports pushed by the host thread, mirroring
+    /// `pending_task`.
+    registry_task: Option<gpui::Task<()>>,
     /// §5.6 Controller-global prompt claim: at most one window may present
     /// the first-install prompt for the pending batch at a time.
     prompt_claimed: bool,
@@ -921,12 +1130,40 @@ pub struct ExtensionHostController {
 pub struct GlobalHostController(pub gpui::Entity<ExtensionHostController>);
 impl gpui::Global for GlobalHostController {}
 
-/// A live extension plus the host-side state that spec §5.6 requires: an
+/// §5.4 A display-list region's fresh draw ops, produced by re-invoking only
+/// the registered renderer methods on the host thread. Applied to status bars
+/// without touching the VDOM set, so a ticking clock never invalidates the
+/// surrounding chrome.
+pub struct DisplayListUpdate {
+    pub region_id: String,
+    pub ops: Vec<vdom_bridge::DrawOp>,
+}
+
+/// §5.4 Parse one refreshed region's drawOps JSON with the same native bounds
+/// as the VDOM path: the serialized payload and the op count are capped so a
+/// pathological renderer output is rejected before it is painted.
+fn parse_display_list_json(json: &str) -> Result<Vec<vdom_bridge::DrawOp>> {
+    if json.len() > vdom_bridge::MAX_VDOM_PAYLOAD_BYTES {
+        bail!(
+            "display list payload of {} bytes exceeds limit of {}",
+            json.len(),
+            vdom_bridge::MAX_VDOM_PAYLOAD_BYTES
+        );
+    }
+    let value: serde_json::Value =
+        serde_json::from_str(json).context("display list JSON invalid")?;
+    vdom_bridge::parse_display_list(&value).context("display list parse failed")
+}
+
+/// §5.4 A live extension plus the host-side state that spec §5.6 requires: an
 /// extension that blows its CPU budget is suspended rather than left to keep
 /// burning the host thread on every subsequent event.
 struct HostedExtension {
     live: LiveExtension,
     suspended: bool,
+    /// §5.6 Why the extension was suspended, surfaced through the chrome
+    /// notice so the user sees an actionable reason. `None` while active.
+    suspension_reason: Option<&'static str>,
 }
 
 impl HostedExtension {
@@ -954,6 +1191,7 @@ impl HostedExtension {
         }
         if self.live.take_cpu_interrupted() {
             self.suspended = true;
+            self.suspension_reason = Some("CPU budget exceeded");
             tracing::error!(
                 id = %self.live.id(),
                 "extension exceeded its CPU budget and was suspended"
@@ -962,10 +1200,266 @@ impl HostedExtension {
         }
         if self.live.take_memory_violated() {
             self.suspended = true;
+            self.suspension_reason = Some("memory budget exceeded");
             tracing::error!(
                 id = %self.live.id(),
                 "extension exceeded its memory budget and was suspended"
             );
+        }
+        // §5.6 IO quota rejection is flagged in Rust at the token bucket, so
+        // it survives an extension's JS try/catch; the flag is the only
+        // reliable signal that the extension exceeded its `io_rate_limit`.
+        if self.live.take_io_violated() {
+            self.suspended = true;
+            self.suspension_reason = Some("io rate limit exceeded");
+            tracing::error!(
+                id = %self.live.id(),
+                "extension exceeded its IO rate limit and was suspended"
+            );
+        }
+    }
+}
+
+/// §16.7 One command an extension registered during activation.
+#[derive(Debug)]
+struct RegisteredCommand {
+    id: String,
+}
+
+/// §16.7 One keymap binding an extension declared during activation.
+#[derive(Debug)]
+struct RegisteredKeymap {
+    chord: String,
+    command: String,
+}
+
+/// §16.7 Activation report for one extension: the commands and keymaps it
+/// registered, so the client-side ownership registry can be rebuilt after
+/// every activation or approval without querying the host thread.
+#[derive(Debug)]
+struct RegistryReport {
+    extension_id: String,
+    commands: Vec<RegisteredCommand>,
+    keymaps: Vec<RegisteredKeymap>,
+}
+
+/// §16.7 Parse the host's `[{id, label}]` command list. Entries without an
+/// id are skipped; a malformed payload degrades to an empty list (logged),
+/// never a failed report.
+fn parse_registered_commands(json: &str, extension_id: &str) -> Vec<RegisteredCommand> {
+    let Ok(entries) = serde_json::from_str::<Vec<serde_json::Value>>(json) else {
+        tracing::warn!(id = %extension_id, "extension command list malformed");
+        return Vec::new();
+    };
+    entries
+        .into_iter()
+        .filter_map(|entry| {
+            entry
+                .get("id")
+                .and_then(serde_json::Value::as_str)
+                .map(|id| RegisteredCommand {
+                    id: id.to_string(),
+                })
+        })
+        .collect()
+}
+
+/// §16.7 Parse the host's `[{chord, command}]` keymap list. Entries missing
+/// either field are skipped; a malformed payload degrades to an empty list
+/// (logged), never a failed report.
+fn parse_registered_keymaps(json: &str, extension_id: &str) -> Vec<RegisteredKeymap> {
+    let Ok(entries) = serde_json::from_str::<Vec<serde_json::Value>>(json) else {
+        tracing::warn!(id = %extension_id, "extension keymap list malformed");
+        return Vec::new();
+    };
+    entries
+        .into_iter()
+        .filter_map(|entry| {
+            let chord = entry.get("chord").and_then(serde_json::Value::as_str)?;
+            let command = entry.get("command").and_then(serde_json::Value::as_str)?;
+            Some(RegisteredKeymap {
+                chord: chord.to_string(),
+                command: command.to_string(),
+            })
+        })
+        .collect()
+}
+
+impl RegistryReport {
+    /// Collect one report from a live extension. A broken or unreadable
+    /// registration list degrades to an empty list (logged), never to a
+    /// silent drop of the extension's other registrations.
+    fn from_live(hosted: &HostedExtension) -> RegistryReport {
+        let extension_id = hosted.live.id().to_string();
+        let commands = match hosted.live.list_commands() {
+            Ok(json) => parse_registered_commands(&json, &extension_id),
+            Err(error) => {
+                tracing::warn!(id = %extension_id, %error, "extension command list failed");
+                Vec::new()
+            }
+        };
+        let keymaps = match hosted.live.list_keymaps() {
+            Ok(json) => parse_registered_keymaps(&json, &extension_id),
+            Err(error) => {
+                tracing::warn!(id = %extension_id, %error, "extension keymap list failed");
+                Vec::new()
+            }
+        };
+        RegistryReport {
+            extension_id,
+            commands,
+            keymaps,
+        }
+    }
+}
+
+/// §16.7 Collect activation reports from every live, non-suspended extension.
+fn registry_reports(live_extensions: &[HostedExtension]) -> Vec<RegistryReport> {
+    live_extensions
+        .iter()
+        .filter(|hosted| !hosted.suspended)
+        .map(RegistryReport::from_live)
+        .collect()
+}
+
+/// §16.7 Client-side command ownership registry.
+///
+/// The single path that decides which extension owns a command id.
+/// Canonical keys are namespaced (`<extension>.<command>`); bare ids
+/// resolve through a first-wins index, and a collision with an earlier
+/// owner rejects the later registration instead of fanning the command out
+/// to every runtime. Declared keymap chords are normalized to gpui's
+/// hyphen form (`ctrl+shift+p` -> `ctrl-shift-p`) so the pane resolver can
+/// compare them against real keystrokes.
+#[derive(Default)]
+struct CommandRegistry {
+    /// namespaced command id -> owning extension id
+    owners: BTreeMap<String, String>,
+    /// bare command id -> owning extension id (first registration wins)
+    bare_owners: BTreeMap<String, String>,
+    /// normalized chord -> command id as declared by the owner
+    keymaps: BTreeMap<String, String>,
+}
+
+/// §16.7 Normalize a declared chord to gpui's hyphen-separated form so it
+/// can be matched against a parsed keystroke (`ctrl+shift+p` ->
+/// `ctrl-shift-p`).
+fn normalize_chord(chord: &str) -> String {
+    chord
+        .split(['+', '-'])
+        .filter(|part| !part.is_empty())
+        .collect::<Vec<_>>()
+        .join("-")
+}
+
+impl CommandRegistry {
+    /// Apply one extension's activation report. Returns the namespaced ids
+    /// rejected for colliding with a different extension's registration.
+    fn apply_report(&mut self, report: &RegistryReport) -> Vec<String> {
+        let mut rejected = Vec::new();
+        for command in &report.commands {
+            let namespaced = format!("{}.{}", report.extension_id, command.id);
+            match self.bare_owners.entry(command.id.clone()) {
+                std::collections::btree_map::Entry::Vacant(entry) => {
+                    entry.insert(report.extension_id.clone());
+                    self.owners.insert(namespaced, report.extension_id.clone());
+                }
+                // The same extension re-registering is idempotent.
+                std::collections::btree_map::Entry::Occupied(entry)
+                    if entry.get() == &report.extension_id => {}
+                // Collision: a different extension already owns this id.
+                // Drop the namespaced entry as well, so neither registration
+                // is dispatchable under that id.
+                std::collections::btree_map::Entry::Occupied(_) => {
+                    self.owners.remove(&namespaced);
+                    rejected.push(namespaced);
+                }
+            }
+        }
+        for keymap in &report.keymaps {
+            // Last declaration wins per chord; the resolver maps the chord
+            // to the owning extension's command id.
+            self.keymaps
+                .insert(normalize_chord(&keymap.chord), keymap.command.clone());
+        }
+        rejected
+    }
+
+    /// Apply a full snapshot of activation reports, replacing prior
+    /// ownership (an extension that unregistered at runtime stops owning
+    /// its commands). Returns the namespaced ids rejected for colliding
+    /// with a different extension's registration.
+    fn apply_reports(&mut self, reports: &[RegistryReport]) -> Vec<String> {
+        *self = CommandRegistry::default();
+        let mut rejected = Vec::new();
+        for report in reports {
+            rejected.extend(self.apply_report(report));
+        }
+        rejected
+    }
+
+    /// Resolve the extension that owns `command`: namespaced ids resolve
+    /// directly, bare ids through the first-wins index.
+    fn resolve_owner(&self, command: &str) -> Option<&str> {
+        self.owners
+            .get(command)
+            .map(String::as_str)
+            .or_else(|| self.bare_owners.get(command).map(String::as_str))
+    }
+
+    /// The resolver snapshot: normalized chord -> command id.
+    fn keymap_snapshot(&self) -> BTreeMap<String, String> {
+        self.keymaps.clone()
+    }
+}
+
+/// §16.7 Execute a command on exactly the extension the client-side
+/// registry resolved as its owner. Returns the number of runtimes that
+/// executed it (0 or 1): the owner may be gone or suspended, or the command
+/// may have been unregistered at runtime.
+fn execute_for_owner(
+    live_extensions: &mut [HostedExtension],
+    owner: Option<&str>,
+    command: &str,
+    arguments: &str,
+) -> usize {
+    let Some(hosted) = live_extensions
+        .iter()
+        .find(|hosted| Some(hosted.live.id()) == owner)
+    else {
+        tracing::warn!(
+            ?owner,
+            %command,
+            "no extension matches the command owner; dispatch dropped"
+        );
+        return 0;
+    };
+    if hosted.suspended {
+        tracing::warn!(
+            id = %hosted.live.id(),
+            %command,
+            "command dropped: owning extension is suspended"
+        );
+        return 0;
+    }
+    match hosted.live.execute_command(command, arguments) {
+        Ok(true) => 1,
+        Ok(false) => {
+            tracing::warn!(
+                id = %hosted.live.id(),
+                %command,
+                "command not registered in the owning extension"
+            );
+            0
+        }
+        Err(error) => {
+            tracing::warn!(
+                id = %hosted.live.id(),
+                %command,
+                %error,
+                "extension command failed"
+            );
+            0
         }
     }
 }
@@ -1041,6 +1535,8 @@ fn push_chrome_if_dirty(
 
 /// §5.6 Synthetic chrome nodes announcing suspended extensions, appended
 /// after the live chrome so the user sees why an extension's views vanished.
+/// Each notice names the extension and the resource reason it was suspended
+/// for (CPU/memory budget or IO rate limit).
 fn suspension_notices(live_extensions: &[HostedExtension]) -> Vec<VDomNode> {
     live_extensions
         .iter()
@@ -1050,11 +1546,29 @@ fn suspension_notices(live_extensions: &[HostedExtension]) -> Vec<VDomNode> {
             props: BTreeMap::new(),
             style: BTreeMap::new(),
             children: vec![VDomChild::Text(format!(
-                "{} suspended (resource limit)",
-                hosted.live.id()
+                "{} suspended ({})",
+                hosted.live.id(),
+                hosted.suspension_reason.unwrap_or("resource limit")
             ))],
         })
         .collect()
+}
+
+/// §5.6 Deliver one host event to every non-suspended extension, returning
+/// the total number of handler invocations that ran. A suspended extension
+/// is skipped here (and in every other dispatch point) so it receives no
+/// further work for the process lifetime.
+fn deliver_event(live_extensions: &mut [HostedExtension], event: &str, payload: &str) -> usize {
+    let mut delivered = 0;
+    for hosted in live_extensions.iter_mut().filter(|hosted| !hosted.suspended) {
+        match hosted.live.emit_event(event, payload) {
+            Ok(count) => delivered += count,
+            Err(error) => {
+                tracing::warn!(id = %hosted.live.id(), %event, %error, "extension emit failed");
+            }
+        }
+    }
+    delivered
 }
 
 impl ExtensionHostController {
@@ -1063,13 +1577,18 @@ impl ExtensionHostController {
             command_sender: None,
             host_thread: None,
             chrome_task: None,
+            display_list_task: None,
             clock_task: None,
             mux_task: None,
+            mux_domain: None,
             status_bars: parking_lot::Mutex::new(Vec::new()),
             local_chrome: Vec::new(),
             server_chrome: BTreeMap::new(),
             pending_approvals: Vec::new(),
             pending_task: None,
+            commands: CommandRegistry::default(),
+            keymap_snapshot: Arc::new(Mutex::new(BTreeMap::new())),
+            registry_task: None,
             prompt_claimed: false,
             consent_file: consent_file_path(),
         }
@@ -1082,8 +1601,12 @@ impl ExtensionHostController {
     fn start_with_roots(&mut self, roots: Vec<std::path::PathBuf>, cx: &mut gpui::Context<Self>) {
         let (command_sender, command_receiver) = std::sync::mpsc::channel::<HostCommand>();
         let (chrome_sender, chrome_receiver) = futures::channel::mpsc::unbounded::<Vec<VDomNode>>();
+        let (display_list_sender, display_list_receiver) =
+            futures::channel::mpsc::unbounded::<Vec<DisplayListUpdate>>();
         let (pending_sender, pending_receiver) =
             futures::channel::mpsc::unbounded::<Vec<PendingApproval>>();
+        let (registry_sender, registry_receiver) =
+            futures::channel::mpsc::unbounded::<Vec<RegistryReport>>();
         let consent_file = self.consent_file.clone();
 
         let host_thread = std::thread::Builder::new()
@@ -1131,11 +1654,20 @@ impl ExtensionHostController {
                     return;
                 }
                 let mut live_extensions = activate_extensions(consented);
-                let mut installed_bridge: Option<Arc<dyn HostBridge>> = None;
+                let mut installed_mux: Option<(Arc<mux::MuxDomain>, Arc<Mutex<MuxBridgeState>>)> = None;
 
                 // First paint: extensions register their chrome during
                 // activate, so publish it before waiting for any event.
                 if !push_chrome_if_dirty(&mut live_extensions, &chrome_sender, true) {
+                    return;
+                }
+                // §16.7 Ship the activation reports so the client-side
+                // command ownership registry and pane shortcut resolvers
+                // see what was registered.
+                if registry_sender
+                    .unbounded_send(registry_reports(&live_extensions))
+                    .is_err()
+                {
                     return;
                 }
 
@@ -1146,34 +1678,81 @@ impl ExtensionHostController {
                     };
                     let mut force_render = false;
                     match command {
-                        HostCommand::InstallBridge(bridge) => {
-                            installed_bridge = Some(bridge.clone());
+                        HostCommand::InstallBridge { domain, state } => {
+                            installed_mux = Some((domain.clone(), state.clone()));
+                            // §5.6 每个扩展按自己声明的文件系统范围构造专属桥:
+                            // `cwd` 声明不会被授予主目录访问权, `home` 声明不会
+                            // 获得工作区外的路径。范围在桥构造时固化。
                             for hosted in live_extensions.iter().filter(|hosted| !hosted.suspended) {
-                                if let Err(error) = hosted.live.install_bridge(bridge.clone()) {
+                                let bridge: Arc<dyn HostBridge> = Arc::new(MuxHostBridge::new(
+                                    domain.clone(),
+                                    state.clone(),
+                                    hosted.live.capabilities().filesystem,
+                                ));
+                                if let Err(error) = hosted.live.install_bridge(bridge) {
                                     tracing::warn!(id = %hosted.live.id(), %error, "installing mux bridge failed");
                                 }
                             }
                         }
                         HostCommand::Emit { event, payload } => {
-                            for hosted in live_extensions.iter().filter(|hosted| !hosted.suspended) {
-                                if let Err(error) = hosted.live.emit_event(&event, &payload) {
-                                    tracing::warn!(id = %hosted.live.id(), %event, %error, "extension emit failed");
-                                }
-                            }
+                            deliver_event(&mut live_extensions, &event, &payload);
                         }
-                        HostCommand::ExecuteCommand { command, arguments } => {
-                            for hosted in live_extensions.iter().filter(|hosted| !hosted.suspended) {
-                                if let Err(error) = hosted.live.execute_command(&command, &arguments)
-                                {
-                                    tracing::warn!(id = %hosted.live.id(), %command, %error, "extension command failed");
-                                }
-                            }
+                        HostCommand::ExecuteCommand { owner, command, arguments } => {
+                            execute_for_owner(
+                                &mut live_extensions,
+                                owner.as_deref(),
+                                &command,
+                                &arguments,
+                            );
                         }
                         HostCommand::Render => {
                             if !push_chrome_if_dirty(&mut live_extensions, &chrome_sender, true) {
                                 break;
                             }
                             continue;
+                        }
+                        HostCommand::RenderDisplayLists => {
+                            // §5.4 refresh only the display-list regions: the
+                            // tick re-invokes renderer methods and ships fresh
+                            // draw ops, never the full VDOM. Fall through so
+                            // the violation sweep still runs — renderer
+                            // methods execute JS on the host thread too.
+                            for hosted in live_extensions.iter().filter(|hosted| !hosted.suspended)
+                            {
+                                let extension_id = hosted.live.id().to_string();
+                                let mut updates = Vec::new();
+                                match hosted.live.refresh_display_lists() {
+                                    Ok(regions) => {
+                                        for region in regions {
+                                            match parse_display_list_json(&region.ops_json) {
+                                                Ok(ops) => updates.push(DisplayListUpdate {
+                                                    region_id: region.region_id,
+                                                    ops,
+                                                }),
+                                                Err(error) => tracing::warn!(
+                                                    id = %extension_id,
+                                                    region = %region.region_id,
+                                                    %error,
+                                                    "extension display list refresh rejected"
+                                                ),
+                                            }
+                                        }
+                                    }
+                                    Err(error) => tracing::warn!(
+                                        id = %extension_id,
+                                        %error,
+                                        "extension display list refresh failed"
+                                    ),
+                                }
+                                if !updates.is_empty()
+                                    && display_list_sender.unbounded_send(updates).is_err()
+                                {
+                                    tracing::debug!(
+                                        "extension controller dropped; ending display list forwarding"
+                                    );
+                                    break;
+                                }
+                            }
                         }
                         HostCommand::Approve { ids } => {
                             let (approved, remaining): (Vec<DiscoveredExtension>, Vec<DiscoveredExtension>) =
@@ -1194,6 +1773,16 @@ impl ExtensionHostController {
                                     }
                                 }
                                 force_render = true;
+                                // §16.7 Newly approved extensions register
+                                // commands and keymaps during activate; the
+                                // full-snapshot report keeps ownership and
+                                // the resolver view consistent.
+                                if registry_sender
+                                    .unbounded_send(registry_reports(&live_extensions))
+                                    .is_err()
+                                {
+                                    break;
+                                }
                             }
                         }
                         HostCommand::Deny { ids } => {
@@ -1232,7 +1821,9 @@ impl ExtensionHostController {
                 self.command_sender = Some(command_sender.clone());
                 self.host_thread = Some(host_thread);
                 self.start_chrome_task(chrome_receiver, cx);
+                self.start_display_list_task(display_list_receiver, cx);
                 self.start_pending_task(pending_receiver, cx);
+                self.start_registry_task(registry_receiver, cx);
                 self.start_clock_task(cx);
                 self.start_mux_task(cx);
             }
@@ -1292,6 +1883,55 @@ impl ExtensionHostController {
         }));
     }
 
+    /// §5.4 Apply display-list refreshes the host thread pushes, mirroring
+    /// `start_chrome_task`: the task parks on the channel instead of polling,
+    /// and each update replaces only the cached draw ops for its region.
+    fn start_display_list_task(
+        &mut self,
+        mut display_list_receiver: futures::channel::mpsc::UnboundedReceiver<
+            Vec<DisplayListUpdate>,
+        >,
+        cx: &mut gpui::Context<Self>,
+    ) {
+        self.display_list_task = Some(cx.spawn(async move |this, cx| {
+            while let Some(updates) = display_list_receiver.next().await {
+                let update = this.update(cx, |this, cx| {
+                    this.apply_display_list_updates(updates, cx);
+                });
+                if let Err(error) = update {
+                    tracing::debug!(
+                        %error,
+                        "extension controller dropped while applying display lists"
+                    );
+                    break;
+                }
+            }
+        }));
+    }
+
+    /// §5.4 Publish refreshed draw ops to every live status bar. The VDOM set
+    /// is untouched, so no full reconciliation happens; each region's cached
+    /// ops are replaced and the status bar schedules its own repaint.
+    fn apply_display_list_updates(
+        &self,
+        updates: Vec<DisplayListUpdate>,
+        cx: &mut gpui::Context<Self>,
+    ) {
+        for update in updates {
+            let region_id = update.region_id;
+            let ops = update.ops;
+            self.status_bars.lock().retain(|status_bar| {
+                let Some(status_bar) = status_bar.upgrade() else {
+                    return false;
+                };
+                status_bar.update(cx, |status_bar, cx| {
+                    status_bar.set_display_list(&region_id, ops.clone(), cx);
+                });
+                true
+            });
+        }
+    }
+
     /// §5.6 Apply pending-approval lists the host thread pushes, mirroring
     /// the chrome channel: the task parks on the channel, and each push
     /// replaces the controller's view of what awaits the user's decision.
@@ -1319,6 +1959,46 @@ impl ExtensionHostController {
         cx: &mut gpui::Context<Self>,
     ) {
         self.pending_approvals = approvals;
+        cx.notify();
+    }
+
+    /// §16.7 Apply registry reports the host thread pushes, mirroring the
+    /// pending-approval channel: the task parks on the channel, and each
+    /// push replaces the controller's command ownership and keymap view.
+    fn start_registry_task(
+        &mut self,
+        mut registry_receiver: futures::channel::mpsc::UnboundedReceiver<Vec<RegistryReport>>,
+        cx: &mut gpui::Context<Self>,
+    ) {
+        self.registry_task = Some(cx.spawn(async move |this, cx| {
+            while let Some(reports) = registry_receiver.next().await {
+                let update = this.update(cx, |this, cx| {
+                    this.apply_registry_reports(reports, cx);
+                });
+                if let Err(error) = update {
+                    tracing::debug!(
+                        %error,
+                        "extension controller dropped while applying registry reports"
+                    );
+                    break;
+                }
+            }
+        }));
+    }
+
+    /// §16.7 Apply the host thread's activation reports: ownership is
+    /// rebuilt from the full snapshot (first-wins, collisions rejected and
+    /// logged), and the shared keymap snapshot is refreshed for the pane
+    /// shortcut resolvers.
+    fn apply_registry_reports(&mut self, reports: Vec<RegistryReport>, cx: &mut gpui::Context<Self>) {
+        let rejected = self.commands.apply_reports(&reports);
+        *self.keymap_snapshot.lock() = self.commands.keymap_snapshot();
+        for command in rejected {
+            tracing::warn!(
+                %command,
+                "command id rejected: already owned by another extension"
+            );
+        }
         cx.notify();
     }
 
@@ -1406,8 +2086,13 @@ impl ExtensionHostController {
         self.clock_task = Some(cx.spawn(async move |this, cx| {
             loop {
                 cx.background_executor().timer(Duration::from_secs(1)).await;
+                // §5.4 The tick refreshes display-list regions only; full
+                // chrome renders stay invalidation driven. A full render is
+                // still performed when an extension asks for one (events,
+                // commands), so nothing is starved by dropping the old
+                // force-render poll.
                 if this
-                    .update(cx, |this, _| this.send(HostCommand::Render))
+                    .update(cx, |this, _| this.send(HostCommand::RenderDisplayLists))
                     .is_err()
                 {
                     break;
@@ -1440,6 +2125,16 @@ impl ExtensionHostController {
                 );
                 return;
             };
+
+            // §16.9 Keep the domain for server-chrome action routing: clicks
+            // on daemon-rendered chrome go back over this connection.
+            if this
+                .update(cx, |this, _| this.mux_domain = Some(domain.clone()))
+                .is_err()
+            {
+                tracing::debug!("extension controller dropped before the mux domain was installed");
+                return;
+            }
 
             let state = Arc::new(Mutex::new(MuxBridgeState::default()));
             if let Some(session_id) = domain.last_attached_session_id()
@@ -1559,18 +2254,118 @@ impl ExtensionHostController {
     }
 
     /// §5.7 Dispatch a command registered by an extension (VDOM `onClick`
-    /// descriptors and native keybindings both route through here).
+    /// descriptors and extension keybindings both route through here).
+    ///
+    /// §16.7 Ownership: the id resolves through the registry to exactly one
+    /// extension; a command no extension owns is rejected here (logged, not
+    /// executed) instead of fanning out to every runtime. Native core
+    /// commands never flow through this path, so they are unaffected when
+    /// the host is absent.
     pub fn execute_command(&self, command: &str, arguments_json: &str) {
+        let Some(owner) = self.commands.resolve_owner(command).map(str::to_string) else {
+            tracing::warn!(
+                %command,
+                "no extension owns this command; dispatch rejected"
+            );
+            return;
+        };
         self.send(HostCommand::ExecuteCommand {
+            owner: Some(owner),
             command: command.to_string(),
             arguments: arguments_json.to_string(),
         });
+    }
+
+    /// §16.7 The extension that owns `command`, if any (namespaced or bare
+    /// id). Exposed for the server-chrome routing path, which must never
+    /// dispatch a server-origin command to a client extension.
+    pub fn resolve_command_owner(&self, command: &str) -> Option<String> {
+        self.commands.resolve_owner(command).map(str::to_string)
+    }
+
+    /// §16.7 Build the shortcut resolver handed to every `MuxPaneView`: a
+    /// snapshot-backed chord -> action lookup that stays live as extensions
+    /// register or are approved. Before any keymap report lands (or without
+    /// a host) the snapshot is empty and nothing matches — the pane
+    /// passthroughs exactly as it did before the resolver existed.
+    pub fn extension_shortcut_resolver(
+        &self,
+    ) -> terminal_view::mux_pane::ExtensionShortcutResolver {
+        let snapshot = self.keymap_snapshot.clone();
+        std::sync::Arc::new(move |keystroke: &Keystroke| {
+            let bindings = snapshot.lock();
+            let matched = bindings.iter().find(|(chord, _)| {
+                Keystroke::parse(chord.as_str())
+                    .map(|parsed| parsed == *keystroke)
+                    .unwrap_or_else(|_| chord.eq_ignore_ascii_case(&keystroke.to_string()))
+            });
+            matched.map(|(_, action)| SharedString::from(action.clone()))
+        })
     }
 
     /// Force a chrome re-render (used after a workspace attaches a new status
     /// bar so it inherits the current chrome).
     pub fn request_render(&self) {
         self.send(HostCommand::Render);
+    }
+
+    /// §16.9 Route a chrome interaction from daemon-rendered chrome back to
+    /// the authoritative server-side extension host. Fail closed: without a
+    /// mux connection the action is logged and dropped — it is never
+    /// executed against client-side extensions, even if one registers the
+    /// same command id. Responses that come back rejected are logged with
+    /// the daemon's contextual error.
+    pub fn execute_server_command(
+        &self,
+        extension_id: &str,
+        view_id: &str,
+        command: &str,
+        arguments: &str,
+        cx: &mut gpui::App,
+    ) {
+        let Some(domain) = self.mux_domain.clone() else {
+            tracing::warn!(
+                extension_id,
+                view_id,
+                %command,
+                "server chrome action dropped: no mux connection"
+            );
+            return;
+        };
+        let request = mux_protocol::ExtensionChromeActionRequest {
+            extension_id: extension_id.to_string(),
+            view_id: view_id.to_string(),
+            command: command.to_string(),
+            arguments: arguments.to_string(),
+        };
+        cx.background_executor().spawn(async move {
+            match domain
+                .send_request(mux_protocol::RequestBody::ExtensionChromeAction(request))
+                .await
+            {
+                Ok(response) => {
+                    if let Some(mux_protocol::ResponseBody::ExtensionChromeActionResult(result)) =
+                        response.body
+                        && !result.accepted
+                    {
+                        tracing::warn!(
+                            extension_id,
+                            %command,
+                            error = %result.error,
+                            "server chrome action rejected by the daemon"
+                        );
+                    }
+                }
+                Err(error) => {
+                    tracing::warn!(
+                        %error,
+                        extension_id,
+                        %command,
+                        "server chrome action transport failed"
+                    );
+                }
+            }
+        });
     }
 
     fn send(&self, command: HostCommand) {
@@ -1612,6 +2407,30 @@ impl ExtensionHostController {
                         return;
                     }
                 };
+                // §5.7 / §16.9 Server chrome first: an invocation stamped with
+                // a server origin belongs to the daemon's extension host and
+                // routes back there — never to client-side extensions, even
+                // if a client extension registers the same command id.
+                // `CommandInvocation::parse` guarantees a stamped origin has
+                // side "server", so any `Some` here is a server interaction.
+                if let Some(origin) = &invocation.origin {
+                    if let Err(error) = this.update(cx, |this, cx| {
+                        this.execute_server_command(
+                            &origin.extension_id,
+                            &origin.view_id,
+                            &invocation.command,
+                            &arguments,
+                            cx,
+                        );
+                    }) {
+                        tracing::debug!(
+                            %error,
+                            command = %invocation.command,
+                            "extension host is gone; server chrome action dropped"
+                        );
+                    }
+                    return;
+                }
                 if let Err(error) = this.update(cx, |this, _| {
                     this.execute_command(&invocation.command, &arguments);
                 }) {
@@ -1642,6 +2461,7 @@ fn activate_extensions(discovered: Vec<DiscoveredExtension>) -> Vec<HostedExtens
                 live_extensions.push(HostedExtension {
                     live,
                     suspended: false,
+                    suspension_reason: None,
                 });
             }
             Err(error) => {
@@ -2022,6 +2842,9 @@ mod tests {
             &notification(mux_protocol::notification::Event::SessionLayoutChanged(
                 mux_protocol::SessionLayoutChanged {
                     layout: Some(layout),
+                    // §15.4 ordinary server layout notifications stay pure
+                    // deltas; only the reconnect resync carries a snapshot.
+                    snapshot: None,
                 },
             )),
             &state,
@@ -2031,6 +2854,150 @@ mod tests {
         assert_eq!(events[0].1["type"], "split");
         assert_eq!(events[0].1["direction"], "left-right");
         assert_eq!(events[0].1["children"][1]["paneId"], "p2");
+    }
+
+    fn snapshot_two_tabs() -> mux_protocol::SessionSnapshot {
+        mux_protocol::SessionSnapshot {
+            tabs: vec![
+                mux_protocol::TabInfo {
+                    id: "t1".into(),
+                    title: "build".into(),
+                    panes: vec![
+                        mux_protocol::PaneInfo {
+                            id: "p1".into(),
+                            title: "cargo".into(),
+                            ..Default::default()
+                        },
+                        mux_protocol::PaneInfo {
+                            id: "p2".into(),
+                            title: "vim".into(),
+                            ..Default::default()
+                        },
+                    ],
+                },
+                mux_protocol::TabInfo {
+                    id: "t2".into(),
+                    title: "logs".into(),
+                    panes: vec![mux_protocol::PaneInfo {
+                        id: "p3".into(),
+                        title: "journalctl".into(),
+                        ..Default::default()
+                    }],
+                },
+            ],
+            focused_pane_id: "p2".into(),
+            focused_tab_id: "t1".into(),
+            ..Default::default()
+        }
+    }
+
+    /// §15.4 A reconnect resync must reconcile the extension-visible mux
+    /// state from the authoritative snapshot: every pane emitted once,
+    /// every tab once, and exactly one focus event — with the focused
+    /// pane's title resolved.
+    #[test]
+    fn snapshot_resync_emits_every_pane_tab_and_focus_once() {
+        let state = Mutex::new(MuxBridgeState::default());
+        state.lock().session_name = Some("work".to_string());
+        let snapshot = snapshot_two_tabs();
+
+        let events = notification_events(
+            &notification(mux_protocol::notification::Event::SessionLayoutChanged(
+                mux_protocol::SessionLayoutChanged {
+                    layout: None,
+                    snapshot: Some(snapshot),
+                },
+            )),
+            &state,
+        );
+
+        let count = |name: &str| events.iter().filter(|(event, _)| event == name).count();
+        assert_eq!(count("session:layout"), 1);
+        assert_eq!(count("pane:added"), 3, "every pane must be emitted");
+        assert_eq!(count("pane:title"), 3);
+        assert_eq!(count("tab:title"), 2, "every tab must be emitted");
+        assert_eq!(count("pane:focus"), 1, "exactly one focus event");
+
+        // pane membership maps each pane to its owning tab.
+        let p3_added = events
+            .iter()
+            .find(|(event, payload)| event == "pane:added" && payload["paneId"] == "p3")
+            .expect("p3 pane:added event");
+        assert_eq!(p3_added.1["tabId"], "t2");
+
+        // The tab-bar upsert payload carries the first pane id and focus.
+        let t1_title = events
+            .iter()
+            .find(|(event, payload)| event == "tab:title" && payload["tabId"] == "t1")
+            .expect("t1 tab:title event");
+        assert_eq!(t1_title.1["paneId"], "p1");
+        assert_eq!(t1_title.1["active"], true);
+        let t2_title = events
+            .iter()
+            .find(|(event, payload)| event == "tab:title" && payload["tabId"] == "t2")
+            .expect("t2 tab:title event");
+        assert_eq!(t2_title.1["active"], false);
+
+        let focus = events
+            .iter()
+            .find(|(event, _)| event == "pane:focus")
+            .expect("pane:focus event")
+            .1
+            .clone();
+        assert_eq!(focus["paneId"], "p2");
+        assert_eq!(focus["title"], "vim", "focused title from the snapshot");
+        assert_eq!(focus["tabId"], "t1");
+
+        // §15.4 at-least-once: re-delivering the same resync must not emit a
+        // duplicate focus event (the state guard suppresses it).
+        let repeated = notification_events(
+            &notification(mux_protocol::notification::Event::SessionLayoutChanged(
+                mux_protocol::SessionLayoutChanged {
+                    layout: None,
+                    snapshot: Some(snapshot_two_tabs()),
+                },
+            )),
+            &state,
+        );
+        assert_eq!(
+            repeated.iter().filter(|(event, _)| event == "pane:focus").count(),
+            0,
+            "an unchanged resync must not duplicate pane:focus"
+        );
+    }
+
+    /// §3.4 / §15.4 Initial attach hydration: two pre-existing tabs must be
+    /// emitted once each — not only the focused pane — with no duplicates.
+    #[test]
+    fn initial_hydration_emits_all_tabs_and_panes_once() {
+        let state = Mutex::new(MuxBridgeState::default());
+        state.lock().session_name = Some("work".to_string());
+        let snapshot = snapshot_two_tabs();
+
+        let events = hydration_events(&snapshot, &state);
+
+        let count = |name: &str| events.iter().filter(|(event, _)| event == name).count();
+        assert_eq!(count("tab:title"), 2, "both pre-existing tabs hydrated");
+        assert_eq!(count("pane:added"), 3);
+        assert_eq!(count("pane:title"), 3);
+        assert_eq!(count("pane:focus"), 1);
+        assert_eq!(count("session:layout"), 1);
+
+        // No duplicated (event, payload) pair in the hydration batch.
+        let mut seen = std::collections::HashSet::new();
+        for (event, payload) in &events {
+            assert!(
+                seen.insert((event.clone(), payload.clone())),
+                "duplicate hydration event {event}"
+            );
+        }
+
+        // The bridge state must be populated by the same pass: extension RPCs
+        // that read it (getFocusedPane, splitPane) see the hydrated session.
+        let state = state.lock();
+        assert_eq!(state.focused_pane.as_deref(), Some("p2"));
+        assert_eq!(state.pane_tabs.get("p3").map(String::as_str), Some("t2"));
+        assert_eq!(state.pane_titles.get("p1").map(String::as_str), Some("cargo"));
     }
 
     /// P0-3 end-to-end at the JS boundary: a mapped notification must actually
@@ -2389,6 +3356,115 @@ mod tests {
         std::fs::remove_dir_all(&root).expect("remove extension root");
     }
 
+    /// §5.4 end to end: a clock-like display-list view refreshes through the
+    /// region-scoped channel — the host thread re-invokes only the renderer
+    /// method, the controller applies the fresh draw ops to the status bar,
+    /// and the VDOM set (and thus the surrounding chrome) is never touched.
+    #[gpui::test]
+    fn clock_like_display_list_refreshes_without_vdom_invalidation(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        cx.background_executor.allow_parking();
+        let root = temporary_extension_dir("dl-clock").expect("create extension root");
+        let directory = root.join("clock");
+        std::fs::create_dir_all(&directory).expect("create extension directory");
+        std::fs::write(
+            directory.join("extension.toml"),
+            "[extension]\nname = \"clock\"\n[runtime]\nside = \"client\"\n",
+        )
+        .expect("write manifest");
+        std::fs::write(
+            directory.join("main.js"),
+            r#"
+            function activate(context) {
+                var ticks = 0;
+                context.registerChromeView('status-bar', {
+                    render: function() {
+                        return {
+                            type: 'display-list',
+                            props: { id: 'clock', renderer: 'renderClock' }
+                        };
+                    },
+                    renderClock: function() {
+                        ticks++;
+                        return [{ op: 'drawText', text: String(ticks), x: 0, y: 0 }];
+                    }
+                });
+            }
+            "#,
+        )
+        .expect("write extension source");
+
+        // §5.6 consent gate: pre-approve the clock so it activates on start.
+        let discovered =
+            quickjs_runtime::discover_client_extensions(std::slice::from_ref(&root));
+        assert_eq!(discovered.len(), 1, "clock extension was not discovered");
+        let consent_file = root.join("extension-consent.json");
+        let mut consent_records = HashMap::new();
+        consent_records.insert(
+            "clock".to_string(),
+            ConsentRecord::approved("clock", consent_fingerprint(&discovered[0])),
+        );
+        save_consent_records(&consent_file, &consent_records).expect("write consent records");
+
+        let host = start_consent_host(cx, &root, &consent_file);
+        let bar = cx.update(|cx| cx.new(|_| ExtensionStatusBar::new()));
+        cx.update(|cx| host.update(cx, |host, cx| host.add_status_bar(bar.downgrade(), cx)));
+
+        // The first chrome push carries the display-list node; the renderer's
+        // drawOps were attached during that render.
+        wait_for(cx, "the first chrome push with the clock region", |cx| {
+            cx.read(|cx| {
+                bar.read(cx)
+                    .vdom_nodes()
+                    .first()
+                    .is_some_and(|node| node.element_type == "display-list")
+            })
+        });
+        let vdom_before = chrome_text(cx, &host);
+
+        // One refresh tick: the host re-invokes renderClock and the fresh ops
+        // land in the status bar's renderer cache.
+        cx.update(|cx| host.update(cx, |host, _| host.send(HostCommand::RenderDisplayLists)));
+        wait_for(cx, "the refreshed clock ops to reach the status bar", |cx| {
+            cx.read(|cx| bar.read(cx).display_list_ops("clock").is_some())
+        });
+
+        // §5.4 the refresh must not have invalidated the chrome: the VDOM set
+        // is byte-identical and the region keeps ticking on later refreshes.
+        assert_eq!(
+            chrome_text(cx, &host),
+            vdom_before,
+            "a display-list refresh must not re-render the chrome VDOM"
+        );
+        // Capture the tick value refresh #1 produced; the absolute number is
+        // racy (the add_status_bar render may have run renderClock once more),
+        // so prove re-evaluation by requiring the next refresh to change it.
+        let first_text = cx
+            .read(|cx| {
+                bar.read(cx)
+                    .display_list_ops("clock")
+                    .and_then(|ops| match &ops[0] {
+                        vdom_bridge::DrawOp::DrawText { text, .. } => Some(text.clone()),
+                        _ => None,
+                    })
+            })
+            .expect("first refresh must carry a drawText op");
+
+        cx.update(|cx| host.update(cx, |host, _| host.send(HostCommand::RenderDisplayLists)));
+        wait_for(cx, "the clock to tick to a new value", |cx| {
+            cx.read(|cx| {
+                bar.read(cx)
+                    .display_list_ops("clock")
+                    .is_some_and(|ops| {
+                        matches!(&ops[0], vdom_bridge::DrawOp::DrawText { text, .. } if text != &first_text)
+                    })
+            })
+        });
+
+        std::fs::remove_dir_all(root).expect("remove extension root");
+    }
+
     #[test]
     fn server_chrome_update_replaces_and_removes_view() {
         let mut server = BTreeMap::new();
@@ -2417,6 +3493,74 @@ mod tests {
         apply_server_chrome_node(&mut server, update("removed", Vec::new()))
             .expect("server chrome removal must succeed");
         assert!(server.is_empty());
+    }
+
+    /// §5.2: an oversized VDOM payload is rejected at the JSON boundary before
+    /// serde allocates a parse tree.
+    #[test]
+    fn parse_vdom_json_rejects_oversized_payload() {
+        let oversized = format!(
+            "{{\"type\":\"div\",\"children\":[\"{}\"]}}",
+            "x".repeat(vdom_bridge::MAX_VDOM_PAYLOAD_BYTES)
+        );
+        let error = parse_vdom_json(&oversized).unwrap_err();
+        let message = format!("{error:#}");
+        assert!(
+            message.contains("payload of"),
+            "expected payload rejection, got: {message}"
+        );
+    }
+
+    /// §5.2: an oversized server chrome update must fail closed without
+    /// partially mutating the live server-chrome cache.
+    #[test]
+    fn oversized_server_chrome_update_leaves_cache_untouched() {
+        let mut server = BTreeMap::new();
+        let update = mux_protocol::ExtensionChromeUpdate {
+            extension_id: "server-ext".to_string(),
+            view_id: "status".to_string(),
+            vdom_payload: vec![b'x'; vdom_bridge::MAX_VDOM_PAYLOAD_BYTES + 1],
+        };
+        let error = apply_server_chrome_node(&mut server, update).unwrap_err();
+        let message = format!("{error:#}");
+        assert!(
+            message.contains("payload of"),
+            "expected payload rejection, got: {message}"
+        );
+        assert!(
+            server.is_empty(),
+            "a rejected server update must not mutate the cache"
+        );
+    }
+
+    /// §5.2: a refreshed display list is capped on serialized size and op
+    /// count before it can reach the renderer's cache.
+    #[test]
+    fn display_list_json_rejects_oversized_payloads() {
+        let oversized = format!(
+            "[{{\"op\":\"drawText\",\"text\":\"{}\",\"x\":0,\"y\":0}}]",
+            "x".repeat(vdom_bridge::MAX_VDOM_PAYLOAD_BYTES)
+        );
+        let error = parse_display_list_json(&oversized).unwrap_err();
+        let message = format!("{error:#}");
+        assert!(
+            message.contains("payload of"),
+            "expected payload rejection, got: {message}"
+        );
+
+        let too_many_ops = format!(
+            "[{}]",
+            (0..=vdom_bridge::MAX_DISPLAY_LIST_OPS)
+                .map(|_| "{\"op\":\"drawText\",\"text\":\"t\",\"x\":0,\"y\":0}".to_string())
+                .collect::<Vec<_>>()
+                .join(",")
+        );
+        let error = parse_display_list_json(&too_many_ops).unwrap_err();
+        let message = format!("{error:#}");
+        assert!(
+            message.contains("draw ops"),
+            "expected op-count rejection, got: {message}"
+        );
     }
 
     #[test]
@@ -2972,6 +4116,468 @@ mod tests {
         assert!(
             text.contains("runaway"),
             "the notice must name the suspended extension: {text}"
+        );
+
+        std::fs::remove_dir_all(root)?;
+        Ok(())
+    }
+
+    /// Host bridge that admits every call and counts them, so tests can
+    /// observe how many calls the runtime's IO token bucket let through.
+    #[derive(Default)]
+    struct CountingBridge {
+        calls: std::sync::atomic::AtomicUsize,
+    }
+
+    impl CountingBridge {
+        fn calls(&self) -> usize {
+            self.calls.load(std::sync::atomic::Ordering::Relaxed)
+        }
+    }
+
+    impl HostBridge for CountingBridge {
+        fn call(&self, _method: &str, _args: &serde_json::Value) -> Result<serde_json::Value> {
+            self.calls.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            Ok(serde_json::json!(true))
+        }
+    }
+
+    /// Load one probe extension with the given manifest `io_rate_limit` and a
+    /// counting bridge, returning the supervisor-side handle and the bridge
+    /// (whose counter reveals how many host calls the token bucket admitted).
+    fn load_io_probe(
+        root: &Path,
+        id: &str,
+        io_rate_limit: f64,
+        main_js: &str,
+    ) -> Result<(HostedExtension, Arc<CountingBridge>)> {
+        let directory = root.join(id);
+        std::fs::create_dir_all(&directory)?;
+        std::fs::write(
+            directory.join("extension.toml"),
+            format!(
+                "[extension]\nname = \"{id}\"\n[runtime]\nside = \"client\"\n[capabilities]\nmux = true\n[resources]\nio_rate_limit = {io_rate_limit}\n"
+            ),
+        )?;
+        std::fs::write(directory.join("main.js"), main_js)?;
+        let discovered =
+            quickjs_runtime::discover_client_extensions(std::slice::from_ref(root));
+        let extension = discovered
+            .iter()
+            .find(|extension| extension.manifest.id == id)
+            .context("probe extension not discovered")?;
+        let bridge = Arc::new(CountingBridge::default());
+        let runner = quickjs_runtime::ExtensionRunner::for_manifest(&extension.manifest)
+            .with_bridge(bridge.clone());
+        let live = runner.load_live(&extension.manifest.id, &extension.source, "activate")?;
+        Ok((
+            HostedExtension {
+                live,
+                suspended: false,
+                suspension_reason: None,
+            },
+            bridge,
+        ))
+    }
+
+    /// Calls past the burst capacity (2/s → capacity 4) are rejected in Rust;
+    /// the JS catches every exception, so only the persistent violation flag
+    /// can prove the quota was crossed.
+    const IO_OVER_LIMIT_JS: &str = r#"
+        function activate(context) {
+            context.on('tick', function() {});
+            for (var i = 0; i < 8; i++) {
+                try { context.mux.focusPane('p' + i); } catch (error) {}
+            }
+        }
+    "#;
+
+    /// §5.6: an extension whose host calls were rejected by its
+    /// `io_rate_limit` must be suspended even though the JS caught the
+    /// exceptions — and the suspension carries a visible reason, denies all
+    /// further work, and is not bypassed when the token bucket refills.
+    #[test]
+    fn io_rate_limit_suspends_extension_and_denies_further_work() -> Result<()> {
+        let root = temporary_extension_dir("io-supervisor-root")?;
+        let (hosted, bridge) = load_io_probe(&root, "io-limit", 2.0, IO_OVER_LIMIT_JS)?;
+        assert_eq!(bridge.calls(), 4, "burst capacity (2× rate) admits 4 calls");
+        let mut live_extensions = vec![hosted];
+
+        // Work within the limit is accepted: the active extension still
+        // receives host events.
+        assert_eq!(
+            deliver_event(&mut live_extensions, "tick", "null"),
+            1,
+            "an active extension must receive events"
+        );
+
+        live_extensions[0].note_resource_violations();
+        assert!(
+            live_extensions[0].suspended,
+            "IO violation must suspend the extension"
+        );
+        assert_eq!(
+            live_extensions[0].suspension_reason,
+            Some("io rate limit exceeded"),
+            "suspension must carry an actionable reason"
+        );
+
+        // Subsequent work is denied at every dispatch point.
+        assert_eq!(
+            deliver_event(&mut live_extensions, "tick", "null"),
+            0,
+            "a suspended extension must not receive further events"
+        );
+        assert!(
+            render_live_extensions(&mut live_extensions).is_empty(),
+            "a suspended extension must stop contributing chrome"
+        );
+
+        // The reason surfaces through the existing chrome notice.
+        let (sender, mut receiver) = futures::channel::mpsc::unbounded::<Vec<VDomNode>>();
+        assert!(push_chrome_if_dirty(&mut live_extensions, &sender, true));
+        let nodes = futures::StreamExt::next(&mut receiver)
+            .now_or_never()
+            .flatten()
+            .context("forced chrome push never arrived")?;
+        let text = nodes
+            .iter()
+            .map(|node| vdom_bridge::vdom_to_text(node, 0))
+            .collect::<String>();
+        assert!(text.contains("suspended"), "notice text: {text}");
+        assert!(text.contains("io-limit"), "notice must name the extension: {text}");
+        assert!(
+            text.contains("io rate limit"),
+            "notice must carry the reason: {text}"
+        );
+
+        // Refilling the token bucket must not resurrect the extension.
+        std::thread::sleep(Duration::from_millis(2500));
+        live_extensions[0].note_resource_violations();
+        assert!(
+            live_extensions[0].suspended,
+            "suspension is permanent; refill is not a bypass"
+        );
+        assert_eq!(
+            deliver_event(&mut live_extensions, "tick", "null"),
+            0,
+            "a suspended extension stays cut off from further work"
+        );
+
+        std::fs::remove_dir_all(root)?;
+        Ok(())
+    }
+
+    /// §5.6: `io_rate_limit = 0` means unlimited (same contract as the memory
+    /// and CPU limits) — every host call is admitted and nothing suspends.
+    #[test]
+    fn io_rate_limit_zero_never_suspends() -> Result<()> {
+        let root = temporary_extension_dir("io-unlimited-root")?;
+        let (hosted, bridge) = load_io_probe(
+            &root,
+            "io-unlimited",
+            0.0,
+            r#"
+            function activate(context) {
+                context.on('tick', function() {});
+                for (var i = 0; i < 100; i++) {
+                    try { context.mux.focusPane('p' + i); } catch (error) {}
+                }
+            }
+            "#,
+        )?;
+        assert_eq!(
+            bridge.calls(),
+            100,
+            "io_rate_limit = 0 must admit every host call"
+        );
+        let mut live_extensions = vec![hosted];
+        live_extensions[0].note_resource_violations();
+        assert!(
+            !live_extensions[0].suspended,
+            "unlimited IO must never suspend the extension"
+        );
+        assert_eq!(
+            deliver_event(&mut live_extensions, "tick", "null"),
+            1,
+            "an unlimited extension must keep receiving events"
+        );
+        std::fs::remove_dir_all(root)?;
+        Ok(())
+    }
+
+    /// Host bridge admitting every call with a canned value, recording the
+    /// method names so tests can prove which declared capabilities reached
+    /// the bridge through the manifest → context → hostCall path.
+    #[derive(Default)]
+    struct DeclaredCapsBridge {
+        methods: Mutex<Vec<String>>,
+    }
+
+    impl DeclaredCapsBridge {
+        fn methods(&self) -> Vec<String> {
+            self.methods.lock().clone()
+        }
+    }
+
+    impl HostBridge for DeclaredCapsBridge {
+        fn call(&self, method: &str, _args: &serde_json::Value) -> Result<serde_json::Value> {
+            self.methods.lock().push(method.to_string());
+            match method {
+                "workspace.getPath" => Ok(serde_json::json!("/work")),
+                "filesystem.readTextFile" => Ok(serde_json::json!("text")),
+                "filesystem.readDir" => Ok(serde_json::json!([])),
+                "network.fetch" => Ok(serde_json::json!({ "status": 200 })),
+                "process.spawn" => Ok(serde_json::json!("pid")),
+                other => bail!("unexpected host method: {other}"),
+            }
+        }
+    }
+
+    /// §5.6: 客户端 manifest 声明 workspace/filesystem/network/process_spawn
+    /// 后, 调用必须真正到达宿主桥 (declared-but-reachable), 返回值回到扩展;
+    /// 未声明的能力在到达桥之前被拒绝 (JS requireCapability + Rust allows)。
+    #[test]
+    fn client_declared_capabilities_reach_the_host_bridge() -> Result<()> {
+        let root = temporary_extension_dir("declared-caps")?;
+        let directory = root.join("caps");
+        std::fs::create_dir_all(&directory)?;
+        std::fs::write(
+            directory.join("extension.toml"),
+            "[extension]\nname = \"caps\"\n[runtime]\nside = \"client\"\n[capabilities]\nworkspace = true\nfilesystem = \"home\"\nnetwork = true\nprocess_spawn = true\n",
+        )?;
+        std::fs::write(
+            directory.join("main.js"),
+            r#"
+            function activate(context) {
+                context.registerChromeView('caps', {
+                    render: function() {
+                        return { type: 'span', children: [
+                            context.workspace.getPath() + '|' +
+                            context.filesystem.readTextFile('/x') + '|' +
+                            String(context.network.fetch('http://example.test').status) + '|' +
+                            context.process.spawn('echo')
+                        ] };
+                    }
+                });
+            }
+            "#,
+        )?;
+
+        let discovered = quickjs_runtime::discover_client_extensions(std::slice::from_ref(&root));
+        let extension = discovered
+            .iter()
+            .find(|extension| extension.manifest.id == "caps")
+            .context("caps extension not discovered")?;
+        let bridge = Arc::new(DeclaredCapsBridge::default());
+        let runner = quickjs_runtime::ExtensionRunner::for_manifest(&extension.manifest)
+            .with_bridge(bridge.clone());
+        let live = runner.load_live(&extension.manifest.id, &extension.source, "activate")?;
+        let vdom = live.render_now()?.context("caps vdom")?;
+        assert!(
+            vdom.contains("/work|text|200|pid"),
+            "声明能力的返回值必须回到扩展: vdom={vdom}"
+        );
+        assert_eq!(
+            bridge.methods(),
+            vec![
+                "workspace.getPath",
+                "filesystem.readTextFile",
+                "network.fetch",
+                "process.spawn",
+            ],
+            "manifest 声明的能力必须到达宿主桥"
+        );
+
+        std::fs::remove_dir_all(root)?;
+        Ok(())
+    }
+
+    /// §16.7: command ownership is first-wins; a second extension claiming
+    /// the same id is rejected (both bare and namespaced forms of the
+    /// colliding registration are unreachable), and re-applying the same
+    /// snapshot keeps the original owner.
+    #[test]
+    fn registry_first_wins_and_rejects_collisions() {
+        let mut registry = CommandRegistry::default();
+        let report_a = RegistryReport {
+            extension_id: "ext-a".to_string(),
+            commands: vec![
+                RegisteredCommand {
+                    id: "noop".to_string(),
+                },
+                RegisteredCommand {
+                    id: "unique".to_string(),
+                },
+            ],
+            keymaps: vec![RegisteredKeymap {
+                chord: "ctrl+shift+p".to_string(),
+                command: "noop".to_string(),
+            }],
+        };
+        let report_b = RegistryReport {
+            extension_id: "ext-b".to_string(),
+            commands: vec![RegisteredCommand {
+                id: "noop".to_string(),
+            }],
+            keymaps: Vec::new(),
+        };
+
+        assert_eq!(registry.apply_report(&report_a), Vec::<String>::new());
+        assert_eq!(
+            registry.apply_report(&report_b),
+            vec!["ext-b.noop".to_string()],
+            "colliding namespaced id must be reported as rejected"
+        );
+        assert_eq!(registry.resolve_owner("noop"), Some("ext-a"));
+        assert_eq!(registry.resolve_owner("ext-a.noop"), Some("ext-a"));
+        assert_eq!(registry.resolve_owner("ext-a.unique"), Some("ext-a"));
+        assert_eq!(
+            registry.resolve_owner("ext-b.noop"),
+            None,
+            "a rejected registration must never dispatch"
+        );
+        assert_eq!(registry.resolve_owner("missing"), None);
+
+        // Full-snapshot re-application (host approval flow) is idempotent.
+        assert_eq!(
+            registry.apply_reports(&[report_a, report_b]),
+            vec!["ext-b.noop".to_string()]
+        );
+        assert_eq!(registry.resolve_owner("noop"), Some("ext-a"));
+    }
+
+    /// §16.7: declared chords use `+` separators in JS manifests but gpui
+    /// keystrokes use `-`; the registry must normalize so the pane resolver
+    /// snapshot matches real keystrokes.
+    #[test]
+    fn registry_normalizes_chords_for_the_resolver() {
+        let mut registry = CommandRegistry::default();
+        registry.apply_report(&RegistryReport {
+            extension_id: "palette".to_string(),
+            commands: vec![RegisteredCommand {
+                id: "z3rm.command-palette.open".to_string(),
+            }],
+            keymaps: vec![RegisteredKeymap {
+                chord: "ctrl+shift+p".to_string(),
+                command: "z3rm.command-palette.open".to_string(),
+            }],
+        });
+        let snapshot = registry.keymap_snapshot();
+        assert_eq!(
+            snapshot.get("ctrl-shift-p").map(String::as_str),
+            Some("z3rm.command-palette.open")
+        );
+        assert_eq!(
+            snapshot.get("ctrl+shift+p"),
+            None,
+            "the declared chord must be normalized to hyphen form"
+        );
+        assert_eq!(normalize_chord("ctrl+shift+p"), "ctrl-shift-p");
+        assert_eq!(normalize_chord("ctrl-shift-p"), "ctrl-shift-p");
+        assert_eq!(normalize_chord("ctrl++p"), "ctrl-p");
+    }
+
+    /// §16.7: the resolver handed to panes matches a real keystroke against
+    /// the normalized chord snapshot and returns the declared action; an
+    /// unbound keystroke falls through (None), preserving native routing.
+    #[test]
+    fn extension_shortcut_resolver_matches_normalized_chords() {
+        let mut controller = ExtensionHostController::new();
+        controller.commands.apply_report(&RegistryReport {
+            extension_id: "palette".to_string(),
+            commands: vec![RegisteredCommand {
+                id: "z3rm.command-palette.open".to_string(),
+            }],
+            keymaps: vec![RegisteredKeymap {
+                chord: "ctrl+shift+p".to_string(),
+                command: "z3rm.command-palette.open".to_string(),
+            }],
+        });
+        *controller.keymap_snapshot.lock() = controller.commands.keymap_snapshot();
+        let resolver = controller.extension_shortcut_resolver();
+
+        let bound = Keystroke::parse("ctrl-shift-p").expect("parse ctrl-shift-p");
+        assert_eq!(
+            resolver(&bound).map(String::from),
+            Some("z3rm.command-palette.open".to_string())
+        );
+        let unbound = Keystroke::parse("ctrl-a").expect("parse ctrl-a");
+        assert_eq!(resolver(&unbound), None);
+    }
+
+    /// §16.7: `execute_for_owner` runs exactly one runtime — the resolved
+    /// owner — even when another extension registered the same bare command
+    /// id; a missing, suspended, or non-registering owner runs nothing.
+    #[test]
+    fn execute_for_owner_runs_exactly_the_owning_extension() -> Result<()> {
+        let root = temporary_extension_dir("registry-single-owner")?;
+        let (owner, _) = load_io_probe(
+            &root,
+            "owner",
+            100.0,
+            r#"
+            function activate(context) {
+                context.renderState = 'idle';
+                context.commands.register('dupe', function() { context.renderState = 'owner-ran'; });
+                context.registerChromeView('main', {
+                    render: function() { return { type: 'span', children: [context.renderState] }; }
+                });
+            }
+            "#,
+        )?;
+        let (other, _) = load_io_probe(
+            &root,
+            "other",
+            100.0,
+            r#"
+            function activate(context) {
+                context.renderState = 'idle';
+                context.commands.register('dupe', function() { context.renderState = 'other-ran'; });
+                context.registerChromeView('main', {
+                    render: function() { return { type: 'span', children: [context.renderState] }; }
+                });
+            }
+            "#,
+        )?;
+        // Note: `other` first, so index 0 is the non-owner.
+        let mut live_extensions = vec![other, owner];
+
+        assert_eq!(
+            execute_for_owner(&mut live_extensions, Some("ghost"), "dupe", ""),
+            0,
+            "an unknown owner must run nothing"
+        );
+        assert_eq!(
+            execute_for_owner(&mut live_extensions, Some("owner"), "dupe", ""),
+            1,
+            "the resolved owner must run exactly once"
+        );
+        assert!(
+            live_extensions[0]
+                .live
+                .render_now()?
+                .is_some_and(|vdom| vdom.contains("idle")),
+            "the non-owner must not have run"
+        );
+        assert!(
+            live_extensions[1]
+                .live
+                .render_now()?
+                .is_some_and(|vdom| vdom.contains("owner-ran")),
+            "the owner must have run"
+        );
+
+        live_extensions[1].suspended = true;
+        assert_eq!(
+            execute_for_owner(&mut live_extensions, Some("owner"), "dupe", ""),
+            0,
+            "a suspended owner must not run, and nobody else may run instead"
+        );
+        assert_eq!(
+            execute_for_owner(&mut live_extensions, Some("other"), "unregistered", ""),
+            0,
+            "a command the owner never registered must be dropped"
         );
 
         std::fs::remove_dir_all(root)?;
