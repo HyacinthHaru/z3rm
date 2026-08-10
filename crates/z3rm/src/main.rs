@@ -188,7 +188,7 @@ fn new_mux_pane_view(
         cx,
     );
     if let Some(host) = cx.try_global::<quickjs_extensions::GlobalHostController>() {
-        view.set_extension_shortcut_resolver(Some(host.read(cx).extension_shortcut_resolver()));
+        view.set_extension_shortcut_resolver(Some(host.0.read(cx).extension_shortcut_resolver()));
     }
     view
 }
@@ -218,7 +218,7 @@ fn route_extension_action(action_id: &str, cx: &mut App) {
         tracing::debug!(action_id, "extension host absent; extension action dropped");
         return;
     };
-    host.read(cx).execute_command(action_id, "");
+    host.0.read(cx).execute_command(action_id, "");
 }
 
 fn apply_mux_layout_to_workspace(
@@ -1474,6 +1474,8 @@ fn main() {
         language_selector::init(cx);
         keymap_editor::init(cx);
         line_ending_selector::init(cx);
+        go_to_line::init(cx);
+        encoding_selector::init(cx);
         git_hosting_providers::init(cx);
         git_ui::init(cx);
         recent_projects::init(cx);
@@ -1551,8 +1553,6 @@ fn main() {
             });
 
             // §3.8/§15.12 Start daemon connection watcher for automatic
-        go_to_line::init(cx);
-        encoding_selector::init(cx);
             // authoritative reconnect. Pass the active session_id so the
             // watcher can reattach and broadcast a synthetic layout
             // notification after the swap.

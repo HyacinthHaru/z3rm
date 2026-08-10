@@ -2713,56 +2713,48 @@ mod tests {
 
     /// §5.6: host calls rejected by the manifest's `io_rate_limit` set the
     /// runtime's persistent violation flag even when the extension's JS
-    /// catches the exceptions; the daemon-side supervisor must consume the
-    /// flag and suspend the extension for the daemon's lifetime.
-    #[test]
-    fn io_rate_limit_rejection_suspends_server_extension() -> Result<()> {
+    /// catches the exceptions; the daemon-side supervisor must suspend the
+    /// extension and publish a notice naming the reason.
+    #[tokio::test]
+    async fn io_rate_limit_rejection_suspends_server_extension() -> Result<()> {
         let temp = tempfile::tempdir()?;
-        let extensions_dir = temp.path().join("extensions");
-        let extension_dir = extensions_dir.join("io-limit");
-        std::fs::create_dir_all(&extension_dir)?;
-        std::fs::write(
-            extension_dir.join("extension.toml"),
-            "id = \"io-limit\"\nname = \"io-limit\"\nversion = \"0.1.0\"\n\n[runtime]\nside = \"server\"\n\n[capabilities]\nmux = true\n\n[resources]\nio_rate_limit = 2\n",
-        )?;
-        std::fs::write(
-            extension_dir.join("main.js"),
-            r#"
+        let (sessions, mut subscriber) = sessions_with_subscriber();
+        let host = ServerExtensionHost::start(sessions, temp.path().join("extensions"));
+        let manifest_text = "id = \"io-limit\"\nname = \"io-limit\"\nversion = \"0.1.0\"\n\n[runtime]\nside = \"server\"\n\n[capabilities]\nmux = true\n\n[resources]\nio_rate_limit = 2\n";
+        let main_js = r#"
             export function activate(context) {
                 for (var i = 0; i < 8; i++) {
                     try { context.mux.listSessions(); } catch (error) {}
                 }
             }
-            "#,
-        )?;
-
-        let (sessions, _rx) = sessions_with_subscriber();
-        let discovered = quickjs_runtime::discover_server_extensions(std::slice::from_ref(
-            &extensions_dir,
-        ));
-        assert_eq!(discovered.len(), 1, "the server-side probe must be discovered");
+        "#;
+        let request = mux_protocol::InstallExtensionRequest {
+            name: "io-limit".to_string(),
+            manifest: manifest_text.as_bytes().to_vec(),
+            source: pack_archive(&[
+                ("extension.toml", manifest_text),
+                ("main.js", main_js),
+            ]),
+        };
         // §5.6: activation requires an explicit approval for the exact policy
-        // fingerprint; the probe's IO budget test needs it activated.
-        let mut consent = BTreeMap::new();
-        consent.insert(
-            "io-limit".to_string(),
-            ServerConsentRecord {
-                id: "io-limit".to_string(),
-                policy_fingerprint: discovered[0].manifest.policy_fingerprint(),
-                state: ServerConsentState::Approved,
-            },
-        );
-        let mut hosted = activate_discovered(discovered, &consent, sessions);
-        assert_eq!(hosted.len(), 1);
-        assert!(
-            !hosted[0].suspended,
-            "activation must succeed: the JS caught the IO rejections"
-        );
+        // fingerprint; the probe's IO budget test needs it installed.
+        let manifest = quickjs_runtime::parse_manifest_str("io-limit", manifest_text)?;
+        host.set_consent(&manifest, true)?;
+        host.install_extension(&request).await?;
 
-        hosted[0].note_resource_violations();
+        // The worker detects the IO violation during activation (the flag is
+        // set in Rust and survives JS try/catch) and reports Suspended; the
+        // daemon publishes the suspension notice instead of the extension's
+        // chrome.
+        let update = recv_chrome_for(&mut subscriber, "io-limit").await;
+        assert_eq!(
+            update.view_id, "z3rm.suspended",
+            "suspension must surface as the daemon notice view"
+        );
+        let payload = String::from_utf8(update.vdom_payload).unwrap();
         assert!(
-            hosted[0].suspended,
-            "IO quota rejection must suspend the server extension"
+            payload.contains("suspended") && payload.contains("io rate limit"),
+            "notice payload: {payload}"
         );
         Ok(())
     }

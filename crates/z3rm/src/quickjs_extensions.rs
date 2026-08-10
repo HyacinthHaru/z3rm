@@ -27,6 +27,7 @@ use extension_host::vdom_bridge::{self, CommandInvocation, VDomChild, VDomNode};
 use futures::{AsyncReadExt as _, StreamExt as _};
 use http_client::HttpClient as _;
 use reqwest_client::ReqwestClient;
+use gpui::{AppContext as _, Global, Keystroke, SharedString};
 use parking_lot::Mutex;
 use quickjs_runtime::{
     DiscoveredExtension, ExtensionCapabilities, ExtensionRunResult, ExtensionRunner,
@@ -1764,10 +1765,16 @@ impl ExtensionHostController {
                                 let existing = live_extensions.len();
                                 live_extensions.extend(activate_extensions(approved));
                                 // A bridge installed before the approval must
-                                // reach the newly activated extensions too.
-                                if let Some(bridge) = &installed_bridge {
+                                // reach the newly activated extensions too,
+                                // each built with its own declared scope.
+                                if let Some((domain, state)) = &installed_mux {
                                     for hosted in &live_extensions[existing..] {
-                                        if let Err(error) = hosted.live.install_bridge(bridge.clone()) {
+                                        let bridge: Arc<dyn HostBridge> = Arc::new(MuxHostBridge::new(
+                                            domain.clone(),
+                                            state.clone(),
+                                            hosted.live.capabilities().filesystem,
+                                        ));
+                                        if let Err(error) = hosted.live.install_bridge(bridge) {
                                             tracing::warn!(id = %hosted.live.id(), %error, "installing mux bridge into approved extension failed");
                                         }
                                     }
@@ -2144,10 +2151,14 @@ impl ExtensionHostController {
                 state.lock().session_name = Some(session.name.clone());
             }
 
-            let bridge: Arc<dyn HostBridge> =
-                Arc::new(MuxHostBridge::new(domain.clone(), state.clone()));
+            // §5.6 The bridge is built per extension with its declared
+            // filesystem scope, so the host thread receives the connection
+            // parts and constructs one scoped bridge per extension.
             if let Err(error) = this.read_with(cx, |this, _| {
-                this.send(HostCommand::InstallBridge(bridge));
+                this.send(HostCommand::InstallBridge {
+                    domain: domain.clone(),
+                    state: state.clone(),
+                });
             }) {
                 tracing::debug!(%error, "extension controller dropped before the mux bridge was installed");
                 return;
@@ -2338,14 +2349,17 @@ impl ExtensionHostController {
             command: command.to_string(),
             arguments: arguments.to_string(),
         };
+        let extension_id = extension_id.to_string();
+        let command = command.to_string();
         cx.background_executor().spawn(async move {
             match domain
-                .send_request(mux_protocol::RequestBody::ExtensionChromeAction(request))
+                .send_request(mux_protocol::request::Body::ExtensionChromeAction(request))
                 .await
             {
                 Ok(response) => {
-                    if let Some(mux_protocol::ResponseBody::ExtensionChromeActionResult(result)) =
-                        response.body
+                    if let Some(
+                        mux_protocol::response::Body::ExtensionChromeActionResult(result),
+                    ) = response.body
                         && !result.accepted
                     {
                         tracing::warn!(
