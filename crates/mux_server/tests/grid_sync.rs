@@ -325,7 +325,8 @@ fn snapshot_and_scrollback_share_one_authoritative_grid() {
         "middle"
     );
 
-    let (history, total) = fetch_scrollback_from_term(&term, 0, 1, 10);
+    let (history, total) =
+        fetch_scrollback_from_term(&term, 0, 1, 10).expect("fetch authoritative scrollback");
     assert_eq!(total, 1);
     assert_eq!(history.len(), 1);
     assert_eq!(history[0].row, 0);

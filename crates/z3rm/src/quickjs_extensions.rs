@@ -146,7 +146,12 @@ fn merge_chrome_nodes(
     server_nodes: &BTreeMap<(String, String), VDomNode>,
 ) -> Vec<VDomNode> {
     let mut merged = Vec::with_capacity(local_nodes.len() + server_nodes.len());
-    merged.extend(local_nodes.iter().cloned());
+    for node in local_nodes {
+        let mut node = node.clone();
+        // Local extensions are never trusted to name a server extension/view.
+        vdom_bridge::strip_server_origin(&mut node);
+        merged.push(node);
+    }
     merged.extend(server_nodes.values().cloned());
     merged
 }
@@ -291,9 +296,18 @@ impl MuxHostBridge {
     }
 
     fn run<T>(&self, future: impl Future<Output = Result<T>>) -> Result<T> {
-        smol::block_on(smol::future::or(future, async {
-            smol::Timer::after(MUX_CALL_TIMEOUT).await;
-            Err(anyhow!("mux call timed out after {MUX_CALL_TIMEOUT:?}"))
+        self.run_for(future, MUX_CALL_TIMEOUT, "mux call")
+    }
+
+    fn run_for<T>(
+        &self,
+        future: impl Future<Output = Result<T>>,
+        timeout: Duration,
+        operation: &'static str,
+    ) -> Result<T> {
+        smol::block_on(smol::future::or(future, async move {
+            smol::Timer::after(timeout).await;
+            Err(anyhow!("{operation} timed out after {timeout:?}"))
         }))
     }
 }
@@ -530,7 +544,18 @@ impl HostBridge for MuxHostBridge {
             }
             "network.fetch" => {
                 let url = required_string(args, 0, method)?;
+                if url.len() > quickjs_runtime::MAX_EXTENSION_URL_LEN {
+                    bail!(
+                        "network URL exceeds {} bytes",
+                        quickjs_runtime::MAX_EXTENSION_URL_LEN
+                    );
+                }
                 let options = args.get(1).cloned().unwrap_or_else(|| serde_json::json!({}));
+                let timeout = quickjs_runtime::parse_extension_timeout(
+                    &options,
+                    quickjs_runtime::EXTENSION_FETCH_TIMEOUT,
+                    quickjs_runtime::EXTENSION_FETCH_TIMEOUT_MAX_MS,
+                )?;
                 let method_name = options
                     .get("method")
                     .and_then(serde_json::Value::as_str)
@@ -553,7 +578,11 @@ impl HostBridge for MuxHostBridge {
                     .body(http_client::AsyncBody::from(body))
                     .context("building network request")?;
                 let client = ReqwestClient::new();
-                let response = self.run(client.send(request))?;
+                let response = self.run_for(
+                    async { client.send(request).await.map_err(anyhow::Error::from) },
+                    timeout,
+                    "network.fetch",
+                )?;
                 let (parts, body) = response.into_parts();
                 let headers = parts
                     .headers
@@ -565,15 +594,19 @@ impl HostBridge for MuxHostBridge {
                         ))
                     })
                     .collect::<serde_json::Map<_, _>>();
-                let response_body = self.run(async move {
-                    let mut bytes = Vec::new();
-                    let mut body = body;
-                    body.read_to_end(&mut bytes).await.map_err(anyhow::Error::from)?;
-                    if bytes.len() > quickjs_runtime::MAX_EXTENSION_FILE_READ as usize {
-                        bail!("network response exceeds {} bytes", quickjs_runtime::MAX_EXTENSION_FILE_READ);
-                    }
-                    Ok::<_, anyhow::Error>(bytes)
-                })?;
+                let response_body = self.run_for(
+                    async move {
+                        let mut bytes = Vec::new();
+                        let mut body = body.take(quickjs_runtime::MAX_EXTENSION_FILE_READ + 1);
+                        body.read_to_end(&mut bytes).await.map_err(anyhow::Error::from)?;
+                        if bytes.len() > quickjs_runtime::MAX_EXTENSION_FILE_READ as usize {
+                            bail!("network response exceeds {} bytes", quickjs_runtime::MAX_EXTENSION_FILE_READ);
+                        }
+                        Ok::<_, anyhow::Error>(bytes)
+                    },
+                    timeout,
+                    "network.fetch response body",
+                )?;
                 Ok(serde_json::json!({
                     "status": parts.status.as_u16(),
                     "headers": headers,
@@ -598,15 +631,13 @@ impl HostBridge for MuxHostBridge {
                     })
                     .transpose()?
                     .unwrap_or_default();
-                let output = std::process::Command::new(&command)
-                    .args(&arguments)
-                    .output()
-                    .with_context(|| format!("spawning process {command}"))?;
-                if output.stdout.len() + output.stderr.len()
-                    > quickjs_runtime::MAX_EXTENSION_FILE_READ as usize
-                {
-                    bail!("process output exceeds {} bytes", quickjs_runtime::MAX_EXTENSION_FILE_READ);
-                }
+                let options = args.get(2).cloned().unwrap_or_else(|| serde_json::json!({}));
+                let timeout = quickjs_runtime::parse_extension_timeout(
+                    &options,
+                    quickjs_runtime::EXTENSION_PROCESS_TIMEOUT,
+                    quickjs_runtime::EXTENSION_PROCESS_TIMEOUT_MAX_MS,
+                )?;
+                let output = quickjs_runtime::run_extension_process(&command, &arguments, timeout)?;
                 Ok(serde_json::json!({
                     "status": output.status.code(),
                     "success": output.status.success(),
@@ -621,18 +652,23 @@ impl HostBridge for MuxHostBridge {
 
 /// §5.6 `settings` capability: dotted-path lookup into the user settings file.
 fn read_setting(key: &str) -> Result<serde_json::Value> {
+    quickjs_runtime::validate_settings_key(key)?;
     let path = paths::settings_file();
-    let text = match std::fs::read_to_string(path) {
-        Ok(text) => text,
+    let bytes = match std::fs::read(&path) {
+        Ok(bytes) => bytes,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
             return Ok(serde_json::Value::Null);
         }
-        Err(error) => {
-            return Err(error).with_context(|| format!("reading {}", path.display()));
-        }
+        Err(error) => return Err(error).with_context(|| format!("reading {}", path.display())),
     };
-    let document: serde_json::Value =
-        serde_json::from_str(&text).with_context(|| format!("parsing {}", path.display()))?;
+    if bytes.len() as u64 > quickjs_runtime::MAX_EXTENSION_SETTINGS_DOCUMENT_BYTES {
+        bail!(
+            "settings document exceeds {} bytes",
+            quickjs_runtime::MAX_EXTENSION_SETTINGS_DOCUMENT_BYTES
+        );
+    }
+    let document: serde_json::Value = serde_json::from_slice(&bytes)
+        .with_context(|| format!("parsing {}", path.display()))?;
     let mut cursor = &document;
     for segment in key.split('.') {
         match cursor.get(segment) {
@@ -642,15 +678,28 @@ fn read_setting(key: &str) -> Result<serde_json::Value> {
     }
     Ok(cursor.clone())
 }
+
 /// §5.6 `settings.set`: update one dotted JSON key atomically.
 fn write_setting(key: &str, value: serde_json::Value) -> Result<serde_json::Value> {
-    if key.trim().is_empty() || key.split('.').any(str::is_empty) {
-        bail!("settings key must be a non-empty dotted path");
+    quickjs_runtime::validate_settings_key(key)?;
+    let value_bytes = serde_json::to_vec(&value).context("serializing settings value")?;
+    if value_bytes.len() > quickjs_runtime::MAX_EXTENSION_SETTINGS_VALUE_BYTES {
+        bail!(
+            "settings value exceeds {} bytes",
+            quickjs_runtime::MAX_EXTENSION_SETTINGS_VALUE_BYTES
+        );
     }
     let path = paths::settings_file();
-    let mut document = match std::fs::read_to_string(path) {
-        Ok(text) => serde_json::from_str(&text)
-            .with_context(|| format!("parsing {}", path.display()))?,
+    let mut document = match std::fs::read(&path) {
+        Ok(bytes) => {
+            if bytes.len() as u64 > quickjs_runtime::MAX_EXTENSION_SETTINGS_DOCUMENT_BYTES {
+                bail!(
+                    "settings document exceeds {} bytes",
+                    quickjs_runtime::MAX_EXTENSION_SETTINGS_DOCUMENT_BYTES
+                );
+            }
+            serde_json::from_slice(&bytes).with_context(|| format!("parsing {}", path.display()))?
+        }
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => serde_json::json!({}),
         Err(error) => return Err(error).with_context(|| format!("reading {}", path.display())),
     };
@@ -669,6 +718,12 @@ fn write_setting(key: &str, value: serde_json::Value) -> Result<serde_json::Valu
     *cursor = value.clone();
 
     let encoded = serde_json::to_vec_pretty(&document).context("serializing settings")?;
+    if encoded.len() > quickjs_runtime::MAX_EXTENSION_SETTINGS_DOCUMENT_BYTES as usize {
+        bail!(
+            "settings document exceeds {} bytes",
+            quickjs_runtime::MAX_EXTENSION_SETTINGS_DOCUMENT_BYTES
+        );
+    }
     let parent = path.parent().context("settings path has no parent")?;
     std::fs::create_dir_all(parent)
         .with_context(|| format!("creating settings directory {}", parent.display()))?;
@@ -785,13 +840,17 @@ fn notification_events(
             )]
         }
         Event::SessionLayoutChanged(changed) => {
-            let layout = changed
-                .layout
-                .as_ref()
-                .and_then(|tree| tree.root.as_ref())
-                .map(layout_node_json)
-                .unwrap_or(serde_json::Value::Null);
-            vec![("session:layout".into(), layout)]
+            if let Some(snapshot) = &changed.snapshot {
+                hydration_events(snapshot, state)
+            } else {
+                let layout = changed
+                    .layout
+                    .as_ref()
+                    .and_then(|tree| tree.root.as_ref())
+                    .map(layout_node_json)
+                    .unwrap_or(serde_json::Value::Null);
+                vec![("session:layout".into(), layout)]
+            }
         }
         Event::PaneAdded(added) => {
             state
@@ -817,6 +876,75 @@ fn notification_events(
         }
         _ => Vec::new(),
     }
+}
+/// Expand an authoritative attach/reconnect snapshot into the same event
+/// vocabulary used by incremental notifications. The state map is populated
+/// before focus payloads are built, so focused titles and tab membership are
+/// available even when no incremental event preceded the snapshot.
+fn hydration_events(
+    snapshot: &mux_protocol::SessionSnapshot,
+    state: &Mutex<MuxBridgeState>,
+) -> Vec<(String, serde_json::Value)> {
+    let mut state = state.lock();
+    let focused_pane = (!snapshot.focused_pane_id.is_empty())
+        .then(|| snapshot.focused_pane_id.clone());
+    let focus_changed = state.focused_pane != focused_pane;
+    state.focused_pane = focused_pane;
+    state.pane_tabs.clear();
+    state.pane_titles.clear();
+    for tab in &snapshot.tabs {
+        for pane in &tab.panes {
+            state.pane_tabs.insert(pane.id.clone(), tab.id.clone());
+            state.pane_titles.insert(pane.id.clone(), pane.title.clone());
+        }
+    }
+
+    let mut events = vec![(
+        "session:layout".to_string(),
+        snapshot
+            .layout
+            .as_ref()
+            .and_then(|tree| tree.root.as_ref())
+            .map(layout_node_json)
+            .unwrap_or(serde_json::Value::Null),
+    )];
+    for tab in &snapshot.tabs {
+        let first_pane = tab.panes.first().map(|pane| pane.id.clone());
+        events.push((
+            "tab:title".to_string(),
+            serde_json::json!({
+                "tabId": tab.id,
+                "title": tab.title,
+                "paneId": first_pane,
+                "active": snapshot.focused_tab_id == tab.id,
+            }),
+        ));
+        for pane in &tab.panes {
+            events.push((
+                "pane:added".to_string(),
+                serde_json::json!({ "paneId": pane.id, "tabId": tab.id }),
+            ));
+            events.push((
+                "pane:title".to_string(),
+                serde_json::json!({ "paneId": pane.id, "title": pane.title }),
+            ));
+        }
+    }
+    if focus_changed {
+        if let Some(pane_id) = state.focused_pane.clone() {
+            events.push((
+                "pane:focus".to_string(),
+                serde_json::json!({
+                    "paneId": pane_id,
+                    "id": pane_id,
+                    "title": state.pane_titles.get(&pane_id).cloned().unwrap_or_default(),
+                    "tabId": state.pane_tabs.get(&pane_id).cloned(),
+                    "sessionName": state.session_name.clone().unwrap_or_default(),
+                }),
+            ));
+        }
+    }
+    events
 }
 
 // ---------------------------------------------------------------------------
@@ -2164,52 +2292,26 @@ impl ExtensionHostController {
                 return;
             }
             if let Some(snapshot) = domain.last_attached_snapshot() {
-                {
-                    let mut bridge_state = state.lock();
-                    for tab in &snapshot.tabs {
-                        for pane in &tab.panes {
-                            bridge_state
-                                .pane_tabs
-                                .insert(pane.id.clone(), tab.id.clone());
-                            bridge_state
-                                .pane_titles
-                                .insert(pane.id.clone(), pane.title.clone());
-                        }
-                    }
-                    if !snapshot.focused_pane_id.is_empty() {
-                        bridge_state.focused_pane = Some(snapshot.focused_pane_id.clone());
-                    }
-                }
-
-                if !snapshot.focused_pane_id.is_empty() {
-                    let hydration = mux_protocol::Notification {
-                        event: Some(mux_protocol::notification::Event::PaneFocused(
-                            mux_protocol::PaneFocused {
-                                pane_id: snapshot.focused_pane_id,
-                            },
-                        )),
-                    };
-                    for (event, payload) in notification_events(&hydration, &state) {
-                        let payload = match serde_json::to_string(&payload) {
-                            Ok(payload) => payload,
-                            Err(error) => {
-                                tracing::warn!(
-                                    %event,
-                                    %error,
-                                    "serializing initial extension focus failed"
-                                );
-                                continue;
-                            }
-                        };
-                        if let Err(error) =
-                            this.read_with(cx, |this, _| this.emit_event(&event, &payload))
-                        {
-                            tracing::debug!(
+                for (event, payload) in hydration_events(&snapshot, &state) {
+                    let payload = match serde_json::to_string(&payload) {
+                        Ok(payload) => payload,
+                        Err(error) => {
+                            tracing::warn!(
+                                %event,
                                 %error,
-                                "extension host dropped before initial focus hydration"
+                                "serializing initial extension hydration failed"
                             );
-                            return;
+                            continue;
                         }
+                    };
+                    if let Err(error) =
+                        this.read_with(cx, |this, _| this.emit_event(&event, &payload))
+                    {
+                        tracing::debug!(
+                            %error,
+                            "extension host dropped before initial mux hydration"
+                        );
+                        return;
                     }
                 }
             }
@@ -2351,35 +2453,37 @@ impl ExtensionHostController {
         };
         let extension_id = extension_id.to_string();
         let command = command.to_string();
-        cx.background_executor().spawn(async move {
-            match domain
-                .send_request(mux_protocol::request::Body::ExtensionChromeAction(request))
-                .await
-            {
-                Ok(response) => {
-                    if let Some(
-                        mux_protocol::response::Body::ExtensionChromeActionResult(result),
-                    ) = response.body
-                        && !result.accepted
-                    {
+        cx.background_executor()
+            .spawn(async move {
+                match domain
+                    .send_request(mux_protocol::request::Body::ExtensionChromeAction(request))
+                    .await
+                {
+                    Ok(response) => {
+                        if let Some(
+                            mux_protocol::response::Body::ExtensionChromeActionResult(result),
+                        ) = response.body
+                            && !result.accepted
+                        {
+                            tracing::warn!(
+                                extension_id,
+                                %command,
+                                error = %result.error,
+                                "server chrome action rejected by the daemon"
+                            );
+                        }
+                    }
+                    Err(error) => {
                         tracing::warn!(
+                            %error,
                             extension_id,
                             %command,
-                            error = %result.error,
-                            "server chrome action rejected by the daemon"
+                            "server chrome action transport failed"
                         );
                     }
                 }
-                Err(error) => {
-                    tracing::warn!(
-                        %error,
-                        extension_id,
-                        %command,
-                        "server chrome action transport failed"
-                    );
-                }
-            }
-        });
+            })
+            .detach();
     }
 
     fn send(&self, command: HostCommand) {
@@ -3733,7 +3837,8 @@ mod tests {
             .iter()
             .find(|extension| extension.manifest.id == "probe")
             .expect("probe discovered");
-        let record = load_consent_records(&consent_file)
+        let records = load_consent_records(&consent_file);
+        let record = records
             .get("probe")
             .expect("approval must persist a consent record");
         assert_eq!(
@@ -3826,7 +3931,8 @@ mod tests {
                 host.read(cx).pending_approvals().is_empty(),
                 "denying removes the approval"
             );
-            let record = load_consent_records(&consent_file)
+            let records = load_consent_records(&consent_file);
+            let record = records
                 .get("probe")
                 .expect("denial must persist a consent record");
             assert_eq!(
@@ -4025,7 +4131,7 @@ mod tests {
         });
         // Give the host thread a beat; nothing must activate.
         wait_for(cx, "no activation occurs", |cx| {
-            cx.read(|cx| !chrome_text(cx, &host).contains("probe-chrome"))
+            !chrome_text(cx, &host).contains("probe-chrome")
         });
         assert!(
             !chrome_text(cx, &host).contains("probe-chrome"),
@@ -4174,8 +4280,8 @@ mod tests {
             ),
         )?;
         std::fs::write(directory.join("main.js"), main_js)?;
-        let discovered =
-            quickjs_runtime::discover_client_extensions(std::slice::from_ref(root));
+        let roots = [root.to_path_buf()];
+        let discovered = quickjs_runtime::discover_client_extensions(&roots);
         let extension = discovered
             .iter()
             .find(|extension| extension.manifest.id == id)

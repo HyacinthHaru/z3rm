@@ -10,7 +10,9 @@
 //! (spec §5.4)，由嵌入方 (z3rm) 实现真实的 mux/settings/terminal 调用。
 
 use std::collections::BTreeMap;
+use std::io::Read as _;
 use std::path::{Path, PathBuf};
+use std::process;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::thread;
@@ -46,6 +48,39 @@ const IO_TOKEN_BUCKET_BURST_FACTOR: f64 = 2.0;
 pub const MAX_EXTENSION_FILE_READ: u64 = 1024 * 1024;
 /// `filesystem.readDir` 单目录条目上限: 防止恶意目录撑爆宿主。
 pub const MAX_EXTENSION_DIR_ENTRIES: usize = 1000;
+
+/// §5.6 `settings.*` 键上限: 点分路径总字节数。
+pub const MAX_EXTENSION_SETTINGS_KEY_LEN: usize = 256;
+/// §5.6 `settings.*` 键段数上限。
+pub const MAX_EXTENSION_SETTINGS_SEGMENTS: usize = 32;
+/// §5.6 `settings.set` 单个值的序列化大小上限: 拒绝把巨型值写进用户设置。
+pub const MAX_EXTENSION_SETTINGS_VALUE_BYTES: usize = 64 * 1024;
+/// §5.6 settings 文档读写大小上限: 超限文件在读取前就被拒绝, 不做无界分配。
+pub const MAX_EXTENSION_SETTINGS_DOCUMENT_BYTES: u64 = 1024 * 1024;
+
+/// §5.6 `network.fetch` URL 总长上限。
+pub const MAX_EXTENSION_URL_LEN: usize = 8192;
+/// §5.6 `network.fetch` 默认超时 (覆盖整个请求 + 响应体读取)。
+pub const EXTENSION_FETCH_TIMEOUT: Duration = Duration::from_secs(10);
+/// §5.6 `network.fetch` 超时上限 (毫秒): 扩展传入的 `options.timeout` 封顶于此。
+pub const EXTENSION_FETCH_TIMEOUT_MAX_MS: u64 = 30_000;
+
+/// §5.6 `process.spawn` 命令长度上限 (命令必须是裸名称, 见
+/// [`run_extension_process`])。
+pub const MAX_EXTENSION_COMMAND_LEN: usize = 256;
+/// §5.6 `process.spawn` 参数个数上限。
+pub const MAX_EXTENSION_ARGUMENTS: usize = 128;
+/// §5.6 `process.spawn` 单个参数长度上限。
+pub const MAX_EXTENSION_ARG_LEN: usize = 4096;
+/// §5.6 `process.spawn` 默认超时; 超时后子进程被杀死 (kill) 并报错。
+pub const EXTENSION_PROCESS_TIMEOUT: Duration = Duration::from_secs(10);
+/// §5.6 `process.spawn` 超时上限 (毫秒): 扩展传入的 `options.timeout` 封顶于此。
+pub const EXTENSION_PROCESS_TIMEOUT_MAX_MS: u64 = 30_000;
+
+/// §5.6 单扩展可注册的 chrome 视图数上限。JS bootstrap 的
+/// `registerChromeView` 用它 fail closed——超限视图注册直接抛异常,
+/// 一个失控扩展无法让宿主无界累积视图。
+pub const MAX_EXTENSION_VIEWS: usize = 32;
 
 /// 环境变量：覆盖内置扩展搜索路径 (平台 PATH 分隔符分隔多个目录)。
 pub const BUILTIN_EXTENSIONS_ENV: &str = "Z3RM_EXTENSIONS_DIR";
@@ -391,6 +426,152 @@ pub fn confine_to_root(root: &Path, path: &str) -> Result<PathBuf> {
         bail!("path escapes the declared filesystem scope: {path}");
     }
     Ok(canonical)
+}
+
+/// §5.6 `settings.*` 键安全校验 (客户端与服务器桥共用): 非空点分路径、无空段、
+/// 总长与段数受限。两套桥共用同一入口, 防止校验逻辑漂移。
+pub fn validate_settings_key(key: &str) -> Result<()> {
+    if key.trim().is_empty() || key.split('.').any(str::is_empty) {
+        bail!("settings key must be a non-empty dotted path");
+    }
+    if key.len() > MAX_EXTENSION_SETTINGS_KEY_LEN {
+        bail!("settings key exceeds {MAX_EXTENSION_SETTINGS_KEY_LEN} bytes");
+    }
+    if key.split('.').count() > MAX_EXTENSION_SETTINGS_SEGMENTS {
+        bail!("settings key exceeds {MAX_EXTENSION_SETTINGS_SEGMENTS} segments");
+    }
+    Ok(())
+}
+
+/// §5.6 解析宿主调用选项里的超时 (毫秒): 必须为正整数, 封顶 `max_ms`;
+/// 缺省返回 `default`。`network.fetch` 与 `process.spawn` 共用, 保证两端
+/// 行为一致; 0 或负数按 fail closed 拒绝 (不提供「无超时」逃生口)。
+pub fn parse_extension_timeout(
+    options: &serde_json::Value,
+    default: Duration,
+    max_ms: u64,
+) -> Result<Duration> {
+    match options.get("timeout") {
+        None => Ok(default),
+        Some(serde_json::Value::Number(number)) => match number.as_u64() {
+            Some(ms) if ms > 0 => Ok(Duration::from_millis(ms.min(max_ms))),
+            _ => bail!("timeout must be a positive number of milliseconds"),
+        },
+        Some(_) => bail!("timeout must be a number of milliseconds"),
+    }
+}
+
+/// §5.6 `process.spawn` 有界执行 (客户端与服务器桥共用): 命令/参数受限,
+/// 超时杀死子进程并报错, 输出总量有界 (读入时截断到上限 + 1 字节再判定)。
+///
+/// 命令必须是裸名称 (不含路径分隔符), 经 PATH 解析——fail closed 拒绝
+/// 任意绝对路径/相对路径执行, 与 `validate_extension_id` 的目录名规则同源。
+/// stdout/stderr 在子进程运行期间由独立线程持续排空；否则子进程写满
+/// OS pipe 后会在退出前阻塞，而宿主的轮询永远看不到退出状态。
+pub fn run_extension_process(
+    command: &str,
+    arguments: &[String],
+    timeout: Duration,
+) -> Result<process::Output> {
+    if command.trim().is_empty() {
+        bail!("process command must be a non-empty name");
+    }
+    if command.len() > MAX_EXTENSION_COMMAND_LEN {
+        bail!("process command exceeds {MAX_EXTENSION_COMMAND_LEN} bytes");
+    }
+    if command.contains('/') || command.contains('\\') {
+        bail!("process command must be a bare name without path separators");
+    }
+    if arguments.len() > MAX_EXTENSION_ARGUMENTS {
+        bail!("process arguments exceed {MAX_EXTENSION_ARGUMENTS} entries");
+    }
+    let mut argument_bytes = 0usize;
+    for argument in arguments {
+        if argument.len() > MAX_EXTENSION_ARG_LEN {
+            bail!("process argument exceeds {MAX_EXTENSION_ARG_LEN} bytes");
+        }
+        argument_bytes = argument_bytes.saturating_add(argument.len());
+    }
+    if argument_bytes > MAX_EXTENSION_ARG_LEN * MAX_EXTENSION_ARGUMENTS {
+        bail!("process arguments exceed the aggregate byte limit");
+    }
+
+    let mut child = process::Command::new(command)
+        .args(arguments)
+        .stdout(process::Stdio::piped())
+        .stderr(process::Stdio::piped())
+        .spawn()
+        .with_context(|| format!("spawning process {command}"))?;
+
+    let output_limit = MAX_EXTENSION_FILE_READ as usize;
+    let stdout_reader = child.stdout.take().map(|mut output| {
+        thread::spawn(move || {
+            let mut bytes = Vec::new();
+            output
+                .take(output_limit as u64 + 1)
+                .read_to_end(&mut bytes)
+                .context("reading process stdout")?;
+            Ok(bytes)
+        })
+    });
+    let stderr_reader = child.stderr.take().map(|mut output| {
+        thread::spawn(move || {
+            let mut bytes = Vec::new();
+            output
+                .take(output_limit as u64 + 1)
+                .read_to_end(&mut bytes)
+                .context("reading process stderr")?;
+            Ok(bytes)
+        })
+    });
+
+    let join_pipe = |reader: Option<std::thread::JoinHandle<Result<Vec<u8>>>>,
+                     stream: &'static str|
+     -> Result<Vec<u8>> {
+        Ok(reader
+            .map(|reader| {
+                reader
+                    .join()
+                    .map_err(|_| anyhow!("process {stream} reader thread panicked"))?
+            })
+            .transpose()
+            .map(|bytes| bytes.unwrap_or_default())?)
+    };
+
+    let deadline = Instant::now() + timeout;
+    loop {
+        match child.try_wait() {
+            Ok(Some(status)) => {
+                let stdout = join_pipe(stdout_reader, "stdout")?;
+                let stderr = join_pipe(stderr_reader, "stderr")?;
+                if stdout.len().saturating_add(stderr.len()) > output_limit {
+                    bail!("process output exceeds {output_limit} bytes");
+                }
+                return Ok(process::Output {
+                    status,
+                    stdout,
+                    stderr,
+                });
+            }
+            Ok(None) => {
+                if Instant::now() >= deadline {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    let _ = join_pipe(stdout_reader, "stdout");
+                    let _ = join_pipe(stderr_reader, "stderr");
+                    bail!("process `{command}` exceeded the {timeout:?} timeout and was killed");
+                }
+                thread::sleep(Duration::from_millis(5));
+            }
+            Err(error) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                let _ = join_pipe(stdout_reader, "stdout");
+                let _ = join_pipe(stderr_reader, "stderr");
+                return Err(error).with_context(|| format!("waiting for process {command}"));
+            }
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -858,6 +1039,7 @@ fn install_host_call(
 const CONTEXT_BOOTSTRAP_JS: &str = r#"
 (function() {
     var capabilities = __Z3RM_CAPABILITIES__;
+    var maxChromeViews = __Z3RM_MAX_EXTENSION_VIEWS__;
 
     globalThis.__chrome_views = {};
     globalThis.__z3rm_view_order = [];
@@ -1092,7 +1274,14 @@ const CONTEXT_BOOTSTRAP_JS: &str = r#"
         },
 
         registerChromeView: function(name, view) {
+            if (typeof name !== 'string' || name.length === 0) {
+                throw new Error('registerChromeView requires a non-empty name');
+            }
             if (!view) { throw new Error('registerChromeView requires a view: ' + name); }
+            if (!globalThis.__chrome_views[name]
+                && globalThis.__z3rm_view_order.length >= maxChromeViews) {
+                throw new Error('registerChromeView limit exceeded: ' + maxChromeViews);
+            }
             if (typeof view.invalidate !== 'function') { view.invalidate = invalidate; }
             if (!globalThis.__chrome_views[name]) { globalThis.__z3rm_view_order.push(name); }
             globalThis.__chrome_views[name] = view;
@@ -1224,9 +1413,11 @@ const CONTEXT_BOOTSTRAP_JS: &str = r#"
         },
 
         process: {
-            spawn: function(command, args) {
+            spawn: function(command, args, options) {
                 requireCapability('process_spawn');
-                return hostCall('process.spawn', [command, args]);
+                return hostCall('process.spawn', options === undefined
+                    ? [command, args]
+                    : [command, args, options]);
             }
         },
 
@@ -1306,7 +1497,9 @@ const ACTIVATE_JS: &str = r#"
 fn bootstrap_source(capabilities: ExtensionCapabilities) -> Result<String> {
     let capabilities_json = serde_json::to_string(&capabilities.to_json())
         .context("serializing extension capabilities")?;
-    Ok(CONTEXT_BOOTSTRAP_JS.replace("__Z3RM_CAPABILITIES__", &capabilities_json))
+    Ok(CONTEXT_BOOTSTRAP_JS
+        .replace("__Z3RM_CAPABILITIES__", &capabilities_json)
+        .replace("__Z3RM_MAX_EXTENSION_VIEWS__", &MAX_EXTENSION_VIEWS.to_string()))
 }
 
 /// §5.2 QuickJS `eval` 执行的是脚本而非 ES 模块，先剥掉 `export` 关键字。
@@ -1969,14 +2162,17 @@ impl LiveExtension {
         Ok(delivered.max(0) as usize)
     }
 
-    /// §5.7 通过命令注册表执行一条命令 (VDOM 里的 onClick 描述符走这条路)。
     pub fn execute_command(&self, command_id: &str, arguments_json: &str) -> Result<bool> {
         let id = serde_json::to_string(command_id).context("serializing command id")?;
         let arguments = if arguments_json.trim().is_empty() {
             "undefined".to_string()
         } else {
-            arguments_json.to_string()
+            let value: serde_json::Value = serde_json::from_str(arguments_json)
+                .context("parsing chrome command arguments")?;
+            serde_json::to_string(&value).context("serializing chrome command arguments")?
         };
+        // Parse/re-serialize before embedding: `arguments_json` can originate
+        // in an ExtensionChromeAction request and must never be treated as JS.
         let snippet = format!("globalThis.__z3rm_execute_command({id}, {arguments})");
         self.run_js(|ctx| eval_checked(ctx, &snippet))
     }
@@ -2107,6 +2303,46 @@ mod tests {
         let result: i32 = ctx.with(|ctx| ctx.eval("1 + 2"))?;
         assert_eq!(result, 3);
         Ok(())
+    }
+
+    #[test]
+    fn extension_settings_keys_and_timeouts_fail_closed() {
+        assert!(validate_settings_key("terminal.theme").is_ok());
+        assert!(validate_settings_key("").is_err());
+        assert!(validate_settings_key("terminal..theme").is_err());
+        let too_many_segments = std::iter::repeat_n("x", MAX_EXTENSION_SETTINGS_SEGMENTS + 1)
+            .collect::<Vec<_>>()
+            .join(".");
+        assert!(validate_settings_key(&too_many_segments).is_err());
+
+        let default = Duration::from_secs(3);
+        assert_eq!(
+            parse_extension_timeout(&serde_json::json!({}), default, 1_000).unwrap(),
+            default
+        );
+        assert_eq!(
+            parse_extension_timeout(&serde_json::json!({"timeout": 2_000}), default, 1_000)
+                .unwrap(),
+            Duration::from_secs(1)
+        );
+        assert!(parse_extension_timeout(&serde_json::json!({"timeout": 0}), default, 1_000)
+            .is_err());
+        assert!(parse_extension_timeout(&serde_json::json!({"timeout": -1}), default, 1_000)
+            .is_err());
+    }
+
+    #[test]
+    fn extension_process_rejects_paths_and_bounds_execution() {
+        assert!(run_extension_process("./tool", &[], Duration::from_secs(1)).is_err());
+        assert!(run_extension_process("", &[], Duration::from_secs(1)).is_err());
+
+        let output = run_extension_process(
+            "printf",
+            &["z3rm".to_string()],
+            Duration::from_secs(1),
+        )
+        .expect("bounded process should complete");
+        assert_eq!(output.stdout, b"z3rm");
     }
 
     #[test]
@@ -2295,23 +2531,24 @@ mod tests {
         let live = runner.load_live("clock-ext", source, "activate")?;
         live.render_all_views()?;
 
-        // First refresh: the renderer method ran once and its ops came back.
+        // Initial VDOM rendering attaches the first draw list; the refresh
+        // path must invoke only renderClock and return its next tick.
         let regions = live.refresh_display_lists()?;
         assert_eq!(regions.len(), 1, "clock region must refresh: {regions:?}");
         assert_eq!(regions[0].region_id, "clock");
         assert!(
-            regions[0].ops_json.contains("\"1\""),
-            "first tick must be visible: {}",
+            regions[0].ops_json.contains("\"2\""),
+            "first refresh tick must be visible: {}",
             regions[0].ops_json
         );
 
-        // Second refresh: renderClock ticks again (ops change) while render()
+        // The second refresh increments the renderer again while render()
         // must not have re-run (the cached VDOM still holds the region).
         let regions = live.refresh_display_lists()?;
         assert_eq!(regions.len(), 1, "render() must not run on refresh: {regions:?}");
         assert!(
-            regions[0].ops_json.contains("\"2\""),
-            "second tick must be visible: {}",
+            regions[0].ops_json.contains("\"3\""),
+            "second refresh tick must be visible: {}",
             regions[0].ops_json
         );
 
@@ -2440,6 +2677,26 @@ mod tests {
             vdom.contains("\"id\":\"pinned\""),
             "named views need stable VDOM identity: {vdom}"
         );
+        Ok(())
+    }
+
+    #[test]
+    fn live_extension_rejects_excess_chrome_views() -> Result<()> {
+        let registrations = (0..=MAX_EXTENSION_VIEWS)
+            .map(|index| {
+                format!(
+                    "context.registerChromeView('view-{index}', {{ render: function() {{ return null; }} }});"
+                )
+            })
+            .collect::<String>();
+        let source = format!("function activate(context) {{ {registrations} }}");
+        let runner = ExtensionRunner::with_defaults();
+        let error = match runner.load_live("view-limit", &source, "activate") {
+            Ok(_) => bail!("the view registration limit must fail closed"),
+            Err(error) => error,
+        };
+        let message = format!("{error:#}");
+        assert!(message.contains("registerChromeView limit exceeded"), "{message}");
         Ok(())
     }
 
@@ -2630,6 +2887,23 @@ mod tests {
         );
         assert_eq!(calls[1].1, serde_json::json!(["pane-1"]));
         assert_eq!(calls[2].1, serde_json::json!(["right", "pane-1"]));
+        Ok(())
+    }
+    #[test]
+    fn execute_command_rejects_javascript_argument_injection() -> Result<()> {
+        let runner = ExtensionRunner::with_defaults();
+        let source = r#"
+            function activate(context) {
+                context.commands.register('safe', function(args) {
+                    globalThis.__safe_arg = args;
+                });
+            }
+        "#;
+        let extension = runner.load_live("command-arguments", source, "activate")?;
+        assert!(extension.execute_command("safe", r#"{"ok":true}"#)?);
+        assert!(extension
+            .execute_command("safe", r#"{}); globalThis.__injected = true; ({}"#)
+            .is_err());
         Ok(())
     }
 

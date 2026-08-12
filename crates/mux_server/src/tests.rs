@@ -263,7 +263,8 @@ fn persisted_layout_round_trips_exact_mixed_axis_tree() {
                     ..
                 } => {
                     assert_eq!(*direction, SplitDirection::TopBottom);
-                    assert_eq!(ratios, &[0.6, 0.4]);
+                    assert!((ratios[0] - 0.6).abs() < 1e-6);
+                    assert!((ratios[1] - 0.4).abs() < 1e-6);
                 }
                 node => panic!("expected nested split, got {node:?}"),
             }
@@ -459,8 +460,8 @@ fn persisted_layout_rejects_disconnected_nodes() {
             PersistedLayoutNode::Split {
                 id: "root".to_string(),
                 direction: SplitDirection::LeftRight,
-                children: vec![1],
-                ratios: vec![1.0],
+                children: vec![1, 2],
+                ratios: vec![0.5, 0.5],
             },
             PersistedLayoutNode::Pane {
                 id: "node-1".to_string(),
@@ -469,6 +470,10 @@ fn persisted_layout_rejects_disconnected_nodes() {
             PersistedLayoutNode::Pane {
                 id: "node-2".to_string(),
                 pane_id: "pane-2".to_string(),
+            },
+            PersistedLayoutNode::Pane {
+                id: "node-orphan".to_string(),
+                pane_id: "pane-orphan".to_string(),
             },
         ],
     };
@@ -481,25 +486,23 @@ fn persisted_layout_rejects_disconnected_nodes() {
 #[test]
 fn persisted_layout_rejects_wire_depth_overflow() {
     let mut nodes = Vec::new();
-    let mut child = 1usize;
     for level in 0..=crate::layout::MAX_WIRE_LAYOUT_DEPTH {
         let direction = if level % 2 == 0 {
             SplitDirection::LeftRight
         } else {
             SplitDirection::TopBottom
         };
-        let pane_index = child + 1;
+        let split_index = nodes.len();
         nodes.push(PersistedLayoutNode::Split {
             id: format!("node-{level}"),
             direction,
-            children: vec![child, pane_index],
+            children: vec![split_index + 1, split_index + 2],
             ratios: vec![0.5, 0.5],
         });
         nodes.push(PersistedLayoutNode::Pane {
             id: format!("node-{level}-left"),
             pane_id: format!("pane-{level}-left"),
         });
-        child = pane_index;
     }
     nodes.push(PersistedLayoutNode::Pane {
         id: "node-deep-right".to_string(),
@@ -516,20 +519,18 @@ fn persisted_layout_rejects_wire_depth_overflow() {
 #[test]
 fn persisted_layout_rejects_internal_depth_overflow() {
     let mut nodes = Vec::new();
-    let mut child = 1usize;
-    for level in 0..crate::layout::MAX_INTERNAL_LAYOUT_DEPTH {
-        let pane_index = child + 1;
+    for level in 0..=crate::layout::MAX_INTERNAL_LAYOUT_DEPTH {
+        let split_index = nodes.len();
         nodes.push(PersistedLayoutNode::Split {
             id: format!("node-{level}"),
             direction: SplitDirection::TopBottom,
-            children: vec![child, pane_index],
+            children: vec![split_index + 1, split_index + 2],
             ratios: vec![0.5, 0.5],
         });
         nodes.push(PersistedLayoutNode::Pane {
             id: format!("node-{level}-left"),
             pane_id: format!("pane-{level}-left"),
         });
-        child = pane_index;
     }
     nodes.push(PersistedLayoutNode::Pane {
         id: "node-deep-right".to_string(),

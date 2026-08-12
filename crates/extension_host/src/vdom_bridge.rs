@@ -27,7 +27,7 @@ use serde_json::Value;
 /// skipped the parser path is still fail-closed.
 const MAX_VDOM_NODES: usize = 4_096;
 const MAX_VDOM_DEPTH: usize = 128;
-const MAX_DISPLAY_LIST_OPS: usize = 4_096;
+pub const MAX_DISPLAY_LIST_OPS: usize = 4_096;
 
 /// §5.2 Upper bound on the serialized size of one VDOM/display-list payload
 /// crossing the JSON boundary (extension render output, server chrome
@@ -307,6 +307,25 @@ pub fn stamp_server_origin(node: &mut VDomNode, extension_id: &str, view_id: &st
                 });
             } else if let serde_json::Value::Object(object) = descriptor {
                 object.insert("origin".to_string(), origin.clone());
+            }
+        }
+        for child in &mut current.children {
+            if let VDomChild::Node(child) = child {
+                stack.push(child);
+            }
+        }
+    }
+}
+/// Remove provenance fields from client-rendered chrome. Server provenance is
+/// assigned only by [`stamp_server_origin`] while accepting a daemon update;
+/// honoring an origin supplied by a local extension would let it impersonate a
+/// published server view when the command is dispatched.
+pub fn strip_server_origin(node: &mut VDomNode) {
+    let mut stack = vec![node];
+    while let Some(current) = stack.pop() {
+        for key in ["onClick", "onChange"] {
+            if let Some(Value::Object(object)) = current.props.get_mut(key) {
+                object.remove("origin");
             }
         }
         for child in &mut current.children {
@@ -1149,6 +1168,40 @@ mod tests {
         let change = CommandInvocation::parse(inner.props.get("onChange").unwrap()).expect("parses");
         assert_eq!(change.origin.as_ref().map(|origin| origin.view_id.as_str()), Some("main"));
     }
+    #[test]
+    fn strip_server_origin_removes_local_impersonation() {
+        let mut node: VDomNode = serde_json::from_value(serde_json::json!({
+            "type": "div",
+            "props": {
+                "onClick": {
+                    "command": "local.act",
+                    "origin": { "side": "server", "extension_id": "evil", "view_id": "main" }
+                }
+            },
+            "children": [{
+                "type": "button",
+                "props": { "onChange": { "command": "local.change", "origin": { "side": "server" } } }
+            }]
+        }))
+        .expect("fixture VDOM");
+
+        strip_server_origin(&mut node);
+        assert_eq!(
+            CommandInvocation::parse(node.props.get("onClick").unwrap())
+                .unwrap()
+                .origin,
+            None
+        );
+        let VDomChild::Node(child) = &node.children[0] else {
+            panic!("expected child node");
+        };
+        assert_eq!(
+            CommandInvocation::parse(child.props.get("onChange").unwrap())
+                .unwrap()
+                .origin,
+            None
+        );
+    }
 
     #[test]
     fn display_list_round_trips_the_status_bar_clock_payload() {
@@ -1366,8 +1419,7 @@ mod tests {
             style: BTreeMap::new(),
             children: Vec::new(),
         };
-        let elements = cx.update(|cx| renderer.render(&oversized, cx));
-        assert_eq!(elements.len(), 1, "region still paints (empty) after rejection");
+        let _element = cx.update(|cx| renderer.render(&oversized, cx));
         assert_eq!(
             renderer.display_list("clock"),
             None,

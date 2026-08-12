@@ -185,9 +185,21 @@ impl Handler for HistoryMutationObserver {
         self.mark_rotation();
     }
 
-    fn clear_screen(&mut self, _: ClearMode) {}
+    fn clear_screen(&mut self, mode: ClearMode) {
+        // CSI 2J (ClearMode::All) 在主屏把整屏内容滚入历史
+        // (alacritty grid::clear_viewport), 满容量时原地轮换历史而不改变
+        // history_size; CSI 3J (ClearMode::Saved) 清空整个历史。两者都可能
+        // 在 size 不变的情况下改变历史内容, 必须标记为 rotation。
+        if matches!(mode, ClearMode::All | ClearMode::Saved) {
+            self.mark_rotation();
+        }
+    }
 
-    fn reset_state(&mut self) {}
+    fn reset_state(&mut self) {
+        // RIS 清空 grid 与整个 scrollback; history_size 归零已命中
+        // size-change 分支, 但显式标记避免任何"reset 不动历史"的错误假设。
+        self.mark_rotation();
+    }
 
     fn reverse_index(&mut self) {
         self.mark_rotation();
@@ -1116,18 +1128,38 @@ impl Pane {
         self.set_bracketed_paste_mode(active);
     }
 
+    /// §16.9 扩展导出路径 (无 typed error 通道): 越界参数按空结果 fail-closed,
+    /// 避免在扩展可控的 count 下做无界分配。RPC 路径请用 `fetch_scrollback_checked`。
     pub fn fetch_scrollback(
         &self,
         from_line: u32,
         direction: u32,
         count: u32,
     ) -> (Vec<grid_sync::RowChange>, u32, u64) {
+        match self.fetch_scrollback_checked(from_line, direction, count) {
+            Ok(result) => result,
+            Err(_) => (
+                Vec::new(),
+                0,
+                self.history_version.load(Ordering::Acquire),
+            ),
+        }
+    }
+
+    /// §16.9 RPC 路径: 在分配/序列化前严格校验 direction 与 count, 失败返回
+    /// typed 错误, 由连接层映射为 RPC error (socket 保持可用)。
+    pub fn fetch_scrollback_checked(
+        &self,
+        from_line: u32,
+        direction: u32,
+        count: u32,
+    ) -> Result<(Vec<grid_sync::RowChange>, u32, u64), grid_sync::ScrollbackError> {
         let _commit = self.commit.lock();
         let term = self.term.lock();
         let (lines, total) =
-            grid_sync::fetch_scrollback_from_term(&*term, from_line, direction, count);
+            grid_sync::fetch_scrollback_from_term(&*term, from_line, direction, count)?;
         let version = self.history_version.load(Ordering::Acquire);
-        (lines, total, version)
+        Ok((lines, total, version))
     }
 
     pub fn search_scrollback(
@@ -1679,6 +1711,126 @@ mod tests {
 
         assert_eq!(after_total, before_total);
         assert!(after_rows.iter().all(|row| row.cells[0].character == "X"));
+        assert_ne!(after_version, before_version);
+    }
+
+    #[test]
+    fn invalid_scrollback_parameters_are_rejected() {
+        let pane = match Pane::spawn_with_session(
+            "invalid-scrollback-pane".to_string(),
+            String::new(),
+            std::env::temp_dir().to_string_lossy().to_string(),
+            4,
+            2,
+            Some(ShellCommand {
+                program: "/bin/cat".to_string(),
+                ..Default::default()
+            }),
+            2,
+        ) {
+            Ok(pane) => pane,
+            Err(error) => panic!("spawn invalid scrollback pane: {error}"),
+        };
+
+        // Only 0 (up) and 1 (down) are valid directions.
+        for direction in [2u32, 3, 7, u32::MAX] {
+            assert!(
+                matches!(
+                    pane.fetch_scrollback_checked(0, direction, 10),
+                    Err(grid_sync::ScrollbackError::InvalidDirection)
+                ),
+                "direction {direction} must be rejected"
+            );
+        }
+        // cols=4, so any count above MAX_GRID_CELLS / 4 is oversized.
+        let cap = (mux_protocol::MAX_GRID_CELLS / 4) as u32;
+        assert!(matches!(
+            pane.fetch_scrollback_checked(0, 1, cap + 1),
+            Err(grid_sync::ScrollbackError::CountTooLarge)
+        ));
+        assert!(matches!(
+            pane.fetch_scrollback_checked(0, 1, u32::MAX),
+            Err(grid_sync::ScrollbackError::CountTooLarge)
+        ));
+        // Valid parameters pass, including the count=0 metadata probe.
+        assert!(pane.fetch_scrollback_checked(0, 0, 10).is_ok());
+        assert!(pane.fetch_scrollback_checked(0, 1, 10).is_ok());
+        assert!(pane.fetch_scrollback_checked(0, 1, 0).is_ok());
+        assert!(pane.fetch_scrollback_checked(0, 1, cap).is_ok());
+    }
+
+    #[test]
+    fn clear_screen_all_rotates_full_history_and_advances_version() {
+        let pane = match Pane::spawn_with_session(
+            "clear-screen-all-pane".to_string(),
+            String::new(),
+            std::env::temp_dir().to_string_lossy().to_string(),
+            4,
+            2,
+            Some(ShellCommand {
+                program: "/bin/cat".to_string(),
+                ..Default::default()
+            }),
+            2,
+        ) {
+            Ok(pane) => pane,
+            Err(error) => panic!("spawn clear screen all pane: {error}"),
+        };
+        let _ = pane.collect_dirty_rows();
+        let mut dec = Dec2026Parser::new();
+        let mut coalescer = AdaptiveCoalescer::new();
+        let mut state = ReadLoopState::default();
+
+        // Fill the 2-row history ring to full capacity: history = [A, B].
+        pane.process_pty_bytes(b"A\r\nB\r\nC\r\n", &mut dec, &mut coalescer, &mut state);
+        let (before_rows, before_total, before_version) = pane.fetch_scrollback(0, 1, 10);
+        assert_eq!(before_total, 2);
+        assert_eq!(before_rows[0].cells[0].character, "A");
+
+        // CSI 2J scrolls the whole viewport into the full history ring:
+        // contents rotate in place (A dropped, C added) without changing size.
+        pane.process_pty_bytes(b"\x1b[2J", &mut dec, &mut coalescer, &mut state);
+        let (after_rows, after_total, after_version) = pane.fetch_scrollback(0, 1, 10);
+
+        assert_eq!(after_total, before_total, "history size must not change");
+        assert_ne!(after_version, before_version, "rotated contents must bump version");
+        assert_eq!(after_rows.len(), 2);
+        assert_eq!(after_rows[0].cells[0].character, "B");
+        assert_eq!(after_rows[1].cells[0].character, "C");
+    }
+
+    #[test]
+    fn clear_screen_saved_clears_history_and_advances_version() {
+        let pane = match Pane::spawn_with_session(
+            "clear-screen-saved-pane".to_string(),
+            String::new(),
+            std::env::temp_dir().to_string_lossy().to_string(),
+            4,
+            2,
+            Some(ShellCommand {
+                program: "/bin/cat".to_string(),
+                ..Default::default()
+            }),
+            2,
+        ) {
+            Ok(pane) => pane,
+            Err(error) => panic!("spawn clear screen saved pane: {error}"),
+        };
+        let _ = pane.collect_dirty_rows();
+        let mut dec = Dec2026Parser::new();
+        let mut coalescer = AdaptiveCoalescer::new();
+        let mut state = ReadLoopState::default();
+
+        pane.process_pty_bytes(b"A\r\nB\r\nC\r\n", &mut dec, &mut coalescer, &mut state);
+        let (_, before_total, before_version) = pane.fetch_scrollback(0, 1, 10);
+        assert_eq!(before_total, 2);
+
+        // CSI 3J erases the saved history entirely.
+        pane.process_pty_bytes(b"\x1b[3J", &mut dec, &mut coalescer, &mut state);
+        let (after_rows, after_total, after_version) = pane.fetch_scrollback(0, 1, 10);
+
+        assert_eq!(after_total, 0, "saved history must be cleared");
+        assert!(after_rows.is_empty());
         assert_ne!(after_version, before_version);
     }
 

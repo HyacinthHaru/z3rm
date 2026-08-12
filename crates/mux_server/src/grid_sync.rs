@@ -540,25 +540,73 @@ pub fn snapshot_from_term<T: EventListener>(term: &Term<T>) -> FullGridSnapshot 
     }
 }
 
+/// §16.9 FetchScrollback 请求参数校验错误。连接层把 `rpc_message()` 作为
+/// typed RPC error 返回给客户端, 连接保持可用。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ScrollbackError {
+    /// `direction` 必须是 0 (向上) 或 1 (向下)。
+    InvalidDirection,
+    /// `cols * count` 超出协议网格上限 (`MAX_GRID_CELLS`)。
+    CountTooLarge,
+}
+
+impl ScrollbackError {
+    /// §16.9 发送给客户端的错误文案。
+    pub fn rpc_message(&self) -> String {
+        match self {
+            ScrollbackError::InvalidDirection => {
+                "invalid scrollback direction: expected 0 (up) or 1 (down)".to_string()
+            }
+            ScrollbackError::CountTooLarge => {
+                "scrollback count exceeds protocol grid limit".to_string()
+            }
+        }
+    }
+}
+
+/// §16.9 在分配/序列化任何响应前校验 FetchScrollback 参数, 返回允许的最大行数。
+///
+/// `direction` 只接受 0 (向上) 与 1 (向下); `cols * count` 用 checked 乘法
+/// 限定在 `MAX_GRID_CELLS` 之内, 与客户端 `MAX_GRID_CELLS / cols` 的分页大小
+/// 一致。`count == 0` 是合法的元数据探测 (返回 0 行), 不分配任何内容。
+pub fn checked_scrollback_count(
+    cols: usize,
+    direction: u32,
+    count: u32,
+) -> Result<usize, ScrollbackError> {
+    if direction > 1 {
+        return Err(ScrollbackError::InvalidDirection);
+    }
+    let count_usize = count as usize;
+    let cells = cols
+        .max(1)
+        .checked_mul(count_usize)
+        .ok_or(ScrollbackError::CountTooLarge)?;
+    if cells > mux_protocol::MAX_GRID_CELLS {
+        return Err(ScrollbackError::CountTooLarge);
+    }
+    Ok(count_usize)
+}
+
 pub fn fetch_scrollback_from_term<T: EventListener>(
     term: &Term<T>,
     from_line: u32,
     direction: u32,
     count: u32,
-) -> (Vec<RowChange>, u32) {
+) -> Result<(Vec<RowChange>, u32), ScrollbackError> {
+    let count = checked_scrollback_count(term.columns(), direction, count)?;
     let history_size = term.grid().history_size();
     let total = u32::try_from(history_size).unwrap_or(u32::MAX);
     if history_size == 0 || count == 0 {
-        return (Vec::new(), total);
+        return Ok((Vec::new(), total));
     }
 
     let from = from_line as usize;
     if from >= history_size {
-        return (Vec::new(), total);
+        return Ok((Vec::new(), total));
     }
-    let count = count as usize;
     let indices = if direction == 0 {
-        let start = from.saturating_sub(count.saturating_sub(1));
+        let start = from.saturating_sub(count - 1);
         start..from.saturating_add(1)
     } else {
         from..from.saturating_add(count).min(history_size)
@@ -566,7 +614,7 @@ pub fn fetch_scrollback_from_term<T: EventListener>(
     let rows = indices
         .map(|index| row_from_history(term, index, history_size))
         .collect();
-    (rows, total)
+    Ok((rows, total))
 }
 
 pub fn search_scrollback_from_term<T: EventListener>(

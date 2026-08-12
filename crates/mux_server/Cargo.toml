@@ -28,6 +28,7 @@ paths = { workspace = true }
 http_client = { workspace = true }
 reqwest_client = { workspace = true }
 futures = { workspace = true }
+smol = { workspace = true }
 tar = "0.4"
 flate2 = { workspace = true }
 tracing = { workspace = true }

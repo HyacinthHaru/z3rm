@@ -22,6 +22,7 @@
 // daemon never invents its own client list.
 
 use std::collections::{BTreeMap, BTreeSet};
+use std::future::Future;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, mpsc};
 use std::time::{Duration, Instant};
@@ -32,7 +33,7 @@ use http_client::HttpClient as _;
 use reqwest_client::ReqwestClient;
 use mux_protocol::{ExtensionChromeUpdate, Notification};
 use quickjs_runtime::{
-    DiscoveredExtension, ExtensionRunner, FilesystemAccess, HostBridge, LiveExtension,
+    ExtensionRunner, FilesystemAccess, HostBridge, LiveExtension,
     discover_server_extensions, extension_roots, parse_manifest_str,
 };
 
@@ -378,13 +379,30 @@ fn optional_u32(args: &serde_json::Value, index: usize) -> Option<u32> {
         .map(|value| value.min(u32::MAX as u64) as u32)
 }
 
+fn run_with_timeout<T>(
+    future: impl Future<Output = Result<T>>,
+    timeout: Duration,
+    operation: &'static str,
+) -> Result<T> {
+    smol::block_on(smol::future::or(future, async move {
+        smol::Timer::after(timeout).await;
+        bail!("{operation} timed out after {timeout:?}");
+    }))
+}
+
 fn read_server_setting(key: &str) -> Result<serde_json::Value> {
-    if key.trim().is_empty() || key.split('.').any(str::is_empty) {
-        bail!("settings key must be a non-empty dotted path");
-    }
+    quickjs_runtime::validate_settings_key(key)?;
     let path = paths::settings_file();
-    let text = match std::fs::read_to_string(path) {
-        Ok(text) => text,
+    let text = match std::fs::read(&path) {
+        Ok(bytes) => {
+            if bytes.len() as u64 > quickjs_runtime::MAX_EXTENSION_SETTINGS_DOCUMENT_BYTES {
+                bail!(
+                    "settings document exceeds {} bytes",
+                    quickjs_runtime::MAX_EXTENSION_SETTINGS_DOCUMENT_BYTES
+                );
+            }
+            String::from_utf8(bytes).context("settings document is not UTF-8")?
+        }
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(serde_json::Value::Null),
         Err(error) => return Err(error).with_context(|| format!("reading {}", path.display())),
     };
@@ -401,13 +419,25 @@ fn read_server_setting(key: &str) -> Result<serde_json::Value> {
 }
 
 fn write_server_setting(key: &str, value: serde_json::Value) -> Result<serde_json::Value> {
-    if key.trim().is_empty() || key.split('.').any(str::is_empty) {
-        bail!("settings key must be a non-empty dotted path");
+    quickjs_runtime::validate_settings_key(key)?;
+    let value_bytes = serde_json::to_vec(&value).context("serializing settings value")?;
+    if value_bytes.len() > quickjs_runtime::MAX_EXTENSION_SETTINGS_VALUE_BYTES {
+        bail!(
+            "settings value exceeds {} bytes",
+            quickjs_runtime::MAX_EXTENSION_SETTINGS_VALUE_BYTES
+        );
     }
     let path = paths::settings_file();
-    let mut document = match std::fs::read_to_string(path) {
-        Ok(text) => serde_json::from_str(&text)
-            .with_context(|| format!("parsing {}", path.display()))?,
+    let mut document = match std::fs::read(&path) {
+        Ok(bytes) => {
+            if bytes.len() as u64 > quickjs_runtime::MAX_EXTENSION_SETTINGS_DOCUMENT_BYTES {
+                bail!(
+                    "settings document exceeds {} bytes",
+                    quickjs_runtime::MAX_EXTENSION_SETTINGS_DOCUMENT_BYTES
+                );
+            }
+            serde_json::from_slice(&bytes).with_context(|| format!("parsing {}", path.display()))?
+        }
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => serde_json::json!({}),
         Err(error) => return Err(error).with_context(|| format!("reading {}", path.display())),
     };
@@ -425,6 +455,12 @@ fn write_server_setting(key: &str, value: serde_json::Value) -> Result<serde_jso
     }
     *cursor = value.clone();
     let encoded = serde_json::to_vec_pretty(&document).context("serializing settings")?;
+    if encoded.len() > quickjs_runtime::MAX_EXTENSION_SETTINGS_DOCUMENT_BYTES as usize {
+        bail!(
+            "settings document exceeds {} bytes",
+            quickjs_runtime::MAX_EXTENSION_SETTINGS_DOCUMENT_BYTES
+        );
+    }
     let parent = path.parent().context("settings path has no parent")?;
     std::fs::create_dir_all(parent)
         .with_context(|| format!("creating settings directory {}", parent.display()))?;
@@ -574,7 +610,18 @@ impl HostBridge for ServerHostBridge {
             }
             "network.fetch" => {
                 let url = required_string(args, 0, method)?;
+                if url.len() > quickjs_runtime::MAX_EXTENSION_URL_LEN {
+                    bail!(
+                        "network URL exceeds {} bytes",
+                        quickjs_runtime::MAX_EXTENSION_URL_LEN
+                    );
+                }
                 let options = args.get(1).cloned().unwrap_or_else(|| serde_json::json!({}));
+                let timeout = quickjs_runtime::parse_extension_timeout(
+                    &options,
+                    quickjs_runtime::EXTENSION_FETCH_TIMEOUT,
+                    quickjs_runtime::EXTENSION_FETCH_TIMEOUT_MAX_MS,
+                )?;
                 let method_name = options
                     .get("method")
                     .and_then(serde_json::Value::as_str)
@@ -597,7 +644,11 @@ impl HostBridge for ServerHostBridge {
                     .body(http_client::AsyncBody::from(body))
                     .context("building network request")?;
                 let client = ReqwestClient::new();
-                let response = futures::executor::block_on(client.send(request))?;
+                let response = run_with_timeout(
+                    async { client.send(request).await.map_err(anyhow::Error::from) },
+                    timeout,
+                    "network.fetch",
+                )?;
                 let (parts, body) = response.into_parts();
                 let headers = parts
                     .headers
@@ -609,15 +660,19 @@ impl HostBridge for ServerHostBridge {
                         ))
                     })
                     .collect::<serde_json::Map<_, _>>();
-                let response_body = futures::executor::block_on(async move {
-                    let mut bytes = Vec::new();
-                    let mut body = body;
-                    body.read_to_end(&mut bytes).await.map_err(anyhow::Error::from)?;
-                    if bytes.len() > quickjs_runtime::MAX_EXTENSION_FILE_READ as usize {
-                        bail!("network response exceeds {} bytes", quickjs_runtime::MAX_EXTENSION_FILE_READ);
-                    }
-                    Ok::<_, anyhow::Error>(bytes)
-                })?;
+                let response_body = run_with_timeout(
+                    async move {
+                        let mut bytes = Vec::new();
+                        let mut body = body.take(quickjs_runtime::MAX_EXTENSION_FILE_READ + 1);
+                        body.read_to_end(&mut bytes).await.map_err(anyhow::Error::from)?;
+                        if bytes.len() > quickjs_runtime::MAX_EXTENSION_FILE_READ as usize {
+                            bail!("network response exceeds {} bytes", quickjs_runtime::MAX_EXTENSION_FILE_READ);
+                        }
+                        Ok::<_, anyhow::Error>(bytes)
+                    },
+                    timeout,
+                    "network.fetch response body",
+                )?;
                 Ok(serde_json::json!({
                     "status": parts.status.as_u16(),
                     "headers": headers,
@@ -642,15 +697,13 @@ impl HostBridge for ServerHostBridge {
                     })
                     .transpose()?
                     .unwrap_or_default();
-                let output = std::process::Command::new(&command)
-                    .args(&arguments)
-                    .output()
-                    .with_context(|| format!("spawning process {command}"))?;
-                if output.stdout.len() + output.stderr.len()
-                    > quickjs_runtime::MAX_EXTENSION_FILE_READ as usize
-                {
-                    bail!("process output exceeds {} bytes", quickjs_runtime::MAX_EXTENSION_FILE_READ);
-                }
+                let options = args.get(2).cloned().unwrap_or_else(|| serde_json::json!({}));
+                let timeout = quickjs_runtime::parse_extension_timeout(
+                    &options,
+                    quickjs_runtime::EXTENSION_PROCESS_TIMEOUT,
+                    quickjs_runtime::EXTENSION_PROCESS_TIMEOUT_MAX_MS,
+                )?;
+                let output = quickjs_runtime::run_extension_process(&command, &arguments, timeout)?;
                 Ok(serde_json::json!({
                     "status": output.status.code(),
                     "success": output.status.success(),
@@ -660,6 +713,7 @@ impl HostBridge for ServerHostBridge {
             }
             other => bail!("unknown host method: {other}"),
     }
+}
 }
 
 // ---------------------------------------------------------------------------
@@ -896,7 +950,7 @@ impl HostedExtension {
 /// the host owner at shutdown so it can reap workers without ever joining a
 /// hung one indefinitely.
 struct WorkerHandle {
-    command_tx: mpsc::Sender<WorkerCommand>,
+    command_tx: mpsc::SyncSender<WorkerCommand>,
     join: std::thread::JoinHandle<()>,
     /// Unique per spawn; guards against late reports from a replaced worker.
     instance: u64,
@@ -907,8 +961,10 @@ pub struct ServerExtensionHost {
     command_tx: mpsc::Sender<HostCommand>,
     thread: parking_lot::Mutex<Option<std::thread::JoinHandle<()>>>,
     /// The manager hands its worker join handles back here at shutdown so
-    /// `Drop` can reap them without waiting on a hung worker itself.
-    shutdown_rx: mpsc::Receiver<Vec<std::thread::JoinHandle<()>>>,
+    /// `Drop` can reap them without waiting on a hung worker itself. The
+    /// receiver is !Sync, so it lives behind a mutex to keep the host
+    /// sharable across Tokio tasks (weak references from lifecycle hooks).
+    shutdown_rx: parking_lot::Mutex<mpsc::Receiver<Vec<std::thread::JoinHandle<()>>>>,
     user_extensions_dir: PathBuf,
     sessions: Sessions,
 }
@@ -1024,7 +1080,7 @@ impl ServerExtensionHost {
         Arc::new(Self {
             command_tx,
             thread: parking_lot::Mutex::new(thread),
-            shutdown_rx,
+            shutdown_rx: parking_lot::Mutex::new(shutdown_rx),
             user_extensions_dir,
             sessions,
         })
@@ -1217,372 +1273,6 @@ impl ServerExtensionHost {
     /// paths (e.g. install-proof records carrying nonce/TTL fields) keep
     /// their extra fields; only the record for `manifest.id` is replaced.
     pub fn set_consent(
-
-// ---------------------------------------------------------------------------
-// §5.6 Server-side extension consent gate
-//
-// Extensions only run after an explicit user decision, mirroring the GUI
-// client's first-install consent store (`z3rm::quickjs_extensions::§5.6`).
-// The server READS the same store the client writes — records are
-// `{"id", "policy_fingerprint", "state": "approved"|"denied"}` keyed by
-// extension id, with the policy fingerprint binding the decision to exactly
-// one manifest (id + version + runtime side + capabilities + resource
-// limits). A record only ever matches the manifest it was made against: a
-// changed manifest re-prompts on the client and fails closed on the server
-// until a matching approval exists. The fingerprint serialization is
-// byte-identical to the client `consent_fingerprint`, so a decision made in
-// the GUI for a `both`-side extension also gates its server half.
-//
-// The shared client format is a persistent per-fingerprint decision with no
-// expiry or one-time-consumption semantics. To support server-side
-// activation-install consent (where a one-off decision should be spent
-// rather than grant perpetual activation) the server also honors two
-// OPTIONAL fields — `expires_at` (RFC 3339; an instant at or before now is
-// expired) and `consumed` (a `true` approval is spent, never re-activates) —
-// that fall closed when present. Records written by the client, which omits
-// both, are unaffected and authorize indefinitely (matching the client
-// behavior).
-// ---------------------------------------------------------------------------
-
-use std::collections::HashMap;
-
-/// §5.6 The user's decision for one exact policy fingerprint (client parity).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum ConsentState {
-    Approved,
-    Denied,
-}
-
-impl ConsentState {
-    fn name(self) -> &'static str {
-        match self {
-            ConsentState::Approved => "approved",
-            ConsentState::Denied => "denied",
-        }
-    }
-
-    fn parse(value: &str) -> Option<Self> {
-        match value {
-            "approved" => Some(ConsentState::Approved),
-            "denied" => Some(ConsentState::Denied),
-            _ => None,
-        }
-    }
-}
-
-/// §5.6 One persisted first-install consent decision, keyed by extension
-/// id plus the exact policy fingerprint decided against. Format-compatible
-/// with the client `ConsentRecord` (`{"id","policy_fingerprint","state"}`),
-/// with optional `expires_at` / `consumed` fields that extend it
-/// fail-closed for server-side activation consent.
-#[derive(Debug, Clone, PartialEq)]
-struct ConsentRecord {
-    id: String,
-    policy_fingerprint: String,
-    state: ConsentState,
-    /// RFC 3339 expiry instant; `None` = never expires. Optional server
-    /// extension field. An unparseable value fails closed (expired).
-    expires_at: Option<String>,
-    /// When true an Approved record is spent and never re-activates.
-    /// Optional server extension field.
-    consumed: bool,
-}
-
-impl ConsentRecord {
-    fn from_json(value: &serde_json::Value) -> Option<Self> {
-        let id = value.get("id")?.as_str()?.to_string();
-        let policy_fingerprint = value.get("policy_fingerprint")?.as_str()?.to_string();
-        let state = ConsentState::parse(value.get("state")?.as_str()?)?;
-        let expires_at = value
-            .get("expires_at")
-            .and_then(serde_json::Value::as_str)
-            .map(str::to_string);
-        let consumed = value
-            .get("consumed")
-            .and_then(serde_json::Value::as_bool)
-            .unwrap_or(false);
-        Some(ConsentRecord {
-            id,
-            policy_fingerprint,
-            state,
-            expires_at,
-            consumed,
-        })
-    }
-}
-
-/// §5.6 Load the consent store as `id → ConsentRecord`. An absent or corrupt
-/// file is treated as empty (fail closed: nothing runs unapproved, nothing
-/// crashes). Records that do not carry the explicit state and policy
-/// fingerprint the current format requires are skipped and fall through to
-// pending, never activating.
-fn load_consent_records(path: &Path) -> HashMap<String, ConsentRecord> {
-    let text = match std::fs::read_to_string(path) {
-        Ok(text) => text,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return HashMap::new(),
-        Err(error) => {
-            tracing::warn!(
-                path = %path.display(),
-                %error,
-                "extension consent file unreadable; treating as empty"
-            );
-            return HashMap::new();
-        }
-    };
-    let value: serde_json::Value = match serde_json::from_str(&text) {
-        Ok(value) => value,
-        Err(error) => {
-            tracing::warn!(
-                path = %path.display(),
-                %error,
-                "extension consent file corrupt; treating as empty"
-            );
-            return HashMap::new();
-        }
-    };
-    let Some(records) = value.as_array() else {
-        tracing::warn!(
-            path = %path.display(),
-            "extension consent file is not an array; treating as empty"
-        );
-        return HashMap::new();
-    };
-    let mut consented = HashMap::new();
-    for record in records {
-        let Some(record) = ConsentRecord::from_json(record) else {
-            tracing::warn!(
-                path = %path.display(),
-                %record,
-                "skipping malformed extension consent record"
-            );
-            continue;
-        };
-        consented.insert(record.id.clone(), record);
-    }
-    consented
-}
-
-/// §5.6 Default consent store location, matching the client
-/// (`z3rm::quickjs_extensions::consent_file_path`) so a single decision
-/// gates both halves of a `both`-side extension.
-pub fn default_consent_file_path() -> PathBuf {
-    dirs::config_dir()
-        .unwrap_or_else(|| PathBuf::from("."))
-        .join("extension-consent.json")
-}
-
-/// §5.6 Canonical policy fingerprint, byte-identical to the client
-/// `consent_fingerprint`: the serialized policy tuple — id, version,
-/// runtime side, capabilities, resource limits — as canonical JSON (objects
-// built from `BTreeMap`, so key order is deterministic). Fingerprints are
-/// never hashed, so they cannot collide: two manifests share a fingerprint
-/// iff their policy tuple is byte-identical, and any manifest change
-/// re-prompts.
-fn consent_fingerprint(manifest: &quickjs_runtime::ExtensionManifest) -> String {
-    let payload = serde_json::Value::Object(
-        BTreeMap::from([
-            ("id".into(), serde_json::Value::String(manifest.id.clone())),
-            ("version".into(), serde_json::Value::String(manifest.version.clone())),
-            ("side".into(), serde_json::Value::String(side_name(manifest.side).into())),
-            ("capabilities".into(), capabilities_json(&manifest.capabilities)),
-            ("limits".into(), limits_json(&manifest.limits)),
-        ])
-        .into_iter()
-        .collect(),
-    );
-    payload.to_string()
-}
-
-fn limits_json(limits: &quickjs_runtime::ExtensionLimits) -> serde_json::Value {
-    serde_json::Value::Object(
-        BTreeMap::from([
-            ("memory_limit_mb".into(), serde_json::json!(limits.memory_limit_mb)),
-            ("cpu_budget_ms".into(), serde_json::json!(limits.cpu_budget_ms)),
-            ("io_rate_limit".into(), serde_json::json!(limits.io_rate_limit)),
-        ])
-        .into_iter()
-        .collect(),
-    )
-}
-
-fn side_name(side: quickjs_runtime::ExtensionSide) -> &'static str {
-    match side {
-        quickjs_runtime::ExtensionSide::Client => "client",
-        quickjs_runtime::ExtensionSide::Server => "server",
-        quickjs_runtime::ExtensionSide::Both => "both",
-    }
-}
-
-fn capabilities_json(capabilities: &quickjs_runtime::ExtensionCapabilities) -> serde_json::Value {
-    serde_json::Value::Object(
-        BTreeMap::from([
-            ("terminal".into(), serde_json::json!(capabilities.terminal)),
-            ("mux".into(), serde_json::json!(capabilities.mux)),
-            ("workspace".into(), serde_json::json!(capabilities.workspace)),
-            ("settings".into(), serde_json::json!(capabilities.settings)),
-            ("network".into(), serde_json::json!(capabilities.network)),
-            ("process_spawn".into(), serde_json::json!(capabilities.process_spawn)),
-            (
-                "filesystem".into(),
-                serde_json::Value::String(filesystem_name(capabilities.filesystem).into()),
-            ),
-        ])
-        .into_iter()
-        .collect(),
-    )
-}
-
-fn filesystem_name(access: quickjs_runtime::FilesystemAccess) -> &'static str {
-    match access {
-        quickjs_runtime::FilesystemAccess::None => "none",
-        quickjs_runtime::FilesystemAccess::Cwd => "cwd",
-        quickjs_runtime::FilesystemAccess::Home => "home",
-    }
-}
-
-/// §5.6 Outcome of consulting the consent ledger for one extension. The
-/// server never activates anything but `ApprovedCurrent`.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum ApprovalDecision {
-    /// Approved, the policy fingerprint matches exactly, and the approval is
-    /// not expired or consumed — the only outcome under which activation may
-    /// proceed.
-    ApprovedCurrent,
-    /// The user denied this exact manifest.
-    DeniedCurrent,
-    /// No record exists for this id, or the record's policy fingerprint does
-    /// not match the manifest (changed manifest), or the record is an
-    /// Approval that is expired or consumed. All fail closed: activation is
-    /// refused and a pending approval is reported up the stack so the user
-    /// can decide again on the client.
-    NeedsApproval,
-}
-
-/// §5.6 Wall-clock seconds since the Unix epoch; isolated for determinism
-/// in tests and any future injected clock.
-fn now_unix_seconds() -> i64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|duration| duration.as_secs() as i64)
-        .unwrap_or(0)
-}
-
-/// §5.6 Seconds remaining on an Approved record's `expires_at`, measured
-/// against `now` (Unix seconds). `None` means the record carries no
-/// `expires_at`; an unparseable value fails closed (returns `0`, expired).
-fn approval_remaining_seconds(record: &ConsentRecord, now: i64) -> Option<i64> {
-    let value = record.expires_at.as_deref()?;
-    // Parse the leading "YYYY-MM-DDTHH:MM:SS" of an RFC 3339 instant, which
-    // the consent file convention uses, into Unix seconds. Any deviation
-    // fails closed (expired) rather than granting activation.
-    let bytes = value.as_bytes();
-    if bytes.len() < 19 {
-        return Some(0);
-    }
-    let dt = &bytes[..19];
-    let parse = |start: usize, len: usize, sep: Option<u8>| -> Option<i64> {
-        if let Some(sep) = sep
-            && dt.get(start + len).copied() != Some(sep)
-        {
-            return None;
-        }
-        std::str::from_utf8(&dt[start..start + len]).ok()?.parse::<i64>().ok()
-    };
-    let year = parse(0, 4, Some(b'-'))?;
-    let month = parse(5, 2, Some(b'-'))?;
-    let day = parse(8, 2, Some(b'T'))?;
-    let hour = parse(11, 2, Some(b':'))?;
-    let minute = parse(14, 2, Some(b':'))?;
-    let second = parse(17, 2, None)?;
-    let days = days_since_epoch(year, month, day)?;
-    Some(days * 86400 + hour * 3600 + minute * 60 + second - now)
-}
-
-/// §5.6 Days elapsed since 1970-01-01 for a proleptic Gregorian date.
-/// Returns `None` for invalid dates (month/day out of range), failing the
-/// expiry parser closed. Algorithmically equivalent to the Howard Hinnant
-/// `days_from_civil` formulation.
-fn days_since_epoch(year: i64, month: i64, day: i64) -> Option<i64> {
-    if !(1..=12).contains(&month) || !(1..=31).contains(&day) {
-        return None;
-    }
-    let y = if month <= 2 { year - 1 } else { year };
-    let era = (if y >= 0 { y } else { y - 399 }) / 400;
-    let yoe = y - era * 400;
-    let doy = (153 * (if month > 2 { month - 3 } else { month + 9 }) + 2) / 5 + day - 1;
-    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
-    Some(era * 146097 + doe - 719468)
-}
-
-/// §5.6 Consult the consent ledger for one extension, enforcing explicit,
-/// unexpired, unconsumed approval bound to extension id and policy
-/// fingerprint.
-fn approval_decision(
-    records: &HashMap<String, ConsentRecord>,
-    manifest: &quickjs_runtime::ExtensionManifest,
-    now: i64,
-) -> ApprovalDecision {
-    let fingerprint = consent_fingerprint(manifest);
-    let Some(record) = records.get(&manifest.id) else {
-        return ApprovalDecision::NeedsApproval;
-    };
-    match record.state {
-        ConsentState::Denied if record.policy_fingerprint == fingerprint => {
-            ApprovalDecision::DeniedCurrent
-        }
-        ConsentState::Approved if record.policy_fingerprint == fingerprint => {
-            // §5.6 Must be explicit, unexpired, unconsumed: any miss fails
-            // closed into NeedsApproval (re-prompt), never into activation.
-            if record.consumed {
-                return ApprovalDecision::NeedsApproval;
-            }
-            match approval_remaining_seconds(record, now) {
-                Some(remaining) if remaining > 0 => ApprovalDecision::ApprovedCurrent,
-                _ => ApprovalDecision::NeedsApproval,
-            }
-        }
-        _ => ApprovalDecision::NeedsApproval,
-    }
-}
-
-/// §5.6 Require valid explicit unexpired unconsumed approval for one
-/// extension; otherwise return an actionable error that surfaces which
-/// reason failed and what the user must approve. Never grants activation on
-/// a miss — the server's protective default is "off".
-fn require_approval(
-    records: &HashMap<String, ConsentRecord>,
-    manifest: &quickjs_runtime::ExtensionManifest,
-) -> Result<ApprovalDecision> {
-    let now = now_unix_seconds();
-    let fingerprint = consent_fingerprint(manifest);
-    match approval_decision(records, manifest, now) {
-        ApprovalDecision::ApprovedCurrent => Ok(ApprovalDecision::ApprovedCurrent),
-        ApprovalDecision::DeniedCurrent => bail!(
-            "extension `{}` is denied by an exact-match consent record; \
-             remove or amend the decision to re-prompt",
-            manifest.id,
-        ),
-        ApprovalDecision::NeedsApproval => bail!(
-            "extension `{}` has no valid approval for the current manifest \
-             (policy fingerprint {}); a server or both-side extension cannot \
-             activate until an explicit, unexpired, unconsumed approval bound \
-             to this id and policy fingerprint exists",
-            manifest.id,
-            fingerprint,
-        ),
-    }
-}
-
-/// §5.6 Severity of a consent miss, for logging. `Denied` is the user's
-/// explicit past decision; `Pending` is the absence of (or mismatch / stale)
-/// approval. The distinction is informational — neither may activate.
-fn approval_miss_kind(decision: ApprovalDecision) -> &'static str {
-    match decision {
-        ApprovalDecision::DeniedCurrent => "denied",
-        ApprovalDecision::NeedsApproval => "pending",
-        ApprovalDecision::ApprovedCurrent => unreachable!("not a miss"),
-    }
-}
         &self,
         manifest: &quickjs_runtime::ExtensionManifest,
         approved: bool,
@@ -1682,6 +1372,7 @@ fn approval_miss_kind(decision: ApprovalDecision) -> &'static str {
     }
 }
 
+
 impl Drop for ServerExtensionHost {
     fn drop(&mut self) {
         if let Err(error) = self.command_tx.send(HostCommand::Shutdown) {
@@ -1692,6 +1383,7 @@ impl Drop for ServerExtensionHost {
         // detached rather than waited on.
         let workers = self
             .shutdown_rx
+            .lock()
             .recv_timeout(MANAGER_SHUTDOWN_GRACE)
             .unwrap_or_default();
         if let Some(handle) = self.thread.lock().take() {
@@ -1805,11 +1497,12 @@ impl ExtensionManager {
         let (ready_tx, ready_rx) = mpsc::channel::<WorkerReady>();
         let events_tx = self.events_tx.clone();
         let thread_name = format!("z3rm-ext-{extension_id}");
+        let thread_extension_id = extension_id.clone();
         let join = std::thread::Builder::new()
             .name(thread_name)
             .spawn(move || {
                 worker_thread_main(
-                    extension_id.clone(),
+                    thread_extension_id,
                     setup,
                     events_tx,
                     instance,
@@ -1859,7 +1552,7 @@ impl ExtensionManager {
     fn insert_worker(
         &mut self,
         extension_id: String,
-        command_tx: mpsc::Sender<WorkerCommand>,
+        command_tx: mpsc::SyncSender<WorkerCommand>,
         join: std::thread::JoinHandle<()>,
         instance: u64,
         suspended: bool,
@@ -2191,9 +1884,9 @@ fn host_thread_main(
     if discovered.is_empty() {
         tracing::info!(?roots, "no server-side extensions discovered");
     }
-    // §5.6 Approval ledger: extensions activate only when an Approved record
-    // exists for their exact policy fingerprint. Loaded once here so
-    // activation, installs and the first paint all see the same ledger.
+    // Startup discovery uses the ledger snapshot below. Install commands
+    // reload it at their activation boundary so a newly approved manifest is
+    // visible without restarting the daemon.
     let consent = load_server_consent(&server_consent_path(user_extensions_dir));
     let mut manager = ExtensionManager::new(chrome_tx, command_tx);
 
@@ -2255,15 +1948,16 @@ fn host_thread_main(
                             archive,
                             user_extensions_dir: user_extensions_dir.to_path_buf(),
                             sessions: sessions.clone(),
-                            consent: consent.clone(),
+                            consent: load_server_consent(&server_consent_path(user_extensions_dir)),
                         },
                         &deadline,
                     )
                     .map_err(anyhow::Error::msg);
+                let install_succeeded = result.is_ok();
                 if reply.send(result).is_err() {
                     tracing::debug!(id = %id, "extension install caller dropped before reply");
                 }
-                if result.is_ok() && manager.render_round(true).is_err() {
+                if install_succeeded && manager.render_round(true).is_err() {
                     return;
                 }
             }
@@ -2643,6 +2337,30 @@ mod tests {
         }
     }
 
+    fn approve_request(host: &ServerExtensionHost, request: &mux_protocol::InstallExtensionRequest) {
+        let manifest_text = std::str::from_utf8(&request.manifest).unwrap();
+        let manifest = quickjs_runtime::parse_manifest_str(&request.name, manifest_text).unwrap();
+        host.set_consent(&manifest, true).unwrap();
+    }
+
+    async fn install_approved(
+        host: &ServerExtensionHost,
+        request: &mux_protocol::InstallExtensionRequest,
+    ) -> Result<()> {
+        approve_request(host, request);
+        host.install_extension(request).await
+    }
+
+    fn write_approval(dir: &Path, manifest_text: &str) -> Result<()> {
+        let manifest = quickjs_runtime::parse_manifest_str("test", manifest_text)?;
+        let record = ServerConsentRecord {
+            id: manifest.id.clone(),
+            policy_fingerprint: manifest.policy_fingerprint(),
+            state: ServerConsentState::Approved,
+        };
+        save_server_consent_raw(&server_consent_path(dir), &[record.to_json()])
+    }
+
     #[test]
     fn validate_extension_id_rejects_unsafe_names() {
         assert!(validate_extension_id("demo").is_ok());
@@ -2682,13 +2400,13 @@ mod tests {
                 .call("mux.listSessions", &serde_json::json!([]))
                 .is_ok()
         );
-        // Declared-but-unsupported capability: contextual, names the
-        // capability — not a generic unknown-method error.
+        // Implemented capabilities still validate arguments before touching
+        // the host; malformed process requests fail with method context.
         let error = bridge
             .call("process.spawn", &serde_json::json!([]))
             .unwrap_err();
         assert!(
-            error.to_string().contains("process.spawn is not supported"),
+            error.to_string().contains("`process.spawn` requires"),
             "error={error}"
         );
         // None 范围: filesystem 调用明确报出未授予, 而不是 generic error。
@@ -2871,19 +2589,17 @@ mod tests {
             .unwrap_err();
         assert!(error.to_string().contains("escapes"), "error={error}");
 
-        // 声明了也不提供的能力: 能力级上下文错误, 不是 silent success。
+        // Network and process are implemented, but malformed requests must
+        // fail before any unbounded or ambiguous host work occurs.
         let error = bridge
-            .call("network.fetch", &serde_json::json!(["http://example.test"]))
+            .call("network.fetch", &serde_json::json!(["not a valid URI"]))
+            .unwrap_err();
+        assert!(error.to_string().contains("invalid URL"), "error={error}");
+        let error = bridge
+            .call("process.spawn", &serde_json::json!([]))
             .unwrap_err();
         assert!(
-            error.to_string().contains("network.fetch is not supported"),
-            "error={error}"
-        );
-        let error = bridge
-            .call("process.spawn", &serde_json::json!(["echo", ["hi"]]))
-            .unwrap_err();
-        assert!(
-            error.to_string().contains("process.spawn is not supported"),
+            error.to_string().contains("`process.spawn` requires"),
             "error={error}"
         );
         Ok(())
@@ -3005,7 +2721,7 @@ mod tests {
             }
         "#;
 
-        host.install_extension(&install_request("late-ext", main_js))
+        install_approved(&host, &install_request("late-ext", main_js))
             .await
             .unwrap();
         let (subscriber, mut notifications) = tokio::sync::mpsc::unbounded_channel();
@@ -3043,7 +2759,7 @@ mod tests {
                 });
             }
         "#;
-        host.install_extension(&install_request("server-demo", main_js))
+        install_approved(&host, &install_request("server-demo", main_js))
             .await
             .unwrap();
 
@@ -3078,24 +2794,19 @@ mod tests {
         let host = ServerExtensionHost::start(sessions, temp.path().join("extensions"));
 
         // Throwing during activate must surface as an install error…
-        let error = host
-            .install_extension(&install_request(
-                "bad-ext",
-                "export function activate() { throw new Error('nope'); }",
-            ))
-            .await
-            .unwrap_err();
+        let bad_request = install_request(
+            "bad-ext",
+            "export function activate() { throw new Error('nope'); }",
+        );
+        approve_request(&host, &bad_request);
+        let error = host.install_extension(&bad_request).await.unwrap_err();
         assert!(format!("{error:#}").contains("nope"));
         // …without leaving a broken directory for startup discovery.
         assert!(!temp.path().join("extensions/bad-ext").exists());
 
         // …and a subsequent good extension still installs.
-        host.install_extension(&install_request(
-            "good-ext",
-            "export function activate(context) {}",
-        ))
-        .await
-        .unwrap();
+        let good_request = install_request("good-ext", "export function activate(context) {}");
+        install_approved(&host, &good_request).await.unwrap();
         let ids = host.loaded_extension_ids().await;
         assert!(
             ids.iter().any(|id| id == "good-ext"),
@@ -3113,16 +2824,14 @@ mod tests {
         let extensions_dir = temp.path().join("extensions");
         let extension_dir = extensions_dir.join("boot-ext");
         std::fs::create_dir_all(&extension_dir).unwrap();
-        std::fs::write(
-            extension_dir.join("extension.toml"),
-            server_manifest("boot-ext"),
-        )
-        .unwrap();
+        let boot_manifest = server_manifest("boot-ext");
+        std::fs::write(extension_dir.join("extension.toml"), &boot_manifest).unwrap();
         std::fs::write(
             extension_dir.join("main.js"),
             "export function activate(context) {}",
         )
         .unwrap();
+        write_approval(&extensions_dir, &boot_manifest).unwrap();
         // A client-only sibling must NOT load on the server.
         let client_dir = extensions_dir.join("gui-ext");
         std::fs::create_dir_all(&client_dir).unwrap();
@@ -3170,7 +2879,7 @@ mod tests {
             }
         "#;
 
-        host.install_extension(&install_request("event-ext", main_js))
+        install_approved(&host, &install_request("event-ext", main_js))
             .await
             .unwrap();
         let initial = recv_chrome_for(&mut subscriber, "event-ext").await;

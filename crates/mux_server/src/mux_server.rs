@@ -5,17 +5,10 @@ use anyhow::{Context as _, Result};
 use interprocess::local_socket::tokio::Listener as LocalSocketListener;
 use sqlez::connection::Connection;
 use std::future::Future;
-use std::io::Write as _;
 use std::path::{Path, PathBuf};
 use std::pin::Pin;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::{Duration, SystemTime};
-use tokio::time::Duration;
-use tokio::time::Duration as TokioDuration;
-use std::pin::Pin;
-use std::sync::atomic::{AtomicUsize, Ordering};
-use std::time::SystemTime;
-use tokio::time::Duration;
 
 pub mod connection;
 mod server_settings;
@@ -133,6 +126,10 @@ fn unix_socket_path() -> Option<std::path::PathBuf> {
     Some(
         std::path::PathBuf::from(runtime_dir)
             .join("z3rm")
+            .join("mux.sock"),
+    )
+}
+
 async fn bind_socket(name: &interprocess::local_socket::Name<'_>) -> Result<LocalSocketListener> {
     use interprocess::local_socket::tokio::prelude::*;
     let listener = LocalSocketListener::from_options(
@@ -194,9 +191,12 @@ fn socket_sidecars(socket_path: &Path) -> SocketSidecars {
 /// "owner gone, safe to reclaim".
 #[cfg(unix)]
 fn owner_process_alive(pid: u32) -> bool {
+    let Ok(pid) = libc::pid_t::try_from(pid) else {
+        return false;
+    };
     // Safety: kill(2) with signal 0 makes no signal delivery and is the
     // documented liveness probe; the only arguments are the pid and 0.
-    let result = unsafe { libc::kill(libc::pid_t::from(pid), 0) };
+    let result = unsafe { libc::kill(pid, 0) };
     if result == 0 {
         return true;
     }
@@ -242,7 +242,7 @@ enum SocketInodeState {
 
 #[cfg(unix)]
 fn classify_socket_inode(socket_path: &Path) -> SocketInodeState {
-    use std::os::unix::fs::MetadataExt as _;
+    use std::os::unix::fs::{FileTypeExt as _, MetadataExt as _};
     let metadata = match std::fs::symlink_metadata(socket_path) {
         Ok(metadata) => metadata,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
@@ -312,19 +312,26 @@ fn write_pidfile(socket_path: &Path, boot: SystemTime) -> Result<()> {
         .duration_since(SystemTime::UNIX_EPOCH)
         .map(|duration| duration.as_secs())
         .unwrap_or(0);
-    let mut staging = tempfile::NamedTempFile::new_in(parent)
-        .with_context(|| format!("create staging pidfile in {}", parent.display()))?;
-    writeln!(staging, "{pid}")?;
-    writeln!(staging, "{boot_secs}")?;
-    staging
-        .as_file()
- .sync_all()
-        .with_context(|| format!("fsync staging pidfile for {}", socket_path.display()))?;
-    staging
-        .persist(&sidecars.pid)
-        .map_err(|error| anyhow::anyhow!("persist pidfile: {error}"))?;
-    fsync_parent(&sidecars.pid);
-    Ok(())
+    // Stage to a sibling temp file, fsync for durability, then rename over
+    // the destination (the crate's shared atomic-write pattern; no tempfile
+    // dependency). The temp file is removed if any step fails so a failed
+    // start cannot leave a stray staging file behind.
+    let staging_path = parent.join(format!(".mux-server.pid.{}.tmp", std::process::id()));
+    let result = (|| -> Result<()> {
+        std::fs::write(&staging_path, format!("{pid}\n{boot_secs}\n"))
+            .with_context(|| format!("writing staging pidfile in {}", parent.display()))?;
+        std::fs::File::open(&staging_path)?
+            .sync_all()
+            .with_context(|| format!("fsync staging pidfile for {}", socket_path.display()))?;
+        std::fs::rename(&staging_path, &sidecars.pid)
+            .map_err(|error| anyhow::anyhow!("persist pidfile: {error}"))?;
+        fsync_parent(&sidecars.pid);
+        Ok(())
+    })();
+    if result.is_err() {
+        let _ = std::fs::remove_file(&staging_path);
+    }
+    result
 }
 
 /// §3.2 fsync the directory containing `path` so the pidfile rename is
@@ -444,6 +451,7 @@ async fn reclaim_or_refuse(
         }
     }
 }
+fn init_database(db_path: &Path) -> Result<Connection> {
     let db = Connection::open_file(db_path.to_str().unwrap_or("file::memory:?mode=memory"));
     // §3.6 初始化持久化表
     persistence::init_tables(&db)?;
@@ -469,6 +477,8 @@ pub fn run() -> Result<()> {
     rt.block_on(async {
         let socket_name = default_socket_name()?;
         let listener = match bind_or_cleanup(&socket_name).await {
+            Ok(listener) => listener,
+            Err(error) => return Err(error),
         };
 
         // §16.1 socket 权限 0600: 仅同 UID 可连接 —— §9 fail-open 角色模型的安全前提。

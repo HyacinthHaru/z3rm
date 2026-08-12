@@ -118,15 +118,19 @@ fn stop_inner(inner: &WatchInner) {
             if sender.send(ShadowCommand::Checkpoint { reply }).is_ok() {
                 match response.recv() {
                     Ok(Ok(())) => {}
-                    Ok(Err(error)) => zlog::warn!(
-                        "shadow final checkpoint failed: session={} error={}",
-                        inner.session_id,
-                        error,
-                    ),
-                    Err(_) => zlog::warn!(
-                        "shadow recorder exited before final checkpoint: session={}",
-                        inner.session_id,
-                    ),
+                    Ok(Err(error)) => {
+                        zlog::warn!(
+                            "shadow final checkpoint failed: session={} error={}",
+                            inner.session_id,
+                            error,
+                        );
+                    }
+                    Err(_) => {
+                        zlog::warn!(
+                            "shadow recorder exited before final checkpoint: session={}",
+                            inner.session_id,
+                        );
+                    }
                 }
             } else {
                 zlog::warn!(
@@ -878,19 +882,23 @@ fn build_path_hash_index(root: &Path) -> std::collections::HashMap<[u8; 32], Pat
                 // distinctive in the log so a permission failure is observable
                 // and cannot be confused with "this directory is simply empty".
                 match error.path() {
-                    Some(path) => zlog::warn!(
-                        "shadow snapshot walkdir error: root={} path={} depth={} error={}",
-                        root.display(),
-                        path.display(),
-                        error.depth(),
-                        error,
-                    ),
-                    None => zlog::warn!(
-                        "shadow snapshot walkdir error: root={} depth={} error={}",
-                        root.display(),
-                        error.depth(),
-                        error,
-                    ),
+                    Some(path) => {
+                        zlog::warn!(
+                            "shadow snapshot walkdir error: root={} path={} depth={} error={}",
+                            root.display(),
+                            path.display(),
+                            error.depth(),
+                            error,
+                        );
+                    }
+                    None => {
+                        zlog::warn!(
+                            "shadow snapshot walkdir error: root={} depth={} error={}",
+                            root.display(),
+                            error.depth(),
+                            error,
+                        );
+                    }
                 }
                 continue;
             }

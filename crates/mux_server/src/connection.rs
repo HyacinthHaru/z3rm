@@ -8,7 +8,8 @@ use mux_protocol::proto::fetch_grid_update_response::Update as FetchGridUpdateRe
 use mux_protocol::proto::request::Body as RequestBody;
 use mux_protocol::proto::response::Body as ResponseBody;
 use mux_protocol::{
-    FrameLengthError, FrameLengthErrorKind, MAX_VARINT_LEN, check_frame_len, proto::*,
+    FrameLengthError, FrameLengthErrorKind, MAX_FRAME_PAYLOAD, MAX_VARINT_LEN, check_frame_len,
+    proto::*,
 };
 use prost::Message;
 use sqlez::connection::Connection;
@@ -2107,6 +2108,11 @@ fn grid_cell_to_proto(cell: crate::grid_sync::Cell) -> Cell {
 }
 
 /// §3.3 获取 grid 更新
+/// §16.9 响应帧校验余量: 覆盖 Envelope/Response 包装 (版本、request_id、
+/// oneof tags、行数与版本号) 的保守编码开销。`encoded_len` 检查以此为基准
+/// 保证整个帧落在 `MAX_FRAME_PAYLOAD` 之内, 客户端不会因帧超限掐断连接。
+const RESPONSE_FRAME_HEADROOM: usize = 256;
+
 /// §16.9 获取回滚缓冲区历史行
 async fn handle_fetch_scrollback(
     req: &FetchScrollbackRequest,
@@ -2116,8 +2122,14 @@ async fn handle_fetch_scrollback(
     for session in sessions_r.iter() {
         let panes = session.panes.clone();
         if let Some(pane) = panes.read().get(&req.pane_id) {
-            let (lines, total, version) =
-                pane.fetch_scrollback(req.from_line, req.direction, req.count);
+            let (lines, total, version) = match pane.fetch_scrollback_checked(
+                req.from_line,
+                req.direction,
+                req.count,
+            ) {
+                Ok(result) => result,
+                Err(error) => return Ok(ResponseBody::Error(error.rpc_message())),
+            };
             let resp = FetchScrollbackResponse {
                 lines: lines
                     .into_iter()
@@ -2129,6 +2141,13 @@ async fn handle_fetch_scrollback(
                 total_lines: total,
                 scrollback_version: version,
             };
+            // §16.9 编码后硬校验: 若实际序列化大小 (含极端 hyperlink 内容) 超出
+            // 帧上限, 返回 typed error 而不是让写循环发出客户端无法接受的巨型帧。
+            if resp.encoded_len() > MAX_FRAME_PAYLOAD - RESPONSE_FRAME_HEADROOM {
+                return Ok(ResponseBody::Error(
+                    "scrollback response exceeds frame limit".to_string(),
+                ));
+            }
             return Ok(ResponseBody::Scrollback(resp));
         }
     }
@@ -3371,6 +3390,73 @@ mod connection_unit_tests {
     }
 
     #[tokio::test]
+    async fn fetch_scrollback_rejects_malformed_requests_with_typed_error() {
+        let pane = match crate::pane::Pane::spawn(
+            "scrollback-validation-pane".to_string(),
+            std::env::temp_dir().to_string_lossy().to_string(),
+            4,
+            2,
+            Some(crate::pane::ShellCommand {
+                program: "/bin/cat".to_string(),
+                ..Default::default()
+            }),
+        ) {
+            Ok(pane) => pane,
+            Err(error) => panic!("spawn scrollback validation pane: {error}"),
+        };
+        let mut session = crate::session::Session::new(
+            "scrollback-validation-session".to_string(),
+            "scrollback-validation-session".to_string(),
+            "/tmp".to_string(),
+        );
+        session.panes.write().insert(pane.id.clone(), pane);
+        let sessions = Arc::new(parking_lot::RwLock::new(vec![session]));
+
+        // Malformed direction must produce a typed RPC error, not an Err that
+        // tears down the connection.
+        let bad_direction = FetchScrollbackRequest {
+            pane_id: "scrollback-validation-pane".to_string(),
+            from_line: 0,
+            direction: 2,
+            count: 10,
+        };
+        let response = handle_fetch_scrollback(&bad_direction, &sessions)
+            .await
+            .expect("malformed request must not break the handler");
+        assert!(matches!(
+            &response,
+            ResponseBody::Error(message) if message.contains("invalid scrollback direction")
+        ));
+
+        // Oversized count must fail before any response rows are built.
+        let oversized = FetchScrollbackRequest {
+            pane_id: "scrollback-validation-pane".to_string(),
+            from_line: 0,
+            direction: 1,
+            count: u32::MAX,
+        };
+        let response = handle_fetch_scrollback(&oversized, &sessions)
+            .await
+            .expect("oversized request must not break the handler");
+        assert!(matches!(
+            &response,
+            ResponseBody::Error(message) if message.contains("exceeds protocol grid limit")
+        ));
+
+        // A valid request still succeeds with a normal Scrollback response.
+        let valid = FetchScrollbackRequest {
+            pane_id: "scrollback-validation-pane".to_string(),
+            from_line: 0,
+            direction: 1,
+            count: 10,
+        };
+        let response = handle_fetch_scrollback(&valid, &sessions)
+            .await
+            .expect("valid request must succeed");
+        assert!(matches!(&response, ResponseBody::Scrollback(_)));
+    }
+
+    #[tokio::test]
     async fn spawn_pane_rejects_missing_session_before_spawning() {
         let sessions = Arc::new(parking_lot::RwLock::new(Vec::new()));
         let settings = crate::server_settings::ServerSettings::load();
@@ -4382,17 +4468,19 @@ mod connection_unit_tests {
             "INSERT INTO sessions (id, name, cwd, layout_snapshot, last_snapshot_timestamp) VALUES (?, ?, ?, ?, ?)",
         )
         .expect("prepare corrupt row insert");
-        insert.bind("corrupt", 1).expect("bind id");
-        insert.bind("corrupt", 2).expect("bind name");
-        insert.bind("/tmp", 3).expect("bind cwd");
+        insert.bind(&"corrupt", 1).expect("bind id");
+        insert.bind(&"corrupt", 2).expect("bind name");
+        insert.bind(&"/tmp", 3).expect("bind cwd");
         insert
-            .bind(r#"{"version":2,"layout":{"nodes":[{"type":"split","id":"root","direction":"LeftRight","children":[1,2],"ratios":[0.0,1.0]},{"type":"pane","id":"n1","pane_id":"pane-1"},{"type":"pane","id":"n2","pane_id":"pane-2"}]},"tabs":[{"id":"tab-1","title":"shell","pane_ids":["pane-1","pane-2"]}],"panes":[{"id":"pane-1","cwd":"/tmp","title":"cat","cols":80,"rows":24},{"id":"pane-2","cwd":"/tmp","title":"cat","cols":80,"rows":24}],"focused_tab":"tab-1","focused_pane":"pane-1"}"#, 4)
+            .bind(&r#"{"version":2,"layout":{"nodes":[{"type":"split","id":"root","direction":"LeftRight","children":[1,2],"ratios":[0.0,1.0]},{"type":"pane","id":"n1","pane_id":"pane-1"},{"type":"pane","id":"n2","pane_id":"pane-2"}]},"tabs":[{"id":"tab-1","title":"shell","pane_ids":["pane-1","pane-2"]}],"panes":[{"id":"pane-1","cwd":"/tmp","title":"cat","cols":80,"rows":24},{"id":"pane-2","cwd":"/tmp","title":"cat","cols":80,"rows":24}],"focused_tab":"tab-1","focused_pane":"pane-1"}"#, 4)
             .expect("bind corrupt layout");
         insert.bind(&0_i64, 5).expect("bind timestamp");
         insert.exec().expect("insert corrupt row");
+        drop(insert);
         let database = Arc::new(parking_lot::Mutex::new(connection));
         let settings = crate::server_settings::ServerSettings::load();
         let clipboard = Arc::new(crate::clipboard::ServerClipboard::new());
+        let sessions = Arc::new(parking_lot::RwLock::new(Vec::new()));
         let (_extensions_dir, extension_host, _unattached) = handler_fixture(&sessions);
 
         let error = handle_confirm_recovery(

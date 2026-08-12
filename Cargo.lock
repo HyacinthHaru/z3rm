@@ -7577,6 +7577,7 @@ dependencies = [
  "serde",
  "serde_json",
  "shadow_snapshot",
+ "smol 2.0.2",
  "sqlez",
  "sysinfo 0.37.2",
  "tar",

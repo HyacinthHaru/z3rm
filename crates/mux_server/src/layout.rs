@@ -310,11 +310,15 @@ impl LayoutTree {
 
     fn remove_from_node(node: &mut LayoutNode, pane_id: &str) -> anyhow::Result<bool> {
         let LayoutNode::Split {
-            children, ratios, ..
+            id,
+            children,
+            ratios,
+            ..
         } = node
         else {
             return Ok(false);
         };
+        let collapsed_id = id.clone();
 
         let direct_child_index = children.iter().position(|child| {
             matches!(child, LayoutNode::Pane { pane_id: child_pane_id, .. } if child_pane_id == pane_id)
@@ -346,7 +350,13 @@ impl LayoutTree {
             return Ok(false);
         }
         if children.len() == 1 {
-            *node = children.remove(0);
+            let mut survivor = children.remove(0);
+            match &mut survivor {
+                LayoutNode::Pane { id, .. } | LayoutNode::Split { id, .. } => {
+                    *id = collapsed_id;
+                }
+            }
+            *node = survivor;
         }
         Ok(true)
     }
