@@ -47,14 +47,27 @@ pub struct RestoreTarget {
     domain: Arc<mux::MuxDomain>,
     session_id: String,
     version_id: u64,
+    expected_latest_seq_no: u64,
+    expected_current_exists: bool,
+    expected_current_sha256: Vec<u8>,
 }
 
 impl RestoreTarget {
-    pub fn new(domain: Arc<mux::MuxDomain>, session_id: String, version_id: u64) -> Self {
+    pub fn new(
+        domain: Arc<mux::MuxDomain>,
+        session_id: String,
+        version_id: u64,
+        expected_latest_seq_no: u64,
+        expected_current_exists: bool,
+        expected_current_sha256: Vec<u8>,
+    ) -> Self {
         Self {
             domain,
             session_id,
             version_id,
+            expected_latest_seq_no,
+            expected_current_exists,
+            expected_current_sha256,
         }
     }
 }
@@ -180,10 +193,20 @@ impl DiffReview {
         let domain = restore_target.domain.clone();
         let session_id = restore_target.session_id.clone();
         let version_id = restore_target.version_id;
+        let expected_latest_seq_no = restore_target.expected_latest_seq_no;
+        let expected_current_exists = restore_target.expected_current_exists;
+        let expected_current_sha256 = restore_target.expected_current_sha256.clone();
         let path = self.file_path.to_string_lossy().into_owned();
         cx.spawn(async move |this, cx| {
             let result = domain
-                .decline_file_version(&session_id, &path, version_id)
+                .decline_file_version(
+                    &session_id,
+                    &path,
+                    version_id,
+                    expected_latest_seq_no,
+                    expected_current_exists,
+                    expected_current_sha256,
+                )
                 .await;
             this.update(cx, |this, cx| {
                 this.decline_pending = false;

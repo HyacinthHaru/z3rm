@@ -318,9 +318,16 @@ pub(crate) async fn open_diff_review(
     let path_string = path.to_string_lossy().into_owned();
     let (previous, restore_target) =
         match fetch_previous_version(&domain, &session_id, &path_string).await {
-            Ok((previous, version_id)) => (
+            Ok((previous, version_id, latest_seq_no, current_exists, current_sha256)) => (
                 previous,
-                Some(RestoreTarget::new(domain, session_id, version_id)),
+                Some(RestoreTarget::new(
+                    domain,
+                    session_id,
+                    version_id,
+                    latest_seq_no,
+                    current_exists,
+                    current_sha256,
+                )),
             ),
             Err(error) => {
                 tracing::warn!(
@@ -383,20 +390,31 @@ async fn fetch_previous_version(
     domain: &Arc<mux::MuxDomain>,
     session_id: &str,
     path: &str,
-) -> anyhow::Result<(String, u64)> {
-    let versions_response = domain.list_file_versions(session_id, path).await?;
-    let versions = versions_response.versions;
-    let target = versions
+) -> anyhow::Result<(String, u64, u64, bool, Vec<u8>)> {
+    let review = domain.get_file_review_state(session_id, path).await?;
+    let target = review
+        .versions
         .len()
         .checked_sub(2)
-        .and_then(|index| versions.get(index))
-        .with_context(|| format!("need at least 2 versions to diff, found {}", versions.len()))?;
+        .and_then(|index| review.versions.get(index))
+        .with_context(|| {
+            format!(
+                "need at least 2 versions to diff, found {}",
+                review.versions.len()
+            )
+        })?;
     let content_response = domain
         .get_file_version(session_id, path, target.version_id)
         .await?;
     let previous = String::from_utf8(content_response.content)
         .map_err(|error| anyhow::anyhow!("shadow version is not valid UTF-8: {error}"))?;
-    Ok((previous, target.version_id))
+    Ok((
+        previous,
+        target.version_id,
+        review.latest_seq_no,
+        review.current_exists,
+        review.current_sha256,
+    ))
 }
 
 /// The mux domain and the session the GUI is attached to.

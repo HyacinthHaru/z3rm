@@ -1052,9 +1052,21 @@ pub async fn run_cli_command(cmd: CliCommand) -> Result<()> {
                 .get_file_version(&session_id, &path, version_id)
                 .await
                 .with_context(|| format!("failed to read version {version_id} of {path}"))?;
-            // 影子快照存的是字节, 不保证是 UTF-8; 原样写出去才能让调用方拿它和
-            // 磁盘上的文件逐字节比对。内容通常不以换行结尾, 显式 flush 才能保证
-            // 最后一段不被留在缓冲区里。
+            let state_name = match version.state {
+                1 => "text",
+                2 => "empty",
+                3 => "binary",
+                4 => "too_large",
+                5 => "deleted",
+                _ => "unspecified",
+            };
+            anyhow::ensure!(
+                version.content_available,
+                "version {version_id} of {path} is not available as bounded text ({state_name})"
+            );
+            // The review RPC only returns bounded UTF-8 content. Write it
+            // verbatim and flush because a retained text version need not end
+            // with a newline.
             let mut stdout = std::io::stdout();
             stdout
                 .write_all(&version.content)
@@ -1070,8 +1082,19 @@ pub async fn run_cli_command(cmd: CliCommand) -> Result<()> {
         } => {
             let target = super::target::parse_target(&target)?;
             let session_id = resolve_session_id(&domain, &target, &default_session).await?;
+            let review = domain
+                .get_file_review_state(&session_id, &path)
+                .await
+                .with_context(|| format!("failed to capture the current review state of {path}"))?;
             let response = domain
-                .decline_file_version(&session_id, &path, version_id)
+                .decline_file_version(
+                    &session_id,
+                    &path,
+                    version_id,
+                    review.latest_seq_no,
+                    review.current_exists,
+                    review.current_sha256,
+                )
                 .await
                 .with_context(|| format!("failed to restore {path} to version {version_id}"))?;
             anyhow::ensure!(

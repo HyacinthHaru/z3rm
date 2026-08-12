@@ -1287,25 +1287,54 @@ impl MuxDomain {
         }
     }
 
-    /// §4.8 把文件还原成 `version_id` 那一版的内容，撤销此后的改动。
-    /// 传的是要还原到的版本，不是要丢弃的那一版。
+    /// §4.8 Restore with the exact review baseline captured by
+    /// `get_file_review_state`. The server rechecks it immediately before the
+    /// WAL intent, so a watcher-latency race cannot overwrite newer bytes.
     pub async fn decline_file_version(
         &self,
         session_id: &str,
         path: &str,
         version_id: u64,
+        expected_latest_seq_no: u64,
+        expected_current_exists: bool,
+        expected_current_sha256: Vec<u8>,
     ) -> Result<DeclineFileVersionResponse> {
-        let req = RequestBody::DeclineFileVersion(mux_protocol::DeclineFileVersionRequest {
+        let request = RequestBody::DeclineFileVersion(mux_protocol::DeclineFileVersionRequest {
             session_id: session_id.to_string(),
             path: path.to_string(),
             version_id,
+            expected_latest_seq_no,
+            expected_current_exists,
+            expected_current_sha256,
         });
-        let resp = self.send_request(req).await?;
-        match resp.body {
-            Some(ResponseBody::DeclineFileVersion(resp)) => Ok(resp),
+        let response = self.send_request(request).await?;
+        match response.body {
+            Some(ResponseBody::DeclineFileVersion(response)) => Ok(response),
             Some(ResponseBody::Error(error)) => Err(anyhow::anyhow!(error)),
             _ => Err(anyhow::anyhow!(
                 "unexpected response type for decline_file_version"
+            )),
+        }
+    }
+
+    pub async fn get_file_review_state(
+        &self,
+        session_id: &str,
+        path: &str,
+    ) -> Result<mux_protocol::GetFileReviewStateResponse> {
+        let response = self
+            .send_request(RequestBody::GetFileReviewState(
+                mux_protocol::GetFileReviewStateRequest {
+                    session_id: session_id.to_string(),
+                    path: path.to_string(),
+                },
+            ))
+            .await?;
+        match response.body {
+            Some(ResponseBody::FileReviewState(state)) => Ok(state),
+            Some(ResponseBody::Error(error)) => Err(anyhow::anyhow!(error)),
+            _ => Err(anyhow::anyhow!(
+                "unexpected response type for get_file_review_state"
             )),
         }
     }

@@ -534,6 +534,16 @@ message FileVersion {
     string trigger = 3;     // 触发此版本的稳定字符串标识（例如 "edit"、"decline-undo"）
 }
 
+// §4 Review content is typed so non-text versions are never decoded lossily.
+enum FileContentState {
+    FILE_CONTENT_STATE_UNSPECIFIED = 0;
+    TEXT = 1;
+    EMPTY = 2;
+    BINARY = 3;
+    TOO_LARGE = 4;
+    DELETED = 5;
+}
+
 // §4 列出某会话内某路径的全部版本。
 message ListFileVersionsRequest {
     string session_id = 1;
@@ -555,6 +565,9 @@ message GetFileVersionRequest {
 // §4 版本内容响应。
 message GetFileVersionResponse {
     bytes content = 1;
+    uint64 total_bytes = 2;
+    FileContentState state = 3;
+    bool content_available = 4;
 }
 
 // §4.8 撤销此后的改动：把文件的内容还原成 version_id 那一版。
@@ -563,11 +576,32 @@ message DeclineFileVersionRequest {
     string session_id = 1;
     string path = 2;        // UTF-8 文件路径
     uint64 version_id = 3;  // §4.5 要还原到的版本 ID（不是要丢弃的那一版）
+    uint64 expected_latest_seq_no = 4;
+    bool expected_current_exists = 5;
+    bytes expected_current_sha256 = 6;
 }
 
 // §4.8 拒绝版本响应：restored 表示是否成功回滚。
 message DeclineFileVersionResponse {
     bool restored = 1;
+    uint64 restored_version_id = 2;
+    uint64 restored_seq_no = 3;
+}
+
+// §4 One atomic review baseline from the recorder thread.
+message GetFileReviewStateRequest {
+    string session_id = 1;
+    string path = 2;
+}
+
+message GetFileReviewStateResponse {
+    repeated FileVersion versions = 1;
+    uint64 latest_seq_no = 2;
+    bool current_exists = 3;
+    uint64 current_size = 4;
+    bytes current_sha256 = 5;
+    FileContentState current_state = 6;
+    bytes current_content = 7;
 }
 
 // §4 某个文件在本 session 内累计的影子版本概况。
@@ -857,6 +891,7 @@ message Request {
         ListChangedFilesRequest list_changed_files = 36;  // §4 shadow snapshot
         ListCommandsRequest list_commands = 37;  // §3.3 OSC 133 shell commands
         ExtensionChromeActionRequest extension_chrome_action = 38;  // §16.9
+        GetFileReviewStateRequest get_file_review_state = 39;  // §4 atomic review baseline
     }
 }
 
@@ -889,5 +924,6 @@ message Response {
         ListChangedFilesResponse changed_files = 24;  // §4 shadow snapshot
         ListCommandsResponse commands = 25;  // §3.3 OSC 133 shell commands
         ExtensionChromeActionResponse extension_chrome_action_result = 26;  // §16.9
+        GetFileReviewStateResponse file_review_state = 27;  // §4 atomic review baseline
     }
 }

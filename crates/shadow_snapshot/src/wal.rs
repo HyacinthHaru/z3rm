@@ -293,6 +293,7 @@ impl Wal {
             w.write_all(&delta.compressed_size.to_le_bytes())?;
         }
         w.write_all(&[match entry.trigger {
+            SnapshotTrigger::Create => 6,
             SnapshotTrigger::Write => 0,
             SnapshotTrigger::Close => 1,
             SnapshotTrigger::Debounce => 2,
@@ -365,6 +366,7 @@ impl Wal {
             3 => SnapshotTrigger::Decline,
             4 => SnapshotTrigger::Delete,
             5 => SnapshotTrigger::DeclineDone,
+            6 => SnapshotTrigger::Create,
             value => return Err(invalid_data(format!("invalid WAL trigger {value}"))),
         };
 
@@ -626,6 +628,7 @@ mod tests {
         let wal = Wal::open(&path).unwrap();
 
         let triggers = [
+            SnapshotTrigger::Create,
             SnapshotTrigger::Write,
             SnapshotTrigger::Close,
             SnapshotTrigger::Debounce,
@@ -648,7 +651,7 @@ mod tests {
         wal.commit().unwrap();
 
         let entries = wal.replay().unwrap();
-        assert_eq!(entries.len(), 6);
+        assert_eq!(entries.len(), triggers.len());
         for (i, entry) in entries.iter().enumerate() {
             assert_eq!(entry.trigger, triggers[i]);
         }

@@ -588,6 +588,9 @@ async fn dispatch_request(
         RequestBody::GetFileVersion(request) => {
             shadow_response(handle_get_file_version(request, sessions).await)
         }
+        RequestBody::GetFileReviewState(request) => {
+            shadow_response(handle_get_file_review_state(request, sessions).await)
+        }
         RequestBody::DeclineFileVersion(request) => {
             if check_permission(role, ClientRole::ReadWrite) {
                 handle_decline_file_version(request, sessions, connection_client_id).await?
@@ -2900,7 +2903,96 @@ async fn handle_get_file_version(
         .context("joining shadow get-version request")??
         .with_context(|| format!("shadow version not found: {version_id}"))?;
     Ok(ResponseBody::FileVersionContent(
-        mux_protocol::GetFileVersionResponse { content },
+        mux_protocol::GetFileVersionResponse {
+            total_bytes: content.len() as u64,
+            state: if content.is_empty() {
+                FileContentState::Empty as i32
+            } else if std::str::from_utf8(&content).is_ok() {
+                FileContentState::Text as i32
+            } else {
+                FileContentState::Binary as i32
+            },
+            content_available: true,
+            content,
+        },
+    ))
+}
+const MAX_REVIEW_CONTENT_BYTES: usize = 2 * 1024 * 1024;
+
+fn classify_review_content(
+    content: Option<Vec<u8>>,
+) -> (i32, bool, u64, Vec<u8>, Vec<u8>) {
+    let Some(content) = content else {
+        return (FileContentState::Deleted as i32, true, 0, Vec::new(), Vec::new());
+    };
+    let total_bytes = content.len() as u64;
+    let sha256 = shadow_snapshot::DeclineProtocol::compute_hash(&content).to_vec();
+    if content.len() > MAX_REVIEW_CONTENT_BYTES {
+        return (
+            FileContentState::TooLarge as i32,
+            false,
+            total_bytes,
+            sha256,
+            Vec::new(),
+        );
+    }
+    if content.is_empty() {
+        return (
+            FileContentState::Empty as i32,
+            true,
+            total_bytes,
+            sha256,
+            content,
+        );
+    }
+    if std::str::from_utf8(&content).is_err() {
+        return (
+            FileContentState::Binary as i32,
+            true,
+            total_bytes,
+            sha256,
+            content,
+        );
+    }
+    (
+        FileContentState::Text as i32,
+        true,
+        total_bytes,
+        sha256,
+        content,
+    )
+}
+
+async fn handle_get_file_review_state(
+    request: &mux_protocol::GetFileReviewStateRequest,
+    sessions: &Arc<parking_lot::RwLock<Vec<crate::session::Session>>>,
+) -> anyhow::Result<ResponseBody> {
+    let (watch, root) = snapshot_context_for_session(sessions, &request.session_id)?;
+    let path = resolve_path_within_root(&root, &request.path)?;
+    let state = tokio::task::spawn_blocking(move || watch.get_review_state(path))
+        .await
+        .context("joining shadow review-state request")??;
+    let current_exists = state.current_content.is_some();
+    let (current_state, _available, current_size, current_sha256, current_content) =
+        classify_review_content(state.current_content);
+    Ok(ResponseBody::FileReviewState(
+        mux_protocol::GetFileReviewStateResponse {
+            versions: state
+                .versions
+                .into_iter()
+                .map(|version| mux_protocol::FileVersion {
+                    version_id: version.version_id,
+                    seq_no: version.seq_no,
+                    trigger: format!("{:?}", version.trigger).to_ascii_lowercase(),
+                })
+                .collect(),
+            latest_seq_no: state.latest_seq_no,
+            current_exists,
+            current_size,
+            current_sha256,
+            current_state,
+            current_content,
+        },
     ))
 }
 
@@ -2915,15 +3007,36 @@ async fn handle_decline_file_version(
     let (watch, root) = snapshot_context_for_session(sessions, &request.session_id)?;
     let path = resolve_path_within_root(&root, &request.path)?;
     let version_id = request.version_id;
-    let declined = tokio::task::spawn_blocking(move || watch.decline(path, version_id))
-        .await
-        .context("joining shadow decline request")?;
+    let expected_hash = match request.expected_current_sha256.as_slice() {
+        [] => None,
+        bytes => Some(
+            bytes
+                .try_into()
+                .map_err(|_| anyhow::anyhow!("expected_current_sha256 must contain 32 bytes"))?,
+        ),
+    };
+    let expected_latest_seq_no = request.expected_latest_seq_no;
+    let expected_current_exists = request.expected_current_exists;
+    let declined = tokio::task::spawn_blocking(move || {
+        watch.decline(
+            path,
+            version_id,
+            expected_latest_seq_no,
+            expected_current_exists,
+            expected_hash,
+        )
+    })
+    .await
+    .context("joining shadow decline request")?;
     match declined {
-        Ok(()) => Ok(ResponseBody::DeclineFileVersion(
-            mux_protocol::DeclineFileVersionResponse { restored: true },
+        Ok(outcome) => Ok(ResponseBody::DeclineFileVersion(
+            mux_protocol::DeclineFileVersionResponse {
+                restored: true,
+                restored_version_id: outcome.version_id,
+                restored_seq_no: outcome.seq_no,
+            },
         )),
-        // §4.8 恢复失败必须让客户端看到原因: 写死 restored=true 会把一次没有
-        // 发生的回滚显示成成功, 而 `?` 会连带拆掉整条连接。
+        // A failed restore must surface its cause without closing the transport.
         Err(error) => Ok(ResponseBody::Error(format!(
             "decline_file_version: {error:#}"
         ))),

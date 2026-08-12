@@ -76,6 +76,44 @@ impl<'a> DeclineProtocol<'a> {
         Ok(content_hash)
     }
 
+    /// Record a restore intent before removing a file. The empty blob is kept
+    /// as the durable operation fingerprint used by `DeclineDone`; recovery
+    /// can therefore complete the unlink idempotently.
+    pub fn prepare_delete(
+        &self,
+        blob_store: &BlobStore,
+        path_hash: PathHash,
+        parent_id: Option<VersionId>,
+        target_path: &Path,
+    ) -> Result<ContentHash> {
+        let content_hash = blob_store.put(&[])?;
+        let intent = WalEntry {
+            seq_no: self.seq_no,
+            path_hash,
+            parent_id,
+            content_ref: Some(content_hash),
+            delta_ref: None,
+            trigger: SnapshotTrigger::Decline,
+        };
+        self.wal.append(&intent)?;
+        self.wal.commit()?;
+        match std::fs::remove_file(target_path) {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error).context("decline: failed to remove target file"),
+        }
+        if let Some(parent_dir) = target_path
+            .parent()
+            .filter(|parent| !parent.as_os_str().is_empty())
+        {
+            std::fs::File::open(parent_dir)
+                .context("decline: failed to open parent dir for fsync")?
+                .sync_all()
+                .context("decline: failed to fsync parent dir")?;
+        }
+        Ok(content_hash)
+    }
+
     /// 写回目标文件并 fsync 文件 + 父目录（原子 replace）。
     ///
     /// 用临时文件 + rename 保证原子性：读者要么看到旧版本，要么看到完整新版本，

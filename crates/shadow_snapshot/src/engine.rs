@@ -99,6 +99,14 @@ pub struct ShadowSnapshotEngine {
     records_since_gc: AtomicU64,
 }
 
+/// Metadata for the history node appended by a successful conditional restore.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DeclineResult {
+    pub version_id: VersionId,
+    pub seq_no: SeqNo,
+    pub content_hash: ContentHash,
+}
+
 impl ShadowSnapshotEngine {
     /// Open or create the engine at the given paths.
     ///
@@ -131,7 +139,8 @@ impl ShadowSnapshotEngine {
             replay_max_seq = replay_max_seq.max(entry.seq_no);
             let produces_node = matches!(
                 entry.trigger,
-                SnapshotTrigger::Write
+                SnapshotTrigger::Create
+                    | SnapshotTrigger::Write
                     | SnapshotTrigger::Close
                     | SnapshotTrigger::Debounce
                     | SnapshotTrigger::Delete
@@ -377,7 +386,10 @@ impl ShadowSnapshotEngine {
         anyhow::ensure!(
             matches!(
                 trigger,
-                SnapshotTrigger::Write | SnapshotTrigger::Close | SnapshotTrigger::Debounce
+                SnapshotTrigger::Create
+                    | SnapshotTrigger::Write
+                    | SnapshotTrigger::Close
+                    | SnapshotTrigger::Debounce
             ),
             "record_change_with_trigger: {trigger:?} is not a content-write trigger"
         );
@@ -611,6 +623,123 @@ impl ShadowSnapshotEngine {
     /// full-snapshot VersionNode 成为新的 HEAD。这样后续 record_change 的
     /// parent 链以还原后的内容为基线，而不是还原前的写入链——避免 decline
     /// 被“幽灵地”覆盖回旧状态。
+    /// Restore only when the reviewed live-file fingerprint and history head
+    /// still match the server-canonical state.
+    pub fn decline_if_current(
+        &self,
+        path: &Path,
+        target_version: VersionId,
+        expected_latest_seq_no: SeqNo,
+        expected_current_exists: bool,
+        expected_current_hash: Option<ContentHash>,
+    ) -> Result<DeclineResult> {
+        use crate::decline::DeclineProtocol;
+        use crate::delta_chain::DeltaReplay;
+
+        let path_hash = compute_path_hash(path);
+        let target_node = self
+            .tree
+            .get_node(target_version)
+            .ok_or_else(|| anyhow::anyhow!("version {target_version} not found"))?;
+        anyhow::ensure!(
+            target_node.path_hash == path_hash,
+            "decline path does not match version {target_version}"
+        );
+        let parent_id = self.tree.get_head(&path_hash);
+        let latest_seq_no = parent_id
+            .and_then(|version_id| self.tree.get_node(version_id))
+            .map_or(0, |node| node.seq_no);
+        anyhow::ensure!(
+            latest_seq_no == expected_latest_seq_no,
+            "stale review: history advanced from {expected_latest_seq_no} to {latest_seq_no}"
+        );
+
+        let current_content = match std::fs::read(path) {
+            Ok(content) => Some(content),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+            Err(error) => return Err(error).context("decline: failed to read current file"),
+        };
+        anyhow::ensure!(
+            current_content.is_some() == expected_current_exists,
+            "stale review: current file existence changed"
+        );
+        if let Some(expected_hash) = expected_current_hash {
+            let actual_hash = current_content
+                .as_deref()
+                .map(DeclineProtocol::compute_hash)
+                .ok_or_else(|| anyhow::anyhow!("stale review: current file was deleted"))?;
+            anyhow::ensure!(
+                actual_hash == expected_hash,
+                "stale review: current file content changed"
+            );
+        }
+
+        let target_content = if let Some(full_hash) = &target_node.full_content {
+            self.blob_store.get(full_hash)?
+        } else if target_node.trigger == SnapshotTrigger::Delete {
+            Vec::new()
+        } else {
+            DeltaReplay::reconstruct(
+                &target_node,
+                |version_id| self.tree.get_node(version_id),
+                |hash: &[u8; 32]| self.blob_store.get(hash).ok(),
+            )
+            .ok_or_else(|| {
+                anyhow::anyhow!(
+                    "decline: target version {target_version} is not reconstructable"
+                )
+            })?
+            .to_string()
+            .into_bytes()
+        };
+
+        let seq_no = self.seq_no.fetch_add(1, Ordering::AcqRel) as SeqNo;
+        let protocol = DeclineProtocol::new(&self.wal, seq_no);
+        let content_hash = if target_node.trigger == SnapshotTrigger::Delete {
+            protocol.prepare_delete(&self.blob_store, path_hash, parent_id, path)?
+        } else {
+            protocol.prepare_restore(
+                &self.blob_store,
+                path_hash,
+                parent_id,
+                &target_content,
+                path,
+            )?
+        };
+        let timestamp_ns = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|duration| duration.as_nanos())
+            .unwrap_or(0);
+        let version_id = self.tree.advance_head(
+            path_hash,
+            seq_no,
+            timestamp_ns,
+            parent_id,
+            Some(content_hash),
+            None,
+            0,
+            SnapshotTrigger::Decline,
+        );
+        self.storage.write_node(
+            version_id,
+            &path_hash,
+            seq_no,
+            parent_id,
+            Some(&content_hash),
+            None,
+            0,
+            SnapshotTrigger::Decline,
+            timestamp_ns,
+        )?;
+        protocol.mark_done(path_hash, content_hash)?;
+        self.maybe_run_gc();
+        Ok(DeclineResult {
+            version_id,
+            seq_no,
+            content_hash,
+        })
+    }
+
     pub fn decline(&self, path: &Path, target_version: VersionId) -> Result<ContentHash> {
         use crate::decline::DeclineProtocol;
         use crate::delta_chain::DeltaReplay;
@@ -898,6 +1027,57 @@ mod tests {
 
         assert!(error.to_string().contains("path"), "error={error:#}");
         assert_eq!(std::fs::read(&destination).unwrap(), b"destination-current");
+    }
+
+    #[test]
+    fn conditional_decline_rejects_changed_current_bytes_without_mutation() {
+        let directory = TempDir::new().unwrap();
+        let database = directory.path().join("conditional.db");
+        let wal = directory.path().join("conditional.wal");
+        let blobs = directory.path().join("conditional-blobs");
+        std::fs::create_dir_all(&blobs).unwrap();
+        let path = directory.path().join("file.txt");
+        std::fs::write(&path, b"current").unwrap();
+        let engine = ShadowSnapshotEngine::open(&database, &wal, &blobs).unwrap();
+        let target = engine.record_change(&path, b"old").unwrap();
+        let latest = engine.list_versions(&path).unwrap()[0].1;
+        let expected_hash = crate::decline::DeclineProtocol::compute_hash(b"current");
+        std::fs::write(&path, b"changed").unwrap();
+
+        let before = engine.list_versions(&path).unwrap();
+        let error = engine
+            .decline_if_current(&path, target, latest, true, Some(expected_hash))
+            .expect_err("changed bytes must stale the review");
+
+        assert!(error.to_string().contains("stale review"));
+        assert_eq!(engine.list_versions(&path).unwrap(), before);
+        assert_eq!(std::fs::read(&path).unwrap(), b"changed");
+    }
+
+    #[test]
+    fn restoring_delete_target_removes_file_and_preserves_history() {
+        let directory = TempDir::new().unwrap();
+        let database = directory.path().join("delete-restore.db");
+        let wal = directory.path().join("delete-restore.wal");
+        let blobs = directory.path().join("delete-restore-blobs");
+        std::fs::create_dir_all(&blobs).unwrap();
+        let path = directory.path().join("file.txt");
+        std::fs::write(&path, b"current").unwrap();
+        let engine = ShadowSnapshotEngine::open(&database, &wal, &blobs).unwrap();
+        engine.record_change(&path, b"old").unwrap();
+        let deleted = engine.record_delete(&path).unwrap();
+        let latest = engine.list_versions(&path).unwrap().last().unwrap().1;
+        let expected_hash = crate::decline::DeclineProtocol::compute_hash(b"current");
+
+        let restored = engine
+            .decline_if_current(&path, deleted, latest, true, Some(expected_hash))
+            .unwrap();
+
+        assert!(!path.exists());
+        let versions = engine.list_versions(&path).unwrap();
+        assert_eq!(versions.len(), 3);
+        assert_eq!(versions.last().unwrap().0, restored.version_id);
+        assert_eq!(versions.last().unwrap().2, SnapshotTrigger::Decline);
     }
 
     #[test]

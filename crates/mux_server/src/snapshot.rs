@@ -39,6 +39,19 @@ pub struct FileVersion {
     pub trigger: SnapshotTrigger,
 }
 
+#[derive(Debug, Clone)]
+pub struct FileReviewState {
+    pub versions: Vec<FileVersion>,
+    pub latest_seq_no: u64,
+    pub current_content: Option<Vec<u8>>,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct DeclineOutcome {
+    pub version_id: u64,
+    pub seq_no: u64,
+}
+
 /// §4 One file that accumulated shadow versions during this session.
 #[derive(Debug, Clone)]
 pub struct FileChange {
@@ -60,10 +73,17 @@ enum ShadowCommand {
         version_id: u64,
         reply: mpsc::Sender<Result<Option<Vec<u8>>>>,
     },
+    GetReviewState {
+        path: PathBuf,
+        reply: mpsc::Sender<Result<FileReviewState>>,
+    },
     Decline {
         path: PathBuf,
         version_id: u64,
-        reply: mpsc::Sender<Result<()>>,
+        expected_latest_seq_no: u64,
+        expected_current_exists: bool,
+        expected_current_hash: Option<shadow_snapshot::ContentHash>,
+        reply: mpsc::Sender<Result<DeclineOutcome>>,
     },
     /// §4 WAL checkpoint: rotate the WAL on the recorder (single-writer)
     /// thread after every prior entry is persisted. The reply carries the
@@ -206,11 +226,29 @@ impl SnapshotWatch {
             .context("shadow recorder stopped before reading version")?
     }
 
-    pub fn decline(&self, path: PathBuf, version_id: u64) -> Result<()> {
+    pub fn get_review_state(&self, path: PathBuf) -> Result<FileReviewState> {
+        let (reply, response) = mpsc::channel();
+        self.send_command(ShadowCommand::GetReviewState { path, reply })?;
+        response
+            .recv()
+            .context("shadow recorder stopped before reading review state")?
+    }
+
+    pub fn decline(
+        &self,
+        path: PathBuf,
+        version_id: u64,
+        expected_latest_seq_no: u64,
+        expected_current_exists: bool,
+        expected_current_hash: Option<shadow_snapshot::ContentHash>,
+    ) -> Result<DeclineOutcome> {
         let (reply, response) = mpsc::channel();
         self.send_command(ShadowCommand::Decline {
             path,
             version_id,
+            expected_latest_seq_no,
+            expected_current_exists,
+            expected_current_hash,
             reply,
         })?;
         response
@@ -877,16 +915,60 @@ fn handle_command(
             }
             None
         }
+        ShadowCommand::GetReviewState { path, reply } => {
+            let result = engine.list_versions(&path).and_then(|versions| {
+                let latest_seq_no = versions.last().map_or(0, |(_, seq_no, _)| *seq_no);
+                let versions = versions
+                    .into_iter()
+                    .map(|(version_id, seq_no, trigger)| FileVersion {
+                        version_id,
+                        seq_no,
+                        trigger,
+                    })
+                    .collect();
+                let current_content = match std::fs::read(&path) {
+                    Ok(content) => Some(content),
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+                    Err(error) => return Err(error.into()),
+                };
+                Ok(FileReviewState {
+                    versions,
+                    latest_seq_no,
+                    current_content,
+                })
+            });
+            if reply.send(result).is_err() {
+                zlog::warn!("shadow review-state requester disconnected");
+            }
+            None
+        }
         ShadowCommand::Decline {
             path,
             version_id,
+            expected_latest_seq_no,
+            expected_current_exists,
+            expected_current_hash,
             reply,
         } => {
             let result = engine
-                .decline(&path, version_id)
-                .map(|content_hash| (shadow_snapshot::compute_path_hash(&path), content_hash));
-            let suppression = result.as_ref().ok().copied();
-            if reply.send(result.map(|_| ())).is_err() {
+                .decline_if_current(
+                    &path,
+                    version_id,
+                    expected_latest_seq_no,
+                    expected_current_exists,
+                    expected_current_hash,
+                )
+                .map(|result| {
+                    (
+                        DeclineOutcome {
+                            version_id: result.version_id,
+                            seq_no: result.seq_no,
+                        },
+                        (shadow_snapshot::compute_path_hash(&path), result.content_hash),
+                    )
+                });
+            let suppression = result.as_ref().ok().map(|(_, suppression)| *suppression);
+            if reply.send(result.map(|(outcome, _)| outcome)).is_err() {
                 zlog::warn!("shadow decline requester disconnected");
             }
             suppression
@@ -1022,7 +1104,9 @@ fn route_record_event(
             // was removed and recreated inside one debounce window. The content
             // is what survived, so it is versioned as a write; recording it
             // under `Delete` would label a content node as a tombstone.
-            let trigger = if trigger == shadow_snapshot::SnapshotTrigger::Delete {
+            let trigger = if engine.head_trigger(path).is_none() {
+                shadow_snapshot::SnapshotTrigger::Create
+            } else if trigger == shadow_snapshot::SnapshotTrigger::Delete {
                 shadow_snapshot::SnapshotTrigger::Write
             } else {
                 trigger

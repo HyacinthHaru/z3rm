@@ -347,6 +347,13 @@ impl DebounceQueue {
         self.pending.insert(path, (trigger, due_at));
     }
 
+    /// Remove one path from the quiet-window queue. Atomic review
+    /// reconciliation consumes the path synchronously on the recorder thread,
+    /// so leaving the queued event behind would append the same bytes again.
+    pub fn take(&mut self, path: &Path) -> Option<SnapshotTrigger> {
+        self.pending.remove(path).map(|(trigger, _)| trigger)
+    }
+
     /// 取出所有已到期的路径。
     pub fn flush_due(&mut self, now: Instant) -> Vec<(PathBuf, SnapshotTrigger)> {
         let mut released = Vec::new();
@@ -757,6 +764,23 @@ mod tests {
         assert!(slow.flush_due(at_100ms).is_empty(), "500ms window is not");
         assert_eq!(slow.pending_count(), 1);
         assert_eq!(slow.flush_due(start + Duration::from_millis(501)).len(), 1);
+    }
+
+    #[test]
+    fn taking_a_pending_path_prevents_a_later_duplicate_flush() {
+        let start = Instant::now();
+        let path = PathBuf::from("/tmp/reviewed.txt");
+        let other = PathBuf::from("/tmp/other.txt");
+        let mut queue = DebounceQueue::new(Duration::from_millis(50));
+        queue.note(path.clone(), SnapshotTrigger::Write, start);
+        queue.note(other.clone(), SnapshotTrigger::Close, start);
+
+        assert_eq!(queue.take(&path), Some(SnapshotTrigger::Write));
+        assert_eq!(queue.take(&path), None);
+        assert_eq!(
+            queue.flush_due(start + Duration::from_millis(51)),
+            vec![(other, SnapshotTrigger::Close)]
+        );
     }
 
     /// 删除一个被监控的文件，watcher 层必须真的报出 `Deleted`。

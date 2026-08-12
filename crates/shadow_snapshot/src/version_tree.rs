@@ -25,6 +25,8 @@ pub type ContentHash = [u8; 32];
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SnapshotTrigger {
     /// 文件写入事件
+    /// First retained content for a newly observed path
+    Create,
     Write,
     /// 文件关闭事件
     Close,

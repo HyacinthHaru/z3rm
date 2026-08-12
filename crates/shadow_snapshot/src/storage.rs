@@ -92,6 +92,7 @@ impl StorageEngine {
         timestamp_ns: u128,
     ) -> Result<()> {
         let trigger_str = match trigger {
+            SnapshotTrigger::Create => "Create",
             SnapshotTrigger::Write => "Write",
             SnapshotTrigger::Close => "Close",
             SnapshotTrigger::Debounce => "Debounce",
@@ -326,6 +327,7 @@ pub struct LoadedNodes {
 /// 把 SQLite 中的 trigger 字符串还原为 `SnapshotTrigger`。
 fn parse_trigger(s: &str) -> Option<SnapshotTrigger> {
     Some(match s {
+        "Create" => SnapshotTrigger::Create,
         "Write" => SnapshotTrigger::Write,
         "Close" => SnapshotTrigger::Close,
         "Debounce" => SnapshotTrigger::Debounce,

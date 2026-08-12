@@ -459,3 +459,72 @@ fn recovery_messages_round_trip() {
         body => panic!("unexpected recovery response body: {body:?}"),
     }
 }
+
+#[test]
+fn file_review_messages_round_trip() {
+    let review_state = GetFileReviewStateResponse {
+        versions: vec![FileVersion {
+            version_id: 7,
+            seq_no: 11,
+            trigger: "create".to_string(),
+        }],
+        latest_seq_no: 11,
+        current_exists: true,
+        current_size: 3,
+        current_sha256: vec![9; 32],
+        current_state: FileContentState::Text as i32,
+        current_content: b"new".to_vec(),
+    };
+    let response = Response {
+        request_id: 41,
+        body: Some(proto::response::Body::FileReviewState(
+            review_state.clone(),
+        )),
+    };
+    let decoded = Response::decode(response.encode_to_vec().as_slice()).expect("decode");
+    match decoded.body {
+        Some(proto::response::Body::FileReviewState(decoded)) => {
+            assert_eq!(decoded, review_state);
+        }
+        body => panic!("unexpected review-state response body: {body:?}"),
+    }
+
+    let decline = DeclineFileVersionRequest {
+        session_id: "session".to_string(),
+        path: "file.txt".to_string(),
+        version_id: 7,
+        expected_latest_seq_no: 11,
+        expected_current_exists: true,
+        expected_current_sha256: vec![9; 32],
+    };
+    let request = Request {
+        request_id: 42,
+        body: Some(proto::request::Body::DeclineFileVersion(decline.clone())),
+    };
+    let decoded = Request::decode(request.encode_to_vec().as_slice()).expect("decode");
+    match decoded.body {
+        Some(proto::request::Body::DeclineFileVersion(decoded)) => {
+            assert_eq!(decoded, decline);
+        }
+        body => panic!("unexpected decline request body: {body:?}"),
+    }
+
+    let historical = GetFileVersionResponse {
+        content: Vec::new(),
+        total_bytes: 4,
+        state: FileContentState::Binary as i32,
+        content_available: false,
+    };
+    let decoded =
+        GetFileVersionResponse::decode(historical.encode_to_vec().as_slice()).expect("decode");
+    assert_eq!(decoded, historical);
+
+    let restored = DeclineFileVersionResponse {
+        restored: true,
+        restored_version_id: 9,
+        restored_seq_no: 13,
+    };
+    let decoded =
+        DeclineFileVersionResponse::decode(restored.encode_to_vec().as_slice()).expect("decode");
+    assert_eq!(decoded, restored);
+}

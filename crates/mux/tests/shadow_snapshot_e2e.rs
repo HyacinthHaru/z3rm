@@ -1,10 +1,9 @@
 //! §4 Shadow snapshot RPC 端到端测试。
 //!
-//! 四个 shadow RPC (`list_changed_files` / `list_file_versions` /
-//! `get_file_version` / `decline_file_version`) 只有对着活的 daemon 才有意义:
-//! 录制链路是 `mux_server` 里的文件系统 watcher → 去抖队列 → 单写 recorder
-//! 线程,进程内假实现覆盖不到任何一环。这里启动真实的 `z3rm-server`,把 session
-//! 的 cwd 指向一个真实临时目录,再通过 socket 驱动这四个 RPC。
+//! Shadow review RPCs only make sense against a live daemon: recording flows
+//! through the filesystem watcher, debounce queue, and single-writer recorder
+//! thread. This suite starts a real server, points a session at a temporary
+//! worktree, and exercises list/review/content/restore requests over the socket.
 
 #![cfg(unix)]
 #[path = "common/mod.rs"]
@@ -13,7 +12,7 @@ use common::binary;
 
 use anyhow::{Context, Result};
 use mux::{AttachMode, MuxDomain};
-use mux_protocol::{ChangedFile, FileVersion};
+use mux_protocol::{ChangedFile, FileContentState, FileVersion};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 use tempfile::TempDir;
@@ -29,6 +28,7 @@ const DEBOUNCE_MILLIS: u64 = 150;
 const ALPHA_FIRST: &[u8] = b"alpha version one\n";
 const ALPHA_SECOND: &[u8] = b"alpha version two\n";
 const BETA_CONTENT: &[u8] = b"beta only write\n";
+const ALPHA_INTERVENING: &[u8] = b"ALPHA VERSION TWO\n";
 
 /// 独占一个 `TempDir` 的 mux_server 进程,与 `tests/e2e.rs` 的 `TestServer`
 /// 同构,额外多做两件事:
@@ -416,8 +416,8 @@ async fn shadow_snapshot_rpc_round_trip() -> Result<()> {
         .cloned()
         .context("list_file_versions returned an empty version list")?;
     assert_eq!(
-        oldest.trigger, "close",
-        "std::fs::write closes the file, so the close event forces the first version flush: {oldest:?}"
+        oldest.trigger, "create",
+        "the first retained event for a newly created file must remain distinguishable: {oldest:?}"
     );
     let oldest_content = session
         .domain
@@ -475,6 +475,18 @@ async fn shadow_snapshot_rpc_round_trip() -> Result<()> {
         "the tombstone must keep SeqNo strictly increasing: {after_delete:?}"
     );
 
+    let deleted_review = session
+        .domain
+        .get_file_review_state(&session.id, alpha.to_string_lossy().as_ref())
+        .await
+        .context("get atomic review state for deleted alpha.txt")?;
+    assert_eq!(
+        deleted_review.current_state,
+        FileContentState::Deleted as i32
+    );
+    assert!(!deleted_review.current_exists);
+    assert!(deleted_review.current_sha256.is_empty());
+
     // §4.8 decline 走 WAL-first 协议并真的把文件写回磁盘。
     let declined = session
         .domain
@@ -482,6 +494,9 @@ async fn shadow_snapshot_rpc_round_trip() -> Result<()> {
             &session.id,
             alpha.to_string_lossy().as_ref(),
             oldest.version_id,
+            deleted_review.latest_seq_no,
+            deleted_review.current_exists,
+            deleted_review.current_sha256,
         )
         .await
         .context("decline_file_version for the oldest alpha.txt version")?;
@@ -490,6 +505,48 @@ async fn shadow_snapshot_rpc_round_trip() -> Result<()> {
         "decline_file_version must report restored=true for a valid version"
     );
     wait_for_file_contents(&alpha, ALPHA_FIRST, Duration::from_secs(5)).await?;
+    assert!(declined.restored_version_id > 0);
+    assert!(declined.restored_seq_no > deleted_review.latest_seq_no);
+
+    let deletion_target = after_delete
+        .last()
+        .context("deleted history must end with a tombstone")?;
+    let restored_review = session
+        .domain
+        .get_file_review_state(&session.id, alpha.to_string_lossy().as_ref())
+        .await
+        .context("review restored alpha.txt before restoring its tombstone")?;
+    let removed = session
+        .domain
+        .decline_file_version(
+            &session.id,
+            alpha.to_string_lossy().as_ref(),
+            deletion_target.version_id,
+            restored_review.latest_seq_no,
+            restored_review.current_exists,
+            restored_review.current_sha256,
+        )
+        .await
+        .context("restore the historical deletion target")?;
+    assert!(removed.restored);
+    assert!(
+        !alpha.exists(),
+        "restoring a deletion target must remove the current file"
+    );
+    let removed_review = session
+        .domain
+        .get_file_review_state(&session.id, alpha.to_string_lossy().as_ref())
+        .await
+        .context("refresh review after restoring deletion")?;
+    assert_eq!(
+        removed_review.current_state,
+        FileContentState::Deleted as i32
+    );
+    assert_eq!(
+        removed_review.versions.len(),
+        restored_review.versions.len() + 1,
+        "restoring a deletion must append exactly one history node"
+    );
 
     // ------------------------------------------------------------------
     // 4. 错误路径
@@ -582,12 +639,24 @@ async fn shadow_snapshot_round_trip_for_a_file_still_on_disk() -> Result<()> {
         ALPHA_SECOND,
         "alpha.txt must still hold the second revision before the decline"
     );
+    let review = session
+        .domain
+        .get_file_review_state(&session.id, alpha.to_string_lossy().as_ref())
+        .await
+        .context("get atomic review state for alpha.txt")?;
+    assert_eq!(review.current_state, FileContentState::Text as i32);
+    assert_eq!(review.current_content, ALPHA_SECOND);
+    assert_eq!(review.current_sha256.len(), 32);
+
     let declined = session
         .domain
         .decline_file_version(
             &session.id,
             alpha.to_string_lossy().as_ref(),
             oldest.version_id,
+            review.latest_seq_no,
+            review.current_exists,
+            review.current_sha256,
         )
         .await
         .context("decline_file_version for the oldest alpha.txt version")?;
@@ -596,6 +665,65 @@ async fn shadow_snapshot_round_trip_for_a_file_still_on_disk() -> Result<()> {
         "decline_file_version must report restored=true for a valid version"
     );
     wait_for_file_contents(&alpha, ALPHA_FIRST, Duration::from_secs(5)).await?;
+
+    session.domain.kill_session(&session.id).await?;
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn restore_rejects_an_intervening_same_size_write_without_overwriting_it() -> Result<()> {
+    let server = TestServer::spawn()?;
+    let (worktree, root) = new_worktree()?;
+    let session = start_session(&server, "shadow-e2e-stale-review", worktree, root).await?;
+    let alpha = record_two_alpha_revisions(&session).await?;
+    let versions = wait_for_file_versions(&session, &alpha, 2, RECORD_TIMEOUT).await?;
+    let oldest = versions
+        .first()
+        .context("list_file_versions returned an empty version list")?;
+    let review = session
+        .domain
+        .get_file_review_state(&session.id, alpha.to_string_lossy().as_ref())
+        .await
+        .context("capture review baseline")?;
+    assert_eq!(review.current_size, ALPHA_INTERVENING.len() as u64);
+
+    std::fs::write(&alpha, ALPHA_INTERVENING).context("write intervening revision")?;
+    let error = session
+        .domain
+        .decline_file_version(
+            &session.id,
+            alpha.to_string_lossy().as_ref(),
+            oldest.version_id,
+            review.latest_seq_no,
+            review.current_exists,
+            review.current_sha256,
+        )
+        .await
+        .expect_err("an intervening same-size write must stale the review");
+    assert!(
+        error.to_string().contains("stale review"),
+        "stale restore must surface an actionable error, got: {error:#}"
+    );
+    assert_eq!(
+        std::fs::read(&alpha).context("read alpha.txt after rejected restore")?,
+        ALPHA_INTERVENING,
+        "a rejected restore must not overwrite the intervening bytes"
+    );
+
+    let refreshed = session
+        .domain
+        .get_file_review_state(&session.id, alpha.to_string_lossy().as_ref())
+        .await
+        .context("refresh review after stale restore")?;
+    assert_eq!(refreshed.current_content, ALPHA_INTERVENING);
+    assert!(
+        refreshed
+            .versions
+            .iter()
+            .all(|version| version.trigger != "decline"),
+        "a stale restore must not append a restore node: {:?}",
+        refreshed.versions
+    );
 
     session.domain.kill_session(&session.id).await?;
     Ok(())
