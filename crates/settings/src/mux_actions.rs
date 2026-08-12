@@ -31,6 +31,11 @@ pub struct Reconnect;
 #[action(namespace = mux)]
 pub struct NewWindow;
 
+/// §16.6 通过 SSH 地址打开一个远程会话窗口。
+#[derive(Clone, Debug, Default, Deserialize, JsonSchema, PartialEq, Action)]
+#[action(namespace = mux)]
+pub struct OpenRemote;
+
 /// §16.7 关闭当前 mux session。
 #[derive(Clone, Debug, Default, Deserialize, JsonSchema, PartialEq, Action)]
 #[action(namespace = mux)]

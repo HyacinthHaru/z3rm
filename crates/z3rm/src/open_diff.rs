@@ -308,7 +308,7 @@ impl PickerDelegate for ChangedFileSelectorDelegate {
 ///
 /// A file with a single recorded version has nothing to compare against, so it
 /// opens as a read-only preview rather than failing outright.
-async fn open_diff_review(
+pub(crate) async fn open_diff_review(
     path: std::path::PathBuf,
     domain: Arc<mux::MuxDomain>,
     session_id: String,
@@ -414,7 +414,10 @@ fn mux_session(cx: &mut gpui::AsyncApp) -> anyhow::Result<(Arc<mux::MuxDomain>, 
 ///
 /// OpenDiff is registered as a global action, so no workspace is in scope when
 /// it fires and the target has to be found by inspecting each window's root.
-fn in_active_workspace(cx: &mut App, body: impl FnOnce(&Entity<Workspace>, &mut Window, &mut App)) {
+pub(crate) fn in_active_workspace(
+    cx: &mut App,
+    body: impl FnOnce(&Entity<Workspace>, &mut Window, &mut App),
+) {
     let mut body = Some(body);
     for window_handle in cx.windows() {
         let opened = window_handle.update(cx, |_root, window, cx| {

@@ -41,6 +41,8 @@
       "ctrl-alt-r": "mux::Reconnect",
       // §3.3 second window on the same session (Plan 32); ctrl-shift-n is NextTab
       "ctrl-alt-n": "mux::NewWindow",
+      // §16.6 remote session window without leaving the GUI
+      "ctrl-alt-o": "mux::OpenRemote",
       "ctrl-alt-k": "mux::KillSession",
       "ctrl-alt-q": "mux::KillServer",
 

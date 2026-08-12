@@ -785,16 +785,20 @@ impl MuxDomain {
     }
 
     /// §3.6 List validated persisted sessions awaiting explicit recovery.
+    ///
+    /// The response also carries the rows the scan rejected. They are not
+    /// recoverable, but dropping them here would make an unreadable session
+    /// indistinguishable from one that never existed.
     pub async fn list_recovery_candidates(
         &self,
-    ) -> Result<Vec<mux_protocol::RecoveryCandidateInfo>> {
+    ) -> Result<mux_protocol::ListRecoveryCandidatesResponse> {
         let response = self
             .send_request(RequestBody::ListRecoveryCandidates(
                 mux_protocol::ListRecoveryCandidatesRequest {},
             ))
             .await?;
         match response.body {
-            Some(ResponseBody::RecoveryCandidates(list)) => Ok(list.candidates),
+            Some(ResponseBody::RecoveryCandidates(list)) => Ok(list),
             _ => Err(anyhow::anyhow!(
                 "unexpected response type for list_recovery_candidates"
             )),
@@ -2263,6 +2267,32 @@ mod tests {
             Ok(domain) => domain,
             Err(error) => panic!("scripted domain: {error}"),
         }
+    }
+
+    /// §15.4 A dead transport has to be observable, and the notification
+    /// stream cannot do it: the subscriber channel is owned by `DomainInner`,
+    /// so it stays open after the I/O thread exits and `recv()` simply blocks
+    /// forever. `check_connection` is the probe that does report the outage —
+    /// if it ever stopped doing so, a remote window would freeze in silence.
+    #[test]
+    fn dead_transport_is_observable_only_through_check_connection() {
+        // An empty cursor returns Ok(0) on read, which the frame reader turns
+        // into UnexpectedEof — the same path a dropped SSH tunnel takes.
+        let domain = match MuxDomain::connect_with_blocking_stream(std::io::Cursor::new(Vec::new()))
+        {
+            Ok(domain) => domain,
+            Err(error) => panic!("dead-stream domain: {error}"),
+        };
+        let notifications = domain.subscribe();
+        assert!(
+            !smol::block_on(domain.check_connection()),
+            "check_connection must report a dead transport"
+        );
+        assert_eq!(
+            notifications.try_recv().err(),
+            Some(async_channel::TryRecvError::Empty),
+            "the notification stream must not be the disconnect signal"
+        );
     }
 
     /// Requests whose response body was previously discarded must still fail

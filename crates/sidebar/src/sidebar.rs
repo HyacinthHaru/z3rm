@@ -26,7 +26,7 @@ use menu::{Cancel, Confirm, SelectFirst, SelectLast, SelectNext, SelectPrevious}
 use mux::MuxDomain;
 use mux_protocol::{SessionInfo, SessionSnapshot, notification::Event};
 use serde::{Deserialize, Serialize};
-use ui::{ListItem, prelude::*};
+use ui::{ListItem, Tooltip, prelude::*};
 use workspace::{
     Sidebar as WorkspaceSidebar, SidebarEvent, SidebarSide, layout_projection::LayoutTree,
 };
@@ -58,6 +58,11 @@ pub enum SidebarRequest {
     ActivateSession(String),
     FocusPane(String),
     OpenFile {
+        session_id: String,
+        path: String,
+    },
+    /// §4 Review a file that shadow snapshot has recorded versions for.
+    ReviewFile {
         session_id: String,
         path: String,
     },
@@ -1178,6 +1183,16 @@ impl Sidebar {
             }
         };
 
+        let review_target = match &entry {
+            ListEntry::File {
+                session_id,
+                path,
+                is_modified: true,
+                ..
+            } => Some((session_id.clone(), path.clone())),
+            _ => None,
+        };
+
         let focused_pane = matches!(
             entry,
             ListEntry::Pane {
@@ -1221,6 +1236,26 @@ impl Sidebar {
                         )
                     }),
             )
+            // §4 A recorded file gets a second action: the row body opens the
+            // read-only view, this opens the diff against its last version.
+            .when_some(review_target, |element, (session_id, path)| {
+                element.end_slot(
+                    IconButton::new(("sidebar-review", index), IconName::Diff)
+                        .icon_size(IconSize::Small)
+                        .tooltip(Tooltip::text("Review changes"))
+                        .on_click(cx.listener(move |this, _, window, cx| {
+                            let handler = this.request_handler.clone();
+                            handler(
+                                SidebarRequest::ReviewFile {
+                                    session_id: session_id.to_string(),
+                                    path: path.to_string(),
+                                },
+                                window,
+                                cx,
+                            );
+                        })),
+                )
+            })
             .on_click(cx.listener(move |this, _, window, cx| {
                 this.activate_entry(index, window, cx);
             }))

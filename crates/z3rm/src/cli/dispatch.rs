@@ -1250,7 +1250,8 @@ pub async fn run_cli_command(cmd: CliCommand) -> Result<()> {
                     recovered.pane_ids.len()
                 );
             } else {
-                for candidate in domain.list_recovery_candidates().await? {
+                let listing = domain.list_recovery_candidates().await?;
+                for candidate in listing.candidates {
                     let state = if candidate.metadata_complete {
                         "ready"
                     } else {
@@ -1264,6 +1265,9 @@ pub async fn run_cli_command(cmd: CliCommand) -> Result<()> {
                         candidate.pane_ids.len(),
                         state
                     );
+                }
+                for rejected in listing.rejected {
+                    println!("unrecoverable: {rejected}");
                 }
             }
         }
