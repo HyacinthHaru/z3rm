@@ -30,7 +30,7 @@ Turn the existing single-baseline Diff Review into a server-backed Shadow Snapsh
 
 ### 1. Review state is a server snapshot
 
-Add a bounded `GetFileReviewState` RPC scoped by `session_id` and path. Its handler runs through `SnapshotWatch`’s single-writer command channel and returns:
+Add a bounded `GetFileReviewState` RPC scoped by `session_id` and path. Its handler runs through `SnapshotWatch`’s single-writer command channel. Before reading versions or current bytes, the recorder flushes any due debounce entry for this path and synchronously consumes the path’s current filesystem state when it differs from the recorded head. This closes the quiet-window race without waiting for the watcher callback; unchanged content creates no duplicate version. The one command then returns:
 
 - versions ordered by ascending `SeqNo`, each with `version_id`, `seq_no`, and trigger;
 - the latest `SeqNo`;
@@ -39,7 +39,8 @@ Add a bounded `GetFileReviewState` RPC scoped by `session_id` and path. Its hand
 - a content classification: text, empty, binary, too large, or deleted;
 - current UTF-8 content only when it is text/empty and at most 2 MiB.
 
-The server reads at most 2 MiB into the response but streams the entire file through SHA-256 when a fingerprint is required. This permits safe restore of binary or oversized current files without pretending they are text-comparable.
+The server reads at most 2 MiB into the response but streams the entire file through SHA-256 when a fingerprint is required. This permits safe restore of binary or oversized current files without pretending they are text-comparable. `ListChangedFiles` first performs the same due-flush/current-state reconciliation for every queued changed path, so a queue refresh cannot publish an already-stale baseline.
+The synchronous reconciliation is a separate engine operation, not `record_change_with_trigger` called blindly: it compares the current digest/existence with HEAD, appends `SnapshotTrigger::Create` when an absent/tombstoned path now exists, appends Delete when a recorded path is now absent, appends Write only when content actually changed, and consumes or invalidates any queued debounce event for the same path. The recorder loop owns the debounce queue, path index, suppression map, and engine throughout this operation.
 
 This dedicated RPC is preferred over combining `ListFileVersions`, `StatFile`, and paged `ReadFile`: those independent calls cannot define one review baseline, and direct local file reads are incorrect for SSH sessions.
 
@@ -48,10 +49,10 @@ This dedicated RPC is preferred over combining `ListFileVersions`, `StatFile`, a
 `GetFileVersionResponse` gains metadata:
 
 - `total_bytes`,
-- `is_binary`, and
+- a typed state: text, empty, binary, too large, or deleted, and
 - `content_available`.
 
-The recorder reconstructs the target version once. Text/empty content up to 2 MiB is returned; binary or oversized content returns metadata with no text payload. A missing/GC-evicted version remains a typed RPC error. This keeps version-to-version comparison bounded while still allowing a retained binary/large version to be selected as a restore target.
+The recorder inspects the target node before reconstruction. A tombstone returns Deleted without trying to replay content. Other retained versions are reconstructed once: text/empty content up to 2 MiB is returned, while binary or oversized content returns metadata with no text payload. A missing/GC-evicted version remains a typed RPC error. This keeps version-to-version comparison bounded while still allowing retained binary, large, and deletion versions to be selected as restore targets.
 
 ### 3. Restore uses an atomic compare-and-restore guard
 
@@ -67,7 +68,7 @@ On the recorder thread, before writing a WAL intent, restore validates:
 2. current existence still matches; and
 3. current bytes still hash to the expected digest.
 
-Any mismatch returns a stale-review error and performs no WAL append, file write, tree mutation, or watcher suppression. If all checks pass, the existing crash-safe decline protocol runs unchanged. The response returns the new restore version ID and `SeqNo`, allowing the client to refresh deterministically.
+Any mismatch returns a stale-review error and performs no WAL append, file write, tree mutation, or watcher suppression. If all checks pass, a content-bearing target runs the existing crash-safe decline protocol. A deletion target runs the same WAL-first state machine with an absent `content_ref`: fsync the intent, remove the file and fsync its parent directory, append a content-less Restore node, then mark the intent done. Recovery interprets a Restore intent without `content_ref` as an idempotent deletion. Watcher suppression represents either an expected content hash or an expected deletion, so the filesystem event cannot create a duplicate node. The response returns the new restore version ID and `SeqNo`, allowing the client to refresh deterministically.
 
 The content fingerprint closes the watcher-latency race: even when a filesystem event has not reached the recorder yet, changed bytes prevent the restore.
 
@@ -120,7 +121,7 @@ Restore is enabled only when From identifies a retained historical version. Acti
 - the path,
 - target version ID and `SeqNo`,
 - current classification, and
-- that current bytes will be replaced while history remains.
+- whether current bytes will be replaced or the current file will be removed, while all history remains.
 
 Confirm sends the compare-and-restore preconditions captured by the latest review state. On success:
 
@@ -186,6 +187,7 @@ The review root adds a `ChangedFilesReview` key context. Default scoped bindings
 - changed bytes with unchanged watcher state reject restore before WAL/tree mutation;
 - changed `SeqNo`, create/delete transitions, and malformed digest reject restore;
 - successful restore creates a newer Restore node and preserves older nodes;
+- restoring a deletion tombstone is WAL-first, idempotent across recovery, and creates one content-less Restore node;
 - review-state classification covers text, empty, deleted, binary, too-large, and unavailable paths.
 
 ### Protocol/mux tests

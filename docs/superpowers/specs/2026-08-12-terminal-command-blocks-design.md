@@ -44,11 +44,11 @@ This is preferred over polling and over independently reading marker positions a
 
 The mux-pane fetch pipeline obtains the structured grid/history and command snapshot, then validates that:
 
-- command `generation` equals the prepared grid generation,
-- command `history_version` equals the prepared history version, and
-- a final grid checkpoint reports no newer generation.
+- command `generation` equals the prepared grid generation;
+- command `history_version` equals the prepared history version; and
+- a final `fetch_grid_update` for that generation reports `NoChange`.
 
-A mismatch retries without mutating the terminal, selected command, or generation. `NoChange` grid replies still carry a refreshed command snapshot so an invisible D marker can change Running to Completed.
+Every fetch, including a grid `NoChange`, requests command metadata; a command-only mismatch restarts the bounded fetch. The final grid confirmation occurs after both history paging and `ListCommands`, so grid output cannot race ahead of an otherwise matching command snapshot. Only then does the client atomically apply generation, history, active screen, command state, and selection. A mismatch retries without mutating any of those fields. An invisible D marker can therefore change Running to Completed without a visible-cell diff.
 
 ### 3. One shared command-span implementation
 
