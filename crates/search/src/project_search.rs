@@ -41,7 +41,6 @@ use std::{
     any::{Any, TypeId},
     mem,
     ops::{Not, Range},
-    pin::pin,
     sync::{
         Arc,
         atomic::{AtomicBool, Ordering},
@@ -507,11 +506,20 @@ async fn consume_search_stream(
     project_search_turning_into_text_finder: Arc<AtomicBool>,
     cx: &mut AsyncApp,
 ) -> Option<SearchResults<SearchResult>> {
-    let search_results_clone = search_results.clone();
-    let mut matches = pin!(search_results_clone.rx.ready_chunks(1024));
-
+    // Consume the receiver owned by this search. `async_channel` receivers
+    // distribute messages across clones, so a cloned receiver can miss the
+    // producer's results entirely.
+    let rx = search_results.rx;
     let mut limit_reached = false;
-    while let Some(results) = matches.next().await {
+    while let Ok(first_result) = rx.recv().await {
+        let mut results = Vec::with_capacity(1024);
+        results.push(first_result);
+        while results.len() < 1024 {
+            let Ok(result) = rx.try_recv() else {
+                break;
+            };
+            results.push(result);
+        }
         let (buffers_with_ranges, has_reached_limit, search_activity) = cx
             .background_executor()
             .spawn(async move {
@@ -585,7 +593,7 @@ async fn consume_search_stream(
 
     if project_search_turning_into_text_finder.load(Ordering::Relaxed) {
         project_search_turning_into_text_finder.store(false, Ordering::Relaxed);
-        return Some(search_results);
+        return Some(SearchResults { rx });
     }
     project_search
         .update(cx, |project_search, cx| {
@@ -3609,7 +3617,7 @@ pub mod tests {
         });
         window.update(cx, |_, window, cx| {
             search_view.update(cx, |search_view, cx| {
-                assert_eq!(search_view.query_editor.read(cx).text(cx), "TWO", "Query should be updated to first search result after search view 2nd open in a row");
+                assert_eq!(search_view.query_editor.read(cx).text(cx), "two", "Query should be updated to the exact text at the first case-insensitive search match after search view 2nd open in a row");
                 assert_eq!(
                     search_view
                         .results_editor
@@ -3994,7 +4002,7 @@ pub mod tests {
             search_view_2.update(cx, |search_view_2, cx| {
                 assert_eq!(
                     search_view_2.query_editor.read(cx).text(cx),
-                    "TWO",
+                    "two",
                     "New search view should get the query from the text cursor was at during the event spawn (first search view's first result)"
                     );
                     assert_eq!(

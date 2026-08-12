@@ -7,6 +7,9 @@
 //! 的 cwd 指向一个真实临时目录,再通过 socket 驱动这四个 RPC。
 
 #![cfg(unix)]
+#[path = "common/mod.rs"]
+mod common;
+use common::binary;
 
 use anyhow::{Context, Result};
 use mux::{AttachMode, MuxDomain};
@@ -59,21 +62,7 @@ impl TestServer {
         )
         .context("write shadow snapshot settings")?;
 
-        let exe = std::env::var("Z3RM_SERVER_BIN").ok().unwrap_or_else(|| {
-            let manifest = std::env::var("CARGO_MANIFEST_DIR")
-                .map(PathBuf::from)
-                .unwrap_or_else(|_| PathBuf::from("."));
-            let candidates = [
-                manifest.join("../../target/debug/z3rm-server"),
-                manifest.join("../../target/release/z3rm-server"),
-            ];
-            for candidate in &candidates {
-                if candidate.exists() {
-                    return candidate.to_string_lossy().into_owned();
-                }
-            }
-            "z3rm-server".to_string()
-        });
+        let exe = binary("Z3RM_SERVER_BIN", "z3rm-server")?;
 
         let child = std::process::Command::new(&exe)
             .env("Z3RM_MUX_SOCKET", &socket_path)
@@ -85,7 +74,7 @@ impl TestServer {
             .stdout(std::process::Stdio::null())
             .stderr(std::process::Stdio::null())
             .spawn()
-            .with_context(|| format!("failed to spawn z3rm-server at {exe}"))?;
+            .with_context(|| format!("failed to spawn z3rm-server at {}", exe.display()))?;
 
         let deadline = Instant::now() + Duration::from_secs(10);
         loop {
@@ -427,8 +416,8 @@ async fn shadow_snapshot_rpc_round_trip() -> Result<()> {
         .cloned()
         .context("list_file_versions returned an empty version list")?;
     assert_eq!(
-        oldest.trigger, "write",
-        "the first recorded version came from a plain write: {oldest:?}"
+        oldest.trigger, "close",
+        "std::fs::write closes the file, so the close event forces the first version flush: {oldest:?}"
     );
     let oldest_content = session
         .domain

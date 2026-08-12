@@ -12,6 +12,10 @@
 //! 测试只用编译好的 z3rm 二进制 (subprocess),不依赖任何 z3rm-crate 符号。
 
 #![cfg(unix)]
+#[path = "common/mod.rs"]
+mod common;
+
+use common::binary;
 
 use anyhow::{Context, Result};
 use std::path::PathBuf;
@@ -32,28 +36,8 @@ impl CliEnv {
         let tmp = tempfile::tempdir().context("temp dir")?;
         let socket_path = tmp.path().join("mux.sock");
         let db_path = tmp.path().join("mux.db");
-
-        let target_dir = std::env::var("CARGO_MANIFEST_DIR")
-            .map(PathBuf::from)
-            .unwrap_or_else(|_| PathBuf::from("."))
-            .join("../../target/debug");
-        let server_bin = std::env::var("Z3RM_SERVER_BIN")
-            .map(PathBuf::from)
-            .unwrap_or_else(|_| target_dir.join("z3rm-server"));
-        let z3rm_bin = std::env::var("Z3RM_BIN")
-            .map(PathBuf::from)
-            .unwrap_or_else(|_| target_dir.join("z3rm"));
-
-        anyhow::ensure!(
-            server_bin.exists(),
-            "z3rm-server binary not found at {}. Run `cargo build -p mux_server` first.",
-            server_bin.display()
-        );
-        anyhow::ensure!(
-            z3rm_bin.exists(),
-            "z3rm binary not found at {}. Run `cargo build -p z3rm` first.",
-            z3rm_bin.display()
-        );
+        let server_bin = binary("Z3RM_SERVER_BIN", "z3rm-server")?;
+        let z3rm_bin = binary("Z3RM_BIN", "z3rm")?;
 
         let server = Command::new(&server_bin)
             .env("Z3RM_MUX_SOCKET", &socket_path)

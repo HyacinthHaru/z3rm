@@ -8,6 +8,9 @@
 //! 不依赖用户的 shell 配置：pane 里跑的是一段自己吐 OSC 133 序列的 `/bin/sh`。
 
 #![cfg(unix)]
+#[path = "common/mod.rs"]
+mod common;
+use common::binary;
 
 use anyhow::{Context, Result};
 use mux::{AttachMode, MuxDomain};
@@ -50,21 +53,7 @@ impl TestServer {
             None
         };
 
-        let exe = std::env::var("Z3RM_SERVER_BIN").ok().unwrap_or_else(|| {
-            let manifest = std::env::var("CARGO_MANIFEST_DIR")
-                .map(PathBuf::from)
-                .unwrap_or_else(|_| PathBuf::from("."));
-            let candidates = [
-                manifest.join("../../target/debug/z3rm-server"),
-                manifest.join("../../target/release/z3rm-server"),
-            ];
-            for candidate in &candidates {
-                if candidate.exists() {
-                    return candidate.to_string_lossy().into_owned();
-                }
-            }
-            "z3rm-server".to_string()
-        });
+        let exe = binary("Z3RM_SERVER_BIN", "z3rm-server")?;
 
         let mut server_command = std::process::Command::new(&exe);
         server_command
@@ -85,7 +74,7 @@ impl TestServer {
         }
         let child = server_command
             .spawn()
-            .with_context(|| format!("failed to spawn z3rm-server at {exe}"))?;
+            .with_context(|| format!("failed to spawn z3rm-server at {}", exe.display()))?;
 
         let deadline = Instant::now() + Duration::from_secs(10);
         loop {
@@ -213,6 +202,32 @@ async fn wait_for_commands(
     }
 }
 
+async fn wait_for_completed_commands(
+    domain: &MuxDomain,
+    pane_id: &str,
+    minimum: usize,
+    timeout: Duration,
+) -> Result<Vec<proto::CommandRange>> {
+    let deadline = Instant::now() + timeout;
+    loop {
+        let listed = domain.list_commands(pane_id, 0).await?;
+        if listed.commands.len() >= minimum
+            && listed.commands[..minimum]
+                .iter()
+                .all(|command| command.command_end.is_some())
+        {
+            return Ok(listed.commands);
+        }
+        if Instant::now() >= deadline {
+            anyhow::bail!(
+                "timeout waiting for {minimum} completed commands in {pane_id}: {:?}",
+                listed.commands
+            );
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+}
+
 /// 把一段 tmux 行区间读成文本，走的正是 CLI `capture-pane -S/-E` 的那条路径。
 async fn read_lines(domain: &MuxDomain, pane_id: &str, from: i64, to: i64) -> Result<Vec<String>> {
     let grid = domain.fetch_grid_update(pane_id, 0).await?;
@@ -299,21 +314,22 @@ async fn default_bash_emits_markers_and_preserves_shell_behavior() -> Result<()>
     domain
         .send_input(&pane_id, b"printf 'rc:%s\\n' \"$Z3RM_TEST_RC_SOURCED\"\r")
         .await?;
-    wait_for_commands(&domain, &pane_id, 1, Duration::from_secs(20)).await?;
+    wait_for_completed_commands(&domain, &pane_id, 1, Duration::from_secs(20)).await?;
     domain.send_input(&pane_id, b"false\r").await?;
-    wait_for_commands(&domain, &pane_id, 2, Duration::from_secs(20)).await?;
+    wait_for_completed_commands(&domain, &pane_id, 2, Duration::from_secs(20)).await?;
     domain
         .send_input(&pane_id, b"z3rm_command_that_does_not_exist\r")
         .await?;
-    wait_for_commands(&domain, &pane_id, 3, Duration::from_secs(20)).await?;
+    wait_for_completed_commands(&domain, &pane_id, 3, Duration::from_secs(20)).await?;
     domain.send_input(&pane_id, b"sleep 30\r").await?;
     wait_for_running_command(&domain, &pane_id, 4, Duration::from_secs(20)).await?;
     domain.send_input(&pane_id, &[0x03]).await?;
-    wait_for_commands(&domain, &pane_id, 4, Duration::from_secs(20)).await?;
+    wait_for_completed_commands(&domain, &pane_id, 4, Duration::from_secs(20)).await?;
     domain
         .send_input(&pane_id, b"printf 'after-interrupt\\n'\r")
         .await?;
-    let commands = wait_for_commands(&domain, &pane_id, 5, Duration::from_secs(20)).await?;
+    let commands =
+        wait_for_completed_commands(&domain, &pane_id, 5, Duration::from_secs(20)).await?;
 
     assert_eq!(
         commands

@@ -9,6 +9,9 @@
 //! 起真实 `z3rm-server` 子进程，走完整协议链路。
 
 #![cfg(unix)]
+#[path = "common/mod.rs"]
+mod common;
+use common::binary;
 
 use anyhow::{Context, Result};
 use mux::{AttachMode, MuxDomain};
@@ -29,21 +32,7 @@ impl TestServer {
         let socket_path = tmp.path().join("mux.sock");
         let db_path = tmp.path().join("mux.db");
 
-        let exe = std::env::var("Z3RM_SERVER_BIN").ok().unwrap_or_else(|| {
-            let manifest = std::env::var("CARGO_MANIFEST_DIR")
-                .map(PathBuf::from)
-                .unwrap_or_else(|_| PathBuf::from("."));
-            let candidates = [
-                manifest.join("../../target/debug/z3rm-server"),
-                manifest.join("../../target/release/z3rm-server"),
-            ];
-            for candidate in &candidates {
-                if candidate.exists() {
-                    return candidate.to_string_lossy().into_owned();
-                }
-            }
-            "z3rm-server".to_string()
-        });
+        let exe = binary("Z3RM_SERVER_BIN", "z3rm-server")?;
 
         let child = std::process::Command::new(&exe)
             .env("Z3RM_MUX_SOCKET", &socket_path)
@@ -53,7 +42,7 @@ impl TestServer {
             .stdout(std::process::Stdio::null())
             .stderr(std::process::Stdio::null())
             .spawn()
-            .with_context(|| format!("failed to spawn z3rm-server at {exe}"))?;
+            .with_context(|| format!("failed to spawn z3rm-server at {}", exe.display()))?;
 
         let deadline = Instant::now() + Duration::from_secs(10);
         loop {

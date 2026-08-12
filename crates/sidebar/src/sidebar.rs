@@ -2078,7 +2078,8 @@ mod live_tests {
     use gpui::{TestAppContext, VisualTestContext};
     use mux_protocol::{PaneInfo, TabInfo};
     use std::cell::RefCell;
-    use std::os::unix::net::UnixStream;
+    use std::io::{self, Read, Write};
+    use std::sync::{Condvar, Mutex};
 
     fn init_test(cx: &mut TestAppContext) {
         cx.update(|cx| {
@@ -2089,18 +2090,55 @@ mod live_tests {
         });
     }
 
-    /// A domain whose peer never answers: the sidebar's `list_sessions` pull
-    /// stays pending, so these tests exercise the view against a session list
-    /// they set explicitly.
-    fn test_domain() -> (Arc<MuxDomain>, UnixStream) {
-        let (client, server) = UnixStream::pair().expect("create a mux socket pair");
-        client
-            .set_nonblocking(true)
-            .expect("make the mux client nonblocking");
-        let domain = MuxDomain::connect_with_blocking_stream(client)
-            .map(Arc::new)
-            .expect("connect the test mux domain");
-        (domain, server)
+    /// The live tests only exercise the sidebar's local projection and request
+    /// handling. An immediately closed transport keeps `list_sessions` from
+    /// overwriting the fixture's explicit session list, without leaving a mux
+    /// I/O worker alive until GPUI tears down the test context.
+    struct ClosedStream {
+        stopped: Arc<(Mutex<bool>, Condvar)>,
+    }
+
+    impl Read for ClosedStream {
+        fn read(&mut self, _buffer: &mut [u8]) -> io::Result<usize> {
+            Ok(0)
+        }
+    }
+
+    impl Write for ClosedStream {
+        fn write(&mut self, _buffer: &[u8]) -> io::Result<usize> {
+            Err(io::Error::new(
+                io::ErrorKind::BrokenPipe,
+                "test stream closed",
+            ))
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl Drop for ClosedStream {
+        fn drop(&mut self) {
+            let (lock, wake) = &*self.stopped;
+            *lock.lock().expect("closed-stream state poisoned") = true;
+            wake.notify_one();
+        }
+    }
+
+    fn test_domain() -> Arc<MuxDomain> {
+        let stopped = Arc::new((Mutex::new(false), Condvar::new()));
+        let domain = MuxDomain::connect_with_blocking_stream(ClosedStream {
+            stopped: stopped.clone(),
+        })
+        .map(Arc::new)
+        .expect("connect the test mux domain");
+
+        let (lock, wake) = &*stopped;
+        let stopped = lock.lock().expect("closed-stream state poisoned");
+        let _stopped = wake
+            .wait_while(stopped, |stopped| !*stopped)
+            .expect("closed-stream state poisoned");
+        domain
     }
 
     fn snapshot() -> SessionSnapshot {
@@ -2148,12 +2186,11 @@ mod live_tests {
         sidebar: Entity<Sidebar>,
         requests: Rc<RefCell<Vec<SidebarRequest>>>,
         _domain: Arc<MuxDomain>,
-        _peer: UnixStream,
     }
 
     fn harness(cx: &mut TestAppContext) -> (Harness, &mut VisualTestContext) {
         init_test(cx);
-        let (domain, peer) = test_domain();
+        let domain = test_domain();
         let requests = Rc::new(RefCell::new(Vec::new()));
         let (sidebar, cx) = cx.add_window_view({
             let domain = domain.clone();
@@ -2179,7 +2216,6 @@ mod live_tests {
                 sidebar,
                 requests,
                 _domain: domain,
-                _peer: peer,
             },
             cx,
         )

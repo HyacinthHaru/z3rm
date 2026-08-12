@@ -2333,7 +2333,7 @@ impl Interactivity {
                         .insert(debug_selector.clone(), bounds);
                 }
 
-                self.paint_hover_group_handler(window, cx);
+                self.paint_hover_group_handler(element_state.as_ref(), window, cx);
 
                 if style.visibility == Visibility::Hidden {
                     return ((), element_state);
@@ -2661,25 +2661,6 @@ impl Interactivity {
                         hover_state.borrow_mut().element = hovered;
                         cx.notify(current_view);
                     }
-                }
-            });
-        }
-
-        if let Some(group_hover) = self.group_hover_style.as_ref()
-            && let Some(group_hitbox_id) = GroupHitboxes::get(&group_hover.group, cx)
-            && let Some(hover_state) = element_state
-                .as_ref()
-                .and_then(|element| element.hover_state.as_ref())
-                .cloned()
-        {
-            let current_view = window.current_view();
-
-            window.on_mouse_event(move |_: &MouseMoveEvent, phase, window, cx| {
-                let group_hovered = group_hitbox_id.is_hovered(window);
-                let was_group_hovered = hover_state.borrow().group;
-                if phase == DispatchPhase::Capture && group_hovered != was_group_hovered {
-                    hover_state.borrow_mut().group = group_hovered;
-                    cx.notify(current_view);
                 }
             });
         }
@@ -3064,18 +3045,35 @@ impl Interactivity {
         }
     }
 
-    fn paint_hover_group_handler(&self, window: &mut Window, cx: &mut App) {
+    fn paint_hover_group_handler(
+        &self,
+        element_state: Option<&InteractiveElementState>,
+        window: &mut Window,
+        cx: &mut App,
+    ) {
         let group_hitbox = self
             .group_hover_style
             .as_ref()
             .and_then(|group_hover| GroupHitboxes::get(&group_hover.group, cx));
 
         if let Some(group_hitbox) = group_hitbox {
-            let was_hovered = group_hitbox.is_hovered(window);
+            let hover_state = element_state
+                .and_then(|element| element.hover_state.as_ref())
+                .cloned();
+            let mut was_hovered = group_hitbox.is_hovered(window);
             let current_view = window.current_view();
             window.on_mouse_event(move |_: &MouseMoveEvent, phase, window, cx| {
                 let hovered = group_hitbox.is_hovered(window);
-                if phase == DispatchPhase::Capture && hovered != was_hovered {
+                let was_group_hovered = hover_state
+                    .as_ref()
+                    .map(|state| state.borrow().group)
+                    .unwrap_or(was_hovered);
+                if phase == DispatchPhase::Capture && hovered != was_group_hovered {
+                    if let Some(hover_state) = &hover_state {
+                        hover_state.borrow_mut().group = hovered;
+                    } else {
+                        was_hovered = hovered;
+                    }
                     cx.notify(current_view);
                 }
             });

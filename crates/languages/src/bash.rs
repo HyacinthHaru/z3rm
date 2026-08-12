@@ -205,6 +205,8 @@ mod tests {
                 cx,
             );
 
+            // The fixture intentionally removes the raw string's trailing newline.
+            // Autoindent only inserts the newline at the marker.
             assert_eq!(buffer.text(), "if foo; then\n  1\n  \nelse\n  3\nfi");
             buffer
         });
