@@ -2002,13 +2002,15 @@ impl Editor {
     ) {
     }
 
-    /// Stub: toggle code actions (code actions 模块已删除)
     pub fn toggle_code_actions(
         &mut self,
         _action: &ToggleCodeActions,
         _window: &mut Window,
         _cx: &mut Context<Self>,
-    ) {
+    ) -> Option<Task<Result<()>>> {
+        Some(Task::ready(Err(anyhow!(
+            "code actions are unavailable in this build (LSP support was removed)"
+        ))))
     }
 
     pub fn diagnostics_enabled(&self) -> bool {
@@ -2422,10 +2424,10 @@ impl Editor {
             disable_expand_excerpt_buttons: !full_mode,
             delegate_expand_excerpts: false,
             delegate_open_excerpts: false,
-            enable_lsp_data: full_mode,
-            needs_initial_data_update: full_mode,
-            enable_runnables: full_mode,
-            enable_code_lens: full_mode,
+            enable_lsp_data: false,
+            needs_initial_data_update: false,
+            enable_runnables: false,
+            enable_code_lens: false,
             enable_mouse_wheel_zoom: full_mode,
             show_git_diff_gutter: None,
             show_code_actions: None,
@@ -2737,12 +2739,6 @@ impl Editor {
 
             editor.minimap =
                 editor.create_minimap(EditorSettings::get_global(cx).minimap, window, cx);
-            editor.colors = Some(LspColorData::new(cx));
-            editor.use_document_folding_ranges = true;
-            editor.inlay_hints = Some(LspInlayHintData::new(inlay_hint_settings));
-            if editor.enable_code_lens && EditorSettings::get_global(cx).code_lens.inline() {
-                editor.code_lens = Some(CodeLensState::default());
-            }
 
             if let Some(buffer) = multi_buffer.read(cx).as_singleton() {
                 editor.register_buffer(buffer.read(cx).remote_id(), cx);
@@ -7383,14 +7379,16 @@ impl Editor {
         }
     }
 
-    /// Stub: rename (重命名功能已删除)
+    /// Rename requires the removed language-server provider in this build.
     pub fn rename(
         &mut self,
         _: &Rename,
         _window: &mut Window,
         _cx: &mut Context<Self>,
     ) -> Option<Task<Result<()>>> {
-        None
+        Some(Task::ready(Err(anyhow!(
+            "rename is unavailable in this build (LSP support was removed)"
+        ))))
     }
 
     pub fn confirm_rename(
@@ -7494,45 +7492,27 @@ impl Editor {
         self.pending_rename.as_ref()
     }
 
-    fn can_format_selections(&self, cx: &App) -> bool {
-        if !self.mode.is_full() {
-            return false;
-        }
 
-        let Some(project) = &self.project else {
-            return false;
-        };
-
-        let project = project.read(cx);
-        let multi_buffer = self.buffer.read(cx);
-        let snapshot = multi_buffer.snapshot(cx);
-
-        self.selections
-            .disjoint_anchor_ranges()
-            .flat_map(|range| [range.start, range.end])
-            .filter_map(|anchor| snapshot.anchor_to_buffer_anchor(anchor))
-            .filter_map(|(_, buffer_snapshot)| multi_buffer.buffer(buffer_snapshot.remote_id()))
-            .any(|buffer| project.supports_range_formatting(&buffer, cx))
-    }
-
-    /// Stub: format (格式化功能已删除)
     fn format(
         &mut self,
         _: &Format,
         _window: &mut Window,
         _cx: &mut Context<Self>,
     ) -> Option<Task<Result<()>>> {
-        None
+        Some(Task::ready(Err(anyhow!(
+            "formatting is unavailable in this build (LSP support was removed)"
+        ))))
     }
 
-    /// Stub: format_selections (格式化功能已删除)
     fn format_selections(
         &mut self,
         _: &FormatSelections,
         _window: &mut Window,
         _cx: &mut Context<Self>,
     ) -> Option<Task<Result<()>>> {
-        None
+        Some(Task::ready(Err(anyhow!(
+            "formatting selections is unavailable in this build (LSP support was removed)"
+        ))))
     }
 
     /// Formatting was deleted with LSP support; report an explicit recoverable

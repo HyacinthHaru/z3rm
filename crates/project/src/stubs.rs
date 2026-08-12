@@ -156,18 +156,32 @@ pub struct LanguageServerToQuery {
 // AI / settings stubs
 // ---------------------------------------------------------------------------
 
-#[derive(Clone, Debug, Default, Deserialize, Serialize)]
+#[derive(Clone, Debug, Default, settings::RegisterSetting)]
 pub struct DisableAiSettings {
     pub disable_ai: bool,
 }
 
-impl DisableAiSettings {
-    pub fn is_ai_disabled_for_buffer(_buffer: Option<&language::Buffer>, _cx: &App) -> bool {
-        false
+impl settings::SettingsKey for DisableAiSettings {
+    const KEY: Option<&'static str> = None;
+}
+
+impl settings::Settings for DisableAiSettings {
+    fn from_settings(content: &settings::SettingsContent) -> Self {
+        Self {
+            disable_ai: content.project.disable_ai.0,
+        }
     }
-    // 来源: spec §2.1 — settings 访问需要 get_global 方法
-    pub fn get_global(_cx: &gpui::App) -> Self {
-        Self::default()
+}
+
+impl DisableAiSettings {
+    pub fn is_ai_disabled_for_buffer(_buffer: Option<&language::Buffer>, cx: &App) -> bool {
+        Self::get_global(cx).disable_ai
+    }
+
+    pub fn get_global(cx: &gpui::App) -> Self {
+        cx.try_global::<settings::SettingsStore>()
+            .map(|store| store.get::<Self>(None).clone())
+            .unwrap_or_default()
     }
 }
 
@@ -276,19 +290,47 @@ pub mod debugger {
             pub verified: bool,
         }
 
+        /// In-memory breakpoint storage. The debugger was removed during
+        /// dependency stripping, so breakpoints cannot be acted upon by a
+        /// session, but setting/clearing/enabling/disabling/log-points must
+        /// still take effect and render in the gutter instead of silently
+        /// ignoring the editor's F9/gutter affordances.
         #[derive(Default)]
-        pub struct BreakpointStore;
+        pub struct BreakpointStore {
+            breakpoints: Vec<(Anchor, Breakpoint)>,
+        }
 
         impl BreakpointStore {
             pub fn breakpoints(
                 &self,
-                _buffer: &Entity<language::Buffer>,
-                _range: Option<Range<Anchor>>,
+                buffer: &Entity<language::Buffer>,
+                range: Option<Range<Anchor>>,
                 _snapshot: &language::BufferSnapshot,
-                _cx: &App,
+                cx: &App,
             ) -> std::vec::IntoIter<(BreakpointWithPosition, Option<BreakpointSessionState>)>
             {
-                Vec::new().into_iter()
+                let buffer_id = buffer.read(cx).text_snapshot().remote_id();
+                self.breakpoints
+                    .iter()
+                    .filter(|(position, _)| {
+                        position.buffer_id == buffer_id
+                            && range.as_ref().is_none_or(|range| {
+                                range.start.buffer_id == buffer_id
+                                    && range.start.offset <= position.offset
+                                    && position.offset <= range.end.offset
+                            })
+                    })
+                    .map(|(position, bp)| {
+                        (
+                            BreakpointWithPosition {
+                                bp: bp.clone(),
+                                position: *position,
+                            },
+                            None,
+                        )
+                    })
+                    .collect::<Vec<_>>()
+                    .into_iter()
             }
 
             pub fn active_position(&self) -> Option<super::super::StackFrame> {
@@ -306,10 +348,57 @@ pub mod debugger {
             pub fn toggle_breakpoint(
                 &mut self,
                 _buffer: Entity<language::Buffer>,
-                _breakpoint: BreakpointWithPosition,
-                _edit_action: BreakpointEditAction,
-                _cx: &mut gpui::Context<Self>,
+                breakpoint: BreakpointWithPosition,
+                edit_action: BreakpointEditAction,
+                cx: &mut gpui::Context<Self>,
             ) {
+                let BreakpointWithPosition { position, mut bp } = breakpoint;
+                match edit_action {
+                    BreakpointEditAction::Toggle => {
+                        if let Some(index) = self
+                            .breakpoints
+                            .iter()
+                            .position(|(existing, _)| *existing == position)
+                        {
+                            self.breakpoints.remove(index);
+                        } else {
+                            self.breakpoints.push((position, bp));
+                        }
+                    }
+                    BreakpointEditAction::InvertState => {
+                        bp.state = match bp.state {
+                            BreakpointState::Enabled => BreakpointState::Disabled,
+                            BreakpointState::Disabled => BreakpointState::Enabled,
+                        };
+                        self.upsert(position, bp);
+                    }
+                    BreakpointEditAction::EditLogMessage(message) => {
+                        bp.log_point = Some(message.clone());
+                        bp.message = Some(message);
+                        self.upsert(position, bp);
+                    }
+                    BreakpointEditAction::EditCondition(condition) => {
+                        bp.condition = Some(condition);
+                        self.upsert(position, bp);
+                    }
+                    BreakpointEditAction::EditHitCondition(hit_condition) => {
+                        bp.hit_condition = Some(hit_condition);
+                        self.upsert(position, bp);
+                    }
+                }
+                cx.notify();
+            }
+
+            fn upsert(&mut self, position: Anchor, bp: Breakpoint) {
+                if let Some((_, existing)) = self
+                    .breakpoints
+                    .iter_mut()
+                    .find(|(existing_position, _)| *existing_position == position)
+                {
+                    *existing = bp;
+                } else {
+                    self.breakpoints.push((position, bp));
+                }
             }
         }
 
@@ -326,6 +415,161 @@ pub mod debugger {
             EditLogMessage(String),
             EditHitCondition(String),
             EditCondition(String),
+        }
+
+        #[cfg(test)]
+        mod tests {
+            use super::*;
+            use gpui::AppContext;
+
+            fn toggle(
+                store: &gpui::Entity<BreakpointStore>,
+                buffer: &gpui::Entity<language::Buffer>,
+                position: Anchor,
+                bp: Breakpoint,
+                edit_action: BreakpointEditAction,
+                cx: &mut gpui::TestAppContext,
+            ) {
+                store.update(cx, |store, cx| {
+                    store.toggle_breakpoint(
+                        buffer.clone(),
+                        BreakpointWithPosition {
+                            position,
+                            bp,
+                        },
+                        edit_action,
+                        cx,
+                    );
+                });
+            }
+
+            fn stored(
+                store: &gpui::Entity<BreakpointStore>,
+                buffer: &gpui::Entity<language::Buffer>,
+                cx: &mut gpui::TestAppContext,
+            ) -> Vec<(Anchor, Breakpoint)> {
+                store.read_with(cx, |store, cx| {
+                    let snapshot = buffer.read(cx).snapshot();
+                    store
+                        .breakpoints(buffer, None, &snapshot, cx)
+                        .map(|(bp, _)| (bp.position, bp.bp))
+                        .collect()
+                })
+            }
+
+            #[gpui::test]
+            async fn test_toggle_invert_and_edit_breakpoints(cx: &mut gpui::TestAppContext) {
+                let buffer = cx.update(|cx| cx.new(|cx| language::Buffer::local("a\nb\nc\nd\n", cx)));
+                let store = cx.update(|cx| cx.new(|_| BreakpointStore::default()));
+                let position = buffer.read_with(cx, |buffer, _| {
+                    buffer.snapshot().anchor_after(Point::new(1, 0))
+                });
+
+                // Toggle on: the breakpoint is stored and returned for its buffer.
+                toggle(
+                    &store,
+                    &buffer,
+                    position,
+                    Breakpoint::new_standard(),
+                    BreakpointEditAction::Toggle,
+                    cx,
+                );
+                let stored_breakpoints = stored(&store, &buffer, cx);
+                assert_eq!(stored_breakpoints.len(), 1);
+                assert_eq!(stored_breakpoints[0].0, position);
+                assert!(stored_breakpoints[0].1.is_enabled());
+
+                // Toggle off: the same position clears the breakpoint.
+                toggle(
+                    &store,
+                    &buffer,
+                    position,
+                    Breakpoint::new_standard(),
+                    BreakpointEditAction::Toggle,
+                    cx,
+                );
+                assert!(stored(&store, &buffer, cx).is_empty());
+
+                // InvertState flips an existing breakpoint to disabled.
+                toggle(
+                    &store,
+                    &buffer,
+                    position,
+                    Breakpoint::new_standard(),
+                    BreakpointEditAction::Toggle,
+                    cx,
+                );
+                toggle(
+                    &store,
+                    &buffer,
+                    position,
+                    Breakpoint::new_standard(),
+                    BreakpointEditAction::InvertState,
+                    cx,
+                );
+                assert!(stored(&store, &buffer, cx)[0].1.is_disabled());
+
+                // Editing the log message updates the stored breakpoint in place.
+                toggle(
+                    &store,
+                    &buffer,
+                    position,
+                    Breakpoint::new_standard(),
+                    BreakpointEditAction::EditLogMessage("hit!".into()),
+                    cx,
+                );
+                let stored_breakpoints = stored(&store, &buffer, cx);
+                assert_eq!(stored_breakpoints.len(), 1);
+                assert_eq!(stored_breakpoints[0].1.log_point.as_deref(), Some("hit!"));
+                assert_eq!(stored_breakpoints[0].1.message.as_deref(), Some("hit!"));
+                // Range-limited queries only return breakpoints inside the range.
+                let other_position = buffer.read_with(cx, |buffer, _| {
+                    buffer.snapshot().anchor_after(Point::new(3, 0))
+                });
+                toggle(
+                    &store,
+                    &buffer,
+                    other_position,
+                    Breakpoint::new_standard(),
+                    BreakpointEditAction::Toggle,
+                    cx,
+                );
+                assert_eq!(stored(&store, &buffer, cx).len(), 2);
+                let range_filtered_count = store.read_with(cx, |store, cx| {
+                    let snapshot = buffer.read(cx).snapshot();
+                    let range = snapshot.anchor_before(Point::new(0, 0))
+                        ..snapshot.anchor_before(Point::new(2, 0));
+                    store
+                        .breakpoints(&buffer, Some(range), &snapshot, cx)
+                        .count()
+                });
+                // The range covers rows 0-1 only; the row-3 breakpoint is excluded.
+                assert_eq!(range_filtered_count, 1);
+            }
+
+            #[gpui::test]
+            async fn test_breakpoints_are_scoped_to_their_buffer(cx: &mut gpui::TestAppContext) {
+                let first = cx.update(|cx| cx.new(|cx| language::Buffer::local("a\n", cx)));
+                let second = cx.update(|cx| cx.new(|cx| language::Buffer::local("b\n", cx)));
+                let store = cx.update(|cx| cx.new(|_| BreakpointStore::default()));
+
+                for (buffer, row) in [(&first, 0u32), (&second, 0u32)] {
+                    let position = buffer.read_with(cx, |buffer, _| {
+                        buffer.snapshot().anchor_after(Point::new(row, 0))
+                    });
+                    toggle(
+                        &store,
+                        buffer,
+                        position,
+                        Breakpoint::new_standard(),
+                        BreakpointEditAction::Toggle,
+                        cx,
+                    );
+                }
+
+                assert_eq!(stored(&store, &first, cx).len(), 1);
+                assert_eq!(stored(&store, &second, cx).len(), 1);
+            }
         }
     }
 
@@ -1290,9 +1534,9 @@ impl Project {
         SearchResults { rx }
     }
 
-    /// Whether this local project can create terminal sessions.
+    /// Terminal creation is local-only in this dependency-stripped build.
     pub fn supports_terminal(&self, _cx: &App) -> bool {
-        true
+        self.is_local()
     }
 
     /// Return the worktree containing the active entry.
@@ -1748,7 +1992,7 @@ mod stub_delegate_tests {
     use super::*;
     use crate::Project;
     use fs::{FakeFs, Fs};
-    use gpui::TestAppContext;
+    use gpui::{BorrowAppContext, TestAppContext};
     use language::LanguageRegistry;
     use serde_json::json;
     use settings::SettingsStore;
@@ -1759,6 +2003,24 @@ mod stub_delegate_tests {
         cx.update(|cx| {
             let settings_store = SettingsStore::test(cx);
             cx.set_global(settings_store);
+        });
+    }
+
+    #[gpui::test]
+    fn disable_ai_settings_follow_merged_project_settings(cx: &mut TestAppContext) {
+        init_test(cx);
+        cx.update(|cx| {
+            let initial = DisableAiSettings::get_global(cx);
+            assert!(!initial.disable_ai);
+            assert!(!DisableAiSettings::is_ai_disabled_for_buffer(None, cx));
+
+            cx.update_global::<SettingsStore, _>(|store, cx| {
+                let result = store.set_user_settings(r#"{"disable_ai": true}"#, cx);
+                assert_eq!(result.parse_status, settings::ParseStatus::Success);
+            });
+
+            assert!(DisableAiSettings::get_global(cx).disable_ai);
+            assert!(DisableAiSettings::is_ai_disabled_for_buffer(None, cx));
         });
     }
 

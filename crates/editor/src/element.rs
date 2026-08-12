@@ -399,44 +399,36 @@ impl EditorElement {
         register_action(editor, window, Editor::go_to_next_hunk);
         register_action(editor, window, Editor::go_to_prev_hunk);
         register_action(editor, window, |editor, action, window, cx| {
-            editor
-                .go_to_definition(action, window, cx)
-                .detach_and_log_err(cx);
+            let task = editor.go_to_definition(action, window, cx);
+            editor.detach_and_notify_err(task, window, cx);
         });
         register_action(editor, window, |editor, action, window, cx| {
-            editor
-                .go_to_definition_split(action, window, cx)
-                .detach_and_log_err(cx);
+            let task = editor.go_to_definition_split(action, window, cx);
+            editor.detach_and_notify_err(task, window, cx);
         });
         register_action(editor, window, |editor, action, window, cx| {
-            editor
-                .go_to_declaration(action, window, cx)
-                .detach_and_log_err(cx);
+            let task = editor.go_to_declaration(action, window, cx);
+            editor.detach_and_notify_err(task, window, cx);
         });
         register_action(editor, window, |editor, action, window, cx| {
-            editor
-                .go_to_declaration_split(action, window, cx)
-                .detach_and_log_err(cx);
+            let task = editor.go_to_declaration_split(action, window, cx);
+            editor.detach_and_notify_err(task, window, cx);
         });
         register_action(editor, window, |editor, action, window, cx| {
-            editor
-                .go_to_implementation(action, window, cx)
-                .detach_and_log_err(cx);
+            let task = editor.go_to_implementation(action, window, cx);
+            editor.detach_and_notify_err(task, window, cx);
         });
         register_action(editor, window, |editor, action, window, cx| {
-            editor
-                .go_to_implementation_split(action, window, cx)
-                .detach_and_log_err(cx);
+            let task = editor.go_to_implementation_split(action, window, cx);
+            editor.detach_and_notify_err(task, window, cx);
         });
         register_action(editor, window, |editor, action, window, cx| {
-            editor
-                .go_to_type_definition(action, window, cx)
-                .detach_and_log_err(cx);
+            let task = editor.go_to_type_definition(action, window, cx);
+            editor.detach_and_notify_err(task, window, cx);
         });
         register_action(editor, window, |editor, action, window, cx| {
-            editor
-                .go_to_type_definition_split(action, window, cx)
-                .detach_and_log_err(cx);
+            let task = editor.go_to_type_definition_split(action, window, cx);
+            editor.detach_and_notify_err(task, window, cx);
         });
         register_action(editor, window, Editor::open_url);
         register_action(editor, window, Editor::open_selected_filename);
@@ -513,51 +505,12 @@ impl EditorElement {
         register_action(
             editor,
             window,
-            |editor, action: &ComposeCompletion, window, cx| {
-                if let Some(task) = editor.compose_completion(action, &mut *window, &mut *cx) {
-                    editor.detach_and_notify_err::<(), anyhow::Error>(task, &mut *window, &mut *cx);
-                } else {
-                    cx.propagate();
-                }
-            },
-        );
-        register_action(
-            editor,
-            window,
             |editor, action: &FindAllReferences, window, cx| {
                 if let Some(task) = editor.find_all_references(action, window, cx) {
-                    task.detach_and_log_err(cx);
+                    editor.detach_and_notify_err(task, window, cx);
                 } else {
                     cx.propagate();
                 }
-            },
-        );
-        register_action(
-            editor,
-            window,
-            |editor: &mut Editor, action: &ShowSignatureHelp, window, cx| {
-                editor.show_signature_help(action, window, cx);
-            },
-        );
-        register_action(
-            editor,
-            window,
-            |editor: &mut Editor, action: &SignatureHelpPrevious, window, cx| {
-                editor.signature_help_prev(action, window, cx);
-            },
-        );
-        register_action(
-            editor,
-            window,
-            |editor: &mut Editor, action: &SignatureHelpNext, window, cx| {
-                editor.signature_help_next(action, window, cx);
-            },
-        );
-        register_action(
-            editor,
-            window,
-            |editor: &mut Editor, action: &ShowEditPrediction, window, cx| {
-                editor.show_edit_prediction(action, window, cx);
             },
         );
         register_action(editor, window, Editor::edit_bookmark);
@@ -659,83 +612,35 @@ impl EditorElement {
                 },
             );
             register_action(editor, window, |editor, action, window, cx| {
+                if let Some(task) = editor.rename(action, window, cx) {
+                    editor.detach_and_notify_err(task, window, cx);
+                } else {
+                    cx.propagate();
+                }
+            });
+            register_action(editor, window, |editor, action, window, cx| {
+                if let Some(task) = editor.toggle_code_actions(action, window, cx) {
+                    editor.detach_and_notify_err(task, window, cx);
+                } else {
+                    cx.propagate();
+                }
+            });
+            register_action(editor, window, |editor, action, window, cx| {
                 if let Some(task) = editor.format(action, window, cx) {
                     editor.detach_and_notify_err(task, window, cx);
                 } else {
                     cx.propagate();
                 }
             });
-            if editor.read(cx).can_format_selections(cx) {
-                register_action(editor, window, |editor, action, window, cx| {
-                    if let Some(task) = editor.format_selections(action, window, cx) {
-                        editor.detach_and_notify_err(task, window, cx);
-                    } else {
-                        cx.propagate();
-                    }
-                });
-            }
             register_action(editor, window, |editor, action, window, cx| {
-                if let Some(task) = editor.organize_imports(action, window, cx) {
+                if let Some(task) = editor.format_selections(action, window, cx) {
                     editor.detach_and_notify_err(task, window, cx);
                 } else {
                     cx.propagate();
                 }
             });
-            register_action(
-                editor,
-                window,
-                |editor, action: &ConfirmCompletion, window, cx| {
-                    if let Some(task) = editor.confirm_completion(action, &mut *window, &mut *cx) {
-                        let _: gpui::Task<Result<Vec<AvailableCodeAction>, anyhow::Error>> = task;
-                        editor.detach_and_notify_err(task, &mut *window, &mut *cx);
-                    } else {
-                        cx.propagate();
-                    }
-                },
-            );
-            register_action(
-                editor,
-                window,
-                |editor, action: &ConfirmCompletionReplace, window, cx| {
-                    if let Some(task) =
-                        editor.confirm_completion_replace(action, &mut *window, &mut *cx)
-                    {
-                        let _: gpui::Task<Result<Vec<String>, anyhow::Error>> = task;
-                        editor.detach_and_notify_err(task, &mut *window, &mut *cx);
-                    } else {
-                        cx.propagate();
-                    }
-                },
-            );
-            register_action(
-                editor,
-                window,
-                |editor, action: &ConfirmCompletionInsert, window, cx| {
-                    if let Some(task) =
-                        editor.confirm_completion_insert(action, &mut *window, &mut *cx)
-                    {
-                        let _: gpui::Task<Result<Vec<String>, anyhow::Error>> = task;
-                        editor.detach_and_notify_err(task, &mut *window, &mut *cx);
-                    } else {
-                        cx.propagate();
-                    }
-                },
-            );
-            register_action(
-                editor,
-                window,
-                |editor, action: &ConfirmCodeAction, window, cx| {
-                    if let Some(task) = editor.confirm_code_action(action, &mut *window, &mut *cx) {
-                        let _: gpui::Task<Result<Vec<AvailableCodeAction>, anyhow::Error>> = task;
-                        editor.detach_and_notify_err(task, &mut *window, &mut *cx);
-                    } else {
-                        cx.propagate();
-                    }
-                },
-            );
-            register_action(editor, window, |editor, action: &Rename, window, cx| {
-                if let Some(task) = editor.rename(action, window, cx) {
-                    let _: gpui::Task<Result<(), anyhow::Error>> = task;
+            register_action(editor, window, |editor, action, window, cx| {
+                if let Some(task) = editor.organize_imports(action, window, cx) {
                     editor.detach_and_notify_err(task, window, cx);
                 } else {
                     cx.propagate();

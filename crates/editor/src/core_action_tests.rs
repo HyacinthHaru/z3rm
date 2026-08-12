@@ -19,6 +19,36 @@ fn editor_with_text(text: &str, cx: &mut TestAppContext) -> WindowHandle<Editor>
 }
 
 #[gpui::test]
+async fn unavailable_lsp_actions_return_errors(cx: &mut TestAppContext) {
+    init(cx);
+    let editor = editor_with_text("symbol", cx);
+
+    let (rename, format, format_selections, code_actions) = editor
+        .update(cx, |editor, window, cx| {
+            (
+                editor
+                    .rename(&Rename, window, cx)
+                    .expect("rename action must return a task"),
+                editor
+                    .format(&Format, window, cx)
+                    .expect("format action must return a task"),
+                editor
+                    .format_selections(&FormatSelections, window, cx)
+                    .expect("format selections action must return a task"),
+                editor
+                    .toggle_code_actions(&ToggleCodeActions::default(), window, cx)
+                    .expect("code actions must return a task"),
+            )
+        })
+        .expect("editor window must remain open");
+
+    assert!(rename.await.is_err());
+    assert!(format.await.is_err());
+    assert!(format_selections.await.is_err());
+    assert!(code_actions.await.is_err());
+}
+
+#[gpui::test]
 fn inlay_hint_settings_preserve_language_defaults(cx: &mut TestAppContext) {
     init(cx);
     cx.update(|cx| {

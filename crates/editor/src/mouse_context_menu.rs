@@ -219,7 +219,6 @@ pub fn deploy_context_menu(
 
         let evaluate_selection = window.is_action_available(&EvaluateSelectedText, cx);
         let run_to_cursor = window.is_action_available(&RunToCursor, cx);
-        let format_selections = window.is_action_available(&FormatSelections, cx);
         let disable_ai = DisableAiSettings::is_ai_disabled_for_buffer(
             editor.buffer.read(cx).as_singleton().map(|b| b.read(cx)),
             cx,
@@ -265,18 +264,6 @@ pub fn deploy_context_menu(
                     Box::new(FindAllReferences::default()),
                 )
                 .separator()
-                .action("Rename Symbol", Box::new(Rename))
-                .action("Format Buffer", Box::new(Format))
-                .when(format_selections, |cx| {
-                    cx.action("Format Selections", Box::new(FormatSelections))
-                })
-                .action(
-                    "Show Code Actions",
-                    Box::new(ToggleCodeActions {
-                        deployed_from: None,
-                        quick_launch: false,
-                    }),
-                )
                 .when(!disable_ai && has_selections, |this| {
                     this.action("Add to Agent Thread", Box::new(AddSelectionToThread))
                 })
