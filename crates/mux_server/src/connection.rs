@@ -965,6 +965,7 @@ fn handle_list_recovery_candidates(
     for error in &scan.rejected {
         tracing::warn!(%error, "rejected invalid mux recovery candidate");
     }
+    let rejected = scan.rejected;
     let live_ids = sessions
         .read()
         .iter()
@@ -986,6 +987,7 @@ fn handle_list_recovery_candidates(
                     pane_ids: candidate.layout.pane_ids(),
                 })
                 .collect(),
+            rejected,
         },
     ))
 }

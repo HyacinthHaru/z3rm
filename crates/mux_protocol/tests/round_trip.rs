@@ -439,6 +439,7 @@ fn recovery_messages_round_trip() {
                     metadata_complete: true,
                     pane_ids: vec!["pane-1".to_string()],
                 }],
+                rejected: vec!["invalid persisted layout for session old-1".to_string()],
             },
         )),
     };
@@ -450,6 +451,10 @@ fn recovery_messages_round_trip() {
     match decoded.body {
         Some(proto::response::Body::RecoveryCandidates(response)) => {
             assert_eq!(response.candidates[0].pane_ids, vec!["pane-1"]);
+            assert_eq!(
+                response.rejected,
+                vec!["invalid persisted layout for session old-1"]
+            );
         }
         body => panic!("unexpected recovery response body: {body:?}"),
     }

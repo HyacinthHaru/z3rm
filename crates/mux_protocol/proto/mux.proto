@@ -794,6 +794,9 @@ message RecoveryCandidateInfo {
 
 message ListRecoveryCandidatesResponse {
     repeated RecoveryCandidateInfo candidates = 1;
+    // 扫描阶段被拒的持久化行，每条一句原因。这些会话不可恢复，但用户需要知道
+    // 它们存在：只写服务端日志的话，界面上等同于"没有这个会话"。
+    repeated string rejected = 2;
 }
 
 // §3.6 确认恢复指定会话：为每个持久化 pane 启动 fresh default shell

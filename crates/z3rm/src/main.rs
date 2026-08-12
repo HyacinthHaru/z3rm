@@ -8,6 +8,7 @@ mod diff_review;
 mod extension_status_bar;
 mod log_viewer;
 mod open_diff;
+mod open_remote;
 mod quickjs_extensions;
 mod zed;
 
@@ -328,6 +329,60 @@ struct MuxWindow<T = mux::SshSession> {
     connection_state: MuxConnectionState,
 }
 
+/// §15.4 The window's persistent connection indicator.
+///
+/// A toast is the wrong surface for this: it tells the user once and then the
+/// window looks identical to a healthy one. An offline remote window has to
+/// keep saying so until it is reconnected.
+struct MuxConnectionStatusItem {
+    state: MuxConnectionState,
+}
+
+impl MuxConnectionStatusItem {
+    fn new() -> Self {
+        Self {
+            state: MuxConnectionState::Connected,
+        }
+    }
+
+    fn set_state(&mut self, state: MuxConnectionState, cx: &mut Context<Self>) {
+        if self.state == state {
+            return;
+        }
+        self.state = state;
+        cx.notify();
+    }
+}
+
+impl Render for MuxConnectionStatusItem {
+    fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
+        use ui::prelude::*;
+
+        let label = match self.state {
+            MuxConnectionState::Connected => None,
+            MuxConnectionState::Disconnected => Some(("Disconnected", ui::Color::Error)),
+            MuxConnectionState::Reconnecting => Some(("Reconnecting…", ui::Color::Warning)),
+        };
+        gpui::div().when_some(label, |element, (text, color)| {
+            element.child(ui::Label::new(text).size(ui::LabelSize::Small).color(color))
+        })
+    }
+}
+
+impl workspace::StatusItemView for MuxConnectionStatusItem {
+    fn set_active_pane_item(
+        &mut self,
+        _active_pane_item: Option<&dyn workspace::ItemHandle>,
+        _window: &mut Window,
+        _cx: &mut Context<Self>,
+    ) {
+    }
+
+    fn hide_setting(&self, _cx: &App) -> Option<workspace::HideStatusItem> {
+        None
+    }
+}
+
 /// §3.3 Client-side view of which windows share which session (Plan 32).
 ///
 /// `windows` holds the windows this process owns; `roster` is the server's
@@ -337,6 +392,7 @@ struct MuxWindow<T = mux::SshSession> {
 struct MuxWindows {
     windows: std::collections::HashMap<gpui::WindowId, MuxWindow>,
     roster: std::collections::HashMap<String, std::collections::BTreeSet<String>>,
+    status_items: std::collections::HashMap<gpui::WindowId, WeakEntity<MuxConnectionStatusItem>>,
 }
 
 impl Global for MuxWindows {}
@@ -428,6 +484,7 @@ fn take_mux_window(window_id: gpui::WindowId, cx: &mut App) -> Option<MuxWindow>
         return None;
     }
     cx.update_global::<MuxWindows, Option<MuxWindow>>(|windows, _| {
+        windows.status_items.remove(&window_id);
         windows.windows.remove(&window_id)
     })
 }
@@ -495,6 +552,69 @@ fn mark_remote_mux_window_disconnected<T>(
     binding.connection_state.mark_disconnected()
 }
 
+/// §15.4 Mirror `window_id`'s connection state into its status bar item.
+fn publish_mux_connection_state(window_id: gpui::WindowId, cx: &mut App) {
+    let Some(windows) = cx.try_global::<MuxWindows>() else {
+        return;
+    };
+    let Some(state) = windows
+        .windows
+        .get(&window_id)
+        .map(|binding| binding.connection_state)
+    else {
+        return;
+    };
+    let Some(item) = windows.status_items.get(&window_id).cloned() else {
+        return;
+    };
+    item.update(cx, |item, cx| item.set_state(state, cx)).ok();
+}
+
+/// §15.4 Watch a remote window's tunnel and surface the outage.
+///
+/// The lifecycle notification stream cannot carry this: its subscriber channel
+/// stays open when the transport dies (only a dropped domain closes it), so a
+/// dead tunnel is indistinguishable from an idle one. `check_connection` issues
+/// a real RPC, which is the same probe the local daemon watcher uses.
+fn watch_remote_mux_connection(
+    domain: Arc<mux::MuxDomain>,
+    window_id: gpui::WindowId,
+    cx: &mut App,
+) -> gpui::Task<()> {
+    // Weak for the same reason the notification watcher is: this task must not
+    // keep a closed window's tunnel open.
+    let domain = Arc::downgrade(&domain);
+    cx.spawn(async move |cx| {
+        const PROBE_INTERVAL: std::time::Duration = std::time::Duration::from_secs(5);
+        loop {
+            cx.background_executor().timer(PROBE_INTERVAL).await;
+            let Some(domain) = domain.upgrade() else {
+                return;
+            };
+            if domain.check_connection().await {
+                continue;
+            }
+            let newly_disconnected = cx.update(|cx| {
+                if cx.try_global::<MuxWindows>().is_none() {
+                    return false;
+                }
+                let marked = cx.update_global::<MuxWindows, bool>(|windows, _| {
+                    mark_remote_mux_window_disconnected(&mut windows.windows, window_id, &domain)
+                });
+                publish_mux_connection_state(window_id, cx);
+                marked
+            });
+            if newly_disconnected {
+                cx.update(|cx| {
+                    daemon::show_daemon_error(
+                        cx,
+                        "Remote mux connection lost. Run mux::Reconnect to rebuild the SSH tunnel.",
+                    );
+                });
+            }
+        }
+    })
+}
 
 /// §3.3 The mux connection that drives `window`.
 ///
@@ -562,12 +682,7 @@ fn mux_binding_for_window(
     let window_id = window.window_handle().window_id();
     cx.try_global::<MuxWindows>()
         .and_then(|windows| windows.windows.get(&window_id))
-        .map(|mux_window| {
-            (
-                mux_window.domain.clone(),
-                mux_window.session_id.clone(),
-            )
-        })
+        .map(|mux_window| (mux_window.domain.clone(), mux_window.session_id.clone()))
 }
 
 /// §15.4 / §15.12 Client-side projection of one authoritative attach snapshot.
@@ -750,6 +865,7 @@ async fn open_mux_window_with_snapshot(
         .await?;
 
     let window_handle = open_result.window;
+    let is_remote = ssh_session.is_some();
     cx.update(|cx| {
         register_mux_window(
             window_handle.window_id(),
@@ -758,6 +874,12 @@ async fn open_mux_window_with_snapshot(
             ssh_session,
             cx,
         );
+        // §15.4 Only remote windows need this: a local daemon window is already
+        // covered by `daemon::watch_daemon_connection`, which reconnects on its
+        // own instead of waiting for the user.
+        if is_remote {
+            watch_remote_mux_connection(domain.clone(), window_handle.window_id(), cx).detach();
+        }
     });
     window_handle
         .update(cx, |multi_workspace, window, cx| {
@@ -828,6 +950,43 @@ fn handle_sidebar_request(
         sidebar::SidebarRequest::ActivateSession(session_id) => {
             activate_mux_session(workspace.clone(), domain.clone(), session_id, window, cx);
         }
+        sidebar::SidebarRequest::ReviewFile { session_id, path } => {
+            let binding = mux_binding_for_window(window, cx);
+            match open_file_route(
+                &session_id,
+                binding
+                    .as_ref()
+                    .map(|(_, bound_session_id)| bound_session_id.as_str()),
+            ) {
+                OpenFileRoute::Matched => {
+                    let (domain, _) = match binding {
+                        Some(binding) => binding,
+                        None => return,
+                    };
+                    let workspace = workspace.clone();
+                    window
+                        .spawn(cx, async move |cx| {
+                            open_diff::open_diff_review(
+                                std::path::PathBuf::from(path),
+                                domain,
+                                session_id,
+                                workspace,
+                                cx,
+                            )
+                            .await;
+                        })
+                        .detach();
+                }
+                OpenFileRoute::Unbound | OpenFileRoute::WrongSession => {
+                    daemon::show_daemon_error(
+                        cx,
+                        format!(
+                            "Cannot review {path}: this window is not attached to session {session_id}"
+                        ),
+                    );
+                }
+            }
+        }
         sidebar::SidebarRequest::OpenFile { session_id, path } => {
             let binding = mux_binding_for_window(window, cx);
             match open_file_route(
@@ -878,11 +1037,19 @@ fn handle_sidebar_request(
     }
 }
 
+/// What a bounded session-file read produced.
+enum MuxFileContent {
+    Text(Vec<u8>),
+    /// The bytes are intact, they just are not text. Kept so the viewer can
+    /// offer to save them instead of throwing the transfer away.
+    Binary(Vec<u8>),
+}
+
 async fn read_mux_file_bounded(
     domain: &mux::MuxDomain,
     path: &str,
     expected_size: u64,
-) -> anyhow::Result<Vec<u8>> {
+) -> anyhow::Result<MuxFileContent> {
     anyhow::ensure!(
         expected_size <= MAX_OPEN_FILE_BYTES,
         "{path} exceeds the 2 MiB Files viewer limit"
@@ -890,6 +1057,7 @@ async fn read_mux_file_bounded(
 
     let mut content = Vec::with_capacity(expected_size as usize);
     let mut offset_bytes = 0;
+    let mut is_binary = false;
     loop {
         let remaining_capacity = MAX_OPEN_FILE_BYTES.saturating_sub(offset_bytes);
         let max_bytes = remaining_capacity
@@ -906,11 +1074,7 @@ async fn read_mux_file_bounded(
             "{path} changed size while opening (stat reported {expected_size} bytes, read reported {} bytes); refresh Files and try again",
             page.total_bytes
         );
-        if page.is_binary {
-            anyhow::bail!(
-                "{path} is a binary file and cannot be shown in the text viewer; open it with a binary-capable tool on the session host"
-            );
-        }
+        is_binary |= page.is_binary;
         anyhow::ensure!(
             content.len() + page.content.len() <= MAX_OPEN_FILE_BYTES as usize,
             "{path} exceeds the 2 MiB Files viewer limit"
@@ -918,10 +1082,68 @@ async fn read_mux_file_bounded(
         content.extend_from_slice(&page.content);
 
         let Some(next_offset_bytes) = page.next_offset_bytes else {
-            return Ok(content);
+            return Ok(if is_binary {
+                MuxFileContent::Binary(content)
+            } else {
+                MuxFileContent::Text(content)
+            });
         };
         offset_bytes = next_offset_bytes;
     }
+}
+
+/// §16.6 Describe a binary session file and offer to save it locally.
+///
+/// Refusing to render it as text is right; refusing to do anything with it is
+/// not — the bytes already crossed the tunnel, and copying them out is the one
+/// thing the user can still reasonably want.
+async fn offer_binary_file_download(
+    path: String,
+    content: Vec<u8>,
+    cx: &mut gpui::AsyncWindowContext,
+) -> anyhow::Result<()> {
+    let file_name = Path::new(&path)
+        .file_name()
+        .map(|name| name.to_string_lossy().into_owned())
+        .unwrap_or_else(|| "download".to_string());
+    let detail = format!(
+        "{path}\n\n{} bytes of binary data.\n\nBinary files are not shown in the text viewer. \
+         The contents have already been fetched from the session host and can be saved locally.",
+        content.len()
+    );
+    let answer = cx
+        .update(|window, cx| {
+            window.prompt(
+                gpui::PromptLevel::Info,
+                "Binary file",
+                Some(&detail),
+                &[
+                    gpui::PromptButton::new("Save a copy…"),
+                    gpui::PromptButton::cancel("Close"),
+                ],
+                cx,
+            )
+        })?
+        .await
+        .ok();
+    if answer != Some(0) {
+        return Ok(());
+    }
+
+    let directory = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
+    let destination = cx
+        .update(|_, cx| cx.prompt_for_new_path(&directory, Some(&file_name)))?
+        .await
+        .context("the save dialog was dismissed")??;
+    let Some(destination) = destination else {
+        return Ok(());
+    };
+    let display = destination.display().to_string();
+    smol::unblock(move || std::fs::write(&destination, &content))
+        .await
+        .with_context(|| format!("failed to write {display}"))?;
+    cx.update(|_, cx| daemon::show_daemon_error(cx, format!("Saved {display}")))?;
+    Ok(())
 }
 
 fn open_mux_file(
@@ -958,7 +1180,12 @@ fn open_mux_file(
                     }
                 }
 
-                let content = read_mux_file_bounded(&domain, &path, stat.size).await?;
+                let content = match read_mux_file_bounded(&domain, &path, stat.size).await? {
+                    MuxFileContent::Text(content) => content,
+                    MuxFileContent::Binary(content) => {
+                        return offer_binary_file_download(path.clone(), content, cx).await;
+                    }
+                };
                 let text = String::from_utf8(content).map_err(|error| {
                     anyhow::anyhow!(
                         "{path} is not valid UTF-8 (invalid data begins at byte {}); convert it to UTF-8 on the session host and try again",
@@ -1134,6 +1361,21 @@ fn activate_mux_session(
         .detach();
 }
 
+/// §15.4 The authoritative focus that rides along with a layout change.
+///
+/// The snapshot travels with the layout, so a reconnect that rebuilt panes and
+/// tabs but left focus wherever it happened to be is not the state the server
+/// holds. An empty id means the server has no focused pane, not pane "".
+fn focused_pane_from_layout_change(
+    layout_change: &mux_protocol::SessionLayoutChanged,
+) -> Option<String> {
+    layout_change
+        .snapshot
+        .as_ref()
+        .map(|snapshot| snapshot.focused_pane_id.clone())
+        .filter(|pane_id| !pane_id.is_empty())
+}
+
 /// §15.4 / §15.12 Reconcile a window from the server's lifecycle stream.
 ///
 /// `SessionLayoutChanged` carries the authoritative layout tree, which is
@@ -1149,7 +1391,6 @@ fn watch_mux_session_notifications(
 ) {
     let notifications = domain.subscribe();
     let mux_window_id = domain.window_id();
-    let gpui_window_id = window_handle.window_id();
     // Weak, so a closed window's connection is not pinned open by this task:
     // the socket closes with the last strong handle, and the notification
     // stream then ends, which is what stops this loop.
@@ -1166,6 +1407,7 @@ fn watch_mux_session_notifications(
                     };
                     let layout =
                         workspace::layout_projection::LayoutTree::from_proto(proto_layout);
+                    let focused_pane = focused_pane_from_layout_change(layout_change);
                     let Some(domain) = domain.upgrade() else {
                         break;
                     };
@@ -1182,7 +1424,12 @@ fn watch_mux_session_notifications(
                         };
                         workspace.update(cx, |workspace, cx| {
                             apply_mux_layout_to_workspace(
-                                workspace, &layout, None, domain, window, cx,
+                                workspace,
+                                &layout,
+                                focused_pane.as_deref(),
+                                domain,
+                                window,
+                                cx,
                             );
                         });
                     }) {
@@ -1222,27 +1469,10 @@ fn watch_mux_session_notifications(
                 _ => {}
             }
         }
-        let Some(domain) = domain.upgrade() else {
-            return;
-        };
-        cx.update(|cx| {
-            let Some(_) = cx.try_global::<MuxWindows>() else {
-                return;
-            };
-            let disconnected = cx.update_global::<MuxWindows, bool>(|windows, _| {
-                mark_remote_mux_window_disconnected(
-                    &mut windows.windows,
-                    gpui_window_id,
-                    &domain,
-                )
-            });
-            if disconnected {
-                daemon::show_daemon_error(
-                    cx,
-                    "Remote mux connection lost. Run mux::Reconnect to rebuild the SSH tunnel.",
-                );
-            }
-        });
+        // Reaching here means the domain was dropped, i.e. the window is going
+        // away. A live tunnel that dies never ends this loop — the subscriber
+        // channel outlives the transport — which is why outage detection lives
+        // in `watch_remote_mux_connection` instead.
     })
     .detach();
 }
@@ -1599,7 +1829,10 @@ enum StartupRecovery {
     },
 }
 
-fn recovery_prompt_detail(candidates: &[mux_protocol::RecoveryCandidateInfo]) -> String {
+fn recovery_prompt_detail(
+    candidates: &[mux_protocol::RecoveryCandidateInfo],
+    rejected: &[String],
+) -> String {
     let mut detail = candidates
         .iter()
         .map(|candidate| {
@@ -1617,6 +1850,15 @@ fn recovery_prompt_detail(candidates: &[mux_protocol::RecoveryCandidateInfo]) ->
         })
         .collect::<Vec<_>>()
         .join("\n\n");
+    // A rejected row is a session the user had and cannot get back. Saying so
+    // beats letting it look like it was never persisted at all.
+    if !rejected.is_empty() {
+        detail.push_str(&format!(
+            "\n\n{} saved session(s) could not be read and are not offered:\n  {}",
+            rejected.len(),
+            rejected.join("\n  ")
+        ));
+    }
     detail.push_str(
         "\n\nOnly the saved layout and new default shells are recreated. \
          Running processes and old commands are never restored or replayed.",
@@ -1637,9 +1879,16 @@ async fn maybe_recover_mux_session(
         return StartupRecovery::Continue { warning: None };
     }
 
-    let candidates = match domain.list_recovery_candidates().await {
-        Ok(candidates) if !candidates.is_empty() => candidates,
-        Ok(_) => return StartupRecovery::Continue { warning: None },
+    let listing = match domain.list_recovery_candidates().await {
+        Ok(listing) if !listing.candidates.is_empty() => listing,
+        // Nothing offerable. Rejected rows alone do not justify interrupting
+        // startup with a prompt that has nothing to confirm.
+        Ok(listing) => {
+            for rejected in &listing.rejected {
+                tracing::warn!(%rejected, "unreadable mux recovery candidate");
+            }
+            return StartupRecovery::Continue { warning: None };
+        }
         Err(error) => {
             return StartupRecovery::Continue {
                 warning: Some(format!(
@@ -1648,6 +1897,7 @@ async fn maybe_recover_mux_session(
             };
         }
     };
+    let candidates = listing.candidates;
 
     if RECOVERY_PROMPT_CLAIMED
         .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
@@ -1673,7 +1923,7 @@ async fn maybe_recover_mux_session(
         }
     };
 
-    let detail = recovery_prompt_detail(&candidates);
+    let detail = recovery_prompt_detail(&candidates, &listing.rejected);
     let mut answers = candidates
         .iter()
         .map(|candidate| gpui::PromptButton::new(format!("Restore {}", candidate.name)))
@@ -2066,6 +2316,7 @@ fn main() {
 
         workspace::init(app_state.clone(), cx);
         open_diff::init(cx);
+        open_remote::init(cx);
         editor::init(cx);
         command_palette::init(cx);
         file_finder::init(cx);
@@ -2221,6 +2472,24 @@ fn main() {
                     workspace.status_bar().update(cx, |sb, cx| {
                         sb.add_right_item(ext_status, window, cx);
                     });
+
+                    // §15.4 The remote window's own offline/reconnecting
+                    // indicator, kept next to the extension chrome.
+                    let connection_status = cx.new(|_| MuxConnectionStatusItem::new());
+                    let status_window_id = window.window_handle().window_id();
+                    let connection_status_handle = connection_status.downgrade();
+                    workspace.status_bar().update(cx, |sb, cx| {
+                        sb.add_right_item(connection_status, window, cx);
+                    });
+                    if cx.try_global::<MuxWindows>().is_none() {
+                        cx.set_global(MuxWindows::default());
+                    }
+                    cx.update_global::<MuxWindows, ()>(|windows, _| {
+                        windows
+                            .status_items
+                            .insert(status_window_id, connection_status_handle);
+                    });
+                    publish_mux_connection_state(status_window_id, cx);
 
                     // §5.6 First-install consent prompt: extensions the user has
                     // not approved yet surface as `pending_approvals` on the
@@ -2631,6 +2900,7 @@ fn main() {
                                 }
                             };
 
+                            publish_mux_connection_state(window_id, cx);
                             daemon::show_daemon_connection_lost(cx);
                             window
                                 .spawn(cx, async move |cx| {
@@ -2680,6 +2950,7 @@ fn main() {
                                         if !state_updated {
                                             return;
                                         }
+                                        publish_mux_connection_state(window_id, cx);
                                         match &result {
                                             Ok(()) => daemon::show_daemon_error(
                                                 cx,
@@ -3280,6 +3551,36 @@ mod tests {
         );
     }
 
+    /// §15.4 Reconnect broadcasts a synthetic `SessionLayoutChanged` carrying
+    /// the whole snapshot. Reading only `.layout` out of it silently drops the
+    /// focused pane, which is part of the state the reconnect has to restore.
+    #[test]
+    fn layout_change_carries_the_authoritative_focus() {
+        let with_focus = mux_protocol::SessionLayoutChanged {
+            layout: None,
+            snapshot: Some(mux_protocol::SessionSnapshot {
+                focused_pane_id: "pane-7".to_string(),
+                ..Default::default()
+            }),
+        };
+        assert_eq!(
+            super::focused_pane_from_layout_change(&with_focus),
+            Some("pane-7".to_string())
+        );
+
+        let unfocused = mux_protocol::SessionLayoutChanged {
+            layout: None,
+            snapshot: Some(mux_protocol::SessionSnapshot::default()),
+        };
+        assert_eq!(super::focused_pane_from_layout_change(&unfocused), None);
+
+        let no_snapshot = mux_protocol::SessionLayoutChanged {
+            layout: None,
+            snapshot: None,
+        };
+        assert_eq!(super::focused_pane_from_layout_change(&no_snapshot), None);
+    }
+
     #[test]
     fn recovery_prompt_is_skipped_for_explicit_attach_targets() {
         assert!(super::should_probe_recovery(None));
@@ -3288,20 +3589,40 @@ mod tests {
 
     #[test]
     fn recovery_prompt_detail_describes_layout_only_recreation() {
-        let detail = super::recovery_prompt_detail(&[
-            mux_protocol::RecoveryCandidateInfo {
+        let detail = super::recovery_prompt_detail(
+            &[mux_protocol::RecoveryCandidateInfo {
                 id: "session-1".to_string(),
                 name: "work".to_string(),
                 cwd: "/tmp/work".to_string(),
                 metadata_complete: false,
                 pane_ids: vec!["pane-1".to_string(), "pane-2".to_string()],
-            },
-        ]);
+            }],
+            &[],
+        );
         assert!(detail.contains("work"));
         assert!(detail.contains("cwd: /tmp/work"));
         assert!(detail.contains("panes: 2"));
         assert!(detail.contains("metadata: incomplete"));
         assert!(detail.contains("new default shells"));
         assert!(detail.contains("never restored or replayed"));
+    }
+
+    /// §3.6 A row the scan could not read is a session the user had and cannot
+    /// get back. Logging it server-side only makes it look like it never
+    /// existed, so the prompt has to name it.
+    #[test]
+    fn recovery_prompt_detail_names_unreadable_candidates() {
+        let detail = super::recovery_prompt_detail(
+            &[mux_protocol::RecoveryCandidateInfo {
+                id: "session-1".to_string(),
+                name: "work".to_string(),
+                cwd: "/tmp/work".to_string(),
+                metadata_complete: true,
+                pane_ids: vec!["pane-1".to_string()],
+            }],
+            &["invalid persisted layout for session old-1".to_string()],
+        );
+        assert!(detail.contains("1 saved session(s) could not be read"));
+        assert!(detail.contains("invalid persisted layout for session old-1"));
     }
 }
