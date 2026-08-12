@@ -158,7 +158,7 @@ impl Wal {
         // append 会写进已归档的旧 inode。
         let new_file = OpenOptions::new()
             .create(true)
-            .append(true)
+            .write(true)
             .truncate(true)
             .open(&self.path)?;
         *file = BufWriter::new(new_file);
@@ -545,7 +545,10 @@ mod tests {
         archived.commit().unwrap();
         drop(archived);
 
-        let error = Wal::open(&path).expect_err("ambiguous rotation state must fail closed");
+        let error = match Wal::open(&path) {
+            Ok(_) => panic!("ambiguous rotation state must fail closed"),
+            Err(error) => error,
+        };
         assert_eq!(error.kind(), io::ErrorKind::InvalidData);
     }
 

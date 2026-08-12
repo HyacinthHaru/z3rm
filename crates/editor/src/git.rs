@@ -13,7 +13,9 @@ trait ProjectGitExt {
         _ranges: Vec<Range<text::Anchor>>,
         _cx: &mut App,
     ) -> Task<Result<()>> {
-        Task::ready(Ok(()))
+        Task::ready(Err(anyhow::anyhow!(
+            "staging hunks is unavailable in this build"
+        )))
     }
 
     fn unstage_uncommitted_hunks(
@@ -23,7 +25,9 @@ trait ProjectGitExt {
         _ranges: Vec<Range<text::Anchor>>,
         _cx: &mut App,
     ) -> Task<Result<()>> {
-        Task::ready(Ok(()))
+        Task::ready(Err(anyhow::anyhow!(
+            "unstaging hunks is unavailable in this build"
+        )))
     }
 
     fn status_for_buffer_id(&self, _buffer_id: BufferId, _cx: &App) -> Option<FileStatus> {
@@ -146,13 +150,20 @@ impl DiffHunkDelegate for UncommittedDiffHunkDelegate {
 
     fn stage_or_unstage(
         &self,
-        _stage: bool,
+        stage: bool,
         _hunks: Vec<ResolvedDiffHunks>,
-        _editor: &mut Editor,
-        _window: &mut Window,
-        _cx: &mut Context<Editor>,
+        editor: &mut Editor,
+        window: &mut Window,
+        cx: &mut Context<Editor>,
     ) {
-        // 只读编辑器：暂存/取消暂存 hunks 已禁用。
+        let operation = if stage { "staging" } else { "unstaging" };
+        editor.detach_and_notify_err::<(), anyhow::Error>(
+            Task::ready(Err(anyhow::anyhow!(
+                "{operation} hunks is unavailable in this build"
+            ))),
+            window,
+            cx,
+        );
     }
 
     fn render_hunk_controls(

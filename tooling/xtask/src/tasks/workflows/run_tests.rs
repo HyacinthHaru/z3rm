@@ -82,6 +82,9 @@ pub(crate) fn run_tests() -> Workflow {
         should_run_tests
             .and_not_in_merge_queue()
             .then(run_ui_regression_suite()),
+        should_run_tests
+            .and_not_in_merge_queue()
+            .then(run_ui_regression_suite_linux()),
         should_run_tests.and_not_in_merge_queue().then(check_wasm()),
         should_run_tests
             .and_not_in_merge_queue()
@@ -662,6 +665,24 @@ fn run_ui_regression_suite() -> NamedJob {
             .add_step(steps::cache_rust_dependencies_namespace())
             .add_step(cargo_test_ui_regression())
             .add_step(steps::cleanup_cargo_config(Platform::Mac)),
+    )
+}
+
+fn run_ui_regression_suite_linux() -> NamedJob {
+    pub fn cargo_test_ui_regression() -> Step<Run> {
+        named::bash("cargo test -p z3rm --test ui_screenshot_regression")
+    }
+
+    named::job(
+        Job::default()
+            .runs_on(runners::LINUX_LARGE)
+            .add_step(steps::harden_runner())
+            .add_step(steps::checkout_repo())
+            .add_step(steps::setup_cargo_config(Platform::Linux))
+            .add_step(steps::cache_rust_dependencies_namespace())
+            .add_step(steps::setup_linux())
+            .add_step(cargo_test_ui_regression())
+            .add_step(steps::cleanup_cargo_config(Platform::Linux)),
     )
 }
 

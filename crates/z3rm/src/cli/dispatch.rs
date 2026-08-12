@@ -572,7 +572,7 @@ pub async fn run_cli_command(cmd: CliCommand) -> Result<()> {
 
         CliCommand::CapturePane {
             target,
-            print,
+            print: _,
             start,
             end,
             join_wrapped,
@@ -589,11 +589,9 @@ pub async fn run_cli_command(cmd: CliCommand) -> Result<()> {
             let text = super::capture::capture_pane(&domain, &pane_id, options)
                 .await
                 .context("failed to capture pane")?;
-            if print {
-                print!("{}", text);
-            } else {
-                println!("{}", text);
-            }
+            // The renderer already terminates each captured row. `println!`
+            // here would add a spurious empty row, including for `-p`.
+            print!("{}", text);
         }
 
         CliCommand::ListPanes { target, format } => {

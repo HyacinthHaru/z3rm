@@ -111,7 +111,7 @@ fn draw_frame(
 ) -> Result<(RgbaImage, serde_json::Value)> {
     let a11y_json = cx
         .update_window(window, |_, window, cx| {
-            window.draw(cx).clear();
+            window.draw(cx).clear(cx);
             window.debug_a11y_tree_json()
         })?
         .context(

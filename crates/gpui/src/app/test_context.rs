@@ -595,7 +595,7 @@ impl TestAppContext {
 
 impl<T: 'static> Entity<T> {
     /// Block until the next event is emitted by the entity, then return it.
-    pub fn next_event<Event>(&self, cx: &mut TestAppContext) -> impl Future<Output = Event>
+    pub fn next_event<Event>(&self, cx: &mut TestAppContext) -> impl Future<Output = Event> + use<Event, T>
     where
         Event: Send + Clone + 'static,
         T: EventEmitter<Event>,
@@ -873,7 +873,7 @@ impl VisualTestContext {
         E: Element,
     {
         self.update(|window, cx| {
-            let _arena_scope = ElementArenaScope::enter(&cx.element_arena);
+            let arena_scope = ElementArenaScope::enter(&cx.element_arena);
 
             window.invalidator.set_phase(DrawPhase::Prepaint);
             let mut element = Drawable::new(f(window, cx));
@@ -887,8 +887,8 @@ impl VisualTestContext {
             window.refresh();
 
             drop(element);
-            cx.element_arena.borrow_mut().clear();
-
+            let arena_clear = arena_scope.exit(&cx.element_arena);
+            arena_clear.clear(cx);
             (request_layout_state, prepaint_state)
         })
     }

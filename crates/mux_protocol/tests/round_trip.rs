@@ -97,8 +97,8 @@ fn test_full_snapshot_serialization() {
         }),
         alternate_screen: false,
         display_offset: 42,
-        history_size: 0,
-        history_version: 0,
+        history_size: 37,
+        history_version: 19,
         modes: Some(terminal_mode::APP_CURSOR | terminal_mode::BRACKETED_PASTE),
     };
 
@@ -120,6 +120,42 @@ fn test_full_snapshot_serialization() {
         decoded.modes,
         Some(terminal_mode::APP_CURSOR | terminal_mode::BRACKETED_PASTE)
     );
+}
+
+#[test]
+fn test_scrollback_request_response_round_trip() {
+    let request = FetchScrollbackRequest {
+        pane_id: "session:pane".into(),
+        from_line: 12,
+        direction: 1,
+        count: 3,
+    };
+    let mut encoded = Vec::new();
+    request.encode(&mut encoded).unwrap();
+    let decoded = FetchScrollbackRequest::decode(encoded.as_slice()).unwrap();
+    assert_eq!(decoded.pane_id, request.pane_id);
+    assert_eq!(decoded.from_line, 12);
+    assert_eq!(decoded.direction, 1);
+    assert_eq!(decoded.count, 3);
+
+    let response = FetchScrollbackResponse {
+        lines: vec![
+            RowChange {
+                row: 12,
+                cells: vec![Cell { char: "a".into(), ..Default::default() }],
+            },
+            RowChange {
+                row: 13,
+                cells: vec![Cell { char: "b".into(), ..Default::default() }],
+            },
+        ],
+        total_lines: 37,
+        scrollback_version: 19,
+    };
+    encoded.clear();
+    response.encode(&mut encoded).unwrap();
+    let decoded = FetchScrollbackResponse::decode(encoded.as_slice()).unwrap();
+    assert_eq!(decoded, response);
 }
 
 // §3.3 验证 ClientIdentity 编码/解码 (Plan 33)

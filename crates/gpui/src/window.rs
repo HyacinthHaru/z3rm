@@ -6512,7 +6512,7 @@ mod tests {
         });
 
         cx.update_window(window.into(), |_, window, cx| {
-            window.draw(cx).clear();
+            window.draw(cx).clear(cx);
         })
         .unwrap();
 
@@ -6539,7 +6539,7 @@ mod tests {
         });
         let json = cx
             .update_window(window.into(), |_, window, cx| {
-                window.draw(cx).clear();
+                window.draw(cx).clear(cx);
                 window.debug_a11y_tree_json()
             })
             .unwrap();
@@ -6584,7 +6584,7 @@ mod tests {
         for _ in 0..100 {
             let json = cx
                 .update_window(window.into(), |_, window, cx| {
-                    window.draw(cx).clear();
+                    window.draw(cx).clear(cx);
                     window.debug_a11y_tree_json()
                 })
                 .unwrap();
@@ -6648,7 +6648,7 @@ mod tests {
 
         let tree_json = cx
             .update_window(window.into(), |_, window, cx| {
-                window.draw(cx).clear();
+                window.draw(cx).clear(cx);
                 window.debug_a11y_tree_json()
             })
             .unwrap()
@@ -6759,6 +6759,100 @@ mod tests {
             action_received.get(),
             "a11y action must reach the listener registered for node {button_id:?}"
         );
+        unsafe {
+            std::env::remove_var("Z3RM_A11Y_BUILD_HEADLESS");
+        }
+    }
+
+    /// Semantic value actions must reach the same production action channel as
+    /// Click. This keeps the non-click part of the AccessKit action matrix
+    /// deterministic without relying on a platform accessibility daemon.
+    #[test]
+    fn a11y_increment_and_decrement_actions_reach_listener() {
+        let _headless_a11y_env_guard = headless_a11y_env_guard();
+        unsafe {
+            std::env::set_var("Z3RM_A11Y_BUILD_HEADLESS", "1");
+        }
+        let mut cx = TestAppContext::single();
+        let window = cx.add_window(|_, _| ActionRootView {
+            clicked: Rc::new(Cell::new(false)),
+        });
+        let tree_json = cx
+            .update_window(window.into(), |_, window, cx| {
+                let arena_clear_needed = window.draw(cx);
+                arena_clear_needed.clear(cx);
+                window.debug_a11y_tree_json()
+            })
+            .unwrap()
+            .expect("a11y tree must be available under Z3RM_A11Y_BUILD_HEADLESS");
+        let button_id = button_a11y_node_id(&tree_json);
+        cx.run_until_parked();
+        let increments = Rc::new(Cell::new(0u32));
+        let decrements = Rc::new(Cell::new(0u32));
+        let focused = Rc::new(Cell::new(0u32));
+        let value = Rc::new(Cell::new(None::<f64>));
+        cx.update_window(window.into(), |_, window, _cx| {
+            let increments_for_listener = increments.clone();
+            window.on_a11y_action(
+                button_id,
+                accesskit::Action::Increment,
+                move |_data, _window, _cx| {
+                    increments_for_listener.set(increments_for_listener.get() + 1);
+                },
+            );
+            let decrements_for_listener = decrements.clone();
+            window.on_a11y_action(
+                button_id,
+                accesskit::Action::Decrement,
+                move |_data, _window, _cx| {
+                    decrements_for_listener.set(decrements_for_listener.get() + 1);
+                },
+            );
+            let focused_for_listener = focused.clone();
+            window.on_a11y_action(
+                button_id,
+                accesskit::Action::Focus,
+                move |_data, _window, _cx| {
+                    focused_for_listener.set(focused_for_listener.get() + 1);
+                },
+            );
+            let value_for_listener = value.clone();
+            window.on_a11y_action(
+                button_id,
+                accesskit::Action::SetValue,
+                move |data, _window, _cx| {
+                    if let Some(accesskit::ActionData::NumericValue(next)) = data {
+                        value_for_listener.set(Some(*next));
+                    }
+                },
+            );
+        })
+        .unwrap();
+
+        for (action, data) in [
+            (accesskit::Action::Increment, None),
+            (accesskit::Action::Decrement, None),
+            (accesskit::Action::Increment, None),
+            (accesskit::Action::Focus, None),
+            (
+                accesskit::Action::SetValue,
+                Some(accesskit::ActionData::NumericValue(42.0)),
+            ),
+        ] {
+            assert!(cx.test_window(window.into()).simulate_a11y_action(
+                accesskit::ActionRequest {
+                    target_tree: accesskit::TreeId::ROOT,
+                    target_node: button_id,
+                    action,
+                    data,
+                },
+            ));
+        }
+        cx.run_until_parked();
+        assert_eq!(increments.get(), 2);
+        assert_eq!(decrements.get(), 1);
+        assert_eq!(focused.get(), 1);
+        assert_eq!(value.get(), Some(42.0));
         unsafe {
             std::env::remove_var("Z3RM_A11Y_BUILD_HEADLESS");
         }

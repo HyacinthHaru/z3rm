@@ -1045,6 +1045,7 @@ pub const MAX_SCROLL_HISTORY_LINES: usize = 100_000;
 const MAX_STRUCTURED_GRID_COLUMNS: usize = 4_096;
 const MAX_STRUCTURED_GRID_ROWS: usize = 4_096;
 const MAX_STRUCTURED_GRID_CELLS: usize = 1_048_576;
+const MAX_STRUCTURED_HISTORY_CELLS: usize = MAX_STRUCTURED_GRID_CELLS * 16;
 static NEXT_INIT_COMMAND_STARTUP_MARKER_ID: AtomicU64 = AtomicU64::new(1);
 
 const INIT_COMMAND_STARTUP_MARKER_PREFIX: &str = "__zed_init_command_ready_";
@@ -2052,6 +2053,12 @@ impl Terminal {
             );
         }
         let history_rows = snapshot.history.len() / snapshot.cols;
+        if snapshot.history.len() > MAX_STRUCTURED_HISTORY_CELLS {
+            bail!(
+                "structured snapshot history exceeds terminal cell limit of {}",
+                MAX_STRUCTURED_HISTORY_CELLS
+            );
+        }
         if history_rows > MAX_SCROLL_HISTORY_LINES {
             bail!("structured snapshot history exceeds terminal limits");
         }

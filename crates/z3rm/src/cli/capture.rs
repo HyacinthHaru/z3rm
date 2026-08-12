@@ -2,6 +2,7 @@
 // 来源: spec §3.10 — capture-pane -p 输出 pane 可见内容
 
 use anyhow::{Context, Result};
+use mux_protocol::{MAX_GRID_CELLS, checked_grid_cell_count};
 use mux::MuxDomain;
 use mux_protocol::proto::{
     Cell, FetchGridUpdateResponse, FullGridSnapshot, fetch_grid_update_response::Update as GridUpdateKind,
@@ -47,6 +48,7 @@ pub async fn capture_pane(
         let Some(GridUpdateKind::FullSnapshot(snapshot)) = grid.update.as_ref() else {
             anyhow::bail!("capture-pane expected a full grid snapshot");
         };
+        validate_snapshot(snapshot)?;
 
         let span = capture_span(
             snapshot.history_size,
@@ -57,22 +59,37 @@ pub async fn capture_pane(
 
         let mut rows: Vec<Vec<Cell>> = Vec::new();
         if let Some((from, count)) = span.history {
-            let scrollback = domain
-                .fetch_scrollback(pane_id, from, 1, count)
-                .await
-                .context("failed to fetch scrollback")?;
-            if !scrollback_matches_snapshot(
-                &scrollback,
-                snapshot.history_version,
-                snapshot.history_size,
-                snapshot.cols,
-                from,
-                count,
-            ) {
+            let page_rows = history_page_rows(snapshot.cols)?;
+            let mut next = from;
+            let mut remaining = count;
+            while remaining > 0 {
+                let page_count = remaining.min(page_rows);
+                let scrollback = domain
+                    .fetch_scrollback(pane_id, next, 1, page_count)
+                    .await
+                    .context("failed to fetch scrollback")?;
+                if !scrollback_matches_snapshot(
+                    &scrollback,
+                    snapshot.history_version,
+                    snapshot.history_size,
+                    snapshot.cols,
+                    next,
+                    page_count,
+                ) {
+                    rows.clear();
+                    break;
+                }
+                rows.extend(scrollback.lines.into_iter().map(|row| row.cells));
+                next = next
+                    .checked_add(page_count)
+                    .context("scrollback row range overflow")?;
+                remaining -= page_count;
+            }
+            if remaining != 0 {
                 continue;
             }
-            rows.extend(scrollback.lines.iter().map(|row| row.cells.clone()));
         }
+
         let checkpoint = domain
             .fetch_grid_update(pane_id, grid.to_generation)
             .await
@@ -81,7 +98,7 @@ pub async fn capture_pane(
             continue;
         }
         if let Some((first, last)) = span.visible {
-            rows.extend(visible_rows(snapshot, first, last));
+            rows.extend(visible_rows(snapshot, first, last)?);
         }
 
         return Ok(render_capture(
@@ -92,6 +109,28 @@ pub async fn capture_pane(
     }
 
     anyhow::bail!("terminal history changed while capture-pane was reading it")
+}
+fn validate_snapshot(snapshot: &FullGridSnapshot) -> Result<()> {
+    let cols = usize::try_from(snapshot.cols).context("grid columns exceed client limits")?;
+    let rows = usize::try_from(snapshot.rows).context("grid rows exceed client limits")?;
+    let expected = checked_grid_cell_count(cols, rows)
+        .map_err(|error| anyhow::anyhow!("invalid grid snapshot: {error}"))?;
+    if snapshot.cells.len() != expected {
+        anyhow::bail!(
+            "invalid grid snapshot: expected {expected} cells, got {}",
+            snapshot.cells.len()
+        );
+    }
+    Ok(())
+}
+
+fn history_page_rows(columns: u32) -> Result<u32> {
+    let columns = usize::try_from(columns).context("scrollback columns exceed client limits")?;
+    let rows = MAX_GRID_CELLS
+        .checked_div(columns.max(1))
+        .filter(|rows| *rows > 0)
+        .context("scrollback columns exceed protocol cell limit")?;
+    Ok(u32::try_from(rows).unwrap_or(u32::MAX))
 }
 
 /// 一次 capture 要读取的行，拆成"历史"和"可见区"两段。
@@ -144,16 +183,29 @@ fn clamp_to_i32(value: u32) -> i32 {
     i32::try_from(value).unwrap_or(i32::MAX)
 }
 
-fn visible_rows(snapshot: &FullGridSnapshot, first: u32, last: u32) -> Vec<Vec<Cell>> {
-    let cols = snapshot.cols as usize;
-    (first..=last)
-        .map(|row| {
-            let offset = row as usize * cols;
-            (0..cols)
-                .filter_map(|col| snapshot.cells.get(offset + col).cloned())
-                .collect()
-        })
-        .collect()
+fn visible_rows(snapshot: &FullGridSnapshot, first: u32, last: u32) -> Result<Vec<Vec<Cell>>> {
+    if first > last || last >= snapshot.rows {
+        anyhow::bail!(
+            "visible capture range {first}..={last} exceeds {} rows",
+            snapshot.rows
+        );
+    }
+    let cols = usize::try_from(snapshot.cols).context("grid columns exceed client limits")?;
+    let mut rows = Vec::with_capacity((last - first + 1) as usize);
+    for row in first..=last {
+        let offset = (row as usize)
+            .checked_mul(cols)
+            .context("visible grid row offset overflow")?;
+        let end = offset
+            .checked_add(cols)
+            .context("visible grid row end overflow")?;
+        let cells = snapshot
+            .cells
+            .get(offset..end)
+            .context("visible grid snapshot is missing cells")?;
+        rows.push(cells.to_vec());
+    }
+    Ok(rows)
 }
 
 fn scrollback_matches_snapshot(
@@ -168,9 +220,12 @@ fn scrollback_matches_snapshot(
         && scrollback.total_lines == history_size
         && scrollback.lines.len() == count as usize
         && scrollback.lines.iter().enumerate().all(|(index, row)| {
-            row.row == from + index as u32 && row.cells.len() == columns as usize
+            from.checked_add(index as u32)
+                .is_some_and(|expected| row.row == expected)
+                && row.cells.len() == columns as usize
         })
 }
+
 
 fn grid_checkpoint_is_stable(
     generation: u64,
@@ -213,13 +268,28 @@ fn render_cells<'a>(cells: impl IntoIterator<Item = &'a Cell>, preserve_ansi: bo
 
     let mut output = String::new();
     let mut current: Option<SgrState> = None;
+    let mut hyperlink: Option<(String, String)> = None;
     for cell in cells {
-        if cell
-            .style
-            .as_ref()
-            .is_some_and(|style| style.wide_char_spacer)
-        {
+        if is_cell_spacer(cell) {
             continue;
+        }
+        let next_hyperlink = cell
+            .hyperlink
+            .as_ref()
+            .map(|link| (link.id.clone(), link.uri.clone()));
+        if hyperlink != next_hyperlink {
+            if hyperlink.is_some() {
+                output.push_str("\x1b]8;;\x1b\\");
+            }
+            if let Some((id, uri)) = &next_hyperlink {
+                let params = if id.is_empty() {
+                    String::new()
+                } else {
+                    format!("id={id}")
+                };
+                output.push_str(&format!("\x1b]8;{params};{uri}\x1b\\"));
+            }
+            hyperlink = next_hyperlink;
         }
         let next = SgrState::from_cell(cell);
         if current.as_ref() != Some(&next) {
@@ -228,18 +298,23 @@ fn render_cells<'a>(cells: impl IntoIterator<Item = &'a Cell>, preserve_ansi: bo
         }
         output.push_str(&cell_text(cell));
     }
+    if hyperlink.is_some() {
+        output.push_str("\x1b]8;;\x1b\\");
+    }
     if current.is_some() {
         output.push_str("\x1b[0m");
     }
     output
 }
 
+fn is_cell_spacer(cell: &Cell) -> bool {
+    cell.style.as_ref().is_some_and(|style| {
+        style.wide_char_spacer || style.leading_wide_char_spacer
+    })
+}
+
 fn cell_text(cell: &Cell) -> String {
-    if cell
-        .style
-        .as_ref()
-        .is_some_and(|style| style.wide_char_spacer)
-    {
+    if is_cell_spacer(cell) {
         return String::new();
     }
     let mut text = cell.char.clone();
@@ -252,9 +327,12 @@ struct SgrState {
     bold: bool,
     italic: bool,
     underline: bool,
+    underline_style: i32,
+    underline_color: Option<u32>,
     strikethrough: bool,
     dim: bool,
     reverse: bool,
+    hidden: bool,
     foreground: u32,
     background: u32,
 }
@@ -266,9 +344,12 @@ impl SgrState {
             bold: style.bold,
             italic: style.italic,
             underline: style.underline,
+            underline_style: style.underline_style,
+            underline_color: style.underline_color,
             strikethrough: style.strikethrough,
             dim: style.dim,
             reverse: style.reverse,
+            hidden: style.hidden,
             foreground: cell.foreground,
             background: cell.background,
         }
@@ -285,11 +366,20 @@ impl SgrState {
         if self.italic {
             parts.push("3".into());
         }
-        if self.underline {
-            parts.push("4".into());
+        match self.underline_style {
+            2 => parts.push("4:1".into()),
+            3 => parts.push("4:2".into()),
+            4 => parts.push("4:3".into()),
+            5 => parts.push("4:4".into()),
+            6 => parts.push("4:5".into()),
+            0 if self.underline => parts.push("4".into()),
+            _ => {}
         }
         if self.reverse {
             parts.push("7".into());
+        }
+        if self.hidden {
+            parts.push("8".into());
         }
         if self.strikethrough {
             parts.push("9".into());
@@ -300,8 +390,18 @@ impl SgrState {
         if self.background != 0 {
             parts.push(color_sgr(false, self.background));
         }
+        if let Some(color) = self.underline_color {
+            parts.push(color_sgr_code(58, color));
+        }
         format!("\x1b[{}m", parts.join(";"))
     }
+}
+
+fn color_sgr_code(code: u8, color: u32) -> String {
+    let r = (color >> 16) & 0xff;
+    let g = (color >> 8) & 0xff;
+    let b = color & 0xff;
+    format!("{code};2;{r};{g};{b}")
 }
 
 /// Prefer classic 16-color SGR when the RGB is near the XTerm palette so
@@ -440,11 +540,11 @@ mod tests {
             ..Default::default()
         };
         assert_eq!(
-            render_capture(&visible_rows(&snapshot, 1, 2), false, false),
+            render_capture(&visible_rows(&snapshot, 1, 2).unwrap(), false, false),
             "cd\nef\n"
         );
         assert_eq!(
-            render_capture(&visible_rows(&snapshot, 0, 0), false, false),
+            render_capture(&visible_rows(&snapshot, 0, 0).unwrap(), false, false),
             "ab\n"
         );
     }

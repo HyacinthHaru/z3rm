@@ -69,6 +69,10 @@ pub enum MuxPaneEvent {
 pub type ExtensionShortcutResolver = Arc<dyn Fn(&Keystroke) -> Option<SharedString> + Send + Sync>;
 
 const HISTORY_PAGE_ROWS: u32 = 512;
+/// Bound the client-side authoritative history cache independently of the
+/// per-page wire bound. This prevents a malicious snapshot from reserving a
+/// huge `cols * history_size` vector before the first RPC.
+const MAX_SCROLLBACK_CELLS: usize = mux_protocol::MAX_GRID_CELLS * 16;
 
 #[derive(Clone, Debug)]
 struct HistoryCache {
@@ -792,6 +796,26 @@ impl MuxPaneView {
         self.terminal.read(cx).title(true).into()
     }
 
+    /// Apply metadata from the server-authoritative pane snapshot without
+    /// sending any mutating RPC back to the server.
+    pub fn reconcile_metadata_from_snapshot(
+        &mut self,
+        title: Option<&str>,
+        zoomed: Option<bool>,
+        cx: &mut Context<Self>,
+    ) {
+        if let Some(title) = title {
+            self.terminal.update(cx, |terminal, cx| {
+                terminal.set_display_title(title.to_string(), cx);
+            });
+            cx.emit(MuxPaneEvent::TitleChanged);
+        }
+        if let Some(zoomed) = zoomed {
+            self.zoomed = zoomed;
+        }
+        cx.notify();
+    }
+
     /// §3.10 resize — notify server of new dimensions.
     pub fn resize(&mut self, cols: u32, rows: u32, cx: &mut Context<Self>) {
         let domain = self.domain.clone();
@@ -931,7 +955,11 @@ pub fn keystroke_to_bytes(keystroke: &Keystroke) -> Vec<u8> {
     let alt = keystroke.modifiers.alt;
     let mut bytes = Vec::new();
 
-    if let Some(key_char) = keystroke.key_char.as_ref() {
+    let key_char = keystroke
+        .key_char
+        .as_ref()
+        .or_else(|| (keystroke.key.chars().count() == 1).then_some(&keystroke.key));
+    if let Some(key_char) = key_char {
         let ch = key_char.chars().next().unwrap_or('\0');
         if ctrl && ch.is_ascii_alphabetic() {
             let base = if ch.is_ascii_uppercase() { b'A' } else { b'a' };
@@ -1037,6 +1065,7 @@ async fn prepare_fetch_update(
             })
         }
         Some(FetchUpdate::FullSnapshot(full)) => {
+            validate_snapshot_metadata(&full)?;
             let (history_cache, fetched_history) =
                 match matching_history_cache(&full, Some(&history_cache)) {
                     Some(cache) => (cache.clone(), false),
@@ -1044,7 +1073,7 @@ async fn prepare_fetch_update(
                     // needs neither page fetches nor a checkpoint round trip.
                     None if full.history_size == 0 => (
                         HistoryPageAccumulator::new(&full)
-                            .and_then(HistoryPageAccumulator::finish)?,
+                            .and_then(|accumulator| accumulator.finish())?,
                         false,
                     ),
                     None => (fetch_history_checkpoint(domain, pane_id, &full).await?, true),
@@ -1063,6 +1092,63 @@ async fn prepare_fetch_update(
             })
         }
     }
+}
+
+fn validate_snapshot_metadata(
+    snapshot: &FullGridSnapshot,
+) -> Result<(), PrepareFetchError> {
+    let cols = usize::try_from(snapshot.cols)
+        .map_err(|_| PrepareFetchError::invalid(anyhow::anyhow!("mux grid columns exceed client limits")))?;
+    let rows = usize::try_from(snapshot.rows)
+        .map_err(|_| PrepareFetchError::invalid(anyhow::anyhow!("mux grid rows exceed client limits")))?;
+    let history_size = usize::try_from(snapshot.history_size).map_err(|_| {
+        PrepareFetchError::invalid(anyhow::anyhow!("mux history size exceeds client limits"))
+    })?;
+    let display_offset = usize::try_from(snapshot.display_offset).map_err(|_| {
+        PrepareFetchError::invalid(anyhow::anyhow!("mux display offset exceeds client limits"))
+    })?;
+    let expected_cells = mux_protocol::checked_grid_cell_count(cols, rows)
+        .map_err(|message| PrepareFetchError::invalid(anyhow::anyhow!("invalid mux grid dimensions: {message}")))?;
+    if snapshot.cells.len() != expected_cells {
+        return Err(PrepareFetchError::invalid(anyhow::anyhow!(
+            "mux grid has {} cells, expected {} for {}x{}",
+            snapshot.cells.len(),
+            expected_cells,
+            cols,
+            rows
+        )));
+    }
+    if history_size > MAX_SCROLL_HISTORY_LINES {
+        return Err(PrepareFetchError::invalid(anyhow::anyhow!(
+            "mux history has {history_size} rows, exceeding client limit {MAX_SCROLL_HISTORY_LINES}"
+        )));
+    }
+    if display_offset > history_size {
+        return Err(PrepareFetchError::invalid(anyhow::anyhow!(
+            "mux display offset {display_offset} exceeds {history_size} history rows"
+        )));
+    }
+    let history_cells = cols.checked_mul(history_size).ok_or_else(|| {
+        PrepareFetchError::invalid(anyhow::anyhow!("mux history cell count overflow"))
+    })?;
+    if history_cells > MAX_SCROLLBACK_CELLS {
+        return Err(PrepareFetchError::invalid(anyhow::anyhow!(
+            "mux history has {history_cells} cells, exceeding client limit {MAX_SCROLLBACK_CELLS}"
+        )));
+    }
+    if let Some(cursor) = &snapshot.cursor
+        && (usize::try_from(cursor.col).unwrap_or(usize::MAX) >= cols
+            || usize::try_from(cursor.row).unwrap_or(usize::MAX) >= rows)
+    {
+        return Err(PrepareFetchError::invalid(anyhow::anyhow!(
+            "mux cursor ({}, {}) lies outside {}x{} grid",
+            cursor.col,
+            cursor.row,
+            cols,
+            rows
+        )));
+    }
+    Ok(())
 }
 
 async fn fetch_history_checkpoint(
@@ -1168,6 +1254,11 @@ impl HistoryPageAccumulator {
         let cell_capacity = cols.checked_mul(history_size).ok_or_else(|| {
             PrepareFetchError::invalid(anyhow::anyhow!("mux history cell count overflow"))
         })?;
+        if cell_capacity > MAX_SCROLLBACK_CELLS {
+            return Err(PrepareFetchError::invalid(anyhow::anyhow!(
+                "mux history has {cell_capacity} cells, exceeding client limit {MAX_SCROLLBACK_CELLS}"
+            )));
+        }
         Ok(Self {
             cols,
             history_size,
@@ -1772,7 +1863,7 @@ impl Item for MuxPaneView {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use gpui::TestAppContext;
+    use gpui::{TestAppContext, VisualContext as _};
     use mux_protocol::{
         Cell, CellStyle, Envelope, FetchGridUpdateResponse, FetchScrollbackResponse, Request,
         Response, RowChange, envelope::Payload as EnvelopePayload, request::Body as RequestBody,
@@ -1781,7 +1872,10 @@ mod tests {
     use settings::SettingsStore;
 
     #[cfg(unix)]
-    fn serve_initial_grid(mut stream: std::os::unix::net::UnixStream) -> Result<(), String> {
+    fn serve_initial_grid(
+        mut stream: std::os::unix::net::UnixStream,
+        expected_pane_id: &str,
+    ) -> Result<(), String> {
         use std::io::{Read, Write};
 
         stream
@@ -1834,7 +1928,7 @@ mod tests {
             Some(RequestBody::FetchGridUpdate(fetch)) => fetch,
             body => return Err(format!("expected initial FetchGridUpdate, got {body:?}")),
         };
-        if fetch.pane_id != "quiet-pane" || fetch.since_generation != 0 {
+        if fetch.pane_id != expected_pane_id || fetch.since_generation != 0 {
             return Err(format!(
                 "unexpected initial fetch target/generation: {}@{}",
                 fetch.pane_id, fetch.since_generation
@@ -2342,7 +2436,7 @@ mod tests {
             Ok(domain) => Arc::new(domain),
             Err(error) => panic!("connect mock mux domain: {error}"),
         };
-        let server_thread = std::thread::spawn(move || serve_initial_grid(server));
+        let server_thread = std::thread::spawn(move || serve_initial_grid(server, "quiet-pane"));
 
         let (view, cx) = cx.add_window_view(|window, cx| {
             MuxPaneView::new(
@@ -2428,7 +2522,7 @@ mod tests {
             Ok(domain) => Arc::new(domain),
             Err(error) => panic!("connect mock mux domain: {error}"),
         };
-        let server_thread = std::thread::spawn(move || serve_initial_grid(server));
+        let server_thread = std::thread::spawn(move || serve_initial_grid(server, "quiet-pane"));
 
         let (view, cx) = cx.add_window_view(|window, cx| {
             MuxPaneView::new(
@@ -2495,11 +2589,11 @@ mod tests {
             Ok(domain) => Arc::new(domain),
             Err(error) => panic!("connect shortcut mux domain: {error}"),
         };
-        let server_thread = std::thread::spawn(move || serve_initial_grid(server));
+        let server_thread = std::thread::spawn(move || serve_initial_grid(server, "quiet-pane"));
 
         let (view, cx) = cx.add_window_view(|window, cx| {
             MuxPaneView::new(
-                "shortcut-pane".to_string(),
+                "quiet-pane".to_string(),
                 domain,
                 WeakEntity::new_invalid(),
                 WeakEntity::new_invalid(),
@@ -2708,6 +2802,7 @@ mod tests {
                 alt: true,
                 ..Default::default()
             },
+
             key: "a".to_string(),
             key_char: Some("a".to_string()),
         };
@@ -2726,6 +2821,43 @@ mod tests {
             history_version: version,
             modes: None,
         }
+    }
+    #[test]
+    fn snapshot_metadata_rejects_wrong_cell_count_and_offset() {
+        let mut snapshot = FullGridSnapshot {
+            cols: 2,
+            rows: 2,
+            cells: vec![Cell::default(); 3],
+            cursor: None,
+            alternate_screen: false,
+            display_offset: 0,
+            history_size: 0,
+            history_version: 1,
+            modes: None,
+        };
+        assert!(validate_snapshot_metadata(&snapshot).is_err());
+
+        snapshot.cells = vec![Cell::default(); 4];
+        snapshot.display_offset = 1;
+        assert!(validate_snapshot_metadata(&snapshot).is_err());
+    }
+
+    #[test]
+    fn snapshot_metadata_rejects_history_cell_budget_overflow() {
+        let cols = mux_protocol::MAX_GRID_COLUMNS;
+        let history_size = MAX_SCROLLBACK_CELLS / cols as usize + 1;
+        let snapshot = FullGridSnapshot {
+            cols: cols as u32,
+            rows: 1,
+            cells: vec![Cell::default(); cols as usize],
+            cursor: None,
+            alternate_screen: false,
+            display_offset: 0,
+            history_size: history_size as u32,
+            history_version: 1,
+            modes: None,
+        };
+        assert!(validate_snapshot_metadata(&snapshot).is_err());
     }
 
     fn history_row(row: u32, chars: &[&str]) -> RowChange {
