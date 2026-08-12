@@ -21,6 +21,11 @@ pub struct Attach;
 #[action(namespace = mux)]
 pub struct Detach;
 
+/// §15.4 Reconnect the current mux transport and reconcile its authoritative snapshot.
+#[derive(Clone, Debug, Default, Deserialize, JsonSchema, PartialEq, Action)]
+#[action(namespace = mux)]
+pub struct Reconnect;
+
 /// §3.3 打开一个新窗口，attach 到当前 session (Plan 32)。
 #[derive(Clone, Debug, Default, Deserialize, JsonSchema, PartialEq, Action)]
 #[action(namespace = mux)]
@@ -160,10 +165,10 @@ mod tests {
     use gpui::TestAppContext;
 
     #[test]
-    fn test_mux_detach_action() {
-        // Detach action 可以实例化
-        let _action = Detach::default();
+    fn test_mux_connection_actions() {
         let _attach = Attach::default();
+        let _detach = Detach::default();
+        let _reconnect = Reconnect::default();
         let _new_window = NewWindow::default();
     }
 

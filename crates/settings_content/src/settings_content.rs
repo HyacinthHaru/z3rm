@@ -376,7 +376,8 @@ pub enum FileFinderWidthContent {
 pub struct FileFinderSettingsContent {
     pub file_icons: bool,
     pub modal_max_width: Option<FileFinderWidthContent>,
-    pub skip_focus_for_active_in_search: bool,
+    /// Default: true
+    pub skip_focus_for_active_in_search: Option<bool>,
 }
 
 /// 远程连接设置 (spec §16 Plan 16)
@@ -813,13 +814,13 @@ pub enum SemanticTokens {
 )]
 #[serde(rename_all = "snake_case")]
 pub enum AutoIndentMode {
-    #[default]
-    On,
-    Off,
-    OnFormatting,
-    OnTyping,
-    SyntaxAware,
+    /// 不自动缩进
     None,
+    /// 沿用上一行的缩进
+    PreserveIndent,
+    /// 依据语法树计算缩进
+    #[default]
+    SyntaxAware,
 }
 
 /// 保存时格式化模式

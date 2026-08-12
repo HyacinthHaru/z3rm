@@ -64,7 +64,7 @@ pub use settings_content::{
     IconThemeName, IndentGuideBackgroundColoring, IndentGuideColoring, IndentGuidesSettingsContent,
     InlayHintKind, InlayHintsSettingsContent, JsxTagAutoCloseContent, LanguageSettingsContent,
     LanguageToSettingsMap, LineEndingSetting, LineIndicatorFormat, LspInsertMode, LspSettings,
-    LspSettingsMap, OpenAiCompatibleApiSettingsContent, PrettierSettingsContent,
+    LspSettingsMap, ModifiersContent, OpenAiCompatibleApiSettingsContent, PrettierSettingsContent,
     REST_OF_LANGUAGE_SERVERS, RewrapBehavior, SemanticTokenRules, SemanticTokens,
     ShowWhitespaceSetting, SoftWrap, SshConnection, SshPortForwardOption, TaskSettingsContent,
     WhitespaceMapContent, WordsCompletionMode, WslConnection,

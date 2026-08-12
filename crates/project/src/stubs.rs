@@ -1316,10 +1316,10 @@ impl Project {
         worktree_id: WorktreeId,
         cx: &mut gpui::Context<Self>,
     ) -> Task<anyhow::Result<()>> {
-        self.worktree_store.update(cx, |store, cx| {
-            store.remove_worktree(worktree_id, cx);
-            Task::ready(Ok(()))
-        })
+        self.worktree_store.update(cx, |worktree_store, cx| {
+            worktree_store.remove_worktree(worktree_id, cx);
+        });
+        Task::ready(Ok(()))
     }
 
     pub fn repositories(&self, cx: &App) -> Vec<Entity<crate::git_store::Repository>> {
@@ -1387,6 +1387,12 @@ impl Project {
         }
     }
 
+    /// 执行项目搜索
+    /// Streams every buffer that matches `query`, one message per file.
+    ///
+    /// Files are opened as buffers so that matches are anchors into live text:
+    /// a result stays valid after the user edits the file, which is what the
+    /// search view's incremental updates rely on.
     pub fn search(
         &mut self,
         query: crate::search::SearchQuery,
@@ -1534,41 +1540,36 @@ impl Project {
         SearchResults { rx }
     }
 
-    /// Terminal creation is local-only in this dependency-stripped build.
+    /// Whether this local project can create terminal sessions.
     pub fn supports_terminal(&self, _cx: &App) -> bool {
         self.is_local()
     }
 
-    /// Return the worktree containing the active entry.
+    /// The root of the worktree owning the active entry, falling back to the
+    /// first worktree that is rooted at a directory. Worktrees rooted at a
+    /// single file have no usable directory and are skipped.
     pub fn active_project_directory(&self, cx: &App) -> Option<std::path::PathBuf> {
-        self.active_entry
+        self.active_entry()
             .and_then(|entry_id| self.worktree_for_entry(entry_id, cx))
-            .and_then(|worktree| {
-                let worktree = worktree.read(cx);
-                (!worktree.is_single_file()).then(|| worktree.abs_path().to_path_buf())
-            })
-            .or_else(|| {
-                self.worktree_store
-                    .read(cx)
-                    .visible_worktrees(cx)
-                    .find_map(|worktree| {
-                        let worktree = worktree.read(cx);
-                        (!worktree.is_single_file()).then(|| worktree.abs_path().to_path_buf())
-                    })
-            })
+            .into_iter()
+            .chain(self.worktrees(cx))
+            .find_map(|worktree| worktree.read(cx).root_dir())
+            .map(|root_dir| root_dir.to_path_buf())
     }
 
-    /// Return the directory containing the active entry.
+    /// The directory containing the active entry: the entry itself when it is a
+    /// directory, otherwise its parent.
     pub fn active_entry_directory(&self, cx: &App) -> Option<std::path::PathBuf> {
-        let entry_id = self.active_entry?;
-        let worktree = self.worktree_for_entry(entry_id, cx)?;
-        let worktree = worktree.read(cx);
-        let entry = worktree.entry_for_id(entry_id)?;
-        let path = worktree.absolutize(&entry.path);
+        let entry_id = self.active_entry()?;
+        let (worktree, entry) = self
+            .worktree_store
+            .read(cx)
+            .worktree_and_entry_for_id(entry_id, cx)?;
+        let abs_path = worktree.read(cx).absolutize(&entry.path);
         if entry.is_dir() {
-            Some(path)
+            Some(abs_path)
         } else {
-            path.parent().map(std::path::Path::to_path_buf)
+            abs_path.parent().map(std::path::Path::to_path_buf)
         }
     }
 
@@ -1639,8 +1640,20 @@ impl Project {
         new_path: crate::ProjectPath,
         cx: &mut gpui::Context<Self>,
     ) -> gpui::Task<anyhow::Result<worktree::CreatedEntry>> {
-        self.worktree_store
-            .update(cx, |store, cx| store.rename_entry(entry_id, new_path, cx))
+        let rename = self.worktree_store.update(cx, |store, cx| {
+            store.rename_entry(entry_id, new_path.clone(), cx)
+        });
+        cx.spawn(async move |this, cx| {
+            let created = rename.await?;
+            this.update(cx, |this, cx| {
+                let abs_path = this.absolute_path(&new_path, cx);
+                cx.emit(crate::Event::EntryRenamed {
+                    project_path: new_path,
+                    abs_path,
+                });
+            })?;
+            Ok(created)
+        })
     }
 
     /// Delete an entry, returning the trashed entry when trashing.
@@ -1958,14 +1971,6 @@ impl Breadcrumbs {
     pub fn new() -> Self {
         Self {}
     }
-}
-
-/// Stub: path_suffix (from project crate, 已删除)
-pub fn path_suffix(path: &std::path::Path, detail: usize) -> String {
-    let _ = detail;
-    path.file_name()
-        .map(|n| n.to_string_lossy().to_string())
-        .unwrap_or_else(|| path.to_string_lossy().to_string())
 }
 
 /// Stub: TerminalDockPosition re-export from settings

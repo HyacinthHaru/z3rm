@@ -32,22 +32,8 @@
     "auto_sync_to_remote": true,
     "auto_install_extensions": {},
     "auto_update_extensions": {},
-    "granted_capabilities": [
-      {
-        "kind": "process:exec",
-        "command": "*",
-        "args": ["**"]
-      },
-      {
-        "kind": "download_file",
-        "host": "*",
-        "path": ["**"]
-      },
-      {
-        "kind": "npm:install",
-        "package": "*"
-      }
-    ]
+    // 默认不授予任何能力（default-deny）：特权操作必须由用户显式授予。
+    "granted_capabilities": []
   },
 
   // === 工作区设置 (WorkspaceSettingsContent - flattened) ===
@@ -107,7 +93,9 @@
     "show_branch_name": true,
     "show_project_items": true,
     "show_sign_in": true,
-    "show_user_menu": true
+    "show_user_menu": true,
+    "show_menus": false,
+    "button_layout": "platform_default"
   },
 
   // === 状态栏设置 ===
@@ -180,8 +168,8 @@
       "enabled": false
     },
     "relative_line_numbers": "disabled",
-    "seed_search_query_from_cursor": "none",
-    "use_smartcase_search": true,
+    "seed_search_query_from_cursor": "surround",
+    "use_smartcase_search": false,
     "multi_cursor_modifier": "alt",
     "redact_private_values": false,
     "expand_excerpt_lines": 3,
@@ -358,7 +346,9 @@
   "mux": {
     "keep_alive": true,
     "tabbar_style": "top",
-    "scroll_mode": "per_client"
+    "scroll_mode": "per_client",
+    "keymap_profile": "default",
+    "connect_timeout_ms": 500
   },
 
   // === 影子快照设置 ===
@@ -407,7 +397,7 @@
     // "small", "medium", "large", "x_large" or "full".
     "modal_max_width": "small",
     // Whether to skip focusing the active file when it is the first result.
-    "skip_focus_for_active_in_search": false
+    "skip_focus_for_active_in_search": true
   },
 
   // === 会话恢复设置 ===
@@ -431,7 +421,7 @@
   "load_direnv": "disabled",
 
   // === 鼠标隐藏模式 ===
-  "hide_mouse": "on_typing",
+  "hide_mouse": "on_typing_and_action",
 
   // === Vim 模式 ===
   "vim_mode": false,

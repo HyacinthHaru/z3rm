@@ -197,8 +197,8 @@ impl Wal {
     pub fn replay(&self) -> io::Result<Vec<WalEntry>> {
         let file = match File::open(&self.path) {
             Ok(file) => file,
-            // 旋转崩溃窗口内规范路径可能尚未重建;此时 WAL 等价于新的空
-            // 日志(旧条目已在上游持久化),而不是损坏状态。
+            // 旋转崩溃窗口或打开句柄存活期间的外部干扰可能令规范路径暂时缺失;
+            // 此时旧条目已在上游持久化,因此 WAL 等价于新的空日志,而不是损坏状态。
             Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(Vec::new()),
             Err(error) => return Err(error),
         };
@@ -545,10 +545,9 @@ mod tests {
         archived.commit().unwrap();
         drop(archived);
 
-        let error = match Wal::open(&path) {
-            Ok(_) => panic!("ambiguous rotation state must fail closed"),
-            Err(error) => error,
-        };
+        let error = Wal::open(&path)
+            .err()
+            .expect("ambiguous rotation state must fail closed");
         assert_eq!(error.kind(), io::ErrorKind::InvalidData);
     }
 
@@ -565,54 +564,56 @@ mod tests {
         }
         wal.commit().unwrap();
 
-        // 在归档路径上放一个目录,令旋转的 rename 失败。
-        std::fs::create_dir(Wal::archive_path(&path)).unwrap();
+        // 归档路径被目录占住:旋转 rename 必须失败,旧日志原封不动。
+        let archive = Wal::archive_path(&path);
+        std::fs::create_dir(&archive).unwrap();
+        wal.checkpoint()
+            .expect_err("blocked rotation must fail the checkpoint");
 
-        assert!(wal.checkpoint().is_err(), "blocked rotation must fail");
         let entries = wal.replay().unwrap();
-        assert_eq!(entries.len(), 3, "failed checkpoint must not touch the log");
+        assert_eq!(entries.len(), 3, "failed checkpoint must keep the old log");
 
+        // 同一句柄继续追加,落到规范路径的新内容。
         wal.append(&make_entry(4)).unwrap();
         wal.commit().unwrap();
         assert_eq!(wal.replay().unwrap().len(), 4);
     }
 
-    /// After a successful rotation the same handle keeps appending to the new
-    /// empty log, and the archive is cleaned up.
+    /// A successful rotation leaves a fresh empty canonical log, drops the
+    /// archive, and keeps appending on the same handle.
     #[test]
     fn rotation_continues_appending_and_drops_archive() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("rotate.wal");
         let wal = Wal::open(&path).unwrap();
-        for i in 1..=2 {
+        for i in 1..=3 {
             wal.append(&make_entry(i)).unwrap();
         }
         wal.commit().unwrap();
 
         wal.checkpoint().unwrap();
+        assert!(wal.replay().unwrap().is_empty());
         assert!(
             !Wal::archive_path(&path).exists(),
-            "archive must be cleaned up after a durable rotation"
+            "rotation must drop the archive"
         );
 
-        wal.append(&make_entry(3)).unwrap();
+        wal.append(&make_entry(4)).unwrap();
         wal.commit().unwrap();
         let entries = wal.replay().unwrap();
-        assert_eq!(
-            entries.len(),
-            1,
-            "post-checkpoint entries live in the fresh log"
-        );
-        assert_eq!(entries[0].seq_no, 3);
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].seq_no, 4);
     }
 
-    /// The canonical log can be missing only inside the rotation crash window;
-    /// replaying it must yield an empty WAL, never an error.
+    /// A missing canonical log at replay time is an empty WAL, not an error
+    /// (live-handle file removal or rotation edge cases).
     #[test]
     fn replay_missing_log_is_an_empty_wal() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("missing.wal");
         let wal = Wal::open(&path).unwrap();
+        wal.append(&make_entry(1)).unwrap();
+        wal.commit().unwrap();
         std::fs::remove_file(&path).unwrap();
         assert!(wal.replay().unwrap().is_empty());
     }

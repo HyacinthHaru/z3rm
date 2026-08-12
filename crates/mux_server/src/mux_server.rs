@@ -21,6 +21,7 @@ pub mod grid_sync;
 pub mod layout;
 pub mod pane;
 pub mod persistence;
+mod shell_integration;
 pub mod snapshot;
 
 pub mod session;

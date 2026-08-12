@@ -14,11 +14,13 @@ use mux_protocol::{
 use prost::Message;
 use sqlez::connection::Connection;
 use std::collections::HashSet;
+use std::io::Read as _;
 use std::sync::Arc;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::sync::mpsc;
 
 // §3.3 客户端角色 (Plan 33)
+use crate::pane::{ShellMarker, ShellMarkerKind};
 use crate::session::ClientRole;
 
 /// §3.3 将 proto ClientRole 值映射为内部 ClientRole
@@ -571,10 +573,21 @@ async fn dispatch_request(
         RequestBody::FetchGridUpdate(r) => handle_fetch_grid_update(r, sessions).await?,
         RequestBody::FetchScrollback(r) => handle_fetch_scrollback(r, sessions).await?,
         RequestBody::SearchScrollback(r) => handle_search_scrollback(r, sessions).await?,
-        RequestBody::ListFileVersions(request) => {
-            handle_list_file_versions(request, sessions).await?
+        RequestBody::ListCommands(request) => handle_list_commands(request, sessions),
+        // §4 A shadow request can fail for perfectly ordinary reasons — the
+        // snapshot engine has not finished arming, the path is outside the
+        // worktree, the version id is stale. `?` here would tear down the whole
+        // connection over any of them, leaving the client with "connection
+        // closed" and no reason; these become Error bodies instead.
+        RequestBody::ListChangedFiles(request) => {
+            shadow_response(handle_list_changed_files(request, sessions).await)
         }
-        RequestBody::GetFileVersion(request) => handle_get_file_version(request, sessions).await?,
+        RequestBody::ListFileVersions(request) => {
+            shadow_response(handle_list_file_versions(request, sessions).await)
+        }
+        RequestBody::GetFileVersion(request) => {
+            shadow_response(handle_get_file_version(request, sessions).await)
+        }
         RequestBody::DeclineFileVersion(request) => {
             if check_permission(role, ClientRole::ReadWrite) {
                 handle_decline_file_version(request, sessions, connection_client_id).await?
@@ -2181,6 +2194,142 @@ async fn handle_search_scrollback(
     Ok(ResponseBody::Error("pane not found".to_string()))
 }
 
+/// §3.10 列出 pane 里由 OSC 133 marker 划出的命令。
+///
+/// 不返回 `Result`: 唯一的失败是找不到 pane, 用 `?` 会把整条连接拆掉, 客户端
+/// 只能看到一句 "connection closed"。
+fn handle_list_commands(
+    request: &ListCommandsRequest,
+    sessions: &Arc<parking_lot::RwLock<Vec<crate::session::Session>>>,
+) -> ResponseBody {
+    let pane = {
+        let sessions_r = sessions.read();
+        sessions_r
+            .iter()
+            .find_map(|session| session.panes.read().get(&request.pane_id).cloned())
+    };
+    let Some(pane) = pane else {
+        return ResponseBody::Error(format!("pane not found: {}", request.pane_id));
+    };
+
+    let (markers, history_size) = shell_marker_snapshot(&pane);
+    let recorded_markers = u32::try_from(markers.len()).unwrap_or(u32::MAX);
+    let mut commands = group_shell_markers(&markers);
+    let max_results = request.max_results as usize;
+    if max_results != 0 && commands.len() > max_results {
+        commands.drain(..commands.len() - max_results);
+    }
+    ResponseBody::Commands(ListCommandsResponse {
+        commands,
+        history_size,
+        recorded_markers,
+    })
+}
+
+/// §3.3 一个 pane 的全部 marker, 每个配上它此刻的 tmux 行号 (不可寻址时为 None)。
+///
+/// `shell_marker_positions` 与 scrollback 大小是两段独立的临界区。两者之间的
+/// 追加是无害的: 追加不动历史下标, 只让 tmux 行号更负一点, 而那正是更新的事实。
+/// 一次 addressing 作废则不然 —— 它在已解析出的下标底下重排了历史。所以这里
+/// 复查 epoch, 配不上的就报"没有行号", 而不是报一个错的行号。
+fn shell_marker_snapshot(pane: &crate::pane::Pane) -> (Vec<(ShellMarker, Option<i64>)>, u32) {
+    const ATTEMPTS: usize = 4;
+    for _ in 0..ATTEMPTS {
+        let epoch = pane.row_addressing_epoch();
+        let positions = pane.shell_marker_positions();
+        let (_, history_size, _) = pane.fetch_scrollback(0, 1, 0);
+        if pane.row_addressing_epoch() == epoch {
+            let located = positions
+                .into_iter()
+                .map(|(marker, position)| (marker, tmux_line(position, history_size)))
+                .collect();
+            return (located, history_size);
+        }
+    }
+    let (_, history_size, _) = pane.fetch_scrollback(0, 1, 0);
+    let markers = pane
+        .shell_markers()
+        .into_iter()
+        .map(|marker| (marker, None))
+        .collect();
+    (markers, history_size)
+}
+
+/// §3.10 把一个 marker 位置换算成 tmux 行号: 可见区首行是 0, 负数进历史。
+///
+/// 历史下标必然小于 scrollback 大小, 所以换算结果必然是负数。真出现非负值就
+/// 说明下标和 scrollback 大小配错了 —— 宁可说"不知道", 也不能交出一个看起来
+/// 像可见区行号的历史行号。
+fn tmux_line(position: crate::pane::ShellMarkerPosition, history_size: u32) -> Option<i64> {
+    match position {
+        crate::pane::ShellMarkerPosition::History { index } => {
+            Some(i64::from(index) - i64::from(history_size)).filter(|line| *line < 0)
+        }
+        crate::pane::ShellMarkerPosition::Viewport { line } => Some(i64::from(line)),
+        crate::pane::ShellMarkerPosition::Unavailable => None,
+    }
+}
+
+/// §3.3 OSC 133 在一条命令内部固定按 A → B → C → D 的顺序发送。
+fn marker_slot(kind: ShellMarkerKind) -> usize {
+    match kind {
+        ShellMarkerKind::PromptStart => 0,
+        ShellMarkerKind::CommandStart => 1,
+        ShellMarkerKind::OutputStart => 2,
+        ShellMarkerKind::CommandEnd => 3,
+    }
+}
+
+/// §3.10 把一串 marker 归拢成命令。
+///
+/// 一条命令内部 kind 严格递增, 所以一个不再前进的 kind 就是下一条命令的开始。
+/// shell 可以任意跳过 marker (有的只发 A 和 D), 命令还在跑时也不会有 D, 因此
+/// 一条命令就是两次"重新开始"之间到达的那些 marker, 缺谁都不影响其余的。
+fn group_shell_markers(markers: &[(ShellMarker, Option<i64>)]) -> Vec<CommandRange> {
+    let mut commands: Vec<CommandRange> = Vec::new();
+    let mut current: Option<(usize, CommandRange)> = None;
+    for (marker, line) in markers {
+        let slot = marker_slot(marker.kind);
+        let mut command = match current.take() {
+            Some((previous_slot, command)) if slot > previous_slot => command,
+            Some((_, finished)) => {
+                commands.push(finished);
+                CommandRange {
+                    id: marker.sequence,
+                    ..Default::default()
+                }
+            }
+            None => CommandRange {
+                id: marker.sequence,
+                ..Default::default()
+            },
+        };
+        let recorded = Some(CommandMarker {
+            line: *line,
+            column: marker.column,
+        });
+        match marker.kind {
+            ShellMarkerKind::PromptStart => command.prompt = recorded,
+            ShellMarkerKind::CommandStart => command.command = recorded,
+            ShellMarkerKind::OutputStart => command.output_start = recorded,
+            ShellMarkerKind::CommandEnd => {
+                command.command_end = recorded;
+                command.exit_code = marker.exit_code;
+            }
+        }
+        current = Some((slot, command));
+    }
+    if let Some((_, command)) = current {
+        commands.push(command);
+    }
+    // 只有一个 prompt start 的那些是"画了个提示符", 不是命令 —— zsh 每次重画
+    // 提示符都会发一个 A。丢掉它们, 列表里才只剩真的跑过的东西。
+    commands.retain(|command| {
+        command.command.is_some() || command.output_start.is_some() || command.command_end.is_some()
+    });
+    commands
+}
+
 async fn handle_fetch_grid_update(
     req: &FetchGridUpdateRequest,
     sessions: &Arc<parking_lot::RwLock<Vec<crate::session::Session>>>,
@@ -2631,6 +2780,14 @@ fn resolve_path_within_root(
     let suffix = candidate
         .strip_prefix(existing_ancestor)
         .context("resolving path suffix")?;
+    // §4 `PathBuf::join("")` appends a separator, so joining an empty suffix
+    // turns "/root/file.txt" into "/root/file.txt/". `Path` equality ignores
+    // the trailing separator, but `compute_path_hash` hashes the string — the
+    // two spellings hash differently and every version lookup for a file that
+    // still exists on disk misses.
+    if suffix.as_os_str().is_empty() {
+        return Ok(canonical_ancestor);
+    }
     Ok(canonical_ancestor.join(suffix))
 }
 
@@ -2698,6 +2855,36 @@ fn resolve_session_file_path(
         .context(format!(
             "path is outside the attached session worktree: {requested}"
         )))
+}
+
+/// §4 Turn a shadow-snapshot handler result into a response the client can read.
+fn shadow_response(result: anyhow::Result<ResponseBody>) -> ResponseBody {
+    match result {
+        Ok(body) => body,
+        Err(error) => ResponseBody::Error(format!("{error:#}")),
+    }
+}
+
+async fn handle_list_changed_files(
+    request: &mux_protocol::ListChangedFilesRequest,
+    sessions: &Arc<parking_lot::RwLock<Vec<crate::session::Session>>>,
+) -> anyhow::Result<ResponseBody> {
+    let (watch, _root) = snapshot_context_for_session(sessions, &request.session_id)?;
+    let changed = tokio::task::spawn_blocking(move || watch.list_changed_files())
+        .await
+        .context("joining shadow list-changed-files request")??;
+    Ok(ResponseBody::ChangedFiles(
+        mux_protocol::ListChangedFilesResponse {
+            files: changed
+                .into_iter()
+                .map(|change| mux_protocol::ChangedFile {
+                    path: change.path.to_string_lossy().into_owned(),
+                    version_count: change.version_count,
+                    latest_seq_no: change.latest_seq_no,
+                })
+                .collect(),
+        },
+    ))
 }
 
 async fn handle_list_file_versions(
@@ -2795,24 +2982,205 @@ async fn handle_read_file(
         Ok((path, _snapshot_watch)) => path,
         Err(error) => return Ok(ResponseBody::Error(format!("read_file: {error:#}"))),
     };
-    match std::fs::read(&path) {
-        Ok(bytes) => {
-            // Binary detection: check for null bytes in first 8KB (same heuristic
-            // as shadow_snapshot Monitor — ELF/PE/Mach-O magic or > 10% null).
-            let is_binary = detect_binary(&bytes);
-            let encoding = if is_binary {
-                "binary".to_string()
-            } else {
-                "utf-8".to_string()
-            };
-            Ok(ResponseBody::FileContent(mux_protocol::ReadFileResponse {
-                content: bytes,
-                is_binary,
-                encoding,
-            }))
-        }
+    match std::fs::File::open(&path) {
+        Ok(mut file) => match (|| -> anyhow::Result<_> {
+            let total_bytes = file.metadata()?.len();
+            let response = read_file_response(req, &mut file, total_bytes)?;
+            anyhow::ensure!(
+                file.metadata()?.len() == total_bytes,
+                "file size changed while reading"
+            );
+            Ok(response)
+        })() {
+            Ok(response) => Ok(ResponseBody::FileContent(response)),
+            Err(error) => Ok(ResponseBody::Error(format!("read_file: {error:#}"))),
+        },
         Err(e) => Ok(ResponseBody::Error(format!("read_file: {}", e))),
     }
+}
+
+fn read_file_response(
+    req: &mux_protocol::ReadFileRequest,
+    file: &mut (impl std::io::Read + std::io::Seek),
+    total_bytes: u64,
+) -> anyhow::Result<mux_protocol::ReadFileResponse> {
+    let line_page_requested = req.offset_line.is_some() || req.max_lines.is_some();
+    let byte_page_requested = req.offset_bytes.is_some() || req.max_bytes.is_some();
+    anyhow::ensure!(
+        !(line_page_requested && byte_page_requested),
+        "line and byte pagination cannot be combined"
+    );
+
+    file.seek(std::io::SeekFrom::Start(0))?;
+    let mut prefix = Vec::with_capacity(8192);
+    (&mut *file).take(8192).read_to_end(&mut prefix)?;
+    let is_binary = detect_binary(&prefix);
+    let encoding = if is_binary { "binary" } else { "utf-8" }.to_string();
+
+    if byte_page_requested {
+        let max_bytes = req
+            .max_bytes
+            .unwrap_or(mux_protocol::DEFAULT_READ_FILE_PAGE_BYTES);
+        anyhow::ensure!(max_bytes > 0, "max_bytes must be at least 1");
+        anyhow::ensure!(
+            max_bytes <= mux_protocol::MAX_READ_FILE_PAGE_BYTES,
+            "max_bytes exceeds the per-page limit of {}",
+            mux_protocol::MAX_READ_FILE_PAGE_BYTES
+        );
+
+        let offset_bytes = req.offset_bytes.unwrap_or(0);
+        anyhow::ensure!(
+            offset_bytes <= total_bytes,
+            "offset_bytes is beyond the end of the file"
+        );
+        let start = offset_bytes;
+        let page_bytes = total_bytes.saturating_sub(start).min(max_bytes as u64) as usize;
+        file.seek(std::io::SeekFrom::Start(start))?;
+        let mut content = Vec::with_capacity(page_bytes);
+        (&mut *file)
+            .take(page_bytes as u64)
+            .read_to_end(&mut content)?;
+        anyhow::ensure!(
+            content.len() == page_bytes,
+            "file changed while reading byte page"
+        );
+        let end = start + page_bytes as u64;
+        let next_offset_bytes = (end < total_bytes).then_some(end);
+        return Ok(mux_protocol::ReadFileResponse {
+            content,
+            is_binary,
+            encoding,
+            offset_line: 0,
+            next_offset_line: None,
+            total_lines: 0,
+            offset_bytes,
+            next_offset_bytes,
+            total_bytes,
+        });
+    }
+
+    if line_page_requested {
+        let max_lines = req
+            .max_lines
+            .unwrap_or(mux_protocol::DEFAULT_READ_FILE_PAGE_LINES);
+        anyhow::ensure!(max_lines > 0, "max_lines must be at least 1");
+        anyhow::ensure!(
+            max_lines <= mux_protocol::MAX_READ_FILE_PAGE_LINES,
+            "max_lines exceeds the per-page limit of {}",
+            mux_protocol::MAX_READ_FILE_PAGE_LINES
+        );
+
+        file.seek(std::io::SeekFrom::Start(0))?;
+        let offset_line = req.offset_line.unwrap_or(0);
+        let (content, total_lines, start) = read_line_page(
+            std::io::BufReader::new(file),
+            total_bytes,
+            offset_line,
+            max_lines,
+        )?;
+        let returned_lines = max_lines.min(total_lines.saturating_sub(offset_line));
+        let next_offset_line = (offset_line.saturating_add(returned_lines) < total_lines)
+            .then_some(offset_line.saturating_add(returned_lines));
+        return Ok(mux_protocol::ReadFileResponse {
+            content,
+            is_binary,
+            encoding,
+            offset_line,
+            next_offset_line,
+            total_lines,
+            offset_bytes: start,
+            next_offset_bytes: None,
+            total_bytes,
+        });
+    }
+
+    // Neither pagination mode means a legacy request. The size check preserves
+    // old clients without allowing them to force an oversized allocation/frame.
+    anyhow::ensure!(
+        total_bytes < mux_protocol::MAX_FRAME_PAYLOAD as u64,
+        "legacy full-file request exceeds the frame limit; use pagination"
+    );
+    file.seek(std::io::SeekFrom::Start(0))?;
+    let mut content = Vec::with_capacity(total_bytes as usize);
+    (&mut *file)
+        .take(mux_protocol::MAX_FRAME_PAYLOAD as u64)
+        .read_to_end(&mut content)?;
+    anyhow::ensure!(
+        content.len() as u64 == total_bytes,
+        "file changed while reading legacy response"
+    );
+    Ok(mux_protocol::ReadFileResponse {
+        total_lines: u32::try_from(logical_line_count(&content)).unwrap_or(u32::MAX),
+        content,
+        is_binary,
+        encoding,
+        offset_line: 0,
+        next_offset_line: None,
+        offset_bytes: 0,
+        next_offset_bytes: None,
+        total_bytes,
+    })
+}
+
+fn read_line_page(
+    mut reader: impl std::io::BufRead,
+    expected_bytes: u64,
+    offset_line: u32,
+    max_lines: u32,
+) -> anyhow::Result<(Vec<u8>, u32, u64)> {
+    let page_end_line = u64::from(offset_line) + u64::from(max_lines);
+    let mut current_line = 0u64;
+    let mut absolute_offset = 0u64;
+    let mut page_start = None;
+    let mut content = Vec::new();
+    let mut saw_byte = false;
+    let mut last_byte = None;
+
+    loop {
+        let consumed = {
+            let buffer = reader.fill_buf()?;
+            if buffer.is_empty() {
+                break;
+            }
+            for byte in buffer {
+                if current_line == u64::from(offset_line) && page_start.is_none() {
+                    page_start = Some(absolute_offset);
+                }
+                if current_line >= u64::from(offset_line) && current_line < page_end_line {
+                    anyhow::ensure!(
+                        content.len() < mux_protocol::MAX_READ_FILE_PAGE_BYTES as usize,
+                        "requested line page exceeds the byte limit of {}; use byte pagination",
+                        mux_protocol::MAX_READ_FILE_PAGE_BYTES
+                    );
+                    content.push(*byte);
+                }
+                saw_byte = true;
+                last_byte = Some(*byte);
+                absolute_offset = absolute_offset.saturating_add(1);
+                if *byte == b'\n' {
+                    current_line = current_line.saturating_add(1);
+                }
+            }
+            buffer.len()
+        };
+        reader.consume(consumed);
+    }
+
+    anyhow::ensure!(
+        absolute_offset == expected_bytes,
+        "file changed while reading line page"
+    );
+    let total_lines = current_line + u64::from(saw_byte && last_byte != Some(b'\n'));
+    let total_lines = u32::try_from(total_lines)
+        .map_err(|_| anyhow::anyhow!("file has more than {} logical lines", u32::MAX))?;
+    Ok((content, total_lines, page_start.unwrap_or(expected_bytes)))
+}
+
+fn logical_line_count(bytes: &[u8]) -> usize {
+    if bytes.is_empty() {
+        return 0;
+    }
+    bytes.iter().filter(|byte| **byte == b'\n').count() + usize::from(bytes.last() != Some(&b'\n'))
 }
 
 /// §16.6 ListDir: 列出 attach 会话 worktree 内某个目录的条目。
@@ -3201,6 +3569,374 @@ fn detect_binary(bytes: &[u8]) -> bool {
 #[cfg(test)]
 mod connection_unit_tests {
     use super::*;
+    use crate::pane::ShellMarkerPosition;
+
+    fn read_file_request() -> mux_protocol::ReadFileRequest {
+        mux_protocol::ReadFileRequest {
+            path: "file.txt".to_string(),
+            offset_line: None,
+            max_lines: None,
+            offset_bytes: None,
+            max_bytes: None,
+        }
+    }
+
+    fn read_file_page_for_test(
+        request: &mux_protocol::ReadFileRequest,
+        bytes: &[u8],
+    ) -> anyhow::Result<mux_protocol::ReadFileResponse> {
+        let mut cursor = std::io::Cursor::new(bytes);
+        read_file_response(request, &mut cursor, bytes.len() as u64)
+    }
+
+    #[test]
+    fn read_file_line_pages_preserve_boundaries() {
+        let bytes = b"zero\none\ntwo\nthree";
+        let first = read_file_page_for_test(
+            &mux_protocol::ReadFileRequest {
+                offset_line: Some(0),
+                max_lines: Some(2),
+                ..read_file_request()
+            },
+            bytes,
+        )
+        .expect("first page");
+        assert_eq!(first.content, b"zero\none\n");
+        assert_eq!(first.offset_line, 0);
+        assert_eq!(first.next_offset_line, Some(2));
+        assert_eq!(first.total_lines, 4);
+
+        let last = read_file_page_for_test(
+            &mux_protocol::ReadFileRequest {
+                offset_line: first.next_offset_line,
+                max_lines: Some(2),
+                ..read_file_request()
+            },
+            bytes,
+        )
+        .expect("last page");
+        assert_eq!(last.content, b"two\nthree");
+        assert_eq!(last.next_offset_line, None);
+
+        let past_end = read_file_page_for_test(
+            &mux_protocol::ReadFileRequest {
+                offset_line: Some(9),
+                max_lines: Some(2),
+                ..read_file_request()
+            },
+            bytes,
+        )
+        .expect("past-end page");
+        assert!(past_end.content.is_empty());
+        assert_eq!(past_end.offset_line, 9);
+        assert_eq!(past_end.next_offset_line, None);
+    }
+
+    #[test]
+    fn read_file_byte_pages_bound_payloads() {
+        let bytes = b"0123456789";
+        let page = read_file_page_for_test(
+            &mux_protocol::ReadFileRequest {
+                offset_bytes: Some(3),
+                max_bytes: Some(4),
+                ..read_file_request()
+            },
+            bytes,
+        )
+        .expect("byte page");
+        assert_eq!(page.content, b"3456");
+        assert_eq!(page.offset_bytes, 3);
+        assert_eq!(page.next_offset_bytes, Some(7));
+        assert_eq!(page.total_bytes, 10);
+
+        let last = read_file_page_for_test(
+            &mux_protocol::ReadFileRequest {
+                offset_bytes: page.next_offset_bytes,
+                max_bytes: Some(4),
+                ..read_file_request()
+            },
+            bytes,
+        )
+        .expect("last byte page");
+        assert_eq!(last.content, b"789");
+        assert_eq!(last.next_offset_bytes, None);
+
+        let past_end = read_file_page_for_test(
+            &mux_protocol::ReadFileRequest {
+                offset_bytes: Some(11),
+                max_bytes: Some(4),
+                ..read_file_request()
+            },
+            bytes,
+        )
+        .expect_err("byte offsets beyond EOF must be rejected");
+        assert!(past_end.to_string().contains("beyond the end"));
+    }
+
+    #[test]
+    fn read_file_rejects_degenerate_or_mixed_pages() {
+        let zero_lines = read_file_page_for_test(
+            &mux_protocol::ReadFileRequest {
+                offset_line: Some(0),
+                max_lines: Some(0),
+                ..read_file_request()
+            },
+            b"text",
+        )
+        .expect_err("zero line pages cannot advance");
+        assert!(zero_lines.to_string().contains("max_lines"));
+
+        let zero_bytes = read_file_page_for_test(
+            &mux_protocol::ReadFileRequest {
+                offset_bytes: Some(0),
+                max_bytes: Some(0),
+                ..read_file_request()
+            },
+            b"text",
+        )
+        .expect_err("zero byte pages cannot advance");
+        assert!(zero_bytes.to_string().contains("max_bytes"));
+
+        let mixed = read_file_page_for_test(
+            &mux_protocol::ReadFileRequest {
+                offset_line: Some(0),
+                max_lines: Some(1),
+                offset_bytes: Some(0),
+                max_bytes: Some(1),
+                ..read_file_request()
+            },
+            b"text",
+        )
+        .expect_err("pagination modes are exclusive");
+        assert!(mixed.to_string().contains("cannot be combined"));
+    }
+
+    #[test]
+    fn read_file_sparse_file_stays_bounded() {
+        let mut file = tempfile::tempfile().expect("temp file");
+        let total_bytes = mux_protocol::MAX_FRAME_PAYLOAD as u64 * 2;
+        file.set_len(total_bytes).expect("make sparse file");
+
+        let page = read_file_response(
+            &mux_protocol::ReadFileRequest {
+                offset_bytes: Some(total_bytes - 3),
+                max_bytes: Some(16),
+                ..read_file_request()
+            },
+            &mut file,
+            total_bytes,
+        )
+        .expect("tail page");
+        assert_eq!(page.content, vec![0; 3]);
+        assert_eq!(page.total_bytes, total_bytes);
+        assert_eq!(page.next_offset_bytes, None);
+
+        let error = read_file_response(&read_file_request(), &mut file, total_bytes)
+            .expect_err("legacy request must not allocate a huge sparse file");
+        assert!(error.to_string().contains("frame limit"));
+    }
+
+    #[test]
+    fn read_file_line_page_rejects_an_oversized_line() {
+        let bytes = vec![b'x'; mux_protocol::MAX_READ_FILE_PAGE_BYTES as usize + 1];
+        let error = read_file_page_for_test(
+            &mux_protocol::ReadFileRequest {
+                offset_line: Some(0),
+                max_lines: Some(1),
+                ..read_file_request()
+            },
+            &bytes,
+        )
+        .expect_err("one logical line must not bypass the byte cap");
+        assert!(error.to_string().contains("byte limit"));
+    }
+
+    fn shell_marker(
+        sequence: u64,
+        kind: ShellMarkerKind,
+        column: u32,
+        exit_code: Option<i32>,
+    ) -> ShellMarker {
+        ShellMarker {
+            sequence,
+            kind,
+            absolute_row: sequence,
+            column,
+            exit_code,
+            epoch: 1,
+        }
+    }
+
+    #[test]
+    fn history_indices_become_negative_tmux_lines_and_viewport_rows_stay_put() {
+        assert_eq!(
+            tmux_line(ShellMarkerPosition::History { index: 0 }, 100),
+            Some(-100)
+        );
+        assert_eq!(
+            tmux_line(ShellMarkerPosition::History { index: 99 }, 100),
+            Some(-1)
+        );
+        assert_eq!(
+            tmux_line(ShellMarkerPosition::Viewport { line: 0 }, 100),
+            Some(0)
+        );
+        assert_eq!(tmux_line(ShellMarkerPosition::Unavailable, 100), None);
+        // 历史下标必然小于 scrollback 大小; 配错了宁可说"不知道", 也不能交出一个
+        // 看起来像可见区行号的历史行号。
+        assert_eq!(
+            tmux_line(ShellMarkerPosition::History { index: 7 }, 3),
+            None
+        );
+    }
+
+    #[test]
+    fn markers_group_into_one_command_per_a_to_d_run() {
+        let markers = [
+            (
+                shell_marker(1, ShellMarkerKind::PromptStart, 0, None),
+                Some(-9),
+            ),
+            (
+                shell_marker(2, ShellMarkerKind::CommandStart, 2, None),
+                Some(-9),
+            ),
+            (
+                shell_marker(3, ShellMarkerKind::OutputStart, 0, None),
+                Some(-8),
+            ),
+            (
+                shell_marker(4, ShellMarkerKind::CommandEnd, 0, Some(0)),
+                Some(-5),
+            ),
+            (
+                shell_marker(5, ShellMarkerKind::PromptStart, 0, None),
+                Some(-5),
+            ),
+            (
+                shell_marker(6, ShellMarkerKind::CommandStart, 2, None),
+                Some(-5),
+            ),
+            (
+                shell_marker(7, ShellMarkerKind::OutputStart, 0, None),
+                Some(-4),
+            ),
+            (
+                shell_marker(8, ShellMarkerKind::CommandEnd, 0, Some(1)),
+                Some(-1),
+            ),
+        ];
+        let commands = group_shell_markers(&markers);
+        assert_eq!(commands.len(), 2, "{commands:?}");
+        assert_eq!(commands[0].id, 1);
+        assert_eq!(commands[0].exit_code, Some(0));
+        assert_eq!(
+            commands[0].output_start.as_ref().and_then(|item| item.line),
+            Some(-8)
+        );
+        assert_eq!(commands[1].id, 5);
+        assert_eq!(commands[1].exit_code, Some(1));
+    }
+
+    /// 真实 shell 不保证四个 marker 都发, 命令还在跑时也没有 D。
+    #[test]
+    fn commands_survive_missing_markers() {
+        // 只发 A 和 D 的 shell。
+        let sparse = [
+            (
+                shell_marker(1, ShellMarkerKind::PromptStart, 0, None),
+                Some(-9),
+            ),
+            (
+                shell_marker(2, ShellMarkerKind::CommandEnd, 0, Some(2)),
+                Some(-6),
+            ),
+            (
+                shell_marker(3, ShellMarkerKind::PromptStart, 0, None),
+                Some(-6),
+            ),
+            (
+                shell_marker(4, ShellMarkerKind::CommandEnd, 0, None),
+                Some(-2),
+            ),
+        ];
+        let commands = group_shell_markers(&sparse);
+        assert_eq!(commands.len(), 2, "{commands:?}");
+        assert_eq!(commands[0].exit_code, Some(2));
+        assert!(commands[0].command.is_none());
+        assert!(commands[0].output_start.is_none());
+        // D 发了但没带状态码: 已结束, 状态未知。两者必须能区分。
+        assert!(commands[1].command_end.is_some());
+        assert_eq!(commands[1].exit_code, None);
+
+        // 还在跑: 有 A/B/C, 没有 D。
+        let running = [
+            (
+                shell_marker(1, ShellMarkerKind::PromptStart, 0, None),
+                Some(-3),
+            ),
+            (
+                shell_marker(2, ShellMarkerKind::CommandStart, 2, None),
+                Some(-3),
+            ),
+            (
+                shell_marker(3, ShellMarkerKind::OutputStart, 0, None),
+                Some(-2),
+            ),
+        ];
+        let commands = group_shell_markers(&running);
+        assert_eq!(commands.len(), 1, "{commands:?}");
+        assert!(commands[0].command_end.is_none());
+    }
+
+    /// zsh 每重画一次提示符就发一个 A。那不是命令, 不该占一行输出。
+    #[test]
+    fn bare_prompt_starts_are_not_commands() {
+        let markers = [
+            (
+                shell_marker(1, ShellMarkerKind::PromptStart, 0, None),
+                Some(-3),
+            ),
+            (
+                shell_marker(2, ShellMarkerKind::PromptStart, 0, None),
+                Some(-2),
+            ),
+            (
+                shell_marker(3, ShellMarkerKind::PromptStart, 0, None),
+                Some(-1),
+            ),
+            (
+                shell_marker(4, ShellMarkerKind::CommandStart, 2, None),
+                Some(-1),
+            ),
+        ];
+        let commands = group_shell_markers(&markers);
+        assert_eq!(commands.len(), 1, "{commands:?}");
+        assert_eq!(commands[0].id, 3);
+    }
+
+    /// 行号不可用不该影响退出码: 位置和状态是两件独立的事。
+    #[test]
+    fn an_unaddressable_command_keeps_its_exit_code() {
+        let markers = [
+            (shell_marker(1, ShellMarkerKind::PromptStart, 0, None), None),
+            (shell_marker(2, ShellMarkerKind::OutputStart, 0, None), None),
+            (
+                shell_marker(3, ShellMarkerKind::CommandEnd, 0, Some(127)),
+                None,
+            ),
+        ];
+        let commands = group_shell_markers(&markers);
+        assert_eq!(commands.len(), 1, "{commands:?}");
+        assert_eq!(commands[0].exit_code, Some(127));
+        assert!(
+            commands[0]
+                .output_start
+                .as_ref()
+                .is_some_and(|marker| marker.line.is_none()),
+            "the marker is recorded but carries no row: {commands:?}"
+        );
+    }
 
     /// Handler fixture: a live extension host (spawn/split bind it to the
     /// session before fanning out) and an unattached connection id mirroring
@@ -3222,6 +3958,7 @@ mod connection_unit_tests {
             Arc::new(parking_lot::Mutex::new(None));
         (extensions_dir, host, unattached)
     }
+
 
     #[test]
     fn take_session_returns_removed_session() {
@@ -3582,7 +4319,14 @@ mod connection_unit_tests {
                 size: Some(mux_protocol::TerminalSize { cols: 20, rows: 5 }),
                 cwd: None,
                 command: Some(mux_protocol::ShellCommand {
-                    program: "/bin/true".to_string(),
+                    // macOS ships `true` only under /usr/bin; hardcoding /bin
+                    // makes this fail as ENOENT instead of testing the fast
+                    // exit it is named for.
+                    program: ["/bin/true", "/usr/bin/true"]
+                        .into_iter()
+                        .find(|candidate| std::path::Path::new(candidate).exists())
+                        .unwrap_or("/usr/bin/true")
+                        .to_string(),
                     args: Vec::new(),
                     env: Default::default(),
                 }),

@@ -117,11 +117,8 @@ pub async fn get_recent_projects(
     limit: Option<usize>,
     fs: Arc<dyn fs::Fs>,
     db: &WorkspaceDb,
-) -> Vec<RecentProjectEntry> {
-    let workspaces = db
-        .recent_project_workspaces(fs.as_ref())
-        .await
-        .unwrap_or_default();
+) -> anyhow::Result<Vec<RecentProjectEntry>> {
+    let workspaces = db.recent_project_workspaces(fs.as_ref()).await?;
 
     let filtered: Vec<_> = workspaces
         .into_iter()
@@ -137,7 +134,7 @@ pub async fn get_recent_projects(
     all_paths.dedup();
     let path_details =
         util::disambiguate::compute_disambiguation_details(&all_paths, |path, detail| {
-            project::path_suffix(path, detail)
+            util::disambiguate::path_suffix(path, detail)
         });
     let path_detail_map: std::collections::HashMap<PathBuf, usize> =
         all_paths.into_iter().zip(path_details).collect();
@@ -152,7 +149,7 @@ pub async fn get_recent_projects(
                 .iter()
                 .map(|p| {
                     let detail = path_detail_map.get(*p).copied().unwrap_or(0);
-                    project::path_suffix(p, detail)
+                    util::disambiguate::path_suffix(p, detail)
                 })
                 .filter(|s| !s.is_empty())
                 .collect::<Vec<_>>()
@@ -175,13 +172,16 @@ pub async fn get_recent_projects(
         .collect();
 
     match limit {
-        Some(n) => entries.into_iter().take(n).collect(),
-        None => entries,
+        Some(n) => Ok(entries.into_iter().take(n).collect()),
+        None => Ok(entries),
     }
 }
 
-pub async fn delete_recent_project(workspace_id: WorkspaceId, db: &WorkspaceDb) {
-    let _ = db.delete_workspace_by_id(workspace_id).await;
+pub async fn delete_recent_project(
+    workspace_id: WorkspaceId,
+    db: &WorkspaceDb,
+) -> anyhow::Result<()> {
+    db.delete_workspace_by_id(workspace_id).await
 }
 
 fn get_open_folders(workspace: &Workspace, cx: &App) -> Vec<OpenFolderEntry> {
@@ -217,7 +217,7 @@ fn get_open_folders(workspace: &Workspace, cx: &App) -> Vec<OpenFolderEntry> {
     all_paths.dedup();
     let path_details =
         util::disambiguate::compute_disambiguation_details(&all_paths, |path, detail| {
-            project::path_suffix(path, detail)
+            util::disambiguate::path_suffix(path, detail)
         });
     let path_detail_map: std::collections::HashMap<PathBuf, usize> =
         all_paths.into_iter().zip(path_details).collect();
@@ -232,7 +232,7 @@ fn get_open_folders(workspace: &Workspace, cx: &App) -> Vec<OpenFolderEntry> {
             let worktree_id = worktree_ref.id();
             let path = worktree_ref.abs_path().to_path_buf();
             let detail = path_detail_map.get(&path).copied().unwrap_or(0);
-            let name = SharedString::from(project::path_suffix(&path, detail));
+            let name = SharedString::from(util::disambiguate::path_suffix(&path, detail));
             let branch = get_branch_for_worktree(worktree_ref, &repositories, cx);
             let is_active = active_worktree_id == Some(worktree_id);
             OpenFolderEntry {
@@ -1216,6 +1216,15 @@ impl PickerDelegate for RecentProjectsDelegate {
                                     multi_workspace.activate(workspace, None, window, cx);
                                 })
                                 .log_err();
+                        } else if let Some(host) = key.host() {
+                            // A remote group has no local worktrees behind it, so
+                            // falling through to the local path would silently open
+                            // an empty workspace on the remote paths (spec §2.1
+                            // removed remote connections).
+                            log::warn!(
+                                "Cannot open project group on remote host {host}: \
+                                 remote workspaces are not supported by this z3rm build"
+                            );
                         } else {
                             let path_list = key.path_list().clone();
                             let connection_options = key.remote_connection_options().cloned();
@@ -2734,7 +2743,7 @@ mod tests {
     }
 
     fn draw(cx: &mut VisualTestContext) {
-        cx.update(|window, cx| window.draw(cx).clear());
+        cx.update(|window, cx| window.draw(cx).clear(cx));
     }
 
     fn build_picker(

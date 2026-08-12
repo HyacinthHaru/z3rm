@@ -7,22 +7,28 @@
 //! 请求/响应关联通过 request_id（§9）。
 
 use anyhow::{Context as _, Result};
-use std::collections::{HashMap, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 const WRITE_QUEUE_CAPACITY: usize = 1024;
+/// §3.4 Ordinary notification queue bound per subscriber. A dropped `PaneDirty`
+/// is coalesced into a per-pane latch instead of buffered, so the queue never
+/// needs to grow for lost dirty signals.
+const NOTIFICATION_QUEUE_CAPACITY: usize = 4096;
 
 // §9 从 mux_protocol 导入所有 protobuf 类型。
 use mux_protocol::{
-    AttachResponse, DeclineFileVersionResponse, Envelope, FetchGridUpdateResponse,
-    FetchScrollbackResponse, GetFileVersionResponse, ListFileVersionsResponse, Notification,
-    PROTOCOL_VERSION, Request, Response, SessionInfo, SessionLayoutChanged, ShellCommand,
-    ShellIntegrationResponse, TerminalSize, attach_request::AttachMode as AttachMode_,
-    check_frame_len, envelope::Payload as EnvelopePayload, frame,
-    notification::Event as NotifEvent, parse_len_prefix, request::Body as RequestBody,
-    response::Body as ResponseBody, split_node::SplitDirection,
+    AttachResponse, ClipboardEntry, DeclineFileVersionResponse, Envelope, FetchGridUpdateResponse,
+    FetchScrollbackResponse, GetFileVersionResponse, ListChangedFilesResponse,
+    ListCommandsResponse, ListDirResponse, ListFileVersionsResponse, Notification,
+    PROTOCOL_VERSION, ReadFileResponse, Request, Response, SearchScrollbackResponse, SessionInfo,
+    SessionLayoutChanged, ShellCommand, ShellIntegrationResponse, StatFileResponse, TerminalSize,
+    attach_request::AttachMode as AttachMode_, check_frame_len,
+    envelope::Payload as EnvelopePayload, frame, notification::Event as NotifEvent,
+    parse_len_prefix, request::Body as RequestBody, response::Body as ResponseBody,
+    split_node::SplitDirection,
 };
 
 // §16.6 SSH 远程连接模块（Plan 19）。
@@ -56,8 +62,8 @@ pub struct MuxDomain {
     /// 没有走 `NewWindow` 的对端使用; GUI 打开窗口时会用 `create_window` 换成
     /// 服务端分配的权威 ID。
     window_id: parking_lot::RwLock<String>,
-    /// §15.4 The local socket used for reconnecting this domain.
-    local_socket_path: Option<PathBuf>,
+    /// §15.4 The local socket selected for the next in-place reconnect.
+    local_socket_path: parking_lot::RwLock<Option<PathBuf>>,
     /// §15.4 Last authoritative snapshot returned by attach/reconnect.
     last_attached_snapshot: parking_lot::RwLock<Option<mux_protocol::SessionSnapshot>>,
     /// §15.7 Last session successfully attached by this domain. Used by native
@@ -94,8 +100,8 @@ fn mint_window_id() -> String {
 struct DomainInner {
     next_request_id: AtomicU64,
     pending_requests: HashMap<u64, PendingRequest>,
-    /// §9 通知订阅者列表。subscribe() 添加新 sender, 路由器 fan-out 到所有。
-    subscribers: Arc<parking_lot::Mutex<Vec<async_channel::Sender<Notification>>>>,
+    /// §9 通知订阅者列表。subscribe() 添加新记录, 路由器 fan-out 到所有。
+    subscribers: Arc<parking_lot::Mutex<Vec<SubscriberSender>>>,
     write_tx: std::sync::mpsc::SyncSender<Vec<u8>>,
     /// Monotonic transport epoch. Each I/O worker records the epoch it was
     /// spawned with; reconnect increments it so a stale worker can no longer
@@ -160,15 +166,80 @@ fn drain_pending_requests_for_epoch(
     }
     worker_senders
 }
+/// Router-side half of one notification subscriber: the bounded ordinary queue
+/// sender plus the per-pane dirty latch shared with the subscriber's
+/// `NotificationReceiver`. A full-queue `PaneDirty` is recorded in the latch
+/// instead of dropped, and the receiver turns each latched pane back into
+/// exactly one `PaneDirty` once its queue drains — the latch bounds loss to
+/// one entry per pane instead of unbounded buffering.
+#[derive(Clone)]
+pub struct SubscriberSender {
+    /// The bounded ordinary notification queue.
+    pub sender: async_channel::Sender<Notification>,
+    /// Panes whose `PaneDirty` could not be enqueued because the queue was full.
+    pub dirty_latches: Arc<parking_lot::Mutex<HashSet<String>>>,
+}
+
+/// Drop subscriber records whose queue sender has been closed, so a dropped
+/// receiver stops consuming router work (and its latch stops growing).
+fn prune_closed_subscribers(subscribers: &mut Vec<SubscriberSender>) {
+    subscribers.retain(|subscriber| !subscriber.sender.is_closed());
+}
+
+/// Fan one notification out to every live subscriber.
+///
+/// Reliable notifications (§3.4 lifecycle events) block the dedicated I/O
+/// thread rather than drop — the bounded subscriber queue applies backpressure.
+/// Everything else is a supplemental dirty signal and never blocks the router:
+/// `PaneOutputChunk` drops outright on a full queue, while a full-queue
+/// `PaneDirty` records the pane in the subscriber's latch for the receiver to
+/// synthesize once the queue drains.
+fn fan_out_notification(subscribers: &[SubscriberSender], notification: &Notification) {
+    let reliable = notification_requires_reliable_delivery(notification);
+    for subscriber in subscribers {
+        if reliable {
+            // §3.1 / §3.4 reliable path: block the dedicated I/O
+            // thread instead of dropping lifecycle state or PTY bytes.
+            if let Err(error) = subscriber.sender.send_blocking(notification.clone()) {
+                tracing::debug!(
+                    ?error,
+                    "reliable notification subscriber closed before delivery"
+                );
+            }
+        } else if let Err(error) = subscriber.sender.try_send(notification.clone()) {
+            match error {
+                async_channel::TrySendError::Full(_) => match notification.event.as_ref() {
+                    Some(NotifEvent::PaneDirty(dirty)) => {
+                        subscriber.dirty_latches.lock().insert(dirty.pane_id.clone());
+                        tracing::trace!(
+                            pane_id = %dirty.pane_id,
+                            "full-queue PaneDirty latched for the subscriber to synthesize"
+                        );
+                    }
+                    _ => {
+                        tracing::trace!("lossy notification subscriber queue full; dropping");
+                    }
+                },
+                async_channel::TrySendError::Closed(_) => {
+                    tracing::debug!("lossy notification subscriber closed before delivery");
+                }
+            }
+        }
+    }
+}
 /// Notifications that must never be dropped by the router fan-out.
 ///
 /// Lifecycle events are at-least-once by contract (§3.4): losing PaneRemoved
 /// leaves a zombie pane, so they briefly block the dedicated I/O thread rather
-/// than drop. PaneOutput is delivered best-effort: it is the §3.1 render-path
-/// byte stream, and the client guards it with a monotonic output sequence — a
-/// dropped or reordered chunk is detected and repaired by an authoritative grid
-/// resync, so the router never blocks on a slow renderer. PaneDirty is lossy
-/// too; the next generation pull repairs it.
+/// than drop. Every other notification is a supplemental dirty signal, not a
+/// data path: `PaneOutputChunk` is the §3.1 render-path byte stream and
+/// `PaneDirty` is the push half of push/pull sync. Neither carries
+/// authoritative state, so losing either only defers the next
+/// `fetch_grid_update` pull and the router never blocks on a slow renderer —
+/// recovery comes from the authoritative pull, not from the notification
+/// stream itself. A full queue drops `PaneOutputChunk` outright and records a
+/// dropped `PaneDirty` in the subscriber's per-pane latch, which the receiver
+/// synthesizes exactly once when the queue drains.
 fn notification_requires_reliable_delivery(notification: &Notification) -> bool {
     matches!(
         notification.event,
@@ -233,8 +304,8 @@ fn connect_local_blocking(path: &Path) -> Result<MuxDomain> {
         use std::os::unix::net::UnixStream;
         let stream = UnixStream::connect(path)?;
         stream.set_nonblocking(true)?;
-        let mut domain = MuxDomain::connect_with_blocking_stream(stream)?;
-        domain.local_socket_path = Some(path.to_path_buf());
+        let domain = MuxDomain::connect_with_blocking_stream(stream)?;
+        *domain.local_socket_path.write() = Some(path.to_path_buf());
         Ok(domain)
     }
     #[cfg(windows)]
@@ -248,8 +319,8 @@ fn connect_local_blocking(path: &Path) -> Result<MuxDomain> {
             .map_err(|error| anyhow::anyhow!("invalid pipe name: {error}"))?;
         let stream = LocalSocketStream::connect(name)
             .map_err(|error| anyhow::anyhow!("connect failed: {error}"))?;
-        let mut domain = MuxDomain::connect_with_stream(stream)?;
-        domain.local_socket_path = Some(path.to_path_buf());
+        let domain = MuxDomain::connect_with_stream(stream)?;
+        *domain.local_socket_path.write() = Some(path.to_path_buf());
         Ok(domain)
     }
 }
@@ -316,9 +387,9 @@ trait ReadWrite: std::io::Read + std::io::Write {}
 impl<T: std::io::Read + std::io::Write> ReadWrite for T {}
 
 /// §15.4 Open a fresh local socket and return the live byte stream, without
-/// spawning the I/O thread. Used by `MuxDomain::reconnect_local_in_place` so
-/// the new I/O thread can be bound to an existing `Arc<RwLock<DomainInner>>`
-/// rather than a freshly-created one. Mirrors the stale-socket retry that
+/// spawning the I/O thread. Used by the in-place reconnect methods so the new
+/// I/O thread can be bound to an existing `Arc<RwLock<DomainInner>>` rather
+/// than a freshly-created one. Mirrors the stale-socket retry that
 /// `connect_local` performs.
 fn connect_local_stream(socket_path: Option<&Path>) -> Result<Box<dyn ReadWrite + Send>> {
     let path = match socket_path {
@@ -379,7 +450,7 @@ impl MuxDomain {
     pub fn connect_with_stream(stream: interprocess::local_socket::Stream) -> Result<Self> {
         let (write_tx, write_rx) = std::sync::mpsc::sync_channel(WRITE_QUEUE_CAPACITY);
 
-        let subscribers: Arc<parking_lot::Mutex<Vec<async_channel::Sender<Notification>>>> =
+        let subscribers: Arc<parking_lot::Mutex<Vec<SubscriberSender>>> =
             Arc::new(parking_lot::Mutex::new(Vec::new()));
 
         let inner = Arc::new(parking_lot::RwLock::new(DomainInner {
@@ -403,7 +474,7 @@ impl MuxDomain {
         Ok(MuxDomain {
             inner,
             window_id: parking_lot::RwLock::new(mint_window_id()),
-            local_socket_path: None,
+            local_socket_path: parking_lot::RwLock::new(None),
             last_attached_snapshot: parking_lot::RwLock::new(None),
             last_attached_session_id: parking_lot::RwLock::new(None),
         })
@@ -414,7 +485,7 @@ impl MuxDomain {
         stream: S,
     ) -> Result<Self> {
         let (write_tx, write_rx) = std::sync::mpsc::sync_channel(WRITE_QUEUE_CAPACITY);
-        let subscribers: Arc<parking_lot::Mutex<Vec<async_channel::Sender<Notification>>>> =
+        let subscribers: Arc<parking_lot::Mutex<Vec<SubscriberSender>>> =
             Arc::new(parking_lot::Mutex::new(Vec::new()));
         let inner = Arc::new(parking_lot::RwLock::new(DomainInner {
             next_request_id: AtomicU64::new(1),
@@ -435,7 +506,7 @@ impl MuxDomain {
         Ok(MuxDomain {
             inner,
             window_id: parking_lot::RwLock::new(mint_window_id()),
-            local_socket_path: None,
+            local_socket_path: parking_lot::RwLock::new(None),
             last_attached_snapshot: parking_lot::RwLock::new(None),
             last_attached_session_id: parking_lot::RwLock::new(None),
         })
@@ -455,7 +526,7 @@ impl MuxDomain {
         mut stream: S,
         write_rx: std::sync::mpsc::Receiver<Vec<u8>>,
         inner: Arc<parking_lot::RwLock<DomainInner>>,
-        subscribers: Arc<parking_lot::Mutex<Vec<async_channel::Sender<Notification>>>>,
+        subscribers: Arc<parking_lot::Mutex<Vec<SubscriberSender>>>,
         worker_epoch: u64,
     ) {
         let mut buf = Vec::new();
@@ -529,32 +600,14 @@ impl MuxDomain {
                             }
                         }
                         Some(EnvelopePayload::Notification(notif)) => {
+                            // Clone the live records so a blocking reliable
+                            // delivery does not hold the subscriber lock.
                             let senders = {
                                 let mut subscribers = subscribers.lock();
-                                subscribers.retain(|tx| !tx.is_closed());
+                                prune_closed_subscribers(&mut subscribers);
                                 subscribers.iter().cloned().collect::<Vec<_>>()
                             };
-                            let reliable = notification_requires_reliable_delivery(&notif);
-                            for sender in senders {
-                                if reliable {
-                                    // §3.1 / §3.4 reliable path: block the dedicated I/O
-                                    // thread instead of dropping lifecycle state or PTY bytes.
-                                    // The bounded subscriber queue applies backpressure.
-                                    if let Err(error) = sender.send_blocking(notif.clone()) {
-                                        tracing::debug!(
-                                            ?error,
-                                            "reliable notification subscriber closed before delivery"
-                                        );
-                                    }
-                                } else if let Err(error) = sender.try_send(notif.clone()) {
-                                    // PaneDirty is at-most-once/lossy under pressure; a later
-                                    // generation pull repairs it without corrupting byte order.
-                                    tracing::trace!(
-                                        ?error,
-                                        "lossy notification subscriber unavailable"
-                                    );
-                                }
-                            }
+                            fan_out_notification(&senders, &notif);
                         }
                         Some(EnvelopePayload::Request(_)) => {
                             tracing::trace!("unexpected request from server");
@@ -1035,6 +1088,58 @@ impl MuxDomain {
         }
     }
 
+    /// §12 在 pane 的 scrollback 历史里做正则搜索。
+    ///
+    /// `from_line` 是历史行下标 (0 = 最旧)，`direction` 0 = 向更旧、1 = 向更新。
+    /// 只搜历史，可见区不在范围内。
+    pub async fn search_scrollback(
+        &self,
+        pane: &str,
+        regex: &str,
+        from_line: u32,
+        direction: u32,
+        max_results: u32,
+    ) -> Result<SearchScrollbackResponse> {
+        let req = RequestBody::SearchScrollback(mux_protocol::SearchScrollbackRequest {
+            pane_id: pane.to_string(),
+            regex: regex.to_string(),
+            from_line,
+            direction,
+            max_results,
+        });
+        let resp = self.send_request(req).await?;
+        match resp.body {
+            Some(ResponseBody::SearchScrollback(matches)) => Ok(matches),
+            Some(ResponseBody::Error(error)) => Err(anyhow::anyhow!(error)),
+            _ => Err(anyhow::anyhow!(
+                "unexpected response type for search_scrollback"
+            )),
+        }
+    }
+
+    /// §3.10 列出 pane 里由 OSC 133 marker 划出的命令。
+    ///
+    /// `max_results` 为 0 表示"全部仍被保留的", 否则只取最近的 N 条。行号是
+    /// tmux 模型 (可见区首行 0, 负数进历史), 缺省表示那一行已不可寻址 —— 退出
+    /// 码不受影响, 仍然准确。
+    pub async fn list_commands(
+        &self,
+        pane: &str,
+        max_results: u32,
+    ) -> Result<ListCommandsResponse> {
+        let request = RequestBody::ListCommands(mux_protocol::ListCommandsRequest {
+            pane_id: pane.to_string(),
+            max_results,
+        });
+        let response = self.send_request(request).await?;
+        match response.body {
+            Some(ResponseBody::Commands(commands)) => Ok(commands),
+            _ => Err(anyhow::anyhow!(
+                "unexpected response type for list_commands"
+            )),
+        }
+    }
+
     // ========================================================================
     // §9 Attach / Detach（§3.10）
     // ========================================================================
@@ -1113,6 +1218,21 @@ impl MuxDomain {
     // §4 Shadow File Versions（crash-safe 文件系统版本控制）
     // ========================================================================
 
+    /// §4 列出指定会话内所有留有 shadow 版本的文件，按最新 SeqNo 从新到旧。
+    pub async fn list_changed_files(&self, session_id: &str) -> Result<ListChangedFilesResponse> {
+        let req = RequestBody::ListChangedFiles(mux_protocol::ListChangedFilesRequest {
+            session_id: session_id.to_string(),
+        });
+        let resp = self.send_request(req).await?;
+        match resp.body {
+            Some(ResponseBody::ChangedFiles(changed)) => Ok(changed),
+            Some(ResponseBody::Error(error)) => Err(anyhow::anyhow!(error)),
+            _ => Err(anyhow::anyhow!(
+                "unexpected response type for list_changed_files"
+            )),
+        }
+    }
+
     /// §4 列出指定会话内某路径的全部 shadow 版本。
     pub async fn list_file_versions(
         &self,
@@ -1126,6 +1246,7 @@ impl MuxDomain {
         let resp = self.send_request(req).await?;
         match resp.body {
             Some(ResponseBody::FileVersions(versions)) => Ok(versions),
+            Some(ResponseBody::Error(error)) => Err(anyhow::anyhow!(error)),
             _ => Err(anyhow::anyhow!(
                 "unexpected response type for list_file_versions"
             )),
@@ -1147,13 +1268,15 @@ impl MuxDomain {
         let resp = self.send_request(req).await?;
         match resp.body {
             Some(ResponseBody::FileVersionContent(content)) => Ok(content),
+            Some(ResponseBody::Error(error)) => Err(anyhow::anyhow!(error)),
             _ => Err(anyhow::anyhow!(
                 "unexpected response type for get_file_version"
             )),
         }
     }
 
-    /// §4.8 拒绝（撤销）指定版本，将文件回滚至前一版本。
+    /// §4.8 把文件还原成 `version_id` 那一版的内容，撤销此后的改动。
+    /// 传的是要还原到的版本，不是要丢弃的那一版。
     pub async fn decline_file_version(
         &self,
         session_id: &str,
@@ -1168,6 +1291,7 @@ impl MuxDomain {
         let resp = self.send_request(req).await?;
         match resp.body {
             Some(ResponseBody::DeclineFileVersion(resp)) => Ok(resp),
+            Some(ResponseBody::Error(error)) => Err(anyhow::anyhow!(error)),
             _ => Err(anyhow::anyhow!(
                 "unexpected response type for decline_file_version"
             )),
@@ -1175,13 +1299,194 @@ impl MuxDomain {
     }
 
     // ========================================================================
+    // §16.6 服务端剪贴板中继
+    // ========================================================================
+
+    /// §16.6 读取服务端剪贴板。
+    ///
+    /// 剪贴板从来没被设置过时服务端回的是一条空 TEXT 条目而不是 `None`，所以
+    /// "没设置过"和"设置成了空文本"在协议上分不开; 调用方只能按空内容处理。
+    pub async fn get_clipboard(&self) -> Result<ClipboardEntry> {
+        let req = RequestBody::GetClipboard(mux_protocol::GetClipboardRequest {});
+        let resp = self.send_request(req).await?;
+        match resp.body {
+            Some(ResponseBody::Clipboard(clipboard)) => clipboard
+                .entry
+                .context("clipboard response carried no entry"),
+            Some(ResponseBody::Error(error)) => Err(anyhow::anyhow!(error)),
+            _ => Err(anyhow::anyhow!(
+                "unexpected response type for get_clipboard"
+            )),
+        }
+    }
+
+    /// §16.6 设置服务端剪贴板，并让服务端向所有 attach 的客户端 fan-out
+    /// `ClipboardChanged`。
+    ///
+    /// 服务端成功时回的是**空** `Error` 体 (proto: `non-empty = error`)，因此这里
+    /// 必须走 `empty_or_error_response`; 直接 `Some(Error(e)) => Err(e)` 会把每一次
+    /// 成功都变成一条错误信息为空的失败。
+    pub async fn set_clipboard(&self, entry: ClipboardEntry) -> Result<()> {
+        let req =
+            RequestBody::SetClipboard(mux_protocol::SetClipboardRequest { entry: Some(entry) });
+        Self::empty_or_error_response(self.send_request(req).await?)
+    }
+
+    // ========================================================================
+    // §16.6 会话 worktree 内的文件访问
+    // ========================================================================
+
+    /// §16.6 读取本连接已 attach 的会话 worktree 内的一个文件。
+    ///
+    /// 路径相对该会话的 cwd 解析，绝对路径必须落在 cwd 内，`..` 一律拒绝。没有
+    /// attach 过任何会话的连接没有 worktree 范围，服务端会直接拒绝而不是退化成
+    /// 整个文件系统。
+    ///
+    /// The compatibility API still returns one aggregate buffer, but obtains it
+    /// through bounded byte pages so no individual response contains a large file.
+    pub async fn read_file(&self, path: &str) -> Result<ReadFileResponse> {
+        let mut offset_bytes = 0;
+        let mut result = ReadFileResponse::default();
+        let mut first_page = true;
+        loop {
+            let page = self
+                .read_file_page(
+                    path,
+                    offset_bytes,
+                    mux_protocol::DEFAULT_READ_FILE_PAGE_BYTES,
+                )
+                .await?;
+            if first_page {
+                result.is_binary = page.is_binary;
+                result.encoding = page.encoding.clone();
+                result.total_lines = page.total_lines;
+                result.total_bytes = page.total_bytes;
+                first_page = false;
+            } else {
+                anyhow::ensure!(
+                    page.is_binary == result.is_binary && page.encoding == result.encoding,
+                    "read_file metadata changed while paging {path}"
+                );
+                anyhow::ensure!(
+                    page.total_bytes == result.total_bytes,
+                    "read_file size changed while paging {path}: {} became {} bytes",
+                    result.total_bytes,
+                    page.total_bytes
+                );
+            }
+            result.content.extend_from_slice(&page.content);
+
+            let Some(next_offset_bytes) = page.next_offset_bytes else {
+                return Ok(result);
+            };
+            offset_bytes = next_offset_bytes;
+        }
+    }
+
+    /// Read one bounded byte page from a file.
+    pub async fn read_file_page(
+        &self,
+        path: &str,
+        offset_bytes: u64,
+        max_bytes: u32,
+    ) -> Result<ReadFileResponse> {
+        anyhow::ensure!(
+            (1..=mux_protocol::MAX_READ_FILE_PAGE_BYTES).contains(&max_bytes),
+            "max_bytes must be between 1 and {}",
+            mux_protocol::MAX_READ_FILE_PAGE_BYTES
+        );
+        let page = self
+            .send_read_file_request(mux_protocol::ReadFileRequest {
+                path: path.to_string(),
+                offset_line: None,
+                max_lines: None,
+                offset_bytes: Some(offset_bytes),
+                max_bytes: Some(max_bytes),
+            })
+            .await?;
+        validate_read_file_byte_page(path, &page, offset_bytes, max_bytes)?;
+        Ok(page)
+    }
+
+    /// Read one page delimited by logical LF-terminated lines.
+    pub async fn read_file_lines(
+        &self,
+        path: &str,
+        offset_line: u32,
+        max_lines: u32,
+    ) -> Result<ReadFileResponse> {
+        self.send_read_file_request(mux_protocol::ReadFileRequest {
+            path: path.to_string(),
+            offset_line: Some(offset_line),
+            max_lines: Some(max_lines),
+            offset_bytes: None,
+            max_bytes: None,
+        })
+        .await
+    }
+
+    async fn send_read_file_request(
+        &self,
+        request: mux_protocol::ReadFileRequest,
+    ) -> Result<ReadFileResponse> {
+        let req = RequestBody::ReadFile(request);
+        let resp = self.send_request(req).await?;
+        match resp.body {
+            Some(ResponseBody::FileContent(content)) => Ok(content),
+            // 越界路径 / 读不到的文件服务端回的是 Error 体; 落进兜底分支会把原因
+            // 换成一句无信息量的 "unexpected"。
+            Some(ResponseBody::Error(error)) => Err(anyhow::anyhow!(error)),
+            _ => Err(anyhow::anyhow!("unexpected response type for read_file")),
+        }
+    }
+
+    /// §16.6 列出已 attach 会话 worktree 内某个目录的条目，目录在前、其余按名称。
+    ///
+    /// `is_modified` 的含义是"本 session 的影子快照给它记过版本"; 会话没有 armed
+    /// 的 watcher 时它恒为 false，那是"未知"而不是"未改过"。
+    pub async fn list_dir(&self, path: &str) -> Result<ListDirResponse> {
+        let req = RequestBody::ListDir(mux_protocol::ListDirRequest {
+            path: path.to_string(),
+        });
+        let resp = self.send_request(req).await?;
+        match resp.body {
+            Some(ResponseBody::DirListing(listing)) => Ok(listing),
+            Some(ResponseBody::Error(error)) => Err(anyhow::anyhow!(error)),
+            _ => Err(anyhow::anyhow!("unexpected response type for list_dir")),
+        }
+    }
+
+    /// §16.6 取已 attach 会话 worktree 内某个路径的元数据。
+    ///
+    /// 路径不存在不是错误：服务端回 `exists=false` 的类型化响应。只有路径越界或
+    /// stat 本身失败 (权限等) 才是 Error 体。
+    pub async fn stat_file(&self, path: &str) -> Result<StatFileResponse> {
+        let req = RequestBody::StatFile(mux_protocol::StatFileRequest {
+            path: path.to_string(),
+        });
+        let resp = self.send_request(req).await?;
+        match resp.body {
+            Some(ResponseBody::FileStat(stat)) => Ok(stat),
+            Some(ResponseBody::Error(error)) => Err(anyhow::anyhow!(error)),
+            _ => Err(anyhow::anyhow!("unexpected response type for stat_file")),
+        }
+    }
+
+    // ========================================================================
     // §9 订阅通知（§9）
     // ========================================================================
 
-    pub fn subscribe(&self) -> async_channel::Receiver<Notification> {
-        let (tx, rx) = async_channel::bounded(4096);
-        self.inner.read().subscribers.lock().push(tx);
-        rx
+    pub fn subscribe(&self) -> NotificationReceiver {
+        let (tx, rx) = async_channel::bounded(NOTIFICATION_QUEUE_CAPACITY);
+        let dirty_latches = Arc::new(parking_lot::Mutex::new(HashSet::new()));
+        self.inner.read().subscribers.lock().push(SubscriberSender {
+            sender: tx,
+            dirty_latches: dirty_latches.clone(),
+        });
+        NotificationReceiver {
+            queue: rx,
+            dirty_latches,
+        }
     }
 
     // ========================================================================
@@ -1198,9 +1503,7 @@ impl MuxDomain {
     /// Extract the subscriber list, leaving an empty list in its place.
     /// Used during reconnect to transfer subscribers from the old (dead)
     /// domain into the freshly connected domain.
-    pub fn take_subscribers(
-        &self,
-    ) -> Arc<parking_lot::Mutex<Vec<async_channel::Sender<Notification>>>> {
+    pub fn take_subscribers(&self) -> Arc<parking_lot::Mutex<Vec<SubscriberSender>>> {
         let inner = self.inner.write();
         let mut subs_guard = inner.subscribers.lock();
         let taken = std::mem::take(&mut *subs_guard);
@@ -1209,29 +1512,24 @@ impl MuxDomain {
 
     /// Install a previously extracted subscriber list into this domain.
     /// Any pre-existing subscribers are replaced.
-    pub fn install_subscribers(
-        &self,
-        subs: Arc<parking_lot::Mutex<Vec<async_channel::Sender<Notification>>>>,
-    ) {
+    pub fn install_subscribers(&self, subs: Arc<parking_lot::Mutex<Vec<SubscriberSender>>>) {
         let mut inner = self.inner.write();
         inner.subscribers = subs;
     }
 
     /// Broadcast a synthetic notification to every subscriber (at-least-once).
     /// Used after reconnect to deliver a SessionLayoutChanged without waiting
-    /// for the server to push one.
+    /// for the server to push one. Same delivery rules as the router fan-out:
+    /// lifecycle events block, a full-queue `PaneDirty` latches for later
+    /// synthesis instead of stalling the reconnect.
     pub fn broadcast_notification(&self, notif: Notification) {
         let senders = {
             let inner = self.inner.read();
             let mut subscribers = inner.subscribers.lock();
-            subscribers.retain(|tx| !tx.is_closed());
+            prune_closed_subscribers(&mut subscribers);
             subscribers.iter().cloned().collect::<Vec<_>>()
         };
-        for sender in senders {
-            if sender.send_blocking(notif.clone()).is_err() {
-                tracing::debug!("notification subscriber closed before synthetic delivery");
-            }
-        }
+        fan_out_notification(&senders, &notif);
     }
 
     /// §15.4 / §15.12 Authoritative in-place reconnect.
@@ -1254,13 +1552,14 @@ impl MuxDomain {
     /// broadcasts a synthetic `SessionLayoutChanged` derived from the full
     /// authoritative snapshot returned by the server — observers reconcile
     /// from the snapshot rather than racing the at-least-once push path.
-    pub async fn reconnect_local_in_place(
+    pub async fn reconnect_at_path_in_place(
         &self,
+        path: &Path,
         session_id: &str,
         attach_mode: AttachMode,
     ) -> Result<()> {
-        let local_socket_path = self.local_socket_path.clone();
-        let stream = connect_local_stream(local_socket_path.as_deref())?;
+        let path = path.to_path_buf();
+        let stream = connect_local_stream(Some(&path))?;
         let (new_write_tx, new_write_rx) = std::sync::mpsc::sync_channel(WRITE_QUEUE_CAPACITY);
         let io_inner = self.inner.clone();
 
@@ -1293,6 +1592,7 @@ impl MuxDomain {
 
             old_pending
         };
+        *self.local_socket_path.write() = Some(path);
         drop(old_pending);
 
         let attach_resp = self.attach(session_id, attach_mode).await?;
@@ -1301,7 +1601,7 @@ impl MuxDomain {
                 self.broadcast_notification(Notification {
                     event: Some(NotifEvent::SessionLayoutChanged(SessionLayoutChanged {
                         layout: Some(layout.clone()),
-                        snapshot: None,
+                        snapshot: Some(snapshot.clone()),
                     })),
                 });
             }
@@ -1318,6 +1618,135 @@ impl MuxDomain {
         }
         Ok(())
     }
+
+    /// Reconnect at the socket selected by the original local connection or the
+    /// last successful path-selectable reconnect.
+    pub async fn reconnect_local_in_place(
+        &self,
+        session_id: &str,
+        attach_mode: AttachMode,
+    ) -> Result<()> {
+        let path = self
+            .local_socket_path
+            .read()
+            .clone()
+            .unwrap_or_else(default_socket_path);
+        self.reconnect_at_path_in_place(&path, session_id, attach_mode)
+            .await
+    }
+}
+
+fn validate_read_file_byte_page(
+    path: &str,
+    page: &ReadFileResponse,
+    requested_offset: u64,
+    max_bytes: u32,
+) -> Result<()> {
+    anyhow::ensure!(
+        page.content.len() <= max_bytes as usize,
+        "read_file returned {} bytes for {path}, exceeding the requested page size of {max_bytes}",
+        page.content.len()
+    );
+    anyhow::ensure!(
+        page.offset_bytes == requested_offset,
+        "read_file returned byte offset {} while {requested_offset} was requested for {path}",
+        page.offset_bytes
+    );
+    anyhow::ensure!(
+        page.offset_bytes <= page.total_bytes,
+        "read_file returned offset {} beyond the {} byte file {path}",
+        page.offset_bytes,
+        page.total_bytes
+    );
+    let page_end = page
+        .offset_bytes
+        .checked_add(page.content.len() as u64)
+        .with_context(|| format!("read_file byte offset overflow for {path}"))?;
+    anyhow::ensure!(
+        page_end <= page.total_bytes,
+        "read_file page for {path} ends at {page_end}, beyond {} bytes",
+        page.total_bytes
+    );
+    match page.next_offset_bytes {
+        Some(next_offset) => {
+            anyhow::ensure!(
+                next_offset == page_end,
+                "read_file returned a discontinuous next offset {next_offset} for {path}; expected {page_end}"
+            );
+            anyhow::ensure!(
+                next_offset > page.offset_bytes && next_offset < page.total_bytes,
+                "read_file returned an invalid continuation offset {next_offset} for {path}"
+            );
+        }
+        None => anyhow::ensure!(
+            page_end == page.total_bytes,
+            "read_file ended early at byte {page_end} of {} for {path}",
+            page.total_bytes
+        ),
+    }
+    Ok(())
+}
+
+/// Subscriber-side handle to a `MuxDomain` notification stream.
+///
+/// Wraps the bounded ordinary queue with a per-pane coalesced dirty latch:
+/// when the router cannot enqueue a lossy `PaneDirty` because the queue is
+/// full, the pane is recorded in the latch instead of dropped, and the
+/// receiver returns exactly one synthesized `PaneDirty` per latched pane
+/// after the ordinary queue has been drained. The ordinary queue stays
+/// bounded — a flood of dropped dirty events coalesces into at most one
+/// latch entry per pane rather than buffering per event.
+pub struct NotificationReceiver {
+    queue: async_channel::Receiver<Notification>,
+    dirty_latches: Arc<parking_lot::Mutex<HashSet<String>>>,
+}
+
+impl NotificationReceiver {
+    /// Receive the next notification, blocking until one is available.
+    ///
+    /// Queued notifications always come first; once the ordinary queue is
+    /// empty, one synthesized `PaneDirty` per latched pane is returned before
+    /// blocking for new traffic.
+    pub async fn recv(&self) -> Result<Notification, async_channel::RecvError> {
+        match self.queue.try_recv() {
+            Ok(notification) => Ok(notification),
+            Err(async_channel::TryRecvError::Empty) => {
+                if let Some(notification) = self.take_latched_dirty() {
+                    Ok(notification)
+                } else {
+                    self.queue.recv().await
+                }
+            }
+            Err(async_channel::TryRecvError::Closed) => Err(async_channel::RecvError),
+        }
+    }
+
+    /// Receive the next notification without blocking.
+    ///
+    /// Returns a queued notification if one is pending; once the ordinary
+    /// queue is empty, returns one synthesized `PaneDirty` per latched pane.
+    pub fn try_recv(&self) -> Result<Notification, async_channel::TryRecvError> {
+        match self.queue.try_recv() {
+            Ok(notification) => Ok(notification),
+            Err(async_channel::TryRecvError::Empty) => self
+                .take_latched_dirty()
+                .ok_or(async_channel::TryRecvError::Empty),
+            Err(error @ async_channel::TryRecvError::Closed) => Err(error),
+        }
+    }
+
+    /// Synthesize one `PaneDirty` for a latched pane, if any remains.
+    ///
+    /// The pane is removed from the latch, so a burst of dropped dirty events
+    /// for one pane still produces exactly one synthesized notification.
+    fn take_latched_dirty(&self) -> Option<Notification> {
+        let mut latches = self.dirty_latches.lock();
+        let pane_id = latches.iter().next()?.clone();
+        latches.remove(&pane_id);
+        Some(Notification {
+            event: Some(NotifEvent::PaneDirty(mux_protocol::PaneDirty { pane_id })),
+        })
+    }
 }
 
 // ============================================================================
@@ -1328,8 +1757,63 @@ impl MuxDomain {
 mod tests {
     use super::*;
 
+    fn read_file_byte_page(
+        offset_bytes: u64,
+        content: &[u8],
+        next_offset_bytes: Option<u64>,
+        total_bytes: u64,
+    ) -> ReadFileResponse {
+        ReadFileResponse {
+            content: content.to_vec(),
+            is_binary: true,
+            encoding: "binary".to_string(),
+            offset_line: 0,
+            next_offset_line: None,
+            total_lines: 0,
+            offset_bytes,
+            next_offset_bytes,
+            total_bytes,
+        }
+    }
+
     #[test]
-    fn lifecycle_blocks_while_byte_stream_and_dirty_are_lossy() {
+    fn read_file_byte_page_validation_accepts_contiguous_pages() {
+        let first = read_file_byte_page(0, b"abcd", Some(4), 6);
+        validate_read_file_byte_page("file", &first, 0, 4).expect("first page");
+
+        let last = read_file_byte_page(4, b"ef", None, 6);
+        validate_read_file_byte_page("file", &last, 4, 4).expect("last page");
+    }
+
+    #[test]
+    fn read_file_byte_page_validation_rejects_gaps_and_truncation() {
+        let skipped = read_file_byte_page(0, b"ab", Some(3), 4);
+        assert!(validate_read_file_byte_page("file", &skipped, 0, 2).is_err());
+
+        let truncated = read_file_byte_page(0, b"ab", None, 4);
+        assert!(validate_read_file_byte_page("file", &truncated, 0, 2).is_err());
+
+        let empty_continuation = read_file_byte_page(0, b"", Some(0), 4);
+        assert!(validate_read_file_byte_page("file", &empty_continuation, 0, 2).is_err());
+    }
+
+    #[test]
+    fn read_file_byte_page_validation_rejects_oversized_or_out_of_range_pages() {
+        let oversized = read_file_byte_page(0, b"abc", Some(3), 4);
+        assert!(validate_read_file_byte_page("file", &oversized, 0, 2).is_err());
+
+        let wrong_offset = read_file_byte_page(2, b"ab", None, 4);
+        assert!(validate_read_file_byte_page("file", &wrong_offset, 0, 2).is_err());
+
+        let past_end = read_file_byte_page(5, b"", None, 4);
+        assert!(validate_read_file_byte_page("file", &past_end, 5, 2).is_err());
+
+        let content_past_end = read_file_byte_page(3, b"ab", None, 4);
+        assert!(validate_read_file_byte_page("file", &content_past_end, 3, 2).is_err());
+    }
+
+    #[test]
+    fn lifecycle_blocks_while_byte_stream_drops_and_dirty_latches() {
         let output = Notification {
             event: Some(NotifEvent::PaneOutput(mux_protocol::PaneOutputChunk {
                 pane_id: "pane-1".to_string(),
@@ -1349,11 +1833,212 @@ mod tests {
             })),
         };
 
+        // The byte stream and PaneDirty are supplemental dirty signals, never
+        // reliable: dropping either only defers an authoritative grid pull.
         assert!(!notification_requires_reliable_delivery(&output));
         assert!(!notification_requires_reliable_delivery(&dirty));
+        // Lifecycle events remain at-least-once and block the router.
         assert!(notification_requires_reliable_delivery(&removed));
     }
 
+    /// §3.4 Deterministic regression: a subscriber saturated with lossy
+    /// notifications must not lose a dropped `PaneDirty` — the router records
+    /// the pane in the subscriber's latch, and the receiver synthesizes exactly
+    /// one `PaneDirty` for it after draining the bounded ordinary queue,
+    /// without unbounded buffering.
+    #[test]
+    fn saturated_subscriber_synthesizes_one_dirty_per_latched_pane_after_drain() {
+        let (tx, rx) = async_channel::bounded(2);
+        let dirty_latches = Arc::new(parking_lot::Mutex::new(HashSet::new()));
+        let subscriber = SubscriberSender {
+            sender: tx,
+            dirty_latches: dirty_latches.clone(),
+        };
+        let receiver = NotificationReceiver {
+            queue: rx,
+            dirty_latches,
+        };
+
+        let output = Notification {
+            event: Some(NotifEvent::PaneOutput(mux_protocol::PaneOutputChunk {
+                pane_id: "pane-1".to_string(),
+                data: b"x".to_vec(),
+                output_sequence: 1,
+            })),
+        };
+        let dirty = |pane_id: &str| Notification {
+            event: Some(NotifEvent::PaneDirty(mux_protocol::PaneDirty {
+                pane_id: pane_id.to_string(),
+            })),
+        };
+
+        // Saturate the ordinary queue with lossy output chunks (capacity 2);
+        // the overflow chunks drop, exactly like a slow renderer under a burst.
+        for _ in 0..4 {
+            fan_out_notification(std::slice::from_ref(&subscriber), &output);
+        }
+        assert_eq!(receiver.queue.len(), 2, "ordinary queue must stay bounded");
+
+        // A full-queue PaneDirty for the target pane is latched, not dropped,
+        // and a second one for the same pane coalesces into the same entry.
+        fan_out_notification(std::slice::from_ref(&subscriber), &dirty("target-pane"));
+        fan_out_notification(std::slice::from_ref(&subscriber), &dirty("target-pane"));
+        assert_eq!(receiver.dirty_latches.lock().len(), 1);
+
+        // Drain: queued notifications come first, then exactly one synthesized
+        // PaneDirty for the target pane, then the stream goes quiet.
+        let mut queued_outputs = 0;
+        let mut synthesized = 0;
+        loop {
+            match receiver.try_recv() {
+                Ok(notification) => match notification.event {
+                    Some(NotifEvent::PaneOutput(_)) => queued_outputs += 1,
+                    Some(NotifEvent::PaneDirty(dirty)) => {
+                        assert_eq!(dirty.pane_id, "target-pane");
+                        synthesized += 1;
+                    }
+                    other => panic!("unexpected notification {other:?}"),
+                },
+                Err(async_channel::TryRecvError::Empty) => break,
+                Err(error) => panic!("unexpected try_recv error {error:?}"),
+            }
+        }
+        assert_eq!(
+            queued_outputs, 2,
+            "queued notifications must drain before synthesized ones"
+        );
+        assert_eq!(
+            synthesized, 1,
+            "exactly one synthesized PaneDirty per latched pane"
+        );
+        assert!(receiver.dirty_latches.lock().is_empty());
+        assert_eq!(receiver.queue.capacity(), Some(2), "ordinary queue must stay bounded");
+        assert_eq!(receiver.queue.len(), 0);
+
+        // Re-saturate: a pane latched again synthesizes exactly one more event
+        // on the next drain, never a flood of buffered notifications.
+        for _ in 0..4 {
+            fan_out_notification(std::slice::from_ref(&subscriber), &output);
+        }
+        fan_out_notification(std::slice::from_ref(&subscriber), &dirty("target-pane"));
+        let queued = receiver.try_recv().expect("queued output must drain first");
+        assert!(matches!(queued.event, Some(NotifEvent::PaneOutput(_))));
+        let queued = receiver.try_recv().expect("queued output must drain first");
+        assert!(matches!(queued.event, Some(NotifEvent::PaneOutput(_))));
+        let notification = receiver.try_recv().expect("latched dirty must synthesize");
+        let Some(NotifEvent::PaneDirty(dirty)) = notification.event else {
+            panic!("expected synthesized PaneDirty, got {notification:?}");
+        };
+        assert_eq!(dirty.pane_id, "target-pane");
+        assert!(matches!(
+            receiver.try_recv(),
+            Err(async_channel::TryRecvError::Empty)
+        ));
+    }
+
+    /// §3.4 The latch is per pane: distinct panes dropped while the queue is
+    /// full each get exactly one synthesized `PaneDirty`, and `recv` returns a
+    /// latched dirty immediately instead of blocking on the empty queue.
+    #[test]
+    fn saturated_subscriber_keeps_one_latch_entry_per_pane_and_recv_does_not_block() {
+        let (tx, rx) = async_channel::bounded(1);
+        let dirty_latches = Arc::new(parking_lot::Mutex::new(HashSet::new()));
+        let subscriber = SubscriberSender {
+            sender: tx,
+            dirty_latches: dirty_latches.clone(),
+        };
+        let receiver = NotificationReceiver {
+            queue: rx,
+            dirty_latches,
+        };
+
+        let dirty = |pane_id: &str| Notification {
+            event: Some(NotifEvent::PaneDirty(mux_protocol::PaneDirty {
+                pane_id: pane_id.to_string(),
+            })),
+        };
+
+        // Fill the queue so every dirty below is latched.
+        fan_out_notification(
+            std::slice::from_ref(&subscriber),
+            &Notification {
+                event: Some(NotifEvent::PaneOutput(mux_protocol::PaneOutputChunk {
+                    pane_id: "filler".to_string(),
+                    data: b"x".to_vec(),
+                    output_sequence: 1,
+                })),
+            },
+        );
+        fan_out_notification(std::slice::from_ref(&subscriber), &dirty("pane-a"));
+        fan_out_notification(std::slice::from_ref(&subscriber), &dirty("pane-b"));
+        fan_out_notification(std::slice::from_ref(&subscriber), &dirty("pane-a"));
+        assert_eq!(
+            receiver.dirty_latches.lock().len(),
+            2,
+            "one latch entry per distinct pane, coalescing repeats"
+        );
+
+        // Drain the queued filler first.
+        assert!(matches!(
+            receiver.try_recv(),
+            Ok(Notification {
+                event: Some(NotifEvent::PaneOutput(_)),
+                ..
+            })
+        ));
+
+        // With the queue empty, recv must return a latched dirty without
+        // blocking on new traffic.
+        let delivered = smol::block_on(smol::future::or(
+            async { receiver.recv().await.ok() },
+            async {
+                smol::Timer::after(Duration::from_millis(200)).await;
+                None
+            },
+        ))
+        .expect("recv must not block while a latched dirty is pending");
+        let Some(NotifEvent::PaneDirty(first)) = delivered.event else {
+            panic!("expected synthesized PaneDirty, got {delivered:?}");
+        };
+
+        let second = receiver.try_recv().expect("second latched pane must synthesize");
+        let Some(NotifEvent::PaneDirty(second)) = second.event else {
+            panic!("expected synthesized PaneDirty, got {second:?}");
+        };
+
+        let mut latched = [first.pane_id, second.pane_id];
+        latched.sort();
+        assert_eq!(latched, ["pane-a", "pane-b"]);
+        assert!(matches!(
+            receiver.try_recv(),
+            Err(async_channel::TryRecvError::Empty)
+        ));
+        assert!(receiver.dirty_latches.lock().is_empty());
+    }
+
+    /// §3.4 Closed subscriber records are pruned, so a dropped receiver stops
+    /// consuming router work (and its latch stops growing).
+    #[test]
+    fn closed_subscriber_records_are_pruned() {
+        let (live_tx, _live_rx) = async_channel::bounded(1);
+        let (closed_tx, closed_rx) = async_channel::bounded(1);
+        drop(closed_rx);
+        let mut subscribers = vec![
+            SubscriberSender {
+                sender: live_tx,
+                dirty_latches: Arc::new(parking_lot::Mutex::new(HashSet::new())),
+            },
+            SubscriberSender {
+                sender: closed_tx,
+                dirty_latches: Arc::new(parking_lot::Mutex::new(HashSet::new())),
+            },
+        ];
+
+        prune_closed_subscribers(&mut subscribers);
+
+        assert_eq!(subscribers.len(), 1);
+        assert!(!subscribers[0].sender.is_closed());
+    }
     #[test]
     fn server_extension_chrome_is_reliable() {
         let notification = Notification {
@@ -1381,7 +2066,7 @@ mod tests {
                 transport_epoch: AtomicU64::new(0),
             })),
             window_id: parking_lot::RwLock::new("test-window".to_string()),
-            local_socket_path: None,
+            local_socket_path: parking_lot::RwLock::new(None),
             last_attached_snapshot: parking_lot::RwLock::new(None),
             last_attached_session_id: parking_lot::RwLock::new(None),
         };

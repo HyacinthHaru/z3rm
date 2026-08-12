@@ -1,11 +1,13 @@
 use anyhow::{Context as _, Result};
 use futures::{StreamExt as _, channel::mpsc};
-use gpui::{App, AsyncApp, WindowHandle};
+use gpui::{AppContext as _, AsyncApp, WindowHandle};
 use std::{path::PathBuf, sync::Arc, time::Duration};
 
 use ::cli::{CliRequest, CliResponse, IpcHandshake, ipc};
 use util::paths::PathWithPosition;
 use workspace::{MultiWorkspace, OpenMode, OpenOptions, OpenVisible, Workspace};
+
+use crate::diff_review::DiffReview;
 
 const CLI_URL_PREFIX: &str = "z3rm-cli://";
 
@@ -102,22 +104,19 @@ async fn handle_cli_request(
         "dev-container path opening is not supported by z3rm"
     );
     anyhow::ensure!(
-        diff_paths.is_empty(),
-        "--diff is not yet supported by the z3rm read-only file viewer"
-    );
-    anyhow::ensure!(
         !wait,
         "--wait is not yet supported by the z3rm read-only file viewer"
     );
 
     let paths = collect_open_paths(paths, urls)?;
+    let diff_paths = collect_diff_paths(diff_paths);
     let window = wait_for_workspace_window(cx).await?;
-    if paths.is_empty() {
+    if paths.is_empty() && diff_paths.is_empty() {
         window.update(cx, |_, window, _| window.activate_window())?;
         return Ok(());
     }
 
-    if matches!(
+    let target_window = if matches!(
         open_behavior,
         ::cli::OpenBehavior::AlwaysNew | ::cli::OpenBehavior::PreferNewWindow
     ) {
@@ -127,30 +126,32 @@ async fn handle_cli_request(
             })
             .await?;
         ensure_open_results(open_result.opened_items)?;
-        open_result
-            .window
-            .update(cx, |_, window, _| window.activate_window())?;
-        return Ok(());
-    }
+        open_result.window
+    } else {
+        if !paths.is_empty() {
+            let task = window.update(cx, |multi_workspace, window, cx| {
+                let workspace = multi_workspace.workspace().clone();
+                workspace.update(cx, |workspace, cx| {
+                    workspace.open_paths(
+                        paths,
+                        OpenOptions {
+                            visible: Some(OpenVisible::All),
+                            focus: Some(true),
+                            ..OpenOptions::default()
+                        },
+                        None,
+                        window,
+                        cx,
+                    )
+                })
+            })?;
+            ensure_open_results(task.await)?;
+        }
+        window
+    };
 
-    let task = window.update(cx, |multi_workspace, window, cx| {
-        let workspace = multi_workspace.workspace().clone();
-        workspace.update(cx, |workspace, cx| {
-            workspace.open_paths(
-                paths,
-                OpenOptions {
-                    visible: Some(OpenVisible::All),
-                    focus: Some(true),
-                    ..OpenOptions::default()
-                },
-                None,
-                window,
-                cx,
-            )
-        })
-    })?;
-    ensure_open_results(task.await)?;
-    window.update(cx, |_, window, _| window.activate_window())?;
+    open_diff_paths(diff_paths, &target_window, cx).await?;
+    target_window.update(cx, |_, window, _| window.activate_window())?;
     Ok(())
 }
 
@@ -171,6 +172,55 @@ fn collect_open_paths(paths: Vec<String>, urls: Vec<String>) -> Result<Vec<PathB
         result.push(PathWithPosition::parse_str(&path.to_string_lossy()).path);
     }
     Ok(result)
+}
+
+fn collect_diff_paths(diff_paths: Vec<[String; 2]>) -> Vec<(PathBuf, PathBuf)> {
+    diff_paths
+        .into_iter()
+        .map(|[previous, current]| {
+            (
+                PathWithPosition::parse_str(&previous).path,
+                PathWithPosition::parse_str(&current).path,
+            )
+        })
+        .collect()
+}
+
+async fn open_diff_paths(
+    diff_paths: Vec<(PathBuf, PathBuf)>,
+    window: &WindowHandle<MultiWorkspace>,
+    cx: &mut AsyncApp,
+) -> Result<()> {
+    let mut reviews = Vec::with_capacity(diff_paths.len());
+    for (previous_path, current_path) in diff_paths {
+        let (previous_content, current_content) = smol::unblock({
+            let previous_path = previous_path.clone();
+            let current_path = current_path.clone();
+            move || -> Result<(String, String)> {
+                let previous_content = std::fs::read_to_string(&previous_path)
+                    .with_context(|| format!("reading diff input {}", previous_path.display()))?;
+                let current_content = std::fs::read_to_string(&current_path)
+                    .with_context(|| format!("reading diff input {}", current_path.display()))?;
+                Ok((previous_content, current_content))
+            }
+        })
+        .await?;
+        let review = cx.update(|cx| {
+            cx.new(|cx| DiffReview::new(current_path, previous_content, current_content, None, cx))
+        });
+        reviews.push(review);
+    }
+
+    window.update(cx, |multi_workspace, window, cx| {
+        let workspace = multi_workspace.workspace().clone();
+        workspace.update(cx, |workspace, cx| {
+            let pane = workspace.active_pane().clone();
+            for review in reviews {
+                workspace.add_item(pane.clone(), Box::new(review), None, true, true, window, cx);
+            }
+        });
+    })?;
+    Ok(())
 }
 
 fn ensure_open_results(
@@ -299,6 +349,21 @@ mod tests {
                 PathBuf::from("/tmp/plain.txt"),
                 PathBuf::from("/tmp/with space.txt")
             ]
+        );
+    }
+
+    #[test]
+    fn collects_diff_pairs_and_strips_positions() {
+        let paths = collect_diff_paths(vec![[
+            "/tmp/previous.txt:4:2".into(),
+            "/tmp/current.txt:8".into(),
+        ]]);
+        assert_eq!(
+            paths,
+            vec![(
+                PathBuf::from("/tmp/previous.txt"),
+                PathBuf::from("/tmp/current.txt")
+            )]
         );
     }
 

@@ -82,6 +82,15 @@ pub const MAX_VARINT_LEN: usize = 10;
 /// §9 单帧 payload 长度上限 (64 MiB)。读取器在分配或扩容前据此拒绝越界前缀。
 pub const MAX_FRAME_PAYLOAD: usize = 64 * 1024 * 1024;
 
+/// Default byte page requested by modern ReadFile clients.
+pub const DEFAULT_READ_FILE_PAGE_BYTES: u32 = 256 * 1024;
+/// Maximum byte payload accepted for one ReadFile page.
+pub const MAX_READ_FILE_PAGE_BYTES: u32 = 1024 * 1024;
+/// Default line page when a caller supplies only `offset_line`.
+pub const DEFAULT_READ_FILE_PAGE_LINES: u32 = 1024;
+/// Maximum number of logical lines accepted in one ReadFile page.
+pub const MAX_READ_FILE_PAGE_LINES: u32 = 16 * 1024;
+
 /// Maximum number of direction-changing split levels in a wire layout.
 /// Each level consumes both a `LayoutNode` and a `SplitNode` decoder frame.
 pub const MAX_LAYOUT_WIRE_DEPTH: usize = 32;

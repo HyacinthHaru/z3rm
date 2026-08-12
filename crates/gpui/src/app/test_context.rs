@@ -887,8 +887,7 @@ impl VisualTestContext {
             window.refresh();
 
             drop(element);
-            let arena_clear = arena_scope.exit(&cx.element_arena);
-            arena_clear.clear(cx);
+            arena_scope.exit(&cx.element_arena).clear(cx);
             (request_layout_state, prepaint_state)
         })
     }

@@ -617,13 +617,14 @@ pub enum RelativeLineNumbers {
 #[serde(rename_all = "snake_case")]
 pub enum SeedQuerySetting {
     /// Never populate the search query from the cursor.
-    #[default]
     None,
     /// Populate the search query from a non-empty selection.
     Selection,
     /// Populate the search query from the cursor's line.
     Line,
-    /// Populate the search query from the text surrounding the cursor.
+    /// Populate the search query from a non-empty selection, otherwise from the
+    /// word surrounding the cursor.
+    #[default]
     Surround,
 }
 

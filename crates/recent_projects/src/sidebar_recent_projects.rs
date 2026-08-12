@@ -14,7 +14,7 @@ use util::{ResultExt, paths::PathExt};
 use workspace::{
     MultiWorkspace, OpenMode, OpenOptions, OpenVisible, ProjectGroupKey, RecentWorkspace,
     SerializedWorkspaceLocation, Workspace, WorkspaceDb,
-    notifications::NotifyResultExt,
+
 };
 
 use zed_actions::OpenRemote;

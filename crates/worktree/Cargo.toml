@@ -59,6 +59,7 @@ ztracing.workspace = true
 [dev-dependencies]
 clock = { workspace = true, features = ["test-support"] }
 collections = { workspace = true, features = ["test-support"] }
+fs = { workspace = true, features = ["test-support"] }
 gpui = { workspace = true, features = ["test-support"] }
 paths = { workspace = true, features = ["test-support"] }
 rand.workspace = true

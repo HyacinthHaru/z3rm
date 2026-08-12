@@ -75,6 +75,38 @@ fn test_frame_unframe_round_trip() {
     ));
 }
 
+#[test]
+fn read_file_pagination_round_trip() {
+    let request = ReadFileRequest {
+        path: "large.bin".to_string(),
+        offset_line: None,
+        max_lines: None,
+        offset_bytes: Some(4096),
+        max_bytes: Some(1024),
+    };
+    let encoded = request.encode_to_vec();
+    let decoded = ReadFileRequest::decode(encoded.as_slice()).expect("decode request");
+    assert_eq!(decoded.offset_bytes, Some(4096));
+    assert_eq!(decoded.max_bytes, Some(1024));
+
+    let response = ReadFileResponse {
+        content: vec![1, 2, 3],
+        is_binary: true,
+        encoding: "binary".to_string(),
+        offset_line: 0,
+        next_offset_line: None,
+        total_lines: 0,
+        offset_bytes: 4096,
+        next_offset_bytes: Some(4099),
+        total_bytes: 8192,
+    };
+    let encoded = response.encode_to_vec();
+    let decoded = ReadFileResponse::decode(encoded.as_slice()).expect("decode response");
+    assert_eq!(decoded.content, vec![1, 2, 3]);
+    assert_eq!(decoded.next_offset_bytes, Some(4099));
+    assert_eq!(decoded.total_bytes, 8192);
+}
+
 // §3.3 验证 FullGridSnapshot 大规模单元格编码/解码。
 #[test]
 fn test_full_snapshot_serialization() {

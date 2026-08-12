@@ -10,6 +10,36 @@ use std::process::Stdio;
 use std::time::Duration;
 use tokio::process::Command;
 
+const REMOTE_DAEMON_START_TIMEOUT: Duration = Duration::from_secs(10);
+const REMOTE_DAEMON_POLL_INTERVAL: Duration = Duration::from_millis(100);
+
+fn parse_remote_daemon_probe(output: &str) -> Result<bool> {
+    match output.trim() {
+        "available" => Ok(true),
+        "unavailable" => Ok(false),
+        other => Err(anyhow!(
+            "远程 mux_server 可用性探测返回未知结果: {other:?}"
+        )),
+    }
+}
+
+fn remote_daemon_probe_command(remote_socket: &str) -> String {
+    let pid_file = format!("{remote_socket}.pid");
+    format!(
+        "socket={}; pid_file={}; \
+         if [ -S \"$socket\" ] && [ -r \"$pid_file\" ]; then \
+           IFS= read -r pid < \"$pid_file\"; \
+           case \"$pid\" in \
+             ''|*[!0-9]*) printf unavailable ;; \
+             *) if kill -0 \"$pid\" 2>/dev/null; then printf available; \
+                else printf unavailable; fi ;; \
+           esac; \
+         else printf unavailable; fi",
+        shell_escape(remote_socket),
+        shell_escape(&pid_file),
+    )
+}
+
 // ============================================================================
 // §16.6 SSH 连接选项
 // ============================================================================
@@ -252,6 +282,137 @@ impl SshSession {
         })
     }
 
+    fn control_master_is_live(&mut self) -> Result<bool> {
+        let Some(master) = self.master_process.as_mut() else {
+            return Ok(false);
+        };
+        if master
+            .try_wait()
+            .context("检查 SSH ControlMaster 进程状态失败")?
+            .is_some()
+        {
+            return Ok(false);
+        }
+        self.control_path
+            .try_exists()
+            .with_context(|| format!("检查 SSH control socket {} 失败", self.control_path.display()))
+    }
+
+    fn take_master(&mut self) -> Result<()> {
+        if let Some(mut child) = self.master_process.take() {
+            match child
+                .try_wait()
+                .context("检查待清理 SSH ControlMaster 状态失败")?
+            {
+                Some(_) => {}
+                None => {
+                    if let Err(error) = child.start_kill() {
+                        self.master_process = Some(child);
+                        return Err(error).context("终止 SSH ControlMaster 子进程失败");
+                    }
+                }
+            }
+        }
+        self.control_dir = None;
+        self.control_path.clear();
+        Ok(())
+    }
+
+    async fn recreate_control_master(&mut self) -> Result<()> {
+        let mut replacement = Self::connect(self.options.clone())
+            .await
+            .context("重新建立 SSH ControlMaster 失败")?;
+
+        self.take_master()
+            .context("替换失效 SSH ControlMaster 时清理旧进程失败")?;
+        self.take_forward();
+        self.control_dir = replacement.control_dir.take();
+        self.control_path = std::mem::take(&mut replacement.control_path);
+        self.master_process = replacement.master_process.take();
+        Ok(())
+    }
+
+    async fn ensure_control_master(&mut self) -> Result<()> {
+        if self.control_master_is_live()? {
+            return Ok(());
+        }
+
+        tracing::warn!(
+            destination = %self.options.destination(),
+            "SSH ControlMaster 不可用，正在重新建立"
+        );
+        self.recreate_control_master().await
+    }
+
+    async fn resolve_remote_socket(&self) -> Result<String> {
+        let remote_socket = self
+            .exec("printf '%s' \"${XDG_RUNTIME_DIR:-/tmp}/z3rm/mux.sock\"")
+            .await
+            .context("解析远程 mux socket 路径失败")?;
+        let remote_socket = remote_socket.trim();
+        anyhow::ensure!(!remote_socket.is_empty(), "远程 mux socket 路径为空");
+        Ok(remote_socket.to_string())
+    }
+
+    async fn remote_daemon_available(&self, remote_socket: &str) -> Result<bool> {
+        let output = self
+            .exec(&remote_daemon_probe_command(remote_socket))
+            .await
+            .context("探测远程 mux_server 可用性失败")?;
+        parse_remote_daemon_probe(&output)
+    }
+
+    async fn start_remote_daemon_if_unavailable(&self, remote_socket: &str) -> Result<()> {
+        if self.remote_daemon_available(remote_socket).await? {
+            return Ok(());
+        }
+
+        let server_path = crate::remote_install::ensure_remote_server(self)
+            .await
+            .context("确保远程 z3rm-server 可用失败")?;
+
+        if self.remote_daemon_available(remote_socket).await? {
+            return Ok(());
+        }
+
+        self.exec(&format!(
+            "nohup {} --daemonize </dev/null >/dev/null 2>&1 &",
+            shell_escape(&server_path)
+        ))
+        .await
+        .context("启动远程 mux_server 失败")?;
+
+        match tokio::time::timeout(REMOTE_DAEMON_START_TIMEOUT, async {
+            loop {
+                if self.remote_daemon_available(remote_socket).await? {
+                    return Ok(());
+                }
+                tokio::time::sleep(REMOTE_DAEMON_POLL_INTERVAL).await;
+            }
+        })
+        .await
+        {
+            Ok(result) => result,
+            Err(_) => Err(anyhow!(
+                "远程 mux_server 启动后未在 {:?} 内可用: {}",
+                REMOTE_DAEMON_START_TIMEOUT,
+                remote_socket
+            )),
+        }
+    }
+
+    /// Re-establish any dead SSH control connection, preserve a live remote
+    /// daemon, and replace the local Unix-socket forwarding endpoint.
+    pub async fn reconnect(&mut self) -> Result<PathBuf> {
+        self.ensure_control_master().await?;
+        let remote_socket = self.resolve_remote_socket().await?;
+        self.start_remote_daemon_if_unavailable(&remote_socket)
+            .await?;
+        self.forward_socket(&remote_socket)
+            .await
+            .context("建立远程 mux socket 转发失败")
+    }
+
     /// §16.6 通过 SSH 执行远程命令，返回 stdout。
     pub async fn exec(&self, command: &str) -> Result<String> {
         let ssh_args = self.options.build_ssh_args();
@@ -337,30 +498,59 @@ impl SshSession {
             .arg("sleep")
             .arg("999999") // §16.6 保持转发进程存活，由 Drop 终止。
             .stdout(Stdio::null())
-            .stderr(Stdio::null());
+            .stderr(Stdio::piped());
 
-        let child = cmd.spawn().context("SSH socket 转发启动失败")?;
+        let mut child = cmd.spawn().context("SSH socket 转发启动失败")?;
 
-        // §16.6 等待本地 socket 就绪：轮询文件出现，而非固定延迟，避免假就绪。
+        // §16.6 等待本地 socket 就绪：轮询文件出现，同时报告转发进程提前退出。
         let forward_timeout = Duration::from_secs(5);
         let ready = tokio::time::timeout(forward_timeout, async {
             loop {
                 if local_socket_path.exists() {
-                    break;
+                    return Ok(());
                 }
-                // §16.6 转发进程提前退出说明失败。
-                // 注意：child 已被存入 session 前无法 here 检查，故仅依赖 socket 出现。
+                match child.try_wait() {
+                    Ok(Some(status)) => {
+                        let stderr_msg = match child.stderr.as_mut() {
+                            Some(stderr) => {
+                                use tokio::io::AsyncReadExt;
+                                let mut buffer = vec![0u8; 4096];
+                                match stderr.read(&mut buffer).await {
+                                    Ok(length) => {
+                                        String::from_utf8_lossy(&buffer[..length]).to_string()
+                                    }
+                                    Err(error) => format!("<读取 stderr 失败: {error}>"),
+                                }
+                            }
+                            None => String::new(),
+                        };
+                        return Err(anyhow!(
+                            "SSH socket 转发进程提前退出: status={} stderr={}",
+                            status,
+                            stderr_msg.trim()
+                        ));
+                    }
+                    Ok(None) => {}
+                    Err(error) => return Err(anyhow!("检查 SSH forward 进程状态失败: {error}")),
+                }
                 tokio::time::sleep(Duration::from_millis(50)).await;
             }
         })
         .await;
-        if ready.is_err() {
-            // §16.6 未就绪：立即终止已 spawn 的转发进程并清理临时目录。
-            let mut leaked = child;
-            if let Err(kill_err) = leaked.start_kill() {
-                tracing::warn!(error = %kill_err, "超时清理时终止 SSH forward 子进程失败");
+        match ready {
+            Ok(Ok(())) => {}
+            Ok(Err(error)) => {
+                if let Err(kill_error) = child.start_kill() {
+                    tracing::warn!(error = %kill_error, "失败清理时终止 SSH forward 子进程失败");
+                }
+                return Err(error);
             }
-            return Err(anyhow!("SSH socket 转发等待本地 socket 超时"));
+            Err(_) => {
+                if let Err(kill_error) = child.start_kill() {
+                    tracing::warn!(error = %kill_error, "超时清理时终止 SSH forward 子进程失败");
+                }
+                return Err(anyhow!("SSH socket 转发等待本地 socket 超时"));
+            }
         }
 
         // §16.6 资源所有权移交会话。
@@ -395,11 +585,9 @@ impl Drop for SshSession {
     fn drop(&mut self) {
         // §16.6 先终止 forward 转发子进程与本地 socket 目录。
         self.take_forward();
-        // §16.6 再终止 SSH ControlMaster 主进程。Drop 不能 async，用 start_kill 发送 SIGTERM。
-        if let Some(mut child) = self.master_process.take() {
-            if let Err(e) = child.start_kill() {
-                tracing::warn!(error = %e, "终止 SSH ControlMaster 子进程失败");
-            }
+        // §16.6 再终止 SSH ControlMaster 主进程。
+        if let Err(error) = self.take_master() {
+            tracing::warn!(error = %error, "清理 SSH ControlMaster 失败");
         }
         // §16.6 control_dir 在结构体析构时一并删除其临时目录。
     }
@@ -413,41 +601,13 @@ impl Drop for SshSession {
 ///
 /// 对外接口。返回 `(MuxDomain, SshSession)`，调用者需保持 `SshSession` 存活。
 pub async fn connect_ssh(target: &str) -> anyhow::Result<(super::MuxDomain, SshSession)> {
-    use crate::remote_install::ensure_remote_server;
-
-    // §16.6 步骤 1：解析连接选项。
     let options = SshConnectionOptions::from_uri(target)
         .with_context(|| format!("解析 SSH URI 失败: {}", target))?;
-    // §16.6 步骤 2：建立 SSH 会话（ControlMaster）。
     let mut session = SshSession::connect(options).await?;
-
-    // §16.6 步骤 3：探测/安装远程服务器。
-    let server_path = ensure_remote_server(&session).await?;
-
-    // §16.6 步骤 4：启动远程 mux_server 守护进程。
-    session
-        .exec(&format!(
-            "nohup {} --daemonize </dev/null >/dev/null 2>&1 &",
-            shell_escape(&server_path)
-        ))
-        .await
-        .context("启动远程 mux_server 失败")?;
-
-    // §16.6 等待服务器启动。
-    tokio::time::sleep(Duration::from_secs(1)).await;
-
-    let remote_socket = session
-        .exec("printf '%s' \"${XDG_RUNTIME_DIR:-/tmp}/z3rm/mux.sock\"")
-        .await
-        .context("解析远程 mux socket 路径失败")?;
-    let remote_socket = remote_socket.trim();
-    anyhow::ensure!(!remote_socket.is_empty(), "远程 mux socket 路径为空");
     let local_socket = session
-        .forward_socket(remote_socket)
+        .reconnect()
         .await
-        .context("建立远程 mux socket 转发失败")?;
-
-    // §16.6 步骤 5：转发远程 socket 到本地。
+        .context("准备远程 mux_server 连接失败")?;
     let domain = super::connect_local(Some(&local_socket))
         .await
         .context("通过转发的 socket 连接 mux_server 失败")?;
@@ -627,6 +787,13 @@ mod tests {
         assert_eq!(shell_escape(""), "''".to_string());
     }
 
+    #[test]
+    fn remote_daemon_probe_requires_an_explicit_state() {
+        assert!(parse_remote_daemon_probe("available\n").unwrap());
+        assert!(!parse_remote_daemon_probe("unavailable").unwrap());
+        assert!(parse_remote_daemon_probe("unexpected output").is_err());
+    }
+
     // §16.6 这些测试验证 SshSession 对 control_dir / forward_dir / forward 进程的
     // 所有权与 Drop 清理行为，不依赖真实 ssh 二进制（CI 沙箱中常不可用）。
 
@@ -677,6 +844,31 @@ mod tests {
             .output()
             .map(|o| o.status.success())
             .unwrap_or(false)
+    }
+
+    #[tokio::test]
+    async fn live_control_master_is_reused() {
+        let control_dir = tempfile::tempdir().expect("tempdir");
+        std::fs::write(control_dir.path().join("ssh_control"), b"")
+            .expect("create fake control socket");
+        let (master, _pid) = long_sleep_child();
+        let mut session = fake_session(Some(control_dir), Some(master), None, None);
+
+        assert!(session.control_master_is_live().unwrap());
+    }
+
+    #[tokio::test]
+    async fn exited_control_master_requires_recreation() {
+        let control_dir = tempfile::tempdir().expect("tempdir");
+        std::fs::write(control_dir.path().join("ssh_control"), b"")
+            .expect("create fake control socket");
+        let mut master = tokio::process::Command::new("true")
+            .spawn()
+            .expect("spawn short-lived child");
+        master.wait().await.expect("wait for short-lived child");
+        let mut session = fake_session(Some(control_dir), Some(master), None, None);
+
+        assert!(!session.control_master_is_live().unwrap());
     }
 
     #[tokio::test]

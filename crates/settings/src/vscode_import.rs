@@ -272,6 +272,9 @@ impl VsCodeSettings {
     fn tab_bar_settings_content(&self) -> TabBarSettingsContent {
         TabBarSettingsContent {
             show: true,
+            show_nav_history_buttons: Some(true),
+            show_tab_bar_buttons: Some(true),
+            show_pinned_tabs_in_separate_row: Some(false),
             middle_click_to_close: true,
             mouse_scroll_to_switch: true,
             show_active_item: false,

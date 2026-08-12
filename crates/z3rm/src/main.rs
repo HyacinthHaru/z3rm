@@ -11,7 +11,14 @@ mod open_diff;
 mod quickjs_extensions;
 mod zed;
 
-use std::{path::Path, rc::Rc, sync::Arc};
+use std::{
+    path::Path,
+    rc::Rc,
+    sync::{
+        atomic::{AtomicBool, Ordering},
+        Arc,
+    },
+};
 
 use anyhow::Context as _;
 use assets::Assets;
@@ -19,8 +26,8 @@ use crashes::InitCrashHandler;
 use fs::{Fs, RealFs};
 use futures::StreamExt as _;
 use gpui::{
-    App, AppContext as _, Application, BorrowAppContext as _, Context, Entity, Global, TaskExt,
-    WeakEntity, Window,
+    App, AppContext as _, Application, BorrowAppContext as _, Context, Entity, Global,
+    IntoElement, Render, TaskExt, WeakEntity, Window,
 };
 use gpui_platform;
 use parking_lot::Mutex;
@@ -70,10 +77,7 @@ fn focus_mux_workspace_pane(
     let focus_handle = item.item_focus_handle(cx);
     window.focus(&focus_handle, cx);
 
-    let Some(state) = workspace::AppState::try_global(cx) else {
-        return;
-    };
-    let Some(domain) = state.mux_domain.clone() else {
+    let Some(domain) = mux_domain_for_window(window, cx) else {
         return;
     };
     cx.spawn(async move |_, cx| {
@@ -271,6 +275,40 @@ fn apply_mux_layout_to_workspace(
 // §3.3 Multiple windows per session (Plan 32)
 // ============================================================================
 
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+enum MuxConnectionState {
+    #[default]
+    Connected,
+    Disconnected,
+    Reconnecting,
+}
+
+impl MuxConnectionState {
+    fn begin_reconnect(&mut self) -> bool {
+        if *self == Self::Reconnecting {
+            return false;
+        }
+        *self = Self::Reconnecting;
+        true
+    }
+
+    fn finish_reconnect(&mut self, succeeded: bool) {
+        *self = if succeeded {
+            Self::Connected
+        } else {
+            Self::Disconnected
+        };
+    }
+
+    fn mark_disconnected(&mut self) -> bool {
+        if *self == Self::Disconnected {
+            return false;
+        }
+        *self = Self::Disconnected;
+        true
+    }
+}
+
 /// §3.3 One GPUI window's mux binding.
 ///
 /// A window owns its own `MuxDomain`, i.e. its own socket, client identity and
@@ -286,7 +324,8 @@ fn apply_mux_layout_to_workspace(
 struct MuxWindow<T = mux::SshSession> {
     domain: Arc<mux::MuxDomain>,
     session_id: String,
-    ssh_session: Option<T>,
+    ssh_session: Option<Arc<futures::lock::Mutex<T>>>,
+    connection_state: MuxConnectionState,
 }
 
 /// §3.3 Client-side view of which windows share which session (Plan 32).
@@ -346,15 +385,19 @@ fn rebind_mux_window<T>(
     session_id: String,
     ssh_session: Option<T>,
 ) {
-    let held = windows
-        .get_mut(&window_id)
-        .and_then(|existing| existing.ssh_session.take());
+    let previous = windows.remove(&window_id);
+    let (held, connection_state) = previous
+        .map(|existing| (existing.ssh_session, existing.connection_state))
+        .unwrap_or_default();
     windows.insert(
         window_id,
         MuxWindow {
             domain,
             session_id,
-            ssh_session: held.or(ssh_session),
+            ssh_session: held.or_else(|| {
+                ssh_session.map(|ssh_session| Arc::new(futures::lock::Mutex::new(ssh_session)))
+            }),
+            connection_state,
         },
     );
 }
@@ -388,6 +431,70 @@ fn take_mux_window(window_id: gpui::WindowId, cx: &mut App) -> Option<MuxWindow>
         windows.windows.remove(&window_id)
     })
 }
+struct MuxReconnectRequest<T> {
+    domain: Arc<mux::MuxDomain>,
+    session_id: String,
+    ssh_session: Arc<futures::lock::Mutex<T>>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum MuxReconnectUnavailable {
+    WindowNotBound,
+    LocalWindow,
+    InProgress,
+}
+
+fn begin_mux_reconnect<T>(
+    windows: &mut std::collections::HashMap<gpui::WindowId, MuxWindow<T>>,
+    window_id: gpui::WindowId,
+) -> Result<MuxReconnectRequest<T>, MuxReconnectUnavailable> {
+    let binding = windows
+        .get_mut(&window_id)
+        .ok_or(MuxReconnectUnavailable::WindowNotBound)?;
+    let ssh_session = binding
+        .ssh_session
+        .clone()
+        .ok_or(MuxReconnectUnavailable::LocalWindow)?;
+    if !binding.connection_state.begin_reconnect() {
+        return Err(MuxReconnectUnavailable::InProgress);
+    }
+    Ok(MuxReconnectRequest {
+        domain: binding.domain.clone(),
+        session_id: binding.session_id.clone(),
+        ssh_session,
+    })
+}
+
+fn finish_mux_reconnect<T>(
+    windows: &mut std::collections::HashMap<gpui::WindowId, MuxWindow<T>>,
+    window_id: gpui::WindowId,
+    domain: &Arc<mux::MuxDomain>,
+    succeeded: bool,
+) -> bool {
+    let Some(binding) = windows.get_mut(&window_id) else {
+        return false;
+    };
+    if !Arc::ptr_eq(&binding.domain, domain) {
+        return false;
+    }
+    binding.connection_state.finish_reconnect(succeeded);
+    true
+}
+
+fn mark_remote_mux_window_disconnected<T>(
+    windows: &mut std::collections::HashMap<gpui::WindowId, MuxWindow<T>>,
+    window_id: gpui::WindowId,
+    domain: &Arc<mux::MuxDomain>,
+) -> bool {
+    let Some(binding) = windows.get_mut(&window_id) else {
+        return false;
+    };
+    if binding.ssh_session.is_none() || !Arc::ptr_eq(&binding.domain, domain) {
+        return false;
+    }
+    binding.connection_state.mark_disconnected()
+}
+
 
 /// §3.3 The mux connection that drives `window`.
 ///
@@ -407,6 +514,60 @@ fn mux_session_for_window(window: &Window, cx: &App) -> Option<String> {
     cx.try_global::<MuxWindows>()
         .and_then(|windows| windows.windows.get(&window_id))
         .map(|mux_window| mux_window.session_id.clone())
+}
+
+const MAX_OPEN_FILE_BYTES: u64 = 2 * 1024 * 1024;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum OpenFileRoute {
+    Matched,
+    Unbound,
+    WrongSession,
+}
+
+fn open_file_route(requested_session_id: &str, bound_session_id: Option<&str>) -> OpenFileRoute {
+    match bound_session_id {
+        None => OpenFileRoute::Unbound,
+        Some(bound_session_id) if bound_session_id == requested_session_id => {
+            OpenFileRoute::Matched
+        }
+        Some(_) => OpenFileRoute::WrongSession,
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum OpenFileMetadata {
+    Readable,
+    Missing,
+    Directory,
+    TooLarge,
+}
+
+fn validate_open_file_metadata(exists: bool, is_dir: bool, size: u64) -> OpenFileMetadata {
+    if !exists {
+        OpenFileMetadata::Missing
+    } else if is_dir {
+        OpenFileMetadata::Directory
+    } else if size > MAX_OPEN_FILE_BYTES {
+        OpenFileMetadata::TooLarge
+    } else {
+        OpenFileMetadata::Readable
+    }
+}
+
+fn mux_binding_for_window(
+    window: &Window,
+    cx: &App,
+) -> Option<(Arc<mux::MuxDomain>, String)> {
+    let window_id = window.window_handle().window_id();
+    cx.try_global::<MuxWindows>()
+        .and_then(|windows| windows.windows.get(&window_id))
+        .map(|mux_window| {
+            (
+                mux_window.domain.clone(),
+                mux_window.session_id.clone(),
+            )
+        })
 }
 
 /// §15.4 / §15.12 Client-side projection of one authoritative attach snapshot.
@@ -667,7 +828,227 @@ fn handle_sidebar_request(
         sidebar::SidebarRequest::ActivateSession(session_id) => {
             activate_mux_session(workspace.clone(), domain.clone(), session_id, window, cx);
         }
+        sidebar::SidebarRequest::OpenFile { session_id, path } => {
+            let binding = mux_binding_for_window(window, cx);
+            match open_file_route(
+                &session_id,
+                binding
+                    .as_ref()
+                    .map(|(_, bound_session_id)| bound_session_id.as_str()),
+            ) {
+                OpenFileRoute::Matched => {
+                    if let Some((domain, _)) = binding {
+                        open_mux_file(workspace.clone(), domain, session_id, path, window, cx);
+                    } else {
+                        daemon::show_daemon_error(
+                            cx,
+                            format!(
+                                "Cannot open {path}: this window is not attached to a mux session"
+                            ),
+                        );
+                    }
+                }
+                OpenFileRoute::Unbound => {
+                    daemon::show_daemon_error(
+                        cx,
+                        format!(
+                            "Cannot open {path}: this window is not attached to a mux session"
+                        ),
+                    );
+                }
+                OpenFileRoute::WrongSession => {
+                    if let Some((_, bound_session_id)) = binding {
+                        daemon::show_daemon_error(
+                            cx,
+                            format!(
+                                "Cannot open {path}: Files requested session {session_id}, but this window is attached to {bound_session_id}; select the file from this window's current Files browser"
+                            ),
+                        );
+                    } else {
+                        daemon::show_daemon_error(
+                            cx,
+                            format!(
+                                "Cannot open {path}: this window is not attached to a mux session"
+                            ),
+                        );
+                    }
+                }
+            }
+        }
     }
+}
+
+async fn read_mux_file_bounded(
+    domain: &mux::MuxDomain,
+    path: &str,
+    expected_size: u64,
+) -> anyhow::Result<Vec<u8>> {
+    anyhow::ensure!(
+        expected_size <= MAX_OPEN_FILE_BYTES,
+        "{path} exceeds the 2 MiB Files viewer limit"
+    );
+
+    let mut content = Vec::with_capacity(expected_size as usize);
+    let mut offset_bytes = 0;
+    loop {
+        let remaining_capacity = MAX_OPEN_FILE_BYTES.saturating_sub(offset_bytes);
+        let max_bytes = remaining_capacity
+            .max(1)
+            .min(mux_protocol::DEFAULT_READ_FILE_PAGE_BYTES as u64)
+            as u32;
+        let page = domain
+            .read_file_page(path, offset_bytes, max_bytes)
+            .await
+            .with_context(|| format!("mux read_file RPC failed for {path}"))?;
+
+        anyhow::ensure!(
+            page.total_bytes == expected_size,
+            "{path} changed size while opening (stat reported {expected_size} bytes, read reported {} bytes); refresh Files and try again",
+            page.total_bytes
+        );
+        if page.is_binary {
+            anyhow::bail!(
+                "{path} is a binary file and cannot be shown in the text viewer; open it with a binary-capable tool on the session host"
+            );
+        }
+        anyhow::ensure!(
+            content.len() + page.content.len() <= MAX_OPEN_FILE_BYTES as usize,
+            "{path} exceeds the 2 MiB Files viewer limit"
+        );
+        content.extend_from_slice(&page.content);
+
+        let Some(next_offset_bytes) = page.next_offset_bytes else {
+            return Ok(content);
+        };
+        offset_bytes = next_offset_bytes;
+    }
+}
+
+fn open_mux_file(
+    workspace: gpui::WeakEntity<workspace::Workspace>,
+    domain: Arc<mux::MuxDomain>,
+    session_id: String,
+    path: String,
+    window: &mut Window,
+    cx: &mut App,
+) {
+    window
+        .spawn(cx, async move |cx| {
+            let error_path = path.clone();
+            let result: anyhow::Result<()> = async {
+                let stat = domain
+                    .stat_file(&path)
+                    .await
+                    .with_context(|| format!("mux stat_file RPC failed for {path}"))?;
+                match validate_open_file_metadata(stat.exists, stat.is_dir, stat.size) {
+                    OpenFileMetadata::Readable => {}
+                    OpenFileMetadata::Missing => {
+                        anyhow::bail!(
+                            "{path} no longer exists; refresh Files and choose an existing file"
+                        )
+                    }
+                    OpenFileMetadata::Directory => {
+                        anyhow::bail!("{path} is a directory; choose a file from Files")
+                    }
+                    OpenFileMetadata::TooLarge => {
+                        anyhow::bail!(
+                            "{path} is {} bytes; the Files viewer limit is 2 MiB",
+                            stat.size
+                        )
+                    }
+                }
+
+                let content = read_mux_file_bounded(&domain, &path, stat.size).await?;
+                let text = String::from_utf8(content).map_err(|error| {
+                    anyhow::anyhow!(
+                        "{path} is not valid UTF-8 (invalid data begins at byte {}); convert it to UTF-8 on the session host and try again",
+                        error.utf8_error().valid_up_to()
+                    )
+                })?;
+
+                let current_session_id =
+                    cx.update(|window, cx| mux_session_for_window(window, cx))?;
+                match open_file_route(&session_id, current_session_id.as_deref()) {
+                    OpenFileRoute::Matched => {}
+                    OpenFileRoute::Unbound => {
+                        anyhow::bail!(
+                            "cannot open {path}: this window is no longer attached to a mux session"
+                        )
+                    }
+                    OpenFileRoute::WrongSession => {
+                        anyhow::bail!(
+                            "cannot open {path}: this window switched away from session {session_id}; choose the file from the current session's Files browser"
+                        )
+                    }
+                }
+
+                let language_registry = workspace.read_with(cx, |workspace, cx| {
+                    workspace.project().read(cx).languages().clone()
+                })?;
+                let language =
+                    if let Some(available) = language_registry.language_for_file_path(Path::new(&path))
+                    {
+                        Some(
+                            language_registry
+                                .load_language(&available)
+                                .await
+                                .with_context(|| {
+                                    format!("language detection was canceled for {path}")
+                                })?
+                                .with_context(|| {
+                                    format!("failed to load the detected language for {path}")
+                                })?,
+                        )
+                    } else {
+                        None
+                    };
+
+                let current_session_id =
+                    cx.update(|window, cx| mux_session_for_window(window, cx))?;
+                anyhow::ensure!(
+                    open_file_route(&session_id, current_session_id.as_deref())
+                        == OpenFileRoute::Matched,
+                    "cannot open {path}: the window's mux session changed while loading the file"
+                );
+
+                workspace.update_in(cx, move |workspace, window, cx| {
+                    let project = workspace.project().clone();
+                    let buffer = cx.new(|cx| {
+                        let mut buffer = language::Buffer::local(text, cx);
+                        buffer.set_language_registry(language_registry);
+                        buffer.set_capability(language::Capability::ReadOnly, cx);
+                        if let Some(language) = language {
+                            buffer.set_language_async(Some(language), cx);
+                        }
+                        buffer
+                    });
+                    let editor =
+                        cx.new(|cx| editor::Editor::for_buffer(buffer, Some(project), window, cx));
+                    let editor_buffer = editor.read(cx).buffer().clone();
+                    editor_buffer.update(cx, |buffer, cx| {
+                        buffer.set_title(path.clone(), cx);
+                    });
+                    workspace.add_item_to_active_pane(
+                        Box::new(editor),
+                        None,
+                        true,
+                        window,
+                        cx,
+                    );
+                })?;
+                Ok(())
+            }
+            .await;
+
+            if let Err(error) = result {
+                tracing::error!(session_id, path = error_path, %error, "opening a mux session file failed");
+                cx.update(|_, cx| {
+                    daemon::show_daemon_error(cx, format!("Failed to open {error_path}: {error}"));
+                })
+                .log_err();
+            }
+        })
+        .detach();
 }
 
 /// §15.4 / §15.12 Attach `session_id` and reproject its authoritative layout
@@ -767,7 +1148,8 @@ fn watch_mux_session_notifications(
     cx: &mut gpui::AsyncApp,
 ) {
     let notifications = domain.subscribe();
-    let window_id = domain.window_id();
+    let mux_window_id = domain.window_id();
+    let gpui_window_id = window_handle.window_id();
     // Weak, so a closed window's connection is not pinned open by this task:
     // the socket closes with the last strong handle, and the notification
     // stream then ends, which is what stops this loop.
@@ -813,7 +1195,7 @@ fn watch_mux_session_notifications(
                     let dropped_this_window = matches!(
                         &event,
                         mux_protocol::notification::Event::WindowRemoved(removed)
-                            if removed.window_id == window_id
+                            if removed.window_id == mux_window_id
                     );
                     let session_id = session_id.clone();
                     cx.update(|cx| {
@@ -840,21 +1222,40 @@ fn watch_mux_session_notifications(
                 _ => {}
             }
         }
+        let Some(domain) = domain.upgrade() else {
+            return;
+        };
+        cx.update(|cx| {
+            let Some(_) = cx.try_global::<MuxWindows>() else {
+                return;
+            };
+            let disconnected = cx.update_global::<MuxWindows, bool>(|windows, _| {
+                mark_remote_mux_window_disconnected(
+                    &mut windows.windows,
+                    gpui_window_id,
+                    &domain,
+                )
+            });
+            if disconnected {
+                daemon::show_daemon_error(
+                    cx,
+                    "Remote mux connection lost. Run mux::Reconnect to rebuild the SSH tunnel.",
+                );
+            }
+        });
     })
     .detach();
 }
 
 /// §16.9 Forward a layout ratio resize to the server.
 fn forward_layout_resize(
+    window: &Window,
     cx: &mut gpui::App,
     pane_id: String,
     direction: mux_protocol::split_node::SplitDirection,
     delta: f32,
 ) {
-    let Some(state) = workspace::AppState::try_global(cx) else {
-        return;
-    };
-    let Some(domain) = state.mux_domain.clone() else {
+    let Some(domain) = mux_domain_for_window(window, cx) else {
         return;
     };
     cx.background_executor()
@@ -1171,6 +1572,176 @@ fn surface_consent_error(cx: &mut gpui::AsyncWindowContext, action: &str, error:
     }
 }
 
+/// Process-global guard for the startup recovery prompt. A startup task can
+/// race with another window's startup task, but only one may own the prompt.
+static RECOVERY_PROMPT_CLAIMED: AtomicBool = AtomicBool::new(false);
+
+#[derive(Default)]
+struct StartupRecoveryPrompt;
+
+impl Render for StartupRecoveryPrompt {
+    fn render(
+        &mut self,
+        _window: &mut Window,
+        _cx: &mut Context<Self>,
+    ) -> impl IntoElement {
+        gpui::div()
+    }
+}
+
+enum StartupRecovery {
+    Continue {
+        warning: Option<String>,
+    },
+    Restored {
+        session_id: String,
+        snapshot: MuxSnapshot,
+    },
+}
+
+fn recovery_prompt_detail(candidates: &[mux_protocol::RecoveryCandidateInfo]) -> String {
+    let mut detail = candidates
+        .iter()
+        .map(|candidate| {
+            format!(
+                "{}\n  cwd: {}\n  panes: {}\n  metadata: {}",
+                candidate.name,
+                candidate.cwd,
+                candidate.pane_ids.len(),
+                if candidate.metadata_complete {
+                    "complete"
+                } else {
+                    "incomplete"
+                },
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("\n\n");
+    detail.push_str(
+        "\n\nOnly the saved layout and new default shells are recreated. \
+         Running processes and old commands are never restored or replayed.",
+    );
+    detail
+}
+
+fn should_probe_recovery(attach_target: Option<&str>) -> bool {
+    attach_target.is_none()
+}
+
+async fn maybe_recover_mux_session(
+    domain: &Arc<mux::MuxDomain>,
+    attach_target: Option<&str>,
+    cx: &mut gpui::AsyncApp,
+) -> StartupRecovery {
+    if !should_probe_recovery(attach_target) {
+        return StartupRecovery::Continue { warning: None };
+    }
+
+    let candidates = match domain.list_recovery_candidates().await {
+        Ok(candidates) if !candidates.is_empty() => candidates,
+        Ok(_) => return StartupRecovery::Continue { warning: None },
+        Err(error) => {
+            return StartupRecovery::Continue {
+                warning: Some(format!(
+                    "Could not inspect mux recovery candidates: {error}. Continuing with normal startup."
+                )),
+            };
+        }
+    };
+
+    if RECOVERY_PROMPT_CLAIMED
+        .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+        .is_err()
+    {
+        return StartupRecovery::Continue { warning: None };
+    }
+
+    let release_claim = || {
+        RECOVERY_PROMPT_CLAIMED.store(false, Ordering::Release);
+    };
+    let prompt_window = match cx.open_window(gpui::WindowOptions::default(), |_, cx| {
+        cx.new(|_| StartupRecoveryPrompt)
+    }) {
+        Ok(window) => window,
+        Err(error) => {
+            release_claim();
+            return StartupRecovery::Continue {
+                warning: Some(format!(
+                    "Could not open the mux recovery prompt: {error}. Continuing with normal startup."
+                )),
+            };
+        }
+    };
+
+    let detail = recovery_prompt_detail(&candidates);
+    let mut answers = candidates
+        .iter()
+        .map(|candidate| gpui::PromptButton::new(format!("Restore {}", candidate.name)))
+        .collect::<Vec<_>>();
+    answers.push(gpui::PromptButton::cancel("Skip"));
+    let answer = match prompt_window.update(cx, |_, window, cx| {
+        window.prompt(
+            gpui::PromptLevel::Warning,
+            "Recover a previous mux session?",
+            Some(&detail),
+            &answers,
+            cx,
+        )
+    }) {
+        Ok(receiver) => receiver.await.ok(),
+        Err(_) => None,
+    };
+    let _ = prompt_window.update(cx, |_, window, _| window.remove_window());
+
+    let Some(answer) = answer else {
+        return StartupRecovery::Continue {
+            warning: Some(
+                "The mux recovery prompt was cancelled. Continuing with normal startup."
+                    .to_string(),
+            ),
+        };
+    };
+    let Some(candidate) = candidates.get(answer).cloned() else {
+        return StartupRecovery::Continue { warning: None };
+    };
+
+    let confirmed = match domain.confirm_recovery(&candidate.id).await {
+        Ok(confirmed) => confirmed,
+        Err(error) => {
+            return StartupRecovery::Continue {
+                warning: Some(format!(
+                    "Could not restore mux session '{}' (it may be stale, incomplete, or already restored): {error}. Continuing with normal startup.",
+                    candidate.name
+                )),
+            };
+        }
+    };
+    if confirmed.session_id != candidate.id || confirmed.session_id.is_empty() {
+        return StartupRecovery::Continue {
+            warning: Some(format!(
+                "Mux recovery returned an invalid session for '{}'. Continuing with normal startup.",
+                candidate.name
+            )),
+        };
+    }
+
+    let attach_response = match domain.create_and_attach_window(&confirmed.session_id).await {
+        Ok(response) => response,
+        Err(error) => {
+            return StartupRecovery::Continue {
+                warning: Some(format!(
+                    "Mux session '{}' was recovered but could not be attached: {error}. Continuing with normal startup.",
+                    candidate.name
+                )),
+            };
+        }
+    };
+    StartupRecovery::Restored {
+        session_id: confirmed.session_id,
+        snapshot: MuxSnapshot::from_attach(&attach_response),
+    }
+}
+
 // ============================================================================
 // §16.1 main: GPUI 应用启动 → daemon → window
 // ============================================================================
@@ -1215,12 +1786,42 @@ fn main() {
                 eprintln!("error: failed to locate z3rm executable: {error}");
                 std::process::exit(1);
             });
+            // The parent exits immediately, so anything the GUI writes on its
+            // way down has to land somewhere durable. Sending it to /dev/null
+            // makes a GUI that dies on startup indistinguishable from one that
+            // came up fine.
+            // Two independent append handles rather than one plus `try_clone`:
+            // both writers land in the same file without sharing a cursor.
+            let attach_log_path = paths::logs_dir().join("attach.log");
+            let open_attach_log = || {
+                std::fs::create_dir_all(paths::logs_dir()).and_then(|()| {
+                    std::fs::OpenOptions::new()
+                        .create(true)
+                        .append(true)
+                        .open(&attach_log_path)
+                })
+            };
+
             let mut command = std::process::Command::new(executable);
             command
                 .env("Z3RM_GUI_ATTACH", "1")
-                .stdin(std::process::Stdio::null())
-                .stdout(std::process::Stdio::null())
-                .stderr(std::process::Stdio::null());
+                .stdin(std::process::Stdio::null());
+            match (open_attach_log(), open_attach_log()) {
+                (Ok(stdout), Ok(stderr)) => {
+                    command
+                        .stdout(std::process::Stdio::from(stdout))
+                        .stderr(std::process::Stdio::from(stderr));
+                }
+                (Err(error), _) | (_, Err(error)) => {
+                    eprintln!(
+                        "warning: failed to open {}: {error}; GUI output will be discarded",
+                        attach_log_path.display()
+                    );
+                    command
+                        .stdout(std::process::Stdio::null())
+                        .stderr(std::process::Stdio::null());
+                }
+            }
             match intent {
                 cli::LaunchIntent::Gui { target } => {
                     if let Some(target) = &target {
@@ -1231,8 +1832,9 @@ fn main() {
                         std::process::exit(1);
                     });
                     eprintln!(
-                        "z3rm: attached to session '{}' in GUI window",
-                        target.as_deref().unwrap_or("default")
+                        "z3rm: attached to session '{}' in GUI window (log: {})",
+                        target.as_deref().unwrap_or("default"),
+                        attach_log_path.display()
                     );
                     std::process::exit(0);
                 }
@@ -1244,7 +1846,10 @@ fn main() {
                         eprintln!("error: failed to launch z3rm GUI: {error}");
                         std::process::exit(1);
                     });
-                    eprintln!("z3rm: connecting to remote mux_server in a GUI window");
+                    eprintln!(
+                        "z3rm: connecting to remote mux_server in a GUI window (log: {})",
+                        attach_log_path.display()
+                    );
                     std::process::exit(0);
                 }
             }
@@ -1265,7 +1870,10 @@ fn main() {
             let runtime =
                 tokio::runtime::Runtime::new().expect("failed to create tokio runtime for CLI");
             if let Err(error) = runtime.block_on(async { cli::run_cli_command(cmd).await }) {
-                eprintln!("error: {error}");
+                // `{error}` 只印最外层那句 context, 服务端给的真正原因全被吞掉:
+                // 一次越界路径会显示成 "failed to read <path>" 而不是 "path may
+                // not contain parent traversal"。`{error:#}` 把整条 anyhow 链印出来。
+                eprintln!("error: {error:#}");
                 std::process::exit(1);
             }
             std::process::exit(0);
@@ -1520,23 +2128,41 @@ fn main() {
                 .detach();
             }
 
-            // §3.10 GUI attach target: 命令行 `attach [-t target]` 把目标 session
-            // 携带过来, 优先解析；target 为空时退回到默认 session。
-            let session_id = daemon::ensure_target_session(
-                &domain,
-                attach_target.as_deref(),
-            )
-            .await?;
-            eprintln!("[z3rm] Session: {}", session_id);
+            // §3.6 Startup recovery is offered before the normal default
+            // session path. Explicit CLI targets always win and bypass it.
+            let (session_id, snapshot, startup_warning) =
+                match maybe_recover_mux_session(&domain, attach_target.as_deref(), cx).await {
+                    StartupRecovery::Restored {
+                        session_id,
+                        snapshot,
+                    } => {
+                        eprintln!("[z3rm] Recovered session: {}", session_id);
+                        (session_id, snapshot, None)
+                    }
+                    StartupRecovery::Continue { warning } => {
+                        // §3.10 GUI attach target: `attach [-t target]` takes
+                        // precedence; without one this is the normal
+                        // create-or-reuse default session path.
+                        let session_id = daemon::ensure_target_session(
+                            &domain,
+                            attach_target.as_deref(),
+                        )
+                        .await?;
+                        eprintln!("[z3rm] Session: {}", session_id);
 
-            daemon::ensure_pane_in_session(&domain, &session_id).await?;
-            eprintln!("[z3rm] Pane ensured");
-            // §3.3 Attach with a server-minted window id so this GUI window is a
-            // distinct session member (Plan 32).
-            let attach_resp = domain.create_and_attach_window(&session_id).await?;
-            // §15.12 / §15.4 Authoritative snapshot: layout tree + pane IDs.
-            let snapshot = MuxSnapshot::from_attach(&attach_resp);
-            eprintln!("[z3rm] Attached to session ({} panes in snapshot)", snapshot.pane_ids.len());
+                        daemon::ensure_pane_in_session(&domain, &session_id).await?;
+                        eprintln!("[z3rm] Pane ensured");
+                        // §3.3 Attach with a server-minted window id so this GUI
+                        // window is a distinct session member (Plan 32).
+                        let attach_resp = domain.create_and_attach_window(&session_id).await?;
+                        let snapshot = MuxSnapshot::from_attach(&attach_resp);
+                        (session_id, snapshot, warning)
+                    }
+                };
+            eprintln!(
+                "[z3rm] Attached to session ({} panes in snapshot)",
+                snapshot.pane_ids.len()
+            );
 
             // §3.2 把 domain 注入 AppState. AppState 是 Arc<AppState>,
             // 替换整个 Arc 让后续代码 (含未来的 workspace::Open 路径) 能拿到。
@@ -1617,8 +2243,7 @@ fn main() {
                     // §15.7 Register mux_pane action handlers on every workspace.
                     workspace
                         .register_action(|workspace, _: &settings::mux_actions::SplitRight, window, cx| {
-                            let Some(state) = workspace::AppState::try_global(cx) else { return };
-                            let Some(domain) = state.mux_domain.clone() else { return };
+                            let Some(domain) = mux_domain_for_window(window, cx) else { return };
                             let Some(mux_view) = workspace.active_item_as::<terminal_view::mux_pane::MuxPaneView>(cx) else { return };
                             let pane_id = mux_view.read(cx).pane_id.clone();
                             let weak_workspace = workspace.weak_handle();
@@ -1653,8 +2278,7 @@ fn main() {
                             }).detach();
                         })
                         .register_action(|workspace, _: &settings::mux_actions::SplitDown, window, cx| {
-                            let Some(state) = workspace::AppState::try_global(cx) else { return };
-                            let Some(domain) = state.mux_domain.clone() else { return };
+                            let Some(domain) = mux_domain_for_window(window, cx) else { return };
                             let Some(mux_view) = workspace.active_item_as::<terminal_view::mux_pane::MuxPaneView>(cx) else { return };
                             let pane_id = mux_view.read(cx).pane_id.clone();
                             let weak_workspace = workspace.weak_handle();
@@ -1765,29 +2389,28 @@ fn main() {
                         .register_action(|workspace, _: &settings::mux_actions::ResizeLeft, window, cx| {
                             workspace.resize_pane(gpui::Axis::Horizontal, gpui::px(-50.0), window, cx);
                             let pane_id = workspace.active_item_as::<terminal_view::mux_pane::MuxPaneView>(cx).map(|v| v.read(cx).pane_id.clone());
-                            if let Some(id) = pane_id { forward_layout_resize(cx, id, mux_protocol::split_node::SplitDirection::LeftRight, -0.05); }
+                            if let Some(id) = pane_id { forward_layout_resize(window, cx, id, mux_protocol::split_node::SplitDirection::LeftRight, -0.05); }
                         })
                         .register_action(|workspace, _: &settings::mux_actions::ResizeRight, window, cx| {
                             workspace.resize_pane(gpui::Axis::Horizontal, gpui::px(50.0), window, cx);
                             let pane_id = workspace.active_item_as::<terminal_view::mux_pane::MuxPaneView>(cx).map(|v| v.read(cx).pane_id.clone());
-                            if let Some(id) = pane_id { forward_layout_resize(cx, id, mux_protocol::split_node::SplitDirection::LeftRight, 0.05); }
+                            if let Some(id) = pane_id { forward_layout_resize(window, cx, id, mux_protocol::split_node::SplitDirection::LeftRight, 0.05); }
                         })
                         .register_action(|workspace, _: &settings::mux_actions::ResizeUp, window, cx| {
                             workspace.resize_pane(gpui::Axis::Vertical, gpui::px(-50.0), window, cx);
                             let pane_id = workspace.active_item_as::<terminal_view::mux_pane::MuxPaneView>(cx).map(|v| v.read(cx).pane_id.clone());
-                            if let Some(id) = pane_id { forward_layout_resize(cx, id, mux_protocol::split_node::SplitDirection::TopBottom, -0.05); }
+                            if let Some(id) = pane_id { forward_layout_resize(window, cx, id, mux_protocol::split_node::SplitDirection::TopBottom, -0.05); }
                         })
                         .register_action(|workspace, _: &settings::mux_actions::ResizeDown, window, cx| {
                             workspace.resize_pane(gpui::Axis::Vertical, gpui::px(50.0), window, cx);
                             let pane_id = workspace.active_item_as::<terminal_view::mux_pane::MuxPaneView>(cx).map(|v| v.read(cx).pane_id.clone());
-                            if let Some(id) = pane_id { forward_layout_resize(cx, id, mux_protocol::split_node::SplitDirection::TopBottom, 0.05); }
+                            if let Some(id) = pane_id { forward_layout_resize(window, cx, id, mux_protocol::split_node::SplitDirection::TopBottom, 0.05); }
                         })
                         .register_action(|workspace, _: &settings::mux_actions::ResizeEqual, _window, cx| {
                             workspace.reset_pane_sizes(cx);
                         })
                         .register_action(|workspace, _: &settings::mux_actions::CloseTab, window, cx| {
-                            let Some(state) = workspace::AppState::try_global(cx) else { return };
-                            let Some(domain) = state.mux_domain.clone() else { return };
+                            let Some(domain) = mux_domain_for_window(window, cx) else { return };
                             let Some(mux_view) = workspace.active_item_as::<terminal_view::mux_pane::MuxPaneView>(cx) else { return };
                             let pane_id = mux_view.read(cx).pane_id.clone();
                             let weak_workspace = workspace.weak_handle();
@@ -1826,12 +2449,14 @@ fn main() {
                             workspace.set_pane_zoomed(pane, new_zoom, window, cx);
                         })
                         .register_action(|workspace, _: &settings::mux_actions::NewTab, window, cx| {
-                            let Some(state) = workspace::AppState::try_global(cx) else { return };
-                            let Some(domain) = state.mux_domain.clone() else { return };
+                            let Some(domain) = mux_domain_for_window(window, cx) else { return };
+                            let known_session = mux_session_for_window(window, cx);
                             let weak_workspace = workspace.weak_handle();
                             let window_handle = window.window_handle();
                             window.spawn(cx, async move |cx| {
-                                let session_id = if let Some(session_id) = domain.last_attached_session_id() {
+                                let session_id = if let Some(session_id) =
+                                    known_session.or_else(|| domain.last_attached_session_id())
+                                {
                                     Some(session_id)
                                 } else {
                                     match domain.list_sessions().await {
@@ -1885,12 +2510,14 @@ fn main() {
                             }).detach();
                         })
                         .register_action(|workspace, _: &settings::mux_actions::Attach, window, cx| {
-                            let Some(state) = workspace::AppState::try_global(cx) else { return };
-                            let Some(domain) = state.mux_domain.clone() else { return };
+                            let Some(domain) = mux_domain_for_window(window, cx) else { return };
+                            let known_session = mux_session_for_window(window, cx);
                             let weak_workspace = workspace.weak_handle();
                             window.spawn(cx, async move |cx| {
                                 let result: anyhow::Result<()> = async {
-                                let session_id = if let Some(session_id) = domain.last_attached_session_id() {
+                                let session_id = if let Some(session_id) =
+                                    known_session.or_else(|| domain.last_attached_session_id())
+                                {
                                     session_id
                                 } else {
                                     domain
@@ -1973,11 +2600,111 @@ fn main() {
                                 }
                             }).detach();
                         })
-                        .register_action(|_workspace, _: &settings::mux_actions::KillSession, _window, cx| {
-                            let Some(state) = workspace::AppState::try_global(cx) else { return };
-                            let Some(domain) = state.mux_domain.clone() else { return };
+                        .register_action(|_workspace, _: &settings::mux_actions::Reconnect, window, cx| {
+                            let window_id = window.window_handle().window_id();
+                            let reconnect = if cx.try_global::<MuxWindows>().is_some() {
+                                cx.update_global::<MuxWindows, _>(|windows, _| {
+                                    begin_mux_reconnect(&mut windows.windows, window_id)
+                                })
+                            } else {
+                                Err(MuxReconnectUnavailable::WindowNotBound)
+                            };
+                            let reconnect = match reconnect {
+                                Ok(reconnect) => reconnect,
+                                Err(MuxReconnectUnavailable::InProgress) => {
+                                    tracing::info!("mux::Reconnect ignored because this window is already reconnecting");
+                                    return;
+                                }
+                                Err(MuxReconnectUnavailable::LocalWindow) => {
+                                    daemon::show_daemon_error(
+                                        cx,
+                                        "This is a local mux window; local reconnect is automatic.",
+                                    );
+                                    return;
+                                }
+                                Err(MuxReconnectUnavailable::WindowNotBound) => {
+                                    daemon::show_daemon_error(
+                                        cx,
+                                        "This window is not bound to a mux connection.",
+                                    );
+                                    return;
+                                }
+                            };
+
+                            daemon::show_daemon_connection_lost(cx);
+                            window
+                                .spawn(cx, async move |cx| {
+                                    let result: anyhow::Result<()> = async {
+                                        let local_path = {
+                                            let mut ssh_session = reconnect.ssh_session.lock().await;
+                                            ssh_session
+                                                .reconnect()
+                                                .await
+                                                .context("failed to rebuild the SSH tunnel")?
+                                        };
+                                        reconnect
+                                            .domain
+                                            .reconnect_at_path_in_place(
+                                                &local_path,
+                                                &reconnect.session_id,
+                                                mux::AttachMode::Shared,
+                                            )
+                                            .await
+                                            .context("failed to reattach the remote mux session")?;
+                                        anyhow::Ok(())
+                                    }
+                                    .await;
+
+                                    if let Err(error) = &result {
+                                        tracing::error!(
+                                            session_id = %reconnect.session_id,
+                                            %error,
+                                            "mux::Reconnect failed"
+                                        );
+                                    }
+                                    let succeeded = result.is_ok();
+                                    if let Err(error) = cx.update(|_, cx| {
+                                        let state_updated =
+                                            if cx.try_global::<MuxWindows>().is_some() {
+                                                cx.update_global::<MuxWindows, bool>(|windows, _| {
+                                                    finish_mux_reconnect(
+                                                        &mut windows.windows,
+                                                        window_id,
+                                                        &reconnect.domain,
+                                                        succeeded,
+                                                    )
+                                                })
+                                            } else {
+                                                false
+                                            };
+                                        if !state_updated {
+                                            return;
+                                        }
+                                        match &result {
+                                            Ok(()) => daemon::show_daemon_error(
+                                                cx,
+                                                "Remote mux connection restored.",
+                                            ),
+                                            Err(error) => daemon::show_daemon_error(
+                                                cx,
+                                                format!(
+                                                    "Remote reconnect failed: {error}. Run mux::Reconnect to try again."
+                                                ),
+                                            ),
+                                        }
+                                    }) {
+                                        tracing::debug!(%error, "window closed before mux reconnect status could be shown");
+                                    }
+                                })
+                                .detach();
+                        })
+                        .register_action(|_workspace, _: &settings::mux_actions::KillSession, window, cx| {
+                            let Some(domain) = mux_domain_for_window(window, cx) else { return };
+                            let known_session = mux_session_for_window(window, cx);
                             cx.spawn(async move |_, cx| {
-                                let session_id = if let Some(session_id) = domain.last_attached_session_id() {
+                                let session_id = if let Some(session_id) =
+                                    known_session.or_else(|| domain.last_attached_session_id())
+                                {
                                     Some(session_id)
                                 } else {
                                     match domain.list_sessions().await {
@@ -2008,9 +2735,8 @@ fn main() {
                                 }
                             }).detach();
                         })
-                        .register_action(|_workspace, _: &settings::mux_actions::KillServer, _window, cx| {
-                            let Some(state) = workspace::AppState::try_global(cx) else { return };
-                            let Some(domain) = state.mux_domain.clone() else { return };
+                        .register_action(|_workspace, _: &settings::mux_actions::KillServer, window, cx| {
+                            let Some(domain) = mux_domain_for_window(window, cx) else { return };
                             cx.spawn(async move |_, cx| {
                                 if let Err(error) = domain.shutdown().await {
                                     tracing::error!(%error, "mux::KillServer failed");
@@ -2091,8 +2817,7 @@ fn main() {
                     if workspace.active_pane().read(cx).items().next().is_some() {
                         return;
                     }
-                    let Some(state) = workspace::AppState::try_global(cx) else { return };
-                    let Some(domain) = state.mux_domain.clone() else { return };
+                    let Some(domain) = mux_domain_for_window(window, cx) else { return };
                     let snapshot = snapshot_for_observer.clone();
                     tracing::info!("observe_new Workspace: injecting {} MuxPaneViews", snapshot.pane_ids.len());
 
@@ -2187,6 +2912,9 @@ fn main() {
             )
             .await?;
             eprintln!("[z3rm] Window created Ok: {:?}", window_handle);
+            if let Some(warning) = startup_warning {
+                cx.update(|cx| daemon::show_daemon_error(cx, warning));
+            }
 
             anyhow::Ok(())
         })
@@ -2295,6 +3023,33 @@ mod tests {
         );
         assert!(windows.session_window_ids("session-2").is_empty());
     }
+    #[test]
+    fn reconnect_state_serializes_attempts_and_records_outcomes() {
+        let mut state = super::MuxConnectionState::Disconnected;
+
+        assert!(state.begin_reconnect());
+        assert_eq!(state, super::MuxConnectionState::Reconnecting);
+        assert!(
+            !state.begin_reconnect(),
+            "a second reconnect must not start while one is in flight"
+        );
+
+        state.finish_reconnect(false);
+        assert_eq!(state, super::MuxConnectionState::Disconnected);
+        assert!(state.begin_reconnect());
+        state.finish_reconnect(true);
+        assert_eq!(state, super::MuxConnectionState::Connected);
+    }
+
+    #[test]
+    fn reconnect_action_is_registered() {
+        assert!(
+            gpui::generate_list_of_all_registered_actions()
+                .any(|action| action.name == "mux::Reconnect"),
+            "native mux::Reconnect action must be registered"
+        );
+    }
+
 
     /// §3.3 / §16.6 Swapping a window's binding (sidebar session switch) must
     /// carry any held SSH session across the swap: the tunnel keeps the
@@ -2402,6 +3157,7 @@ mod tests {
             "mux::KillSession",
             "mux::KillServer",
             "mux::NewWindow",
+            "mux::Reconnect",
         ] {
             assert!(
                 action_names.contains(required),
@@ -2487,5 +3243,65 @@ mod tests {
             "tmux profile must not retain default's mux::Detach binding, still bound to: {:?}",
             after.iter().map(|b| b.action().name()).collect::<Vec<_>>()
         );
+    }
+    #[test]
+    fn file_viewer_routes_only_to_the_window_bound_session() {
+        assert_eq!(
+            super::open_file_route("session-a", Some("session-a")),
+            super::OpenFileRoute::Matched
+        );
+        assert_eq!(
+            super::open_file_route("session-a", Some("session-b")),
+            super::OpenFileRoute::WrongSession
+        );
+        assert_eq!(
+            super::open_file_route("session-a", None),
+            super::OpenFileRoute::Unbound
+        );
+    }
+
+    #[test]
+    fn file_viewer_enforces_the_two_mib_limit() {
+        assert_eq!(
+            super::validate_open_file_metadata(true, false, super::MAX_OPEN_FILE_BYTES),
+            super::OpenFileMetadata::Readable
+        );
+        assert_eq!(
+            super::validate_open_file_metadata(true, false, super::MAX_OPEN_FILE_BYTES + 1),
+            super::OpenFileMetadata::TooLarge
+        );
+        assert_eq!(
+            super::validate_open_file_metadata(false, false, 0),
+            super::OpenFileMetadata::Missing
+        );
+        assert_eq!(
+            super::validate_open_file_metadata(true, true, 0),
+            super::OpenFileMetadata::Directory
+        );
+    }
+
+    #[test]
+    fn recovery_prompt_is_skipped_for_explicit_attach_targets() {
+        assert!(super::should_probe_recovery(None));
+        assert!(!super::should_probe_recovery(Some("session-1")));
+    }
+
+    #[test]
+    fn recovery_prompt_detail_describes_layout_only_recreation() {
+        let detail = super::recovery_prompt_detail(&[
+            mux_protocol::RecoveryCandidateInfo {
+                id: "session-1".to_string(),
+                name: "work".to_string(),
+                cwd: "/tmp/work".to_string(),
+                metadata_complete: false,
+                pane_ids: vec!["pane-1".to_string(), "pane-2".to_string()],
+            },
+        ]);
+        assert!(detail.contains("work"));
+        assert!(detail.contains("cwd: /tmp/work"));
+        assert!(detail.contains("panes: 2"));
+        assert!(detail.contains("metadata: incomplete"));
+        assert!(detail.contains("new default shells"));
+        assert!(detail.contains("never restored or replayed"));
     }
 }

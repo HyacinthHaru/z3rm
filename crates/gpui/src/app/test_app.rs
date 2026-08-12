@@ -486,8 +486,7 @@ impl<V: 'static + Render> TestAppWindow<V> {
         let mut app = self.app.borrow_mut();
         let any_handle: AnyWindowHandle = self.handle.into();
         app.update_window(any_handle, |_, window, cx| {
-            let arena_clear_needed = window.draw(cx);
-            arena_clear_needed.clear(cx);
+            window.draw(cx).clear(cx);
         })
         .unwrap();
     }

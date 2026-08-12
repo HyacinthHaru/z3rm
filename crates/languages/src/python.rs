@@ -78,11 +78,9 @@ impl ShellKind {
         if s.contains('\0') {
             return None;
         }
-        if s.contains([' ', '"', '\\', '$', '`', '!', ';', '|', '&', '(', ')']) {
-            Some(format!("'{}'", s.replace('\'', "'\\''")))
-        } else {
-            Some(s.to_string())
-        }
+        self.to_util_shell_kind()
+            .try_quote(s)
+            .map(|quoted| quoted.into_owned())
     }
 
     /// shell 激活脚本的关键字 (spec §3.1 L1)
@@ -114,6 +112,22 @@ impl ShellKind {
             util::shell::ShellKind::Rc => ShellKind::Rc,
             util::shell::ShellKind::Xonsh => ShellKind::Xonsh,
             util::shell::ShellKind::Elvish => ShellKind::Elvish,
+        }
+    }
+
+    fn to_util_shell_kind(self) -> util::shell::ShellKind {
+        match self {
+            ShellKind::Posix => util::shell::ShellKind::Posix,
+            ShellKind::Fish => util::shell::ShellKind::Fish,
+            ShellKind::Csh => util::shell::ShellKind::Csh,
+            ShellKind::Tcsh => util::shell::ShellKind::Tcsh,
+            ShellKind::PowerShell => util::shell::ShellKind::PowerShell,
+            ShellKind::Pwsh => util::shell::ShellKind::Pwsh,
+            ShellKind::Nushell => util::shell::ShellKind::Nushell,
+            ShellKind::Cmd => util::shell::ShellKind::Cmd,
+            ShellKind::Rc => util::shell::ShellKind::Rc,
+            ShellKind::Xonsh => util::shell::ShellKind::Xonsh,
+            ShellKind::Elvish => util::shell::ShellKind::Elvish,
         }
     }
 }

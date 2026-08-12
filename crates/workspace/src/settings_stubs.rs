@@ -62,10 +62,10 @@ pub enum ShowDiagnostics {
 #[derive(Copy, Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum SeedQuerySetting {
-    #[default]
     None,
     Selection,
     Line,
+    #[default]
     Surround,
 }
 

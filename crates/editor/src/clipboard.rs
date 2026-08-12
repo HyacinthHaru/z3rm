@@ -591,6 +591,7 @@ impl Editor {
 
         let max_point = buffer.max_point();
         let mut is_first = true;
+        let mut prev_selection_was_entire_line = false;
         for selection in &selections {
             let mut start = selection.start;
             let mut end = selection.end;
@@ -646,7 +647,6 @@ impl Editor {
 
             let is_multiline_trim = trimmed_selections.len() > 1;
             let mut selection_len: usize = 0;
-            let prev_selection_was_entire_line = is_entire_line && !is_multiline_trim;
 
             for trimmed_range in trimmed_selections {
                 if is_first {
@@ -666,6 +666,7 @@ impl Editor {
                     selection_len += 1;
                 }
             }
+            prev_selection_was_entire_line = is_entire_line && !is_multiline_trim;
 
             clipboard_selections.push(ClipboardSelection::for_buffer(
                 selection_len,

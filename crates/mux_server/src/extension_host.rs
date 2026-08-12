@@ -33,7 +33,7 @@ use http_client::HttpClient as _;
 use reqwest_client::ReqwestClient;
 use mux_protocol::{ExtensionChromeUpdate, Notification};
 use quickjs_runtime::{
-    ExtensionRunner, FilesystemAccess, HostBridge, LiveExtension,
+    ExtensionManifest, ExtensionRunner, FilesystemAccess, HostBridge, LiveExtension,
     discover_server_extensions, extension_roots, parse_manifest_str,
 };
 
@@ -728,7 +728,7 @@ enum HostCommand {
     /// Extract + load (or replace) an extension on a fresh worker, answering
     /// on `reply`.
     Install {
-        id: String,
+        manifest: ExtensionManifest,
         archive: Vec<u8>,
         reply: tokio::sync::oneshot::Sender<Result<()>>,
     },
@@ -828,6 +828,7 @@ enum WorkerSetup {
     /// §16.6 Fresh install: extract, validate and activate on the worker
     /// thread; the extracted directory is swapped into place atomically.
     Install {
+        manifest: ExtensionManifest,
         archive: Vec<u8>,
         user_extensions_dir: PathBuf,
         sessions: Sessions,
@@ -1230,6 +1231,12 @@ impl ServerExtensionHost {
             );
         }
         validate_extension_id(&manifest.id)?;
+        if manifest.id != name {
+            bail!(
+                "extension manifest id `{}` does not match request name `{name}`",
+                manifest.id
+            );
+        }
         // §5.6 Approval gate: an install is refused before any extraction
         // when the shipped manifest is not approved for its exact policy
         // fingerprint. The host thread re-checks the on-disk copy.
@@ -1244,7 +1251,7 @@ impl ServerExtensionHost {
         let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
         self.command_tx
             .send(HostCommand::Install {
-                id: manifest.id.clone(),
+                manifest,
                 archive: request.source.clone(),
                 reply: reply_tx,
             })
@@ -1939,12 +1946,18 @@ fn host_thread_main(
             Err(_) => break,
         };
         match command {
-            HostCommand::Install { id, archive, reply } => {
+            HostCommand::Install {
+                manifest,
+                archive,
+                reply,
+            } => {
+                let id = manifest.id.clone();
                 let deadline = Instant::now() + INSTALL_TIMEOUT;
                 let result = manager
                     .spawn_worker(
                         id.clone(),
                         WorkerSetup::Install {
+                            manifest,
                             archive,
                             user_extensions_dir: user_extensions_dir.to_path_buf(),
                             sessions: sessions.clone(),
@@ -2022,13 +2035,14 @@ fn worker_thread_main(
 ) {
     let live = match setup {
         WorkerSetup::Install {
+            manifest,
             archive,
             user_extensions_dir,
             sessions,
             consent,
         } => match install_on_host_thread(
             &user_extensions_dir,
-            &extension_id,
+            &manifest,
             &archive,
             sessions,
             &consent,
@@ -2146,11 +2160,12 @@ fn suspension_notice_json(extension_id: &str, reason: SuspensionReason) -> Strin
 /// never reach activation.
 fn install_on_host_thread(
     user_extensions_dir: &Path,
-    id: &str,
+    expected_manifest: &ExtensionManifest,
     archive: &[u8],
     sessions: Sessions,
     consent: &BTreeMap<String, ServerConsentRecord>,
 ) -> Result<LiveExtension> {
+    let id = &expected_manifest.id;
     std::fs::create_dir_all(user_extensions_dir)
         .with_context(|| format!("creating {}", user_extensions_dir.display()))?;
     let staging_root = user_extensions_dir.join(".staging");
@@ -2177,6 +2192,9 @@ fn install_on_host_thread(
             .with_context(|| format!("reading {}", manifest_path.display()))?;
         let manifest = parse_manifest_str(id, &manifest_text)
             .with_context(|| format!("parsing {}", manifest_path.display()))?;
+        if &manifest != expected_manifest {
+            bail!("archive manifest for `{id}` does not match the request manifest");
+        }
         // Defense in depth: the request pre-validated the shipped manifest,
         // but the on-disk copy is what actually loads.
         if !manifest.side.runs_on_server() {
@@ -2662,6 +2680,56 @@ mod tests {
         );
         // Nothing was extracted for a rejected install.
         assert!(!temp.path().join("extensions/client-only").exists());
+    }
+
+    #[tokio::test]
+    async fn install_rejects_an_archive_with_a_different_manifest() {
+        let temp = tempfile::tempdir().unwrap();
+        let (sessions, _rx) = sessions_with_subscriber();
+        let host = ServerExtensionHost::start(sessions, temp.path().join("extensions"));
+        let requested_manifest = server_manifest("requested");
+        let archive_manifest = server_manifest("substituted");
+        let request = mux_protocol::InstallExtensionRequest {
+            name: "requested".to_string(),
+            manifest: requested_manifest.into_bytes(),
+            source: pack_archive(&[
+                ("extension.toml", &archive_manifest),
+                ("main.js", "export function activate() {}"),
+            ]),
+        };
+        approve_request(&host, &request);
+
+        let error = host.install_extension(&request).await.unwrap_err();
+
+        assert!(
+            format!("{error:#}").contains("does not match"),
+            "unexpected error: {error:#}"
+        );
+        assert!(!temp.path().join("extensions/requested").exists());
+    }
+
+    #[tokio::test]
+    async fn install_rejects_a_manifest_with_a_different_request_name() {
+        let temp = tempfile::tempdir().unwrap();
+        let (sessions, _rx) = sessions_with_subscriber();
+        let host = ServerExtensionHost::start(sessions, temp.path().join("extensions"));
+        let manifest = server_manifest("manifest-id");
+        let request = mux_protocol::InstallExtensionRequest {
+            name: "request-name".to_string(),
+            manifest: manifest.as_bytes().to_vec(),
+            source: pack_archive(&[
+                ("extension.toml", &manifest),
+                ("main.js", "export function activate() {}"),
+            ]),
+        };
+
+        let error = host.install_extension(&request).await.unwrap_err();
+
+        assert!(
+            format!("{error:#}").contains("does not match request name"),
+            "unexpected error: {error:#}"
+        );
+        assert!(!temp.path().join("extensions/manifest-id").exists());
     }
 
     #[tokio::test]

@@ -4,7 +4,7 @@
 //! The engine is the primary entry point for recording file changes,
 //! querying versions, declining to prior versions, and listing history.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::path::Path;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -697,6 +697,19 @@ impl ShadowSnapshotEngine {
         Ok(content_hash)
     }
 
+    /// The trigger on this path's current HEAD, or `None` when the path has no
+    /// recorded history at all.
+    ///
+    /// Callers routing filesystem events need to tell three states apart before
+    /// writing a tombstone: a path that was never versioned (nothing to point
+    /// back to), a path already tombstoned (the removal is recorded), and a
+    /// path with live content history. This is an O(1) in-memory lookup, unlike
+    /// `list_versions`, so it is cheap enough to consult per event.
+    pub fn head_trigger(&self, path: &Path) -> Option<SnapshotTrigger> {
+        let head = self.tree.get_head(&compute_path_hash(path))?;
+        self.tree.get_node(head).map(|node| node.trigger)
+    }
+
     /// List all versions of a file.
     pub fn list_versions(&self, path: &Path) -> Result<Vec<(VersionId, SeqNo, SnapshotTrigger)>> {
         let path_hash = compute_path_hash(path);
@@ -711,6 +724,29 @@ impl ShadowSnapshotEngine {
         versions.sort_by_key(|(_, seq, _)| *seq);
         Ok(versions)
     }
+
+    /// Summarize every path that has at least one version: version count and
+    /// the newest SeqNo among them, newest first.
+    ///
+    /// Nodes only ever carry `path_hash`, never the path itself, so callers
+    /// have to supply their own reverse mapping to turn these into filenames
+    /// (mux holds one; see `recover_incomplete_restores` for the same split).
+    pub fn list_path_summaries(&self) -> Vec<(PathHash, u64, SeqNo)> {
+        let mut summaries: HashMap<PathHash, (u64, SeqNo)> = HashMap::new();
+        for (_, node) in self.tree.iter_nodes() {
+            let entry = summaries.entry(node.path_hash).or_insert((0, 0));
+            entry.0 += 1;
+            entry.1 = entry.1.max(node.seq_no);
+        }
+
+        let mut summaries: Vec<_> = summaries
+            .into_iter()
+            .map(|(path_hash, (count, latest_seq_no))| (path_hash, count, latest_seq_no))
+            .collect();
+        summaries.sort_by(|left, right| right.2.cmp(&left.2));
+        summaries
+    }
+
     /// 崩溃恢复：补完所有未完成的 decline 还原操作。
     ///
     /// 扫描 WAL 找出有 Decline 意图但无对应 DeclineDone 的条目，

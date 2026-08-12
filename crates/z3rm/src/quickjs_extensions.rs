@@ -25,14 +25,14 @@ use std::time::Duration;
 use anyhow::{Context as _, Result, anyhow, bail};
 use extension_host::vdom_bridge::{self, CommandInvocation, VDomChild, VDomNode};
 use futures::{AsyncReadExt as _, StreamExt as _};
-use http_client::HttpClient as _;
-use reqwest_client::ReqwestClient;
 use gpui::{AppContext as _, Global, Keystroke, SharedString};
+use http_client::HttpClient as _;
 use parking_lot::Mutex;
 use quickjs_runtime::{
-    DiscoveredExtension, ExtensionCapabilities, ExtensionRunResult, ExtensionRunner,
-    ExtensionSide, FilesystemAccess, HostBridge, LiveExtension,
+    DiscoveredExtension, ExtensionCapabilities, ExtensionLimits, ExtensionRunResult,
+    ExtensionRunner, ExtensionSide, FilesystemAccess, HostBridge, LiveExtension,
 };
+use reqwest_client::ReqwestClient;
 
 /// §5.4 Upper bound on a single blocking mux RPC issued from the extension
 /// thread. The extension host is a dedicated thread, so blocking here can only
@@ -1169,6 +1169,7 @@ fn pending_approval_for(extension: &DiscoveredExtension) -> PendingApproval {
     }
 }
 
+
 // ---------------------------------------------------------------------------
 // §5.2 Dedicated-thread extension host actor.
 //
@@ -1683,13 +1684,16 @@ fn suspension_notices(live_extensions: &[HostedExtension]) -> Vec<VDomNode> {
         .collect()
 }
 
-/// §5.6 Deliver one host event to every non-suspended extension, returning
-/// the total number of handler invocations that ran. A suspended extension
-/// is skipped here (and in every other dispatch point) so it receives no
-/// further work for the process lifetime.
+/// §5.6 Deliver one authorized host event to every non-suspended extension,
+/// returning the total number of handler invocations that ran. Capability
+/// filtering happens before entering JavaScript, so an extension cannot
+/// subscribe around a manifest denial. A suspended extension is skipped here
+/// (and in every other dispatch point) for the rest of the process lifetime.
 fn deliver_event(live_extensions: &mut [HostedExtension], event: &str, payload: &str) -> usize {
     let mut delivered = 0;
-    for hosted in live_extensions.iter_mut().filter(|hosted| !hosted.suspended) {
+    for hosted in live_extensions.iter_mut().filter(|hosted| {
+        !hosted.suspended && hosted.live.capabilities().allows_host_event(event)
+    }) {
         match hosted.live.emit_event(event, payload) {
             Ok(count) => delivered += count,
             Err(error) => {
@@ -1699,7 +1703,6 @@ fn deliver_event(live_extensions: &mut [HostedExtension], event: &str, payload: 
     }
     delivered
 }
-
 impl ExtensionHostController {
     pub fn new() -> Self {
         Self {
@@ -2066,7 +2069,6 @@ impl ExtensionHostController {
             });
         }
     }
-
     /// §5.6 Apply pending-approval lists the host thread pushes, mirroring
     /// the chrome channel: the task parks on the channel, and each push
     /// replaces the controller's view of what awaits the user's decision.
@@ -2136,7 +2138,6 @@ impl ExtensionHostController {
         }
         cx.notify();
     }
-
     /// §5.6 Extensions waiting for the user's first-install decision.
     pub fn pending_approvals(&self) -> Vec<PendingApproval> {
         self.pending_approvals.clone()
@@ -3582,7 +3583,6 @@ mod tests {
 
         std::fs::remove_dir_all(root).expect("remove extension root");
     }
-
     #[test]
     fn server_chrome_update_replaces_and_removes_view() {
         let mut server = BTreeMap::new();
@@ -3680,7 +3680,6 @@ mod tests {
             "expected op-count rejection, got: {message}"
         );
     }
-
     #[test]
     fn server_chrome_nodes_merge_after_local_nodes() {
         let local = VDomNode {

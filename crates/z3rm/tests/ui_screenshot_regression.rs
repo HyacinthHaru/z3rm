@@ -274,6 +274,42 @@ fn draw_until(
     }
 }
 
+
+/// Like [`draw_until`], but the convergence test looks at pixels.
+///
+/// The framebuffer is the ground truth for the async grid-update path: the
+/// updated grid's accent row only reaches the screen after the dirty signal
+/// triggered a follow-up fetch, so the frame that converges is the frame that
+/// proves the pull happened.
+fn draw_until_pixels(
+    cx: &mut HeadlessAppContext,
+    window: AnyWindowHandle,
+    converged: impl Fn(&RgbaImage) -> bool,
+) -> Result<(RgbaImage, serde_json::Value)> {
+    let deadline = Instant::now() + CONVERGE_TIMEOUT;
+    loop {
+        cx.run_until_parked();
+        // MuxPaneView coalesces the PaneOutput dirty signal behind a background
+        // timer; without advancing the clock that timer never fires and the
+        // follow-up grid fetch is never scheduled.
+        cx.advance_clock(Duration::from_millis(20));
+        cx.run_until_parked();
+        let (image, tree) = draw_frame(cx, window)?;
+        if converged(&image) {
+            return Ok((image, tree));
+        }
+        if Instant::now() >= deadline {
+            anyhow::bail!(
+                "frame never converged within {:?}; distinct colors: {}, roles seen: {:?}",
+                CONVERGE_TIMEOUT,
+                distinct_colors(&image),
+                a11y_role_summary(&tree)
+            );
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
+}
+
 // ============================================================================
 // Mock mux server (§3.3 grid sync)
 // ============================================================================
@@ -347,20 +383,44 @@ impl MockGrid {
 
 /// Serve mux requests on `stream` until the peer disconnects or `stop` is set.
 ///
-/// `FetchGridUpdate` always answers with the same full snapshot: the view may
-/// refetch after a resize, and re-sending the authoritative snapshot is exactly
-/// what a real server does on a generation mismatch (§15.4). Every other
-/// request gets an empty (success) response so nothing the view does at startup
-/// — resize, focus, subscribe — is left hanging.
+/// `FetchGridUpdate` returns the current full snapshot when the caller is stale
+/// and `NoChange` at the current generation, including the history-checkpoint
+/// confirmation fetch. Scrollback requests page through the matching history
+/// fixture. Every other request gets an empty success response so nothing the
+/// view does at startup is left hanging.
 fn serve_mock_mux(
+    stream: UnixStream,
+    grid: MockGrid,
+    stop: Arc<AtomicBool>,
+) -> Result<(), String> {
+    serve_mock_mux_with_output(stream, grid, None, Vec::new(), stop)
+}
+
+/// Same as [`serve_mock_mux`], plus the post-fetch story that exercises the
+/// §3.1 push-signal / §3.3 pull-data contract: one nonempty `PaneOutputChunk`
+/// (sequence 1) is pushed right after the first grid fetch, and `updated_grid`
+/// — when given — becomes the authoritative full grid for a stale follow-up
+/// fetch, the way a real server reports its post-output state.
+///
+/// PaneOutput is a lossy dirty signal only: the client never parses the byte
+/// payload, so the mock never has to make that payload meaningful. The renderer
+/// changes exclusively through the structured grid snapshot path.
+fn serve_mock_mux_with_output(
     mut stream: UnixStream,
     grid: MockGrid,
+    updated_grid: Option<MockGrid>,
+    pane_output: Vec<u8>,
     stop: Arc<AtomicBool>,
 ) -> Result<(), String> {
     stream
         .set_read_timeout(Some(Duration::from_millis(100)))
         .map_err(|error| format!("set mock mux read timeout: {error}"))?;
 
+    let snapshot = grid.snapshot();
+    let updated = updated_grid.as_ref().map(MockGrid::snapshot);
+    let updated_generation = updated_grid.as_ref().map_or(0, |grid| grid.generation);
+    let mut fetches_served = 0u64;
+    let mut pane_output_sent = false;
     let mut buffered: Vec<u8> = Vec::new();
     let mut chunk = [0u8; 8192];
 
@@ -383,7 +443,33 @@ fn serve_mock_mux(
             let Some(EnvelopePayload::Request(request)) = envelope.payload else {
                 continue;
             };
-            let response = mock_response(&request, &grid);
+            // The real server pushes PaneOutput to every attached client; it
+            // does not wait for a SubscribePaneOutput request, and the client
+            // never sends one. The first grid fetch is the point where the view
+            // is known to be listening.
+            let is_grid_fetch = matches!(&request.body, Some(RequestBody::FetchGridUpdate(_)));
+            // The first fetch is answered with the initial grid (generation 9,
+            // output fence 0 — no chunk is part of that state yet). The stale
+            // follow-up fetch triggered by the chunk is answered with the
+            // authoritative updated grid (generation 10, output fence 1).
+            let (served_snapshot, served_history, served_generation, served_fence) =
+                match (&updated, updated_grid.as_ref(), fetches_served) {
+                    (Some(_), Some(_), 0) => (&snapshot, grid.history.as_slice(), grid.generation, 0),
+                    (Some(updated), Some(updated_grid), _) => (
+                        updated,
+                        updated_grid.history.as_slice(),
+                        updated_generation,
+                        1,
+                    ),
+                    _ => (&snapshot, grid.history.as_slice(), grid.generation, 0),
+                };
+            let response = mock_response(
+                &request,
+                served_snapshot,
+                served_history,
+                served_generation,
+                served_fence,
+            );
             let bytes = mux_protocol::frame(&Envelope {
                 version: Some(mux_protocol::PROTOCOL_VERSION),
                 payload: Some(EnvelopePayload::Response(response)),
@@ -396,62 +482,80 @@ fn serve_mock_mux(
                 }
                 return Err(format!("mock mux write: {error}"));
             }
+
+            if is_grid_fetch {
+                fetches_served += 1;
+            }
+
+            if is_grid_fetch && fetches_served == 1 && !pane_output_sent && !pane_output.is_empty() {
+                pane_output_sent = true;
+                let notification = Envelope {
+                    version: Some(mux_protocol::PROTOCOL_VERSION),
+                    payload: Some(EnvelopePayload::Notification(
+                        mux_protocol::Notification {
+                            event: Some(mux_protocol::notification::Event::PaneOutput(
+                                mux_protocol::PaneOutputChunk {
+                                    pane_id: MOCK_PANE_ID.to_string(),
+                                    data: pane_output.clone(),
+                                    // First emitted chunk for this pane, so the
+                                    // per-pane monotonic sequence starts at 1.
+                                    output_sequence: 1,
+                                },
+                            )),
+                        },
+                    )),
+                };
+                let bytes = mux_protocol::frame(&notification)
+                    .map_err(|error| format!("encode mock pane output: {error}"))?;
+                if let Err(error) = stream.write_all(&bytes) {
+                    if error.kind() == ErrorKind::BrokenPipe {
+                        return Ok(());
+                    }
+                    return Err(format!("mock mux write: {error}"));
+                }
+            }
         }
     }
     Ok(())
 }
 
-fn mock_response(request: &Request, grid: &MockGrid) -> Response {
-    let generation = grid.generation;
+fn mock_response(
+    request: &Request,
+    snapshot: &FullGridSnapshot,
+    history: &[String],
+    generation: u64,
+    output_sequence: u64,
+) -> Response {
     let body = match &request.body {
         Some(RequestBody::FetchGridUpdate(fetch)) => {
-            if fetch.since_generation == generation {
-                // Stable checkpoint / quiet refetch: the grid has not moved
-                // since the client's generation (§15.4).
-                Some(ResponseBody::GridUpdate(FetchGridUpdateResponse {
-                    from_generation: generation,
-                    to_generation: generation,
-                    update: None,
-                    output_sequence: 0,
-                }))
-            } else {
-                Some(ResponseBody::GridUpdate(FetchGridUpdateResponse {
-                    from_generation: fetch.since_generation,
-                    to_generation: generation,
-                    update: Some(FetchUpdate::FullSnapshot(grid.snapshot())),
-                    output_sequence: 0,
-                }))
-            }
+            Some(ResponseBody::GridUpdate(FetchGridUpdateResponse {
+                from_generation: fetch.since_generation,
+                to_generation: generation,
+                // Highest PaneOutputChunk.output_sequence incorporated into the
+                // returned grid state: 0 before any chunk was emitted, 1 once
+                // the pane's first chunk is part of the state.
+                output_sequence,
+                update: (fetch.since_generation != generation)
+                    .then(|| FetchUpdate::FullSnapshot(snapshot.clone())),
+            }))
         }
         Some(RequestBody::FetchScrollback(fetch)) => {
             let from = fetch.from_line as usize;
             let count = fetch.count as usize;
-            let lines = (from..from + count)
-                .map(|row| RowChange {
-                    row: row as u32,
-                    cells: grid
-                        .history
-                        .get(row)
-                        .map(|line| {
-                            let chars: Vec<char> = line.chars().collect();
-                            (0..grid.cols)
-                                .map(|col| Cell {
-                                    char: chars
-                                        .get(col as usize)
-                                        .copied()
-                                        .unwrap_or(' ')
-                                        .to_string(),
-                                    ..Default::default()
-                                })
-                                .collect()
-                        })
-                        .unwrap_or_default(),
-                })
+            let indices = if history.is_empty() || count == 0 || from >= history.len() {
+                0..0
+            } else if fetch.direction == 0 {
+                from.saturating_sub(count.saturating_sub(1))..from.saturating_add(1)
+            } else {
+                from..from.saturating_add(count).min(history.len())
+            };
+            let lines = indices
+                .map(|row| mock_history_row(row, &history[row], snapshot.cols))
                 .collect();
             Some(ResponseBody::Scrollback(FetchScrollbackResponse {
                 lines,
-                total_lines: u32::try_from(grid.history.len()).expect("history fits u32"),
-                scrollback_version: grid.history_version,
+                total_lines: u32::try_from(history.len()).unwrap_or(u32::MAX),
+                scrollback_version: snapshot.history_version,
             }))
         }
         // Empty body = success. Anything the view issues during startup that is
@@ -461,6 +565,23 @@ fn mock_response(request: &Request, grid: &MockGrid) -> Response {
     Response {
         request_id: request.request_id,
         body,
+    }
+}
+
+fn mock_history_row(row: usize, text: &str, cols: u32) -> RowChange {
+    let cells = text
+        .chars()
+        .chain(std::iter::repeat(' '))
+        .take(cols as usize)
+        .map(|character| Cell {
+            char: character.to_string(),
+            foreground: 0xd0d0d0,
+            ..Default::default()
+        })
+        .collect();
+    RowChange {
+        row: u32::try_from(row).unwrap_or(u32::MAX),
+        cells,
     }
 }
 
@@ -492,6 +613,17 @@ struct MockMuxServer {
 
 impl MockMuxServer {
     fn start(grid: MockGrid) -> Result<(Arc<MuxDomain>, Self)> {
+        Self::start_with_output(grid, None, Vec::new())
+    }
+
+    /// Like [`Self::start`], plus the optional post-fetch story: an updated
+    /// authoritative grid served on follow-up fetches and a `PaneOutputChunk`
+    /// pushed after the first fetch. See [`serve_mock_mux_with_output`].
+    fn start_with_output(
+        grid: MockGrid,
+        updated_grid: Option<MockGrid>,
+        pane_output: Vec<u8>,
+    ) -> Result<(Arc<MuxDomain>, Self)> {
         let (client, server) = UnixStream::pair().context("create mux socket pair")?;
         client
             .set_nonblocking(true)
@@ -502,7 +634,7 @@ impl MockMuxServer {
         let stop = Arc::new(AtomicBool::new(false));
         let thread = std::thread::spawn({
             let stop = stop.clone();
-            move || serve_mock_mux(server, grid, stop)
+            move || serve_mock_mux_with_output(server, grid, updated_grid, pane_output, stop)
         });
         Ok((
             domain,
@@ -532,6 +664,10 @@ impl Drop for MockMuxServer {
 // ============================================================================
 
 const TERMINAL_MARKER: &str = "Z3RM-HEADLESS-GRID";
+
+/// Pane id shared by the mock server and the view under test; a `PaneOutputChunk`
+/// addressed to any other pane is ignored by the client.
+const MOCK_PANE_ID: &str = "headless-pane";
 const TERMINAL_ACCENT_BG: u32 = 0x1e6fd9;
 const TERMINAL_ACCENT_FG: u32 = 0xffe680;
 
@@ -589,7 +725,7 @@ fn open_mux_pane(
     cx.open_window(size(px(720.0), px(320.0)), |window, cx| {
         cx.new(|cx| {
             MuxPaneView::new(
-                "headless-pane".to_string(),
+                MOCK_PANE_ID.to_string(),
                 domain,
                 WeakEntity::new_invalid(),
                 WeakEntity::new_invalid(),
@@ -1178,6 +1314,71 @@ fn _app_type_is_used(_: &App) {}
 /// keeps tests on the main thread when it runs them one at a time. Owning the
 /// harness lets `cargo test` run this suite correctly without callers having to
 /// remember `--test-threads=1`.
+
+/// Magenta accent background for the updated grid: far from anything the theme
+/// or the initial grid paints, so its presence in the framebuffer is
+/// unambiguous evidence that the updated snapshot was rasterized rather than
+/// some incidental chrome.
+const UPDATED_ACCENT_BG: u32 = 0xff00ff;
+
+/// Text marker unique to the updated grid, so the a11y tree can prove the
+/// follow-up fetch's snapshot replaced the initial one.
+const UPDATED_MARKER: &str = "Z3RM-PUSH-SYNC";
+
+/// §3.1 / §3.3 PaneOutput is a lossy dirty signal, never a byte stream for the
+/// client to parse: the server stays the sole VT parser, and every
+/// render-affecting change is pulled through the structured grid snapshot
+/// path. This drives the whole contract: mock server → PaneOutputChunk
+/// (sequence 1) → socket → MuxPaneView dirty signal → follow-up
+/// FetchGridUpdate → authoritative updated grid (generation 10, output
+/// fence 1) → framebuffer + a11y tree. The chunk payload is deliberately
+/// opaque — a client that tried to render it would change nothing, because
+/// only the pulled snapshot reaches the renderer.
+fn pane_output_dirty_signal_pulls_authoritative_grid() -> Result<()> {
+    let mut cx = headless_app()?;
+    let output = b"opaque bytes the client must never parse\n".to_vec();
+    let updated = MockGrid {
+        cols: 60,
+        rows: 12,
+        lines: vec![
+            format!("{UPDATED_MARKER} row0"),
+            "updated second line".to_string(),
+            "updated third line 0123456789".to_string(),
+            "updated magenta accent row".to_string(),
+        ],
+        accent_row: 3,
+        accent_background: UPDATED_ACCENT_BG,
+        accent_foreground: 0xffffff,
+        generation: 10,
+        history: Vec::new(),
+        history_version: 0,
+    };
+    let (domain, _server) = MockMuxServer::start_with_output(terminal_grid(), Some(updated), output)?;
+    cx.allow_parking();
+
+    let window = open_mux_pane(&mut cx, domain)?;
+    let (image, tree) = draw_until_pixels(&mut cx, window.into(), |image| {
+        count_near_color(image, [255, 0, 255], 24) > 200
+    })?;
+    save_frame("mux_pane_dirty_signal_grid_update", &image, &tree)?;
+
+    let magenta = count_near_color(&image, [255, 0, 255], 24);
+    assert!(
+        magenta > 200,
+        "the updated grid's accent row must reach the framebuffer; magenta pixels: {magenta}"
+    );
+    let runs = a11y_text_run_values(&tree);
+    assert!(
+        runs.iter().any(|value| value.contains(UPDATED_MARKER)),
+        "the dirty signal must pull the authoritative updated grid; runs: {runs:?}"
+    );
+    assert!(
+        !runs.iter().any(|value| value.contains(TERMINAL_MARKER)),
+        "the updated grid must replace the initial one; runs: {runs:?}"
+    );
+    Ok(())
+}
+
 fn main() {
     let cases: &[(&str, fn() -> Result<()>)] = &[
         (
@@ -1203,6 +1404,10 @@ fn main() {
         (
             "terminal_semantic_scroll_actions_move_viewport",
             terminal_semantic_scroll_actions_move_viewport,
+        ),
+        (
+            "pane_output_dirty_signal_pulls_authoritative_grid",
+            pane_output_dirty_signal_pulls_authoritative_grid,
         ),
         (
             "headless_renderer_produces_real_pixels",

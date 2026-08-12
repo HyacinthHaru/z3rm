@@ -30,6 +30,8 @@ pub struct ServerSettings {
     pub keep_alive_seconds: AtomicU64,
     pub scrollback_lines: AtomicU64,
     settings_path: Option<PathBuf>,
+    env_keep_alive_seconds: Option<u64>,
+    env_scrollback_lines: Option<u64>,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -46,30 +48,42 @@ struct ServerSettingsFile {
 impl ServerSettings {
     pub fn load() -> Arc<Self> {
         let path = resolve_settings_path();
-        let mut keep_alive = std::env::var("Z3RM_KEEP_ALIVE_SECONDS")
+        let env_keep_alive_seconds = std::env::var("Z3RM_KEEP_ALIVE_SECONDS")
             .ok()
-            .and_then(|v| v.parse().ok())
+            .and_then(|v| v.parse().ok());
+        let env_scrollback_lines = std::env::var("Z3RM_SCROLLBACK_LINES")
+            .ok()
+            .and_then(|v| v.parse().ok());
+        let file = path.as_deref().and_then(read_file);
+        Self::from_sources(
+            path,
+            file.as_ref(),
+            env_keep_alive_seconds,
+            env_scrollback_lines,
+        )
+    }
+
+    fn from_sources(
+        settings_path: Option<PathBuf>,
+        file: Option<&ServerSettingsFile>,
+        env_keep_alive_seconds: Option<u64>,
+        env_scrollback_lines: Option<u64>,
+    ) -> Arc<Self> {
+        let keep_alive_seconds = env_keep_alive_seconds
+            .or_else(|| file.and_then(|file| file.keep_alive_seconds))
             .unwrap_or(DEFAULT_KEEP_ALIVE_SECONDS);
-        let mut scrollback = std::env::var("Z3RM_SCROLLBACK_LINES")
-            .ok()
-            .and_then(|v| v.parse().ok())
+        let scrollback_lines = env_scrollback_lines
+            .or_else(|| {
+                file.and_then(|file| file.scrollback_lines.or(file.max_scroll_history_lines))
+                    .map(|value| value.min(100_000))
+            })
             .unwrap_or(DEFAULT_SCROLLBACK_LINES);
-
-        if let Some(ref p) = path {
-            if let Some(file) = read_file(p) {
-                if let Some(v) = file.keep_alive_seconds {
-                    keep_alive = v;
-                }
-                if let Some(v) = file.scrollback_lines.or(file.max_scroll_history_lines) {
-                    scrollback = v.min(100_000);
-                }
-            }
-        }
-
         Arc::new(Self {
-            keep_alive_seconds: AtomicU64::new(keep_alive),
-            scrollback_lines: AtomicU64::new(scrollback),
-            settings_path: path,
+            keep_alive_seconds: AtomicU64::new(keep_alive_seconds),
+            scrollback_lines: AtomicU64::new(scrollback_lines),
+            settings_path,
+            env_keep_alive_seconds,
+            env_scrollback_lines,
         })
     }
 
@@ -84,11 +98,14 @@ impl ServerSettings {
     /// Apply a file snapshot; returns true if scrollback changed.
     pub(crate) fn apply_file(&self, file: &ServerSettingsFile) -> bool {
         let mut scrollback_changed = false;
-        if let Some(v) = file.keep_alive_seconds {
+        if let Some(v) = self.env_keep_alive_seconds.or(file.keep_alive_seconds) {
             self.keep_alive_seconds.store(v, Ordering::Relaxed);
         }
-        if let Some(v) = file.scrollback_lines.or(file.max_scroll_history_lines) {
-            let v = v.min(100_000);
+        if let Some(v) = self.env_scrollback_lines.or_else(|| {
+            file.scrollback_lines
+                .or(file.max_scroll_history_lines)
+                .map(|value| value.min(100_000))
+        }) {
             let prev = self.scrollback_lines.swap(v, Ordering::Relaxed);
             scrollback_changed = prev != v;
         }
@@ -185,12 +202,24 @@ mod tests {
     use super::*;
     use std::io::Write;
 
+    /// §3.5 daemon 默认永不自动退出，直到被显式 kill —— 这是 tmux 用户的预期。
+    /// `0` 编码的就是"永远"，把它改成一个有限秒数会让 session 在闲置后无声消失。
+    #[test]
+    fn keep_alive_defaults_to_forever() {
+        assert_eq!(
+            DEFAULT_KEEP_ALIVE_SECONDS, 0,
+            "0 means never expire; a finite default would silently drop idle sessions"
+        );
+    }
+
     #[test]
     fn apply_file_updates_atomics() {
         let settings = ServerSettings {
             keep_alive_seconds: AtomicU64::new(0),
             scrollback_lines: AtomicU64::new(10_000),
             settings_path: None,
+            env_keep_alive_seconds: None,
+            env_scrollback_lines: None,
         };
         let changed = settings.apply_file(&ServerSettingsFile {
             keep_alive_seconds: Some(30),
@@ -208,6 +237,8 @@ mod tests {
             keep_alive_seconds: AtomicU64::new(0),
             scrollback_lines: AtomicU64::new(10_000),
             settings_path: None,
+            env_keep_alive_seconds: None,
+            env_scrollback_lines: None,
         };
         settings.apply_file(&ServerSettingsFile {
             keep_alive_seconds: None,
@@ -215,6 +246,31 @@ mod tests {
             max_scroll_history_lines: None,
         });
         assert_eq!(settings.scrollback_lines(), 100_000);
+    }
+
+    #[test]
+    fn environment_overrides_file_during_initial_load() {
+        let file = ServerSettingsFile {
+            keep_alive_seconds: Some(30),
+            scrollback_lines: Some(2000),
+            max_scroll_history_lines: None,
+        };
+        let settings = ServerSettings::from_sources(None, Some(&file), Some(90), Some(8000));
+        assert_eq!(settings.keep_alive_seconds(), 90);
+        assert_eq!(settings.scrollback_lines(), 8000);
+    }
+
+    #[test]
+    fn hot_reload_preserves_environment_overrides() {
+        let settings = ServerSettings::from_sources(None, None, Some(90), Some(8000));
+        let changed = settings.apply_file(&ServerSettingsFile {
+            keep_alive_seconds: Some(5),
+            scrollback_lines: Some(500),
+            max_scroll_history_lines: None,
+        });
+        assert!(!changed);
+        assert_eq!(settings.keep_alive_seconds(), 90);
+        assert_eq!(settings.scrollback_lines(), 8000);
     }
 
     #[test]
@@ -252,6 +308,8 @@ mod tests {
             keep_alive_seconds: AtomicU64::new(999),
             scrollback_lines: AtomicU64::new(999),
             settings_path: None,
+            env_keep_alive_seconds: None,
+            env_scrollback_lines: None,
         };
         settings.apply_file(&parsed);
         assert_eq!(settings.keep_alive_seconds(), 0);

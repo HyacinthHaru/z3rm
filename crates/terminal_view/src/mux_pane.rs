@@ -1073,7 +1073,7 @@ async fn prepare_fetch_update(
                     // needs neither page fetches nor a checkpoint round trip.
                     None if full.history_size == 0 => (
                         HistoryPageAccumulator::new(&full)
-                            .and_then(|accumulator| accumulator.finish())?,
+                            .and_then(HistoryPageAccumulator::finish)?,
                         false,
                     ),
                     None => (fetch_history_checkpoint(domain, pane_id, &full).await?, true),

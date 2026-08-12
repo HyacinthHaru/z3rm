@@ -81,6 +81,15 @@ pub struct TabBarSettingsContent {
     /// Whether to show the tab bar. Default: true
     pub show: bool,
 
+    /// Whether to show the navigation history buttons. Default: true
+    pub show_nav_history_buttons: Option<bool>,
+
+    /// Whether to show the tab bar buttons. Default: true
+    pub show_tab_bar_buttons: Option<bool>,
+
+    /// Whether to show the pinned tabs in a separate row. Default: false
+    pub show_pinned_tabs_in_separate_row: Option<bool>,
+
     /// Whether to show the middle click to close tab behavior. Default: true
     pub middle_click_to_close: bool,
 

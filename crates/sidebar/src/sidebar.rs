@@ -12,7 +12,7 @@
 //! notification stream. The sidebar never re-attaches on its own, because attach
 //! has server-visible side effects.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::rc::Rc;
 use std::sync::Arc;
 
@@ -57,6 +57,10 @@ gpui::actions!(
 pub enum SidebarRequest {
     ActivateSession(String),
     FocusPane(String),
+    OpenFile {
+        session_id: String,
+        path: String,
+    },
 }
 
 pub type RequestHandler = Rc<dyn Fn(SidebarRequest, &mut Window, &mut App)>;
@@ -236,18 +240,230 @@ impl SessionTree {
                     _ => false,
                 }
             }
-            Event::SessionLayoutChanged(changed) => match changed.layout.as_ref() {
-                Some(layout) => self.retain_layout_panes(&LayoutTree::from_proto(layout)),
-                None => false,
-            },
+            Event::SessionLayoutChanged(changed) => {
+                if let Some(snapshot) = changed.snapshot.as_ref() {
+                    let mut next = Self::from_snapshot(snapshot);
+                    next.bells = self
+                        .bells
+                        .iter()
+                        .filter(|pane_id| next.contains_pane(pane_id))
+                        .cloned()
+                        .collect();
+                    if *self == next {
+                        false
+                    } else {
+                        *self = next;
+                        true
+                    }
+                } else {
+                    changed
+                        .layout
+                        .as_ref()
+                        .is_some_and(|layout| {
+                            self.retain_layout_panes(&LayoutTree::from_proto(layout))
+                        })
+                }
+            }
             _ => false,
         }
     }
 }
 
 // ============================================================
+// Lazy session file tree
+// ============================================================
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum SidebarMode {
+    Sessions,
+    Files,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct FileNode {
+    path: String,
+    name: String,
+    is_dir: bool,
+    size: u64,
+    is_modified: bool,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum DirectoryLoad {
+    Unloaded,
+    Loading,
+    Loaded(Vec<FileNode>),
+    Error(String),
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct DirectoryNode {
+    expanded: bool,
+    load: DirectoryLoad,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct FileTree {
+    session_id: String,
+    root_path: String,
+    directories: HashMap<String, DirectoryNode>,
+}
+
+impl FileTree {
+    fn new(session_id: impl Into<String>, root_path: impl Into<String>) -> Self {
+        let session_id = session_id.into();
+        let root_path = root_path.into();
+        let mut directories = HashMap::new();
+        directories.insert(
+            root_path.clone(),
+            DirectoryNode {
+                expanded: true,
+                load: DirectoryLoad::Unloaded,
+            },
+        );
+        Self {
+            session_id,
+            root_path,
+            directories,
+        }
+    }
+
+    fn session_id(&self) -> &str {
+        &self.session_id
+    }
+
+    fn root_path(&self) -> &str {
+        &self.root_path
+    }
+
+    fn directory(&self, path: &str) -> Option<&DirectoryNode> {
+        self.directories.get(path)
+    }
+
+    fn rebind(&mut self, session_id: &str, root_path: &str) -> bool {
+        if self.session_id == session_id && self.root_path == root_path {
+            return false;
+        }
+        *self = Self::new(session_id, root_path);
+        true
+    }
+
+    fn start_loading(&mut self, path: &str) -> Option<String> {
+        let directory = self.directories.get_mut(path)?;
+        if !matches!(
+            &directory.load,
+            DirectoryLoad::Unloaded | DirectoryLoad::Error(_)
+        ) {
+            return None;
+        }
+        directory.expanded = true;
+        directory.load = DirectoryLoad::Loading;
+        Some(path.to_string())
+    }
+
+    fn toggle_directory(&mut self, path: &str) -> Option<String> {
+        let directory = self.directories.get_mut(path)?;
+        if matches!(&directory.load, DirectoryLoad::Loaded(_)) {
+            directory.expanded = !directory.expanded;
+            return None;
+        }
+        if matches!(
+            &directory.load,
+            DirectoryLoad::Unloaded | DirectoryLoad::Error(_)
+        ) {
+            directory.expanded = true;
+            directory.load = DirectoryLoad::Loading;
+            return Some(path.to_string());
+        }
+        None
+    }
+
+    fn complete_loading(&mut self, path: &str, mut entries: Vec<mux_protocol::DirEntry>) -> bool {
+        if !matches!(
+            self.directories.get(path).map(|directory| &directory.load),
+            Some(DirectoryLoad::Loading)
+        ) {
+            return false;
+        }
+
+        sort_directory_entries(&mut entries);
+        let nodes: Vec<FileNode> = entries
+            .into_iter()
+            .map(|entry| FileNode {
+                path: join_remote_path(path, &entry.name),
+                name: entry.name,
+                is_dir: entry.is_dir,
+                size: entry.size,
+                is_modified: entry.is_modified,
+            })
+            .collect();
+        for node in &nodes {
+            if node.is_dir {
+                self.directories
+                    .entry(node.path.clone())
+                    .or_insert(DirectoryNode {
+                        expanded: false,
+                        load: DirectoryLoad::Unloaded,
+                    });
+            }
+        }
+        let Some(directory) = self.directories.get_mut(path) else {
+            return false;
+        };
+        directory.load = DirectoryLoad::Loaded(nodes);
+        true
+    }
+
+    fn fail_loading(&mut self, path: &str, error: String) -> bool {
+        let Some(directory) = self.directories.get_mut(path) else {
+            return false;
+        };
+        if !matches!(&directory.load, DirectoryLoad::Loading) {
+            return false;
+        }
+        directory.load = DirectoryLoad::Error(error);
+        true
+    }
+}
+
+fn join_remote_path(parent: &str, name: &str) -> String {
+    if parent.is_empty() || parent == "." {
+        return name.to_string();
+    }
+    let separator = if parent.contains('\\') && !parent.contains('/') {
+        '\\'
+    } else {
+        '/'
+    };
+    if parent.chars().all(|character| character == separator) {
+        return format!("{parent}{name}");
+    }
+    format!(
+        "{}{separator}{name}",
+        parent.trim_end_matches(separator)
+    )
+}
+
+fn sort_directory_entries(entries: &mut [mux_protocol::DirEntry]) {
+    entries.sort_by(|left, right| {
+        right
+            .is_dir
+            .cmp(&left.is_dir)
+            .then_with(|| left.name.cmp(&right.name))
+    });
+}
+
+// ============================================================
 // List entries
 // ============================================================
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum DirectoryStatus {
+    Unloaded,
+    Loading,
+    Loaded,
+    Error(SharedString),
+}
 
 #[derive(Clone, Debug, PartialEq)]
 pub enum ListEntry {
@@ -270,6 +486,21 @@ pub enum ListEntry {
         is_focused: bool,
         has_bell: bool,
     },
+    Directory {
+        path: SharedString,
+        name: SharedString,
+        depth: usize,
+        expanded: bool,
+        status: DirectoryStatus,
+    },
+    File {
+        session_id: SharedString,
+        path: SharedString,
+        name: SharedString,
+        depth: usize,
+        size: u64,
+        is_modified: bool,
+    },
 }
 
 impl ListEntry {
@@ -278,6 +509,7 @@ impl ListEntry {
             ListEntry::Session { .. } => 0,
             ListEntry::Tab { .. } => 1,
             ListEntry::Pane { .. } => 2,
+            ListEntry::Directory { depth, .. } | ListEntry::File { depth, .. } => *depth,
         }
     }
 
@@ -286,6 +518,7 @@ impl ListEntry {
             ListEntry::Session { name, .. } => name,
             ListEntry::Tab { title, .. } => title,
             ListEntry::Pane { title, .. } => title,
+            ListEntry::Directory { name, .. } | ListEntry::File { name, .. } => name,
         }
     }
 
@@ -294,6 +527,8 @@ impl ListEntry {
             ListEntry::Session { session_id, .. } => format!("session-{session_id}").into(),
             ListEntry::Tab { tab_id, .. } => format!("tab-{tab_id}").into(),
             ListEntry::Pane { pane_id, .. } => format!("pane-{pane_id}").into(),
+            ListEntry::Directory { path, .. } => format!("directory-{path}").into(),
+            ListEntry::File { path, .. } => format!("file-{path}").into(),
         }
     }
     fn is_session(&self) -> bool {
@@ -313,6 +548,13 @@ impl ListEntry {
                 .as_ref()
                 .map(|pane_id| SidebarRequest::FocusPane(pane_id.to_string())),
             ListEntry::Pane { pane_id, .. } => Some(SidebarRequest::FocusPane(pane_id.to_string())),
+            ListEntry::File {
+                session_id, path, ..
+            } => Some(SidebarRequest::OpenFile {
+                session_id: session_id.to_string(),
+                path: path.to_string(),
+            }),
+            ListEntry::Directory { .. } => None,
         }
     }
 }
@@ -372,6 +614,73 @@ fn build_entries(
         }
     }
     entries
+}
+
+fn build_file_entries(tree: &FileTree) -> Vec<ListEntry> {
+    let mut entries = Vec::new();
+    append_directory_entries(
+        tree,
+        tree.root_path(),
+        SharedString::from(tree.root_path().to_string()),
+        0,
+        &mut entries,
+    );
+    entries
+}
+
+fn append_directory_entries(
+    tree: &FileTree,
+    path: &str,
+    name: SharedString,
+    depth: usize,
+    entries: &mut Vec<ListEntry>,
+) {
+    let Some(directory) = tree.directory(path) else {
+        return;
+    };
+    let status = match &directory.load {
+        DirectoryLoad::Unloaded => DirectoryStatus::Unloaded,
+        DirectoryLoad::Loading => DirectoryStatus::Loading,
+        DirectoryLoad::Loaded(_) => DirectoryStatus::Loaded,
+        DirectoryLoad::Error(error) => DirectoryStatus::Error(error.clone().into()),
+    };
+    entries.push(ListEntry::Directory {
+        path: path.to_string().into(),
+        name,
+        depth,
+        expanded: directory.expanded,
+        status,
+    });
+    if !directory.expanded {
+        return;
+    }
+    let DirectoryLoad::Loaded(children) = &directory.load else {
+        return;
+    };
+    for child in children {
+        if child.is_dir {
+            append_directory_entries(
+                tree,
+                &child.path,
+                child.name.clone().into(),
+                depth + 1,
+                entries,
+            );
+        } else {
+            entries.push(ListEntry::File {
+                session_id: tree.session_id().to_string().into(),
+                path: child.path.clone().into(),
+                name: child.name.clone().into(),
+                depth: depth + 1,
+                size: child.size,
+                is_modified: child.is_modified,
+            });
+        }
+    }
+}
+
+fn format_file_size(size: u64) -> SharedString {
+    format!("{size} B").into()
 }
 
 /// Keeps a row when it matches, an ancestor matches, or a descendant matches,
@@ -453,6 +762,8 @@ pub struct Sidebar {
     request_handler: RequestHandler,
     sessions: Vec<SessionInfo>,
     tree: SessionTree,
+    mode: SidebarMode,
+    file_tree: Option<FileTree>,
     entries: Vec<ListEntry>,
     selected_index: Option<usize>,
     filter_editor: Entity<Editor>,
@@ -462,6 +773,7 @@ pub struct Sidebar {
     _subscriptions: Vec<Subscription>,
     _refresh_task: Option<Task<()>>,
     _notification_task: Option<Task<()>>,
+    _directory_tasks: HashMap<String, Task<()>>,
 }
 
 impl Sidebar {
@@ -476,7 +788,7 @@ impl Sidebar {
         let focus_handle = cx.focus_handle();
         let filter_editor = cx.new(|cx| {
             let mut editor = Editor::single_line(window, cx);
-            editor.set_placeholder_text("Filter sessions…", window, cx);
+            editor.set_placeholder_text("Filter…", window, cx);
             editor
         });
         let subscriptions = vec![cx.subscribe(&filter_editor, |this, _, event, cx| {
@@ -491,6 +803,8 @@ impl Sidebar {
             request_handler,
             sessions: Vec::new(),
             tree: snapshot.map(SessionTree::from_snapshot).unwrap_or_default(),
+            mode: SidebarMode::Sessions,
+            file_tree: None,
             entries: Vec::new(),
             selected_index: None,
             filter_editor,
@@ -500,6 +814,7 @@ impl Sidebar {
             _subscriptions: subscriptions,
             _refresh_task: None,
             _notification_task: None,
+            _directory_tasks: HashMap::new(),
         };
         this.rebuild_entries(cx);
         this.refresh_sessions(cx);
@@ -507,15 +822,121 @@ impl Sidebar {
         this
     }
 
+    pub fn rebind_session(
+        &mut self,
+        session_id: String,
+        snapshot: Option<&SessionSnapshot>,
+        cx: &mut Context<Self>,
+    ) {
+        let session_changed = self.session_id != session_id;
+        self.session_id = session_id;
+        self.tree = snapshot.map(SessionTree::from_snapshot).unwrap_or_default();
+        if session_changed {
+            self.file_tree = None;
+            self._directory_tasks.clear();
+        }
+        self.rebuild_entries(cx);
+        self.refresh_sessions(cx);
+    }
+
+    fn set_mode(&mut self, mode: SidebarMode, cx: &mut Context<Self>) {
+        if self.mode == mode {
+            return;
+        }
+        self.mode = mode;
+        self.selected_index = None;
+        let root_to_load = (mode == SidebarMode::Files)
+            .then(|| self.start_root_load())
+            .flatten();
+        self.rebuild_entries(cx);
+        if let Some(path) = root_to_load {
+            self.spawn_directory_load(path, cx);
+        }
+    }
+
+    fn bind_file_tree_to_active_session(&mut self) -> bool {
+        let Some(cwd) = self
+            .sessions
+            .iter()
+            .find(|session| session.id == self.session_id)
+            .map(|session| session.cwd.clone())
+        else {
+            let changed = self.file_tree.take().is_some();
+            if changed {
+                self._directory_tasks.clear();
+            }
+            return changed;
+        };
+
+        let changed = match &mut self.file_tree {
+            Some(tree) => tree.rebind(&self.session_id, &cwd),
+            None => {
+                self.file_tree = Some(FileTree::new(&self.session_id, cwd));
+                true
+            }
+        };
+        if changed {
+            self._directory_tasks.clear();
+        }
+        changed
+    }
+
+    fn start_root_load(&mut self) -> Option<String> {
+        let tree = self.file_tree.as_mut()?;
+        let root_path = tree.root_path().to_string();
+        tree.start_loading(&root_path)
+    }
+
+    fn spawn_directory_load(&mut self, path: String, cx: &mut Context<Self>) {
+        let domain = self.domain.clone();
+        let session_id = self.session_id.clone();
+        let task_path = path.clone();
+        let task = cx.spawn(async move |this, cx| {
+            let result = domain
+                .list_dir(&task_path)
+                .await
+                .map(|listing| listing.entries)
+                .map_err(|error| error.to_string());
+            if let Err(error) = this.update(cx, |this, cx| {
+                if this.session_id != session_id {
+                    return;
+                }
+                let Some(tree) = this.file_tree.as_mut() else {
+                    return;
+                };
+                if tree.session_id() != session_id.as_str() {
+                    return;
+                }
+                let changed = match result {
+                    Ok(entries) => tree.complete_loading(&task_path, entries),
+                    Err(error) => tree.fail_loading(&task_path, error),
+                };
+                if changed {
+                    this.rebuild_entries(cx);
+                }
+            }) {
+                tracing::debug!(?error, "sidebar dropped before directory listing arrived");
+            }
+        });
+        self._directory_tasks.insert(path, task);
+    }
+
     /// Pulls the authoritative session list (spec §3.3 push signal, pull data).
     fn refresh_sessions(&mut self, cx: &mut Context<Self>) {
         let domain = self.domain.clone();
-        self._refresh_task = Some(cx.spawn(
-            async move |this, cx| match domain.list_sessions().await {
+        self._refresh_task = Some(cx.spawn(async move |this, cx| {
+            match domain.list_sessions().await {
                 Ok(sessions) => {
                     if let Err(error) = this.update(cx, |this, cx| {
                         this.sessions = sessions;
+                        this.bind_file_tree_to_active_session();
+                        let root_to_load = (this.mode == SidebarMode::Files)
+                            .then(|| this.start_root_load())
+                            .flatten();
                         this.rebuild_entries(cx);
+                        if let Some(path) = root_to_load {
+                            this.spawn_directory_load(path, cx);
+                        }
                     }) {
                         tracing::debug!(?error, "sidebar dropped before session list arrived");
                     }
@@ -523,8 +944,8 @@ impl Sidebar {
                 Err(error) => {
                     tracing::error!(%error, "sidebar failed to list mux sessions");
                 }
-            },
-        ));
+            }
+        }));
     }
 
     /// Maintains the tree from the lifecycle stream instead of re-attaching.
@@ -561,7 +982,14 @@ impl Sidebar {
 
     fn rebuild_entries(&mut self, cx: &mut Context<Self>) {
         let query = self.filter_editor.read(cx).text(cx);
-        let entries = build_entries(&self.sessions, &self.session_id, &self.tree);
+        let entries = match self.mode {
+            SidebarMode::Sessions => build_entries(&self.sessions, &self.session_id, &self.tree),
+            SidebarMode::Files => self
+                .file_tree
+                .as_ref()
+                .map(build_file_entries)
+                .unwrap_or_default(),
+        };
         self.entries = filter_entries(&entries, &query);
         self.selected_index = match self.entries.len() {
             0 => None,
@@ -627,13 +1055,24 @@ impl Sidebar {
     }
 
     fn activate_entry(&mut self, index: usize, window: &mut Window, cx: &mut Context<Self>) {
-        let Some(entry) = self.entries.get(index) else {
-            return;
-        };
-        let Some(request) = entry.request() else {
+        let Some(entry) = self.entries.get(index).cloned() else {
             return;
         };
         self.selected_index = Some(index);
+        if let ListEntry::Directory { path, .. } = &entry {
+            let path_to_load = self
+                .file_tree
+                .as_mut()
+                .and_then(|tree| tree.toggle_directory(path));
+            self.rebuild_entries(cx);
+            if let Some(path) = path_to_load {
+                self.spawn_directory_load(path, cx);
+            }
+            return;
+        }
+        let Some(request) = entry.request() else {
+            return;
+        };
         // Cloned out of `self` so the handler can freely touch this window.
         let handler = self.request_handler.clone();
         handler(request, window, cx);
@@ -697,6 +1136,46 @@ impl Sidebar {
                     !*is_alive,
                 )
             }
+            ListEntry::Directory {
+                name,
+                expanded,
+                status,
+                ..
+            } => {
+                let secondary = match status {
+                    DirectoryStatus::Unloaded | DirectoryStatus::Loaded => None,
+                    DirectoryStatus::Loading => Some(SharedString::from("loading…")),
+                    DirectoryStatus::Error(error) => Some(error.clone()),
+                };
+                (
+                    if *expanded {
+                        IconName::FolderOpen
+                    } else {
+                        IconName::Folder
+                    },
+                    name.clone(),
+                    secondary,
+                    false,
+                )
+            }
+            ListEntry::File {
+                name,
+                size,
+                is_modified,
+                ..
+            } => {
+                let size = format_file_size(*size);
+                (
+                    IconName::File,
+                    name.clone(),
+                    Some(if *is_modified {
+                        format!("{size} · modified").into()
+                    } else {
+                        size
+                    }),
+                    false,
+                )
+            }
         };
 
         let focused_pane = matches!(
@@ -748,17 +1227,42 @@ impl Sidebar {
             .into_any_element()
     }
 
-    fn render_header(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
-        h_flex()
+    fn render_header(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        v_flex()
             .id("sidebar-header")
             .w_full()
             .px_3()
             .py_2()
             .gap_2()
-            .child(div().min_w_0().flex_1().child(self.filter_editor.clone()))
+            .child(
+                h_flex()
+                    .gap_1()
+                    .child(
+                        Button::new("sidebar-sessions-mode", "Sessions")
+                            .label_size(LabelSize::Small)
+                            .toggle_state(self.mode == SidebarMode::Sessions)
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                this.set_mode(SidebarMode::Sessions, cx);
+                            })),
+                    )
+                    .child(
+                        Button::new("sidebar-files-mode", "Files")
+                            .label_size(LabelSize::Small)
+                            .toggle_state(self.mode == SidebarMode::Files)
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                this.set_mode(SidebarMode::Files, cx);
+                            })),
+                    ),
+            )
+            .child(div().min_w_0().w_full().child(self.filter_editor.clone()))
     }
 
     fn render_empty_state(&self, _cx: &App) -> impl IntoElement {
+        let message = match self.mode {
+            SidebarMode::Sessions => "No mux sessions",
+            SidebarMode::Files if self.file_tree.is_none() => "Loading session files…",
+            SidebarMode::Files => "No matching files",
+        };
         v_flex()
             .id("sidebar-empty")
             .w_full()
@@ -767,7 +1271,7 @@ impl Sidebar {
             .items_center()
             .p_4()
             .child(
-                Label::new("No mux sessions")
+                Label::new(message)
                     .size(LabelSize::Small)
                     .color(Color::Muted),
             )
@@ -1258,7 +1762,7 @@ mod tests {
         assert!(tree.apply_event(&Event::SessionLayoutChanged(
             mux_protocol::SessionLayoutChanged {
                 layout: None,
-                snapshot: Some(resynced),
+                snapshot: Some(resynced.clone()),
             }
         )));
 
@@ -1300,7 +1804,7 @@ mod tests {
             pane_id: "pane-1".to_string(),
         })));
         assert!(tree.apply_event(&Event::PaneBell(mux_protocol::PaneBell {
-            pane_id: "pane-9".to_string(),
+            pane_id: "pane-3".to_string(),
         })));
 
         let resynced = SessionSnapshot {
@@ -1333,7 +1837,7 @@ mod tests {
         )));
 
         assert!(tree.bells.contains("pane-1"));
-        assert!(!tree.bells.contains("pane-9"));
+        assert!(!tree.bells.contains("pane-3"));
     }
 
     #[test]
@@ -1389,6 +1893,182 @@ mod tests {
         assert_eq!(move_selection(Some(0), 3, Previous), Some(0));
         assert_eq!(move_selection(Some(1), 3, First), Some(0));
         assert_eq!(move_selection(Some(1), 3, Last), Some(2));
+    }
+
+    fn directory_entry(
+        name: &str,
+        is_dir: bool,
+        size: u64,
+        is_modified: bool,
+    ) -> mux_protocol::DirEntry {
+        mux_protocol::DirEntry {
+            name: name.to_string(),
+            is_dir,
+            size,
+            is_modified,
+        }
+    }
+
+    #[test]
+    fn joins_remote_paths_without_using_client_path_rules() {
+        assert_eq!(join_remote_path("/workspace", "src"), "/workspace/src");
+        assert_eq!(join_remote_path("/workspace/", "src"), "/workspace/src");
+        assert_eq!(join_remote_path("/", "src"), "/src");
+        assert_eq!(join_remote_path(".", "src"), "src");
+        assert_eq!(join_remote_path(r"C:\workspace", "src"), r"C:\workspace\src");
+        assert_eq!(join_remote_path(r"C:\workspace\", "src"), r"C:\workspace\src");
+    }
+
+    #[test]
+    fn directory_loading_is_lazy_and_has_explicit_transitions() {
+        let mut tree = FileTree::new("session-a", "/workspace");
+
+        assert!(matches!(
+            tree.directory("/workspace").map(|directory| &directory.load),
+            Some(DirectoryLoad::Unloaded)
+        ));
+        assert_eq!(
+            tree.start_loading("/workspace"),
+            Some("/workspace".to_string())
+        );
+        assert!(matches!(
+            tree.directory("/workspace").map(|directory| &directory.load),
+            Some(DirectoryLoad::Loading)
+        ));
+        assert_eq!(tree.start_loading("/workspace"), None);
+
+        assert!(tree.complete_loading(
+            "/workspace",
+            vec![directory_entry("src", true, 0, false)]
+        ));
+        assert!(matches!(
+            tree.directory("/workspace").map(|directory| &directory.load),
+            Some(DirectoryLoad::Loaded(_))
+        ));
+        assert_eq!(tree.toggle_directory("/workspace"), None);
+        assert_eq!(
+            tree.directory("/workspace")
+                .map(|directory| directory.expanded),
+            Some(false)
+        );
+        assert_eq!(
+            tree.toggle_directory("/workspace"),
+            None,
+            "expanding loaded directories must not issue another RPC"
+        );
+        assert_eq!(
+            tree.directory("/workspace")
+                .map(|directory| directory.expanded),
+            Some(true)
+        );
+        assert!(matches!(
+            tree.directory("/workspace/src")
+                .map(|directory| &directory.load),
+            Some(DirectoryLoad::Unloaded)
+        ));
+        assert_eq!(
+            tree.start_loading("/workspace/src"),
+            Some("/workspace/src".to_string())
+        );
+        assert!(tree.fail_loading("/workspace/src", "permission denied".to_string()));
+        assert!(matches!(
+            tree.directory("/workspace/src")
+                .map(|directory| &directory.load),
+            Some(DirectoryLoad::Error(error)) if error == "permission denied"
+        ));
+        assert_eq!(
+            tree.start_loading("/workspace/src"),
+            Some("/workspace/src".to_string()),
+            "activating an errored directory retries it"
+        );
+    }
+
+    #[test]
+    fn directory_rows_are_directories_first_then_deterministic_by_name() {
+        let mut entries = vec![
+            directory_entry("zeta.txt", false, 4, false),
+            directory_entry("beta", true, 0, false),
+            directory_entry("Alpha.txt", false, 3, true),
+            directory_entry("alpha", true, 0, false),
+            directory_entry("alpha.txt", false, 5, false),
+        ];
+
+        sort_directory_entries(&mut entries);
+
+        assert_eq!(
+            entries
+                .iter()
+                .map(|entry| (entry.is_dir, entry.name.as_str()))
+                .collect::<Vec<_>>(),
+            vec![
+                (true, "alpha"),
+                (true, "beta"),
+                (false, "Alpha.txt"),
+                (false, "alpha.txt"),
+                (false, "zeta.txt"),
+            ]
+        );
+    }
+
+    #[test]
+    fn file_rows_keep_remote_identity_size_and_modified_state() {
+        let mut tree = FileTree::new("session-a", "/workspace");
+        assert_eq!(
+            tree.start_loading("/workspace"),
+            Some("/workspace".to_string())
+        );
+        assert!(tree.complete_loading(
+            "/workspace",
+            vec![directory_entry("notes.txt", false, 42, true)]
+        ));
+
+        let rows = build_file_entries(&tree);
+        let file = rows.get(1).expect("loaded file row");
+        assert!(matches!(
+            file,
+            ListEntry::File {
+                size: 42,
+                is_modified: true,
+                ..
+            }
+        ));
+        assert_eq!(
+            file.request(),
+            Some(SidebarRequest::OpenFile {
+                session_id: "session-a".to_string(),
+                path: "/workspace/notes.txt".to_string(),
+            })
+        );
+    }
+
+    #[test]
+    fn rebinding_resets_all_lazily_loaded_directory_state() {
+        let mut tree = FileTree::new("session-a", "/workspace-a");
+        assert_eq!(
+            tree.start_loading("/workspace-a"),
+            Some("/workspace-a".to_string())
+        );
+        assert!(tree.complete_loading(
+            "/workspace-a",
+            vec![directory_entry("src", true, 0, false)]
+        ));
+        assert_eq!(
+            tree.start_loading("/workspace-a/src"),
+            Some("/workspace-a/src".to_string())
+        );
+
+        assert!(!tree.rebind("session-a", "/workspace-a"));
+        assert!(tree.rebind("session-b", "/workspace-b"));
+
+        assert_eq!(tree.session_id(), "session-b");
+        assert_eq!(tree.root_path(), "/workspace-b");
+        assert_eq!(tree.directories.len(), 1);
+        assert!(matches!(
+            tree.directory("/workspace-b")
+                .map(|directory| &directory.load),
+            Some(DirectoryLoad::Unloaded)
+        ));
+        assert!(tree.directory("/workspace-a").is_none());
     }
 }
 

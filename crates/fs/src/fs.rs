@@ -1313,6 +1313,7 @@ impl Fs for RealFs {
                 tx.send(res)
             })
             .expect("The OS can spawn a threads");
+
         rx.await.expect("Restore all never panics")?;
         Ok(restored_item_path)
     }
@@ -1847,6 +1848,20 @@ impl FakeFs {
 
     pub fn clear_buffered_events(&self) {
         self.state.lock().buffered_events.clear();
+    }
+
+    /// Simulates the kernel's watch queue overflowing: all buffered
+    /// (undelivered) events are lost, and the watcher reports only a single
+    /// `Rescan` event for `root`, mirroring how the native backends report
+    /// lost sync (FSEvents `kFSEventStreamEventFlagMustScanSubDirs`, inotify
+    /// `IN_Q_OVERFLOW`, Windows `ERROR_NOTIFY_ENUM_DIR`).
+    ///
+    /// Note that the fake file system's state is unaffected; like a real
+    /// overflow, only the notifications are lost, not the changes themselves.
+    pub fn simulate_watcher_overflow(&self, root: impl Into<PathBuf>) {
+        let mut state = self.state.lock();
+        state.buffered_events.clear();
+        state.emit_event([(root, Some(PathEventKind::Rescan))]);
     }
 
     pub fn create_file_before_next_watch_add(

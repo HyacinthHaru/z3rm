@@ -4,17 +4,18 @@
 //! Left pane: previous version (shadow snapshot). Right pane: current content.
 //! Accept = keep current. Decline = revert via shadow_snapshot (§4.8).
 //!
-//! §16.6 Entry points:
-//! - file tree sidebar click (handled in project_panel)
-//! - command palette `file::openDiff`
-//! - terminal output path detection (handled in terminal_view)
+//! §16.6 Entry point: `workspace::OpenDiff`, from the command palette or its
+//! keybinding. It lists the session's changed files and opens the picked one
+//! here — see `open_diff`.
 
 use gpui::{
     AppContext, Context, Entity, EventEmitter, FocusHandle, Focusable, IntoElement, Render,
     SharedString, Task, Window, div, px,
 };
+use imara_diff::{Algorithm, diff, intern::InternedInput};
 use std::any::TypeId;
-use std::path::PathBuf;
+use std::ops::Range;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use ui::prelude::*;
 use workspace::{
@@ -30,6 +31,7 @@ pub struct DiffReview {
     pub previous_content: SharedString,
     /// Current content (from disk)
     pub current_content: SharedString,
+    current_file_exists: bool,
     /// Whether the diff has been resolved (accept/decline)
     pub resolved: bool,
     /// Tab title for the workspace item ("Diff: <file_name>")
@@ -57,6 +59,14 @@ impl RestoreTarget {
     }
 }
 
+fn read_current_content(path: &Path) -> std::io::Result<(String, bool)> {
+    match std::fs::read_to_string(path) {
+        Ok(current) => Ok((current, true)),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok((String::new(), false)),
+        Err(error) => Err(error),
+    }
+}
+
 /// §16.6 Events emitted by DiffReview
 #[derive(Clone, Debug)]
 pub enum DiffReviewEvent {
@@ -76,6 +86,17 @@ impl DiffReview {
         restore_target: Option<RestoreTarget>,
         cx: &mut Context<Self>,
     ) -> Self {
+        Self::new_with_current_file_state(file_path, previous, current, true, restore_target, cx)
+    }
+
+    fn new_with_current_file_state(
+        file_path: PathBuf,
+        previous: String,
+        current: String,
+        current_file_exists: bool,
+        restore_target: Option<RestoreTarget>,
+        cx: &mut Context<Self>,
+    ) -> Self {
         let file_name = file_path
             .file_name()
             .and_then(|n| n.to_str())
@@ -86,6 +107,7 @@ impl DiffReview {
             file_path,
             previous_content: previous.into(),
             current_content: current.into(),
+            current_file_exists,
             resolved: false,
             title,
             restore_target,
@@ -112,14 +134,27 @@ impl DiffReview {
         cx.spawn(async move |cx| {
             let current = smol::unblock({
                 let path = path.clone();
-                move || std::fs::read_to_string(&path)
+                move || read_current_content(&path)
             })
             .await
-            .map_err(|e| anyhow::anyhow!("failed to read {}: {}", path.display(), e))?;
-            let entity =
-                cx.new(|cx| DiffReview::new(path.clone(), prev, current, restore_target, cx));
+            .map_err(|error| anyhow::anyhow!("failed to read {}: {}", path.display(), error))?;
+            let (current, current_file_exists) = current;
+            let entity = cx.new(|cx| {
+                DiffReview::new_with_current_file_state(
+                    path.clone(),
+                    prev,
+                    current,
+                    current_file_exists,
+                    restore_target,
+                    cx,
+                )
+            });
             Ok(entity)
         })
+    }
+
+    pub fn is_deleted(&self) -> bool {
+        !self.current_file_exists
     }
 
     /// §16.6 Accept the current version (dismiss diff, file stays).
@@ -154,6 +189,8 @@ impl DiffReview {
                 this.decline_pending = false;
                 match result {
                     Ok(response) if response.restored => {
+                        this.current_content = this.previous_content.clone();
+                        this.current_file_exists = true;
                         this.resolved = true;
                         cx.emit(DiffReviewEvent::Declined);
                     }
@@ -173,28 +210,58 @@ impl DiffReview {
 
     /// §16.6 Compute line-level diff for display.
     pub fn line_diff(&self) -> Vec<DiffLine> {
-        let prev_lines: Vec<&str> = self.previous_content.lines().collect();
-        let curr_lines: Vec<&str> = self.current_content.lines().collect();
-        let max_len = prev_lines.len().max(curr_lines.len());
-        let mut result = Vec::with_capacity(max_len);
-        for i in 0..max_len {
-            match (prev_lines.get(i), curr_lines.get(i)) {
-                (Some(prev), Some(curr)) => {
-                    if prev == curr {
-                        result.push(DiffLine::Unchanged((*prev).to_string()));
-                    } else {
-                        result.push(DiffLine::Modified {
-                            old: (*prev).to_string(),
-                            new: (*curr).to_string(),
-                        });
-                    }
+        let previous_content: &str = &self.previous_content;
+        let current_content: &str = &self.current_content;
+        let input = InternedInput::new(previous_content, current_content);
+        let mut lines = Vec::new();
+        let mut unchanged_start = 0usize;
+
+        diff(
+            Algorithm::Histogram,
+            &input,
+            |removed_range: Range<u32>, added_range: Range<u32>| {
+                let removed_start = removed_range.start as usize;
+                for token in input
+                    .before
+                    .get(unchanged_start..removed_start)
+                    .unwrap_or_default()
+                {
+                    lines.push(DiffLine::Unchanged(input.interner[*token].to_string()));
                 }
-                (Some(prev), None) => result.push(DiffLine::Removed((*prev).to_string())),
-                (None, Some(curr)) => result.push(DiffLine::Added((*curr).to_string())),
-                (None, None) => {}
-            }
+
+                let removed = input
+                    .before
+                    .get(removed_start..removed_range.end as usize)
+                    .unwrap_or_default();
+                let added = input
+                    .after
+                    .get(added_range.start as usize..added_range.end as usize)
+                    .unwrap_or_default();
+
+                // A real diff reports a hunk as "delete this run, insert that run". Pairing the
+                // two runs positionally keeps a single-line edit rendered as one `Modified` row,
+                // preserving the original side-by-side visual design.
+                for (old_token, new_token) in removed.iter().zip(added.iter()) {
+                    lines.push(DiffLine::Modified {
+                        old: input.interner[*old_token].to_string(),
+                        new: input.interner[*new_token].to_string(),
+                    });
+                }
+                for token in removed.iter().skip(added.len()) {
+                    lines.push(DiffLine::Removed(input.interner[*token].to_string()));
+                }
+                for token in added.iter().skip(removed.len()) {
+                    lines.push(DiffLine::Added(input.interner[*token].to_string()));
+                }
+
+                unchanged_start = removed_range.end as usize;
+            },
+        );
+
+        for token in input.before.get(unchanged_start..).unwrap_or_default() {
+            lines.push(DiffLine::Unchanged(input.interner[*token].to_string()));
         }
-        result
+        lines
     }
 }
 
@@ -244,7 +311,17 @@ impl Render for DiffReview {
             .py_2()
             .border_b_1()
             .border_color(colors.border)
-            .child(SharedString::from(format!("Diff: {}", file_name)))
+            .child(
+                div()
+                    .flex()
+                    .flex_row()
+                    .items_center()
+                    .gap_2()
+                    .child(SharedString::from(format!("Diff: {}", file_name)))
+                    .when(self.is_deleted(), |this| {
+                        this.child(Label::new("Deleted").color(Color::Error))
+                    }),
+            )
             .child(
                 div()
                     .flex()
@@ -417,6 +494,139 @@ impl Item for DiffReview {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Renders a diff as compact tags so assertions read like a unified diff:
+    /// `" x"` unchanged, `"+x"` added, `"-x"` removed, `"~old>new"` modified.
+    fn summarize(cx: &mut gpui::TestAppContext, previous: &str, current: &str) -> Vec<String> {
+        let review = cx.new(|cx| {
+            DiffReview::new(
+                PathBuf::from("file.txt"),
+                previous.to_string(),
+                current.to_string(),
+                None,
+                cx,
+            )
+        });
+        cx.read(|cx| {
+            review
+                .read(cx)
+                .line_diff()
+                .iter()
+                .map(|line| match line {
+                    DiffLine::Unchanged(text) => format!(" {text}"),
+                    DiffLine::Added(text) => format!("+{text}"),
+                    DiffLine::Removed(text) => format!("-{text}"),
+                    DiffLine::Modified { old, new } => format!("~{old}>{new}"),
+                })
+                .collect()
+        })
+    }
+
+    #[gpui::test]
+    fn insertion_in_the_middle_keeps_surrounding_lines_unchanged(cx: &mut gpui::TestAppContext) {
+        let lines = summarize(
+            cx,
+            "alpha\nbeta\ngamma\ndelta\n",
+            "alpha\nbeta\ninserted\ngamma\ndelta\n",
+        );
+        assert_eq!(
+            lines,
+            vec![" alpha", " beta", "+inserted", " gamma", " delta"]
+        );
+    }
+
+    #[gpui::test]
+    fn deletion_in_the_middle_keeps_surrounding_lines_unchanged(cx: &mut gpui::TestAppContext) {
+        let lines = summarize(cx, "alpha\nbeta\ngamma\ndelta\n", "alpha\nbeta\ndelta\n");
+        assert_eq!(lines, vec![" alpha", " beta", "-gamma", " delta"]);
+    }
+
+    #[gpui::test]
+    fn single_line_edit_becomes_one_modified_line(cx: &mut gpui::TestAppContext) {
+        let lines = summarize(cx, "alpha\nbeta\ngamma\n", "alpha\nBETA\ngamma\n");
+        assert_eq!(lines, vec![" alpha", "~beta>BETA", " gamma"]);
+    }
+
+    #[gpui::test]
+    fn uneven_replacement_pairs_lines_then_reports_the_remainder(cx: &mut gpui::TestAppContext) {
+        let lines = summarize(cx, "alpha\nbeta\ngamma\n", "alpha\nBETA\nextra\ngamma\n");
+        assert_eq!(lines, vec![" alpha", "~beta>BETA", "+extra", " gamma"]);
+
+        let lines = summarize(cx, "alpha\nbeta\nextra\ngamma\n", "alpha\nBETA\ngamma\n");
+        assert_eq!(lines, vec![" alpha", "~beta>BETA", "-extra", " gamma"]);
+    }
+
+    #[gpui::test]
+    fn identical_content_is_entirely_unchanged(cx: &mut gpui::TestAppContext) {
+        let content = "alpha\nbeta\ngamma\n";
+        let lines = summarize(cx, content, content);
+        assert_eq!(lines, vec![" alpha", " beta", " gamma"]);
+    }
+
+    #[gpui::test]
+    fn empty_previous_content_is_all_additions(cx: &mut gpui::TestAppContext) {
+        let lines = summarize(cx, "", "alpha\nbeta\n");
+        assert_eq!(lines, vec!["+alpha", "+beta"]);
+    }
+
+    #[gpui::test]
+    fn empty_current_content_is_all_removals(cx: &mut gpui::TestAppContext) {
+        let lines = summarize(cx, "alpha\nbeta\n", "");
+        assert_eq!(lines, vec!["-alpha", "-beta"]);
+    }
+
+    #[test]
+    fn current_content_reader_distinguishes_deleted_and_empty_files() {
+        let directory = tempfile::tempdir().expect("create temporary directory");
+        let missing_path = directory.path().join("deleted.txt");
+        assert_eq!(
+            read_current_content(&missing_path).expect("read missing file state"),
+            (String::new(), false)
+        );
+
+        let empty_path = directory.path().join("empty.txt");
+        std::fs::write(&empty_path, "").expect("write empty file");
+        assert_eq!(
+            read_current_content(&empty_path).expect("read empty file state"),
+            (String::new(), true)
+        );
+    }
+
+    #[gpui::test]
+    fn deleted_file_review_has_empty_current_side(cx: &mut gpui::TestAppContext) {
+        let review = cx.new(|cx| {
+            DiffReview::new_with_current_file_state(
+                PathBuf::from("deleted.txt"),
+                "alpha\nbeta\n".to_string(),
+                String::new(),
+                false,
+                None,
+                cx,
+            )
+        });
+        cx.read(|cx| {
+            let review = review.read(cx);
+            assert!(review.is_deleted());
+            assert_eq!(review.current_content.as_ref(), "");
+            assert_eq!(
+                review
+                    .line_diff()
+                    .iter()
+                    .map(|line| match line {
+                        DiffLine::Removed(text) => format!("-{text}"),
+                        other => format!("{other:?}"),
+                    })
+                    .collect::<Vec<_>>(),
+                vec!["-alpha", "-beta"]
+            );
+        });
+    }
+
+    #[gpui::test]
+    fn both_contents_empty_produces_no_lines(cx: &mut gpui::TestAppContext) {
+        let lines = summarize(cx, "", "");
+        assert!(lines.is_empty(), "{lines:?}");
+    }
 
     #[gpui::test]
     fn review_without_snapshot_cannot_decline(cx: &mut gpui::TestAppContext) {

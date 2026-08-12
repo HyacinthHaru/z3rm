@@ -805,13 +805,14 @@ impl WasmExtension {
 }
 
 impl WasmState {
-    fn on_main_thread<T, Fn>(&self, f: Fn) -> impl 'static + Future<Output = T>
+    fn on_main_thread<T, Fn>(&self, f: Fn) -> impl 'static + Future<Output = Result<T>>
     where
         T: 'static + Send,
         Fn: 'static + Send + for<'a> FnOnce(&'a mut AsyncApp) -> LocalBoxFuture<'a, T>,
     {
         let (return_tx, return_rx) = oneshot::channel();
-        self.host
+        let send_result = self
+            .host
             .main_thread_message_tx
             .clone()
             .unbounded_send(Box::new(move |cx| {
@@ -820,19 +821,20 @@ impl WasmState {
                     return_tx.send(result).ok();
                 }
                 .boxed_local()
-            }))
-            .unwrap_or_else(|_| {
-                panic!(
-                    "main thread message channel should not be closed yet, extension {} (id {})",
-                    self.manifest.name, self.manifest.id,
-                )
-            });
+            }));
         let name = self.manifest.name.clone();
         let id = self.manifest.id.clone();
         async move {
-            return_rx.await.unwrap_or_else(|_| {
-                panic!("main thread message channel, extension {name} (id {id})")
-            })
+            match send_result {
+                Err(_) => Err(anyhow!(
+                    "main thread message channel is closed, extension {name} (id {id})"
+                )),
+                Ok(()) => return_rx.await.map_err(|_| {
+                    anyhow!(
+                        "main thread message channel closed before the extension call completed, extension {name} (id {id})"
+                    )
+                }),
+            }
         }
     }
 
@@ -898,9 +900,12 @@ impl CacheStore for IncrementalCompilationCache {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::BTreeMap;
+
     use super::*;
     use extension::ExtensionHostProxy;
     use fs::FakeFs;
+    use futures::StreamExt as _;
     use gpui::TestAppContext;
     use http_client::FakeHttpClient;
     use serde_json::json;
@@ -917,6 +922,160 @@ mod tests {
             ExtensionSettings::register(cx);
             gpui_tokio::init(cx);
         });
+    }
+
+    fn test_wasm_host(
+        cx: &mut TestAppContext,
+        main_thread_message_tx: UnboundedSender<MainThreadCall>,
+        message_task: Task<()>,
+    ) -> Arc<WasmHost> {
+        cx.update(|cx| {
+            Arc::new(WasmHost {
+                engine: wasm_engine(cx.background_executor()),
+                release_channel: ReleaseChannel::global(cx),
+                http_client: FakeHttpClient::with_200_response(),
+                node_runtime: NodeRuntime::unavailable(),
+                proxy: Arc::new(ExtensionHostProxy::default()),
+                fs: FakeFs::new(cx.background_executor().clone()),
+                work_dir: PathBuf::from("/work"),
+                granted_capabilities: ExtensionSettings::get_global(cx)
+                    .granted_capabilities
+                    .clone(),
+                _main_thread_message_task: message_task,
+                main_thread_message_tx,
+            })
+        })
+    }
+
+    fn test_wasm_state(host: Arc<WasmHost>) -> WasmState {
+        let manifest = Arc::new(ExtensionManifest {
+            id: "test-extension".into(),
+            name: "Test Extension".to_string(),
+            version: "1.0.0".into(),
+            schema_version: extension::SchemaVersion::ZERO,
+            description: None,
+            repository: None,
+            authors: vec![],
+            lib: Default::default(),
+            themes: vec![],
+            icon_themes: vec![],
+            languages: vec![],
+            grammars: BTreeMap::default(),
+            language_servers: BTreeMap::default(),
+            context_servers: BTreeMap::default(),
+            slash_commands: BTreeMap::default(),
+            snippets: None,
+            capabilities: vec![],
+            debug_adapters: Default::default(),
+            debug_locators: Default::default(),
+            language_model_providers: BTreeMap::default(),
+        });
+        WasmState {
+            manifest: manifest.clone(),
+            table: ResourceTable::new(),
+            ctx: WasiCtxBuilder::new().build(),
+            host,
+            capability_granter: CapabilityGranter::new(Vec::new(), manifest),
+        }
+    }
+
+    fn spawn_main_thread_message_loop(
+        cx: &mut TestAppContext,
+        mut rx: mpsc::UnboundedReceiver<MainThreadCall>,
+    ) -> Task<()> {
+        cx.update(|cx| {
+            cx.spawn(async move |cx| {
+                while let Some(message) = rx.next().await {
+                    message(cx).await;
+                }
+            })
+        })
+    }
+
+    #[gpui::test]
+    async fn test_on_main_thread_returns_value(cx: &mut TestAppContext) {
+        init_test(cx);
+
+        let (tx, rx) = mpsc::unbounded::<MainThreadCall>();
+        let message_task = spawn_main_thread_message_loop(cx, rx);
+        let state = test_wasm_state(test_wasm_host(cx, tx, Task::ready(())));
+
+        let result = state
+            .on_main_thread(|cx| {
+                async move { cx.update(|_cx| "hello from the main thread".to_string()) }
+                    .boxed_local()
+            })
+            .await;
+
+        assert_eq!(
+            result.expect("main thread dispatch should succeed"),
+            "hello from the main thread",
+        );
+        drop(message_task);
+    }
+
+    #[gpui::test]
+    async fn test_on_main_thread_reports_closed_channel(cx: &mut TestAppContext) {
+        init_test(cx);
+
+        // Simulate the main thread message loop having shut down: the receiver
+        // is dropped, so any enqueue attempt fails.
+        let (tx, rx) = mpsc::unbounded::<MainThreadCall>();
+        drop(rx);
+        let state = test_wasm_state(test_wasm_host(cx, tx, Task::ready(())));
+
+        let result = state
+            .on_main_thread(|_cx| async move { 42u64 }.boxed_local())
+            .await;
+
+        let error = result.expect_err("enqueueing onto a closed channel should fail");
+        let message = error.to_string();
+        assert!(
+            message.contains("main thread message channel is closed"),
+            "unexpected error: {message}",
+        );
+        assert!(
+            message.contains("Test Extension") && message.contains("test-extension"),
+            "error should name the extension: {message}",
+        );
+    }
+
+    #[gpui::test]
+    async fn test_on_main_thread_reports_dropped_responder(cx: &mut TestAppContext) {
+        init_test(cx);
+
+        // Simulate the main thread shutting down while a call is in flight: the
+        // message loop task is cancelled after the call has been dispatched but
+        // before the response is sent, dropping the response channel.
+        let (tx, rx) = mpsc::unbounded::<MainThreadCall>();
+        let message_task = spawn_main_thread_message_loop(cx, rx);
+        let state = test_wasm_state(test_wasm_host(cx, tx, Task::ready(())));
+
+        let (started_tx, started_rx) = oneshot::channel();
+        let response = state.on_main_thread(move |_cx| {
+            async move {
+                started_tx.send(()).ok();
+                // Never complete: the call stays in flight until the loop dies.
+                futures::future::pending::<u64>().await
+            }
+            .boxed_local()
+        });
+        started_rx
+            .await
+            .expect("the main thread should start running the dispatched call");
+        drop(message_task);
+
+        let result = response.await;
+        let error = result.expect_err("a dropped response channel should fail");
+        let message = error.to_string();
+        assert!(
+            message.contains("closed before the extension call completed"),
+            "unexpected error: {message}",
+        );
+        assert!(
+            message.contains("Test Extension") && message.contains("test-extension"),
+            "error should name the extension: {message}",
+        );
     }
 
     #[gpui::test]

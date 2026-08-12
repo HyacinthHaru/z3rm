@@ -158,6 +158,12 @@ pub enum Event {
     WorktreePathsChanged {
         old_worktree_paths: WorktreePaths,
     },
+    /// An entry moved to `project_path`. Consumers that cache paths per open
+    /// item (navigation history) have to rewrite their entry.
+    EntryRenamed {
+        project_path: ProjectPath,
+        abs_path: Option<PathBuf>,
+    },
     WorktreeUpdatedEntries(WorktreeId, UpdatedEntriesSet),
     Toast {
         notification_id: String,

@@ -614,4 +614,3 @@ fn project_name(paths: &PathList) -> String {
 }
 
 // #[cfg(test)]
-// mod tests;

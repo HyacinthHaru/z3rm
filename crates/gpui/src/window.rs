@@ -1554,7 +1554,34 @@ impl Window {
             let needs_present = needs_present.clone();
             let next_frame_callbacks = next_frame_callbacks.clone();
             let input_rate_tracker = input_rate_tracker.clone();
+            let mut deferred_force_render = false;
             move |request_frame_options| {
+                // This must be checked before anything else: if this request
+                // arrived re-entrantly while a draw is on this thread's stack
+                // (e.g. via a nested message pump in the Windows window
+                // procedure), drawing would nest draws, and even touching the
+                // App would panic on its already-mutable borrow. Skip instead;
+                // the platform leaves the window invalidated (or re-invalidates
+                // it), so a fresh request arrives once the in-progress draw
+                // unwinds. Remember force_render so the deferred frame still
+                // bypasses the view cache.
+                //
+                // Returning here skips `complete_frame`, which on Wayland would
+                // stall the window's frame callbacks (no `surface.commit()`) —
+                // but calling it would hit the App borrow panic above, and this
+                // branch is unreachable there in practice: only Windows pumps
+                // platform events (and thus requests frames) mid-draw.
+                if draw_in_progress() {
+                    log::debug!("deferring re-entrant window draw request");
+                    deferred_force_render |= request_frame_options.force_render;
+                    return;
+                }
+                // Take the deferred flag first: `||` short-circuits, and leaving
+                // the flag set when this request already forces a render would
+                // force a second, redundant render on the next frame.
+                let force_render =
+                    mem::take(&mut deferred_force_render) || request_frame_options.force_render;
+
                 let thermal_state = handle
                     .update(&mut cx, |_, _, cx| cx.thermal_state())
                     .log_err();
@@ -1562,7 +1589,7 @@ impl Window {
                 // Throttle frame rate based on conditions:
                 // - Thermal pressure (Serious/Critical): cap to ~60fps
                 // - Inactive window (not focused): cap to ~30fps to save energy
-                let min_frame_interval = if !request_frame_options.force_render
+                let min_frame_interval = if !force_render
                     && !request_frame_options.require_presentation
                     && next_frame_callbacks.borrow().is_empty()
                 {
@@ -1580,6 +1607,8 @@ impl Window {
                     if let Some(last_frame) = last_frame_time.get()
                         && now.duration_since(last_frame) < min_interval
                     {
+                        // Don't lose a pending forced render to throttling.
+                        deferred_force_render |= force_render;
                         // Must still complete the frame on platforms that require it.
                         // On Wayland, `surface.frame()` was already called to request the
                         // next frame callback, so we must call `surface.commit()` (via
@@ -1610,11 +1639,11 @@ impl Window {
                     || needs_present.get()
                     || (active.get() && input_rate_tracker.borrow_mut().is_high_rate());
 
-                if invalidator.is_dirty() || request_frame_options.force_render {
+                if invalidator.is_dirty() || force_render {
                     measure("frame duration", || {
                         handle
                             .update(&mut cx, |_, window, cx| {
-                                if request_frame_options.force_render {
+                                if force_render {
                                     // Bypass cached view reuse so we don't replay stale
                                     // atlas tile references after a GPU device recovery.
                                     window.refresh();
@@ -2830,6 +2859,9 @@ impl Window {
                 draw_end: Instant::now(),
             });
         }
+
+        // Exit the scope to obtain the arena-clear token this draw owes; the
+        // scope's teardown itself happens in `ElementArenaScope::drop`.
         arena_scope.exit(&cx.element_arena)
     }
 
@@ -4827,8 +4859,7 @@ impl Window {
 
     fn dispatch_key_event(&mut self, event: &dyn Any, cx: &mut App) {
         if self.invalidator.is_dirty() {
-            let arena_clear_needed = self.draw(cx);
-            arena_clear_needed.clear(cx);
+            self.draw(cx).clear(cx);
         }
 
         let node_id = self.focus_node_id_in_rendered_frame(self.focus);
@@ -5308,6 +5339,10 @@ impl Window {
                 window.platform_window.set_input_handler(input_handler);
             }
         });
+    }
+
+    pub(crate) fn has_active_prompt(&self) -> bool {
+        self.prompt.is_some()
     }
 
     /// Present a platform dialog.
@@ -6434,10 +6469,11 @@ pub fn outline(
 
 #[cfg(test)]
 mod tests {
+
     use crate::{
-        AppContext as _, Bounds, Context, InteractiveElement as _, IntoElement, ParentElement as _,
-        Pixels, Render, StatefulInteractiveElement as _, Styled as _, TestAppContext, Window,
-        accesskit, canvas, div, px, size,
+        AppContext as _, Bounds, Context, FocusHandle, InteractiveElement as _, IntoElement,
+        ParentElement as _, Pixels, Render, StatefulInteractiveElement as _, Styled as _,
+        TestAppContext, Window, WindowOptions, accesskit, canvas, div, px, size,
     };
     use std::{
         cell::Cell,
@@ -6451,6 +6487,53 @@ mod tests {
         HEADLESS_A11Y_ENV_LOCK
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
+    struct EmptyView;
+
+    impl Render for EmptyView {
+        fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
+            div()
+        }
+    }
+
+    struct OpensWindowOnPaint {
+        opened: Rc<Cell<bool>>,
+    }
+
+    impl Render for OpensWindowOnPaint {
+        fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
+            let opened = self.opened.clone();
+            div()
+                .size_full()
+                .child(canvas(
+                    |_, _, _| {},
+                    move |_, _, _window, cx| {
+                        if !opened.replace(true) {
+                            cx.open_window(WindowOptions::default(), |_, cx| cx.new(|_| EmptyView))
+                                .unwrap();
+                        }
+                    },
+                ))
+                .child(div().child("after"))
+        }
+    }
+
+    #[test]
+    fn test_window_opened_during_draw_defers_arena_clear() {
+        let mut cx = TestAppContext::single();
+
+        let opened = Rc::new(Cell::new(false));
+        let window = cx.add_window({
+            let opened = opened.clone();
+            move |_, _| OpensWindowOnPaint { opened }
+        });
+
+        assert!(opened.get());
+        assert_eq!(cx.windows().len(), 2);
+
+        cx.update_window(window.into(), |_, window, cx| window.draw(cx).clear(cx))
+            .unwrap();
     }
 
     struct RootView {
@@ -6490,8 +6573,7 @@ mod tests {
 
         let viewport_size = cx
             .update_window(window.into(), |_, window, cx| {
-                let arena_clear_needed = window.draw(cx);
-                arena_clear_needed.clear(cx);
+                window.draw(cx).clear(cx);
                 window.viewport_size()
             })
             .unwrap();
@@ -6720,8 +6802,7 @@ mod tests {
         // `action_listeners` at the start of each frame.
         let tree_json = cx
             .update_window(window.into(), |_, window, cx| {
-                let arena_clear_needed = window.draw(cx);
-                arena_clear_needed.clear(cx);
+                window.draw(cx).clear(cx);
                 window.debug_a11y_tree_json()
             })
             .unwrap()
@@ -6857,7 +6938,6 @@ mod tests {
             std::env::remove_var("Z3RM_A11Y_BUILD_HEADLESS");
         }
     }
-
     /// §15.12 Built-in action handling: with no listener registered for a
     /// node, `Action::Click` must still produce the real GPUI event effect —
     /// synthesized mouse down/up at the node's bounds center — firing the
@@ -6879,8 +6959,7 @@ mod tests {
 
         let tree_json = cx
             .update_window(window.into(), |_, window, cx| {
-                let arena_clear_needed = window.draw(cx);
-                arena_clear_needed.clear(cx);
+                window.draw(cx).clear(cx);
                 window.debug_a11y_tree_json()
             })
             .unwrap()

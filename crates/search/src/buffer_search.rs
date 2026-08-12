@@ -1146,7 +1146,10 @@ impl BufferSearchBar {
                 replace_enabled: false,
                 selection_search_enabled: false,
             },
-            Some(SeedQuerySetting::Selection),
+            // `UseSelectionForFind` seeds from the selection *or* the word under
+            // the cursor, which is what `Surround` means; `Selection` would give
+            // up on an empty selection.
+            Some(SeedQuerySetting::Surround),
             window,
             cx,
         );

@@ -1460,7 +1460,6 @@ mod tests {
             "valid sibling's cache survives the rejection"
         );
     }
-
     /// §5.4: a display-list region that stops appearing in the VDOM must be
     /// evicted from the native cache — otherwise a ticking extension that
     /// cycles region ids grows the renderer's state without bound (§5.2).

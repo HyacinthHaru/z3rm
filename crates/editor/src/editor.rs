@@ -10987,189 +10987,116 @@ impl Editor {
     ) {
     }
 
+    /// Wraps each selection in the language's block comment delimiters, or
+    /// unwraps it when the selection is already commented.
+    ///
+    /// An empty selection is treated as the caret sitting inside a candidate
+    /// comment: uncommenting looks outward for the nearest enclosing pair, and
+    /// commenting inserts an empty comment around the caret.
     pub fn toggle_block_comments(
         &mut self,
-        _: &ToggleBlockComments,
+        _action: &ToggleBlockComments,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
         if self.read_only(cx) {
             return;
         }
-        self.transact(window, cx, |this, _window, cx| {
-            let mut selections = this
-                .selections
-                .all::<MultiBufferPoint>(&this.display_snapshot(cx));
-            let mut edits = Vec::new();
-            let snapshot = this.buffer.read(cx).read(cx);
-            let empty_str: Arc<str> = Arc::default();
-            let mut markers_inserted = Vec::new();
+        let buffer = self.buffer.read(cx).snapshot(cx);
 
-            for selection in &mut selections {
-                let start_point = selection.start;
-                let end_point = selection.end;
+        let mut new_selections = Vec::new();
+        let mut edits = Vec::new();
+        // Selections are handled in document order, so each edit shifts every
+        // later one by the length it added or removed.
+        let mut delta: isize = 0;
 
-                let Some(language) =
-                    snapshot.language_scope_at(Point::new(start_point.row, start_point.column))
-                else {
-                    continue;
-                };
+        for selection in self.selections.all_adjusted(&self.display_snapshot(cx)) {
+            let start = buffer.point_to_offset(selection.start);
+            let end = buffer.point_to_offset(selection.end);
 
-                let Some(BlockCommentConfig {
-                    start: comment_start,
-                    end: comment_end,
-                    ..
-                }) = language.block_comment()
-                else {
-                    continue;
-                };
+            let Some(config) = buffer
+                .language_scope_at(start)
+                .and_then(|scope| scope.block_comment().cloned())
+            else {
+                continue;
+            };
+            let (open, close) = (config.start.as_ref(), config.end.as_ref());
 
-                let prefix_needle = comment_start.trim_end().as_bytes();
-                let suffix_needle = comment_end.trim_start().as_bytes();
-                if prefix_needle.is_empty() || suffix_needle.is_empty() {
-                    continue;
-                }
+            // Uncommenting has to consider text outside the selection: the
+            // caret may sit between the delimiters rather than around them.
+            let commented = enclosing_block_comment(&buffer, start.0..end.0, open, close);
 
-                let region_start = Point::new(start_point.row, 0);
-                let region_end = Point::new(
-                    end_point.row,
-                    snapshot.line_len(MultiBufferRow(end_point.row)),
-                );
-                let region_bytes: Vec<u8> = snapshot
-                    .bytes_in_range(region_start..region_end)
-                    .flatten()
-                    .copied()
-                    .collect();
+            // A caret stays a caret across the toggle; only a real selection
+            // grows or shrinks with the delimiters.
+            let caret = start == end;
 
-                let region_start_offset = snapshot.point_to_offset(region_start);
-                let start_byte = snapshot.point_to_offset(start_point) - region_start_offset;
-                let end_byte = snapshot.point_to_offset(end_point) - region_start_offset;
-
-                let mut is_commented = false;
-                let mut prefix_range = start_point..start_point;
-                let mut suffix_range = end_point..end_point;
-
-                if let Some(prefix_pos) = region_bytes[..end_byte.min(region_bytes.len())]
-                    .windows(prefix_needle.len())
-                    .rposition(|window| window == prefix_needle)
-                {
-                    let after_prefix = prefix_pos + prefix_needle.len();
-                    if let Some(suffix_pos) = region_bytes[after_prefix..]
-                        .windows(suffix_needle.len())
-                        .position(|window| window == suffix_needle)
-                        .map(|position| position + after_prefix)
-                    {
-                        let suffix_end = suffix_pos + suffix_needle.len();
-                        let markers_surround = prefix_pos <= start_byte
-                            && suffix_end >= end_byte
-                            && start_byte < suffix_end;
-                        let selection_contains = start_byte <= prefix_pos
-                            && suffix_end <= end_byte
-                            && region_bytes[start_byte..prefix_pos]
-                                .iter()
-                                .all(|byte| byte.is_ascii_whitespace())
-                            && region_bytes[suffix_end..end_byte]
-                                .iter()
-                                .all(|byte| byte.is_ascii_whitespace());
-
-                        if markers_surround || selection_contains {
-                            is_commented = true;
-                            let prefix_point =
-                                snapshot.offset_to_point(region_start_offset + prefix_pos);
-                            let suffix_point =
-                                snapshot.offset_to_point(region_start_offset + suffix_pos);
-                            prefix_range = prefix_point
-                                ..Point::new(
-                                    prefix_point.row,
-                                    prefix_point.column + prefix_needle.len() as u32,
-                                );
-                            suffix_range = suffix_point
-                                ..Point::new(
-                                    suffix_point.row,
-                                    suffix_point.column + suffix_needle.len() as u32,
-                                );
-                        }
-                    }
-                }
-
-                if is_commented {
-                    if snapshot
-                        .bytes_in_range(prefix_range.end..snapshot.max_point())
-                        .flatten()
-                        .next()
-                        == Some(&b' ')
-                    {
-                        prefix_range.end.column += 1;
-                    }
-                    if suffix_range.start.column > 0 {
-                        let before =
-                            Point::new(suffix_range.start.row, suffix_range.start.column - 1);
-                        if snapshot
-                            .bytes_in_range(before..suffix_range.start)
-                            .flatten()
-                            .next()
-                            == Some(&b' ')
-                        {
-                            suffix_range.start.column -= 1;
-                        }
-                    }
-
-                    edits.push((prefix_range, empty_str.clone()));
-                    edits.push((suffix_range, empty_str.clone()));
-                } else {
-                    let prefix: Arc<str> = if comment_start.ends_with(' ') {
-                        comment_start.clone()
+            let (range, new_text, select_start, select_end) = match commented {
+                Some(range) => {
+                    let inner = buffer
+                        .text_for_range(
+                            MultiBufferOffset(range.start + open.len())
+                                ..MultiBufferOffset(range.end - close.len()),
+                        )
+                        .collect::<String>();
+                    let end_offset = range.start + inner.len();
+                    if caret {
+                        let cursor = start
+                            .0
+                            .saturating_sub(open.len())
+                            .clamp(range.start, end_offset);
+                        (range.clone(), inner, cursor, cursor)
                     } else {
-                        format!("{} ", comment_start).into()
-                    };
-                    let suffix: Arc<str> = if comment_end.starts_with(' ') {
-                        comment_end.clone()
-                    } else {
-                        format!(" {}", comment_end).into()
-                    };
-
-                    edits.push((start_point..start_point, prefix.clone()));
-                    edits.push((end_point..end_point, suffix.clone()));
-                    markers_inserted.push((
-                        selection.id,
-                        prefix.len(),
-                        suffix.len(),
-                        selection.is_empty(),
-                        end_point.row,
-                    ));
+                        (range.clone(), inner, range.start, end_offset)
+                    }
                 }
-            }
+                None => {
+                    let inner = buffer.text_for_range(start..end).collect::<String>();
+                    let text = format!("{open}{inner}{close}");
+                    if caret {
+                        let cursor = start.0 + open.len();
+                        (start.0..end.0, text, cursor, cursor)
+                    } else {
+                        let end_offset = start.0 + text.len();
+                        (start.0..end.0, text, start.0, end_offset)
+                    }
+                }
+            };
 
-            drop(snapshot);
+            new_selections.push((
+                selection.id,
+                selection.reversed,
+                (select_start as isize + delta) as usize,
+                (select_end as isize + delta) as usize,
+            ));
+            delta += new_text.len() as isize - (range.end - range.start) as isize;
+            edits.push((MultiBufferOffset(range.start)..MultiBufferOffset(range.end), new_text));
+        }
+
+        if edits.is_empty() {
+            return;
+        }
+
+        self.transact(window, cx, |this, window, cx| {
             this.buffer.update(cx, |buffer, cx| {
                 buffer.edit(edits, None, cx);
             });
 
-            let mut selections = this
-                .selections
-                .all::<MultiBufferPoint>(&this.display_snapshot(cx));
-            for selection in &mut selections {
-                if let Some((_, prefix_len, suffix_len, was_empty, suffix_row)) = markers_inserted
-                    .iter()
-                    .find(|(id, _, _, _, _)| *id == selection.id)
-                {
-                    if *was_empty {
-                        selection.start.column = selection
-                            .start
-                            .column
-                            .saturating_sub((*prefix_len + *suffix_len) as u32);
-                    } else {
-                        selection.start.column =
-                            selection.start.column.saturating_sub(*prefix_len as u32);
-                        if selection.end.row == *suffix_row {
-                            selection.end.column += *suffix_len as u32;
-                        }
-                    }
-                }
-            }
-            this.change_selections(Default::default(), _window, cx, |selections_collection| {
-                selections_collection.select(selections);
+            let snapshot = this.buffer.read(cx).snapshot(cx);
+            let selections = new_selections
+                .into_iter()
+                .map(|(id, reversed, start, end)| Selection {
+                    start: snapshot.anchor_before(MultiBufferOffset(start)),
+                    end: snapshot.anchor_after(MultiBufferOffset(end)),
+                    goal: SelectionGoal::None,
+                    id,
+                    reversed,
+                })
+                .collect::<Vec<_>>();
+            this.change_selections(Default::default(), window, cx, |s| {
+                s.select_anchors(selections);
             });
+
+            this.request_autoscroll(Autoscroll::fit(), cx);
         });
     }
 
@@ -12703,6 +12630,45 @@ impl RowRangeExt for Range<DisplayRow> {
 
 /// If select range has more than one line, we
 /// just point the cursor to range.start.
+/// Byte range of the block comment enclosing `range`, if any.
+///
+/// The caret case matters as much as the selection case: with an empty
+/// selection inside `/* x */` there is no delimiter within the range at all,
+/// so the search walks outward from the selection to the nearest `open` before
+/// it and `close` after it, and only accepts the pair when nothing else
+/// intervenes.
+fn enclosing_block_comment(
+    buffer: &MultiBufferSnapshot,
+    range: Range<usize>,
+    open: &str,
+    close: &str,
+) -> Option<Range<usize>> {
+    let text = buffer.text();
+    if range.end > text.len() {
+        return None;
+    }
+
+    // Selection already spans the delimiters.
+    if text.get(range.clone()).is_some_and(|selected| {
+        selected.starts_with(open) && selected.ends_with(close) && selected.len() >= open.len() + close.len()
+    }) {
+        return Some(range);
+    }
+
+    let before = text.get(..range.start)?;
+    let after = text.get(range.end..)?;
+    let start = before.rfind(open)?;
+    let close_at = after.find(close)?;
+    let end = range.end + close_at + close.len();
+
+    // A `close` between the opener and the selection means the opener belongs
+    // to an earlier comment, not this one.
+    if before.get(start + open.len()..)?.contains(close) {
+        return None;
+    }
+    Some(start..end)
+}
+
 fn collapse_multiline_range(range: Range<Point>) -> Range<Point> {
     if range.start.row == range.end.row {
         range

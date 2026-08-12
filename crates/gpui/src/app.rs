@@ -1563,10 +1563,7 @@ impl App {
                     })
                     .collect::<Vec<_>>()
                 {
-                    self.update_window(window, |_, window, cx| {
-                        let arena_clear_needed = window.draw(cx);
-                        arena_clear_needed.clear(cx);
-                    })
+                    self.update_window(window, |_, window, cx| window.draw(cx).clear(cx))
                         .unwrap();
                 }
 

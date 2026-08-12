@@ -5,7 +5,8 @@ pub mod invalid_item_view;
 pub mod item;
 mod modal_layer;
 mod multi_workspace;
-// #[cfg(test)]
+// Frozen: needs AgentSettings (the AI crate is gone) plus Project::project_group_key
+// and DisableAiSettings::override_global, none of which survived the fork.
 // mod multi_workspace_tests;
 pub mod layout_projection;
 pub mod notifications;
@@ -1065,10 +1066,22 @@ impl AppState {
     #[cfg(feature = "test-support")]
     pub fn test(cx: &mut App) -> Arc<Self> {
         use session::Session;
+        // Anything built on an AppState reads settings somewhere, and a test
+        // that forgot to install the store panics deep inside unrelated code
+        // rather than at the missing setup. Callers that install their own
+        // store first keep it.
+        if cx.try_global::<settings::SettingsStore>().is_none() {
+            let store = settings::SettingsStore::test(cx);
+            cx.set_global(store);
+        }
         let session = cx.new(|cx| AppSession::new(Session::test(), cx));
+        let fs = Self::test_fs(cx);
+        // Mirrors `main`, which publishes the same filesystem as a global so
+        // that code reaching for `<dyn Fs>::global` sees the fake one.
+        <dyn Fs>::set_global(fs.clone(), cx);
         Arc::new(Self {
             languages: Arc::new(LanguageRegistry::new(cx.background_executor().clone())),
-            fs: Self::test_fs(cx),
+            fs,
             build_window_options: |_, _| Default::default(),
             session,
             client: Arc::new(()),
@@ -1387,19 +1400,6 @@ impl Workspace {
                     }
                 }
 
-                project::Event::Toast {
-                    notification_id,
-                    message,
-                    link: _,
-                } => {
-                    this.show_toast(
-                        Toast::new(
-                            NotificationId::named(notification_id.clone().into()),
-                            message.clone(),
-                        ),
-                        cx,
-                    );
-                }
                 project::Event::Closed => {
                     window.remove_window();
                 }
@@ -1412,6 +1412,51 @@ impl Workspace {
                     }
                 }
 
+                project::Event::EntryRenamed {
+                    project_path,
+                    abs_path,
+                } => {
+                    for pane in this.panes.iter() {
+                        pane.update(cx, |pane, cx| {
+                            let renamed_items = pane
+                                .items()
+                                .filter(|item| item.project_path(cx).as_ref() == Some(project_path))
+                                .map(|item| item.item_id())
+                                .collect::<Vec<_>>();
+                            for item_id in renamed_items {
+                                pane.nav_history_mut().rename_item(
+                                    item_id,
+                                    project_path.clone(),
+                                    abs_path.clone(),
+                                );
+                            }
+                        });
+                    }
+                }
+
+                project::Event::Toast {
+                    notification_id,
+                    message,
+                    link,
+                } => {
+                    let message = message.clone();
+                    let link = link.clone();
+                    this.show_notification(
+                        NotificationId::named(notification_id.clone().into()),
+                        cx,
+                        |cx| {
+                            cx.new(|cx| {
+                                let notification = MessageNotification::new(message, cx);
+                                match link {
+                                    Some(link) => notification
+                                        .more_info_message("More info")
+                                        .more_info_url(link),
+                                    None => notification,
+                                }
+                            })
+                        },
+                    );
+                }
                 _ => {}
             }
             cx.notify()
@@ -2676,8 +2721,12 @@ impl Workspace {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> oneshot::Receiver<Option<Vec<PathBuf>>> {
+        // The hook is moved out for the call because it borrows the workspace
+        // mutably, then put back so later prompts still see it.
         if let Some(prompt) = self.on_prompt_for_open_path.take() {
-            return prompt(self, window, cx);
+            let rx = prompt(self, window, cx);
+            self.on_prompt_for_open_path = Some(prompt);
+            return rx;
         }
 
         let (tx, rx) = oneshot::channel();
@@ -2713,7 +2762,9 @@ impl Workspace {
         cx: &mut Context<Self>,
     ) -> oneshot::Receiver<Option<Vec<PathBuf>>> {
         if let Some(prompt) = self.on_prompt_for_new_path.take() {
-            return prompt(self, suggested_name, window, cx);
+            let rx = prompt(self, suggested_name, window, cx);
+            self.on_prompt_for_new_path = Some(prompt);
+            return rx;
         }
 
         let (tx, rx) = oneshot::channel();
@@ -3001,8 +3052,7 @@ impl Workspace {
                                         // (Note that the tests always do this implicitly, so you must manually test with something like:
                                         //   "bindings": { "g z": ["workspace::SendKeystrokes", ": j <enter> u"]}
                                         // )
-                                        let arena_clear_needed = window.draw(cx);
-                                        arena_clear_needed.clear(cx);
+                                        window.draw(cx).clear(cx);
                                         return true;
                                     }
                                     false

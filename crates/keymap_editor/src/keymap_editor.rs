@@ -3949,6 +3949,7 @@ mod tests {
             cx.set_global(settings_store);
             theme_settings::init(theme::LoadThemes::JustBase, cx);
             let _state = AppState::test(cx);
+            theme_settings::init(theme::LoadThemes::JustBase, cx);
             editor::init(cx);
             cx.set_global(KeymapEventChannel::new());
         });

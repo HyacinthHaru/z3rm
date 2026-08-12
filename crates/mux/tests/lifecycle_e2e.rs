@@ -114,7 +114,7 @@ async fn setup_session_with_pane(domain: &MuxDomain, name: &str) -> Result<(Stri
 
 /// 在通知流上等待满足条件的通知, 带超时。
 async fn wait_for_notification(
-    rx: &async_channel::Receiver<mux_protocol::Notification>,
+    rx: &mux::NotificationReceiver,
     timeout: Duration,
     mut predicate: impl FnMut(&NotifEvent) -> bool,
 ) -> Result<NotifEvent> {

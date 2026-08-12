@@ -4131,31 +4131,26 @@ pub(crate) fn all_projects(
     window: Option<&WindowHandle<MultiWorkspace>>,
     cx: &App,
 ) -> impl Iterator<Item = Entity<Project>> {
-    let mut workspace_windows = cx
-        .windows()
-        .into_iter()
-        .filter_map(|window| window.downcast::<MultiWorkspace>())
-        .collect::<Vec<_>>();
-    if let Some(window) = window.copied()
-        && !workspace_windows.contains(&window)
-    {
-        workspace_windows.push(window);
-    }
-
-    let mut projects = Vec::new();
-    for window in workspace_windows {
-        if let Ok(multi_workspace) = window.read(cx) {
-            projects.extend(
-                multi_workspace
-                    .workspaces()
-                    .map(|workspace| workspace.read(cx).project().clone()),
-            );
-        }
-    }
 
     let mut seen_project_ids = std::collections::HashSet::new();
-    projects
+    // The originating window comes first so its settings files keep their
+    // position in the file list, but every other open workspace window
+    // contributes its projects too.
+    window
+        .copied()
         .into_iter()
+        .chain(
+            cx.windows()
+                .into_iter()
+                .filter_map(|handle| handle.downcast::<MultiWorkspace>()),
+        )
+        .filter_map(|handle| handle.read(cx).ok())
+        .flat_map(|multi_workspace| {
+            multi_workspace
+                .workspaces()
+                .map(|workspace| workspace.read(cx).project().clone())
+                .collect::<Vec<_>>()
+        })
         .filter(move |project| seen_project_ids.insert(project.entity_id()))
 }
 
@@ -5738,7 +5733,7 @@ mod project_settings_update_tests {
     async fn test_updates_existing_settings_file(cx: &mut TestAppContext) {
         let setup = init_test(
             cx,
-            Some(r#"{ "all_languages": { "defaults": { "tab_size": 2 } } }"#),
+            Some("{\n  \"all_languages\": {\n    \"defaults\": {\n      \"tab_size\": 2\n    }\n  }\n}"),
         )
         .await;
 
@@ -5929,7 +5924,7 @@ mod project_settings_update_tests {
     async fn test_reloads_conflicted_buffer(cx: &mut TestAppContext) {
         let setup = init_test(
             cx,
-            Some(r#"{ "all_languages": { "defaults": { "tab_size": 2 } } }"#),
+            Some("{\n  \"all_languages\": {\n    \"defaults\": {\n      \"tab_size\": 2\n    }\n  }\n}"),
         )
         .await;
 
@@ -5954,7 +5949,8 @@ mod project_settings_update_tests {
             .fs
             .save(
                 "/project/.zed/settings.json".as_ref(),
-                &r#"{ "all_languages": { "defaults": { "tab_size": 99 } } }"#.into(),
+                &"{\n  \"all_languages\": {\n    \"defaults\": {\n      \"tab_size\": 99\n    }\n  }\n}"
+                    .into(),
                 Default::default(),
             )
             .await

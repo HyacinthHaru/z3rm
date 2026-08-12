@@ -30,7 +30,6 @@ use std::{ops::Range, time::Duration};
 use collections::{HashMap, HashSet};
 use editor::{MultiBufferSnapshot, PathKey, multibuffer_context_lines};
 use file_icons::FileIcons;
-use futures::StreamExt;
 use gpui::{
     AnyElement, AppContext, AsyncApp, ClickEvent, DismissEvent, EntityId, HighlightStyle,
     Modifiers, StyledText, Task, TextStyle, prelude::*,
@@ -38,7 +37,7 @@ use gpui::{
 use gpui::{Entity, FocusHandle, WeakEntity};
 use language::{Buffer, LanguageAwareStyling};
 use picker::{Picker, PickerDelegate};
-use project::{Project, ProjectPath, Search};
+use project::{Project, ProjectPath};
 use project::{SearchResults, search::SearchQuery, search::SearchResult};
 use settings::Settings;
 use smol::future::yield_now;
@@ -1207,18 +1206,27 @@ async fn stream_results_to_picker(
     imported_matches: ImportedMatches,
     cx: &mut AsyncApp,
 ) -> Option<SearchResults<SearchResult>> {
-    let search_results_clone = search_results.clone();
-    let mut results_stream = std::pin::pin!(
-        search_results_clone
-            .rx
-            .ready_chunks(SEARCH_RESULTS_BATCH_SIZE)
-    );
+    // Consumed in place: a SearchResults owns the only receiver, so cloning it
+    // could only ever hand back a stream the producer never writes to.
+    let SearchResults { rx } = search_results;
 
     let cap = MAX_SEARCH_RESULT_RANGES;
     let mut total_matches = 0;
 
     let mut clear_existing = matches!(imported_matches, ImportedMatches::No);
-    while let Some(results) = results_stream.next().await {
+    loop {
+        let first_result = match rx.recv().await {
+            Ok(result) => result,
+            Err(_) => break,
+        };
+        let mut results = Vec::with_capacity(SEARCH_RESULTS_BATCH_SIZE);
+        results.push(first_result);
+        while results.len() < SEARCH_RESULTS_BATCH_SIZE {
+            let Ok(result) = rx.try_recv() else {
+                break;
+            };
+            results.push(result);
+        }
         if cancel_flag.load(std::sync::atomic::Ordering::SeqCst) {
             break;
         }
@@ -1281,7 +1289,9 @@ async fn stream_results_to_picker(
         // processed before taking out the search result stream. The cancel flag
         // just needs to stop the search.
         if text_finder_turning_into_project_search.load(Ordering::Relaxed) {
-            return Some(search_results);
+            // Hand the still-live stream to project search so the in-flight
+            // results are not thrown away when the view switches.
+            return Some(SearchResults { rx });
         }
 
         smol::future::yield_now().await;

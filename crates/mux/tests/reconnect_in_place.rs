@@ -103,7 +103,7 @@ impl Drop for TestServer {
 }
 
 async fn wait_for_notification(
-    rx: &async_channel::Receiver<mux_protocol::Notification>,
+    rx: &mux::NotificationReceiver,
     timeout: Duration,
     mut predicate: impl FnMut(&NotifEvent) -> bool,
 ) -> Result<NotifEvent> {

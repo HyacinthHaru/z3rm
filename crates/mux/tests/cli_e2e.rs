@@ -121,6 +121,38 @@ impl CliEnv {
         let stderr = String::from_utf8_lossy(&out.stderr).into_owned();
         Ok((code, stdout, stderr))
     }
+
+    /// §16.6 `show-buffer` / `show-file` 的契约是把字节原样写到 stdout, 所以断言
+    /// 必须看原始字节: lossy 转 String 会把每个非 UTF-8 字节换成 U+FFFD, 一次
+    /// 真正的损坏和一次正确的二进制往返在字符串上长得一模一样。
+    fn run_raw(&self, args: &[&str], stdin: Option<&[u8]>) -> Result<(i32, Vec<u8>, String)> {
+        use std::io::Write;
+
+        let mut child = Command::new(&self.z3rm_bin)
+            .env("Z3RM_MUX_SOCKET", &self.socket_path)
+            .args(args)
+            .stdin(if stdin.is_some() {
+                Stdio::piped()
+            } else {
+                Stdio::null()
+            })
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .with_context(|| format!("spawn z3rm {:?}", args))?;
+        if let Some(bytes) = stdin {
+            child
+                .stdin
+                .take()
+                .context("child stdin was not piped")?
+                .write_all(bytes)
+                .context("write child stdin")?;
+        }
+        let out = child.wait_with_output().context("wait for z3rm")?;
+        let code = out.status.code().unwrap_or(-1);
+        let stderr = String::from_utf8_lossy(&out.stderr).into_owned();
+        Ok((code, out.stdout, stderr))
+    }
 }
 
 impl Drop for CliEnv {
@@ -656,6 +688,177 @@ fn cli_extension_uninstall_removes_the_directory() -> Result<()> {
     ])?;
     assert_ne!(code, 0, "uninstalling a missing extension must fail");
     assert!(stderr.contains("not installed"), "stderr={stderr:?}");
+
+    Ok(())
+}
+
+// ============================================================================
+// §16.6 会话 worktree 文件访问 + 服务端剪贴板的 CLI 表面
+// ============================================================================
+
+/// 建一棵可预测的 worktree 并把它注册成一个会话，返回 worktree 路径。
+fn session_worktree(env: &CliEnv, session_name: &str) -> Result<PathBuf> {
+    let worktree = env._tmp.path().join(session_name);
+    std::fs::create_dir_all(worktree.join("nested")).context("create worktree")?;
+    std::fs::write(worktree.join("readme.txt"), "hello worktree\n")?;
+    std::fs::write(worktree.join("payload.bin"), [0x00u8, 0x01, 0xff, 0x00])?;
+    std::fs::write(worktree.join("nested/inner.txt"), "inner\n")?;
+
+    let worktree_arg = worktree.to_string_lossy().into_owned();
+    let (code, _, stderr) = env.run(&["new", "-s", session_name, "-c", &worktree_arg])?;
+    anyhow::ensure!(
+        code == 0,
+        "creating session {session_name} failed: {stderr}"
+    );
+    Ok(worktree)
+}
+
+#[test]
+fn cli_file_commands_walk_the_session_worktree() -> Result<()> {
+    let env = CliEnv::spawn()?;
+    let worktree = session_worktree(&env, "files")?;
+
+    // 不给路径就是会话 cwd 本身。目录在前，其余按名称。
+    let (code, stdout, stderr) = env.run(&["list-dir", "-t", "files"])?;
+    assert_eq!(code, 0, "list-dir should succeed; stderr={stderr}");
+    let names: Vec<&str> = stdout
+        .lines()
+        .filter_map(|line| line.split('\t').nth(3))
+        .collect();
+    assert_eq!(
+        names,
+        vec!["nested", "payload.bin", "readme.txt"],
+        "{stdout:?}"
+    );
+    assert!(
+        stdout.contains("dir\t") && stdout.contains("file\t15\t-\treadme.txt"),
+        "list-dir must report kind/size/modified/name, got:\n{stdout}"
+    );
+
+    let (code, stdout, stderr) = env.run(&["list-dir", "-t", "files", "nested"])?;
+    assert_eq!(code, 0, "stderr={stderr}");
+    assert!(stdout.trim_end().ends_with("inner.txt"), "{stdout:?}");
+
+    let (code, stdout, stderr) = env.run(&["stat-file", "-t", "files", "readme.txt"])?;
+    assert_eq!(code, 0, "stderr={stderr}");
+    assert!(stdout.contains("exists\ttrue"), "{stdout:?}");
+    assert!(stdout.contains("type\tfile"), "{stdout:?}");
+    assert!(stdout.contains("size\t15"), "{stdout:?}");
+
+    let (code, stdout, stderr) = env.run(&["stat-file", "-t", "files", "nested"])?;
+    assert_eq!(code, 0, "stderr={stderr}");
+    assert!(stdout.contains("type\tdir"), "{stdout:?}");
+
+    // `test -e` 契约: 路径不在就退非 0，但仍然把四个字段印出来。服务端把
+    // "不存在"编码成 exists=false 而不是错误，这个区分只能由 CLI 做出来。
+    let (code, stdout, _) = env.run(&["stat-file", "-t", "files", "no-such.txt"])?;
+    assert_ne!(code, 0, "a missing path must exit non-zero, got:\n{stdout}");
+    assert!(stdout.contains("exists\tfalse"), "{stdout:?}");
+    assert!(
+        stdout.contains("type\t-"),
+        "a path that does not exist is neither file nor dir, got:\n{stdout}"
+    );
+
+    let (code, stdout, stderr) = env.run_raw(&["show-file", "-t", "files", "readme.txt"], None)?;
+    assert_eq!(code, 0, "stderr={stderr}");
+    assert_eq!(stdout, b"hello worktree\n");
+
+    // 二进制文件必须逐字节落到 stdout，不能被 UTF-8 转换弄脏。
+    let (code, stdout, stderr) = env.run_raw(&["show-file", "-t", "files", "payload.bin"], None)?;
+    assert_eq!(code, 0, "stderr={stderr}");
+    assert_eq!(stdout, vec![0x00u8, 0x01, 0xff, 0x00]);
+
+    let large = (0..mux_protocol::DEFAULT_READ_FILE_PAGE_BYTES as usize * 2 + 19)
+        .map(|index| (index % 251) as u8)
+        .collect::<Vec<_>>();
+    std::fs::write(worktree.join("large.bin"), &large)?;
+    let (code, stdout, stderr) = env.run_raw(&["show-file", "-t", "files", "large.bin"], None)?;
+    assert_eq!(code, 0, "stderr={stderr}");
+    assert_eq!(stdout, large, "show-file must concatenate every byte page");
+
+    Ok(())
+}
+
+#[test]
+fn cli_file_commands_reject_paths_outside_the_session_worktree() -> Result<()> {
+    let env = CliEnv::spawn()?;
+    session_worktree(&env, "sandbox")?;
+
+    for (args, expected) in [
+        (
+            vec!["show-file", "-t", "sandbox", "nested/../readme.txt"],
+            "parent traversal",
+        ),
+        (
+            vec!["show-file", "-t", "sandbox", "/etc/passwd"],
+            "escapes session cwd",
+        ),
+        (
+            vec!["list-dir", "-t", "sandbox", "/etc"],
+            "escapes session cwd",
+        ),
+        (
+            vec!["stat-file", "-t", "sandbox", "../outside"],
+            "parent traversal",
+        ),
+    ] {
+        let (code, _, stderr) = env.run(&args)?;
+        assert_ne!(code, 0, "{args:?} must be rejected");
+        // 原因要一路活到用户眼前: 只印最外层 context 的话这里会退化成
+        // "failed to read <path>", 排查一次越界得去翻 daemon 日志。
+        assert!(
+            stderr.contains(expected),
+            "{args:?} must explain why; wanted {expected:?}, got: {stderr}"
+        );
+    }
+
+    Ok(())
+}
+
+#[test]
+fn cli_clipboard_round_trips_text_and_binary() -> Result<()> {
+    let env = CliEnv::spawn()?;
+
+    // 全新 daemon 的剪贴板是空的，但仍然要能读，且不能是错误。
+    let (code, stdout, stderr) = env.run_raw(&["show-buffer"], None)?;
+    assert_eq!(
+        code, 0,
+        "an empty clipboard must still be readable: {stderr}"
+    );
+    assert!(stdout.is_empty(), "{stdout:?}");
+    let (code, stdout, stderr) = env.run(&["show-buffer", "-I"])?;
+    assert_eq!(code, 0, "stderr={stderr}");
+    assert!(stdout.starts_with("text\t-\t0 bytes"), "{stdout:?}");
+
+    // set-buffer 成功时服务端回的是**空** Error 体。客户端要是照抄
+    // `Some(Error(e)) => Err(e)` 的写法，这一行就会以退出码 1 + 空错误信息失败。
+    let (code, _, stderr) = env.run(&["set-buffer", "hello from the cli"])?;
+    assert_eq!(
+        code, 0,
+        "an empty Error body means success, not failure: {stderr}"
+    );
+    let (code, stdout, stderr) = env.run_raw(&["show-buffer"], None)?;
+    assert_eq!(code, 0, "stderr={stderr}");
+    assert_eq!(stdout, b"hello from the cli");
+
+    // 二进制内容走 stdin，往返必须逐字节相同。
+    let png = vec![0x89u8, b'P', b'N', b'G', 0x0d, 0x0a, 0x1a, 0x0a, 0xff, 0x00];
+    let (code, _, stderr) = env.run_raw(&["set-buffer", "--type", "png", "-"], Some(&png))?;
+    assert_eq!(code, 0, "stderr={stderr}");
+    let (code, stdout, stderr) = env.run_raw(&["show-buffer"], None)?;
+    assert_eq!(code, 0, "stderr={stderr}");
+    assert_eq!(stdout, png, "the clipboard must be byte exact");
+    let (code, stdout, stderr) = env.run(&["show-buffer", "-I"])?;
+    assert_eq!(code, 0, "stderr={stderr}");
+    assert!(stdout.starts_with("png\t"), "{stdout:?}");
+    assert!(stdout.trim_end().ends_with("10 bytes"), "{stdout:?}");
+
+    // 剪贴板是服务端全局的一份内容，不需要任何会话。
+    let (code, _, stderr) = env.run(&["set-buffer", "--type", "path", "/tmp/x"])?;
+    assert_eq!(
+        code, 0,
+        "the clipboard must not require an attached session: {stderr}"
+    );
 
     Ok(())
 }
