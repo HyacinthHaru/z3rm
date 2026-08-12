@@ -99,12 +99,18 @@ pub struct ShadowSnapshotEngine {
     records_since_gc: AtomicU64,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum VersionContent {
+    Present(Vec<u8>),
+    Deleted,
+}
+
 /// Metadata for the history node appended by a successful conditional restore.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct DeclineResult {
     pub version_id: VersionId,
     pub seq_no: SeqNo,
-    pub content_hash: ContentHash,
+    pub content_hash: Option<ContentHash>,
 }
 
 impl ShadowSnapshotEngine {
@@ -168,19 +174,13 @@ impl ShadowSnapshotEngine {
                     (None, None, 0u8)
                 }
                 SnapshotTrigger::Decline => {
-                    let content_hash = entry.content_ref.ok_or_else(|| {
-                        anyhow::anyhow!(
-                            "WAL replay: decline entry seq {} is missing content_ref",
-                            entry.seq_no
-                        )
-                    })?;
                     if entry.delta_ref.is_some() {
                         return Err(anyhow::anyhow!(
                             "WAL replay: decline entry seq {} contains a delta",
                             entry.seq_no
                         ));
                     }
-                    (Some(content_hash), None, 0u8)
+                    (entry.content_ref, None, 0u8)
                 }
                 _ => match entry.content_ref {
                     Some(full_hash) => (Some(full_hash), None, 0u8),
@@ -588,6 +588,42 @@ impl ShadowSnapshotEngine {
         self.read_node_content(&node).map(Some)
     }
 
+    pub fn query_version_content_for_path(
+        &self,
+        path: &Path,
+        version_id: VersionId,
+    ) -> Result<Option<VersionContent>> {
+        let Some(node) = self.tree.get_node(version_id) else {
+            return Ok(None);
+        };
+        anyhow::ensure!(
+            compute_path_hash(path) == node.path_hash,
+            "version {version_id} does not belong to requested path"
+        );
+        if node.full_content.is_none() && node.delta.is_none() {
+            return Ok(Some(VersionContent::Deleted));
+        }
+        self.read_node_content(&node)
+            .map(VersionContent::Present)
+            .map(Some)
+    }
+
+    pub fn head_matches_content(&self, path: &Path, content: Option<&[u8]>) -> Result<bool> {
+        let path_hash = compute_path_hash(path);
+        let Some(version_id) = self.tree.get_head(&path_hash) else {
+            return Ok(content.is_none());
+        };
+        let node = self
+            .tree
+            .get_node(version_id)
+            .ok_or_else(|| anyhow::anyhow!("head version {version_id} not found"))?;
+        if node.full_content.is_none() && node.delta.is_none() {
+            return Ok(content.is_none());
+        }
+        let head_content = self.read_node_content(&node)?;
+        Ok(content.is_some_and(|content| content == head_content))
+    }
+
     pub fn query_version_for_path(
         &self,
         path: &Path,
@@ -663,48 +699,58 @@ impl ShadowSnapshotEngine {
             current_content.is_some() == expected_current_exists,
             "stale review: current file existence changed"
         );
-        if let Some(expected_hash) = expected_current_hash {
-            let actual_hash = current_content
-                .as_deref()
-                .map(DeclineProtocol::compute_hash)
-                .ok_or_else(|| anyhow::anyhow!("stale review: current file was deleted"))?;
-            anyhow::ensure!(
-                actual_hash == expected_hash,
-                "stale review: current file content changed"
-            );
+        match (current_content.as_deref(), expected_current_hash) {
+            (Some(content), Some(expected_hash)) => {
+                anyhow::ensure!(
+                    DeclineProtocol::compute_hash(content) == expected_hash,
+                    "stale review: current file content changed"
+                );
+            }
+            (Some(_), None) => {
+                anyhow::bail!("decline: expected current SHA-256 is required");
+            }
+            (None, None) => {}
+            (None, Some(_)) => {
+                anyhow::bail!("decline: current SHA-256 must be absent for a deleted file");
+            }
         }
 
-        let target_content = if let Some(full_hash) = &target_node.full_content {
-            self.blob_store.get(full_hash)?
-        } else if target_node.trigger == SnapshotTrigger::Delete {
-            Vec::new()
+        let target_deleted = target_node.full_content.is_none() && target_node.delta.is_none();
+        let target_content = if target_deleted {
+            None
+        } else if let Some(full_hash) = &target_node.full_content {
+            Some(self.blob_store.get(full_hash)?)
         } else {
-            DeltaReplay::reconstruct(
-                &target_node,
-                |version_id| self.tree.get_node(version_id),
-                |hash: &[u8; 32]| self.blob_store.get(hash).ok(),
-            )
-            .ok_or_else(|| {
-                anyhow::anyhow!(
-                    "decline: target version {target_version} is not reconstructable"
+            Some(
+                DeltaReplay::reconstruct(
+                    &target_node,
+                    |version_id| self.tree.get_node(version_id),
+                    |hash: &[u8; 32]| self.blob_store.get(hash).ok(),
                 )
-            })?
-            .to_string()
-            .into_bytes()
+                .ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "decline: target version {target_version} is not reconstructable"
+                    )
+                })?
+                .to_string()
+                .into_bytes(),
+            )
         };
 
         let seq_no = self.seq_no.fetch_add(1, Ordering::AcqRel) as SeqNo;
         let protocol = DeclineProtocol::new(&self.wal, seq_no);
-        let content_hash = if target_node.trigger == SnapshotTrigger::Delete {
-            protocol.prepare_delete(&self.blob_store, path_hash, parent_id, path)?
-        } else {
-            protocol.prepare_restore(
+        let content_hash = match target_content {
+            None => {
+                protocol.prepare_delete(path_hash, parent_id, path)?;
+                None
+            }
+            Some(target_content) => Some(protocol.prepare_restore(
                 &self.blob_store,
                 path_hash,
                 parent_id,
                 &target_content,
                 path,
-            )?
+            )?),
         };
         let timestamp_ns = SystemTime::now()
             .duration_since(UNIX_EPOCH)
@@ -715,7 +761,7 @@ impl ShadowSnapshotEngine {
             seq_no,
             timestamp_ns,
             parent_id,
-            Some(content_hash),
+            content_hash,
             None,
             0,
             SnapshotTrigger::Decline,
@@ -725,7 +771,7 @@ impl ShadowSnapshotEngine {
             &path_hash,
             seq_no,
             parent_id,
-            Some(&content_hash),
+            content_hash.as_ref(),
             None,
             0,
             SnapshotTrigger::Decline,
@@ -812,7 +858,7 @@ impl ShadowSnapshotEngine {
             SnapshotTrigger::Decline,
             timestamp_ns,
         )?;
-        protocol.mark_done(path_hash, content_hash)?;
+        protocol.mark_done(path_hash, Some(content_hash))?;
 
         tracing::info!(
             version_id = target_version,
@@ -901,7 +947,42 @@ impl ShadowSnapshotEngine {
                 );
                 continue;
             };
-            DeclineProtocol::finish_restore(&self.wal, &self.blob_store, entry, &target_path)?;
+            DeclineProtocol::apply_intent(&self.blob_store, entry, &target_path)?;
+            let node_exists = self.tree.iter_nodes().into_iter().any(|(_, node)| {
+                node.path_hash == entry.path_hash
+                    && node.seq_no == entry.seq_no
+                    && node.trigger == SnapshotTrigger::Decline
+                    && node.full_content == entry.content_ref
+                    && node.delta.is_none()
+            });
+            if !node_exists {
+                let timestamp_ns = SystemTime::now()
+                    .duration_since(UNIX_EPOCH)
+                    .map(|duration| duration.as_nanos())
+                    .unwrap_or(0);
+                let version_id = self.tree.advance_head(
+                    entry.path_hash,
+                    entry.seq_no,
+                    timestamp_ns,
+                    entry.parent_id,
+                    entry.content_ref,
+                    None,
+                    0,
+                    SnapshotTrigger::Decline,
+                );
+                self.storage.write_node(
+                    version_id,
+                    &entry.path_hash,
+                    entry.seq_no,
+                    entry.parent_id,
+                    entry.content_ref.as_ref(),
+                    None,
+                    0,
+                    SnapshotTrigger::Decline,
+                    timestamp_ns,
+                )?;
+            }
+            DeclineProtocol::mark_entry_done(&self.wal, entry)?;
             completed += 1;
         }
         tracing::info!(
@@ -1078,6 +1159,81 @@ mod tests {
         assert_eq!(versions.len(), 3);
         assert_eq!(versions.last().unwrap().0, restored.version_id);
         assert_eq!(versions.last().unwrap().2, SnapshotTrigger::Decline);
+        assert_eq!(
+            engine
+                .query_version_content_for_path(&path, restored.version_id)
+                .unwrap(),
+            Some(VersionContent::Deleted),
+        );
+        let entries = engine.wal.replay().unwrap();
+        let restore_entries = entries
+            .iter()
+            .filter(|entry| entry.seq_no == restored.seq_no)
+            .collect::<Vec<_>>();
+        assert_eq!(restore_entries.len(), 2);
+        assert!(
+            restore_entries
+                .iter()
+                .all(|entry| entry.content_ref.is_none()),
+            "deletion restore WAL intent and completion must stay content-less",
+        );
+    }
+    #[test]
+    fn deletion_restore_recovery_removes_file_and_appends_one_contentless_node() {
+        let directory = TempDir::new().unwrap();
+        let database = directory.path().join("delete-recovery.db");
+        let wal_path = directory.path().join("delete-recovery.wal");
+        let blobs = directory.path().join("delete-recovery-blobs");
+        std::fs::create_dir_all(&blobs).unwrap();
+        let path = directory.path().join("file.txt");
+        std::fs::write(&path, b"current").unwrap();
+        let path_hash = compute_path_hash(&path);
+        let pending_seq_no;
+        {
+            let engine = ShadowSnapshotEngine::open(&database, &wal_path, &blobs).unwrap();
+            engine.record_change(&path, b"current").unwrap();
+            let parent_id = engine.tree.get_head(&path_hash);
+            pending_seq_no = engine.seq_no.fetch_add(1, Ordering::AcqRel) as SeqNo;
+            engine
+                .wal
+                .append(&crate::wal::WalEntry {
+                    seq_no: pending_seq_no,
+                    path_hash,
+                    parent_id,
+                    content_ref: None,
+                    delta_ref: None,
+                    trigger: SnapshotTrigger::Decline,
+                })
+                .unwrap();
+            engine.wal.commit().unwrap();
+        }
+
+        let engine = ShadowSnapshotEngine::open(&database, &wal_path, &blobs).unwrap();
+        assert_eq!(
+            engine
+                .recover_incomplete_restores(|hash| (hash == &path_hash).then(|| path.clone()))
+                .unwrap(),
+            1,
+        );
+        assert!(!path.exists());
+        let versions = engine.list_versions(&path).unwrap();
+        assert_eq!(versions.len(), 2);
+        let restored = versions.last().unwrap();
+        assert_eq!(restored.1, pending_seq_no);
+        assert_eq!(restored.2, SnapshotTrigger::Decline);
+        assert_eq!(
+            engine
+                .query_version_content_for_path(&path, restored.0)
+                .unwrap(),
+            Some(VersionContent::Deleted),
+        );
+        assert_eq!(
+            engine
+                .recover_incomplete_restores(|hash| (hash == &path_hash).then(|| path.clone()))
+                .unwrap(),
+            0,
+        );
+        assert_eq!(engine.list_versions(&path).unwrap().len(), 2);
     }
 
     #[test]
@@ -1699,7 +1855,11 @@ mod tests {
         // 重启:三个版本全部重建,WAL 只剩 checkpoint 后的条目。
         let engine = ShadowSnapshotEngine::open(&db, &wal_path, &blobs).unwrap();
         let versions = engine.list_versions(&path).unwrap();
-        assert_eq!(versions.len(), 3, "checkpoint must not lose persisted history");
+        assert_eq!(
+            versions.len(),
+            3,
+            "checkpoint must not lose persisted history"
+        );
         assert_eq!(
             engine
                 .query_version(versions.last().expect("v3 version").0)
@@ -1853,11 +2013,7 @@ mod tests {
         let (database, wal_path, blobs, path, wal_only_content) =
             engine_with_wal_only_entry(&directory, "crash-missing");
 
-        std::fs::rename(
-            &wal_path,
-            directory.path().join("crash-missing.wal.old"),
-        )
-        .unwrap();
+        std::fs::rename(&wal_path, directory.path().join("crash-missing.wal.old")).unwrap();
         assert!(!wal_path.exists());
 
         let engine = ShadowSnapshotEngine::open(&database, &wal_path, &blobs).unwrap();

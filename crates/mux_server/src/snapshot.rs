@@ -64,6 +64,9 @@ enum ShadowCommand {
     ListChangedFiles {
         reply: mpsc::Sender<Result<Vec<FileChange>>>,
     },
+    ListChangedFilesReconciled {
+        reply: mpsc::Sender<Result<Vec<FileChange>>>,
+    },
     ListVersions {
         path: PathBuf,
         reply: mpsc::Sender<Result<Vec<FileVersion>>>,
@@ -71,7 +74,7 @@ enum ShadowCommand {
     GetVersion {
         path: PathBuf,
         version_id: u64,
-        reply: mpsc::Sender<Result<Option<Vec<u8>>>>,
+        reply: mpsc::Sender<Result<Option<shadow_snapshot::VersionContent>>>,
     },
     GetReviewState {
         path: PathBuf,
@@ -206,6 +209,14 @@ impl SnapshotWatch {
             .context("shadow recorder stopped before listing changed files")?
     }
 
+    pub fn list_changed_files_reconciled(&self) -> Result<Vec<FileChange>> {
+        let (reply, response) = mpsc::channel();
+        self.send_command(ShadowCommand::ListChangedFilesReconciled { reply })?;
+        response
+            .recv()
+            .context("shadow recorder stopped before reconciling changed files")?
+    }
+
     pub fn list_versions(&self, path: PathBuf) -> Result<Vec<FileVersion>> {
         let (reply, response) = mpsc::channel();
         self.send_command(ShadowCommand::ListVersions { path, reply })?;
@@ -214,7 +225,11 @@ impl SnapshotWatch {
             .context("shadow recorder stopped before listing versions")?
     }
 
-    pub fn get_version(&self, path: PathBuf, version_id: u64) -> Result<Option<Vec<u8>>> {
+    pub fn get_version(
+        &self,
+        path: PathBuf,
+        version_id: u64,
+    ) -> Result<Option<shadow_snapshot::VersionContent>> {
         let (reply, response) = mpsc::channel();
         self.send_command(ShadowCommand::GetVersion {
             path,
@@ -713,10 +728,68 @@ pub fn start_with_config(
                 }
 
                 while let Ok(command) = command_rx.try_recv() {
-                    if let Some((path_hash, content_hash)) =
-                        handle_command(&engine, command, config.git_commit_hook, &path_index)
-                    {
-                        suppressed_writes.insert(path_hash, (content_hash, now + suppression_ttl));
+                    match command {
+                        ShadowCommand::GetReviewState { path, reply } => {
+                            handle_review_state_command(
+                                &engine,
+                                path,
+                                reply,
+                                &mut debouncer,
+                                &mut suppressed_writes,
+                                &mut path_index,
+                            );
+                        }
+                        ShadowCommand::ListChangedFilesReconciled { reply } => {
+                            let paths = path_index.values().cloned().collect::<Vec<_>>();
+                            let mut failure = None;
+                            for path in paths {
+                                match engine.list_versions(&path) {
+                                    Ok(versions) if versions.is_empty() => continue,
+                                    Ok(_) => {}
+                                    Err(error) => {
+                                        failure = Some(error);
+                                        break;
+                                    }
+                                }
+                                let (state_reply, state_response) = mpsc::channel();
+                                handle_review_state_command(
+                                    &engine,
+                                    path,
+                                    state_reply,
+                                    &mut debouncer,
+                                    &mut suppressed_writes,
+                                    &mut path_index,
+                                );
+                                match state_response
+                                    .recv()
+                                    .context("shadow reconciliation response dropped")
+                                    .and_then(|result| result)
+                                {
+                                    Ok(_) => {}
+                                    Err(error) => {
+                                        failure = Some(error);
+                                        break;
+                                    }
+                                }
+                            }
+                            let result = match failure {
+                                Some(error) => Err(error),
+                                None => Ok(collect_changed_files(&engine, &path_index)),
+                            };
+                            if reply.send(result).is_err() {
+                                zlog::warn!(
+                                    "shadow reconciled changed-files requester disconnected"
+                                );
+                            }
+                        }
+                        command => {
+                            if let Some((path_hash, content_hash)) =
+                                handle_command(&engine, command, config.git_commit_hook, &path_index)
+                            {
+                                suppressed_writes
+                                    .insert(path_hash, (content_hash, now + suppression_ttl));
+                            }
+                        }
                     }
                 }
 
@@ -858,6 +931,84 @@ fn start_git_commit_watch(
     }
 }
 
+fn handle_review_state_command(
+    engine: &shadow_snapshot::ShadowSnapshotEngine,
+    path: PathBuf,
+    reply: mpsc::Sender<Result<FileReviewState>>,
+    debouncer: &mut DebounceQueue,
+    suppressed_writes: &mut std::collections::HashMap<
+        shadow_snapshot::PathHash,
+        (shadow_snapshot::ContentHash, std::time::Instant),
+    >,
+    path_index: &mut std::collections::HashMap<shadow_snapshot::PathHash, PathBuf>,
+) {
+    let result = (|| {
+        let queued_trigger = debouncer.take(&path);
+        let current_content = match std::fs::read(&path) {
+            Ok(content) => Some(content),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+            Err(error) => return Err(error.into()),
+        };
+
+        if !engine.head_matches_content(&path, current_content.as_deref())? {
+            let path_hash = shadow_snapshot::compute_path_hash(&path);
+            path_index.entry(path_hash).or_insert_with(|| path.clone());
+            suppressed_writes.remove(&path_hash);
+            match current_content.as_deref() {
+                Some(content) => {
+                    let trigger = if engine.head_trigger(&path).is_none() {
+                        SnapshotTrigger::Create
+                    } else {
+                        match queued_trigger.unwrap_or(SnapshotTrigger::Write) {
+                            SnapshotTrigger::Delete => SnapshotTrigger::Write,
+                            trigger => trigger,
+                        }
+                    };
+                    engine.record_change_with_trigger(&path, content, trigger)?;
+                }
+                None => {
+                    engine.record_delete(&path)?;
+                }
+            }
+        }
+
+        let versions = engine.list_versions(&path)?;
+        let latest_seq_no = versions.last().map_or(0, |(_, seq_no, _)| *seq_no);
+        Ok(FileReviewState {
+            versions: versions
+                .into_iter()
+                .map(|(version_id, seq_no, trigger)| FileVersion {
+                    version_id,
+                    seq_no,
+                    trigger,
+                })
+                .collect(),
+            latest_seq_no,
+            current_content,
+        })
+    })();
+    if reply.send(result).is_err() {
+        zlog::warn!("shadow review-state requester disconnected");
+    }
+}
+
+fn collect_changed_files(
+    engine: &shadow_snapshot::ShadowSnapshotEngine,
+    path_index: &std::collections::HashMap<shadow_snapshot::PathHash, PathBuf>,
+) -> Vec<FileChange> {
+    engine
+        .list_path_summaries()
+        .into_iter()
+        .filter_map(|(path_hash, version_count, latest_seq_no)| {
+            path_index.get(&path_hash).map(|path| FileChange {
+                path: path.clone(),
+                version_count,
+                latest_seq_no,
+            })
+        })
+        .collect()
+}
+
 fn handle_command(
     engine: &shadow_snapshot::ShadowSnapshotEngine,
     command: ShadowCommand,
@@ -870,19 +1021,20 @@ fn handle_command(
             // recorded by an earlier run of this session that no longer exists
             // on disk. Naming it is impossible (the hash is one-way), so it is
             // dropped rather than reported under a placeholder path.
-            let changed = engine
-                .list_path_summaries()
-                .into_iter()
-                .filter_map(|(path_hash, version_count, latest_seq_no)| {
-                    path_index.get(&path_hash).map(|path| FileChange {
-                        path: path.clone(),
-                        version_count,
-                        latest_seq_no,
-                    })
-                })
-                .collect();
+            let changed = collect_changed_files(engine, path_index);
             if reply.send(Ok(changed)).is_err() {
                 zlog::warn!("shadow list-changed-files requester disconnected");
+            }
+            None
+        }
+        ShadowCommand::ListChangedFilesReconciled { reply } => {
+            if reply
+                .send(Err(anyhow::anyhow!(
+                    "reconciled changed-files command must run in the recorder loop"
+                )))
+                .is_err()
+            {
+                zlog::warn!("shadow reconciled changed-files requester disconnected");
             }
             None
         }
@@ -908,7 +1060,7 @@ fn handle_command(
             reply,
         } => {
             if reply
-                .send(engine.query_version_for_path(&path, version_id))
+                .send(engine.query_version_content_for_path(&path, version_id))
                 .is_err()
             {
                 zlog::warn!("shadow get-version requester disconnected");
@@ -959,15 +1111,21 @@ fn handle_command(
                     expected_current_hash,
                 )
                 .map(|result| {
+                    let suppression = result.content_hash.map(|content_hash| {
+                        (shadow_snapshot::compute_path_hash(&path), content_hash)
+                    });
                     (
                         DeclineOutcome {
                             version_id: result.version_id,
                             seq_no: result.seq_no,
                         },
-                        (shadow_snapshot::compute_path_hash(&path), result.content_hash),
+                        suppression,
                     )
                 });
-            let suppression = result.as_ref().ok().map(|(_, suppression)| *suppression);
+            let suppression = result
+                .as_ref()
+                .ok()
+                .and_then(|(_, suppression)| *suppression);
             if reply.send(result.map(|(outcome, _)| outcome)).is_err() {
                 zlog::warn!("shadow decline requester disconnected");
             }
@@ -1092,6 +1250,21 @@ fn route_record_event(
         .or_insert_with(|| path.to_path_buf());
     match std::fs::read(path) {
         Ok(content) => {
+            match engine.head_matches_content(path, Some(&content)) {
+                Ok(true) => {
+                    suppressed_writes.remove(&path_hash);
+                    return;
+                }
+                Ok(false) => {}
+                Err(error) => {
+                    zlog::warn!(
+                        "shadow snapshot head comparison failed: path={} error={}",
+                        path.display(),
+                        error,
+                    );
+                    return;
+                }
+            }
             if suppressed_writes
                 .remove(&path_hash)
                 .is_some_and(|(expected_hash, _deadline)| {
@@ -1121,7 +1294,17 @@ fn route_record_event(
         }
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
             suppressed_writes.remove(&path_hash);
-            record_tombstone(engine, path);
+            match engine.head_matches_content(path, None) {
+                Ok(true) => {}
+                Ok(false) => record_tombstone(engine, path),
+                Err(error) => {
+                    zlog::warn!(
+                        "shadow snapshot head comparison failed: path={} error={}",
+                        path.display(),
+                        error,
+                    );
+                }
+            }
         }
         Err(error) => {
             zlog::warn!(
@@ -1313,7 +1496,8 @@ mod tests {
             .unwrap()
             .expect("the newest version has content");
         assert_eq!(
-            newest, b"beta two",
+            newest,
+            b"beta two",
             "the recreated content must be what got versioned, got {:?}",
             String::from_utf8_lossy(&newest),
         );
@@ -1590,8 +1774,8 @@ mod tests {
         let wal_path = directory.path().join("command-checkpoint.wal");
         let blobs = directory.path().join("command-checkpoint-blobs");
         std::fs::create_dir_all(&blobs).unwrap();
-        let engine = shadow_snapshot::ShadowSnapshotEngine::open(&database, &wal_path, &blobs)
-            .unwrap();
+        let engine =
+            shadow_snapshot::ShadowSnapshotEngine::open(&database, &wal_path, &blobs).unwrap();
         let path = directory.path().join("checked.txt");
         engine.record_change(&path, b"v1").unwrap();
 
@@ -1646,9 +1830,12 @@ mod tests {
 
     /// 用真实 fs watcher 启动一个会话的 snapshot 子系统。
     fn armed_watch(session_id: &str, cwd: &str) -> Arc<SnapshotWatch> {
-        start_with_config(session_id, cwd, SnapshotConfig::default(), |monitor, root| {
-            monitor.watch_directory(root)
-        })
+        start_with_config(
+            session_id,
+            cwd,
+            SnapshotConfig::default(),
+            |monitor, root| monitor.watch_directory(root),
+        )
         .expect("start succeeds")
         .expect("watch armed")
     }
@@ -1664,7 +1851,9 @@ mod tests {
         let watch = armed_watch(session_id, &cwd);
 
         seed_wal_entries(session_id);
-        watch.checkpoint().expect("explicit checkpoint must succeed");
+        watch
+            .checkpoint()
+            .expect("explicit checkpoint must succeed");
 
         let wal_path = session_shadow_dir(session_id).join("wal.bin");
         let wal = shadow_snapshot::Wal::open(&wal_path).unwrap();
@@ -1687,7 +1876,9 @@ mod tests {
         seed_wal_entries(session_id);
         std::fs::create_dir(session_shadow_dir(session_id).join("wal.bin.old")).unwrap();
 
-        let error = watch.checkpoint().expect_err("blocked rotation must surface");
+        let error = watch
+            .checkpoint()
+            .expect_err("blocked rotation must surface");
         assert!(
             error.to_string().contains("checkpoint"),
             "error must name the failing checkpoint: {error:#}"
@@ -1993,6 +2184,85 @@ mod tests {
         assert_eq!(config.debounce, Duration::from_millis(500));
         assert_eq!(config.circuit_breaker_writes_per_second, 10.0);
         assert_eq!(config.git_commit_hook, GitCommitHookMode::Clear);
+    }
+
+    #[test]
+    fn review_state_reconciles_current_bytes_before_reply_without_duplicates() {
+        let directory = tempfile::tempdir().expect("temp directory");
+        let unrelated_watch_root = directory.path().join("unrelated");
+        std::fs::create_dir(&unrelated_watch_root).expect("create unrelated watch root");
+        let cwd = directory.path().to_str().expect("utf-8 cwd").to_string();
+        let session_id = "review-state-reconcile-test";
+        reset_session_dir(session_id);
+        let config = SnapshotConfig {
+            debounce: Duration::from_secs(30),
+            ..SnapshotConfig::default()
+        };
+        let watch = start_with_config(session_id, &cwd, config, move |monitor, _root| {
+            monitor.watch_directory(unrelated_watch_root)
+        })
+        .expect("start snapshot")
+        .expect("snapshot enabled");
+        let path = directory.path().join("same-size.txt");
+
+        std::fs::write(&path, b"one").expect("write first content");
+        let first = watch
+            .get_review_state(path.clone())
+            .expect("capture first review state");
+        assert_eq!(first.current_content.as_deref(), Some(b"one".as_slice()));
+        assert_eq!(first.versions.len(), 1);
+
+        std::fs::write(&path, b"two").expect("write intervening same-size content");
+        let second = watch
+            .get_review_state(path.clone())
+            .expect("capture reconciled review state");
+        assert_eq!(second.current_content.as_deref(), Some(b"two".as_slice()));
+        assert_eq!(second.versions.len(), 2, "{:?}", second.versions);
+        assert!(second.latest_seq_no > first.latest_seq_no);
+
+        let unchanged = watch
+            .get_review_state(path)
+            .expect("capture unchanged review state");
+        assert_eq!(unchanged.versions.len(), 2);
+        assert_eq!(unchanged.latest_seq_no, second.latest_seq_no);
+    }
+
+    #[test]
+    fn changed_files_reconciles_current_bytes_before_listing() {
+        let directory = tempfile::tempdir().expect("temp directory");
+        let unrelated_watch_root = directory.path().join("unrelated");
+        std::fs::create_dir(&unrelated_watch_root).expect("create unrelated watch root");
+        let cwd = directory.path().to_str().expect("utf-8 cwd").to_string();
+        let session_id = "changed-files-reconcile-test";
+        reset_session_dir(session_id);
+        let config = SnapshotConfig {
+            debounce: Duration::from_secs(30),
+            ..SnapshotConfig::default()
+        };
+        let watch = start_with_config(session_id, &cwd, config, move |monitor, _root| {
+            monitor.watch_directory(unrelated_watch_root)
+        })
+        .expect("start snapshot")
+        .expect("snapshot enabled");
+        let path = directory.path().join("listed.txt");
+
+        std::fs::write(&path, b"one").expect("write first content");
+        watch
+            .get_review_state(path.clone())
+            .expect("seed reviewed path");
+        std::fs::write(&path, b"two").expect("write unseen content");
+
+        let changed = watch
+            .list_changed_files_reconciled()
+            .expect("list reconciled files");
+        let listed = changed
+            .iter()
+            .find(|change| change.path == path)
+            .expect("changed file listed");
+        assert_eq!(listed.version_count, 2, "{changed:?}");
+        let state = watch.get_review_state(path).expect("read reconciled state");
+        assert_eq!(state.current_content.as_deref(), Some(b"two".as_slice()));
+        assert_eq!(state.versions.len(), 2);
     }
 
     #[test]

@@ -1636,4 +1636,18 @@
       "shift-tab": "skill_creator::FocusPreviousField",
     },
   },
+  {
+    "context": "ChangedFilesReview",
+    "bindings": {
+      "up": "change_review::PreviousFile",
+      "down": "change_review::NextFile",
+      "left": "change_review::PreviousVersion",
+      "right": "change_review::NextVersion",
+      "c": "change_review::CompareCurrent",
+      "a": "change_review::AcceptCurrent",
+      "r": "change_review::RestoreSelectedVersion",
+      "shift-r": "change_review::RefreshCurrent",
+      "escape": "change_review::CloseReview",
+    },
+  },
 ]

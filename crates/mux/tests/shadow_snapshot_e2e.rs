@@ -511,6 +511,19 @@ async fn shadow_snapshot_rpc_round_trip() -> Result<()> {
     let deletion_target = after_delete
         .last()
         .context("deleted history must end with a tombstone")?;
+    let deletion_content = session
+        .domain
+        .get_file_version(
+            &session.id,
+            alpha.to_string_lossy().as_ref(),
+            deletion_target.version_id,
+        )
+        .await
+        .context("get deletion target content")?;
+    assert_eq!(deletion_content.state, FileContentState::Deleted as i32);
+    assert!(!deletion_content.content_available);
+    assert_eq!(deletion_content.total_bytes, 0);
+    assert!(deletion_content.content.is_empty());
     let restored_review = session
         .domain
         .get_file_review_state(&session.id, alpha.to_string_lossy().as_ref())

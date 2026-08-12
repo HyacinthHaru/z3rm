@@ -2851,9 +2851,9 @@ async fn handle_list_changed_files(
     sessions: &Arc<parking_lot::RwLock<Vec<crate::session::Session>>>,
 ) -> anyhow::Result<ResponseBody> {
     let (watch, _root) = snapshot_context_for_session(sessions, &request.session_id)?;
-    let changed = tokio::task::spawn_blocking(move || watch.list_changed_files())
+    let changed = tokio::task::spawn_blocking(move || watch.list_changed_files_reconciled())
         .await
-        .context("joining shadow list-changed-files request")??;
+        .context("joining reconciled shadow list-changed-files request")??;
     Ok(ResponseBody::ChangedFiles(
         mux_protocol::ListChangedFilesResponse {
             files: changed
@@ -2898,32 +2898,36 @@ async fn handle_get_file_version(
     let (watch, root) = snapshot_context_for_session(sessions, &request.session_id)?;
     let path = resolve_path_within_root(&root, &request.path)?;
     let version_id = request.version_id;
-    let content = tokio::task::spawn_blocking(move || watch.get_version(path, version_id))
+    let version_content = tokio::task::spawn_blocking(move || watch.get_version(path, version_id))
         .await
         .context("joining shadow get-version request")??
         .with_context(|| format!("shadow version not found: {version_id}"))?;
+    let content = match version_content {
+        shadow_snapshot::VersionContent::Present(content) => Some(content),
+        shadow_snapshot::VersionContent::Deleted => None,
+    };
+    let (state, content_available, total_bytes, _sha256, content) =
+        classify_review_content(content);
     Ok(ResponseBody::FileVersionContent(
         mux_protocol::GetFileVersionResponse {
-            total_bytes: content.len() as u64,
-            state: if content.is_empty() {
-                FileContentState::Empty as i32
-            } else if std::str::from_utf8(&content).is_ok() {
-                FileContentState::Text as i32
-            } else {
-                FileContentState::Binary as i32
-            },
-            content_available: true,
             content,
+            total_bytes,
+            state,
+            content_available,
         },
     ))
 }
 const MAX_REVIEW_CONTENT_BYTES: usize = 2 * 1024 * 1024;
 
-fn classify_review_content(
-    content: Option<Vec<u8>>,
-) -> (i32, bool, u64, Vec<u8>, Vec<u8>) {
+fn classify_review_content(content: Option<Vec<u8>>) -> (i32, bool, u64, Vec<u8>, Vec<u8>) {
     let Some(content) = content else {
-        return (FileContentState::Deleted as i32, true, 0, Vec::new(), Vec::new());
+        return (
+            FileContentState::Deleted as i32,
+            false,
+            0,
+            Vec::new(),
+            Vec::new(),
+        );
     };
     let total_bytes = content.len() as u64;
     let sha256 = shadow_snapshot::DeclineProtocol::compute_hash(&content).to_vec();
@@ -2948,10 +2952,10 @@ fn classify_review_content(
     if std::str::from_utf8(&content).is_err() {
         return (
             FileContentState::Binary as i32,
-            true,
+            false,
             total_bytes,
             sha256,
-            content,
+            Vec::new(),
         );
     }
     (
@@ -4604,6 +4608,33 @@ mod connection_unit_tests {
         wait_for_connection_tasks(reader, writer, || async {}).await;
 
         assert!(writer_dropped.load(std::sync::atomic::Ordering::SeqCst));
+    }
+
+    #[test]
+    fn review_content_classification_never_sends_binary_or_oversized_bytes() {
+        let (state, available, total_bytes, sha256, payload) =
+            classify_review_content(Some(vec![0xff, 0xfe]));
+        assert_eq!(state, FileContentState::Binary as i32);
+        assert!(!available);
+        assert_eq!(total_bytes, 2);
+        assert_eq!(sha256.len(), 32);
+        assert!(payload.is_empty());
+
+        let oversized = vec![b'x'; MAX_REVIEW_CONTENT_BYTES + 1];
+        let (state, available, total_bytes, sha256, payload) =
+            classify_review_content(Some(oversized));
+        assert_eq!(state, FileContentState::TooLarge as i32);
+        assert!(!available);
+        assert_eq!(total_bytes, (MAX_REVIEW_CONTENT_BYTES + 1) as u64);
+        assert_eq!(sha256.len(), 32);
+        assert!(payload.is_empty());
+
+        let (state, available, total_bytes, sha256, payload) = classify_review_content(None);
+        assert_eq!(state, FileContentState::Deleted as i32);
+        assert!(!available);
+        assert_eq!(total_bytes, 0);
+        assert!(sha256.is_empty());
+        assert!(payload.is_empty());
     }
 
     #[test]

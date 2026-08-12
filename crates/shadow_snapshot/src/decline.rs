@@ -76,27 +76,27 @@ impl<'a> DeclineProtocol<'a> {
         Ok(content_hash)
     }
 
-    /// Record a restore intent before removing a file. The empty blob is kept
-    /// as the durable operation fingerprint used by `DeclineDone`; recovery
-    /// can therefore complete the unlink idempotently.
+    /// Record and fsync a content-less restore intent before removing a file.
     pub fn prepare_delete(
         &self,
-        blob_store: &BlobStore,
         path_hash: PathHash,
         parent_id: Option<VersionId>,
         target_path: &Path,
-    ) -> Result<ContentHash> {
-        let content_hash = blob_store.put(&[])?;
+    ) -> Result<()> {
         let intent = WalEntry {
             seq_no: self.seq_no,
             path_hash,
             parent_id,
-            content_ref: Some(content_hash),
+            content_ref: None,
             delta_ref: None,
             trigger: SnapshotTrigger::Decline,
         };
         self.wal.append(&intent)?;
         self.wal.commit()?;
+        Self::remove_file(target_path)
+    }
+
+    fn remove_file(target_path: &Path) -> Result<()> {
         match std::fs::remove_file(target_path) {
             Ok(()) => {}
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
@@ -111,7 +111,7 @@ impl<'a> DeclineProtocol<'a> {
                 .sync_all()
                 .context("decline: failed to fsync parent dir")?;
         }
-        Ok(content_hash)
+        Ok(())
     }
 
     /// 写回目标文件并 fsync 文件 + 父目录（原子 replace）。
@@ -161,12 +161,12 @@ impl<'a> DeclineProtocol<'a> {
         Ok(())
     }
 
-    pub fn mark_done(&self, path_hash: PathHash, content_hash: ContentHash) -> Result<()> {
+    pub fn mark_done(&self, path_hash: PathHash, content_hash: Option<ContentHash>) -> Result<()> {
         let done = WalEntry {
             seq_no: self.seq_no,
             path_hash,
             parent_id: None,
-            content_ref: Some(content_hash),
+            content_ref: content_hash,
             delta_ref: None,
             trigger: SnapshotTrigger::DeclineDone,
         };
@@ -229,32 +229,39 @@ impl<'a> DeclineProtocol<'a> {
         Ok(pending)
     }
 
-    /// 完成一次恢复：按 content_ref 取回 blob，重新写回目标文件，
-    /// 然后追加 DeclineDone 完成标记并 fsync。
-    ///
-    /// 供 crash recovery 调用——对 `recover` 返回的每个条目逐一执行，
-    /// 把崩溃前未写完的还原操作补完。
+    pub(crate) fn apply_intent(
+        blob_store: &BlobStore,
+        entry: &WalEntry,
+        target_path: &Path,
+    ) -> Result<()> {
+        match entry.content_ref {
+            Some(content_hash) => Self::restore_file(blob_store, &content_hash, target_path),
+            None => Self::remove_file(target_path),
+        }
+    }
+
+    pub(crate) fn mark_entry_done(wal: &Wal, entry: &WalEntry) -> Result<()> {
+        let done = WalEntry {
+            seq_no: entry.seq_no,
+            path_hash: entry.path_hash,
+            parent_id: None,
+            content_ref: entry.content_ref,
+            delta_ref: None,
+            trigger: SnapshotTrigger::DeclineDone,
+        };
+        wal.append(&done)?;
+        wal.commit()?;
+        Ok(())
+    }
+
     pub fn finish_restore(
         wal: &Wal,
         blob_store: &BlobStore,
         entry: &WalEntry,
         target_path: &Path,
     ) -> Result<()> {
-        let content_hash = entry
-            .content_ref
-            .ok_or_else(|| anyhow::anyhow!("decline recover: intent missing content_ref"))?;
-        Self::restore_file(blob_store, &content_hash, target_path)?;
-
-        let done = WalEntry {
-            seq_no: entry.seq_no,
-            path_hash: entry.path_hash,
-            parent_id: None,
-            content_ref: Some(content_hash),
-            delta_ref: None,
-            trigger: SnapshotTrigger::DeclineDone,
-        };
-        wal.append(&done)?;
-        wal.commit()?;
+        Self::apply_intent(blob_store, entry, target_path)?;
+        Self::mark_entry_done(wal, entry)?;
         info!(
             seq_no = entry.seq_no,
             "decline: recovery completed and marked done"
@@ -306,7 +313,7 @@ mod tests {
         let hash = protocol
             .prepare_restore(&stack.blob_store, path_hash, None, content, &file_path)
             .unwrap();
-        protocol.mark_done(path_hash, hash).unwrap();
+        protocol.mark_done(path_hash, Some(hash)).unwrap();
 
         // 文件已写回
         let written = std::fs::read(&file_path).unwrap();
