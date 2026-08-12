@@ -9,7 +9,7 @@ use anyhow::Context as _;
 use fuzzy::{StringMatch, StringMatchCandidate, match_strings};
 use gpui::{App, DismissEvent, Entity, EventEmitter, Focusable, Task, WeakEntity, prelude::*};
 use picker::{Picker, PickerDelegate};
-use std::sync::Arc;
+use std::{path::Path, sync::Arc};
 use ui::{ListItem, ListItemSpacing, prelude::*};
 use util::ResultExt as _;
 use workspace::ModalView;
@@ -285,6 +285,18 @@ async fn open_remote_window(
     Ok(())
 }
 
+fn new_remote_session_defaults() -> (&'static str, &'static str) {
+    ("default", "/tmp")
+}
+
+async fn create_remote_session(domain: &mux::MuxDomain) -> anyhow::Result<String> {
+    let (name, working_directory) = new_remote_session_defaults();
+    domain
+        .create_session(name, Path::new(working_directory))
+        .await
+        .context("failed to create a session on the remote host")
+}
+
 /// §16.6 Show the remote host's sessions and let the user pick or create one.
 async fn choose_remote_session(
     domain: &Arc<mux::MuxDomain>,
@@ -295,7 +307,7 @@ async fn choose_remote_session(
         .await
         .context("failed to list sessions on the remote host")?;
     if sessions.is_empty() {
-        return crate::daemon::ensure_target_session(domain, None).await;
+        return create_remote_session(domain).await;
     }
 
     let detail = sessions
@@ -331,7 +343,7 @@ async fn choose_remote_session(
     match sessions.get(answer) {
         Some(session) => Ok(session.id.clone()),
         // The trailing button is "New session".
-        None => crate::daemon::ensure_target_session(domain, None).await,
+        None => create_remote_session(domain).await,
     }
 }
 
@@ -348,5 +360,12 @@ mod tests {
     fn ssh_config_hosts_deduplicates() {
         let hosts = super::parse_ssh_config_hosts("Host web\nHost web\nHost api\n");
         assert_eq!(hosts, vec!["api".to_string(), "web".to_string()]);
+    }
+
+    #[test]
+    fn new_remote_sessions_use_a_remote_safe_working_directory() {
+        let (name, working_directory) = super::new_remote_session_defaults();
+        assert_eq!(name, "default");
+        assert_eq!(working_directory, "/tmp");
     }
 }
