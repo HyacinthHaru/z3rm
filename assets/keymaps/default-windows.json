@@ -1297,6 +1297,10 @@
       // §12 复制模式 (Plan 31)
       "ctrl-shift-;": "terminal::EnterCopyMode",
       "ctrl-shift-r": "terminal::RerunTask",
+      "ctrl-alt-shift-up": "mux_pane::PreviousCommand",
+      "ctrl-alt-shift-down": "mux_pane::NextCommand",
+      "ctrl-alt-shift-f": "mux_pane::PreviousFailedCommand",
+      "ctrl-alt-shift-c": "mux_pane::CopyCommandOutput",
       "alt-t": "terminal::RerunTask",
       "ctrl-shift-5": "pane::SplitRight",
       "ctrl-shift-.": "agent::AddSelectionToThread",

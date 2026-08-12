@@ -110,6 +110,14 @@ actions!(
         ResizeDown,
         /// §16.7 等分所有 pane 大小。
         ResizeEqual,
+        /// Select and reveal the previous addressable shell command.
+        PreviousCommand,
+        /// Select and reveal the next addressable shell command.
+        NextCommand,
+        /// Select and reveal the previous failed shell command.
+        PreviousFailedCommand,
+        /// Copy the selected shell command's bounded output.
+        CopyCommandOutput,
     ]
 );
 
@@ -203,6 +211,10 @@ mod tests {
         let _ = FocusDown::default();
         let _ = ZoomToggle::default();
         let _ = FocusPane0::default();
+        let _ = PreviousCommand::default();
+        let _ = NextCommand::default();
+        let _ = PreviousFailedCommand::default();
+        let _ = CopyCommandOutput::default();
         let _ = FocusPane1::default();
     }
 }

@@ -62,8 +62,10 @@ pub struct Pane {
     pub bracketed_paste_mode: AtomicBool,
     /// §3.3 Pane zoom 状态 (zoomed = 最大化, 隐藏其他 pane)。
     pub zoomed: AtomicBool,
+    /// §3.3 Monotonic version of accepted OSC 133 markers.
+    command_version: AtomicU64,
     /// §3.3 OSC 133 prompt marker 计数器。
-    pub prompt_marker: AtomicU64,
+    prompt_marker: AtomicU64,
     /// §3.3 Absolute row id of viewport line 0, counted from pane start.
     ///
     /// Alacritty addresses scrollback as `0..history_size` with 0 = oldest, so
@@ -198,6 +200,16 @@ pub enum ShellMarkerPosition {
     /// The row was evicted, or its id predates a reflow/reset/uncounted
     /// rotation. Never guess a row here: a wrong row is worse than no row.
     Unavailable,
+}
+
+/// §3.10 One atomic command-list checkpoint captured under `Pane::commit`.
+#[derive(Clone, Debug)]
+pub struct CommandSnapshot {
+    pub marker_positions: Vec<(ShellMarker, ShellMarkerPosition)>,
+    pub history_size: u32,
+    pub generation: u64,
+    pub history_version: u64,
+    pub command_version: u64,
 }
 
 /// Four markers per command, so this keeps roughly the last 256 commands. Sized
@@ -810,6 +822,7 @@ impl Pane {
             rows: AtomicU64::new(rows as u64),
             bracketed_paste_mode: AtomicBool::new(false),
             zoomed: AtomicBool::new(false),
+            command_version: AtomicU64::new(0),
             prompt_marker: AtomicU64::new(0),
             viewport_top_absolute: AtomicU64::new(0),
             // Epoch 0 is reserved so a default-constructed marker can never
@@ -950,6 +963,7 @@ impl Pane {
         state
             .history_processor
             .advance(&mut state.history_observer, bytes);
+        let command_version_before = self.command_version.load(Ordering::Acquire);
         let (
             render_state_changed,
             history_size_before,
@@ -958,6 +972,7 @@ impl Pane {
             modes_after,
             alt_screen_changed,
             addressing,
+            marker_changed,
         ) = {
             let mut term = self.term.lock();
             let before = (
@@ -980,6 +995,7 @@ impl Pane {
                 term.grid().display_offset(),
                 modes_from_alacritty(*term.mode()),
             );
+            let command_version_after = self.command_version.load(Ordering::Acquire);
             (
                 before != after,
                 history_size_before,
@@ -988,6 +1004,7 @@ impl Pane {
                 after.3,
                 alt_screen_before != term.mode().contains(TermMode::ALT_SCREEN),
                 addressing,
+                command_version_after != command_version_before,
             )
         };
         self.set_bracketed_paste_mode(
@@ -1016,7 +1033,8 @@ impl Pane {
             state.history_observer.may_break_addressing,
         );
 
-        let grid_changed = !dirty_rows.is_empty() || render_state_changed || history_changed;
+        let grid_changed =
+            !dirty_rows.is_empty() || render_state_changed || history_changed || marker_changed;
         let should_broadcast_dirty = if in_sync && !transitions.ended() {
             if grid_changed {
                 state.pending_sync = true;
@@ -1035,7 +1053,7 @@ impl Pane {
             let should_broadcast = self.emit_generation(
                 all_dirty_rows,
                 requires_full_snapshot,
-                transitions.ended(),
+                transitions.ended() || marker_changed,
                 coalescer,
                 state,
             );
@@ -1168,6 +1186,7 @@ impl Pane {
         markers.push_back(marker);
         drop(markers);
         self.prompt_marker.fetch_add(1, Ordering::SeqCst);
+        self.command_version.fetch_add(1, Ordering::AcqRel);
     }
 
     /// Publish one coherent grid generation after its structured state is in
@@ -1711,11 +1730,7 @@ impl Pane {
     ) -> (Vec<grid_sync::RowChange>, u32, u64) {
         match self.fetch_scrollback_checked(from_line, direction, count) {
             Ok(result) => result,
-            Err(_) => (
-                Vec::new(),
-                0,
-                self.history_version.load(Ordering::Acquire),
-            ),
+            Err(_) => (Vec::new(), 0, self.history_version.load(Ordering::Acquire)),
         }
     }
 
@@ -1786,6 +1801,32 @@ impl Pane {
     /// §3.3 Recorded OSC 133 markers, oldest first.
     pub fn shell_markers(&self) -> Vec<ShellMarker> {
         self.shell_markers.lock().iter().copied().collect()
+    }
+
+    /// Capture marker positions and the pane state they address under one commit lock.
+    pub fn command_snapshot(&self) -> CommandSnapshot {
+        let _commit = self.commit.lock();
+        let term = self.term.lock();
+        let history_size = term.grid().history_size();
+        let screen_lines = term.screen_lines();
+        let marker_positions = self
+            .shell_markers
+            .lock()
+            .iter()
+            .map(|marker| {
+                (
+                    *marker,
+                    self.resolve_shell_marker(marker, history_size, screen_lines),
+                )
+            })
+            .collect();
+        CommandSnapshot {
+            marker_positions,
+            history_size: u32::try_from(history_size).unwrap_or(u32::MAX),
+            generation: self.generation.load(Ordering::Acquire),
+            history_version: self.history_version.load(Ordering::Acquire),
+            command_version: self.command_version.load(Ordering::Acquire),
+        }
     }
 
     /// §3.3 Current row-numbering epoch. A marker recorded under a different
@@ -2353,7 +2394,10 @@ mod tests {
         let (after_rows, after_total, after_version) = pane.fetch_scrollback(0, 1, 10);
 
         assert_eq!(after_total, before_total, "history size must not change");
-        assert_ne!(after_version, before_version, "rotated contents must bump version");
+        assert_ne!(
+            after_version, before_version,
+            "rotated contents must bump version"
+        );
         assert_eq!(after_rows.len(), 2);
         assert_eq!(after_rows[0].cells[0].character, "B");
         assert_eq!(after_rows[1].cells[0].character, "C");
@@ -2660,6 +2704,26 @@ mod tests {
                 pane.shell_markers()
             ),
         }
+    }
+
+    #[test]
+    fn command_snapshot_is_one_commit_checkpoint() {
+        let pane = spawn_marker_pane("osc133-command-snapshot", 20, 6, 100);
+        let before = pane.command_snapshot();
+        assert!(before.marker_positions.is_empty());
+        assert_eq!(before.command_version, 0);
+
+        let mut feed = PtyFeed::new();
+        feed.feed(
+            &pane,
+            b"\x1b]133;A\x07prompt\x1b]133;B\x07cmd\x1b]133;C\x07out",
+        );
+
+        let after = pane.command_snapshot();
+        assert_eq!(after.marker_positions.len(), 3);
+        assert_eq!(after.command_version, 3);
+        assert_eq!(after.generation, pane.get_generation());
+        assert_eq!(after.history_version, pane.get_scrollback_version());
     }
 
     /// §3.3 One shell command emits A/B/C/D at four different rows within a

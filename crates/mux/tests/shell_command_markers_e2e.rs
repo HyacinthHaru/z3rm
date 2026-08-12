@@ -267,7 +267,15 @@ async fn read_lines(domain: &MuxDomain, pane_id: &str, from: i64, to: i64) -> Re
                 .to_string(),
         );
     }
+
     Ok(lines)
+}
+fn trimmed_capture(text: &str) -> Vec<String> {
+    text.lines()
+        .map(str::trim_end)
+        .filter(|line| !line.is_empty())
+        .map(ToOwned::to_owned)
+        .collect()
 }
 
 fn marker_line(marker: &Option<proto::CommandMarker>) -> Option<i64> {
@@ -458,6 +466,19 @@ async fn list_commands_rpc_contract() -> Result<()> {
         read_lines(&domain, &pane_id, start, end).await?,
         vec!["alpha".to_string(), "bravo".to_string()],
         "the output range must cover exactly that command's output"
+    );
+
+    let captured = mux::capture_command_output(
+        &domain,
+        &pane_id,
+        mux::CommandSelector::Id(first.id),
+        mux::CommandCaptureOptions::default(),
+    )
+    .await?;
+    assert_eq!(
+        trimmed_capture(&captured),
+        vec!["alpha".to_string(), "bravo".to_string()],
+        "command capture must use the marker/grid checkpoint rather than refetching guessed rows"
     );
 
     // 还在跑的那条: 起点找得到, 终点没有 —— `-E` 缺省即"到可见区末尾"。

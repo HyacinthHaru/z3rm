@@ -9,11 +9,12 @@ pub mod marketplace;
 pub mod search;
 pub mod target;
 
-pub use capture::{CaptureLine, CommandSelector};
+pub use capture::CaptureLine;
 pub use dispatch::CliCommand;
 pub use dispatch::SendKeysEncoding;
 pub use dispatch::run_cli_command;
 pub use dispatch::{BufferSource, ClipboardContentType};
+pub use mux::CommandSelector;
 
 use std::path::PathBuf;
 
@@ -2116,7 +2117,6 @@ mod tests {
             Some(CliCommand::Attach { target }) => assert_eq!(target.as_deref(), Some("dev")),
             other => panic!("unexpected parse result: {other:?}"),
         }
-
 
         for arguments in [
             vec!["attach", "-t"],

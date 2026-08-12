@@ -462,6 +462,10 @@ message ListCommandsResponse {
     // 当前保留的 marker 总数。commands 为空而它不为 0, 说明 shell 只发了
     // prompt start, 没有报告任何命令边界。
     uint32 recorded_markers = 3;
+    // All checkpoint fields below describe the same pane commit.
+    uint64 generation = 4;
+    uint64 history_version = 5;
+    uint64 command_version = 6;
 }
 
 // === File Fetch (for remote file viewer) ===

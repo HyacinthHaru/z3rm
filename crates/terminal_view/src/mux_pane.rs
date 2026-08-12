@@ -13,13 +13,13 @@ use gpui::{
     InteractiveElement, KeyDownEvent, Keystroke, ParentElement, Render, SharedString,
     StatefulInteractiveElement, Styled, Task, WeakEntity, Window, div, prelude::FluentBuilder as _,
 };
-use mux::MuxDomain;
+use mux::{CommandCaptureOptions, CommandSelector, CommandSpan, MuxDomain};
 use mux_protocol::input::{
     KeyDispatchContext, KeyDispatchResult, PaneModes, PrefixAction, PrefixModeConfig,
     PrefixModeMachine, handle_key_event, is_full_screen_active,
 };
 use mux_protocol::{
-    FetchScrollbackResponse, FullGridSnapshot, GridDiff,
+    CommandRange, FetchScrollbackResponse, FullGridSnapshot, GridDiff, ListCommandsResponse,
     fetch_grid_update_response::Update as FetchUpdate, notification::Event as NotifEvent,
 };
 use project::Project;
@@ -80,6 +80,158 @@ struct HistoryCache {
     history_size: usize,
     history_version: u64,
     cells: Arc<Vec<StructuredTerminalCell>>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum CommandStatus {
+    Running,
+    Succeeded,
+    Failed(i32),
+    Completed,
+}
+
+#[derive(Clone, Debug, Default)]
+struct CommandUiState {
+    commands: Vec<CommandRange>,
+    selected_id: Option<u64>,
+    command_version: u64,
+    recorded_markers: u32,
+    action_invoked: bool,
+}
+
+impl CommandUiState {
+    fn apply_checkpoint(&mut self, response: ListCommandsResponse) {
+        self.selected_id = reconcile_command_selection(&response.commands, self.selected_id);
+        self.commands = response.commands;
+        self.command_version = response.command_version;
+        self.recorded_markers = response.recorded_markers;
+    }
+
+    fn selected(&self) -> Option<&CommandRange> {
+        let selected_id = self.selected_id?;
+        self.commands
+            .iter()
+            .find(|command| command.id == selected_id)
+    }
+
+    fn has_command_chrome(&self, alternate_screen: bool) -> bool {
+        !alternate_screen
+            && self.commands.iter().any(|command| {
+                command.command.is_some()
+                    || command.output_start.is_some()
+                    || command.command_end.is_some()
+            })
+    }
+}
+
+fn command_status_label(status: CommandStatus) -> String {
+    match status {
+        CommandStatus::Running => "running".to_string(),
+        CommandStatus::Succeeded => "succeeded".to_string(),
+        CommandStatus::Failed(code) => format!("failed ({code})"),
+        CommandStatus::Completed => "completed".to_string(),
+    }
+}
+
+fn command_status(command: &CommandRange) -> CommandStatus {
+    if command.command_end.is_none() {
+        CommandStatus::Running
+    } else {
+        match command.exit_code {
+            Some(0) => CommandStatus::Succeeded,
+            Some(code) => CommandStatus::Failed(code),
+            None => CommandStatus::Completed,
+        }
+    }
+}
+
+fn reconcile_command_selection(commands: &[CommandRange], selected_id: Option<u64>) -> Option<u64> {
+    if commands.is_empty() {
+        return None;
+    }
+    if let Some(selected_id) = selected_id {
+        if commands.iter().any(|command| command.id == selected_id) {
+            return Some(selected_id);
+        }
+        if let Some(command) = commands
+            .iter()
+            .filter(|command| command.id > selected_id)
+            .min_by_key(|command| command.id)
+        {
+            return Some(command.id);
+        }
+    }
+    commands.last().map(|command| command.id)
+}
+
+fn relative_command_selection(
+    commands: &[CommandRange],
+    selected_id: Option<u64>,
+    forward: bool,
+    failed_only: bool,
+) -> Option<u64> {
+    let selected_index = selected_id.and_then(|selected_id| {
+        commands
+            .iter()
+            .position(|command| command.id == selected_id)
+    });
+    let matches = |command: &&CommandRange| {
+        matches!(
+            mux::command_output_span(command),
+            CommandSpan::Located { .. }
+        ) && (!failed_only || matches!(command_status(command), CommandStatus::Failed(_)))
+    };
+    if forward {
+        commands
+            .iter()
+            .skip(selected_index.map_or(0, |index| index.saturating_add(1)))
+            .find(matches)
+            .map(|command| command.id)
+    } else {
+        commands
+            .iter()
+            .take(selected_index.unwrap_or(commands.len()))
+            .rev()
+            .find(matches)
+            .map(|command| command.id)
+    }
+}
+
+fn command_display_offset(command: &CommandRange, history_size: usize) -> Option<usize> {
+    let CommandSpan::Located { start, .. } = mux::command_output_span(command) else {
+        return None;
+    };
+    if start >= 0 {
+        Some(0)
+    } else {
+        usize::try_from(start.saturating_neg())
+            .ok()
+            .filter(|offset| *offset <= history_size)
+    }
+}
+
+fn projected_command_rows(
+    command: &CommandRange,
+    display_offset: usize,
+    viewport_rows: usize,
+) -> Vec<(usize, bool)> {
+    let CommandSpan::Located { start, end } = mux::command_output_span(command) else {
+        return Vec::new();
+    };
+    let display_offset = i64::try_from(display_offset).unwrap_or(i64::MAX);
+    let mut boundaries = Vec::with_capacity(2);
+    for (line, is_start) in [(start, true), (end.unwrap_or(start), false)] {
+        let row = line.saturating_add(display_offset);
+        if let Ok(row) = usize::try_from(row)
+            && row < viewport_rows
+            && boundaries
+                .last()
+                .is_none_or(|(previous, _)| *previous != row)
+        {
+            boundaries.push((row, is_start));
+        }
+    }
+    boundaries
 }
 
 #[derive(Debug)]
@@ -175,6 +327,10 @@ pub struct MuxPaneView {
     /// A delayed retry keeps a transient transport failure from permanently
     /// stopping reconciliation without spinning the GPUI executor.
     fetch_retry_task: Option<Task<()>>,
+    /// Command metadata refresh currently in flight.
+    command_fetch_in_flight: bool,
+    /// Server-authored OSC 133 command records for the applied grid checkpoint.
+    command_state: CommandUiState,
     /// §3.3 current grid snapshot (recovery path for reconnect)
     snapshot: FullGridSnapshot,
     /// Oldest-to-newest authoritative history for `snapshot`.
@@ -339,6 +495,8 @@ impl MuxPaneView {
             fetch_in_flight: false,
             fetch_pending: false,
             fetch_retry_task: None,
+            command_fetch_in_flight: false,
+            command_state: CommandUiState::default(),
             snapshot,
             history_cache,
             zoomed: false,
@@ -606,8 +764,160 @@ impl MuxPaneView {
                 });
             }
         }
+        self.schedule_command_refresh(cx);
         cx.notify();
         Ok(())
+    }
+    fn schedule_command_refresh(&mut self, cx: &mut Context<Self>) {
+        if self.command_fetch_in_flight || self.fetch_pending {
+            return;
+        }
+        self.command_fetch_in_flight = true;
+        let pane_id = self.pane_id.clone();
+        let domain = self.domain.clone();
+        let expected_generation = self.generation;
+        let expected_history_version = self.snapshot.history_version;
+        let weak = cx.entity().downgrade();
+        cx.spawn(async move |_, cx| {
+            let result = domain.list_commands(&pane_id, 0).await;
+            if let Err(error) = weak.update(cx, |view, cx| {
+                view.command_fetch_in_flight = false;
+                match result {
+                    Ok(response)
+                        if response.generation == expected_generation
+                            && response.history_version == expected_history_version
+                            && view.generation == expected_generation
+                            && view.snapshot.history_version == expected_history_version =>
+                    {
+                        view.command_state.apply_checkpoint(response);
+                        cx.notify();
+                    }
+                    Ok(_) => {
+                        view.fetch_pending = true;
+                        view.schedule_fetch(cx);
+                    }
+                    Err(error) => {
+                        cx.emit(MuxPaneEvent::InputFailed {
+                            message: SharedString::from(format!(
+                                "failed to list shell commands for pane {pane_id}: {error}"
+                            )),
+                        });
+                    }
+                }
+            }) {
+                tracing::debug!(error = %error, "MuxPaneView dropped after command refresh");
+            }
+        })
+        .detach();
+    }
+
+    fn navigate_command(&mut self, forward: bool, failed_only: bool, cx: &mut Context<Self>) {
+        self.command_state.action_invoked = true;
+        let next = relative_command_selection(
+            &self.command_state.commands,
+            self.command_state.selected_id,
+            forward,
+            failed_only,
+        );
+        if let Some(command_id) = next {
+            self.command_state.selected_id = Some(command_id);
+            self.reveal_selected_command(cx);
+        }
+        cx.notify();
+    }
+
+    fn reveal_selected_command(&mut self, cx: &mut Context<Self>) {
+        let Some(command) = self.command_state.selected().cloned() else {
+            return;
+        };
+        let Some(offset) = command_display_offset(&command, self.history_cache.history_size) else {
+            return;
+        };
+        if offset == 0 {
+            self.terminal_view
+                .update(cx, |view, cx| view.jump_to_bottom(cx));
+        } else {
+            self.terminal
+                .update(cx, |terminal, _| terminal.scroll_to_display_offset(offset));
+            self.terminal_view.update(cx, |view, cx| {
+                view.set_scrollback_offset(Some(offset), cx);
+            });
+        }
+    }
+
+    fn previous_command(
+        &mut self,
+        _: &settings::mux_actions::PreviousCommand,
+        _: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.navigate_command(false, false, cx);
+    }
+
+    fn next_command(
+        &mut self,
+        _: &settings::mux_actions::NextCommand,
+        _: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.navigate_command(true, false, cx);
+    }
+
+    fn previous_failed_command(
+        &mut self,
+        _: &settings::mux_actions::PreviousFailedCommand,
+        _: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.navigate_command(false, true, cx);
+    }
+
+    fn copy_command_output(
+        &mut self,
+        _: &settings::mux_actions::CopyCommandOutput,
+        _: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.command_state.action_invoked = true;
+        let Some(command) = self.command_state.selected() else {
+            cx.notify();
+            return;
+        };
+        if !matches!(
+            mux::command_output_span(command),
+            CommandSpan::Located { .. }
+        ) {
+            cx.notify();
+            return;
+        }
+        let command_id = command.id;
+        let pane_id = self.pane_id.clone();
+        let domain = self.domain.clone();
+        let weak = cx.entity().downgrade();
+        cx.spawn(async move |_, cx| {
+            let result = mux::capture_command_output(
+                &domain,
+                &pane_id,
+                CommandSelector::Id(command_id),
+                CommandCaptureOptions::default(),
+            )
+            .await;
+            if let Err(error) = weak.update(cx, |_view, cx| match result {
+                Ok(output) => {
+                    cx.write_to_clipboard(gpui::ClipboardItem::new_string(output));
+                }
+                Err(error) => {
+                    cx.emit(MuxPaneEvent::InputFailed {
+                        message: SharedString::from(format!(
+                            "failed to copy command {command_id} output: {error}"
+                        )),
+                    });
+                }
+            }) {
+                tracing::debug!(error = %error, "MuxPaneView dropped after command capture");
+            }
+        })
+        .detach();
     }
 
     /// §3.10 / §16.7 keystroke → priority chain → routed action.
@@ -1076,7 +1386,10 @@ async fn prepare_fetch_update(
                             .and_then(HistoryPageAccumulator::finish)?,
                         false,
                     ),
-                    None => (fetch_history_checkpoint(domain, pane_id, &full).await?, true),
+                    None => (
+                        fetch_history_checkpoint(domain, pane_id, &full).await?,
+                        true,
+                    ),
                 };
             if fetched_history {
                 confirm_grid_checkpoint(domain, pane_id, generation).await?;
@@ -1094,21 +1407,22 @@ async fn prepare_fetch_update(
     }
 }
 
-fn validate_snapshot_metadata(
-    snapshot: &FullGridSnapshot,
-) -> Result<(), PrepareFetchError> {
-    let cols = usize::try_from(snapshot.cols)
-        .map_err(|_| PrepareFetchError::invalid(anyhow::anyhow!("mux grid columns exceed client limits")))?;
-    let rows = usize::try_from(snapshot.rows)
-        .map_err(|_| PrepareFetchError::invalid(anyhow::anyhow!("mux grid rows exceed client limits")))?;
+fn validate_snapshot_metadata(snapshot: &FullGridSnapshot) -> Result<(), PrepareFetchError> {
+    let cols = usize::try_from(snapshot.cols).map_err(|_| {
+        PrepareFetchError::invalid(anyhow::anyhow!("mux grid columns exceed client limits"))
+    })?;
+    let rows = usize::try_from(snapshot.rows).map_err(|_| {
+        PrepareFetchError::invalid(anyhow::anyhow!("mux grid rows exceed client limits"))
+    })?;
     let history_size = usize::try_from(snapshot.history_size).map_err(|_| {
         PrepareFetchError::invalid(anyhow::anyhow!("mux history size exceeds client limits"))
     })?;
     let display_offset = usize::try_from(snapshot.display_offset).map_err(|_| {
         PrepareFetchError::invalid(anyhow::anyhow!("mux display offset exceeds client limits"))
     })?;
-    let expected_cells = mux_protocol::checked_grid_cell_count(cols, rows)
-        .map_err(|message| PrepareFetchError::invalid(anyhow::anyhow!("invalid mux grid dimensions: {message}")))?;
+    let expected_cells = mux_protocol::checked_grid_cell_count(cols, rows).map_err(|message| {
+        PrepareFetchError::invalid(anyhow::anyhow!("invalid mux grid dimensions: {message}"))
+    })?;
     if snapshot.cells.len() != expected_cells {
         return Err(PrepareFetchError::invalid(anyhow::anyhow!(
             "mux grid has {} cells, expected {} for {}x{}",
@@ -1703,6 +2017,60 @@ impl Render for MuxPaneView {
         let focused = self.focus_handle.is_focused(window);
         let terminal_handle = self.terminal.clone();
         let terminal_view_handle = self.terminal_view.clone();
+        let terminal_content = self.terminal.read(cx).last_content();
+        let display_offset = terminal_content.display_offset;
+        let viewport_rows = usize::try_from(rows).unwrap_or(0);
+        let selected_id = self.command_state.selected_id;
+        let has_command_chrome = self
+            .command_state
+            .has_command_chrome(self.snapshot.alternate_screen);
+        let show_shell_integration_notice = !has_command_chrome
+            && !self.snapshot.alternate_screen
+            && self.command_state.action_invoked
+            && self.command_state.recorded_markers > 0;
+        let command_boundaries = if has_command_chrome {
+            self.command_state
+                .commands
+                .iter()
+                .flat_map(|command| {
+                    projected_command_rows(command, display_offset, viewport_rows)
+                        .into_iter()
+                        .map(move |(row, is_start)| {
+                            (row, is_start, Some(command.id) == selected_id)
+                        })
+                })
+                .collect::<Vec<_>>()
+        } else {
+            Vec::new()
+        };
+        let selected_command = self.command_state.selected().cloned();
+        let selected_addressable = selected_command.as_ref().is_some_and(|command| {
+            matches!(
+                mux::command_output_span(command),
+                CommandSpan::Located { .. }
+            )
+        });
+        let previous_available =
+            relative_command_selection(&self.command_state.commands, selected_id, false, false)
+                .is_some();
+        let next_available =
+            relative_command_selection(&self.command_state.commands, selected_id, true, false)
+                .is_some();
+        let failed_available =
+            relative_command_selection(&self.command_state.commands, selected_id, false, true)
+                .is_some();
+        let command_label = selected_command.as_ref().map(|command| {
+            let location = match mux::command_output_span(command) {
+                CommandSpan::Located { .. } => "located",
+                CommandSpan::Unaddressable => "output no longer addressable",
+                CommandSpan::Incomplete => "shell integration incomplete",
+            };
+            SharedString::from(format!(
+                "#{} · {} · {location}",
+                command.id,
+                command_status_label(command_status(command))
+            ))
+        });
 
         let mut dispatch_context = gpui::KeyContext::new_with_defaults();
         dispatch_context.add("Terminal");
@@ -1738,6 +2106,43 @@ impl Render for MuxPaneView {
                         TerminalMode::Standalone,
                     )),
             )
+            .children(
+                command_boundaries
+                    .into_iter()
+                    .map(|(row, is_start, selected)| {
+                        let top = gpui::px(f32::from(bounds.line_height) * row as f32);
+                        gpui::deferred(
+                            div()
+                                .absolute()
+                                .top(top)
+                                .left_0()
+                                .right_0()
+                                .h(gpui::px(if selected { 2.0 } else { 1.0 }))
+                                .bg(if selected {
+                                    colors.border_selected
+                                } else {
+                                    colors.border_variant
+                                })
+                                .when(selected && is_start, |line| {
+                                    line.child(
+                                        div()
+                                            .absolute()
+                                            .left_0()
+                                            .px_1()
+                                            .bg(colors.editor_background)
+                                            .text_size(gpui::Rems(0.75))
+                                            .text_color(colors.text_accent)
+                                            .child("COMMAND"),
+                                    )
+                                }),
+                        )
+                        .with_priority(1)
+                    }),
+            )
+            .on_action(cx.listener(Self::previous_command))
+            .on_action(cx.listener(Self::next_command))
+            .on_action(cx.listener(Self::previous_failed_command))
+            .on_action(cx.listener(Self::copy_command_output))
             // §16.7 keyboard → shared input router → MuxDomain::send_input
             .on_key_down(cx.listener(|this, event: &KeyDownEvent, window, cx| {
                 if this.is_prefix_mode() {
@@ -1783,6 +2188,152 @@ impl Render for MuxPaneView {
                     )
                 },
             )
+            .when_some(
+                has_command_chrome.then_some(command_label).flatten(),
+                |this, command_label| {
+                    this.child(
+                        gpui::deferred(
+                            div()
+                                .id("mux-command-bar")
+                                .absolute()
+                                .bottom_0()
+                                .left_0()
+                                .right_0()
+                                .flex()
+                                .items_center()
+                                .gap_1()
+                                .px_2()
+                                .py_1()
+                                .bg(colors.editor_background)
+                                .border_t_1()
+                                .border_color(colors.border_variant)
+                                .text_size(gpui::Rems(0.75))
+                                .child(
+                                    div()
+                                        .id("mux-command-previous")
+                                        .px_1()
+                                        .text_color(if previous_available {
+                                            colors.text
+                                        } else {
+                                            colors.text_disabled
+                                        })
+                                        .aria_label(if previous_available {
+                                            "Previous command"
+                                        } else {
+                                            "Previous command; output no longer addressable"
+                                        })
+                                        .when(previous_available, |button| {
+                                            button.cursor_pointer().on_click(cx.listener(
+                                                |this, _, _, cx| {
+                                                    this.navigate_command(false, false, cx)
+                                                },
+                                            ))
+                                        })
+                                        .child("Prev"),
+                                )
+                                .child(
+                                    div()
+                                        .id("mux-command-next")
+                                        .px_1()
+                                        .text_color(if next_available {
+                                            colors.text
+                                        } else {
+                                            colors.text_disabled
+                                        })
+                                        .aria_label(if next_available {
+                                            "Next command"
+                                        } else {
+                                            "Next command; output no longer addressable"
+                                        })
+                                        .when(next_available, |button| {
+                                            button.cursor_pointer().on_click(cx.listener(
+                                                |this, _, _, cx| {
+                                                    this.navigate_command(true, false, cx)
+                                                },
+                                            ))
+                                        })
+                                        .child("Next"),
+                                )
+                                .child(
+                                    div()
+                                        .id("mux-command-previous-failed")
+                                        .px_1()
+                                        .text_color(if failed_available {
+                                            colors.text
+                                        } else {
+                                            colors.text_disabled
+                                        })
+                                        .aria_label(if failed_available {
+                                            "Previous failed command"
+                                        } else {
+                                            "Previous failed command; no addressable failure"
+                                        })
+                                        .when(failed_available, |button| {
+                                            button.cursor_pointer().on_click(cx.listener(
+                                                |this, _, _, cx| {
+                                                    this.navigate_command(false, true, cx)
+                                                },
+                                            ))
+                                        })
+                                        .child("Failed"),
+                                )
+                                .child(
+                                    div()
+                                        .id("mux-command-copy")
+                                        .px_1()
+                                        .text_color(if selected_addressable {
+                                            colors.text
+                                        } else {
+                                            colors.text_disabled
+                                        })
+                                        .aria_label(if selected_addressable {
+                                            "Copy command output"
+                                        } else {
+                                            "Copy command output; output no longer addressable"
+                                        })
+                                        .when(selected_addressable, |button| {
+                                            button.cursor_pointer().on_click(cx.listener(
+                                                |this, _, window, cx| {
+                                                    this.copy_command_output(
+                                                        &settings::mux_actions::CopyCommandOutput,
+                                                        window,
+                                                        cx,
+                                                    )
+                                                },
+                                            ))
+                                        })
+                                        .child("Copy"),
+                                )
+                                .child(
+                                    div()
+                                        .ml_auto()
+                                        .text_color(colors.text_muted)
+                                        .child(command_label),
+                                ),
+                        )
+                        .with_priority(2),
+                    )
+                },
+            )
+            .when(show_shell_integration_notice, |this| {
+                this.child(
+                    gpui::deferred(
+                        div()
+                            .id("mux-command-incomplete")
+                            .absolute()
+                            .bottom_0()
+                            .left_0()
+                            .right_0()
+                            .px_2()
+                            .py_1()
+                            .bg(colors.editor_background)
+                            .text_size(gpui::Rems(0.75))
+                            .text_color(colors.text_muted)
+                            .child("Shell integration does not report command ranges"),
+                    )
+                    .with_priority(2),
+                )
+            })
             // §3.3 只读指示器 (Plan 33)
             .when(self.is_read_only(), |this| {
                 this.child(
@@ -1851,10 +2402,6 @@ impl Item for MuxPaneView {
         match event {
             MuxPaneEvent::CloseRequested => f(workspace::item::ItemEvent::CloseItem),
             MuxPaneEvent::TitleChanged => f(workspace::item::ItemEvent::UpdateTab),
-            // §3.1 InputFailed is informational only — it does not change tab
-            // state. Subscribers that want to surface it (toast/status) listen
-            // for the MuxPaneEvent directly via cx.subscribe. §16.7
-            // ExtensionAction is likewise routed by a direct subscriber.
             MuxPaneEvent::InputFailed { .. } | MuxPaneEvent::ExtensionAction { .. } => {}
         }
     }
@@ -1865,9 +2412,9 @@ mod tests {
     use super::*;
     use gpui::{TestAppContext, VisualContext as _};
     use mux_protocol::{
-        Cell, CellStyle, Envelope, FetchGridUpdateResponse, FetchScrollbackResponse, Request,
-        Response, RowChange, envelope::Payload as EnvelopePayload, request::Body as RequestBody,
-        response::Body as ResponseBody,
+        Cell, CellStyle, CommandMarker, Envelope, FetchGridUpdateResponse, FetchScrollbackResponse,
+        Request, Response, RowChange, envelope::Payload as EnvelopePayload,
+        request::Body as RequestBody, response::Body as ResponseBody,
     };
     use settings::SettingsStore;
 
@@ -2206,15 +2753,21 @@ mod tests {
         let checkpoint = read_test_envelope(&mut stream, "history checkpoint request")?;
         let checkpoint = match checkpoint.payload {
             Some(EnvelopePayload::Request(request)) => request,
-            payload => return Err(format!("expected history checkpoint request, got {payload:?}")),
+            payload => {
+                return Err(format!(
+                    "expected history checkpoint request, got {payload:?}"
+                ));
+            }
         };
         let checkpoint_fetch = match checkpoint.body {
             Some(RequestBody::FetchGridUpdate(fetch)) => fetch,
-            body => return Err(format!("expected history checkpoint grid request, got {body:?}")),
+            body => {
+                return Err(format!(
+                    "expected history checkpoint grid request, got {body:?}"
+                ));
+            }
         };
-        if checkpoint_fetch.pane_id != "history-pane"
-            || checkpoint_fetch.since_generation != 5
-        {
+        if checkpoint_fetch.pane_id != "history-pane" || checkpoint_fetch.since_generation != 5 {
             return Err(format!(
                 "unexpected history checkpoint request: {checkpoint_fetch:?}"
             ));
@@ -2612,12 +3165,11 @@ mod tests {
         initial_grid_applied.await;
 
         // Install a snapshot-backed resolver shaped like the extension host's.
-        let bindings = std::sync::Arc::new(std::sync::Mutex::new(
-            std::collections::BTreeMap::from([(
+        let bindings =
+            std::sync::Arc::new(std::sync::Mutex::new(std::collections::BTreeMap::from([(
                 "ctrl-shift-p".to_string(),
                 "z3rm.command-palette.open".to_string(),
-            )]),
-        ));
+            )])));
         view.update(cx, |view, _cx| {
             view.set_extension_shortcut_resolver(Some(std::sync::Arc::new(
                 move |keystroke: &Keystroke| {
@@ -2973,6 +3525,7 @@ mod tests {
                 .push(
                     FetchScrollbackResponse {
                         lines: vec![history_row(0, &["A"]), history_row(1, &["B"])],
+
                         total_lines: 2,
                         scrollback_version: 7,
                     },
@@ -3214,5 +3767,90 @@ mod tests {
             Err(_) => Vec::new(),
         };
         assert!(again.is_empty(), "buffer must be empty after drain");
+    }
+    fn command_marker(line: Option<i64>, column: u32) -> Option<CommandMarker> {
+        Some(CommandMarker { line, column })
+    }
+
+    fn recorded_command(
+        id: u64,
+        start: Option<i64>,
+        end: Option<(i64, u32)>,
+        exit: Option<i32>,
+    ) -> CommandRange {
+        CommandRange {
+            id,
+            output_start: command_marker(start, 0),
+            command_end: end.and_then(|(line, column)| command_marker(Some(line), column)),
+            exit_code: exit,
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn command_status_and_addressability_are_independent() {
+        let running = recorded_command(1, Some(-3), None, None);
+        let success = recorded_command(2, Some(-2), Some((0, 0)), Some(0));
+        let failed = recorded_command(3, None, Some((2, 1)), Some(17));
+        let completed = recorded_command(4, Some(1), Some((2, 1)), None);
+
+        assert_eq!(command_status(&running), CommandStatus::Running);
+        assert_eq!(command_status(&success), CommandStatus::Succeeded);
+        assert_eq!(command_status(&failed), CommandStatus::Failed(17));
+        assert_eq!(command_status(&completed), CommandStatus::Completed);
+        assert_eq!(
+            mux::command_output_span(&failed),
+            CommandSpan::Unaddressable
+        );
+    }
+
+    #[test]
+    fn command_selection_reconciles_by_stable_id_and_skips_unsafe_rows() {
+        let commands = vec![
+            recorded_command(10, Some(-4), Some((-3, 1)), Some(1)),
+            recorded_command(12, None, Some((-2, 1)), Some(2)),
+            recorded_command(15, Some(0), Some((1, 1)), Some(0)),
+        ];
+        assert_eq!(reconcile_command_selection(&commands, Some(11)), Some(12));
+        assert_eq!(reconcile_command_selection(&commands, Some(99)), Some(15));
+        assert_eq!(
+            relative_command_selection(&commands, Some(15), false, true),
+            Some(10)
+        );
+        assert_eq!(
+            relative_command_selection(&commands, Some(10), true, false),
+            Some(15)
+        );
+    }
+
+    #[test]
+    fn command_rows_project_only_inside_the_current_viewport() {
+        let command = recorded_command(7, Some(-2), Some((1, 1)), Some(0));
+        assert_eq!(
+            projected_command_rows(&command, 2, 4),
+            vec![(0, true), (3, false)]
+        );
+        assert_eq!(projected_command_rows(&command, 0, 2), vec![(1, false)]);
+        assert_eq!(command_display_offset(&command, 10), Some(2));
+
+        let visible = recorded_command(8, Some(3), Some((4, 1)), Some(0));
+        assert_eq!(command_display_offset(&visible, 10), Some(0));
+    }
+
+    #[test]
+    fn command_chrome_is_suppressed_for_alt_screen_and_prompt_only_markers() {
+        let mut state = CommandUiState::default();
+        state.commands.push(CommandRange {
+            id: 1,
+            prompt: command_marker(Some(0), 0),
+            ..Default::default()
+        });
+        assert!(!state.has_command_chrome(false));
+
+        state
+            .commands
+            .push(recorded_command(2, Some(1), None, None));
+        assert!(state.has_command_chrome(false));
+        assert!(!state.has_command_chrome(true));
     }
 }

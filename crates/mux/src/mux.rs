@@ -32,12 +32,17 @@ use mux_protocol::{
 };
 
 // §16.6 SSH 远程连接模块（Plan 19）。
+mod command_capture;
 #[cfg(feature = "ssh")]
 mod remote_install;
 #[cfg(feature = "ssh")]
 mod ssh;
 mod sync;
 
+pub use command_capture::{
+    CommandCaptureOptions, CommandSelector, CommandSpan, capture_command_output,
+    command_output_span, select_command,
+};
 #[cfg(feature = "ssh")]
 pub use remote_install::{auto_install_server, ensure_remote_server};
 #[cfg(feature = "ssh")]
@@ -210,7 +215,10 @@ fn fan_out_notification(subscribers: &[SubscriberSender], notification: &Notific
             match error {
                 async_channel::TrySendError::Full(_) => match notification.event.as_ref() {
                     Some(NotifEvent::PaneDirty(dirty)) => {
-                        subscriber.dirty_latches.lock().insert(dirty.pane_id.clone());
+                        subscriber
+                            .dirty_latches
+                            .lock()
+                            .insert(dirty.pane_id.clone());
                         tracing::trace!(
                             pane_id = %dirty.pane_id,
                             "full-queue PaneDirty latched for the subscriber to synthesize"
@@ -1916,7 +1924,11 @@ mod tests {
             "exactly one synthesized PaneDirty per latched pane"
         );
         assert!(receiver.dirty_latches.lock().is_empty());
-        assert_eq!(receiver.queue.capacity(), Some(2), "ordinary queue must stay bounded");
+        assert_eq!(
+            receiver.queue.capacity(),
+            Some(2),
+            "ordinary queue must stay bounded"
+        );
         assert_eq!(receiver.queue.len(), 0);
 
         // Re-saturate: a pane latched again synthesizes exactly one more event
@@ -2005,7 +2017,9 @@ mod tests {
             panic!("expected synthesized PaneDirty, got {delivered:?}");
         };
 
-        let second = receiver.try_recv().expect("second latched pane must synthesize");
+        let second = receiver
+            .try_recv()
+            .expect("second latched pane must synthesize");
         let Some(NotifEvent::PaneDirty(second)) = second.event else {
             panic!("expected synthesized PaneDirty, got {second:?}");
         };

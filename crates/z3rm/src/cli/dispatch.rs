@@ -5,13 +5,14 @@ use anyhow::{Context, Result};
 use std::path::PathBuf;
 use std::time::Duration;
 
-use mux::MuxDomain;
+use mux::{CommandCaptureOptions, MuxDomain};
 use mux_protocol::proto::{
     ClipboardEntry, PaneInfo, ShellCommand,
     clipboard_entry::ClipboardContentType as ProtoClipboardContentType, split_node::SplitDirection,
 };
 
-use super::capture::{CaptureLine, CaptureOptions, CommandSelector};
+use super::CommandSelector;
+use super::capture::{CaptureLine, CaptureOptions};
 use super::format::{FormatScope, expand as expand_format};
 use super::keys::parse_keys;
 use super::target::Target;
@@ -70,39 +71,29 @@ pub enum SendKeysEncoding {
 #[derive(Debug)]
 pub enum CliCommand {
     /// `z3rm ls [-F <format>]` — 列出所有 session
-    ListSessions {
-        format: Option<String>,
-    },
+    ListSessions { format: Option<String> },
     /// `z3rm new -s <name>` — 创建新 session
     NewSession {
         name: Option<String>,
         cwd: Option<PathBuf>,
     },
     /// `z3rm kill -t <target>` — 终止 session
-    KillSession {
-        target: String,
-    },
+    KillSession { target: String },
     /// `z3rm rename-session [-t <target>] <name>` — 重命名 session
     RenameSession {
         target: Option<String>,
         name: String,
     },
     /// `z3rm has-session -t <target>` — session 存在则退出码 0，否则非 0
-    HasSession {
-        target: String,
-    },
+    HasSession { target: String },
     /// `z3rm kill-server` — 优雅关闭 mux_server (结束所有 session 并退出)
     KillServer,
     /// `z3rm attach -t <target>` — 连接到 session (打开 GUI)
-    Attach {
-        target: Option<String>,
-    },
+    Attach { target: Option<String> },
     /// `z3rm detach` — 断开当前 client
     Detach,
     /// `z3rm recover [--list | -t <session>]` — list or explicitly confirm recovery.
-    Recover {
-        target: Option<String>,
-    },
+    Recover { target: Option<String> },
     /// `z3rm split-window -t <target> [-h|-v]` — 分割 pane
     SplitWindow {
         target: Option<String>,
@@ -117,9 +108,7 @@ pub enum CliCommand {
         repeat: u32,
     },
     /// `z3rm paste-buffer -t <target>` — 把 stdin 的内容粘贴进 pane
-    PasteBuffer {
-        target: Option<String>,
-    },
+    PasteBuffer { target: Option<String> },
     /// `z3rm capture-pane -t <target> [-p] [-S <line>] [-E <line>] [-J] [-e]` — 捕获 pane 内容
     CapturePane {
         target: Option<String>,
@@ -148,13 +137,9 @@ pub enum CliCommand {
         format: Option<String>,
     },
     /// `z3rm select-pane -t <target>` — 聚焦 pane
-    SelectPane {
-        target: Option<String>,
-    },
+    SelectPane { target: Option<String> },
     /// `z3rm kill-pane -t <target>` — 关闭 pane
-    KillPane {
-        target: Option<String>,
-    },
+    KillPane { target: Option<String> },
     /// `z3rm resize-pane -t <target> [-x <W>] [-y <H>] [-Z]` — 调整 pane 大小或切换 zoom
     ResizePane {
         target: Option<String>,
@@ -163,9 +148,7 @@ pub enum CliCommand {
         zoom: bool,
     },
     /// `z3rm new-window -t <target>` — 创建新 tab
-    NewWindow {
-        target: Option<String>,
-    },
+    NewWindow { target: Option<String> },
     /// `z3rm rename-window -t <target> <title>` — 设置 pane 标题
     RenameWindow {
         target: Option<String>,
@@ -180,9 +163,7 @@ pub enum CliCommand {
         max_results: u32,
     },
     /// §4 `z3rm list-changes [-t <session>]` — 列出本 session 留有影子版本的文件
-    ListChanges {
-        target: Option<String>,
-    },
+    ListChanges { target: Option<String> },
     /// §4 `z3rm list-versions [-t <session>] <path>` — 列出某文件的影子版本
     ListVersions {
         target: Option<String>,
@@ -201,9 +182,7 @@ pub enum CliCommand {
         version_id: u64,
     },
     /// §16.6 `z3rm show-buffer [-I]` — 把服务端剪贴板写到 stdout
-    ShowBuffer {
-        info: bool,
-    },
+    ShowBuffer { info: bool },
     /// §16.6 `z3rm set-buffer [--type <type>] [--] <data> | -` — 设置服务端剪贴板
     SetBuffer {
         content_type: ClipboardContentType,
@@ -751,27 +730,30 @@ pub async fn run_cli_command(cmd: CliCommand) -> Result<()> {
         } => {
             let target = super::target::parse_target(&target)?;
             let pane_id = resolve_pane_id(&domain, &target, ResolveAccess::ReadOnly).await?;
-            let (start, end) = match command {
-                Some(selector) => {
-                    let listed = domain
-                        .list_commands(&pane_id, 0)
-                        .await
-                        .context("failed to list shell commands")?;
-                    let selected = super::capture::select_command(&listed.commands, selector)?;
-                    let (start, end) = super::capture::command_capture_lines(selected)?;
-                    (Some(start), end)
-                }
-                None => (start, end),
-            };
-            let options = CaptureOptions {
-                start,
-                end,
-                join_wrapped,
-                preserve_ansi: escape,
-            };
-            let text = super::capture::capture_pane(&domain, &pane_id, options)
+            let text = match command {
+                Some(selector) => mux::capture_command_output(
+                    &domain,
+                    &pane_id,
+                    selector,
+                    CommandCaptureOptions {
+                        join_wrapped,
+                        preserve_ansi: escape,
+                    },
+                )
                 .await
-                .context("failed to capture pane")?;
+                .context("failed to capture command output")?,
+                None => {
+                    let options = CaptureOptions {
+                        start,
+                        end,
+                        join_wrapped,
+                        preserve_ansi: escape,
+                    };
+                    super::capture::capture_pane(&domain, &pane_id, options)
+                        .await
+                        .context("failed to capture pane")?
+                }
+            };
             // The renderer already terminates each captured row. `println!`
             // here would add a spurious empty row, including for `-p`.
             print!("{}", text);
@@ -800,16 +782,16 @@ pub async fn run_cli_command(cmd: CliCommand) -> Result<()> {
             } else {
                 let mut unaddressable = 0usize;
                 for command in &listed.commands {
-                    let (start, end) = match super::capture::command_output_span(command) {
-                        super::capture::CommandSpan::Located { start, end } => (
+                    let (start, end) = match mux::command_output_span(command) {
+                        mux::CommandSpan::Located { start, end } => (
                             start.to_string(),
                             end.map_or_else(|| "-".to_string(), |end| end.to_string()),
                         ),
-                        super::capture::CommandSpan::Unaddressable => {
+                        mux::CommandSpan::Unaddressable => {
                             unaddressable += 1;
                             ("?".to_string(), "?".to_string())
                         }
-                        super::capture::CommandSpan::Unmarked => ("?".to_string(), "?".to_string()),
+                        mux::CommandSpan::Incomplete => ("?".to_string(), "?".to_string()),
                     };
                     let status = match (&command.command_end, command.exit_code) {
                         (Some(_), Some(code)) => format!("exit={code}"),

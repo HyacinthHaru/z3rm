@@ -2137,14 +2137,11 @@ async fn handle_fetch_scrollback(
     for session in sessions_r.iter() {
         let panes = session.panes.clone();
         if let Some(pane) = panes.read().get(&req.pane_id) {
-            let (lines, total, version) = match pane.fetch_scrollback_checked(
-                req.from_line,
-                req.direction,
-                req.count,
-            ) {
-                Ok(result) => result,
-                Err(error) => return Ok(ResponseBody::Error(error.rpc_message())),
-            };
+            let (lines, total, version) =
+                match pane.fetch_scrollback_checked(req.from_line, req.direction, req.count) {
+                    Ok(result) => result,
+                    Err(error) => return Ok(ResponseBody::Error(error.rpc_message())),
+                };
             let resp = FetchScrollbackResponse {
                 lines: lines
                     .into_iter()
@@ -2214,8 +2211,13 @@ fn handle_list_commands(
         return ResponseBody::Error(format!("pane not found: {}", request.pane_id));
     };
 
-    let (markers, history_size) = shell_marker_snapshot(&pane);
-    let recorded_markers = u32::try_from(markers.len()).unwrap_or(u32::MAX);
+    let snapshot = pane.command_snapshot();
+    let recorded_markers = u32::try_from(snapshot.marker_positions.len()).unwrap_or(u32::MAX);
+    let markers = snapshot
+        .marker_positions
+        .into_iter()
+        .map(|(marker, position)| (marker, tmux_line(position, snapshot.history_size)))
+        .collect::<Vec<_>>();
     let mut commands = group_shell_markers(&markers);
     let max_results = request.max_results as usize;
     if max_results != 0 && commands.len() > max_results {
@@ -2223,38 +2225,12 @@ fn handle_list_commands(
     }
     ResponseBody::Commands(ListCommandsResponse {
         commands,
-        history_size,
+        history_size: snapshot.history_size,
         recorded_markers,
+        generation: snapshot.generation,
+        history_version: snapshot.history_version,
+        command_version: snapshot.command_version,
     })
-}
-
-/// §3.3 一个 pane 的全部 marker, 每个配上它此刻的 tmux 行号 (不可寻址时为 None)。
-///
-/// `shell_marker_positions` 与 scrollback 大小是两段独立的临界区。两者之间的
-/// 追加是无害的: 追加不动历史下标, 只让 tmux 行号更负一点, 而那正是更新的事实。
-/// 一次 addressing 作废则不然 —— 它在已解析出的下标底下重排了历史。所以这里
-/// 复查 epoch, 配不上的就报"没有行号", 而不是报一个错的行号。
-fn shell_marker_snapshot(pane: &crate::pane::Pane) -> (Vec<(ShellMarker, Option<i64>)>, u32) {
-    const ATTEMPTS: usize = 4;
-    for _ in 0..ATTEMPTS {
-        let epoch = pane.row_addressing_epoch();
-        let positions = pane.shell_marker_positions();
-        let (_, history_size, _) = pane.fetch_scrollback(0, 1, 0);
-        if pane.row_addressing_epoch() == epoch {
-            let located = positions
-                .into_iter()
-                .map(|(marker, position)| (marker, tmux_line(position, history_size)))
-                .collect();
-            return (located, history_size);
-        }
-    }
-    let (_, history_size, _) = pane.fetch_scrollback(0, 1, 0);
-    let markers = pane
-        .shell_markers()
-        .into_iter()
-        .map(|marker| (marker, None))
-        .collect();
-    (markers, history_size)
 }
 
 /// §3.10 把一个 marker 位置换算成 tmux 行号: 可见区首行是 0, 负数进历史。
@@ -3961,7 +3937,6 @@ mod connection_unit_tests {
         (extensions_dir, host, unattached)
     }
 
-
     #[test]
     fn take_session_returns_removed_session() {
         let sessions = Arc::new(parking_lot::RwLock::new(vec![
@@ -5101,10 +5076,8 @@ mod connection_unit_tests {
                 .expect("spawn original pane"),
             );
         }
-        let mut layout = crate::layout::LayoutTree::with_pane(
-            "node-1".to_string(),
-            "pane-1".to_string(),
-        );
+        let mut layout =
+            crate::layout::LayoutTree::with_pane("node-1".to_string(), "pane-1".to_string());
         layout
             .split(
                 "pane-1",
@@ -5175,10 +5148,7 @@ mod connection_unit_tests {
         .expect("confirm exact layout recovery");
         match response {
             ResponseBody::RecoveryConfirmed(recovered) => {
-                assert_eq!(
-                    recovered.pane_ids,
-                    vec!["pane-1", "pane-2", "pane-3"]
-                );
+                assert_eq!(recovered.pane_ids, vec!["pane-1", "pane-2", "pane-3"]);
             }
             response => panic!("expected recovery confirmation, got {response:?}"),
         }

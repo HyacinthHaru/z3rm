@@ -2,12 +2,12 @@
 // 来源: spec §3.10 — capture-pane -p 输出 pane 可见内容
 
 use anyhow::{Context, Result};
-use mux_protocol::{MAX_GRID_CELLS, checked_grid_cell_count};
 use mux::MuxDomain;
 use mux_protocol::proto::{
-    Cell, FetchGridUpdateResponse, FullGridSnapshot, fetch_grid_update_response::Update as GridUpdateKind,
-CommandRange,
+    Cell, FetchGridUpdateResponse, FullGridSnapshot,
+    fetch_grid_update_response::Update as GridUpdateKind,
 };
+use mux_protocol::{MAX_GRID_CELLS, checked_grid_cell_count};
 
 /// `-S` / `-E` 接受的行号，遵循 tmux 的行号模型。
 ///
@@ -31,118 +31,6 @@ pub struct CaptureOptions {
     pub join_wrapped: bool,
     /// `-e`：保留 ANSI 颜色/样式码。
     pub preserve_ansi: bool,
-}
-
-/// `capture-pane --command` / `--last-command` 选中的那条命令。
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum CommandSelector {
-    /// `list-commands` 第一列打印的那个 id。
-    Id(u64),
-    /// 相对最新一条命令往回数：`0` 是最新的一条，`1` 是上一条。
-    Recent(u32),
-}
-
-/// 从 `list-commands` 的结果里挑出被选中的那条命令。
-pub fn select_command(
-    commands: &[CommandRange],
-    selector: CommandSelector,
-) -> Result<&CommandRange> {
-    anyhow::ensure!(
-        !commands.is_empty(),
-        "this pane has no recorded shell commands: the shell does not emit OSC 133 \
-         markers, or nothing has run since it started"
-    );
-    match selector {
-        CommandSelector::Id(id) => commands
-            .iter()
-            .find(|command| command.id == id)
-            .with_context(|| format!("no recorded command with id {id}")),
-        CommandSelector::Recent(offset) => {
-            let index = commands
-                .len()
-                .checked_sub(offset as usize + 1)
-                .with_context(|| {
-                    format!(
-                        "only {} recorded command(s), cannot go back {offset} from the newest",
-                        commands.len(),
-                    )
-                })?;
-            commands
-                .get(index)
-                .context("recorded command index out of range")
-        }
-    }
-}
-
-/// 一条命令的输出落在哪些行，用 tmux 行号表示。
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum CommandSpan {
-    /// 起点可用。`end` 为 `None` 表示命令还在跑，取到可见区末尾。
-    Located { start: i64, end: Option<i64> },
-    /// marker 记下来了，但那些行已经不可寻址。
-    Unaddressable,
-    /// shell 根本没报告过这条命令从哪儿开始。
-    Unmarked,
-}
-
-/// 求一条命令的输出区间。
-///
-/// 缺 marker 时退到更靠前的那个 (`C` → `B` → `A`)：多带上命令行甚至提示符，
-/// 总好过漏掉真正的输出。行号本身不可用时返回 `Unaddressable`，绝不猜一个。
-pub fn command_output_span(command: &CommandRange) -> CommandSpan {
-    let starts = [&command.output_start, &command.command, &command.prompt];
-    let Some(start) = starts
-        .iter()
-        .find_map(|marker| marker.as_ref().and_then(|marker| marker.line))
-    else {
-        return if starts.iter().any(|marker| marker.is_some()) {
-            CommandSpan::Unaddressable
-        } else {
-            CommandSpan::Unmarked
-        };
-    };
-
-    let end = match &command.command_end {
-        // D 落在第 0 列意味着 shell 已经换到新的一行才报告结束，那一行不属于
-        // 输出；落在行中间则说明它还在输出的最后一行上。
-        Some(marker) => match marker.line {
-            Some(line) if marker.column == 0 => Some(line.saturating_sub(1)),
-            Some(line) => Some(line),
-            // 起点找得到而终点找不到，说明这一对配不上了；capture 到可见区末尾
-            // 会把后面无关的输出一起带上。
-            None => return CommandSpan::Unaddressable,
-        },
-        None => None,
-    };
-
-    CommandSpan::Located { start, end }
-}
-
-/// 把一条命令的输出区间变成 `-S` / `-E`，行号不可用时给出说清原因的报错。
-pub fn command_capture_lines(command: &CommandRange) -> Result<(CaptureLine, Option<CaptureLine>)> {
-    match command_output_span(command) {
-        CommandSpan::Located { start, end } => Ok((
-            CaptureLine::Line(capture_line_number(start)?),
-            end.map(capture_line_number)
-                .transpose()?
-                .map(CaptureLine::Line),
-        )),
-        CommandSpan::Unaddressable => anyhow::bail!(
-            "command {} was recorded but its rows can no longer be addressed: they were \
-             evicted from scrollback, or the line numbering was retired by a resize, a clear, \
-             or scrollback reaching capacity. 'z3rm list-commands' still reports its exit status.",
-            command.id,
-        ),
-        CommandSpan::Unmarked => anyhow::bail!(
-            "command {} carries no marker saying where its output starts; this shell reports \
-             only command ends",
-            command.id,
-        ),
-    }
-}
-
-fn capture_line_number(line: i64) -> Result<i32> {
-    i32::try_from(line).with_context(|| format!("line number {line} is out of range"))
 }
 
 /// 捕获 pane 的内容，转换为文本。
@@ -346,11 +234,7 @@ fn scrollback_matches_snapshot(
         })
 }
 
-
-fn grid_checkpoint_is_stable(
-    generation: u64,
-    response: &FetchGridUpdateResponse,
-) -> bool {
+fn grid_checkpoint_is_stable(generation: u64, response: &FetchGridUpdateResponse) -> bool {
     response.from_generation == generation
         && response.to_generation == generation
         && response.update.is_none()
@@ -431,9 +315,9 @@ pub(super) fn render_cells<'a>(
 }
 
 fn is_cell_spacer(cell: &Cell) -> bool {
-    cell.style.as_ref().is_some_and(|style| {
-        style.wide_char_spacer || style.leading_wide_char_spacer
-    })
+    cell.style
+        .as_ref()
+        .is_some_and(|style| style.wide_char_spacer || style.leading_wide_char_spacer)
 }
 
 fn cell_text(cell: &Cell) -> String {
@@ -586,168 +470,7 @@ fn color_sgr(foreground: bool, color: u32) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use mux_protocol::proto::{CellStyle, CommandMarker};
-
-    fn marker(line: Option<i64>, column: u32) -> Option<CommandMarker> {
-        Some(CommandMarker { line, column })
-    }
-
-    fn command(id: u64) -> CommandRange {
-        CommandRange {
-            id,
-            ..Default::default()
-        }
-    }
-
-    #[test]
-    fn output_span_runs_from_the_output_marker_to_the_row_before_the_end_marker() {
-        let mut range = command(1);
-        range.prompt = marker(Some(-40), 0);
-        range.command = marker(Some(-40), 8);
-        range.output_start = marker(Some(-39), 0);
-        // D 在第 0 列 = shell 已经换到新行才报告结束, 那一行不属于输出。
-        range.command_end = marker(Some(-30), 0);
-        assert_eq!(
-            command_output_span(&range),
-            CommandSpan::Located {
-                start: -39,
-                end: Some(-31),
-            }
-        );
-
-        // D 落在行中间说明它还在输出的最后一行上, 那一行要留下。
-        range.command_end = marker(Some(-30), 12);
-        assert_eq!(
-            command_output_span(&range),
-            CommandSpan::Located {
-                start: -39,
-                end: Some(-30),
-            }
-        );
-    }
-
-    #[test]
-    fn a_running_command_has_no_end_bound() {
-        let mut range = command(2);
-        range.prompt = marker(Some(-3), 0);
-        range.command = marker(Some(-3), 5);
-        range.output_start = marker(Some(-2), 0);
-        assert_eq!(
-            command_output_span(&range),
-            CommandSpan::Located {
-                start: -2,
-                end: None,
-            }
-        );
-        // -E 缺省就是可见区末尾, 正是"跑到现在为止的全部输出"。
-        let (start, end) = command_capture_lines(&range).expect("a located span");
-        assert_eq!(start, CaptureLine::Line(-2));
-        assert_eq!(end, None);
-    }
-
-    /// 有的 shell 只发 A 和 D。缺 C 时退到更靠前的 marker: 多带上命令行甚至
-    /// 提示符, 好过漏掉真正的输出。
-    #[test]
-    fn a_missing_output_marker_falls_back_to_the_earlier_ones() {
-        let mut range = command(3);
-        range.command = marker(Some(-9), 6);
-        range.command_end = marker(Some(-4), 0);
-        assert_eq!(
-            command_output_span(&range),
-            CommandSpan::Located {
-                start: -9,
-                end: Some(-5),
-            }
-        );
-
-        let mut only_prompt_and_end = command(4);
-        only_prompt_and_end.prompt = marker(Some(-9), 0);
-        only_prompt_and_end.command_end = marker(Some(-4), 0);
-        assert_eq!(
-            command_output_span(&only_prompt_and_end),
-            CommandSpan::Located {
-                start: -9,
-                end: Some(-5),
-            }
-        );
-    }
-
-    /// 行号不可用时绝不猜 —— 错的行号比查不到糟得多。
-    #[test]
-    fn evicted_rows_are_reported_rather_than_guessed() {
-        let mut range = command(5);
-        range.prompt = marker(None, 0);
-        range.command = marker(None, 4);
-        range.output_start = marker(None, 0);
-        range.command_end = marker(None, 0);
-        range.exit_code = Some(3);
-        assert_eq!(command_output_span(&range), CommandSpan::Unaddressable);
-
-        let error = command_capture_lines(&range).expect_err("an unaddressable span must fail");
-        let message = format!("{error:#}");
-        assert!(message.contains("scrollback"), "{message}");
-        assert!(
-            message.contains("exit status"),
-            "the error must point at the exit status that still works: {message}"
-        );
-
-        // 起点找得到而终点找不到, 这一对就配不上了: 取到可见区末尾会把后面
-        // 无关的输出一起带上。
-        let mut half_located = command(6);
-        half_located.output_start = marker(Some(-8), 0);
-        half_located.command_end = marker(None, 0);
-        assert_eq!(
-            command_output_span(&half_located),
-            CommandSpan::Unaddressable
-        );
-    }
-
-    #[test]
-    fn a_command_with_no_start_marker_at_all_is_distinguished_from_evicted_rows() {
-        let mut range = command(7);
-        range.command_end = marker(Some(-4), 0);
-        range.exit_code = Some(0);
-        assert_eq!(command_output_span(&range), CommandSpan::Unmarked);
-
-        let error = command_capture_lines(&range).expect_err("an unmarked span must fail");
-        assert!(
-            format!("{error:#}").contains("only command ends"),
-            "{error}"
-        );
-    }
-
-    #[test]
-    fn command_selection_addresses_ids_and_offsets_from_the_newest() {
-        let commands: Vec<CommandRange> = [10u64, 20, 30].into_iter().map(command).collect();
-        assert_eq!(
-            select_command(&commands, CommandSelector::Recent(0))
-                .expect("newest")
-                .id,
-            30
-        );
-        assert_eq!(
-            select_command(&commands, CommandSelector::Recent(2))
-                .expect("oldest")
-                .id,
-            10
-        );
-        assert_eq!(
-            select_command(&commands, CommandSelector::Id(20))
-                .expect("by id")
-                .id,
-            20
-        );
-
-        let error = select_command(&commands, CommandSelector::Recent(3))
-            .expect_err("walking past the oldest command must fail");
-        assert!(format!("{error:#}").contains("only 3"), "{error}");
-        let error = select_command(&commands, CommandSelector::Id(11))
-            .expect_err("an unknown id must fail");
-        assert!(format!("{error:#}").contains("11"), "{error}");
-        let error = select_command(&[], CommandSelector::Recent(0))
-            .expect_err("a pane with no commands must fail");
-        assert!(format!("{error:#}").contains("OSC 133"), "{error}");
-    }
+    use mux_protocol::proto::CellStyle;
 
     fn cell(ch: &str, fg: u32, bold: bool) -> Cell {
         Cell {
