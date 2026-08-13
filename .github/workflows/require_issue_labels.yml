@@ -1,0 +1,46 @@
+name: Require labels on new issues
+
+on:
+  issues:
+    types:
+      - opened
+      - reopened
+
+permissions:
+  issues: write
+
+jobs:
+  enforce-labels:
+    if: github.repository == 'cyjin-yl/z3rm'
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/github-script@60a0d83039c74a4aee543508d2ffcb1c3799cdea # v7.0.1
+        with:
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          script: |
+            const issue = context.payload.issue;
+            if (issue.labels.length > 0) {
+              console.log(`Issue #${issue.number} already has labels, skipping`);
+              return;
+            }
+            await github.rest.issues.addLabels({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: issue.number,
+              labels: ['state:needs triage'],
+            });
+            await github.rest.issues.createComment({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: issue.number,
+              body: [
+                '这条 issue 创建时没有标签，已自动打上 `state:needs triage`。',
+                '',
+                '请补充一个类型标签（`bug` / `enhancement` / `documentation` / `question`）',
+                '和至少一个区域标签（`area:mux` / `area:ui` / `area:reliability` / `area:filesystem` / `area:remote`）。',
+                '',
+                'issue 模板已预填标签，直接用模板创建即可避免这条提醒。',
+              ].join('\n'),
+            });
+            console.log(`Added state:needs triage and notice to issue #${issue.number}`);
