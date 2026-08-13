@@ -609,6 +609,10 @@ message ChangedFile {
     string path = 1;           // 绝对路径
     uint64 version_count = 2;  // 该文件的版本数量
     uint64 latest_seq_no = 3;  // §4.4 最新版本的单调序列号
+    // 下面两项让审查队列不必为每个文件各发一次 RPC 就能分辨
+    // 新增 / 修改 / 删除。
+    bool current_exists = 4;   // 该路径此刻是否还在磁盘上
+    string first_trigger = 5;  // 最早那个版本的触发原因; "create" 即本 session 内新建
 }
 
 // §4 列出本 session 内所有留有影子版本的文件。

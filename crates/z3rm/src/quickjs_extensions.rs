@@ -1486,9 +1486,9 @@ fn registry_reports(live_extensions: &[HostedExtension]) -> Vec<RegistryReport> 
 // ---------------------------------------------------------------------------
 
 /// §16.7 Build the `[{id, label}]` external directory for one extension:
-/// every command the *other* live extensions registered. The id stays bare
-/// (the owner's runtime dispatches by bare id) and the label carries the
-/// source extension so discovery surfaces can show ownership.
+/// every command the *other* live extensions registered. The id is namespaced
+/// so a click resolves to exactly one owner, and the label carries the source
+/// extension so discovery surfaces can show ownership.
 fn external_command_directory(
     reports: &[RegistryReport],
     for_extension: &str,
@@ -1499,8 +1499,12 @@ fn external_command_directory(
             continue;
         }
         for command in &report.commands {
+            // Namespaced, not bare: the palette entry is what comes back on
+            // click, and two extensions may register the same bare id. A bare
+            // id would resolve through the first-wins index and run whichever
+            // extension registered first, not the one the user picked.
             entries.push(serde_json::json!({
-                "id": command.id,
+                "id": format!("{}.{}", report.extension_id, command.id),
                 "label": format!("{} — {}", command.label, report.extension_id),
             }));
         }
@@ -1549,6 +1553,21 @@ struct CommandRegistry {
     shortcut_entries: HashMap<Keystroke, String>,
 }
 
+/// Drop `key_char` so a declared chord matches the keystroke the platform
+/// actually reports.
+///
+/// `Keystroke` hashes `key_char`, but a parsed chord never carries one while
+/// macOS fills it in for every key without ctrl/cmd/fn — and unconditionally
+/// for space, tab and enter. Keying on the whole struct therefore missed
+/// exactly the chords the user is most likely to declare.
+fn chord_lookup_key(keystroke: &Keystroke) -> Keystroke {
+    Keystroke {
+        modifiers: keystroke.modifiers,
+        key: keystroke.key.clone(),
+        key_char: None,
+    }
+}
+
 /// One command the client-side directory exposes to discovery surfaces.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ExtensionCommandEntry {
@@ -1589,18 +1608,23 @@ impl CommandRegistry {
                 // The same extension re-registering is idempotent.
                 std::collections::btree_map::Entry::Occupied(entry)
                     if entry.get() == &report.extension_id => {}
-                // Collision: a different extension already owns this id.
-                // Drop the namespaced entry as well, so neither registration
-                // is dispatchable under that id.
+                // Collision: a different extension already owns the bare id,
+                // so only that one keeps it. The namespaced form is unique by
+                // construction and stays dispatchable — §16.7 asks that the
+                // user's pick decides, not the registration order.
                 std::collections::btree_map::Entry::Occupied(entry) => {
-                    self.owners.remove(&namespaced);
-                    self.labels.remove(&namespaced);
+                    self.owners
+                        .insert(namespaced.clone(), report.extension_id.clone());
+                    self.labels.insert(namespaced, command.label.clone());
                     rejected.push(RegistryConflict {
                         extension_id: report.extension_id.clone(),
                         detail: format!(
-                            "command id \"{}\" is already owned by extension \"{}\"",
+                            "command id \"{}\" is already owned by extension \"{}\"; \
+                             use \"{}.{}\" to reach this one",
                             command.id,
-                            entry.get()
+                            entry.get(),
+                            report.extension_id,
+                            command.id
                         ),
                     });
                 }
@@ -1616,14 +1640,16 @@ impl CommandRegistry {
                     // keystroke interceptor without re-parsing on keypress.
                     self.keymaps.insert(chord.clone(), keymap.command.clone());
                     if let Ok(keystroke) = Keystroke::parse(&chord) {
-                        self.shortcut_entries.insert(keystroke, keymap.command.clone());
+                        self.shortcut_entries
+                            .insert(chord_lookup_key(&keystroke), keymap.command.clone());
                     }
                 }
                 std::collections::btree_map::Entry::Occupied(entry)
                     if entry.get() == &report.extension_id => {
                     self.keymaps.insert(chord.clone(), keymap.command.clone());
                     if let Ok(keystroke) = Keystroke::parse(&chord) {
-                        self.shortcut_entries.insert(keystroke, keymap.command.clone());
+                        self.shortcut_entries
+                            .insert(chord_lookup_key(&keystroke), keymap.command.clone());
                     }
                 }
                 std::collections::btree_map::Entry::Occupied(entry) => {
@@ -1695,7 +1721,7 @@ impl CommandRegistry {
         keystroke: &Keystroke,
     ) -> Option<(String, String)> {
         self.shortcut_entries
-            .get(keystroke)
+            .get(&chord_lookup_key(keystroke))
             .and_then(|command| {
                 self.resolve_owner(command)
                     .map(|owner| (owner.to_string(), command.clone()))
@@ -1853,6 +1879,8 @@ pub fn install_command_palette_interception(cx: &mut gpui::App) {
 /// dispatches its owning extension's command, and propagation stops so the
 /// pane-level shortcut resolver does not fire a second time.
 pub fn install_global_shortcuts(cx: &mut gpui::App) {
+    // The subscription unsubscribes on drop, so discarding it here would
+    // uninstall the interceptor on the same line that installs it.
     cx.intercept_keystrokes(move |event, _window, cx| {
         let Some(host) = cx.try_global::<GlobalHostController>() else {
             return;
@@ -1882,7 +1910,8 @@ pub fn install_global_shortcuts(cx: &mut gpui::App) {
         }
         host.0.read(cx).invoke_command(&extension_id, &command, "{}");
         cx.stop_propagation();
-    });
+    })
+    .detach();
 }
 
 /// Render every live extension and hand the VDOM JSON back, logging (never
@@ -2235,6 +2264,17 @@ impl ExtensionHostController {
                         .filter(|hosted| hosted.suspended)
                         .count()
                         > suspended_before;
+                    // §16.7 A suspended extension must stop offering commands:
+                    // republish the snapshot so its entries leave the native
+                    // palette, the chord index, and every other runtime's
+                    // external directory instead of failing at dispatch time.
+                    if newly_suspended {
+                        let reports = registry_reports(&live_extensions);
+                        if registry_sender.unbounded_send(reports.clone()).is_err() {
+                            break;
+                        }
+                        install_external_directories(&mut live_extensions, &reports);
+                    }
                     // §5.6 Force the push when a suspension first occurs so
                     // the user notice appears without waiting for invalidation.
                     if !push_chrome_if_dirty(
@@ -2733,9 +2773,15 @@ impl ExtensionHostController {
             );
             return;
         };
+        // A namespaced id disambiguates the owner but is not what the owning
+        // runtime registered, so hand it back the bare id it knows.
+        let command = command
+            .strip_prefix(&format!("{owner}."))
+            .unwrap_or(command)
+            .to_string();
         self.send(HostCommand::ExecuteCommand {
             owner: Some(owner),
-            command: command.to_string(),
+            command,
             arguments: arguments_json.to_string(),
         });
     }
@@ -2758,9 +2804,10 @@ impl ExtensionHostController {
         let snapshot = self.keymap_snapshot.clone();
         std::sync::Arc::new(move |keystroke: &Keystroke| {
             let bindings = snapshot.lock();
+            let pressed = chord_lookup_key(keystroke);
             let matched = bindings.iter().find(|(chord, _)| {
                 Keystroke::parse(chord.as_str())
-                    .map(|parsed| parsed == *keystroke)
+                    .map(|parsed| chord_lookup_key(&parsed) == pressed)
                     .unwrap_or_else(|_| chord.eq_ignore_ascii_case(&keystroke.to_string()))
             });
             matched.map(|(_, action)| SharedString::from(action.clone()))
@@ -2838,9 +2885,13 @@ impl ExtensionHostController {
     }
 
     fn send(&self, command: HostCommand) {
-        if let Some(sender) = &self.command_sender
-            && let Err(error) = sender.send(command)
-        {
+        // A missing sender means the host thread never started. Dropping the
+        // command silently makes an extension look merely unresponsive.
+        let Some(sender) = &self.command_sender else {
+            tracing::warn!("QuickJS host is not running; command dropped");
+            return;
+        };
+        if let Err(error) = sender.send(command) {
             tracing::warn!(%error, "failed to send command to QuickJS host");
         }
     }
@@ -4900,7 +4951,8 @@ mod tests {
             registry.apply_report(&report_b),
             vec![RegistryConflict {
                 extension_id: "ext-b".to_string(),
-                detail: "command id \"noop\" is already owned by extension \"ext-a\"".to_string(),
+                detail: "command id \"noop\" is already owned by extension \"ext-a\"; use \"ext-b.noop\" to reach this one"
+                    .to_string(),
             }],
             "colliding namespaced id must be reported as rejected"
         );
@@ -4909,8 +4961,8 @@ mod tests {
         assert_eq!(registry.resolve_owner("ext-a.unique"), Some("ext-a"));
         assert_eq!(
             registry.resolve_owner("ext-b.noop"),
-            None,
-            "a rejected registration must never dispatch"
+            Some("ext-b"),
+            "the bare id is taken, but the namespaced id must still reach its owner"
         );
         assert_eq!(registry.resolve_owner("missing"), None);
 
@@ -4919,7 +4971,8 @@ mod tests {
             registry.apply_reports(&[report_a, report_b]),
             vec![RegistryConflict {
                 extension_id: "ext-b".to_string(),
-                detail: "command id \"noop\" is already owned by extension \"ext-a\"".to_string(),
+                detail: "command id \"noop\" is already owned by extension \"ext-a\"; use \"ext-b.noop\" to reach this one"
+                    .to_string(),
             }]
         );
         assert_eq!(registry.resolve_owner("noop"), Some("ext-a"));
@@ -5121,6 +5174,70 @@ mod tests {
         assert_eq!(registry.resolve_keystroke(&unbound), None);
     }
 
+    /// The platform fills `key_char` on keys typed without ctrl/cmd/fn, and
+    /// unconditionally on space/tab/enter, while a parsed chord never carries
+    /// one. Hashing the whole `Keystroke` therefore missed exactly the chords
+    /// an extension is most likely to declare.
+    #[test]
+    fn chord_resolution_ignores_the_typed_character() {
+        let mut registry = CommandRegistry::default();
+        registry.apply_report(&RegistryReport {
+            extension_id: "ext-a".to_string(),
+            commands: vec![RegisteredCommand {
+                id: "fire".to_string(),
+                label: "Fire".to_string(),
+            }],
+            keymaps: vec![RegisteredKeymap {
+                chord: "alt-space".to_string(),
+                command: "fire".to_string(),
+            }],
+        });
+
+        let mut pressed = Keystroke::parse("alt-space").expect("parse chord");
+        pressed.key_char = Some(" ".to_string());
+        assert_eq!(
+            registry.resolve_keystroke(&pressed),
+            Some(("ext-a".to_string(), "fire".to_string()))
+        );
+    }
+
+    /// Two extensions may register the same bare command id. The directory a
+    /// runtime shows must therefore carry ids that resolve to exactly one
+    /// owner, or clicking the entry labelled with one extension runs the
+    /// other's command.
+    #[test]
+    fn external_directory_ids_resolve_to_one_owner() {
+        let reports = vec![
+            RegistryReport {
+                extension_id: "ext-a".to_string(),
+                commands: vec![RegisteredCommand {
+                    id: "dupe".to_string(),
+                    label: "A Thing".to_string(),
+                }],
+                keymaps: Vec::new(),
+            },
+            RegistryReport {
+                extension_id: "ext-b".to_string(),
+                commands: vec![RegisteredCommand {
+                    id: "dupe".to_string(),
+                    label: "B Thing".to_string(),
+                }],
+                keymaps: Vec::new(),
+            },
+        ];
+        let mut registry = CommandRegistry::default();
+        registry.apply_reports(&reports);
+
+        let for_a = external_command_directory(&reports, "ext-a");
+        let id_b = for_a[0]["id"].as_str().expect("directory id");
+        assert_eq!(id_b, "ext-b.dupe");
+        assert_eq!(registry.resolve_owner(id_b), Some("ext-b"));
+
+        let for_b = external_command_directory(&reports, "ext-b");
+        let id_a = for_b[0]["id"].as_str().expect("directory id");
+        assert_eq!(registry.resolve_owner(id_a), Some("ext-a"));
+    }
+
     /// §16.7: the app-wide keystroke interceptor leaves a keystroke alone
     /// when a native binding owns it — an extension chord must never
     /// shadow a core action — and lets an unclaimed keystroke reach the
@@ -5228,6 +5345,54 @@ mod tests {
         );
     }
 
+    /// The interceptor must survive installation. `intercept_keystrokes`
+    /// returns a `Subscription` that unsubscribes on drop, so discarding it
+    /// removed the interceptor on the same line that installed it and no
+    /// extension chord ever fired.
+    #[gpui::test]
+    async fn global_shortcuts_dispatch_a_chord_no_native_binding_claims(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let (command_sender, command_receiver) = std::sync::mpsc::channel::<HostCommand>();
+        let controller = cx.new(|_| {
+            let mut controller = ExtensionHostController::new();
+            controller.command_sender = Some(command_sender);
+            controller.commands.apply_report(&RegistryReport {
+                extension_id: "ext-a".to_string(),
+                commands: vec![RegisteredCommand {
+                    id: "fire".to_string(),
+                    label: "Fire".to_string(),
+                }],
+                keymaps: vec![RegisteredKeymap {
+                    chord: "ctrl+alt+e".to_string(),
+                    command: "fire".to_string(),
+                }],
+            });
+            controller
+        });
+        cx.update(|cx| {
+            cx.set_global(GlobalHostController(controller));
+            install_global_shortcuts(cx);
+        });
+
+        let window_handle = cx.add_window(|_window, _cx| gpui::Empty);
+        let any_window: gpui::AnyWindowHandle = window_handle.into();
+        cx.dispatch_keystroke(
+            any_window,
+            Keystroke::parse("ctrl-alt-e").expect("parse extension chord"),
+        );
+
+        match command_receiver.try_recv() {
+            Ok(HostCommand::ExecuteCommand { owner, command, .. }) => {
+                assert_eq!(owner.as_deref(), Some("ext-a"));
+                assert_eq!(command, "fire");
+            }
+            Ok(_) => panic!("the chord dispatched the wrong host command"),
+            Err(_) => panic!(
+                "the extension chord did not dispatch: the keystroke interceptor is not installed"
+            ),
+        }
+    }
 
 
     /// §16.7: `execute_for_owner` runs exactly one runtime — the resolved

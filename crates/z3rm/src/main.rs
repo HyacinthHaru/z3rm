@@ -282,6 +282,10 @@ enum MuxConnectionState {
     Connected,
     Reconnecting {
         attempt: u32,
+        /// Why the previous attempt failed. Carried through the retry so the
+        /// reason stays readable while the retry is running — that is exactly
+        /// when the user goes looking for it.
+        last_error: Option<SharedString>,
     },
     Offline {
         attempts: u32,
@@ -291,12 +295,18 @@ enum MuxConnectionState {
 
 impl MuxConnectionState {
     fn begin_reconnect(&mut self) -> Option<u32> {
-        let attempt = match self {
+        let (attempt, last_error) = match self {
             Self::Reconnecting { .. } => return None,
-            Self::Connected => 1,
-            Self::Offline { attempts, .. } => attempts.saturating_add(1),
+            Self::Connected => (1, None),
+            Self::Offline {
+                attempts,
+                last_error,
+            } => (attempts.saturating_add(1), Some(last_error.clone())),
         };
-        *self = Self::Reconnecting { attempt };
+        *self = Self::Reconnecting {
+            attempt,
+            last_error,
+        };
         Some(attempt)
     }
 
@@ -305,7 +315,7 @@ impl MuxConnectionState {
             None => Self::Connected,
             Some(last_error) => {
                 let attempts = match self {
-                    Self::Reconnecting { attempt } => *attempt,
+                    Self::Reconnecting { attempt, .. } => *attempt,
                     Self::Offline { attempts, .. } => *attempts,
                     Self::Connected => 1,
                 };
@@ -317,19 +327,24 @@ impl MuxConnectionState {
         };
     }
 
+    /// Record that a liveness probe failed. Returns true only for the
+    /// transition into the outage, so the caller reports it once.
+    ///
+    /// An already-offline window keeps its attempt count and its concrete
+    /// failure reason: the monitor calls this once per back-off cycle, and
+    /// resetting here would peg the counter at one and re-announce the same
+    /// outage on every cycle.
     fn mark_disconnected(&mut self, error: impl Into<SharedString>) -> bool {
-        if matches!(self, Self::Reconnecting { .. }) {
-            return false;
+        match self {
+            Self::Reconnecting { .. } | Self::Offline { .. } => false,
+            Self::Connected => {
+                *self = Self::Offline {
+                    attempts: 0,
+                    last_error: error.into(),
+                };
+                true
+            }
         }
-        let next = Self::Offline {
-            attempts: 0,
-            last_error: error.into(),
-        };
-        if *self == next {
-            return false;
-        }
-        *self = next;
-        true
     }
 }
 
@@ -346,9 +361,12 @@ impl From<&MuxConnectionState> for MuxConnectionPresentation {
                 label: "Connected".into(),
                 error: None,
             },
-            MuxConnectionState::Reconnecting { attempt } => Self {
+            MuxConnectionState::Reconnecting {
+                attempt,
+                last_error,
+            } => Self {
                 label: format!("Reconnecting · attempt {attempt}").into(),
-                error: None,
+                error: last_error.clone(),
             },
             MuxConnectionState::Offline {
                 attempts,
@@ -754,7 +772,7 @@ fn start_mux_connection_monitor(
                     newly_disconnected
                 });
                 if newly_disconnected {
-                    cx.update(|cx| daemon::show_daemon_connection_lost(cx));
+                    cx.update(|cx| daemon::show_daemon_connection_lost(Some(window_id), cx));
                 }
             }
 
@@ -3058,10 +3076,18 @@ fn main() {
                         })
                         .register_action(|_workspace, _: &settings::mux_actions::Reconnect, window, cx| {
                             let window_id = window.window_handle().window_id();
+                            // Reported on this window: with several windows on
+                            // several sessions, a process-wide toast does not
+                            // say which connection is being retried.
                             if signal_mux_reconnect(window_id, cx) {
-                                daemon::show_daemon_error(cx, "Retrying this window's mux connection.");
+                                daemon::show_window_error(
+                                    window_id,
+                                    cx,
+                                    "Retrying this window's mux connection.",
+                                );
                             } else {
-                                daemon::show_daemon_error(
+                                daemon::show_window_error(
+                                    window_id,
                                     cx,
                                     "This window is not bound to an active mux connection.",
                                 );
@@ -3424,7 +3450,10 @@ mod tests {
         assert_eq!(state.begin_reconnect(), Some(1));
         assert_eq!(
             state,
-            super::MuxConnectionState::Reconnecting { attempt: 1 }
+            super::MuxConnectionState::Reconnecting {
+                attempt: 1,
+                last_error: None,
+            }
         );
         assert_eq!(
             state.begin_reconnect(),
@@ -3441,8 +3470,52 @@ mod tests {
             }
         );
         assert_eq!(state.begin_reconnect(), Some(2));
+        assert_eq!(
+            state,
+            super::MuxConnectionState::Reconnecting {
+                attempt: 2,
+                last_error: Some("SSH tunnel closed".into()),
+            },
+            "the retry keeps showing why the previous attempt failed"
+        );
         state.finish_reconnect(None);
         assert_eq!(state, super::MuxConnectionState::Connected);
+    }
+
+    /// The monitor calls `mark_disconnected` once per back-off cycle before it
+    /// retries. Resetting the outage there pegged the counter at one and
+    /// re-announced the same outage every cycle.
+    #[test]
+    fn repeated_probe_failures_keep_counting_the_same_outage() {
+        let mut state = super::MuxConnectionState::Connected;
+        let mut announcements = 0;
+        let mut labels = Vec::new();
+        for cycle in 1..=3 {
+            if state.mark_disconnected("mux connection probe failed") {
+                announcements += 1;
+            }
+            let attempt = state.begin_reconnect();
+            labels.push((
+                attempt,
+                super::MuxConnectionPresentation::from(&state)
+                    .label
+                    .to_string(),
+            ));
+            state.finish_reconnect(Some(format!("tunnel refused (cycle {cycle})").into()));
+        }
+
+        assert_eq!(
+            announcements, 1,
+            "one outage must be announced once, not once per back-off cycle"
+        );
+        assert_eq!(
+            labels
+                .iter()
+                .map(|(attempt, _)| *attempt)
+                .collect::<Vec<_>>(),
+            vec![Some(1), Some(2), Some(3)]
+        );
+        assert_eq!(labels[2].1, "Reconnecting · attempt 3");
     }
     #[test]
     fn disconnect_marks_do_not_clobber_an_inflight_reconnect() {
@@ -3453,7 +3526,13 @@ mod tests {
             !state.mark_disconnected("late probe failure"),
             "a probe that fires during a reconnect must not overwrite it"
         );
-        assert_eq!(state, super::MuxConnectionState::Reconnecting { attempt: 1 });
+        assert_eq!(
+            state,
+            super::MuxConnectionState::Reconnecting {
+                attempt: 1,
+                last_error: None,
+            }
+        );
 
         state.finish_reconnect(None);
         assert!(state.mark_disconnected("probe failure"));
@@ -3476,9 +3555,14 @@ mod tests {
         let reconnecting =
             super::MuxConnectionPresentation::from(&super::MuxConnectionState::Reconnecting {
                 attempt: 7,
+                last_error: Some("tunnel refused".into()),
             });
         assert_eq!(reconnecting.label.as_ref(), "Reconnecting · attempt 7");
-        assert_eq!(reconnecting.error, None);
+        assert_eq!(
+            reconnecting.error.as_deref(),
+            Some("tunnel refused"),
+            "the reason must stay reachable while the retry runs"
+        );
 
         let offline = super::MuxConnectionPresentation::from(
             &super::MuxConnectionState::Offline {

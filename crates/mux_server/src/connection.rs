@@ -2862,6 +2862,8 @@ async fn handle_list_changed_files(
                     path: change.path.to_string_lossy().into_owned(),
                     version_count: change.version_count,
                     latest_seq_no: change.latest_seq_no,
+                    current_exists: change.current_exists,
+                    first_trigger: change.first_trigger,
                 })
                 .collect(),
         },

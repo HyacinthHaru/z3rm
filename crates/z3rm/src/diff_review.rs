@@ -160,6 +160,22 @@ pub enum ReviewClassification {
     Unavailable,
 }
 
+/// Classify a queue row from the listing alone.
+///
+/// The listing carries existence and the oldest trigger, which is enough to
+/// separate added / modified / deleted without one review-state RPC per file.
+/// Binary and oversized content still needs the file itself, so those rows
+/// read as `Modified` until they are opened and `mark_refreshed` corrects them.
+fn queue_row_classification(file: &mux_protocol::ChangedFile) -> ReviewClassification {
+    if !file.current_exists {
+        ReviewClassification::Deleted
+    } else if file.first_trigger.eq_ignore_ascii_case("create") {
+        ReviewClassification::Added
+    } else {
+        ReviewClassification::Modified
+    }
+}
+
 impl ReviewClassification {
     pub fn label(self) -> &'static str {
         match self {
@@ -512,7 +528,6 @@ impl ReviewStateModel {
         let old_to = self.timeline.to().clone();
         let old_active = self.timeline.active_endpoint();
         *self = Self::from_response(response);
-        self.timeline.set_active_endpoint(old_active);
         if let ReviewEndpoint::Historical(version_id) = old_from {
             self.timeline.select_from(version_id);
         }
@@ -524,6 +539,11 @@ impl ReviewStateModel {
                     .mark_unavailable(ReviewEndpointRole::To, version_id, state)
             }
         }
+        // Last: `select_from` / `select_to` / `compare_to_current` each move
+        // the active endpoint as a side effect, so restoring it any earlier
+        // leaves the user's browsing endpoint pointing at the wrong side and
+        // the version arrows nudging the endpoint they were not using.
+        self.timeline.set_active_endpoint(old_active);
         changed
     }
 
@@ -1297,21 +1317,32 @@ impl DiffReview {
                             );
                         }
                         this.restore_confirmation = None;
-                        this.resolved = true;
+                        // Deliberately not `resolved`: a restore appends a new
+                        // version rather than closing the file out, and §4 asks
+                        // that the user can keep comparing and undo it. Marking
+                        // it resolved hid the Restore control until the review
+                        // was reopened. The queue entry is already marked
+                        // reviewed above, so the queue still advances.
                         cx.emit(DiffReviewEvent::Declined);
                         this.advance_after_success(cx);
                     }
                     (Ok(_), Some((Err(error), _))) | (Ok(_), Some((_, Err(error)))) => {
+                        // The confirmation described an operation that is over;
+                        // leaving it up next to the failure reads as if it were
+                        // still awaiting a second press.
+                        this.restore_confirmation = None;
                         this.mark_current_queue_item_needs_refresh();
                         this.decline_error =
                             Some(format!("Restore succeeded but refresh failed: {error:#}").into());
                     }
                     (Ok(_), _) => {
+                        this.restore_confirmation = None;
                         this.mark_current_queue_item_needs_refresh();
                         this.decline_error =
                             Some("shadow restore was not confirmed".to_string().into());
                     }
                     (Err(error), _) => {
+                        this.restore_confirmation = None;
                         this.mark_current_queue_item_needs_refresh();
                         this.decline_error = Some(format!("Restore failed: {error:#}").into());
                         if let Some(model) = this.review_model.as_mut() {
@@ -2180,10 +2211,10 @@ impl ReviewQueue {
             entries: files
                 .into_iter()
                 .map(|file| ReviewQueueEntry {
+                    classification: queue_row_classification(&file),
                     path: PathBuf::from(file.path),
                     latest_seq_no: file.latest_seq_no,
                     version_count: file.version_count,
-                    classification: ReviewClassification::Unavailable,
                     status: ReviewQueueStatus::Pending,
                     current_exists: None,
                     current_sha256: None,
@@ -2211,8 +2242,16 @@ impl ReviewQueue {
             .collect()
     }
 
+    /// Show that `index` is being fetched, without forgetting that it was
+    /// already reviewed.
+    ///
+    /// `mark_refreshed` decides "still reviewed" by looking at the current
+    /// status, so overwriting a `Reviewed` entry here made that check
+    /// impossible and every revisit demoted the entry back to Pending.
     pub fn mark_loading(&mut self, index: usize) {
-        if let Some(entry) = self.entries.get_mut(index) {
+        if let Some(entry) = self.entries.get_mut(index)
+            && entry.status != ReviewQueueStatus::Reviewed
+        {
             entry.status = ReviewQueueStatus::Loading;
         }
     }
@@ -2294,17 +2333,19 @@ impl ReviewQueue {
                     entry.version_count = file.version_count;
                     entry.current_exists = None;
                     entry.current_sha256 = None;
-                    entry.classification = ReviewClassification::Unavailable;
+                    // Fall back to what the listing knows rather than blanking
+                    // the row: a new version does not make the file unreadable.
+                    entry.classification = queue_row_classification(file);
                     entry.status = ReviewQueueStatus::NeedsRefresh;
                 } else {
                     entry.version_count = file.version_count;
                 }
             } else {
                 self.entries.push(ReviewQueueEntry {
+                    classification: queue_row_classification(file),
                     path: path.to_path_buf(),
                     latest_seq_no: file.latest_seq_no,
                     version_count: file.version_count,
-                    classification: ReviewClassification::Unavailable,
                     status: ReviewQueueStatus::Pending,
                     current_exists: None,
                     current_sha256: None,
@@ -2319,7 +2360,13 @@ impl ReviewQueue {
             .enumerate()
             .skip(current_index.saturating_add(1))
             .find_map(|(index, entry)| {
-                (entry.status != ReviewQueueStatus::Reviewed).then_some(index)
+                // An entry that could not be loaded is not reviewable, so
+                // advancing onto it would park the queue there forever.
+                (!matches!(
+                    entry.status,
+                    ReviewQueueStatus::Reviewed | ReviewQueueStatus::Unavailable
+                ))
+                .then_some(index)
             })
             .or_else(|| {
                 self.entries
@@ -2348,7 +2395,12 @@ impl ReviewQueue {
         (
             self.entries
                 .iter()
-                .filter(|entry| entry.status == ReviewQueueStatus::Reviewed)
+                .filter(|entry| {
+                    matches!(
+                        entry.status,
+                        ReviewQueueStatus::Reviewed | ReviewQueueStatus::Unavailable
+                    )
+                })
                 .count(),
             self.entries.len(),
         )
@@ -2594,6 +2646,100 @@ mod tests {
         assert_eq!(queue.progress(), (0, 1));
     }
 
+    /// Revisiting an accepted file must not undo the acceptance. The
+    /// navigation path marks the row loading before it refreshes it, and the
+    /// refresh decides "still reviewed" from the current status — so a
+    /// `Loading` overwrite silently demoted the row and walked the progress
+    /// counter backwards.
+    #[test]
+    fn revisiting_a_reviewed_file_keeps_it_reviewed() {
+        let mut queue = ReviewQueue::from_changed_files(vec![
+            changed_file("/tmp/alpha", 7, 4),
+            changed_file("/tmp/beta", 9, 2),
+        ]);
+        queue.mark_reviewed_with_classification(
+            0,
+            7,
+            true,
+            vec![2; 32],
+            ReviewClassification::Modified,
+        );
+        assert_eq!(queue.progress(), (1, 2));
+
+        // Exactly what `navigate_queue_to` does when the user goes back.
+        queue.mark_loading(0);
+        queue.refresh_changed_files(&[changed_file("/tmp/alpha", 7, 4)]);
+        queue.mark_refreshed(0, 7, true, vec![2; 32], 4, ReviewClassification::Modified);
+
+        assert_eq!(queue.status(0), Some(ReviewQueueStatus::Reviewed));
+        assert_eq!(queue.progress(), (1, 2));
+        assert_eq!(queue.next_unreviewed(0), Some(1));
+    }
+
+    /// The listing carries existence and the oldest trigger, so a queue row
+    /// says what kind of change it is before the file is opened. Every row
+    /// reading "Unavailable" told the user nothing.
+    #[test]
+    fn queue_rows_classify_from_the_listing_alone() {
+        let mut added = changed_file("/tmp/added", 1, 1);
+        added.first_trigger = "create".to_string();
+        let mut deleted = changed_file("/tmp/deleted", 2, 2);
+        deleted.current_exists = false;
+        let modified = changed_file("/tmp/modified", 3, 2);
+
+        let queue = ReviewQueue::from_changed_files(vec![added, deleted, modified]);
+        let kinds = queue
+            .entries()
+            .iter()
+            .map(|entry| entry.classification)
+            .collect::<Vec<_>>();
+        assert_eq!(
+            kinds,
+            vec![
+                ReviewClassification::Added,
+                ReviewClassification::Deleted,
+                ReviewClassification::Modified,
+            ]
+        );
+    }
+
+    /// A new version means "look again", not "this file became unreadable".
+    #[test]
+    fn a_new_version_keeps_the_row_classified() {
+        let mut queue = ReviewQueue::from_changed_files(vec![changed_file("/tmp/alpha", 7, 4)]);
+        let mut deleted = changed_file("/tmp/alpha", 8, 5);
+        deleted.current_exists = false;
+
+        queue.refresh_changed_files(&[deleted]);
+
+        let entry = queue.entry(0).expect("queue entry");
+        assert_eq!(entry.status, ReviewQueueStatus::NeedsRefresh);
+        assert_eq!(entry.classification, ReviewClassification::Deleted);
+    }
+
+    /// A file that could not be loaded is not reviewable, so the queue has to
+    /// step past it. Treating it as outstanding parked auto-advance on that
+    /// row and kept the queue from ever reporting completion.
+    #[test]
+    fn an_unloadable_entry_does_not_stall_the_queue() {
+        let mut queue = ReviewQueue::from_changed_files(vec![
+            changed_file("/tmp/alpha", 7, 4),
+            changed_file("/tmp/beta", 9, 2),
+        ]);
+        queue.mark_unavailable(1);
+        queue.mark_reviewed_with_classification(
+            0,
+            7,
+            true,
+            vec![2; 32],
+            ReviewClassification::Modified,
+        );
+
+        assert_eq!(queue.next_unreviewed(0), None);
+        assert_eq!(queue.progress(), (2, 2));
+        assert_eq!(queue.progress_label(), "All changed files reviewed (2/2)");
+    }
+
     #[test]
     fn review_queue_empty_and_complete_states_are_distinct() {
         let empty = ReviewQueue::default();
@@ -2616,6 +2762,8 @@ mod tests {
             path: path.to_string(),
             latest_seq_no,
             version_count,
+            current_exists: true,
+            first_trigger: "write".to_string(),
         }
     }
 }
@@ -2791,6 +2939,42 @@ mod timeline_tests {
                 .map(ReviewTimelineVersion::trigger_label),
             Some("Restored".to_string())
         );
+    }
+
+    /// A refresh must leave the user on the endpoint they were browsing.
+    /// `select_from` / `select_to` / `compare_to_current` each move the active
+    /// endpoint as a side effect, so restoring it before them was a no-op and
+    /// the version arrows silently started driving the other side.
+    #[test]
+    fn refresh_keeps_the_endpoint_the_user_was_browsing() {
+        let initial = review_response(
+            vec![(1, 10, "create"), (2, 20, "write")],
+            20,
+            b"current",
+            mux_protocol::FileContentState::Text,
+        );
+        let refreshed = review_response(
+            vec![(1, 10, "create"), (2, 20, "write"), (3, 30, "decline")],
+            30,
+            b"restored",
+            mux_protocol::FileContentState::Text,
+        );
+
+        let mut model = ReviewStateModel::from_response(&initial);
+        model.select_from(1);
+        assert_eq!(model.timeline().active_endpoint(), ReviewEndpointRole::From);
+
+        model.refresh_from(&refreshed);
+        assert_eq!(
+            model.timeline().active_endpoint(),
+            ReviewEndpointRole::From,
+            "the browsing endpoint must survive a refresh"
+        );
+
+        model.timeline_mut().select_to(2);
+        assert_eq!(model.timeline().active_endpoint(), ReviewEndpointRole::To);
+        model.refresh_from(&refreshed);
+        assert_eq!(model.timeline().active_endpoint(), ReviewEndpointRole::To);
     }
 
     #[test]

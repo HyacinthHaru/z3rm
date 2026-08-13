@@ -15,11 +15,21 @@ use mux_protocol::TerminalSize;
 use gpui::{App, SharedString};
 use ui::{Icon, IconName};
 
+/// Mount `toast` on `window_id` when given, otherwise on the first workspace.
+///
+/// A connection outage belongs to one window: mounting it on whichever window
+/// happens to come first tells the user the wrong window went offline.
 fn mount_status_toast(
     toast: gpui::Entity<notifications::status_toast::StatusToast>,
+    window_id: Option<gpui::WindowId>,
     cx: &mut gpui::App,
 ) {
     for window_handle in cx.windows() {
+        if let Some(window_id) = window_id
+            && window_handle.window_id() != window_id
+        {
+            continue;
+        }
         let mounted = window_handle.update(cx, |_root, window, cx| {
             let Some(Some(multi)) = window.root::<workspace::MultiWorkspace>() else {
                 return false;
@@ -38,7 +48,7 @@ fn mount_status_toast(
 }
 
 /// §16.12 显示 "daemon 连接丢失" 通知 (warning toast)
-pub fn show_daemon_connection_lost(cx: &mut App) {
+pub fn show_daemon_connection_lost(window_id: Option<gpui::WindowId>, cx: &mut App) {
     let toast = notifications::status_toast::StatusToast::new(
         "Connection to mux_server lost. Reconnecting...",
         cx,
@@ -49,7 +59,7 @@ pub fn show_daemon_connection_lost(cx: &mut App) {
                 .dismiss_button(true)
         },
     );
-    mount_status_toast(toast, cx);
+    mount_status_toast(toast, window_id, cx);
 }
 
 /// §16.12 显示 daemon 错误通知 (error toast)
@@ -60,9 +70,19 @@ pub fn show_daemon_error(cx: &mut App, error: impl Into<SharedString>) {
             .auto_dismiss(false)
             .dismiss_button(true)
     });
-    mount_status_toast(toast, cx);
+    mount_status_toast(toast, None, cx);
 }
 
+/// §15.4 Report `error` on the window it belongs to.
+pub fn show_window_error(window_id: gpui::WindowId, cx: &mut App, error: impl Into<SharedString>) {
+    let toast = notifications::status_toast::StatusToast::new(error, cx, |toast, _| {
+        toast
+            .icon(Icon::new(IconName::XCircle).color(ui::Color::Error))
+            .auto_dismiss(false)
+            .dismiss_button(true)
+    });
+    mount_status_toast(toast, Some(window_id), cx);
+}
 
 /// 默认 socket 路径: $XDG_RUNTIME_DIR/z3rm/mux.sock 或 /tmp/z3rm/mux.sock (§16.1)
 /// 测试与多实例场景可用 Z3RM_MUX_SOCKET 环境变量覆盖。

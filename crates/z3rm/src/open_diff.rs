@@ -363,6 +363,12 @@ impl Render for OpenChangedFilesReviewModal {
                     cx.emit(DismissEvent);
                 }),
             )
+            // Without this the list is keyboard-navigable but not keyboard-
+            // enterable: the whole review flow would still need the mouse for
+            // its very first step.
+            .on_action(cx.listener(|this, _: &menu::Confirm, window, cx| {
+                this.open_selected(window, cx);
+            }))
     }
 }
 

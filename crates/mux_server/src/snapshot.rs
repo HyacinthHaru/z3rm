@@ -58,6 +58,10 @@ pub struct FileChange {
     pub path: PathBuf,
     pub version_count: u64,
     pub latest_seq_no: u64,
+    pub current_exists: bool,
+    /// Trigger of the oldest retained version; `"create"` means this session
+    /// saw the file appear.
+    pub first_trigger: String,
 }
 
 enum ShadowCommand {
@@ -1001,6 +1005,19 @@ fn collect_changed_files(
         .into_iter()
         .filter_map(|(path_hash, version_count, latest_seq_no)| {
             path_index.get(&path_hash).map(|path| FileChange {
+                // The review queue classifies rows from these two, so it does
+                // not have to fetch review state per file just to tell an
+                // added file from a deleted one.
+                current_exists: path.exists(),
+                first_trigger: engine
+                    .list_versions(path)
+                    .ok()
+                    .and_then(|versions| {
+                        versions
+                            .first()
+                            .map(|(_, _, trigger)| format!("{trigger:?}").to_ascii_lowercase())
+                    })
+                    .unwrap_or_default(),
                 path: path.clone(),
                 version_count,
                 latest_seq_no,

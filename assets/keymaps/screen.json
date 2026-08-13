@@ -52,6 +52,8 @@
 
       // Mux session
       "d": "mux::Detach",
+      // §15.4 手动重连当前窗口的连接
+      "r": "mux::Reconnect",
 
       // Send literal Ctrl-a to PTY (double-tap escape)
       "ctrl-a": ["terminal::SendLiteral", { "keystroke": "Ctrl-a" }]

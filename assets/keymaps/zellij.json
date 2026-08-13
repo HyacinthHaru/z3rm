@@ -50,6 +50,8 @@
 
       // Mux session
       "alt-d": "mux::Detach",
+      // §15.4 手动重连当前窗口的连接
+      "alt-r": "mux::Reconnect",
       // §3.3 second window on the same session (Plan 32); alt-n is NextTab
       "ctrl-alt-n": "mux::NewWindow",
 
