@@ -63,57 +63,6 @@ pub fn show_daemon_error(cx: &mut App, error: impl Into<SharedString>) {
     mount_status_toast(toast, cx);
 }
 
-/// §16.12 / §15.12 daemon 连接监视器 — 后台检测连接状态并在丢失时做权威
-/// 重连 (§15.4 in-place swap)。会话 ID 由调用方持有, 重连期间原 `Arc<MuxDomain>`
-/// 被原地换上新传输/inner, 保留 `window_id` 与所有通知订阅者, 并主动广播
-/// 一条 `SessionLayoutChanged` 触发下游快照重对账。
-pub fn watch_daemon_connection(
-    domain: std::sync::Arc<MuxDomain>,
-    session_id: String,
-    cx: &mut App,
-) -> gpui::Task<()> {
-    cx.spawn(async move |cx| {
-        const INITIAL_BACKOFF: Duration = Duration::from_millis(500);
-        const MAX_BACKOFF: Duration = Duration::from_secs(30);
-        let mut backoff = INITIAL_BACKOFF;
-        loop {
-            cx.background_executor().timer(backoff).await;
-
-            // §15.4 Probe the live connection (issues a real RPC), not just
-            // socket presence — a stale socket file can outlive a dead daemon.
-            if domain.check_connection().await {
-                backoff = INITIAL_BACKOFF;
-                continue;
-            }
-
-            // §16.12 Connection lost: surface it and escalate. Spawn-then-
-            // reconnect is a fallback for the case where the daemon process
-            // itself died. Successful reconnect uses the same exponential
-            // back-off envelope below.
-            cx.update(|cx| show_daemon_connection_lost(cx));
-            if let Err(spawn_err) = ensure_daemon_running().await {
-                tracing::warn!(error = %spawn_err, "ensure_daemon_running failed before reconnect");
-            }
-
-            match domain
-                .reconnect_local_in_place(&session_id, mux::AttachMode::Shared)
-                .await
-            {
-                Ok(_) => {
-                    tracing::info!(session_id = %session_id, "reconnected to daemon in place");
-                    cx.update(|cx| show_daemon_error(cx, "Mux reconnected"));
-                    backoff = INITIAL_BACKOFF;
-                }
-                Err(reconnect_err) => {
-                    let msg = format!("Failed to reconnect to mux: {reconnect_err}");
-                    tracing::warn!(error = %reconnect_err, "reconnect attempt failed");
-                    cx.update(|cx| show_daemon_error(cx, msg));
-                    backoff = (backoff * 2).min(MAX_BACKOFF);
-                }
-            }
-        }
-    })
-}
 
 /// 默认 socket 路径: $XDG_RUNTIME_DIR/z3rm/mux.sock 或 /tmp/z3rm/mux.sock (§16.1)
 /// 测试与多实例场景可用 Z3RM_MUX_SOCKET 环境变量覆盖。

@@ -25,10 +25,10 @@ use anyhow::Context as _;
 use assets::Assets;
 use crashes::InitCrashHandler;
 use fs::{Fs, RealFs};
-use futures::StreamExt as _;
+use futures::{FutureExt as _, StreamExt as _};
 use gpui::{
     App, AppContext as _, Application, BorrowAppContext as _, Context, Entity, Global,
-    IntoElement, Render, TaskExt, WeakEntity, Window,
+    IntoElement, Render, SharedString, Task, TaskExt, WeakEntity, Window,
 };
 use gpui_platform;
 use parking_lot::Mutex;
@@ -276,37 +276,92 @@ fn apply_mux_layout_to_workspace(
 // §3.3 Multiple windows per session (Plan 32)
 // ============================================================================
 
-#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
 enum MuxConnectionState {
     #[default]
     Connected,
-    Disconnected,
-    Reconnecting,
+    Reconnecting {
+        attempt: u32,
+    },
+    Offline {
+        attempts: u32,
+        last_error: SharedString,
+    },
 }
 
 impl MuxConnectionState {
-    fn begin_reconnect(&mut self) -> bool {
-        if *self == Self::Reconnecting {
-            return false;
-        }
-        *self = Self::Reconnecting;
-        true
+    fn begin_reconnect(&mut self) -> Option<u32> {
+        let attempt = match self {
+            Self::Reconnecting { .. } => return None,
+            Self::Connected => 1,
+            Self::Offline { attempts, .. } => attempts.saturating_add(1),
+        };
+        *self = Self::Reconnecting { attempt };
+        Some(attempt)
     }
 
-    fn finish_reconnect(&mut self, succeeded: bool) {
-        *self = if succeeded {
-            Self::Connected
-        } else {
-            Self::Disconnected
+    fn finish_reconnect(&mut self, error: Option<SharedString>) {
+        *self = match error {
+            None => Self::Connected,
+            Some(last_error) => {
+                let attempts = match self {
+                    Self::Reconnecting { attempt } => *attempt,
+                    Self::Offline { attempts, .. } => *attempts,
+                    Self::Connected => 1,
+                };
+                Self::Offline {
+                    attempts,
+                    last_error,
+                }
+            }
         };
     }
 
-    fn mark_disconnected(&mut self) -> bool {
-        if *self == Self::Disconnected {
+    fn mark_disconnected(&mut self, error: impl Into<SharedString>) -> bool {
+        if matches!(self, Self::Reconnecting { .. }) {
             return false;
         }
-        *self = Self::Disconnected;
+        let next = Self::Offline {
+            attempts: 0,
+            last_error: error.into(),
+        };
+        if *self == next {
+            return false;
+        }
+        *self = next;
         true
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct MuxConnectionPresentation {
+    label: SharedString,
+    error: Option<SharedString>,
+}
+
+impl From<&MuxConnectionState> for MuxConnectionPresentation {
+    fn from(state: &MuxConnectionState) -> Self {
+        match state {
+            MuxConnectionState::Connected => Self {
+                label: "Connected".into(),
+                error: None,
+            },
+            MuxConnectionState::Reconnecting { attempt } => Self {
+                label: format!("Reconnecting · attempt {attempt}").into(),
+                error: None,
+            },
+            MuxConnectionState::Offline {
+                attempts,
+                last_error,
+            } => Self {
+                label: format!(
+                    "Offline · {attempts} attempt{}",
+                    if *attempts == 1 { "" } else { "s" }
+                )
+                .into(),
+                error: Some(last_error.clone()),
+            },
+        }
     }
 }
 
@@ -355,17 +410,36 @@ impl MuxConnectionStatusItem {
 }
 
 impl Render for MuxConnectionStatusItem {
-    fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         use ui::prelude::*;
 
-        let label = match self.state {
-            MuxConnectionState::Connected => None,
-            MuxConnectionState::Disconnected => Some(("Disconnected", ui::Color::Error)),
-            MuxConnectionState::Reconnecting => Some(("Reconnecting…", ui::Color::Warning)),
+        let presentation = MuxConnectionPresentation::from(&self.state);
+        let color = match &self.state {
+            MuxConnectionState::Connected => ui::Color::Muted,
+            MuxConnectionState::Reconnecting { .. } => ui::Color::Warning,
+            MuxConnectionState::Offline { .. } => ui::Color::Error,
         };
-        gpui::div().when_some(label, |element, (text, color)| {
-            element.child(ui::Label::new(text).size(ui::LabelSize::Small).color(color))
-        })
+        let error_for_tooltip = presentation.error.clone();
+        let error_for_copy = presentation.error.clone();
+        gpui::div()
+            .id("mux-connection-status")
+            .child(
+                ui::Label::new(presentation.label)
+                    .size(ui::LabelSize::Small)
+                    .color(color),
+            )
+            .when_some(error_for_tooltip, |element, error| {
+                element.tooltip(move |_window, cx| ui::Tooltip::simple(error.clone(), cx))
+            })
+            .when_some(error_for_copy, |element, error| {
+                element.on_click(cx.listener(move |_this, _event, _window, cx| {
+                    cx.write_to_clipboard(gpui::ClipboardItem::new_string(error.to_string()));
+                    daemon::show_daemon_error(
+                        cx,
+                        format!("Connection error copied to clipboard: {error}"),
+                    );
+                }))
+            })
     }
 }
 
@@ -393,6 +467,9 @@ struct MuxWindows {
     windows: std::collections::HashMap<gpui::WindowId, MuxWindow>,
     roster: std::collections::HashMap<String, std::collections::BTreeSet<String>>,
     status_items: std::collections::HashMap<gpui::WindowId, WeakEntity<MuxConnectionStatusItem>>,
+    retry_senders:
+        std::collections::HashMap<gpui::WindowId, futures::channel::mpsc::Sender<()>>,
+    connection_tasks: std::collections::HashMap<gpui::WindowId, Task<()>>,
 }
 
 impl Global for MuxWindows {}
@@ -472,11 +549,14 @@ fn register_mux_window(
         rebind_mux_window(
             &mut windows.windows,
             window_id,
-            domain,
+            domain.clone(),
             session_id,
             ssh_session,
         );
+        windows.retry_senders.remove(&window_id);
+        windows.connection_tasks.remove(&window_id);
     });
+    start_mux_connection_monitor(domain, window_id, cx);
 }
 
 fn take_mux_window(window_id: gpui::WindowId, cx: &mut App) -> Option<MuxWindow> {
@@ -484,6 +564,8 @@ fn take_mux_window(window_id: gpui::WindowId, cx: &mut App) -> Option<MuxWindow>
         return None;
     }
     cx.update_global::<MuxWindows, Option<MuxWindow>>(|windows, _| {
+        windows.retry_senders.remove(&window_id);
+        windows.connection_tasks.remove(&window_id);
         windows.status_items.remove(&window_id);
         windows.windows.remove(&window_id)
     })
@@ -491,13 +573,12 @@ fn take_mux_window(window_id: gpui::WindowId, cx: &mut App) -> Option<MuxWindow>
 struct MuxReconnectRequest<T> {
     domain: Arc<mux::MuxDomain>,
     session_id: String,
-    ssh_session: Arc<futures::lock::Mutex<T>>,
+    ssh_session: Option<Arc<futures::lock::Mutex<T>>>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum MuxReconnectUnavailable {
     WindowNotBound,
-    LocalWindow,
     InProgress,
 }
 
@@ -508,17 +589,13 @@ fn begin_mux_reconnect<T>(
     let binding = windows
         .get_mut(&window_id)
         .ok_or(MuxReconnectUnavailable::WindowNotBound)?;
-    let ssh_session = binding
-        .ssh_session
-        .clone()
-        .ok_or(MuxReconnectUnavailable::LocalWindow)?;
-    if !binding.connection_state.begin_reconnect() {
+    if binding.connection_state.begin_reconnect().is_none() {
         return Err(MuxReconnectUnavailable::InProgress);
     }
     Ok(MuxReconnectRequest {
         domain: binding.domain.clone(),
         session_id: binding.session_id.clone(),
-        ssh_session,
+        ssh_session: binding.ssh_session.clone(),
     })
 }
 
@@ -526,7 +603,7 @@ fn finish_mux_reconnect<T>(
     windows: &mut std::collections::HashMap<gpui::WindowId, MuxWindow<T>>,
     window_id: gpui::WindowId,
     domain: &Arc<mux::MuxDomain>,
-    succeeded: bool,
+    error: Option<SharedString>,
 ) -> bool {
     let Some(binding) = windows.get_mut(&window_id) else {
         return false;
@@ -534,22 +611,23 @@ fn finish_mux_reconnect<T>(
     if !Arc::ptr_eq(&binding.domain, domain) {
         return false;
     }
-    binding.connection_state.finish_reconnect(succeeded);
+    binding.connection_state.finish_reconnect(error);
     true
 }
 
-fn mark_remote_mux_window_disconnected<T>(
+fn mark_mux_window_disconnected<T>(
     windows: &mut std::collections::HashMap<gpui::WindowId, MuxWindow<T>>,
     window_id: gpui::WindowId,
     domain: &Arc<mux::MuxDomain>,
+    error: impl Into<SharedString>,
 ) -> bool {
     let Some(binding) = windows.get_mut(&window_id) else {
         return false;
     };
-    if binding.ssh_session.is_none() || !Arc::ptr_eq(&binding.domain, domain) {
+    if !Arc::ptr_eq(&binding.domain, domain) {
         return false;
     }
-    binding.connection_state.mark_disconnected()
+    binding.connection_state.mark_disconnected(error)
 }
 
 /// §15.4 Mirror `window_id`'s connection state into its status bar item.
@@ -560,7 +638,7 @@ fn publish_mux_connection_state(window_id: gpui::WindowId, cx: &mut App) {
     let Some(state) = windows
         .windows
         .get(&window_id)
-        .map(|binding| binding.connection_state)
+        .map(|binding| binding.connection_state.clone())
     else {
         return;
     };
@@ -570,50 +648,175 @@ fn publish_mux_connection_state(window_id: gpui::WindowId, cx: &mut App) {
     item.update(cx, |item, cx| item.set_state(state, cx)).ok();
 }
 
-/// §15.4 Watch a remote window's tunnel and surface the outage.
-///
-/// The lifecycle notification stream cannot carry this: its subscriber channel
-/// stays open when the transport dies (only a dropped domain closes it), so a
-/// dead tunnel is indistinguishable from an idle one. `check_connection` issues
-/// a real RPC, which is the same probe the local daemon watcher uses.
-fn watch_remote_mux_connection(
+async fn reconnect_mux_window(request: &MuxReconnectRequest<mux::SshSession>) -> anyhow::Result<()> {
+    if let Some(ssh_session) = &request.ssh_session {
+        let local_path = {
+            let mut ssh_session = ssh_session.lock().await;
+            ssh_session
+                .reconnect()
+                .await
+                .context("failed to rebuild the SSH tunnel")?
+        };
+        request
+            .domain
+            .reconnect_at_path_in_place(
+                &local_path,
+                &request.session_id,
+                mux::AttachMode::Shared,
+            )
+            .await
+            .context("failed to reattach the remote mux session")?;
+    } else {
+        daemon::ensure_daemon_running()
+            .await
+            .context("failed to start the local mux service")?;
+        request
+            .domain
+            .reconnect_local_in_place(&request.session_id, mux::AttachMode::Shared)
+            .await
+            .context("failed to reattach the local mux session")?;
+    }
+    Ok(())
+}
+fn signal_mux_reconnect(window_id: gpui::WindowId, cx: &mut App) -> bool {
+    let Some(mut sender) = cx
+        .try_global::<MuxWindows>()
+        .and_then(|windows| windows.retry_senders.get(&window_id))
+        .cloned()
+    else {
+        return false;
+    };
+    let sent = sender.try_send(());
+    sent.is_ok() || sent.is_err_and(|error| error.is_full())
+}
+
+fn start_mux_connection_monitor(
     domain: Arc<mux::MuxDomain>,
     window_id: gpui::WindowId,
     cx: &mut App,
-) -> gpui::Task<()> {
-    // Weak for the same reason the notification watcher is: this task must not
-    // keep a closed window's tunnel open.
+) {
+    let (retry_sender, mut retry_receiver) = futures::channel::mpsc::channel(1);
     let domain = Arc::downgrade(&domain);
-    cx.spawn(async move |cx| {
+    let task = cx.spawn(async move |cx| {
         const PROBE_INTERVAL: std::time::Duration = std::time::Duration::from_secs(5);
+        const INITIAL_BACKOFF: std::time::Duration = std::time::Duration::from_secs(1);
+        const MAX_BACKOFF: std::time::Duration = std::time::Duration::from_secs(30);
+
+        let mut delay = PROBE_INTERVAL;
         loop {
-            cx.background_executor().timer(PROBE_INTERVAL).await;
+            let timer = cx.background_executor().timer(delay).fuse();
+            let retry = retry_receiver.next().fuse();
+            futures::pin_mut!(timer, retry);
+            let manual_retry = match futures::future::select(timer, retry).await {
+                futures::future::Either::Left(_) => false,
+                futures::future::Either::Right((Some(()), _)) => true,
+                futures::future::Either::Right((None, _)) => return,
+            };
+
             let Some(domain) = domain.upgrade() else {
                 return;
             };
-            if domain.check_connection().await {
-                continue;
+            let still_bound = cx.update(|cx| {
+                cx.try_global::<MuxWindows>()
+                    .and_then(|windows| windows.windows.get(&window_id))
+                    .is_some_and(|binding| Arc::ptr_eq(&binding.domain, &domain))
+            });
+            if !still_bound {
+                return;
             }
-            let newly_disconnected = cx.update(|cx| {
+
+            if !manual_retry && domain.check_connection().await {
+                let connected = cx.update(|cx| {
+                    cx.try_global::<MuxWindows>()
+                        .and_then(|windows| windows.windows.get(&window_id))
+                        .is_some_and(|binding| {
+                            matches!(binding.connection_state, MuxConnectionState::Connected)
+                        })
+                });
+                if connected {
+                    delay = PROBE_INTERVAL;
+                    continue;
+                }
+            } else if !manual_retry {
+                let newly_disconnected = cx.update(|cx| {
+                    if cx.try_global::<MuxWindows>().is_none() {
+                        return false;
+                    }
+                    let newly_disconnected = cx.update_global::<MuxWindows, bool>(|windows, _| {
+                        mark_mux_window_disconnected(
+                            &mut windows.windows,
+                            window_id,
+                            &domain,
+                            "mux connection probe failed",
+                        )
+                    });
+                    publish_mux_connection_state(window_id, cx);
+                    newly_disconnected
+                });
+                if newly_disconnected {
+                    cx.update(|cx| daemon::show_daemon_connection_lost(cx));
+                }
+            }
+
+            let request = cx.update(|cx| {
+                if cx.try_global::<MuxWindows>().is_none() {
+                    return Err(MuxReconnectUnavailable::WindowNotBound);
+                }
+                cx.update_global::<MuxWindows, _>(|windows, _| {
+                    begin_mux_reconnect(&mut windows.windows, window_id)
+                })
+            });
+            let request = match request {
+                Ok(request) => request,
+                Err(MuxReconnectUnavailable::InProgress) => continue,
+                Err(MuxReconnectUnavailable::WindowNotBound) => return,
+            };
+            cx.update(|cx| publish_mux_connection_state(window_id, cx));
+
+            let result = reconnect_mux_window(&request).await;
+            let reconnect_error: Option<SharedString> =
+                result.as_ref().err().map(|error| format!("{error:#}").into());
+            if let Err(error) = &result {
+                tracing::warn!(
+                    session_id = %request.session_id,
+                    %error,
+                    "per-window mux reconnect failed"
+                );
+            }
+            let state_updated = cx.update(|cx| {
                 if cx.try_global::<MuxWindows>().is_none() {
                     return false;
                 }
-                let marked = cx.update_global::<MuxWindows, bool>(|windows, _| {
-                    mark_remote_mux_window_disconnected(&mut windows.windows, window_id, &domain)
+                let updated = cx.update_global::<MuxWindows, bool>(|windows, _| {
+                    finish_mux_reconnect(
+                        &mut windows.windows,
+                        window_id,
+                        &request.domain,
+                        reconnect_error,
+                    )
                 });
                 publish_mux_connection_state(window_id, cx);
-                marked
+                updated
             });
-            if newly_disconnected {
-                cx.update(|cx| {
-                    daemon::show_daemon_error(
-                        cx,
-                        "Remote mux connection lost. Run mux::Reconnect to rebuild the SSH tunnel.",
-                    );
-                });
+            if !state_updated {
+                return;
             }
+
+            delay = if result.is_ok() {
+                PROBE_INTERVAL
+            } else {
+                delay.max(INITIAL_BACKOFF).saturating_mul(2).min(MAX_BACKOFF)
+            };
+            // Retry signals that arrived while the reconnect was in flight are
+            // already covered by the run that just completed: coalesce them.
+            while retry_receiver.next().now_or_never().flatten().is_some() {}
         }
-    })
+    });
+
+    cx.update_global::<MuxWindows, ()>(|windows, _| {
+        windows.retry_senders.insert(window_id, retry_sender);
+        windows.connection_tasks.insert(window_id, task);
+    });
 }
 
 /// §3.3 The mux connection that drives `window`.
@@ -865,7 +1068,6 @@ async fn open_mux_window_with_snapshot(
         .await?;
 
     let window_handle = open_result.window;
-    let is_remote = ssh_session.is_some();
     cx.update(|cx| {
         register_mux_window(
             window_handle.window_id(),
@@ -874,12 +1076,8 @@ async fn open_mux_window_with_snapshot(
             ssh_session,
             cx,
         );
-        // §15.4 Only remote windows need this: a local daemon window is already
-        // covered by `daemon::watch_daemon_connection`, which reconnects on its
-        // own instead of waiting for the user.
-        if is_remote {
-            watch_remote_mux_connection(domain.clone(), window_handle.window_id(), cx).detach();
-        }
+
+
     });
     window_handle
         .update(cx, |multi_workspace, window, cx| {
@@ -2429,21 +2627,10 @@ fn main() {
                 }
             });
 
-            // §3.8/§15.12 Start daemon connection watcher for automatic
-            // authoritative reconnect. Pass the active session_id so the
-            // watcher can reattach and broadcast a synthetic layout
-            // notification after the swap.
-            // §16.6 The watcher is local-daemon machinery: an SSH window's
-            // connection is the tunnel itself, which the SshSession owns —
-            // there is no local daemon to watch or restart.
-            if ssh_session.is_none() {
-                let domain_for_watch = domain.clone();
-                let session_for_watch = session_id.clone();
-                cx.update(|cx| {
-                    daemon::watch_daemon_connection(domain_for_watch, session_for_watch, cx)
-                        .detach();
-                });
-            }
+            // §15.4 Per-window connection monitoring (probe + authoritative
+            // reconnect + manual retry) starts when the window is registered
+            // in `open_mux_window_with_snapshot`, which covers local and
+            // remote windows alike.
 
             // §1.1 spec: terminal 是默认 center pane item.
             // 任何新 Workspace 如果 active pane 为空, 自动 spawn terminal pane。
@@ -2871,103 +3058,14 @@ fn main() {
                         })
                         .register_action(|_workspace, _: &settings::mux_actions::Reconnect, window, cx| {
                             let window_id = window.window_handle().window_id();
-                            let reconnect = if cx.try_global::<MuxWindows>().is_some() {
-                                cx.update_global::<MuxWindows, _>(|windows, _| {
-                                    begin_mux_reconnect(&mut windows.windows, window_id)
-                                })
+                            if signal_mux_reconnect(window_id, cx) {
+                                daemon::show_daemon_error(cx, "Retrying this window's mux connection.");
                             } else {
-                                Err(MuxReconnectUnavailable::WindowNotBound)
-                            };
-                            let reconnect = match reconnect {
-                                Ok(reconnect) => reconnect,
-                                Err(MuxReconnectUnavailable::InProgress) => {
-                                    tracing::info!("mux::Reconnect ignored because this window is already reconnecting");
-                                    return;
-                                }
-                                Err(MuxReconnectUnavailable::LocalWindow) => {
-                                    daemon::show_daemon_error(
-                                        cx,
-                                        "This is a local mux window; local reconnect is automatic.",
-                                    );
-                                    return;
-                                }
-                                Err(MuxReconnectUnavailable::WindowNotBound) => {
-                                    daemon::show_daemon_error(
-                                        cx,
-                                        "This window is not bound to a mux connection.",
-                                    );
-                                    return;
-                                }
-                            };
-
-                            publish_mux_connection_state(window_id, cx);
-                            daemon::show_daemon_connection_lost(cx);
-                            window
-                                .spawn(cx, async move |cx| {
-                                    let result: anyhow::Result<()> = async {
-                                        let local_path = {
-                                            let mut ssh_session = reconnect.ssh_session.lock().await;
-                                            ssh_session
-                                                .reconnect()
-                                                .await
-                                                .context("failed to rebuild the SSH tunnel")?
-                                        };
-                                        reconnect
-                                            .domain
-                                            .reconnect_at_path_in_place(
-                                                &local_path,
-                                                &reconnect.session_id,
-                                                mux::AttachMode::Shared,
-                                            )
-                                            .await
-                                            .context("failed to reattach the remote mux session")?;
-                                        anyhow::Ok(())
-                                    }
-                                    .await;
-
-                                    if let Err(error) = &result {
-                                        tracing::error!(
-                                            session_id = %reconnect.session_id,
-                                            %error,
-                                            "mux::Reconnect failed"
-                                        );
-                                    }
-                                    let succeeded = result.is_ok();
-                                    if let Err(error) = cx.update(|_, cx| {
-                                        let state_updated =
-                                            if cx.try_global::<MuxWindows>().is_some() {
-                                                cx.update_global::<MuxWindows, bool>(|windows, _| {
-                                                    finish_mux_reconnect(
-                                                        &mut windows.windows,
-                                                        window_id,
-                                                        &reconnect.domain,
-                                                        succeeded,
-                                                    )
-                                                })
-                                            } else {
-                                                false
-                                            };
-                                        if !state_updated {
-                                            return;
-                                        }
-                                        publish_mux_connection_state(window_id, cx);
-                                        match &result {
-                                            Ok(()) => daemon::show_daemon_error(
-                                                cx,
-                                                "Remote mux connection restored.",
-                                            ),
-                                            Err(error) => daemon::show_daemon_error(
-                                                cx,
-                                                format!(
-                                                    "Remote reconnect failed: {error}. Run mux::Reconnect to try again."
-                                                ),
-                                            ),
-                                        }
-                                    }) {
-                                        tracing::debug!(%error, "window closed before mux reconnect status could be shown");
-                                    }
-                                })
-                                .detach();
+                                daemon::show_daemon_error(
+                                    cx,
+                                    "This window is not bound to an active mux connection.",
+                                );
+                            }
                         })
                         .register_action(|_workspace, _: &settings::mux_actions::KillSession, window, cx| {
                             let Some(domain) = mux_domain_for_window(window, cx) else { return };
@@ -3295,21 +3393,79 @@ mod tests {
         assert!(windows.session_window_ids("session-2").is_empty());
     }
     #[test]
-    fn reconnect_state_serializes_attempts_and_records_outcomes() {
-        let mut state = super::MuxConnectionState::Disconnected;
+    fn connection_state_tracks_attempts_and_preserves_the_last_error() {
+        let mut state = super::MuxConnectionState::Connected;
 
-        assert!(state.begin_reconnect());
-        assert_eq!(state, super::MuxConnectionState::Reconnecting);
-        assert!(
-            !state.begin_reconnect(),
+        assert_eq!(state.begin_reconnect(), Some(1));
+        assert_eq!(
+            state,
+            super::MuxConnectionState::Reconnecting { attempt: 1 }
+        );
+        assert_eq!(
+            state.begin_reconnect(),
+            None,
             "a second reconnect must not start while one is in flight"
         );
 
-        state.finish_reconnect(false);
-        assert_eq!(state, super::MuxConnectionState::Disconnected);
-        assert!(state.begin_reconnect());
-        state.finish_reconnect(true);
+        state.finish_reconnect(Some("SSH tunnel closed".into()));
+        assert_eq!(
+            state,
+            super::MuxConnectionState::Offline {
+                attempts: 1,
+                last_error: "SSH tunnel closed".into(),
+            }
+        );
+        assert_eq!(state.begin_reconnect(), Some(2));
+        state.finish_reconnect(None);
         assert_eq!(state, super::MuxConnectionState::Connected);
+    }
+    #[test]
+    fn disconnect_marks_do_not_clobber_an_inflight_reconnect() {
+        let mut state = super::MuxConnectionState::Connected;
+        assert_eq!(state.begin_reconnect(), Some(1));
+
+        assert!(
+            !state.mark_disconnected("late probe failure"),
+            "a probe that fires during a reconnect must not overwrite it"
+        );
+        assert_eq!(state, super::MuxConnectionState::Reconnecting { attempt: 1 });
+
+        state.finish_reconnect(None);
+        assert!(state.mark_disconnected("probe failure"));
+        assert_eq!(
+            state,
+            super::MuxConnectionState::Offline {
+                attempts: 0,
+                last_error: "probe failure".into(),
+            }
+        );
+        assert!(
+            !state.mark_disconnected("probe failure"),
+            "an identical offline mark must not restart the toast cycle"
+        );
+    }
+
+
+    #[test]
+    fn connection_status_projection_exposes_progress_and_complete_error() {
+        let reconnecting =
+            super::MuxConnectionPresentation::from(&super::MuxConnectionState::Reconnecting {
+                attempt: 7,
+            });
+        assert_eq!(reconnecting.label.as_ref(), "Reconnecting · attempt 7");
+        assert_eq!(reconnecting.error, None);
+
+        let offline = super::MuxConnectionPresentation::from(
+            &super::MuxConnectionState::Offline {
+                attempts: 7,
+                last_error: "failed to rebuild tunnel: control master exited".into(),
+            },
+        );
+        assert_eq!(offline.label.as_ref(), "Offline · 7 attempts");
+        assert_eq!(
+            offline.error.as_deref(),
+            Some("failed to rebuild tunnel: control master exited")
+        );
     }
 
     #[test]
