@@ -61,10 +61,11 @@ export function activate(context) {
                             props: {
                                 id: `palette-entry-${entry.id}`,
                                 class: index === state.selected ? 'entry selected' : 'entry',
-                                onClick: {
-                                    command: 'z3rm.command-palette.select',
-                                    args: [entry.id],
-                                },
+                                // Direct command click: the native bridge
+                                // resolves the owner from the global registry,
+                                // so entries from other extensions execute
+                                // exactly once, on the right extension.
+                                onClick: { command: entry.id },
                             },
                             children: [entry.label],
                         })),

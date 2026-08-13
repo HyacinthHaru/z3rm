@@ -3067,6 +3067,31 @@ fn main() {
                                 );
                             }
                         })
+                        .register_action(|_workspace, action: &quickjs_extensions::InvokeExtensionCommand, _window, cx| {
+                            // §16.7 Exact-dispatch: the action names its
+                            // extension, so a command id shared by two
+                            // extensions runs only the one the user picked.
+                            // Without a host the command is reported, never
+                            // silently dropped — and native actions are
+                            // unaffected either way.
+                            let Some(host) = cx
+                                .try_global::<quickjs_extensions::GlobalHostController>()
+                            else {
+                                daemon::show_daemon_error(
+                                    cx,
+                                    format!(
+                                        "Extension command \"{}\" dropped: the extension host is not running.",
+                                        action.command
+                                    ),
+                                );
+                                return;
+                            };
+                            host.0.read(cx).invoke_command(
+                                &action.extension_id,
+                                &action.command,
+                                &action.arguments,
+                            );
+                        })
                         .register_action(|_workspace, _: &settings::mux_actions::KillSession, window, cx| {
                             let Some(domain) = mux_domain_for_window(window, cx) else { return };
                             let known_session = mux_session_for_window(window, cx);

@@ -25,7 +25,7 @@ use std::time::Duration;
 use anyhow::{Context as _, Result, anyhow, bail};
 use extension_host::vdom_bridge::{self, CommandInvocation, VDomChild, VDomNode};
 use futures::{AsyncReadExt as _, StreamExt as _};
-use gpui::{AppContext as _, Global, Keystroke, SharedString};
+use gpui::{Action, AppContext as _, Global, Keystroke, SharedString, Task};
 use http_client::HttpClient as _;
 use parking_lot::Mutex;
 use quickjs_runtime::{
@@ -217,6 +217,11 @@ pub fn init_extensions(cx: &mut gpui::App) {
         controller
     });
     cx.set_global(GlobalHostController(controller));
+    // §16.7 Native surfaces for extension commands: the global command
+    // palette lists them, and declared chords dispatch through the app's
+    // keystroke path with native bindings always winning.
+    install_command_palette_interception(cx);
+    install_global_shortcuts(cx);
 }
 
 // ---------------------------------------------------------------------------
@@ -1249,6 +1254,10 @@ pub struct ExtensionHostController {
     /// Applies registry reports pushed by the host thread, mirroring
     /// `pending_task`.
     registry_task: Option<gpui::Task<()>>,
+    /// §16.7 Synthetic chrome announcing registry conflicts (command id or
+    /// chord collisions, or chords shadowed by native bindings), appended
+    /// after the live chrome so the rejected registration is never silent.
+    registry_notices: Vec<VDomNode>,
     /// §5.6 Controller-global prompt claim: at most one window may present
     /// the first-install prompt for the pending batch at a time.
     prompt_claimed: bool,
@@ -1351,13 +1360,24 @@ impl HostedExtension {
 }
 
 /// §16.7 One command an extension registered during activation.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 struct RegisteredCommand {
     id: String,
+    label: String,
+}
+/// §16.7 A registration that could not take effect, in terms a user can read.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RegistryConflict {
+    /// The extension whose registration lost.
+    pub extension_id: String,
+    /// What was rejected and why.
+    pub detail: String,
 }
 
+
+
 /// §16.7 One keymap binding an extension declared during activation.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 struct RegisteredKeymap {
     chord: String,
     command: String,
@@ -1366,12 +1386,14 @@ struct RegisteredKeymap {
 /// §16.7 Activation report for one extension: the commands and keymaps it
 /// registered, so the client-side ownership registry can be rebuilt after
 /// every activation or approval without querying the host thread.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 struct RegistryReport {
     extension_id: String,
     commands: Vec<RegisteredCommand>,
     keymaps: Vec<RegisteredKeymap>,
 }
+
+
 
 /// §16.7 Parse the host's `[{id, label}]` command list. Entries without an
 /// id are skipped; a malformed payload degrades to an empty list (logged),
@@ -1387,8 +1409,16 @@ fn parse_registered_commands(json: &str, extension_id: &str) -> Vec<RegisteredCo
             entry
                 .get("id")
                 .and_then(serde_json::Value::as_str)
-                .map(|id| RegisteredCommand {
-                    id: id.to_string(),
+                .map(|id| {
+                    let label = entry
+                        .get("label")
+                        .and_then(serde_json::Value::as_str)
+                        .filter(|label| !label.is_empty())
+                        .unwrap_or(id);
+                    RegisteredCommand {
+                        id: id.to_string(),
+                        label: label.to_string(),
+                    }
                 })
         })
         .collect()
@@ -1451,24 +1481,85 @@ fn registry_reports(live_extensions: &[HostedExtension]) -> Vec<RegistryReport> 
         .map(RegistryReport::from_live)
         .collect()
 }
+// ---------------------------------------------------------------------------
+// §16.7 Command ownership registry and external directory sharing
+// ---------------------------------------------------------------------------
 
-/// §16.7 Client-side command ownership registry.
-///
-/// The single path that decides which extension owns a command id.
-/// Canonical keys are namespaced (`<extension>.<command>`); bare ids
-/// resolve through a first-wins index, and a collision with an earlier
-/// owner rejects the later registration instead of fanning the command out
-/// to every runtime. Declared keymap chords are normalized to gpui's
-/// hyphen form (`ctrl+shift+p` -> `ctrl-shift-p`) so the pane resolver can
-/// compare them against real keystrokes.
+/// §16.7 Build the `[{id, label}]` external directory for one extension:
+/// every command the *other* live extensions registered. The id stays bare
+/// (the owner's runtime dispatches by bare id) and the label carries the
+/// source extension so discovery surfaces can show ownership.
+fn external_command_directory(
+    reports: &[RegistryReport],
+    for_extension: &str,
+) -> Vec<serde_json::Value> {
+    let mut entries = Vec::new();
+    for report in reports {
+        if report.extension_id == for_extension {
+            continue;
+        }
+        for command in &report.commands {
+            entries.push(serde_json::json!({
+                "id": command.id,
+                "label": format!("{} — {}", command.label, report.extension_id),
+            }));
+        }
+    }
+    entries
+}
+
+/// §16.7 Push the merged external directory into every live extension so
+/// `context.commands.list()` exposes all enabled extensions' commands.
+fn install_external_directories(live_extensions: &mut [HostedExtension], reports: &[RegistryReport]) {
+    let entries_json: Vec<(String, String)> = live_extensions
+        .iter()
+        .filter(|hosted| !hosted.suspended)
+        .map(|hosted| {
+            let extension_id = hosted.live.id().to_string();
+            let entries = external_command_directory(reports, &extension_id);
+            let json =
+                serde_json::to_string(&entries).unwrap_or_else(|_| "[]".to_string());
+            (extension_id, json)
+        })
+        .collect();
+    for hosted in live_extensions.iter().filter(|hosted| !hosted.suspended) {
+        let extension_id = hosted.live.id().to_string();
+        if let Some((_, json)) = entries_json.iter().find(|(id, _)| id == &extension_id) {
+            if let Err(error) = hosted.live.install_external_commands(json) {
+                tracing::warn!(id = %extension_id, %error, "installing external command directory failed");
+            }
+        }
+    }
+}
+
 #[derive(Default)]
 struct CommandRegistry {
     /// namespaced command id -> owning extension id
     owners: BTreeMap<String, String>,
+    /// namespaced command id -> display label
+    labels: BTreeMap<String, String>,
     /// bare command id -> owning extension id (first registration wins)
     bare_owners: BTreeMap<String, String>,
     /// normalized chord -> command id as declared by the owner
     keymaps: BTreeMap<String, String>,
+    /// normalized chord -> owning extension id (first registration wins)
+    chord_owners: BTreeMap<String, String>,
+    /// parsed keystroke -> command id, so the app-wide interceptor matches
+    /// real keystrokes without re-parsing every chord on every keypress
+    shortcut_entries: HashMap<Keystroke, String>,
+}
+
+/// One command the client-side directory exposes to discovery surfaces.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ExtensionCommandEntry {
+    /// The extension that registered the command.
+    pub extension_id: String,
+    /// The bare command id the extension declared.
+    pub command_id: String,
+    /// The namespaced form (`<extension>.<command>`), always unique.
+    pub namespaced_id: String,
+    /// The display label declared by the extension.
+    pub label: String,
 }
 
 /// §16.7 Normalize a declared chord to gpui's hyphen-separated form so it
@@ -1483,16 +1574,17 @@ fn normalize_chord(chord: &str) -> String {
 }
 
 impl CommandRegistry {
-    /// Apply one extension's activation report. Returns the namespaced ids
-    /// rejected for colliding with a different extension's registration.
-    fn apply_report(&mut self, report: &RegistryReport) -> Vec<String> {
+    /// Apply one extension's activation report. Returns the registrations
+    /// rejected because another extension already owns the id or chord.
+    fn apply_report(&mut self, report: &RegistryReport) -> Vec<RegistryConflict> {
         let mut rejected = Vec::new();
         for command in &report.commands {
             let namespaced = format!("{}.{}", report.extension_id, command.id);
             match self.bare_owners.entry(command.id.clone()) {
                 std::collections::btree_map::Entry::Vacant(entry) => {
                     entry.insert(report.extension_id.clone());
-                    self.owners.insert(namespaced, report.extension_id.clone());
+                    self.owners.insert(namespaced.clone(), report.extension_id.clone());
+                    self.labels.insert(namespaced, command.label.clone());
                 }
                 // The same extension re-registering is idempotent.
                 std::collections::btree_map::Entry::Occupied(entry)
@@ -1500,26 +1592,60 @@ impl CommandRegistry {
                 // Collision: a different extension already owns this id.
                 // Drop the namespaced entry as well, so neither registration
                 // is dispatchable under that id.
-                std::collections::btree_map::Entry::Occupied(_) => {
+                std::collections::btree_map::Entry::Occupied(entry) => {
                     self.owners.remove(&namespaced);
-                    rejected.push(namespaced);
+                    self.labels.remove(&namespaced);
+                    rejected.push(RegistryConflict {
+                        extension_id: report.extension_id.clone(),
+                        detail: format!(
+                            "command id \"{}\" is already owned by extension \"{}\"",
+                            command.id,
+                            entry.get()
+                        ),
+                    });
                 }
             }
         }
         for keymap in &report.keymaps {
-            // Last declaration wins per chord; the resolver maps the chord
-            // to the owning extension's command id.
-            self.keymaps
-                .insert(normalize_chord(&keymap.chord), keymap.command.clone());
+            let chord = normalize_chord(&keymap.chord);
+            match self.chord_owners.entry(chord.clone()) {
+                std::collections::btree_map::Entry::Vacant(entry) => {
+                    entry.insert(report.extension_id.clone());
+                    // The resolver maps the chord to the owning extension's
+                    // command id; the parsed entry feeds the app-wide
+                    // keystroke interceptor without re-parsing on keypress.
+                    self.keymaps.insert(chord.clone(), keymap.command.clone());
+                    if let Ok(keystroke) = Keystroke::parse(&chord) {
+                        self.shortcut_entries.insert(keystroke, keymap.command.clone());
+                    }
+                }
+                std::collections::btree_map::Entry::Occupied(entry)
+                    if entry.get() == &report.extension_id => {
+                    self.keymaps.insert(chord.clone(), keymap.command.clone());
+                    if let Ok(keystroke) = Keystroke::parse(&chord) {
+                        self.shortcut_entries.insert(keystroke, keymap.command.clone());
+                    }
+                }
+                std::collections::btree_map::Entry::Occupied(entry) => {
+                    rejected.push(RegistryConflict {
+                        extension_id: report.extension_id.clone(),
+                        detail: format!(
+                            "chord \"{}\" is already bound by extension \"{}\"",
+                            keymap.chord,
+                            entry.get()
+                        ),
+                    });
+                }
+            }
         }
         rejected
     }
 
     /// Apply a full snapshot of activation reports, replacing prior
     /// ownership (an extension that unregistered at runtime stops owning
-    /// its commands). Returns the namespaced ids rejected for colliding
+    /// its commands). Returns the registrations rejected for colliding
     /// with a different extension's registration.
-    fn apply_reports(&mut self, reports: &[RegistryReport]) -> Vec<String> {
+    fn apply_reports(&mut self, reports: &[RegistryReport]) -> Vec<RegistryConflict> {
         *self = CommandRegistry::default();
         let mut rejected = Vec::new();
         for report in reports {
@@ -1540,6 +1666,40 @@ impl CommandRegistry {
     /// The resolver snapshot: normalized chord -> command id.
     fn keymap_snapshot(&self) -> BTreeMap<String, String> {
         self.keymaps.clone()
+    }
+
+    /// Every currently owned command, namespaced, with its display label.
+    fn command_directory(&self) -> Vec<ExtensionCommandEntry> {
+        self.owners
+            .iter()
+            .map(|(namespaced_id, extension_id)| ExtensionCommandEntry {
+                extension_id: extension_id.clone(),
+                command_id: namespaced_id
+                    .strip_prefix(&format!("{extension_id}."))
+                    .unwrap_or(namespaced_id)
+                    .to_string(),
+                namespaced_id: namespaced_id.clone(),
+                label: self
+                    .labels
+                    .get(namespaced_id)
+                    .cloned()
+                    .unwrap_or_else(|| namespaced_id.clone()),
+            })
+            .collect()
+    }
+
+    /// Resolve a real keystroke against the declared chords, returning the
+    /// owning extension and the command it bound to the chord.
+    fn resolve_keystroke(
+        &self,
+        keystroke: &Keystroke,
+    ) -> Option<(String, String)> {
+        self.shortcut_entries
+            .get(keystroke)
+            .and_then(|command| {
+                self.resolve_owner(command)
+                    .map(|owner| (owner.to_string(), command.clone()))
+            })
     }
 }
 
@@ -1592,6 +1752,137 @@ fn execute_for_owner(
             0
         }
     }
+}
+
+// ---------------------------------------------------------------------------
+// §16.7 Global command surface: palette listing and keystroke dispatch.
+//
+// One action type carries every extension command through the native
+// discovery and keybinding systems. The extension identity travels in the
+// action itself, so dispatch is exact even when two extensions declare the
+// same command id — the registry's first-wins rule guarantees at most one
+// owner is ever listed, and execution targets that owner by id.
+// ---------------------------------------------------------------------------
+
+/// Invokes a command registered by an extension. Produced by the command
+/// palette interceptor and by extension-declared chords; handled by the
+/// workspace, which routes it to the owning extension's host thread.
+#[derive(Clone, Debug, Default, PartialEq, serde::Deserialize, schemars::JsonSchema, Action)]
+#[action(namespace = extension)]
+#[serde(deny_unknown_fields)]
+pub struct InvokeExtensionCommand {
+    /// The extension that registered the command.
+    pub extension_id: String,
+    /// The bare command id the extension declared.
+    pub command: String,
+    /// JSON arguments to pass to the command handler.
+    #[serde(default)]
+    pub arguments: String,
+}
+
+/// §16.7 Pure interception step: fuzzy-match `query` against the command
+/// directory and produce palette items whose action is an exact
+/// `InvokeExtensionCommand`. Kept free of GPUI state so ownership and
+/// collision behavior are unit-testable.
+pub fn palette_interception(
+    query: &str,
+    directory: &[ExtensionCommandEntry],
+) -> command_palette_hooks::CommandInterceptResult {
+    use command_palette_hooks::{CommandInterceptItem, CommandInterceptResult};
+
+    let candidates: Vec<fuzzy_nucleo::StringMatchCandidate> = directory
+        .iter()
+        .enumerate()
+        .map(|(index, entry)| {
+            fuzzy_nucleo::StringMatchCandidate::new(
+                index,
+                format!("{} — {}", entry.label, entry.extension_id),
+            )
+        })
+        .collect();
+    let matches = fuzzy_nucleo::match_strings(
+        &candidates,
+        query,
+        fuzzy_nucleo::Case::Ignore,
+        fuzzy_nucleo::LengthPenalty::Off,
+        100,
+    );
+    let results = matches
+        .into_iter()
+        .filter_map(|string_match| {
+            let entry = directory.get(string_match.candidate_id)?;
+            Some(CommandInterceptItem {
+                action: Box::new(InvokeExtensionCommand {
+                    extension_id: entry.extension_id.clone(),
+                    command: entry.command_id.clone(),
+                    arguments: String::new(),
+                }),
+                string: format!("{} — {}", entry.label, entry.extension_id),
+                positions: string_match.positions,
+            })
+        })
+        .collect();
+    CommandInterceptResult {
+        results,
+        exclusive: false,
+    }
+}
+
+/// §16.7 Install the command palette interceptor. Reads the live directory
+/// on every keystroke, so disable/unload/suspend/reload is reflected in the
+/// palette immediately rather than on the next host push.
+pub fn install_command_palette_interception(cx: &mut gpui::App) {
+    command_palette_hooks::GlobalCommandPaletteInterceptor::set(
+        cx,
+        move |query, _workspace, cx| {
+            let directory = cx
+                .try_global::<GlobalHostController>()
+                .map(|host| host.0.read(cx).command_directory())
+                .unwrap_or_default();
+            Task::ready(palette_interception(&query, &directory))
+        },
+    );
+}
+
+/// §16.7 Install the app-wide keystroke interceptor for extension chords.
+///
+/// Precedence is fail-safe: a keystroke that matches any native binding —
+/// including a pending multi-key chord — is left untouched, so extension
+/// chords can never shadow split-pane, focus-pane, attach, settings, or
+/// kill-session keybindings. Only a chord with no native consumer at all
+/// dispatches its owning extension's command, and propagation stops so the
+/// pane-level shortcut resolver does not fire a second time.
+pub fn install_global_shortcuts(cx: &mut gpui::App) {
+    cx.intercept_keystrokes(move |event, _window, cx| {
+        let Some(host) = cx.try_global::<GlobalHostController>() else {
+            return;
+        };
+        let Some((extension_id, command)) = host.0.read(cx).resolve_shortcut(&event.keystroke)
+        else {
+            return;
+        };
+        // Native bindings win: exact single-key bindings via
+        // `all_bindings_for_input`, plus any longer chord that this
+        // keystroke could be the prefix of (`bindings_for_input`'s pending
+        // flag), so an extension chord never amputates a native sequence.
+        if !cx
+            .all_bindings_for_input(std::slice::from_ref(&event.keystroke))
+            .is_empty()
+        {
+            return;
+        }
+        let context_stack = event.context_stack.clone();
+        let keymap = cx.key_bindings();
+        if keymap
+            .borrow()
+            .bindings_for_input(std::slice::from_ref(&event.keystroke), &context_stack)
+            .1
+        {
+            return;
+        }
+        host.0.read(cx).invoke_command(&extension_id, &command, "{}");
+        cx.stop_propagation();
+    });
 }
 
 /// Render every live extension and hand the VDOM JSON back, logging (never
@@ -1721,6 +2012,7 @@ impl ExtensionHostController {
             commands: CommandRegistry::default(),
             keymap_snapshot: Arc::new(Mutex::new(BTreeMap::new())),
             registry_task: None,
+            registry_notices: Vec::new(),
             prompt_claimed: false,
             consent_file: consent_file_path(),
         }
@@ -1795,13 +2087,14 @@ impl ExtensionHostController {
                 }
                 // §16.7 Ship the activation reports so the client-side
                 // command ownership registry and pane shortcut resolvers
-                // see what was registered.
-                if registry_sender
-                    .unbounded_send(registry_reports(&live_extensions))
-                    .is_err()
-                {
+                // see what was registered, and push the merged external
+                // directory into every runtime so `commands.list()`
+                // exposes all enabled extensions' commands.
+                let reports = registry_reports(&live_extensions);
+                if registry_sender.unbounded_send(reports.clone()).is_err() {
                     return;
                 }
+                install_external_directories(&mut live_extensions, &reports);
 
                 loop {
                     let command = match command_receiver.recv() {
@@ -1913,14 +2206,14 @@ impl ExtensionHostController {
                                 force_render = true;
                                 // §16.7 Newly approved extensions register
                                 // commands and keymaps during activate; the
-                                // full-snapshot report keeps ownership and
-                                // the resolver view consistent.
-                                if registry_sender
-                                    .unbounded_send(registry_reports(&live_extensions))
-                                    .is_err()
-                                {
+                                // full-snapshot report keeps ownership, the
+                                // resolver view, and the merged external
+                                // directories consistent.
+                                let reports = registry_reports(&live_extensions);
+                                if registry_sender.unbounded_send(reports.clone()).is_err() {
                                     break;
                                 }
+                                install_external_directories(&mut live_extensions, &reports);
                             }
                         }
                         HostCommand::Deny { ids } => {
@@ -1974,7 +2267,8 @@ impl ExtensionHostController {
     /// §5.5 Apply chrome pushed by the host thread. Event driven: the task
     /// parks on the channel instead of polling on a timer.
     fn publish_chrome(&mut self, cx: &mut gpui::Context<Self>) {
-        let nodes = merge_chrome_nodes(&self.local_chrome, &self.server_chrome);
+        let mut nodes = merge_chrome_nodes(&self.local_chrome, &self.server_chrome);
+        nodes.extend(self.registry_notices.clone());
         self.status_bars.lock().retain(|status_bar| {
             let Some(status_bar) = status_bar.upgrade() else {
                 return false;
@@ -2125,18 +2419,74 @@ impl ExtensionHostController {
 
     /// §16.7 Apply the host thread's activation reports: ownership is
     /// rebuilt from the full snapshot (first-wins, collisions rejected and
-    /// logged), and the shared keymap snapshot is refreshed for the pane
-    /// shortcut resolvers.
+    /// surfaced as chrome notices), the shared keymap snapshot is refreshed
+    /// for the pane shortcut resolvers, and chords that collide with a
+    /// native binding are reported instead of silently firing twice.
     fn apply_registry_reports(&mut self, reports: Vec<RegistryReport>, cx: &mut gpui::Context<Self>) {
-        let rejected = self.commands.apply_reports(&reports);
+        let mut conflicts = self.commands.apply_reports(&reports);
         *self.keymap_snapshot.lock() = self.commands.keymap_snapshot();
-        for command in rejected {
-            tracing::warn!(
-                %command,
-                "command id rejected: already owned by another extension"
-            );
+        // Native bindings always win: a chord that matches anything already
+        // in the app keymap can never fire the extension command, so the
+        // registration is reported as a conflict rather than a dead chord.
+        for (chord, command) in self.commands.keymap_snapshot() {
+            if let Ok(keystroke) = Keystroke::parse(&chord) {
+                if !cx.all_bindings_for_input(&[keystroke]).is_empty() {
+                    let extension_id = self
+                        .commands
+                        .resolve_owner(&command)
+                        .map(str::to_string)
+                        .unwrap_or_else(|| "unknown".to_string());
+                    conflicts.push(RegistryConflict {
+                        extension_id,
+                        detail: format!(
+                            "chord \"{chord}\" is already used by a built-in keybinding"
+                        ),
+                    });
+                }
+            }
         }
+        for conflict in &conflicts {
+            tracing::warn!(extension = %conflict.extension_id, %conflict.detail, "extension registration rejected");
+        }
+        self.registry_notices = conflicts
+            .iter()
+            .map(|conflict| VDomNode {
+                element_type: "div".to_string(),
+                props: BTreeMap::new(),
+                style: BTreeMap::new(),
+                children: vec![VDomChild::Text(format!(
+                    "{}: {}",
+                    conflict.extension_id, conflict.detail
+                ))],
+            })
+            .collect();
+        self.publish_chrome(cx);
         cx.notify();
+    }
+
+    /// §16.7 Every currently owned command with its extension identity and
+    /// display label, for the command palette and other discovery surfaces.
+    pub fn command_directory(&self) -> Vec<ExtensionCommandEntry> {
+        self.commands.command_directory()
+    }
+
+    /// §16.7 Resolve a real keystroke against the declared chords. Returns
+    /// the owning extension and the command it bound to the chord, or
+    /// `None` when no extension chord matches.
+    pub fn resolve_shortcut(&self, keystroke: &Keystroke) -> Option<(String, String)> {
+        self.commands.resolve_keystroke(keystroke)
+    }
+
+    /// §16.7 Execute a command on exactly the extension the caller names.
+    /// The host thread never broadcasts: the owner filter is carried into
+    /// `execute_for_owner`, so a name collision can never fan one invocation
+    /// out to several extensions.
+    pub fn invoke_command(&self, extension_id: &str, command: &str, arguments: &str) {
+        self.send(HostCommand::ExecuteCommand {
+            owner: Some(extension_id.to_string()),
+            command: command.to_string(),
+            arguments: arguments.to_string(),
+        });
     }
     /// §5.6 Extensions waiting for the user's first-install decision.
     pub fn pending_approvals(&self) -> Vec<PendingApproval> {
@@ -4524,9 +4874,11 @@ mod tests {
             commands: vec![
                 RegisteredCommand {
                     id: "noop".to_string(),
+                    label: "Noop".to_string(),
                 },
                 RegisteredCommand {
                     id: "unique".to_string(),
+                    label: "Unique".to_string(),
                 },
             ],
             keymaps: vec![RegisteredKeymap {
@@ -4538,14 +4890,18 @@ mod tests {
             extension_id: "ext-b".to_string(),
             commands: vec![RegisteredCommand {
                 id: "noop".to_string(),
+                label: "Noop Two".to_string(),
             }],
             keymaps: Vec::new(),
         };
 
-        assert_eq!(registry.apply_report(&report_a), Vec::<String>::new());
+        assert_eq!(registry.apply_report(&report_a), Vec::<RegistryConflict>::new());
         assert_eq!(
             registry.apply_report(&report_b),
-            vec!["ext-b.noop".to_string()],
+            vec![RegistryConflict {
+                extension_id: "ext-b".to_string(),
+                detail: "command id \"noop\" is already owned by extension \"ext-a\"".to_string(),
+            }],
             "colliding namespaced id must be reported as rejected"
         );
         assert_eq!(registry.resolve_owner("noop"), Some("ext-a"));
@@ -4561,7 +4917,10 @@ mod tests {
         // Full-snapshot re-application (host approval flow) is idempotent.
         assert_eq!(
             registry.apply_reports(&[report_a, report_b]),
-            vec!["ext-b.noop".to_string()]
+            vec![RegistryConflict {
+                extension_id: "ext-b".to_string(),
+                detail: "command id \"noop\" is already owned by extension \"ext-a\"".to_string(),
+            }]
         );
         assert_eq!(registry.resolve_owner("noop"), Some("ext-a"));
     }
@@ -4576,6 +4935,7 @@ mod tests {
             extension_id: "palette".to_string(),
             commands: vec![RegisteredCommand {
                 id: "z3rm.command-palette.open".to_string(),
+                label: "Open Palette".to_string(),
             }],
             keymaps: vec![RegisteredKeymap {
                 chord: "ctrl+shift+p".to_string(),
@@ -4607,6 +4967,7 @@ mod tests {
             extension_id: "palette".to_string(),
             commands: vec![RegisteredCommand {
                 id: "z3rm.command-palette.open".to_string(),
+                label: "Open Palette".to_string(),
             }],
             keymaps: vec![RegisteredKeymap {
                 chord: "ctrl+shift+p".to_string(),
@@ -4624,6 +4985,250 @@ mod tests {
         let unbound = Keystroke::parse("ctrl-a").expect("parse ctrl-a");
         assert_eq!(resolver(&unbound), None);
     }
+
+    /// §16.7: labels the runtime ships (`{id, label}`) survive into the
+    /// directory; a missing label falls back to the command id.
+    #[test]
+    fn command_labels_survive_parsing_with_id_fallback() {
+        let parsed = parse_registered_commands(
+            r#"[{"id":"open","label":"Open Palette"},{"id":"bare"}]"#,
+            "ext",
+        );
+        assert_eq!(parsed.len(), 2);
+        assert_eq!(parsed[0].id, "open");
+        assert_eq!(parsed[0].label, "Open Palette");
+        assert_eq!(parsed[1].id, "bare");
+        assert_eq!(parsed[1].label, "bare");
+    }
+
+    /// §16.7: two extensions declaring the same chord get a readable
+    /// conflict, and only the first owner's chord stays dispatchable.
+    #[test]
+    fn chord_collisions_reject_the_later_extension() {
+        let mut registry = CommandRegistry::default();
+        let report_a = RegistryReport {
+            extension_id: "ext-a".to_string(),
+            commands: vec![RegisteredCommand {
+                id: "one".to_string(),
+                label: "One".to_string(),
+            }],
+            keymaps: vec![RegisteredKeymap {
+                chord: "ctrl+alt+e".to_string(),
+                command: "one".to_string(),
+            }],
+        };
+        let report_b = RegistryReport {
+            extension_id: "ext-b".to_string(),
+            commands: vec![RegisteredCommand {
+                id: "two".to_string(),
+                label: "Two".to_string(),
+            }],
+            keymaps: vec![RegisteredKeymap {
+                chord: "ctrl+alt+e".to_string(),
+                command: "two".to_string(),
+            }],
+        };
+        assert_eq!(registry.apply_report(&report_a), Vec::<RegistryConflict>::new());
+        assert_eq!(
+            registry.apply_report(&report_b),
+            vec![RegistryConflict {
+                extension_id: "ext-b".to_string(),
+                detail: "chord \"ctrl+alt+e\" is already bound by extension \"ext-a\"".to_string(),
+            }]
+        );
+        assert_eq!(registry.keymap_snapshot().get("ctrl-alt-e").map(String::as_str), Some("one"));
+    }
+
+    /// §16.7: the directory exposes owner, bare id, namespaced id, and
+    /// label for every owned command.
+    #[test]
+    fn directory_carries_owner_and_label() {
+        let mut registry = CommandRegistry::default();
+        registry.apply_report(&RegistryReport {
+            extension_id: "ext-a".to_string(),
+            commands: vec![RegisteredCommand {
+                id: "noop".to_string(),
+                label: "Noop".to_string(),
+            }],
+            keymaps: Vec::new(),
+        });
+        let directory = registry.command_directory();
+        assert_eq!(directory.len(), 1);
+        assert_eq!(
+            directory[0],
+            ExtensionCommandEntry {
+                extension_id: "ext-a".to_string(),
+                command_id: "noop".to_string(),
+                namespaced_id: "ext-a.noop".to_string(),
+                label: "Noop".to_string(),
+            }
+        );
+    }
+
+    /// §16.7: palette interception fuzzy-matches the directory, highlights
+    /// matched positions, and produces an action that names exactly the
+    /// owning extension.
+    #[test]
+    fn palette_interception_returns_owner_actions() {
+        let directory = vec![ExtensionCommandEntry {
+            extension_id: "palette".to_string(),
+            command_id: "open".to_string(),
+            namespaced_id: "palette.open".to_string(),
+            label: "Open Palette".to_string(),
+        }];
+        let result = palette_interception("open", &directory);
+        assert_eq!(result.results.len(), 1);
+        let item = &result.results[0];
+        assert_eq!(item.string, "Open Palette — palette");
+        assert!(!item.positions.is_empty(), "matched characters must be highlighted");
+        let action = item
+            .action
+            .as_any()
+            .downcast_ref::<InvokeExtensionCommand>()
+            .expect("palette items carry InvokeExtensionCommand");
+        assert_eq!(action.extension_id, "palette");
+        assert_eq!(action.command, "open");
+
+        // A non-matching query and an empty directory both yield nothing,
+        // leaving the native action list untouched (exclusive stays false).
+        assert!(palette_interception("zzz", &directory).results.is_empty());
+        assert!(palette_interception("", &[]).results.is_empty());
+        assert!(!result.exclusive);
+    }
+
+    /// §16.7: chord resolution matches a real keystroke to its owning
+    /// extension and command; unbound keystrokes never resolve.
+    #[test]
+    fn chord_resolution_reports_the_owner() {
+        let mut registry = CommandRegistry::default();
+        registry.apply_report(&RegistryReport {
+            extension_id: "ext-a".to_string(),
+            commands: vec![RegisteredCommand {
+                id: "one".to_string(),
+                label: "One".to_string(),
+            }],
+            keymaps: vec![RegisteredKeymap {
+                chord: "ctrl+alt+e".to_string(),
+                command: "one".to_string(),
+            }],
+        });
+        let bound = Keystroke::parse("ctrl-alt-e").expect("parse bound chord");
+        assert_eq!(
+            registry.resolve_keystroke(&bound),
+            Some(("ext-a".to_string(), "one".to_string()))
+        );
+        let unbound = Keystroke::parse("ctrl-alt-y").expect("parse unbound chord");
+        assert_eq!(registry.resolve_keystroke(&unbound), None);
+    }
+
+    /// §16.7: the app-wide keystroke interceptor leaves a keystroke alone
+    /// when a native binding owns it — an extension chord must never
+    /// shadow a core action — and lets an unclaimed keystroke reach the
+    /// focused view normally.
+    #[gpui::test]
+    async fn global_shortcuts_never_shadow_native_bindings(cx: &mut gpui::TestAppContext) {
+        gpui::actions!(extension_shortcut_tests, [NativeProbe]);
+
+        struct KeystrokeProbeView {
+            received: std::rc::Rc<std::cell::Cell<bool>>,
+            focus_handle: gpui::FocusHandle,
+        }
+        impl gpui::Focusable for KeystrokeProbeView {
+            fn focus_handle(&self, _cx: &gpui::App) -> gpui::FocusHandle {
+                self.focus_handle.clone()
+            }
+        }
+        impl gpui::Render for KeystrokeProbeView {
+            fn render(
+                &mut self,
+                _window: &mut gpui::Window,
+                cx: &mut gpui::Context<Self>,
+            ) -> impl gpui::IntoElement {
+                use gpui::{InteractiveElement as _, StatefulInteractiveElement as _};
+                let received = self.received.clone();
+                let focus_handle = self.focus_handle.clone();
+                gpui::div()
+                    .id("keystroke-probe")
+                    .track_focus(&focus_handle)
+                    .on_key_down(cx.listener(
+                        move |_this, _event: &gpui::KeyDownEvent, _window, _cx| {
+                            received.set(true);
+                        },
+                    ))
+            }
+        }
+
+        let controller = cx.new(|_| {
+            let mut controller = ExtensionHostController::new();
+            controller.commands.apply_report(&RegistryReport {
+                extension_id: "ext-a".to_string(),
+                commands: vec![RegisteredCommand {
+                    id: "fire".to_string(),
+                    label: "Fire".to_string(),
+                }],
+                keymaps: vec![RegisteredKeymap {
+                    chord: "ctrl+alt+e".to_string(),
+                    command: "fire".to_string(),
+                }],
+            });
+            *controller.keymap_snapshot.lock() = controller.commands.keymap_snapshot();
+            controller
+        });
+        let native_fired = std::rc::Rc::new(std::cell::Cell::new(false));
+        let native_flag = native_fired.clone();
+        cx.update(|cx| {
+            cx.set_global(GlobalHostController(controller));
+            install_global_shortcuts(cx);
+            cx.bind_keys([gpui::KeyBinding::new(
+                "ctrl-alt-e",
+                NativeProbe,
+                None,
+            )]);
+            cx.on_action(move |_: &NativeProbe, _| {
+                native_flag.set(true);
+            });
+        });
+
+        let received = std::rc::Rc::new(std::cell::Cell::new(false));
+        let received_for_view = received.clone();
+        let window_handle = cx.add_window(|_window, cx| KeystrokeProbeView {
+            received: received_for_view,
+            focus_handle: cx.focus_handle(),
+        });
+        let any_window: gpui::AnyWindowHandle = window_handle.into();
+        {
+            use gpui::Focusable as _;
+            let root = window_handle
+                .root(cx)
+                .expect("probe window root view must exist");
+            let focus_handle = cx.read(|cx| root.read(cx).focus_handle(cx).clone());
+            cx.update_window(any_window, |_, window, cx| focus_handle.focus(window, cx))
+                .expect("focus the probe view");
+        }
+        let keystroke = Keystroke::parse("ctrl-alt-e").expect("parse shared chord");
+
+        // Native binding owns the chord: the extension interceptor must not
+        // consume it, so the native action fires.
+        cx.dispatch_keystroke(any_window, keystroke);
+        assert!(
+            native_fired.get(),
+            "a native binding must win over an extension chord"
+        );
+
+        // A chord no native binding uses must still reach the focused view —
+        // interceptor consumption only happens for extension chords, and this
+        // registry holds only ctrl-alt-e.
+        native_fired.set(false);
+        let free_keystroke = Keystroke::parse("ctrl-alt-y").expect("parse free chord");
+        cx.dispatch_keystroke(any_window, free_keystroke);
+        assert!(!native_fired.get());
+        assert!(
+            received.get(),
+            "an unclaimed keystroke must still reach the focused view"
+        );
+    }
+
+
 
     /// §16.7: `execute_for_owner` runs exactly one runtime — the resolved
     /// owner — even when another extension registered the same bare command

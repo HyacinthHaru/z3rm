@@ -1074,6 +1074,8 @@ const CONTEXT_BOOTSTRAP_JS: &str = r#"
     globalThis.__z3rm_commands = {};
     globalThis.__z3rm_command_order = [];
     globalThis.__z3rm_keymaps = {};
+    globalThis.__z3rm_external_commands = [];
+
     globalThis.__z3rm_errors = [];
     globalThis.__z3rm_render_result = null;
 
@@ -1278,7 +1280,7 @@ const CONTEXT_BOOTSTRAP_JS: &str = r#"
 
     globalThis.__z3rm_list_commands = function() {
         return JSON.stringify(globalThis.__z3rm_command_order.map(function(id) {
-            return { id: id, command: globalThis.__z3rm_commands[id].label };
+            return { id: id, label: globalThis.__z3rm_commands[id].label };
         }));
     };
 
@@ -1466,9 +1468,10 @@ const CONTEXT_BOOTSTRAP_JS: &str = r#"
                 return true;
             },
             list: function() {
-                return globalThis.__z3rm_command_order.map(function(id) {
+                var own = globalThis.__z3rm_command_order.map(function(id) {
                     return { id: id, label: globalThis.__z3rm_commands[id].label };
                 });
+                return own.concat(globalThis.__z3rm_external_commands);
             },
             execute: function(id, args) {
                 return globalThis.__z3rm_execute_command(id, args);
@@ -2209,6 +2212,19 @@ impl LiveExtension {
     /// 扩展注册的命令列表 (JSON: `[{id, label}]`)。
     pub fn list_commands(&self) -> Result<String> {
         self.run_js(|ctx| eval_checked(ctx, "globalThis.__z3rm_list_commands()"))
+    }
+
+    /// Install the host-merged directory of commands registered by *other*
+    /// extensions as `[{id, label}]`, so `context.commands.list()` exposes
+    /// every enabled extension's commands (spec §16.7). Own commands stay
+    /// in `__z3rm_commands`; the list merges both.
+    pub fn install_external_commands(&self, entries_json: &str) -> Result<()> {
+        self.run_js(|ctx| {
+            eval_checked(
+                ctx,
+                &format!("globalThis.__z3rm_external_commands = {entries_json}; true"),
+            )
+        })
     }
 
     /// 扩展注册的键位列表 (JSON: `[{chord, command}]`)。
@@ -3609,6 +3625,39 @@ mod tests {
         );
         Ok(())
     }
+
+    /// §16.7: 宿主注入的外部命令目录进入 `context.commands.list()`，
+    /// 内置 palette 因此能展示所有已启用扩展的命令，而不只是自己的。
+    #[test]
+    fn external_command_directory_surfaces_in_the_palette() -> Result<()> {
+        let discovered = discover_client_extensions(&builtin_extension_roots());
+        let palette = discovered
+            .iter()
+            .find(|extension| extension.manifest.id == "z3rm-command-palette")
+            .context("z3rm-command-palette 未被发现")?;
+        let runner = ExtensionRunner::for_manifest(&palette.manifest);
+        let live = runner.load_live("z3rm-command-palette", &palette.source, "activate")?;
+
+        live.install_external_commands(
+            r#"[{"id":"other.do","label":"Do Thing — other"}]"#,
+        )?;
+        assert!(live.execute_command("z3rm.command-palette.open", "[]")?);
+        let vdom = live.render_now()?.context("打开后 palette 应产生 VDOM")?;
+        assert!(
+            vdom.contains("other.do"),
+            "palette 必须列出其他扩展的命令: {vdom}"
+        );
+        assert!(
+            vdom.contains("Do Thing — other"),
+            "外部命令必须携带来源扩展: {vdom}"
+        );
+        assert!(
+            vdom.contains("z3rm.command-palette.open"),
+            "palette 自身命令必须保留: {vdom}"
+        );
+        Ok(())
+    }
+
 
     // -----------------------------------------------------------------------
     // §16.8 运行侧分派
