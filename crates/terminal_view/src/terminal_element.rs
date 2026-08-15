@@ -1591,6 +1591,10 @@ impl Element for TerminalElement {
                         };
                         window
                             .paint_image(
+                                // The layout already clipped the image to the cells
+                                // that are on screen, so the clip and placement
+                                // rects are the same.
+                                image_bounds,
                                 image_bounds,
                                 gpui::Corners::all(px(0.)),
                                 render_image.clone(),
