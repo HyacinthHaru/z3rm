@@ -742,7 +742,7 @@ pub trait InteractiveElement: Sized {
     /// the first tab stop inside it while having the container element itself be unreachable via the keyboard.
     /// Should only be used with `tab_index`.
     fn tab_stop(mut self, tab_stop: bool) -> Self {
-        self.interactivity().tab_stop = tab_stop;
+        self.interactivity().tab_stop = Some(tab_stop);
         self
     }
 
@@ -753,7 +753,7 @@ pub trait InteractiveElement: Sized {
     fn tab_index(mut self, index: isize) -> Self {
         self.interactivity().focusable = true;
         self.interactivity().tab_index = Some(index);
-        self.interactivity().tab_stop = true;
+        self.interactivity().tab_stop = Some(true);
         self
     }
 
@@ -2012,7 +2012,9 @@ pub struct Interactivity {
     pub(crate) hitbox_behavior: HitboxBehavior,
     pub(crate) tab_index: Option<isize>,
     pub(crate) tab_group: bool,
-    pub(crate) tab_stop: bool,
+    // `None` means the element never asked; only an explicit request may
+    // overwrite the flag on a focus handle supplied via `track_focus`.
+    pub(crate) tab_stop: Option<bool>,
 
     pub(crate) a11y_action_listeners:
         Vec<(accesskit::Action, crate::window::a11y::A11yActionListener)>,
@@ -2080,17 +2082,29 @@ impl Interactivity {
                     && self.tracked_focus_handle.is_none()
                     && let Some(element_state) = element_state.as_mut()
                 {
-                    let mut handle = element_state
-                        .focus_handle
-                        .get_or_insert_with(|| cx.focus_handle())
-                        .clone()
-                        .tab_stop(self.tab_stop);
+                    self.tracked_focus_handle = Some(
+                        element_state
+                            .focus_handle
+                            .get_or_insert_with(|| cx.focus_handle())
+                            .clone()
+                            .tab_stop(self.tab_stop.unwrap_or(false)),
+                    );
+                }
 
-                    if let Some(index) = self.tab_index {
-                        handle = handle.tab_index(index);
-                    }
-
-                    self.tracked_focus_handle = Some(handle);
+                // A handle supplied via `track_focus` also has to pick up the
+                // element's tab semantics, otherwise `.tab_stop(..)`/`.tab_index(..)`
+                // are silently dropped and the element never enters the tab order.
+                // Only explicit requests are propagated, so callers that configure
+                // the handle directly keep their settings.
+                if let Some(handle) = self.tracked_focus_handle.take() {
+                    let handle = match self.tab_stop {
+                        Some(tab_stop) => handle.tab_stop(tab_stop),
+                        None => handle,
+                    };
+                    self.tracked_focus_handle = Some(match self.tab_index {
+                        Some(index) => handle.tab_index(index),
+                        None => handle,
+                    });
                 }
 
                 if let Some(scroll_handle) = self.tracked_scroll_handle.as_ref() {
@@ -4900,5 +4914,46 @@ mod tests {
             .unwrap();
 
         assert_eq!(focused, Some(item_b.id));
+    }
+
+    struct TrackedTabStop {
+        first: FocusHandle,
+        second: FocusHandle,
+    }
+
+    impl Render for TrackedTabStop {
+        fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
+            div()
+                .child(div().track_focus(&self.first))
+                .child(div().track_focus(&self.second).tab_stop(true))
+        }
+    }
+
+    /// An element that supplies its own focus handle through `track_focus` must
+    /// still honor [`InteractiveElement::tab_stop`]. The element-level flag used
+    /// to be applied only when no handle was tracked, so this combination left
+    /// the element out of the tab order without any diagnostic.
+    #[test]
+    fn element_tab_stop_applies_to_a_tracked_focus_handle() {
+        let mut cx = TestAppContext::single();
+        let (first, second) = cx.update(|cx| (cx.focus_handle().tab_stop(true), cx.focus_handle()));
+        let window: AnyWindowHandle = cx
+            .add_window({
+                let (first, second) = (first.clone(), second.clone());
+                move |_, _| TrackedTabStop { first, second }
+            })
+            .into();
+        cx.update_window(window, |_, window, cx| window.draw(cx).clear(cx))
+            .unwrap();
+
+        let focused = cx
+            .update_window(window, |_, window, cx| {
+                window.focus(&first, cx);
+                window.focus_next(cx);
+                window.focused(cx).map(|handle| handle.id)
+            })
+            .unwrap();
+
+        assert_eq!(focused, Some(second.id));
     }
 }
