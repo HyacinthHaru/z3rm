@@ -298,6 +298,20 @@ impl A11y {
         self.nodes.begin_frame(self.window_title.as_ref());
     }
 
+    /// Record that the window has a focused handle but no element claimed it
+    /// this frame.
+    ///
+    /// Distinct from [`Self::note_focus_without_node`], which fires when the
+    /// focused element *did* render and simply lacked an id or a role. Here the
+    /// element was not rendered at all, so nothing reports anything and the
+    /// dump would otherwise show a null focus with no explanation — the same
+    /// silence that made this class of bug hard to see in the first place.
+    pub(crate) fn note_focus_element_not_rendered(&mut self) {
+        if self.nodes.focus.is_none() && self.focus_without_node_this_frame.is_none() {
+            self.focus_without_node_this_frame = Some("its element was not rendered this frame");
+        }
+    }
+
     /// Finalize the tree and produce a [`TreeUpdate`] for the platform adapter.
     pub(crate) fn end_frame(&mut self, mut frame: debug::FrameDebugInfo) -> TreeUpdate {
         let update = self.nodes.finalize();

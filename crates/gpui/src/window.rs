@@ -3098,6 +3098,11 @@ impl Window {
                 // Filled in by `end_frame`, which owns the diagnostic.
                 focus_without_node: None,
             };
+            // A focused handle whose element never rendered leaves the tree
+            // with no focus and no reason for it.
+            if self.focus.is_some() {
+                self.a11y.note_focus_element_not_rendered();
+            }
             // clear the builder state regardless
             let tree_update = self.a11y.end_frame(frame_info);
 
