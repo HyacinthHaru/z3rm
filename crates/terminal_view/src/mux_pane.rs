@@ -3527,6 +3527,13 @@ mod tests {
         }
         cx.run_until_parked();
 
+        // Focused so the tree check below is about a focused pane rather than
+        // an idle one: focus is where a reader starts.
+        pane.update_in(cx, |pane, window, cx| {
+            pane.focus_active_item(window, cx);
+        });
+        cx.run_until_parked();
+
         cx.activate_a11y(cx.window_handle());
 
         // The grid arrives over the socket after the pane is mounted, so the
@@ -3543,6 +3550,7 @@ mod tests {
             let tree: serde_json::Value =
                 serde_json::from_str(&json).expect("the dump is valid JSON");
             let nodes = tree["nodes"].as_object().expect("the dump lists nodes");
+            gpui::a11y_checks::assert_focus_reached_the_tree(&tree, "hosted terminal");
             let named = nodes
                 .values()
                 .find(|node| node["element_id"].as_str() == Some("Name(\"mux-pane-root\")"))

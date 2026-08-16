@@ -2779,6 +2779,7 @@ mod live_tests {
         gpui::a11y_checks::assert_no_role_was_discarded(&tree, "sidebar panel");
         gpui::a11y_checks::assert_roles_are_contained(&tree, "sidebar panel");
         gpui::a11y_checks::assert_click_targets_are_reachable(&tree, "sidebar panel");
+        gpui::a11y_checks::assert_focus_reached_the_tree(&tree, "sidebar panel");
 
         // A screen reader derives "item 2 of 5" and the arrow-key conventions
         // from containment, so a row outside its tree loses all of it.

@@ -68,6 +68,7 @@ async fn the_file_tree_is_exposed_as_a_named_tree(cx: &mut gpui::TestAppContext)
         let tree: serde_json::Value = serde_json::from_str(&json).expect("the dump is valid JSON");
         let nodes = tree["nodes"].as_object().expect("the dump lists nodes");
 
+        gpui::a11y_checks::assert_focus_reached_the_tree(&tree, "project panel");
         let file_tree = nodes
             .iter()
             .find(|(_, node)| node["aria"]["label"].as_str() == Some("Project files"))
