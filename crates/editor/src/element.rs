@@ -248,6 +248,9 @@ pub struct EditorElement {
     /// because [`Element::id`] and [`Element::a11y_role`] run without a context
     /// and so cannot read the editor's mode.
     single_line: bool,
+    /// Whether this element renders a full editor that the user can focus, as
+    /// opposed to a single-line input, a minimap, or an inline prompt.
+    focusable_region: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -265,6 +268,7 @@ impl EditorElement {
             style,
             split_side: None,
             single_line: false,
+            focusable_region: false,
         }
     }
 
@@ -272,6 +276,15 @@ impl EditorElement {
     /// gives it text-input accessibility semantics.
     pub fn single_line(mut self, single_line: bool) -> Self {
         self.single_line = single_line;
+        self
+    }
+
+    /// Marks this element as a full editor the user can focus, which is what
+    /// gives it a node for that focus to land on. Left off for elements built
+    /// outside [`Editor::render`] — minimaps and inline prompts — so they stay
+    /// out of the tree.
+    pub fn focusable_region(mut self, focusable_region: bool) -> Self {
+        self.focusable_region = focusable_region;
         self
     }
 
@@ -7776,7 +7789,7 @@ impl Element for EditorElement {
     /// that, so a text input with no id can carry no semantics at all. Multi-
     /// line editors keep the previous stateless behavior.
     fn id(&self) -> Option<ElementId> {
-        self.single_line
+        (self.single_line || self.focusable_region)
             .then(|| ElementId::View(self.editor.entity_id()))
     }
 
@@ -7785,11 +7798,19 @@ impl Element for EditorElement {
     }
 
     /// Single-line editors are the app's text inputs — filters, search boxes,
-    /// settings fields — so they are reported as such. Multi-line editors need
-    /// folds, wrapping and inlays reflected in the text pattern and are left
-    /// unexposed rather than described incorrectly.
+    /// settings fields — so they are reported as such. A multi-line editor's
+    /// text pattern would have to reflect folds, wrapping and inlays, so it is
+    /// reported as a named region rather than described incorrectly as a flat
+    /// text input: focus lands somewhere, and the user hears where they are,
+    /// without a promise the element cannot keep.
     fn a11y_role(&self) -> Option<gpui::accesskit::Role> {
-        self.single_line.then_some(gpui::accesskit::Role::TextInput)
+        if self.single_line {
+            Some(gpui::accesskit::Role::TextInput)
+        } else if self.focusable_region {
+            Some(gpui::accesskit::Role::Group)
+        } else {
+            None
+        }
     }
 
     fn a11y_synthetic_children(
@@ -7797,6 +7818,9 @@ impl Element for EditorElement {
         prepaint: &mut Self::PrepaintState,
         builder: &mut gpui::A11ySubtreeBuilder,
     ) {
+        if let Some(name) = prepaint.a11y_region_name.as_ref() {
+            builder.parent_node().set_label(name.to_string());
+        }
         if let Some(a11y_text) = prepaint.a11y_text.as_ref() {
             // The placeholder is the only name most of these inputs have; the
             // parent node is reachable here, so no element-level plumbing is
@@ -7889,7 +7913,7 @@ impl Element for EditorElement {
 
     fn prepaint(
         &mut self,
-        _: Option<&GlobalElementId>,
+        global_id: Option<&GlobalElementId>,
         _inspector_id: Option<&gpui::InspectorElementId>,
         bounds: Bounds<Pixels>,
         request_layout: &mut Self::RequestLayoutState,
@@ -7910,6 +7934,12 @@ impl Element for EditorElement {
             let focus_handle = self.editor.focus_handle(cx);
             window.set_view_id(self.editor.entity_id());
             window.set_focus_handle(&focus_handle, cx);
+            // Registering the handle is only half of it: without naming the
+            // node that carries the focus, a focused editor produces no node
+            // and screen readers fall back to announcing the whole window.
+            if let Some(global_id) = global_id {
+                window.report_a11y_focus_target(global_id, &focus_handle);
+            }
         }
 
         let rem_size = self.rem_size(cx);
@@ -9310,6 +9340,12 @@ impl Element for EditorElement {
                     // Captured here because the accessibility hooks run without
                     // a context, and a single-line editor's whole content is
                     // small enough to snapshot per frame.
+                    let a11y_region_name = self.focusable_region.then(|| {
+                        self.editor
+                            .update(cx, |editor, cx| editor.placeholder_text(cx))
+                            .map(SharedString::from)
+                            .unwrap_or_else(|| SharedString::new_static("Editor"))
+                    });
                     let a11y_text = self.single_line.then(|| {
                         let (text, selection) = {
                             let editor = self.editor.read(cx);
@@ -9338,6 +9374,7 @@ impl Element for EditorElement {
 
                     EditorLayout {
                         a11y_text,
+                        a11y_region_name,
                         mode,
                         position_map,
                         visible_display_row_range: start_row..end_row,
@@ -9567,6 +9604,9 @@ struct A11yTextInput {
 
 pub struct EditorLayout {
     a11y_text: Option<A11yTextInput>,
+    /// What a focused full editor announces itself as. Captured during layout
+    /// because the accessibility hooks run without a context.
+    a11y_region_name: Option<SharedString>,
     position_map: Rc<PositionMap>,
     hitbox: Hitbox,
     gutter_hitbox: Hitbox,
@@ -12307,8 +12347,11 @@ mod tests {
         assert_eq!(run["aria"]["value"].as_str(), Some("needle"));
     }
 
-    /// A multi-line editor's text pattern has to reflect folds, wrapping and
-    /// inlays, so it is deliberately not described as a flat text input.
+    /// A multi-line editor's text pattern would have to reflect folds, wrapping
+    /// and inlays, so it is deliberately not described as a flat text input.
+    /// It still has to be somewhere focus can land: registering a focus handle
+    /// is only half of it, and without a node the whole window gets announced
+    /// instead of the editor the user is typing into.
     #[gpui::test]
     async fn test_multi_line_editor_is_not_described_as_a_text_input(cx: &mut TestAppContext) {
         init_test(cx, |_| {});
@@ -12322,7 +12365,11 @@ mod tests {
         // other test sharing this binary.
         cx.activate_a11y(window.into());
         let json = cx
-            .update_window(window.into(), |_, window, cx| {
+            .update_window(window.into(), |view, window, cx| {
+                if let Ok(editor) = view.downcast::<Editor>() {
+                    let handle = editor.read(cx).focus_handle(cx);
+                    window.focus(&handle, cx);
+                }
                 window.draw(cx).clear(cx);
                 window.debug_a11y_tree_json()
             })
@@ -12338,5 +12385,17 @@ mod tests {
                 .all(|node| node["aria"]["role"] != "TextInput"),
             "a full editor must not claim to be a text input"
         );
+
+        assert_eq!(
+            tree["frame"]["focus_without_node"].as_str(),
+            None,
+            "the focused editor has to reach the tree"
+        );
+        let focused = tree["gpui_focus"]
+            .as_str()
+            .and_then(|id| tree["nodes"].get(id))
+            .expect("the focus must name a node in the dump");
+        assert_eq!(focused["aria"]["role"].as_str(), Some("Group"));
+        assert_eq!(focused["aria"]["label"].as_str(), Some("Editor"));
     }
 }

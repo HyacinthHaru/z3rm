@@ -4673,8 +4673,33 @@ impl Window {
         self.invalidator.debug_assert_prepaint();
         if focus_handle.is_focused(self) {
             self.next_frame.focus = Some(focus_handle.id);
+            if self.a11y.is_building_frame() {
+                self.a11y.note_focused_element_rendered();
+            }
         }
         self.next_frame.dispatch_tree.set_focus_id(focus_handle.id);
+    }
+
+    /// Report that `global_id`'s accessibility node is where `focus_handle`
+    /// lives, so focus has somewhere to land.
+    ///
+    /// [`Self::set_focus_handle`] only registers the handle for dispatch.
+    /// `div` follows it with this claim internally; a custom [`Element`] that
+    /// tracks focus itself has to say so, or the focused element produces no
+    /// node and screen readers announce the whole window instead.
+    pub fn report_a11y_focus_target(
+        &mut self,
+        global_id: &GlobalElementId,
+        focus_handle: &FocusHandle,
+    ) {
+        if !self.a11y.is_building_frame() {
+            return;
+        }
+        let node_id = global_id.accesskit_node_id();
+        self.a11y.set_focusable(node_id, focus_handle.id);
+        if focus_handle.is_focused(self) {
+            self.a11y.set_focus(node_id);
+        }
     }
 
     /// Sets the view id for the current element, which will be used to manage view caching.

@@ -12248,6 +12248,7 @@ impl Render for Editor {
     fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         EditorElement::new(&cx.entity(), self.create_style(cx))
             .single_line(self.mode.is_single_line())
+            .focusable_region(!self.mode.is_single_line() && !self.mode.is_minimap())
     }
 }
 

@@ -158,6 +158,10 @@ pub(crate) struct A11y {
     /// Set for the frame in which focus was dropped for lack of a node, so the
     /// debug dump can explain an otherwise silent `gpui_focus: null`.
     focus_without_node_this_frame: Option<&'static str>,
+    /// Whether the focused element registered its focus handle this frame,
+    /// which distinguishes an element that never rendered from one that
+    /// rendered and simply produced no node.
+    focused_element_rendered_this_frame: bool,
     /// Whether a node claimed to be the active descendant this frame without
     /// the focused node being one of its ancestors, so the claim was dropped.
     active_descendant_without_focus_this_frame: bool,
@@ -190,6 +194,7 @@ impl A11y {
             window_title,
             last_focus_without_node: None,
             focus_without_node_this_frame: None,
+            focused_element_rendered_this_frame: false,
             active_descendant_without_focus_this_frame: false,
             roles_without_id_this_frame: Vec::new(),
             debug: debug::A11yDebug::default(),
@@ -342,9 +347,21 @@ impl A11y {
     /// element was not rendered at all, so nothing reports anything and the
     /// dump would otherwise show a null focus with no explanation — the same
     /// silence that made this class of bug hard to see in the first place.
+    /// Records that the focused element rendered, whether or not it produced a
+    /// node. An element can register a focus handle without going through the
+    /// interactivity path that reports a missing id, so without this the
+    /// end-of-frame diagnostic would blame a render that did happen.
+    pub(crate) fn note_focused_element_rendered(&mut self) {
+        self.focused_element_rendered_this_frame = true;
+    }
+
     pub(crate) fn note_focus_element_not_rendered(&mut self) {
         if self.nodes.focus.is_none() && self.focus_without_node_this_frame.is_none() {
-            self.focus_without_node_this_frame = Some("its element was not rendered this frame");
+            self.focus_without_node_this_frame = Some(if self.focused_element_rendered_this_frame {
+                "its element rendered but produced no accessibility node"
+            } else {
+                "its element was not rendered this frame"
+            });
         }
     }
 
@@ -362,6 +379,7 @@ impl A11y {
             .collect();
         frame.active_descendant_without_focus =
             std::mem::take(&mut self.active_descendant_without_focus_this_frame);
+        self.focused_element_rendered_this_frame = false;
         self.debug.capture(
             &update,
             self.nodes.focus,
