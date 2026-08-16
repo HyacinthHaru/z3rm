@@ -1439,10 +1439,15 @@ impl<D: PickerDelegate> Picker<D> {
     fn render_element_container(&self, cx: &mut Context<Self>) -> impl IntoElement {
         // The list elements are custom, so the role lives on a wrapper that
         // parents the options rather than on the list itself.
+        // The wrapper has to be a flex column that can shrink, or the list
+        // inside it stops growing and its scroll height collapses.
         div()
             .id("picker-candidates")
             .role(gpui::Role::ListBox)
+            .flex()
+            .flex_col()
             .flex_grow_1()
+            .min_h_0()
             .child(self.render_element_list(cx))
     }
 
