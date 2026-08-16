@@ -566,6 +566,47 @@ async fn test_split_panes_say_which_one_they_are(cx: &mut TestAppContext) {
     );
 }
 
+/// The welcome screen takes focus when it opens. Its root carried no id and no
+/// role, so that focus produced no node and a reader was told about the window
+/// rather than the screen the user had just landed on.
+#[gpui::test]
+async fn test_the_welcome_screen_is_announced_when_it_takes_focus(cx: &mut TestAppContext) {
+    init_test(cx);
+    let fs = FakeFs::new(cx.executor());
+    fs.insert_tree("/root", json!({ "a.txt": "" })).await;
+    let project = Project::test(fs, [path!("/root").as_ref()], cx).await;
+
+    let (multi_workspace, cx) =
+        cx.add_window_view(|window, cx| MultiWorkspace::test_new(project, window, cx));
+    let workspace = multi_workspace.read_with(cx, |mw, _| mw.workspace().clone());
+    let welcome = cx.update(|window, cx| {
+        cx.new(|cx| crate::welcome::WelcomePage::new(workspace.downgrade(), false, window, cx))
+    });
+    let pane = workspace.read_with(cx, |ws, _| ws.active_pane().clone());
+    pane.update_in(cx, |pane, window, cx| {
+        pane.add_item(Box::new(welcome.clone()), true, true, None, window, cx);
+    });
+    cx.run_until_parked();
+
+    cx.activate_a11y(cx.window_handle());
+    let json = cx
+        .update(|window, cx| {
+            let handle = gpui::Focusable::focus_handle(welcome.read(cx), cx);
+            window.focus(&handle, cx);
+            window.draw(cx).clear(cx);
+            window.debug_a11y_tree_json()
+        })
+        .expect("activation makes the debug tree available");
+    let tree: serde_json::Value = serde_json::from_str(&json).expect("the dump is valid JSON");
+
+    gpui::a11y_checks::assert_focus_reached_the_tree(&tree, "welcome screen");
+    let focused = tree["gpui_focus"]
+        .as_str()
+        .and_then(|id| tree["nodes"].get(id))
+        .expect("the focus must name a node in the dump");
+    assert_eq!(focused["aria"]["label"].as_str(), Some("Welcome to Zed"));
+}
+
 /// A live region announces changes made *inside* it. A region that is created
 /// at the same moment as its first message has nothing to compare against, so
 /// both regions have to be in the tree before there is anything to say.
