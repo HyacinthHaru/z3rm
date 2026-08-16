@@ -734,6 +734,32 @@ impl PickerDelegate for WorktreePickerDelegate {
         "worktree picker"
     }
 
+    /// Named from the entry rather than from a match string: with an empty
+    /// query the entries carry no match text, and separators and headers are
+    /// not selectable, so naming them would announce rows the user cannot
+    /// reach.
+    fn match_label(&self, ix: usize, _cx: &App) -> Option<SharedString> {
+        match self.matches.get(ix)? {
+            WorktreeEntry::Separator | WorktreeEntry::SectionHeader(_) => None,
+            WorktreeEntry::CreateFromCurrentBranch => {
+                Some(SharedString::new_static("New worktree from current branch"))
+            }
+            WorktreeEntry::CreateFromDefaultBranch { default_branch } => Some(SharedString::from(
+                format!("New worktree from {}", default_branch.branch_name),
+            )),
+            WorktreeEntry::CreateNamed { name, .. } => {
+                Some(SharedString::from(format!("New worktree {name}")))
+            }
+            WorktreeEntry::Worktree { worktree, .. } => {
+                let path = worktree.path.file_name()?.to_string_lossy().to_string();
+                Some(match worktree.ref_name.as_ref() {
+                    Some(branch) => SharedString::from(format!("{path}, {branch}")),
+                    None => SharedString::from(path),
+                })
+            }
+        }
+    }
+
     fn placeholder_text(&self, _window: &mut Window, _cx: &mut App) -> Arc<str> {
         "Select or type to create a worktree…".into()
     }
@@ -1229,6 +1255,7 @@ impl PickerDelegate for WorktreePickerDelegate {
                         .when(!is_deleting && !is_current, |this| {
                             let open_in_new_window_button =
                                 IconButton::new(("open-new-window", ix), IconName::ArrowUpRight)
+                                    .aria_label("Open in New Window")
                                     .icon_size(IconSize::Small)
                                     .tooltip(Tooltip::text("Open in New Window"))
                                     .on_click(cx.listener(move |picker, _, window, cx| {
@@ -1267,6 +1294,7 @@ impl PickerDelegate for WorktreePickerDelegate {
                                 }))
                                 .child(
                                     IconButton::new(("delete-worktree", ix), IconName::Trash)
+                                        .aria_label("Delete Worktree")
                                         .icon_size(IconSize::Small)
                                         .when(force_delete, |this| this.icon_color(Color::Error))
                                         .tooltip(move |_, cx| {
@@ -1745,6 +1773,59 @@ mod tests {
         worktrees
             .iter()
             .any(|worktree| worktree.path == *worktree_path)
+    }
+
+    /// A row's per-worktree controls are icon buttons, which cannot name
+    /// themselves the way a text button does. Read out of a drawn frame rather
+    /// than from the builder calls: a role only becomes a node when its element
+    /// also has an id, and a name only reaches a reader if it is on the node.
+    #[gpui::test]
+    async fn the_worktree_rows_and_their_controls_are_named(cx: &mut TestAppContext) {
+        let (_, worktree_picker, _repository, _worktree_path, mut cx) =
+            init_worktree_picker_test(cx).await;
+
+        // The harness builds the picker without showing it, and an unmounted
+        // view renders nothing at all.
+        drop(worktree_picker);
+        let workspace = cx
+            .update(|window, _| window.root::<MultiWorkspace>())
+            .flatten()
+            .expect("the harness opens a workspace window")
+            .read_with(&cx, |multi_workspace, _| multi_workspace.workspace().clone());
+        workspace.update_in(&mut cx, |workspace, window, cx| {
+            let project = workspace.project().clone();
+            let workspace_handle = workspace.weak_handle();
+            let focused_dock = workspace.focused_dock_position(window, cx);
+            workspace.toggle_modal(window, cx, move |window, cx| {
+                WorktreePicker::new_modal(project, workspace_handle, focused_dock, window, cx)
+            });
+        });
+        cx.run_until_parked();
+
+        cx.activate_a11y(cx.window_handle());
+        let json = cx
+            .update(|window, cx| {
+                window.draw(cx).clear(cx);
+                window.debug_a11y_tree_json()
+            })
+            .expect("activation makes the debug tree available");
+        let tree: serde_json::Value = serde_json::from_str(&json).expect("the dump is valid JSON");
+
+        gpui::a11y_checks::assert_interactive_nodes_are_named(&tree, "worktree picker");
+        gpui::a11y_checks::assert_no_role_was_discarded(&tree, "worktree picker");
+        gpui::a11y_checks::assert_roles_are_contained(&tree, "worktree picker");
+        gpui::a11y_checks::assert_click_targets_are_reachable(&tree, "worktree picker");
+
+        let options = tree["nodes"]
+            .as_object()
+            .expect("the dump lists nodes")
+            .values()
+            .filter(|node| node["aria"]["role"] == "ListBoxOption")
+            .count();
+        assert!(
+            options > 0,
+            "the picker showed no worktrees, so this check would pass on an empty list: {json}"
+        );
     }
 
     #[gpui::test]
