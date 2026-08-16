@@ -37,6 +37,7 @@ workspace.workspace = true
 zed_actions.workspace = true
 
 [dev-dependencies]
+serde_json.workspace = true
 
 db = { workspace = true, features = ["test-support"] }
 editor = { workspace = true, features = ["test-support"] }

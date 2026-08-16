@@ -872,6 +872,74 @@ mod tests {
         assert!(!is_zed_link("zed:file/src/main.rs"));
     }
 
+    /// The command palette is a core surface (§15.7) and the one a keyboard-only
+    /// user reaches for first. Checks what it actually exposes: a list box of
+    /// named options inside a dialog, with no control announced as a bare role.
+    #[gpui::test]
+    async fn test_the_open_palette_exposes_named_options(cx: &mut TestAppContext) {
+        let app_state = init_test(cx);
+        let db = cx.update(|cx| persistence::CommandPaletteDB::global(cx));
+        db.clear_all().await.unwrap();
+        let project = Project::test(app_state.fs.clone(), [], cx).await;
+        let (multi_workspace, cx) =
+            cx.add_window_view(|window, cx| MultiWorkspace::test_new(project.clone(), window, cx));
+        let workspace = multi_workspace.read_with(cx, |mw, _| mw.workspace().clone());
+
+        let editor = cx.new_window_entity(|window, cx| Editor::single_line(window, cx));
+        workspace.update_in(cx, |workspace, window, cx| {
+            workspace.add_item_to_active_pane(Box::new(editor.clone()), None, true, window, cx);
+            editor.update(cx, |editor, cx| window.focus(&editor.focus_handle(cx), cx))
+        });
+        cx.simulate_keystrokes("cmd-shift-p");
+        cx.run_until_parked();
+
+        cx.activate_a11y(cx.window_handle());
+        let json = cx
+            .update(|window, cx| {
+                window.draw(cx).clear(cx);
+                window.debug_a11y_tree_json()
+            })
+            .expect("activation makes the debug tree available");
+        let tree: serde_json::Value = serde_json::from_str(&json).expect("the dump is valid JSON");
+        let nodes = tree["nodes"].as_object().expect("the dump lists nodes");
+
+        let role_count = |role: &str| {
+            nodes
+                .values()
+                .filter(|node| node["aria"]["role"] == role)
+                .count()
+        };
+        assert!(role_count("Dialog") > 0, "an open palette is a modal dialog");
+        assert!(
+            role_count("ListBox") > 0,
+            "the command list must be reported as one"
+        );
+        assert!(
+            role_count("ListBoxOption") > 0,
+            "the palette had no options to announce"
+        );
+
+        const NEEDS_A_NAME: &[&str] = &["Button", "Tab", "TreeItem", "ListBoxOption", "Link"];
+        let unnamed: Vec<String> = nodes
+            .values()
+            .filter(|node| {
+                node["aria"]["role"]
+                    .as_str()
+                    .is_some_and(|role| NEEDS_A_NAME.contains(&role))
+            })
+            .filter(|node| {
+                ["label", "value", "placeholder"]
+                    .iter()
+                    .all(|field| node["aria"][field].as_str().is_none_or(str::is_empty))
+            })
+            .map(|node| format!("{} ({})", node["aria"]["role"], node["element_id"]))
+            .collect();
+        assert!(
+            unnamed.is_empty(),
+            "these nodes are announced as a bare role: {unnamed:?}"
+        );
+    }
+
     #[gpui::test]
     async fn test_command_palette(cx: &mut TestAppContext) {
         let app_state = init_test(cx);
