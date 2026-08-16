@@ -123,6 +123,12 @@ impl PickerDelegate for PickerPromptDelegate {
         self.prompt.clone()
     }
 
+    /// Rows are announced by the option they offer. Without this every choice
+    /// in the prompt is a bare "option".
+    fn match_label(&self, ix: usize, _cx: &App) -> Option<SharedString> {
+        Some(self.matches.get(ix)?.string.clone().into())
+    }
+
     fn match_count(&self) -> usize {
         self.matches.len()
     }

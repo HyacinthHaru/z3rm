@@ -1289,6 +1289,12 @@ impl PickerDelegate for BranchListDelegate {
         }
     }
 
+    /// Rows are announced by the branch or name they show. Without this every
+    /// row in the list is a bare "option".
+    fn match_label(&self, ix: usize, _cx: &App) -> Option<SharedString> {
+        Some(SharedString::from(self.matches.get(ix)?.name().to_string()))
+    }
+
     fn match_count(&self) -> usize {
         self.matches.len()
     }

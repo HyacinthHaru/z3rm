@@ -787,6 +787,23 @@ impl PickerDelegate for Delegate {
         ]
     }
 
+    /// Rows are announced by the file and line they point at; headers and
+    /// separators are not selectable, so naming them would offer rows the
+    /// arrow keys skip. Without this every result is a bare "option".
+    fn match_label(&self, ix: usize, _cx: &App) -> Option<SharedString> {
+        match self.entries.get(ix)? {
+            Entry::Header(_) | Entry::Separator => None,
+            Entry::Match(match_ix) => {
+                let search_match = self.matches.get(*match_ix)?;
+                let file = search_match.path.path.file_name()?;
+                Some(SharedString::from(format!(
+                    "{file}, line {}",
+                    search_match.line_number
+                )))
+            }
+        }
+    }
+
     fn match_count(&self) -> usize {
         self.entries.len()
     }

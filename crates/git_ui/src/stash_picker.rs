@@ -377,6 +377,17 @@ impl PickerDelegate for StashListDelegate {
         "Select a stash…".into()
     }
 
+    /// Rows are announced by the same message the row shows, with the branch
+    /// the stash came from. Without this every stash is a bare "option".
+    fn match_label(&self, ix: usize, _cx: &App) -> Option<SharedString> {
+        let entry = &self.matches.get(ix)?.entry;
+        let message = Self::format_message(entry.index, &entry.message);
+        Some(match entry.branch.as_ref() {
+            Some(branch) => SharedString::from(format!("{message}, on {branch}")),
+            None => SharedString::from(message),
+        })
+    }
+
     fn match_count(&self) -> usize {
         self.matches.len()
     }

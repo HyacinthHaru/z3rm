@@ -152,6 +152,13 @@ impl PickerDelegate for RepositorySelectorDelegate {
         "repository selector"
     }
 
+    /// Rows are announced by the repository they point at. Without this every
+    /// row in the list is a bare "option".
+    fn match_label(&self, ix: usize, cx: &App) -> Option<SharedString> {
+        let repository = self.filtered_repositories.get(ix)?;
+        Some(repository.read(cx).display_name())
+    }
+
     fn match_count(&self) -> usize {
         self.filtered_repositories.len()
     }

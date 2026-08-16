@@ -150,6 +150,12 @@ impl PickerDelegate for CommitTagPickerDelegate {
         "Copy Tag".into()
     }
 
+    /// Rows are announced by the tag they name. Without this every tag in the
+    /// list is a bare "option".
+    fn match_label(&self, ix: usize, _cx: &App) -> Option<SharedString> {
+        self.tag_names.get(ix).cloned()
+    }
+
     fn match_count(&self) -> usize {
         self.tag_names.len()
     }

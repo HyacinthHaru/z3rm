@@ -205,6 +205,12 @@ impl PickerDelegate for LanguageSelectorDelegate {
         "Select a language…".into()
     }
 
+    /// Rows are announced by the text they show. Without this every row in the
+    /// list is a bare "option".
+    fn match_label(&self, ix: usize, _cx: &App) -> Option<SharedString> {
+        Some(self.matches.get(ix)?.string.clone().into())
+    }
+
     fn match_count(&self) -> usize {
         self.matches.len()
     }
