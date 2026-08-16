@@ -6415,6 +6415,13 @@ impl GitPanel {
                 .into_any_element()
             } else {
                 Checkbox::new(checkbox_id, toggle_state)
+                    .aria_label(match section {
+                        Section::Conflict => "Stage all conflicts",
+                        Section::Tracked => "Stage all tracked changes",
+                        Section::New => "Stage all new files",
+                        Section::Staged => "Unstage all",
+                        Section::Unstaged => "Stage all",
+                    })
                     .disabled(!has_write_access)
                     .fill()
                     .elevation(ElevationIndex::Surface)
@@ -6614,6 +6621,7 @@ impl GitPanel {
             Color::Muted
         };
 
+        let staged_label: SharedString = format!("Stage {display_name}").into();
         let id: ElementId = ElementId::Name(format!("entry_{}_{}", display_name, ix).into());
         let checkbox_wrapper_id: ElementId =
             ElementId::Name(format!("entry_{}_{}_checkbox_wrapper", display_name, ix).into());
@@ -6795,6 +6803,7 @@ impl GitPanel {
                         .into_any_element()
                     } else {
                         Checkbox::new(checkbox_id, is_staged)
+                            .aria_label(staged_label.clone())
                             .disabled(!has_write_access)
                             .fill()
                             .elevation(ElevationIndex::Surface)

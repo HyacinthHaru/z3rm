@@ -540,6 +540,12 @@ mod tests {
         let tree: serde_json::Value =
             serde_json::from_str(&json).expect("the dump is valid JSON");
 
+        gpui::a11y_checks::assert_interactive_nodes_are_named(&tree, "diff review");
+        gpui::a11y_checks::assert_no_role_was_discarded(&tree, "diff review");
+        gpui::a11y_checks::assert_roles_are_contained(&tree, "diff review");
+        gpui::a11y_checks::assert_click_targets_are_reachable(&tree, "diff review");
+        gpui::a11y_checks::assert_focus_reached_the_tree(&tree, "diff review");
+
         assert_eq!(
             tree["frame"]["focus_without_node"].as_str(),
             None,

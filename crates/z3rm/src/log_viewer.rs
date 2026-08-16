@@ -825,4 +825,60 @@ mod tests {
         assert!(matches(&entries[0], "hello"));
         assert!(!matches(&entries[1], "hello"));
     }
+
+    /// The log viewer is where a user goes when something has gone wrong, so
+    /// it is a bad place to be silent. Read out of a drawn frame rather than
+    /// from the builder call: a role only becomes a node when its element also
+    /// has an id, and focus lands here when the view opens.
+    #[gpui::test]
+    async fn the_log_viewer_is_announced_and_names_its_controls(cx: &mut gpui::TestAppContext) {
+        cx.update(|cx| {
+            let settings_store = settings::SettingsStore::test(cx);
+            cx.set_global(settings_store);
+            theme_settings::init(theme::LoadThemes::JustBase, cx);
+        });
+
+        let window = cx.add_window(|window, cx| LogViewer::new(window, cx));
+        cx.activate_a11y(window.into());
+
+        let json = cx
+            .update_window(window.into(), |view, window, cx| {
+                if let Ok(viewer) = view.downcast::<LogViewer>() {
+                    let handle = viewer.read(cx).focus_handle.clone();
+                    window.focus(&handle, cx);
+                }
+                window.draw(cx).clear(cx);
+                window.debug_a11y_tree_json()
+            })
+            .expect("the log window is still open")
+            .expect("activation makes the debug tree available");
+        let tree: serde_json::Value = serde_json::from_str(&json).expect("the dump is valid JSON");
+
+        gpui::a11y_checks::assert_interactive_nodes_are_named(&tree, "log viewer");
+        gpui::a11y_checks::assert_no_role_was_discarded(&tree, "log viewer");
+        gpui::a11y_checks::assert_roles_are_contained(&tree, "log viewer");
+        gpui::a11y_checks::assert_click_targets_are_reachable(&tree, "log viewer");
+        gpui::a11y_checks::assert_focus_reached_the_tree(&tree, "log viewer");
+
+        // The filter checkboxes are the only controls here; a viewer that
+        // announces its own name and nothing inside it is no more usable than
+        // one that announces nothing.
+        let checkboxes: Vec<&str> = tree["nodes"]
+            .as_object()
+            .expect("the dump lists nodes")
+            .values()
+            .filter(|node| node["aria"]["role"] == "CheckBox")
+            .filter_map(|node| node["aria"]["label"].as_str())
+            .collect();
+        assert!(
+            checkboxes.len() >= 5,
+            "every log level filter has to be reachable: {checkboxes:?}"
+        );
+
+        let focused = tree["gpui_focus"]
+            .as_str()
+            .and_then(|id| tree["nodes"].get(id))
+            .expect("the focus must name a node in the dump");
+        assert_eq!(focused["aria"]["label"].as_str(), Some("Log viewer"));
+    }
 }
