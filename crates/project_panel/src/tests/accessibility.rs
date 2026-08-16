@@ -35,12 +35,25 @@ async fn the_file_tree_is_exposed_as_a_named_tree(cx: &mut gpui::TestAppContext)
     let mut cx = VisualTestContext::from_window(window.into(), cx);
     let panel = workspace.update_in(&mut cx, ProjectPanel::new);
     workspace.update_in(&mut cx, |workspace, window, cx| {
-        workspace.add_panel(panel, window, cx);
+        workspace.add_panel(panel.clone(), window, cx);
         workspace.open_panel::<ProjectPanel>(window, cx);
     });
     cx.run_until_parked();
 
+    // Focus the panel and move the highlight onto a row: an active-descendant
+    // claim is only honoured while the claiming row has a focused ancestor,
+    // and with no selection there is nothing to claim.
+    panel.update_in(&mut cx, |panel, window, cx| {
+        window.focus(&gpui::Focusable::focus_handle(panel, cx), cx);
+        panel.select_first(&Default::default(), window, cx);
+    });
+    cx.run_until_parked();
+
     cx.activate_a11y(cx.window_handle());
+    // The selection lands a frame after the action, so the first frame is drawn
+    // and discarded before anything is read out of the tree.
+    cx.update(|window, cx| window.draw(cx).clear(cx));
+    cx.run_until_parked();
     // Checked on two consecutive frames: a dock hosts its panel in a cached
     // view, and a cached view that replays its recorded prepaint contributes
     // no nodes at all, so the panel can be reported once and then vanish on
@@ -93,5 +106,6 @@ async fn the_file_tree_is_exposed_as_a_named_tree(cx: &mut gpui::TestAppContext)
                 .all(|(name, level)| !name.is_empty() && *level >= 1),
             "every row needs a name and a 1-based depth: {rows:?}"
         );
+
     }
 }

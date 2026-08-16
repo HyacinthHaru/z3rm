@@ -5497,6 +5497,7 @@ impl ProjectPanel {
         let announced_name = details.filename.clone();
         let announced_depth = details.depth;
         let announced_expanded = details.is_expanded;
+        let announced_selected = details.is_selected;
         let is_sticky = details.sticky.is_some();
         let sticky_index = details.sticky.as_ref().map(|this| this.sticky_index);
         let settings = ProjectPanelSettings::get_global(cx);
@@ -5966,6 +5967,11 @@ impl ProjectPanel {
                     // be set separately, and is 1-based.
                     .aria_role(gpui::Role::TreeItem)
                     .aria_label(announced_name)
+                    // Focus stays on the panel while the arrow keys move a
+                    // highlight through it, so the current row reaches a reader
+                    // only through the selected state and the active descendant.
+                    .aria_selected(announced_selected)
+                    .when(announced_selected, ListItem::aria_active_descendant)
                     .aria_level(announced_depth + 1)
                     .when(kind.is_dir(), |this| this.aria_expanded(announced_expanded))
                     .indent_level(depth)

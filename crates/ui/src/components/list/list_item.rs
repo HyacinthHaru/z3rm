@@ -57,6 +57,7 @@ pub struct ListItem {
     aria_label: Option<SharedString>,
     aria_keyshortcuts: Option<SharedString>,
     aria_checked: Option<bool>,
+    aria_selected: Option<bool>,
     aria_level: Option<usize>,
     aria_expanded: Option<bool>,
     aria_active_descendant: bool,
@@ -95,6 +96,7 @@ impl ListItem {
             aria_label: None,
             aria_keyshortcuts: None,
             aria_checked: None,
+            aria_selected: None,
             aria_level: None,
             aria_expanded: None,
             aria_active_descendant: false,
@@ -139,6 +141,13 @@ impl ListItem {
     /// as "level N". Requires [`Self::aria_role`] to be set. Levels are
     /// 1-based, so a root item is level 1. [`Self::indent_level`] only controls
     /// visual indentation and carries no meaning for screen readers.
+    /// Sets whether this item is the current one in its list. Requires
+    /// [`Self::aria_role`] to be set.
+    pub fn aria_selected(mut self, selected: bool) -> Self {
+        self.aria_selected = Some(selected);
+        self
+    }
+
     pub fn aria_level(mut self, level: usize) -> Self {
         self.aria_level = Some(level);
         self
@@ -356,6 +365,9 @@ impl RenderOnce for ListItem {
                         |this| this.aria_active_descendant(),
                     )
                     .when_some(self.aria_label, |this, label| this.aria_label(label))
+                    .when_some(self.aria_selected, |this, selected| {
+                        this.aria_selected(selected)
+                    })
                     .when_some(self.aria_keyshortcuts, |this, keyshortcuts| {
                         this.aria_keyshortcuts(keyshortcuts)
                     })

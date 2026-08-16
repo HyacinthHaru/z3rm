@@ -2857,6 +2857,7 @@ impl Pane {
             // `tab_content` renders arbitrary elements, so the announced name
             // comes from the item's own text rather than the rendered tab.
             .aria_label(item.tab_content_text(detail, cx))
+            .aria_position(ix + 1, self.items.len())
             .position(if is_first_item {
                 TabPosition::First
             } else if is_last_item {

@@ -233,6 +233,7 @@ pub mod a11y_checks {
     pub const ROLES_NEEDING_A_NAME: &[&str] = &[
         "Button",
         "CheckBox",
+        "ComboBox",
         "Link",
         "ListBoxOption",
         "MenuItem",

@@ -6713,6 +6713,10 @@ impl GitPanel {
             .role(gpui::Role::ListBoxOption)
             .aria_label(announced_name)
             .aria_selected(selected)
+            // Focus stays on the panel while the arrow keys move a highlight
+            // through it, so the current row is only announced if it is also
+            // claimed as the active descendant.
+            .when(selected, |this| this.aria_active_descendant())
             .h(self.list_item_height())
             .w_full()
             .pl_3()
@@ -11370,6 +11374,21 @@ mod tests {
         });
         await_git_panel_entries(&panel, &mut cx).await;
 
+        // Focus stays on the panel while the arrow keys move a highlight through
+        // it, so the current row reaches a reader only through the selected
+        // state and the active descendant.
+        let entry_index = panel
+            .read_with(&cx, |panel, _| {
+                entry_index_for_repo_path(panel, &repo_path("tracked"))
+            })
+            .expect("the tracked file has a row");
+        panel.update_in(&mut cx, |panel, window, cx| {
+            window.focus(&panel.focus_handle, cx);
+            panel.selected_entry = Some(entry_index);
+            cx.notify();
+        });
+        cx.run_until_parked();
+
         cx.activate_a11y(cx.window_handle());
         let json = cx
             .update(|window, cx| {
@@ -11379,6 +11398,14 @@ mod tests {
             .expect("activation makes the debug tree available");
         let tree: serde_json::Value = serde_json::from_str(&json).expect("the dump is valid JSON");
         let nodes = tree["nodes"].as_object().expect("the dump lists nodes");
+
+        let current = tree["active_descendant_focus"]
+            .as_str()
+            .and_then(|id| nodes.get(id))
+            .unwrap_or_else(|| panic!("the panel must point at the row it highlights: {json}"));
+        assert_eq!(current["aria"]["role"].as_str(), Some("ListBoxOption"));
+        assert_eq!(current["aria"]["selected"].as_bool(), Some(true));
+        assert_eq!(current["aria"]["label"].as_str(), Some("tracked"));
 
         gpui::a11y_checks::assert_interactive_nodes_are_named(&tree, "git panel");
         gpui::a11y_checks::assert_no_role_was_discarded(&tree, "git panel");
