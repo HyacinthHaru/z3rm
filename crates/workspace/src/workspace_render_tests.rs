@@ -283,3 +283,53 @@ async fn test_region_navigation_reaches_the_session_sidebar(cx: &mut TestAppCont
         "FocusNextPart must reach the session sidebar within one full rotation"
     );
 }
+
+/// Notifications appear away from wherever the user is working and several can
+/// stack up. Without a live region the container is just a `div`, so nothing is
+/// ever announced and a screen-reader user has no idea anything happened.
+#[gpui::test]
+async fn test_notifications_are_announced_as_a_live_region(cx: &mut TestAppContext) {
+    init_test(cx);
+    let fs = FakeFs::new(cx.executor());
+    fs.insert_tree("/root", json!({ "a.txt": "" })).await;
+    let project = Project::test(fs, [path!("/root").as_ref()], cx).await;
+
+    let (multi_workspace, cx) =
+        cx.add_window_view(|window, cx| MultiWorkspace::test_new(project, window, cx));
+    let workspace = multi_workspace.read_with(cx, |mw, _| mw.workspace().clone());
+
+    workspace.update(cx, |workspace, cx| {
+        struct TestNotification;
+        workspace.show_notification(crate::NotificationId::unique::<TestNotification>(), cx, |cx| {
+            cx.new(|cx| {
+                crate::notifications::simple_message_notification::MessageNotification::new(
+                    "the mux server went away",
+                    cx,
+                )
+            })
+        });
+    });
+    cx.run_until_parked();
+
+    cx.activate_a11y(cx.window_handle());
+    let json = cx
+        .update(|window, cx| {
+            window.draw(cx).clear(cx);
+            window.debug_a11y_tree_json()
+        })
+        .expect("activation makes the debug tree available");
+    let tree: serde_json::Value = serde_json::from_str(&json).expect("the dump is valid JSON");
+
+    let log = tree["nodes"]
+        .as_object()
+        .expect("the dump lists nodes")
+        .values()
+        .find(|node| node["aria"]["role"] == "Log")
+        .expect("the notification stack must be reported as a log");
+    assert_eq!(
+        log["aria"]["live"].as_str(),
+        Some("Polite"),
+        "a notification that arrives on its own has to be announced"
+    );
+    assert_eq!(log["aria"]["label"].as_str(), Some("Notifications"));
+}

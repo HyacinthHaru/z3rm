@@ -5548,12 +5548,26 @@ impl Workspace {
         self.update_window_edited(window, cx);
     }
 
-    fn render_notifications(&self, _window: &mut Window, _cx: &mut Context<Self>) -> Option<Div> {
+    fn render_notifications(
+        &self,
+        _window: &mut Window,
+        _cx: &mut Context<Self>,
+    ) -> Option<gpui::Stateful<Div>> {
         if self.notifications.is_empty() {
             None
         } else {
             Some(
                 div()
+                    .id("workspace-notifications")
+                    // Notifications appear on their own, away from wherever the
+                    // user is working, and several can stack up — which is what
+                    // `Log` describes and what a live region makes audible.
+                    // Polite rather than assertive: an error that already
+                    // happened does not justify cutting off whatever is being
+                    // read.
+                    .role(gpui::Role::Log)
+                    .aria_live(gpui::accesskit::Live::Polite)
+                    .aria_label("Notifications")
                     .absolute()
                     .right_3()
                     .bottom_3()

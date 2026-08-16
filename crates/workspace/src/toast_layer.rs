@@ -232,6 +232,10 @@ impl Render for ToastLayer {
         div().absolute().size_full().bottom_0().left_0().child(
             v_flex()
                 .id(("toast-layer-container", active_toast.id))
+                // A toast is transient status the user never navigates to, so
+                // it is only ever perceived if it is announced.
+                .role(gpui::Role::Status)
+                .aria_live(gpui::accesskit::Live::Polite)
                 .absolute()
                 .w_full()
                 .bottom(px(0.))
