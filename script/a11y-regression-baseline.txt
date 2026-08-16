@@ -1,8 +1,8 @@
 # Tests already failing at the branch point (34c034625d), verified there.
 #
-# shadow_snapshot_rpc_round_trip: the watcher reports a "write" trigger where
-# the test expects "close".
-# confine_to_root_anchors_relative_paths_and_denies_escapes: macOS resolves the
-# temp dir through /private/var, and the path comparison does not canonicalize.
+# shadow_snapshot_rpc_round_trip: a file written before the watcher was armed
+# is reported by list_changed_files as changed. That is a real behavioural
+# failure in the snapshot watcher rather than a test artefact, and it is
+# unrelated to this branch — but it is worth someone's attention rather than
+# living here forever.
 shadow_snapshot_rpc_round_trip
-tests::confine_to_root_anchors_relative_paths_and_denies_escapes
