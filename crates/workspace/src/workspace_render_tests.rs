@@ -334,6 +334,82 @@ async fn test_notifications_are_announced_as_a_live_region(cx: &mut TestAppConte
     assert_eq!(log["aria"]["label"].as_str(), Some("Notifications"));
 }
 
+/// A node that advertises an action but cannot be operated by it reads as
+/// working right up until someone tries. GPUI advertises `Click` for anything
+/// with a click handler and answers it by synthesizing a mouse press at the
+/// node's centre — which lands wherever the layout puts it, not necessarily on
+/// the control that asked for the action.
+#[gpui::test]
+async fn test_the_zoom_button_can_be_operated_through_its_action(cx: &mut TestAppContext) {
+    init_test(cx);
+    let fs = FakeFs::new(cx.executor());
+    fs.insert_tree("/root", json!({ "a.txt": "" })).await;
+    let project = Project::test(fs, [path!("/root").as_ref()], cx).await;
+
+    let (multi_workspace, cx) =
+        cx.add_window_view(|window, cx| MultiWorkspace::test_new(project, window, cx));
+    let workspace = multi_workspace.read_with(cx, |mw, _| mw.workspace().clone());
+    let pane = workspace.read_with(cx, |ws, _| ws.active_pane().clone());
+
+    pane.update_in(cx, |pane, window, cx| {
+        pane.add_item(
+            Box::new(cx.new(|cx| TestItem::new(cx).with_label("shell"))),
+            true,
+            true,
+            None,
+            window,
+            cx,
+        );
+    });
+    cx.run_until_parked();
+
+    cx.activate_a11y(cx.window_handle());
+    let json = cx
+        .update(|window, cx| {
+            window.draw(cx).clear(cx);
+            window.debug_a11y_tree_json()
+        })
+        .expect("activation makes the debug tree available");
+    let tree: serde_json::Value = serde_json::from_str(&json).expect("the dump is valid JSON");
+
+    let zoom = tree["nodes"]
+        .as_object()
+        .expect("the dump lists nodes")
+        .values()
+        .find(|node| node["element_id"].as_str() == Some("Name(\"toggle_zoom\")"))
+        .expect("the zoom control must be in the tree");
+    assert_eq!(zoom["aria"]["label"].as_str(), Some("Zoom In"));
+    assert!(
+        zoom["aria"]["on_action"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .any(|action| action == "Click"),
+        "the control has to advertise that it can be clicked: {zoom}"
+    );
+
+    let node_id = zoom["accesskit_id"]
+        .as_str()
+        .and_then(|id| id.parse::<u64>().ok())
+        .expect("every node in the dump carries its AccessKit id");
+    let delivered = cx.simulate_a11y_action(
+        cx.window_handle(),
+        gpui::accesskit::ActionRequest {
+            target_tree: gpui::accesskit::TreeId::ROOT,
+            target_node: gpui::accesskit::NodeId(node_id),
+            action: gpui::accesskit::Action::Click,
+            data: None,
+        },
+    );
+    assert!(delivered, "the action must reach the window");
+    cx.run_until_parked();
+
+    assert!(
+        pane.read_with(cx, |pane, _| pane.is_zoomed()),
+        "advertising Click is worth nothing if it does not zoom the pane"
+    );
+}
+
 /// A live region announces changes made *inside* it. A region that is created
 /// at the same moment as its first message has nothing to compare against, so
 /// both regions have to be in the tree before there is anything to say.
