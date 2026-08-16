@@ -215,6 +215,21 @@ fn node_to_json(
         map.insert("children".into(), json!(children));
     }
 
+    // A node's geometry decides where a synthesized `Click` action lands, so a
+    // dump that omits it cannot answer whether an advertised action reaches the
+    // control that advertised it.
+    if let Some(bounds) = node.bounds() {
+        map.insert(
+            "bounds".into(),
+            json!({
+                "x0": bounds.x0,
+                "y0": bounds.y0,
+                "x1": bounds.x1,
+                "y1": bounds.y1,
+            }),
+        );
+    }
+
     // Provenance (debug builds only), ordered before the accessibility section.
     if let Some(element_id) = provenance.element_id {
         map.insert("element_id".into(), json!(element_id));

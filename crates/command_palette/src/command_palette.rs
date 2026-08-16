@@ -922,6 +922,7 @@ mod tests {
         gpui::a11y::assert_interactive_nodes_are_named(&tree, "open command palette");
         gpui::a11y::assert_no_role_was_discarded(&tree, "open command palette");
         gpui::a11y::assert_roles_are_contained(&tree, "open command palette");
+        gpui::a11y::assert_click_targets_are_reachable(&tree, "open command palette");
 
         // Focus is in the query editor, which is not an ancestor of the match
         // rows, so GPUI cannot report the highlighted match without misstating

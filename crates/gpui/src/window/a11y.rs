@@ -1442,4 +1442,52 @@ mod activation_tests {
             "the report has to say which role was lost: {discarded:?}"
         );
     }
+
+    /// A control whose centre is covered by a smaller clickable child is the
+    /// shape that makes an advertised `Click` land somewhere else — a close
+    /// button inside a tab is the real case. Proven end to end so the check
+    /// cannot quietly become vacuous.
+    #[crate::test]
+    #[should_panic(expected = "would click")]
+    fn a_click_target_covered_by_its_own_child_is_reported(cx: &mut TestAppContext) {
+        use crate::Styled as _;
+
+        struct Nested;
+        impl Render for Nested {
+            fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+                div()
+                    .id("outer")
+                    .role(accesskit::Role::Button)
+                    .aria_label("Outer")
+                    .w(crate::px(100.0))
+                    .h(crate::px(100.0))
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .on_click(|_, _, _| {})
+                    .child(
+                        div()
+                            .id("inner")
+                            .role(accesskit::Role::Button)
+                            .aria_label("Inner")
+                            .w(crate::px(40.0))
+                            .h(crate::px(40.0))
+                            .on_click(|_, _, _| {}),
+                    )
+            }
+        }
+
+        let window = cx.add_window(|_, _| Nested);
+        cx.activate_a11y(window.into());
+        let json = cx
+            .update_window(window.into(), |_, window, cx| {
+                window.draw(cx).clear(cx);
+                window.debug_a11y_tree_json()
+            })
+            .expect("the window is open")
+            .expect("activation makes the debug tree available");
+        let tree: serde_json::Value = serde_json::from_str(&json).expect("the dump is valid JSON");
+
+        crate::test::a11y::assert_click_targets_are_reachable(&tree, "nested click targets");
+    }
 }

@@ -5215,6 +5215,7 @@ pub mod test {
         gpui::a11y::assert_interactive_nodes_are_named(&tree, "settings window");
         gpui::a11y::assert_no_role_was_discarded(&tree, "settings window");
         gpui::a11y::assert_roles_are_contained(&tree, "settings window");
+        gpui::a11y::assert_click_targets_are_reachable(&tree, "settings window");
 
         // Guards against the whole check passing because nothing rendered.
         let interactive = nodes

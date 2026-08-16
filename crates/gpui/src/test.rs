@@ -319,6 +319,86 @@ pub mod a11y {
         );
     }
 
+    /// Panics if a control that advertises `Click` would have the action land
+    /// on one of its own descendants.
+    ///
+    /// GPUI answers an incoming `Click` by synthesizing a mouse press at the
+    /// node's bounds centre. When a smaller clickable node sits at that centre
+    /// — a close button inside a tab, say — the action reaches the wrong
+    /// control, and the node reads as operable right up until someone tries.
+    #[track_caller]
+    pub fn assert_click_targets_are_reachable(tree: &serde_json::Value, context: &str) {
+        let nodes = nodes(tree);
+        let clickable = |node: &serde_json::Value| {
+            node["aria"]["on_action"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .any(|action| action == "Click")
+        };
+        let bounds = |node: &serde_json::Value| {
+            let bounds = node.get("bounds")?;
+            Some((
+                bounds["x0"].as_f64()?,
+                bounds["y0"].as_f64()?,
+                bounds["x1"].as_f64()?,
+                bounds["y1"].as_f64()?,
+            ))
+        };
+
+        let mut misdirected = Vec::new();
+        for node in nodes.values() {
+            if !clickable(node) {
+                continue;
+            }
+            let Some((x0, y0, x1, y1)) = bounds(node) else {
+                continue;
+            };
+            let (centre_x, centre_y) = ((x0 + x1) / 2.0, (y0 + y1) / 2.0);
+
+            // Only descendants: an ancestor covering the centre is the normal
+            // case and does not steal the click, since the press is dispatched
+            // to the topmost element at that point.
+            let mut stack: Vec<&str> = node["children"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .filter_map(|child| child.as_str())
+                .collect();
+            while let Some(descendant_id) = stack.pop() {
+                let Some(descendant) = nodes.get(descendant_id) else {
+                    continue;
+                };
+                stack.extend(
+                    descendant["children"]
+                        .as_array()
+                        .into_iter()
+                        .flatten()
+                        .filter_map(|child| child.as_str()),
+                );
+                if !clickable(descendant) {
+                    continue;
+                }
+                let Some((dx0, dy0, dx1, dy1)) = bounds(descendant) else {
+                    continue;
+                };
+                if (dx0..=dx1).contains(&centre_x) && (dy0..=dy1).contains(&centre_y) {
+                    misdirected.push(format!(
+                        "{} ({}) would click {} ({}) instead",
+                        node["aria"]["role"],
+                        node["element_id"],
+                        descendant["aria"]["role"],
+                        descendant["element_id"]
+                    ));
+                }
+            }
+        }
+        assert!(
+            misdirected.is_empty(),
+            "{context}: {misdirected:?}"
+        );
+    }
+
     /// Panics if a containment-dependent node has no matching container among
     /// its ancestors.
     #[track_caller]

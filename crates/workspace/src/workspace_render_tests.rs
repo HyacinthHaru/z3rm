@@ -674,6 +674,7 @@ async fn test_every_interactive_node_in_the_window_has_a_name(cx: &mut TestAppCo
     gpui::a11y::assert_interactive_nodes_are_named(&tree, "workspace window");
     gpui::a11y::assert_no_role_was_discarded(&tree, "workspace window");
     gpui::a11y::assert_roles_are_contained(&tree, "workspace window");
+    gpui::a11y::assert_click_targets_are_reachable(&tree, "workspace window");
     gpui::a11y::assert_focus_reached_the_tree(&tree, "workspace window");
 }
 
