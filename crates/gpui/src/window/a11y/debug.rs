@@ -309,6 +309,27 @@ fn node_to_json(
         aria.insert("column_count".into(), json!(v));
     }
 
+    // The caret is what tells assistive technology where typing lands, so a
+    // dump that omits it cannot answer "is the cursor exposed?".
+    if let Some(selection) = node.text_selection() {
+        let position = |position: &accesskit::TextPosition| {
+            json!({
+                "node": ephemeral
+                    .get(&position.node)
+                    .cloned()
+                    .unwrap_or_else(|| position.node.0.to_string()),
+                "character_index": position.character_index,
+            })
+        };
+        aria.insert(
+            "text_selection".into(),
+            json!({
+                "anchor": position(&selection.anchor),
+                "focus": position(&selection.focus),
+            }),
+        );
+    }
+
     map.insert("aria".into(), serde_json::Value::Object(aria));
 
     serde_json::Value::Object(map)

@@ -11,6 +11,7 @@ use image::RgbaImage;
 use parking_lot::Mutex;
 use raw_window_handle::{HasDisplayHandle, HasWindowHandle};
 use std::{
+    cell::Cell,
     rc::{Rc, Weak},
     sync::{self, Arc},
 };
@@ -34,8 +35,12 @@ pub(crate) struct TestWindowState {
     resize_callback: Option<Box<dyn FnMut(Size<Pixels>, f32)>>,
     moved_callback: Option<Box<dyn FnMut()>>,
     a11y_action_callback: Option<Box<dyn Fn(accesskit::ActionRequest) + Send + 'static>>,
+    appearance_change_callback: Option<Box<dyn FnMut()>>,
+    request_frame_callback: Option<Box<dyn FnMut(RequestFrameOptions)>>,
+    frame_wake_count: Rc<Cell<usize>>,
     input_handler: Option<PlatformInputHandler>,
     is_fullscreen: bool,
+    appearance: WindowAppearance,
 }
 
 #[derive(Clone)]
@@ -90,8 +95,12 @@ impl TestWindow {
             resize_callback: None,
             moved_callback: None,
             a11y_action_callback: None,
+            appearance_change_callback: None,
+            request_frame_callback: None,
+            frame_wake_count: Rc::new(Cell::new(0)),
             input_handler: None,
             is_fullscreen: false,
+            appearance: WindowAppearance::Light,
         })))
     }
 
@@ -116,6 +125,34 @@ impl TestWindow {
         drop(lock);
         callback(active);
         self.0.lock().active_status_change_callback = Some(callback);
+    }
+
+    pub fn simulate_appearance_change(&self, appearance: WindowAppearance) {
+        let mut lock = self.0.lock();
+        lock.appearance = appearance;
+        let Some(mut callback) = lock.appearance_change_callback.take() else {
+            return;
+        };
+        drop(lock);
+        callback();
+        self.0.lock().appearance_change_callback = Some(callback);
+    }
+
+    /// Returns how many times this window's frame waker has been invoked.
+    pub fn frame_wake_count(&self) -> usize {
+        self.0.lock().frame_wake_count.get()
+    }
+
+    /// Delivers a frame request to the window, as the platform's frame source
+    /// would.
+    pub fn simulate_frame_request(&self, options: RequestFrameOptions) {
+        let mut lock = self.0.lock();
+        let Some(mut callback) = lock.request_frame_callback.take() else {
+            return;
+        };
+        drop(lock);
+        callback(options);
+        self.0.lock().request_frame_callback = Some(callback);
     }
 
     pub fn simulate_input(&mut self, event: PlatformInput) -> bool {
@@ -174,7 +211,7 @@ impl PlatformWindow for TestWindow {
     }
 
     fn appearance(&self) -> WindowAppearance {
-        WindowAppearance::Light
+        self.0.lock().appearance
     }
 
     fn display(&self) -> Option<std::rc::Rc<dyn crate::PlatformDisplay>> {
@@ -284,7 +321,19 @@ impl PlatformWindow for TestWindow {
         self.0.lock().is_fullscreen
     }
 
-    fn on_request_frame(&self, _callback: Box<dyn FnMut(RequestFrameOptions)>) {}
+    fn frame_waker(&self) -> Option<Rc<dyn Fn()>> {
+        // Recording invocations (rather than delivering a frame) lets tests
+        // assert the wake protocol without coupling to frame timing; tests
+        // deliver frames explicitly via `simulate_frame_request`.
+        let frame_wake_count = self.0.lock().frame_wake_count.clone();
+        Some(Rc::new(move || {
+            frame_wake_count.set(frame_wake_count.get() + 1);
+        }))
+    }
+
+    fn on_request_frame(&self, callback: Box<dyn FnMut(RequestFrameOptions)>) {
+        self.0.lock().request_frame_callback = Some(callback);
+    }
 
     fn on_input(&self, callback: Box<dyn FnMut(crate::PlatformInput) -> DispatchEventResult>) {
         self.0.lock().input_callback = Some(callback)
@@ -316,7 +365,9 @@ impl PlatformWindow for TestWindow {
         self.0.lock().hit_test_window_control_callback = Some(callback);
     }
 
-    fn on_appearance_changed(&self, _callback: Box<dyn FnMut()>) {}
+    fn on_appearance_changed(&self, callback: Box<dyn FnMut()>) {
+        self.0.lock().appearance_change_callback = Some(callback);
+    }
 
     fn a11y_init(&self, callbacks: crate::A11yCallbacks) {
         let crate::A11yCallbacks {

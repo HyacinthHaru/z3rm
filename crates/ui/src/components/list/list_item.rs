@@ -57,6 +57,8 @@ pub struct ListItem {
     aria_label: Option<SharedString>,
     aria_keyshortcuts: Option<SharedString>,
     aria_checked: Option<bool>,
+    aria_level: Option<usize>,
+    aria_expanded: Option<bool>,
     aria_active_descendant: bool,
 }
 
@@ -93,6 +95,8 @@ impl ListItem {
             aria_label: None,
             aria_keyshortcuts: None,
             aria_checked: None,
+            aria_level: None,
+            aria_expanded: None,
             aria_active_descendant: false,
         }
     }
@@ -128,6 +132,23 @@ impl ListItem {
     /// "checked"/"not checked" accurately.
     pub fn aria_checked(mut self, checked: bool) -> Self {
         self.aria_checked = Some(checked);
+        self
+    }
+
+    /// Sets the item's depth in a hierarchy, announced by assistive technology
+    /// as "level N". Requires [`Self::aria_role`] to be set. Levels are
+    /// 1-based, so a root item is level 1. [`Self::indent_level`] only controls
+    /// visual indentation and carries no meaning for screen readers.
+    pub fn aria_level(mut self, level: usize) -> Self {
+        self.aria_level = Some(level);
+        self
+    }
+
+    /// Sets whether this item's children are shown, for items that can be
+    /// collapsed. Requires [`Self::aria_role`] to be set. Leave unset on items
+    /// that have no children, so they are not announced as collapsible.
+    pub fn aria_expanded(mut self, expanded: bool) -> Self {
+        self.aria_expanded = Some(expanded);
         self
     }
 
@@ -337,6 +358,12 @@ impl RenderOnce for ListItem {
                     .when_some(self.aria_label, |this, label| this.aria_label(label))
                     .when_some(self.aria_keyshortcuts, |this, keyshortcuts| {
                         this.aria_keyshortcuts(keyshortcuts)
+                    })
+                    .when(self.aria_role.is_some(), |this| {
+                        this.when_some(self.aria_level, |this, level| this.aria_level(level))
+                            .when_some(self.aria_expanded, |this, expanded| {
+                                this.aria_expanded(expanded)
+                            })
                     })
                     .when(self.aria_role.is_some(), |this| {
                         this.aria_selected(self.selected).when_some(

@@ -9,8 +9,8 @@ pub mod layer_shell;
 /// Types for configuring parent-anchored popup windows such as menus, dropdowns and tooltips.
 pub mod popup;
 
-#[cfg(any(test, feature = "bench"))]
-mod bench_dispatcher;
+#[cfg(any(test, feature = "test-support"))]
+mod threaded_dispatcher;
 
 #[cfg(any(test, feature = "test-support"))]
 mod test;
@@ -42,15 +42,15 @@ use crate::{
     RenderImageParams, RenderSvgParams, Scene, ShapedGlyph, ShapedRun, SharedString, Size,
     SvgRenderer, SystemWindowTab, Task, Window, WindowControlArea, hash, point, px, size,
 };
-use anyhow::Result;
 #[cfg(any(target_os = "linux", target_os = "freebsd"))]
 use anyhow::bail;
+use anyhow::{Context as _, Result};
 use async_task::Runnable;
 use futures::channel::oneshot;
 #[cfg(any(test, feature = "test-support"))]
 use image::RgbaImage;
 use image::codecs::gif::GifDecoder;
-use image::{AnimationDecoder as _, Frame};
+use image::{AnimationDecoder as _, DynamicImage, Frame};
 use raw_window_handle::{HasDisplayHandle, HasWindowHandle};
 use scheduler::Instant;
 pub use scheduler::RunnableMeta;
@@ -83,8 +83,8 @@ pub(crate) use test::*;
 #[cfg(any(test, feature = "test-support"))]
 pub use test::{TestDispatcher, TestScreenCaptureSource, TestScreenCaptureStream};
 
-#[cfg(any(test, feature = "bench"))]
-pub use bench_dispatcher::BenchDispatcher;
+#[cfg(any(test, feature = "test-support"))]
+pub use threaded_dispatcher::ThreadedDispatcher;
 
 #[cfg(all(target_os = "macos", any(test, feature = "test-support")))]
 pub use visual_test::VisualTestPlatform;
@@ -747,6 +747,9 @@ pub trait PlatformWindow: HasWindowHandle + HasDisplayHandle {
     fn zoom(&self);
     fn toggle_fullscreen(&self);
     fn is_fullscreen(&self) -> bool;
+    fn frame_waker(&self) -> Option<Rc<dyn Fn()>> {
+        None
+    }
     fn on_request_frame(&self, callback: Box<dyn FnMut(RequestFrameOptions)>);
     fn on_input(&self, callback: Box<dyn FnMut(PlatformInput) -> DispatchEventResult>);
     fn on_active_status_change(&self, callback: Box<dyn FnMut(bool)>);
@@ -800,6 +803,9 @@ pub trait PlatformWindow: HasWindowHandle + HasDisplayHandle {
     fn show_window_menu(&self, _position: Point<Pixels>) {}
     fn start_window_move(&self) {}
     fn start_window_resize(&self, _edge: ResizeEdge) {}
+    fn set_exclusive_zone(&self, _zone: Pixels) {}
+    #[cfg(all(target_os = "linux", feature = "wayland"))]
+    fn set_exclusive_edge(&self, _edge: layer_shell::Anchor) {}
     fn set_input_region(&self, _region: Option<&[Bounds<Pixels>]>) {}
     fn window_decorations(&self) -> Decorations {
         Decorations::Server
@@ -932,10 +938,10 @@ pub trait PlatformDispatcher: Send + Sync {
         None
     }
 
-    // This cfg must match the `bench_dispatcher` module's, which implements
+    // This cfg must match the `threaded_dispatcher` module's, which implements
     // this method whenever it compiles.
-    #[cfg(any(test, feature = "bench"))]
-    fn as_bench(&self) -> Option<&BenchDispatcher> {
+    #[cfg(any(test, feature = "test-support"))]
+    fn as_threaded(&self) -> Option<&ThreadedDispatcher> {
         None
     }
 }
@@ -1499,10 +1505,18 @@ impl PlatformInputHandler {
             .unwrap_or(true)
     }
 
-    #[allow(dead_code)]
+    /// See [`InputHandler::prefers_ime_for_printable_keys`].
+    ///
+    /// This is not a pure delegation to the handler: while a multi-stroke binding is pending this
+    /// returns `false` regardless of the handler's preference, because the next printable key may
+    /// complete a binding whose prefix already bypassed the IME.
     pub fn query_prefers_ime_for_printable_keys(&mut self) -> bool {
         self.cx
-            .update(|window, cx| self.handler.prefers_ime_for_printable_keys(window, cx))
+            .update(|window, cx| {
+                // The next printable key may complete a chord whose prefix bypassed the IME.
+                !window.has_pending_keystrokes()
+                    && self.handler.prefers_ime_for_printable_keys(window, cx)
+            })
             .unwrap_or(false)
     }
 }
@@ -2365,6 +2379,33 @@ pub struct Image {
     pub id: u64,
 }
 
+pub(crate) fn decode_static_image(
+    bytes: &[u8],
+    format: image::ImageFormat,
+) -> Result<SmallVec<[Frame; 1]>> {
+    let decoder = image::ImageReader::with_format(Cursor::new(bytes), format)
+        .into_decoder()
+        .context("creating image decoder")?;
+    decode_static_image_from_decoder(decoder)
+}
+
+pub(crate) fn decode_static_image_from_decoder(
+    mut decoder: impl image::ImageDecoder,
+) -> Result<SmallVec<[Frame; 1]>> {
+    let orientation = decoder
+        .orientation()
+        .context("reading decoder's orientation")?;
+    let mut image = DynamicImage::from_decoder(decoder).context("decoding image")?;
+    image.apply_orientation(orientation);
+
+    let mut data = image.into_rgba8();
+    for pixel in data.chunks_exact_mut(4) {
+        pixel.swap(0, 2);
+    }
+
+    Ok(SmallVec::from_elem(Frame::new(data), 1))
+}
+
 impl Hash for Image {
     fn hash<H: Hasher>(&self, state: &mut H) {
         state.write_u64(self.id);
@@ -2420,20 +2461,6 @@ impl Image {
 
     /// Convert the clipboard image to an `ImageData` object.
     pub fn to_image_data(&self, svg_renderer: SvgRenderer) -> Result<Arc<RenderImage>> {
-        fn frames_for_image(
-            bytes: &[u8],
-            format: image::ImageFormat,
-        ) -> Result<SmallVec<[Frame; 1]>> {
-            let mut data = image::load_from_memory_with_format(bytes, format)?.into_rgba8();
-
-            // Convert from RGBA to BGRA.
-            for pixel in data.chunks_exact_mut(4) {
-                pixel.swap(0, 2);
-            }
-
-            Ok(SmallVec::from_elem(Frame::new(data), 1))
-        }
-
         let frames = match self.format {
             ImageFormat::Gif => {
                 let decoder = GifDecoder::new(Cursor::new(&self.bytes))?;
@@ -2460,18 +2487,18 @@ impl Image {
 
                 frames
             }
-            ImageFormat::Png => frames_for_image(&self.bytes, image::ImageFormat::Png)?,
-            ImageFormat::Jpeg => frames_for_image(&self.bytes, image::ImageFormat::Jpeg)?,
-            ImageFormat::Webp => frames_for_image(&self.bytes, image::ImageFormat::WebP)?,
-            ImageFormat::Bmp => frames_for_image(&self.bytes, image::ImageFormat::Bmp)?,
-            ImageFormat::Tiff => frames_for_image(&self.bytes, image::ImageFormat::Tiff)?,
-            ImageFormat::Ico => frames_for_image(&self.bytes, image::ImageFormat::Ico)?,
+            ImageFormat::Png => decode_static_image(&self.bytes, image::ImageFormat::Png)?,
+            ImageFormat::Jpeg => decode_static_image(&self.bytes, image::ImageFormat::Jpeg)?,
+            ImageFormat::Webp => decode_static_image(&self.bytes, image::ImageFormat::WebP)?,
+            ImageFormat::Bmp => decode_static_image(&self.bytes, image::ImageFormat::Bmp)?,
+            ImageFormat::Tiff => decode_static_image(&self.bytes, image::ImageFormat::Tiff)?,
+            ImageFormat::Ico => decode_static_image(&self.bytes, image::ImageFormat::Ico)?,
             ImageFormat::Svg => {
                 return svg_renderer
                     .render_single_frame(&self.bytes, 1.0)
                     .map_err(Into::into);
             }
-            ImageFormat::Pnm => frames_for_image(&self.bytes, image::ImageFormat::Pnm)?,
+            ImageFormat::Pnm => decode_static_image(&self.bytes, image::ImageFormat::Pnm)?,
         };
 
         Ok(Arc::new(RenderImage::new(frames)))
@@ -2555,6 +2582,22 @@ impl From<String> for ClipboardString {
 mod image_tests {
     use super::*;
     use std::sync::Arc;
+
+    #[test]
+    fn test_image_to_image_data_applies_exif_orientation() {
+        let image = Image::from_bytes(
+            ImageFormat::Jpeg,
+            include_bytes!("../examples/image/exif-orientation-rotate-180.jpg").to_vec(),
+        );
+
+        let render_image = image.to_image_data(SvgRenderer::new(Arc::new(()))).unwrap();
+
+        assert_eq!(render_image.size(0), size(16.into(), 32.into()));
+
+        let bytes = render_image.as_bytes(0).unwrap();
+        assert_eq!(&bytes[..4], &[255, 255, 255, 255]);
+        assert_eq!(&bytes[(16 * 32 - 1) * 4..], &[0, 0, 0, 255]);
+    }
 
     #[test]
     fn test_svg_image_to_image_data_converts_to_bgra() {

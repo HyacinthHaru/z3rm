@@ -171,6 +171,48 @@ pub fn parse_vdom(value: &serde_json::Value) -> Result<VDomNode> {
     serde_json::from_value(normalized).map_err(|e| anyhow::anyhow!("VDOM parse error: {}", e))
 }
 
+/// The explicit accessible name an extension set on a node, if any.
+fn explicit_aria_label(node: &VDomNode) -> Option<&str> {
+    node.props
+        .get("aria-label")
+        .or_else(|| node.props.get("ariaLabel"))
+        .and_then(|value| value.as_str())
+}
+
+/// Append a node's descendant text to `out`, separating runs with a space.
+fn collect_text_content(node: &VDomNode, out: &mut String) {
+    for child in &node.children {
+        match child {
+            VDomChild::Text(text) => {
+                let text = text.trim();
+                if text.is_empty() {
+                    continue;
+                }
+                if !out.is_empty() {
+                    out.push(' ');
+                }
+                out.push_str(text);
+            }
+            VDomChild::Node(child) => collect_text_content(child, out),
+        }
+    }
+}
+
+/// The accessible name for a node, following the ARIA precedence of an
+/// explicit label first and the rendered text content as the fallback.
+///
+/// Without the fallback an extension that writes the idiomatic
+/// `<button>Split</button>` produces a control that screen readers announce
+/// with no name at all, since chrome authors rarely set `aria-label`.
+fn accessible_name(node: &VDomNode) -> Option<String> {
+    if let Some(label) = explicit_aria_label(node) {
+        return Some(label.to_owned());
+    }
+    let mut content = String::new();
+    collect_text_content(node, &mut content);
+    (!content.is_empty()).then_some(content)
+}
+
 /// Flatten a VDOM tree into a text representation.
 ///
 /// Used by tests and by headless callers that need to assert on chrome
@@ -544,13 +586,8 @@ impl VDomRenderer {
 
         let mut element =
             self.style_and_fill(div().id(self.element_id(node, path)), node, path, cx);
-        if let Some(label) = node
-            .props
-            .get("aria-label")
-            .or_else(|| node.props.get("ariaLabel"))
-            .and_then(|value| value.as_str())
-        {
-            element = element.aria_label(SharedString::from(label.to_owned()));
+        if let Some(label) = accessible_name(node) {
+            element = element.aria_label(SharedString::from(label));
         }
 
         let button_focus_handle = if is_button {
@@ -625,7 +662,7 @@ impl VDomRenderer {
 
         let showing_placeholder = value.is_empty() && !placeholder.is_empty();
         let label: SharedString = if showing_placeholder {
-            placeholder.into()
+            placeholder.clone().into()
         } else {
             value.clone().into()
         };
@@ -643,13 +680,13 @@ impl VDomRenderer {
             } else {
                 self.palette.text
             });
-        if let Some(aria_label) = node
-            .props
-            .get("aria-label")
-            .or_else(|| node.props.get("ariaLabel"))
-            .and_then(|value| value.as_str())
+        // An input has no text content to name it, so the placeholder is the
+        // only name a chrome author supplies in practice.
+        if let Some(aria_label) = explicit_aria_label(node)
+            .map(str::to_owned)
+            .or_else(|| (!placeholder.is_empty()).then(|| placeholder.clone()))
         {
-            element = element.aria_label(SharedString::from(aria_label.to_owned()));
+            element = element.aria_label(SharedString::from(aria_label));
         }
         element = apply_styles(element, node, &self.palette);
 
@@ -1030,6 +1067,56 @@ mod tests {
         assert!(text.contains("<div>"));
         assert!(text.contains("Hello"));
         assert!(text.contains("</div>"));
+    }
+
+    #[test]
+    fn accessible_name_falls_back_to_content_and_yields_to_an_explicit_label() {
+        let button = |props: BTreeMap<String, serde_json::Value>, children| VDomNode {
+            element_type: "button".into(),
+            props,
+            style: BTreeMap::new(),
+            children,
+        };
+
+        assert_eq!(
+            accessible_name(&button(
+                BTreeMap::new(),
+                vec![VDomChild::Text("  Split  ".into())]
+            )),
+            Some("Split".to_string()),
+            "text content names a button when the author sets no label"
+        );
+
+        assert_eq!(
+            accessible_name(&button(
+                BTreeMap::new(),
+                vec![
+                    VDomChild::Node(VDomNode {
+                        element_type: "span".into(),
+                        props: BTreeMap::new(),
+                        style: BTreeMap::new(),
+                        children: vec![VDomChild::Text("Split".into())],
+                    }),
+                    VDomChild::Text("pane".into()),
+                ]
+            )),
+            Some("Split pane".to_string()),
+            "nested text joins into one name"
+        );
+
+        let mut labelled = BTreeMap::new();
+        labelled.insert("aria-label".to_string(), serde_json::json!("Split pane"));
+        assert_eq!(
+            accessible_name(&button(labelled, vec![VDomChild::Text("⊞".into())])),
+            Some("Split pane".to_string()),
+            "an explicit label wins over glyph content"
+        );
+
+        assert_eq!(
+            accessible_name(&button(BTreeMap::new(), vec![VDomChild::Text("   ".into())])),
+            None,
+            "whitespace-only content is not a name"
+        );
     }
 
     #[test]

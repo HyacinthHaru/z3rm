@@ -788,6 +788,31 @@ fn mux_pane_renders_terminal_grid_and_exposes_a11y_tree() -> Result<()> {
         "expected one TextRun per non-empty visible row, got {} ({text_runs:?})",
         text_runs.len()
     );
+
+    // The served snapshot puts the cursor at row 1, column 4. Without a caret
+    // on the Terminal node the text runs describe content but not position, so
+    // assistive technology cannot follow where typing lands.
+    let caret = terminals
+        .first()
+        .and_then(|node| node.get("aria"))
+        .and_then(|aria| aria.get("text_selection"))
+        .and_then(|selection| selection.get("focus"))
+        .expect("the Terminal node must expose a caret");
+    assert_eq!(
+        caret.get("character_index").and_then(|ix| ix.as_u64()),
+        Some(4),
+        "the caret column must match the served cursor state"
+    );
+    let caret_run = caret
+        .get("node")
+        .and_then(|id| id.as_str())
+        .and_then(|id| tree.get("nodes").and_then(|nodes| nodes.get(id)))
+        .and_then(|node| a11y_string_field(node, "value"));
+    assert_eq!(
+        caret_run.as_deref(),
+        Some("second line with cursor"),
+        "the caret must point at the run for the cursor's row"
+    );
     // Every TextRun must be parented by the Terminal node, otherwise assistive
     // technology cannot associate the lines with the pane.
     let terminal_children = terminals
@@ -1146,6 +1171,24 @@ fn extension_chrome_vdom_renders_status_bar() -> Result<()> {
         a11y_nodes_with_role(&tree, "Button").len(),
         1,
         "the status bar fixture contains one semantic button"
+    );
+
+    // A control with a role but no name is announced as just "button" by a
+    // screen reader. The fixture sets no `aria-label`, so these names can only
+    // come from the bridge deriving them from content and placeholder.
+    assert_eq!(
+        a11y_nodes_with_role(&tree, "Button")
+            .first()
+            .and_then(|node| a11y_string_field(node, "label")),
+        Some("Split".to_string()),
+        "the button's accessible name must fall back to its text content"
+    );
+    assert_eq!(
+        a11y_nodes_with_role(&tree, "TextInput")
+            .first()
+            .and_then(|node| a11y_string_field(node, "label")),
+        Some("filter panes".to_string()),
+        "the input's accessible name must fall back to its placeholder"
     );
     assert_eq!(
         a11y_nodes_with_role(&tree, "TextInput").len(),

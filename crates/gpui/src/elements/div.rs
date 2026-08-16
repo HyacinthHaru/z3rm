@@ -625,6 +625,7 @@ impl Interactivity {
 
     /// Bind the given callback on the hover start and end events of this element. Note that the boolean
     /// passed to the callback is true when the hover starts and false when it ends.
+    /// Transitions caused by layout changes under a stationary mouse also invoke the callback.
     /// The imperative API equivalent to [`StatefulInteractiveElement::on_hover`].
     ///
     /// See [`Context::listener`](crate::Context::listener) to get access to a view's state from this callback.
@@ -742,7 +743,7 @@ pub trait InteractiveElement: Sized {
     /// the first tab stop inside it while having the container element itself be unreachable via the keyboard.
     /// Should only be used with `tab_index`.
     fn tab_stop(mut self, tab_stop: bool) -> Self {
-        self.interactivity().tab_stop = tab_stop;
+        self.interactivity().tab_stop = Some(tab_stop);
         self
     }
 
@@ -753,7 +754,7 @@ pub trait InteractiveElement: Sized {
     fn tab_index(mut self, index: isize) -> Self {
         self.interactivity().focusable = true;
         self.interactivity().tab_index = Some(index);
-        self.interactivity().tab_stop = true;
+        self.interactivity().tab_stop = Some(true);
         self
     }
 
@@ -1236,6 +1237,18 @@ pub trait StatefulInteractiveElement: InteractiveElement {
         self
     }
 
+    /// Set the author-provided identifier exposed to accessibility clients.
+    ///
+    /// Unlike the GPUI element ID, this value is visible outside the process.
+    /// Keep it stable and unique within its accessibility tree.
+    /// AccessKit maps it to platform identifiers where supported, including
+    /// UIA `AutomationId` on Windows, `AXIdentifier` on macOS, and AT-SPI
+    /// `AccessibleId` on Linux stacks whose deployed adapter exposes it.
+    fn accessibility_id(mut self, id: impl Into<SharedString>) -> Self {
+        self.interactivity().aria.author_id = Some(id.into());
+        self
+    }
+
     /// Set the accessible label for this element.
     fn aria_label(mut self, label: impl Into<SharedString>) -> Self {
         self.interactivity().aria.label = Some(label.into());
@@ -1531,6 +1544,7 @@ pub trait StatefulInteractiveElement: InteractiveElement {
 
     /// Bind the given callback on the hover start and end events of this element. Note that the boolean
     /// passed to the callback is true when the hover starts and false when it ends.
+    /// Transitions caused by layout changes under a stationary mouse also invoke the callback.
     /// The fluent API equivalent to [`Interactivity::on_hover`].
     ///
     /// See [`Context::listener`](crate::Context::listener) to get access to a view's state from this callback.
@@ -1932,6 +1946,7 @@ impl IntoElement for Div {
 
 #[derive(Default)]
 pub(crate) struct AriaProperties {
+    pub(crate) author_id: Option<SharedString>,
     pub(crate) label: Option<SharedString>,
     pub(crate) description: Option<SharedString>,
     pub(crate) keyshortcuts: Option<SharedString>,
@@ -2012,7 +2027,9 @@ pub struct Interactivity {
     pub(crate) hitbox_behavior: HitboxBehavior,
     pub(crate) tab_index: Option<isize>,
     pub(crate) tab_group: bool,
-    pub(crate) tab_stop: bool,
+    // `None` means the element never asked; only an explicit request may
+    // overwrite the flag on a focus handle supplied via `track_focus`.
+    pub(crate) tab_stop: Option<bool>,
 
     pub(crate) a11y_action_listeners:
         Vec<(accesskit::Action, crate::window::a11y::A11yActionListener)>,
@@ -2080,17 +2097,29 @@ impl Interactivity {
                     && self.tracked_focus_handle.is_none()
                     && let Some(element_state) = element_state.as_mut()
                 {
-                    let mut handle = element_state
-                        .focus_handle
-                        .get_or_insert_with(|| cx.focus_handle())
-                        .clone()
-                        .tab_stop(self.tab_stop);
+                    self.tracked_focus_handle = Some(
+                        element_state
+                            .focus_handle
+                            .get_or_insert_with(|| cx.focus_handle())
+                            .clone()
+                            .tab_stop(self.tab_stop.unwrap_or(false)),
+                    );
+                }
 
-                    if let Some(index) = self.tab_index {
-                        handle = handle.tab_index(index);
-                    }
-
-                    self.tracked_focus_handle = Some(handle);
+                // A handle supplied via `track_focus` also has to pick up the
+                // element's tab semantics, otherwise `.tab_stop(..)`/`.tab_index(..)`
+                // are silently dropped and the element never enters the tab order.
+                // Only explicit requests are propagated, so callers that configure
+                // the handle directly keep their settings.
+                if let Some(handle) = self.tracked_focus_handle.take() {
+                    let handle = match self.tab_stop {
+                        Some(tab_stop) => handle.tab_stop(tab_stop),
+                        None => handle,
+                    };
+                    self.tracked_focus_handle = Some(match self.tab_index {
+                        Some(index) => handle.tab_index(index),
+                        None => handle,
+                    });
                 }
 
                 if let Some(scroll_handle) = self.tracked_scroll_handle.as_ref() {
@@ -2900,14 +2929,25 @@ impl Interactivity {
                     .get_or_insert_with(Default::default)
                     .clone();
                 let hover_listener = Rc::new(hover_listener);
+                let hover_listener_state = was_hovered.clone();
                 let update_hover = move |is_hovered: bool, window: &mut Window, cx: &mut App| {
-                    let mut was_hovered = was_hovered.borrow_mut();
+                    let mut was_hovered = hover_listener_state.borrow_mut();
                     if is_hovered != *was_hovered {
                         *was_hovered = is_hovered;
                         drop(was_hovered);
                         hover_listener(&is_hovered, window, cx);
                     }
                 };
+
+                if has_mouse_down.borrow().is_none() {
+                    let is_hovered = !cx.has_active_drag() && hitbox.is_hovered(window);
+                    if is_hovered != *was_hovered.borrow() {
+                        let update_hover = update_hover.clone();
+                        window.defer(cx, move |window, cx| {
+                            update_hover(is_hovered, window, cx);
+                        });
+                    }
+                }
 
                 window.on_mouse_event({
                     let update_hover = update_hover.clone();
@@ -3273,6 +3313,9 @@ impl Interactivity {
     }
 
     pub(crate) fn write_a11y_info(&self, node: &mut accesskit::Node) {
+        if let Some(id) = &self.aria.author_id {
+            node.set_author_id(id.to_string());
+        }
         if let Some(label) = &self.aria.label {
             node.set_label(label.to_string());
         }
@@ -4223,6 +4266,123 @@ mod tests {
         assert_eq!(stateful_width.get(), px(10.));
     }
 
+    struct HoverListenerLayoutTestView {
+        target_left: Pixels,
+        hover_transitions: Rc<RefCell<Vec<bool>>>,
+    }
+
+    impl Render for HoverListenerLayoutTestView {
+        fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
+            let hover_transitions = self.hover_transitions.clone();
+            div().relative().size_full().child(
+                div()
+                    .id("hover-target")
+                    .absolute()
+                    .left(self.target_left)
+                    .top_0()
+                    .size(px(20.))
+                    .on_click(|_, _, _| {})
+                    .on_hover(move |is_hovered, _, _| {
+                        hover_transitions.borrow_mut().push(*is_hovered);
+                    }),
+            )
+        }
+    }
+
+    #[gpui::test]
+    fn hover_listeners_update_when_layout_changes_under_stationary_mouse(cx: &mut TestAppContext) {
+        let hover_transitions = Rc::new(RefCell::new(Vec::new()));
+        let window = cx.add_window({
+            let hover_transitions = hover_transitions.clone();
+            move |_, _| HoverListenerLayoutTestView {
+                target_left: px(40.),
+                hover_transitions,
+            }
+        });
+        let any_window = AnyWindowHandle::from(window);
+
+        cx.update_window(any_window, |_, window, cx| {
+            window.draw(cx).clear(cx);
+            window.simulate_mouse_move(point(px(10.), px(10.)), cx);
+        })
+        .unwrap();
+        assert!(hover_transitions.borrow().is_empty());
+
+        window
+            .update(cx, |view, _, cx| {
+                view.target_left = px(0.);
+                cx.notify();
+            })
+            .unwrap();
+        cx.update_window(any_window, |_, window, cx| window.draw(cx).clear(cx))
+            .unwrap();
+        assert_eq!(*hover_transitions.borrow(), [true]);
+
+        window
+            .update(cx, |view, _, cx| {
+                view.target_left = px(40.);
+                cx.notify();
+            })
+            .unwrap();
+        cx.update_window(any_window, |_, window, cx| window.draw(cx).clear(cx))
+            .unwrap();
+        assert_eq!(*hover_transitions.borrow(), [true, false]);
+    }
+
+    #[gpui::test]
+    fn hover_listeners_remain_hovered_during_stationary_mouse_press(cx: &mut TestAppContext) {
+        let hover_transitions = Rc::new(RefCell::new(Vec::new()));
+        let window = cx.add_window({
+            let hover_transitions = hover_transitions.clone();
+            move |_, _| HoverListenerLayoutTestView {
+                target_left: px(0.),
+                hover_transitions,
+            }
+        });
+        let any_window = AnyWindowHandle::from(window);
+        let mouse_position = point(px(10.), px(10.));
+
+        cx.update_window(any_window, |_, window, cx| {
+            window.draw(cx).clear(cx);
+            window.simulate_mouse_move(mouse_position, cx);
+        })
+        .unwrap();
+        assert_eq!(*hover_transitions.borrow(), [true]);
+
+        cx.update_window(any_window, |_, window, cx| {
+            window.dispatch_event(
+                MouseDownEvent {
+                    position: mouse_position,
+                    button: MouseButton::Left,
+                    modifiers: Default::default(),
+                    click_count: 1,
+                    first_mouse: false,
+                }
+                .to_platform_input(),
+                cx,
+            );
+            window.draw(cx).clear(cx);
+        })
+        .unwrap();
+        assert_eq!(*hover_transitions.borrow(), [true]);
+
+        cx.update_window(any_window, |_, window, cx| {
+            window.dispatch_event(
+                MouseUpEvent {
+                    position: mouse_position,
+                    button: MouseButton::Left,
+                    modifiers: Default::default(),
+                    click_count: 1,
+                }
+                .to_platform_input(),
+                cx,
+            );
+            window.draw(cx).clear(cx);
+        })
+        .unwrap();
+        assert_eq!(*hover_transitions.borrow(), [true]);
+    }
+
     struct TestTooltipView;
 
     impl Render for TestTooltipView {
@@ -4610,8 +4770,21 @@ mod tests {
         );
     }
     #[test]
+    fn test_accessibility_id_builder_writes_author_id() {
+        let mut element = div()
+            .id("buffer-font-size")
+            .accessibility_id("settings.buffer-font-size");
+        let mut node = accesskit::Node::new(accesskit::Role::SpinButton);
+
+        element.interactivity().write_a11y_info(&mut node);
+
+        assert_eq!(node.author_id(), Some("settings.buffer-font-size"));
+    }
+
+    #[test]
     fn test_write_a11y_info_string_and_numeric_properties() {
         let mut interactivity = Interactivity::default();
+        interactivity.aria.author_id = Some("settings.buffer-font-size".into());
         interactivity.aria.label = Some("Buffer Font Size".into());
         interactivity.aria.value = Some("15".into());
         interactivity.aria.placeholder = Some("Search".into());
@@ -4623,6 +4796,7 @@ mod tests {
         let mut node = accesskit::Node::new(accesskit::Role::SpinButton);
         interactivity.write_a11y_info(&mut node);
 
+        assert_eq!(node.author_id(), Some("settings.buffer-font-size"));
         assert_eq!(node.label(), Some("Buffer Font Size"));
         assert_eq!(node.value(), Some("15"));
         assert_eq!(node.placeholder(), Some("Search"));
@@ -4900,5 +5074,46 @@ mod tests {
             .unwrap();
 
         assert_eq!(focused, Some(item_b.id));
+    }
+
+    struct TrackedTabStop {
+        first: FocusHandle,
+        second: FocusHandle,
+    }
+
+    impl Render for TrackedTabStop {
+        fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
+            div()
+                .child(div().track_focus(&self.first))
+                .child(div().track_focus(&self.second).tab_stop(true))
+        }
+    }
+
+    /// An element that supplies its own focus handle through `track_focus` must
+    /// still honor [`InteractiveElement::tab_stop`]. The element-level flag used
+    /// to be applied only when no handle was tracked, so this combination left
+    /// the element out of the tab order without any diagnostic.
+    #[test]
+    fn element_tab_stop_applies_to_a_tracked_focus_handle() {
+        let mut cx = TestAppContext::single();
+        let (first, second) = cx.update(|cx| (cx.focus_handle().tab_stop(true), cx.focus_handle()));
+        let window: AnyWindowHandle = cx
+            .add_window({
+                let (first, second) = (first.clone(), second.clone());
+                move |_, _| TrackedTabStop { first, second }
+            })
+            .into();
+        cx.update_window(window, |_, window, cx| window.draw(cx).clear(cx))
+            .unwrap();
+
+        let focused = cx
+            .update_window(window, |_, window, cx| {
+                window.focus(&first, cx);
+                window.focus_next(cx);
+                window.focused(cx).map(|handle| handle.id)
+            })
+            .unwrap();
+
+        assert_eq!(focused, Some(second.id));
     }
 }
