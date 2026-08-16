@@ -923,6 +923,16 @@ mod tests {
         gpui::a11y_checks::assert_no_role_was_discarded(&tree, "open command palette");
         gpui::a11y_checks::assert_roles_are_contained(&tree, "open command palette");
         gpui::a11y_checks::assert_click_targets_are_reachable(&tree, "open command palette");
+        gpui::a11y_checks::assert_focus_reached_the_tree(&tree, "open command palette");
+        let focused = tree["gpui_focus"]
+            .as_str()
+            .and_then(|id| nodes.get(id))
+            .expect("the focus must name a node in the dump");
+        assert_eq!(
+            focused["aria"]["role"].as_str(),
+            Some("TextInput"),
+            "typing in the palette has to land somewhere a reader can follow"
+        );
 
         // Focus is in the query editor, which is not an ancestor of the match
         // rows, so GPUI cannot report the highlighted match without misstating

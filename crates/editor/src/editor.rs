@@ -12387,7 +12387,13 @@ impl ui_input::ErasedEditor for ErasedEditorImpl {
             text: text_style,
             ..Default::default()
         };
-        EditorElement::new(&self.0, editor_style).into_any()
+        // The erased editor is always a single-line input — a picker's query
+        // box, a settings field — and rendering it without saying so gives it
+        // no id and no role, so focus lands on nothing and the field cannot be
+        // read at all.
+        EditorElement::new(&self.0, editor_style)
+            .single_line(true)
+            .into_any()
     }
 
     fn as_any(&self) -> &dyn Any {

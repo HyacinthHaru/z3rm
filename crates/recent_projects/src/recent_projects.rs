@@ -2827,6 +2827,7 @@ mod tests {
         gpui::a11y_checks::assert_no_role_was_discarded(&tree, "recent projects picker");
         gpui::a11y_checks::assert_roles_are_contained(&tree, "recent projects picker");
         gpui::a11y_checks::assert_click_targets_are_reachable(&tree, "recent projects picker");
+        gpui::a11y_checks::assert_focus_reached_the_tree(&tree, "recent projects picker");
 
         let options = tree["nodes"]
             .as_object()

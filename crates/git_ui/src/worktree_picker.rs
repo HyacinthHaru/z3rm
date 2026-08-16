@@ -1816,6 +1816,7 @@ mod tests {
         gpui::a11y_checks::assert_no_role_was_discarded(&tree, "worktree picker");
         gpui::a11y_checks::assert_roles_are_contained(&tree, "worktree picker");
         gpui::a11y_checks::assert_click_targets_are_reachable(&tree, "worktree picker");
+        gpui::a11y_checks::assert_focus_reached_the_tree(&tree, "worktree picker");
 
         let options = tree["nodes"]
             .as_object()

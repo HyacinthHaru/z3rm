@@ -11420,6 +11420,7 @@ mod tests {
         gpui::a11y_checks::assert_no_role_was_discarded(&tree, "git panel");
         gpui::a11y_checks::assert_roles_are_contained(&tree, "git panel");
         gpui::a11y_checks::assert_click_targets_are_reachable(&tree, "git panel");
+        gpui::a11y_checks::assert_focus_reached_the_tree(&tree, "git panel");
 
         let changes = nodes
             .values()
