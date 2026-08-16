@@ -726,7 +726,45 @@ impl VDomRenderer {
                 }
             }
         }
-        let mut container = apply_styles(div().relative(), node, &self.palette);
+        // A display list paints straight to draw-ops, so nothing about it
+        // reaches assistive technology unless it is named here. The name is the
+        // text the region draws, which is what a clock or a meter is.
+        //
+        // Deliberately `Group` rather than `Status`: `Status` carries an
+        // implicit polite live region, and these are the high-frequency widgets
+        // (§5.4) — a clock announcing itself every tick would make the app
+        // unusable with a screen reader.
+        let drawn_text = self
+            .display_lists
+            .get(region_id)
+            .map(|ops| {
+                ops.iter()
+                    .filter_map(|op| match op {
+                        DrawOp::DrawText { text, .. } => Some(text.trim()),
+                        _ => None,
+                    })
+                    .filter(|text| !text.is_empty())
+                    .collect::<Vec<_>>()
+                    .join(" ")
+            })
+            .filter(|text| !text.is_empty());
+        let name = explicit_aria_label(node)
+            .map(str::to_owned)
+            .or(drawn_text);
+
+        let mut container = apply_styles(
+            div()
+                .id(SharedString::from(format!("display-list:{region_id}")))
+                .relative(),
+            node,
+            &self.palette,
+        );
+        if let Some(name) = name {
+            container = container
+                .role(Role::Group)
+                .aria_label(SharedString::from(name));
+        }
+
         let Some(ops) = self.display_lists.get(region_id) else {
             return container.into_any_element();
         };

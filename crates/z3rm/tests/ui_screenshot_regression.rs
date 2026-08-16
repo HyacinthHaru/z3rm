@@ -1190,6 +1190,21 @@ fn extension_chrome_vdom_renders_status_bar() -> Result<()> {
         Some("filter panes".to_string()),
         "the input's accessible name must fall back to its placeholder"
     );
+
+    // §5.4 A display list paints straight to draw-ops, so the only thing a
+    // screen reader can read is the text it draws — here the meter's "42%".
+    let meter = a11y_nodes(&tree)
+        .into_iter()
+        .find(|(_, node)| a11y_string_field(node, "label").as_deref() == Some("42%"))
+        .map(|(_, node)| node)
+        .expect("a display-list region must be named by the text it draws");
+    assert_eq!(
+        meter
+            .get("aria")
+            .and_then(|aria| aria.get("live")),
+        None,
+        "a high-frequency widget must not announce itself on every repaint"
+    );
     assert_eq!(
         a11y_nodes_with_role(&tree, "TextInput").len(),
         1,
