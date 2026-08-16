@@ -436,3 +436,72 @@ async fn test_modal_is_announced_as_a_dialog(cx: &mut TestAppContext) {
         "the focused element must be a descendant of the dialog"
     );
 }
+
+/// A node with an interactive role and no name is announced as a bare "button"
+/// with nothing to tell it apart. Checked across a whole rendered workspace
+/// rather than per control, so chrome added later cannot quietly skip it.
+#[gpui::test]
+async fn test_every_interactive_node_in_the_window_has_a_name(cx: &mut TestAppContext) {
+    init_test(cx);
+    let fs = FakeFs::new(cx.executor());
+    fs.insert_tree("/root", json!({ "a.txt": "" })).await;
+    let project = Project::test(fs, [path!("/root").as_ref()], cx).await;
+
+    let (multi_workspace, cx) =
+        cx.add_window_view(|window, cx| MultiWorkspace::test_new(project, window, cx));
+    let workspace = multi_workspace.read_with(cx, |mw, _| mw.workspace().clone());
+    let pane = workspace.read_with(cx, |ws, _| ws.active_pane().clone());
+
+    pane.update_in(cx, |pane, window, cx| {
+        pane.add_item(
+            Box::new(cx.new(|cx| TestItem::new(cx).with_label("shell"))),
+            true,
+            true,
+            None,
+            window,
+            cx,
+        );
+    });
+    cx.run_until_parked();
+
+    cx.activate_a11y(cx.window_handle());
+    let json = cx
+        .update(|window, cx| {
+            window.draw(cx).clear(cx);
+            window.debug_a11y_tree_json()
+        })
+        .expect("activation makes the debug tree available");
+    let tree: serde_json::Value = serde_json::from_str(&json).expect("the dump is valid JSON");
+
+    const NEEDS_A_NAME: &[&str] = &[
+        "Button",
+        "Tab",
+        "TreeItem",
+        "ListBoxOption",
+        "Link",
+        "CheckBox",
+        "RadioButton",
+        "MenuItem",
+    ];
+    let unnamed: Vec<String> = tree["nodes"]
+        .as_object()
+        .expect("the dump lists nodes")
+        .values()
+        .filter(|node| {
+            node["aria"]["role"]
+                .as_str()
+                .is_some_and(|role| NEEDS_A_NAME.contains(&role))
+        })
+        .filter(|node| {
+            ["label", "value", "placeholder"]
+                .iter()
+                .all(|field| node["aria"][field].as_str().is_none_or(str::is_empty))
+        })
+        .map(|node| format!("{} ({})", node["aria"]["role"], node["element_id"]))
+        .collect();
+
+    assert!(
+        unnamed.is_empty(),
+        "these nodes are announced as a bare role: {unnamed:?}"
+    );
+}
