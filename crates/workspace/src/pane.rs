@@ -2849,6 +2849,9 @@ impl Pane {
 
         let capability = item.capability(cx);
         let tab = Tab::new(ix)
+            // `tab_content` renders arbitrary elements, so the announced name
+            // comes from the item's own text rather than the rendered tab.
+            .aria_label(item.tab_content_text(detail, cx))
             .position(if is_first_item {
                 TabPosition::First
             } else if is_last_item {

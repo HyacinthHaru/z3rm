@@ -37,6 +37,9 @@ pub struct Tab {
     close_side: TabCloseSide,
     start_slot: Option<AnyElement>,
     end_slot: Option<AnyElement>,
+    /// The tab's name for assistive technology. Tabs render arbitrary content,
+    /// so the text has to be supplied rather than derived.
+    aria_label: Option<SharedString>,
     children: SmallVec<[AnyElement; 2]>,
 }
 
@@ -48,12 +51,19 @@ impl Tab {
                 .id(id.clone())
                 .debug_selector(|| format!("TAB-{}", id)),
             selected: false,
+            aria_label: None,
             position: TabPosition::First,
             close_side: TabCloseSide::End,
             start_slot: None,
             end_slot: None,
             children: SmallVec::new(),
         }
+    }
+
+    /// Sets the name announced for this tab.
+    pub fn aria_label(mut self, label: impl Into<SharedString>) -> Self {
+        self.aria_label = Some(label.into());
+        self
     }
 
     pub fn position(mut self, position: TabPosition) -> Self {
@@ -142,6 +152,11 @@ impl RenderOnce for Tab {
         };
 
         self.div
+            // A tab that is not reported as one leaves the user with no idea
+            // that a set of them exists, nor which is current.
+            .role(gpui::Role::Tab)
+            .aria_selected(self.selected)
+            .when_some(self.aria_label, |this, label| this.aria_label(label))
             .h(Tab::container_height(cx))
             .bg(tab_bg)
             .border_color(cx.theme().colors().border)

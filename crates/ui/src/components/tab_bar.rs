@@ -129,6 +129,10 @@ impl RenderOnce for TabBar {
                     .child(
                         h_flex()
                             .id("tabs")
+                            // The element that directly parents the tabs, so
+                            // the toolbar buttons in the start/end slots stay
+                            // outside the set.
+                            .role(gpui::Role::TabList)
                             .flex_grow_1()
                             .overflow_x_scroll()
                             .when_some(self.scroll_handle, |cx, scroll_handle| {
@@ -202,5 +206,75 @@ impl Component for TabBar {
                 ),
             ])
             .into_any_element()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use gpui::TestAppContext;
+
+    struct TabBarHarness;
+
+    impl Render for TabBarHarness {
+        fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+            TabBar::new("test-tab-bar")
+                .start_child(Button::new("new-tab", "New"))
+                .child(Tab::new("shell").aria_label("shell"))
+                .child(Tab::new("logs").aria_label("logs").toggle_state(true))
+        }
+    }
+
+    /// Tabs are how a multiplexer is navigated. Without a tab list and per-tab
+    /// semantics a screen reader gets an unlabelled row with no indication that
+    /// the tabs form a set, or which one is current.
+    #[gpui::test]
+    fn tabs_are_exposed_as_a_tab_list(cx: &mut TestAppContext) {
+        cx.update(|cx| {
+            let settings_store = settings::SettingsStore::test(cx);
+            cx.set_global(settings_store);
+            theme_settings::init(theme::LoadThemes::JustBase, cx);
+        });
+        let window = cx.add_window(|_, _| TabBarHarness);
+        cx.activate_a11y(window.into());
+
+        let json = cx
+            .update_window(window.into(), |_, window, cx| {
+                window.draw(cx).clear(cx);
+                window.debug_a11y_tree_json()
+            })
+            .expect("the harness window is still open")
+            .expect("activation makes the debug tree available");
+        let tree: serde_json::Value = serde_json::from_str(&json).expect("the dump is valid JSON");
+        let nodes = tree["nodes"].as_object().expect("the dump lists nodes");
+
+        let tab_list = nodes
+            .iter()
+            .find(|(_, node)| node["aria"]["role"] == "TabList")
+            .map(|(id, _)| id.clone())
+            .expect("the tab strip must be reported as a tab list");
+
+        // Read the tabs from inside the list: the toolbar button in the start
+        // slot must stay outside the set.
+        let mut announced: Vec<(String, bool)> = nodes[&tab_list]["children"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter_map(|id| id.as_str().and_then(|id| nodes.get(id)))
+            .filter(|node| node["aria"]["role"] == "Tab")
+            .map(|node| {
+                (
+                    node["aria"]["label"].as_str().unwrap_or_default().to_string(),
+                    node["aria"]["selected"].as_bool().unwrap_or(false),
+                )
+            })
+            .collect();
+        announced.sort();
+
+        assert_eq!(
+            announced,
+            vec![("logs".to_string(), true), ("shell".to_string(), false)],
+            "each tab must carry its name and whether it is the current one"
+        );
     }
 }

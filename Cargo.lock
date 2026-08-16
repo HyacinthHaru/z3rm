@@ -13940,9 +13940,12 @@ dependencies = [
  "num-format",
  "schemars",
  "serde",
+ "serde_json",
+ "settings",
  "smallvec",
  "strum",
  "theme",
+ "theme_settings",
  "ui_macros",
  "windows 0.61.3",
 ]
