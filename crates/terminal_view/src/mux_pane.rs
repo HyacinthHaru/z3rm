@@ -1882,52 +1882,61 @@ mod tests {
             .set_read_timeout(Some(std::time::Duration::from_secs(5)))
             .map_err(|error| format!("set mock mux read timeout: {error}"))?;
 
-        let mut prefix = Vec::with_capacity(mux_protocol::MAX_VARINT_LEN);
-        loop {
-            let mut byte = [0u8; 1];
+        // The client also sends a `ResizePane` once its viewport size is known,
+        // and whether that lands before or after the initial fetch depends on
+        // how many frames were drawn first — which changes when accessibility
+        // is active. These tests are about the fetch, so skip past anything
+        // else rather than pinning the wire order.
+        let (request_id, fetch) = loop {
+            let mut prefix = Vec::with_capacity(mux_protocol::MAX_VARINT_LEN);
+            loop {
+                let mut byte = [0u8; 1];
+                stream
+                    .read_exact(&mut byte)
+                    .map_err(|error| format!("read initial grid request prefix: {error}"))?;
+                prefix.push(byte[0]);
+                if byte[0] & 0x80 == 0 {
+                    break;
+                }
+                if prefix.len() == mux_protocol::MAX_VARINT_LEN {
+                    return Err("initial grid request used an overlong frame prefix".to_string());
+                }
+            }
+
+            let (raw_len, prefix_len) = mux_protocol::parse_len_prefix(&prefix)
+                .map_err(|error| format!("parse initial grid request prefix: {error}"))?
+                .ok_or_else(|| "initial grid request prefix was incomplete".to_string())?;
+            let payload_len = mux_protocol::check_frame_len(raw_len)
+                .map_err(|error| format!("validate initial grid request length: {error}"))?;
+            let mut framed = prefix;
+            framed.resize(prefix_len + payload_len, 0);
             stream
-                .read_exact(&mut byte)
-                .map_err(|error| format!("read initial grid request prefix: {error}"))?;
-            prefix.push(byte[0]);
-            if byte[0] & 0x80 == 0 {
-                break;
-            }
-            if prefix.len() == mux_protocol::MAX_VARINT_LEN {
-                return Err("initial grid request used an overlong frame prefix".to_string());
-            }
-        }
+                .read_exact(&mut framed[prefix_len..])
+                .map_err(|error| format!("read initial grid request payload: {error}"))?;
 
-        let (raw_len, prefix_len) = mux_protocol::parse_len_prefix(&prefix)
-            .map_err(|error| format!("parse initial grid request prefix: {error}"))?
-            .ok_or_else(|| "initial grid request prefix was incomplete".to_string())?;
-        let payload_len = mux_protocol::check_frame_len(raw_len)
-            .map_err(|error| format!("validate initial grid request length: {error}"))?;
-        let mut framed = prefix;
-        framed.resize(prefix_len + payload_len, 0);
-        stream
-            .read_exact(&mut framed[prefix_len..])
-            .map_err(|error| format!("read initial grid request payload: {error}"))?;
-
-        let (envelope, consumed) = mux_protocol::unframe(&framed)
-            .map_err(|error| format!("decode initial grid request: {error}"))?;
-        if consumed != framed.len() {
-            return Err(format!(
-                "initial grid request left {} trailing bytes",
-                framed.len() - consumed
-            ));
-        }
-        let request = match envelope.payload {
-            Some(EnvelopePayload::Request(request)) => request,
-            payload => {
+            let (envelope, consumed) = mux_protocol::unframe(&framed)
+                .map_err(|error| format!("decode initial grid request: {error}"))?;
+            if consumed != framed.len() {
                 return Err(format!(
-                    "expected initial request envelope, got {payload:?}"
+                    "initial grid request left {} trailing bytes",
+                    framed.len() - consumed
                 ));
             }
+            let request = match envelope.payload {
+                Some(EnvelopePayload::Request(request)) => request,
+                payload => {
+                    return Err(format!(
+                        "expected initial request envelope, got {payload:?}"
+                    ));
+                }
+            };
+            match request.body {
+                Some(RequestBody::FetchGridUpdate(fetch)) => break (request.request_id, fetch),
+                Some(RequestBody::ResizePane(_)) => continue,
+                body => return Err(format!("expected initial FetchGridUpdate, got {body:?}")),
+            }
         };
-        let fetch = match request.body {
-            Some(RequestBody::FetchGridUpdate(fetch)) => fetch,
-            body => return Err(format!("expected initial FetchGridUpdate, got {body:?}")),
-        };
+
         if fetch.pane_id != expected_pane_id || fetch.since_generation != 0 {
             return Err(format!(
                 "unexpected initial fetch target/generation: {}@{}",
@@ -1965,7 +1974,7 @@ mod tests {
         let response = Envelope {
             version: Some(mux_protocol::PROTOCOL_VERSION),
             payload: Some(EnvelopePayload::Response(Response {
-                request_id: request.request_id,
+                request_id,
                 body: Some(ResponseBody::GridUpdate(FetchGridUpdateResponse {
                     from_generation: 0,
                     to_generation: 7,
@@ -2263,14 +2272,21 @@ mod tests {
             .set_read_timeout(Some(std::time::Duration::from_secs(5)))
             .map_err(|error| format!("set race server read timeout: {error}"))?;
 
-        let first = read_test_envelope(&mut stream, "first grid request")?;
-        let first = match first.payload {
-            Some(EnvelopePayload::Request(request)) => request,
-            payload => return Err(format!("expected first request, got {payload:?}")),
-        };
-        let first_fetch = match first.body {
-            Some(RequestBody::FetchGridUpdate(fetch)) => fetch,
-            body => return Err(format!("expected first grid fetch, got {body:?}")),
+        // The viewport-size `ResizePane` may land before the initial fetch
+        // depending on how many frames were drawn first, which changes when
+        // accessibility is active. This test is about the fetch/dirty race, so
+        // skip anything else rather than pinning the wire order.
+        let (first_request_id, first_fetch) = loop {
+            let first = read_test_envelope(&mut stream, "first grid request")?;
+            let first = match first.payload {
+                Some(EnvelopePayload::Request(request)) => request,
+                payload => return Err(format!("expected first request, got {payload:?}")),
+            };
+            match first.body {
+                Some(RequestBody::FetchGridUpdate(fetch)) => break (first.request_id, fetch),
+                Some(RequestBody::ResizePane(_)) => continue,
+                body => return Err(format!("expected first grid fetch, got {body:?}")),
+            }
         };
         if first_fetch.pane_id != "race-pane" || first_fetch.since_generation != 0 {
             return Err(format!(
@@ -2287,7 +2303,7 @@ mod tests {
             .map_err(|error| format!("wait to release first response: {error}"))?;
         write_test_envelope(
             &mut stream,
-            &grid_response(first.request_id, 0, 7, 0),
+            &grid_response(first_request_id, 0, 7, 0),
             "first grid response",
         )?;
 
