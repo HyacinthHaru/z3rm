@@ -406,6 +406,15 @@ impl Render for DiffReview {
         }
 
         div()
+            // Same shape as the log viewer: without a role this focused root
+            // yields no accessibility node at all. Named by the file so two
+            // open reviews are told apart.
+            .id("diff-review")
+            .role(gpui::Role::Group)
+            .aria_label(SharedString::from(format!(
+                "Diff review: {}",
+                self.file_path.display()
+            )))
             .track_focus(&self.focus_handle)
             .size_full()
             .bg(bg)
@@ -494,6 +503,55 @@ impl Item for DiffReview {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A focused element with no role produces no accessibility node, so
+    /// opening this view discarded focus and screen readers announced the whole
+    /// window instead of the review.
+    #[gpui::test]
+    async fn the_review_is_announced_by_the_file_it_reviews(cx: &mut gpui::TestAppContext) {
+        cx.update(|cx| {
+            let settings_store = settings::SettingsStore::test(cx);
+            cx.set_global(settings_store);
+            theme_settings::init(theme::LoadThemes::JustBase, cx);
+        });
+
+        let window = cx.add_window(|_, cx| {
+            DiffReview::new(
+                PathBuf::from("src/main.rs"),
+                "one\n".to_string(),
+                "two\n".to_string(),
+                None,
+                cx,
+            )
+        });
+        cx.activate_a11y(window.into());
+
+        let focus_handle = window
+            .update(cx, |review, _, _| review.focus_handle.clone())
+            .expect("the review window is still open");
+        let json = cx
+            .update_window(window.into(), |_, window, cx| {
+                window.focus(&focus_handle, cx);
+                window.draw(cx).clear(cx);
+                window.debug_a11y_tree_json()
+            })
+            .expect("the review window is still open")
+            .expect("activation makes the debug tree available");
+        let tree: serde_json::Value =
+            serde_json::from_str(&json).expect("the dump is valid JSON");
+
+        assert_eq!(
+            tree["frame"]["focus_without_node"].as_str(),
+            None,
+            "the review carries a role now, so its focus must reach the tree"
+        );
+        let focused = tree["gpui_focus"].as_str().expect("the review holds focus");
+        assert_eq!(
+            tree["nodes"][focused]["aria"]["label"].as_str(),
+            Some("Diff review: src/main.rs"),
+            "two open reviews are only told apart by the file they review"
+        );
+    }
 
     /// Renders a diff as compact tags so assertions read like a unified diff:
     /// `" x"` unchanged, `"+x"` added, `"-x"` removed, `"~old>new"` modified.

@@ -599,6 +599,12 @@ impl Focusable for LogViewer {
 impl Render for LogViewer {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         v_flex()
+            // A focused element with no role produces no accessibility node,
+            // so opening this view discarded focus and screen readers announced
+            // the whole window instead of the log.
+            .id("log-viewer")
+            .role(gpui::Role::Group)
+            .aria_label("Log viewer")
             .track_focus(&self.focus_handle)
             .size_full()
             .bg(cx.theme().colors().editor_background)
