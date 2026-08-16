@@ -5548,42 +5548,35 @@ impl Workspace {
         self.update_window_edited(window, cx);
     }
 
-    fn render_notifications(
-        &self,
-        _window: &mut Window,
-        _cx: &mut Context<Self>,
-    ) -> Option<gpui::Stateful<Div>> {
-        if self.notifications.is_empty() {
-            None
-        } else {
-            Some(
-                div()
-                    .id("workspace-notifications")
-                    // Notifications appear on their own, away from wherever the
-                    // user is working, and several can stack up — which is what
-                    // `Log` describes and what a live region makes audible.
-                    // Polite rather than assertive: an error that already
-                    // happened does not justify cutting off whatever is being
-                    // read.
-                    .role(gpui::Role::Log)
-                    .aria_live(gpui::accesskit::Live::Polite)
-                    .aria_label("Notifications")
-                    .absolute()
-                    .right_3()
-                    .bottom_3()
-                    .w_112()
-                    .h_full()
-                    .flex()
-                    .flex_col()
-                    .justify_end()
-                    .gap_2()
-                    .children(
-                        self.notifications
-                            .iter()
-                            .map(|(_, notification)| notification.clone().into_any_element()),
-                    ),
-            )
-        }
+    fn render_notifications(&self, _window: &mut Window, _cx: &mut Context<Self>) -> Div {
+        let has_notifications = !self.notifications.is_empty();
+
+        // Rendered even when there is nothing to show. A live region announces
+        // changes made *inside* it, so a region that appears at the same moment
+        // as its first notification has nothing to compare against; it has to
+        // already be in the tree when the notification arrives. While empty it
+        // takes no space, so it cannot cover the workspace beneath it.
+        div().absolute().right_3().bottom_3().child(
+            div()
+                .id("workspace-notifications")
+                // Notifications appear on their own, away from wherever the
+                // user is working, and several can stack up — which is what
+                // `Log` describes and what a live region makes audible.
+                // Polite rather than assertive: an error that already
+                // happened does not justify cutting off whatever is being
+                // read.
+                .role(gpui::Role::Log)
+                .aria_live(gpui::accesskit::Live::Polite)
+                .aria_label("Notifications")
+                .when(has_notifications, |this| {
+                    this.w_112().h_full().flex().flex_col().justify_end().gap_2()
+                })
+                .children(
+                    self.notifications
+                        .iter()
+                        .map(|(_, notification)| notification.clone().into_any_element()),
+                ),
+        )
     }
 
     // RPC handlers
@@ -8357,7 +8350,7 @@ impl Render for Workspace {
                                     None => div.top_2().bottom_2().left_2().right_2().border_1(),
                                 })
                             }))
-                            .children(self.render_notifications(window, cx)),
+                            .child(self.render_notifications(window, cx)),
                     )
                     .when(self.status_bar_visible(cx), |parent| {
                         parent.child(self.status_bar.clone())

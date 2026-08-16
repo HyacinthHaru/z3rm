@@ -334,6 +334,47 @@ async fn test_notifications_are_announced_as_a_live_region(cx: &mut TestAppConte
     assert_eq!(log["aria"]["label"].as_str(), Some("Notifications"));
 }
 
+/// A live region announces changes made *inside* it. A region that is created
+/// at the same moment as its first message has nothing to compare against, so
+/// both regions have to be in the tree before there is anything to say.
+#[gpui::test]
+async fn test_the_live_regions_exist_before_they_have_anything_to_say(cx: &mut TestAppContext) {
+    init_test(cx);
+    let fs = FakeFs::new(cx.executor());
+    fs.insert_tree("/root", json!({ "a.txt": "" })).await;
+    let project = Project::test(fs, [path!("/root").as_ref()], cx).await;
+
+    let (_multi_workspace, cx) =
+        cx.add_window_view(|window, cx| MultiWorkspace::test_new(project, window, cx));
+
+    cx.activate_a11y(cx.window_handle());
+    let json = cx
+        .update(|window, cx| {
+            window.draw(cx).clear(cx);
+            window.debug_a11y_tree_json()
+        })
+        .expect("activation makes the debug tree available");
+    let tree: serde_json::Value = serde_json::from_str(&json).expect("the dump is valid JSON");
+
+    let live_regions: Vec<(&str, &str)> = tree["nodes"]
+        .as_object()
+        .expect("the dump lists nodes")
+        .values()
+        .filter_map(|node| {
+            Some((node["aria"]["role"].as_str()?, node["aria"]["live"].as_str()?))
+        })
+        .collect();
+
+    assert!(
+        live_regions.contains(&("Log", "Polite")),
+        "the notification stack must already be a live region: {live_regions:?}"
+    );
+    assert!(
+        live_regions.contains(&("Status", "Polite")),
+        "the toast layer must already be a live region: {live_regions:?}"
+    );
+}
+
 /// A modal captures input and hides everything behind it. Its container had no
 /// role and no id, so the focused element produced no accessibility node at
 /// all: focus was discarded and the whole window announced instead of the

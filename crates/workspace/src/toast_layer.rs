@@ -225,13 +225,22 @@ impl ToastLayer {
 
 impl Render for ToastLayer {
     fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        // The container is rendered even with no toast in it. A live region
+        // announces changes made *inside* it, so one that appears at the same
+        // moment as the toast has nothing to compare against; it has to already
+        // be in the tree when the toast arrives.
         let Some(active_toast) = &self.active_toast else {
-            return div();
+            return div().child(
+                div()
+                    .id("toast-layer-container")
+                    .role(gpui::Role::Status)
+                    .aria_live(gpui::accesskit::Live::Polite),
+            );
         };
 
         div().absolute().size_full().bottom_0().left_0().child(
             v_flex()
-                .id(("toast-layer-container", active_toast.id))
+                .id("toast-layer-container")
                 // A toast is transient status the user never navigates to, so
                 // it is only ever perceived if it is announced.
                 .role(gpui::Role::Status)
@@ -244,8 +253,11 @@ impl Render for ToastLayer {
                 .items_center()
                 .track_focus(&active_toast.focus_handle)
                 .child(
+                    // Keyed by the toast so a replacement is a new element and
+                    // plays the entrance animation; the region around it stays
+                    // the same node so it can announce the change.
                     h_flex()
-                        .id("active-toast-container")
+                        .id(("active-toast-container", active_toast.id))
                         .occlude()
                         .on_hover(cx.listener(|this, hover_start, _window, cx| {
                             if *hover_start {
@@ -264,9 +276,9 @@ impl Render for ToastLayer {
                                 this.hide_toast(cx);
                             }),
                         )
-                        .child(active_toast.toast.view()),
-                )
-                .animate_in(AnimationDirection::FromBottom, true),
+                        .child(active_toast.toast.view())
+                        .animate_in(AnimationDirection::FromBottom, true),
+                ),
         )
     }
 }
