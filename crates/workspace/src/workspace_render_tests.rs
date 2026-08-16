@@ -505,3 +505,49 @@ async fn test_every_interactive_node_in_the_window_has_a_name(cx: &mut TestAppCo
         "these nodes are announced as a bare role: {unnamed:?}"
     );
 }
+
+/// A pane with no items has nothing inside to take focus, so focus stays on the
+/// pane's own root. The pane is not rendered while it is empty, so focus points
+/// at an element that is not on screen — the dump has to say so rather than
+/// showing a null focus with no reason, which is indistinguishable from having
+/// no focus at all.
+#[gpui::test]
+async fn test_focus_on_an_unrendered_element_is_reported(cx: &mut TestAppContext) {
+    init_test(cx);
+    let fs = FakeFs::new(cx.executor());
+    fs.insert_tree("/root", json!({ "a.txt": "" })).await;
+    let project = Project::test(fs, [path!("/root").as_ref()], cx).await;
+
+    let (multi_workspace, cx) =
+        cx.add_window_view(|window, cx| MultiWorkspace::test_new(project, window, cx));
+    let workspace = multi_workspace.read_with(cx, |mw, _| mw.workspace().clone());
+    let pane = workspace.read_with(cx, |ws, _| ws.active_pane().clone());
+    let pane_focus = pane.read_with(cx, |pane, cx| gpui::Focusable::focus_handle(pane, cx));
+
+    cx.activate_a11y(cx.window_handle());
+    let json = cx
+        .update(|window, cx| {
+            window.focus(&pane_focus, cx);
+            window.draw(cx).clear(cx);
+            window.debug_a11y_tree_json()
+        })
+        .expect("activation makes the debug tree available");
+    let tree: serde_json::Value = serde_json::from_str(&json).expect("the dump is valid JSON");
+
+    assert!(
+        cx.update(|window, cx| window
+            .focused(cx)
+            .is_some_and(|handle| handle == pane_focus)),
+        "the pane really does hold focus, so this is not a vacuous check"
+    );
+    assert_eq!(
+        tree["gpui_focus"].as_str(),
+        None,
+        "an element that never rendered cannot carry the focus"
+    );
+    assert_eq!(
+        tree["frame"]["focus_without_node"].as_str(),
+        Some("its element was not rendered this frame"),
+        "a null focus has to come with the reason for it"
+    );
+}
