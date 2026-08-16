@@ -19,7 +19,7 @@ use std::sync::Arc;
 use editor::{Editor, EditorEvent};
 use gpui::{
     AnyElement, App, Context, Entity, FocusHandle, Focusable, IntoElement, KeyContext,
-    ListAlignment, ListState, Pixels, Render, SharedString, Subscription, Task, Window, list,
+    ListAlignment, ListState, Pixels, Render, Role, SharedString, Subscription, Task, Window, list,
     prelude::*, px,
 };
 use menu::{Cancel, Confirm, SelectFirst, SelectLast, SelectNext, SelectPrevious};
@@ -515,6 +515,85 @@ impl ListEntry {
             ListEntry::Tab { .. } => 1,
             ListEntry::Pane { .. } => 2,
             ListEntry::Directory { depth, .. } | ListEntry::File { depth, .. } => *depth,
+        }
+    }
+
+    /// Whether this row can be collapsed, and if so its current state. Rows
+    /// that never collapse stay `None` so they are not announced as
+    /// collapsible.
+    fn expanded(&self) -> Option<bool> {
+        match self {
+            ListEntry::Directory { expanded, .. } => Some(*expanded),
+            _ => None,
+        }
+    }
+
+    /// The name assistive technology announces for this row.
+    ///
+    /// Screen readers get no icon, so the row kind is spoken first; the
+    /// trailing detail mirrors the secondary label shown next to the name.
+    fn accessible_name(&self) -> String {
+        let kind = match self {
+            ListEntry::Session { .. } => "Session",
+            ListEntry::Tab { .. } => "Tab",
+            ListEntry::Pane { .. } => "Pane",
+            ListEntry::Directory { .. } => "Folder",
+            ListEntry::File { .. } => "File",
+        };
+
+        let mut detail = Vec::new();
+        match self {
+            ListEntry::Session {
+                attached_clients,
+                is_current,
+                ..
+            } => {
+                detail.push(format!("{attached_clients} attached"));
+                if *is_current {
+                    detail.push("current".to_string());
+                }
+            }
+            ListEntry::Pane {
+                is_alive,
+                zoomed,
+                has_bell,
+                is_focused,
+                ..
+            } => {
+                if *is_focused {
+                    detail.push("focused".to_string());
+                }
+                if *zoomed {
+                    detail.push("zoomed".to_string());
+                }
+                if *has_bell {
+                    detail.push("bell".to_string());
+                }
+                if !*is_alive {
+                    detail.push("exited".to_string());
+                }
+            }
+            ListEntry::File {
+                size, is_modified, ..
+            } => {
+                detail.push(format_file_size(*size).to_string());
+                if *is_modified {
+                    detail.push("modified".to_string());
+                }
+            }
+            ListEntry::Directory { status, .. } => match status {
+                DirectoryStatus::Loading => detail.push("loading".to_string()),
+                DirectoryStatus::Error(error) => detail.push(error.to_string()),
+                DirectoryStatus::Unloaded | DirectoryStatus::Loaded => {}
+            },
+            ListEntry::Tab { .. } => {}
+        }
+
+        let name = format!("{kind} {}", self.label());
+        if detail.is_empty() {
+            name
+        } else {
+            format!("{name}, {}", detail.join(", "))
         }
     }
 
@@ -1211,6 +1290,17 @@ impl Sidebar {
         ListItem::new(entry.element_id())
             .indent_level(entry.indent_level())
             .toggle_state(selected)
+            // The icon is what tells a sighted user whether a row is a session,
+            // a pane or a file, so the kind has to be spoken as part of the
+            // name; `indent_level` is only visual, hence the explicit level.
+            .aria_role(Role::TreeItem)
+            .aria_label(entry.accessible_name())
+            .aria_level(entry.indent_level() + 1)
+            .when_some(entry.expanded(), ListItem::aria_expanded)
+            // Keyboard focus stays on the sidebar container while `Select*`
+            // actions move `selected_index`, so without this the current row is
+            // never reported.
+            .when(selected, ListItem::aria_active_descendant)
             .start_slot(Icon::new(icon).size(IconSize::Small).color(if muted {
                 Color::Disabled
             } else {
@@ -1476,11 +1566,17 @@ impl Render for Sidebar {
             })
             .when(!is_empty, |element| {
                 element.child(
-                    div().flex_1().min_h_0().child(
-                        list(self.list_state.clone(), cx.processor(Self::render_entry))
-                            .with_sizing_behavior(gpui::ListSizingBehavior::Auto)
-                            .size_full(),
-                    ),
+                    div()
+                        .id("workspace-sidebar-tree")
+                        .role(Role::Tree)
+                        .aria_label("Sessions")
+                        .flex_1()
+                        .min_h_0()
+                        .child(
+                            list(self.list_state.clone(), cx.processor(Self::render_entry))
+                                .with_sizing_behavior(gpui::ListSizingBehavior::Auto)
+                                .size_full(),
+                        ),
                 )
             })
     }
@@ -1571,6 +1667,44 @@ mod tests {
                 ..
             })
         ));
+    }
+
+    /// Indentation and icons carry the hierarchy and the row kind visually.
+    /// Neither reaches a screen reader, so the name has to say both, and the
+    /// level has to be reported separately from the visual indent.
+    #[test]
+    fn rows_announce_their_kind_state_and_depth() {
+        let tree = SessionTree::from_snapshot(&snapshot());
+        let sessions = vec![
+            session("session-a", "work", 1),
+            session("session-b", "spare", 0),
+        ];
+
+        let entries = build_entries(&sessions, "session-a", &tree);
+        let announced: Vec<(String, usize)> = entries
+            .iter()
+            .map(|entry| (entry.accessible_name(), entry.indent_level() + 1))
+            .collect();
+
+        assert_eq!(
+            announced,
+            vec![
+                ("Session work, 1 attached, current".to_string(), 1),
+                ("Tab editor".to_string(), 2),
+                ("Pane vim".to_string(), 3),
+                ("Pane cargo watch, focused".to_string(), 3),
+                ("Tab logs".to_string(), 2),
+                ("Pane journalctl".to_string(), 3),
+                ("Session spare, 0 attached".to_string(), 1),
+            ]
+        );
+
+        // Only collapsible rows report an expanded state; announcing a pane as
+        // collapsed would be a lie.
+        assert!(
+            entries.iter().all(|entry| entry.expanded().is_none()),
+            "sessions, tabs and panes are not collapsible"
+        );
     }
 
     #[test]
