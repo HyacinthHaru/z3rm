@@ -222,6 +222,17 @@ impl A11y {
         self.active_this_frame
     }
 
+    /// Whether elements may attach nodes right now.
+    ///
+    /// Distinct from [`Self::is_active`]: an element can be laid out while no
+    /// frame is open — `prepaint_as_root` from a measurement pass, for
+    /// instance — and a node pushed then has no tree to join. Callers that ask
+    /// "is a screen reader listening" (rather than "may I push") want
+    /// [`Self::is_active`], which stays true between frames.
+    pub(crate) fn is_building_frame(&self) -> bool {
+        self.active_this_frame && self.nodes.frame_open
+    }
+
     pub(crate) fn set_focusable(&mut self, node_id: NodeId, focus_id: FocusId) {
         self.focus_ids.insert(node_id, focus_id);
     }
@@ -390,6 +401,10 @@ impl<'a> A11ySubtreeBuilder<'a> {
 }
 
 pub(crate) struct A11yNodeBuilder {
+    /// Whether a frame is currently being built. Nodes can only be attached
+    /// between [`Self::begin_frame`] and [`Self::finalize`]; outside that
+    /// window there is no tree for them to join.
+    frame_open: bool,
     ids_stack: SmallVec<[NodeId; 16]>,
     nodes_stack: SmallVec<[accesskit::Node; 16]>,
     /// This is the exact type required by accesskit, so we can't just make it a
@@ -411,6 +426,7 @@ pub(crate) struct A11yNodeBuilder {
 impl A11yNodeBuilder {
     fn new() -> Self {
         Self {
+            frame_open: false,
             ids_stack: SmallVec::new(),
             nodes_stack: SmallVec::new(),
             all_nodes: Vec::new(),
@@ -493,6 +509,7 @@ impl A11yNodeBuilder {
 
     /// Push the root node to start a new frame.
     fn begin_frame(&mut self, window_title: Option<&SharedString>) {
+        self.frame_open = true;
         self.all_nodes.clear();
         self.ids_stack.clear();
         self.nodes_stack.clear();
@@ -563,6 +580,7 @@ impl A11yNodeBuilder {
     }
 
     fn finalize(&mut self) -> TreeUpdate {
+        self.frame_open = false;
         // Stack should contain only the root node
         debug_assert_eq!(self.ids_stack.len(), 1);
         debug_assert_eq!(self.ids_stack[0], ROOT_NODE_ID);
@@ -656,6 +674,35 @@ impl A11yNodeBuilder {
 
 #[cfg(test)]
 mod tests {
+    /// An element can be laid out while no frame is open — a measurement pass
+    /// calling `prepaint_as_root`, for instance. A node pushed then has no
+    /// tree to join, and pushing anyway trips the "node pushed before
+    /// push_root" invariant.
+    #[test]
+    fn pushes_are_closed_between_frames() {
+        let mut a11y = super::A11y::new(std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true)), false, None);
+        a11y.sync_active_flag();
+
+        assert!(a11y.is_active(), "the flag is on");
+        assert!(
+            !a11y.is_building_frame(),
+            "no frame has begun, so nothing may be attached yet"
+        );
+
+        a11y.begin_frame();
+        assert!(a11y.is_building_frame());
+
+        let _ = a11y.end_frame(super::debug::FrameDebugInfo::default());
+        assert!(
+            a11y.is_active(),
+            "the screen reader is still listening between frames"
+        );
+        assert!(
+            !a11y.is_building_frame(),
+            "but the frame is closed, so pushes must not be attempted"
+        );
+    }
+
     // Import specific items rather than glob-importing `super`, which would pull
     // in gpui's own `test` attribute macro and shadow the standard one.
     use super::{A11y, A11yNodeBuilder, ROOT_NODE_ID};
