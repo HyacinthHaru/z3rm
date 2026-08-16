@@ -39,6 +39,10 @@ pub struct LayoutState {
     rects: Vec<LayoutRect>,
     relative_highlighted_ranges: Vec<(Range, Hsla)>,
     cursor: Option<CursorLayout>,
+    /// Viewport-relative `(line, column)` of the rendered cursor, kept
+    /// alongside the pixel layout because the accessibility caret is addressed
+    /// in grid coordinates rather than pixels.
+    cursor_grid_position: Option<(i32, usize)>,
     ime_cursor_bounds: Option<Bounds<Pixels>>,
     background_color: Hsla,
     dimensions: TerminalBounds,
@@ -999,7 +1003,11 @@ impl Element for TerminalElement {
         prepaint: &mut Self::PrepaintState,
         builder: &mut A11ySubtreeBuilder,
     ) {
-        push_terminal_line_text_runs(builder, &prepaint.batched_text_runs);
+        push_terminal_line_text_runs(
+            builder,
+            &prepaint.batched_text_runs,
+            prepaint.cursor_grid_position,
+        );
     }
 
     fn request_layout(
@@ -1451,6 +1459,13 @@ impl Element for TerminalElement {
                 LayoutState {
                     hitbox,
                     batched_text_runs,
+                    // Only a cursor that is actually rendered gets a caret:
+                    // a terminal that hid it via DECTCEM must not have one
+                    // announced, and `cursor` is already `None` when the
+                    // position falls outside the viewport.
+                    cursor_grid_position: cursor
+                        .as_ref()
+                        .map(|_| (cursor_point.line(), cursor_point.col())),
                     cursor,
                     ime_cursor_bounds,
                     background_color,
@@ -1927,11 +1942,59 @@ fn build_terminal_line_runs(
 /// `value`, `character_lengths` and `word_starts` so platform text patterns
 /// can drive caret/review. Synthetic ids key off the parent node id + a
 /// `(line, chunk)` key, so they are stable frame-to-frame.
-fn push_terminal_line_text_runs(builder: &mut A11ySubtreeBuilder, runs: &[BatchedTextRun]) {
-    let runs =
+/// Locate the synthetic run holding the cursor, as an AccessKit text position.
+///
+/// Returns `None` when the cursor sits on a line that produced no run, since a
+/// caret must name a node that exists in the tree.
+fn terminal_caret_position(
+    runs: &[BatchedTextRun],
+    (cursor_line, cursor_column): (i32, usize),
+    synthetic_id: impl Fn(u64, u64) -> accesskit::NodeId,
+) -> Option<accesskit::TextPosition> {
+    let line = collect_terminal_lines(runs)
+        .into_iter()
+        .find(|line| line.line == cursor_line)?;
+
+    let total = line.text.chars().count();
+    let num_chunks = total.div_ceil(MAX_CHARS_PER_A11Y_RUN).max(1);
+    let chunk_index = (cursor_column / MAX_CHARS_PER_A11Y_RUN).min(num_chunks - 1);
+    let chunk_start = chunk_index * MAX_CHARS_PER_A11Y_RUN;
+    let chunk_length = total
+        .saturating_sub(chunk_start)
+        .min(MAX_CHARS_PER_A11Y_RUN);
+
+    Some(accesskit::TextPosition {
+        node: synthetic_id(cursor_line as u64, chunk_index as u64),
+        // A terminal cursor routinely sits past the last glyph on a line —
+        // trailing blanks are trimmed out of the run — and AccessKit rejects a
+        // character index beyond its node's text.
+        character_index: cursor_column.saturating_sub(chunk_start).min(chunk_length),
+    })
+}
+
+fn push_terminal_line_text_runs(
+    builder: &mut A11ySubtreeBuilder,
+    runs: &[BatchedTextRun],
+    cursor: Option<(i32, usize)>,
+) {
+    let line_runs =
         build_terminal_line_runs(runs, |line, chunk| builder.synthetic_node_id((line, chunk)));
-    for (id, node) in runs {
+    for (id, node) in line_runs {
         builder.push_child(id, node);
+    }
+
+    let caret = cursor.and_then(|cursor| {
+        terminal_caret_position(runs, cursor, |line, chunk| {
+            builder.synthetic_node_id((line, chunk))
+        })
+    });
+    if let Some(caret) = caret {
+        builder
+            .parent_node()
+            .set_text_selection(accesskit::TextSelection {
+                anchor: caret,
+                focus: caret,
+            });
     }
 }
 
@@ -3070,6 +3133,60 @@ mod tests {
         for (_, node) in &nodes {
             assert_eq!(node.role(), accesskit::Role::TextRun);
         }
+    }
+
+    /// Without a caret on the parent node, assistive technology has no idea
+    /// where in the grid typing lands: the text runs alone describe content,
+    /// not position.
+    #[test]
+    fn a11y_caret_lands_on_the_run_holding_the_cursor() {
+        let runs = vec![
+            a11y_run(0, "hello world"),
+            a11y_run(1, "git status"),
+            a11y_run(2, "        "),
+        ];
+
+        let caret = terminal_caret_position(&runs, (1, 4), fake_id)
+            .expect("a cursor on a rendered line has a caret");
+        assert_eq!(caret.node, fake_id(1, 0));
+        assert_eq!(caret.character_index, 4);
+
+        // The prompt cursor sits one past the last glyph, and trailing blanks
+        // were trimmed out of the run, so the index clamps to the run length
+        // instead of pointing past the node.
+        let past_end = terminal_caret_position(&runs, (1, 40), fake_id)
+            .expect("a cursor past the last glyph still belongs to that line");
+        assert_eq!(past_end.node, fake_id(1, 0));
+        assert_eq!(past_end.character_index, "git status".chars().count());
+
+        // A blank row keeps an empty run, so the caret is addressable there.
+        let blank = terminal_caret_position(&runs, (2, 3), fake_id)
+            .expect("a blank row still carries a run");
+        assert_eq!(blank.node, fake_id(2, 0));
+        assert_eq!(blank.character_index, 0);
+
+        assert!(
+            terminal_caret_position(&runs, (9, 0), fake_id).is_none(),
+            "a line that produced no run cannot host a caret"
+        );
+    }
+
+    /// Long lines are split across chunks, and the caret has to name the chunk
+    /// it actually falls in — otherwise it silently snaps to the start of the
+    /// line once a row exceeds the AccessKit run limit.
+    #[test]
+    fn a11y_caret_selects_the_chunk_containing_the_cursor() {
+        let long = "x".repeat(MAX_CHARS_PER_A11Y_RUN + 10);
+        let runs = vec![a11y_run(0, &long)];
+
+        let first = terminal_caret_position(&runs, (0, 7), fake_id).expect("caret in first chunk");
+        assert_eq!(first.node, fake_id(0, 0));
+        assert_eq!(first.character_index, 7);
+
+        let second = terminal_caret_position(&runs, (0, MAX_CHARS_PER_A11Y_RUN + 3), fake_id)
+            .expect("caret in second chunk");
+        assert_eq!(second.node, fake_id(0, 1));
+        assert_eq!(second.character_index, 3);
     }
 
     /// Runs on the same painted line are concatenated in order, regardless of
