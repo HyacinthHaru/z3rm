@@ -3416,7 +3416,12 @@ mod tests {
         cx.run_until_parked();
 
         cx.activate_a11y(cx.window_handle());
-        for frame in 1..=2 {
+
+        // The grid arrives over the socket after the pane is mounted, so the
+        // first frames legitimately have nothing to say. Once the text is
+        // there it must stay there: the pane group is a cached view, and a
+        // cached subtree that stops prepainting contributes no nodes at all.
+        let read_frame = |cx: &mut gpui::VisualTestContext| {
             let json = cx
                 .update(|window, cx| {
                     window.draw(cx).clear(cx);
@@ -3425,19 +3430,47 @@ mod tests {
                 .expect("activation makes the debug tree available");
             let tree: serde_json::Value =
                 serde_json::from_str(&json).expect("the dump is valid JSON");
-
-            let named = tree["nodes"]
-                .as_object()
-                .expect("the dump lists nodes")
+            let nodes = tree["nodes"].as_object().expect("the dump lists nodes");
+            let named = nodes
                 .values()
                 .find(|node| node["element_id"].as_str() == Some("Name(\"mux-pane-root\")"))
                 .and_then(|node| node["aria"]["label"].as_str())
                 .unwrap_or_default()
                 .to_string();
+            let text_runs: Vec<String> = nodes
+                .values()
+                .filter(|node| node["aria"]["role"] == "TextRun")
+                .filter_map(|node| node["aria"]["value"].as_str().map(str::to_string))
+                .collect();
+            (named, text_runs)
+        };
 
+        // The first cell carries a combining acute accent, so the plain word is
+        // not a substring of what the terminal reports.
+        const SERVED_GRID_TEXT: &str = "q\u{301}uiet";
+
+        let mut settled = None;
+        for _ in 0..20 {
+            let frame = read_frame(cx);
+            if frame.1.iter().any(|value| value.contains(SERVED_GRID_TEXT)) {
+                settled = Some(frame);
+                break;
+            }
+            cx.run_until_parked();
+        }
+        let (named, text_runs) =
+            settled.expect("the served grid text never reached the accessibility tree");
+        assert!(!named.is_empty(), "the hosted terminal must be announced");
+
+        for frame in 1..=2 {
+            let (named, text_runs_again) = read_frame(cx);
             assert!(
                 !named.is_empty(),
-                "the hosted terminal must be announced on frame {frame}: {json}"
+                "the pane lost its name on redraw {frame}"
+            );
+            assert_eq!(
+                text_runs_again, text_runs,
+                "the grid stopped reaching the tree on redraw {frame}"
             );
         }
     }
