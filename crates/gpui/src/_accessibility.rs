@@ -271,6 +271,57 @@
 //! [prepainted][Element::prepaint], so prepaint state can be used (for example,
 //! to determine what is visible on screen).
 //!
+//! ## Checking your work
+//!
+//! Accessibility APIs in GPUI accept calls that do nothing. A role on an
+//! element with no id produces no node; a duplicate node id is discarded; a
+//! focused element that never becomes a node leaves the whole window announced
+//! instead. None of these look different from working code at the call site,
+//! so the only reliable evidence is the tree that was actually built.
+//!
+//! [`Window::debug_a11y_tree_json`] dumps that tree, and
+//! `gpui::a11y_checks` (behind `test-support`) asserts the properties that
+//! keep going wrong:
+//!
+//! - `assert_interactive_nodes_are_named` — a control announced as a bare
+//!   "button" is unusable even though it is present.
+//! - `assert_no_role_was_discarded` — a role whose element had no id.
+//! - `assert_roles_are_contained` — a `Tab` outside a `TabList` loses "2 of 5"
+//!   and the arrow-key conventions that come with containment.
+//! - `assert_focus_reached_the_tree` — focus that produced no node.
+//! - `assert_click_targets_are_reachable` — a control whose synthesized
+//!   `Click` would land on a smaller clickable child instead.
+//!
+//! Assert that something is *present* before asserting nothing is wrong with
+//! it: every one of these checks passes trivially on an empty tree, and a view
+//! that was never mounted renders nothing.
+//!
+//! ### Things that are easy to get wrong
+//!
+//! **Nodes are pushed during prepaint, and the tree is rebuilt every frame.**
+//! A view rendered with [`AnyView::cached`] replays its recorded prepaint
+//! instead of running it, which contributes no nodes at all. Check at least two
+//! consecutive frames; "reported once, then gone" is otherwise invisible.
+//!
+//! **Tracking focus is not the same as receiving it.** [`div`] follows
+//! [`Window::set_focus_handle`] with an internal claim naming the node that
+//! carries the focus. A custom [`Element`] that tracks focus itself has to call
+//! [`Window::report_a11y_focus_target`], or its focus is dropped.
+//!
+//! **Active descendant needs an ancestor.** A node claiming
+//! [`StatefulInteractiveElement::aria_active_descendant`] is honoured only when
+//! the focused node is one of its ancestors, because GPUI reports the
+//! descendant *as* the focus. A list filtered from a separate input cannot use
+//! it: focus is in the input, which is not an ancestor of the rows.
+//!
+//! **A live region has to exist before its content.** A region created at the
+//! same moment as its first message gives the platform adapter nothing to
+//! diff. Render the container always, and let it be empty.
+//!
+//! **Static text is not in the tree.** Text elements have no id and so no
+//! node. If a message matters — an empty state, an error, a status line — put
+//! it in the name of a container that does have an id.
+//!
 //! ## Further reading
 //!
 //! Designing high-quality accessible interfaces can be challenging, in the same
