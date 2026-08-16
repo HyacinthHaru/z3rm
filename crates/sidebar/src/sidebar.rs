@@ -2637,6 +2637,34 @@ mod live_tests {
         );
     }
 
+    /// The filter is an `Editor`, and an editor with no element id can carry no
+    /// accessibility node at all — so a visible search box contributed nothing
+    /// to the tree.
+    #[gpui::test]
+    async fn the_filter_input_is_exposed_as_a_named_text_input(cx: &mut TestAppContext) {
+        let tree = a11y_tree(cx, SidebarMode::Sessions);
+        let nodes = tree["nodes"].as_object().expect("the dump lists nodes");
+
+        let input = nodes
+            .values()
+            .find(|node| node["aria"]["role"] == "TextInput")
+            .expect("the sidebar filter must be reported as a text input");
+        assert!(
+            input["aria"]["placeholder"].as_str().is_some_and(|p| !p.is_empty()),
+            "the filter's placeholder is the only name it has"
+        );
+        assert!(
+            input["aria"]["text_selection"].is_object(),
+            "a text input must expose a caret so typing can be followed"
+        );
+        assert!(
+            input["children"]
+                .as_array()
+                .is_some_and(|children| !children.is_empty()),
+            "the input's content must be readable as text runs"
+        );
+    }
+
     /// The tree renders both modes' rows, so a fixed name would announce
     /// "Sessions and panes" over a list of files, and would collide with the
     /// mode buttons that are already called "Sessions" and "Files".
