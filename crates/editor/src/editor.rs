@@ -12825,6 +12825,9 @@ impl PromptEditor {
             line_height: relative(settings.buffer_line_height.value()),
             ..Default::default()
         };
+        // Built here rather than through `Editor::render`, so it has to be told
+        // it is a focusable region: without that it has no id and no role, and
+        // typing into the prompt announces nothing.
         EditorElement::new(
             &self.prompt,
             EditorStyle {
@@ -12834,6 +12837,7 @@ impl PromptEditor {
                 ..Default::default()
             },
         )
+        .focusable_region(true)
     }
 
     fn render_close_button(&self, cx: &mut Context<Self>) -> impl IntoElement {

@@ -12347,6 +12347,39 @@ mod tests {
         assert_eq!(run["aria"]["value"].as_str(), Some("needle"));
     }
 
+    /// The inline prompt is built by hand rather than through `Editor::render`,
+    /// which is a second render path for the same widget — the shape that hid
+    /// the picker query box being invisible. A prompt the user types into has
+    /// to be somewhere focus can land.
+    #[gpui::test]
+    async fn test_the_inline_prompt_is_a_focusable_region(cx: &mut TestAppContext) {
+        init_test(cx, |_| {});
+        let window = cx.add_window(|window, cx| {
+            let buffer = MultiBuffer::build_simple("one\ntwo", cx);
+            Editor::new(EditorMode::full(), buffer, None, window, cx)
+        });
+
+        window
+            .update(cx, |editor, window, cx| {
+                let anchor = editor.selections.newest_anchor().head();
+                editor.add_edit_block(anchor, "one", "Rename to…", None, None, window, cx);
+            })
+            .expect("the editor window is still open");
+        cx.run_until_parked();
+
+        cx.activate_a11y(window.into());
+        let json = cx
+            .update_window(window.into(), |_, window, cx| {
+                window.draw(cx).clear(cx);
+                window.debug_a11y_tree_json()
+            })
+            .expect("the editor window is still open")
+            .expect("activation makes the debug tree available");
+        let tree: serde_json::Value = serde_json::from_str(&json).expect("the dump is valid JSON");
+
+        gpui::a11y_checks::assert_focus_reached_the_tree(&tree, "inline prompt");
+    }
+
     /// A multi-line editor's text pattern would have to reflect folds, wrapping
     /// and inlays, so it is deliberately not described as a flat text input.
     /// It still has to be somewhere focus can land: registering a focus handle
