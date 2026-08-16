@@ -2654,6 +2654,98 @@ mod tests {
         );
     }
 
+    /// Copy mode exists so the user can select terminal output. A collapsed
+    /// caret is checked elsewhere; a real selection takes a different path,
+    /// and it is the one that makes copy mode worth entering with a screen
+    /// reader.
+    #[cfg(unix)]
+    #[gpui::test]
+    async fn a_terminal_selection_is_reported_as_a_text_range(cx: &mut TestAppContext) {
+        cx.executor().allow_parking();
+        cx.update(|cx| {
+            let settings_store = SettingsStore::test(cx);
+            cx.set_global(settings_store);
+            theme_settings::init(theme::LoadThemes::JustBase, cx);
+        });
+
+        let (client, server) = match std::os::unix::net::UnixStream::pair() {
+            Ok(pair) => pair,
+            Err(error) => panic!("create mock mux socket pair: {error}"),
+        };
+        if let Err(error) = client.set_nonblocking(true) {
+            panic!("set mock mux client nonblocking: {error}");
+        }
+        let domain = match MuxDomain::connect_with_blocking_stream(client) {
+            Ok(domain) => std::sync::Arc::new(domain),
+            Err(error) => panic!("connect mock mux domain: {error}"),
+        };
+        let server_thread = std::thread::spawn(move || serve_initial_grid(server, "quiet-pane"));
+
+        let (view, cx) = cx.add_window_view(|window, cx| {
+            MuxPaneView::new(
+                "quiet-pane".to_string(),
+                domain,
+                WeakEntity::new_invalid(),
+                WeakEntity::new_invalid(),
+                window,
+                cx,
+            )
+        });
+        match server_thread.join() {
+            Ok(Ok(())) => {}
+            Ok(Err(error)) => panic!("mock mux server failed: {error}"),
+            Err(_) => panic!("mock mux server panicked"),
+        }
+        cx.run_until_parked();
+
+        cx.activate_a11y(cx.window_handle());
+        let selection = |cx: &mut gpui::VisualTestContext| {
+            let json = cx
+                .update(|window, cx| {
+                    window.draw(cx).clear(cx);
+                    window.debug_a11y_tree_json()
+                })
+                .expect("activation makes the debug tree available");
+            let tree: serde_json::Value =
+                serde_json::from_str(&json).expect("the dump is valid JSON");
+            tree["nodes"]
+                .as_object()
+                .expect("the dump lists nodes")
+                .values()
+                .find(|node| node["aria"]["role"] == "Terminal")
+                .and_then(|node| node["aria"]["text_selection"].as_object().cloned())
+        };
+
+        // The grid arrives over the socket after the pane is mounted, so the
+        // first frames legitimately have no content and no caret in them.
+        let mut caret = None;
+        for _ in 0..20 {
+            caret = selection(cx);
+            if caret.is_some() {
+                break;
+            }
+            cx.run_until_parked();
+        }
+        let caret = caret.expect("the terminal reports a caret once its grid has arrived");
+        assert_eq!(
+            caret.get("anchor"),
+            caret.get("focus"),
+            "with nothing selected the caret is collapsed: {caret:?}"
+        );
+
+        view.update(cx, |view, cx| {
+            view.terminal.update(cx, |terminal, _| terminal.select_all());
+        });
+        cx.run_until_parked();
+
+        let range = selection(cx).expect("the terminal still reports a selection");
+        assert_ne!(
+            range.get("anchor"),
+            range.get("focus"),
+            "a selection has to be reported as a range, not as a caret: {range:?}"
+        );
+    }
+
     /// §15.4 After a reconnect resync, the server-authoritative title/zoom
     /// metadata must land in the view without re-issuing RPCs.
     #[cfg(unix)]
