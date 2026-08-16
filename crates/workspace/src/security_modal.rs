@@ -100,6 +100,9 @@ impl Render for SecurityModal {
             .then(|| self.trust_path_input.clone());
 
         AlertModal::new("security-modal")
+            // The heading is rendered inside `header` as elements, so the modal
+            // needs the text separately to be announced by name.
+            .title(header_label.clone())
             .width(rems(40.))
             .key_context("SecurityModal")
             .track_focus(&self.focus_handle(cx))
