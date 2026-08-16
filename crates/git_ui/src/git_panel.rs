@@ -6561,6 +6561,9 @@ impl GitPanel {
         let git_path_style = ProjectSettings::get_global(cx).git.path_style;
         let display_name = entry.display_name(path_style);
 
+        // Captured before the render closures take `display_name`, so the
+        // row's announced name survives.
+        let announced_name = display_name.clone();
         let selected = self.selected_entry == Some(ix);
         let marked = self.marked_entries.contains(&ix);
         let status_style = settings.status_style;
@@ -6693,6 +6696,11 @@ impl GitPanel {
 
         h_flex()
             .id(id)
+            // The row's name is the file it is about; without it the panel
+            // reads as a list of unidentified entries.
+            .role(gpui::Role::ListBoxOption)
+            .aria_label(announced_name)
+            .aria_selected(selected)
             .h(self.list_item_height())
             .w_full()
             .pl_3()
@@ -7262,6 +7270,11 @@ impl Render for GitPanel {
 
         v_flex()
             .id("git_panel")
+            // Without a role this focused root produces no accessibility node,
+            // so focus is discarded and the whole window is announced instead
+            // of the panel.
+            .role(gpui::Role::ListBox)
+            .aria_label("Changed files")
             .key_context(self.dispatch_context(window, cx))
             .track_focus(&self.focus_handle)
             .when(has_write_access, |this| {
