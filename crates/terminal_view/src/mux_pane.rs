@@ -2536,12 +2536,10 @@ mod tests {
         });
     }
 
-    /// §15.4 After a reconnect resync, the server-authoritative title/zoom
-    /// metadata must land in the view without re-issuing RPCs.
-    #[cfg(unix)]
     /// Prefix and copy mode change what every key does. A sighted user sees the
     /// hint panel or the selection; without saying so in the pane's name, the
     /// pane announces identically in all three states.
+    #[cfg(unix)]
     #[gpui::test]
     async fn prefix_mode_changes_what_the_pane_announces(cx: &mut TestAppContext) {
         cx.executor().allow_parking();
@@ -2636,6 +2634,9 @@ mod tests {
         );
     }
 
+    /// §15.4 After a reconnect resync, the server-authoritative title/zoom
+    /// metadata must land in the view without re-issuing RPCs.
+    #[cfg(unix)]
     #[gpui::test]
     async fn reconcile_metadata_from_snapshot_updates_title_and_zoom(cx: &mut TestAppContext) {
         cx.executor().allow_parking();
@@ -3348,5 +3349,96 @@ mod tests {
             Err(_) => Vec::new(),
         };
         assert!(again.is_empty(), "buffer must be empty after drain");
+    }
+
+    /// A terminal in the real window lives inside the workspace pane group,
+    /// which is a cached view. Every mux pane test above renders the view in a
+    /// window of its own, so none of them exercise the path the product takes —
+    /// and a cached subtree that stops prepainting contributes no nodes at all.
+    #[cfg(unix)]
+    #[gpui::test]
+    async fn a_terminal_in_a_workspace_pane_is_announced_on_every_frame(cx: &mut TestAppContext) {
+        cx.executor().allow_parking();
+        let params = cx.update(workspace::AppState::test);
+        cx.update(|cx| {
+            let settings_store = SettingsStore::test(cx);
+            cx.set_global(settings_store);
+            theme_settings::init(theme::LoadThemes::JustBase, cx);
+        });
+
+        let project = project::Project::test(params.fs.clone(), [], cx).await;
+        let window_handle = cx
+            .add_window(|window, cx| workspace::MultiWorkspace::test_new(project, window, cx));
+        let workspace = window_handle
+            .read_with(cx, |multi_workspace, _| multi_workspace.workspace().clone())
+            .expect("the window is open");
+        let cx = &mut gpui::VisualTestContext::from_window(window_handle.into(), cx);
+
+        // Started only once the workspace exists: the mock server reads with a
+        // timeout, and building a project and a window takes longer than it.
+        let (client, server) = match std::os::unix::net::UnixStream::pair() {
+            Ok(pair) => pair,
+            Err(error) => panic!("create mock mux socket pair: {error}"),
+        };
+        if let Err(error) = client.set_nonblocking(true) {
+            panic!("set mock mux client nonblocking: {error}");
+        }
+        let domain = match MuxDomain::connect_with_blocking_stream(client) {
+            Ok(domain) => std::sync::Arc::new(domain),
+            Err(error) => panic!("connect mock mux domain: {error}"),
+        };
+        let server_thread = std::thread::spawn(move || serve_initial_grid(server, "hosted-pane"));
+
+        let pane_view = cx.update(|window, cx| {
+            cx.new(|cx| {
+                MuxPaneView::new(
+                    "hosted-pane".to_string(),
+                    domain,
+                    WeakEntity::new_invalid(),
+                    WeakEntity::new_invalid(),
+                    window,
+                    cx,
+                )
+            })
+        });
+        // The pane only asks for its grid once it is on screen, so the mock
+        // server is joined after the item has been mounted and drawn.
+        let pane = workspace.read_with(cx, |workspace, _| workspace.active_pane().clone());
+        pane.update_in(cx, |pane, window, cx| {
+            pane.add_item(Box::new(pane_view), true, true, None, window, cx);
+        });
+        cx.run_until_parked();
+        match server_thread.join() {
+            Ok(Ok(())) => {}
+            Ok(Err(error)) => panic!("mock mux server failed: {error}"),
+            Err(_) => panic!("mock mux server panicked"),
+        }
+        cx.run_until_parked();
+
+        cx.activate_a11y(cx.window_handle());
+        for frame in 1..=2 {
+            let json = cx
+                .update(|window, cx| {
+                    window.draw(cx).clear(cx);
+                    window.debug_a11y_tree_json()
+                })
+                .expect("activation makes the debug tree available");
+            let tree: serde_json::Value =
+                serde_json::from_str(&json).expect("the dump is valid JSON");
+
+            let named = tree["nodes"]
+                .as_object()
+                .expect("the dump lists nodes")
+                .values()
+                .find(|node| node["element_id"].as_str() == Some("Name(\"mux-pane-root\")"))
+                .and_then(|node| node["aria"]["label"].as_str())
+                .unwrap_or_default()
+                .to_string();
+
+            assert!(
+                !named.is_empty(),
+                "the hosted terminal must be announced on frame {frame}: {json}"
+            );
+        }
     }
 }
