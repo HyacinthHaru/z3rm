@@ -68,7 +68,14 @@ async fn the_file_tree_is_exposed_as_a_named_tree(cx: &mut gpui::TestAppContext)
         let tree: serde_json::Value = serde_json::from_str(&json).expect("the dump is valid JSON");
         let nodes = tree["nodes"].as_object().expect("the dump lists nodes");
 
-        gpui::a11y_checks::assert_focus_reached_the_tree(&tree, "project panel");
+        // Run over the whole window, not just the panel: this is the only test
+        // that renders a workspace with a dock open, so a defect in how the
+        // pieces sit together shows up here or nowhere.
+        gpui::a11y_checks::assert_interactive_nodes_are_named(&tree, "workspace with a dock");
+        gpui::a11y_checks::assert_no_role_was_discarded(&tree, "workspace with a dock");
+        gpui::a11y_checks::assert_roles_are_contained(&tree, "workspace with a dock");
+        gpui::a11y_checks::assert_click_targets_are_reachable(&tree, "workspace with a dock");
+        gpui::a11y_checks::assert_focus_reached_the_tree(&tree, "workspace with a dock");
         let file_tree = nodes
             .iter()
             .find(|(_, node)| node["aria"]["label"].as_str() == Some("Project files"))
