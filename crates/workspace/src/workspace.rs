@@ -7078,7 +7078,8 @@ impl Workspace {
 
     /// Returns the currently-visible major window regions ("parts"), in a stable
     /// cyclic order: title bar, left dock, editor, right dock, bottom dock,
-    /// status bar. Closed docks are skipped. Used by
+    /// status bar. The mux session sidebar joins on whichever side it is docked
+    /// to. Closed docks are skipped. Used by
     /// [`FocusNextPart`]/[`FocusPreviousPart`] so keyboard and screen-reader
     /// users can move between regions without a mouse.
     fn focusable_parts(&self, cx: &App) -> Vec<FocusablePart> {
@@ -7098,11 +7099,32 @@ impl Workspace {
                 .then(|| FocusablePart::landmark(wrapper.clone(), dock_content_handle(dock, cx)))
         };
 
+        // The sidebar root carries its own landmark role and label, so it is
+        // both the wrapper and the content of its region. It is reachable by a
+        // dedicated binding, but region navigation is the discoverable path
+        // between landmarks, and in a mux window the session tree is the
+        // primary one.
+        let sidebar_part = || {
+            self.sidebar_focus_handle
+                .as_ref()
+                .map(|handle| FocusablePart::landmark(handle.clone(), handle.clone()))
+        };
+        let sidebar_on_right = self
+            .multi_workspace
+            .as_ref()
+            .and_then(|multi_workspace| multi_workspace.upgrade())
+            .is_some_and(|multi_workspace| {
+                multi_workspace.read(cx).sidebar_side(cx) == SidebarSide::Right
+            });
+
         let mut parts = Vec::new();
         if self.titlebar_item.is_some() {
             // The title bar is an ARIA toolbar, so region navigation lands on
             // its first control rather than the toolbar container.
             parts.push(FocusablePart::toolbar(self.titlebar_focus_handle.clone()));
+        }
+        if !sidebar_on_right {
+            parts.extend(sidebar_part());
         }
         parts.extend(dock_part(
             &self.left_dock,
@@ -7123,6 +7145,9 @@ impl Workspace {
             &self.right_dock,
             &self.region_focus_handles.right_dock,
         ));
+        if sidebar_on_right {
+            parts.extend(sidebar_part());
+        }
         parts.extend(dock_part(
             &self.bottom_dock,
             &self.region_focus_handles.bottom_dock,
@@ -7137,7 +7162,12 @@ impl Workspace {
 
     /// Moves focus to the next (or previous) visible window region. See
     /// [`FocusNextPart`].
-    fn move_part_focus(&mut self, forward: bool, window: &mut Window, cx: &mut Context<Self>) {
+    pub(crate) fn move_part_focus(
+        &mut self,
+        forward: bool,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         let parts = self.focusable_parts(cx);
         if parts.is_empty() {
             return;
