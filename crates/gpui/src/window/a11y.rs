@@ -155,6 +155,9 @@ pub(crate) struct A11y {
     /// The focus id we most recently reported as having no accessibility node,
     /// used to log at most once per focus change rather than every frame.
     last_focus_without_node: Option<FocusId>,
+    /// Set for the frame in which focus was dropped for lack of a node, so the
+    /// debug dump can explain an otherwise silent `gpui_focus: null`.
+    focus_without_node_this_frame: Option<&'static str>,
     /// Retains the last tree update (and, in debug builds, per-node provenance)
     /// so it can be dumped via [`crate::Window::debug_a11y_tree_json`].
     debug: debug::A11yDebug,
@@ -179,6 +182,7 @@ impl A11y {
             action_listeners: FxHashMap::default(),
             window_title,
             last_focus_without_node: None,
+            focus_without_node_this_frame: None,
             debug: debug::A11yDebug::default(),
             #[cfg(debug_assertions)]
             view_type_names: FxHashMap::default(),
@@ -190,7 +194,8 @@ impl A11y {
     /// happens, screen readers fall back to announcing the whole window instead
     /// of the focused element. The fix is to give the element both an
     /// `.id(...)` and a `.role(...)`.
-    pub(crate) fn note_focus_without_node(&mut self, focus_id: FocusId, reason: &str) {
+    pub(crate) fn note_focus_without_node(&mut self, focus_id: FocusId, reason: &'static str) {
+        self.focus_without_node_this_frame = Some(reason);
         if self.last_focus_without_node != Some(focus_id) {
             self.last_focus_without_node = Some(focus_id);
             log::info!(
@@ -276,8 +281,9 @@ impl A11y {
     }
 
     /// Finalize the tree and produce a [`TreeUpdate`] for the platform adapter.
-    pub(crate) fn end_frame(&mut self, frame: debug::FrameDebugInfo) -> TreeUpdate {
+    pub(crate) fn end_frame(&mut self, mut frame: debug::FrameDebugInfo) -> TreeUpdate {
         let update = self.nodes.finalize();
+        frame.focus_without_node = self.focus_without_node_this_frame.take();
         self.debug.capture(
             &update,
             self.nodes.focus,
