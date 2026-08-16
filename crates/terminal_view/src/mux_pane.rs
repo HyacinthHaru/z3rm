@@ -1712,6 +1712,27 @@ impl Render for MuxPaneView {
 
         // §16.4 a11y: the root exposes the pane title as a labelled group,
         // while the TerminalElement child owns the Terminal/TextRun tree.
+        //
+        // Prefix and copy mode both change what every key does. A sighted user
+        // sees the hint panel and the selection; without saying so here, the
+        // pane announces the same name in all three states.
+        let announced_title = self.terminal.read(cx).title(true);
+        let mode = if self.is_prefix_mode() {
+            Some("prefix mode")
+        } else if self
+            .terminal_view
+            .read(cx)
+            .copy_mode_state()
+            .active
+        {
+            Some("copy mode")
+        } else {
+            None
+        };
+        let announced_title = match mode {
+            Some(mode) => format!("{announced_title}, {mode}"),
+            None => announced_title,
+        };
 
         div()
             .size_full()
@@ -1719,7 +1740,7 @@ impl Render for MuxPaneView {
             .id("mux-pane-root")
             .track_focus(&self.focus_handle)
             .role(gpui::Role::Group)
-            .aria_label(self.terminal.read(cx).title(true))
+            .aria_label(SharedString::from(announced_title))
             .key_context(dispatch_context)
             .bg(colors.editor_background)
             .child(
@@ -2518,6 +2539,84 @@ mod tests {
     /// §15.4 After a reconnect resync, the server-authoritative title/zoom
     /// metadata must land in the view without re-issuing RPCs.
     #[cfg(unix)]
+    /// Prefix and copy mode change what every key does. A sighted user sees the
+    /// hint panel or the selection; without saying so in the pane's name, the
+    /// pane announces identically in all three states.
+    #[gpui::test]
+    async fn prefix_mode_changes_what_the_pane_announces(cx: &mut TestAppContext) {
+        cx.executor().allow_parking();
+        cx.update(|cx| {
+            let settings_store = SettingsStore::test(cx);
+            cx.set_global(settings_store);
+            theme_settings::init(theme::LoadThemes::JustBase, cx);
+        });
+
+        let (client, server) = match std::os::unix::net::UnixStream::pair() {
+            Ok(pair) => pair,
+            Err(error) => panic!("create mock mux socket pair: {error}"),
+        };
+        if let Err(error) = client.set_nonblocking(true) {
+            panic!("set mock mux client nonblocking: {error}");
+        }
+        let domain = match MuxDomain::connect_with_blocking_stream(client) {
+            Ok(domain) => std::sync::Arc::new(domain),
+            Err(error) => panic!("connect mock mux domain: {error}"),
+        };
+        let server_thread = std::thread::spawn(move || serve_initial_grid(server, "quiet-pane"));
+
+        let (view, cx) = cx.add_window_view(|window, cx| {
+            MuxPaneView::new(
+                "quiet-pane".to_string(),
+                domain,
+                WeakEntity::new_invalid(),
+                WeakEntity::new_invalid(),
+                window,
+                cx,
+            )
+        });
+        match server_thread.join() {
+            Ok(Ok(())) => {}
+            Ok(Err(error)) => panic!("mock mux server failed: {error}"),
+            Err(_) => panic!("mock mux server panicked"),
+        }
+        cx.run_until_parked();
+
+        cx.activate_a11y(cx.window_handle());
+        let pane_label = |cx: &mut gpui::VisualTestContext| {
+            let json = cx
+                .update(|window, cx| {
+                    window.draw(cx).clear(cx);
+                    window.debug_a11y_tree_json()
+                })
+                .expect("activation makes the debug tree available");
+            let tree: serde_json::Value =
+                serde_json::from_str(&json).expect("the dump is valid JSON");
+            tree["nodes"]
+                .as_object()
+                .expect("the dump lists nodes")
+                .values()
+                .find(|node| node["element_id"].as_str() == Some("Name(\"mux-pane-root\")"))
+                .and_then(|node| node["aria"]["label"].as_str().map(str::to_string))
+        };
+
+        let plain = pane_label(cx).expect("the pane root is named");
+        assert!(
+            !plain.contains("prefix mode"),
+            "an idle pane must not claim a mode: {plain}"
+        );
+
+        view.update_in(cx, |view, _window, cx| {
+            view.enter_prefix_mode(5_000, cx);
+        });
+        cx.run_until_parked();
+
+        assert_eq!(
+            pane_label(cx).as_deref(),
+            Some(format!("{plain}, prefix mode").as_str()),
+            "entering prefix mode has to change what the pane announces"
+        );
+    }
+
     #[gpui::test]
     async fn reconcile_metadata_from_snapshot_updates_title_and_zoom(cx: &mut TestAppContext) {
         cx.executor().allow_parking();
