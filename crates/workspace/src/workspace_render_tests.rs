@@ -410,6 +410,87 @@ async fn test_the_zoom_button_can_be_operated_through_its_action(cx: &mut TestAp
     );
 }
 
+/// A tab carries a close button inside its own bounds, so answering `Click` at
+/// the tab node's centre is only correct while the close button stays off
+/// centre. Activating a tab and closing it are not close enough for a mistake
+/// to be recoverable.
+#[gpui::test]
+async fn test_clicking_a_tab_through_its_action_activates_it(cx: &mut TestAppContext) {
+    init_test(cx);
+    let fs = FakeFs::new(cx.executor());
+    fs.insert_tree("/root", json!({ "a.txt": "" })).await;
+    let project = Project::test(fs, [path!("/root").as_ref()], cx).await;
+
+    let (multi_workspace, cx) =
+        cx.add_window_view(|window, cx| MultiWorkspace::test_new(project, window, cx));
+    let workspace = multi_workspace.read_with(cx, |mw, _| mw.workspace().clone());
+    let pane = workspace.read_with(cx, |ws, _| ws.active_pane().clone());
+
+    pane.update_in(cx, |pane, window, cx| {
+        for label in ["shell", "logs"] {
+            pane.add_item(
+                Box::new(cx.new(|cx| TestItem::new(cx).with_label(label))),
+                true,
+                true,
+                None,
+                window,
+                cx,
+            );
+        }
+    });
+    cx.run_until_parked();
+    assert_eq!(
+        pane.read_with(cx, |pane, _| pane.active_item_index()),
+        1,
+        "the second item starts active, so activating the first is a real change"
+    );
+
+    cx.activate_a11y(cx.window_handle());
+    let json = cx
+        .update(|window, cx| {
+            window.draw(cx).clear(cx);
+            window.debug_a11y_tree_json()
+        })
+        .expect("activation makes the debug tree available");
+    let tree: serde_json::Value = serde_json::from_str(&json).expect("the dump is valid JSON");
+
+    let first_tab = tree["nodes"]
+        .as_object()
+        .expect("the dump lists nodes")
+        .values()
+        .find(|node| {
+            node["aria"]["role"] == "Tab" && node["aria"]["label"].as_str() == Some("shell")
+        })
+        .expect("every open item must be reported as a named tab");
+    let node_id = first_tab["accesskit_id"]
+        .as_str()
+        .and_then(|id| id.parse::<u64>().ok())
+        .expect("every node in the dump carries its AccessKit id");
+
+    let delivered = cx.simulate_a11y_action(
+        cx.window_handle(),
+        gpui::accesskit::ActionRequest {
+            target_tree: gpui::accesskit::TreeId::ROOT,
+            target_node: gpui::accesskit::NodeId(node_id),
+            action: gpui::accesskit::Action::Click,
+            data: None,
+        },
+    );
+    assert!(delivered, "the action must reach the window");
+    cx.run_until_parked();
+
+    assert_eq!(
+        pane.read_with(cx, |pane, _| pane.items_len()),
+        2,
+        "clicking a tab must not land on its close button"
+    );
+    assert_eq!(
+        pane.read_with(cx, |pane, _| pane.active_item_index()),
+        0,
+        "clicking a tab has to activate it"
+    );
+}
+
 /// A live region announces changes made *inside* it. A region that is created
 /// at the same moment as its first message has nothing to compare against, so
 /// both regions have to be in the tree before there is anything to say.
