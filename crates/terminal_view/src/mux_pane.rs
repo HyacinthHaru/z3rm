@@ -1717,14 +1717,14 @@ impl Render for MuxPaneView {
         // sees the hint panel and the selection; without saying so here, the
         // pane announces the same name in all three states.
         let announced_title = self.terminal.read(cx).title(true);
+        // Copy mode is the same disjunction the key dispatcher uses: vi mode
+        // changes what keys do just as much, and announcing only one of the two
+        // would be silent in a state where the keyboard behaves differently.
+        let in_copy_mode = self.terminal_view.read(cx).copy_mode_state().active
+            || self.terminal.read(cx).vi_mode_enabled();
         let mode = if self.is_prefix_mode() {
             Some("prefix mode")
-        } else if self
-            .terminal_view
-            .read(cx)
-            .copy_mode_state()
-            .active
-        {
+        } else if in_copy_mode {
             Some("copy mode")
         } else {
             None
@@ -2614,6 +2614,25 @@ mod tests {
             pane_label(cx).as_deref(),
             Some(format!("{plain}, prefix mode").as_str()),
             "entering prefix mode has to change what the pane announces"
+        );
+
+        // Copy mode is the other state where the keyboard behaves differently,
+        // and it is reached from a different code path, so it needs its own
+        // check rather than being assumed from the prefix case.
+        view.update_in(cx, |view, _window, cx| {
+            // Leave prefix mode the way a timeout would, so the next assertion
+            // is about copy mode rather than a leftover prefix.
+            view.prefix_machine.on_timeout();
+            view.terminal_view.update(cx, |terminal_view, cx| {
+                terminal_view.enter_copy_mode_for_test(cx);
+            });
+        });
+        cx.run_until_parked();
+
+        assert_eq!(
+            pane_label(cx).as_deref(),
+            Some(format!("{plain}, copy mode").as_str()),
+            "entering copy mode has to change what the pane announces"
         );
     }
 

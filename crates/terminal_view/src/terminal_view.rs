@@ -1049,6 +1049,14 @@ impl TerminalView {
     }
 
     /// §12 进入复制模式 (Plan 31)
+    /// Enter copy mode without dispatching the action, for tests that need the
+    /// state rather than the key routing that normally produces it.
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn enter_copy_mode_for_test(&mut self, cx: &mut Context<Self>) {
+        copy_mode::enter_copy_mode(&self.terminal, &mut self.copy_mode_state, cx);
+        cx.notify();
+    }
+
     fn enter_copy_mode(&mut self, _: &EnterCopyMode, _: &mut Window, cx: &mut Context<Self>) {
         copy_mode::enter_copy_mode(&self.terminal, &mut self.copy_mode_state, cx);
         cx.notify();
