@@ -507,12 +507,10 @@ async fn test_every_interactive_node_in_the_window_has_a_name(cx: &mut TestAppCo
 }
 
 /// A pane with no items has nothing inside to take focus, so focus stays on the
-/// pane's own root. The pane is not rendered while it is empty, so focus points
-/// at an element that is not on screen — the dump has to say so rather than
-/// showing a null focus with no reason, which is indistinguishable from having
-/// no focus at all.
+/// pane's own root. That root carried no id and no role, so the focus produced
+/// no node at all and screen readers fell back to announcing the whole window.
 #[gpui::test]
-async fn test_focus_on_an_unrendered_element_is_reported(cx: &mut TestAppContext) {
+async fn test_an_empty_pane_holding_focus_is_announced(cx: &mut TestAppContext) {
     init_test(cx);
     let fs = FakeFs::new(cx.executor());
     fs.insert_tree("/root", json!({ "a.txt": "" })).await;
@@ -541,13 +539,67 @@ async fn test_focus_on_an_unrendered_element_is_reported(cx: &mut TestAppContext
         "the pane really does hold focus, so this is not a vacuous check"
     );
     assert_eq!(
-        tree["gpui_focus"].as_str(),
-        None,
-        "an element that never rendered cannot carry the focus"
-    );
-    assert_eq!(
         tree["frame"]["focus_without_node"].as_str(),
-        Some("its element was not rendered this frame"),
-        "a null focus has to come with the reason for it"
+        None,
+        "the focused pane must reach the tree"
     );
+    let focused = tree["gpui_focus"]
+        .as_str()
+        .and_then(|id| tree["nodes"].get(id))
+        .expect("the focus must name a node in the dump");
+    assert_eq!(focused["aria"]["label"].as_str(), Some("Empty pane"));
+}
+
+/// The pane group is hosted in a cached view, and a cached view that replays
+/// its recorded prepaint contributes no accessibility nodes. The tree is
+/// rebuilt from scratch every frame, so the centre of the window could be
+/// reported once and then disappear on the next redraw — leaving the reader
+/// with whatever happened to be dirty that frame.
+#[gpui::test]
+async fn test_the_open_item_is_still_reported_on_later_frames(cx: &mut TestAppContext) {
+    init_test(cx);
+    let fs = FakeFs::new(cx.executor());
+    fs.insert_tree("/root", json!({ "a.txt": "" })).await;
+    let project = Project::test(fs, [path!("/root").as_ref()], cx).await;
+
+    let (multi_workspace, cx) =
+        cx.add_window_view(|window, cx| MultiWorkspace::test_new(project, window, cx));
+    let workspace = multi_workspace.read_with(cx, |mw, _| mw.workspace().clone());
+    let pane = workspace.read_with(cx, |ws, _| ws.active_pane().clone());
+
+    pane.update_in(cx, |pane, window, cx| {
+        pane.add_item(
+            Box::new(cx.new(|cx| TestItem::new(cx).with_label("shell"))),
+            true,
+            true,
+            None,
+            window,
+            cx,
+        );
+    });
+    cx.run_until_parked();
+
+    cx.activate_a11y(cx.window_handle());
+    for frame in 1..=3 {
+        let json = cx
+            .update(|window, cx| {
+                window.draw(cx).clear(cx);
+                window.debug_a11y_tree_json()
+            })
+            .expect("activation makes the debug tree available");
+        let tree: serde_json::Value = serde_json::from_str(&json).expect("the dump is valid JSON");
+
+        let tabs: Vec<String> = tree["nodes"]
+            .as_object()
+            .expect("the dump lists nodes")
+            .values()
+            .filter(|node| node["aria"]["role"] == "Tab")
+            .filter_map(|node| node["aria"]["label"].as_str().map(str::to_string))
+            .collect();
+
+        assert!(
+            tabs.iter().any(|label| label == "shell"),
+            "the open item vanished from the tree on frame {frame}: {tabs:?}"
+        );
+    }
 }

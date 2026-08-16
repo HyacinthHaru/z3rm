@@ -1257,4 +1257,45 @@ mod activation_tests {
             );
         }
     }
+
+    /// Focus can point at an element that never rendered — a collapsed panel, a
+    /// pane behind a zoomed one. The dump has to say so: a null focus with no
+    /// reason is indistinguishable from having no focus at all.
+    #[crate::test]
+    fn focus_on_an_element_that_never_rendered_says_so(cx: &mut TestAppContext) {
+        struct Hidden {
+            focus_handle: crate::FocusHandle,
+        }
+        impl Render for Hidden {
+            fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+                // Deliberately renders nothing that tracks the handle.
+                div()
+            }
+        }
+
+        let window = cx.add_window(|_, cx| Hidden {
+            focus_handle: cx.focus_handle(),
+        });
+        let focus_handle = window
+            .read_with(cx, |view, _| view.focus_handle.clone())
+            .expect("the window is open");
+        cx.activate_a11y(window.into());
+
+        let json = cx
+            .update_window(window.into(), |_, window, cx| {
+                window.focus(&focus_handle, cx);
+                window.draw(cx).clear(cx);
+                window.debug_a11y_tree_json()
+            })
+            .expect("the window is open")
+            .expect("activation makes the debug tree available");
+        let tree: serde_json::Value = serde_json::from_str(&json).expect("the dump is valid JSON");
+
+        assert_eq!(tree["gpui_focus"].as_str(), None);
+        assert_eq!(
+            tree["frame"]["focus_without_node"].as_str(),
+            Some("its element was not rendered this frame"),
+            "a null focus has to come with the reason for it"
+        );
+    }
 }

@@ -41,45 +41,57 @@ async fn the_file_tree_is_exposed_as_a_named_tree(cx: &mut gpui::TestAppContext)
     cx.run_until_parked();
 
     cx.activate_a11y(cx.window_handle());
-    let json = cx
-        .update(|window, cx| {
-            window.draw(cx).clear(cx);
-            window.debug_a11y_tree_json()
-        })
-        .expect("activation makes the debug tree available");
-    let tree: serde_json::Value = serde_json::from_str(&json).expect("the dump is valid JSON");
-    let nodes = tree["nodes"].as_object().expect("the dump lists nodes");
+    // Checked on two consecutive frames: a dock hosts its panel in a cached
+    // view, and a cached view that replays its recorded prepaint contributes
+    // no nodes at all, so the panel can be reported once and then vanish on
+    // the next redraw.
+    for frame in 1..=2 {
+        let json = cx
+            .update(|window, cx| {
+                window.draw(cx).clear(cx);
+                window.debug_a11y_tree_json()
+            })
+            .expect("activation makes the debug tree available");
+        let tree: serde_json::Value = serde_json::from_str(&json).expect("the dump is valid JSON");
+        let nodes = tree["nodes"].as_object().expect("the dump lists nodes");
 
-    let file_tree = nodes
-        .iter()
-        .find(|(_, node)| node["aria"]["label"].as_str() == Some("Project files"))
-        .map(|(id, node)| (id.clone(), node.clone()))
-        .expect("the panel must be reported as a named tree");
-    assert_eq!(file_tree.1["aria"]["role"].as_str(), Some("Tree"));
+        let file_tree = nodes
+            .iter()
+            .find(|(_, node)| node["aria"]["label"].as_str() == Some("Project files"))
+            .map(|(id, node)| (id.clone(), node.clone()))
+            .unwrap_or_else(|| {
+                panic!("the panel must be reported as a named tree on frame {frame}")
+            });
+        assert_eq!(file_tree.1["aria"]["role"].as_str(), Some("Tree"));
 
-    // Read the rows from inside the tree: a row rendered outside it would keep
-    // its role and silently lose the set semantics that go with containment.
-    let mut rows: Vec<(String, u64)> = file_tree.1["children"]
-        .as_array()
-        .into_iter()
-        .flatten()
-        .filter_map(|id| id.as_str().and_then(|id| nodes.get(id)))
-        .filter(|node| node["aria"]["role"] == "TreeItem")
-        .map(|node| {
-            (
-                node["aria"]["label"].as_str().unwrap_or_default().to_string(),
-                node["aria"]["level"].as_u64().unwrap_or_default(),
-            )
-        })
-        .collect();
-    rows.sort();
+        // Read the rows from inside the tree: a row rendered outside it would keep
+        // its role and silently lose the set semantics that go with containment.
+        let mut rows: Vec<(String, u64)> = file_tree.1["children"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter_map(|id| id.as_str().and_then(|id| nodes.get(id)))
+            .filter(|node| node["aria"]["role"] == "TreeItem")
+            .map(|node| {
+                (
+                    node["aria"]["label"]
+                        .as_str()
+                        .unwrap_or_default()
+                        .to_string(),
+                    node["aria"]["level"].as_u64().unwrap_or_default(),
+                )
+            })
+            .collect();
+        rows.sort();
 
-    assert!(
-        !rows.is_empty(),
-        "the tree must contain its rows, not merely exist alongside them"
-    );
-    assert!(
-        rows.iter().all(|(name, level)| !name.is_empty() && *level >= 1),
-        "every row needs a name and a 1-based depth: {rows:?}"
-    );
+        assert!(
+            !rows.is_empty(),
+            "the tree must contain its rows, not merely exist alongside them"
+        );
+        assert!(
+            rows.iter()
+                .all(|(name, level)| !name.is_empty() && *level >= 1),
+            "every row needs a name and a 1-based depth: {rows:?}"
+        );
+    }
 }
