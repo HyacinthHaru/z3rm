@@ -257,7 +257,14 @@ impl A11y {
             // The focused element is properly exposed; reset the dedup so a
             // later focus on a node-less element logs again.
             self.last_focus_without_node = None;
-            self.nodes.set_focus(node_id);
+            let claiming_handle = self.focus_ids.get(&node_id).copied();
+            let same_handle_as_previous = self
+                .nodes
+                .focus
+                .and_then(|previous| self.focus_ids.get(&previous).copied())
+                .zip(claiming_handle)
+                .is_some_and(|(previous, claiming)| previous == claiming);
+            self.nodes.set_focus(node_id, same_handle_as_previous);
         } else {
             // The element registered a focus handle and an id, but never got a
             // node because it has no role.
@@ -565,8 +572,17 @@ impl A11yNodeBuilder {
         self.active_descendant = Some(id);
     }
 
-    pub(crate) fn set_focus(&mut self, id: NodeId) {
-        if self.focus.is_some() {
+    /// Report `id` as the focused node.
+    ///
+    /// `same_handle_as_previous` tells whether this claim comes from the same
+    /// focus handle as the last one this frame. Nesting an element that tracks
+    /// a handle inside another element tracking the same handle is a normal
+    /// GPUI pattern — a terminal surface inside its labelled pane, say — and
+    /// both report focus. The innermost claim wins, since it is the more
+    /// specific target. Two *different* handles claiming focus in one frame is
+    /// a real bug and still fails loudly.
+    pub(crate) fn set_focus(&mut self, id: NodeId, same_handle_as_previous: bool) {
+        if self.focus.is_some() && !same_handle_as_previous {
             if cfg!(debug_assertions) {
                 panic!("set_focus called more than once in a single frame");
             } else {
@@ -674,6 +690,29 @@ impl A11yNodeBuilder {
 
 #[cfg(test)]
 mod tests {
+    /// Nesting an element that tracks a focus handle inside another element
+    /// tracking the same handle is a normal GPUI pattern — a terminal surface
+    /// inside its labelled pane — and both report focus. The inner one is the
+    /// more specific target, so it wins rather than tripping the invariant.
+    #[test]
+    fn nested_elements_sharing_a_focus_handle_report_the_innermost() {
+        let mut builder = new_builder();
+
+        let outer = NodeId(1);
+        let inner = NodeId(2);
+        builder.push(outer, test_node());
+        builder.push(inner, test_node());
+
+        builder.set_focus(outer, false);
+        builder.set_focus(inner, true);
+
+        assert_eq!(
+            builder.focus,
+            Some(inner),
+            "the innermost element tracking the handle is what should be announced"
+        );
+    }
+
     /// An element can be laid out while no frame is open — a measurement pass
     /// calling `prepaint_as_root`, for instance. A node pushed then has no
     /// tree to join, and pushing anyway trips the "node pushed before
@@ -733,7 +772,7 @@ mod tests {
         let item = NodeId(2);
 
         assert!(builder.push(container, test_node()));
-        builder.set_focus(container);
+        builder.set_focus(container, false);
         assert!(builder.push(item, test_node()));
 
         // The item is on top of the stack; the focused container is its
@@ -755,7 +794,7 @@ mod tests {
         let item = NodeId(3);
 
         assert!(builder.push(container, test_node()));
-        builder.set_focus(container);
+        builder.set_focus(container, false);
         assert!(builder.push(group, test_node()));
         assert!(builder.push(item, test_node()));
 
@@ -782,7 +821,7 @@ mod tests {
         // First subtree holds real focus.
         assert!(builder.push(focused_container, test_node()));
         assert!(builder.push(focused_leaf, test_node()));
-        builder.set_focus(focused_leaf);
+        builder.set_focus(focused_leaf, false);
         builder.pop(); // focused_leaf
         builder.pop(); // focused_container
 
@@ -823,7 +862,7 @@ mod tests {
         let focused = NodeId(1);
 
         assert!(builder.push(focused, test_node()));
-        builder.set_focus(focused);
+        builder.set_focus(focused, false);
         builder.pop();
 
         let update = builder.finalize();
@@ -837,7 +876,7 @@ mod tests {
         let item = NodeId(2);
 
         assert!(builder.push(container, test_node()));
-        builder.set_focus(container);
+        builder.set_focus(container, false);
 
         // With the focused container itself on top, it is not its own (strict)
         // ancestor, so the gate is false.
@@ -873,8 +912,8 @@ mod tests {
     )]
     fn setting_focus_twice_panics_in_debug() {
         let mut builder = new_builder();
-        builder.set_focus(NodeId(1));
-        builder.set_focus(NodeId(2));
+        builder.set_focus(NodeId(1), false);
+        builder.set_focus(NodeId(2), false);
     }
 
     // Focusing a node that was never registered as focusable is a bug: panic in
