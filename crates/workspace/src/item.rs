@@ -1429,7 +1429,9 @@ pub mod test {
                     let description = *descriptions.get(detail).or_else(|| descriptions.last())?;
                     description.into()
                 })
-                .unwrap_or_default()
+                // Falling back to the label keeps an item that was given a name
+                // from reaching the tab bar as an unnamed tab.
+                .unwrap_or(self.label.as_str())
                 .into()
         }
 

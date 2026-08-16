@@ -2979,6 +2979,7 @@ impl Pane {
                             .detach_and_log_err(cx);
                     }))
                 }
+                .aria_label(end_slot_tooltip_text)
                 .map(|this| {
                     if is_active {
                         let focus_handle = focus_handle.clone();
@@ -3309,6 +3310,7 @@ impl Pane {
 
         let navigate_backward = IconButton::new("navigate_backward", IconName::ArrowLeft)
             .icon_size(IconSize::Small)
+            .aria_label("Go Back")
             .on_click({
                 let entity = cx.entity();
                 move |_, window, cx| {
@@ -3332,6 +3334,7 @@ impl Pane {
 
         let navigate_forward = IconButton::new("navigate_forward", IconName::ArrowRight)
             .icon_size(IconSize::Small)
+            .aria_label("Go Forward")
             .on_click({
                 let entity = cx.entity();
                 move |_, window, cx| {
@@ -4167,7 +4170,9 @@ fn default_render_tab_bar_buttons(
         .child(
             PopoverMenu::new("pane-tab-bar-popover-menu")
                 .trigger_with_tooltip(
-                    IconButton::new("plus", IconName::Plus).icon_size(IconSize::Small),
+                    IconButton::new("plus", IconName::Plus)
+                        .icon_size(IconSize::Small)
+                        .aria_label("New"),
                     Tooltip::text("New…"),
                 )
                 .anchor(Anchor::TopRight)
@@ -4192,6 +4197,7 @@ fn default_render_tab_bar_buttons(
             PopoverMenu::new("pane-tab-bar-split")
                 .trigger_with_tooltip(
                     IconButton::new("split", IconName::Split)
+                        .aria_label("Split Pane")
                         .icon_size(IconSize::Small)
                         .disabled(!can_clone && !can_split_move),
                     Tooltip::text("Split Pane"),
@@ -4220,6 +4226,7 @@ fn default_render_tab_bar_buttons(
             let zoomed = pane.is_zoomed();
             IconButton::new("toggle_zoom", IconName::Maximize)
                 .icon_size(IconSize::Small)
+                .aria_label(if zoomed { "Zoom Out" } else { "Zoom In" })
                 .toggle_state(zoomed)
                 .selected_icon(IconName::Minimize)
                 .on_click(cx.listener(|pane, _, window, cx| {
@@ -4264,7 +4271,19 @@ impl Render for Pane {
         // degrade gracefully below.
         let project = self.project.upgrade();
 
+        // Focus lands here whenever the pane has nothing inside to take it — an
+        // empty pane, or one whose item has not claimed focus yet. Without an id
+        // and a role that focus produces no node and the whole window gets
+        // announced instead of the pane.
+        let pane_name = self
+            .active_item()
+            .map(|item| item.tab_content_text(0, cx))
+            .unwrap_or_else(|| SharedString::new_static("Empty pane"));
+
         v_flex()
+            .id(ElementId::View(cx.entity_id()))
+            .role(gpui::Role::Group)
+            .aria_label(pane_name)
             .key_context(key_context)
             .track_focus(&self.focus_handle(cx))
             .size_full()
