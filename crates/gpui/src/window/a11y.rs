@@ -214,12 +214,8 @@ impl A11y {
     ///
     /// See the docs for [`Self::active_flag`] and [`Self::active_this_frame`]
     /// for more commentary.
-    /// Adopt the platform's activation flag for this frame, returning whether
-    /// accessibility just turned on.
-    pub(crate) fn sync_active_flag(&mut self) -> bool {
-        let was_active = self.active_this_frame;
+    pub(crate) fn sync_active_flag(&mut self) {
         self.active_this_frame = !self.force_disabled && self.active_flag.load(Ordering::SeqCst);
-        self.active_this_frame && !was_active
     }
 
     pub(crate) fn is_active(&self) -> bool {
@@ -1226,5 +1222,39 @@ mod activation_tests {
                 .any(|node| node["aria"]["label"].as_str() == Some("Cached child")),
             "a cached subtree must reach the tree on the first frame after activation: {json}"
         );
+    }
+
+    /// The tree is rebuilt from scratch every frame, so a cached view must
+    /// keep contributing on frames where nothing about it changed. Otherwise
+    /// any unrelated redraw — a blinking cursor, a hover — would delete the
+    /// stable content from under the reader.
+    #[crate::test]
+    fn a_cached_view_keeps_reporting_on_later_frames(cx: &mut TestAppContext) {
+        let window = cx.add_window(|_, cx| Root(cx.new(|_| Child)));
+        cx.update_window(window.into(), |_, window, cx| {
+            window.draw(cx).clear(cx);
+        })
+        .expect("the window is open");
+        cx.activate_a11y(window.into());
+
+        for frame in 1..=3 {
+            let json = cx
+                .update_window(window.into(), |_, window, cx| {
+                    window.draw(cx).clear(cx);
+                    window.debug_a11y_tree_json()
+                })
+                .expect("the window is open")
+                .expect("activation makes the debug tree available");
+            let tree: serde_json::Value =
+                serde_json::from_str(&json).expect("the dump is valid JSON");
+            assert!(
+                tree["nodes"]
+                    .as_object()
+                    .expect("the dump lists nodes")
+                    .values()
+                    .any(|node| node["aria"]["label"].as_str() == Some("Cached child")),
+                "the cached subtree vanished on frame {frame}: {json}"
+            );
+        }
     }
 }

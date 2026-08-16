@@ -383,12 +383,18 @@ impl<V: View> Element for ViewElement<V> {
                         let content_mask = window.content_mask();
                         let text_style = window.text_style();
 
+                        // Accessibility nodes are pushed during prepaint, and the
+                        // tree is rebuilt from scratch every frame, so replaying
+                        // recorded prepaint would drop this subtree out of the
+                        // tree entirely — the reader would lose exactly the
+                        // content that was stable enough to cache.
                         if let Some(mut element_state) = element_state
                             && element_state.cache_key.bounds == bounds
                             && element_state.cache_key.content_mask == content_mask
                             && element_state.cache_key.text_style == text_style
                             && !window.dirty_views.contains(&entity_id)
                             && !window.refreshing
+                            && !window.a11y.is_building_frame()
                         {
                             let prepaint_start = window.prepaint_index();
                             window.reuse_prepaint(element_state.prepaint_range.clone());
