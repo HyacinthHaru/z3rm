@@ -135,6 +135,25 @@ impl WhichKeyModal {
     }
 }
 
+/// What assistive technology announces when the hint appears.
+///
+/// The panel shows a prefix and the keys that can follow it. Split out from
+/// rendering so the wording is testable without standing up a workspace.
+fn announcement(pending_keys: &str, bindings: &[(SharedString, SharedString)]) -> String {
+    if bindings.is_empty() {
+        return format!("Prefix {pending_keys}");
+    }
+    format!(
+        "Prefix {pending_keys}, {} continuations: {}",
+        bindings.len(),
+        bindings
+            .iter()
+            .map(|(keys, action)| format!("{keys} {action}"))
+            .collect::<Vec<_>>()
+            .join(", ")
+    )
+}
+
 impl Render for WhichKeyModal {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let has_rows = !self.bindings.is_empty();
@@ -235,8 +254,17 @@ impl Render for WhichKeyModal {
                     })),
             );
 
+        // The hint appears on its own the moment a prefix is pressed and
+        // disappears again, so it is only ever perceived if it is announced.
+        // Polite rather than assertive: it is a reminder, not something that
+        // should interrupt whatever is being read.
+        let announced = announcement(&self.pending_keys, &self.bindings);
+
         div()
             .id("which-key-buffer-panel-scroll")
+            .role(gpui::Role::Status)
+            .aria_live(gpui::accesskit::Live::Polite)
+            .aria_label(SharedString::from(announced))
             .occlude()
             .absolute()
             .bottom(bottom_offset)
@@ -305,4 +333,27 @@ fn group_bindings(
     }
 
     result
+}
+
+#[cfg(test)]
+mod tests {
+    use super::announcement;
+    use gpui::SharedString;
+
+    /// The hint appears on its own and vanishes again, so what it announces is
+    /// the whole of what a screen-reader user gets from it: which prefix is
+    /// pending and what can follow.
+    #[test]
+    fn the_announcement_names_the_prefix_and_its_continuations() {
+        assert_eq!(announcement("ctrl-b", &[]), "Prefix ctrl-b");
+
+        let bindings = vec![
+            (SharedString::from("c"), SharedString::from("New tab")),
+            (SharedString::from("%"), SharedString::from("Split right")),
+        ];
+        assert_eq!(
+            announcement("ctrl-b", &bindings),
+            "Prefix ctrl-b, 2 continuations: c New tab, % Split right"
+        );
+    }
 }
