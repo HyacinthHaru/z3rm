@@ -162,6 +162,7 @@ fn save_frame(name: &str, image: &RgbaImage, tree: &serde_json::Value) -> Result
     assert_interactive_nodes_are_named(tree, name);
     assert_roles_are_contained(tree, name);
     assert_focus_reached_the_tree(tree, name);
+    assert_no_role_was_discarded(tree, name);
     Ok(())
 }
 
@@ -193,6 +194,24 @@ fn count_near_color(image: &RgbaImage, rgb: [u8; 3], tolerance: u8) -> usize {
 }
 
 /// All nodes in a `debug_a11y_tree_json` dump, as `(role, node)` pairs.
+/// Assert no element asked for a role and got nothing.
+///
+/// Accessibility node ids are derived from the element id, so a role set on an
+/// element without one is discarded with no node, no warning, and no visible
+/// difference in the code that requested it.
+fn assert_no_role_was_discarded(tree: &serde_json::Value, scenario: &str) {
+    let discarded = tree
+        .get("frame")
+        .and_then(|frame| frame.get("roles_without_id"))
+        .and_then(serde_json::Value::as_array)
+        .map(Vec::as_slice)
+        .unwrap_or_default();
+    assert!(
+        discarded.is_empty(),
+        "{scenario}: these roles never became nodes for lack of an element id: {discarded:?}"
+    );
+}
+
 /// Assert the frame did not discard the focused element.
 ///
 /// A focused element with an id but no role produces no accessibility node, so

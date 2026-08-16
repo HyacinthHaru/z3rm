@@ -504,6 +504,16 @@ async fn test_every_interactive_node_in_the_window_has_a_name(cx: &mut TestAppCo
         unnamed.is_empty(),
         "these nodes are announced as a bare role: {unnamed:?}"
     );
+
+    // A role on an element with no id produces no node at all, which is the
+    // quietest way to lose one: nothing is missing from the code.
+    let discarded = tree["frame"]["roles_without_id"]
+        .as_array()
+        .expect("the dump lists discarded roles");
+    assert!(
+        discarded.is_empty(),
+        "these roles never became nodes for lack of an element id: {discarded:?}"
+    );
 }
 
 /// A pane with no items has nothing inside to take focus, so focus stays on the

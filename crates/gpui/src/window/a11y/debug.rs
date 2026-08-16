@@ -19,6 +19,9 @@ pub(crate) struct FrameDebugInfo {
     /// it a dump shows `gpui_focus: null` and gives no hint that focus was
     /// dropped rather than simply absent.
     pub focus_without_node: Option<&'static str>,
+    /// Roles that never became nodes because their element had no id. Filled in
+    /// by `end_frame`, which owns the diagnostic.
+    pub roles_without_id: Vec<String>,
 }
 
 struct CapturedFrame {
@@ -30,6 +33,7 @@ struct CapturedFrame {
     viewport_size: Size<Pixels>,
     scale_factor: f32,
     focus_without_node: Option<&'static str>,
+    roles_without_id: Vec<String>,
 }
 
 #[cfg(debug_assertions)]
@@ -94,6 +98,7 @@ impl A11yDebug {
             viewport_size: frame.viewport_size,
             scale_factor: frame.scale_factor,
             focus_without_node: frame.focus_without_node,
+            roles_without_id: frame.roles_without_id,
         });
     }
 
@@ -150,6 +155,7 @@ impl A11yDebug {
                 },
                 "scale_factor": frame.scale_factor,
                 "focus_without_node": frame.focus_without_node,
+                "roles_without_id": frame.roles_without_id,
             })
         });
 

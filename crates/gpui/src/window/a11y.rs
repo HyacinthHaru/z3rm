@@ -158,6 +158,10 @@ pub(crate) struct A11y {
     /// Set for the frame in which focus was dropped for lack of a node, so the
     /// debug dump can explain an otherwise silent `gpui_focus: null`.
     focus_without_node_this_frame: Option<&'static str>,
+    /// Elements that set a role this frame but had no element id, so the role
+    /// was discarded. This is the quietest way to lose a node: nothing is
+    /// missing from the code, only from the tree.
+    roles_without_id_this_frame: Vec<String>,
     /// Retains the last tree update (and, in debug builds, per-node provenance)
     /// so it can be dumped via [`crate::Window::debug_a11y_tree_json`].
     debug: debug::A11yDebug,
@@ -183,9 +187,27 @@ impl A11y {
             window_title,
             last_focus_without_node: None,
             focus_without_node_this_frame: None,
+            roles_without_id_this_frame: Vec::new(),
             debug: debug::A11yDebug::default(),
             #[cfg(debug_assertions)]
             view_type_names: FxHashMap::default(),
+        }
+    }
+
+    /// Records that an element asked for a role but had no element id, so its
+    /// node could not be created. Node ids are derived from the element id, so
+    /// a role on its own produces nothing at all.
+    pub(crate) fn note_role_without_id(
+        &mut self,
+        role: accesskit::Role,
+        source_location: Option<&'static std::panic::Location<'static>>,
+    ) {
+        let site = match source_location {
+            Some(location) => format!("{role:?} at {location}"),
+            None => format!("{role:?}"),
+        };
+        if !self.roles_without_id_this_frame.contains(&site) {
+            self.roles_without_id_this_frame.push(site);
         }
     }
 
@@ -316,6 +338,7 @@ impl A11y {
     pub(crate) fn end_frame(&mut self, mut frame: debug::FrameDebugInfo) -> TreeUpdate {
         let update = self.nodes.finalize();
         frame.focus_without_node = self.focus_without_node_this_frame.take();
+        frame.roles_without_id = std::mem::take(&mut self.roles_without_id_this_frame);
         self.debug.capture(
             &update,
             self.nodes.focus,
@@ -1170,8 +1193,8 @@ mod a11y_text_run_tests {
 #[cfg(test)]
 mod activation_tests {
     use crate::{
-        AppContext as _, Context, Entity, InteractiveElement, IntoElement, ParentElement, Render,
-        StatefulInteractiveElement as _, StyleRefinement, TestAppContext, Window, div,
+        App, AppContext as _, Context, Entity, InteractiveElement, IntoElement, ParentElement,
+        Render, StatefulInteractiveElement as _, StyleRefinement, TestAppContext, Window, div,
     };
 
     struct Child;
@@ -1296,6 +1319,104 @@ mod activation_tests {
             tree["frame"]["focus_without_node"].as_str(),
             Some("its element was not rendered this frame"),
             "a null focus has to come with the reason for it"
+        );
+    }
+
+    /// A custom element can return a role while returning no id — the role is
+    /// then discarded with no node, no warning, and no visible difference in
+    /// the code that asked for it. That is the quietest way to lose a node, so
+    /// the dump has to name the site.
+    #[crate::test]
+    fn a_role_without_an_element_id_is_reported(cx: &mut TestAppContext) {
+        struct RolefulButIdless;
+
+        impl crate::Element for RolefulButIdless {
+            type RequestLayoutState = ();
+            type PrepaintState = ();
+
+            fn id(&self) -> Option<crate::ElementId> {
+                None
+            }
+
+            fn source_location(&self) -> Option<&'static std::panic::Location<'static>> {
+                None
+            }
+
+            fn request_layout(
+                &mut self,
+                _: Option<&crate::GlobalElementId>,
+                _: Option<&crate::InspectorElementId>,
+                window: &mut Window,
+                cx: &mut App,
+            ) -> (crate::LayoutId, ()) {
+                (window.request_layout(crate::Style::default(), [], cx), ())
+            }
+
+            fn prepaint(
+                &mut self,
+                _: Option<&crate::GlobalElementId>,
+                _: Option<&crate::InspectorElementId>,
+                _: crate::Bounds<crate::Pixels>,
+                _: &mut (),
+                _: &mut Window,
+                _: &mut App,
+            ) {
+            }
+
+            fn paint(
+                &mut self,
+                _: Option<&crate::GlobalElementId>,
+                _: Option<&crate::InspectorElementId>,
+                _: crate::Bounds<crate::Pixels>,
+                _: &mut (),
+                _: &mut (),
+                _: &mut Window,
+                _: &mut App,
+            ) {
+            }
+
+            fn a11y_role(&self) -> Option<accesskit::Role> {
+                Some(accesskit::Role::Button)
+            }
+        }
+
+        impl IntoElement for RolefulButIdless {
+            type Element = Self;
+
+            fn into_element(self) -> Self {
+                self
+            }
+        }
+
+        struct Host;
+        impl Render for Host {
+            fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+                div().child(RolefulButIdless)
+            }
+        }
+
+        let window = cx.add_window(|_, _| Host);
+        cx.activate_a11y(window.into());
+        let json = cx
+            .update_window(window.into(), |_, window, cx| {
+                window.draw(cx).clear(cx);
+                window.debug_a11y_tree_json()
+            })
+            .expect("the window is open")
+            .expect("activation makes the debug tree available");
+        let tree: serde_json::Value = serde_json::from_str(&json).expect("the dump is valid JSON");
+
+        let discarded = tree["frame"]["roles_without_id"]
+            .as_array()
+            .expect("the dump lists discarded roles");
+        assert_eq!(
+            discarded.len(),
+            1,
+            "the discarded role must be named, not silently dropped: {json}"
+        );
+        assert!(
+            discarded[0].as_str().is_some_and(|site| site.contains("Button")),
+            "the report has to say which role was lost: {discarded:?}"
         );
     }
 }
