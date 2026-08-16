@@ -24,6 +24,14 @@ fi
 tree_before=$(git status --porcelain=v1; git rev-parse HEAD)
 
 output=$(cargo test --workspace --features gpui_platform/runtime_shaders --no-fail-fast 2>&1)
+
+# A crate whose tests do not compile runs none of them, and contributes no
+# failing test names — so without this it looks exactly like a clean crate.
+if printf '%s\n' "$output" | grep -qE '^error(\[E[0-9]+\])?: |^error: could not compile'; then
+    echo "Some tests did not compile, so their results are missing entirely:"
+    printf '%s\n' "$output" | grep -E '^error(\[E[0-9]+\])?: |^error: could not compile' | sort -u | head -20
+    exit 1
+fi
 failures=$(printf '%s\n' "$output" | grep -E '^    [a-z_]+' | sed 's/^ *//' | sort -u)
 
 baseline=$(grep -vE '^\s*(#|$)' "$BASELINE_FILE" | sort -u)
