@@ -2585,4 +2585,5 @@ mod tests {
             .expect("the menu must point at the entry it has highlighted");
         assert_eq!(active["aria"]["label"].as_str(), Some("Split Right"));
     }
+
 }
