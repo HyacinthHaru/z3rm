@@ -2661,6 +2661,39 @@ mod live_tests {
             unnamed.is_empty(),
             "these nodes are announced as a bare role: {unnamed:?}"
         );
+
+        // A screen reader derives "item 2 of 5" and the arrow-key conventions
+        // from containment, so a row outside its tree loses all of it.
+        let mut parent_of = std::collections::HashMap::new();
+        for (id, node) in nodes {
+            for child in node["children"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .filter_map(|child| child.as_str())
+            {
+                parent_of.insert(child.to_string(), id.clone());
+            }
+        }
+        let orphaned: Vec<&str> = nodes
+            .iter()
+            .filter(|(_, node)| node["aria"]["role"] == "TreeItem")
+            .filter(|(id, _)| {
+                let mut ancestor = parent_of.get(*id);
+                while let Some(current) = ancestor {
+                    if nodes[current]["aria"]["role"] == "Tree" {
+                        return false;
+                    }
+                    ancestor = parent_of.get(current);
+                }
+                true
+            })
+            .map(|(id, _)| id.as_str())
+            .collect();
+        assert!(
+            orphaned.is_empty(),
+            "these rows have no Tree ancestor: {orphaned:?}"
+        );
     }
 
     /// The filter is an `Editor`, and an editor with no element id can carry no

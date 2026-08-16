@@ -1796,6 +1796,18 @@ mod tests {
             .filter(|node| node["aria"]["label"].as_str().is_none_or(str::is_empty))
             .count();
         assert_eq!(unnamed, 0, "a delegate that supplies labels must reach the tree");
+
+        // Every option must be inside the list box, not merely present in the
+        // frame: "option 2 of 3" comes from containment.
+        let options_in_frame = nodes
+            .values()
+            .filter(|node| node["aria"]["role"] == "ListBoxOption")
+            .count();
+        assert_eq!(
+            options.len(),
+            options_in_frame,
+            "every option in the frame must be inside the list box"
+        );
     }
 
     #[gpui::test]

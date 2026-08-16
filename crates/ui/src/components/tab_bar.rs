@@ -289,5 +289,17 @@ mod tests {
             unnamed.is_empty(),
             "these nodes are announced as a bare role: {unnamed:?}"
         );
+
+        // Every tab must be inside the list, not merely present in the frame:
+        // "tab 2 of 3" and the arrow-key conventions come from containment.
+        let tabs_in_frame = nodes
+            .values()
+            .filter(|node| node["aria"]["role"] == "Tab")
+            .count();
+        assert_eq!(
+            announced.len(),
+            tabs_in_frame,
+            "every tab in the frame must be inside the tab list"
+        );
     }
 }

@@ -160,6 +160,7 @@ fn save_frame(name: &str, image: &RgbaImage, tree: &serde_json::Value) -> Result
     save_a11y_tree(name, tree)?;
     // Checked here rather than per scenario so a new scenario cannot forget it.
     assert_interactive_nodes_are_named(tree, name);
+    assert_roles_are_contained(tree, name);
     Ok(())
 }
 
@@ -191,6 +192,74 @@ fn count_near_color(image: &RgbaImage, rgb: [u8; 3], tolerance: u8) -> usize {
 }
 
 /// All nodes in a `debug_a11y_tree_json` dump, as `(role, node)` pairs.
+/// Roles that only mean anything inside a matching container. A screen reader
+/// derives "tab 2 of 5" and the arrow-key conventions from that containment, so
+/// an orphaned option or tab is announced without any of it.
+const ROLE_REQUIRES_CONTAINER: &[(&str, &str)] = &[
+    ("Tab", "TabList"),
+    ("ListBoxOption", "ListBox"),
+    ("TreeItem", "Tree"),
+];
+
+/// Assert every containment-dependent node has its container as an ancestor.
+fn assert_roles_are_contained(tree: &serde_json::Value, scenario: &str) {
+    let Some(nodes) = tree.get("nodes").and_then(|nodes| nodes.as_object()) else {
+        return;
+    };
+    let role_of = |id: &str| {
+        nodes
+            .get(id)
+            .and_then(|node| node.get("aria"))
+            .and_then(|aria| aria.get("role"))
+            .and_then(|role| role.as_str())
+            .unwrap_or_default()
+            .to_string()
+    };
+
+    // Child -> parent, derived from the child lists the dump already prints.
+    let mut parent_of: std::collections::HashMap<String, String> =
+        std::collections::HashMap::new();
+    for (id, node) in nodes {
+        for child in node
+            .get("children")
+            .and_then(|children| children.as_array())
+            .into_iter()
+            .flatten()
+            .filter_map(|child| child.as_str())
+        {
+            parent_of.insert(child.to_string(), id.clone());
+        }
+    }
+
+    let orphaned: Vec<String> = nodes
+        .iter()
+        .filter_map(|(id, node)| {
+            let role = role_of(id);
+            let (_, container) = ROLE_REQUIRES_CONTAINER
+                .iter()
+                .find(|(needle, _)| *needle == role)?;
+            let mut ancestor = parent_of.get(id);
+            while let Some(current) = ancestor {
+                if role_of(current) == *container {
+                    return None;
+                }
+                ancestor = parent_of.get(current);
+            }
+            Some(format!(
+                "{role} ({}) has no {container} ancestor",
+                node.get("element_id")
+                    .and_then(|id| id.as_str())
+                    .unwrap_or("no element id")
+            ))
+        })
+        .collect();
+
+    assert!(
+        orphaned.is_empty(),
+        "{scenario}: {orphaned:?}"
+    );
+}
+
 /// Roles whose whole purpose is to be operated or read by name. A node with one
 /// of these and no accessible name is announced as a bare role ("button",
 /// "tab") with nothing to distinguish it, which is the single most common way
