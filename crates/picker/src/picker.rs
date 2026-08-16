@@ -511,7 +511,7 @@ impl<D: PickerDelegate> Picker<D> {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Self {
-        let head = Head::empty(Self::on_empty_head_blur, window, cx);
+        let head = Head::empty(D::name().into(), Self::on_empty_head_blur, window, cx);
 
         Self::new(delegate, ContainerKind::UniformList, head, None, window, cx)
     }
@@ -520,7 +520,7 @@ impl<D: PickerDelegate> Picker<D> {
     /// The picker allows the user to perform search items by text.
     /// If `PickerDelegate::render_match` only returns items with the same height, use `Picker::uniform_list` as its implementation is optimized for that.
     pub fn nonsearchable_list(delegate: D, window: &mut Window, cx: &mut Context<Self>) -> Self {
-        let head = Head::empty(Self::on_empty_head_blur, window, cx);
+        let head = Head::empty(D::name().into(), Self::on_empty_head_blur, window, cx);
 
         Self::new(delegate, ContainerKind::List, head, None, window, cx)
     }
@@ -1728,6 +1728,55 @@ mod tests {
             theme_settings::init(theme::LoadThemes::JustBase, cx);
             editor::init(cx);
         });
+    }
+
+    /// A non-searchable picker has no query field, so its invisible head holds
+    /// focus. Without a role that head produced no accessibility node, and
+    /// opening the picker announced the whole window instead.
+    ///
+    /// The head was also mounted twice per frame — once at each editor
+    /// position — which put one focusable entity in the tree twice and made any
+    /// id inside it a duplicate.
+    #[gpui::test]
+    async fn test_a_nonsearchable_picker_head_holds_focus_in_the_tree(cx: &mut TestAppContext) {
+        init_test(cx);
+
+        let (picker, cx) = cx.add_window_view(|window, cx| {
+            Picker::nonsearchable_uniform_list(TestDelegate::new(vec![true, true]), window, cx)
+        });
+        cx.run_until_parked();
+
+        cx.activate_a11y(cx.window_handle());
+        let picker_focus = picker.read_with(cx, |picker, cx| picker.focus_handle(cx));
+        let json = cx
+            .update(|window, cx| {
+                window.focus(&picker_focus, cx);
+                window.draw(cx).clear(cx);
+                window.debug_a11y_tree_json()
+            })
+            .expect("activation makes the debug tree available");
+        let tree: serde_json::Value = serde_json::from_str(&json).expect("the dump is valid JSON");
+        let nodes = tree["nodes"].as_object().expect("the dump lists nodes");
+
+        assert_eq!(
+            tree["frame"]["focus_without_node"].as_str(),
+            None,
+            "the head carries a role now, so its focus must reach the tree"
+        );
+        let focused = tree["gpui_focus"].as_str().expect("the head holds focus");
+        assert_eq!(
+            nodes[focused]["aria"]["label"].as_str(),
+            Some("test"),
+            "the picker is announced by its delegate's name"
+        );
+        assert_eq!(
+            nodes
+                .values()
+                .filter(|node| node["aria"]["label"].as_str() == Some("test"))
+                .count(),
+            1,
+            "the head must be mounted once, not at both editor positions"
+        );
     }
 
     /// Keyboard focus stays in the query input while the selection moves, so a

@@ -38,11 +38,12 @@ impl Head {
     }
 
     pub fn empty<V: 'static>(
+        label: SharedString,
         blur_handler: impl FnMut(&mut V, &mut Window, &mut Context<V>) + 'static,
         window: &mut Window,
         cx: &mut Context<V>,
     ) -> Self {
-        let head = cx.new(EmptyHead::new);
+        let head = cx.new(|cx| EmptyHead::new(label, cx));
         cx.on_blur(&head.focus_handle(cx), window, blur_handler)
             .detach();
         Self::Empty(head)
@@ -52,19 +53,31 @@ impl Head {
 /// An invisible element that can hold focus.
 pub(crate) struct EmptyHead {
     focus_handle: FocusHandle,
+    /// What assistive technology announces when focus lands here. A
+    /// non-searchable picker has no query field, so this invisible element
+    /// holds focus, and unnamed it is announced as nothing at all.
+    label: SharedString,
 }
 
 impl EmptyHead {
-    fn new(cx: &mut Context<Self>) -> Self {
+    fn new(label: SharedString, cx: &mut Context<Self>) -> Self {
         Self {
             focus_handle: cx.focus_handle(),
+            label,
         }
     }
 }
 
 impl Render for EmptyHead {
     fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        div().track_focus(&self.focus_handle(cx))
+        // An id and a role are what make this an accessibility node at all;
+        // without them focus is discarded and the whole window is announced in
+        // place of the picker.
+        div()
+            .id("picker-empty-head")
+            .role(gpui::Role::Group)
+            .aria_label(self.label.clone())
+            .track_focus(&self.focus_handle(cx))
     }
 }
 
