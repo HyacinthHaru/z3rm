@@ -214,8 +214,12 @@ impl A11y {
     ///
     /// See the docs for [`Self::active_flag`] and [`Self::active_this_frame`]
     /// for more commentary.
-    pub(crate) fn sync_active_flag(&mut self) {
+    /// Adopt the platform's activation flag for this frame, returning whether
+    /// accessibility just turned on.
+    pub(crate) fn sync_active_flag(&mut self) -> bool {
+        let was_active = self.active_this_frame;
         self.active_this_frame = !self.force_disabled && self.active_flag.load(Ordering::SeqCst);
+        self.active_this_frame && !was_active
     }
 
     pub(crate) fn is_active(&self) -> bool {
@@ -414,6 +418,8 @@ impl<'a> A11ySubtreeBuilder<'a> {
         self.parent_node().set_text_selection(selection);
     }
 
+    /// The node of the element that owns this subtree, so callers can set
+    /// properties that describe the synthetic children as a whole.
     pub fn parent_node(&mut self) -> &mut accesskit::Node {
         self.nodes
             .current_node_mut()
@@ -1162,5 +1168,63 @@ mod a11y_text_run_tests {
         selection_head: usize,
     ) {
         let _ = build_a11y_text_runs(&text, selection_tail, selection_head, NodeId);
+    }
+}
+
+#[cfg(test)]
+mod activation_tests {
+    use crate::{
+        AppContext as _, Context, Entity, InteractiveElement, IntoElement, ParentElement, Render,
+        StatefulInteractiveElement as _, StyleRefinement, TestAppContext, Window, div,
+    };
+
+    struct Child;
+    impl Render for Child {
+        fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+            div()
+                .id("cached-child")
+                .role(crate::accesskit::Role::Button)
+                .aria_label("Cached child")
+        }
+    }
+
+    struct Root(Entity<Child>);
+    impl Render for Root {
+        fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+            div().child(self.0.clone().cached(StyleRefinement::default()))
+        }
+    }
+
+    /// A screen reader usually attaches to a window that has already been
+    /// drawn, so it meets a warm view cache. A cached view replays its recorded
+    /// prepaint instead of running it again, and only a real prepaint pushes
+    /// nodes — so the first frame after activation would otherwise report an
+    /// empty tree for exactly the content the user is already looking at.
+    #[crate::test]
+    fn activating_mid_session_still_reports_cached_views(cx: &mut TestAppContext) {
+        let window = cx.add_window(|_, cx| Root(cx.new(|_| Child)));
+        cx.update_window(window.into(), |_, window, cx| {
+            window.draw(cx).clear(cx);
+        })
+        .expect("the window is open");
+
+        cx.activate_a11y(window.into());
+        let json = cx
+            .update_window(window.into(), |_, window, cx| {
+                window.draw(cx).clear(cx);
+                window.debug_a11y_tree_json()
+            })
+            .expect("the window is open")
+            .expect("activation makes the debug tree available");
+        let tree: serde_json::Value = serde_json::from_str(&json).expect("the dump is valid JSON");
+
+        assert!(
+            tree["nodes"]
+                .as_object()
+                .expect("the dump lists nodes")
+                .values()
+                .any(|node| node["aria"]["label"].as_str() == Some("Cached child")),
+            "a cached subtree must reach the tree on the first frame after activation: {json}"
+        );
     }
 }

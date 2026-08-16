@@ -2996,8 +2996,13 @@ impl Window {
         self.invalidator.set_phase(DrawPhase::Prepaint);
         self.tooltip_bounds.take();
 
-        self.a11y.sync_active_flag();
+        let a11y_just_activated = self.a11y.sync_active_flag();
         if self.a11y.is_active() {
+            // A cached view replays its recorded prepaint instead of running it
+            // again, and only a real prepaint pushes accessibility nodes. So the
+            // first frame after a screen reader attaches would be missing every
+            // subtree that happened to be clean; force one uncached pass.
+            self.refreshing |= a11y_just_activated;
             self.a11y.begin_frame();
         }
 
