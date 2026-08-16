@@ -1140,6 +1140,7 @@ impl KeymapEditor {
     ) -> IconButton {
         if is_unbound_by_unbind {
             base_button_style(index, IconName::Warning)
+                .aria_label("This action is unbound")
                 .icon_color(Color::Warning)
                 .disabled(true)
                 .tooltip(Tooltip::text("This action is unbound"))
@@ -1148,6 +1149,7 @@ impl KeymapEditor {
         {
             if conflict.is_user_keybind_conflict() {
                 base_button_style(index, IconName::Warning)
+                    .aria_label("View conflicts")
                     .icon_color(Color::Warning)
                     .tooltip(|_window, cx| {
                         Tooltip::with_meta(
@@ -1168,6 +1170,7 @@ impl KeymapEditor {
                     }))
             } else if self.search_mode.exact_match() {
                 base_button_style(index, IconName::Info)
+                    .aria_label("This binding is overridden")
                     .tooltip(|_window, cx| {
                         Tooltip::with_meta(
                             "Edit this binding",
@@ -1183,6 +1186,7 @@ impl KeymapEditor {
                     }))
             } else {
                 base_button_style(index, IconName::Info)
+                    .aria_label("Show matching keybinds")
                     .tooltip(|_window, cx|  {
                         Tooltip::with_meta(
                             "Show matching keybinds",
@@ -1203,6 +1207,7 @@ impl KeymapEditor {
             }
         } else {
             base_button_style(index, IconName::Pencil)
+                .aria_label("Edit Keybinding")
                 .visible_on_hover(if self.selected_index == Some(index) {
                     "".into()
                 } else if self.show_hover_menus {
@@ -1669,6 +1674,7 @@ impl KeymapEditor {
             })
             .trigger_with_tooltip(
                 IconButton::new("KeymapEditorFilterMenuButton", IconName::Sliders)
+                    .aria_label("Filters")
                     .icon_size(IconSize::Small)
                     .when(
                         self.keybinding_conflict_state.any_user_binding_conflicts(),
@@ -1948,6 +1954,7 @@ impl Render for KeymapEditor {
     fn render(&mut self, _window: &mut Window, cx: &mut ui::Context<Self>) -> impl ui::IntoElement {
         if let SearchMode::KeyStroke { exact_match } = self.search_mode {
             let button = IconButton::new("keystrokes-exact-match", IconName::CaseSensitive)
+                .aria_label("Toggle Exact Match Mode")
                 .tooltip(move |_window, cx| {
                     Tooltip::for_action(
                         "Toggle Exact Match Mode",
@@ -2037,6 +2044,7 @@ impl Render for KeymapEditor {
                                             "KeymapEditorKeystrokeSearchButton",
                                             IconName::Keyboard,
                                         )
+                                        .aria_label("Search by Keystrokes")
                                         .icon_size(IconSize::Small)
                                         .toggle_state(matches!(
                                             search_mode,
