@@ -5190,6 +5190,82 @@ pub mod test {
         "
     );
 
+    /// The settings window is full of controls whose semantics were written but
+    /// never read back out of a frame. A role only becomes a node when its
+    /// element also has an id, so a role set on an id-less element is discarded
+    /// with no node, no warning, and no difference in the code that asked.
+    #[gpui::test]
+    fn the_settings_window_exposes_named_controls(cx: &mut gpui::TestAppContext) {
+        let (_settings_window, cx) = cx.add_window_view(|window, cx| {
+            register_settings(cx);
+            SettingsWindow::new(None, window, cx)
+        });
+        cx.run_until_parked();
+
+        cx.activate_a11y(cx.window_handle());
+        let json = cx
+            .update(|window, cx| {
+                window.draw(cx).clear(cx);
+                window.debug_a11y_tree_json()
+            })
+            .expect("activation makes the debug tree available");
+        let tree: serde_json::Value = serde_json::from_str(&json).expect("the dump is valid JSON");
+        let nodes = tree["nodes"].as_object().expect("the dump lists nodes");
+
+        let discarded = tree["frame"]["roles_without_id"]
+            .as_array()
+            .expect("the dump lists discarded roles");
+        assert!(
+            discarded.is_empty(),
+            "these roles never became nodes for lack of an element id: {discarded:?}"
+        );
+
+        const NEEDS_A_NAME: &[&str] = &[
+            "Button",
+            "Tab",
+            "TreeItem",
+            "ListBoxOption",
+            "Link",
+            "CheckBox",
+            "RadioButton",
+            "MenuItem",
+            "SpinButton",
+        ];
+        let unnamed: Vec<String> = nodes
+            .values()
+            .filter(|node| {
+                node["aria"]["role"]
+                    .as_str()
+                    .is_some_and(|role| NEEDS_A_NAME.contains(&role))
+            })
+            .filter(|node| {
+                ["label", "value", "placeholder"]
+                    .iter()
+                    .all(|field| node["aria"][field].as_str().is_none_or(str::is_empty))
+            })
+            .map(|node| format!("{} ({})", node["aria"]["role"], node["element_id"]))
+            .collect();
+        assert!(
+            unnamed.is_empty(),
+            "these nodes are announced as a bare role: {unnamed:?}"
+        );
+
+        // Guards against the whole check passing because nothing rendered.
+        let interactive = nodes
+            .values()
+            .filter(|node| {
+                node["aria"]["role"]
+                    .as_str()
+                    .is_some_and(|role| NEEDS_A_NAME.contains(&role))
+            })
+            .count();
+        assert!(
+            interactive > 10,
+            "the settings window rendered almost no controls, so this check \
+             would pass on an empty window: {json}"
+        );
+    }
+
     #[gpui::test]
     fn navbar_double_click_toggle(cx: &mut gpui::TestAppContext) {
         let (settings_window, cx) = cx.add_window_view(|window, cx| {

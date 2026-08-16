@@ -164,7 +164,7 @@ pub(crate) struct A11y {
     /// Elements that set a role this frame but had no element id, so the role
     /// was discarded. This is the quietest way to lose a node: nothing is
     /// missing from the code, only from the tree.
-    roles_without_id_this_frame: Vec<String>,
+    roles_without_id_this_frame: Vec<(accesskit::Role, Option<&'static std::panic::Location<'static>>)>,
     /// Retains the last tree update (and, in debug builds, per-node provenance)
     /// so it can be dumped via [`crate::Window::debug_a11y_tree_json`].
     debug: debug::A11yDebug,
@@ -206,10 +206,10 @@ impl A11y {
         role: accesskit::Role,
         source_location: Option<&'static std::panic::Location<'static>>,
     ) {
-        let site = match source_location {
-            Some(location) => format!("{role:?} at {location}"),
-            None => format!("{role:?}"),
-        };
+        // Kept unformatted until the frame ends: this runs for every element
+        // that asks for a role without an id, on every frame a screen reader is
+        // attached.
+        let site = (role, source_location);
         if !self.roles_without_id_this_frame.contains(&site) {
             self.roles_without_id_this_frame.push(site);
         }
@@ -352,7 +352,14 @@ impl A11y {
     pub(crate) fn end_frame(&mut self, mut frame: debug::FrameDebugInfo) -> TreeUpdate {
         let update = self.nodes.finalize();
         frame.focus_without_node = self.focus_without_node_this_frame.take();
-        frame.roles_without_id = std::mem::take(&mut self.roles_without_id_this_frame);
+        frame.roles_without_id = self
+            .roles_without_id_this_frame
+            .drain(..)
+            .map(|(role, location)| match location {
+                Some(location) => format!("{role:?} at {location}"),
+                None => format!("{role:?}"),
+            })
+            .collect();
         frame.active_descendant_without_focus =
             std::mem::take(&mut self.active_descendant_without_focus_this_frame);
         self.debug.capture(
