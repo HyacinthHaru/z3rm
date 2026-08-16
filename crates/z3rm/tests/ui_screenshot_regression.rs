@@ -155,16 +155,21 @@ fn save_a11y_tree(name: &str, tree: &serde_json::Value) -> Result<PathBuf> {
 }
 
 /// Write both artifacts for a scenario.
-fn save_frame(name: &str, image: &RgbaImage, tree: &serde_json::Value) -> Result<()> {
-    save_screenshot(name, image)?;
-    save_a11y_tree(name, tree)?;
-    // Checked here rather than per scenario so a new scenario cannot forget it.
+/// The checks every captured frame has to pass, whether or not it is saved.
+fn check_a11y(tree: &serde_json::Value, name: &str) {
     gpui::a11y_checks::assert_interactive_nodes_are_named(tree, name);
     gpui::a11y_checks::assert_roles_are_contained(tree, name);
     gpui::a11y_checks::assert_no_role_was_discarded(tree, name);
     gpui::a11y_checks::assert_click_targets_are_reachable(tree, name);
     gpui::a11y_checks::assert_focus_reached_the_tree(tree, name);
     gpui::a11y_checks::assert_landmarks_are_distinguishable(tree, name);
+}
+
+fn save_frame(name: &str, image: &RgbaImage, tree: &serde_json::Value) -> Result<()> {
+    save_screenshot(name, image)?;
+    save_a11y_tree(name, tree)?;
+    // Checked here rather than per scenario so a new scenario cannot forget it.
+    check_a11y(tree, name);
     Ok(())
 }
 
@@ -1078,6 +1083,10 @@ fn extension_chrome_semantic_button_dispatches_command() -> Result<()> {
     let window = open_chrome_with_dispatch(&mut cx, status_bar_vdom()?, dispatch)?;
     draw_frame(&mut cx, window.into())?;
     let (_, tree) = draw_frame(&mut cx, window.into())?;
+    // Only `save_frame` runs these, and this scenario does not save one, so
+    // without this the extension chrome is checked for dispatch but never for
+    // whether a reader could find the thing being dispatched.
+    check_a11y(&tree, "extension chrome button");
 
     let button = a11y_nodes_with_role(&tree, "Button")
         .into_iter()
@@ -1432,6 +1441,7 @@ fn pane_output_dirty_signal_pulls_authoritative_grid() -> Result<()> {
         magenta > 200,
         "the updated grid's accent row must reach the framebuffer; magenta pixels: {magenta}"
     );
+    check_a11y(&tree, "pane after a dirty signal");
     let runs = a11y_text_run_values(&tree);
     assert!(
         runs.iter().any(|value| value.contains(UPDATED_MARKER)),
