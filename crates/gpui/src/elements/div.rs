@@ -1317,6 +1317,14 @@ pub trait StatefulInteractiveElement: InteractiveElement {
         self
     }
 
+    /// Marks this element as modal: assistive technology treats everything
+    /// outside it as inert, so the user cannot wander out of a dialog that is
+    /// capturing input.
+    fn aria_modal(mut self) -> Self {
+        self.interactivity().aria.modal = true;
+        self
+    }
+
     /// Marks this element as a live region: assistive technology announces its
     /// contents when they change, without the user having to move focus there.
     ///
@@ -1964,6 +1972,7 @@ pub(crate) struct AriaProperties {
     pub(crate) selected: Option<bool>,
     pub(crate) expanded: Option<bool>,
     pub(crate) live: Option<accesskit::Live>,
+    pub(crate) modal: bool,
     pub(crate) toggled: Option<accesskit::Toggled>,
     pub(crate) numeric_value: Option<f64>,
     pub(crate) min_numeric_value: Option<f64>,
@@ -3342,6 +3351,9 @@ impl Interactivity {
         }
         if let Some(live) = self.aria.live {
             node.set_live(live);
+        }
+        if self.aria.modal {
+            node.set_modal();
         }
         if let Some(expanded) = self.aria.expanded {
             node.set_expanded(expanded);
