@@ -536,7 +536,6 @@ mod test {
     use crate::{ProjectSettingsContent, Shell};
 
     #[test]
-    #[ignore]
     fn test_project_settings() {
         let project_content =
             json!({"terminal": {"shell": {"program": "/bin/project"}}, "option_as_meta": true});
