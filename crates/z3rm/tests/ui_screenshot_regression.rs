@@ -1147,6 +1147,24 @@ fn extension_chrome_vdom_renders_status_bar() -> Result<()> {
         1,
         "the status bar fixture contains one semantic button"
     );
+
+    // A control with a role but no name is announced as just "button" by a
+    // screen reader. The fixture sets no `aria-label`, so these names can only
+    // come from the bridge deriving them from content and placeholder.
+    assert_eq!(
+        a11y_nodes_with_role(&tree, "Button")
+            .first()
+            .and_then(|node| a11y_string_field(node, "label")),
+        Some("Split".to_string()),
+        "the button's accessible name must fall back to its text content"
+    );
+    assert_eq!(
+        a11y_nodes_with_role(&tree, "TextInput")
+            .first()
+            .and_then(|node| a11y_string_field(node, "label")),
+        Some("filter panes".to_string()),
+        "the input's accessible name must fall back to its placeholder"
+    );
     assert_eq!(
         a11y_nodes_with_role(&tree, "TextInput").len(),
         1,
