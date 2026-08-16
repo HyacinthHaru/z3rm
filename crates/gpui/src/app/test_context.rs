@@ -500,6 +500,16 @@ impl TestAppContext {
         .unwrap();
     }
 
+    /// Activate accessibility for a single window, as the platform adapter
+    /// would when a screen reader connects.
+    ///
+    /// Prefer this to the `Z3RM_A11Y_BUILD_HEADLESS` environment variable in a
+    /// test binary shared with unrelated tests: the variable applies to every
+    /// window in the process, so it changes what those tests render too.
+    pub fn activate_a11y(&self, window: AnyWindowHandle) {
+        self.test_window(window).simulate_a11y_activation();
+    }
+
     /// Returns the `TestWindow` backing the given handle.
     pub(crate) fn test_window(&self, window: AnyWindowHandle) -> TestWindow {
         self.app
