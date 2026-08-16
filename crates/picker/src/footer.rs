@@ -155,6 +155,7 @@ impl<D: PickerDelegate> Picker<D> {
                 this.child(Divider::vertical().mx_1())
                     .child(
                         IconButton::new("picker-preview-below", IconName::DiffUnified)
+                            .aria_label("Preview Below")
                             .icon_size(IconSize::Small)
                             .toggle_state(current == preview::Layout::Below)
                             .tooltip(move |_window, cx| {
@@ -171,6 +172,7 @@ impl<D: PickerDelegate> Picker<D> {
                     )
                     .child(
                         IconButton::new("picker-preview-right", diff_split)
+                            .aria_label("Preview to the Right")
                             .icon_size(IconSize::Small)
                             .toggle_state(current == preview::Layout::Right)
                             .tooltip(move |_window, cx| {

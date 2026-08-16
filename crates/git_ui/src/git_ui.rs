@@ -1116,6 +1116,9 @@ mod remote_button {
     }
 }
 
+/// The chevron half of a split button. `ButtonLike` takes its children as
+/// opaque elements, so unlike [`Button`] it cannot name itself from a label —
+/// a chevron with no name is announced as a bare "button".
 pub(crate) fn render_split_button_chevron_trigger(
     id: impl Into<ElementId>,
     menu_open: bool,
@@ -1128,6 +1131,7 @@ pub(crate) fn render_split_button_chevron_trigger(
     };
 
     ButtonLike::new_rounded_right(id)
+        .aria_label("More actions")
         .layer(ElevationIndex::ModalSurface)
         .selected_style(ButtonStyle::Tinted(TintColor::Accent))
         .width(chevron_button_size)

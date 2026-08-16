@@ -4772,6 +4772,7 @@ impl GitPanel {
         PopoverMenu::new(id.into())
             .trigger_with_tooltip(
                 IconButton::new("view-options-menu-trigger", IconName::Sliders)
+                    .aria_label("View Options")
                     .icon_size(IconSize::Small),
                 Tooltip::text("View Options"),
             )
@@ -4799,6 +4800,7 @@ impl GitPanel {
         } else {
             Some(
                 IconButton::new("co-authors", icon)
+                    .aria_label(tooltip_label)
                     .shape(ui::IconButtonShape::Square)
                     .icon_color(Color::Disabled)
                     .selected_icon_color(Color::Selected)
@@ -4994,6 +4996,7 @@ impl GitPanel {
 
         SplitButton::new(
             ButtonLike::new_rounded_left("git-changes-actions-split-button-left")
+                .aria_label(text.clone())
                 .layer(ElevationIndex::ModalSurface)
                 .size(ButtonSize::Compact)
                 .child(Label::new(text).size(LabelSize::Small).mr_0p5())
@@ -5043,6 +5046,7 @@ impl GitPanel {
                 .justify_between()
                 .child(
                     ButtonLike::new("diff-button")
+                        .aria_label("View Diff")
                         .child(
                             h_flex()
                                 .gap_1()
@@ -5274,6 +5278,7 @@ impl GitPanel {
             }))
             .child(SplitButton::new(
                 ButtonLike::new_rounded_left(format!("split-button-left-{}", title))
+                    .aria_label(title)
                     .layer(ElevationIndex::ModalSurface)
                     .size(ButtonSize::Compact)
                     .disabled(!can_commit || self.modal_open)
@@ -5425,6 +5430,7 @@ impl GitPanel {
                             let has_unstaged = self.has_unstaged_changes();
                             this.child(
                                 IconButton::new("undo", IconName::Undo)
+                                    .aria_label("Uncommit")
                                     .icon_size(IconSize::Small)
                                     .tooltip(move |_window, cx| {
                                         Tooltip::with_meta(
@@ -5447,6 +5453,7 @@ impl GitPanel {
                         })
                         .child(
                             IconButton::new("git-graph-button", IconName::GitGraph)
+                                .aria_label("Open Git Graph")
                                 .icon_size(IconSize::Small)
                                 .tooltip(|_window, cx| {
                                     Tooltip::for_action(
@@ -11367,6 +11374,11 @@ mod tests {
             .expect("activation makes the debug tree available");
         let tree: serde_json::Value = serde_json::from_str(&json).expect("the dump is valid JSON");
         let nodes = tree["nodes"].as_object().expect("the dump lists nodes");
+
+        gpui::a11y::assert_interactive_nodes_are_named(&tree, "git panel");
+        gpui::a11y::assert_no_role_was_discarded(&tree, "git panel");
+        gpui::a11y::assert_roles_are_contained(&tree, "git panel");
+        gpui::a11y::assert_click_targets_are_reachable(&tree, "git panel");
 
         let changes = nodes
             .values()

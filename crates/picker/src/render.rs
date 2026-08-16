@@ -131,6 +131,7 @@ impl<D: PickerDelegate> Picker<D> {
         let active = self.select_instead_of_open;
         let focus_handle = self.focus_handle(cx);
         IconButton::new("picker-multi-select-toggle", IconName::FileMultiple)
+            .aria_label("Toggle Multi Select")
             .icon_size(IconSize::Small)
             .toggle_state(active)
             .tooltip(move |_window, cx| {
