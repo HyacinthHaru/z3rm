@@ -102,6 +102,13 @@ pub struct FallbackPromptRenderer {
 impl Render for FallbackPromptRenderer {
     fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let prompt = div()
+            // A prompt asks the user to decide something. Without an id and a
+            // role it produces no accessibility node, so focus is discarded and
+            // the question itself is never announced.
+            .id("fallback-prompt")
+            .role(crate::Role::AlertDialog)
+            .aria_modal()
+            .aria_label(self.message.clone())
             .cursor_default()
             .track_focus(&self.focus)
             .w_72()
@@ -228,5 +235,61 @@ impl Deref for PromptBuilder {
             Self::Default => &fallback_prompt_renderer,
             Self::Custom(f) => f.as_ref(),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::{AppContext as _, Render, TestAppContext, Window, div};
+
+    struct EmptyView;
+    impl Render for EmptyView {
+        fn render(&mut self, _: &mut Window, _: &mut crate::Context<Self>) -> impl crate::IntoElement {
+            div()
+        }
+    }
+
+    /// A prompt asks the user to decide something. Its root tracked focus
+    /// without a role, so it produced no accessibility node: focus was
+    /// discarded and the question was never announced.
+    #[crate::test]
+    fn an_open_prompt_is_announced_with_its_message(cx: &mut TestAppContext) {
+        let window = cx.add_window(|_, _| EmptyView);
+        cx.activate_a11y(window.into());
+
+        let json = cx
+            .update_window(window.into(), |_, window, cx| {
+                cx.set_prompt_builder(crate::fallback_prompt_renderer);
+                let _receiver = window.prompt(
+                    crate::PromptLevel::Warning,
+                    "Discard unsaved changes?",
+                    None,
+                    &["Discard", "Cancel"],
+                    cx,
+                );
+                window.draw(cx).clear(cx);
+                window.debug_a11y_tree_json()
+            })
+            .expect("the prompt window is still open")
+            .expect("activation makes the debug tree available");
+        let tree: serde_json::Value = serde_json::from_str(&json).expect("the dump is valid JSON");
+
+        assert_eq!(
+            tree["frame"]["focus_without_node"].as_str(),
+            None,
+            "the prompt carries a role now, so its focus must reach the tree"
+        );
+        let dialog = tree["nodes"]
+            .as_object()
+            .expect("the dump lists nodes")
+            .values()
+            .find(|node| node["aria"]["role"] == "AlertDialog")
+            .expect("an open prompt must be reported as an alert dialog");
+        assert_eq!(
+            dialog["aria"]["label"].as_str(),
+            Some("Discard unsaved changes?"),
+            "the prompt must be announced by the question it asks"
+        );
+        assert_eq!(dialog["aria"]["modal"].as_bool(), Some(true));
     }
 }
