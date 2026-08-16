@@ -938,6 +938,28 @@ mod tests {
             unnamed.is_empty(),
             "these nodes are announced as a bare role: {unnamed:?}"
         );
+
+        // Focus is in the query editor, which is not an ancestor of the match
+        // rows, so GPUI cannot report the highlighted match without misstating
+        // where the keyboard is. Pinned rather than asserted as correct: typing
+        // in the palette announces the query but never which command is about
+        // to run.
+        assert_eq!(
+            tree["active_descendant_focus"].as_str(),
+            None,
+            "a match cannot be reported as focused while the query holds the keyboard"
+        );
+        let selected: Vec<&str> = nodes
+            .values()
+            .filter(|node| node["aria"]["role"] == "ListBoxOption")
+            .filter(|node| node["aria"]["selected"].as_bool() == Some(true))
+            .filter_map(|node| node["aria"]["label"].as_str())
+            .collect();
+        assert_eq!(
+            selected.len(),
+            1,
+            "exactly one match is current, and it has to say so: {selected:?}"
+        );
     }
 
     #[gpui::test]
