@@ -300,6 +300,7 @@ impl Render for WorktreeFetchFailedToast {
             )
             .child(
                 IconButton::new("dismiss-worktree-fetch-failed-toast", IconName::Close)
+                    .aria_label("Dismiss")
                     .shape(ui::IconButtonShape::Square)
                     .icon_size(IconSize::Small)
                     .icon_color(Color::Muted)

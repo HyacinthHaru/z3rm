@@ -1311,6 +1311,7 @@ impl Render for CommitViewToolbar {
             })
             .child(
                 IconButton::new("buffer-search", IconName::MagnifyingGlass)
+                        .aria_label("Buffer Search")
                     .icon_size(IconSize::Small)
                     .tooltip(move |_, cx| {
                         Tooltip::for_action(
@@ -1329,6 +1330,7 @@ impl Render for CommitViewToolbar {
             .when(!is_stash, |this| {
                 this.child(
                     IconButton::new("show-in-git-graph", IconName::GitGraph)
+                        .aria_label("Show in Git Graph")
                         .icon_size(IconSize::Small)
                         .tooltip(Tooltip::text("Show in Git Graph"))
                         .on_click(move |_, window, cx| {
@@ -1344,6 +1346,7 @@ impl Render for CommitViewToolbar {
                     let icon = crate::get_provider_icon(provider_name.as_str());
 
                     IconButton::new("view_on_provider", icon)
+                        .aria_label(format!("View on {provider_name}"))
                         .icon_size(IconSize::Small)
                         .tooltip(Tooltip::text(format!("View on {}", provider_name)))
                         .on_click(move |_, _, cx| cx.open_url(&url))

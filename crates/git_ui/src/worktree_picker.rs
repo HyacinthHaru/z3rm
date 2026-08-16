@@ -1325,6 +1325,7 @@ impl PickerDelegate for WorktreePickerDelegate {
                                                 ("remove-worktree-from-window", ix),
                                                 IconName::Close,
                                             )
+                                            .aria_label("Remove Worktree from Window")
                                             .icon_size(IconSize::Small)
                                             .tooltip(Tooltip::text("Remove Worktree from Window"))
                                             .on_click(
