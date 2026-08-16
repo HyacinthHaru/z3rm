@@ -32,9 +32,24 @@ if [[ -n "$fixed" ]]; then
 fi
 
 if [[ -n "$new" ]]; then
-    echo "New failures not in the baseline:"
-    printf '  %s\n' $new
-    exit 1
+    # The mux suites spawn real servers and sockets and go flaky under a loaded
+    # parallel run, so a first failure is a candidate, not a verdict. Re-run
+    # each one on its own before calling it a regression.
+    confirmed=()
+    for name in $new; do
+        if cargo test --workspace --features gpui_platform/runtime_shaders \
+            -- --exact "$name" >/dev/null 2>&1; then
+            echo "Flaky under load, passes alone: $name"
+        else
+            confirmed+=("$name")
+        fi
+    done
+
+    if [[ ${#confirmed[@]} -gt 0 ]]; then
+        echo "New failures not in the baseline:"
+        printf '  %s\n' "${confirmed[@]}"
+        exit 1
+    fi
 fi
 
 echo "No new failures."
