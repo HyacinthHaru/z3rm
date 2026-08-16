@@ -269,6 +269,11 @@ fn node_to_json(
     if let Some(v) = node.is_selected() {
         aria.insert("selected".into(), json!(v));
     }
+    // A live region that is not announced is indistinguishable from a silent
+    // one in the dump, so it has to be printed to be checkable.
+    if let Some(live) = node.live().filter(|live| *live != accesskit::Live::Off) {
+        aria.insert("live".into(), json!(format!("{live:?}")));
+    }
     if let Some(v) = node.is_expanded() {
         aria.insert("expanded".into(), json!(v));
     }

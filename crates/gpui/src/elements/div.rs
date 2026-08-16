@@ -1317,6 +1317,17 @@ pub trait StatefulInteractiveElement: InteractiveElement {
         self
     }
 
+    /// Marks this element as a live region: assistive technology announces its
+    /// contents when they change, without the user having to move focus there.
+    ///
+    /// Use [`accesskit::Live::Polite`] for status that can wait for a pause in
+    /// speech, and [`accesskit::Live::Assertive`] only for changes a user must
+    /// hear immediately, since those interrupt whatever is being read.
+    fn aria_live(mut self, live: accesskit::Live) -> Self {
+        self.interactivity().aria.live = Some(live);
+        self
+    }
+
     /// Set the expanded state for this element.
     fn aria_expanded(mut self, expanded: bool) -> Self {
         self.interactivity().aria.expanded = Some(expanded);
@@ -1952,6 +1963,7 @@ pub(crate) struct AriaProperties {
     pub(crate) keyshortcuts: Option<SharedString>,
     pub(crate) selected: Option<bool>,
     pub(crate) expanded: Option<bool>,
+    pub(crate) live: Option<accesskit::Live>,
     pub(crate) toggled: Option<accesskit::Toggled>,
     pub(crate) numeric_value: Option<f64>,
     pub(crate) min_numeric_value: Option<f64>,
@@ -3327,6 +3339,9 @@ impl Interactivity {
         }
         if let Some(selected) = self.aria.selected {
             node.set_selected(selected);
+        }
+        if let Some(live) = self.aria.live {
+            node.set_live(live);
         }
         if let Some(expanded) = self.aria.expanded {
             node.set_expanded(expanded);
@@ -4804,6 +4819,26 @@ mod tests {
         assert_eq!(node.min_numeric_value(), Some(6.0));
         assert_eq!(node.max_numeric_value(), Some(72.0));
         assert_eq!(node.numeric_value_step(), Some(1.0));
+    }
+
+    /// A status that changes while the user is working elsewhere is only
+    /// announced if it is marked as a live region; without it the change is
+    /// silent, and the element carries no signal that anything happened.
+    #[test]
+    fn test_write_a11y_info_live_region() {
+        let mut interactivity = Interactivity::default();
+        let mut node = accesskit::Node::new(accesskit::Role::Status);
+        interactivity.write_a11y_info(&mut node);
+        assert_eq!(
+            node.live(),
+            None,
+            "an element that never asked must not be announced on change"
+        );
+
+        interactivity.aria.live = Some(accesskit::Live::Polite);
+        let mut node = accesskit::Node::new(accesskit::Role::Status);
+        interactivity.write_a11y_info(&mut node);
+        assert_eq!(node.live(), Some(accesskit::Live::Polite));
     }
 
     /// Two focusable, clickable elements ("a" and "b") used to exercise the
