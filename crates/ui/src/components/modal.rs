@@ -178,6 +178,7 @@ impl RenderOnce for ModalHeader {
             .when(self.show_back_button, |this| {
                 this.child(
                     IconButton::new("back", IconName::ArrowLeft)
+                .aria_label("Back")
                         .shape(IconButtonShape::Square)
                         .on_click(|_, window, cx| {
                             window.dispatch_action(menu::Cancel.boxed_clone(), cx);
@@ -202,6 +203,7 @@ impl RenderOnce for ModalHeader {
                             .when(self.show_dismiss_button, |this| {
                                 this.child(
                                     IconButton::new("dismiss", IconName::Close)
+                .aria_label("Close")
                                         .icon_size(IconSize::Small)
                                         .on_click(|_, window, cx| {
                                             window.dispatch_action(menu::Cancel.boxed_clone(), cx);

@@ -113,6 +113,7 @@ impl Render for StatusToast {
                 let handle = self.this_handle.clone();
                 this.child(
                     IconButton::new("dismiss", IconName::Close)
+                .aria_label("Dismiss")
                         .shape(ui::IconButtonShape::Square)
                         .icon_size(IconSize::Small)
                         .icon_color(Color::Muted)

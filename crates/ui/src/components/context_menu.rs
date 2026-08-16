@@ -2096,6 +2096,7 @@ impl ContextMenu {
                         |el, (((icon, action), title), handler)| {
                             el.end_slot({
                                 let icon_button = IconButton::new("end-slot-icon", *icon)
+                                    .aria_label(title.clone())
                                     .shape(IconButtonShape::Square)
                                     .style(ButtonStyle::Subtle)
                                     .tooltip({

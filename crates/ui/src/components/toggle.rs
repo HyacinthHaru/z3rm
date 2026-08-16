@@ -658,6 +658,7 @@ impl RenderOnce for SwitchField {
             .map(|(tooltip_fn, label)| {
                 h_flex().gap_0p5().child(Label::new(label)).child(
                     IconButton::new("tooltip_button", IconName::Info)
+                        .aria_label("More information")
                         .icon_size(IconSize::XSmall)
                         .icon_color(Color::Muted)
                         .shape(crate::IconButtonShape::Square)

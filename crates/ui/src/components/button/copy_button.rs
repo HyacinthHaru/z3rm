@@ -100,6 +100,7 @@ impl RenderOnce for CopyButton {
         };
 
         let button = IconButton::new(id, icon)
+            .aria_label(tooltip.clone())
             .icon_color(color)
             .icon_size(self.icon_size)
             .disabled(self.disabled)

@@ -148,6 +148,7 @@ impl RenderOnce for AnnouncementToast {
             .child(
                 div().absolute().top_1().right_1().child(
                     IconButton::new("dismiss", IconName::Close)
+                .aria_label("Dismiss")
                         .icon_size(IconSize::Small)
                         .on_click(self.dismiss_on_click),
                 ),

@@ -213,6 +213,7 @@ impl Render for InputField {
                                     IconName::EyeOff
                                 },
                             )
+                            .aria_label(if is_masked { "Show" } else { "Hide" })
                             .icon_size(IconSize::Small)
                             .icon_color(Color::Muted)
                             .tooltip(Tooltip::text(if is_masked { "Show" } else { "Hide" }))
