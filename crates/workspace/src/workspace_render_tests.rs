@@ -239,3 +239,47 @@ async fn test_run_create_worktree_tasks_surfaces_missing_worktree(cx: &mut TestA
         );
     });
 }
+
+/// Region navigation ([`crate::FocusNextPart`]) is the discoverable way to move
+/// between landmarks, and in a mux window the session tree is the primary one.
+/// It was absent from the rotation, so F6 cycled title bar, docks, editor and
+/// status bar and never reached it.
+#[gpui::test]
+async fn test_region_navigation_reaches_the_session_sidebar(cx: &mut TestAppContext) {
+    init_test(cx);
+    let fs = FakeFs::new(cx.executor());
+    fs.insert_tree("/root", json!({ "a.txt": "" })).await;
+    let project = Project::test(fs, [path!("/root").as_ref()], cx).await;
+
+    let (multi_workspace, cx) =
+        cx.add_window_view(|window, cx| MultiWorkspace::test_new(project, window, cx));
+    let workspace = multi_workspace.read_with(cx, |mw, _| mw.workspace().clone());
+
+    let sidebar_focus_handle = cx.update(|_window, cx| cx.focus_handle());
+    workspace.update(cx, |workspace, _| {
+        workspace.set_sidebar_focus_handle(Some(sidebar_focus_handle.clone()));
+    });
+    cx.run_until_parked();
+
+    // A rotation is at most one lap; the exact index depends on which docks
+    // happen to be open, which this test deliberately does not fix.
+    let mut reached = false;
+    for _ in 0..8 {
+        reached = workspace.update_in(cx, |workspace, window, cx| {
+            workspace.move_part_focus(true, window, cx);
+            // Checked inside the same update: this handle belongs to no
+            // rendered element, so it cannot hold focus across a frame.
+            window
+                .focused(cx)
+                .is_some_and(|handle| handle == sidebar_focus_handle)
+        });
+        if reached {
+            break;
+        }
+        cx.run_until_parked();
+    }
+    assert!(
+        reached,
+        "FocusNextPart must reach the session sidebar within one full rotation"
+    );
+}

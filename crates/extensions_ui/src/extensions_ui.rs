@@ -1373,6 +1373,7 @@ impl ExtensionsPage {
                 ..Default::default()
             },
         )
+        .single_line(editor.read(cx).mode().is_single_line())
     }
 
     fn on_query_change(

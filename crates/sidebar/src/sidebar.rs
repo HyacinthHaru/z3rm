@@ -1352,6 +1352,18 @@ impl Sidebar {
             .into_any_element()
     }
 
+    /// The name announced for the row list.
+    ///
+    /// The same list renders either mode's rows, so a fixed name would say
+    /// "sessions" while the panel shows files. It also must not repeat the mode
+    /// buttons' labels, or "Sessions" would name three things in one panel.
+    fn tree_label(&self) -> &'static str {
+        match self.mode {
+            SidebarMode::Sessions => "Sessions and panes",
+            SidebarMode::Files => "Session files",
+        }
+    }
+
     fn render_header(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         v_flex()
             .id("sidebar-header")
@@ -1545,6 +1557,12 @@ impl Render for Sidebar {
 
         v_flex()
             .id("workspace-sidebar")
+            // A focused element without a role never becomes an accessibility
+            // node, so focus is dropped and the selected row's
+            // `aria_active_descendant` — which needs a focused ancestor — is
+            // discarded with it.
+            .role(Role::Complementary)
+            .aria_label("Session sidebar")
             .key_context(self.dispatch_context(window, cx))
             .track_focus(&self.focus_handle)
             .on_action(cx.listener(Self::select_next))
@@ -1569,7 +1587,7 @@ impl Render for Sidebar {
                     div()
                         .id("workspace-sidebar-tree")
                         .role(Role::Tree)
-                        .aria_label("Sessions")
+                        .aria_label(self.tree_label())
                         .flex_1()
                         .min_h_0()
                         .child(
@@ -2485,5 +2503,203 @@ mod live_tests {
             );
             assert!(sidebar.has_notifications(cx));
         });
+    }
+
+    /// Read the a11y semantics the sidebar actually renders, keyed by role.
+    ///
+    /// The unit tests above check the strings the sidebar *computes*; this
+    /// reads what lands in the tree AccessKit would hand to a screen reader,
+    /// which is the only place the `Role::Tree` -> `Role::TreeItem` parenting
+    /// can be observed at all.
+    fn a11y_tree(cx: &mut TestAppContext, mode: SidebarMode) -> serde_json::Value {
+        init_test(cx);
+        let domain = test_domain();
+        let window = cx.add_window(move |window, cx| {
+            let mut sidebar = Sidebar::new(
+                domain,
+                "session-a".to_string(),
+                Some(&snapshot()),
+                Rc::new(|_request, _window, _cx| {}),
+                window,
+                cx,
+            );
+            sidebar.sessions = sessions();
+            sidebar.mode = mode;
+            sidebar.selected_index = Some(3);
+            sidebar.rebuild_entries(cx);
+            sidebar
+        });
+
+        // Per window rather than the process-wide environment variable, which
+        // would switch accessibility on for the other tests in this binary.
+        cx.activate_a11y(window.into());
+        let json = cx
+            .update_window(window.into(), |view, window, cx| {
+                // `aria_active_descendant` is honored only while the container
+                // actually holds focus, so an unfocused dump would silently
+                // skip the property this asserts on.
+                if let Ok(sidebar) = view.downcast::<Sidebar>() {
+                    let handle = sidebar.read(cx).focus_handle.clone();
+                    window.focus(&handle, cx);
+                }
+                window.draw(cx).clear(cx);
+                window.debug_a11y_tree_json()
+            })
+            .expect("the sidebar window is still open")
+            .expect("activation makes the debug tree available");
+        serde_json::from_str(&json).expect("the dump is valid JSON")
+    }
+
+    /// Roles and names are only useful if they are actually reachable from the
+    /// tree root: a `TreeItem` parented by something other than a `Tree` is not
+    /// a tree row as far as assistive technology is concerned.
+    #[gpui::test]
+    async fn the_rendered_tree_parents_named_rows_under_a_tree_role(cx: &mut TestAppContext) {
+        let tree = a11y_tree(cx, SidebarMode::Sessions);
+        let nodes = tree["nodes"].as_object().expect("the dump lists nodes");
+
+        let node_role = |node: &serde_json::Value| {
+            node["aria"]["role"]
+                .as_str()
+                .unwrap_or_default()
+                .to_string()
+        };
+
+        let (tree_id, tree_node) = nodes
+            .iter()
+            .find(|(_, node)| node_role(node) == "Tree")
+            .expect("the session list must be reported as a tree");
+        assert_eq!(
+            tree_node["aria"]["label"].as_str(),
+            Some("Sessions and panes"),
+            "an unnamed tree is announced as just \"tree\""
+        );
+
+        // Walk down from the Tree node rather than scanning the whole dump, so
+        // rows that render outside it would not count.
+        let mut rows = Vec::new();
+        let mut pending = vec![tree_id.clone()];
+        while let Some(id) = pending.pop() {
+            let Some(node) = nodes.get(&id) else { continue };
+            if node_role(node) == "TreeItem" {
+                rows.push(node.clone());
+            }
+            if let Some(children) = node["children"].as_array() {
+                pending.extend(
+                    children
+                        .iter()
+                        .filter_map(|child| child.as_str().map(str::to_string)),
+                );
+            }
+        }
+
+        let mut announced: Vec<(String, u64, bool)> = rows
+            .iter()
+            .map(|row| {
+                (
+                    row["aria"]["label"].as_str().unwrap_or_default().to_string(),
+                    row["aria"]["level"].as_u64().unwrap_or_default(),
+                    row["aria"]["selected"].as_bool().unwrap_or(false),
+                )
+            })
+            .collect();
+        announced.sort();
+
+        assert_eq!(
+            announced,
+            vec![
+                // Selection and mux focus are different things, and the dump
+                // keeps them apart: the selected row is the one the sidebar's
+                // cursor is on, the focused row is the live pane.
+                ("Pane cargo watch".to_string(), 3, true),
+                ("Pane vim, focused".to_string(), 3, false),
+                ("Session spare, 0 attached".to_string(), 1, false),
+                ("Session work, 0 attached, current".to_string(), 1, false),
+                ("Tab editor".to_string(), 2, false),
+            ],
+            "every row under the tree must carry a name, a level, and its selection state"
+        );
+
+        // Selection lives on the container, so the current row has to be
+        // reported as the active descendant or nothing announces it.
+        let active = tree["active_descendant_focus"]
+            .as_str()
+            .expect("the focused sidebar must report an active descendant");
+        assert_eq!(
+            nodes[active]["aria"]["label"].as_str(),
+            Some("Pane cargo watch"),
+            "the active descendant must be the row the sidebar's cursor is on"
+        );
+    }
+
+    /// The filter is an `Editor`, and an editor with no element id can carry no
+    /// accessibility node at all — so a visible search box contributed nothing
+    /// to the tree.
+    #[gpui::test]
+    async fn the_filter_input_is_exposed_as_a_named_text_input(cx: &mut TestAppContext) {
+        let tree = a11y_tree(cx, SidebarMode::Sessions);
+        let nodes = tree["nodes"].as_object().expect("the dump lists nodes");
+
+        let input = nodes
+            .values()
+            .find(|node| node["aria"]["role"] == "TextInput")
+            .expect("the sidebar filter must be reported as a text input");
+        assert!(
+            input["aria"]["placeholder"].as_str().is_some_and(|p| !p.is_empty()),
+            "the filter's placeholder is the only name it has"
+        );
+        assert!(
+            input["aria"]["text_selection"].is_object(),
+            "a text input must expose a caret so typing can be followed"
+        );
+        assert!(
+            input["children"]
+                .as_array()
+                .is_some_and(|children| !children.is_empty()),
+            "the input's content must be readable as text runs"
+        );
+    }
+
+    /// The tree renders both modes' rows, so a fixed name would announce
+    /// "Sessions and panes" over a list of files, and would collide with the
+    /// mode buttons that are already called "Sessions" and "Files".
+    #[gpui::test]
+    async fn the_tree_name_follows_the_sidebar_mode(cx: &mut TestAppContext) {
+        init_test(cx);
+        let domain = test_domain();
+        let window = cx.add_window(move |window, cx| {
+            Sidebar::new(
+                domain,
+                "session-a".to_string(),
+                Some(&snapshot()),
+                Rc::new(|_request, _window, _cx| {}),
+                window,
+                cx,
+            )
+        });
+
+        window
+            .update(cx, |sidebar, _, cx| {
+                assert_eq!(sidebar.tree_label(), "Sessions and panes");
+                sidebar.set_mode(SidebarMode::Files, cx);
+                assert_eq!(sidebar.tree_label(), "Session files");
+            })
+            .expect("the sidebar window is still open");
+    }
+
+    /// A dropped focus is invisible in a dump — `gpui_focus` is simply null —
+    /// so the frame has to say when focus was discarded and why.
+    #[gpui::test]
+    async fn the_dump_explains_a_focus_that_produced_no_node(cx: &mut TestAppContext) {
+        let tree = a11y_tree(cx, SidebarMode::Sessions);
+        assert_eq!(
+            tree["frame"]["focus_without_node"].as_str(),
+            None,
+            "the sidebar has a role, so its focus must reach the tree"
+        );
+        assert!(
+            tree["gpui_focus"].as_str().is_some(),
+            "a focused container with a role must be reported as focused"
+        );
     }
 }

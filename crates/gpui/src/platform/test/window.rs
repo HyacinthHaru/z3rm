@@ -36,6 +36,7 @@ pub(crate) struct TestWindowState {
     moved_callback: Option<Box<dyn FnMut()>>,
     a11y_action_callback: Option<Box<dyn Fn(accesskit::ActionRequest) + Send + 'static>>,
     appearance_change_callback: Option<Box<dyn FnMut()>>,
+    a11y_activation_callback: Option<Box<dyn Fn() -> Option<accesskit::TreeUpdate> + Send + 'static>>,
     request_frame_callback: Option<Box<dyn FnMut(RequestFrameOptions)>>,
     frame_wake_count: Rc<Cell<usize>>,
     input_handler: Option<PlatformInputHandler>,
@@ -81,6 +82,7 @@ impl TestWindow {
             handle,
             sprite_atlas,
             renderer,
+            a11y_activation_callback: None,
             title: params
                 .titlebar
                 .as_ref()
@@ -125,6 +127,16 @@ impl TestWindow {
         drop(lock);
         callback(active);
         self.0.lock().active_status_change_callback = Some(callback);
+    }
+
+    /// Activate accessibility for this window only, as the platform adapter
+    /// would.
+    pub fn simulate_a11y_activation(&self) {
+        let callback = self.0.lock().a11y_activation_callback.take();
+        if let Some(callback) = callback {
+            let _ = callback();
+            self.0.lock().a11y_activation_callback = Some(callback);
+        }
     }
 
     pub fn simulate_appearance_change(&self, appearance: WindowAppearance) {
@@ -384,6 +396,10 @@ impl PlatformWindow for TestWindow {
         if std::env::var("Z3RM_A11Y_BUILD_HEADLESS").is_ok() {
             let _ = activation();
         }
+        // Retained so a single test can opt in without an environment
+        // variable, which would apply to every window in the process and
+        // change the behavior of unrelated tests sharing the binary.
+        self.0.lock().a11y_activation_callback = Some(activation);
         // §15.12 Semantic actions: retain the action callback (it was
         // previously dropped, so tests could not inject actions). It is the
         // genuine callback installed by `Window::new`, so requests injected

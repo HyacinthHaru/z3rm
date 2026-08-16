@@ -130,7 +130,7 @@ pub(crate) fn render_text_input(
         editor_style.syntax = app.theme().syntax().clone();
     }
 
-    EditorElement::new(editor, editor_style)
+    EditorElement::new(editor, editor_style).single_line(editor.read(app).mode().is_single_line())
 }
 
 /// This element makes all search inputs align as if they were in the same column

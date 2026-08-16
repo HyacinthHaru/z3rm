@@ -15,6 +15,10 @@ pub(crate) struct FrameDebugInfo {
     pub viewport_size: Size<Pixels>,
     pub scale_factor: f32,
     pub tab_stop_count: usize,
+    /// Why the focused element produced no node, when that happened. Without
+    /// it a dump shows `gpui_focus: null` and gives no hint that focus was
+    /// dropped rather than simply absent.
+    pub focus_without_node: Option<&'static str>,
 }
 
 struct CapturedFrame {
@@ -25,6 +29,7 @@ struct CapturedFrame {
     tab_stop_count: usize,
     viewport_size: Size<Pixels>,
     scale_factor: f32,
+    focus_without_node: Option<&'static str>,
 }
 
 #[cfg(debug_assertions)]
@@ -88,6 +93,7 @@ impl A11yDebug {
             tab_stop_count: frame.tab_stop_count,
             viewport_size: frame.viewport_size,
             scale_factor: frame.scale_factor,
+            focus_without_node: frame.focus_without_node,
         });
     }
 
@@ -143,6 +149,7 @@ impl A11yDebug {
                     "height": frame.viewport_size.height.0,
                 },
                 "scale_factor": frame.scale_factor,
+                "focus_without_node": frame.focus_without_node,
             })
         });
 

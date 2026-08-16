@@ -3095,6 +3095,8 @@ impl Window {
                 viewport_size: self.viewport_size,
                 scale_factor: self.scale_factor,
                 tab_stop_count: self.next_frame.tab_stops.tab_stop_count(),
+                // Filled in by `end_frame`, which owns the diagnostic.
+                focus_without_node: None,
             };
             // clear the builder state regardless
             let tree_update = self.a11y.end_frame(frame_info);

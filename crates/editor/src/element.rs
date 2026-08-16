@@ -244,6 +244,10 @@ pub struct EditorElement {
     editor: Entity<Editor>,
     style: EditorStyle,
     split_side: Option<SplitSide>,
+    /// Whether this element renders a single-line editor. Kept on the element
+    /// because [`Element::id`] and [`Element::a11y_role`] run without a context
+    /// and so cannot read the editor's mode.
+    single_line: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -260,7 +264,15 @@ impl EditorElement {
             editor: editor.clone(),
             style,
             split_side: None,
+            single_line: false,
         }
+    }
+
+    /// Marks this element as rendering a single-line editor, which is what
+    /// gives it text-input accessibility semantics.
+    pub fn single_line(mut self, single_line: bool) -> Self {
+        self.single_line = single_line;
+        self
     }
 
     pub fn set_split_side(&mut self, side: SplitSide) {
@@ -7759,12 +7771,45 @@ impl Element for EditorElement {
     type RequestLayoutState = EditorRequestLayoutState;
     type PrepaintState = EditorLayout;
 
+    /// Only single-line editors take an id. An element without one never
+    /// receives a `GlobalElementId`, and accessibility nodes are keyed off
+    /// that, so a text input with no id can carry no semantics at all. Multi-
+    /// line editors keep the previous stateless behavior.
     fn id(&self) -> Option<ElementId> {
-        None
+        self.single_line
+            .then(|| ElementId::View(self.editor.entity_id()))
     }
 
     fn source_location(&self) -> Option<&'static core::panic::Location<'static>> {
         None
+    }
+
+    /// Single-line editors are the app's text inputs — filters, search boxes,
+    /// settings fields — so they are reported as such. Multi-line editors need
+    /// folds, wrapping and inlays reflected in the text pattern and are left
+    /// unexposed rather than described incorrectly.
+    fn a11y_role(&self) -> Option<gpui::accesskit::Role> {
+        self.single_line.then_some(gpui::accesskit::Role::TextInput)
+    }
+
+    fn a11y_synthetic_children(
+        &mut self,
+        prepaint: &mut Self::PrepaintState,
+        builder: &mut gpui::A11ySubtreeBuilder,
+    ) {
+        if let Some(a11y_text) = prepaint.a11y_text.as_ref() {
+            // The placeholder is the only name most of these inputs have; the
+            // parent node is reachable here, so no element-level plumbing is
+            // needed to reach it.
+            if let Some(placeholder) = a11y_text.placeholder.as_ref() {
+                builder.parent_node().set_placeholder(placeholder.clone());
+            }
+            builder.push_text_runs(
+                &a11y_text.text,
+                a11y_text.selection_tail,
+                a11y_text.selection_head,
+            );
+        }
     }
 
     fn request_layout(
@@ -9262,6 +9307,29 @@ impl Element for EditorElement {
                             scrollbars_layout.visible && scrollbars_layout.horizontal.is_some()
                         });
 
+                    // Captured here because the accessibility hooks run without
+                    // a context, and a single-line editor's whole content is
+                    // small enough to snapshot per frame.
+                    let a11y_text = self.single_line.then(|| {
+                        let (text, selection) = {
+                            let editor = self.editor.read(cx);
+                            (
+                                editor.text(cx),
+                                editor.selections.newest::<MultiBufferOffset>(
+                                    &position_map.snapshot.display_snapshot,
+                                ),
+                            )
+                        };
+                        A11yTextInput {
+                            text,
+                            placeholder: self
+                                .editor
+                                .update(cx, |editor, cx| editor.placeholder_text(cx)),
+                            selection_tail: selection.tail().0,
+                            selection_head: selection.head().0,
+                        }
+                    });
+
                     self.editor.update(cx, |editor, _| {
                         editor.last_position_map = Some(position_map.clone());
                         editor.last_right_margin = right_margin;
@@ -9269,6 +9337,7 @@ impl Element for EditorElement {
                     });
 
                     EditorLayout {
+                        a11y_text,
                         mode,
                         position_map,
                         visible_display_row_range: start_row..end_row,
@@ -9487,7 +9556,17 @@ impl IntoElement for EditorElement {
     }
 }
 
+/// A single-line editor's content and caret, snapshotted for the accessibility
+/// tree. Byte offsets, matching how the editor addresses its own selections.
+struct A11yTextInput {
+    text: String,
+    placeholder: Option<String>,
+    selection_tail: usize,
+    selection_head: usize,
+}
+
 pub struct EditorLayout {
+    a11y_text: Option<A11yTextInput>,
     position_map: Rc<PositionMap>,
     hitbox: Hitbox,
     gutter_hitbox: Hitbox,
@@ -12178,6 +12257,86 @@ mod tests {
         assert_eq!(
             calculate_wrap_width(SoftWrap::Bounded(200), px(400.0), em_width),
             Some(px(400.0)),
+        );
+    }
+
+    /// Filters, search boxes and settings fields are all single-line editors.
+    /// The element used to return no id, and accessibility nodes are keyed off
+    /// `GlobalElementId`, so none of them could produce a node no matter what
+    /// role they claimed.
+    #[gpui::test]
+    async fn test_single_line_editor_is_exposed_as_a_text_input(cx: &mut TestAppContext) {
+        init_test(cx, |_| {});
+        let window = cx.add_window(|window, cx| {
+            let buffer = MultiBuffer::build_simple("needle", cx);
+            let mut editor = Editor::new(EditorMode::SingleLine, buffer, None, window, cx);
+            editor.set_placeholder_text("Search", window, cx);
+            editor
+        });
+
+        // Activated per window rather than through the process-wide
+        // environment variable, which would switch accessibility on for every
+        // other test sharing this binary.
+        cx.activate_a11y(window.into());
+        let json = cx
+            .update_window(window.into(), |_, window, cx| {
+                window.draw(cx).clear(cx);
+                window.debug_a11y_tree_json()
+            })
+            .expect("the editor window is still open")
+            .expect("activation makes the debug tree available");
+        let tree: serde_json::Value = serde_json::from_str(&json).expect("the dump is valid JSON");
+        let nodes = tree["nodes"].as_object().expect("the dump lists nodes");
+
+        let input = nodes
+            .values()
+            .find(|node| node["aria"]["role"] == "TextInput")
+            .expect("a single-line editor must be reported as a text input");
+        assert_eq!(input["aria"]["placeholder"].as_str(), Some("Search"));
+        assert!(
+            input["aria"]["text_selection"].is_object(),
+            "a text input must expose a caret"
+        );
+
+        let run = input["children"]
+            .as_array()
+            .and_then(|children| children.first())
+            .and_then(|id| id.as_str())
+            .and_then(|id| nodes.get(id))
+            .expect("the content must be readable as a text run");
+        assert_eq!(run["aria"]["value"].as_str(), Some("needle"));
+    }
+
+    /// A multi-line editor's text pattern has to reflect folds, wrapping and
+    /// inlays, so it is deliberately not described as a flat text input.
+    #[gpui::test]
+    async fn test_multi_line_editor_is_not_described_as_a_text_input(cx: &mut TestAppContext) {
+        init_test(cx, |_| {});
+        let window = cx.add_window(|window, cx| {
+            let buffer = MultiBuffer::build_simple("one\ntwo", cx);
+            Editor::new(EditorMode::full(), buffer, None, window, cx)
+        });
+
+        // Activated per window rather than through the process-wide
+        // environment variable, which would switch accessibility on for every
+        // other test sharing this binary.
+        cx.activate_a11y(window.into());
+        let json = cx
+            .update_window(window.into(), |_, window, cx| {
+                window.draw(cx).clear(cx);
+                window.debug_a11y_tree_json()
+            })
+            .expect("the editor window is still open")
+            .expect("activation makes the debug tree available");
+        let tree: serde_json::Value = serde_json::from_str(&json).expect("the dump is valid JSON");
+
+        assert!(
+            tree["nodes"]
+                .as_object()
+                .expect("the dump lists nodes")
+                .values()
+                .all(|node| node["aria"]["role"] != "TextInput"),
+            "a full editor must not claim to be a text input"
         );
     }
 }

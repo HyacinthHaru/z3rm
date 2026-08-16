@@ -5217,10 +5217,15 @@ impl GitPanel {
                                     .on_action(|&zed_actions::editor::MoveDown, _, cx| {
                                         cx.stop_propagation();
                                     })
-                                    .child(EditorElement::new(
-                                        &self.commit_editor,
-                                        panel_editor_style,
-                                    )),
+                                    .child(
+                                        EditorElement::new(
+                                            &self.commit_editor,
+                                            panel_editor_style,
+                                        )
+                                        .single_line(
+                                            self.commit_editor.read(cx).mode().is_single_line(),
+                                        ),
+                                    ),
                             )
                             .child(vertical_buttons),
                     )
