@@ -363,9 +363,20 @@ impl Render for MuxConnectionStatusItem {
             MuxConnectionState::Disconnected => Some(("Disconnected", ui::Color::Error)),
             MuxConnectionState::Reconnecting => Some(("Reconnecting…", ui::Color::Warning)),
         };
-        gpui::div().when_some(label, |element, (text, color)| {
-            element.child(ui::Label::new(text).size(ui::LabelSize::Small).color(color))
-        })
+        // Losing the connection is conveyed only by this text and its color, and
+        // it happens while the user is working somewhere else entirely. A polite
+        // live region is what tells a screen reader to announce the change
+        // without the user having to go looking for it; assertive would cut off
+        // whatever they were reading for something they cannot act on instantly.
+        gpui::div()
+            .id("mux-connection-status")
+            .role(gpui::Role::Status)
+            .aria_live(gpui::accesskit::Live::Polite)
+            .when_some(label, |element, (text, color)| {
+                element
+                    .aria_label(format!("Mux connection: {text}"))
+                    .child(ui::Label::new(text).size(ui::LabelSize::Small).color(color))
+            })
     }
 }
 
@@ -3195,8 +3206,51 @@ fn main() {
 
 #[cfg(test)]
 mod tests {
-    use gpui::App;
+    use gpui::{App, AppContext as _};
     use settings::{KeymapFile, KeymapFileLoadResult, Settings as _};
+
+    /// Losing the mux connection is shown as small coloured text in the status
+    /// bar, while the user is working inside a pane. Without a live region the
+    /// change is never announced, so a screen-reader user keeps typing into a
+    /// session that is no longer attached.
+    #[gpui::test]
+    async fn mux_connection_state_is_announced_when_it_changes(cx: &mut gpui::TestAppContext) {
+        cx.update(|cx| {
+            let settings_store = settings::SettingsStore::test(cx);
+            cx.set_global(settings_store);
+            theme_settings::init(theme::LoadThemes::JustBase, cx);
+        });
+        let window = cx.add_window(|_, _| super::MuxConnectionStatusItem {
+            state: super::MuxConnectionState::Disconnected,
+        });
+        cx.activate_a11y(window.into());
+
+        let json = cx
+            .update_window(window.into(), |_, window, cx| {
+                window.draw(cx).clear(cx);
+                window.debug_a11y_tree_json()
+            })
+            .expect("the status window is still open")
+            .expect("activation makes the debug tree available");
+        let tree: serde_json::Value = serde_json::from_str(&json).expect("the dump is valid JSON");
+
+        let status = tree["nodes"]
+            .as_object()
+            .expect("the dump lists nodes")
+            .values()
+            .find(|node| node["aria"]["role"] == "Status")
+            .expect("the connection indicator must be reported as a status");
+        assert_eq!(
+            status["aria"]["live"].as_str(),
+            Some("Polite"),
+            "a status that changes on its own has to be a live region"
+        );
+        assert_eq!(
+            status["aria"]["label"].as_str(),
+            Some("Mux connection: Disconnected"),
+            "the announcement has to say what changed, not just \"Disconnected\""
+        );
+    }
 
     #[gpui::test]
     fn mux_keymap_profiles_load(cx: &mut App) {
