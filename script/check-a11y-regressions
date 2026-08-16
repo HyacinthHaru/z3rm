@@ -18,6 +18,11 @@ if [[ "${1:-}" == "--a11y" ]]; then
     export Z3RM_A11Y_BUILD_HEADLESS=1
 fi
 
+# The re-run below compiles again, so it reports on whatever the tree looks
+# like then rather than on what actually failed. Editing during a run turns a
+# real regression into a reassuring "passes alone".
+tree_before=$(git status --porcelain=v1; git rev-parse HEAD)
+
 output=$(cargo test --workspace --features gpui_platform/runtime_shaders --no-fail-fast 2>&1)
 failures=$(printf '%s\n' "$output" | grep -E '^    [a-z_]+' | sed 's/^ *//' | sort -u)
 
@@ -29,6 +34,13 @@ fixed=$(comm -23 <(printf '%s\n' "$baseline") <(printf '%s\n' "$failures"))
 if [[ -n "$fixed" ]]; then
     echo "These baseline failures now pass; drop them from the baseline:"
     printf '  %s\n' $fixed
+fi
+
+if [[ -n "$new" && "$(git status --porcelain=v1; git rev-parse HEAD)" != "$tree_before" ]]; then
+    echo "The working tree changed while the suite ran, so these failures cannot"
+    echo "be re-checked against the code that produced them:"
+    printf '  %s\n' $new
+    exit 1
 fi
 
 if [[ -n "$new" ]]; then
