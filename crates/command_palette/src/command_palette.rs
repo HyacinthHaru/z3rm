@@ -389,6 +389,10 @@ impl PickerDelegate for CommandPaletteDelegate {
         "command palette"
     }
 
+    fn match_label(&self, ix: usize, _cx: &App) -> Option<SharedString> {
+        Some(self.matches.get(ix)?.string.clone().into())
+    }
+
     fn placeholder_text(&self, _window: &mut Window, _cx: &mut App) -> Arc<str> {
         "Execute a command...".into()
     }

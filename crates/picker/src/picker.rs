@@ -214,6 +214,15 @@ pub trait PickerDelegate: Sized + 'static {
         None
     }
     fn placeholder_text(&self, _window: &mut Window, _cx: &mut App) -> Arc<str>;
+    /// The name announced for a match.
+    ///
+    /// `render_match` returns arbitrary elements, so the text cannot be derived
+    /// from what was rendered. A delegate that does not supply one leaves its
+    /// options unnamed, which is the previous behavior.
+    fn match_label(&self, _ix: usize, _cx: &App) -> Option<SharedString> {
+        None
+    }
+
     fn no_matches_text(&self, _window: &mut Window, _cx: &mut App) -> Option<SharedString> {
         Some("No matches".into())
     }
@@ -1284,8 +1293,22 @@ impl<D: PickerDelegate> Picker<D> {
             multi_select_active && selectable && item_with_checkbox.is_none();
         let focus_handle = self.focus_handle(cx);
 
+        let match_count = self.delegate.match_count();
+        let is_selected = ix == self.delegate.selected_index();
+
         div()
             .id(("item", ix))
+            // Keyboard focus stays in the query input, which is a sibling of
+            // this list rather than an ancestor, so `aria_active_descendant`
+            // would be discarded. Currency is carried by the selected state and
+            // the position within the set instead.
+            .role(gpui::Role::ListBoxOption)
+            .aria_selected(is_selected)
+            .when_some(self.delegate.match_label(ix, cx), |this, label| {
+                this.aria_label(label)
+            })
+            .aria_position_in_set(ix + 1)
+            .aria_size_of_set(match_count)
             .when(selectable, |this| this.cursor_pointer())
             .when(use_fallback_indicator, |this| {
                 this.hover(|s| s.bg(cx.theme().colors().ghost_element_hover))
@@ -1414,6 +1437,16 @@ impl<D: PickerDelegate> Picker<D> {
     }
 
     fn render_element_container(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        // The list elements are custom, so the role lives on a wrapper that
+        // parents the options rather than on the list itself.
+        div()
+            .id("picker-candidates")
+            .role(gpui::Role::ListBox)
+            .flex_grow_1()
+            .child(self.render_element_list(cx))
+    }
+
+    fn render_element_list(&self, cx: &mut Context<Self>) -> impl IntoElement {
         // When the picker shrinks to fit its content, the list infers its size
         // from its items. When it fills its full height (preview visible), the
         // list fills the available space.
@@ -1691,6 +1724,65 @@ mod tests {
             theme_settings::init(theme::LoadThemes::JustBase, cx);
             editor::init(cx);
         });
+    }
+
+    /// Keyboard focus stays in the query input while the selection moves, so a
+    /// picker is only usable with a screen reader if the list reports itself as
+    /// one and the current row is the active descendant.
+    #[gpui::test]
+    async fn test_matches_are_exposed_as_a_list_box(cx: &mut TestAppContext) {
+        init_test(cx);
+
+        let (picker, cx) = cx.add_window_view(|window, cx| {
+            Picker::uniform_list(TestDelegate::new(vec![true, true, true]), window, cx)
+        });
+        picker.update(cx, |picker, cx| {
+            picker.delegate.selected_index = 1;
+            cx.notify();
+        });
+        cx.run_until_parked();
+
+        cx.activate_a11y(cx.window_handle());
+        let json = cx
+            .update(|window, cx| {
+                window.draw(cx).clear(cx);
+                window.debug_a11y_tree_json()
+            })
+            .expect("activation makes the debug tree available");
+        let tree: serde_json::Value = serde_json::from_str(&json).expect("the dump is valid JSON");
+        let nodes = tree["nodes"].as_object().expect("the dump lists nodes");
+
+        let list_box = nodes
+            .iter()
+            .find(|(_, node)| node["aria"]["role"] == "ListBox")
+            .map(|(id, _)| id.clone())
+            .expect("the match list must be reported as a list box");
+
+        let options: Vec<(u64, u64, bool)> = nodes[&list_box]["children"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter_map(|id| id.as_str().and_then(|id| nodes.get(id)))
+            .filter(|node| node["aria"]["role"] == "ListBoxOption")
+            .map(|node| {
+                (
+                    node["aria"]["position_in_set"].as_u64().unwrap_or_default(),
+                    node["aria"]["size_of_set"].as_u64().unwrap_or_default(),
+                    node["aria"]["selected"].as_bool().unwrap_or(false),
+                )
+            })
+            .collect();
+        assert_eq!(
+            options,
+            vec![(1, 3, false), (2, 3, true), (3, 3, false)],
+            "each option must report where it sits in the list and whether it is current"
+        );
+
+        assert_eq!(
+            options.iter().filter(|(_, _, selected)| *selected).count(),
+            1,
+            "exactly one option is current at a time"
+        );
     }
 
     #[gpui::test]
