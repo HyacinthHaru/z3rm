@@ -332,6 +332,21 @@ async fn test_notifications_are_announced_as_a_live_region(cx: &mut TestAppConte
         "a notification that arrives on its own has to be announced"
     );
     assert_eq!(log["aria"]["label"].as_str(), Some("Notifications"));
+    // A live region announces what is inside it, and the notification body is
+    // plain text that contributes no node of its own, so the region can exist
+    // and still have nothing to read out.
+    let nodes = tree["nodes"].as_object().expect("the dump lists nodes");
+    let announced: Vec<&str> = log["children"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(|id| id.as_str().and_then(|id| nodes.get(id)))
+        .filter_map(|node| node["aria"]["label"].as_str())
+        .collect();
+    assert!(
+        announced.contains(&"the mux server went away"),
+        "the region has to contain what the notification says: {announced:?}"
+    );
 }
 
 /// A node that advertises an action but cannot be operated by it reads as

@@ -2062,16 +2062,41 @@ impl Styled for MarkdownElement {
     }
 }
 
+/// What a markdown view contributes to the accessibility tree, captured during
+/// prepaint because the accessibility hooks run without a context.
+pub struct MarkdownPrepaint {
+    hitbox: Hitbox,
+    a11y_text: Option<(SharedString, usize, usize)>,
+}
+
 impl Element for MarkdownElement {
     type RequestLayoutState = RenderedMarkdown;
-    type PrepaintState = Hitbox;
+    type PrepaintState = MarkdownPrepaint;
 
     fn id(&self) -> Option<ElementId> {
-        None
+        Some(ElementId::View(self.markdown.entity_id()))
     }
 
     fn source_location(&self) -> Option<&'static core::panic::Location<'static>> {
         None
+    }
+
+    /// Reported as a region carrying its text rather than as any richer
+    /// pattern: the rendered layout is wrapped and styled, but the source is
+    /// what the user would read aloud, and a markdown view that contributes no
+    /// nodes leaves the live regions it sits inside with nothing to announce.
+    fn a11y_role(&self) -> Option<gpui::accesskit::Role> {
+        Some(gpui::accesskit::Role::Group)
+    }
+
+    fn a11y_synthetic_children(
+        &mut self,
+        prepaint: &mut Self::PrepaintState,
+        builder: &mut gpui::A11ySubtreeBuilder,
+    ) {
+        if let Some((text, tail, head)) = prepaint.a11y_text.as_ref() {
+            builder.push_text_runs(text, *tail, *head);
+        }
     }
 
     fn request_layout(
@@ -2793,12 +2818,34 @@ impl Element for MarkdownElement {
     ) -> Self::PrepaintState {
         let focus_handle = self.markdown.read(cx).focus_handle.clone();
         window.set_focus_handle(&focus_handle, cx);
+        // Registering the handle is only half of it: without naming the node
+        // that carries the focus, a focused markdown view produces no node and
+        // the whole window gets announced instead.
+        if let Some(global_id) = _id {
+            window.report_a11y_focus_target(global_id, &focus_handle);
+        }
         window.set_view_id(self.markdown.entity_id());
 
         let hitbox = window.insert_hitbox(bounds, HitboxBehavior::Normal);
         rendered_markdown.element.prepaint(window, cx);
         self.autoscroll(&rendered_markdown.text, window, cx);
-        hitbox
+
+        let a11y_text = {
+            let markdown = self.markdown.read(cx);
+            let source = markdown.source().clone();
+            (!source.is_empty()).then(|| {
+                let selection = &markdown.selection;
+                let (tail, head) = if selection.reversed {
+                    (selection.end, selection.start)
+                } else {
+                    (selection.start, selection.end)
+                };
+                let clamp = |offset: usize| offset.min(source.len());
+                (source.clone(), clamp(tail), clamp(head))
+            })
+        };
+
+        MarkdownPrepaint { hitbox, a11y_text }
     }
 
     fn paint(
@@ -2807,10 +2854,11 @@ impl Element for MarkdownElement {
         _inspector_id: Option<&gpui::InspectorElementId>,
         _bounds: Bounds<Pixels>,
         rendered_markdown: &mut Self::RequestLayoutState,
-        hitbox: &mut Self::PrepaintState,
+        prepaint: &mut Self::PrepaintState,
         window: &mut Window,
         cx: &mut App,
     ) {
+        let hitbox = &mut prepaint.hitbox;
         let mut context = KeyContext::default();
         context.add("Markdown");
         window.set_key_context(context);

@@ -336,10 +336,10 @@ impl Render for LanguageServerPrompt {
         };
 
         let suppress = window.modifiers().shift;
-        let (close_id, close_icon) = if suppress {
-            ("suppress", IconName::Minimize)
+        let (close_id, close_icon, close_label) = if suppress {
+            ("suppress", IconName::Minimize, "Suppress notification")
         } else {
-            ("close", IconName::Close)
+            ("close", IconName::Close, "Dismiss notification")
         };
 
         div()
@@ -377,6 +377,8 @@ impl Render for LanguageServerPrompt {
                                     )
                                     .child(
                                         IconButton::new(close_id, close_icon)
+                            .aria_label(close_label)
+                                            .aria_label(close_label)
                                             .tooltip(move |_window, cx| {
                                                 if suppress {
                                                     Tooltip::with_meta(
@@ -675,6 +677,10 @@ pub mod simple_message_notification {
         more_info_url: Option<Arc<str>>,
         show_close_button: bool,
         show_suppress_button: bool,
+        /// What the notification says, kept so it can be announced. The body is
+        /// rendered as plain text, which contributes no accessibility node, so
+        /// the live region around it would otherwise have nothing to read out.
+        announcement: Option<SharedString>,
         title: Option<SharedString>,
         scroll_handle: ScrollHandle,
         auto_hide: Option<AutoHideState>,
@@ -699,9 +705,12 @@ pub mod simple_message_notification {
             S: Into<SharedString>,
         {
             let message = message.into();
-            Self::new_from_builder(cx, move |_, _| {
+            let announcement = message.clone();
+            let mut this = Self::new_from_builder(cx, move |_, _| {
                 Label::new(message.clone()).into_any_element()
-            })
+            });
+            this.announcement = Some(announcement);
+            this
         }
 
         pub fn new_from_builder<F>(cx: &mut App, content: F) -> MessageNotification
@@ -727,6 +736,7 @@ pub mod simple_message_notification {
                 more_info_url: None,
                 show_close_button: true,
                 show_suppress_button: true,
+                announcement: None,
                 title: None,
                 focus_handle: cx.focus_handle(),
                 scroll_handle: ScrollHandle::new(),
@@ -988,10 +998,10 @@ pub mod simple_message_notification {
             let show_suppress_button = self.show_suppress_button;
             let show_close_button = self.show_close_button;
             let suppress = show_suppress_button && window.modifiers().shift;
-            let (close_id, close_icon) = if suppress {
-                ("suppress", IconName::Minimize)
+            let (close_id, close_icon, close_label) = if suppress {
+                ("suppress", IconName::Minimize, "Suppress notification")
             } else {
-                ("close", IconName::Close)
+                ("close", IconName::Close, "Dismiss notification")
             };
 
             let main_content = (self.build_content)(window, cx);
@@ -1010,6 +1020,7 @@ pub mod simple_message_notification {
                 .when(show_close_button, |el| {
                     el.child(
                         IconButton::new(close_id, close_icon)
+                            .aria_label(close_label)
                             .tooltip(move |_window, cx| {
                                 if suppress {
                                     Tooltip::with_meta(
@@ -1155,8 +1166,25 @@ pub mod simple_message_notification {
                         .when(has_suffix, |this| this.child(suffix)),
                 );
 
+            // The title and the message body are plain text, which contributes
+            // no accessibility node, so without a name here the live region
+            // around the stack announces that a notification arrived and not
+            // what it says.
+            let announcement = match (self.title.as_ref(), self.announcement.as_ref()) {
+                (Some(title), Some(message)) => Some(SharedString::from(format!("{title}. {message}"))),
+                (Some(title), None) => Some(title.clone()),
+                (None, message) => message.cloned(),
+            };
+
             div()
                 .id("message-notification-wrapper")
+                .when_some(announcement, |this, announcement| {
+                    // Deliberately not `Alert`, which carries an implicit
+                    // assertive live region: the stack around it is polite, and
+                    // an error that already happened does not justify cutting
+                    // off whatever is being read.
+                    this.role(gpui::Role::Group).aria_label(announcement)
+                })
                 .opacity(opacity)
                 .child(
                     v_flex()
