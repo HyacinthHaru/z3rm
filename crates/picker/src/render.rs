@@ -268,6 +268,11 @@ impl<D: PickerDelegate> Picker<D> {
                     el.child(
                         v_flex().flex_grow_1().py_2().child(
                             ListItem::new("empty_state")
+                                // The message is a plain label and contributes
+                                // no node, so a picker that found nothing would
+                                // otherwise be silent rather than say so.
+                                .aria_role(gpui::Role::Status)
+                                .aria_label(text.clone())
                                 .inset(true)
                                 .spacing(ListItemSpacing::Sparse)
                                 .disabled(true)

@@ -2841,6 +2841,41 @@ mod tests {
         );
     }
 
+    /// A search that finds nothing is a state the user has to be told about.
+    /// The message is a plain label, which contributes no node, so the picker
+    /// would otherwise go silent rather than say it found nothing.
+    #[gpui::test]
+    fn a_picker_that_finds_nothing_says_so(cx: &mut TestAppContext) {
+        let (picker, cx) = build_picker(cx);
+
+        picker.update_in(cx, |picker, window, cx| {
+            picker.set_query("zzzzzzzz-no-such-project", window, cx);
+        });
+        cx.run_until_parked();
+        draw(cx);
+
+        cx.activate_a11y(cx.window_handle());
+        let json = cx
+            .update(|window, cx| {
+                window.draw(cx).clear(cx);
+                window.debug_a11y_tree_json()
+            })
+            .expect("activation makes the debug tree available");
+        let tree: serde_json::Value = serde_json::from_str(&json).expect("the dump is valid JSON");
+
+        let announced: Vec<&str> = tree["nodes"]
+            .as_object()
+            .expect("the dump lists nodes")
+            .values()
+            .filter(|node| node["aria"]["role"] == "Status")
+            .filter_map(|node| node["aria"]["label"].as_str())
+            .collect();
+        assert!(
+            !announced.is_empty(),
+            "an empty result list has to say it is empty: {json}"
+        );
+    }
+
     fn scroll_to_and_select(
         picker: &Entity<Picker<RecentProjectsDelegate>>,
         cx: &mut VisualTestContext,
