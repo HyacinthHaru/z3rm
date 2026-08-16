@@ -22,6 +22,9 @@ pub(crate) struct FrameDebugInfo {
     /// Roles that never became nodes because their element had no id. Filled in
     /// by `end_frame`, which owns the diagnostic.
     pub roles_without_id: Vec<String>,
+    /// Whether an active-descendant claim was dropped because the focused node
+    /// was not an ancestor of the claiming one.
+    pub active_descendant_without_focus: bool,
 }
 
 struct CapturedFrame {
@@ -34,6 +37,7 @@ struct CapturedFrame {
     scale_factor: f32,
     focus_without_node: Option<&'static str>,
     roles_without_id: Vec<String>,
+    active_descendant_without_focus: bool,
 }
 
 #[cfg(debug_assertions)]
@@ -99,6 +103,7 @@ impl A11yDebug {
             scale_factor: frame.scale_factor,
             focus_without_node: frame.focus_without_node,
             roles_without_id: frame.roles_without_id,
+            active_descendant_without_focus: frame.active_descendant_without_focus,
         });
     }
 
@@ -156,6 +161,7 @@ impl A11yDebug {
                 "scale_factor": frame.scale_factor,
                 "focus_without_node": frame.focus_without_node,
                 "roles_without_id": frame.roles_without_id,
+                "active_descendant_without_focus": frame.active_descendant_without_focus,
             })
         });
 

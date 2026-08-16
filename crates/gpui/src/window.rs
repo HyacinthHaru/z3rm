@@ -3098,6 +3098,7 @@ impl Window {
                 // Filled in by `end_frame`, which owns the diagnostics.
                 focus_without_node: None,
                 roles_without_id: Vec::new(),
+                active_descendant_without_focus: false,
             };
             // A focused handle whose element never rendered leaves the tree
             // with no focus and no reason for it.

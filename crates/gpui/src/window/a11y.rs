@@ -158,6 +158,9 @@ pub(crate) struct A11y {
     /// Set for the frame in which focus was dropped for lack of a node, so the
     /// debug dump can explain an otherwise silent `gpui_focus: null`.
     focus_without_node_this_frame: Option<&'static str>,
+    /// Whether a node claimed to be the active descendant this frame without
+    /// the focused node being one of its ancestors, so the claim was dropped.
+    active_descendant_without_focus_this_frame: bool,
     /// Elements that set a role this frame but had no element id, so the role
     /// was discarded. This is the quietest way to lose a node: nothing is
     /// missing from the code, only from the tree.
@@ -187,6 +190,7 @@ impl A11y {
             window_title,
             last_focus_without_node: None,
             focus_without_node_this_frame: None,
+            active_descendant_without_focus_this_frame: false,
             roles_without_id_this_frame: Vec::new(),
             debug: debug::A11yDebug::default(),
             #[cfg(debug_assertions)]
@@ -307,8 +311,18 @@ impl A11y {
             }
             return;
         }
-        if self.nodes.has_node(node_id) && self.nodes.focus_is_ancestor_of_current() {
+        if !self.nodes.has_node(node_id) {
+            return;
+        }
+        if self.nodes.focus_is_ancestor_of_current() {
             self.nodes.set_active_descendant(node_id);
+        } else {
+            // A highlight in a list the user filters from a separate input is
+            // the common shape here: focus is in the input, which is not an
+            // ancestor of the row, so reporting the row as focused would
+            // misstate where the keyboard is. The claim is dropped — but
+            // silently dropping it is how the picker's call stayed a no-op.
+            self.active_descendant_without_focus_this_frame = true;
         }
     }
 
@@ -339,6 +353,8 @@ impl A11y {
         let update = self.nodes.finalize();
         frame.focus_without_node = self.focus_without_node_this_frame.take();
         frame.roles_without_id = std::mem::take(&mut self.roles_without_id_this_frame);
+        frame.active_descendant_without_focus =
+            std::mem::take(&mut self.active_descendant_without_focus_this_frame);
         self.debug.capture(
             &update,
             self.nodes.focus,

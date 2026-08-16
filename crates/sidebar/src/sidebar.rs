@@ -2632,6 +2632,56 @@ mod live_tests {
         );
     }
 
+    /// Typing in the filter and arrowing through the results is the sidebar's
+    /// keyboard-first flow, and it is the one case where the highlight cannot
+    /// be announced: focus is in the filter, which is not an ancestor of the
+    /// rows, so reporting a row as focused would misstate where the keyboard
+    /// is. The claim is dropped — this pins that it is dropped *visibly*.
+    #[gpui::test]
+    async fn filtering_leaves_the_highlighted_row_unannounced(cx: &mut TestAppContext) {
+        init_test(cx);
+        let domain = test_domain();
+        let window = cx.add_window(move |window, cx| {
+            let mut sidebar = Sidebar::new(
+                domain,
+                "session-a".to_string(),
+                Some(&snapshot()),
+                Rc::new(|_request, _window, _cx| {}),
+                window,
+                cx,
+            );
+            sidebar.sessions = sessions();
+            sidebar.selected_index = Some(3);
+            sidebar.rebuild_entries(cx);
+            sidebar
+        });
+        cx.activate_a11y(window.into());
+
+        let json = cx
+            .update_window(window.into(), |view, window, cx| {
+                if let Ok(sidebar) = view.downcast::<Sidebar>() {
+                    let filter = sidebar.read(cx).filter_editor.focus_handle(cx);
+                    window.focus(&filter, cx);
+                }
+                window.draw(cx).clear(cx);
+                window.debug_a11y_tree_json()
+            })
+            .expect("the sidebar window is still open")
+            .expect("activation makes the debug tree available");
+        let tree: serde_json::Value = serde_json::from_str(&json).expect("the dump is valid JSON");
+
+        assert_eq!(
+            tree["active_descendant_focus"].as_str(),
+            None,
+            "a row cannot be reported as focused while the filter holds the keyboard"
+        );
+        assert_eq!(
+            tree["frame"]["active_descendant_without_focus"].as_bool(),
+            Some(true),
+            "the dropped claim has to be visible in the dump rather than silent"
+        );
+    }
+
     /// A node with an interactive role and no name is announced as a bare
     /// "button" or "tree item" with nothing to tell it apart. Checked across
     /// the whole rendered panel rather than per element, so a row or control
