@@ -11320,4 +11320,73 @@ mod tests {
             assert!(panel.commit_editor.focus_handle(cx).is_focused(window));
         });
     }
+
+    /// A role only becomes a node when its element also has an id, so "the code
+    /// sets a role" and "a screen reader sees one" are different claims. Read
+    /// the semantics back out of a drawn frame rather than trusting the
+    /// builder calls that produce them.
+    #[gpui::test]
+    async fn the_changed_files_are_exposed_as_a_named_list(cx: &mut TestAppContext) {
+        init_test(cx);
+
+        let fs = FakeFs::new(cx.background_executor.clone());
+        fs.insert_tree(
+            path!("/project"),
+            json!({
+                ".git": {},
+                "tracked": "tracked\n",
+            }),
+        )
+        .await;
+        fs.set_head_and_index_for_repo(
+            path!("/project/.git").as_ref(),
+            &[("tracked", "old tracked\n".into())],
+        );
+
+        let project = Project::test(fs, [Path::new(path!("/project"))], cx).await;
+        let window_handle =
+            cx.add_window(|window, cx| MultiWorkspace::test_new(project.clone(), window, cx));
+        let workspace = window_handle
+            .read_with(cx, |mw, _| mw.workspace().clone())
+            .unwrap();
+        let mut cx = VisualTestContext::from_window(window_handle.into(), cx);
+
+        let panel = workspace.update_in(&mut cx, GitPanel::new);
+        workspace.update_in(&mut cx, |workspace, window, cx| {
+            workspace.add_panel(panel.clone(), window, cx);
+            workspace.open_panel::<GitPanel>(window, cx);
+        });
+        await_git_panel_entries(&panel, &mut cx).await;
+
+        cx.activate_a11y(cx.window_handle());
+        let json = cx
+            .update(|window, cx| {
+                window.draw(cx).clear(cx);
+                window.debug_a11y_tree_json()
+            })
+            .expect("activation makes the debug tree available");
+        let tree: serde_json::Value = serde_json::from_str(&json).expect("the dump is valid JSON");
+        let nodes = tree["nodes"].as_object().expect("the dump lists nodes");
+
+        let changes = nodes
+            .values()
+            .find(|node| node["aria"]["label"].as_str() == Some("Changed files"))
+            .expect("the panel must be reported as a named list");
+        assert_eq!(changes["aria"]["role"].as_str(), Some("ListBox"));
+
+        // Read the rows from inside the list: a row rendered outside it keeps
+        // its role but loses the set semantics that go with containment.
+        let rows: Vec<&str> = changes["children"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter_map(|id| id.as_str().and_then(|id| nodes.get(id)))
+            .filter(|node| node["aria"]["role"] == "ListBoxOption")
+            .filter_map(|node| node["aria"]["label"].as_str())
+            .collect();
+        assert!(
+            rows.contains(&"tracked"),
+            "every changed file needs a name of its own: {rows:?}"
+        );
+    }
 }
