@@ -4050,6 +4050,11 @@ impl Render for SettingsWindow {
                 .child(
                     div()
                         .id("settings-window")
+                        // This element takes focus when the window opens, and a
+                        // focused element with no role produces no node, so the
+                        // whole window was announced instead of the settings.
+                        .role(gpui::Role::Group)
+                        .aria_label("Settings")
                         .key_context("SettingsWindow")
                         .track_focus(&self.focus_handle)
                         .on_action(cx.listener(|this, _: &OpenCurrentFile, window, cx| {
@@ -5204,8 +5209,12 @@ pub mod test {
         cx.run_until_parked();
 
         cx.activate_a11y(cx.window_handle());
+        // Focused before the dump so the focus check is not vacuous: with
+        // nothing focused it passes on any tree at all.
         let json = cx
             .update(|window, cx| {
+                let handle = _settings_window.read(cx).focus_handle.clone();
+                window.focus(&handle, cx);
                 window.draw(cx).clear(cx);
                 window.debug_a11y_tree_json()
             })
@@ -5217,6 +5226,7 @@ pub mod test {
         gpui::a11y_checks::assert_no_role_was_discarded(&tree, "settings window");
         gpui::a11y_checks::assert_roles_are_contained(&tree, "settings window");
         gpui::a11y_checks::assert_click_targets_are_reachable(&tree, "settings window");
+        gpui::a11y_checks::assert_focus_reached_the_tree(&tree, "settings window");
 
         // Guards against the whole check passing because nothing rendered.
         let interactive = nodes
