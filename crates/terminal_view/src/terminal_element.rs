@@ -43,6 +43,9 @@ pub struct LayoutState {
     /// alongside the pixel layout because the accessibility caret is addressed
     /// in grid coordinates rather than pixels.
     cursor_grid_position: Option<(i32, usize)>,
+    /// Viewport-relative `(anchor, focus)` of the active selection, in the same
+    /// coordinates as `cursor_grid_position`.
+    selection_grid_range: Option<((i32, usize), (i32, usize))>,
     ime_cursor_bounds: Option<Bounds<Pixels>>,
     background_color: Hsla,
     dimensions: TerminalBounds,
@@ -1007,6 +1010,7 @@ impl Element for TerminalElement {
             builder,
             &prepaint.batched_text_runs,
             prepaint.cursor_grid_position,
+            prepaint.selection_grid_range,
         );
     }
 
@@ -1288,6 +1292,11 @@ impl Element for TerminalElement {
                     relative_highlighted_ranges
                         .push((selection.point_range(), player_color.selection));
                 }
+                let selection_grid_range = selection.as_ref().map(|selection| {
+                    let start = DisplayCursor::from(selection.start, display_offset);
+                    let end = DisplayCursor::from(selection.end, display_offset);
+                    ((start.line(), start.col()), (end.line(), end.col()))
+                });
 
                 // then have that representation be converted to the appropriate highlight data structure
 
@@ -1466,6 +1475,7 @@ impl Element for TerminalElement {
                     cursor_grid_position: cursor
                         .as_ref()
                         .map(|_| (cursor_point.line(), cursor_point.col())),
+                    selection_grid_range,
                     cursor,
                     ime_cursor_bounds,
                     background_color,
@@ -1942,18 +1952,18 @@ fn build_terminal_line_runs(
 /// `value`, `character_lengths` and `word_starts` so platform text patterns
 /// can drive caret/review. Synthetic ids key off the parent node id + a
 /// `(line, chunk)` key, so they are stable frame-to-frame.
-/// Locate the synthetic run holding the cursor, as an AccessKit text position.
+/// Locate the synthetic run holding a grid position, as an AccessKit text
+/// position.
 ///
-/// Returns `None` when the cursor sits on a line that produced no run, since a
-/// caret must name a node that exists in the tree.
-fn terminal_caret_position(
-    runs: &[BatchedTextRun],
-    (cursor_line, cursor_column): (i32, usize),
-    synthetic_id: impl Fn(u64, u64) -> accesskit::NodeId,
+/// Returns `None` when the position sits on a line that produced no run, since
+/// a text position must name a node that exists in the tree.
+fn terminal_text_position(
+    lines: &[A11yTerminalLine],
+    (target_line, cursor_column): (i32, usize),
+    synthetic_id: &impl Fn(u64, u64) -> accesskit::NodeId,
 ) -> Option<accesskit::TextPosition> {
-    let line = collect_terminal_lines(runs)
-        .into_iter()
-        .find(|line| line.line == cursor_line)?;
+    let line = lines.iter().find(|line| line.line == target_line)?;
+    let cursor_line = target_line;
 
     let total = line.text.chars().count();
     let num_chunks = total.div_ceil(MAX_CHARS_PER_A11Y_RUN).max(1);
@@ -1972,29 +1982,66 @@ fn terminal_caret_position(
     })
 }
 
+/// Resolve the selection's endpoints, clamping each to the visible rows.
+///
+/// A selection that started before the viewport keeps only the part that is on
+/// screen, which is what the grid paints too; a selection entirely off screen
+/// has nothing to report.
+fn terminal_selection_positions(
+    lines: &[A11yTerminalLine],
+    (anchor, focus): ((i32, usize), (i32, usize)),
+    synthetic_id: &impl Fn(u64, u64) -> accesskit::NodeId,
+) -> Option<(accesskit::TextPosition, accesskit::TextPosition)> {
+    let first = lines.first()?.line;
+    let last = lines.last()?.line;
+    if anchor.0.max(focus.0) < first || anchor.0.min(focus.0) > last {
+        return None;
+    }
+
+    let clamp = |(line, column): (i32, usize)| {
+        if line < first {
+            (first, 0)
+        } else if line > last {
+            (last, usize::MAX)
+        } else {
+            (line, column)
+        }
+    };
+
+    Some((
+        terminal_text_position(lines, clamp(anchor), synthetic_id)?,
+        terminal_text_position(lines, clamp(focus), synthetic_id)?,
+    ))
+}
+
 fn push_terminal_line_text_runs(
     builder: &mut A11ySubtreeBuilder,
     runs: &[BatchedTextRun],
     cursor: Option<(i32, usize)>,
+    selection: Option<((i32, usize), (i32, usize))>,
 ) {
+    let lines = collect_terminal_lines(runs);
     let line_runs =
         build_terminal_line_runs(runs, |line, chunk| builder.synthetic_node_id((line, chunk)));
     for (id, node) in line_runs {
         builder.push_child(id, node);
     }
 
-    let caret = cursor.and_then(|cursor| {
-        terminal_caret_position(runs, cursor, |line, chunk| {
-            builder.synthetic_node_id((line, chunk))
-        })
-    });
-    if let Some(caret) = caret {
+    let synthetic_id = |line, chunk| builder.synthetic_node_id((line, chunk));
+    // A real selection outranks the cursor: reporting a collapsed caret while
+    // the user has a range selected misdescribes the terminal to assistive
+    // technology, and copy-mode selection is the point of reading it.
+    let selection = selection
+        .and_then(|selection| terminal_selection_positions(&lines, selection, &synthetic_id))
+        .or_else(|| {
+            let caret = terminal_text_position(&lines, cursor?, &synthetic_id)?;
+            Some((caret, caret))
+        });
+
+    if let Some((anchor, focus)) = selection {
         builder
             .parent_node()
-            .set_text_selection(accesskit::TextSelection {
-                anchor: caret,
-                focus: caret,
-            });
+            .set_text_selection(accesskit::TextSelection { anchor, focus });
     }
 }
 
@@ -3145,8 +3192,10 @@ mod tests {
             a11y_run(1, "git status"),
             a11y_run(2, "        "),
         ];
+        let lines = collect_terminal_lines(&runs);
+        let id = fake_id;
 
-        let caret = terminal_caret_position(&runs, (1, 4), fake_id)
+        let caret = terminal_text_position(&lines, (1, 4), &id)
             .expect("a cursor on a rendered line has a caret");
         assert_eq!(caret.node, fake_id(1, 0));
         assert_eq!(caret.character_index, 4);
@@ -3154,19 +3203,19 @@ mod tests {
         // The prompt cursor sits one past the last glyph, and trailing blanks
         // were trimmed out of the run, so the index clamps to the run length
         // instead of pointing past the node.
-        let past_end = terminal_caret_position(&runs, (1, 40), fake_id)
+        let past_end = terminal_text_position(&lines, (1, 40), &id)
             .expect("a cursor past the last glyph still belongs to that line");
         assert_eq!(past_end.node, fake_id(1, 0));
         assert_eq!(past_end.character_index, "git status".chars().count());
 
         // A blank row keeps an empty run, so the caret is addressable there.
-        let blank = terminal_caret_position(&runs, (2, 3), fake_id)
+        let blank = terminal_text_position(&lines, (2, 3), &id)
             .expect("a blank row still carries a run");
         assert_eq!(blank.node, fake_id(2, 0));
         assert_eq!(blank.character_index, 0);
 
         assert!(
-            terminal_caret_position(&runs, (9, 0), fake_id).is_none(),
+            terminal_text_position(&lines, (9, 0), &id).is_none(),
             "a line that produced no run cannot host a caret"
         );
     }
@@ -3178,15 +3227,55 @@ mod tests {
     fn a11y_caret_selects_the_chunk_containing_the_cursor() {
         let long = "x".repeat(MAX_CHARS_PER_A11Y_RUN + 10);
         let runs = vec![a11y_run(0, &long)];
+        let lines = collect_terminal_lines(&runs);
+        let id = fake_id;
 
-        let first = terminal_caret_position(&runs, (0, 7), fake_id).expect("caret in first chunk");
+        let first =
+            terminal_text_position(&lines, (0, 7), &id).expect("caret in first chunk");
         assert_eq!(first.node, fake_id(0, 0));
         assert_eq!(first.character_index, 7);
 
-        let second = terminal_caret_position(&runs, (0, MAX_CHARS_PER_A11Y_RUN + 3), fake_id)
+        let second = terminal_text_position(&lines, (0, MAX_CHARS_PER_A11Y_RUN + 3), &id)
             .expect("caret in second chunk");
         assert_eq!(second.node, fake_id(0, 1));
         assert_eq!(second.character_index, 3);
+    }
+
+    /// A collapsed caret while the user has a range selected misdescribes the
+    /// terminal: copy mode is exactly the workflow that needs the range.
+    #[test]
+    fn a11y_selection_spans_its_endpoints_and_clamps_to_the_viewport() {
+        let runs = vec![
+            a11y_run(0, "hello world"),
+            a11y_run(1, "git status"),
+            a11y_run(2, "third row"),
+        ];
+        let lines = collect_terminal_lines(&runs);
+        let id = fake_id;
+
+        let (anchor, focus) = terminal_selection_positions(&lines, ((0, 6), (1, 3)), &id)
+            .expect("a selection inside the viewport resolves both endpoints");
+        assert_eq!((anchor.node, anchor.character_index), (fake_id(0, 0), 6));
+        assert_eq!((focus.node, focus.character_index), (fake_id(1, 0), 3));
+
+        // Scrolled-out endpoints keep the part that is actually on screen,
+        // matching what the grid paints.
+        let (anchor, focus) = terminal_selection_positions(&lines, ((-5, 2), (1, 4)), &id)
+            .expect("a selection starting above the viewport keeps its visible part");
+        assert_eq!((anchor.node, anchor.character_index), (fake_id(0, 0), 0));
+        assert_eq!((focus.node, focus.character_index), (fake_id(1, 0), 4));
+
+        let (_, focus) = terminal_selection_positions(&lines, ((1, 0), (40, 0)), &id)
+            .expect("a selection running past the viewport ends at the last row");
+        assert_eq!(
+            (focus.node, focus.character_index),
+            (fake_id(2, 0), "third row".chars().count())
+        );
+
+        assert!(
+            terminal_selection_positions(&lines, ((-9, 0), (-4, 0)), &id).is_none(),
+            "a selection entirely off screen has nothing to report"
+        );
     }
 
     /// Runs on the same painted line are concatenated in order, regardless of
