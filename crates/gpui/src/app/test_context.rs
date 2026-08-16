@@ -727,6 +727,11 @@ pub struct VisualTestContext {
 }
 
 impl VisualTestContext {
+    /// The handle of the window this context drives.
+    pub fn window_handle(&self) -> AnyWindowHandle {
+        self.window
+    }
+
     /// Provides a `Window` and `App` for the duration of the closure.
     pub fn update<R>(&mut self, f: impl FnOnce(&mut Window, &mut App) -> R) -> R {
         self.cx
