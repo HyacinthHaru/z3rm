@@ -363,6 +363,25 @@ impl<'a> A11ySubtreeBuilder<'a> {
     }
 
     /// A mutable reference to the parent node.
+
+    /// Expose a plain string as AccessKit text runs plus the selection for the
+    /// given byte offsets, enabling the platform text pattern (caret tracking,
+    /// review, typed-character echo) on a custom text control.
+    ///
+    /// Text is chunked so per-run character indices fit AccessKit's `u8`-indexed
+    /// `word_starts`; an empty string still produces one run so the pattern stays
+    /// supported when the control is empty.
+    pub fn push_text_runs(&mut self, text: &str, selection_tail: usize, selection_head: usize) {
+        let (runs, selection) =
+            build_a11y_text_runs(text, selection_tail, selection_head, |chunk| {
+                self.synthetic_node_id(chunk)
+            });
+        for (id, node) in runs {
+            self.push_child(id, node);
+        }
+        self.parent_node().set_text_selection(selection);
+    }
+
     pub fn parent_node(&mut self) -> &mut accesskit::Node {
         self.nodes
             .current_node_mut()
@@ -890,5 +909,158 @@ mod tests {
 
         let update = a11y.end_frame(Default::default());
         assert_eq!(update.focus, a);
+    }
+}
+
+/// AccessKit's `word_starts` uses `u8` indices, so a single text run cannot
+/// exceed this many characters. Longer text is split into multiple runs.
+const MAX_CHARS_PER_TEXT_RUN: usize = 255;
+
+fn is_word_char(c: char) -> bool {
+    c.is_alphanumeric() || c == '_'
+}
+
+fn char_index_for_byte(text: &str, byte_offset: usize) -> usize {
+    text.char_indices()
+        .take_while(|(byte_ix, _)| *byte_ix < byte_offset)
+        .count()
+}
+
+/// Convert a character index into an AccessKit text position, accounting for
+/// text that is split into multiple runs.
+///
+/// `synthetic_node_id` maps a chunk index to the run's node id (in practice
+/// [`A11ySubtreeBuilder::synthetic_node_id`]); it is a parameter so this
+/// arithmetic can be property-tested without constructing a builder.
+fn a11y_text_position(
+    char_index: usize,
+    synthetic_node_id: impl Fn(u64) -> accesskit::NodeId,
+) -> accesskit::TextPosition {
+    // A position landing exactly on a chunk boundary refers to the end of the
+    // previous chunk rather than the start of the next one.
+    let chunk_index = if char_index > 0 && char_index.is_multiple_of(MAX_CHARS_PER_TEXT_RUN) {
+        char_index / MAX_CHARS_PER_TEXT_RUN - 1
+    } else {
+        char_index / MAX_CHARS_PER_TEXT_RUN
+    };
+    accesskit::TextPosition {
+        node: synthetic_node_id(chunk_index as u64),
+        character_index: char_index - chunk_index * MAX_CHARS_PER_TEXT_RUN,
+    }
+}
+
+/// Split `text` into AccessKit text runs (chunked small enough that per-run
+/// character indices fit AccessKit's `u8`-indexed `word_starts`), and compute
+/// the text selection for the given byte offsets.
+///
+/// `synthetic_node_id` maps a chunk index to that run's node id. Returns the
+/// runs in order plus the selection, leaving it to the caller to push them —
+/// this keeps the logic free of [`A11ySubtreeBuilder`] so it can be
+/// property-tested against arbitrary strings.
+///
+/// `selection_tail` and `selection_head` are byte offsets into `text`.
+fn build_a11y_text_runs(
+    text: &str,
+    selection_tail: usize,
+    selection_head: usize,
+    synthetic_node_id: impl Fn(u64) -> accesskit::NodeId,
+) -> (
+    Vec<(accesskit::NodeId, accesskit::Node)>,
+    accesskit::TextSelection,
+) {
+    let chars: Vec<char> = text.chars().collect();
+    let total_chars = chars.len();
+    // Build at least one (possibly empty) run so the text pattern remains
+    // supported when the field is empty.
+    let num_chunks = total_chars.div_ceil(MAX_CHARS_PER_TEXT_RUN).max(1);
+
+    let mut word_starts = Vec::new();
+    let mut was_word_char = false;
+    for (ix, c) in chars.iter().enumerate() {
+        let is_word = is_word_char(*c);
+        if is_word && !was_word_char {
+            word_starts.push(ix);
+        }
+        was_word_char = is_word;
+    }
+
+    let mut runs = Vec::with_capacity(num_chunks);
+    for chunk_index in 0..num_chunks {
+        let char_start = chunk_index * MAX_CHARS_PER_TEXT_RUN;
+        let char_end = (char_start + MAX_CHARS_PER_TEXT_RUN).min(total_chars);
+        let chunk_chars = &chars[char_start..char_end];
+
+        let mut node = accesskit::Node::new(accesskit::Role::TextRun);
+        node.set_text_direction(accesskit::TextDirection::LeftToRight);
+        node.set_value(chunk_chars.iter().collect::<String>());
+        node.set_character_lengths(
+            chunk_chars
+                .iter()
+                .map(|c| c.len_utf8() as u8)
+                .collect::<Vec<u8>>(),
+        );
+        node.set_word_starts(
+            word_starts
+                .iter()
+                .filter(|&&word_start| word_start >= char_start && word_start < char_end)
+                .map(|&word_start| (word_start - char_start) as u8)
+                .collect::<Vec<u8>>(),
+        );
+        if chunk_index > 0 {
+            node.set_previous_on_line(synthetic_node_id(chunk_index as u64 - 1));
+        }
+        if chunk_index + 1 < num_chunks {
+            node.set_next_on_line(synthetic_node_id(chunk_index as u64 + 1));
+        }
+
+        runs.push((synthetic_node_id(chunk_index as u64), node));
+    }
+
+    let anchor = a11y_text_position(
+        char_index_for_byte(text, selection_tail),
+        &synthetic_node_id,
+    );
+    let focus = a11y_text_position(
+        char_index_for_byte(text, selection_head),
+        &synthetic_node_id,
+    );
+    (runs, accesskit::TextSelection { anchor, focus })
+}
+
+#[cfg(test)]
+mod a11y_text_run_tests {
+    use super::build_a11y_text_runs;
+    use crate::accesskit::NodeId;
+    use proptest::strategy::Strategy;
+
+    /// A strategy producing strings with a deliberate mix of character
+    /// categories — ASCII, Latin accents, Cyrillic, Arabic, CJK, emoji, and
+    /// arbitrary scalars — so run-splitting is exercised across scripts and
+    /// byte widths (1–4 UTF-8 bytes). Lengths reach past one chunk (255 chars).
+    fn arbitrary_text() -> impl Strategy<Value = String> {
+        let character = proptest::prop_oneof![
+            proptest::char::range(' ', '~'), // ASCII printable
+            proptest::char::range('\u{00A1}', '\u{00FF}'), // Latin-1 (accents)
+            proptest::char::range('\u{0100}', '\u{024F}'), // Latin Extended-A/B
+            proptest::char::range('\u{0400}', '\u{04FF}'), // Cyrillic
+            proptest::char::range('\u{0600}', '\u{06FF}'), // Arabic
+            proptest::char::range('\u{4E00}', '\u{9FFF}'), // CJK Unified Ideographs
+            proptest::char::range('\u{1F300}', '\u{1FAFF}'), // emoji & pictographs
+            proptest::char::any(),           // anything else
+        ];
+        proptest::collection::vec(character, 0..600)
+            .prop_map(|chars| chars.into_iter().collect::<String>())
+    }
+
+    /// Splitting an arbitrary string into AccessKit text runs must never panic,
+    /// for any text and any byte selection offsets — including empty text, text
+    /// spanning multiple chunks, multi-byte characters, and offsets past the end.
+    #[crate::property_test]
+    fn building_text_runs_never_panics(
+        #[strategy = arbitrary_text()] text: String,
+        selection_tail: usize,
+        selection_head: usize,
+    ) {
+        let _ = build_a11y_text_runs(&text, selection_tail, selection_head, NodeId);
     }
 }
