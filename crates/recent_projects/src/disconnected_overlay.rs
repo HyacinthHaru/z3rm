@@ -180,8 +180,11 @@ impl Render for DisconnectedOverlay {
                 Modal::new("disconnected", None)
                     .header(
                         ModalHeader::new()
-                            .show_dismiss_button(true)
-                            .child(Headline::new("Disconnected").size(HeadlineSize::Small)),
+                            // Set as the headline rather than as a child so the
+                            // dialog can name itself with it; the rendering is
+                            // the same `Headline` either way.
+                            .headline("Disconnected")
+                            .show_dismiss_button(true),
                     )
                     .section(Section::new().child(Label::new(message)))
                     .footer(

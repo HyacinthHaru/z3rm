@@ -21,6 +21,10 @@ pub use traits::animation_ext::*;
 
 #[cfg(test)]
 mod accessibility_tests {
+    use crate::{
+        ContextMenu, DropdownMenu, Modal, ModalHeader, Switch, ToggleState, Toggleable as _,
+        TreeViewItem,
+    };
     use gpui::{
         AppContext as _, Context, Entity, IntoElement, ParentElement, Render, Styled as _,
         TestAppContext, Window, div,
@@ -34,7 +38,6 @@ mod accessibility_tests {
 /// away from announcing nothing.
 #[gpui::test]
 fn the_shared_controls_report_their_state(cx: &mut TestAppContext) {
-    use crate::{ContextMenu, DropdownMenu, Switch, Toggleable as _, ToggleState, TreeViewItem};
 
     struct ControlsHost(Entity<ContextMenu>);
 
@@ -112,4 +115,46 @@ fn the_shared_controls_report_their_state(cx: &mut TestAppContext) {
         Some("TreeItem")
     );
 }
+
+    /// A modal's heading is a plain `Headline`, which contributes no node, so
+    /// a dialog built from one would be announced as an unnamed "dialog" with
+    /// nothing readable inside it.
+    #[gpui::test]
+    fn a_modal_names_itself_with_its_headline(cx: &mut TestAppContext) {
+        struct ModalHost;
+        impl Render for ModalHost {
+            fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+                Modal::new("host-modal", None)
+                    .header(ModalHeader::new().headline("Disconnected"))
+                    .child(div())
+            }
+        }
+
+        cx.update(|cx| {
+            let settings_store = settings::SettingsStore::test(cx);
+            cx.set_global(settings_store);
+            theme_settings::init(theme::LoadThemes::JustBase, cx);
+        });
+
+        let window = cx.add_window(|_, _| ModalHost);
+        cx.activate_a11y(window.into());
+
+        let json = cx
+            .update_window(window.into(), |_, window, cx| {
+                window.draw(cx).clear(cx);
+                window.debug_a11y_tree_json()
+            })
+            .expect("the harness window is still open")
+            .expect("activation makes the debug tree available");
+        let tree: serde_json::Value = serde_json::from_str(&json).expect("the dump is valid JSON");
+
+        assert!(
+            tree["nodes"]
+                .as_object()
+                .expect("the dump lists nodes")
+                .values()
+                .any(|node| node["aria"]["label"].as_str() == Some("Disconnected")),
+            "a modal has to say what it is about: {json}"
+        );
+    }
 }

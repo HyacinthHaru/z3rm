@@ -65,6 +65,12 @@ impl RenderOnce for Modal {
     fn render(self, _window: &mut Window, cx: &mut App) -> impl IntoElement {
         v_flex()
             .id(self.id.clone())
+            // The headline is rendered as a plain label, which contributes no
+            // node, so the dialog around this would otherwise be announced as
+            // an unnamed "dialog" with nothing readable inside it.
+            .when_some(self.header.headline.clone(), |this, headline| {
+                this.role(gpui::Role::Group).aria_label(headline)
+            })
             .size_full()
             .flex_1()
             .overflow_hidden()
