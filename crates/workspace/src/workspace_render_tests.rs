@@ -514,47 +514,10 @@ async fn test_every_interactive_node_in_the_window_has_a_name(cx: &mut TestAppCo
         .expect("activation makes the debug tree available");
     let tree: serde_json::Value = serde_json::from_str(&json).expect("the dump is valid JSON");
 
-    const NEEDS_A_NAME: &[&str] = &[
-        "Button",
-        "Tab",
-        "TreeItem",
-        "ListBoxOption",
-        "Link",
-        "CheckBox",
-        "RadioButton",
-        "MenuItem",
-    ];
-    let unnamed: Vec<String> = tree["nodes"]
-        .as_object()
-        .expect("the dump lists nodes")
-        .values()
-        .filter(|node| {
-            node["aria"]["role"]
-                .as_str()
-                .is_some_and(|role| NEEDS_A_NAME.contains(&role))
-        })
-        .filter(|node| {
-            ["label", "value", "placeholder"]
-                .iter()
-                .all(|field| node["aria"][field].as_str().is_none_or(str::is_empty))
-        })
-        .map(|node| format!("{} ({})", node["aria"]["role"], node["element_id"]))
-        .collect();
-
-    assert!(
-        unnamed.is_empty(),
-        "these nodes are announced as a bare role: {unnamed:?}"
-    );
-
-    // A role on an element with no id produces no node at all, which is the
-    // quietest way to lose one: nothing is missing from the code.
-    let discarded = tree["frame"]["roles_without_id"]
-        .as_array()
-        .expect("the dump lists discarded roles");
-    assert!(
-        discarded.is_empty(),
-        "these roles never became nodes for lack of an element id: {discarded:?}"
-    );
+    gpui::a11y::assert_interactive_nodes_are_named(&tree, "workspace window");
+    gpui::a11y::assert_no_role_was_discarded(&tree, "workspace window");
+    gpui::a11y::assert_roles_are_contained(&tree, "workspace window");
+    gpui::a11y::assert_focus_reached_the_tree(&tree, "workspace window");
 }
 
 /// A pane with no items has nothing inside to take focus, so focus stays on the

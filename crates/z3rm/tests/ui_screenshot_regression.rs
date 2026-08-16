@@ -159,10 +159,10 @@ fn save_frame(name: &str, image: &RgbaImage, tree: &serde_json::Value) -> Result
     save_screenshot(name, image)?;
     save_a11y_tree(name, tree)?;
     // Checked here rather than per scenario so a new scenario cannot forget it.
-    assert_interactive_nodes_are_named(tree, name);
-    assert_roles_are_contained(tree, name);
-    assert_focus_reached_the_tree(tree, name);
-    assert_no_role_was_discarded(tree, name);
+    gpui::a11y::assert_interactive_nodes_are_named(tree, name);
+    gpui::a11y::assert_roles_are_contained(tree, name);
+    gpui::a11y::assert_no_role_was_discarded(tree, name);
+    gpui::a11y::assert_focus_reached_the_tree(tree, name);
     Ok(())
 }
 
@@ -194,156 +194,6 @@ fn count_near_color(image: &RgbaImage, rgb: [u8; 3], tolerance: u8) -> usize {
 }
 
 /// All nodes in a `debug_a11y_tree_json` dump, as `(role, node)` pairs.
-/// Assert no element asked for a role and got nothing.
-///
-/// Accessibility node ids are derived from the element id, so a role set on an
-/// element without one is discarded with no node, no warning, and no visible
-/// difference in the code that requested it.
-fn assert_no_role_was_discarded(tree: &serde_json::Value, scenario: &str) {
-    let discarded = tree
-        .get("frame")
-        .and_then(|frame| frame.get("roles_without_id"))
-        .and_then(serde_json::Value::as_array)
-        .map(Vec::as_slice)
-        .unwrap_or_default();
-    assert!(
-        discarded.is_empty(),
-        "{scenario}: these roles never became nodes for lack of an element id: {discarded:?}"
-    );
-}
-
-/// Assert the frame did not discard the focused element.
-///
-/// A focused element with an id but no role produces no accessibility node, so
-/// focus has nowhere to land and screen readers fall back to announcing the
-/// whole window. GPUI records why when that happens; the dump prints it.
-fn assert_focus_reached_the_tree(tree: &serde_json::Value, scenario: &str) {
-    let dropped = tree
-        .get("frame")
-        .and_then(|frame| frame.get("focus_without_node"))
-        .and_then(|reason| reason.as_str());
-    assert!(
-        dropped.is_none(),
-        "{scenario}: the focused element produced no accessibility node ({}), so assistive \
-         technology announces the whole window instead of it",
-        dropped.unwrap_or_default()
-    );
-}
-
-/// Roles that only mean anything inside a matching container. A screen reader
-/// derives "tab 2 of 5" and the arrow-key conventions from that containment, so
-/// an orphaned option or tab is announced without any of it.
-const ROLE_REQUIRES_CONTAINER: &[(&str, &str)] = &[
-    ("Tab", "TabList"),
-    ("ListBoxOption", "ListBox"),
-    ("TreeItem", "Tree"),
-    ("MenuItem", "Menu"),
-    ("MenuItemCheckBox", "Menu"),
-];
-
-/// Assert every containment-dependent node has its container as an ancestor.
-fn assert_roles_are_contained(tree: &serde_json::Value, scenario: &str) {
-    let Some(nodes) = tree.get("nodes").and_then(|nodes| nodes.as_object()) else {
-        return;
-    };
-    let role_of = |id: &str| {
-        nodes
-            .get(id)
-            .and_then(|node| node.get("aria"))
-            .and_then(|aria| aria.get("role"))
-            .and_then(|role| role.as_str())
-            .unwrap_or_default()
-            .to_string()
-    };
-
-    // Child -> parent, derived from the child lists the dump already prints.
-    let mut parent_of: std::collections::HashMap<String, String> =
-        std::collections::HashMap::new();
-    for (id, node) in nodes {
-        for child in node
-            .get("children")
-            .and_then(|children| children.as_array())
-            .into_iter()
-            .flatten()
-            .filter_map(|child| child.as_str())
-        {
-            parent_of.insert(child.to_string(), id.clone());
-        }
-    }
-
-    let orphaned: Vec<String> = nodes
-        .iter()
-        .filter_map(|(id, node)| {
-            let role = role_of(id);
-            let (_, container) = ROLE_REQUIRES_CONTAINER
-                .iter()
-                .find(|(needle, _)| *needle == role)?;
-            let mut ancestor = parent_of.get(id);
-            while let Some(current) = ancestor {
-                if role_of(current) == *container {
-                    return None;
-                }
-                ancestor = parent_of.get(current);
-            }
-            Some(format!(
-                "{role} ({}) has no {container} ancestor",
-                node.get("element_id")
-                    .and_then(|id| id.as_str())
-                    .unwrap_or("no element id")
-            ))
-        })
-        .collect();
-
-    assert!(
-        orphaned.is_empty(),
-        "{scenario}: {orphaned:?}"
-    );
-}
-
-/// Roles whose whole purpose is to be operated or read by name. A node with one
-/// of these and no accessible name is announced as a bare role ("button",
-/// "tab") with nothing to distinguish it, which is the single most common way
-/// UI regresses for screen-reader users.
-const ROLES_REQUIRING_A_NAME: &[&str] = &[
-    "Button",
-    "Tab",
-    "TreeItem",
-    "ListBoxOption",
-    "Link",
-    "CheckBox",
-    "RadioButton",
-    "MenuItem",
-];
-
-/// Assert every interactive node in the frame carries a name.
-///
-/// A `TextInput` counts as named by its placeholder, since that is what an
-/// empty field is announced by.
-fn assert_interactive_nodes_are_named(tree: &serde_json::Value, scenario: &str) {
-    let unnamed: Vec<String> = a11y_nodes(tree)
-        .into_iter()
-        .filter(|(role, _)| ROLES_REQUIRING_A_NAME.contains(&role.as_str()))
-        .filter(|(_, node)| {
-            ["label", "value", "placeholder"]
-                .iter()
-                .all(|field| a11y_string_field(node, field).is_none_or(|text| text.is_empty()))
-        })
-        .map(|(role, node)| {
-            format!(
-                "{role} ({})",
-                node.get("element_id")
-                    .and_then(|id| id.as_str())
-                    .unwrap_or("no element id")
-            )
-        })
-        .collect();
-
-    assert!(
-        unnamed.is_empty(),
-        "{scenario}: these nodes are announced as a bare role with nothing to identify them: {unnamed:?}"
-    );
-}
-
 fn a11y_nodes(tree: &serde_json::Value) -> Vec<(String, &serde_json::Value)> {
     tree.get("nodes")
         .and_then(|nodes| nodes.as_object())

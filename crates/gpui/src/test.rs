@@ -218,3 +218,154 @@ pub fn observe<T: 'static>(entity: &Entity<T>, cx: &mut TestAppContext) -> Obser
 
     Observation { rx, _subscription }
 }
+
+/// Assertions over a [`crate::Window::debug_a11y_tree_json`] dump.
+///
+/// These live here rather than in each crate's tests because the defects they
+/// catch are properties of the dump, not of any one screen: a role with no
+/// name, a role that never became a node, a role outside the container that
+/// gives it meaning. Five copies of the same role list had already started to
+/// drift apart.
+pub mod a11y {
+    /// Roles whose whole purpose is to be told apart from their siblings. A
+    /// node with one of these and no name is announced as a bare "button" or
+    /// "tree item".
+    pub const ROLES_NEEDING_A_NAME: &[&str] = &[
+        "Button",
+        "CheckBox",
+        "Link",
+        "ListBoxOption",
+        "MenuItem",
+        "MenuItemCheckBox",
+        "RadioButton",
+        "SpinButton",
+        "Switch",
+        "Tab",
+        "TreeItem",
+    ];
+
+    /// Roles that only mean anything inside a matching container. A screen
+    /// reader derives "tab 2 of 5" and the arrow-key conventions from that
+    /// containment, so an orphaned option or tab loses all of it.
+    pub const ROLE_REQUIRES_CONTAINER: &[(&str, &str)] = &[
+        ("ListBoxOption", "ListBox"),
+        ("MenuItem", "Menu"),
+        ("MenuItemCheckBox", "Menu"),
+        ("Tab", "TabList"),
+        ("TreeItem", "Tree"),
+    ];
+
+    fn nodes(tree: &serde_json::Value) -> &serde_json::Map<String, serde_json::Value> {
+        tree["nodes"]
+            .as_object()
+            .expect("an a11y dump lists its nodes")
+    }
+
+    /// Panics if any node with an interactive role has nothing to announce.
+    #[track_caller]
+    pub fn assert_interactive_nodes_are_named(tree: &serde_json::Value, context: &str) {
+        let unnamed: Vec<String> = nodes(tree)
+            .values()
+            .filter(|node| {
+                node["aria"]["role"]
+                    .as_str()
+                    .is_some_and(|role| ROLES_NEEDING_A_NAME.contains(&role))
+            })
+            .filter(|node| {
+                ["label", "value", "placeholder"]
+                    .iter()
+                    .all(|field| node["aria"][field].as_str().is_none_or(str::is_empty))
+            })
+            .map(|node| format!("{} ({})", node["aria"]["role"], node["element_id"]))
+            .collect();
+        assert!(
+            unnamed.is_empty(),
+            "{context}: these nodes are announced as a bare role: {unnamed:?}"
+        );
+    }
+
+    /// Panics if a role was set on an element with no id, which produces no
+    /// node at all — no warning, and no difference in the code that asked.
+    #[track_caller]
+    pub fn assert_no_role_was_discarded(tree: &serde_json::Value, context: &str) {
+        let discarded = tree
+            .get("frame")
+            .and_then(|frame| frame.get("roles_without_id"))
+            .and_then(serde_json::Value::as_array)
+            .map(Vec::as_slice)
+            .unwrap_or_default();
+        assert!(
+            discarded.is_empty(),
+            "{context}: these roles never became nodes for lack of an element id: {discarded:?}"
+        );
+    }
+
+    /// Panics if the focused element produced no node.
+    ///
+    /// A focused element with an id but no role produces no accessibility node,
+    /// so focus has nowhere to land and screen readers fall back to announcing
+    /// the whole window. GPUI records why when that happens; the dump prints it.
+    #[track_caller]
+    pub fn assert_focus_reached_the_tree(tree: &serde_json::Value, context: &str) {
+        let dropped = tree
+            .get("frame")
+            .and_then(|frame| frame.get("focus_without_node"))
+            .and_then(|reason| reason.as_str());
+        assert!(
+            dropped.is_none(),
+            "{context}: the focused element produced no accessibility node ({}), so assistive \
+             technology announces the whole window instead of it",
+            dropped.unwrap_or_default()
+        );
+    }
+
+    /// Panics if a containment-dependent node has no matching container among
+    /// its ancestors.
+    #[track_caller]
+    pub fn assert_roles_are_contained(tree: &serde_json::Value, context: &str) {
+        let nodes = nodes(tree);
+        let role_of = |id: &str| {
+            nodes[id]["aria"]["role"]
+                .as_str()
+                .unwrap_or_default()
+                .to_string()
+        };
+
+        let mut parent_of: collections::FxHashMap<&str, &str> = collections::FxHashMap::default();
+        for (id, node) in nodes {
+            for child in node["children"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .filter_map(|child| child.as_str())
+            {
+                parent_of.insert(child, id.as_str());
+            }
+        }
+
+        let orphaned: Vec<String> = nodes
+            .iter()
+            .filter_map(|(id, node)| {
+                let role = role_of(id);
+                let (_, container) = ROLE_REQUIRES_CONTAINER
+                    .iter()
+                    .find(|(needle, _)| *needle == role)?;
+                let mut ancestor = parent_of.get(id.as_str()).copied();
+                while let Some(current) = ancestor {
+                    if role_of(current) == *container {
+                        return None;
+                    }
+                    ancestor = parent_of.get(current).copied();
+                }
+                Some(format!(
+                    "{role} ({}) has no {container} ancestor",
+                    node["element_id"]
+                ))
+            })
+            .collect();
+        assert!(
+            orphaned.is_empty(),
+            "{context}: {orphaned:?}"
+        );
+    }
+}

@@ -919,25 +919,9 @@ mod tests {
             "the palette had no options to announce"
         );
 
-        const NEEDS_A_NAME: &[&str] = &["Button", "Tab", "TreeItem", "ListBoxOption", "Link"];
-        let unnamed: Vec<String> = nodes
-            .values()
-            .filter(|node| {
-                node["aria"]["role"]
-                    .as_str()
-                    .is_some_and(|role| NEEDS_A_NAME.contains(&role))
-            })
-            .filter(|node| {
-                ["label", "value", "placeholder"]
-                    .iter()
-                    .all(|field| node["aria"][field].as_str().is_none_or(str::is_empty))
-            })
-            .map(|node| format!("{} ({})", node["aria"]["role"], node["element_id"]))
-            .collect();
-        assert!(
-            unnamed.is_empty(),
-            "these nodes are announced as a bare role: {unnamed:?}"
-        );
+        gpui::a11y::assert_interactive_nodes_are_named(&tree, "open command palette");
+        gpui::a11y::assert_no_role_was_discarded(&tree, "open command palette");
+        gpui::a11y::assert_roles_are_contained(&tree, "open command palette");
 
         // Focus is in the query editor, which is not an ancestor of the match
         // rows, so GPUI cannot report the highlighted match without misstating

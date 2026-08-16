@@ -1398,7 +1398,15 @@ pub mod test {
 
     impl Render for TestItem {
         fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-            let parent = gpui::div().track_focus(&self.focus_handle(cx));
+            // Real items carry an id and a role, so focus landing on one
+            // produces a node. Without that here, every workspace test would
+            // look like a window whose focus is dropped.
+            use gpui::StatefulInteractiveElement as _;
+            let parent = gpui::div()
+                .id(gpui::ElementId::View(cx.entity_id()))
+                .role(gpui::Role::Group)
+                .aria_label(SharedString::from(self.label.clone()))
+                .track_focus(&self.focus_handle(cx));
             self.child_focus_handles
                 .iter()
                 .fold(parent, |parent, child_handle| {

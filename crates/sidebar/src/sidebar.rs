@@ -2691,26 +2691,9 @@ mod live_tests {
         let tree = a11y_tree(cx, SidebarMode::Sessions);
         let nodes = tree["nodes"].as_object().expect("the dump lists nodes");
 
-        const NEEDS_A_NAME: &[&str] = &["Button", "TreeItem", "Tab", "ListBoxOption", "Link"];
-        let unnamed: Vec<String> = nodes
-            .values()
-            .filter(|node| {
-                node["aria"]["role"]
-                    .as_str()
-                    .is_some_and(|role| NEEDS_A_NAME.contains(&role))
-            })
-            .filter(|node| {
-                ["label", "value", "placeholder"]
-                    .iter()
-                    .all(|field| node["aria"][field].as_str().is_none_or(str::is_empty))
-            })
-            .map(|node| format!("{} ({})", node["aria"]["role"], node["element_id"]))
-            .collect();
-
-        assert!(
-            unnamed.is_empty(),
-            "these nodes are announced as a bare role: {unnamed:?}"
-        );
+        gpui::a11y::assert_interactive_nodes_are_named(&tree, "sidebar panel");
+        gpui::a11y::assert_no_role_was_discarded(&tree, "sidebar panel");
+        gpui::a11y::assert_roles_are_contained(&tree, "sidebar panel");
 
         // A screen reader derives "item 2 of 5" and the arrow-key conventions
         // from containment, so a row outside its tree loses all of it.
