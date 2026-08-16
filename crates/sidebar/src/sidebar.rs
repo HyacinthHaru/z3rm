@@ -1403,6 +1403,11 @@ impl Sidebar {
         };
         v_flex()
             .id("sidebar-empty")
+            // The message is a plain label, which contributes no node of its
+            // own, so without a name here an empty sidebar reads as nothing at
+            // all rather than as "no matching files".
+            .role(gpui::Role::Group)
+            .aria_label(message)
             .w_full()
             .flex_1()
             .justify_center()
@@ -2648,6 +2653,48 @@ mod live_tests {
             nodes[active]["aria"]["label"].as_str(),
             Some("Pane cargo watch"),
             "the active descendant must be the row the sidebar's cursor is on"
+        );
+    }
+
+    /// An empty list is a state the user has to be told about — they filtered
+    /// something away, or nothing is there yet. The message is a plain label,
+    /// which contributes no accessibility node, so an empty panel would
+    /// otherwise be indistinguishable from a broken one.
+    #[gpui::test]
+    async fn an_empty_sidebar_says_why_it_is_empty(cx: &mut TestAppContext) {
+        init_test(cx);
+        let domain = test_domain();
+        let window = cx.add_window(move |window, cx| {
+            let mut sidebar = Sidebar::new(
+                domain,
+                "session-a".to_string(),
+                None,
+                Rc::new(|_request, _window, _cx| {}),
+                window,
+                cx,
+            );
+            sidebar.sessions = Vec::new();
+            sidebar.rebuild_entries(cx);
+            sidebar
+        });
+        cx.activate_a11y(window.into());
+
+        let json = cx
+            .update_window(window.into(), |_, window, cx| {
+                window.draw(cx).clear(cx);
+                window.debug_a11y_tree_json()
+            })
+            .expect("the sidebar window is still open")
+            .expect("activation makes the debug tree available");
+        let tree: serde_json::Value = serde_json::from_str(&json).expect("the dump is valid JSON");
+
+        assert!(
+            tree["nodes"]
+                .as_object()
+                .expect("the dump lists nodes")
+                .values()
+                .any(|node| node["aria"]["label"].as_str() == Some("No mux sessions")),
+            "an empty sidebar has to say so: {json}"
         );
     }
 

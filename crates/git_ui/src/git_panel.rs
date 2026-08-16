@@ -6048,6 +6048,11 @@ impl GitPanel {
         let show_branch_diff = self.changes_count == 0 && !self.is_on_main_branch(cx);
 
         v_flex()
+            // The message is a plain label and contributes no node of its own,
+            // so without a name here an empty panel reads as nothing at all.
+            .id("git-panel-no-changes")
+            .role(gpui::Role::Group)
+            .aria_label("No changes to commit")
             .gap_1()
             .items_center()
             .child(Label::new("No changes to commit").color(Color::Muted))

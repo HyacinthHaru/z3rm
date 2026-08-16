@@ -1495,6 +1495,11 @@ impl ExtensionsPage {
         };
 
         h_flex()
+            // The message is a plain label and contributes no node of its own,
+            // so without a name here the list reads as empty with no reason.
+            .id("extensions-empty")
+            .role(gpui::Role::Group)
+            .aria_label(message.clone())
             .py_4()
             .gap_1p5()
             .when(self.fetch_failed, |this| {
