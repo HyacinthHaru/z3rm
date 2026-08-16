@@ -534,6 +534,7 @@ impl PickerDelegate for StashListDelegate {
         let view_button = {
             let focus_handle = self.focus_handle.clone();
             IconButton::new(("view-stash", ix), IconName::Eye)
+                        .aria_label("View Stash")
                 .icon_size(IconSize::Small)
                 .tooltip(move |_, cx| {
                     Tooltip::for_action_in("View Stash", &ShowStashItem, &focus_handle, cx)
@@ -546,6 +547,7 @@ impl PickerDelegate for StashListDelegate {
         let pop_button = {
             let focus_handle = self.focus_handle.clone();
             IconButton::new(("pop-stash", ix), IconName::MaximizeAlt)
+                        .aria_label("Pop Stash")
                 .icon_size(IconSize::Small)
                 .tooltip(move |_, cx| {
                     Tooltip::for_action_in("Pop Stash", &menu::SecondaryConfirm, &focus_handle, cx)
@@ -558,6 +560,7 @@ impl PickerDelegate for StashListDelegate {
         let drop_button = {
             let focus_handle = self.focus_handle.clone();
             IconButton::new(("drop-stash", ix), IconName::Trash)
+                        .aria_label("Drop Stash")
                 .icon_size(IconSize::Small)
                 .tooltip(move |_, cx| {
                     Tooltip::for_action_in("Drop Stash", &DropStashItem, &focus_handle, cx)
@@ -730,6 +733,58 @@ mod tests {
             branch: branch.map(Into::into),
             timestamp: 1000 - index as i64,
         }
+    }
+
+    /// Checks the stash list as it opens. With no stashes in the fixture the
+    /// list itself is empty, so what this actually covers is the modal and the
+    /// workspace behind it — which is how it found the onboarding buttons.
+    /// The per-row controls are named from their tooltips but are not reached
+    /// by this test.
+    #[gpui::test]
+    async fn the_stash_list_names_its_rows_and_controls(cx: &mut TestAppContext) {
+        init_test(cx);
+
+        let fs = FakeFs::new(cx.executor());
+        let project = Project::test(fs, [], cx).await;
+        let multi_workspace =
+            cx.add_window(|window, cx| MultiWorkspace::test_new(project, window, cx));
+        let cx = &mut VisualTestContext::from_window(*multi_workspace, cx);
+        let workspace = multi_workspace
+            .read_with(cx, |multi_workspace, _| multi_workspace.workspace().clone())
+            .expect("the harness opens a workspace window");
+
+        workspace.update_in(cx, |workspace, window, cx| {
+            let weak_workspace = workspace.weak_handle();
+            workspace.toggle_modal(window, cx, move |window, cx| {
+                StashList::new(None, weak_workspace, rems(34.), window, cx)
+            });
+        });
+        cx.run_until_parked();
+
+        cx.activate_a11y(cx.window_handle());
+        let json = cx
+            .update(|window, cx| {
+                window.draw(cx).clear(cx);
+                window.debug_a11y_tree_json()
+            })
+            .expect("activation makes the debug tree available");
+        let tree: serde_json::Value = serde_json::from_str(&json).expect("the dump is valid JSON");
+
+        gpui::a11y_checks::assert_interactive_nodes_are_named(&tree, "stash list");
+        gpui::a11y_checks::assert_no_role_was_discarded(&tree, "stash list");
+        gpui::a11y_checks::assert_roles_are_contained(&tree, "stash list");
+        gpui::a11y_checks::assert_click_targets_are_reachable(&tree, "stash list");
+
+        let dialog = tree["nodes"]
+            .as_object()
+            .expect("the dump lists nodes")
+            .values()
+            .filter(|node| node["aria"]["role"] == "Dialog")
+            .count();
+        assert!(
+            dialog > 0,
+            "the stash list never opened, so this check would pass on an empty tree: {json}"
+        );
     }
 
     #[gpui::test]

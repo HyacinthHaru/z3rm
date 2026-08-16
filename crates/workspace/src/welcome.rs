@@ -98,6 +98,9 @@ impl RenderOnce for SectionButton {
         let action_ref: &dyn Action = &*self.action;
 
         ButtonLike::new(id)
+            // `ButtonLike` takes its children as opaque elements, so unlike
+            // `Button` it cannot fall back to the label it is showing.
+            .aria_label(self.label.clone())
             .tab_index(self.tab_index as isize)
             .full_width()
             .size(ButtonSize::Medium)
