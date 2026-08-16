@@ -11375,10 +11375,10 @@ mod tests {
         let tree: serde_json::Value = serde_json::from_str(&json).expect("the dump is valid JSON");
         let nodes = tree["nodes"].as_object().expect("the dump lists nodes");
 
-        gpui::a11y::assert_interactive_nodes_are_named(&tree, "git panel");
-        gpui::a11y::assert_no_role_was_discarded(&tree, "git panel");
-        gpui::a11y::assert_roles_are_contained(&tree, "git panel");
-        gpui::a11y::assert_click_targets_are_reachable(&tree, "git panel");
+        gpui::a11y_checks::assert_interactive_nodes_are_named(&tree, "git panel");
+        gpui::a11y_checks::assert_no_role_was_discarded(&tree, "git panel");
+        gpui::a11y_checks::assert_roles_are_contained(&tree, "git panel");
+        gpui::a11y_checks::assert_click_targets_are_reachable(&tree, "git panel");
 
         let changes = nodes
             .values()

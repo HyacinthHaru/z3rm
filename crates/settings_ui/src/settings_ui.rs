@@ -5212,17 +5212,17 @@ pub mod test {
         let tree: serde_json::Value = serde_json::from_str(&json).expect("the dump is valid JSON");
         let nodes = tree["nodes"].as_object().expect("the dump lists nodes");
 
-        gpui::a11y::assert_interactive_nodes_are_named(&tree, "settings window");
-        gpui::a11y::assert_no_role_was_discarded(&tree, "settings window");
-        gpui::a11y::assert_roles_are_contained(&tree, "settings window");
-        gpui::a11y::assert_click_targets_are_reachable(&tree, "settings window");
+        gpui::a11y_checks::assert_interactive_nodes_are_named(&tree, "settings window");
+        gpui::a11y_checks::assert_no_role_was_discarded(&tree, "settings window");
+        gpui::a11y_checks::assert_roles_are_contained(&tree, "settings window");
+        gpui::a11y_checks::assert_click_targets_are_reachable(&tree, "settings window");
 
         // Guards against the whole check passing because nothing rendered.
         let interactive = nodes
             .values()
             .filter(|node| {
                 node["aria"]["role"].as_str().is_some_and(|role| {
-                    gpui::a11y::ROLES_NEEDING_A_NAME.contains(&role)
+                    gpui::a11y_checks::ROLES_NEEDING_A_NAME.contains(&role)
                 })
             })
             .count();

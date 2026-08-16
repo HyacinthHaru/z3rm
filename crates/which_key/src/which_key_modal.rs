@@ -337,8 +337,11 @@ fn group_bindings(
 
 #[cfg(test)]
 mod tests {
-    use super::announcement;
-    use gpui::SharedString;
+    use super::{WhichKeyModal, announcement};
+    use gpui::{
+        AppContext as _, Context, Entity, IntoElement, ParentElement as _, Render, SharedString,
+        TestAppContext, WeakEntity, Window, div,
+    };
 
     /// The hint appears on its own and vanishes again, so what it announces is
     /// the whole of what a screen-reader user gets from it: which prefix is
@@ -354,6 +357,74 @@ mod tests {
         assert_eq!(
             announcement("ctrl-b", &bindings),
             "Prefix ctrl-b, 2 continuations: c New tab, % Split right"
+        );
+    }
+
+    /// The hint is a live region, and a live region announces what is inside
+    /// it. Reading the semantics back out of a drawn frame rather than out of
+    /// the builder call: a role only becomes a node when its element also has
+    /// an id, and the modal renders bare, without the dialog wrapper that
+    /// would otherwise carry it.
+    #[gpui::test]
+    fn the_pending_prefix_reaches_the_tree_as_a_live_region(cx: &mut TestAppContext) {
+        cx.update(|cx| {
+            let settings_store = settings::SettingsStore::test(cx);
+            cx.set_global(settings_store);
+            theme_settings::init(theme::LoadThemes::JustBase, cx);
+        });
+
+        struct Host(Entity<WhichKeyModal>);
+        impl Render for Host {
+            fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+                div().child(self.0.clone())
+            }
+        }
+
+        let window = cx.add_window(|window, cx| {
+            let modal = cx.new(|cx| {
+                let mut modal = WhichKeyModal::new(WeakEntity::new_invalid(), window, cx);
+                modal.pending_keys = SharedString::new_static("ctrl-b");
+                modal.bindings = vec![
+                    (
+                        SharedString::new_static("c"),
+                        SharedString::new_static("New tab"),
+                    ),
+                    (
+                        SharedString::new_static("%"),
+                        SharedString::new_static("Split right"),
+                    ),
+                ];
+                modal
+            });
+            Host(modal)
+        });
+        let cx = &mut gpui::VisualTestContext::from_window(window.into(), cx);
+        cx.run_until_parked();
+        cx.activate_a11y(cx.window_handle());
+
+        let json = cx
+            .update(|window, cx| {
+                window.draw(cx).clear(cx);
+                window.debug_a11y_tree_json()
+            })
+            .expect("activation makes the debug tree available");
+        let tree: serde_json::Value = serde_json::from_str(&json).expect("the dump is valid JSON");
+
+        let hint = tree["nodes"]
+            .as_object()
+            .expect("the dump lists nodes")
+            .values()
+            .find(|node| node["aria"]["role"] == "Status")
+            .unwrap_or_else(|| panic!("the hint must reach the tree: {json}"));
+        assert_eq!(
+            hint["aria"]["live"].as_str(),
+            Some("Polite"),
+            "a hint that appears on its own is only perceived if it is announced"
+        );
+        assert_eq!(
+            hint["aria"]["label"].as_str(),
+            Some("Prefix ctrl-b, 2 continuations: c New tab, % Split right"),
+            "the announcement has to name the prefix and what can follow it"
         );
     }
 }

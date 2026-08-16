@@ -686,11 +686,11 @@ async fn test_every_interactive_node_in_the_window_has_a_name(cx: &mut TestAppCo
         .expect("activation makes the debug tree available");
     let tree: serde_json::Value = serde_json::from_str(&json).expect("the dump is valid JSON");
 
-    gpui::a11y::assert_interactive_nodes_are_named(&tree, "workspace window");
-    gpui::a11y::assert_no_role_was_discarded(&tree, "workspace window");
-    gpui::a11y::assert_roles_are_contained(&tree, "workspace window");
-    gpui::a11y::assert_click_targets_are_reachable(&tree, "workspace window");
-    gpui::a11y::assert_focus_reached_the_tree(&tree, "workspace window");
+    gpui::a11y_checks::assert_interactive_nodes_are_named(&tree, "workspace window");
+    gpui::a11y_checks::assert_no_role_was_discarded(&tree, "workspace window");
+    gpui::a11y_checks::assert_roles_are_contained(&tree, "workspace window");
+    gpui::a11y_checks::assert_click_targets_are_reachable(&tree, "workspace window");
+    gpui::a11y_checks::assert_focus_reached_the_tree(&tree, "workspace window");
 }
 
 /// A pane with no items has nothing inside to take focus, so focus stays on the

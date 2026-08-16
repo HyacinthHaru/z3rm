@@ -226,7 +226,7 @@ pub fn observe<T: 'static>(entity: &Entity<T>, cx: &mut TestAppContext) -> Obser
 /// name, a role that never became a node, a role outside the container that
 /// gives it meaning. Five copies of the same role list had already started to
 /// drift apart.
-pub mod a11y {
+pub mod a11y_checks {
     /// Roles whose whole purpose is to be told apart from their siblings. A
     /// node with one of these and no name is announced as a bare "button" or
     /// "tree item".

@@ -1506,6 +1506,6 @@ mod activation_tests {
             .expect("activation makes the debug tree available");
         let tree: serde_json::Value = serde_json::from_str(&json).expect("the dump is valid JSON");
 
-        crate::test::a11y::assert_click_targets_are_reachable(&tree, "nested click targets");
+        crate::test::a11y_checks::assert_click_targets_are_reachable(&tree, "nested click targets");
     }
 }
