@@ -106,6 +106,48 @@ async fn the_file_tree_is_exposed_as_a_named_tree(cx: &mut gpui::TestAppContext)
                 .all(|(name, level)| !name.is_empty() && *level >= 1),
             "every row needs a name and a 1-based depth: {rows:?}"
         );
-
     }
+}
+
+/// A panel with no worktree shows an explanation and two buttons, and it takes
+/// focus. The explanation is a plain label, which contributes no node of its
+/// own, so without a name on the container the panel announces the whole
+/// window and says nothing about why it is empty.
+#[gpui::test]
+async fn an_empty_project_panel_says_why_it_is_empty(cx: &mut gpui::TestAppContext) {
+    project_panel_tests::init_test(cx);
+
+    let fs = FakeFs::new(cx.executor());
+    let project = Project::test(fs, [] as [&std::path::Path; 0], cx).await;
+    let window = cx.add_window(|window, cx| MultiWorkspace::test_new(project.clone(), window, cx));
+    let workspace = window
+        .read_with(cx, |mw, _| mw.workspace().clone())
+        .unwrap();
+    let mut cx = VisualTestContext::from_window(window.into(), cx);
+    let panel = workspace.update_in(&mut cx, ProjectPanel::new);
+    workspace.update_in(&mut cx, |workspace, window, cx| {
+        workspace.add_panel(panel, window, cx);
+        workspace.open_panel::<ProjectPanel>(window, cx);
+    });
+    cx.run_until_parked();
+
+    cx.activate_a11y(cx.window_handle());
+    let json = cx
+        .update(|window, cx| {
+            window.draw(cx).clear(cx);
+            window.debug_a11y_tree_json()
+        })
+        .expect("activation makes the debug tree available");
+    let tree: serde_json::Value = serde_json::from_str(&json).expect("the dump is valid JSON");
+
+    let explained = tree["nodes"]
+        .as_object()
+        .expect("the dump lists nodes")
+        .values()
+        .filter_map(|node| node["aria"]["label"].as_str())
+        .any(|label| label.starts_with("Choose one of the options below"));
+    assert!(explained, "an empty panel has to say why it is empty: {json}");
+
+    gpui::a11y_checks::assert_interactive_nodes_are_named(&tree, "empty project panel");
+    gpui::a11y_checks::assert_no_role_was_discarded(&tree, "empty project panel");
 }

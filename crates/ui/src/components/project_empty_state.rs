@@ -51,6 +51,11 @@ impl RenderOnce for ProjectEmptyState {
 
         v_flex()
             .id(id)
+            // The explanation is a plain label and contributes no node of its
+            // own, and this element takes focus, so without a role the empty
+            // panel discards that focus and announces the whole window.
+            .role(gpui::Role::Group)
+            .aria_label(label.clone())
             .p_4()
             .size_full()
             .items_center()
