@@ -219,7 +219,12 @@ impl<D: PickerDelegate> Picker<D> {
                         None
                     }
                 }
-                Head::Empty(empty_head) => Some(h_flex().child(empty_head.clone())),
+                // Gated the same way the editor is: without this the head is
+                // mounted here *and* at the end position, putting one focusable
+                // entity in the tree twice and duplicating every element id
+                // inside it.
+                Head::Empty(empty_head) => (editor_position == PickerEditorPosition::Start)
+                    .then(|| h_flex().child(empty_head.clone())),
             })
             .when(self.delegate.match_count() > 0, |el| {
                 el.child(
@@ -280,7 +285,8 @@ impl<D: PickerDelegate> Picker<D> {
                         None
                     }
                 }
-                Head::Empty(empty_head) => Some(div().child(empty_head.clone())),
+                Head::Empty(empty_head) => (editor_position == PickerEditorPosition::End)
+                    .then(|| div().child(empty_head.clone())),
             });
 
         let Some(aside) = aside else {
