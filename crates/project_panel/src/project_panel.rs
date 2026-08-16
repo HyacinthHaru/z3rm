@@ -5492,6 +5492,11 @@ impl ProjectPanel {
         const GROUP_NAME: &str = "project_entry";
 
         let kind = details.kind;
+        // Captured before the render closures take `details`, so the row's
+        // announced name survives.
+        let announced_name = details.filename.clone();
+        let announced_depth = details.depth;
+        let announced_expanded = details.is_expanded;
         let is_sticky = details.sticky.is_some();
         let sticky_index = details.sticky.as_ref().map(|this| this.sticky_index);
         let settings = ProjectPanelSettings::get_global(cx);
@@ -5957,6 +5962,12 @@ impl ProjectPanel {
             )
             .child(
                 ListItem::new(id)
+                    // `indent_level` is visual only; the announced depth has to
+                    // be set separately, and is 1-based.
+                    .aria_role(gpui::Role::TreeItem)
+                    .aria_label(announced_name)
+                    .aria_level(announced_depth + 1)
+                    .when(kind.is_dir(), |this| this.aria_expanded(announced_expanded))
                     .indent_level(depth)
                     .indent_step_size(px(settings.indent_size))
                     .spacing(match settings.entry_spacing {
@@ -6851,6 +6862,11 @@ impl Render for ProjectPanel {
             }
             h_flex()
                 .id("project-panel")
+                // The panel reported nothing at all: no role on the focused
+                // root, so focus was discarded, and no semantics on the rows,
+                // so the file tree read as a flat run of text.
+                .role(gpui::Role::Tree)
+                .aria_label("Project files")
                 .group("project-panel")
                 .when(panel_settings.drag_and_drop, |this| {
                     this.on_drag_move(cx.listener(handle_drag_move::<ExternalPaths>))
