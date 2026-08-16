@@ -1298,17 +1298,24 @@ impl<D: PickerDelegate> Picker<D> {
 
         div()
             .id(("item", ix))
+            // Only rows the user can actually land on are options. A section
+            // header rendered as one would be counted in "3 of 12" and offered
+            // as a target the arrow keys skip over, and it has no name of its
+            // own to be announced by.
+            //
             // Keyboard focus stays in the query input, which is a sibling of
             // this list rather than an ancestor, so `aria_active_descendant`
             // would be discarded. Currency is carried by the selected state and
             // the position within the set instead.
-            .role(gpui::Role::ListBoxOption)
-            .aria_selected(is_selected)
-            .when_some(self.delegate.match_label(ix, cx), |this, label| {
-                this.aria_label(label)
+            .when(selectable, |this| {
+                this.role(gpui::Role::ListBoxOption)
+                    .aria_selected(is_selected)
+                    .when_some(self.delegate.match_label(ix, cx), |this, label| {
+                        this.aria_label(label)
+                    })
+                    .aria_position_in_set(ix + 1)
+                    .aria_size_of_set(match_count)
             })
-            .aria_position_in_set(ix + 1)
-            .aria_size_of_set(match_count)
             .when(selectable, |this| this.cursor_pointer())
             .when(use_fallback_indicator, |this| {
                 this.hover(|s| s.bg(cx.theme().colors().ghost_element_hover))

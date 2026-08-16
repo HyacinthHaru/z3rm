@@ -969,9 +969,22 @@ impl PickerDelegate for RecentProjectsDelegate {
             ProjectPickerEntry::OpenFolder { index, .. } => {
                 Some(self.open_folders.get(*index)?.name.clone())
             }
-            ProjectPickerEntry::ProjectGroup(matched)
-            | ProjectPickerEntry::RecentProject(matched) => {
-                Some(matched.string.clone().into())
+            // Not `matched.string`: with an empty query — the state the picker
+            // opens in — entries are built with no match string at all, while
+            // the row on screen still shows a name derived from the candidate.
+            // Reading the string would announce every row as a bare option
+            // until the user typed something.
+            ProjectPickerEntry::ProjectGroup(matched) => {
+                let group = self.window_project_groups.get(matched.candidate_id)?;
+                let paths = path_list_label(group.path_list())?;
+                Some(match group.host() {
+                    Some(host) => SharedString::from(format!("{paths} ({host})")),
+                    None => paths,
+                })
+            }
+            ProjectPickerEntry::RecentProject(matched) => {
+                let workspace = self.workspaces.get(matched.candidate_id)?;
+                path_list_label(&workspace.identity_paths)
             }
         }
     }
@@ -1323,6 +1336,7 @@ impl PickerDelegate for RecentProjectsDelegate {
                     .gap_1()
                     .child(
                         IconButton::new(("remove-folder", worktree_id.to_usize()), IconName::Close)
+                            .aria_label("Remove Folder from Project")
                             .icon_size(IconSize::Small)
                             .tooltip({
                                 let focus_handle = self.focus_handle.clone();
@@ -1468,6 +1482,7 @@ impl PickerDelegate for RecentProjectsDelegate {
                     .when(is_local && has_multiple_groups, |this| {
                         this.child(
                             IconButton::new("move_to_new_window", IconName::ArrowUpRight)
+                                .aria_label("Open in New Window")
                                 .icon_size(IconSize::Small)
                                 .tooltip({
                                     let focus_handle = self.focus_handle.clone();
@@ -1498,6 +1513,7 @@ impl PickerDelegate for RecentProjectsDelegate {
                     .when(!is_active, |this| {
                         this.child(
                             IconButton::new("remove_open_project", IconName::Close)
+                                .aria_label("Remove Project from Window")
                                 .icon_size(IconSize::Small)
                                 .tooltip({
                                     let focus_handle = self.focus_handle.clone();
@@ -1632,6 +1648,7 @@ impl PickerDelegate for RecentProjectsDelegate {
                     .when(is_local, |this| {
                         this.child(
                             IconButton::new("add_to_workspace", IconName::FolderInclude)
+                                .aria_label(tooltip_title)
                                 .icon_size(IconSize::Small)
                                 .tooltip({
                                     let focus_handle = self.focus_handle.clone();
@@ -1661,6 +1678,7 @@ impl PickerDelegate for RecentProjectsDelegate {
                     })
                     .child(
                         IconButton::new("alternate_open", secondary_confirm_icon)
+                            .aria_label(secondary_confirm_tooltip)
                             .icon_size(IconSize::Small)
                             .tooltip({
                                 move |_, cx| {
@@ -1681,6 +1699,7 @@ impl PickerDelegate for RecentProjectsDelegate {
                     )
                     .child(
                         IconButton::new("delete", IconName::Close)
+                            .aria_label("Remove from Recent Projects")
                             .icon_size(IconSize::Small)
                             .tooltip({
                                 let focus_handle = self.focus_handle.clone();
@@ -2787,6 +2806,40 @@ mod tests {
         (picker, cx)
     }
 
+    /// The picker's rows carry per-project controls that no test had read out
+    /// of a frame. `ButtonLike` and `IconButton` cannot name themselves from
+    /// their children, so a control with a visible icon and a tooltip is still
+    /// announced as a bare "button".
+    #[gpui::test]
+    fn the_project_picker_names_what_it_shows(cx: &mut TestAppContext) {
+        let (_picker, cx) = build_picker(cx);
+
+        cx.activate_a11y(cx.window_handle());
+        let json = cx
+            .update(|window, cx| {
+                window.draw(cx).clear(cx);
+                window.debug_a11y_tree_json()
+            })
+            .expect("activation makes the debug tree available");
+        let tree: serde_json::Value = serde_json::from_str(&json).expect("the dump is valid JSON");
+
+        gpui::a11y::assert_interactive_nodes_are_named(&tree, "recent projects picker");
+        gpui::a11y::assert_no_role_was_discarded(&tree, "recent projects picker");
+        gpui::a11y::assert_roles_are_contained(&tree, "recent projects picker");
+        gpui::a11y::assert_click_targets_are_reachable(&tree, "recent projects picker");
+
+        let options = tree["nodes"]
+            .as_object()
+            .expect("the dump lists nodes")
+            .values()
+            .filter(|node| node["aria"]["role"] == "ListBoxOption")
+            .count();
+        assert!(
+            options > 0,
+            "the picker rendered no options, so this check would pass on an empty list: {json}"
+        );
+    }
+
     fn scroll_to_and_select(
         picker: &Entity<Picker<RecentProjectsDelegate>>,
         cx: &mut VisualTestContext,
@@ -3352,4 +3405,14 @@ mod tests {
             "remote project group confirm should surface an error notification"
         );
     }
+}
+
+/// The paths a project row shows, joined the way they read aloud.
+fn path_list_label(paths: &PathList) -> Option<SharedString> {
+    let joined = paths
+        .ordered_paths()
+        .map(|path| path.compact().to_string_lossy().to_string())
+        .collect::<Vec<_>>()
+        .join(", ");
+    (!joined.is_empty()).then(|| SharedString::from(joined))
 }
