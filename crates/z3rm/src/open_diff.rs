@@ -190,6 +190,10 @@ impl PickerDelegate for ChangedFileSelectorDelegate {
         "changed file selector"
     }
 
+    fn match_label(&self, ix: usize, _cx: &App) -> Option<SharedString> {
+        Some(self.matches.get(ix)?.string.clone().into())
+    }
+
     fn placeholder_text(&self, _window: &mut Window, _cx: &mut App) -> Arc<str> {
         "Select a changed file to review...".into()
     }

@@ -961,6 +961,21 @@ impl PickerDelegate for RecentProjectsDelegate {
         "recent projects"
     }
 
+    fn match_label(&self, ix: usize, _cx: &App) -> Option<SharedString> {
+        // Headers are not selectable, so naming them would announce a row the
+        // user cannot reach.
+        match self.filtered_entries.get(ix)? {
+            ProjectPickerEntry::Header(_) => None,
+            ProjectPickerEntry::OpenFolder { index, .. } => {
+                Some(self.open_folders.get(*index)?.name.clone())
+            }
+            ProjectPickerEntry::ProjectGroup(matched)
+            | ProjectPickerEntry::RecentProject(matched) => {
+                Some(matched.string.clone().into())
+            }
+        }
+    }
+
     fn placeholder_text(&self, _window: &mut Window, _cx: &mut App) -> Arc<str> {
         "Search projects…".into()
     }

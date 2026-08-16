@@ -126,6 +126,10 @@ impl PickerDelegate for RemoteHostSelectorDelegate {
         "remote host selector"
     }
 
+    fn match_label(&self, ix: usize, _cx: &App) -> Option<SharedString> {
+        Some(self.matches.get(ix)?.string.clone().into())
+    }
+
     fn placeholder_text(&self, _window: &mut Window, _cx: &mut App) -> Arc<str> {
         "ssh://user@host[:port] or an ~/.ssh/config host...".into()
     }

@@ -138,6 +138,10 @@ impl PickerDelegate for SidebarRecentProjectsDelegate {
         "sidebar recent projects"
     }
 
+    fn match_label(&self, ix: usize, _cx: &App) -> Option<SharedString> {
+        Some(self.filtered_workspaces.get(ix)?.string.clone().into())
+    }
+
     fn placeholder_text(&self, _window: &mut Window, _cx: &mut App) -> Arc<str> {
         "Search projects…".into()
     }

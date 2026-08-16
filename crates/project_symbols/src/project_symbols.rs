@@ -115,6 +115,10 @@ impl PickerDelegate for ProjectSymbolsDelegate {
     fn name() -> &'static str {
         "project symbols"
     }
+    fn match_label(&self, ix: usize, _cx: &App) -> Option<SharedString> {
+        Some(self.matches.get(ix)?.string.clone().into())
+    }
+
     fn placeholder_text(&self, _window: &mut Window, _cx: &mut App) -> Arc<str> {
         "Search project symbols...".into()
     }

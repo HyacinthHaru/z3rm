@@ -73,6 +73,10 @@ impl PickerDelegate for FontPickerDelegate {
         cx.notify();
     }
 
+    fn match_label(&self, ix: usize, _cx: &App) -> Option<SharedString> {
+        Some(self.filtered_fonts.get(ix)?.string.clone().into())
+    }
+
     fn placeholder_text(&self, _window: &mut Window, _cx: &mut App) -> Arc<str> {
         "Search fonts…".into()
     }
