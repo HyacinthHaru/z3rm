@@ -237,6 +237,8 @@ const ROLE_REQUIRES_CONTAINER: &[(&str, &str)] = &[
     ("Tab", "TabList"),
     ("ListBoxOption", "ListBox"),
     ("TreeItem", "Tree"),
+    ("MenuItem", "Menu"),
+    ("MenuItemCheckBox", "Menu"),
 ];
 
 /// Assert every containment-dependent node has its container as an ancestor.

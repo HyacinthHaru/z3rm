@@ -2507,4 +2507,82 @@ mod tests {
             );
         });
     }
+
+    struct MenuHost(Entity<ContextMenu>);
+
+    impl Render for MenuHost {
+        fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+            div().size_full().child(self.0.clone())
+        }
+    }
+
+    /// Focus stays on the menu while the arrow keys move a highlight through
+    /// it, so which entry is current reaches assistive technology only through
+    /// the active descendant. GPUI honours that claim only when the claiming
+    /// node has a focused ancestor, which is a condition the builder call
+    /// cannot show — it has to be read back out of a drawn frame.
+    #[gpui::test]
+    fn the_selected_entry_is_the_menus_active_descendant(cx: &mut TestAppContext) {
+        cx.update(|cx| {
+            let settings_store = settings::SettingsStore::test(cx);
+            cx.set_global(settings_store);
+            theme_settings::init(theme::LoadThemes::JustBase, cx);
+        });
+
+        let window = cx.add_window(|window, cx| {
+            let menu = ContextMenu::build(window, cx, |menu, _, _| {
+                menu.entry("Split Right", None, |_, _| {})
+                    .entry("Split Down", None, |_, _| {})
+            });
+            MenuHost(menu)
+        });
+        cx.activate_a11y(window.into());
+
+        window
+            .update(cx, |host, window, cx| {
+                host.0.update(cx, |menu, cx| {
+                    window.focus(&menu.focus_handle(cx), cx);
+                    menu.select_first(&Default::default(), window, cx);
+                });
+            })
+            .expect("the harness window is still open");
+
+        let json = cx
+            .update_window(window.into(), |_, window, cx| {
+                window.draw(cx).clear(cx);
+                window.debug_a11y_tree_json()
+            })
+            .expect("the harness window is still open")
+            .expect("activation makes the debug tree available");
+        let tree: serde_json::Value = serde_json::from_str(&json).expect("the dump is valid JSON");
+        let nodes = tree["nodes"].as_object().expect("the dump lists nodes");
+
+        let menu = nodes
+            .iter()
+            .find(|(_, node)| node["aria"]["role"] == "Menu")
+            .map(|(id, node)| (id.clone(), node.clone()))
+            .expect("the menu must be reported as a menu");
+
+        let entries: Vec<String> = nodes
+            .values()
+            .filter(|node| node["aria"]["role"] == "MenuItem")
+            .filter_map(|node| node["aria"]["label"].as_str().map(str::to_string))
+            .collect();
+        assert!(
+            entries.contains(&"Split Right".to_string())
+                && entries.contains(&"Split Down".to_string()),
+            "every entry needs a name of its own: {entries:?}"
+        );
+
+        assert_eq!(
+            tree["gpui_focus"].as_str(),
+            Some(menu.0.as_str()),
+            "the menu itself holds focus while a highlight moves inside it"
+        );
+        let active = tree["active_descendant_focus"]
+            .as_str()
+            .and_then(|id| nodes.get(id))
+            .expect("the menu must point at the entry it has highlighted");
+        assert_eq!(active["aria"]["label"].as_str(), Some("Split Right"));
+    }
 }
