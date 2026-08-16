@@ -866,6 +866,7 @@ impl ExtensionsPage {
                             SharedString::from(format!("repository-{}", extension.id)),
                             repository_icon,
                         )
+                        .aria_label("Visit Extension Repository")
                         .icon_color(Color::Accent)
                         .icon_size(IconSize::Small)
                         .on_click(cx.listener({
@@ -1011,6 +1012,7 @@ impl ExtensionsPage {
                                     SharedString::from(format!("repository-{}", extension.id)),
                                     repository_icon,
                                 )
+                                .aria_label("Visit Extension Repository")
                                 .icon_size(IconSize::Small)
                                 .tooltip(move |_, cx| {
                                     Tooltip::with_meta(

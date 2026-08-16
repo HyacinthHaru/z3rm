@@ -49,6 +49,8 @@ pub(super) fn render_action_button(
         SharedString::from(format!("{id_prefix}-{}", action.name())),
         icon,
     )
+    // Every search toggle goes through here, so this one name covers them all.
+    .aria_label(tooltip)
     .shape(IconButtonShape::Square)
     .on_click({
         let focus_handle = focus_handle.clone();

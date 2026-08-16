@@ -3509,6 +3509,7 @@ impl SettingsWindow {
                         .gap_1()
                         .child(
                             IconButton::new("back-btn", IconName::ArrowLeft)
+                                .aria_label("Back")
                                 .icon_size(IconSize::Small)
                                 .shape(IconButtonShape::Square)
                                 .on_click(cx.listener(|this, _, window, cx| {

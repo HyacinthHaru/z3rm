@@ -2444,6 +2444,7 @@ impl Render for ProjectSearchBar {
             .min_w_64()
             .child(
                 IconButton::new("project-search-filter-button", IconName::Filter)
+            .aria_label("Toggle Filters")
                     .shape(IconButtonShape::Square)
                     .tooltip(|_window, cx| {
                         Tooltip::for_action("Toggle Filters", &ToggleFilters, cx)
@@ -2491,6 +2492,7 @@ impl Render for ProjectSearchBar {
         };
 
         let expand_button = IconButton::new("project-search-collapse-expand", icon)
+            .aria_label(tooltip_label)
             .shape(IconButtonShape::Square)
             .tooltip(move |_, cx| {
                 Tooltip::for_action_in(
@@ -2576,6 +2578,7 @@ impl Render for ProjectSearchBar {
                 .min_w_64()
                 .child(
                     IconButton::new("project-search-opened-only", IconName::FolderSearch)
+                        .aria_label("Only Search Open Files")
                         .shape(IconButtonShape::Square)
                         .toggle_state(self.is_opened_only_enabled(cx))
                         .tooltip(Tooltip::text("Only Search Open Files"))

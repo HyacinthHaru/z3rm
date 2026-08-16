@@ -1331,6 +1331,7 @@ impl Sidebar {
             .when_some(review_target, |element, (session_id, path)| {
                 element.end_slot(
                     IconButton::new(("sidebar-review", index), IconName::Diff)
+                        .aria_label("Review changes")
                         .icon_size(IconSize::Small)
                         .tooltip(Tooltip::text("Review changes"))
                         .on_click(cx.listener(move |this, _, window, cx| {

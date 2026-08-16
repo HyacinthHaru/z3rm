@@ -516,6 +516,7 @@ impl RenderOnce for DiffStyleControls {
             .gap_1()
             .child(
                 IconButton::new("diff-style-unified", IconName::DiffUnified)
+                    .aria_label("Unified diff")
                     .icon_size(IconSize::Small)
                     .toggle_state(diff_view_style == DiffViewStyle::Unified)
                     .tooltip(Tooltip::text("Unified"))
@@ -533,6 +534,7 @@ impl RenderOnce for DiffStyleControls {
             )
             .child(
                 IconButton::new("diff-style-split", split_icon)
+                    .aria_label("Split diff")
                     .icon_size(IconSize::Small)
                     .toggle_state(is_split_set)
                     .tooltip(Tooltip::element(move |_, cx| {

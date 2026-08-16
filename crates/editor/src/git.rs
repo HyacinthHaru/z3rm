@@ -2567,6 +2567,7 @@ impl Editor {
                             .gap_1()
                             .child(
                                 IconButton::new("diff-review-close", IconName::Close)
+                                    .aria_label("Close review")
                                     .icon_color(ui::Color::Muted)
                                     .icon_size(action_icon_size)
                                     .tooltip(Tooltip::text("Close"))
@@ -2577,6 +2578,7 @@ impl Editor {
                             )
                             .child(
                                 IconButton::new("diff-review-add", IconName::Return)
+                                    .aria_label("Add comment")
                                     .icon_color(ui::Color::Muted)
                                     .icon_size(action_icon_size)
                                     .tooltip(Tooltip::text("Add comment"))
@@ -2737,6 +2739,7 @@ impl Editor {
                             format!("diff-review-cancel-edit-{comment_id}"),
                             IconName::Close,
                         )
+                        .aria_label("Cancel edit")
                         .icon_color(ui::Color::Muted)
                         .icon_size(action_icon_size)
                         .tooltip(Tooltip::text("Cancel"))
@@ -2754,6 +2757,7 @@ impl Editor {
                             format!("diff-review-confirm-edit-{comment_id}"),
                             IconName::Return,
                         )
+                        .aria_label("Confirm edit")
                         .icon_color(ui::Color::Muted)
                         .icon_size(action_icon_size)
                         .tooltip(Tooltip::text("Confirm"))

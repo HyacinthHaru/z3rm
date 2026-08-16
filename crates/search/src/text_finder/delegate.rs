@@ -727,6 +727,7 @@ impl PickerDelegate for Delegate {
                 ("text-finder-search-option", option as usize),
                 option.icon(),
             )
+            .aria_label(label)
             .icon_size(IconSize::Small)
             .toggle_state(active.contains(options))
             .tooltip(move |_window, cx| Tooltip::for_action_in(label, action, &focus_handle, cx))

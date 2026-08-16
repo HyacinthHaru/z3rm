@@ -127,6 +127,7 @@ impl Render for BufferSearchBar {
 
             let collapse_expand_icon_button = |id| {
                 IconButton::new(id, icon)
+                    .aria_label(tooltip_label)
                     .icon_size(IconSize::Small)
                     .tooltip(move |_, cx| {
                         Tooltip::for_action_in(
@@ -282,6 +283,7 @@ impl Render for BufferSearchBar {
                         "buffer-search-bar-toggle-search-selection-button",
                         IconName::Quote,
                     )
+                    .aria_label("Toggle Search Selection")
                     .style(ButtonStyle::Subtle)
                     .shape(IconButtonShape::Square)
                     .when(self.selection_search_enabled.is_some(), |button| {
