@@ -1,0 +1,40 @@
+#!/usr/bin/env bash
+# Compare the workspace test failures against the known-failing baseline by
+# NAME, not by count.
+#
+# A matching count is not a matching set: the mux e2e suites alternate between
+# passing and failing under a loaded parallel run, so a real regression can slip
+# in while the total stays the same. This is exactly how a picker layout
+# regression went unnoticed for eleven rounds of accessibility work.
+#
+# Usage: script/check-a11y-regressions [--a11y]
+#   --a11y  run with accessibility active, which exercises code paths nothing
+#           else does (see crates/gpui/src/window/a11y.rs).
+set -uo pipefail
+
+BASELINE_FILE="$(dirname "$0")/a11y-regression-baseline.txt"
+
+if [[ "${1:-}" == "--a11y" ]]; then
+    export Z3RM_A11Y_BUILD_HEADLESS=1
+fi
+
+output=$(cargo test --workspace --features gpui_platform/runtime_shaders --no-fail-fast 2>&1)
+failures=$(printf '%s\n' "$output" | grep -E '^    [a-z_]+' | sed 's/^ *//' | sort -u)
+
+baseline=$(grep -vE '^\s*(#|$)' "$BASELINE_FILE" | sort -u)
+
+new=$(comm -13 <(printf '%s\n' "$baseline") <(printf '%s\n' "$failures"))
+fixed=$(comm -23 <(printf '%s\n' "$baseline") <(printf '%s\n' "$failures"))
+
+if [[ -n "$fixed" ]]; then
+    echo "These baseline failures now pass; drop them from the baseline:"
+    printf '  %s\n' $fixed
+fi
+
+if [[ -n "$new" ]]; then
+    echo "New failures not in the baseline:"
+    printf '  %s\n' $new
+    exit 1
+fi
+
+echo "No new failures."
