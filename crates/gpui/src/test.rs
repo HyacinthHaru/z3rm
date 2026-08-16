@@ -301,6 +301,51 @@ pub mod a11y_checks {
         );
     }
 
+    /// Landmark roles a reader offers as a way to jump around the window. More
+    /// than one of the same landmark is only useful if they can be told apart.
+    pub const LANDMARK_ROLES: &[&str] = &["Main", "Complementary", "Navigation", "Banner"];
+
+    /// Panics if a window has more than one `Main`, or two landmarks of the
+    /// same kind that a reader cannot tell apart.
+    ///
+    /// A landmark list reading "complementary, complementary" is worse than no
+    /// landmarks: it offers destinations and refuses to say what they are.
+    #[track_caller]
+    pub fn assert_landmarks_are_distinguishable(tree: &serde_json::Value, context: &str) {
+        let mut by_role: collections::FxHashMap<&str, Vec<&str>> = collections::FxHashMap::default();
+        for node in nodes(tree).values() {
+            let Some(role) = node["aria"]["role"].as_str() else {
+                continue;
+            };
+            if !LANDMARK_ROLES.contains(&role) {
+                continue;
+            }
+            by_role
+                .entry(role)
+                .or_default()
+                .push(node["aria"]["label"].as_str().unwrap_or_default());
+        }
+
+        if let Some(mains) = by_role.get("Main") {
+            assert!(
+                mains.len() <= 1,
+                "{context}: a window has one main region, found {}: {mains:?}",
+                mains.len()
+            );
+        }
+
+        for (role, mut names) in by_role {
+            let total = names.len();
+            names.sort_unstable();
+            names.dedup();
+            assert_eq!(
+                names.len(),
+                total,
+                "{context}: {total} {role} landmarks that cannot be told apart: {names:?}"
+            );
+        }
+    }
+
     /// Panics if the focused element produced no node.
     ///
     /// A focused element with an id but no role produces no accessibility node,

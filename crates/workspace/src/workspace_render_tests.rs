@@ -792,6 +792,7 @@ async fn test_every_interactive_node_in_the_window_has_a_name(cx: &mut TestAppCo
     gpui::a11y_checks::assert_roles_are_contained(&tree, "workspace window");
     gpui::a11y_checks::assert_click_targets_are_reachable(&tree, "workspace window");
     gpui::a11y_checks::assert_focus_reached_the_tree(&tree, "workspace window");
+    gpui::a11y_checks::assert_landmarks_are_distinguishable(&tree, "workspace window");
 }
 
 /// A pane with no items has nothing inside to take focus, so focus stays on the

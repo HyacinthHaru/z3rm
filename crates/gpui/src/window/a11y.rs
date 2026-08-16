@@ -1508,4 +1508,32 @@ mod activation_tests {
 
         crate::test::a11y_checks::assert_click_targets_are_reachable(&tree, "nested click targets");
     }
+
+    /// Two landmarks of the same kind with the same name — or none — offer a
+    /// reader destinations and then refuse to say what they are.
+    #[crate::test]
+    #[should_panic(expected = "cannot be told apart")]
+    fn landmarks_that_cannot_be_told_apart_are_reported(cx: &mut TestAppContext) {
+        struct TwoPanels;
+        impl Render for TwoPanels {
+            fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+                div()
+                    .child(div().id("left").role(accesskit::Role::Complementary))
+                    .child(div().id("right").role(accesskit::Role::Complementary))
+            }
+        }
+
+        let window = cx.add_window(|_, _| TwoPanels);
+        cx.activate_a11y(window.into());
+        let json = cx
+            .update_window(window.into(), |_, window, cx| {
+                window.draw(cx).clear(cx);
+                window.debug_a11y_tree_json()
+            })
+            .expect("the window is open")
+            .expect("activation makes the debug tree available");
+        let tree: serde_json::Value = serde_json::from_str(&json).expect("the dump is valid JSON");
+
+        crate::test::a11y_checks::assert_landmarks_are_distinguishable(&tree, "two panels");
+    }
 }

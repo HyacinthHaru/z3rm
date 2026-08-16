@@ -164,6 +164,7 @@ fn save_frame(name: &str, image: &RgbaImage, tree: &serde_json::Value) -> Result
     gpui::a11y_checks::assert_no_role_was_discarded(tree, name);
     gpui::a11y_checks::assert_click_targets_are_reachable(tree, name);
     gpui::a11y_checks::assert_focus_reached_the_tree(tree, name);
+    gpui::a11y_checks::assert_landmarks_are_distinguishable(tree, name);
     Ok(())
 }
 
