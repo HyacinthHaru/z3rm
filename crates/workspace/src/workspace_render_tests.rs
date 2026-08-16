@@ -333,3 +333,106 @@ async fn test_notifications_are_announced_as_a_live_region(cx: &mut TestAppConte
     );
     assert_eq!(log["aria"]["label"].as_str(), Some("Notifications"));
 }
+
+/// A modal captures input and hides everything behind it. Its container had no
+/// role and no id, so the focused element produced no accessibility node at
+/// all: focus was discarded and the whole window announced instead of the
+/// dialog the user is now inside.
+#[gpui::test]
+async fn test_modal_is_announced_as_a_dialog(cx: &mut TestAppContext) {
+    use gpui::{Context, EventEmitter, InteractiveElement as _, IntoElement, ParentElement as _,
+        Render, StatefulInteractiveElement as _, Window};
+
+    struct TestModal {
+        focus_handle: gpui::FocusHandle,
+    }
+
+    impl gpui::Focusable for TestModal {
+        fn focus_handle(&self, _: &gpui::App) -> gpui::FocusHandle {
+            self.focus_handle.clone()
+        }
+    }
+    impl EventEmitter<gpui::DismissEvent> for TestModal {}
+    impl crate::ModalView for TestModal {}
+    impl Render for TestModal {
+        fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+            // Shaped like a real modal: `show_modal` focuses the modal's own
+            // handle, not the layer's container, so this is what has to carry
+            // an id and a role for focus to reach the tree at all.
+            gpui::div()
+                .id("test-modal-root")
+                .role(gpui::Role::Group)
+                .aria_label("Test modal")
+                .track_focus(&self.focus_handle)
+        }
+    }
+
+    init_test(cx);
+    let fs = FakeFs::new(cx.executor());
+    fs.insert_tree("/root", json!({ "a.txt": "" })).await;
+    let project = Project::test(fs, [path!("/root").as_ref()], cx).await;
+
+    let (multi_workspace, cx) =
+        cx.add_window_view(|window, cx| MultiWorkspace::test_new(project, window, cx));
+    let workspace = multi_workspace.read_with(cx, |mw, _| mw.workspace().clone());
+
+    workspace.update_in(cx, |workspace, window, cx| {
+        workspace.toggle_modal(window, cx, |_, cx| TestModal {
+            focus_handle: cx.focus_handle(),
+        });
+    });
+    cx.run_until_parked();
+
+    cx.activate_a11y(cx.window_handle());
+    let json = cx
+        .update(|window, cx| {
+            window.draw(cx).clear(cx);
+            window.debug_a11y_tree_json()
+        })
+        .expect("activation makes the debug tree available");
+    let tree: serde_json::Value = serde_json::from_str(&json).expect("the dump is valid JSON");
+
+    let dialog = tree["nodes"]
+        .as_object()
+        .expect("the dump lists nodes")
+        .values()
+        .find(|node| node["aria"]["role"] == "Dialog")
+        .expect("an open modal must be reported as a dialog");
+    assert_eq!(
+        dialog["aria"]["modal"].as_bool(),
+        Some(true),
+        "content behind an open modal is unreachable, and has to be reported that way"
+    );
+    assert_eq!(
+        tree["frame"]["focus_without_node"].as_str(),
+        None,
+        "a modal whose root carries a role must keep its focus in the tree"
+    );
+
+    // The focused element has to sit inside the dialog, or assistive technology
+    // reports a modal context the user is not actually in.
+    let focused = tree["gpui_focus"]
+        .as_str()
+        .expect("the modal's root holds focus");
+    let nodes = tree["nodes"].as_object().expect("the dump lists nodes");
+    let mut pending: Vec<String> = dialog["children"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(|id| id.as_str().map(str::to_string))
+        .collect();
+    let mut focus_is_inside = false;
+    while let Some(id) = pending.pop() {
+        if id == focused {
+            focus_is_inside = true;
+            break;
+        }
+        if let Some(children) = nodes.get(&id).and_then(|node| node["children"].as_array()) {
+            pending.extend(children.iter().filter_map(|id| id.as_str().map(str::to_string)));
+        }
+    }
+    assert!(
+        focus_is_inside,
+        "the focused element must be a descendant of the dialog"
+    );
+}

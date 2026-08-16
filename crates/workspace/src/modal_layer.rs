@@ -288,6 +288,14 @@ impl Render for ModalLayer {
             )
             .child(
                 v_flex()
+                    // Without an id and a role this focused container gets no
+                    // accessibility node, so focus is dropped and the whole
+                    // window is announced instead of the dialog. The modal flag
+                    // matches what the layer already does visually: everything
+                    // behind it is occluded and cannot be reached.
+                    .id("modal-layer-dialog")
+                    .role(gpui::Role::Dialog)
+                    .aria_modal()
                     .h(px(0.0))
                     .top_20()
                     .items_center()
