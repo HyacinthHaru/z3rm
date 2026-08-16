@@ -1722,16 +1722,22 @@ impl Render for MuxPaneView {
         // would be silent in a state where the keyboard behaves differently.
         let in_copy_mode = self.terminal_view.read(cx).copy_mode_state().active
             || self.terminal.read(cx).vi_mode_enabled();
-        let mode = if self.is_prefix_mode() {
-            Some("prefix mode")
+        let mut states: Vec<&str> = Vec::new();
+        if self.is_prefix_mode() {
+            states.push("prefix mode");
         } else if in_copy_mode {
-            Some("copy mode")
+            states.push("copy mode");
+        }
+        // Zooming hides every other pane. A sighted user sees that at once; from
+        // the tree it is indistinguishable from a window that only ever had one
+        // pane. Same word the sidebar uses for it.
+        if self.zoomed {
+            states.push("zoomed");
+        }
+        let announced_title = if states.is_empty() {
+            announced_title
         } else {
-            None
-        };
-        let announced_title = match mode {
-            Some(mode) => format!("{announced_title}, {mode}"),
-            None => announced_title,
+            format!("{announced_title}, {}", states.join(", "))
         };
 
         div()
@@ -2631,6 +2637,20 @@ mod tests {
             pane_label(cx).as_deref(),
             Some(format!("{plain}, copy mode").as_str()),
             "entering copy mode has to change what the pane announces"
+        );
+
+        // Zooming is orthogonal to the keyboard modes and hides every other
+        // pane, so it has to be announced alongside whichever mode is active
+        // rather than replacing it.
+        view.update_in(cx, |view, _window, cx| {
+            view.set_zoomed_from_snapshot(true, cx);
+        });
+        cx.run_until_parked();
+
+        assert_eq!(
+            pane_label(cx).as_deref(),
+            Some(format!("{plain}, copy mode, zoomed").as_str()),
+            "a zoomed pane looks nothing like an unzoomed one and has to say so"
         );
     }
 
