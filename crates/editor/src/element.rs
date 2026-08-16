@@ -12259,4 +12259,84 @@ mod tests {
             Some(px(400.0)),
         );
     }
+
+    /// Filters, search boxes and settings fields are all single-line editors.
+    /// The element used to return no id, and accessibility nodes are keyed off
+    /// `GlobalElementId`, so none of them could produce a node no matter what
+    /// role they claimed.
+    #[gpui::test]
+    async fn test_single_line_editor_is_exposed_as_a_text_input(cx: &mut TestAppContext) {
+        init_test(cx, |_| {});
+        let window = cx.add_window(|window, cx| {
+            let buffer = MultiBuffer::build_simple("needle", cx);
+            let mut editor = Editor::new(EditorMode::SingleLine, buffer, None, window, cx);
+            editor.set_placeholder_text("Search", window, cx);
+            editor
+        });
+
+        // Activated per window rather than through the process-wide
+        // environment variable, which would switch accessibility on for every
+        // other test sharing this binary.
+        cx.activate_a11y(window.into());
+        let json = cx
+            .update_window(window.into(), |_, window, cx| {
+                window.draw(cx).clear(cx);
+                window.debug_a11y_tree_json()
+            })
+            .expect("the editor window is still open")
+            .expect("activation makes the debug tree available");
+        let tree: serde_json::Value = serde_json::from_str(&json).expect("the dump is valid JSON");
+        let nodes = tree["nodes"].as_object().expect("the dump lists nodes");
+
+        let input = nodes
+            .values()
+            .find(|node| node["aria"]["role"] == "TextInput")
+            .expect("a single-line editor must be reported as a text input");
+        assert_eq!(input["aria"]["placeholder"].as_str(), Some("Search"));
+        assert!(
+            input["aria"]["text_selection"].is_object(),
+            "a text input must expose a caret"
+        );
+
+        let run = input["children"]
+            .as_array()
+            .and_then(|children| children.first())
+            .and_then(|id| id.as_str())
+            .and_then(|id| nodes.get(id))
+            .expect("the content must be readable as a text run");
+        assert_eq!(run["aria"]["value"].as_str(), Some("needle"));
+    }
+
+    /// A multi-line editor's text pattern has to reflect folds, wrapping and
+    /// inlays, so it is deliberately not described as a flat text input.
+    #[gpui::test]
+    async fn test_multi_line_editor_is_not_described_as_a_text_input(cx: &mut TestAppContext) {
+        init_test(cx, |_| {});
+        let window = cx.add_window(|window, cx| {
+            let buffer = MultiBuffer::build_simple("one\ntwo", cx);
+            Editor::new(EditorMode::full(), buffer, None, window, cx)
+        });
+
+        // Activated per window rather than through the process-wide
+        // environment variable, which would switch accessibility on for every
+        // other test sharing this binary.
+        cx.activate_a11y(window.into());
+        let json = cx
+            .update_window(window.into(), |_, window, cx| {
+                window.draw(cx).clear(cx);
+                window.debug_a11y_tree_json()
+            })
+            .expect("the editor window is still open")
+            .expect("activation makes the debug tree available");
+        let tree: serde_json::Value = serde_json::from_str(&json).expect("the dump is valid JSON");
+
+        assert!(
+            tree["nodes"]
+                .as_object()
+                .expect("the dump lists nodes")
+                .values()
+                .all(|node| node["aria"]["role"] != "TextInput"),
+            "a full editor must not claim to be a text input"
+        );
+    }
 }

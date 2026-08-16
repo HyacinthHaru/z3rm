@@ -2512,14 +2512,6 @@ mod live_tests {
     /// which is the only place the `Role::Tree` -> `Role::TreeItem` parenting
     /// can be observed at all.
     fn a11y_tree(cx: &mut TestAppContext, mode: SidebarMode) -> serde_json::Value {
-        // SAFETY: read by `TestWindow::a11y_init` when a window is created.
-        // Set once for the whole test binary and never unset, so threads
-        // running in parallel observe a stable value.
-        static ONCE: std::sync::Once = std::sync::Once::new();
-        ONCE.call_once(|| unsafe {
-            std::env::set_var("Z3RM_A11Y_BUILD_HEADLESS", "1");
-        });
-
         init_test(cx);
         let domain = test_domain();
         let window = cx.add_window(move |window, cx| {
@@ -2538,6 +2530,9 @@ mod live_tests {
             sidebar
         });
 
+        // Per window rather than the process-wide environment variable, which
+        // would switch accessibility on for the other tests in this binary.
+        cx.activate_a11y(window.into());
         let json = cx
             .update_window(window.into(), |view, window, cx| {
                 // `aria_active_descendant` is honored only while the container
@@ -2551,7 +2546,7 @@ mod live_tests {
                 window.debug_a11y_tree_json()
             })
             .expect("the sidebar window is still open")
-            .expect("Z3RM_A11Y_BUILD_HEADLESS makes the debug tree available");
+            .expect("activation makes the debug tree available");
         serde_json::from_str(&json).expect("the dump is valid JSON")
     }
 
