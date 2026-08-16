@@ -722,6 +722,11 @@ impl PickerDelegate for TabSwitcherDelegate {
         "tab switcher"
     }
 
+    fn match_label(&self, ix: usize, cx: &App) -> Option<SharedString> {
+        let tab_match = self.matches.get(ix)?;
+        Some(tab_match.item.tab_content_text(tab_match.detail, cx))
+    }
+
     fn placeholder_text(&self, _window: &mut Window, _cx: &mut App) -> Arc<str> {
         "Search all tabs…".into()
     }

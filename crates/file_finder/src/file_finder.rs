@@ -1683,6 +1683,11 @@ impl PickerDelegate for FileFinderDelegate {
         "file finder"
     }
 
+    fn match_label(&self, ix: usize, _cx: &App) -> Option<SharedString> {
+        let path = self.matches.get(ix)?.relative_path()?;
+        Some(path.as_unix_str().to_string().into())
+    }
+
     fn placeholder_text(&self, _window: &mut Window, _cx: &mut App) -> Arc<str> {
         "Search project files...".into()
     }

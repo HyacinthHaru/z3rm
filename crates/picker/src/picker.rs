@@ -1616,6 +1616,10 @@ mod tests {
             self.items.len()
         }
 
+        fn match_label(&self, ix: usize, _cx: &App) -> Option<SharedString> {
+            Some(format!("item {ix}").into())
+        }
+
         fn selected_index(&self) -> usize {
             self.selected_index
         }
@@ -1783,6 +1787,15 @@ mod tests {
             1,
             "exactly one option is current at a time"
         );
+
+        // An option with a position but no name is announced as "option 2 of 3"
+        // with nothing to identify it.
+        let unnamed = nodes
+            .values()
+            .filter(|node| node["aria"]["role"] == "ListBoxOption")
+            .filter(|node| node["aria"]["label"].as_str().is_none_or(str::is_empty))
+            .count();
+        assert_eq!(unnamed, 0, "a delegate that supplies labels must reach the tree");
     }
 
     #[gpui::test]
