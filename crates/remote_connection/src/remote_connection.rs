@@ -165,6 +165,7 @@ impl Render for RemoteConnectionPrompt {
                                 .when(is_password_prompt, |this| {
                                     this.child(
                                         IconButton::new("toggle_mask", masked_password_icon)
+                                            .aria_label(masked_password_tooltip)
                                             .icon_size(IconSize::Small)
                                             .tooltip(Tooltip::text(masked_password_tooltip))
                                             .on_click(cx.listener(|this, _, window, cx| {

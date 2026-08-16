@@ -2997,6 +2997,7 @@ fn render_wrap_code_block_button(
     );
 
     IconButton::new(button_id, icon)
+        .aria_label(tooltip.clone())
         .icon_size(IconSize::Small)
         .icon_color(Color::Muted)
         .tooltip(Tooltip::text(tooltip))

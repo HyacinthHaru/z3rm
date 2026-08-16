@@ -1034,6 +1034,7 @@ impl ExtensionsPage {
                                         SharedString::from(format!("more-{}", extension.id)),
                                         IconName::Ellipsis,
                                     )
+                                    .aria_label("More extension actions")
                                     .icon_size(IconSize::Small),
                                 )
                                 .anchor(Anchor::TopRight)
