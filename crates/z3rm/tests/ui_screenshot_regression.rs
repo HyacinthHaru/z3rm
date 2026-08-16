@@ -161,6 +161,7 @@ fn save_frame(name: &str, image: &RgbaImage, tree: &serde_json::Value) -> Result
     // Checked here rather than per scenario so a new scenario cannot forget it.
     assert_interactive_nodes_are_named(tree, name);
     assert_roles_are_contained(tree, name);
+    assert_focus_reached_the_tree(tree, name);
     Ok(())
 }
 
@@ -192,6 +193,24 @@ fn count_near_color(image: &RgbaImage, rgb: [u8; 3], tolerance: u8) -> usize {
 }
 
 /// All nodes in a `debug_a11y_tree_json` dump, as `(role, node)` pairs.
+/// Assert the frame did not discard the focused element.
+///
+/// A focused element with an id but no role produces no accessibility node, so
+/// focus has nowhere to land and screen readers fall back to announcing the
+/// whole window. GPUI records why when that happens; the dump prints it.
+fn assert_focus_reached_the_tree(tree: &serde_json::Value, scenario: &str) {
+    let dropped = tree
+        .get("frame")
+        .and_then(|frame| frame.get("focus_without_node"))
+        .and_then(|reason| reason.as_str());
+    assert!(
+        dropped.is_none(),
+        "{scenario}: the focused element produced no accessibility node ({}), so assistive \
+         technology announces the whole window instead of it",
+        dropped.unwrap_or_default()
+    );
+}
+
 /// Roles that only mean anything inside a matching container. A screen reader
 /// derives "tab 2 of 5" and the arrow-key conventions from that containment, so
 /// an orphaned option or tab is announced without any of it.
