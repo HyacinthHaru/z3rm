@@ -2526,6 +2526,24 @@ mod live_tests {
             );
             sidebar.sessions = sessions();
             sidebar.mode = mode;
+            // In file mode a modified file grows a second control, which is the
+            // only place that control appears — a fixture without one checks a
+            // strictly smaller screen than the user sees.
+            if mode == SidebarMode::Files {
+                let entry = |name: &str, is_modified: bool| mux_protocol::DirEntry {
+                    name: name.to_string(),
+                    is_dir: false,
+                    size: 42,
+                    is_modified,
+                };
+                let mut tree = FileTree::new("session-a", "/workspace");
+                tree.start_loading("/workspace");
+                tree.complete_loading(
+                    "/workspace",
+                    vec![entry("notes.txt", true), entry("README.md", false)],
+                );
+                sidebar.file_tree = Some(tree);
+            }
             sidebar.selected_index = Some(3);
             sidebar.rebuild_entries(cx);
             sidebar
@@ -2689,6 +2707,24 @@ mod live_tests {
     /// added later cannot quietly skip it.
     #[gpui::test]
     async fn every_interactive_node_in_the_panel_has_a_name(cx: &mut TestAppContext) {
+        // Checked in both modes: the file list carries a per-row control that
+        // the session list has no equivalent of, so one mode is not a proxy for
+        // the other.
+        let files = a11y_tree(cx, SidebarMode::Files);
+        gpui::a11y_checks::assert_interactive_nodes_are_named(&files, "sidebar files");
+        gpui::a11y_checks::assert_no_role_was_discarded(&files, "sidebar files");
+        gpui::a11y_checks::assert_roles_are_contained(&files, "sidebar files");
+        gpui::a11y_checks::assert_click_targets_are_reachable(&files, "sidebar files");
+        assert!(
+            files["nodes"]
+                .as_object()
+                .expect("the dump lists nodes")
+                .values()
+                .any(|node| node["aria"]["label"].as_str() == Some("Review changes")),
+            "the modified file's review control has to be on screen for this to \
+             be checking anything: {files}"
+        );
+
         let tree = a11y_tree(cx, SidebarMode::Sessions);
         let nodes = tree["nodes"].as_object().expect("the dump lists nodes");
 
