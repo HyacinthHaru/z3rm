@@ -158,6 +158,8 @@ fn save_a11y_tree(name: &str, tree: &serde_json::Value) -> Result<PathBuf> {
 fn save_frame(name: &str, image: &RgbaImage, tree: &serde_json::Value) -> Result<()> {
     save_screenshot(name, image)?;
     save_a11y_tree(name, tree)?;
+    // Checked here rather than per scenario so a new scenario cannot forget it.
+    assert_interactive_nodes_are_named(tree, name);
     Ok(())
 }
 
@@ -189,6 +191,50 @@ fn count_near_color(image: &RgbaImage, rgb: [u8; 3], tolerance: u8) -> usize {
 }
 
 /// All nodes in a `debug_a11y_tree_json` dump, as `(role, node)` pairs.
+/// Roles whose whole purpose is to be operated or read by name. A node with one
+/// of these and no accessible name is announced as a bare role ("button",
+/// "tab") with nothing to distinguish it, which is the single most common way
+/// UI regresses for screen-reader users.
+const ROLES_REQUIRING_A_NAME: &[&str] = &[
+    "Button",
+    "Tab",
+    "TreeItem",
+    "ListBoxOption",
+    "Link",
+    "CheckBox",
+    "RadioButton",
+    "MenuItem",
+];
+
+/// Assert every interactive node in the frame carries a name.
+///
+/// A `TextInput` counts as named by its placeholder, since that is what an
+/// empty field is announced by.
+fn assert_interactive_nodes_are_named(tree: &serde_json::Value, scenario: &str) {
+    let unnamed: Vec<String> = a11y_nodes(tree)
+        .into_iter()
+        .filter(|(role, _)| ROLES_REQUIRING_A_NAME.contains(&role.as_str()))
+        .filter(|(_, node)| {
+            ["label", "value", "placeholder"]
+                .iter()
+                .all(|field| a11y_string_field(node, field).is_none_or(|text| text.is_empty()))
+        })
+        .map(|(role, node)| {
+            format!(
+                "{role} ({})",
+                node.get("element_id")
+                    .and_then(|id| id.as_str())
+                    .unwrap_or("no element id")
+            )
+        })
+        .collect();
+
+    assert!(
+        unnamed.is_empty(),
+        "{scenario}: these nodes are announced as a bare role with nothing to identify them: {unnamed:?}"
+    );
+}
+
 fn a11y_nodes(tree: &serde_json::Value) -> Vec<(String, &serde_json::Value)> {
     tree.get("nodes")
         .and_then(|nodes| nodes.as_object())

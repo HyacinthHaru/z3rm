@@ -276,5 +276,18 @@ mod tests {
             vec![("logs".to_string(), true), ("shell".to_string(), false)],
             "each tab must carry its name and whether it is the current one"
         );
+
+        // The start-slot button is part of the bar too, and a bare "button" is
+        // just as unusable as a bare "tab".
+        let unnamed: Vec<String> = nodes
+            .values()
+            .filter(|node| matches!(node["aria"]["role"].as_str(), Some("Button" | "Tab")))
+            .filter(|node| node["aria"]["label"].as_str().is_none_or(str::is_empty))
+            .map(|node| format!("{} ({})", node["aria"]["role"], node["element_id"]))
+            .collect();
+        assert!(
+            unnamed.is_empty(),
+            "these nodes are announced as a bare role: {unnamed:?}"
+        );
     }
 }

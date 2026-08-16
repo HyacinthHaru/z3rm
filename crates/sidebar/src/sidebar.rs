@@ -2632,6 +2632,37 @@ mod live_tests {
         );
     }
 
+    /// A node with an interactive role and no name is announced as a bare
+    /// "button" or "tree item" with nothing to tell it apart. Checked across
+    /// the whole rendered panel rather than per element, so a row or control
+    /// added later cannot quietly skip it.
+    #[gpui::test]
+    async fn every_interactive_node_in_the_panel_has_a_name(cx: &mut TestAppContext) {
+        let tree = a11y_tree(cx, SidebarMode::Sessions);
+        let nodes = tree["nodes"].as_object().expect("the dump lists nodes");
+
+        const NEEDS_A_NAME: &[&str] = &["Button", "TreeItem", "Tab", "ListBoxOption", "Link"];
+        let unnamed: Vec<String> = nodes
+            .values()
+            .filter(|node| {
+                node["aria"]["role"]
+                    .as_str()
+                    .is_some_and(|role| NEEDS_A_NAME.contains(&role))
+            })
+            .filter(|node| {
+                ["label", "value", "placeholder"]
+                    .iter()
+                    .all(|field| node["aria"][field].as_str().is_none_or(str::is_empty))
+            })
+            .map(|node| format!("{} ({})", node["aria"]["role"], node["element_id"]))
+            .collect();
+
+        assert!(
+            unnamed.is_empty(),
+            "these nodes are announced as a bare role: {unnamed:?}"
+        );
+    }
+
     /// The filter is an `Editor`, and an editor with no element id can carry no
     /// accessibility node at all — so a visible search box contributed nothing
     /// to the tree.
