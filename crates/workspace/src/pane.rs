@@ -4285,10 +4285,25 @@ impl Render for Pane {
             .map(|item| item.tab_content_text(0, cx))
             .unwrap_or_else(|| SharedString::new_static("Empty pane"));
 
+        // Which pane of how many is only conveyed by the layout, so two panes
+        // running the same program are indistinguishable from the tree. The
+        // lookup is over the window's panes, of which there are a handful.
+        let pane_position = self.workspace.upgrade().and_then(|workspace| {
+            let workspace = workspace.read(cx);
+            let panes = workspace.panes();
+            let index = panes
+                .iter()
+                .position(|pane| pane.entity_id() == cx.entity_id())?;
+            (panes.len() > 1).then_some((index + 1, panes.len()))
+        });
+
         v_flex()
             .id(ElementId::View(cx.entity_id()))
             .role(gpui::Role::Group)
             .aria_label(pane_name)
+            .when_some(pane_position, |this, (position, count)| {
+                this.aria_position_in_set(position).aria_size_of_set(count)
+            })
             .key_context(key_context)
             .track_focus(&self.focus_handle(cx))
             .size_full()

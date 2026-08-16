@@ -506,6 +506,66 @@ async fn test_clicking_a_tab_through_its_action_activates_it(cx: &mut TestAppCon
     );
 }
 
+/// Which pane of how many is conveyed only by the layout. Two panes running
+/// the same program are the same name in the tree, and there is nothing to say
+/// how many others exist or where in them the user is.
+#[gpui::test]
+async fn test_split_panes_say_which_one_they_are(cx: &mut TestAppContext) {
+    init_test(cx);
+    let fs = FakeFs::new(cx.executor());
+    fs.insert_tree("/root", json!({ "a.txt": "" })).await;
+    let project = Project::test(fs, [path!("/root").as_ref()], cx).await;
+
+    let (multi_workspace, cx) =
+        cx.add_window_view(|window, cx| MultiWorkspace::test_new(project, window, cx));
+    let workspace = multi_workspace.read_with(cx, |mw, _| mw.workspace().clone());
+    let pane = workspace.read_with(cx, |ws, _| ws.active_pane().clone());
+
+    pane.update_in(cx, |pane, window, cx| {
+        pane.add_item(
+            Box::new(cx.new(|cx| TestItem::new(cx).with_label("shell"))),
+            true,
+            true,
+            None,
+            window,
+            cx,
+        );
+    });
+    workspace.update_in(cx, |workspace, window, cx| {
+        workspace.split_pane(pane.clone(), crate::SplitDirection::Right, window, cx);
+    });
+    cx.run_until_parked();
+
+    cx.activate_a11y(cx.window_handle());
+    let json = cx
+        .update(|window, cx| {
+            window.draw(cx).clear(cx);
+            window.debug_a11y_tree_json()
+        })
+        .expect("activation makes the debug tree available");
+    let tree: serde_json::Value = serde_json::from_str(&json).expect("the dump is valid JSON");
+
+    let mut positions: Vec<(u64, u64)> = tree["nodes"]
+        .as_object()
+        .expect("the dump lists nodes")
+        .values()
+        .filter(|node| node["aria"]["role"] == "Group")
+        .filter_map(|node| {
+            Some((
+                node["aria"]["position_in_set"].as_u64()?,
+                node["aria"]["size_of_set"].as_u64()?,
+            ))
+        })
+        .collect();
+    positions.sort();
+
+    assert_eq!(
+        positions,
+        vec![(1, 2), (2, 2)],
+        "each pane has to say which of how many it is"
+    );
+}
+
 /// A live region announces changes made *inside* it. A region that is created
 /// at the same moment as its first message has nothing to compare against, so
 /// both regions have to be in the tree before there is anything to say.
