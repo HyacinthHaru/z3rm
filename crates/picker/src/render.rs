@@ -78,8 +78,31 @@ impl<D: PickerDelegate> Render for Picker<D> {
             .preview_layout_rendered(window)
             .unwrap_or(Layout::Hidden);
 
+        // Typing filters the list, and nothing said what came back: the rows
+        // change under a reader that is looking at the query input. Rendered
+        // whether or not there are matches, because a region that appears with
+        // its message has nothing to diff against. Polite, since it changes on
+        // every keystroke.
+        let match_count = self.delegate.match_count();
+        let announced_matches = if match_count == 0 {
+            self.delegate
+                .no_matches_text(window, cx)
+                .unwrap_or_else(|| SharedString::new_static("No matches"))
+        } else if match_count == 1 {
+            SharedString::new_static("1 match")
+        } else {
+            SharedString::from(format!("{match_count} matches"))
+        };
+
         div()
             .relative()
+            .child(
+                div()
+                    .id("picker-match-count")
+                    .role(gpui::Role::Status)
+                    .aria_live(gpui::accesskit::Live::Polite)
+                    .aria_label(announced_matches),
+            )
             .child(content)
             .when(self.is_resizable(), |this| {
                 this.left(self.shape.horizontal_offset(window))

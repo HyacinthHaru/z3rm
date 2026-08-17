@@ -1835,6 +1835,18 @@ mod tests {
         gpui::a11y_checks::assert_active_descendant_is_honoured(&tree, "picker");
         let nodes = tree["nodes"].as_object().expect("the dump lists nodes");
 
+        // Typing filters the list, so what came back has to be announced from
+        // somewhere: the region exists whether or not there are matches.
+        let counted = nodes
+            .values()
+            .filter(|node| node["aria"]["live"] == "Polite")
+            .filter_map(|node| node["aria"]["label"].as_str())
+            .collect::<Vec<_>>();
+        assert!(
+            counted.contains(&"3 matches"),
+            "the picker has to say how many matches it found: {counted:?}"
+        );
+
         // The query input points at the row the arrow keys are on: focus stays
         // where typing goes, and the row is announced from there.
         let focused = tree["gpui_focus"]

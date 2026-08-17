@@ -229,19 +229,22 @@ impl Render for InputField {
                         )
                     }),
             )
-            .when_some(self.error.clone(), |this, error| {
-                // The message is a plain label and contributes no node, so a
-                // field that has gone red says nothing at all. `Status` carries
-                // a polite live region, which is what announces the error when
-                // it appears rather than only when the user goes looking.
-                this.child(
-                    div()
-                        .id("input-field-error")
-                        .role(gpui::Role::Status)
-                        .aria_label(error.clone())
-                        .child(Label::new(error).size(LabelSize::Small).color(Color::Error)),
-                )
-            })
+            // The message is a plain label and contributes no node, so a field
+            // that has gone red says nothing at all. Rendered whether or not
+            // there is an error: a live region that appears together with its
+            // message has nothing to diff against, so it announces nothing —
+            // which is what the old shape did, comment notwithstanding.
+            .child(
+                div()
+                    .id("input-field-error")
+                    .role(gpui::Role::Status)
+                    .aria_live(gpui::accesskit::Live::Polite)
+                    .when_some(self.error.clone(), |this, error| {
+                        this.aria_label(error.clone()).child(
+                            Label::new(error).size(LabelSize::Small).color(Color::Error),
+                        )
+                    }),
+            )
     }
 }
 
