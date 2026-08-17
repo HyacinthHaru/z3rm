@@ -441,12 +441,30 @@ async fn test_the_zoom_button_can_be_operated_through_its_action(cx: &mut TestAp
         pane.read_with(cx, |pane, _| pane.is_zoomed()),
         "advertising Click is worth nothing if it does not zoom the pane"
     );
+
+    // Zooming hides the other panes, which from the tree is indistinguishable
+    // from a window that only ever had one.
+    let json = cx
+        .update(|window, cx| {
+            window.draw(cx).clear(cx);
+            window.debug_a11y_tree_json()
+        })
+        .expect("activation makes the debug tree available");
+    let tree: serde_json::Value = serde_json::from_str(&json).expect("the dump is valid JSON");
+    let zoomed: Vec<&str> = tree["nodes"]
+        .as_object()
+        .expect("the dump lists nodes")
+        .values()
+        .filter_map(|node| node["aria"]["label"].as_str())
+        .filter(|label| label.ends_with(", zoomed"))
+        .collect();
+    assert_eq!(
+        zoomed.len(),
+        1,
+        "the zoomed pane has to say so: {zoomed:?}"
+    );
 }
 
-/// A tab carries a close button inside its own bounds, so answering `Click` at
-/// the tab node's centre is only correct while the close button stays off
-/// centre. Activating a tab and closing it are not close enough for a mistake
-/// to be recoverable.
 /// Two files with the same name are the ordinary case in any project with a
 /// `mod.rs` or an `index.ts`, and the tab bar disambiguates them by widening
 /// the path it shows. The announced name is built from the same detail level,
@@ -592,6 +610,10 @@ async fn test_a_tab_says_it_has_unsaved_changes(cx: &mut TestAppContext) {
     );
 }
 
+/// A tab carries a close button inside its own bounds, so answering `Click` at
+/// the tab node's centre is only correct while the close button stays off
+/// centre. Activating a tab and closing it are not close enough for a mistake
+/// to be recoverable.
 #[gpui::test]
 async fn test_clicking_a_tab_through_its_action_activates_it(cx: &mut TestAppContext) {
     init_test(cx);

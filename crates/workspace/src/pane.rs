@@ -4289,6 +4289,14 @@ impl Render for Pane {
             .active_item()
             .map(|item| item.tab_content_text(0, cx))
             .unwrap_or_else(|| SharedString::new_static("Empty pane"));
+        // Zooming hides every other pane. A sighted user sees that at once;
+        // from the tree it is indistinguishable from a window that only ever
+        // had one pane. Same word the mux pane and the sidebar use for it.
+        let pane_name = if self.zoomed {
+            SharedString::from(format!("{pane_name}, zoomed"))
+        } else {
+            pane_name
+        };
 
         // Which pane of how many is only conveyed by the layout, so two panes
         // running the same program are indistinguishable from the tree. The
