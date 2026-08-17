@@ -140,7 +140,31 @@ impl RenderOnce for Callout {
             ),
         };
 
+        // The title and the description are labels, and a label contributes no
+        // node, so a callout explaining why something is unavailable reaches a
+        // reader as an icon and a button with no explanation between them. The
+        // severity goes in too: it is otherwise carried by colour alone.
+        let announced = [self.title.clone(), self.description.clone()]
+            .into_iter()
+            .flatten()
+            .map(|part| part.to_string())
+            .collect::<Vec<_>>()
+            .join(". ");
+        let announced = if announced.is_empty() {
+            None
+        } else {
+            Some(match self.severity {
+                Severity::Info => announced,
+                Severity::Success => format!("Success: {announced}"),
+                Severity::Warning => format!("Warning: {announced}"),
+                Severity::Error => format!("Error: {announced}"),
+            })
+        };
+
         h_flex()
+            .id("callout")
+            .role(gpui::Role::Group)
+            .when_some(announced, |this, announced| this.aria_label(announced))
             .min_w_0()
             .w_full()
             .p_2()

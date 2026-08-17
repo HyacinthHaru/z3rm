@@ -262,6 +262,73 @@ fn the_shared_controls_report_their_state(cx: &mut TestAppContext) {
         );
     }
 
+    /// A callout and an announcement toast are built out of a `Headline` and
+    /// `Label`s, none of which contributes a node, so both reached a reader as
+    /// a row of unexplained buttons. Severity is carried by colour, which is
+    /// not information either.
+    #[gpui::test]
+    fn a_message_says_what_it_is_about(cx: &mut TestAppContext) {
+        use crate::{AnnouncementToast, Callout, Severity};
+
+        struct MessageHost;
+        impl Render for MessageHost {
+            fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+                div()
+                    .size_full()
+                    .child(
+                        Callout::new()
+                            .severity(Severity::Warning)
+                            .title("Restricted mode")
+                            .description("Language servers are disabled."),
+                    )
+                    .child(
+                        AnnouncementToast::new()
+                            .heading("Skills are here")
+                            .description("Teach the agent a new trick.")
+                            .primary_action_label("Try now")
+                            .secondary_action_label("Release notes"),
+                    )
+            }
+        }
+
+        cx.update(|cx| {
+            let settings_store = settings::SettingsStore::test(cx);
+            cx.set_global(settings_store);
+            theme_settings::init(theme::LoadThemes::JustBase, cx);
+        });
+
+        let window = cx.add_window(|_, _| MessageHost);
+        cx.activate_a11y(window.into());
+
+        let json = cx
+            .update_window(window.into(), |_, window, cx| {
+                window.draw(cx).clear(cx);
+                window.debug_a11y_tree_json()
+            })
+            .expect("the harness window is still open")
+            .expect("activation makes the debug tree available");
+        let tree: serde_json::Value = serde_json::from_str(&json).expect("the dump is valid JSON");
+
+        gpui::a11y_checks::assert_interactive_nodes_are_named(&tree, "messages");
+        gpui::a11y_checks::assert_no_role_was_discarded(&tree, "messages");
+        gpui::a11y_checks::assert_names_are_distinguishable(&tree, "messages");
+
+        let names: Vec<&str> = tree["nodes"]
+            .as_object()
+            .expect("the dump lists nodes")
+            .values()
+            .filter_map(|node| node["aria"]["label"].as_str())
+            .collect();
+        assert!(
+            names.contains(&"Warning: Restricted mode. Language servers are disabled."),
+            "a callout has to say what it is warning about, and that it is a warning: {names:?}"
+        );
+        assert!(
+            names.contains(&"Skills are here. Teach the agent a new trick."),
+            "an announcement has to say what it is announcing: {names:?}"
+        );
+    }
+
     /// Each button in a toggle group is a `ButtonLike` holding a `Label`, and
     /// `ButtonLike` cannot name itself from a child, so every one of them —
     /// the extension filters, the git picker's tabs — announced as a bare
