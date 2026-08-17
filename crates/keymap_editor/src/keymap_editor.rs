@@ -2473,7 +2473,11 @@ struct KeybindingEditorModal {
     focus_state: KeybindingEditorModalFocusState,
 }
 
-impl ModalView for KeybindingEditorModal {}
+impl ModalView for KeybindingEditorModal {
+    fn a11y_name(&self, _cx: &gpui::App) -> Option<gpui::SharedString> {
+        Some("Edit Keybinding".into())
+    }
+}
 
 impl EventEmitter<DismissEvent> for KeybindingEditorModal {}
 

@@ -56,7 +56,11 @@ pub struct TabSwitcher {
     init_modifiers: Option<Modifiers>,
 }
 
-impl ModalView for TabSwitcher {}
+impl ModalView for TabSwitcher {
+    fn a11y_name(&self, _cx: &gpui::App) -> Option<gpui::SharedString> {
+        Some("Open Tabs".into())
+    }
+}
 
 pub fn init(cx: &mut App) {
     cx.observe_new(TabSwitcher::register).detach();

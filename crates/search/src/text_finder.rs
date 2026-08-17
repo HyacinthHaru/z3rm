@@ -446,6 +446,10 @@ fn remove_project_search_tab(
 }
 
 impl ModalView for TextFinder {
+    fn a11y_name(&self, _cx: &gpui::App) -> Option<gpui::SharedString> {
+        Some("Find Text".into())
+    }
+
     fn on_before_dismiss(
         &mut self,
         _window: &mut Window,

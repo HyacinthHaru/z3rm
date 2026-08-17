@@ -633,6 +633,10 @@ pub struct RecentProjects {
 }
 
 impl ModalView for RecentProjects {
+    fn a11y_name(&self, _cx: &gpui::App) -> Option<gpui::SharedString> {
+        Some("Recent Projects".into())
+    }
+
     fn on_before_dismiss(
         &mut self,
         window: &mut Window,

@@ -119,7 +119,11 @@ impl CommitTagPicker {
 }
 
 impl EventEmitter<DismissEvent> for CommitTagPicker {}
-impl ModalView for CommitTagPicker {}
+impl ModalView for CommitTagPicker {
+    fn a11y_name(&self, _cx: &gpui::App) -> Option<gpui::SharedString> {
+        Some("Commit Tags".into())
+    }
+}
 
 impl Focusable for CommitTagPicker {
     fn focus_handle(&self, cx: &App) -> FocusHandle {

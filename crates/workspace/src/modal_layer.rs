@@ -62,6 +62,15 @@ pub trait ModalView: ManagedView {
     fn render_bare(&self) -> bool {
         false
     }
+
+    /// What this dialog is called. The layer wraps every modal in a dialog
+    /// node, and a dialog with no name is announced as "dialog" and nothing
+    /// else — the one moment the user most needs to be told where they are.
+    /// Labels are not text nodes in GPUI, so nothing can be derived from the
+    /// modal's own contents; it has to say so itself.
+    fn a11y_name(&self, _cx: &App) -> Option<SharedString> {
+        None
+    }
 }
 
 trait ModalViewHandle {
@@ -71,6 +80,7 @@ trait ModalViewHandle {
     fn subscribe_dismiss(&self, window: &mut Window, cx: &mut Context<ModalLayer>) -> Subscription;
     fn fade_out_background(&self, cx: &mut App) -> bool;
     fn render_bare(&self, cx: &mut App) -> bool;
+    fn a11y_name(&self, cx: &App) -> Option<SharedString>;
 }
 
 impl<V: ModalView> ModalViewHandle for Entity<V> {
@@ -98,6 +108,10 @@ impl<V: ModalView> ModalViewHandle for Entity<V> {
 
     fn render_bare(&self, cx: &mut App) -> bool {
         self.read(cx).render_bare()
+    }
+
+    fn a11y_name(&self, cx: &App) -> Option<SharedString> {
+        self.read(cx).a11y_name(cx)
     }
 }
 
@@ -296,6 +310,9 @@ impl Render for ModalLayer {
                     .id("modal-layer-dialog")
                     .role(gpui::Role::Dialog)
                     .aria_modal()
+                    .when_some(active_modal.modal.a11y_name(cx), |this, name| {
+                        this.aria_label(name)
+                    })
                     .h(px(0.0))
                     .top_20()
                     .items_center()

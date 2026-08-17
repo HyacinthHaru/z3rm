@@ -448,7 +448,11 @@ impl RenameBranchModal {
 }
 
 impl EventEmitter<DismissEvent> for RenameBranchModal {}
-impl ModalView for RenameBranchModal {}
+impl ModalView for RenameBranchModal {
+    fn a11y_name(&self, _cx: &gpui::App) -> Option<gpui::SharedString> {
+        Some("Rename Branch".into())
+    }
+}
 impl Focusable for RenameBranchModal {
     fn focus_handle(&self, cx: &App) -> FocusHandle {
         self.editor.focus_handle(cx)
@@ -666,7 +670,11 @@ impl RefPickerModal {
 }
 
 impl EventEmitter<DismissEvent> for RefPickerModal {}
-impl ModalView for RefPickerModal {}
+impl ModalView for RefPickerModal {
+    fn a11y_name(&self, _cx: &gpui::App) -> Option<gpui::SharedString> {
+        Some("Git References".into())
+    }
+}
 impl Focusable for RefPickerModal {
     fn focus_handle(&self, cx: &App) -> FocusHandle {
         self.editor.focus_handle(cx)
@@ -1306,7 +1314,11 @@ impl Render for GitCloneModal {
 
 impl EventEmitter<DismissEvent> for GitCloneModal {}
 
-impl ModalView for GitCloneModal {}
+impl ModalView for GitCloneModal {
+    fn a11y_name(&self, _cx: &gpui::App) -> Option<gpui::SharedString> {
+        Some("Clone Repository".into())
+    }
+}
 
 #[cfg(test)]
 mod view_commit_tests {

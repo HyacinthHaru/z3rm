@@ -204,7 +204,11 @@ impl StashList {
     }
 }
 
-impl ModalView for StashList {}
+impl ModalView for StashList {
+    fn a11y_name(&self, _cx: &gpui::App) -> Option<gpui::SharedString> {
+        Some("Stashes".into())
+    }
+}
 impl EventEmitter<DismissEvent> for StashList {}
 impl Focusable for StashList {
     fn focus_handle(&self, _: &App) -> FocusHandle {

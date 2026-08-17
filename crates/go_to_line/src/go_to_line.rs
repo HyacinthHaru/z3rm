@@ -32,6 +32,10 @@ pub struct GoToLine {
 }
 
 impl ModalView for GoToLine {
+    fn a11y_name(&self, _cx: &App) -> Option<gpui::SharedString> {
+        Some("Go to Line".into())
+    }
+
     fn on_before_dismiss(
         &mut self,
         _window: &mut Window,

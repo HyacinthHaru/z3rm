@@ -94,7 +94,11 @@ actions!(
     ]
 );
 
-impl ModalView for FileFinder {}
+impl ModalView for FileFinder {
+    fn a11y_name(&self, _cx: &gpui::App) -> Option<gpui::SharedString> {
+        Some("File Finder".into())
+    }
+}
 
 pub struct FileFinder {
     picker: Entity<Picker<FileFinderDelegate>>,

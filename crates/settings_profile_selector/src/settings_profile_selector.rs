@@ -30,7 +30,11 @@ pub struct SettingsProfileSelector {
     picker: Entity<Picker<SettingsProfileSelectorDelegate>>,
 }
 
-impl ModalView for SettingsProfileSelector {}
+impl ModalView for SettingsProfileSelector {
+    fn a11y_name(&self, _cx: &gpui::App) -> Option<gpui::SharedString> {
+        Some("Settings Profiles".into())
+    }
+}
 
 impl EventEmitter<DismissEvent> for SettingsProfileSelector {}
 

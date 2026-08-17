@@ -17,7 +17,11 @@ pub struct ExtensionVersionSelector {
     picker: Entity<Picker<ExtensionVersionSelectorDelegate>>,
 }
 
-impl ModalView for ExtensionVersionSelector {}
+impl ModalView for ExtensionVersionSelector {
+    fn a11y_name(&self, _cx: &gpui::App) -> Option<gpui::SharedString> {
+        Some("Extension Versions".into())
+    }
+}
 
 impl EventEmitter<DismissEvent> for ExtensionVersionSelector {}
 

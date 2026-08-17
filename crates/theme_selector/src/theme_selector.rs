@@ -80,6 +80,10 @@ fn toggle_icon_theme_selector(
 }
 
 impl ModalView for ThemeSelector {
+    fn a11y_name(&self, _cx: &gpui::App) -> Option<gpui::SharedString> {
+        Some("Themes".into())
+    }
+
     fn on_before_dismiss(
         &mut self,
         _window: &mut Window,

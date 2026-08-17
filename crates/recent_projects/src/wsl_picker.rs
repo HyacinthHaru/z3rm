@@ -287,7 +287,11 @@ impl WslOpenModal {
     }
 }
 
-impl ModalView for WslOpenModal {}
+impl ModalView for WslOpenModal {
+    fn a11y_name(&self, _cx: &gpui::App) -> Option<gpui::SharedString> {
+        Some("Open WSL Project".into())
+    }
+}
 
 impl Focusable for WslOpenModal {
     fn focus_handle(&self, cx: &App) -> gpui::FocusHandle {

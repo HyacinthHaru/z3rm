@@ -667,7 +667,11 @@ async fn test_modal_is_announced_as_a_dialog(cx: &mut TestAppContext) {
         }
     }
     impl EventEmitter<gpui::DismissEvent> for TestModal {}
-    impl crate::ModalView for TestModal {}
+    impl crate::ModalView for TestModal {
+        fn a11y_name(&self, _: &gpui::App) -> Option<gpui::SharedString> {
+            Some("Test dialog".into())
+        }
+    }
     impl Render for TestModal {
         fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
             // Shaped like a real modal: `show_modal` focuses the modal's own
@@ -716,6 +720,11 @@ async fn test_modal_is_announced_as_a_dialog(cx: &mut TestAppContext) {
         dialog["aria"]["modal"].as_bool(),
         Some(true),
         "content behind an open modal is unreachable, and has to be reported that way"
+    );
+    assert_eq!(
+        dialog["aria"]["label"].as_str(),
+        Some("Test dialog"),
+        "a dialog with no name is announced as \"dialog\" and nothing else"
     );
     assert_eq!(
         tree["frame"]["focus_without_node"].as_str(),

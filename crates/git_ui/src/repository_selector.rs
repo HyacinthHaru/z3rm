@@ -119,7 +119,11 @@ impl Render for RepositorySelector {
     }
 }
 
-impl ModalView for RepositorySelector {}
+impl ModalView for RepositorySelector {
+    fn a11y_name(&self, _cx: &gpui::App) -> Option<gpui::SharedString> {
+        Some("Repositories".into())
+    }
+}
 
 pub struct RepositorySelectorDelegate {
     repository_selector: WeakEntity<RepositorySelector>,

@@ -421,6 +421,10 @@ impl Focusable for RemoteConnectionModal {
 impl EventEmitter<DismissEvent> for RemoteConnectionModal {}
 
 impl ModalView for RemoteConnectionModal {
+    fn a11y_name(&self, _cx: &gpui::App) -> Option<gpui::SharedString> {
+        Some("Remote Connection".into())
+    }
+
     fn on_before_dismiss(
         &mut self,
         _window: &mut Window,

@@ -454,7 +454,11 @@ impl BranchList {
         self.set_branch_filter(branch_filter, window, cx);
     }
 }
-impl ModalView for BranchList {}
+impl ModalView for BranchList {
+    fn a11y_name(&self, _cx: &gpui::App) -> Option<gpui::SharedString> {
+        Some("Branches".into())
+    }
+}
 impl EventEmitter<DismissEvent> for BranchList {}
 
 impl Focusable for BranchList {

@@ -27,6 +27,10 @@ impl Focusable for IconThemeSelector {
 }
 
 impl ModalView for IconThemeSelector {
+    fn a11y_name(&self, _cx: &gpui::App) -> Option<gpui::SharedString> {
+        Some("Icon Themes".into())
+    }
+
     fn on_before_dismiss(
         &mut self,
         _window: &mut Window,

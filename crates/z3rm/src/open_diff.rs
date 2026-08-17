@@ -82,7 +82,11 @@ pub struct ChangedFileSelector {
     picker: Entity<Picker<ChangedFileSelectorDelegate>>,
 }
 
-impl ModalView for ChangedFileSelector {}
+impl ModalView for ChangedFileSelector {
+    fn a11y_name(&self, _cx: &gpui::App) -> Option<gpui::SharedString> {
+        Some("Changed Files".into())
+    }
+}
 
 impl EventEmitter<DismissEvent> for ChangedFileSelector {}
 

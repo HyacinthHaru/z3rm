@@ -20,7 +20,12 @@ pub(crate) struct AskPassModal {
 }
 
 impl EventEmitter<DismissEvent> for AskPassModal {}
-impl ModalView for AskPassModal {}
+impl ModalView for AskPassModal {
+    fn a11y_name(&self, _cx: &App) -> Option<SharedString> {
+        // The same string the modal shows as its headline.
+        Some(self.operation.clone())
+    }
+}
 impl Focusable for AskPassModal {
     fn focus_handle(&self, cx: &App) -> gpui::FocusHandle {
         self.editor.focus_handle(cx)

@@ -233,7 +233,11 @@ impl Focusable for WorktreePicker {
     }
 }
 
-impl ModalView for WorktreePicker {}
+impl ModalView for WorktreePicker {
+    fn a11y_name(&self, _cx: &gpui::App) -> Option<gpui::SharedString> {
+        Some("Worktrees".into())
+    }
+}
 impl EventEmitter<DismissEvent> for WorktreePicker {}
 
 impl Render for WorktreePicker {

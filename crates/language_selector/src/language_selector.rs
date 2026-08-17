@@ -103,7 +103,11 @@ impl Focusable for LanguageSelector {
 }
 
 impl EventEmitter<DismissEvent> for LanguageSelector {}
-impl ModalView for LanguageSelector {}
+impl ModalView for LanguageSelector {
+    fn a11y_name(&self, _cx: &gpui::App) -> Option<gpui::SharedString> {
+        Some("Languages".into())
+    }
+}
 
 pub struct LanguageSelectorDelegate {
     language_selector: WeakEntity<LanguageSelector>,
