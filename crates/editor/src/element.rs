@@ -6712,6 +6712,13 @@ pub fn render_breadcrumb_text(
         );
     }
 
+    // The button below draws the breadcrumbs as children, which name nothing.
+    // This is both where the user is and what the button acts on.
+    let breadcrumb_text = segments
+        .iter()
+        .map(|segment| segment.text.replace('\n', " "))
+        .collect::<Vec<_>>()
+        .join(" › ");
     let highlighted_segments = segments.into_iter().enumerate().map(|(index, segment)| {
         let mut text_style = window.text_style();
         if let Some(font) = &breadcrumb_font {
@@ -6766,6 +6773,7 @@ pub fn render_breadcrumb_text(
             .when(!multibuffer_header, |this| this.overflow_x_scroll())
             .child(
                 ButtonLike::new("toggle outline view")
+                    .aria_label(format!("Outline: {breadcrumb_text}"))
                     .child(breadcrumbs)
                     .when(multibuffer_header, |this| {
                         this.style(ButtonStyle::Transparent)

@@ -1644,6 +1644,11 @@ impl PickerDelegate for BranchListDelegate {
             let picker = picker.clone();
             let focus_handle = focus_handle.clone();
             let force_delete = self.is_force_delete_hovering_index(entry_ix);
+            // One per row, and it deletes a branch: the row's own name is the
+            // only thing that says which one.
+            let deleted_branch = self
+                .match_label(entry_ix, cx)
+                .unwrap_or_else(|| SharedString::new_static("branch"));
 
             div()
                 .id(("delete-hover", entry_ix))
@@ -1657,6 +1662,7 @@ impl PickerDelegate for BranchListDelegate {
                 }))
                 .child(
                     IconButton::new(("delete", entry_ix), IconName::Trash)
+                        .aria_label(format!("Delete branch {deleted_branch}"))
                         .icon_size(IconSize::Small)
                         .when(force_delete, |this| this.icon_color(Color::Error))
                         .tooltip(move |_, cx| {
@@ -1686,6 +1692,7 @@ impl PickerDelegate for BranchListDelegate {
             let focus_handle = self.focus_handle.clone();
 
             IconButton::new("create_from_default", IconName::GitBranchPlus)
+                .aria_label(tooltip_label.clone())
                 .icon_size(IconSize::Small)
                 .tooltip(move |_, cx| {
                     Tooltip::for_action_in(

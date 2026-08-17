@@ -1806,6 +1806,9 @@ impl PickerDelegate for RecentProjectsDelegate {
                     .border_color(cx.theme().colors().border_variant)
                     .child({
                         ButtonLike::new("open_local_folder")
+                            // `ButtonLike` cannot take a name from its
+                            // children, and the child here is a `Label`.
+                            .aria_label("Open Local Folders")
                             .child(
                                 h_flex()
                                     .w_full()
@@ -1835,6 +1838,7 @@ impl PickerDelegate for RecentProjectsDelegate {
                     })
                     .child(
                         ButtonLike::new("open_remote_folder")
+                            .aria_label("Open Remote Folder")
                             .child(
                                 h_flex()
                                     .w_full()

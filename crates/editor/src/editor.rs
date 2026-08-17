@@ -4179,6 +4179,9 @@ impl Editor {
     fn render_bookmark(&self, row: DisplayRow, cx: &mut Context<Self>) -> IconButton {
         let focus_handle = self.focus_handle.clone();
         IconButton::new(("bookmark indicator", row.0 as usize), IconName::Bookmark)
+            // Icon-only: the action is written down in a tooltip, which is not
+            // a name, so this was announced as a bare "button".
+            .aria_label("Remove Bookmark")
             .icon_size(IconSize::XSmall)
             .size(ui::ButtonSize::None)
             .icon_color(Color::Info)
@@ -4546,6 +4549,7 @@ impl Editor {
             SharedString::from("Right-click for more options")
         };
         IconButton::new(("breakpoint_indicator", row.0 as usize), icon)
+            .aria_label(primary_action_text)
             .icon_size(IconSize::XSmall)
             .size(ui::ButtonSize::None)
             .when(is_rejected, |this| {
@@ -4619,6 +4623,7 @@ impl Editor {
         let focus_handle = self.focus_handle.clone();
         let has_context_menu = self.has_mouse_context_menu();
         IconButton::new(("add_breakpoint_button", row.0 as usize), intent.icon())
+            .aria_label(intent.as_str())
             .icon_size(IconSize::XSmall)
             .size(ui::ButtonSize::None)
             .icon_color(intent.color())

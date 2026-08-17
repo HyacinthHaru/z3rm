@@ -3082,6 +3082,7 @@ pub fn render_diff_hunk_controls(
             |el| {
                 el.child(
                     IconButton::new(("next-hunk", row as u64), IconName::ArrowDown)
+                        .aria_label("Next Hunk")
                         .shape(IconButtonShape::Square)
                         .icon_size(IconSize::Small)
                         // .disabled(!has_multiple_hunks)
@@ -3113,6 +3114,7 @@ pub fn render_diff_hunk_controls(
                 )
                 .child(
                     IconButton::new(("prev-hunk", row as u64), IconName::ArrowUp)
+                        .aria_label("Previous Hunk")
                         .shape(IconButtonShape::Square)
                         .icon_size(IconSize::Small)
                         // .disabled(!has_multiple_hunks)

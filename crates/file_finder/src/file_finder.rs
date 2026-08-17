@@ -1712,6 +1712,9 @@ impl PickerDelegate for FileFinderDelegate {
         };
 
         let filter_button = IconButton::new("filter-ignored", IconName::FileIgnored)
+            // Icon-only, with its meaning only in a tooltip. The label also
+            // flips with the state, which the toggle state alone does not say.
+            .aria_label(tooltip_label)
             .icon_size(IconSize::Small)
             .toggle_state(including_ignored)
             .tooltip(move |_window, cx| {
