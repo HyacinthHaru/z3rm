@@ -1535,6 +1535,6 @@ mod activation_tests {
         let tree: serde_json::Value = serde_json::from_str(&json).expect("the dump is valid JSON");
 
         crate::test::a11y_checks::assert_landmarks_are_distinguishable(&tree, "two panels");
-a11y_checks::assert_names_are_distinguishable(&tree, "two panels");
+        crate::test::a11y_checks::assert_names_are_distinguishable(&tree, "two panels");
     }
 }
