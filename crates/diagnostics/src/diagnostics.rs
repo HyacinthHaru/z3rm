@@ -140,8 +140,24 @@ impl Render for ProjectDiagnosticsEditor {
                 div().size_full().child(self.editor.clone())
             };
 
+        // Without an id and a role this focused root produces no accessibility
+        // node, so opening the view announces the whole window instead of it.
+        // The summary is in the name because the counts on screen are labels,
+        // which contribute no nodes of their own.
+        let name = match (self.summary.error_count, warning_count) {
+            (0, 0) => SharedString::new_static("Project diagnostics, no problems"),
+            (errors, warnings) => SharedString::from(format!(
+                "Project diagnostics, {errors} error{}, {warnings} warning{}",
+                if errors == 1 { "" } else { "s" },
+                if warnings == 1 { "" } else { "s" },
+            )),
+        };
+
         div()
             .key_context("Diagnostics")
+            .id("project-diagnostics")
+            .role(gpui::Role::Group)
+            .aria_label(name)
             .track_focus(&self.focus_handle(cx))
             .size_full()
             .on_action(cx.listener(Self::toggle_warnings))
@@ -1152,4 +1168,77 @@ fn is_line_blank_or_indented_less(
 ) -> bool {
     let line_indent = snapshot.line_indent_for_row(row);
     line_indent.is_line_blank() || line_indent.len(tab_size) < indent_level
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use fs::FakeFs;
+    use gpui::{TestAppContext, VisualTestContext};
+    use serde_json::json;
+    use settings::SettingsStore;
+    use workspace::MultiWorkspace;
+
+    /// The view tracks focus on a root that had no id and no role, so opening
+    /// it announced the whole window; the counts beside it are labels, which
+    /// contribute no nodes either, so nothing said what it had found.
+    #[gpui::test]
+    async fn the_diagnostics_view_says_what_it_found(cx: &mut TestAppContext) {
+        zlog::init_test();
+        cx.update(|cx| {
+            let settings_store = SettingsStore::test(cx);
+            cx.set_global(settings_store);
+            theme_settings::init(theme::LoadThemes::JustBase, cx);
+            editor::init(cx);
+        });
+
+        let fs = FakeFs::new(cx.executor());
+        fs.insert_tree("/project", json!({ "main.rs": "fn main() {}\n" }))
+            .await;
+        let project = Project::test(fs, ["/project".as_ref()], cx).await;
+        let window =
+            cx.add_window(|window, cx| MultiWorkspace::test_new(project.clone(), window, cx));
+        let workspace = window
+            .read_with(cx, |multi_workspace, _| {
+                multi_workspace.workspace().clone()
+            })
+            .unwrap();
+        let mut cx = VisualTestContext::from_window(window.into(), cx);
+
+        workspace.update_in(&mut cx, |workspace, window, cx| {
+            ProjectDiagnosticsEditor::deploy(workspace, &Deploy, window, cx);
+        });
+        cx.run_until_parked();
+
+        cx.activate_a11y(cx.window_handle());
+        let json = cx
+            .update(|window, cx| {
+                window.draw(cx).clear(cx);
+                window.debug_a11y_tree_json()
+            })
+            .expect("activation makes the debug tree available");
+        let tree: serde_json::Value = serde_json::from_str(&json).expect("the dump is valid JSON");
+        let nodes = tree["nodes"].as_object().expect("the dump lists nodes");
+
+        gpui::a11y_checks::assert_interactive_nodes_are_named(&tree, "project diagnostics");
+        gpui::a11y_checks::assert_no_role_was_discarded(&tree, "project diagnostics");
+        gpui::a11y_checks::assert_roles_are_contained(&tree, "project diagnostics");
+        gpui::a11y_checks::assert_focus_reached_the_tree(&tree, "project diagnostics");
+        gpui::a11y_checks::assert_click_targets_are_reachable(&tree, "project diagnostics");
+        gpui::a11y_checks::assert_landmarks_are_distinguishable(&tree, "project diagnostics");
+
+        // A project with no diagnostics: the view says so rather than being an
+        // unnamed region with an unreadable label in it. Asserted through the
+        // focused node, because the check above passes vacuously when focus is
+        // somewhere else entirely.
+        let focused = tree["gpui_focus"]
+            .as_str()
+            .and_then(|id| nodes.get(id))
+            .unwrap_or_else(|| panic!("focus in the diagnostics view must reach a node: {json}"));
+        assert_eq!(
+            focused["aria"]["label"].as_str(),
+            Some("Project diagnostics, no problems"),
+            "the view has to say what it found"
+        );
+    }
 }

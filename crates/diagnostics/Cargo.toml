@@ -42,6 +42,7 @@ zed_actions.workspace = true
 [dev-dependencies]
 
 editor = { workspace = true, features = ["test-support"] }
+fs = { workspace = true, features = ["test-support"] }
 gpui = { workspace = true, features = ["test-support"] }
 language = { workspace = true, features = ["test-support"] }
 lsp = { workspace = true, features = ["test-support"] }

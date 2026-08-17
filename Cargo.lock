@@ -3098,6 +3098,7 @@ dependencies = [
  "component",
  "ctor",
  "editor",
+ "fs",
  "futures-lite 1.13.0",
  "gpui",
  "indoc",
