@@ -34,7 +34,14 @@ impl RenderOnce for ListBulletItem {
     fn render(self, window: &mut Window, _cx: &mut App) -> impl IntoElement {
         let line_height = window.line_height() * 0.85;
 
-        ListItem::new("list-item")
+        // Keyed by the label so sibling bullets are distinct elements: a
+        // shared id would collapse them into one node and drop the rest.
+        ListItem::new(ElementId::Name(self.label.clone()))
+            // The bullet's text is a `Label`, which is not a node, so a list of
+            // them reaches a reader as nothing at all — and these lists are
+            // usually the whole content of the notice they sit in.
+            .aria_role(gpui::Role::ListItem)
+            .aria_label(self.label.clone())
             .selectable(false)
             .child(
                 h_flex()

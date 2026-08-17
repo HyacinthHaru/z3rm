@@ -267,10 +267,19 @@ mod tests {
 
     impl Render for AlertHarness {
         fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+            // Shaped like the security modal this component actually carries:
+            // a title and a list of what restricted mode prevents. An empty
+            // child proved the modal reached the tree and nothing about what
+            // the user is being asked to decide.
             AlertModal::new("harness-alert")
                 .title("Unrecognized Project")
                 .track_focus(&self.focus_handle)
-                .child(div())
+                .child(
+                    v_flex()
+                        .child(ListBulletItem::new("Project settings from being applied"))
+                        .child(ListBulletItem::new("Language servers from running"))
+                        .child(ListBulletItem::new("MCP integrations from installing")),
+                )
         }
     }
 
@@ -303,6 +312,27 @@ mod tests {
         let tree: serde_json::Value = serde_json::from_str(&json).expect("the dump is valid JSON");
         gpui::a11y_checks::assert_interactive_nodes_are_named(&tree, "alert modal");
         gpui::a11y_checks::assert_names_are_distinguishable(&tree, "alert modal");
+
+        // The bullets are the whole substance of the warning: what restricted
+        // mode actually prevents. A user is asked to trust a workspace on the
+        // strength of this list, so it has to be readable.
+        let mut bullets: Vec<&str> = tree["nodes"]
+            .as_object()
+            .expect("the dump lists nodes")
+            .values()
+            .filter(|node| node["aria"]["role"] == "ListItem")
+            .filter_map(|node| node["aria"]["label"].as_str())
+            .collect();
+        bullets.sort_unstable();
+        assert_eq!(
+            bullets,
+            vec![
+                "Language servers from running",
+                "MCP integrations from installing",
+                "Project settings from being applied",
+            ],
+            "a security decision cannot rest on a list the user cannot read"
+        );
         gpui::a11y_checks::assert_clickable_elements_are_reachable(&tree, "alert modal");
         gpui::a11y_checks::assert_click_targets_are_reachable(&tree, "alert modal");
         gpui::a11y_checks::assert_controls_have_area(&tree, "alert modal");
