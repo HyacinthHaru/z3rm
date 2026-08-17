@@ -102,6 +102,17 @@ impl WindowControlType {
             WindowControlType::Close => IconName::GenericClose,
         }
     }
+
+    /// What the control is announced as. The button draws an icon and nothing
+    /// else, so there is no text anywhere for a name to come from.
+    pub fn a11y_label(&self) -> &'static str {
+        match self {
+            WindowControlType::Minimize => "Minimize",
+            WindowControlType::Restore => "Restore",
+            WindowControlType::Maximize => "Maximize",
+            WindowControlType::Close => "Close Window",
+        }
+    }
 }
 
 #[allow(unused)]
@@ -215,6 +226,12 @@ impl RenderOnce for WindowControl {
 
         h_flex()
             .id(self.id)
+            // These are the window's own minimize, maximize and close buttons.
+            // Drawn by GPUI rather than the system on Linux, so without a role
+            // and a name they are clickable `div`s: a user who cannot use a
+            // mouse has no way to close the window from its title bar.
+            .role(gpui::Role::Button)
+            .aria_label(self.icon.a11y_label())
             .group("")
             .cursor_pointer()
             .justify_center()
@@ -241,5 +258,79 @@ impl RenderOnce for WindowControl {
                     ),
                 }
             })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use gpui::{Context, Render, TestAppContext, Window, div};
+
+    /// The window's own minimize, maximize and close buttons. On Linux GPUI
+    /// draws them rather than the system, so they reach assistive technology
+    /// only if GPUI says what they are — and each one is an icon with no text
+    /// anywhere to take a name from.
+    #[gpui::test]
+    fn the_window_controls_say_what_they_do(cx: &mut TestAppContext) {
+        struct ControlsHost;
+
+        impl Render for ControlsHost {
+            fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+                div()
+                    .child(WindowControl::new(
+                        "minimize",
+                        WindowControlType::Minimize,
+                        cx,
+                    ))
+                    .child(WindowControl::new(
+                        "maximize",
+                        WindowControlType::Maximize,
+                        cx,
+                    ))
+                    .child(WindowControl::new_close(
+                        "close",
+                        WindowControlType::Close,
+                        Box::new(workspace::CloseWindow),
+                        cx,
+                    ))
+            }
+        }
+
+        cx.update(|cx| {
+            let settings_store = settings::SettingsStore::test(cx);
+            cx.set_global(settings_store);
+            theme_settings::init(theme::LoadThemes::JustBase, cx);
+        });
+
+        let window = cx.add_window(|_, _| ControlsHost);
+        cx.activate_a11y(window.into());
+
+        let json = cx
+            .update_window(window.into(), |_, window, cx| {
+                window.draw(cx).clear(cx);
+                window.debug_a11y_tree_json()
+            })
+            .expect("the harness window is still open")
+            .expect("activation makes the debug tree available");
+        let tree: serde_json::Value = serde_json::from_str(&json).expect("the dump is valid JSON");
+        gpui::a11y_checks::assert_interactive_nodes_are_named(&tree, "window controls");
+        gpui::a11y_checks::assert_names_are_distinguishable(&tree, "window controls");
+        gpui::a11y_checks::assert_no_role_was_discarded(&tree, "window controls");
+        gpui::a11y_checks::assert_clickable_elements_are_reachable(&tree, "window controls");
+        gpui::a11y_checks::assert_controls_have_area(&tree, "window controls");
+
+        let mut buttons: Vec<&str> = tree["nodes"]
+            .as_object()
+            .expect("the dump lists nodes")
+            .values()
+            .filter(|node| node["aria"]["role"] == "Button")
+            .filter_map(|node| node["aria"]["label"].as_str())
+            .collect();
+        buttons.sort_unstable();
+        assert_eq!(
+            buttons,
+            vec!["Close Window", "Maximize", "Minimize"],
+            "a user who cannot use a mouse still has to be able to close the window"
+        );
     }
 }

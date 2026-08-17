@@ -84,6 +84,18 @@ impl WindowsCaptionButton {
         }
     }
 
+    /// The button's face is a glyph from a symbol font, which carries no text
+    /// for a name to come from.
+    #[inline]
+    fn a11y_label(&self) -> &'static str {
+        match self {
+            Self::Minimize => "Minimize",
+            Self::Restore => "Restore",
+            Self::Maximize => "Maximize",
+            Self::Close => "Close Window",
+        }
+    }
+
     #[inline]
     fn control_area(&self) -> WindowControlArea {
         match self {
@@ -123,6 +135,12 @@ impl RenderOnce for WindowsCaptionButton {
 
         h_flex()
             .id(self.id())
+            // The system answers the press through the control area rather than
+            // a click handler here, so this node is announced but not operable
+            // from assistive technology; naming it is what makes the title bar
+            // readable at all.
+            .role(gpui::Role::Button)
+            .aria_label(self.a11y_label())
             .justify_center()
             .content_center()
             .occlude()

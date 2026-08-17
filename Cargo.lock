@@ -9431,6 +9431,7 @@ version = "0.1.0"
 dependencies = [
  "gpui",
  "project",
+ "serde_json",
  "settings",
  "smallvec",
  "theme",

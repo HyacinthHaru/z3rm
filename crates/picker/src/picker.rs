@@ -1323,7 +1323,6 @@ impl<D: PickerDelegate> Picker<D> {
             multi_select_active && selectable && item_with_checkbox.is_none();
         let focus_handle = self.focus_handle(cx);
 
-        let match_count = self.delegate.match_count();
         let is_selected = ix == self.delegate.selected_index();
 
         div()
