@@ -179,48 +179,64 @@ impl Render for RemoteConnectionPrompt {
                         )
                         .child(div().flex_1().child(self.editor.render(window, cx))),
                 )
-                .when(window.capslock().on, |this| {
-                    this.child(
-                        h_flex()
-                            .py_0p5()
-                            .min_w_0()
-                            .w_full()
-                            .gap_1()
-                            .child(
-                                Icon::new(IconName::Warning)
-                                    .size(IconSize::Small)
-                                    .color(Color::Muted),
-                            )
-                            .child(
-                                Label::new("Caps lock is on.")
-                                    .size(LabelSize::Small)
-                                    .color(Color::Muted),
-                            ),
-                    )
-                })
-            })
-            .when_some(self.status_message.clone(), |this, status_message| {
-                this.child(
+                // Rendered whether or not caps lock is on: a live region that
+                // appears together with its message has nothing to compare
+                // against, so the warning would be announced to nobody — and a
+                // rejected password with no explanation is exactly what this
+                // warning exists to prevent.
+                .child(
                     h_flex()
+                        .id("remote-connection-capslock")
+                        .role(gpui::Role::Status)
+                        .aria_live(gpui::accesskit::Live::Polite)
+                        .py_0p5()
                         .min_w_0()
                         .w_full()
-                        .mt_1()
                         .gap_1()
-                        .child(
-                            Icon::new(IconName::LoadCircle)
-                                .size(IconSize::Small)
-                                .color(Color::Muted)
-                                .with_rotate_animation(2),
-                        )
-                        .child(
-                            Label::new(format!("{}…", status_message))
-                                .size(LabelSize::Small)
-                                .color(Color::Muted)
-                                .truncate()
-                                .flex_1(),
-                        ),
+                        .when(window.capslock().on, |this| {
+                            this.aria_label("Caps lock is on.")
+                                .child(
+                                    Icon::new(IconName::Warning)
+                                        .size(IconSize::Small)
+                                        .color(Color::Muted),
+                                )
+                                .child(
+                                    Label::new("Caps lock is on.")
+                                        .size(LabelSize::Small)
+                                        .color(Color::Muted),
+                                )
+                        }),
                 )
             })
+            // Also unconditional, for the same reason. The spinner beside it
+            // says "still going" only to people who can see it, so the status
+            // is the only thing that reports progress at all.
+            .child(
+                h_flex()
+                    .id("remote-connection-status")
+                    .role(gpui::Role::Status)
+                    .aria_live(gpui::accesskit::Live::Polite)
+                    .min_w_0()
+                    .w_full()
+                    .mt_1()
+                    .gap_1()
+                    .when_some(self.status_message.clone(), |this, status_message| {
+                        this.aria_label(SharedString::from(format!("{status_message}…")))
+                            .child(
+                                Icon::new(IconName::LoadCircle)
+                                    .size(IconSize::Small)
+                                    .color(Color::Muted)
+                                    .with_rotate_animation(2),
+                            )
+                            .child(
+                                Label::new(format!("{}…", status_message))
+                                    .size(LabelSize::Small)
+                                    .color(Color::Muted)
+                                    .truncate()
+                                    .flex_1(),
+                            )
+                    }),
+            )
     }
 }
 
@@ -738,3 +754,87 @@ pub fn connect(
 }
 
 use anyhow::Context as _;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use gpui::TestAppContext;
+
+    /// Connecting to a host reports progress with a spinner and a line of
+    /// text, and both were invisible: the spinner is an icon and the line is a
+    /// label, neither of which contributes an accessibility node. The caps lock
+    /// warning had the same problem, which is worse — it exists precisely to
+    /// explain a password that is about to be rejected.
+    #[gpui::test]
+    fn the_connection_status_is_announced(cx: &mut TestAppContext) {
+        cx.update(|cx| {
+            let settings_store = settings::SettingsStore::test(cx);
+            cx.set_global(settings_store);
+            theme_settings::init(theme::LoadThemes::JustBase, cx);
+            editor::init(cx);
+        });
+
+        let window = cx.add_window(|window, cx| {
+            RemoteConnectionPrompt::new("host.example".to_string(), None, false, false, window, cx)
+        });
+        cx.activate_a11y(window.into());
+
+        let read = |cx: &mut TestAppContext| {
+            let json = cx
+                .update_window(window.into(), |_, window, cx| {
+                    window.draw(cx).clear(cx);
+                    window.debug_a11y_tree_json()
+                })
+                .expect("the prompt window is still open")
+                .expect("activation makes the debug tree available");
+            let tree: serde_json::Value =
+                serde_json::from_str(&json).expect("the dump is valid JSON");
+            gpui::a11y_checks::assert_interactive_nodes_are_named(&tree, "remote connection");
+            gpui::a11y_checks::assert_no_role_was_discarded(&tree, "remote connection");
+            gpui::a11y_checks::assert_roles_are_contained(&tree, "remote connection");
+            gpui::a11y_checks::assert_focus_reached_the_tree(&tree, "remote connection");
+            gpui::a11y_checks::assert_click_targets_are_reachable(&tree, "remote connection");
+            gpui::a11y_checks::assert_landmarks_are_distinguishable(&tree, "remote connection");
+            tree["nodes"]
+                .as_object()
+                .expect("the dump lists nodes")
+                .values()
+                .filter(|node| node["aria"]["live"] == "Polite")
+                .map(|node| {
+                    (
+                        node["element_id"].as_str().unwrap_or_default().to_string(),
+                        node["aria"]["label"]
+                            .as_str()
+                            .unwrap_or_default()
+                            .to_string(),
+                    )
+                })
+                .collect::<Vec<_>>()
+        };
+
+        // Before there is anything to say: the regions have to be there
+        // already, or the change that follows has nothing to diff against.
+        let quiet = read(cx);
+        assert!(
+            quiet
+                .iter()
+                .any(|(id, label)| id.contains("remote-connection-status") && label.is_empty()),
+            "the status region has to exist before it has a status: {quiet:?}"
+        );
+
+        window
+            .update(cx, |prompt, _, cx| {
+                prompt.set_status(Some("Connecting".to_string()), cx);
+            })
+            .expect("the prompt window is still open");
+
+        let connecting = read(cx);
+        assert!(
+            connecting
+                .iter()
+                .any(|(id, label)| id.contains("remote-connection-status")
+                    && label == "Connecting…"),
+            "the status has to be announced once there is one: {connecting:?}"
+        );
+    }
+}
