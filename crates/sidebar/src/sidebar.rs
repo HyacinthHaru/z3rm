@@ -1373,10 +1373,19 @@ impl Sidebar {
             .py_2()
             .gap_2()
             .child(
+                // These two choose which list the panel shows, and choosing one
+                // unchooses the other. As pressed/unpressed toggles a reader
+                // describes two independent switches that happen to disagree,
+                // and never says "1 of 2". The git panel's Changes/History pair
+                // is the same control and is already modelled this way.
                 h_flex()
+                    .id("sidebar-mode-tabs")
+                    .role(gpui::Role::TabList)
+                    .aria_label("Sidebar views")
                     .gap_1()
                     .child(
                         Button::new("sidebar-sessions-mode", "Sessions")
+                            .aria_role(gpui::Role::Tab)
                             .label_size(LabelSize::Small)
                             .toggle_state(self.mode == SidebarMode::Sessions)
                             .on_click(cx.listener(|this, _, _, cx| {
@@ -1385,6 +1394,7 @@ impl Sidebar {
                     )
                     .child(
                         Button::new("sidebar-files-mode", "Files")
+                            .aria_role(gpui::Role::Tab)
                             .label_size(LabelSize::Small)
                             .toggle_state(self.mode == SidebarMode::Files)
                             .on_click(cx.listener(|this, _, _, cx| {
@@ -2695,6 +2705,29 @@ mod live_tests {
         gpui::a11y_checks::assert_landmarks_are_distinguishable(&tree, "empty sidebar");
         gpui::a11y_checks::assert_names_are_distinguishable(&tree, "empty sidebar");
         gpui::a11y_checks::assert_clickable_elements_are_reachable(&tree, "empty sidebar");
+
+        // Picking one of these unpicks the other, which is what a tab is. As
+        // pressed/unpressed toggles they describe two independent switches that
+        // happen to disagree.
+        let mut views: Vec<(&str, Option<bool>, Option<&str>)> = tree["nodes"]
+            .as_object()
+            .expect("the dump lists nodes")
+            .values()
+            .filter(|node| node["aria"]["role"] == "Tab")
+            .map(|node| {
+                (
+                    node["aria"]["label"].as_str().unwrap_or_default(),
+                    node["aria"]["selected"].as_bool(),
+                    node["aria"]["toggled"].as_str(),
+                )
+            })
+            .collect();
+        views.sort_unstable();
+        assert_eq!(
+            views,
+            vec![("Files", Some(false), None), ("Sessions", Some(true), None)],
+            "the sidebar's views are chosen, not pressed"
+        );
         gpui::a11y_checks::assert_controls_have_area(&tree, "empty sidebar");
         gpui::a11y_checks::assert_active_descendant_is_honoured(&tree, "empty sidebar");
 

@@ -784,21 +784,31 @@ impl RenderOnce for ButtonLike {
             // does nothing, which greying it out only says to people who can
             // see it.
             .aria_disabled(self.disabled)
+            // A tab is chosen, not pressed: picking one unpicks its siblings,
+            // which is what `selected` means and what `pressed` does not.
+            .when(
+                matches!(self.aria_role, Some(Role::Tab | Role::ListBoxOption)),
+                |this| this.aria_selected(self.selected),
+            )
             // Not both: `expanded` describes a control that opens something,
             // `toggled` a control that is pressed or not. A node carrying both
             // is announced as a toggle button that is also expanded, which
             // describes no control that exists. `toggle_state` is how a
             // disclosure and a popover trigger get their pressed *styling*, so
             // the two arrive together by construction.
-            .when(self.aria_expanded.is_none(), |this| {
-                this.when_some(self.toggled, |this, toggled| {
-                    this.aria_toggled(if toggled {
-                        Toggled::True
-                    } else {
-                        Toggled::False
+            .when(
+                self.aria_expanded.is_none()
+                    && !matches!(self.aria_role, Some(Role::Tab | Role::ListBoxOption)),
+                |this| {
+                    this.when_some(self.toggled, |this, toggled| {
+                        this.aria_toggled(if toggled {
+                            Toggled::True
+                        } else {
+                            Toggled::False
+                        })
                     })
-                })
-            })
+                },
+            )
             .when_some(self.tab_index, |this, tab_index| this.tab_index(tab_index))
             .when_some(self.focus_handle, |this, focus_handle| {
                 this.track_focus(&focus_handle)
