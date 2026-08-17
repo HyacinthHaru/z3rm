@@ -330,6 +330,13 @@ impl Render for DiffReview {
                     .child(
                         div()
                             .id("accept-btn")
+                            // Hand-built out of a div rather than a `Button`,
+                            // so nothing gives it a role: without one it is not
+                            // in the tree at all and the review cannot be
+                            // completed without a mouse.
+                            .role(gpui::Role::Button)
+                            .aria_label("Accept (a)")
+                            .aria_keyshortcuts("a")
                             .px_3()
                             .py_1()
                             .rounded_md()
@@ -343,6 +350,9 @@ impl Render for DiffReview {
                     .child(if self.can_decline() {
                         div()
                             .id("decline-btn")
+                            .role(gpui::Role::Button)
+                            .aria_label("Decline (d)")
+                            .aria_keyshortcuts("d")
                             .px_3()
                             .py_1()
                             .rounded_md()
@@ -355,6 +365,13 @@ impl Render for DiffReview {
                     } else {
                         div()
                             .id("decline-unavailable")
+                            // Still a button in the layout, just an inert one:
+                            // muted text is the only thing that said so, and it
+                            // says it to sighted users alone.
+                            .role(gpui::Role::Button)
+                            .aria_label("Decline")
+                            .aria_description("No snapshot to restore from")
+                            .aria_disabled(true)
                             .px_3()
                             .py_1()
                             .rounded_md()
@@ -556,6 +573,32 @@ mod tests {
             tree["nodes"][focused]["aria"]["label"].as_str(),
             Some("Diff review: src/main.rs"),
             "two open reviews are only told apart by the file they review"
+        );
+
+        // The checks above pass on a control that is missing entirely — there
+        // is no node to find fault with — so the buttons have to be asserted
+        // present by name. Both are hand-built divs rather than `Button`s.
+        let buttons: Vec<(&str, bool)> = tree["nodes"]
+            .as_object()
+            .expect("the dump lists nodes")
+            .values()
+            .filter(|node| node["aria"]["role"] == "Button")
+            .map(|node| {
+                (
+                    node["aria"]["label"].as_str().unwrap_or_default(),
+                    node["aria"]["disabled"].as_bool().unwrap_or(false),
+                )
+            })
+            .collect();
+        assert!(
+            buttons.contains(&("Accept (a)", false)),
+            "the review cannot be completed without a mouse otherwise: {buttons:?}"
+        );
+        // This review was opened with no restore target, so declining is not
+        // available; muted text was the only thing that said so.
+        assert!(
+            buttons.contains(&("Decline", true)),
+            "an inert control has to say it is inert: {buttons:?}"
         );
     }
 
