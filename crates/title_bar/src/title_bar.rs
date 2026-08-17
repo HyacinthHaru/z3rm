@@ -936,5 +936,23 @@ mod tests {
             .find(|node| node["aria"]["role"] == "Banner")
             .unwrap_or_else(|| panic!("the title bar is the window's banner landmark: {json}"));
         assert_eq!(banner["aria"]["label"].as_str(), Some("Title bar"));
+
+        // The banner landmark and the toolbar inside it are two containers for
+        // one strip. Sharing a name describes two places where there is one,
+        // and `assert_names_are_distinguishable` cannot see it: they have
+        // different roles.
+        let mut containers: Vec<&str> = tree["nodes"]
+            .as_object()
+            .expect("the dump lists nodes")
+            .values()
+            .filter(|node| matches!(node["aria"]["role"].as_str(), Some("Banner") | Some("Toolbar")))
+            .filter_map(|node| node["aria"]["label"].as_str())
+            .collect();
+        containers.sort_unstable();
+        assert_eq!(
+            containers,
+            vec!["Status bar", "Title bar", "Title bar controls"],
+            "each container in the window has to say which one it is"
+        );
     }
 }

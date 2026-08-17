@@ -7968,7 +7968,11 @@ impl Render for Workspace {
                         .track_focus(&self.titlebar_focus_handle)
                         .tab_group()
                         .role(gpui::Role::Toolbar)
-                        .aria_label("Title bar")
+                        // Not "Title bar": the banner landmark around this is
+                        // already called that, and a reader announcing the same
+                        // name twice for one strip describes two places where
+                        // there is one.
+                        .aria_label("Title bar controls")
                         .on_key_down(cx.listener(
                             |workspace, event: &gpui::KeyDownEvent, window, cx| {
                                 if event.keystroke.modifiers.modified() {
