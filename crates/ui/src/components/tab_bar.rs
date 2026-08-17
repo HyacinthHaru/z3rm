@@ -11,6 +11,7 @@ pub struct TabBar {
     children: SmallVec<[AnyElement; 2]>,
     end_children: SmallVec<[AnyElement; 2]>,
     scroll_handle: Option<ScrollHandle>,
+    aria_label: Option<SharedString>,
 }
 
 impl TabBar {
@@ -21,7 +22,16 @@ impl TabBar {
             children: SmallVec::new(),
             end_children: SmallVec::new(),
             scroll_handle: None,
+            aria_label: None,
         }
+    }
+
+    /// Names the list of tabs. A window with more than one tab bar in it —
+    /// pinned tabs beside unpinned ones — otherwise offers a reader two lists
+    /// it cannot tell apart.
+    pub fn aria_label(mut self, label: impl Into<SharedString>) -> Self {
+        self.aria_label = Some(label.into());
+        self
     }
 
     pub fn track_scroll(mut self, scroll_handle: &ScrollHandle) -> Self {
@@ -133,6 +143,7 @@ impl RenderOnce for TabBar {
                             // the toolbar buttons in the start/end slots stay
                             // outside the set.
                             .role(gpui::Role::TabList)
+                            .when_some(self.aria_label, |this, label| this.aria_label(label))
                             .flex_grow_1()
                             .overflow_x_scroll()
                             .when_some(self.scroll_handle, |cx, scroll_handle| {

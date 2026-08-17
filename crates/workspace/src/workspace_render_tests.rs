@@ -11,7 +11,7 @@ use crate::item::PreviewTabsSettings;
 use crate::item::test::TestItem;
 use crate::{BottomDockLayout, MultiWorkspace, TabBarSettings, WorkspaceSettings};
 use fs::{FakeFs, Fs};
-use gpui::{AppContext, TestAppContext};
+use gpui::{AppContext, TestAppContext, UpdateGlobal as _};
 use project::{Project, WorktreeSettings, project_settings::ProjectSettings};
 use serde_json::json;
 use settings::{Settings, SettingsStore};
@@ -1164,4 +1164,106 @@ async fn test_the_open_item_is_still_reported_on_later_frames(cx: &mut TestAppCo
             "the open item vanished from the tree on frame {frame}: {tabs:?}"
         );
     }
+}
+
+/// Pinning a tab splits the bar in two, and each half is its own tab list. A
+/// tab's place has to be within the list it is actually in: numbering across
+/// both makes the first unpinned tab "3 of 7" inside a list of five, and leaves
+/// a reader with two lists it cannot tell apart.
+#[gpui::test]
+async fn pinned_tabs_are_their_own_list(cx: &mut TestAppContext) {
+    init_test(cx);
+    cx.update(|cx| {
+        SettingsStore::update_global(cx, |store, cx| {
+            store.update_user_settings(cx, |settings| {
+                let tab_bar = settings.tab_bar.get_or_insert_default();
+                tab_bar.show = true;
+                tab_bar.show_pinned_tabs_in_separate_row = Some(true);
+            });
+        });
+    });
+    let fs = FakeFs::new(cx.executor());
+    fs.insert_tree("/root", json!({ "a.txt": "" })).await;
+    let project = Project::test(fs, [path!("/root").as_ref()], cx).await;
+
+    let (multi_workspace, cx) =
+        cx.add_window_view(|window, cx| MultiWorkspace::test_new(project, window, cx));
+    let workspace = multi_workspace.read_with(cx, |mw, _| mw.workspace().clone());
+    let pane = workspace.read_with(cx, |ws, _| ws.active_pane().clone());
+
+    pane.update_in(cx, |pane, window, cx| {
+        for label in ["pinned.rs", "notes.md", "shell", "logs", "main.rs"] {
+            pane.add_item(
+                Box::new(cx.new(|cx| TestItem::new(cx).with_label(label))),
+                true,
+                true,
+                None,
+                window,
+                cx,
+            );
+        }
+        pane.set_pinned_count(2);
+    });
+    cx.run_until_parked();
+
+    cx.activate_a11y(cx.window_handle());
+    let json = cx
+        .update(|window, cx| {
+            window.draw(cx).clear(cx);
+            window.debug_a11y_tree_json()
+        })
+        .expect("activation makes the debug tree available");
+    let tree: serde_json::Value = serde_json::from_str(&json).expect("the dump is valid JSON");
+    gpui::a11y_checks::assert_interactive_nodes_are_named(&tree, "pinned tabs");
+    gpui::a11y_checks::assert_no_role_was_discarded(&tree, "pinned tabs");
+    gpui::a11y_checks::assert_roles_are_contained(&tree, "pinned tabs");
+    gpui::a11y_checks::assert_names_are_distinguishable(&tree, "pinned tabs");
+    gpui::a11y_checks::assert_clickable_elements_are_reachable(&tree, "pinned tabs");
+    gpui::a11y_checks::assert_controls_have_area(&tree, "pinned tabs");
+
+    let nodes = tree["nodes"].as_object().expect("the dump lists nodes");
+    let mut lists: Vec<&str> = nodes
+        .values()
+        .filter(|node| node["aria"]["role"] == "TabList")
+        .filter_map(|node| node["aria"]["label"].as_str())
+        .collect();
+    lists.sort_unstable();
+    assert_eq!(
+        lists,
+        vec!["Pinned tabs", "Tabs"],
+        "two lists in one window have to say which is which"
+    );
+
+    // Each tab's set size must match the list it sits in, not the total.
+    let mut sets: Vec<u64> = nodes
+        .values()
+        .filter(|node| node["aria"]["role"] == "Tab")
+        .filter_map(|node| node["aria"]["size_of_set"].as_u64())
+        .collect();
+    sets.sort_unstable();
+    assert_eq!(
+        sets,
+        vec![2, 2, 3, 3, 3],
+        "two tabs are in a list of two and three are in a list of three"
+    );
+
+    let mut pinned_positions: Vec<u64> = nodes
+        .values()
+        .filter(|node| node["aria"]["role"] == "Tab" && node["aria"]["size_of_set"] == 2)
+        .filter_map(|node| node["aria"]["position_in_set"].as_u64())
+        .collect();
+    pinned_positions.sort_unstable();
+    assert_eq!(pinned_positions, vec![1, 2]);
+
+    let mut unpinned_positions: Vec<u64> = nodes
+        .values()
+        .filter(|node| node["aria"]["role"] == "Tab" && node["aria"]["size_of_set"] == 3)
+        .filter_map(|node| node["aria"]["position_in_set"].as_u64())
+        .collect();
+    unpinned_positions.sort_unstable();
+    assert_eq!(
+        unpinned_positions,
+        vec![1, 2, 3],
+        "the unpinned list starts at one, not after the pinned tabs"
+    );
 }

@@ -2852,6 +2852,18 @@ impl Pane {
 
         let has_file_icon = icon.is_some();
 
+        let pinned_count = self.pinned_count();
+        let tab_position_in_bar = if pinned_count == 0 {
+            (ix + 1, self.items.len())
+        } else if self.is_tab_pinned(ix) {
+            (ix + 1, pinned_count)
+        } else {
+            (
+                ix + 1 - pinned_count,
+                self.items.len().saturating_sub(pinned_count),
+            )
+        };
+
         let capability = item.capability(cx);
         // Every tab has a close button, so "Close Tab" on its own is the same
         // name repeated across the whole bar.
@@ -2861,7 +2873,10 @@ impl Pane {
             // comes from the item's own text rather than the rendered tab, and
             // carries the state its indicator dot shows in colour alone.
             .aria_label(tab_announcement(item, detail, cx))
-            .aria_position(ix + 1, self.items.len())
+            // Pinned tabs render in their own tab bar, so a tab's place is
+            // within the bar it is actually in. Numbering across both makes the
+            // first unpinned tab "3 of 7" inside a list of five.
+            .aria_position(tab_position_in_bar.0, tab_position_in_bar.1)
             .position(if is_first_item {
                 TabPosition::First
             } else if is_last_item {
@@ -3548,7 +3563,7 @@ impl Pane {
     ) -> AnyElement {
         let pinned_tab_bar = self
             .configure_tab_bar_start(
-                TabBar::new("pinned_tab_bar"),
+                TabBar::new("pinned_tab_bar").aria_label("Pinned tabs"),
                 navigate_backward,
                 navigate_forward,
                 window,
@@ -3568,7 +3583,9 @@ impl Pane {
             .flex_none()
             .child(pinned_tab_bar)
             .child(
-                TabBar::new("unpinned_tab_bar").child(self.render_unpinned_tabs_container(
+                TabBar::new("unpinned_tab_bar")
+                    .aria_label("Tabs")
+                    .child(self.render_unpinned_tabs_container(
                     unpinned_tabs,
                     tab_count,
                     cx,
@@ -3646,6 +3663,7 @@ impl Pane {
     fn render_pinned_tab_bar_drop_target(&self, cx: &mut Context<Pane>) -> impl IntoElement {
         div()
             .id("pinned_tabs_border")
+            .pointer_gesture_only()
             .debug_selector(|| "pinned_tabs_border".into())
             .min_w_6()
             .h(Tab::container_height(cx))
