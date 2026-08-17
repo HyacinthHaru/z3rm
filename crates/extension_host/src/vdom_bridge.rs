@@ -606,6 +606,15 @@ impl VDomRenderer {
                 .tab_stop(true)
                 .track_focus(focus_handle)
                 .cursor_pointer();
+        } else if click.is_some() {
+            // An extension that hangs `onClick` on a plain node built a control
+            // whatever it called it. Without a role it produces no node at all,
+            // so it is neither announced nor clickable by assistive technology
+            // — the `Click` action GPUI registers for the listener has nowhere
+            // to live. The tab stop stays with `type: "button"`, because
+            // putting arbitrary nodes into the keyboard order is a decision for
+            // whoever designs the extension API, not a side effect of naming.
+            element = element.role(Role::Button);
         }
 
         if let (Some(invocation), Some(dispatch)) = (click.clone(), self.dispatch.clone()) {

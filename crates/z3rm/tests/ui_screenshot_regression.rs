@@ -1011,6 +1011,14 @@ fn status_bar_vdom() -> Result<VDomNode> {
                 "children": ["Split"]
             },
             {
+                // A plain node made clickable: an extension can call it what it
+                // likes, but it is a control and has to reach the tree as one.
+                "type": "div",
+                "props": { "id": "zoom-toggle", "onClick": "z3rm.pane.zoom" },
+                "style": { "padding": "6px" },
+                "children": ["Zoom"]
+            },
+            {
                 "type": "input",
                 "props": {
                     "id": "filter-input",
@@ -1186,21 +1194,19 @@ fn extension_chrome_vdom_renders_status_bar() -> Result<()> {
         roles.iter().any(|role| role == "TextInput"),
         "extension input must be exposed to assistive technology: {roles:?}"
     );
+    // One node typed `button`, and one plain `div` the extension hung an
+    // `onClick` on — a control whatever it is called, and it has to reach the
+    // tree as one or it is neither announced nor clickable.
+    let mut button_names: Vec<String> = a11y_nodes_with_role(&tree, "Button")
+        .iter()
+        .filter_map(|node| a11y_string_field(node, "label"))
+        .collect();
+    button_names.sort();
     assert_eq!(
-        a11y_nodes_with_role(&tree, "Button").len(),
-        1,
-        "the status bar fixture contains one semantic button"
-    );
-
-    // A control with a role but no name is announced as just "button" by a
-    // screen reader. The fixture sets no `aria-label`, so these names can only
-    // come from the bridge deriving them from content and placeholder.
-    assert_eq!(
-        a11y_nodes_with_role(&tree, "Button")
-            .first()
-            .and_then(|node| a11y_string_field(node, "label")),
-        Some("Split".to_string()),
-        "the button's accessible name must fall back to its text content"
+        button_names,
+        vec!["Split".to_string(), "Zoom".to_string()],
+        "both the semantic button and the clickable node must be exposed, \
+         named from their text content since the fixture sets no aria-label"
     );
     assert_eq!(
         a11y_nodes_with_role(&tree, "TextInput")
