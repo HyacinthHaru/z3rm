@@ -307,6 +307,14 @@ fn node_to_json(
     if let Some(v) = node.is_expanded() {
         aria.insert("expanded".into(), json!(v));
     }
+    // The focused node points at the row it highlights when the two are in
+    // different subtrees; without printing it the claim is invisible again.
+    if let Some(target) = node.active_descendant() {
+        aria.insert(
+            "active_descendant".into(),
+            json!(ephemeral.get(&target).cloned()),
+        );
+    }
     if node.is_disabled() {
         aria.insert("disabled".into(), json!(true));
     }

@@ -386,6 +386,28 @@ pub mod a11y_checks {
         );
     }
 
+    /// Panics if a container claimed an active descendant that was dropped.
+    ///
+    /// GPUI honours [`StatefulInteractiveElement::aria_active_descendant`] only
+    /// while the focused node is one of the claiming node's ancestors, because
+    /// it reports the descendant *as* the focus. A list filtered from a
+    /// separate input cannot use it — focus is in the input, which is not an
+    /// ancestor of the rows — and the claim is dropped without a word, leaving
+    /// the highlighted row announced to nobody.
+    #[track_caller]
+    pub fn assert_active_descendant_is_honoured(tree: &serde_json::Value, context: &str) {
+        let dropped = tree
+            .get("frame")
+            .and_then(|frame| frame.get("active_descendant_without_focus"))
+            .and_then(serde_json::Value::as_bool)
+            .unwrap_or(false);
+        assert!(
+            !dropped,
+            "{context}: a container claimed the row it highlights while focus was outside it, \
+             so the claim was dropped and the row announced to nobody"
+        );
+    }
+
     /// Panics if a control is announced with no area to click.
     ///
     /// GPUI answers an incoming `Click` by synthesizing a mouse press at the

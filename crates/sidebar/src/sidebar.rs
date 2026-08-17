@@ -2695,6 +2695,7 @@ mod live_tests {
         gpui::a11y_checks::assert_landmarks_are_distinguishable(&tree, "empty sidebar");
         gpui::a11y_checks::assert_names_are_distinguishable(&tree, "empty sidebar");
         gpui::a11y_checks::assert_controls_have_area(&tree, "empty sidebar");
+        gpui::a11y_checks::assert_active_descendant_is_honoured(&tree, "empty sidebar");
 
         assert!(
             tree["nodes"]
@@ -2707,12 +2708,12 @@ mod live_tests {
     }
 
     /// Typing in the filter and arrowing through the results is the sidebar's
-    /// keyboard-first flow, and it is the one case where the highlight cannot
-    /// be announced: focus is in the filter, which is not an ancestor of the
-    /// rows, so reporting a row as focused would misstate where the keyboard
-    /// is. The claim is dropped — this pins that it is dropped *visibly*.
+    /// keyboard-first flow. Focus is in the filter, which is not an ancestor of
+    /// the rows, so reporting a row as focused would misstate where the
+    /// keyboard is — the filter points at the highlighted row instead, which is
+    /// how a reader announces both.
     #[gpui::test]
-    async fn filtering_leaves_the_highlighted_row_unannounced(cx: &mut TestAppContext) {
+    async fn filtering_announces_the_highlighted_row_from_the_filter(cx: &mut TestAppContext) {
         init_test(cx);
         let domain = test_domain();
         let window = cx.add_window(move |window, cx| {
@@ -2751,6 +2752,7 @@ mod live_tests {
         gpui::a11y_checks::assert_landmarks_are_distinguishable(&tree, "filtered sidebar");
         gpui::a11y_checks::assert_names_are_distinguishable(&tree, "filtered sidebar");
         gpui::a11y_checks::assert_controls_have_area(&tree, "filtered sidebar");
+        gpui::a11y_checks::assert_active_descendant_is_honoured(&tree, "filtered sidebar");
 
         assert_eq!(
             tree["active_descendant_focus"].as_str(),
@@ -2759,9 +2761,22 @@ mod live_tests {
         );
         assert_eq!(
             tree["frame"]["active_descendant_without_focus"].as_bool(),
-            Some(true),
-            "the dropped claim has to be visible in the dump rather than silent"
+            Some(false),
+            "the claim is carried by the focused node, not dropped"
         );
+
+        let nodes = tree["nodes"].as_object().expect("the dump lists nodes");
+        let focused = tree["gpui_focus"]
+            .as_str()
+            .and_then(|id| nodes.get(id))
+            .unwrap_or_else(|| panic!("the filter holds focus: {json}"));
+        let highlighted = focused["aria"]["active_descendant"]
+            .as_str()
+            .and_then(|id| nodes.get(id))
+            .unwrap_or_else(|| {
+                panic!("the filter has to point at the row it highlights: {json}")
+            });
+        assert_eq!(highlighted["aria"]["selected"].as_bool(), Some(true));
     }
 
     /// A node with an interactive role and no name is announced as a bare

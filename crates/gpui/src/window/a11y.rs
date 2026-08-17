@@ -321,12 +321,18 @@ impl A11y {
         }
         if self.nodes.focus_is_ancestor_of_current() {
             self.nodes.set_active_descendant(node_id);
+        } else if self.nodes.has_focus() {
+            // A highlight in a list the user filters from a separate input:
+            // focus is in the input, which is not an ancestor of the row, so
+            // reporting the row as focused would misstate where the keyboard
+            // is. The focused node points at the row instead — the same shape
+            // as a combo box — and the reader announces both.
+            self.nodes.set_active_descendant_of_focus(node_id);
         } else {
-            // A highlight in a list the user filters from a separate input is
-            // the common shape here: focus is in the input, which is not an
-            // ancestor of the row, so reporting the row as focused would
-            // misstate where the keyboard is. The claim is dropped — but
-            // silently dropping it is how the picker's call stayed a no-op.
+            // Nothing is focused at all, so there is nothing to hang the claim
+            // on and no keyboard position to describe. Recorded rather than
+            // dropped in silence, which is how the picker's call stayed a
+            // no-op for so long.
             self.active_descendant_without_focus_this_frame = true;
         }
     }
@@ -506,6 +512,11 @@ pub(crate) struct A11yNodeBuilder {
     /// pattern, which allows a focused container to act as if a descendant is
     /// focused.
     active_descendant: Option<NodeId>,
+    /// A claim made from outside the focused node's subtree — a list filtered
+    /// from its own input is the usual shape. Focus stays where the keyboard
+    /// is, and the focused node points at the highlighted row instead, which is
+    /// what a reader needs to announce it.
+    active_descendant_of_focus: Option<NodeId>,
     #[cfg(debug_assertions)]
     node_info: FxHashMap<NodeId, debug::NodeDebugInfo>,
 }
@@ -520,6 +531,7 @@ impl A11yNodeBuilder {
             seen_ids: FxHashSet::default(),
             focus: None,
             active_descendant: None,
+            active_descendant_of_focus: None,
             #[cfg(debug_assertions)]
             node_info: FxHashMap::default(),
         }
@@ -612,6 +624,7 @@ impl A11yNodeBuilder {
         self.nodes_stack.push(root_node);
         self.focus = None;
         self.active_descendant = None;
+        self.active_descendant_of_focus = None;
     }
 
     /// Returns whether a node with the given ID has been pushed in this frame.
@@ -633,6 +646,16 @@ impl A11yNodeBuilder {
         // ancestor.
         let ancestor_count = self.ids_stack.len().saturating_sub(1);
         self.ids_stack[..ancestor_count].contains(&focus)
+    }
+
+    /// Whether any node has claimed focus this frame.
+    pub(crate) fn has_focus(&self) -> bool {
+        self.focus.is_some()
+    }
+
+    /// Point the focused node at `id` rather than reporting `id` as the focus.
+    pub(crate) fn set_active_descendant_of_focus(&mut self, id: NodeId) {
+        self.active_descendant_of_focus = Some(id);
     }
 
     pub(crate) fn set_active_descendant(&mut self, id: NodeId) {
@@ -709,6 +732,19 @@ impl A11yNodeBuilder {
 
             _ => self.focus.unwrap_or(ROOT_NODE_ID),
         };
+
+        // Attached last, once every node exists: the focused node points at the
+        // row it highlights, which is how a reader announces a list the user is
+        // filtering from somewhere else.
+        if let (Some(target), Some(focused_id)) = (self.active_descendant_of_focus, self.focus)
+            && self.has_node(target)
+            && let Some((_, node)) = self
+                .all_nodes
+                .iter_mut()
+                .find(|(id, _)| *id == focused_id)
+        {
+            node.set_active_descendant(target);
+        }
 
         let nodes = std::mem::take(&mut self.all_nodes);
         let update = TreeUpdate {
@@ -888,6 +924,43 @@ mod tests {
         builder.pop(); // container
         let update = builder.finalize();
         assert_eq!(update.focus, item);
+    }
+
+    /// The list-plus-filter shape: the keyboard is in the input, the highlight
+    /// is in a list beside it. Focus has to stay on the input — saying the row
+    /// is focused would be a lie about where typing goes — so the input points
+    /// at the row instead, and a reader announces both.
+    #[test]
+    fn a_claim_from_another_subtree_lands_on_the_focused_node() {
+        let mut builder = new_builder();
+        let input = NodeId(1);
+        let list = NodeId(2);
+        let row = NodeId(3);
+
+        assert!(builder.push(input, test_node()));
+        builder.set_focus(input, false);
+        builder.pop();
+
+        assert!(builder.push(list, test_node()));
+        assert!(builder.push(row, test_node()));
+        assert!(!builder.focus_is_ancestor_of_current());
+        builder.set_active_descendant_of_focus(row);
+        builder.pop();
+        builder.pop();
+
+        let update = builder.finalize();
+        assert_eq!(update.focus, input, "the keyboard is still in the input");
+        let focused_node = update
+            .nodes
+            .iter()
+            .find(|(id, _)| *id == input)
+            .map(|(_, node)| node)
+            .expect("the focused node is in the tree");
+        assert_eq!(
+            focused_node.active_descendant(),
+            Some(row),
+            "the input has to point at the row it is highlighting"
+        );
     }
 
     #[test]
@@ -1537,5 +1610,6 @@ mod activation_tests {
         crate::test::a11y_checks::assert_landmarks_are_distinguishable(&tree, "two panels");
         crate::test::a11y_checks::assert_names_are_distinguishable(&tree, "two panels");
         crate::test::a11y_checks::assert_controls_have_area(&tree, "two panels");
+        crate::test::a11y_checks::assert_active_descendant_is_honoured(&tree, "two panels");
     }
 }

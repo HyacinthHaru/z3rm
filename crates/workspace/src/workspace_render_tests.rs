@@ -327,6 +327,7 @@ async fn test_notifications_are_announced_as_a_live_region(cx: &mut TestAppConte
     gpui::a11y_checks::assert_landmarks_are_distinguishable(&tree, "notifications");
     gpui::a11y_checks::assert_names_are_distinguishable(&tree, "notifications");
     gpui::a11y_checks::assert_controls_have_area(&tree, "notifications");
+    gpui::a11y_checks::assert_active_descendant_is_honoured(&tree, "notifications");
 
     let log = tree["nodes"]
         .as_object()
@@ -402,6 +403,7 @@ async fn test_the_zoom_button_can_be_operated_through_its_action(cx: &mut TestAp
     gpui::a11y_checks::assert_landmarks_are_distinguishable(&tree, "zoom button");
     gpui::a11y_checks::assert_names_are_distinguishable(&tree, "zoom button");
     gpui::a11y_checks::assert_controls_have_area(&tree, "zoom button");
+    gpui::a11y_checks::assert_active_descendant_is_honoured(&tree, "zoom button");
 
     let zoom = tree["nodes"]
         .as_object()
@@ -491,6 +493,7 @@ async fn test_a_tab_says_it_has_unsaved_changes(cx: &mut TestAppContext) {
     gpui::a11y_checks::assert_landmarks_are_distinguishable(&tree, "dirty tab");
     gpui::a11y_checks::assert_names_are_distinguishable(&tree, "dirty tab");
     gpui::a11y_checks::assert_controls_have_area(&tree, "dirty tab");
+    gpui::a11y_checks::assert_active_descendant_is_honoured(&tree, "dirty tab");
 
     let mut tabs: Vec<&str> = tree["nodes"]
         .as_object()
@@ -571,6 +574,7 @@ async fn test_clicking_a_tab_through_its_action_activates_it(cx: &mut TestAppCon
     gpui::a11y_checks::assert_landmarks_are_distinguishable(&tree, "tab bar");
     gpui::a11y_checks::assert_names_are_distinguishable(&tree, "tab bar");
     gpui::a11y_checks::assert_controls_have_area(&tree, "tab bar");
+    gpui::a11y_checks::assert_active_descendant_is_honoured(&tree, "tab bar");
 
     let first_tab = tree["nodes"]
         .as_object()
@@ -655,6 +659,7 @@ async fn test_split_panes_say_which_one_they_are(cx: &mut TestAppContext) {
     gpui::a11y_checks::assert_landmarks_are_distinguishable(&tree, "split panes");
     gpui::a11y_checks::assert_names_are_distinguishable(&tree, "split panes");
     gpui::a11y_checks::assert_controls_have_area(&tree, "split panes");
+    gpui::a11y_checks::assert_active_descendant_is_honoured(&tree, "split panes");
 
     let mut positions: Vec<(u64, u64)> = tree["nodes"]
         .as_object()
@@ -747,6 +752,7 @@ async fn test_the_live_regions_exist_before_they_have_anything_to_say(cx: &mut T
     gpui::a11y_checks::assert_landmarks_are_distinguishable(&tree, "idle live regions");
     gpui::a11y_checks::assert_names_are_distinguishable(&tree, "idle live regions");
     gpui::a11y_checks::assert_controls_have_area(&tree, "idle live regions");
+    gpui::a11y_checks::assert_active_descendant_is_honoured(&tree, "idle live regions");
 
     let live_regions: Vec<(&str, &str)> = tree["nodes"]
         .as_object()
@@ -841,6 +847,7 @@ async fn test_modal_is_announced_as_a_dialog(cx: &mut TestAppContext) {
     gpui::a11y_checks::assert_landmarks_are_distinguishable(&tree, "modal layer");
     gpui::a11y_checks::assert_names_are_distinguishable(&tree, "modal layer");
     gpui::a11y_checks::assert_controls_have_area(&tree, "modal layer");
+    gpui::a11y_checks::assert_active_descendant_is_honoured(&tree, "modal layer");
 
     let dialog = tree["nodes"]
         .as_object()
@@ -936,6 +943,7 @@ async fn test_every_interactive_node_in_the_window_has_a_name(cx: &mut TestAppCo
     gpui::a11y_checks::assert_landmarks_are_distinguishable(&tree, "workspace window");
     gpui::a11y_checks::assert_names_are_distinguishable(&tree, "workspace window");
     gpui::a11y_checks::assert_controls_have_area(&tree, "workspace window");
+    gpui::a11y_checks::assert_active_descendant_is_honoured(&tree, "workspace window");
 }
 
 /// A pane with no items has nothing inside to take focus, so focus stays on the
@@ -971,6 +979,7 @@ async fn test_an_empty_pane_holding_focus_is_announced(cx: &mut TestAppContext) 
     gpui::a11y_checks::assert_landmarks_are_distinguishable(&tree, "empty pane");
     gpui::a11y_checks::assert_names_are_distinguishable(&tree, "empty pane");
     gpui::a11y_checks::assert_controls_have_area(&tree, "empty pane");
+    gpui::a11y_checks::assert_active_descendant_is_honoured(&tree, "empty pane");
 
     assert!(
         cx.update(|window, cx| window
@@ -1036,6 +1045,7 @@ async fn test_the_open_item_is_still_reported_on_later_frames(cx: &mut TestAppCo
         gpui::a11y_checks::assert_landmarks_are_distinguishable(&tree, "open item");
         gpui::a11y_checks::assert_names_are_distinguishable(&tree, "open item");
         gpui::a11y_checks::assert_controls_have_area(&tree, "open item");
+        gpui::a11y_checks::assert_active_descendant_is_honoured(&tree, "open item");
 
         let tabs: Vec<String> = tree["nodes"]
             .as_object()

@@ -797,6 +797,7 @@ mod tests {
             gpui::a11y_checks::assert_landmarks_are_distinguishable(&tree, "remote connection");
             gpui::a11y_checks::assert_names_are_distinguishable(&tree, "remote connection");
             gpui::a11y_checks::assert_controls_have_area(&tree, "remote connection");
+            gpui::a11y_checks::assert_active_descendant_is_honoured(&tree, "remote connection");
             tree["nodes"]
                 .as_object()
                 .expect("the dump lists nodes")

@@ -1304,9 +1304,10 @@ impl<D: PickerDelegate> Picker<D> {
             // own to be announced by.
             //
             // Keyboard focus stays in the query input, which is a sibling of
-            // this list rather than an ancestor, so `aria_active_descendant`
-            // would be discarded. Currency is carried by the selected state and
-            // the position within the set instead.
+            // this list rather than an ancestor. GPUI points the focused node
+            // at the claiming row in that case, so typing a query announces the
+            // row the arrow keys are on rather than leaving it to be inferred
+            // from a selected state nobody reads out.
             .when(selectable, |this| {
                 this.role(gpui::Role::ListBoxOption)
                     .aria_selected(is_selected)
@@ -1315,6 +1316,7 @@ impl<D: PickerDelegate> Picker<D> {
                     })
                     .aria_position_in_set(ix + 1)
                     .aria_size_of_set(match_count)
+                    .when(is_selected, |this| this.aria_active_descendant())
             })
             .when(selectable, |this| this.cursor_pointer())
             .when(use_fallback_indicator, |this| {
@@ -1804,8 +1806,12 @@ mod tests {
         let (picker, cx) = cx.add_window_view(|window, cx| {
             Picker::uniform_list(TestDelegate::new(vec![true, true, true]), window, cx)
         });
-        picker.update(cx, |picker, cx| {
+        picker.update_in(cx, |picker, window, cx| {
             picker.delegate.selected_index = 1;
+            // Focused the way a picker always is in use: the query input holds
+            // the keyboard, and the row the arrow keys are on is announced from
+            // there. Without focus there is nothing for the claim to hang on.
+            window.focus(&picker.focus_handle(cx), cx);
             cx.notify();
         });
         cx.run_until_parked();
@@ -1826,7 +1832,20 @@ mod tests {
         gpui::a11y_checks::assert_landmarks_are_distinguishable(&tree, "picker");
         gpui::a11y_checks::assert_names_are_distinguishable(&tree, "picker");
         gpui::a11y_checks::assert_controls_have_area(&tree, "picker");
+        gpui::a11y_checks::assert_active_descendant_is_honoured(&tree, "picker");
         let nodes = tree["nodes"].as_object().expect("the dump lists nodes");
+
+        // The query input points at the row the arrow keys are on: focus stays
+        // where typing goes, and the row is announced from there.
+        let focused = tree["gpui_focus"]
+            .as_str()
+            .and_then(|id| nodes.get(id))
+            .unwrap_or_else(|| panic!("the query input holds focus: {json}"));
+        let highlighted = focused["aria"]["active_descendant"]
+            .as_str()
+            .and_then(|id| nodes.get(id))
+            .unwrap_or_else(|| panic!("the input has to point at the current row: {json}"));
+        assert_eq!(highlighted["aria"]["position_in_set"].as_u64(), Some(2));
 
         let list_box = nodes
             .iter()

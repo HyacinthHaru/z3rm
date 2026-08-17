@@ -310,11 +310,15 @@
 //! carries the focus. A custom [`Element`] that tracks focus itself has to call
 //! [`Window::report_a11y_focus_target`], or its focus is dropped.
 //!
-//! **Active descendant needs an ancestor.** A node claiming
-//! [`StatefulInteractiveElement::aria_active_descendant`] is honoured only when
-//! the focused node is one of its ancestors, because GPUI reports the
-//! descendant *as* the focus. A list filtered from a separate input cannot use
-//! it: focus is in the input, which is not an ancestor of the rows.
+//! **Active descendant is reported two different ways.** A node claiming
+//! [`StatefulInteractiveElement::aria_active_descendant`] while the focused
+//! node is one of its ancestors is reported *as* the focus — the focused
+//! container acts as if the descendant has the keyboard. When the claim comes
+//! from outside the focused node's subtree — a list filtered from its own
+//! input, where focus is in the input and not an ancestor of the rows — the
+//! focused node points at the claiming row instead. Either way something has
+//! to be focused: a claim made with nothing focused is dropped, and the frame
+//! records that it was.
 //!
 //! **A live region has to exist before its content.** A region created at the
 //! same moment as its first message gives the platform adapter nothing to
