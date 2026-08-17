@@ -82,3 +82,67 @@ impl RenderOnce for ExtensionCard {
         )
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use gpui::{Context, Render, TestAppContext, Window};
+    use ui::Label;
+
+    /// A card's contents are labels — name, version, authors, description — and
+    /// a label contributes no accessibility node, so a card reaches a reader as
+    /// its buttons and nothing else unless it names itself.
+    #[gpui::test]
+    fn a_named_card_is_a_group_and_an_unnamed_one_is_not(cx: &mut TestAppContext) {
+        struct CardHost;
+        impl Render for CardHost {
+            fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+                div()
+                    .size_full()
+                    .child(
+                        ExtensionCard::new()
+                            .aria_label("Vim Mode, v0.1.2, by Zed Industries")
+                            .child(Label::new("Vim Mode")),
+                    )
+                    // Naming is opt-in: a card the caller has nothing to say
+                    // about stays out of the tree rather than announcing an
+                    // empty group.
+                    .child(ExtensionCard::new().child(Label::new("Anonymous")))
+            }
+        }
+
+        cx.update(|cx| {
+            let settings_store = settings::SettingsStore::test(cx);
+            cx.set_global(settings_store);
+            theme_settings::init(theme::LoadThemes::JustBase, cx);
+        });
+
+        let window = cx.add_window(|_, _| CardHost);
+        cx.activate_a11y(window.into());
+
+        let json = cx
+            .update_window(window.into(), |_, window, cx| {
+                window.draw(cx).clear(cx);
+                window.debug_a11y_tree_json()
+            })
+            .expect("the harness window is still open")
+            .expect("activation makes the debug tree available");
+        let tree: serde_json::Value = serde_json::from_str(&json).expect("the dump is valid JSON");
+
+        gpui::a11y_checks::assert_no_role_was_discarded(&tree, "extension cards");
+        gpui::a11y_checks::assert_names_are_distinguishable(&tree, "extension cards");
+
+        let groups: Vec<&str> = tree["nodes"]
+            .as_object()
+            .expect("the dump lists nodes")
+            .values()
+            .filter(|node| node["aria"]["role"] == "Group")
+            .filter_map(|node| node["aria"]["label"].as_str())
+            .collect();
+        assert_eq!(
+            groups,
+            vec!["Vim Mode, v0.1.2, by Zed Industries"],
+            "the named card is a group and the unnamed one adds nothing"
+        );
+    }
+}
