@@ -299,6 +299,10 @@ impl<T: ButtonBuilder, const COLS: usize, const ROWS: usize> RenderOnce
                     let entry_index = row_index * COLS + col_index;
 
                     ButtonLike::new((group_name.clone(), entry_index))
+                        // The label is a child, and `ButtonLike` cannot name
+                        // itself from one, so every button in every one of
+                        // these groups announced as a bare "button".
+                        .aria_label(label.clone())
                         .when(!self.auto_width, |this| this.full_width())
                         .rounding(Some(
                             ToggleButtonPosition {

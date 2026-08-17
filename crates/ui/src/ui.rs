@@ -252,4 +252,69 @@ fn the_shared_controls_report_their_state(cx: &mut TestAppContext) {
             "an operable button must not be announced as disabled: {json}"
         );
     }
+
+    /// Each button in a toggle group is a `ButtonLike` holding a `Label`, and
+    /// `ButtonLike` cannot name itself from a child, so every one of them —
+    /// the extension filters, the git picker's tabs — announced as a bare
+    /// "button" with nothing to tell them apart.
+    #[gpui::test]
+    fn a_toggle_button_group_names_its_buttons(cx: &mut TestAppContext) {
+        use crate::{ToggleButtonGroup, ToggleButtonSimple};
+
+        struct GroupHost;
+        impl Render for GroupHost {
+            fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+                div().size_full().child(
+                    ToggleButtonGroup::single_row(
+                        "extension-filters",
+                        [
+                            ToggleButtonSimple::new("All", |_, _, _| {}),
+                            ToggleButtonSimple::new("Installed", |_, _, _| {}),
+                        ],
+                    )
+                    .selected_index(1),
+                )
+            }
+        }
+
+        cx.update(|cx| {
+            let settings_store = settings::SettingsStore::test(cx);
+            cx.set_global(settings_store);
+            theme_settings::init(theme::LoadThemes::JustBase, cx);
+        });
+
+        let window = cx.add_window(|_, _| GroupHost);
+        cx.activate_a11y(window.into());
+
+        let json = cx
+            .update_window(window.into(), |_, window, cx| {
+                window.draw(cx).clear(cx);
+                window.debug_a11y_tree_json()
+            })
+            .expect("the harness window is still open")
+            .expect("activation makes the debug tree available");
+        let tree: serde_json::Value = serde_json::from_str(&json).expect("the dump is valid JSON");
+
+        gpui::a11y_checks::assert_interactive_nodes_are_named(&tree, "toggle button group");
+        gpui::a11y_checks::assert_no_role_was_discarded(&tree, "toggle button group");
+
+        let mut buttons: Vec<(&str, Option<&str>)> = tree["nodes"]
+            .as_object()
+            .expect("the dump lists nodes")
+            .values()
+            .filter(|node| node["aria"]["role"] == "Button")
+            .map(|node| {
+                (
+                    node["aria"]["label"].as_str().unwrap_or_default(),
+                    node["aria"]["toggled"].as_str(),
+                )
+            })
+            .collect();
+        buttons.sort();
+        assert_eq!(
+            buttons,
+            vec![("All", None), ("Installed", Some("True"))],
+            "each button says which one it is, and the chosen one says it is chosen"
+        );
+    }
 }
