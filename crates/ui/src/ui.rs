@@ -157,4 +157,72 @@ fn the_shared_controls_report_their_state(cx: &mut TestAppContext) {
             "a modal has to say what it is about: {json}"
         );
     }
+
+    /// Greying a control out is the only thing that said it was disabled, and
+    /// that says it to sighted users alone: everything else announced as an
+    /// ordinary button, checkbox or switch that does nothing when pressed.
+    #[gpui::test]
+    fn a_disabled_control_says_so(cx: &mut TestAppContext) {
+        use crate::{Button, Checkbox, Disableable as _};
+
+        struct DisabledHost;
+        impl Render for DisabledHost {
+            fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+                div()
+                    .size_full()
+                    .child(Button::new("commit", "Commit").disabled(true))
+                    .child(Button::new("cancel", "Cancel"))
+                    .child(
+                        Checkbox::new("amend", ToggleState::Unselected)
+                            .label("Amend")
+                            .disabled(true),
+                    )
+                    .child(
+                        Switch::new("wrap", ToggleState::Selected)
+                            .aria_label("Soft wrap")
+                            .disabled(true),
+                    )
+            }
+        }
+
+        cx.update(|cx| {
+            let settings_store = settings::SettingsStore::test(cx);
+            cx.set_global(settings_store);
+            theme_settings::init(theme::LoadThemes::JustBase, cx);
+        });
+
+        let window = cx.add_window(|_, _| DisabledHost);
+        cx.activate_a11y(window.into());
+
+        let json = cx
+            .update_window(window.into(), |_, window, cx| {
+                window.draw(cx).clear(cx);
+                window.debug_a11y_tree_json()
+            })
+            .expect("the harness window is still open")
+            .expect("activation makes the debug tree available");
+        let tree: serde_json::Value = serde_json::from_str(&json).expect("the dump is valid JSON");
+        let nodes = tree["nodes"].as_object().expect("the dump lists nodes");
+
+        let by_name = |name: &str| {
+            nodes
+                .values()
+                .find(|node| node["aria"]["label"] == name)
+                .unwrap_or_else(|| panic!("no node named {name} in the tree: {json}"))
+        };
+
+        for name in ["Commit", "Amend", "Soft wrap"] {
+            assert_eq!(
+                by_name(name)["aria"]["disabled"].as_bool(),
+                Some(true),
+                "{name} is disabled and has to be announced that way: {json}"
+            );
+        }
+        // The flag is only written when it is true, so an operable control
+        // must not carry it at all.
+        assert!(
+            by_name("Cancel")["aria"]["disabled"].is_null(),
+            "an operable button must not be announced as disabled: {json}"
+        );
+    }
 }

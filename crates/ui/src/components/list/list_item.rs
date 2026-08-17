@@ -365,6 +365,7 @@ impl RenderOnce for ListItem {
                         |this| this.aria_active_descendant(),
                     )
                     .when_some(self.aria_label, |this, label| this.aria_label(label))
+                    .aria_disabled(self.disabled)
                     .when_some(self.aria_selected, |this, selected| {
                         this.aria_selected(selected)
                     })

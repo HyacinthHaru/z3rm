@@ -242,6 +242,7 @@ impl RenderOnce for Checkbox {
                 ToggleState::Indeterminate => Toggled::Mixed,
                 ToggleState::Unselected => Toggled::False,
             })
+            .aria_disabled(self.disabled)
             .size(size)
             .justify_center()
             .child(
@@ -510,6 +511,7 @@ impl RenderOnce for Switch {
                 ToggleState::Indeterminate => Toggled::Mixed,
                 ToggleState::Unselected => Toggled::False,
             })
+            .aria_disabled(self.disabled)
             .p(px(1.0))
             .border_2()
             .border_color(cx.theme().colors().border_transparent)

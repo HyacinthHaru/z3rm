@@ -769,6 +769,11 @@ impl RenderOnce for ButtonLike {
             .when_some(self.aria_expanded, |this, expanded| {
                 this.aria_expanded(expanded)
             })
+            // A disabled button keeps its node — it is still part of the
+            // layout the user is reading — but it has to say that pressing it
+            // does nothing, which greying it out only says to people who can
+            // see it.
+            .aria_disabled(self.disabled)
             .when_some(self.toggled, |this, toggled| {
                 this.aria_toggled(if toggled {
                     Toggled::True

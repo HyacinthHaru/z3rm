@@ -1342,6 +1342,14 @@ pub trait StatefulInteractiveElement: InteractiveElement {
         self
     }
 
+    /// Mark this element as present but not operable. A control that is only
+    /// greyed out is announced as an ordinary one, so the user activates it and
+    /// nothing happens.
+    fn aria_disabled(mut self, disabled: bool) -> Self {
+        self.interactivity().aria.disabled = disabled;
+        self
+    }
+
     /// Set the toggled state for this element.
     fn aria_toggled(mut self, toggled: accesskit::Toggled) -> Self {
         self.interactivity().aria.toggled = Some(toggled);
@@ -1971,6 +1979,7 @@ pub(crate) struct AriaProperties {
     pub(crate) keyshortcuts: Option<SharedString>,
     pub(crate) selected: Option<bool>,
     pub(crate) expanded: Option<bool>,
+    pub(crate) disabled: bool,
     pub(crate) live: Option<accesskit::Live>,
     pub(crate) modal: bool,
     pub(crate) toggled: Option<accesskit::Toggled>,
@@ -3357,6 +3366,9 @@ impl Interactivity {
         }
         if let Some(expanded) = self.aria.expanded {
             node.set_expanded(expanded);
+        }
+        if self.aria.disabled {
+            node.set_disabled();
         }
         if let Some(toggled) = self.aria.toggled {
             node.set_toggled(toggled);
