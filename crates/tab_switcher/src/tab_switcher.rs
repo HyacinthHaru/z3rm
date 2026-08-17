@@ -728,7 +728,13 @@ impl PickerDelegate for TabSwitcherDelegate {
 
     fn match_label(&self, ix: usize, cx: &App) -> Option<SharedString> {
         let tab_match = self.matches.get(ix)?;
-        Some(tab_match.item.tab_content_text(tab_match.detail, cx))
+        // Same name the tab itself announces, including the state its
+        // indicator dot shows in colour alone.
+        Some(workspace::pane::tab_announcement(
+            tab_match.item.as_ref(),
+            tab_match.detail,
+            cx,
+        ))
     }
 
     fn placeholder_text(&self, _window: &mut Window, _cx: &mut App) -> Arc<str> {

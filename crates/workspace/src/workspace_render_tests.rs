@@ -441,6 +441,66 @@ async fn test_the_zoom_button_can_be_operated_through_its_action(cx: &mut TestAp
 /// the tab node's centre is only correct while the close button stays off
 /// centre. Activating a tab and closing it are not close enough for a mistake
 /// to be recoverable.
+/// A tab shows unsaved changes as a coloured dot beside its name, and an icon
+/// contributes no accessibility node, so nothing told a reader which of the
+/// open files had unsaved work in them.
+#[gpui::test]
+async fn test_a_tab_says_it_has_unsaved_changes(cx: &mut TestAppContext) {
+    init_test(cx);
+    let fs = FakeFs::new(cx.executor());
+    fs.insert_tree("/root", json!({ "a.txt": "" })).await;
+    let project = Project::test(fs, [path!("/root").as_ref()], cx).await;
+
+    let (multi_workspace, cx) =
+        cx.add_window_view(|window, cx| MultiWorkspace::test_new(project, window, cx));
+    let workspace = multi_workspace.read_with(cx, |mw, _| mw.workspace().clone());
+    let pane = workspace.read_with(cx, |ws, _| ws.active_pane().clone());
+
+    pane.update_in(cx, |pane, window, cx| {
+        for (label, dirty) in [("saved", false), ("edited", true)] {
+            pane.add_item(
+                Box::new(cx.new(|cx| TestItem::new(cx).with_label(label).with_dirty(dirty))),
+                true,
+                true,
+                None,
+                window,
+                cx,
+            );
+        }
+    });
+    cx.run_until_parked();
+
+    cx.activate_a11y(cx.window_handle());
+    let json = cx
+        .update(|window, cx| {
+            window.draw(cx).clear(cx);
+            window.debug_a11y_tree_json()
+        })
+        .expect("activation makes the debug tree available");
+    let tree: serde_json::Value = serde_json::from_str(&json).expect("the dump is valid JSON");
+
+    gpui::a11y_checks::assert_interactive_nodes_are_named(&tree, "dirty tab");
+    gpui::a11y_checks::assert_no_role_was_discarded(&tree, "dirty tab");
+    gpui::a11y_checks::assert_roles_are_contained(&tree, "dirty tab");
+    gpui::a11y_checks::assert_focus_reached_the_tree(&tree, "dirty tab");
+    gpui::a11y_checks::assert_click_targets_are_reachable(&tree, "dirty tab");
+    gpui::a11y_checks::assert_landmarks_are_distinguishable(&tree, "dirty tab");
+
+    let mut tabs: Vec<&str> = tree["nodes"]
+        .as_object()
+        .expect("the dump lists nodes")
+        .values()
+        .filter(|node| node["aria"]["role"] == "Tab")
+        .filter_map(|node| node["aria"]["label"].as_str())
+        .collect();
+    tabs.sort();
+    assert_eq!(
+        tabs,
+        vec!["edited, unsaved changes", "saved"],
+        "the dot beside the name is the only other thing that says this"
+    );
+}
+
 #[gpui::test]
 async fn test_clicking_a_tab_through_its_action_activates_it(cx: &mut TestAppContext) {
     init_test(cx);

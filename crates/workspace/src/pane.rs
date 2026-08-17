@@ -2855,8 +2855,9 @@ impl Pane {
         let capability = item.capability(cx);
         let tab = Tab::new(ix)
             // `tab_content` renders arbitrary elements, so the announced name
-            // comes from the item's own text rather than the rendered tab.
-            .aria_label(item.tab_content_text(detail, cx))
+            // comes from the item's own text rather than the rendered tab, and
+            // carries the state its indicator dot shows in colour alone.
+            .aria_label(tab_announcement(item, detail, cx))
             .aria_position(ix + 1, self.items.len())
             .position(if is_first_item {
                 TabPosition::First
@@ -4943,6 +4944,18 @@ pub fn tab_details(items: &[Box<dyn ItemHandle>], _window: &Window, cx: &App) ->
     util::disambiguate::compute_disambiguation_details(items, |item, detail| {
         item.tab_content_text(detail, cx)
     })
+}
+
+/// The name a tab announces. The indicator beside it is a coloured dot, which
+/// contributes no accessibility node, so whether the file has unsaved changes
+/// or has moved under the editor reaches a reader only as part of this name.
+pub fn tab_announcement(item: &dyn ItemHandle, detail: usize, cx: &App) -> SharedString {
+    let name = item.tab_content_text(detail, cx);
+    match (item.has_conflict(cx), item.is_dirty(cx)) {
+        (true, _) => SharedString::from(format!("{name}, changed on disk")),
+        (_, true) => SharedString::from(format!("{name}, unsaved changes")),
+        (false, false) => name,
+    }
 }
 
 pub fn render_item_indicator(item: Box<dyn ItemHandle>, cx: &App) -> Option<Indicator> {
