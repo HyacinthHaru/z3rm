@@ -1184,7 +1184,6 @@ impl RenderOnce for Table {
 
         let is_resizable = resizable_entity.is_some();
 
-        let cols = self.cols;
         let total_row_count = table_context.total_row_count;
         let aria_label = self.aria_label.clone();
         let table = div()
@@ -1380,10 +1379,15 @@ impl RenderOnce for Table {
                 .track_focus(&state.read(cx).focus_handle)
                 .id(("table", state.entity_id()))
                 .when_some(aria_label, |this, label| {
+                    // A row count is honest even while the list is virtualised:
+                    // it says how long the table is, and the visible rows are
+                    // real nodes. A column count is not, because no cell in
+                    // this table is a node — callers put a row's whole text on
+                    // the row. Declaring columns offers cell-by-cell navigation
+                    // that finds nothing to move to.
                     this.role(gpui::Role::Table)
                         .aria_label(label)
                         .aria_row_count(total_row_count)
-                        .aria_column_count(cols)
                 })
                 .into_any_element()
         } else {
@@ -1395,7 +1399,6 @@ impl RenderOnce for Table {
                     .role(gpui::Role::Table)
                     .aria_label(label)
                     .aria_row_count(total_row_count)
-                    .aria_column_count(cols)
                     .into_any_element(),
                 None => table.into_any_element(),
             }

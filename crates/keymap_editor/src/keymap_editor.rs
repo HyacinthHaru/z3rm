@@ -4107,6 +4107,26 @@ mod tests {
         gpui::a11y_checks::assert_click_targets_are_reachable(&tree, "keymap editor");
         gpui::a11y_checks::assert_landmarks_are_distinguishable(&tree, "keymap editor");
         gpui::a11y_checks::assert_names_are_distinguishable(&tree, "keymap editor");
+
+        // The rows carry their whole text and no cell is a node, so a column
+        // count would offer cell-by-cell navigation with nothing to move to.
+        // The row count is real: it says how long the table is while the list
+        // is virtualised.
+        let table = tree["nodes"]
+            .as_object()
+            .expect("the dump lists nodes")
+            .values()
+            .find(|node| node["aria"]["role"] == "Table")
+            .expect("the key bindings are a table");
+        assert!(
+            table["aria"]["row_count"].as_u64().is_some_and(|rows| rows > 0),
+            "the table says how long it is: {table}"
+        );
+        assert_eq!(
+            table["aria"]["column_count"].as_u64(),
+            None,
+            "a table with no cell nodes must not promise columns to move between"
+        );
         gpui::a11y_checks::assert_clickable_elements_are_reachable(&tree, "keymap editor");
         gpui::a11y_checks::assert_controls_have_area(&tree, "keymap editor");
         gpui::a11y_checks::assert_active_descendant_is_honoured(&tree, "keymap editor");
@@ -4116,7 +4136,6 @@ mod tests {
             .find(|node| node["aria"]["role"] == "Table")
             .unwrap_or_else(|| panic!("the bindings must be reported as a table: {json}"));
         assert_eq!(table["aria"]["label"].as_str(), Some("Key bindings"));
-        assert_eq!(table["aria"]["column_count"].as_u64(), Some(COLS as u64));
 
         let rows: Vec<&str> = nodes
             .values()
