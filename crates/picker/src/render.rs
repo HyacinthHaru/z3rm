@@ -27,6 +27,7 @@ pub mod window_controls;
 impl<D: PickerDelegate> Render for Picker<D> {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         self.finish_any_completed_resize(window, cx);
+        self.recompute_a11y_set_positions(window, cx);
         // toggle between BelowForced and Right based on whether it'd clamp if
         // horizontal
         let rendered_layout = self.preview_layout_rendered(window);

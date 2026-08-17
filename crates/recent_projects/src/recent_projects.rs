@@ -2855,6 +2855,34 @@ mod tests {
         gpui::a11y_checks::assert_click_targets_are_reachable(&tree, "recent projects picker");
         gpui::a11y_checks::assert_focus_reached_the_tree(&tree, "recent projects picker");
 
+        // The list is section headers interleaved with projects, and the arrow
+        // keys stop only on the projects. Counting the headers would describe a
+        // list whose end the user can never reach.
+        let mut set: Vec<(u64, u64)> = tree["nodes"]
+            .as_object()
+            .expect("the dump lists nodes")
+            .values()
+            .filter(|node| node["aria"]["role"] == "ListBoxOption")
+            .map(|node| {
+                (
+                    node["aria"]["position_in_set"].as_u64().unwrap_or_default(),
+                    node["aria"]["size_of_set"].as_u64().unwrap_or_default(),
+                )
+            })
+            .collect();
+        set.sort_unstable();
+        let sizes: Vec<u64> = set.iter().map(|(_, size)| *size).collect();
+        let positions: Vec<u64> = set.iter().map(|(position, _)| *position).collect();
+        assert!(
+            sizes.iter().all(|size| *size == sizes[0]),
+            "every option is in the same set: {set:?}"
+        );
+        assert_eq!(
+            positions,
+            (1..=positions.len() as u64).collect::<Vec<_>>(),
+            "the options are numbered from one with no gaps where a header was: {set:?}"
+        );
+
         let options = tree["nodes"]
             .as_object()
             .expect("the dump lists nodes")

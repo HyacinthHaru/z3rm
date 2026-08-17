@@ -147,6 +147,11 @@ pub struct Picker<D: PickerDelegate> {
     picker_bounds: Rc<Cell<Option<Bounds<Pixels>>>>,
     /// Bounds tracking for items (for aside positioning) - maps item index to bounds
     item_bounds: Rc<RefCell<HashMap<usize, Bounds<Pixels>>>>,
+    /// For each row, its place among the rows a user can actually land on, and
+    /// how many of those there are. Recomputed per frame, and only while a
+    /// screen reader is attached, because it costs a pass over every match.
+    a11y_positions_in_set: Vec<usize>,
+    a11y_size_of_set: usize,
     shape_loaded_from_persistence: bool,
     /// Handle for the default footer's Actions popover menu. Used to keep the
     /// picker open while that menu has focus.
@@ -591,6 +596,8 @@ impl<D: PickerDelegate> Picker<D> {
             }),
             default_shape,
             show_scrollbar: false,
+            a11y_positions_in_set: Vec::new(),
+            a11y_size_of_set: 0,
             presentation: Presentation::Modal {
                 resizable: has_preview,
             },
@@ -1259,6 +1266,30 @@ impl<D: PickerDelegate> Picker<D> {
         }
     }
 
+    /// Numbers the rows a user can land on, skipping separators and section
+    /// headers. Announcing "3 of 27" where 27 counts rows the arrow keys refuse
+    /// to stop on describes a list the user cannot reach the end of.
+    pub(crate) fn recompute_a11y_set_positions(
+        &mut self,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if !window.is_a11y_active() {
+            return;
+        }
+        let match_count = self.delegate.match_count();
+        self.a11y_positions_in_set.clear();
+        self.a11y_positions_in_set.reserve(match_count);
+        let mut selectable_so_far = 0;
+        for ix in 0..match_count {
+            if self.delegate.can_select(ix, window, cx) {
+                selectable_so_far += 1;
+            }
+            self.a11y_positions_in_set.push(selectable_so_far);
+        }
+        self.a11y_size_of_set = selectable_so_far;
+    }
+
     fn render_element(
         &self,
         window: &mut Window,
@@ -1313,8 +1344,13 @@ impl<D: PickerDelegate> Picker<D> {
                     .when_some(self.delegate.match_label(ix, cx), |this, label| {
                         this.aria_label(label)
                     })
-                    .aria_position_in_set(ix + 1)
-                    .aria_size_of_set(match_count)
+                    .when_some(
+                        self.a11y_positions_in_set.get(ix).copied(),
+                        |this, position| {
+                            this.aria_position_in_set(position)
+                                .aria_size_of_set(self.a11y_size_of_set)
+                        },
+                    )
                     .when(is_selected, |this| this.aria_active_descendant())
             })
             .when(selectable, |this| this.cursor_pointer())
