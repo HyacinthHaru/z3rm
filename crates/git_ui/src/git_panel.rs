@@ -11520,6 +11520,9 @@ mod tests {
 
         gpui::a11y_checks::assert_interactive_nodes_are_named(&tree, "git panel");
         gpui::a11y_checks::assert_names_are_distinguishable(&tree, "git panel");
+        gpui::a11y_checks::assert_controls_have_area(&tree, "git panel");
+        gpui::a11y_checks::assert_landmarks_are_distinguishable(&tree, "git panel");
+        gpui::a11y_checks::assert_active_descendant_is_honoured(&tree, "git panel");
         gpui::a11y_checks::assert_no_role_was_discarded(&tree, "git panel");
         gpui::a11y_checks::assert_roles_are_contained(&tree, "git panel");
         gpui::a11y_checks::assert_click_targets_are_reachable(&tree, "git panel");

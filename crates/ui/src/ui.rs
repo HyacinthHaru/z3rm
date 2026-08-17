@@ -312,6 +312,11 @@ fn the_shared_controls_report_their_state(cx: &mut TestAppContext) {
         gpui::a11y_checks::assert_interactive_nodes_are_named(&tree, "messages");
         gpui::a11y_checks::assert_no_role_was_discarded(&tree, "messages");
         gpui::a11y_checks::assert_names_are_distinguishable(&tree, "messages");
+        gpui::a11y_checks::assert_roles_are_contained(&tree, "messages");
+        gpui::a11y_checks::assert_click_targets_are_reachable(&tree, "messages");
+        gpui::a11y_checks::assert_controls_have_area(&tree, "messages");
+        gpui::a11y_checks::assert_landmarks_are_distinguishable(&tree, "messages");
+        gpui::a11y_checks::assert_active_descendant_is_honoured(&tree, "messages");
 
         let names: Vec<&str> = tree["nodes"]
             .as_object()
@@ -373,6 +378,11 @@ fn the_shared_controls_report_their_state(cx: &mut TestAppContext) {
 
         gpui::a11y_checks::assert_interactive_nodes_are_named(&tree, "toggle button group");
         gpui::a11y_checks::assert_names_are_distinguishable(&tree, "toggle button group");
+        gpui::a11y_checks::assert_roles_are_contained(&tree, "toggle button group");
+        gpui::a11y_checks::assert_click_targets_are_reachable(&tree, "toggle button group");
+        gpui::a11y_checks::assert_controls_have_area(&tree, "toggle button group");
+        gpui::a11y_checks::assert_landmarks_are_distinguishable(&tree, "toggle button group");
+        gpui::a11y_checks::assert_active_descendant_is_honoured(&tree, "toggle button group");
         gpui::a11y_checks::assert_no_role_was_discarded(&tree, "toggle button group");
 
         let mut buttons: Vec<(&str, Option<&str>)> = tree["nodes"]
@@ -445,6 +455,12 @@ fn the_shared_controls_report_their_state(cx: &mut TestAppContext) {
 
         gpui::a11y_checks::assert_interactive_nodes_are_named(&tree, "collapsible sections");
         gpui::a11y_checks::assert_names_are_distinguishable(&tree, "collapsible sections");
+        gpui::a11y_checks::assert_no_role_was_discarded(&tree, "collapsible sections");
+        gpui::a11y_checks::assert_roles_are_contained(&tree, "collapsible sections");
+        gpui::a11y_checks::assert_click_targets_are_reachable(&tree, "collapsible sections");
+        gpui::a11y_checks::assert_controls_have_area(&tree, "collapsible sections");
+        gpui::a11y_checks::assert_landmarks_are_distinguishable(&tree, "collapsible sections");
+        gpui::a11y_checks::assert_active_descendant_is_honoured(&tree, "collapsible sections");
 
         let mut chevrons: Vec<&str> = tree["nodes"]
             .as_object()

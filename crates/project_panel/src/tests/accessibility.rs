@@ -173,6 +173,11 @@ async fn a_modified_file_says_it_is_modified(cx: &mut gpui::TestAppContext) {
 
     gpui::a11y_checks::assert_interactive_nodes_are_named(&tree, "project panel with git status");
     gpui::a11y_checks::assert_names_are_distinguishable(&tree, "project panel with git status");
+    gpui::a11y_checks::assert_roles_are_contained(&tree, "project panel with git status");
+    gpui::a11y_checks::assert_click_targets_are_reachable(&tree, "project panel with git status");
+    gpui::a11y_checks::assert_controls_have_area(&tree, "project panel with git status");
+    gpui::a11y_checks::assert_landmarks_are_distinguishable(&tree, "project panel with git status");
+    gpui::a11y_checks::assert_active_descendant_is_honoured(&tree, "project panel with git status");
     gpui::a11y_checks::assert_no_role_was_discarded(&tree, "project panel with git status");
 
     let mut rows: Vec<&str> = tree["nodes"]
@@ -240,6 +245,11 @@ async fn the_rename_field_says_what_it_is(cx: &mut gpui::TestAppContext) {
 
     gpui::a11y_checks::assert_interactive_nodes_are_named(&tree, "renaming a file");
     gpui::a11y_checks::assert_names_are_distinguishable(&tree, "renaming a file");
+    gpui::a11y_checks::assert_roles_are_contained(&tree, "renaming a file");
+    gpui::a11y_checks::assert_click_targets_are_reachable(&tree, "renaming a file");
+    gpui::a11y_checks::assert_controls_have_area(&tree, "renaming a file");
+    gpui::a11y_checks::assert_landmarks_are_distinguishable(&tree, "renaming a file");
+    gpui::a11y_checks::assert_active_descendant_is_honoured(&tree, "renaming a file");
     gpui::a11y_checks::assert_no_role_was_discarded(&tree, "renaming a file");
     gpui::a11y_checks::assert_focus_reached_the_tree(&tree, "renaming a file");
 
@@ -292,5 +302,10 @@ async fn an_empty_project_panel_says_why_it_is_empty(cx: &mut gpui::TestAppConte
 
     gpui::a11y_checks::assert_interactive_nodes_are_named(&tree, "empty project panel");
     gpui::a11y_checks::assert_names_are_distinguishable(&tree, "empty project panel");
+    gpui::a11y_checks::assert_roles_are_contained(&tree, "empty project panel");
+    gpui::a11y_checks::assert_click_targets_are_reachable(&tree, "empty project panel");
+    gpui::a11y_checks::assert_controls_have_area(&tree, "empty project panel");
+    gpui::a11y_checks::assert_landmarks_are_distinguishable(&tree, "empty project panel");
+    gpui::a11y_checks::assert_active_descendant_is_honoured(&tree, "empty project panel");
     gpui::a11y_checks::assert_no_role_was_discarded(&tree, "empty project panel");
 }

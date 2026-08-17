@@ -303,6 +303,10 @@ mod tests {
         let tree: serde_json::Value = serde_json::from_str(&json).expect("the dump is valid JSON");
         gpui::a11y_checks::assert_interactive_nodes_are_named(&tree, "alert modal");
         gpui::a11y_checks::assert_names_are_distinguishable(&tree, "alert modal");
+        gpui::a11y_checks::assert_click_targets_are_reachable(&tree, "alert modal");
+        gpui::a11y_checks::assert_controls_have_area(&tree, "alert modal");
+        gpui::a11y_checks::assert_landmarks_are_distinguishable(&tree, "alert modal");
+        gpui::a11y_checks::assert_active_descendant_is_honoured(&tree, "alert modal");
         gpui::a11y_checks::assert_no_role_was_discarded(&tree, "alert modal");
         gpui::a11y_checks::assert_roles_are_contained(&tree, "alert modal");
 

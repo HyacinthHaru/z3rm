@@ -2791,6 +2791,9 @@ mod live_tests {
         let files = a11y_tree(cx, SidebarMode::Files);
         gpui::a11y_checks::assert_interactive_nodes_are_named(&files, "sidebar files");
         gpui::a11y_checks::assert_names_are_distinguishable(&files, "sidebar files");
+        gpui::a11y_checks::assert_controls_have_area(&files, "sidebar files");
+        gpui::a11y_checks::assert_landmarks_are_distinguishable(&files, "sidebar files");
+        gpui::a11y_checks::assert_active_descendant_is_honoured(&files, "sidebar files");
         gpui::a11y_checks::assert_no_role_was_discarded(&files, "sidebar files");
         gpui::a11y_checks::assert_roles_are_contained(&files, "sidebar files");
         gpui::a11y_checks::assert_click_targets_are_reachable(&files, "sidebar files");
@@ -2809,6 +2812,9 @@ mod live_tests {
 
         gpui::a11y_checks::assert_interactive_nodes_are_named(&tree, "sidebar panel");
         gpui::a11y_checks::assert_names_are_distinguishable(&tree, "sidebar panel");
+        gpui::a11y_checks::assert_controls_have_area(&tree, "sidebar panel");
+        gpui::a11y_checks::assert_landmarks_are_distinguishable(&tree, "sidebar panel");
+        gpui::a11y_checks::assert_active_descendant_is_honoured(&tree, "sidebar panel");
         gpui::a11y_checks::assert_no_role_was_discarded(&tree, "sidebar panel");
         gpui::a11y_checks::assert_roles_are_contained(&tree, "sidebar panel");
         gpui::a11y_checks::assert_click_targets_are_reachable(&tree, "sidebar panel");

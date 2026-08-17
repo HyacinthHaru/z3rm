@@ -2597,6 +2597,10 @@ mod tests {
                 serde_json::from_str(&json).expect("the dump is valid JSON");
             gpui::a11y_checks::assert_interactive_nodes_are_named(&tree, "mux pane");
             gpui::a11y_checks::assert_names_are_distinguishable(&tree, "mux pane");
+            gpui::a11y_checks::assert_click_targets_are_reachable(&tree, "mux pane");
+            gpui::a11y_checks::assert_controls_have_area(&tree, "mux pane");
+            gpui::a11y_checks::assert_landmarks_are_distinguishable(&tree, "mux pane");
+            gpui::a11y_checks::assert_active_descendant_is_honoured(&tree, "mux pane");
             gpui::a11y_checks::assert_no_role_was_discarded(&tree, "mux pane");
             gpui::a11y_checks::assert_roles_are_contained(&tree, "mux pane");
             tree["nodes"]

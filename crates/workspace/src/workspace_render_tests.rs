@@ -514,6 +514,12 @@ async fn test_two_tabs_with_the_same_file_name_are_told_apart(cx: &mut TestAppCo
 
     gpui::a11y_checks::assert_interactive_nodes_are_named(&tree, "ambiguous tabs");
     gpui::a11y_checks::assert_names_are_distinguishable(&tree, "ambiguous tabs");
+    gpui::a11y_checks::assert_no_role_was_discarded(&tree, "ambiguous tabs");
+    gpui::a11y_checks::assert_roles_are_contained(&tree, "ambiguous tabs");
+    gpui::a11y_checks::assert_click_targets_are_reachable(&tree, "ambiguous tabs");
+    gpui::a11y_checks::assert_controls_have_area(&tree, "ambiguous tabs");
+    gpui::a11y_checks::assert_landmarks_are_distinguishable(&tree, "ambiguous tabs");
+    gpui::a11y_checks::assert_active_descendant_is_honoured(&tree, "ambiguous tabs");
 
     let mut tabs: Vec<&str> = tree["nodes"]
         .as_object()

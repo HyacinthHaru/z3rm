@@ -2823,11 +2823,15 @@ mod tests {
     /// announced as a bare "button".
     #[gpui::test]
     fn the_project_picker_names_what_it_shows(cx: &mut TestAppContext) {
-        let (_picker, cx) = build_picker(cx);
+        let (picker, cx) = build_picker(cx);
 
         cx.activate_a11y(cx.window_handle());
         let json = cx
             .update(|window, cx| {
+                // Opening the picker puts the keyboard in its query editor, and
+                // the highlighted row is reported relative to that focus. A
+                // frame with nothing focused is a state the user never sees.
+                window.focus(&picker.focus_handle(cx), cx);
                 window.draw(cx).clear(cx);
                 window.debug_a11y_tree_json()
             })
@@ -2836,6 +2840,9 @@ mod tests {
 
         gpui::a11y_checks::assert_interactive_nodes_are_named(&tree, "recent projects picker");
         gpui::a11y_checks::assert_names_are_distinguishable(&tree, "recent projects picker");
+        gpui::a11y_checks::assert_controls_have_area(&tree, "recent projects picker");
+        gpui::a11y_checks::assert_landmarks_are_distinguishable(&tree, "recent projects picker");
+        gpui::a11y_checks::assert_active_descendant_is_honoured(&tree, "recent projects picker");
         gpui::a11y_checks::assert_no_role_was_discarded(&tree, "recent projects picker");
         gpui::a11y_checks::assert_roles_are_contained(&tree, "recent projects picker");
         gpui::a11y_checks::assert_click_targets_are_reachable(&tree, "recent projects picker");
