@@ -1037,6 +1037,40 @@ async fn test_every_interactive_node_in_the_window_has_a_name(cx: &mut TestAppCo
     let tree: serde_json::Value = serde_json::from_str(&json).expect("the dump is valid JSON");
 
     gpui::a11y_checks::assert_interactive_nodes_are_named(&tree, "workspace window");
+
+    // A button that opens a menu is a disclosure, not a two-state toggle. The
+    // tab bar has one of each, so this pins the difference: the menu triggers
+    // report whether they are open, the zoom button whether it is pressed, and
+    // neither reports both.
+    let button_state = |label: &str| {
+        tree["nodes"]
+            .as_object()
+            .expect("the dump lists nodes")
+            .values()
+            .find(|node| node["aria"]["label"] == label)
+            .map(|node| {
+                (
+                    node["aria"]["expanded"].as_bool(),
+                    node["aria"]["toggled"].as_str().map(str::to_owned),
+                )
+            })
+            .unwrap_or_else(|| panic!("no button named {label:?}: {json}"))
+    };
+    assert_eq!(
+        button_state("New"),
+        (Some(false), None),
+        "a menu trigger says whether its menu is open, not whether it is pressed"
+    );
+    assert_eq!(
+        button_state("Split Pane"),
+        (Some(false), None),
+        "a menu trigger says whether its menu is open, not whether it is pressed"
+    );
+    assert_eq!(
+        button_state("Zoom In"),
+        (None, Some("False".to_string())),
+        "a real toggle still reports the state it actually has"
+    );
     gpui::a11y_checks::assert_no_role_was_discarded(&tree, "workspace window");
     gpui::a11y_checks::assert_roles_are_contained(&tree, "workspace window");
     gpui::a11y_checks::assert_click_targets_are_reachable(&tree, "workspace window");

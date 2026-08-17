@@ -203,7 +203,13 @@ impl<M: ManagedView> PopoverMenu<M> {
         let on_open = self.on_open.clone();
         self.child_builder = Some(Box::new(move |menu, builder| {
             let open = menu.borrow().is_some();
-            t.toggle_state(open)
+            // `toggle_state` is the pressed *styling* while the menu is open.
+            // On its own it also makes the button announce itself as pressed or
+            // not, which describes a two-state control rather than one that
+            // opens a menu; saying it is expanded is both the truth and what
+            // suppresses the toggle semantics.
+            t.aria_expanded(open)
+                .toggle_state(open)
                 .when_some(builder, |el, builder| {
                     el.on_click(move |_, window, cx| {
                         show_menu(&builder, &menu, on_open.clone(), window, cx)

@@ -365,6 +365,10 @@ impl FixedWidth for Button {
 }
 
 impl ButtonCommon for Button {
+    fn aria_expanded(self, expanded: bool) -> Self {
+        Self::aria_expanded(self, expanded)
+    }
+
     fn id(&self) -> &ElementId {
         self.base.id()
     }

@@ -32,6 +32,12 @@ pub trait ButtonCommon: Clickable + Disableable {
     /// that are consistently sized with buttons.
     fn size(self, size: ButtonSize) -> Self;
 
+    /// Whether the popup this button controls is open.
+    ///
+    /// A menu trigger is a disclosure, not a two-state toggle: without this it
+    /// is announced as "not pressed", which says nothing about the menu.
+    fn aria_expanded(self, expanded: bool) -> Self;
+
     /// The tooltip that shows when a user hovers over the button.
     ///
     /// Nearly all interactable elements should have a tooltip. Some example
@@ -694,6 +700,10 @@ impl FixedWidth for ButtonLike {
 }
 
 impl ButtonCommon for ButtonLike {
+    fn aria_expanded(self, expanded: bool) -> Self {
+        Self::aria_expanded(self, expanded)
+    }
+
     fn id(&self) -> &ElementId {
         &self.id
     }
@@ -774,11 +784,19 @@ impl RenderOnce for ButtonLike {
             // does nothing, which greying it out only says to people who can
             // see it.
             .aria_disabled(self.disabled)
-            .when_some(self.toggled, |this, toggled| {
-                this.aria_toggled(if toggled {
-                    Toggled::True
-                } else {
-                    Toggled::False
+            // Not both: `expanded` describes a control that opens something,
+            // `toggled` a control that is pressed or not. A node carrying both
+            // is announced as a toggle button that is also expanded, which
+            // describes no control that exists. `toggle_state` is how a
+            // disclosure and a popover trigger get their pressed *styling*, so
+            // the two arrive together by construction.
+            .when(self.aria_expanded.is_none(), |this| {
+                this.when_some(self.toggled, |this, toggled| {
+                    this.aria_toggled(if toggled {
+                        Toggled::True
+                    } else {
+                        Toggled::False
+                    })
                 })
             })
             .when_some(self.tab_index, |this, tab_index| this.tab_index(tab_index))
