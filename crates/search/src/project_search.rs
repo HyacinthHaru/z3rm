@@ -2338,6 +2338,12 @@ impl Render for ProjectSearchBar {
             _ => None,
         };
 
+        // What the counter is announced as, kept apart from what it draws.
+        // "3/17" belongs in a toolbar; out loud it is "three slash seventeen".
+        // Empty until there is something to report: this is a live region, and
+        // a count sitting in it before anyone has searched announces a result
+        // for a search that has not happened.
+        let mut announced_matches = SharedString::default();
         let match_text = search
             .active_match_index
             .and_then(|index| {
@@ -2345,6 +2351,11 @@ impl Render for ProjectSearchBar {
                 let match_quantity = project_search.match_ranges.len();
                 if match_quantity > 0 {
                     debug_assert!(match_quantity >= index);
+                    announced_matches = if limit_reached {
+                        format!("Match {index} of {match_quantity} or more").into()
+                    } else {
+                        format!("Match {index} of {match_quantity}").into()
+                    };
                     if limit_reached {
                         Some(format!("{index}/{match_quantity}+"))
                     } else {
@@ -2426,10 +2437,10 @@ impl Render for ProjectSearchBar {
                     // tree. Polite: it changes while the user types.
                     .role(gpui::Role::Status)
                     .aria_live(gpui::accesskit::Live::Polite)
-                    .aria_label(if is_search_underway {
-                        SharedString::from(format!("Searching, {match_text}"))
-                    } else {
-                        SharedString::from(match_text.clone())
+                    .aria_label(match (is_search_underway, announced_matches.is_empty()) {
+                        (true, true) => SharedString::new_static("Searching"),
+                        (true, false) => format!("Searching, {announced_matches}").into(),
+                        (false, _) => announced_matches,
                     })
                     .ml_2()
                     .min_w(rems_from_px(40.))
@@ -3511,19 +3522,33 @@ pub mod tests {
         // Both error lines and the match count exist with nothing in them yet:
         // a live region created at the same moment as its message has nothing
         // to diff against and is never announced.
-        let quiet_regions: Vec<&str> = nodes
+        let quiet_regions: Vec<(&str, &str)> = nodes
             .values()
             .filter(|node| node["aria"]["live"] == "Polite")
-            .filter_map(|node| node["element_id"].as_str())
+            .filter_map(|node| {
+                Some((
+                    node["element_id"].as_str()?,
+                    node["aria"]["label"].as_str().unwrap_or_default(),
+                ))
+            })
             .collect();
         for region in [
             "project-search-query-error",
             "project-search-filter-error",
             "matches",
         ] {
-            assert!(
-                quiet_regions.iter().any(|id| id.contains(region)),
-                "{region} has to exist before it has anything to say: {quiet_regions:?}"
+            let found = quiet_regions
+                .iter()
+                .find(|(id, _)| id.contains(region))
+                .unwrap_or_else(|| {
+                    panic!("{region} has to exist before it has anything to say: {quiet_regions:?}")
+                });
+            // Existing is half of it. The match count used to sit here reading
+            // "0/0" before anyone had searched, which is a live region
+            // reporting a result for a search that has not happened.
+            assert_eq!(
+                found.1, "",
+                "{region} must say nothing until there is something to say"
             );
         }
     }
