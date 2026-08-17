@@ -55,9 +55,10 @@ async fn the_file_tree_is_exposed_as_a_named_tree(cx: &mut gpui::TestAppContext)
     cx.update(|window, cx| window.draw(cx).clear(cx));
     cx.run_until_parked();
     // Checked on two consecutive frames: a dock hosts its panel in a cached
-    // view, and a cached view that replays its recorded prepaint contributes
-    // no nodes at all, so the panel can be reported once and then vanish on
-    // the next redraw.
+    // view, which would replay its recorded prepaint and contribute no nodes,
+    // reporting the panel once and then losing it on the next redraw. GPUI
+    // skips the cache while an accessibility frame is building; this is what
+    // keeps that true.
     for frame in 1..=2 {
         let json = cx
             .update(|window, cx| {

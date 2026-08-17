@@ -299,9 +299,11 @@
 //! ### Things that are easy to get wrong
 //!
 //! **Nodes are pushed during prepaint, and the tree is rebuilt every frame.**
-//! A view rendered with [`AnyView::cached`] replays its recorded prepaint
-//! instead of running it, which contributes no nodes at all. Check at least two
-//! consecutive frames; "reported once, then gone" is otherwise invisible.
+//! A view rendered with [`AnyView::cached`] would replay its recorded prepaint
+//! instead of running it and contribute no nodes at all, so GPUI skips the
+//! cache while an accessibility frame is being built. Check at least two
+//! consecutive frames anyway: "reported once, then gone" is otherwise
+//! invisible, and this is the guard that keeps it from coming back.
 //!
 //! **Tracking focus is not the same as receiving it.** [`div`] follows
 //! [`Window::set_focus_handle`] with an internal claim naming the node that

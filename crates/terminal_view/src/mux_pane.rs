@@ -3469,7 +3469,8 @@ mod tests {
     /// A terminal in the real window lives inside the workspace pane group,
     /// which is a cached view. Every mux pane test above renders the view in a
     /// window of its own, so none of them exercise the path the product takes —
-    /// and a cached subtree that stops prepainting contributes no nodes at all.
+    /// the one where a cached subtree that stopped prepainting would drop out
+    /// of the tree entirely.
     #[cfg(unix)]
     #[gpui::test]
     async fn a_terminal_in_a_workspace_pane_is_announced_on_every_frame(cx: &mut TestAppContext) {
@@ -3542,7 +3543,7 @@ mod tests {
         // The grid arrives over the socket after the pane is mounted, so the
         // first frames legitimately have nothing to say. Once the text is
         // there it must stay there: the pane group is a cached view, and a
-        // cached subtree that stops prepainting contributes no nodes at all.
+        // cached subtree that stopped prepainting would drop out of the tree.
         let read_frame = |cx: &mut gpui::VisualTestContext| {
             let json = cx
                 .update(|window, cx| {

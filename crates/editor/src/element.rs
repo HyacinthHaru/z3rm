@@ -280,9 +280,9 @@ impl EditorElement {
     }
 
     /// Marks this element as a full editor the user can focus, which is what
-    /// gives it a node for that focus to land on. Left off for elements built
-    /// outside [`Editor::render`] — minimaps and inline prompts — so they stay
-    /// out of the tree.
+    /// gives it a node for that focus to land on. An element that mirrors
+    /// another editor's content — a minimap — leaves it off, because focus
+    /// lands on the editor being mirrored.
     pub fn focusable_region(mut self, focusable_region: bool) -> Self {
         self.focusable_region = focusable_region;
         self
