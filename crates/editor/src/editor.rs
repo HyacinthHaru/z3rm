@@ -898,6 +898,11 @@ pub struct Editor {
     /// Handles soft wraps, folds, fake inlay text insertions, etc.
     pub display_map: Entity<DisplayMap>,
     placeholder_display_map: Option<Entity<DisplayMap>>,
+    /// What this editor is called, for inputs whose placeholder is not the
+    /// answer: a rename field pre-filled with the current name shows no
+    /// placeholder at all, so without this it is announced as "edit text" and
+    /// nothing else.
+    a11y_label: Option<SharedString>,
     pub selections: SelectionsCollection,
     /// Manages the scroll position for the given editor.
     ///
@@ -2383,6 +2388,7 @@ impl Editor {
             buffer: multi_buffer.clone(),
             display_map: display_map.clone(),
             placeholder_display_map: None,
+            a11y_label: None,
             selections,
             scroll_manager: ScrollManager::new(cx),
             columnar_selection_state: None,
@@ -3192,6 +3198,18 @@ impl Editor {
 
     pub fn set_semantics_provider(&mut self, provider: Option<Rc<dyn SemanticsProvider>>) {
         self.semantics_provider = provider;
+    }
+
+    /// Name this editor for assistive technology. Use it for inputs that carry
+    /// no placeholder — the visible label sits beside them, and a label is not
+    /// an accessibility node.
+    pub fn set_a11y_label(&mut self, label: impl Into<SharedString>) {
+        self.a11y_label = Some(label.into());
+    }
+
+    /// The name set by [`Self::set_a11y_label`], if any.
+    pub fn a11y_label(&self) -> Option<SharedString> {
+        self.a11y_label.clone()
     }
 
     pub fn placeholder_text(&self, cx: &mut App) -> Option<String> {

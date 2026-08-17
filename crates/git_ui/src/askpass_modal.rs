@@ -44,8 +44,10 @@ impl AskPassModal {
             let mut editor = Editor::single_line(window, cx);
             if prompt.contains("yes/no") || prompt.contains("Username") {
                 editor.set_masked(false, cx);
+                editor.set_a11y_label("Answer");
             } else {
                 editor.set_masked(true, cx);
+                editor.set_a11y_label("Password");
             }
             editor
         });

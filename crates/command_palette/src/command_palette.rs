@@ -889,7 +889,13 @@ mod tests {
             cx.add_window_view(|window, cx| MultiWorkspace::test_new(project.clone(), window, cx));
         let workspace = multi_workspace.read_with(cx, |mw, _| mw.workspace().clone());
 
-        let editor = cx.new_window_entity(|window, cx| Editor::single_line(window, cx));
+        let editor = cx.new_window_entity(|window, cx| {
+            let mut editor = Editor::single_line(window, cx);
+            // Named like the inputs this stands in for: a single-line editor
+            // with no placeholder is announced as "edit text" and nothing else.
+            editor.set_a11y_label("Test input");
+            editor
+        });
         workspace.update_in(cx, |workspace, window, cx| {
             workspace.add_item_to_active_pane(Box::new(editor.clone()), None, true, window, cx);
             editor.update(cx, |editor, cx| window.focus(&editor.focus_handle(cx), cx))

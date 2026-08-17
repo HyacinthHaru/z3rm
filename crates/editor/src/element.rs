@@ -9341,7 +9341,11 @@ impl Element for EditorElement {
                     // Captured here because the accessibility hooks run without
                     // a context, and a single-line editor's whole content is
                     // small enough to snapshot per frame.
-                    let a11y_region_name = self.focusable_region.then(|| {
+                    // A single-line input names itself with its placeholder;
+                    // one without a placeholder needs to be told what it is.
+                    let a11y_explicit_name = self.editor.read(cx).a11y_label();
+                    let a11y_region_name = a11y_explicit_name.or_else(|| {
+                        self.focusable_region.then(|| {
                         self.editor
                             .update(cx, |editor, cx| editor.placeholder_text(cx))
                             .map(SharedString::from)
@@ -9359,6 +9363,7 @@ impl Element for EditorElement {
                                 None => None,
                             })
                             .unwrap_or_else(|| SharedString::new_static("Editor"))
+                        })
                     });
                     let a11y_text = self.single_line.then(|| {
                         let (text, selection) = {

@@ -1481,6 +1481,7 @@ impl Editor {
                     let parent_editor = cx.entity().downgrade();
                     let inline_editor = cx.new(|cx| {
                         let mut editor = Editor::single_line(window, cx);
+                        editor.set_a11y_label("Review comment");
                         editor.set_text(&*comment_text, window, cx);
                         // Select all text for easy replacement
                         editor.select_all(&crate::actions::SelectAll, window, cx);

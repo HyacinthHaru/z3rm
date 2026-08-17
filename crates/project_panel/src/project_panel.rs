@@ -735,7 +735,13 @@ impl ProjectPanel {
                 });
             }
 
-            let filename_editor = cx.new(|cx| Editor::single_line(window, cx));
+            let filename_editor = cx.new(|cx| {
+                let mut editor = Editor::single_line(window, cx);
+                // Pre-filled with the current name, so no placeholder is ever
+                // shown and the field would announce as "edit text".
+                editor.set_a11y_label("File name");
+                editor
+            });
 
             cx.subscribe_in(
                 &filename_editor,

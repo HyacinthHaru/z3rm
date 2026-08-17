@@ -408,6 +408,7 @@ impl RenameBranchModal {
         let editor = cx.new(|cx| {
             let mut editor = Editor::single_line(window, cx);
             editor.set_text(current_branch.clone(), window, cx);
+            editor.set_a11y_label("Branch name");
             editor
         });
         Self {

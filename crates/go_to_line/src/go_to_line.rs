@@ -111,6 +111,9 @@ impl GoToLine {
 
         let line_editor = cx.new(|cx| {
             let mut editor = Editor::single_line(window, cx);
+            // The hint below it is a label, which is not a node, so the field
+            // has to say what it takes.
+            editor.set_a11y_label("Line and column");
             let editor_handle = cx.entity().downgrade();
             editor
                 .register_action::<Tab>({

@@ -245,6 +245,10 @@ pub mod a11y_checks {
         "RadioButton",
         "SpinButton",
         "Switch",
+        // A text input usually names itself with its placeholder; one with
+        // neither a placeholder nor a label is announced as "edit text" and
+        // nothing else, which says nothing about what to type into it.
+        "TextInput",
         "Tab",
         "TreeItem",
     ];
