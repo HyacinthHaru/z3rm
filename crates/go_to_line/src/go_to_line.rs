@@ -623,6 +623,22 @@ mod tests {
                     .selection_stats(),
                 "After selecting a text with multibyte unicode characters, the character count should be correct"
             );
+            // The visible label puts this in parentheses, and abbreviates it to
+            // "3 c" under the Short setting. Neither survives being read out,
+            // and how much is selected is what a user who cannot see the
+            // highlight most needs to know.
+            assert_eq!(
+                workspace
+                    .status_bar()
+                    .read(cx)
+                    .item_of_type::<CursorPosition>()
+                    .expect("missing cursor position item")
+                    .read(cx)
+                    .announced_selection_for_test()
+                    .as_deref(),
+                Some("3 characters"),
+                "the size of a selection has to be said, not only drawn"
+            );
         });
     }
 
