@@ -1185,6 +1185,18 @@ fn extension_chrome_vdom_renders_status_bar() -> Result<()> {
         "expected rasterized label glyphs in the status bar, found {glyph_pixels}"
     );
 
+    // The extension's own text: spans carrying labels rather than controls.
+    // They contribute no node on their own, so the bridge has to name them or
+    // the status bar reaches a reader as its buttons and nothing else.
+    let labels: Vec<String> = a11y_nodes_with_role(&tree, "Label")
+        .iter()
+        .filter_map(|node| a11y_string_field(node, "label"))
+        .collect();
+    assert!(
+        labels.iter().any(|label| label == "session: main"),
+        "the extension's own text has to reach the tree: {labels:?}"
+    );
+
     let roles = a11y_role_summary(&tree);
     assert!(
         roles.iter().any(|role| role == "Button"),

@@ -580,6 +580,24 @@ impl VDomRenderer {
         // remain stateless while buttons expose keyboard and accessibility
         // semantics equivalent to a native control.
         if click.is_none() && !is_button {
+            // A node holding nothing but text is the extension's label, and
+            // text contributes no accessibility node of its own — so a status
+            // bar of spans reaches a reader as its buttons and nothing else.
+            // Only leaf text nodes are named: a container with element children
+            // would repeat everything its children already say.
+            let text = node
+                .children
+                .iter()
+                .all(|child| matches!(child, VDomChild::Text(_)))
+                .then(|| accessible_name(node))
+                .flatten();
+            if let Some(text) = text {
+                let element = self.style_and_fill(div().id(self.element_id(node, path)), node, path, cx);
+                return element
+                    .role(Role::Label)
+                    .aria_label(SharedString::from(text))
+                    .into_any_element();
+            }
             let element = self.style_and_fill(div(), node, path, cx);
             return element.into_any_element();
         }
