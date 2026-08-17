@@ -2822,9 +2822,9 @@ impl Pane {
         let read_only_toggle = |toggleable: bool| {
             IconButton::new("toggle_read_only", IconName::FileLock)
                 .aria_label(if toggleable {
-                    "Locked file, unlock"
+                    "Unlock File"
                 } else {
-                    "Locked file"
+                    "Locked File"
                 })
                 .size(ButtonSize::None)
                 .shape(IconButtonShape::Square)

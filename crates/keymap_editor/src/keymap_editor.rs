@@ -1170,7 +1170,7 @@ impl KeymapEditor {
                     }))
             } else if self.search_mode.exact_match() {
                 base_button_style(index, IconName::Info)
-                    .aria_label("This binding is overridden")
+                    .aria_label("Edit this binding")
                     .tooltip(|_window, cx| {
                         Tooltip::with_meta(
                             "Edit this binding",

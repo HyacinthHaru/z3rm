@@ -606,6 +606,11 @@ impl Render for KeystrokeInput {
                         if is_recording {
                             this.child(
                                 IconButton::new("stop-record-btn", IconName::Stop)
+                                    .aria_label(if self.search {
+                                        "Stop Searching"
+                                    } else {
+                                        "Stop Recording"
+                                    })
                                     .shape(IconButtonShape::Square)
                                     .map(|this| {
                                         this.tooltip(Tooltip::for_action_title(
@@ -625,6 +630,11 @@ impl Render for KeystrokeInput {
                         } else {
                             this.child(
                                 IconButton::new("record-btn", record_icon)
+                                    .aria_label(if self.search {
+                                        "Start Searching"
+                                    } else {
+                                        "Start Recording"
+                                    })
                                     .shape(IconButtonShape::Square)
                                     .map(|this| {
                                         this.tooltip(Tooltip::for_action_title(
@@ -647,6 +657,7 @@ impl Render for KeystrokeInput {
                     .when(is_recording, |this| {
                         this.child(
                             IconButton::new("clear-btn", IconName::Backspace)
+                                .aria_label("Clear Keystrokes")
                                 .shape(IconButtonShape::Square)
                                 .tooltip(move |_, cx| {
                                     Tooltip::with_meta(

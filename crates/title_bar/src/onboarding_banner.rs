@@ -123,6 +123,12 @@ impl Render for OnboardingBanner {
         }
 
         let border_color = cx.theme().colors().editor_foreground.opacity(0.3);
+        // `ButtonLike` takes its children as opaque elements, so unlike `Button`
+        // it cannot name itself from the labels it is showing.
+        let banner_label: SharedString = match self.details.subtitle.as_ref() {
+            Some(subtitle) => format!("{subtitle} {}", self.details.label).into(),
+            None => self.details.label.clone(),
+        };
         let banner = h_flex()
             .rounded_sm()
             .border_1()
@@ -130,6 +136,7 @@ impl Render for OnboardingBanner {
             .occlude()
             .child(
                 ButtonLike::new("try-a-feature")
+                    .aria_label(banner_label)
                     .child(
                         h_flex()
                             .h_full()
@@ -157,7 +164,7 @@ impl Render for OnboardingBanner {
             .child(
                 div().border_l_1().border_color(border_color).child(
                     IconButton::new("close", IconName::Close)
-                .aria_label("Dismiss")
+                        .aria_label("Close Announcement Banner")
                         .icon_size(IconSize::Indicator)
                         .on_click(cx.listener(|this, _, _window, cx| {
                             telemetry::event!("Banner Dismissed", source = this.source);

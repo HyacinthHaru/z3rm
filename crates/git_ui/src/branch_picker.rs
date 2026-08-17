@@ -1253,6 +1253,7 @@ impl PickerDelegate for BranchListDelegate {
                                     }))
                                     .trigger(
                                         IconButton::new("branch-filter", IconName::ListFilter)
+                                            .aria_label("Filter branches")
                                             .toggle_state(branch_filter != BranchFilter::All)
                                             .when(branch_filter != BranchFilter::All, |this| {
                                                 this.indicator(Indicator::dot().color(Color::Info))

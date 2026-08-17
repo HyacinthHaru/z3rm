@@ -836,6 +836,12 @@ pub(crate) fn render_buffer_header(
                                 path_header
                                     .child(
                                         ButtonLike::new("filename-button")
+                                            // The tooltip is the only place the
+                                            // action is written down, and a
+                                            // tooltip is not an accessible
+                                            // description, so the name carries
+                                            // both.
+                                            .aria_label(format!("Open {filename}"))
                                             .when(ItemSettings::get_global(cx).file_icons, |this| {
                                                 let path = std::path::Path::new(filename.as_str());
                                                 let icon = FileIcons::get_icon(path, cx)

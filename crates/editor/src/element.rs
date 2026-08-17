@@ -2645,6 +2645,7 @@ impl EditorElement {
                 };
 
                 let toggle = IconButton::new(("expand", ix), icon_name)
+                    .aria_label("Expand Excerpt")
                     .icon_color(Color::Custom(cx.theme().colors().editor_line_number))
                     .icon_size(IconSize::Custom(rems(editor_font_size / window.rem_size())))
                     .width(width)
