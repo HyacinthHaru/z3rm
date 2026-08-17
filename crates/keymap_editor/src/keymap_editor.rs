@@ -4146,12 +4146,20 @@ mod tests {
             !rows.is_empty(),
             "the visible bindings must be reported as rows: {json}"
         );
-        // "Open Keymap, alt-cmd-shift-c, Editor" — what it does, what presses
-        // it, and where it applies.
-        assert!(
-            rows.iter().all(|label| label.contains(", ")),
-            "a row has to say what it binds and where: {rows:?}"
-        );
+        // A row reads "zed: open keymap, Command-Option-Shift-C, Editor" — the
+        // action, what presses it, and where it applies. The context is absent
+        // for a binding that has none, and the keystroke is the word "Unbound"
+        // when there is none, so what every row shares is the action and one of
+        // those two, never the action alone.
+        for row in &rows {
+            let (action, rest) = row
+                .split_once(", ")
+                .unwrap_or_else(|| panic!("a row has to say what it binds: {row:?}"));
+            assert!(
+                !action.is_empty() && !rest.is_empty(),
+                "a row must not name an action and then trail off: {row:?}"
+            );
+        }
 
         let current = tree["active_descendant_focus"]
             .as_str()
@@ -4159,6 +4167,13 @@ mod tests {
             .unwrap_or_else(|| panic!("the table must point at the row it highlights: {json}"));
         assert_eq!(current["aria"]["row_index"].as_u64(), Some(1));
         assert_eq!(current["aria"]["selected"].as_bool(), Some(true));
+        // The concrete shape the loop above can only approximate, on the one
+        // row this test controls.
+        assert_eq!(
+            current["aria"]["label"].as_str(),
+            Some("zed: open keymap, Command-Option-Shift-C, Editor"),
+            "the highlighted row says the action, the keystroke and the context"
+        );
     }
 
     fn visible_rows_for_action(editor: &KeymapEditor, action_name: &str) -> Vec<usize> {
