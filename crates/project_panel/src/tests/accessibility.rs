@@ -131,6 +131,7 @@ async fn a_modified_file_says_it_is_modified(cx: &mut gpui::TestAppContext) {
         "/workspace",
         json!({
             ".git": {},
+            "src": { "nested.rs": "changed" },
             "edited.rs": "changed",
             "untouched.rs": "same",
         }),
@@ -141,6 +142,7 @@ async fn a_modified_file_says_it_is_modified(cx: &mut gpui::TestAppContext) {
         &[
             ("edited.rs", "original".into()),
             ("untouched.rs", "same".into()),
+            ("src/nested.rs", "original".into()),
         ],
     );
 
@@ -175,12 +177,18 @@ async fn a_modified_file_says_it_is_modified(cx: &mut gpui::TestAppContext) {
         .values()
         .filter(|node| node["aria"]["role"] == "TreeItem")
         .filter_map(|node| node["aria"]["label"].as_str())
-        .filter(|label| label.starts_with("edited.rs") || label.starts_with("untouched.rs"))
+        .filter(|label| {
+            label.starts_with("edited.rs")
+                || label.starts_with("untouched.rs")
+                || label.starts_with("src")
+        })
         .collect();
     rows.sort();
     assert_eq!(
         rows,
-        vec!["edited.rs, modified", "untouched.rs"],
+        // A folder's summary is about what is inside it: the dot beside a
+        // folder does not mean the folder itself was modified.
+        vec!["edited.rs, modified", "src, contains changes", "untouched.rs"],
         "the colour beside the name is the only other thing that says this"
     );
 }

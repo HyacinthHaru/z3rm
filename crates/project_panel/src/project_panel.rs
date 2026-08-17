@@ -5499,8 +5499,15 @@ impl ProjectPanel {
         let announced_name = {
             let mut name = details.filename.clone().to_string();
             if let Some((_, status, _)) = git_status_indicator(details.git_status) {
-                name.push_str(", ");
-                name.push_str(status);
+                // A directory's summary is about what is inside it — the dot
+                // beside a folder means "something in here changed", not that
+                // the folder itself was modified.
+                if kind.is_dir() {
+                    name.push_str(", contains changes");
+                } else {
+                    name.push_str(", ");
+                    name.push_str(status);
+                }
             } else if details.is_ignored {
                 name.push_str(", ignored");
             }

@@ -499,6 +499,23 @@ async fn test_a_tab_says_it_has_unsaved_changes(cx: &mut TestAppContext) {
         vec!["edited, unsaved changes", "saved"],
         "the dot beside the name is the only other thing that says this"
     );
+
+    // One close button per tab, so a shared name would be the same word
+    // repeated across the bar with nothing to tell them apart.
+    let mut close_buttons: Vec<&str> = tree["nodes"]
+        .as_object()
+        .expect("the dump lists nodes")
+        .values()
+        .filter(|node| node["aria"]["role"] == "Button")
+        .filter_map(|node| node["aria"]["label"].as_str())
+        .filter(|label| label.starts_with("Close Tab"))
+        .collect();
+    close_buttons.sort();
+    assert_eq!(
+        close_buttons,
+        vec!["Close Tab: edited", "Close Tab: saved"],
+        "each close button says which tab it closes"
+    );
 }
 
 #[gpui::test]

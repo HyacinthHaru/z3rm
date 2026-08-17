@@ -2853,6 +2853,9 @@ impl Pane {
         let has_file_icon = icon.is_some();
 
         let capability = item.capability(cx);
+        // Every tab has a close button, so "Close Tab" on its own is the same
+        // name repeated across the whole bar.
+        let tab_name = item.tab_content_text(detail, cx);
         let tab = Tab::new(ix)
             // `tab_content` renders arbitrary elements, so the announced name
             // comes from the item's own text rather than the rendered tab, and
@@ -2986,7 +2989,7 @@ impl Pane {
                             .detach_and_log_err(cx);
                     }))
                 }
-                .aria_label(end_slot_tooltip_text)
+                .aria_label(format!("{end_slot_tooltip_text}: {tab_name}"))
                 .map(|this| {
                     if is_active {
                         let focus_handle = focus_handle.clone();
