@@ -12843,6 +12843,7 @@ impl PromptEditor {
     fn render_close_button(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let focus_handle = self.prompt.focus_handle(cx);
         IconButton::new("cancel", IconName::Close)
+            .aria_label("Cancel")
             .icon_color(Color::Muted)
             .shape(IconButtonShape::Square)
             .tooltip(move |_window, cx| {
@@ -12856,6 +12857,7 @@ impl PromptEditor {
     fn render_confirm_button(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let focus_handle = self.prompt.focus_handle(cx);
         IconButton::new("confirm", IconName::Return)
+            .aria_label("Confirm")
             .icon_color(Color::Muted)
             .shape(IconButtonShape::Square)
             .tooltip(move |_window, cx| {

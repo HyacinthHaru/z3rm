@@ -301,6 +301,9 @@ mod tests {
             .expect("the harness window is still open")
             .expect("activation makes the debug tree available");
         let tree: serde_json::Value = serde_json::from_str(&json).expect("the dump is valid JSON");
+        gpui::a11y_checks::assert_interactive_nodes_are_named(&tree, "alert modal");
+        gpui::a11y_checks::assert_no_role_was_discarded(&tree, "alert modal");
+        gpui::a11y_checks::assert_roles_are_contained(&tree, "alert modal");
 
         assert_eq!(
             tree["frame"]["focus_without_node"].as_str(),

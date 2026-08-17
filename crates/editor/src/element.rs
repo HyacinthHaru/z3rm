@@ -12326,6 +12326,9 @@ mod tests {
             .expect("the editor window is still open")
             .expect("activation makes the debug tree available");
         let tree: serde_json::Value = serde_json::from_str(&json).expect("the dump is valid JSON");
+        gpui::a11y_checks::assert_interactive_nodes_are_named(&tree, "editor");
+        gpui::a11y_checks::assert_no_role_was_discarded(&tree, "editor");
+        gpui::a11y_checks::assert_roles_are_contained(&tree, "editor");
         let nodes = tree["nodes"].as_object().expect("the dump lists nodes");
 
         let input = nodes
@@ -12376,6 +12379,9 @@ mod tests {
             .expect("the editor window is still open")
             .expect("activation makes the debug tree available");
         let tree: serde_json::Value = serde_json::from_str(&json).expect("the dump is valid JSON");
+        gpui::a11y_checks::assert_interactive_nodes_are_named(&tree, "editor");
+        gpui::a11y_checks::assert_no_role_was_discarded(&tree, "editor");
+        gpui::a11y_checks::assert_roles_are_contained(&tree, "editor");
 
         gpui::a11y_checks::assert_focus_reached_the_tree(&tree, "inline prompt");
     }
@@ -12409,6 +12415,9 @@ mod tests {
             .expect("the editor window is still open")
             .expect("activation makes the debug tree available");
         let tree: serde_json::Value = serde_json::from_str(&json).expect("the dump is valid JSON");
+        gpui::a11y_checks::assert_interactive_nodes_are_named(&tree, "editor");
+        gpui::a11y_checks::assert_no_role_was_discarded(&tree, "editor");
+        gpui::a11y_checks::assert_roles_are_contained(&tree, "editor");
 
         assert!(
             tree["nodes"]
