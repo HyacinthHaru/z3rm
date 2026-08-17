@@ -1289,10 +1289,19 @@ impl PickerDelegate for BranchListDelegate {
         }
     }
 
-    /// Rows are announced by the branch or name they show. Without this every
-    /// row in the list is a bare "option".
+    /// Named the way each row is drawn. `Entry::name` returns the bare name for
+    /// the create-new rows, which would announce "Create branch main" and
+    /// "switch to main" identically — the difference being the whole point of
+    /// those rows.
     fn match_label(&self, ix: usize, _cx: &App) -> Option<SharedString> {
-        Some(SharedString::from(self.matches.get(ix)?.name().to_string()))
+        Some(match self.matches.get(ix)? {
+            Entry::Branch { branch, .. } => SharedString::from(branch.name().to_string()),
+            Entry::NewUrl { .. } => SharedString::new_static("Create Remote Repository"),
+            Entry::NewBranch { name } => SharedString::from(format!("Create Branch: {name}")),
+            Entry::NewRemoteName { name, .. } => {
+                SharedString::from(format!("Create Remote: {name}"))
+            }
+        })
     }
 
     fn match_count(&self) -> usize {
