@@ -1713,6 +1713,30 @@ impl GitGraph {
         self.context_menu.is_some()
     }
 
+    /// What a row says about itself. Every cell holds a label, and a label
+    /// contributes no accessibility node, so this is the only thing a reader
+    /// has to go on when moving through the history.
+    fn row_announcement(&self, index: usize, cx: &App) -> Option<SharedString> {
+        let commit = self.graph_data.commits.get(index)?;
+        let short_sha = commit.data.sha.display_short();
+        let data = self
+            .get_repository(cx)
+            .and_then(|repository| repository.read(cx).cached_commit_data(&commit.data.sha).cloned());
+        let Some(CommitDataState::Loaded(data)) = data else {
+            // The same wording the cell shows while the fetch is in flight.
+            return Some(format!("Loading…, {short_sha}").into());
+        };
+        Some(
+            format!(
+                "{}, {}, {}, {short_sha}",
+                data.subject,
+                data.author_name,
+                format_timestamp(data.commit_timestamp)
+            )
+            .into(),
+        )
+    }
+
     /// Checks whether a ref name from git's `%D` decoration
     ///  format refers to the currently checked-out branch.
     fn is_head_ref(ref_name: &str, head_branch_name: &Option<SharedString>) -> bool {
@@ -2786,6 +2810,7 @@ impl GitGraph {
                     .child({
                         let focus_handle = self.focus_handle.clone();
                         IconButton::new("git-graph-search-prev", IconName::ChevronLeft)
+                            .aria_label("Select Previous Match")
                             .shape(ui::IconButtonShape::Square)
                             .icon_size(IconSize::Small)
                             .tooltip(move |_, cx| {
@@ -2809,6 +2834,7 @@ impl GitGraph {
                     .child({
                         let focus_handle = self.focus_handle.clone();
                         IconButton::new("git-graph-search-next", IconName::ChevronRight)
+                            .aria_label("Select Next Match")
                             .shape(ui::IconButtonShape::Square)
                             .icon_size(IconSize::Small)
                             .tooltip(move |_, cx| {
@@ -4070,6 +4096,7 @@ impl Render for GitGraph {
                                 }));
 
                             let commits_table = Table::new(4)
+                                .aria_label("Commits")
                                 .interactable(&self.table_interaction_state)
                                 .hide_row_borders()
                                 .hide_row_hover()
@@ -4094,7 +4121,18 @@ impl Render for GitGraph {
                                         cx.theme().colors().element_hover
                                     };
 
+                                    let announced = weak
+                                        .read_with(cx, |this, cx| this.row_announcement(index, cx))
+                                        .ok()
+                                        .flatten();
+
                                     row.h(row_height)
+                                        .role(gpui::Role::Row)
+                                        .aria_row_index(index + 1)
+                                        .aria_selected(is_selected)
+                                        .when_some(announced, |row, announced| {
+                                            row.aria_label(announced)
+                                        })
                                         .cursor_pointer()
                                         .when(is_selected || is_context_menu_target, |row| {
                                             row.bg(selected_bg)
@@ -4227,6 +4265,11 @@ impl Render for GitGraph {
 
         div()
             .key_context("GitGraph")
+            // A focused element with no id and no role produces no node, so
+            // opening the graph announced the whole window instead of it.
+            .id("git-graph")
+            .role(gpui::Role::Group)
+            .aria_label("Commit graph")
             .track_focus(&self.focus_handle)
             .size_full()
             .bg(cx.theme().colors().editor_background)
@@ -6699,6 +6742,161 @@ mod tests {
                 computed_row_height, measured_item_height,
             );
         });
+    }
+
+    /// Every cell in the commit table holds a label, and a label contributes no
+    /// accessibility node, so the history announced nothing at all: no table,
+    /// no rows, and no way to hear what any commit was.
+    #[gpui::test]
+    async fn the_commit_table_names_its_rows(cx: &mut TestAppContext) {
+        init_test(cx);
+
+        let fs = FakeFs::new(cx.executor());
+        fs.insert_tree(
+            Path::new("/project"),
+            serde_json::json!({
+                ".git": {},
+                "file.txt": "content",
+            }),
+        )
+        .await;
+
+        let head_sha = Oid::from_bytes(&[7; 20]).unwrap();
+        let parent_sha = Oid::from_bytes(&[8; 20]).unwrap();
+        fs.set_graph_commits(
+            Path::new("/project/.git"),
+            vec![
+                Arc::new(InitialGraphCommitData {
+                    sha: head_sha,
+                    parents: smallvec![parent_sha],
+                    ref_names: vec![],
+                }),
+                Arc::new(InitialGraphCommitData {
+                    sha: parent_sha,
+                    parents: smallvec![],
+                    ref_names: vec![],
+                }),
+            ],
+        );
+        fs.set_commit_data(
+            Path::new("/project/.git"),
+            [
+                (
+                    CommitData {
+                        sha: head_sha,
+                        parents: smallvec![parent_sha],
+                        author_name: "Ada".into(),
+                        author_email: "ada@example.com".into(),
+                        commit_timestamp: 2,
+                        subject: "Name the commit rows".into(),
+                        message: "Name the commit rows".into(),
+                    },
+                    false,
+                ),
+                (
+                    CommitData {
+                        sha: parent_sha,
+                        parents: smallvec![],
+                        author_name: "Ada".into(),
+                        author_email: "ada@example.com".into(),
+                        commit_timestamp: 1,
+                        subject: "Add the graph".into(),
+                        message: "Add the graph".into(),
+                    },
+                    false,
+                ),
+            ],
+        );
+
+        let project = Project::test(fs.clone(), [Path::new("/project")], cx).await;
+        cx.run_until_parked();
+
+        let repository = project.read_with(cx, |project, cx| {
+            project
+                .active_repository(cx)
+                .expect("should have a repository")
+        });
+
+        let (multi_workspace, cx) = cx.add_window_view(|window, cx| {
+            workspace::MultiWorkspace::test_new(project.clone(), window, cx)
+        });
+        let workspace = multi_workspace.read_with(&*cx, |multi, _| multi.workspace().clone());
+
+        let git_graph = cx.new_window_entity(|window, cx| {
+            GitGraph::new(
+                repository.read(cx).id,
+                project.read(cx).git_store().clone(),
+                workspace.downgrade(),
+                None,
+                window,
+                cx,
+            )
+        });
+        cx.run_until_parked();
+
+        // Drawn only as an item in a pane; built on its own it never reaches a
+        // frame, so the tree would be empty for reasons that have nothing to do
+        // with the table.
+        workspace.update_in(cx, |workspace, window, cx| {
+            workspace.add_item_to_active_pane(Box::new(git_graph.clone()), None, true, window, cx);
+        });
+        cx.run_until_parked();
+
+        cx.activate_a11y(cx.window_handle());
+        let read_rows = |cx: &mut gpui::VisualTestContext| {
+            let json = cx
+                .update(|window, cx| {
+                    window.draw(cx).clear(cx);
+                    window.debug_a11y_tree_json()
+                })
+                .expect("activation makes the debug tree available");
+            let tree: serde_json::Value =
+                serde_json::from_str(&json).expect("the dump is valid JSON");
+
+            gpui::a11y_checks::assert_interactive_nodes_are_named(&tree, "git graph");
+            gpui::a11y_checks::assert_no_role_was_discarded(&tree, "git graph");
+            gpui::a11y_checks::assert_roles_are_contained(&tree, "git graph");
+            gpui::a11y_checks::assert_focus_reached_the_tree(&tree, "git graph");
+            gpui::a11y_checks::assert_click_targets_are_reachable(&tree, "git graph");
+            gpui::a11y_checks::assert_landmarks_are_distinguishable(&tree, "git graph");
+
+            let nodes = tree["nodes"].as_object().expect("the dump lists nodes");
+            let table_named = nodes
+                .values()
+                .any(|node| node["aria"]["role"] == "Table" && node["aria"]["label"] == "Commits");
+            let rows: Vec<String> = nodes
+                .values()
+                .filter(|node| node["aria"]["role"] == "Row")
+                .filter_map(|node| node["aria"]["label"].as_str().map(str::to_string))
+                .collect();
+            (table_named, rows)
+        };
+
+        // Commit subjects arrive asynchronously, and a row says "Loading…"
+        // until they do — which is what the cell shows too.
+        let mut loaded = Vec::new();
+        let mut last_seen = Vec::new();
+        let mut table_named = false;
+        for _ in 0..20 {
+            let (named, rows) = read_rows(cx);
+            table_named |= named;
+            last_seen = rows.clone();
+            if !rows.is_empty() && rows.iter().all(|row| !row.starts_with("Loading…")) {
+                loaded = rows;
+                break;
+            }
+            cx.run_until_parked();
+        }
+
+        assert!(table_named, "the history has to be reported as a table");
+        assert!(
+            !loaded.is_empty(),
+            "the visible commits have to be reported as rows, last seen: {last_seen:?}"
+        );
+        assert!(
+            loaded.iter().all(|row| row.matches(", ").count() >= 3),
+            "a row says its subject, author, date and short sha: {loaded:?}"
+        );
     }
 
     #[gpui::test]

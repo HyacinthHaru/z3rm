@@ -6493,6 +6493,13 @@ impl Repository {
         Ok(())
     }
 
+    /// Commit data already in the cache, without starting a fetch for it.
+    /// Callers that only describe what is on screen — an accessible name for a
+    /// row, say — must not drive loading as a side effect of being read.
+    pub fn cached_commit_data(&self, sha: &Oid) -> Option<&CommitDataState> {
+        self.commit_data.get(sha)
+    }
+
     pub fn fetch_commit_data(
         &mut self,
         sha: Oid,
