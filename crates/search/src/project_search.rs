@@ -5768,6 +5768,70 @@ pub mod tests {
         });
     }
 
+    /// Search results are a multibuffer: one header per file, from all over the
+    /// project. The header names itself with the file name alone, so two files
+    /// called `main.rs` give a reader two headers it cannot tell apart — and
+    /// the directory that separates them is on screen right beside each one,
+    /// as a plain label, which is not a node.
+    #[gpui::test]
+    async fn two_files_with_one_name_get_headers_that_differ(cx: &mut TestAppContext) {
+        init_test(cx);
+
+        let fs = FakeFs::new(cx.background_executor.clone());
+        fs.insert_tree(
+            path!("/dir"),
+            json!({
+                "app": { "main.rs": "const NEEDLE: usize = 1;" },
+                "tests": { "main.rs": "const NEEDLE: usize = 2;" },
+            }),
+        )
+        .await;
+        let project = Project::test(fs.clone(), [path!("/dir").as_ref()], cx).await;
+        let window =
+            cx.add_window(|window, cx| MultiWorkspace::test_new(project.clone(), window, cx));
+        let workspace = window
+            .read_with(cx, |mw, _| mw.workspace().clone())
+            .unwrap();
+        let search = cx.new(|cx| ProjectSearch::new(project, cx));
+        let search_view = cx.add_window(|window, cx| {
+            ProjectSearchView::new(workspace.downgrade(), search, window, cx, None)
+        });
+
+        perform_search(search_view, "NEEDLE", cx);
+
+        cx.activate_a11y(search_view.into());
+        let json = cx
+            .update_window(search_view.into(), |_, window, cx| {
+                window.draw(cx).clear(cx);
+                window.debug_a11y_tree_json()
+            })
+            .unwrap()
+            .expect("activation makes the debug tree available");
+        let tree: serde_json::Value = serde_json::from_str(&json).expect("the dump is valid JSON");
+        gpui::a11y_checks::assert_interactive_nodes_are_named(&tree, "search results");
+        gpui::a11y_checks::assert_names_are_distinguishable(&tree, "search results");
+
+        let mut headers: Vec<&str> = tree["nodes"]
+            .as_object()
+            .expect("the dump lists nodes")
+            .values()
+            .filter_map(|node| node["aria"]["label"].as_str())
+            .filter(|label| label.contains("main.rs"))
+            .collect();
+        headers.sort_unstable();
+        headers.dedup();
+        assert_eq!(
+            headers,
+            vec![
+                "Fold app/main.rs",
+                "Fold tests/main.rs",
+                "Open app/main.rs",
+                "Open tests/main.rs",
+            ],
+            "every control in a header has to say which file it acts on"
+        );
+    }
+
     fn perform_search(
         search_view: WindowHandle<ProjectSearchView>,
         text: impl Into<Arc<str>>,
