@@ -64,7 +64,14 @@ impl PickerPrompt {
         }
     }
 }
-impl ModalView for PickerPrompt {}
+impl ModalView for PickerPrompt {
+    fn a11y_name(&self, cx: &App) -> Option<SharedString> {
+        // The prompt is the only thing that says what is being asked; it is
+        // also the placeholder, so a reader repeats it, which is still better
+        // than opening a dialog with no name at all.
+        Some(self.picker.read(cx).delegate.prompt.to_string().into())
+    }
+}
 impl EventEmitter<DismissEvent> for PickerPrompt {}
 
 impl Focusable for PickerPrompt {

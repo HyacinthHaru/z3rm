@@ -231,8 +231,12 @@ pub mod a11y_checks {
     /// node with one of these and no name is announced as a bare "button" or
     /// "tree item".
     pub const ROLES_NEEDING_A_NAME: &[&str] = &[
+        // A dialog is announced the moment it opens, before the user can
+        // explore it, so an unnamed one is "dialog" and nothing else.
+        "AlertDialog",
         "Button",
         "CheckBox",
+        "Dialog",
         "ComboBox",
         "Link",
         "ListBoxOption",
