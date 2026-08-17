@@ -258,6 +258,9 @@ pub mod a11y_checks {
     /// containment, so an orphaned option or tab loses all of it.
     pub const ROLE_REQUIRES_CONTAINER: &[(&str, &str)] = &[
         ("ListBoxOption", "ListBox"),
+        // A row outside a table is a row of nothing: no column headers to
+        // relate its cells to, and no "row 3 of 40" to place it in.
+        ("Row", "Table"),
         ("MenuItem", "Menu"),
         ("MenuItemCheckBox", "Menu"),
         ("Tab", "TabList"),
