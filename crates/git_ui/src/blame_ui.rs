@@ -172,6 +172,14 @@ impl BlameRenderer for GitBlameRenderer {
                 .child(
                     h_flex()
                         .id(("blame", ix))
+                        // Clickable — it opens the commit — and built out of
+                        // bare strings, so without a role and a name the whole
+                        // annotation is absent from the tree: no sha, no
+                        // author, and no way to open it without a mouse.
+                        .role(gpui::Role::Button)
+                        .aria_label(format!(
+                            "Blame: {short_commit_id}, {author_name}, {relative_timestamp}"
+                        ))
                         .w_full()
                         .gap_2()
                         .justify_between()
