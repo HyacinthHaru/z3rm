@@ -3214,6 +3214,105 @@ mod tests {
     /// together: a name that is unique within a panel can still collide with a
     /// name in the panel beside it, and two docks are two landmarks.
     #[gpui::test]
+    /// `workspace` pins where focus goes when a tab closes, but it does so
+    /// with a `TestItem`, which is a focus handle and nothing else. A real
+    /// editor owns its own focus, its own element, and the accessibility node
+    /// that focus has to land on — so the plumbing being right there says
+    /// nothing about it being right here.
+    #[gpui::test]
+    async fn closing_a_real_editor_leaves_focus_in_the_tree(cx: &mut gpui::TestAppContext) {
+        use fs::FakeFs;
+        use gpui::VisualTestContext;
+        use project::Project;
+        use serde_json::json;
+        use workspace::MultiWorkspace;
+
+        zlog::init_test();
+        cx.update(|cx| {
+            let settings_store = settings::SettingsStore::test(cx);
+            cx.set_global(settings_store);
+            theme_settings::init(theme::LoadThemes::JustBase, cx);
+            editor::init(cx);
+        });
+
+        let fs = FakeFs::new(cx.executor());
+        fs.insert_tree("/project", json!({ "main.rs": "fn main() {}\n" }))
+            .await;
+        let project = Project::test(fs, ["/project".as_ref()], cx).await;
+        let window =
+            cx.add_window(|window, cx| MultiWorkspace::test_new(project.clone(), window, cx));
+        let workspace = window
+            .read_with(cx, |mw, _| mw.workspace().clone())
+            .unwrap();
+        let mut cx = VisualTestContext::from_window(window.into(), cx);
+
+        workspace.update_in(&mut cx, |workspace, window, cx| {
+            let project = workspace.project().clone();
+            for text in ["fn one() {}\n", "fn two() {}\n"] {
+                let buffer = cx.new(|cx| language::Buffer::local(text, cx));
+                let editor = cx.new(|cx| {
+                    editor::Editor::for_buffer(buffer, Some(project.clone()), window, cx)
+                });
+                workspace.add_item_to_active_pane(Box::new(editor), None, true, window, cx);
+            }
+        });
+        cx.run_until_parked();
+
+        cx.activate_a11y(cx.window_handle());
+        let focus_reaches_tree = |cx: &mut VisualTestContext| {
+            let json = cx
+                .update(|window, cx| {
+                    window.draw(cx).clear(cx);
+                    window.debug_a11y_tree_json()
+                })
+                .expect("activation makes the debug tree available");
+            let tree: serde_json::Value =
+                serde_json::from_str(&json).expect("the dump is valid JSON");
+            gpui::a11y_checks::assert_focus_reached_the_tree(&tree, "closing a real editor");
+            let role = tree["gpui_focus"]
+                .as_str()
+                .and_then(|id| tree["nodes"].get(id))
+                .and_then(|node| node["aria"]["role"].as_str())
+                .map(str::to_string);
+            (role, tree)
+        };
+
+        let (before, _) = focus_reaches_tree(&mut cx);
+        assert!(
+            before.is_some(),
+            "the open editor holds focus and is a node before anything closes"
+        );
+
+        let pane = workspace.read_with(&cx, |workspace, _| workspace.active_pane().clone());
+        pane.update_in(&mut cx, |pane, window, cx| {
+            pane.close_active_item(&workspace::CloseActiveItem::default(), window, cx)
+                .detach();
+        });
+        cx.run_until_parked();
+
+        let (after, tree) = focus_reaches_tree(&mut cx);
+        assert!(
+            after.is_some(),
+            "focus after closing a real editor has to be on a node: {}",
+            serde_json::to_string(&tree["frame"]).unwrap_or_default()
+        );
+
+        // Closing the last one is the case with no obvious answer: there is no
+        // next tab to fall back to, and an empty pane is the only thing left.
+        pane.update_in(&mut cx, |pane, window, cx| {
+            pane.close_active_item(&workspace::CloseActiveItem::default(), window, cx)
+                .detach();
+        });
+        cx.run_until_parked();
+
+        let (empty, tree) = focus_reaches_tree(&mut cx);
+        assert!(
+            empty.is_some(),
+            "closing the last editor must not leave focus without a node: {}",
+            serde_json::to_string(&tree["frame"]).unwrap_or_default()
+        );
+    }
+
     async fn two_panels_open_at_once_stay_distinguishable(cx: &mut gpui::TestAppContext) {
         use fs::FakeFs;
         use git_ui::git_panel::GitPanel;
