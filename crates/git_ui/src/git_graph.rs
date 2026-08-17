@@ -3124,6 +3124,9 @@ impl GitGraph {
 
                                 this.child(
                                     Button::new("author-email-copy", author_email.clone())
+                                        // The address alone never says that
+                                        // pressing it copies anything.
+                                        .aria_label(format!("Copy email {author_email}"))
                                         .start_icon(
                                             Icon::new(icon).size(IconSize::Small).color(icon_color),
                                         )
@@ -3171,6 +3174,14 @@ impl GitGraph {
                                 };
 
                                 Button::new("sha-button", &full_sha)
+                                    // The visible label is the whole hash,
+                                    // truncated on screen. As a name it is read
+                                    // out digit by digit — forty of them — and
+                                    // never says what pressing it does.
+                                    .aria_label(format!(
+                                        "Copy commit SHA {}",
+                                        full_sha.chars().take(7).collect::<String>()
+                                    ))
                                     .start_icon(
                                         Icon::new(icon).size(IconSize::Small).color(icon_color),
                                     )
@@ -6904,6 +6915,18 @@ mod tests {
             gpui::a11y_checks::assert_active_descendant_is_honoured(&tree, "git graph");
 
             let nodes = tree["nodes"].as_object().expect("the dump lists nodes");
+            // A name that is a bare identifier is read out character by
+            // character and never says what pressing it does.
+            for label in nodes
+                .values()
+                .filter(|node| node["aria"]["role"] == "Button")
+                .filter_map(|node| node["aria"]["label"].as_str())
+            {
+                assert!(
+                    !label.chars().all(|c| c.is_ascii_hexdigit()) || label.len() < 8,
+                    "a button named only by a hash spells it out: {label:?}"
+                );
+            }
             let table_named = nodes
                 .values()
                 .any(|node| node["aria"]["role"] == "Table" && node["aria"]["label"] == "Commits");
