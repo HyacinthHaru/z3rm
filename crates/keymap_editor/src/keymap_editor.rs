@@ -2115,6 +2115,7 @@ impl Render for KeymapEditor {
             )
             .child(
                 Table::new(COLS)
+                    .aria_label("Key bindings")
                     .interactable(&self.table_interaction_state)
                     .striped()
                     .empty_table_callback({
@@ -2264,8 +2265,37 @@ impl Render for KeymapEditor {
 
                             let row_id = row_group_id(row_index);
 
+                            // Every cell holds a label, and a label is not a
+                            // node, so the row is only readable if it says what
+                            // it holds: the binding, what it runs and where.
+                            let announced = candidate_id
+                                .and_then(|candidate_id| this.keybindings.get(candidate_id))
+                                .map(|binding| {
+                                    let action = binding.action().humanized_name.clone();
+                                    let keystrokes = binding
+                                        .keystroke_text()
+                                        .cloned()
+                                        .unwrap_or_else(|| SharedString::new_static("Unbound"));
+                                    let context = binding.context().map(|context| {
+                                        context
+                                            .local_str()
+                                            .map(SharedString::from)
+                                            .unwrap_or(KeybindContextString::GLOBAL)
+                                    });
+                                    match context {
+                                        Some(context) => {
+                                            format!("{action}, {keystrokes}, {context}")
+                                        }
+                                        None => format!("{action}, {keystrokes}"),
+                                    }
+                                });
+
                             div()
                                 .id(("keymap-row-wrapper", row_index))
+                                .role(gpui::Role::Row)
+                                .aria_row_index(row_index + 1)
+                                .aria_selected(is_selected)
+                                .when_some(announced, |this, announced| this.aria_label(announced))
                                 .child(
                                     row.id(row_id.clone())
                                         .when(!is_unbound_by_unbind, |row| {
@@ -3955,7 +3985,12 @@ mod tests {
     async fn setup_keymap_editor(
         cx: &mut TestAppContext,
         keymap_content: &str,
-    ) -> (Arc<FakeFs>, Entity<KeymapEditor>, VisualTestContext) {
+    ) -> (
+        Arc<FakeFs>,
+        Entity<KeymapEditor>,
+        Entity<Workspace>,
+        VisualTestContext,
+    ) {
         cx.update(|cx| {
             let settings_store = SettingsStore::test(cx);
             cx.set_global(settings_store);
@@ -3985,7 +4020,78 @@ mod tests {
         let keymap_editor = cx
             .update(|window, cx| cx.new(|cx| KeymapEditor::new(workspace.downgrade(), window, cx)));
         cx.run_until_parked();
-        (fs, keymap_editor, cx)
+        (fs, keymap_editor, workspace, cx)
+    }
+
+    /// Every cell in the table holds a label, and a label contributes no node,
+    /// so the whole list of bindings was absent: no table, no rows, and no way
+    /// to hear what any binding runs or where it applies.
+    #[gpui::test]
+    async fn the_binding_table_names_itself_and_its_rows(cx: &mut TestAppContext) {
+        let keymap_content = r#"[
+    {
+        "context": "Editor",
+        "bindings": {
+            "alt-cmd-shift-c": "zed::OpenKeymap"
+        }
+    }
+]"#;
+        let (_fs, keymap_editor, workspace, mut cx) =
+            setup_keymap_editor(cx, keymap_content).await;
+        let cx = &mut cx;
+
+        // The editor is only drawn once it is an item in a pane; created on its
+        // own it never reaches a frame.
+        workspace.update_in(cx, |workspace, window, cx| {
+            workspace.add_item_to_active_pane(
+                Box::new(keymap_editor.clone()),
+                None,
+                true,
+                window,
+                cx,
+            );
+        });
+        cx.run_until_parked();
+
+        cx.activate_a11y(cx.window_handle());
+        let json = cx
+            .update(|window, cx| {
+                window.draw(cx).clear(cx);
+                window.debug_a11y_tree_json()
+            })
+            .expect("activation makes the debug tree available");
+        let tree: serde_json::Value = serde_json::from_str(&json).expect("the dump is valid JSON");
+        let nodes = tree["nodes"].as_object().expect("the dump lists nodes");
+
+        gpui::a11y_checks::assert_interactive_nodes_are_named(&tree, "keymap editor");
+        gpui::a11y_checks::assert_no_role_was_discarded(&tree, "keymap editor");
+        gpui::a11y_checks::assert_roles_are_contained(&tree, "keymap editor");
+        gpui::a11y_checks::assert_focus_reached_the_tree(&tree, "keymap editor");
+        gpui::a11y_checks::assert_click_targets_are_reachable(&tree, "keymap editor");
+        gpui::a11y_checks::assert_landmarks_are_distinguishable(&tree, "keymap editor");
+
+        let table = nodes
+            .values()
+            .find(|node| node["aria"]["role"] == "Table")
+            .unwrap_or_else(|| panic!("the bindings must be reported as a table: {json}"));
+        assert_eq!(table["aria"]["label"].as_str(), Some("Key bindings"));
+        assert_eq!(table["aria"]["column_count"].as_u64(), Some(COLS as u64));
+
+        let rows: Vec<&str> = nodes
+            .values()
+            .filter(|node| node["aria"]["role"] == "Row")
+            .filter_map(|node| node["aria"]["label"].as_str())
+            .collect();
+        assert!(
+            !rows.is_empty(),
+            "the visible bindings must be reported as rows: {json}"
+        );
+        // "Open Keymap, alt-cmd-shift-c, Editor" — what it does, what presses
+        // it, and where it applies.
+        assert!(
+            rows.iter().all(|label| label.contains(", ")),
+            "a row has to say what it binds and where: {rows:?}"
+        );
     }
 
     fn visible_rows_for_action(editor: &KeymapEditor, action_name: &str) -> Vec<usize> {
@@ -4015,7 +4121,7 @@ mod tests {
         }
     }
 ]"#;
-        let (fs, keymap_editor, mut cx) = setup_keymap_editor(cx, keymap_content).await;
+        let (fs, keymap_editor, _workspace, mut cx) = setup_keymap_editor(cx, keymap_content).await;
         let cx = &mut cx;
 
         let rows = keymap_editor.read_with(cx, |editor, _| {
@@ -4070,7 +4176,7 @@ mod tests {
         }
     }
 ]"#;
-        let (fs, keymap_editor, mut cx) = setup_keymap_editor(cx, keymap_content).await;
+        let (fs, keymap_editor, _workspace, mut cx) = setup_keymap_editor(cx, keymap_content).await;
         let cx = &mut cx;
 
         let rows = keymap_editor.read_with(cx, |editor, _| {
