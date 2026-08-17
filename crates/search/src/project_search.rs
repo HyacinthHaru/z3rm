@@ -628,6 +628,11 @@ impl Render for ProjectSearchView {
         if self.has_matches() {
             div()
                 .key_context(key_context)
+                // A focused root with no id and no role produces no node, so
+                // the whole window was announced instead of the results.
+                .id("project-search-results")
+                .role(gpui::Role::Group)
+                .aria_label("Search results")
                 .on_action(cx.listener(Self::open_text_finder))
                 .flex_1()
                 .size_full()
@@ -636,7 +641,7 @@ impl Render for ProjectSearchView {
         } else {
             let model = self.entity.read(cx);
 
-            let heading_text = match model.search_state {
+            let heading = match model.search_state {
                 SearchState::Running(SearchActivity::WaitingForScan) => "Loading project…",
                 SearchState::Running(SearchActivity::Searching) => "Searching…",
                 SearchState::Completed(SearchCompletion::NoResults) => "No Results",
@@ -645,7 +650,7 @@ impl Render for ProjectSearchView {
 
             let heading_text = div()
                 .justify_center()
-                .child(Label::new(heading_text).size(LabelSize::Large));
+                .child(Label::new(heading).size(LabelSize::Large));
 
             let page_content: Option<AnyElement> = match model.search_state {
                 SearchState::Idle => Some(self.landing_text_minor(cx).into_any_element()),
@@ -661,6 +666,12 @@ impl Render for ProjectSearchView {
 
             h_flex()
                 .key_context(key_context)
+                // Same as the results branch, and the heading beside it —
+                // "Searching…", "No Results" — is a label, so the state of the
+                // search only reaches a reader through this name.
+                .id("project-search-landing")
+                .role(gpui::Role::Group)
+                .aria_label(SharedString::from(format!("Project search: {heading}")))
                 .on_action(cx.listener(Self::open_text_finder))
                 .size_full()
                 .items_center()
@@ -2410,6 +2421,16 @@ impl Render for ProjectSearchBar {
             .child(
                 div()
                     .id("matches")
+                    // "3/17" is a label, and the spinner beside it is an icon,
+                    // so neither the count nor "still searching" reached the
+                    // tree. Polite: it changes while the user types.
+                    .role(gpui::Role::Status)
+                    .aria_live(gpui::accesskit::Live::Polite)
+                    .aria_label(if is_search_underway {
+                        SharedString::from(format!("Searching, {match_text}"))
+                    } else {
+                        SharedString::from(match_text.clone())
+                    })
                     .ml_2()
                     .min_w(rems_from_px(40.))
                     .child(
@@ -2616,28 +2637,37 @@ impl Render for ProjectSearchBar {
             key_context.add("in_replace");
         }
 
-        let query_error_line = search
-            .panels_with_errors
-            .get(&InputPanel::Query)
-            .map(|error| {
-                Label::new(error)
-                    .size(LabelSize::Small)
-                    .color(Color::Error)
-                    .mt_neg_1()
-                    .ml_2()
-            });
+        // Both lines are rendered whether or not there is an error in them: a
+        // live region that appears at the same moment as its message has
+        // nothing to compare against, so it announces nothing at all.
+        let error_line = |id: &'static str, error: Option<&String>| {
+            div()
+                .id(id)
+                .role(gpui::Role::Status)
+                .aria_live(gpui::accesskit::Live::Polite)
+                .when_some(error, |this, error| {
+                    this.aria_label(SharedString::from(error.clone())).child(
+                        Label::new(error.clone())
+                            .size(LabelSize::Small)
+                            .color(Color::Error)
+                            .mt_neg_1()
+                            .ml_2(),
+                    )
+                })
+        };
 
-        let filter_error_line = search
-            .panels_with_errors
-            .get(&InputPanel::Include)
-            .or_else(|| search.panels_with_errors.get(&InputPanel::Exclude))
-            .map(|error| {
-                Label::new(error)
-                    .size(LabelSize::Small)
-                    .color(Color::Error)
-                    .mt_neg_1()
-                    .ml_2()
-            });
+        let query_error_line = error_line(
+            "project-search-query-error",
+            search.panels_with_errors.get(&InputPanel::Query),
+        );
+
+        let filter_error_line = error_line(
+            "project-search-filter-error",
+            search
+                .panels_with_errors
+                .get(&InputPanel::Include)
+                .or_else(|| search.panels_with_errors.get(&InputPanel::Exclude)),
+        );
 
         v_flex()
             .gap_2()
@@ -2684,10 +2714,10 @@ impl Render for ProjectSearchBar {
             .on_action(cx.listener(Self::select_prev_match))
             .on_action(cx.listener(Self::open_text_finder))
             .child(search_line)
-            .children(query_error_line)
+            .child(query_error_line)
             .children(replace_line)
             .children(filter_line)
-            .children(filter_error_line)
+            .child(filter_error_line)
             .into_any_element()
     }
 }
@@ -3413,6 +3443,85 @@ pub mod tests {
             has_any_folded,
             "Should report folds after manually folding one buffer"
         );
+    }
+
+    /// The view tracks focus on roots with no id and no role, so opening a
+    /// search announced the whole window; the heading that says whether it is
+    /// searching, found nothing, or is waiting for a query is a label, which
+    /// contributes no node of its own.
+    #[gpui::test]
+    async fn the_project_search_says_what_state_it_is_in(cx: &mut TestAppContext) {
+        init_test(cx);
+
+        let fs = FakeFs::new(cx.background_executor.clone());
+        fs.insert_tree("/dir", json!({ "one.rs": "const ONE: usize = 1;" }))
+            .await;
+        let project = Project::test(fs.clone(), ["/dir".as_ref()], cx).await;
+        let window = cx.add_window(|window, cx| MultiWorkspace::test_new(project, window, cx));
+        let workspace = window
+            .read_with(cx, |mw, _| mw.workspace().clone())
+            .unwrap();
+        let cx = &mut VisualTestContext::from_window(window.into(), cx);
+        let search_bar = window.build_entity(cx, |_, _| ProjectSearchBar::new());
+
+        workspace.update_in(cx, move |workspace, window, cx| {
+            workspace.panes()[0].update(cx, |pane, cx| {
+                pane.toolbar()
+                    .update(cx, |toolbar, cx| toolbar.add_item(search_bar, window, cx))
+            });
+            ProjectSearchView::deploy_search(
+                workspace,
+                &workspace::DeploySearch::default(),
+                window,
+                cx,
+            )
+        });
+        cx.run_until_parked();
+
+        cx.activate_a11y(cx.window_handle());
+        let json = cx
+            .update(|window, cx| {
+                window.draw(cx).clear(cx);
+                window.debug_a11y_tree_json()
+            })
+            .expect("activation makes the debug tree available");
+        let tree: serde_json::Value = serde_json::from_str(&json).expect("the dump is valid JSON");
+        let nodes = tree["nodes"].as_object().expect("the dump lists nodes");
+
+        gpui::a11y_checks::assert_interactive_nodes_are_named(&tree, "project search");
+        gpui::a11y_checks::assert_no_role_was_discarded(&tree, "project search");
+        gpui::a11y_checks::assert_roles_are_contained(&tree, "project search");
+        gpui::a11y_checks::assert_focus_reached_the_tree(&tree, "project search");
+        gpui::a11y_checks::assert_click_targets_are_reachable(&tree, "project search");
+        gpui::a11y_checks::assert_landmarks_are_distinguishable(&tree, "project search");
+
+        let named: Vec<&str> = nodes
+            .values()
+            .filter_map(|node| node["aria"]["label"].as_str())
+            .collect();
+        assert!(
+            named.contains(&"Project search: Search All Files"),
+            "the landing state has to say it is waiting for a query: {named:?}"
+        );
+
+        // Both error lines and the match count exist with nothing in them yet:
+        // a live region created at the same moment as its message has nothing
+        // to diff against and is never announced.
+        let quiet_regions: Vec<&str> = nodes
+            .values()
+            .filter(|node| node["aria"]["live"] == "Polite")
+            .filter_map(|node| node["element_id"].as_str())
+            .collect();
+        for region in [
+            "project-search-query-error",
+            "project-search-filter-error",
+            "matches",
+        ] {
+            assert!(
+                quiet_regions.iter().any(|id| id.contains(region)),
+                "{region} has to exist before it has anything to say: {quiet_regions:?}"
+            );
+        }
     }
 
     #[perf]
