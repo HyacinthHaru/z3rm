@@ -4996,7 +4996,7 @@ impl GitPanel {
 
         SplitButton::new(
             ButtonLike::new_rounded_left("git-changes-actions-split-button-left")
-                .aria_label(text.clone())
+                .aria_label(text)
                 .layer(ElevationIndex::ModalSurface)
                 .size(ButtonSize::Compact)
                 .child(Label::new(text).size(LabelSize::Small).mr_0p5())
@@ -5391,6 +5391,14 @@ impl GitPanel {
                 .child(
                     div()
                         .id("commit-msg-hover")
+                        // Opens the commit, but nothing said so: the subject is
+                        // a label, which is not a node, and the container had
+                        // no role, so the whole line was absent from the tree.
+                        .role(gpui::Role::Button)
+                        .aria_label(SharedString::from(format!(
+                            "Most recent commit: {}",
+                            commit.subject
+                        )))
                         .cursor_pointer()
                         .px_1()
                         .rounded_sm()
@@ -5481,17 +5489,33 @@ impl GitPanel {
         let active_tab = self.active_tab;
 
         let focus_handle = self.focus_handle.clone();
+        // Two tabs, both rendered by the closure below, so the set sizes stay
+        // in one place with the children they describe.
+        const TAB_COUNT: usize = 2;
         let tab = |id: ElementId,
+                   position: usize,
                    active: bool,
                    show_changes: bool,
                    label: SharedString,
                    set_active_tab: GitPanelTab,
                    tooltip_action: Box<dyn Action>| {
             let focus_handle = focus_handle.clone();
+            let count = (show_changes && self.changes_count > 0).then_some(self.changes_count);
+            // The count is a second label beside the name, and a label is not a
+            // node, so it only reaches a reader as part of the tab's own name.
+            let announced = match count {
+                Some(count) => SharedString::from(format!("{label} ({count})")),
+                None => label.clone(),
+            };
 
             h_flex()
                 .cursor_pointer()
                 .id(id)
+                .role(gpui::Role::Tab)
+                .aria_label(announced)
+                .aria_selected(active)
+                .aria_position_in_set(position)
+                .aria_size_of_set(TAB_COUNT)
                 .h_full()
                 .py_1()
                 .gap_1()
@@ -5504,9 +5528,9 @@ impl GitPanel {
                         .border_color(cx.theme().colors().border.opacity(0.6))
                 })
                 .child(Label::new(label.clone()).when(!active, |this| this.color(Color::Muted)))
-                .when(show_changes && self.changes_count > 0, |this| {
+                .when_some(count, |this, count| {
                     this.child(
-                        Label::new(format!("({})", self.changes_count))
+                        Label::new(format!("({})", count))
                             .size(LabelSize::Small)
                             .color(Color::Muted),
                     )
@@ -5523,10 +5547,15 @@ impl GitPanel {
 
         h_flex()
             .relative()
+            // A `Tab` outside a `TabList` keeps its role and loses "1 of 2"
+            // and the arrow-key conventions that come with containment.
+            .id("git-panel-tab-bar")
+            .role(gpui::Role::TabList)
             .h(Tab::container_height(cx))
             .w_full()
             .child(tab(
                 ElementId::Name("changes-tab".into()),
+                1,
                 active_tab == GitPanelTab::Changes,
                 true,
                 "Changes".into(),
@@ -5540,6 +5569,7 @@ impl GitPanel {
             )
             .child(tab(
                 ElementId::Name("history-tab".into()),
+                2,
                 active_tab != GitPanelTab::Changes,
                 false,
                 "History".into(),
@@ -11448,6 +11478,40 @@ mod tests {
         assert!(
             rows.contains(&"tracked"),
             "every changed file needs a name of its own: {rows:?}"
+        );
+
+        // The tab bar is two clickable containers, so the checks above have
+        // nothing to fault when it is missing from the tree entirely.
+        let mut tabs: Vec<(&str, bool, u64)> = nodes
+            .values()
+            .filter(|node| node["aria"]["role"] == "Tab")
+            .map(|node| {
+                (
+                    node["aria"]["label"].as_str().unwrap_or_default(),
+                    node["aria"]["selected"].as_bool().unwrap_or(false),
+                    node["aria"]["position_in_set"].as_u64().unwrap_or_default(),
+                )
+            })
+            .collect();
+        tabs.sort_by_key(|(_, _, position)| *position);
+        let (changes_name, changes_selected, changes_position) =
+            *tabs.first().expect("the panel has a tab bar: {json}");
+        assert!(
+            changes_name.starts_with("Changes"),
+            "the first tab announces itself and its count: {tabs:?}"
+        );
+        assert!(
+            changes_selected && changes_position == 1,
+            "the open tab has to say it is the open one: {tabs:?}"
+        );
+        assert_eq!(
+            tabs.get(1).map(|(name, selected, position)| (
+                *name,
+                *selected,
+                *position
+            )),
+            Some(("History", false, 2)),
+            "both tabs have to be reachable and counted: {tabs:?}"
         );
     }
 
