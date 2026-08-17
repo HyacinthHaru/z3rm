@@ -196,6 +196,59 @@ async fn a_modified_file_says_it_is_modified(cx: &mut gpui::TestAppContext) {
     );
 }
 
+/// Renaming happens in an editor that appears inside the row, pre-filled with
+/// the current name — so it never shows a placeholder, and a single-line editor
+/// takes its name from its placeholder. Without a name of its own the field the
+/// user is typing into announces as "edit text" and nothing else.
+#[gpui::test]
+async fn the_rename_field_says_what_it_is(cx: &mut gpui::TestAppContext) {
+    project_panel_tests::init_test(cx);
+
+    let fs = FakeFs::new(cx.executor());
+    fs.insert_tree("/workspace", json!({ "edited.rs": "changed" }))
+        .await;
+    let project = Project::test(fs, ["/workspace".as_ref()], cx).await;
+    let window = cx.add_window(|window, cx| MultiWorkspace::test_new(project.clone(), window, cx));
+    let workspace = window
+        .read_with(cx, |mw, _| mw.workspace().clone())
+        .unwrap();
+    let mut cx = VisualTestContext::from_window(window.into(), cx);
+    let panel = workspace.update_in(&mut cx, ProjectPanel::new);
+    workspace.update_in(&mut cx, |workspace, window, cx| {
+        workspace.add_panel(panel.clone(), window, cx);
+        workspace.open_panel::<ProjectPanel>(window, cx);
+    });
+    cx.run_until_parked();
+
+    panel.update_in(&mut cx, |panel, window, cx| {
+        window.focus(&gpui::Focusable::focus_handle(panel, cx), cx);
+        panel.select_next(&Default::default(), window, cx);
+        panel.rename(&Default::default(), window, cx);
+    });
+    cx.run_until_parked();
+
+    cx.activate_a11y(cx.window_handle());
+    let json = cx
+        .update(|window, cx| {
+            window.draw(cx).clear(cx);
+            window.debug_a11y_tree_json()
+        })
+        .expect("activation makes the debug tree available");
+    let tree: serde_json::Value = serde_json::from_str(&json).expect("the dump is valid JSON");
+    let nodes = tree["nodes"].as_object().expect("the dump lists nodes");
+
+    gpui::a11y_checks::assert_interactive_nodes_are_named(&tree, "renaming a file");
+    gpui::a11y_checks::assert_no_role_was_discarded(&tree, "renaming a file");
+    gpui::a11y_checks::assert_focus_reached_the_tree(&tree, "renaming a file");
+
+    let focused = tree["gpui_focus"]
+        .as_str()
+        .and_then(|id| nodes.get(id))
+        .unwrap_or_else(|| panic!("the rename field holds focus: {json}"));
+    assert_eq!(focused["aria"]["role"].as_str(), Some("TextInput"));
+    assert_eq!(focused["aria"]["label"].as_str(), Some("File name"));
+}
+
 /// A panel with no worktree shows an explanation and two buttons, and it takes
 /// focus. The explanation is a plain label, which contributes no node of its
 /// own, so without a name on the container the panel announces the whole
