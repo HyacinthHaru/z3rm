@@ -1133,8 +1133,16 @@ fn semantic_chrome_vdom() -> Result<VDomNode> {
             {
                 // A plain node made clickable: an extension can call it what it
                 // likes, but it is a control and has to reach the tree as one.
+                //
+                // Marked chosen the way an extension marks a row: the class
+                // gives it a background colour, and the state has to reach a
+                // reader as well as the theme.
                 "type": "div",
-                "props": { "id": "zoom-toggle", "onClick": "z3rm.pane.zoom" },
+                "props": {
+                    "id": "zoom-toggle",
+                    "onClick": "z3rm.pane.zoom",
+                    "class": "selected"
+                },
                 "style": { "padding": "6px" },
                 "children": ["Zoom"]
             },
@@ -1170,6 +1178,18 @@ fn extension_chrome_exposes_its_controls_and_text() -> Result<()> {
         buttons,
         vec!["Zoom".to_string()],
         "a node with an onClick is a control whatever it is typed as"
+    );
+    // The same node carries `class: "selected"`. That draws a background and
+    // says nothing on its own; being the chosen one is state, and state has to
+    // reach a reader.
+    let selected: Vec<bool> = a11y_nodes_with_role(&tree, "Button")
+        .iter()
+        .filter_map(|node| node.get("aria")?.get("selected")?.as_bool())
+        .collect();
+    assert_eq!(
+        selected,
+        vec![true],
+        "an extension marking a row chosen must not say it in colour alone"
     );
 
     let labels: Vec<String> = a11y_nodes_with_role(&tree, "Label")

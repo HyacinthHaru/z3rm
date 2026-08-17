@@ -607,6 +607,13 @@ impl VDomRenderer {
         if let Some(label) = accessible_name(node) {
             element = element.aria_label(SharedString::from(label));
         }
+        // `class: "selected"` is how an extension marks the row a user is on,
+        // and `apply_classes` gives it a background colour. Colour is not
+        // information: without this the chosen row is indistinguishable from
+        // every other one, which is the whole point of marking it.
+        if is_selected_class(node) {
+            element = element.aria_selected(true);
+        }
 
         let button_focus_handle = if is_button {
             Some(
@@ -990,6 +997,21 @@ fn apply_styles<E: Styled>(mut element: E, node: &VDomNode, palette: &VDomPalett
     }
 
     apply_classes(element, node, palette)
+}
+
+/// Whether an extension marked this node as the chosen one.
+///
+/// Read separately from `apply_classes`, which turns the same class into a
+/// background colour, because the two go to different audiences.
+fn is_selected_class(node: &VDomNode) -> bool {
+    node.props
+        .get("class")
+        .and_then(|value| value.as_str())
+        .is_some_and(|classes| {
+            classes
+                .split_whitespace()
+                .any(|class| matches!(class, "selected" | "active"))
+        })
 }
 
 /// Semantic classes extensions use for state that has no inline-style
@@ -1419,6 +1441,38 @@ mod tests {
                 color: None,
             }]
         );
+    }
+
+    /// An extension marks the row a user is on with `class: "selected"`, and
+    /// the bridge turns that into a background colour. Colour reaches sighted
+    /// users; nothing reached anyone else, so the chosen row was
+    /// indistinguishable from the rest of the list.
+    #[test]
+    fn a_selected_class_reaches_the_tree_and_not_only_the_theme() {
+        for class in ["selected", "active", "dim selected", "selected emphasis"] {
+            let node = parse_vdom(&serde_json::json!({
+                "type": "div",
+                "props": { "class": class },
+            }))
+            .expect("parse");
+            assert!(
+                is_selected_class(&node),
+                "{class:?} marks the chosen row and has to say so"
+            );
+        }
+        for class in ["dim", "emphasis", "", "selectable", "inactive"] {
+            let node = parse_vdom(&serde_json::json!({
+                "type": "div",
+                "props": { "class": class },
+            }))
+            .expect("parse");
+            assert!(
+                !is_selected_class(&node),
+                "{class:?} does not mark anything as chosen"
+            );
+        }
+        let bare = parse_vdom(&serde_json::json!({ "type": "div" })).expect("parse");
+        assert!(!is_selected_class(&bare), "a node with no class is not chosen");
     }
 
     #[test]
