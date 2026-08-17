@@ -1,0 +1,13 @@
+# Controls `script/find-unnamed-controls` reports that are not defects, and why.
+#
+# Keyed by `path:function`, so moving code within a file does not churn this
+# list, while a new unnamed control in the same function still gets reported.
+#
+# A line here is a claim that the name arrives somewhere the script cannot see.
+# Check it before adding one: every entry is a place where the only thing
+# standing between a user and a control announced as "button" is this file.
+
+crates/extension_host/src/vdom_bridge.rs:render_container — the name comes from the extension's own `aria-label` prop, or from the node's text, applied further down `render_container` than a builder chain reaches.
+crates/extension_host/src/vdom_bridge.rs:render_input — same: `render_input` names the field from the extension's label or placeholder after the role is set.
+crates/keymap_editor/src/keymap_editor.rs:base_button_style — a helper returning a bare `IconButton`; all four callers add `.aria_label(row_label(...))`, which names the row's action.
+crates/workspace/src/pane.rs:render_tab — the pin and close buttons are named once for both branches after the `match` that chooses between them, as `"{end_slot_tooltip_text}: {tab_name}"`.
