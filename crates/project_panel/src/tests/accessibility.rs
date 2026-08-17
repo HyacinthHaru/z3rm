@@ -119,6 +119,72 @@ async fn the_file_tree_is_exposed_as_a_named_tree(cx: &mut gpui::TestAppContext)
     }
 }
 
+/// A modified file is shown in a different colour, with a small "M" beside it
+/// when the setting is on. Colour is not information a reader can reach and a
+/// lone "M" is not information either, so the row says the word.
+#[gpui::test]
+async fn a_modified_file_says_it_is_modified(cx: &mut gpui::TestAppContext) {
+    project_panel_tests::init_test(cx);
+
+    let fs = FakeFs::new(cx.executor());
+    fs.insert_tree(
+        "/workspace",
+        json!({
+            ".git": {},
+            "edited.rs": "changed",
+            "untouched.rs": "same",
+        }),
+    )
+    .await;
+    fs.set_head_and_index_for_repo(
+        "/workspace/.git".as_ref(),
+        &[
+            ("edited.rs", "original".into()),
+            ("untouched.rs", "same".into()),
+        ],
+    );
+
+    let project = Project::test(fs, ["/workspace".as_ref()], cx).await;
+    let window = cx.add_window(|window, cx| MultiWorkspace::test_new(project.clone(), window, cx));
+    let workspace = window
+        .read_with(cx, |mw, _| mw.workspace().clone())
+        .unwrap();
+    let mut cx = VisualTestContext::from_window(window.into(), cx);
+    let panel = workspace.update_in(&mut cx, ProjectPanel::new);
+    workspace.update_in(&mut cx, |workspace, window, cx| {
+        workspace.add_panel(panel.clone(), window, cx);
+        workspace.open_panel::<ProjectPanel>(window, cx);
+    });
+    cx.run_until_parked();
+
+    cx.activate_a11y(cx.window_handle());
+    let json = cx
+        .update(|window, cx| {
+            window.draw(cx).clear(cx);
+            window.debug_a11y_tree_json()
+        })
+        .expect("activation makes the debug tree available");
+    let tree: serde_json::Value = serde_json::from_str(&json).expect("the dump is valid JSON");
+
+    gpui::a11y_checks::assert_interactive_nodes_are_named(&tree, "project panel with git status");
+    gpui::a11y_checks::assert_no_role_was_discarded(&tree, "project panel with git status");
+
+    let mut rows: Vec<&str> = tree["nodes"]
+        .as_object()
+        .expect("the dump lists nodes")
+        .values()
+        .filter(|node| node["aria"]["role"] == "TreeItem")
+        .filter_map(|node| node["aria"]["label"].as_str())
+        .filter(|label| label.starts_with("edited.rs") || label.starts_with("untouched.rs"))
+        .collect();
+    rows.sort();
+    assert_eq!(
+        rows,
+        vec!["edited.rs, modified", "untouched.rs"],
+        "the colour beside the name is the only other thing that says this"
+    );
+}
+
 /// A panel with no worktree shows an explanation and two buttons, and it takes
 /// focus. The explanation is a plain label, which contributes no node of its
 /// own, so without a name on the container the panel announces the whole

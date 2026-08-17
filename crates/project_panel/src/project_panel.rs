@@ -5493,8 +5493,35 @@ impl ProjectPanel {
 
         let kind = details.kind;
         // Captured before the render closures take `details`, so the row's
-        // announced name survives.
-        let announced_name = details.filename.clone();
+        // announced name survives. Git status is carried by the label's colour
+        // and diagnostics by a decoration on the icon, and neither is something
+        // a reader can reach, so both go into the name.
+        let announced_name = {
+            let mut name = details.filename.clone().to_string();
+            if let Some((_, status, _)) = git_status_indicator(details.git_status) {
+                name.push_str(", ");
+                name.push_str(status);
+            } else if details.is_ignored {
+                name.push_str(", ignored");
+            }
+            if let Some(count) = details.diagnostic_count {
+                if count.error_count > 0 {
+                    name.push_str(&format!(
+                        ", {} error{}",
+                        count.error_count,
+                        if count.error_count == 1 { "" } else { "s" }
+                    ));
+                }
+                if count.warning_count > 0 {
+                    name.push_str(&format!(
+                        ", {} warning{}",
+                        count.warning_count,
+                        if count.warning_count == 1 { "" } else { "s" }
+                    ));
+                }
+            }
+            SharedString::from(name)
+        };
         let announced_depth = details.depth;
         let announced_expanded = details.is_expanded;
         let announced_selected = details.is_selected;
@@ -6027,7 +6054,7 @@ impl ProjectPanel {
                                             },
                                         )
                                     })
-                                    .when_some(git_indicator, |this, (label, color)| {
+                                    .when_some(git_indicator, |this, (label, _status, color)| {
                                         let git_indicator = if kind.is_dir() {
                                             Indicator::dot()
                                                 .color(Color::Custom(color.color(cx).opacity(0.5)))
@@ -7611,27 +7638,30 @@ pub fn par_sort_worktree_entries(
     entries.par_sort_by(|lhs, rhs| cmp_worktree_entries(lhs, rhs, &mode, &order));
 }
 
-fn git_status_indicator(git_status: GitSummary) -> Option<(&'static str, Color)> {
+/// The single letter shown beside a row, the word behind it, and the colour
+/// both share. The letter and the colour are all a sighted user gets; "M" read
+/// aloud is not information, so the word is what the row announces.
+fn git_status_indicator(git_status: GitSummary) -> Option<(&'static str, &'static str, Color)> {
     if git_status.conflict > 0 {
-        return Some(("!", Color::Conflict));
+        return Some(("!", "conflict", Color::Conflict));
     }
     if git_status.untracked > 0 {
-        return Some(("U", Color::Created));
+        return Some(("U", "untracked", Color::Created));
     }
     if git_status.worktree.deleted > 0 {
-        return Some(("D", Color::Deleted));
+        return Some(("D", "deleted", Color::Deleted));
     }
     if git_status.worktree.modified > 0 {
-        return Some(("M", Color::Modified));
+        return Some(("M", "modified", Color::Modified));
     }
     if git_status.index.deleted > 0 {
-        return Some(("D", Color::Deleted));
+        return Some(("D", "deleted", Color::Deleted));
     }
     if git_status.index.modified > 0 {
-        return Some(("M", Color::Modified));
+        return Some(("M", "modified", Color::Modified));
     }
     if git_status.index.added > 0 {
-        return Some(("A", Color::Created));
+        return Some(("A", "added", Color::Created));
     }
     None
 }
