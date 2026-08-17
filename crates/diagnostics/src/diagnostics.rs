@@ -1227,6 +1227,7 @@ mod tests {
         gpui::a11y_checks::assert_click_targets_are_reachable(&tree, "project diagnostics");
         gpui::a11y_checks::assert_landmarks_are_distinguishable(&tree, "project diagnostics");
         gpui::a11y_checks::assert_names_are_distinguishable(&tree, "project diagnostics");
+        gpui::a11y_checks::assert_controls_have_area(&tree, "project diagnostics");
 
         // A project with no diagnostics: the view says so rather than being an
         // unnamed region with an unreadable label in it. Asserted through the

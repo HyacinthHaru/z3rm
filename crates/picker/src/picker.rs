@@ -1825,6 +1825,7 @@ mod tests {
         gpui::a11y_checks::assert_click_targets_are_reachable(&tree, "picker");
         gpui::a11y_checks::assert_landmarks_are_distinguishable(&tree, "picker");
         gpui::a11y_checks::assert_names_are_distinguishable(&tree, "picker");
+        gpui::a11y_checks::assert_controls_have_area(&tree, "picker");
         let nodes = tree["nodes"].as_object().expect("the dump lists nodes");
 
         let list_box = nodes

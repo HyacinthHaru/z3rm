@@ -302,23 +302,29 @@ impl Render for ModalLayer {
             )
             .child(
                 v_flex()
-                    // Without an id and a role this focused container gets no
-                    // accessibility node, so focus is dropped and the whole
-                    // window is announced instead of the dialog. The modal flag
-                    // matches what the layer already does visually: everything
-                    // behind it is occluded and cannot be reached.
-                    .id("modal-layer-dialog")
-                    .role(gpui::Role::Dialog)
-                    .aria_modal()
-                    .when_some(active_modal.modal.a11y_name(cx), |this, name| {
-                        this.aria_label(name)
-                    })
+                    // Zero height on purpose: the modal below overflows it and
+                    // is centred by it. The dialog semantics sit on the child
+                    // rather than here, because a node reported with an empty
+                    // rectangle tells assistive technology the dialog is
+                    // nowhere on screen.
                     .h(px(0.0))
                     .top_20()
                     .items_center()
-                    .track_focus(&active_modal.focus_handle)
                     .child(
                         h_flex()
+                            // Without an id and a role this focused container
+                            // gets no accessibility node, so focus is dropped
+                            // and the whole window is announced instead of the
+                            // dialog. The modal flag matches what the layer
+                            // already does visually: everything behind it is
+                            // occluded and cannot be reached.
+                            .id("modal-layer-dialog")
+                            .role(gpui::Role::Dialog)
+                            .aria_modal()
+                            .when_some(active_modal.modal.a11y_name(cx), |this, name| {
+                                this.aria_label(name)
+                            })
+                            .track_focus(&active_modal.focus_handle)
                             .occlude()
                             .child(active_modal.modal.view())
                             .on_mouse_down(MouseButton::Left, |_, _, cx| {

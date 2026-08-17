@@ -386,6 +386,46 @@ pub mod a11y_checks {
         );
     }
 
+    /// Panics if a control is announced with no area to click.
+    ///
+    /// GPUI answers an incoming `Click` by synthesizing a mouse press at the
+    /// centre of the node's bounds. A node with no width or no height has no
+    /// centre to press, so it reads as an operable control and does nothing
+    /// when operated — the same dead end as a control with no name, reached a
+    /// different way.
+    #[track_caller]
+    pub fn assert_controls_have_area(tree: &serde_json::Value, context: &str) {
+        let mut empty = Vec::new();
+        for node in nodes(tree).values() {
+            let Some(role) = node["aria"]["role"].as_str() else {
+                continue;
+            };
+            if !ROLES_NEEDING_A_NAME.contains(&role) {
+                continue;
+            }
+            let bounds = &node["bounds"];
+            let (Some(x0), Some(y0), Some(x1), Some(y1)) = (
+                bounds["x0"].as_f64(),
+                bounds["y0"].as_f64(),
+                bounds["x1"].as_f64(),
+                bounds["y1"].as_f64(),
+            ) else {
+                continue;
+            };
+            if x1 - x0 <= 0.0 || y1 - y0 <= 0.0 {
+                empty.push(format!(
+                    "{role} named {:?}",
+                    node["aria"]["label"].as_str().unwrap_or_default()
+                ));
+            }
+        }
+        empty.sort_unstable();
+        assert!(
+            empty.is_empty(),
+            "{context}: controls announced with nothing to click: {empty:?}"
+        );
+    }
+
     /// Panics if the focused element produced no node.
     ///
     /// A focused element with an id but no role produces no accessibility node,

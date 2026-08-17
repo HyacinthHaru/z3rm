@@ -4088,6 +4088,7 @@ mod tests {
         gpui::a11y_checks::assert_click_targets_are_reachable(&tree, "keymap editor");
         gpui::a11y_checks::assert_landmarks_are_distinguishable(&tree, "keymap editor");
         gpui::a11y_checks::assert_names_are_distinguishable(&tree, "keymap editor");
+        gpui::a11y_checks::assert_controls_have_area(&tree, "keymap editor");
 
         let table = nodes
             .values()

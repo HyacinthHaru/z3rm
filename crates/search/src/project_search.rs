@@ -3495,6 +3495,7 @@ pub mod tests {
         gpui::a11y_checks::assert_click_targets_are_reachable(&tree, "project search");
         gpui::a11y_checks::assert_landmarks_are_distinguishable(&tree, "project search");
         gpui::a11y_checks::assert_names_are_distinguishable(&tree, "project search");
+        gpui::a11y_checks::assert_controls_have_area(&tree, "project search");
 
         let named: Vec<&str> = nodes
             .values()

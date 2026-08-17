@@ -6860,6 +6860,7 @@ mod tests {
             gpui::a11y_checks::assert_click_targets_are_reachable(&tree, "git graph");
             gpui::a11y_checks::assert_landmarks_are_distinguishable(&tree, "git graph");
             gpui::a11y_checks::assert_names_are_distinguishable(&tree, "git graph");
+            gpui::a11y_checks::assert_controls_have_area(&tree, "git graph");
 
             let nodes = tree["nodes"].as_object().expect("the dump lists nodes");
             let table_named = nodes
