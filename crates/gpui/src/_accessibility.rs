@@ -285,12 +285,22 @@
 //!
 //! - `assert_interactive_nodes_are_named` — a control announced as a bare
 //!   "button" is unusable even though it is present.
+//! - `assert_names_are_distinguishable` — a name that is present can still be
+//!   useless: a row of tabs whose close buttons all announce "Close Tab" gives
+//!   the user no way to say which one they mean.
 //! - `assert_no_role_was_discarded` — a role whose element had no id.
 //! - `assert_roles_are_contained` — a `Tab` outside a `TabList` loses "2 of 5"
 //!   and the arrow-key conventions that come with containment.
 //! - `assert_focus_reached_the_tree` — focus that produced no node.
+//! - `assert_active_descendant_is_honoured` — a highlight claimed with nothing
+//!   focused, which has nowhere to be reported and is dropped.
 //! - `assert_click_targets_are_reachable` — a control whose synthesized
 //!   `Click` would land on a smaller clickable child instead.
+//! - `assert_controls_have_area` — a control with no width or height has no
+//!   centre to press, and nowhere on screen for a magnifier to follow.
+//! - `assert_landmarks_are_distinguishable` — a landmark list reading
+//!   "complementary, complementary" offers destinations and refuses to say
+//!   what they are.
 //!
 //! Assert that something is *present* before asserting nothing is wrong with
 //! it: every one of these checks passes trivially on an empty tree, and a view
@@ -319,6 +329,19 @@
 //! focused node points at the claiming row instead. Either way something has
 //! to be focused: a claim made with nothing focused is dropped, and the frame
 //! records that it was.
+//!
+//! **Colour and icons are not information.** A coloured dot for unsaved
+//! changes, an `M` beside a modified file, a spinner that means "still
+//! working": none of them is a node, and none of them reaches a reader. When
+//! the only thing that says a control's state is how it is painted, the state
+//! belongs in the name — computed from the same value the paint uses, so the
+//! two cannot drift apart.
+//!
+//! **An input's name comes from its placeholder.** A field pre-filled with a
+//! value — a rename box, a password prompt — never shows its placeholder, so
+//! it announces as "edit text" and nothing else. Zed's editor has
+//! `set_a11y_label` for this; it names the field without putting new text on
+//! screen.
 //!
 //! **A live region has to exist before its content.** A region created at the
 //! same moment as its first message gives the platform adapter nothing to
