@@ -514,6 +514,11 @@ impl TitleBar {
                 })
                 .trigger(
                     ButtonLike::new("remote_project")
+                        // Nothing but an icon and a status dot, so without this
+                        // it announces as a bare button — and the host it is
+                        // connected to is not written down anywhere else the
+                        // tree can reach.
+                        .aria_label(format!("{tooltip_title}: {nickname}"))
                         .selected_style(ButtonStyle::Tinted(TintColor::Accent))
                         .child(
                             h_flex().gap_2().max_w_32().child(

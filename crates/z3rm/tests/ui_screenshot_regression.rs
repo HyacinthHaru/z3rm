@@ -1270,8 +1270,12 @@ fn extension_chrome_display_list_updates_without_touching_vdom() -> Result<()> {
         Ok(())
     })??;
 
-    let (after, _) = draw_frame(&mut cx, window.into())?;
-    save_screenshot("extension_chrome_display_list_shrunk", &after)?;
+    let (after, after_tree) = draw_frame(&mut cx, window.into())?;
+    save_frame(
+        "extension_chrome_display_list_shrunk",
+        &after,
+        &after_tree,
+    )?;
     let after_fill = count_near_color(&after, meter, 4);
 
     assert!(
@@ -1363,8 +1367,8 @@ fn headless_renderer_produces_real_pixels() -> Result<()> {
     // visual assertion meaningless.
     let mut cx = headless_app()?;
     let window = cx.open_window(size(px(100.0), px(100.0)), |_, cx| cx.new(|_| Swatch))?;
-    let (image, _) = draw_frame(&mut cx, window.into())?;
-    save_screenshot("harness_swatch", &image)?;
+    let (image, tree) = draw_frame(&mut cx, window.into())?;
+    save_frame("harness_swatch", &image, &tree)?;
     let green = count_near_color(&image, [0, 255, 0], 2);
     #[cfg(target_os = "linux")]
     assert_eq!(

@@ -2616,6 +2616,13 @@ impl Editor {
         colors: &theme::ThemeColors,
     ) -> impl IntoElement {
         let comment_count = comments.len();
+        // The chevron is an icon and the count is a label, and neither is a
+        // node, so this header only reaches a reader through its own name.
+        let header_name = format!(
+            "{} Comment{}",
+            comment_count,
+            if comment_count == 1 { "" } else { "s" }
+        );
 
         v_flex()
             .w_full()
@@ -2624,6 +2631,9 @@ impl Editor {
             .child(
                 h_flex()
                     .id("review-comments-header")
+                    .role(gpui::Role::Button)
+                    .aria_label(header_name.clone())
+                    .aria_expanded(expanded)
                     .w_full()
                     .items_center()
                     .gap_1()
@@ -2648,13 +2658,9 @@ impl Editor {
                         .color(ui::Color::Muted),
                     )
                     .child(
-                        Label::new(format!(
-                            "{} Comment{}",
-                            comment_count,
-                            if comment_count == 1 { "" } else { "s" }
-                        ))
-                        .size(LabelSize::Small)
-                        .color(Color::Muted),
+                        Label::new(header_name)
+                            .size(LabelSize::Small)
+                            .color(Color::Muted),
                     ),
             )
             // Comments list (when expanded)
