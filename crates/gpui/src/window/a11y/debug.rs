@@ -10,6 +10,14 @@ use collections::FxHashMap;
 
 use crate::{Pixels, SharedString, Size};
 
+/// An element that answers a click but produced no accessibility node, with the
+/// rectangle it occupies so a check can ask whether anything inside it did.
+#[derive(Clone, Debug)]
+pub(crate) struct ClickableWithoutRole {
+    pub source_location: String,
+    pub bounds: accesskit::Rect,
+}
+
 #[derive(Default)]
 pub(crate) struct FrameDebugInfo {
     pub viewport_size: Size<Pixels>,
@@ -22,6 +30,10 @@ pub(crate) struct FrameDebugInfo {
     /// Roles that never became nodes because their element had no id. Filled in
     /// by `end_frame`, which owns the diagnostic.
     pub roles_without_id: Vec<String>,
+    /// Elements that answer a click but produced no node at all. Nothing else
+    /// in the dump records them: every other diagnostic is about nodes, and
+    /// these have none.
+    pub clickable_without_role: Vec<ClickableWithoutRole>,
     /// Whether an active-descendant claim was dropped because the focused node
     /// was not an ancestor of the claiming one.
     pub active_descendant_without_focus: bool,
@@ -37,6 +49,7 @@ struct CapturedFrame {
     scale_factor: f32,
     focus_without_node: Option<&'static str>,
     roles_without_id: Vec<String>,
+    clickable_without_role: Vec<ClickableWithoutRole>,
     active_descendant_without_focus: bool,
 }
 
@@ -103,6 +116,7 @@ impl A11yDebug {
             scale_factor: frame.scale_factor,
             focus_without_node: frame.focus_without_node,
             roles_without_id: frame.roles_without_id,
+            clickable_without_role: frame.clickable_without_role,
             active_descendant_without_focus: frame.active_descendant_without_focus,
         });
     }
@@ -161,6 +175,21 @@ impl A11yDebug {
                 "scale_factor": frame.scale_factor,
                 "focus_without_node": frame.focus_without_node,
                 "roles_without_id": frame.roles_without_id,
+                "clickable_without_role": frame
+                    .clickable_without_role
+                    .iter()
+                    .map(|entry| {
+                        serde_json::json!({
+                            "source_location": entry.source_location,
+                            "bounds": {
+                                "x0": entry.bounds.x0,
+                                "y0": entry.bounds.y0,
+                                "x1": entry.bounds.x1,
+                                "y1": entry.bounds.y1,
+                            },
+                        })
+                    })
+                    .collect::<Vec<_>>(),
                 "active_descendant_without_focus": frame.active_descendant_without_focus,
             })
         });

@@ -929,6 +929,7 @@ mod tests {
 
         gpui::a11y_checks::assert_interactive_nodes_are_named(&tree, "number fields");
         gpui::a11y_checks::assert_names_are_distinguishable(&tree, "number fields");
+        gpui::a11y_checks::assert_clickable_elements_are_reachable(&tree, "number fields");
         gpui::a11y_checks::assert_no_role_was_discarded(&tree, "number fields");
         gpui::a11y_checks::assert_roles_are_contained(&tree, "number fields");
         gpui::a11y_checks::assert_click_targets_are_reachable(&tree, "number fields");

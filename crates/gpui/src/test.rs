@@ -474,6 +474,76 @@ pub mod a11y_checks {
         );
     }
 
+    /// Panics if an element that answers a click contains no node at all.
+    ///
+    /// An id and a click handler are not enough — a node needs a role. The
+    /// common shape is harmless: a clickable wrapper whose child carries the
+    /// role, so assistive technology still finds something to operate at that
+    /// spot. What is not harmless is a clickable element with nothing inside
+    /// it that became a node, because then the action it offers is reachable
+    /// by mouse and by nothing else — and no other check can see it, since
+    /// they all reason about nodes and this one has none.
+    #[track_caller]
+    pub fn assert_clickable_elements_are_reachable(tree: &serde_json::Value, context: &str) {
+        let node_rects: Vec<(f64, f64, f64, f64)> = nodes(tree)
+            .values()
+            .filter(|node| node["aria"]["role"].as_str().is_some())
+            .filter_map(|node| {
+                let bounds = &node["bounds"];
+                Some((
+                    bounds["x0"].as_f64()?,
+                    bounds["y0"].as_f64()?,
+                    bounds["x1"].as_f64()?,
+                    bounds["y1"].as_f64()?,
+                ))
+            })
+            .collect();
+
+        let mut unreachable = Vec::new();
+        for entry in tree
+            .get("frame")
+            .and_then(|frame| frame.get("clickable_without_role"))
+            .and_then(serde_json::Value::as_array)
+            .map(Vec::as_slice)
+            .unwrap_or_default()
+        {
+            let bounds = &entry["bounds"];
+            let (Some(x0), Some(y0), Some(x1), Some(y1)) = (
+                bounds["x0"].as_f64(),
+                bounds["y0"].as_f64(),
+                bounds["x1"].as_f64(),
+                bounds["y1"].as_f64(),
+            ) else {
+                continue;
+            };
+            // An empty rectangle cannot contain anything, and a control with no
+            // area is already `assert_controls_have_area`'s business.
+            if x1 - x0 <= 0.0 || y1 - y0 <= 0.0 {
+                continue;
+            }
+            let contains_a_node = node_rects
+                .iter()
+                .any(|(nx0, ny0, nx1, ny1)| {
+                    *nx0 >= x0 && *ny0 >= y0 && *nx1 <= x1 && *ny1 <= y1
+                });
+            if !contains_a_node {
+                unreachable.push(
+                    entry["source_location"]
+                        .as_str()
+                        .unwrap_or_default()
+                        .to_string(),
+                );
+            }
+        }
+        unreachable.sort_unstable();
+        unreachable.dedup();
+        assert!(
+            unreachable.is_empty(),
+            "{context}: these elements answer a click and contain no node at all, so \
+             the action they offer is reachable by mouse only: {unreachable:?}"
+        );
+    }
+
     /// Panics if the focused element produced no node.
     ///
     /// A focused element with an id but no role produces no accessibility node,

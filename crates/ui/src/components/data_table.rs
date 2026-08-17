@@ -622,6 +622,9 @@ fn render_header_cell(
             shared_element_id.clone(),
             header_idx as u64,
         ))
+        // The only click a header cell answers is a double-click to reset the
+        // column width — a pointer gesture, not a control.
+        .pointer_gesture_only()
         .when_some(resize_info.cloned(), |this, info| {
             if info.resize_behavior[header_idx].is_resizable() {
                 this.on_click(move |event, window, cx| {

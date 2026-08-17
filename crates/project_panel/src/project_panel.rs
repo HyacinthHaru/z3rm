@@ -7231,6 +7231,7 @@ impl Render for ProjectPanel {
                         .child(
                             div()
                                 .id("project-panel-blank-area")
+                                .pointer_gesture_only()
                                 .block_mouse_except_scroll()
                                 .flex_grow_1()
                                 .on_scroll_wheel({

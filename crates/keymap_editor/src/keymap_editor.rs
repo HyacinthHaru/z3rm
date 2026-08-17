@@ -4107,6 +4107,7 @@ mod tests {
         gpui::a11y_checks::assert_click_targets_are_reachable(&tree, "keymap editor");
         gpui::a11y_checks::assert_landmarks_are_distinguishable(&tree, "keymap editor");
         gpui::a11y_checks::assert_names_are_distinguishable(&tree, "keymap editor");
+        gpui::a11y_checks::assert_clickable_elements_are_reachable(&tree, "keymap editor");
         gpui::a11y_checks::assert_controls_have_area(&tree, "keymap editor");
         gpui::a11y_checks::assert_active_descendant_is_honoured(&tree, "keymap editor");
 

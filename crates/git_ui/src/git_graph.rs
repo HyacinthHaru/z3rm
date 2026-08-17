@@ -3861,6 +3861,7 @@ impl GitGraph {
             .child(
                 div()
                     .id("commit-view-split-resize-handle")
+                    .pointer_gesture_only()
                     .absolute()
                     .left(px(-RESIZE_HANDLE_WIDTH / 2.0))
                     .w(px(RESIZE_HANDLE_WIDTH))
@@ -4086,6 +4087,14 @@ impl Render for GitGraph {
 
                             let graph_canvas = div()
                                 .id("graph-canvas")
+                                // Painted rather than built from elements, so
+                                // nothing inside it becomes a node. Named as a
+                                // region so it is at least reported to exist;
+                                // picking a commit out of it stays a mouse
+                                // gesture, and the table beside it is the path
+                                // that works from the keyboard.
+                                .role(gpui::Role::Group)
+                                .aria_label("Commit graph")
                                 .size_full()
                                 .overflow_hidden()
                                 .cursor_pointer()
@@ -6890,6 +6899,7 @@ mod tests {
             gpui::a11y_checks::assert_click_targets_are_reachable(&tree, "git graph");
             gpui::a11y_checks::assert_landmarks_are_distinguishable(&tree, "git graph");
             gpui::a11y_checks::assert_names_are_distinguishable(&tree, "git graph");
+            gpui::a11y_checks::assert_clickable_elements_are_reachable(&tree, "git graph");
             gpui::a11y_checks::assert_controls_have_area(&tree, "git graph");
             gpui::a11y_checks::assert_active_descendant_is_honoured(&tree, "git graph");
 

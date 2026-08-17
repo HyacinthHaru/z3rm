@@ -1173,6 +1173,19 @@ pub trait InteractiveElement: Sized {
         self
     }
 
+    /// Declare that this element's click handler is a pointer gesture rather
+    /// than a control: a drag handle, a double-click on background space, a
+    /// resize grip. Such an element is deliberately not in the accessibility
+    /// tree, and whatever it does is expected to be reachable another way.
+    ///
+    /// This exists so that a clickable element with no node is a *choice* on
+    /// the record rather than an oversight — see
+    /// `gpui::a11y_checks::assert_clickable_elements_are_reachable`.
+    fn pointer_gesture_only(mut self) -> Self {
+        self.interactivity().pointer_gesture_only = true;
+        self
+    }
+
     /// Set the bounds of this element as a window control area for the platform window.
     /// The fluent API equivalent to [`Interactivity::window_control_area`].
     fn window_control_area(mut self, area: WindowControlArea) -> Self {
@@ -2048,6 +2061,8 @@ pub struct Interactivity {
     pub(crate) drop_listeners: Vec<(TypeId, DropListener)>,
     pub(crate) can_drop_predicate: Option<CanDropPredicate>,
     pub(crate) click_listeners: Vec<ClickListener>,
+    /// Set by [`InteractiveElement::pointer_gesture_only`]. See there.
+    pub(crate) pointer_gesture_only: bool,
     pub(crate) aux_click_listeners: Vec<ClickListener>,
     pub(crate) drag_listener: Option<(Arc<dyn Any>, DragListener)>,
     pub(crate) hover_listener: Option<Box<dyn Fn(&bool, &mut Window, &mut App)>>,
@@ -2197,6 +2212,26 @@ impl Interactivity {
                 }
             },
         );
+
+        if window.a11y.is_building_frame()
+            && !self.pointer_gesture_only
+            && !self.click_listeners.is_empty()
+            && self
+                .override_role
+                .filter(|role| *role != accesskit::Role::GenericContainer)
+                .is_none()
+        {
+            let scale = window.scale_factor();
+            window.a11y.note_clickable_without_role(
+                self.source_location(),
+                accesskit::Rect {
+                    x0: (bounds.origin.x.0 * scale) as f64,
+                    y0: (bounds.origin.y.0 * scale) as f64,
+                    x1: ((bounds.origin.x.0 + bounds.size.width.0) * scale) as f64,
+                    y1: ((bounds.origin.y.0 + bounds.size.height.0) * scale) as f64,
+                },
+            );
+        }
 
         if let Some(focus_handle) = self.tracked_focus_handle.as_ref() {
             window.set_focus_handle(focus_handle, cx);

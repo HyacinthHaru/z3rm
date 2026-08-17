@@ -1318,6 +1318,10 @@ impl<D: PickerDelegate> Picker<D> {
                     .when(is_selected, |this| this.aria_active_descendant())
             })
             .when(selectable, |this| this.cursor_pointer())
+            // A row the user cannot land on is a separator or a section header.
+            // It still answers a click, because the click is attached to every
+            // row, but there is nothing there for a reader to operate.
+            .when(!selectable, |this| this.pointer_gesture_only())
             .when(use_fallback_indicator, |this| {
                 this.hover(|s| s.bg(cx.theme().colors().ghost_element_hover))
             })
@@ -1771,6 +1775,7 @@ mod tests {
         let tree: serde_json::Value = serde_json::from_str(&json).expect("the dump is valid JSON");
         gpui::a11y_checks::assert_interactive_nodes_are_named(&tree, "picker");
         gpui::a11y_checks::assert_names_are_distinguishable(&tree, "picker");
+        gpui::a11y_checks::assert_clickable_elements_are_reachable(&tree, "picker");
         gpui::a11y_checks::assert_click_targets_are_reachable(&tree, "picker");
         gpui::a11y_checks::assert_controls_have_area(&tree, "picker");
         gpui::a11y_checks::assert_landmarks_are_distinguishable(&tree, "picker");
@@ -1835,6 +1840,7 @@ mod tests {
         gpui::a11y_checks::assert_click_targets_are_reachable(&tree, "picker");
         gpui::a11y_checks::assert_landmarks_are_distinguishable(&tree, "picker");
         gpui::a11y_checks::assert_names_are_distinguishable(&tree, "picker");
+        gpui::a11y_checks::assert_clickable_elements_are_reachable(&tree, "picker");
         gpui::a11y_checks::assert_controls_have_area(&tree, "picker");
         gpui::a11y_checks::assert_active_descendant_is_honoured(&tree, "picker");
         let nodes = tree["nodes"].as_object().expect("the dump lists nodes");

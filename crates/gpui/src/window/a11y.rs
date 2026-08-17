@@ -168,6 +168,11 @@ pub(crate) struct A11y {
     /// was discarded. This is the quietest way to lose a node: nothing is
     /// missing from the code, only from the tree.
     roles_without_id_this_frame: Vec<(accesskit::Role, Option<&'static std::panic::Location<'static>>)>,
+    /// Elements that answer a click but carry no role, so they produce no node
+    /// at all. Nothing else in the tree records them: a check can only reason
+    /// about nodes that exist, and these do not.
+    clickable_without_role_this_frame:
+        Vec<(Option<&'static std::panic::Location<'static>>, accesskit::Rect)>,
     /// Retains the last tree update (and, in debug builds, per-node provenance)
     /// so it can be dumped via [`crate::Window::debug_a11y_tree_json`].
     debug: debug::A11yDebug,
@@ -195,6 +200,7 @@ impl A11y {
             focus_without_node_this_frame: None,
             focused_element_rendered_this_frame: false,
             roles_without_id_this_frame: Vec::new(),
+            clickable_without_role_this_frame: Vec::new(),
             debug: debug::A11yDebug::default(),
             #[cfg(debug_assertions)]
             view_type_names: FxHashMap::default(),
@@ -215,6 +221,27 @@ impl A11y {
         let site = (role, source_location);
         if !self.roles_without_id_this_frame.contains(&site) {
             self.roles_without_id_this_frame.push(site);
+        }
+    }
+
+    /// Records that an element takes a click but was given no role, so it
+    /// produced no accessibility node and the action it offers is reachable by
+    /// mouse only.
+    /// The bounds travel with the site because they are what makes the report
+    /// usable: an element with no node of its own is harmless if something
+    /// inside it does have one, and only the geometry can say so.
+    pub(crate) fn note_clickable_without_role(
+        &mut self,
+        source_location: Option<&'static std::panic::Location<'static>>,
+        bounds: accesskit::Rect,
+    ) {
+        if !self
+            .clickable_without_role_this_frame
+            .iter()
+            .any(|(location, _)| *location == source_location)
+        {
+            self.clickable_without_role_this_frame
+                .push((source_location, bounds));
         }
     }
 
@@ -355,6 +382,17 @@ impl A11y {
             .map(|(role, location)| match location {
                 Some(location) => format!("{role:?} at {location}"),
                 None => format!("{role:?}"),
+            })
+            .collect();
+        frame.clickable_without_role = self
+            .clickable_without_role_this_frame
+            .drain(..)
+            .map(|(location, bounds)| debug::ClickableWithoutRole {
+                source_location: match location {
+                    Some(location) => location.to_string(),
+                    None => "<unknown source location>".to_string(),
+                },
+                bounds,
             })
             .collect();
         frame.active_descendant_without_focus =
@@ -1635,6 +1673,7 @@ mod activation_tests {
 
         crate::test::a11y_checks::assert_landmarks_are_distinguishable(&tree, "two panels");
         crate::test::a11y_checks::assert_names_are_distinguishable(&tree, "two panels");
+        crate::test::a11y_checks::assert_clickable_elements_are_reachable(&tree, "two panels");
         crate::test::a11y_checks::assert_no_role_was_discarded(&tree, "two panels");
         crate::test::a11y_checks::assert_roles_are_contained(&tree, "two panels");
         crate::test::a11y_checks::assert_controls_have_area(&tree, "two panels");

@@ -3602,6 +3602,7 @@ impl Pane {
     ) -> impl IntoElement {
         div()
             .id("tab_bar_drop_target")
+            .pointer_gesture_only()
             .min_w_6()
             .h(Tab::container_height(cx))
             .flex_grow_1()

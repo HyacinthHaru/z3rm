@@ -5243,6 +5243,7 @@ pub mod test {
         // A page is a column of near-identical rows, so this is the window most
         // likely to offer the same name several times over.
         gpui::a11y_checks::assert_names_are_distinguishable(&tree, "settings window");
+        gpui::a11y_checks::assert_clickable_elements_are_reachable(&tree, "settings window");
         gpui::a11y_checks::assert_controls_have_area(&tree, "settings window");
         gpui::a11y_checks::assert_landmarks_are_distinguishable(&tree, "settings window");
         gpui::a11y_checks::assert_active_descendant_is_honoured(&tree, "settings window");
