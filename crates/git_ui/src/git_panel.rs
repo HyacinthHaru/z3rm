@@ -4841,6 +4841,7 @@ impl GitPanel {
         PopoverMenu::new(id.into())
             .trigger(crate::render_split_button_chevron_trigger(
                 "commit-split-button-right",
+                "More commit actions",
                 menu_open,
             ))
             .with_handle(self.commit_menu_handle.clone())
@@ -4965,6 +4966,7 @@ impl GitPanel {
         PopoverMenu::new(id.into())
             .trigger(crate::render_split_button_chevron_trigger(
                 "changes-actions-split-button-right",
+                "More actions for changed files",
                 menu_open,
             ))
             .with_handle(self.changes_actions_menu_handle.clone())

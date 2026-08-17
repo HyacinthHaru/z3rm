@@ -3209,6 +3209,113 @@ mod tests {
     use gpui::{App, AppContext as _};
     use settings::{KeymapFile, KeymapFileLoadResult, Settings as _};
 
+    /// Every accessibility test in the workspace draws one surface at a time,
+    /// so nothing has ever checked what happens when two of them are open
+    /// together: a name that is unique within a panel can still collide with a
+    /// name in the panel beside it, and two docks are two landmarks.
+    #[gpui::test]
+    async fn two_panels_open_at_once_stay_distinguishable(cx: &mut gpui::TestAppContext) {
+        use fs::FakeFs;
+        use git_ui::git_panel::GitPanel;
+        use gpui::VisualTestContext;
+        use project::Project;
+        use project_panel::ProjectPanel;
+        use serde_json::json;
+        use workspace::MultiWorkspace;
+        use workspace::dock::{Panel as _, PanelHandle as _};
+
+        zlog::init_test();
+        cx.update(|cx| {
+            let settings_store = settings::SettingsStore::test(cx);
+            cx.set_global(settings_store);
+            theme_settings::init(theme::LoadThemes::JustBase, cx);
+            editor::init(cx);
+            git_ui::init(cx);
+            project_panel::init(cx);
+        });
+
+        let fs = FakeFs::new(cx.executor());
+        fs.insert_tree(
+            "/project",
+            json!({
+                ".git": {},
+                "main.rs": "fn main() {}\n",
+            }),
+        )
+        .await;
+        fs.set_head_and_index_for_repo("/project/.git".as_ref(), &[("main.rs", "old\n".into())]);
+
+        let project = Project::test(fs, ["/project".as_ref()], cx).await;
+        let window =
+            cx.add_window(|window, cx| MultiWorkspace::test_new(project.clone(), window, cx));
+        let workspace = window
+            .read_with(cx, |mw, _| mw.workspace().clone())
+            .unwrap();
+        let mut cx = VisualTestContext::from_window(window.into(), cx);
+
+        // Both panels are built the way the app builds them, through the
+        // loaders that also read serialized state, rather than through a
+        // constructor a test can reach and the product cannot.
+        let project_panel = cx
+            .update(|window, cx| {
+                let workspace = workspace.downgrade();
+                window.spawn(cx, async move |cx| {
+                    ProjectPanel::load(workspace, cx.clone()).await
+                })
+            })
+            .await
+            .expect("the project panel loads");
+        let git_panel = workspace.update_in(&mut cx, GitPanel::new_test);
+        workspace.update_in(&mut cx, |workspace, window, cx| {
+            // One on each side, so both are drawn: two panels in one dock means
+            // only the active one renders, which is the single-surface case
+            // every other test already covers.
+            project_panel.update(cx, |panel, cx| {
+                panel.set_position(workspace::dock::DockPosition::Left, window, cx)
+            });
+            git_panel.update(cx, |panel, cx| {
+                panel.set_position(workspace::dock::DockPosition::Right, window, cx)
+            });
+            workspace.add_panel(project_panel.clone(), window, cx);
+            workspace.add_panel(git_panel.clone(), window, cx);
+            workspace.open_panel::<ProjectPanel>(window, cx);
+            workspace.open_panel::<GitPanel>(window, cx);
+        });
+        cx.run_until_parked();
+
+        cx.activate_a11y(cx.window_handle());
+        let json = cx
+            .update(|window, cx| {
+                window.draw(cx).clear(cx);
+                window.debug_a11y_tree_json()
+            })
+            .expect("activation makes the debug tree available");
+        let tree: serde_json::Value = serde_json::from_str(&json).expect("the dump is valid JSON");
+
+        gpui::a11y_checks::assert_interactive_nodes_are_named(&tree, "two panels");
+        gpui::a11y_checks::assert_names_are_distinguishable(&tree, "two panels");
+        gpui::a11y_checks::assert_no_role_was_discarded(&tree, "two panels");
+        gpui::a11y_checks::assert_roles_are_contained(&tree, "two panels");
+        gpui::a11y_checks::assert_focus_reached_the_tree(&tree, "two panels");
+        gpui::a11y_checks::assert_active_descendant_is_honoured(&tree, "two panels");
+        gpui::a11y_checks::assert_click_targets_are_reachable(&tree, "two panels");
+        gpui::a11y_checks::assert_controls_have_area(&tree, "two panels");
+        gpui::a11y_checks::assert_landmarks_are_distinguishable(&tree, "two panels");
+
+        let names: Vec<&str> = tree["nodes"]
+            .as_object()
+            .expect("the dump lists nodes")
+            .values()
+            .filter_map(|node| node["aria"]["label"].as_str())
+            .collect();
+        for panel in ["Project files", "Changed files"] {
+            assert!(
+                names.contains(&panel),
+                "both panels have to be in the tree at once: {names:?}"
+            );
+        }
+    }
+
     /// Losing the mux connection is shown as small coloured text in the status
     /// bar, while the user is working inside a pane. Without a live region the
     /// change is never announced, so a screen-reader user keeps typing into a

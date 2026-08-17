@@ -1012,6 +1012,7 @@ mod remote_button {
         PopoverMenu::new(id.into())
             .trigger(crate::render_split_button_chevron_trigger(
                 "split-button-right",
+                "More git actions",
                 menu_open,
             ))
             .with_handle(menu_handle)
@@ -1130,6 +1131,7 @@ mod remote_button {
 /// a chevron with no name is announced as a bare "button".
 pub(crate) fn render_split_button_chevron_trigger(
     id: impl Into<ElementId>,
+    label: impl Into<SharedString>,
     menu_open: bool,
 ) -> ButtonLike {
     let chevron_button_size = rems_from_px(20.);
@@ -1140,7 +1142,10 @@ pub(crate) fn render_split_button_chevron_trigger(
     };
 
     ButtonLike::new_rounded_right(id)
-        .aria_label("More actions")
+        // Named by the caller: several of these are on screen at once, and
+        // "More actions" three times over is three buttons a user cannot ask
+        // for by name or tell apart while moving between them.
+        .aria_label(label)
         .layer(ElevationIndex::ModalSurface)
         .selected_style(ButtonStyle::Tinted(TintColor::Accent))
         .width(chevron_button_size)
