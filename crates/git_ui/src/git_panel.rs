@@ -5228,6 +5228,13 @@ impl GitPanel {
                                         )
                                         .single_line(
                                             self.commit_editor.read(cx).mode().is_single_line(),
+                                        )
+                                        // An auto-height editor is not single
+                                        // line, so without this the commit box
+                                        // has no node and focus on it is
+                                        // dropped.
+                                        .focusable_region(
+                                            !self.commit_editor.read(cx).mode().is_single_line(),
                                         ),
                                     ),
                             )
@@ -11442,5 +11449,78 @@ mod tests {
             rows.contains(&"tracked"),
             "every changed file needs a name of its own: {rows:?}"
         );
+    }
+
+    /// The commit box is an auto-height editor rendered as an `EditorElement`
+    /// outside `Editor::render`, so it had no id and no node: the user could
+    /// type into it while a reader had nothing to report about where they were.
+    #[gpui::test]
+    async fn the_commit_message_box_is_a_focusable_region(cx: &mut TestAppContext) {
+        init_test(cx);
+
+        let fs = FakeFs::new(cx.background_executor.clone());
+        fs.insert_tree(
+            path!("/project"),
+            json!({
+                ".git": {},
+                "tracked": "tracked\n",
+            }),
+        )
+        .await;
+        fs.set_head_and_index_for_repo(
+            path!("/project/.git").as_ref(),
+            &[("tracked", "old tracked\n".into())],
+        );
+
+        let project = Project::test(fs, [Path::new(path!("/project"))], cx).await;
+        let window_handle =
+            cx.add_window(|window, cx| MultiWorkspace::test_new(project.clone(), window, cx));
+        let workspace = window_handle
+            .read_with(cx, |mw, _| mw.workspace().clone())
+            .unwrap();
+        let mut cx = VisualTestContext::from_window(window_handle.into(), cx);
+
+        let panel = workspace.update_in(&mut cx, GitPanel::new);
+        workspace.update_in(&mut cx, |workspace, window, cx| {
+            workspace.add_panel(panel.clone(), window, cx);
+            workspace.open_panel::<GitPanel>(window, cx);
+        });
+        await_git_panel_entries(&panel, &mut cx).await;
+
+        panel.update_in(&mut cx, |panel, window, cx| {
+            window.focus(&panel.commit_editor.focus_handle(cx), cx);
+        });
+        cx.run_until_parked();
+
+        cx.activate_a11y(cx.window_handle());
+        let json = cx
+            .update(|window, cx| {
+                window.draw(cx).clear(cx);
+                window.debug_a11y_tree_json()
+            })
+            .expect("activation makes the debug tree available");
+        let tree: serde_json::Value = serde_json::from_str(&json).expect("the dump is valid JSON");
+        let nodes = tree["nodes"].as_object().expect("the dump lists nodes");
+
+        gpui::a11y_checks::assert_focus_reached_the_tree(&tree, "git panel commit box");
+
+        let focused = tree["gpui_focus"]
+            .as_str()
+            .and_then(|id| nodes.get(id))
+            .unwrap_or_else(|| panic!("focus in the commit box must land on a node: {json}"));
+        assert_eq!(focused["aria"]["role"].as_str(), Some("Group"));
+        // A multi-line editor is reported as a named region rather than as a
+        // text input, and the placeholder is the only name this one has — it
+        // holds the suggested commit message, so it is read from the editor
+        // rather than written out here.
+        let placeholder: SharedString = panel
+            .update_in(&mut cx, |panel, _window, cx| {
+                panel
+                    .commit_editor
+                    .update(cx, |editor, cx| editor.placeholder_text(cx))
+            })
+            .map(SharedString::from)
+            .expect("the commit box has a placeholder");
+        assert_eq!(focused["aria"]["label"].as_str(), Some(placeholder.as_ref()));
     }
 }

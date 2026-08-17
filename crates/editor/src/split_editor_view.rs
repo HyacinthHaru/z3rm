@@ -154,8 +154,11 @@ impl RenderOnce for SplitEditorView {
         let lhs_editor = splittable_editor.lhs_editor().unwrap().clone();
         let rhs_editor = splittable_editor.rhs_editor().clone();
 
-        let mut lhs = EditorElement::new(&lhs_editor, self.style.clone());
-        let mut rhs = EditorElement::new(&rhs_editor, self.style.clone());
+        // Both halves are full editors the user tabs between, and neither goes
+        // through `Editor::render`, so without this they have no node for that
+        // focus to land on.
+        let mut lhs = EditorElement::new(&lhs_editor, self.style.clone()).focusable_region(true);
+        let mut rhs = EditorElement::new(&rhs_editor, self.style.clone()).focusable_region(true);
 
         lhs.set_split_side(SplitSide::Left);
         rhs.set_split_side(SplitSide::Right);

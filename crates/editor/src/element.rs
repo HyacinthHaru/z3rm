@@ -9345,6 +9345,19 @@ impl Element for EditorElement {
                         self.editor
                             .update(cx, |editor, cx| editor.placeholder_text(cx))
                             .map(SharedString::from)
+                            // The two halves of a split diff have no
+                            // placeholder between them, and "Editor" twice
+                            // gives the user no way to tell which half they
+                            // are in.
+                            .or_else(|| match self.split_side {
+                                Some(SplitSide::Left) => {
+                                    Some(SharedString::new_static("Original side of the diff"))
+                                }
+                                Some(SplitSide::Right) => {
+                                    Some(SharedString::new_static("Modified side of the diff"))
+                                }
+                                None => None,
+                            })
                             .unwrap_or_else(|| SharedString::new_static("Editor"))
                     });
                     let a11y_text = self.single_line.then(|| {
