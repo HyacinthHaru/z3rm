@@ -205,10 +205,12 @@ impl PickerDelegate for LanguageSelectorDelegate {
         "Select a language…".into()
     }
 
-    /// Rows are announced by the text they show. Without this every row in the
-    /// list is a bare "option".
-    fn match_label(&self, ix: usize, _cx: &App) -> Option<SharedString> {
-        Some(self.matches.get(ix)?.string.clone().into())
+    /// Named from the same helper the row renders with, so the current
+    /// language keeps its "(current)" suffix — which is the one thing that
+    /// tells it apart from every other row.
+    fn match_label(&self, ix: usize, cx: &App) -> Option<SharedString> {
+        let (label, _) = self.language_data_for_match(self.matches.get(ix)?, cx);
+        Some(label.into())
     }
 
     fn match_count(&self) -> usize {

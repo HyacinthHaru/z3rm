@@ -228,10 +228,10 @@ impl PickerDelegate for EncodingSelectorDelegate {
         "Reopen with encoding...".into()
     }
 
-    /// Rows are announced by the text they show. Without this every row in the
-    /// list is a bare "option".
-    fn match_label(&self, ix: usize, _cx: &App) -> Option<gpui::SharedString> {
-        Some(self.matches.get(ix)?.string.clone().into())
+    /// Named from the same helper the row renders with, so the current
+    /// encoding keeps its "(current)" suffix.
+    fn match_label(&self, ix: usize, cx: &App) -> Option<gpui::SharedString> {
+        Some(self.render_data_for_match(self.matches.get(ix)?, cx).into())
     }
 
     fn match_count(&self) -> usize {

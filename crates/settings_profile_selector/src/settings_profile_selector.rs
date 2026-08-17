@@ -158,10 +158,12 @@ impl PickerDelegate for SettingsProfileSelectorDelegate {
         "Select a settings profile...".into()
     }
 
-    /// Rows are announced by the text they show. Without this every row in the
-    /// list is a bare "option".
+    /// Named the way the row is drawn: the profile with no name renders as
+    /// "Disabled", and announcing its empty match string instead would leave
+    /// that row nameless.
     fn match_label(&self, ix: usize, _cx: &App) -> Option<SharedString> {
-        Some(self.matches.get(ix)?.string.clone().into())
+        let mat = self.matches.get(ix)?;
+        Some(display_name(self.profile_names.get(mat.candidate_id)?).into())
     }
 
     fn match_count(&self) -> usize {
