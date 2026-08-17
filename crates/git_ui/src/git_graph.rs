@@ -4099,13 +4099,15 @@ impl Render for GitGraph {
                             let graph_canvas = div()
                                 .id("graph-canvas")
                                 // Painted rather than built from elements, so
-                                // nothing inside it becomes a node. Named as a
-                                // region so it is at least reported to exist;
-                                // picking a commit out of it stays a mouse
-                                // gesture, and the table beside it is the path
-                                // that works from the keyboard.
-                                .role(gpui::Role::Group)
-                                .aria_label("Commit graph")
+                                // nothing inside it becomes a node. It sits
+                                // inside the focusable region already named
+                                // "Commit graph", so a second node borrowing
+                                // that name would describe two places where
+                                // there is one; the click that selects a commit
+                                // from the picture is a pointer gesture, and
+                                // the table beside it is the path that works
+                                // from the keyboard.
+                                .pointer_gesture_only()
                                 .size_full()
                                 .overflow_hidden()
                                 .cursor_pointer()
@@ -6927,6 +6929,18 @@ mod tests {
                     "a button named only by a hash spells it out: {label:?}"
                 );
             }
+            // One region is the commit graph. A node inside it borrowing the
+            // same name describes two places where there is one, and the
+            // name-distinguishability check cannot see it — the two have
+            // different roles, or the same role in an ancestor relationship.
+            assert_eq!(
+                nodes
+                    .values()
+                    .filter(|node| node["aria"]["label"] == "Commit graph")
+                    .count(),
+                1,
+                "only the focusable region is the commit graph"
+            );
             let table_named = nodes
                 .values()
                 .any(|node| node["aria"]["role"] == "Table" && node["aria"]["label"] == "Commits");
