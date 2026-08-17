@@ -321,6 +321,7 @@ impl ParentElement for ListItem {
 
 impl RenderOnce for ListItem {
     fn render(self, _window: &mut Window, cx: &mut App) -> impl IntoElement {
+        let disclosure_label = self.aria_label.clone();
         h_flex()
             .id(self.id)
             .when_some(self.group_name, |this, group| this.group(group))
@@ -451,6 +452,12 @@ impl RenderOnce for ListItem {
                             })
                             .child(
                                 Disclosure::new("toggle", is_open)
+                                    .when_some(disclosure_label, |disclosure, label| {
+                                        disclosure.aria_label(format!(
+                                            "{}: {label}",
+                                            if is_open { "Collapse" } else { "Expand" }
+                                        ))
+                                    })
                                     .on_toggle_expanded(self.on_toggle),
                             )
                     }))

@@ -1112,6 +1112,10 @@ impl Delegate {
                                                 ("text-finder-fold", ix),
                                                 !is_collapsed,
                                             )
+                                            .aria_label(format!(
+                                                "{}: {file_name}",
+                                                if is_collapsed { "Unfold" } else { "Fold" }
+                                            ))
                                             .tooltip(move |_window, cx| {
                                                 let (label, action): (_, &dyn gpui::Action) =
                                                     if is_collapsed {

@@ -58,6 +58,11 @@ impl EditorSnapshot {
         if folded || (is_foldable && (row_contains_cursor || self.gutter_hovered)) {
             Some(
                 Disclosure::new(("gutter_crease", buffer_row.0), !folded)
+                    .aria_label(format!(
+                        "{} line {}",
+                        if folded { "Unfold" } else { "Fold" },
+                        buffer_row.0 + 1
+                    ))
                     .toggle_state(folded)
                     .on_click(window.listener_for(&editor, move |this, _e, window, cx| {
                         if folded {

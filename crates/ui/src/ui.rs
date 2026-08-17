@@ -22,8 +22,8 @@ pub use traits::animation_ext::*;
 #[cfg(test)]
 mod accessibility_tests {
     use crate::{
-        ContextMenu, DropdownMenu, Modal, ModalHeader, Switch, ToggleState, Toggleable as _,
-        TreeViewItem,
+        ContextMenu, DropdownMenu, ListHeader, Modal, ModalHeader, Switch, ToggleState,
+        Toggleable as _, TreeViewItem,
     };
     use gpui::{
         AppContext as _, Context, Entity, InteractiveElement as _, IntoElement, ParentElement,
@@ -391,6 +391,78 @@ fn the_shared_controls_report_their_state(cx: &mut TestAppContext) {
             buttons,
             vec![("All", None), ("Installed", Some("True"))],
             "each button says which one it is, and the chosen one says it is chosen"
+        );
+    }
+
+    /// Collapsible sections come one per row, so the chevron that opens them is
+    /// the most duplicated button in the product: every list header, tree root,
+    /// search result group and gutter crease renders one. Named only "Expand",
+    /// a screen reader user hears the same button over and over with no way to
+    /// tell which section any of them belongs to.
+    #[gpui::test]
+    fn every_disclosure_says_what_it_opens(cx: &mut TestAppContext) {
+        struct SectionsHost;
+
+        impl Render for SectionsHost {
+            fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+                div()
+                    .size_full()
+                    .child(ListHeader::new("Panes").toggle(Some(true)))
+                    .child(ListHeader::new("Windows").toggle(Some(false)))
+                    .child(
+                        div()
+                            .id("sessions")
+                            .role(gpui::Role::Tree)
+                            .aria_label("Sessions")
+                            .child(
+                                TreeViewItem::new("work", "work")
+                                    .root_item(true)
+                                    .expanded(true),
+                            )
+                            .child(TreeViewItem::new("build", "build").root_item(true)),
+                    )
+            }
+        }
+
+        cx.update(|cx| {
+            let settings_store = settings::SettingsStore::test(cx);
+            cx.set_global(settings_store);
+            theme_settings::init(theme::LoadThemes::JustBase, cx);
+        });
+
+        let window = cx.add_window(|_, _| SectionsHost);
+        cx.activate_a11y(window.into());
+
+        let json = cx
+            .update_window(window.into(), |_, window, cx| {
+                window.draw(cx).clear(cx);
+                window.debug_a11y_tree_json()
+            })
+            .expect("the harness window is still open")
+            .expect("activation makes the debug tree available");
+        let tree: serde_json::Value = serde_json::from_str(&json).expect("the dump is valid JSON");
+
+        gpui::a11y_checks::assert_interactive_nodes_are_named(&tree, "collapsible sections");
+        gpui::a11y_checks::assert_names_are_distinguishable(&tree, "collapsible sections");
+
+        let mut chevrons: Vec<&str> = tree["nodes"]
+            .as_object()
+            .expect("the dump lists nodes")
+            .values()
+            .filter(|node| node["aria"]["role"] == "Button")
+            .filter_map(|node| node["aria"]["label"].as_str())
+            .filter(|label| label.starts_with("Collapse") || label.starts_with("Expand"))
+            .collect();
+        chevrons.sort();
+        assert_eq!(
+            chevrons,
+            vec![
+                "Collapse: Panes",
+                "Collapse: work",
+                "Expand: Windows",
+                "Expand: build"
+            ],
+            "each chevron names the section it opens"
         );
     }
 }

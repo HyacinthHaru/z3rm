@@ -640,6 +640,7 @@ impl CommitView {
                                                 )
                                                 .closed_icon(IconName::ExpandVertical)
                                                 .opened_icon(IconName::FoldVertical)
+                                                .aria_label(expand_tooltip)
                                                 .tooltip(Tooltip::text(expand_tooltip))
                                                 .on_click(cx.listener(|this, _, _, cx| {
                                                     this.message_expanded = !this.message_expanded;

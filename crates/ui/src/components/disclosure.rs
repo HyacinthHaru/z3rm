@@ -16,6 +16,7 @@ pub struct Disclosure {
     closed_icon: IconName,
     visible_on_hover: Option<SharedString>,
     tooltip: Option<Box<dyn Fn(&mut Window, &mut App) -> AnyView + 'static>>,
+    aria_label: Option<SharedString>,
 }
 
 impl Disclosure {
@@ -31,7 +32,17 @@ impl Disclosure {
             closed_icon: IconName::ChevronRight,
             visible_on_hover: None,
             tooltip: None,
+            aria_label: None,
         }
+    }
+
+    /// Names the button after whatever it expands.
+    ///
+    /// Without this every disclosure in a frame is called "Expand", which tells
+    /// a screen reader user nothing when a list has one per row.
+    pub fn aria_label(mut self, label: impl Into<SharedString>) -> Self {
+        self.aria_label = Some(label.into());
+        self
     }
 
     pub fn tooltip(mut self, tooltip: impl Fn(&mut Window, &mut App) -> AnyView + 'static) -> Self {
@@ -100,7 +111,13 @@ impl RenderOnce for Disclosure {
         )
         .icon_color(Color::Muted)
         .icon_size(IconSize::Small)
-        .aria_label(if self.is_open { "Collapse" } else { "Expand" })
+        .aria_label(self.aria_label.unwrap_or_else(|| {
+            if self.is_open {
+                "Collapse".into()
+            } else {
+                "Expand".into()
+            }
+        }))
         .aria_expanded(self.is_open)
         .disabled(self.disabled)
         .toggle_state(self.selected)

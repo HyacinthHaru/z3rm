@@ -108,6 +108,11 @@ impl RenderOnce for ListHeader {
                             .gap(DynamicSpacing::Base04.rems(cx))
                             .children(self.toggle.map(|is_open| {
                                 Disclosure::new("toggle", is_open)
+                                    .aria_label(format!(
+                                        "{}: {}",
+                                        if is_open { "Collapse" } else { "Expand" },
+                                        self.label
+                                    ))
                                     .on_toggle_expanded(self.on_toggle.clone())
                             }))
                             .child(
