@@ -119,6 +119,11 @@ impl Render for ZedPromptRenderer {
             .role(gpui::Role::AlertDialog)
             .aria_modal()
             .aria_label(self.message.read(cx).source().clone())
+            // Same reason as the fallback renderer: the consequence is in the
+            // detail, and a dialog is announced by its name when it opens.
+            .when_some(self.detail.as_ref(), |this, detail| {
+                this.aria_description(detail.read(cx).source().clone())
+            })
             .key_context("Prompt")
             .cursor_default()
             .track_focus(&self.focus)
