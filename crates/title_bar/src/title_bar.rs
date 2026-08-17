@@ -869,3 +869,68 @@ impl TitleBar {
         )
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use fs::FakeFs;
+    use gpui::TestAppContext;
+    use serde_json::json;
+
+    /// The bar holds the project name, the branch and the connection controls,
+    /// and had no role at all, so there was no landmark to jump to and the
+    /// remote-project button announced as a bare "button".
+    #[gpui::test]
+    async fn the_title_bar_is_a_named_landmark(cx: &mut TestAppContext) {
+        cx.update(|cx| {
+            let settings_store = settings::SettingsStore::test(cx);
+            cx.set_global(settings_store);
+            theme_settings::init(theme::LoadThemes::JustBase, cx);
+        });
+
+        let fs = FakeFs::new(cx.executor());
+        fs.insert_tree("/project", json!({ "main.rs": "" })).await;
+        let project = project::Project::test(fs, ["/project".as_ref()], cx).await;
+        let window =
+            cx.add_window(|window, cx| MultiWorkspace::test_new(project.clone(), window, cx));
+        let workspace = window
+            .read_with(cx, |multi_workspace, _| {
+                multi_workspace.workspace().clone()
+            })
+            .unwrap();
+        let mut cx = gpui::VisualTestContext::from_window(window.into(), cx);
+
+        // Installed the way the app installs it, so the test covers the path
+        // the product takes rather than a bar rendered on its own.
+        workspace.update_in(&mut cx, |workspace, window, cx| {
+            let title_bar =
+                cx.new(|cx| TitleBar::new("title-bar", workspace, None, window, cx));
+            workspace.set_titlebar_item(title_bar.into(), window, cx);
+        });
+        cx.run_until_parked();
+
+        cx.activate_a11y(cx.window_handle());
+        let json = cx
+            .update(|window, cx| {
+                window.draw(cx).clear(cx);
+                window.debug_a11y_tree_json()
+            })
+            .expect("activation makes the debug tree available");
+        let tree: serde_json::Value = serde_json::from_str(&json).expect("the dump is valid JSON");
+
+        gpui::a11y_checks::assert_interactive_nodes_are_named(&tree, "title bar");
+        gpui::a11y_checks::assert_no_role_was_discarded(&tree, "title bar");
+        gpui::a11y_checks::assert_roles_are_contained(&tree, "title bar");
+        gpui::a11y_checks::assert_click_targets_are_reachable(&tree, "title bar");
+        gpui::a11y_checks::assert_focus_reached_the_tree(&tree, "title bar");
+        gpui::a11y_checks::assert_landmarks_are_distinguishable(&tree, "title bar");
+
+        let banner = tree["nodes"]
+            .as_object()
+            .expect("the dump lists nodes")
+            .values()
+            .find(|node| node["aria"]["role"] == "Banner")
+            .unwrap_or_else(|| panic!("the title bar is the window's banner landmark: {json}"));
+        assert_eq!(banner["aria"]["label"].as_str(), Some("Title bar"));
+    }
+}
