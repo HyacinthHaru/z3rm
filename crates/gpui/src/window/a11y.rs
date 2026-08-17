@@ -230,19 +230,17 @@ impl A11y {
     /// The bounds travel with the site because they are what makes the report
     /// usable: an element with no node of its own is harmless if something
     /// inside it does have one, and only the geometry can say so.
+    ///
+    /// Every instance is kept, not one per source location. A `render_match`
+    /// that draws fifty rows is one location with fifty rectangles, and a row
+    /// with nothing in it is a defect whether or not its neighbours are fine.
     pub(crate) fn note_clickable_without_role(
         &mut self,
         source_location: Option<&'static std::panic::Location<'static>>,
         bounds: accesskit::Rect,
     ) {
-        if !self
-            .clickable_without_role_this_frame
-            .iter()
-            .any(|(location, _)| *location == source_location)
-        {
-            self.clickable_without_role_this_frame
-                .push((source_location, bounds));
-        }
+        self.clickable_without_role_this_frame
+            .push((source_location, bounds));
     }
 
     /// Logs (once per focus change) that the focused element is not exposed to

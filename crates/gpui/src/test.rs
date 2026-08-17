@@ -693,3 +693,76 @@ pub mod a11y_checks {
         );
     }
 }
+
+#[cfg(test)]
+mod a11y_check_tests {
+    use super::a11y_checks::assert_clickable_elements_are_reachable;
+    use serde_json::json;
+
+    fn tree(node_rects: &[(f64, f64, f64, f64)], clickable: &[(f64, f64, f64, f64)]) -> serde_json::Value {
+        let nodes: serde_json::Map<String, serde_json::Value> = node_rects
+            .iter()
+            .enumerate()
+            .map(|(ix, (x0, y0, x1, y1))| {
+                (
+                    ix.to_string(),
+                    json!({
+                        "element_id": format!("node-{ix}"),
+                        "aria": { "role": "Button", "label": format!("node {ix}") },
+                        "bounds": { "x0": x0, "y0": y0, "x1": x1, "y1": y1 },
+                    }),
+                )
+            })
+            .collect();
+        json!({
+            "nodes": nodes,
+            "frame": {
+                "clickable_without_role": clickable
+                    .iter()
+                    .map(|(x0, y0, x1, y1)| json!({
+                        "source_location": "crates/example.rs:1:1",
+                        "bounds": { "x0": x0, "y0": y0, "x1": x1, "y1": y1 },
+                    }))
+                    .collect::<Vec<_>>(),
+            },
+        })
+    }
+
+    /// A clickable wrapper whose child carries the role is the ordinary shape:
+    /// assistive technology clicks by bounds centre and lands inside it.
+    #[test]
+    fn a_clickable_wrapper_around_a_node_is_fine() {
+        let tree = tree(&[(10., 10., 20., 20.)], &[(0., 0., 100., 100.)]);
+        assert_clickable_elements_are_reachable(&tree, "wrapper");
+    }
+
+    /// The shape that shipped the prompt's buttons: a clickable rectangle with
+    /// nothing in it that ever became a node.
+    #[test]
+    #[should_panic(expected = "reachable by mouse only")]
+    fn a_clickable_element_containing_nothing_is_reported() {
+        let tree = tree(&[(500., 500., 600., 600.)], &[(0., 0., 100., 100.)]);
+        assert_clickable_elements_are_reachable(&tree, "empty");
+    }
+
+    /// One source location draws many rows. A row with nothing in it is a
+    /// defect whether or not the row above it is fine, so the check looks at
+    /// every instance rather than the first one it saw.
+    #[test]
+    #[should_panic(expected = "reachable by mouse only")]
+    fn one_empty_row_among_full_ones_is_still_reported() {
+        let tree = tree(
+            &[(10., 10., 20., 20.)],
+            &[(0., 0., 100., 100.), (0., 200., 100., 300.)],
+        );
+        assert_clickable_elements_are_reachable(&tree, "rows");
+    }
+
+    /// An element with no area cannot contain anything, and a control with no
+    /// area is already `assert_controls_have_area`'s business.
+    #[test]
+    fn an_element_with_no_area_is_left_to_the_other_check() {
+        let tree = tree(&[(500., 500., 600., 600.)], &[(0., 0., 0., 0.)]);
+        assert_clickable_elements_are_reachable(&tree, "empty rect");
+    }
+}
