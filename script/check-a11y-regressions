@@ -32,7 +32,15 @@ if printf '%s\n' "$output" | grep -qE '^error(\[E[0-9]+\])?: |^error: could not 
     printf '%s\n' "$output" | grep -E '^error(\[E[0-9]+\])?: |^error: could not compile' | sort -u | head -20
     exit 1
 fi
-failures=$(printf '%s\n' "$output" | grep -E '^    [a-z_]+' | sed 's/^ *//' | sort -u)
+# Only the names listed under cargo's own "failures:" heading, and only lines
+# shaped like a test path. Matching every indented lowercase line swept up
+# panic text too: "mux server error: pane not found" became six test names,
+# each of which then "passed alone" because it matched no test at all.
+failures=$(printf '%s\n' "$output" \
+    | awk '/^failures:$/ {collecting = 1; next}
+           /^$/ {collecting = 0}
+           collecting && /^    [a-z_][a-z0-9_]*(::[a-z0-9_]+)*$/ {sub(/^ +/, ""); print}' \
+    | sort -u)
 
 baseline=$(grep -vE '^\s*(#|$)' "$BASELINE_FILE" | sort -u)
 
@@ -56,14 +64,25 @@ if [[ -n "$new" ]]; then
     # parallel run, so a first failure is a candidate, not a verdict. Re-run
     # each one on its own before calling it a regression.
     confirmed=()
-    for name in $new; do
-        if cargo test --workspace --features gpui_platform/runtime_shaders \
-            -- --exact "$name" >/dev/null 2>&1; then
+    while IFS= read -r name; do
+        [[ -n "$name" ]] || continue
+        rerun=$(cargo test --workspace --features gpui_platform/runtime_shaders \
+            -- --exact "$name" 2>&1)
+        status=$?
+        # A filter that matches nothing exits 0 with every count at zero, which
+        # would read as "passes alone" and quietly bless a real failure.
+        ran=$(printf '%s\n' "$rerun" \
+            | grep -oE '^test result: [a-z]+\. [0-9]+ passed' \
+            | grep -oE '[0-9]+' | awk '{total += $1} END {print total + 0}')
+        if [[ "$status" -eq 0 && "$ran" -gt 0 ]]; then
             echo "Flaky under load, passes alone: $name"
+        elif [[ "$status" -eq 0 ]]; then
+            echo "Re-run matched no test at all, so nothing was verified: $name"
+            confirmed+=("$name")
         else
             confirmed+=("$name")
         fi
-    done
+    done <<< "$new" 
 
     if [[ ${#confirmed[@]} -gt 0 ]]; then
         echo "New failures not in the baseline:"
