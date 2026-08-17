@@ -447,6 +447,71 @@ async fn test_the_zoom_button_can_be_operated_through_its_action(cx: &mut TestAp
 /// the tab node's centre is only correct while the close button stays off
 /// centre. Activating a tab and closing it are not close enough for a mistake
 /// to be recoverable.
+/// Two files with the same name are the ordinary case in any project with a
+/// `mod.rs` or an `index.ts`, and the tab bar disambiguates them by widening
+/// the path it shows. The announced name is built from the same detail level,
+/// so if that ever stops being true a reader hears the same word twice with no
+/// way to tell the tabs apart.
+#[gpui::test]
+async fn test_two_tabs_with_the_same_file_name_are_told_apart(cx: &mut TestAppContext) {
+    init_test(cx);
+    let fs = FakeFs::new(cx.executor());
+    fs.insert_tree("/root", json!({ "a.txt": "" })).await;
+    let project = Project::test(fs, [path!("/root").as_ref()], cx).await;
+
+    let (multi_workspace, cx) =
+        cx.add_window_view(|window, cx| MultiWorkspace::test_new(project, window, cx));
+    let workspace = multi_workspace.read_with(cx, |mw, _| mw.workspace().clone());
+    let pane = workspace.read_with(cx, |ws, _| ws.active_pane().clone());
+
+    pane.update_in(cx, |pane, window, cx| {
+        for descriptions in [
+            vec!["main.rs", "src/main.rs"],
+            vec!["main.rs", "tests/main.rs"],
+        ] {
+            pane.add_item(
+                Box::new(cx.new(|cx| {
+                    let mut item = TestItem::new(cx).with_label("main.rs");
+                    item.tab_descriptions = Some(descriptions);
+                    item
+                })),
+                true,
+                true,
+                None,
+                window,
+                cx,
+            );
+        }
+    });
+    cx.run_until_parked();
+
+    cx.activate_a11y(cx.window_handle());
+    let json = cx
+        .update(|window, cx| {
+            window.draw(cx).clear(cx);
+            window.debug_a11y_tree_json()
+        })
+        .expect("activation makes the debug tree available");
+    let tree: serde_json::Value = serde_json::from_str(&json).expect("the dump is valid JSON");
+
+    gpui::a11y_checks::assert_interactive_nodes_are_named(&tree, "ambiguous tabs");
+    gpui::a11y_checks::assert_names_are_distinguishable(&tree, "ambiguous tabs");
+
+    let mut tabs: Vec<&str> = tree["nodes"]
+        .as_object()
+        .expect("the dump lists nodes")
+        .values()
+        .filter(|node| node["aria"]["role"] == "Tab")
+        .filter_map(|node| node["aria"]["label"].as_str())
+        .collect();
+    tabs.sort();
+    assert_eq!(
+        tabs,
+        vec!["src/main.rs", "tests/main.rs"],
+        "the tab bar widened the path it shows, and the name has to follow it"
+    );
+}
+
 /// A tab shows unsaved changes as a coloured dot beside its name, and an icon
 /// contributes no accessibility node, so nothing told a reader which of the
 /// open files had unsaved work in them.

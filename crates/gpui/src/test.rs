@@ -369,9 +369,23 @@ pub mod a11y_checks {
         // button of each tab is a child of its own tab, so a per-parent check
         // sees one of each and misses the row of identical "Close Tab"s that
         // the user actually hears.
-        let mut seen: collections::FxHashMap<(&str, &str), usize> =
+        //
+        // Tree rows are the exception. Two files called `main.rs` in different
+        // folders are told apart by the branch they hang from, which a reader
+        // announces along with the row, so they are only ambiguous when they
+        // share a parent.
+        let nodes = nodes(tree);
+        let mut parent_of: collections::FxHashMap<&str, &str> = collections::FxHashMap::default();
+        for (id, node) in nodes {
+            for child in node["children"].as_array().into_iter().flatten() {
+                if let Some(child) = child.as_str() {
+                    parent_of.insert(child, id.as_str());
+                }
+            }
+        }
+        let mut seen: collections::FxHashMap<(&str, &str, &str), usize> =
             collections::FxHashMap::default();
-        for node in nodes(tree).values() {
+        for (id, node) in nodes {
             let Some(role) = node["aria"]["role"].as_str() else {
                 continue;
             };
@@ -379,12 +393,17 @@ pub mod a11y_checks {
                 continue;
             }
             let name = node["aria"]["label"].as_str().unwrap_or_default();
-            *seen.entry((role, name)).or_default() += 1;
+            let scope = if role == "TreeItem" {
+                parent_of.get(id.as_str()).copied().unwrap_or_default()
+            } else {
+                ""
+            };
+            *seen.entry((role, name, scope)).or_default() += 1;
         }
         let mut clashes: Vec<String> = seen
             .into_iter()
             .filter(|(_, count)| *count > 1)
-            .map(|((role, name), count)| format!("{count} × {role} named {name:?}"))
+            .map(|((role, name, _), count)| format!("{count} × {role} named {name:?}"))
             .collect();
         clashes.sort_unstable();
         assert!(
