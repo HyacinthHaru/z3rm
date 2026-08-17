@@ -1392,3 +1392,188 @@ async fn the_stacked_tab_bar_is_still_a_tab_list(cx: &mut TestAppContext) {
         "stacked mode is one list, so the pinned tab is numbered with the rest"
     );
 }
+
+/// Opening a dialog moves focus into it; closing one has to give focus back.
+/// Every other accessibility test on this branch reads one frame, and this is
+/// not visible in one: a dialog that leaves focus nowhere looks identical to a
+/// healthy window until the user presses a key and nothing happens.
+#[gpui::test]
+async fn dismissing_a_dialog_gives_focus_back(cx: &mut TestAppContext) {
+    use gpui::{
+        Context, EventEmitter, InteractiveElement as _, IntoElement, Render,
+        StatefulInteractiveElement as _, Styled as _, Window,
+    };
+
+    struct TestModal {
+        focus_handle: gpui::FocusHandle,
+    }
+    impl gpui::Focusable for TestModal {
+        fn focus_handle(&self, _: &gpui::App) -> gpui::FocusHandle {
+            self.focus_handle.clone()
+        }
+    }
+    impl EventEmitter<gpui::DismissEvent> for TestModal {}
+    impl crate::ModalView for TestModal {
+        fn a11y_name(&self, _: &gpui::App) -> Option<gpui::SharedString> {
+            Some("Test dialog".into())
+        }
+    }
+    impl Render for TestModal {
+        fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+            gpui::div()
+                .id("test-modal-root")
+                .role(gpui::Role::Group)
+                .aria_label("Test modal")
+                .w(gpui::px(320.))
+                .h(gpui::px(160.))
+                .track_focus(&self.focus_handle)
+        }
+    }
+
+    init_test(cx);
+    let fs = FakeFs::new(cx.executor());
+    fs.insert_tree("/root", json!({ "a.txt": "" })).await;
+    let project = Project::test(fs, [path!("/root").as_ref()], cx).await;
+
+    let (multi_workspace, cx) =
+        cx.add_window_view(|window, cx| MultiWorkspace::test_new(project, window, cx));
+    let workspace = multi_workspace.read_with(cx, |mw, _| mw.workspace().clone());
+    let pane = workspace.read_with(cx, |ws, _| ws.active_pane().clone());
+
+    let item = cx.new(|cx| TestItem::new(cx).with_label("shell"));
+    pane.update_in(cx, |pane, window, cx| {
+        pane.add_item(Box::new(item.clone()), true, true, None, window, cx);
+    });
+    cx.run_until_parked();
+
+    cx.activate_a11y(cx.window_handle());
+    let focused_name = |cx: &mut gpui::VisualTestContext| {
+        let json = cx
+            .update(|window, cx| {
+                window.draw(cx).clear(cx);
+                window.debug_a11y_tree_json()
+            })
+            .expect("activation makes the debug tree available");
+        let tree: serde_json::Value = serde_json::from_str(&json).expect("the dump is valid JSON");
+        let focused = tree["gpui_focus"].as_str().map(str::to_string);
+        let name = focused
+            .as_ref()
+            .and_then(|id| tree["nodes"].get(id))
+            .and_then(|node| node["aria"]["label"].as_str())
+            .map(str::to_string);
+        (name, tree)
+    };
+
+    let (before, _) = focused_name(cx);
+    assert_eq!(
+        before.as_deref(),
+        Some("shell"),
+        "the item holds focus before the dialog opens"
+    );
+
+    workspace.update_in(cx, |workspace, window, cx| {
+        workspace.toggle_modal(window, cx, |_, cx| TestModal {
+            focus_handle: cx.focus_handle(),
+        });
+    });
+    cx.run_until_parked();
+
+    let (during, tree) = focused_name(cx);
+    assert_eq!(
+        during.as_deref(),
+        Some("Test modal"),
+        "opening a dialog moves focus into it"
+    );
+    gpui::a11y_checks::assert_focus_reached_the_tree(&tree, "open dialog");
+
+    workspace.update_in(cx, |workspace, window, cx| {
+        workspace.modal_layer.clone().update(cx, |layer, cx| {
+            layer.hide_modal(window, cx);
+        });
+    });
+    cx.run_until_parked();
+
+    let (after, tree) = focused_name(cx);
+    assert_eq!(
+        after.as_deref(),
+        Some("shell"),
+        "closing a dialog has to put focus back where it came from, not nowhere"
+    );
+    gpui::a11y_checks::assert_focus_reached_the_tree(&tree, "dismissed dialog");
+}
+
+/// Closing the item you are inside is the other side of the same problem, and
+/// the harder one: a dialog knows where focus came from, while a closed tab
+/// leaves focus on an element that no longer exists. Whatever the answer is —
+/// the next tab, the pane, the window — it has to be a node, or the reader
+/// falls back to announcing the whole window and the user cannot tell that
+/// anything happened.
+#[gpui::test]
+async fn closing_the_focused_item_leaves_focus_somewhere(cx: &mut TestAppContext) {
+    init_test(cx);
+    let fs = FakeFs::new(cx.executor());
+    fs.insert_tree("/root", json!({ "a.txt": "" })).await;
+    let project = Project::test(fs, [path!("/root").as_ref()], cx).await;
+
+    let (multi_workspace, cx) =
+        cx.add_window_view(|window, cx| MultiWorkspace::test_new(project, window, cx));
+    let workspace = multi_workspace.read_with(cx, |mw, _| mw.workspace().clone());
+    let pane = workspace.read_with(cx, |ws, _| ws.active_pane().clone());
+
+    pane.update_in(cx, |pane, window, cx| {
+        for label in ["notes.md", "shell"] {
+            pane.add_item(
+                Box::new(cx.new(|cx| TestItem::new(cx).with_label(label))),
+                true,
+                true,
+                None,
+                window,
+                cx,
+            );
+        }
+    });
+    cx.run_until_parked();
+
+    cx.activate_a11y(cx.window_handle());
+    let focus_state = |cx: &mut gpui::VisualTestContext| {
+        let json = cx
+            .update(|window, cx| {
+                window.draw(cx).clear(cx);
+                window.debug_a11y_tree_json()
+            })
+            .expect("activation makes the debug tree available");
+        let tree: serde_json::Value = serde_json::from_str(&json).expect("the dump is valid JSON");
+        let name = tree["gpui_focus"]
+            .as_str()
+            .and_then(|id| tree["nodes"].get(id))
+            .and_then(|node| node["aria"]["label"].as_str())
+            .map(str::to_string);
+        (name, tree)
+    };
+
+    let (before, _) = focus_state(cx);
+    assert_eq!(
+        before.as_deref(),
+        Some("shell"),
+        "the item added last holds focus"
+    );
+
+    pane.update_in(cx, |pane, window, cx| {
+        pane.close_active_item(&crate::CloseActiveItem::default(), window, cx)
+            .detach();
+    });
+    cx.run_until_parked();
+
+    let (after, tree) = focus_state(cx);
+    gpui::a11y_checks::assert_focus_reached_the_tree(&tree, "after closing the focused item");
+    assert!(
+        after.is_some(),
+        "focus has to land on something that is in the tree: {}",
+        serde_json::to_string(&tree["frame"]).unwrap_or_default()
+    );
+    assert_ne!(
+        after.as_deref(),
+        Some("shell"),
+        "focus must not stay on the item that was closed"
+    );
+}
