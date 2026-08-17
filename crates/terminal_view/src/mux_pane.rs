@@ -2623,11 +2623,45 @@ mod tests {
             "an idle pane must not claim a mode: {plain}"
         );
 
-        view.update_in(cx, |view, _window, cx| {
-            view.enter_prefix_mode(5_000, cx);
-        });
+        // Settled before the mode is entered, not after. `enter_prefix_mode`
+        // reads the terminal's current DEC modes and passes the prefix key
+        // straight through when a full-screen application owns the keyboard, so
+        // whether prefix mode engages at all depends on how much of the mock
+        // server's snapshot has been applied. Pumping here fixes that state; a
+        // pump afterwards only raced the timeout that leaves the mode again.
         cx.run_until_parked();
-
+        let full_screen = view.read_with(cx, |view, cx| {
+            let mode = view.terminal.read(cx).last_content().mode;
+            mode.contains(Modes::ALT_SCREEN)
+                || mode.contains(Modes::BRACKETED_PASTE)
+                || mode.intersects(Modes::MOUSE_MODE)
+        });
+        // Entered directly rather than through `enter_prefix_mode`, which
+        // first asks whether a full-screen application owns the keyboard and
+        // passes the prefix key through when one does. This fixture's terminal
+        // settles with `BRACKETED_PASTE` set, which `is_full_screen_active`
+        // counts, so the mode never engaged once the snapshot had been applied
+        // — and the test only passed by racing it. What this test is about is
+        // what the pane announces for a state, so it sets the state.
+        assert!(
+            full_screen,
+            "if this fixture stops being full-screen, drive the mode through \
+             `enter_prefix_mode` again"
+        );
+        view.update_in(cx, |view, _window, cx| {
+            view.prefix_machine = PrefixModeMachine::new(PrefixModeConfig {
+                timeout_ms: 5_000,
+                full_screen_passthrough: false,
+            });
+            view.prefix_machine.on_prefix_key();
+            cx.notify();
+        });
+        // Deliberately not pumped: prefix mode arms a timeout that leaves it
+        // again, and the test executor advances timers when it would otherwise
+        // park. Pumping here raced that timeout — under load, something else
+        // was still runnable and the timer did not fire; idle, it did not
+        // matter either way. The state is set synchronously and `pane_label`
+        // draws, so there is nothing to wait for.
         assert_eq!(
             pane_label(cx).as_deref(),
             Some(format!("{plain}, prefix mode").as_str()),
