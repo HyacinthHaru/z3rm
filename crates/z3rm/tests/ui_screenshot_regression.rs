@@ -1011,14 +1011,6 @@ fn status_bar_vdom() -> Result<VDomNode> {
                 "children": ["Split"]
             },
             {
-                // A plain node made clickable: an extension can call it what it
-                // likes, but it is a control and has to reach the tree as one.
-                "type": "div",
-                "props": { "id": "zoom-toggle", "onClick": "z3rm.pane.zoom" },
-                "style": { "padding": "6px" },
-                "children": ["Zoom"]
-            },
-            {
                 "type": "input",
                 "props": {
                     "id": "filter-input",
@@ -1126,6 +1118,84 @@ fn extension_chrome_semantic_button_dispatches_command() -> Result<()> {
     );
     Ok(())
 }
+/// Chrome shapes the golden status-bar frame does not contain. Kept in its own
+/// fixture and deliberately not saved: perturbing a screenshot baseline to
+/// assert a semantic property means the next person has to regenerate an image
+/// on another platform to land an unrelated change.
+fn semantic_chrome_vdom() -> Result<VDomNode> {
+    let json = serde_json::json!({
+        "type": "div",
+        "props": { "id": "semantic-chrome" },
+        "style": { "flexDirection": "row", "gap": "8px", "padding": "6px" },
+        "children": [
+            { "type": "span", "props": { "id": "session-name" }, "children": ["session: main"] },
+            {
+                // A plain node made clickable: an extension can call it what it
+                // likes, but it is a control and has to reach the tree as one.
+                "type": "div",
+                "props": { "id": "zoom-toggle", "onClick": "z3rm.pane.zoom" },
+                "style": { "padding": "6px" },
+                "children": ["Zoom"]
+            },
+            {
+                "type": "input",
+                "props": {
+                    "id": "filter-input",
+                    "value": "pane-2",
+                    "placeholder": "filter panes",
+                    "onChange": "z3rm.status-bar.filter"
+                },
+                "style": { "width": "140px", "height": "24px" }
+            }
+        ]
+    });
+    extension_host::vdom_bridge::parse_vdom(&json).map_err(|error| anyhow::anyhow!("{error}"))
+}
+
+fn extension_chrome_exposes_its_controls_and_text() -> Result<()> {
+    let mut cx = headless_app()?;
+    let window = open_chrome(&mut cx, semantic_chrome_vdom()?)?;
+
+    draw_frame(&mut cx, window.into())?;
+    let (_, tree) = draw_frame(&mut cx, window.into())?;
+    check_a11y(&tree, "extension_chrome_exposes_its_controls_and_text");
+
+    let mut buttons: Vec<String> = a11y_nodes_with_role(&tree, "Button")
+        .iter()
+        .filter_map(|node| a11y_string_field(node, "label"))
+        .collect();
+    buttons.sort();
+    assert_eq!(
+        buttons,
+        vec!["Zoom".to_string()],
+        "a node with an onClick is a control whatever it is typed as"
+    );
+
+    let labels: Vec<String> = a11y_nodes_with_role(&tree, "Label")
+        .iter()
+        .filter_map(|node| a11y_string_field(node, "label"))
+        .collect();
+    assert!(
+        labels.iter().any(|label| label == "session: main"),
+        "the extension's own text has to reach the tree: {labels:?}"
+    );
+
+    let input = a11y_nodes_with_role(&tree, "TextInput");
+    let input = input.first().context("the input must be exposed")?;
+    assert_eq!(
+        a11y_string_field(input, "label"),
+        Some("filter panes".to_string()),
+        "a filled field keeps the name it had when it was empty"
+    );
+    assert_eq!(
+        a11y_string_field(input, "value"),
+        Some("pane-2".to_string()),
+        "and reports what is in it as its value"
+    );
+
+    Ok(())
+}
+
 fn extension_chrome_vdom_renders_status_bar() -> Result<()> {
     let mut cx = headless_app()?;
     let window = open_chrome(&mut cx, status_bar_vdom()?)?;
@@ -1206,19 +1276,21 @@ fn extension_chrome_vdom_renders_status_bar() -> Result<()> {
         roles.iter().any(|role| role == "TextInput"),
         "extension input must be exposed to assistive technology: {roles:?}"
     );
-    // One node typed `button`, and one plain `div` the extension hung an
-    // `onClick` on — a control whatever it is called, and it has to reach the
-    // tree as one or it is neither announced nor clickable.
-    let mut button_names: Vec<String> = a11y_nodes_with_role(&tree, "Button")
-        .iter()
-        .filter_map(|node| a11y_string_field(node, "label"))
-        .collect();
-    button_names.sort();
     assert_eq!(
-        button_names,
-        vec!["Split".to_string(), "Zoom".to_string()],
-        "both the semantic button and the clickable node must be exposed, \
-         named from their text content since the fixture sets no aria-label"
+        a11y_nodes_with_role(&tree, "Button").len(),
+        1,
+        "the status bar fixture contains one semantic button"
+    );
+
+    // A control with a role but no name is announced as just "button" by a
+    // screen reader. The fixture sets no `aria-label`, so these names can only
+    // come from the bridge deriving them from content and placeholder.
+    assert_eq!(
+        a11y_nodes_with_role(&tree, "Button")
+            .first()
+            .and_then(|node| a11y_string_field(node, "label")),
+        Some("Split".to_string()),
+        "the button's accessible name must fall back to its text content"
     );
     assert_eq!(
         a11y_nodes_with_role(&tree, "TextInput")
@@ -1492,6 +1564,10 @@ fn main() {
         (
             "extension_chrome_vdom_renders_status_bar",
             extension_chrome_vdom_renders_status_bar,
+        ),
+        (
+            "extension_chrome_exposes_its_controls_and_text",
+            extension_chrome_exposes_its_controls_and_text,
         ),
         (
             "extension_chrome_semantic_button_dispatches_command",

@@ -715,6 +715,12 @@ impl VDomRenderer {
         {
             element = element.aria_label(SharedString::from(aria_label));
         }
+        // What is typed in it is drawn as a child string, which contributes no
+        // node, so a filled field announced its name and nothing about its
+        // contents.
+        if !value.is_empty() {
+            element = element.aria_value(SharedString::from(value.clone()));
+        }
         element = apply_styles(element, node, &self.palette);
 
         if let (Some(invocation), Some(dispatch)) = (change, self.dispatch.clone()) {
