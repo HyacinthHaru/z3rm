@@ -2638,11 +2638,12 @@ mod tests {
         });
         // Entered directly rather than through `enter_prefix_mode`, which
         // first asks whether a full-screen application owns the keyboard and
-        // passes the prefix key through when one does. This fixture's terminal
-        // settles with `BRACKETED_PASTE` set, which `is_full_screen_active`
-        // counts, so the mode never engaged once the snapshot had been applied
-        // — and the test only passed by racing it. What this test is about is
-        // what the pane announces for a state, so it sets the state.
+        // passes the prefix key through when one does. The snapshot this mock
+        // server sends sets `alternate_screen`, so once it has been applied the
+        // pane is running a full-screen application and the mode correctly
+        // never engages — the test only passed by drawing before the snapshot
+        // arrived. What this test is about is what the pane announces for a
+        // state, so it sets the state.
         assert!(
             full_screen,
             "if this fixture stops being full-screen, drive the mode through \
