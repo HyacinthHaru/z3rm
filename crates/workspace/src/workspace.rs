@@ -7020,11 +7020,23 @@ impl Workspace {
         let dock_is_open = dock.read(cx).is_open();
         let a11y_active = window.is_a11y_active();
 
+        // Named after the panel it is showing, not just where it sits: a
+        // landmark list reading "left dock, right dock" offers two
+        // destinations and refuses to say what either one holds.
+        let dock_label = match dock
+            .read(cx)
+            .active_panel()
+            .and_then(|panel| panel.icon_tooltip(window, cx))
+        {
+            Some(panel_name) => SharedString::from(format!("{dock_label}: {panel_name}")),
+            None => SharedString::from(dock_label),
+        };
+
         let mut container = div()
             .id(dock_element_id)
             .when(dock_is_open, |this| {
                 this.role(gpui::Role::Complementary)
-                    .aria_label(dock_label)
+                    .aria_label(dock_label.clone())
                     .when(a11y_active, |this| {
                         this.track_focus(self.region_focus_handles.dock(position))
                     })

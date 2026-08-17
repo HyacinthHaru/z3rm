@@ -3283,6 +3283,24 @@ mod tests {
         });
         cx.run_until_parked();
 
+        // With the centre empty the frame is two panels and a status bar; the
+        // tab bar and its per-tab controls only exist once something is open,
+        // and those are the controls most likely to repeat a name.
+        workspace.update_in(&mut cx, |workspace, window, cx| {
+            for label in ["main.rs", "notes.md"] {
+                workspace.add_item_to_active_pane(
+                    Box::new(cx.new(|cx| {
+                        workspace::item::test::TestItem::new(cx).with_label(label)
+                    })),
+                    None,
+                    true,
+                    window,
+                    cx,
+                );
+            }
+        });
+        cx.run_until_parked();
+
         cx.activate_a11y(cx.window_handle());
         let json = cx
             .update(|window, cx| {
@@ -3314,6 +3332,23 @@ mod tests {
                 "both panels have to be in the tree at once: {names:?}"
             );
         }
+
+        // The landmark list is how a reader jumps between regions, so it has to
+        // say what each one holds rather than only where it sits.
+        let mut landmarks: Vec<&str> = tree["nodes"]
+            .as_object()
+            .expect("the dump lists nodes")
+            .values()
+            .filter(|node| node["aria"]["role"] == "Complementary")
+            .filter_map(|node| node["aria"]["label"].as_str())
+            .collect();
+        landmarks.sort();
+        assert_eq!(
+            landmarks,
+            vec!["Left dock: Project Panel", "Right dock: Git Panel"],
+            "a landmark that only says where it sits offers a destination and \
+             refuses to say what is there"
+        );
     }
 
     /// Losing the mux connection is shown as small coloured text in the status
