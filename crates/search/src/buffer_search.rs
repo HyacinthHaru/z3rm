@@ -188,6 +188,10 @@ impl Render for BufferSearchBar {
         });
 
         let mut color_override = None;
+        // What the counter is announced as, kept apart from what it draws.
+        // "1/2" is four characters on screen and "one slash two" out loud, and
+        // the other search surfaces already say "5 matches".
+        let mut announced_matches = SharedString::new_static("No matches");
         let match_text = self
             .active_searchable_item
             .as_ref()
@@ -201,6 +205,8 @@ impl Render for BufferSearchBar {
                     .map(|(matches, _)| matches.len())
                     .unwrap_or(0);
                 if let Some(match_ix) = self.active_match_index {
+                    announced_matches =
+                        format!("Match {} of {}", match_ix + 1, matches_count).into();
                     Some(format!("{}/{}", match_ix + 1, matches_count))
                 } else {
                     color_override = Some(Color::Error); // No matches found
@@ -344,7 +350,7 @@ impl Render for BufferSearchBar {
                                 .id("buffer-search-match-count")
                                 .role(gpui::Role::Status)
                                 .aria_live(gpui::accesskit::Live::Polite)
-                                .aria_label(match_text.clone())
+                                .aria_label(announced_matches)
                                 .ml_2()
                                 .min_w(rems_from_px(40.))
                                 .child(
@@ -2058,13 +2064,12 @@ mod tests {
             .iter()
             .find(|(id, _)| id.contains("buffer-search-match-count"))
             .unwrap_or_else(|| panic!("the match count has to be announced: {json}"));
-        let (index, total) = count
-            .1
-            .split_once('/')
-            .unwrap_or_else(|| panic!("the count reads as \"index/total\": {count:?}"));
-        assert!(
-            index.parse::<usize>().is_ok() && total.parse::<usize>().unwrap_or(0) > 0,
-            "a query that matches has to say how many: {count:?}"
+        // The label is what a reader says out loud, not what the bar draws.
+        // "1/2" fits in the toolbar and reads as "one slash two"; the other
+        // search surfaces already announce "5 matches".
+        assert_eq!(
+            count.1, "Match 1 of 2",
+            "the count has to be a sentence, not a fraction: {count:?}"
         );
 
         // Present with no error in it: a region created at the same moment as

@@ -1265,9 +1265,15 @@ impl PickerDelegate for WorktreePickerDelegate {
                             )
                         })
                         .when(!is_deleting && !is_current, |this| {
+                            // One pair of these per row, so the bare action
+                            // repeats down the list with nothing saying which
+                            // worktree it acts on.
+                            let row_name = self
+                                .match_label(ix, cx)
+                                .unwrap_or_else(|| SharedString::new_static("worktree"));
                             let open_in_new_window_button =
                                 IconButton::new(("open-new-window", ix), IconName::ArrowUpRight)
-                                    .aria_label("Open in New Window")
+                                    .aria_label(format!("Open in New Window: {row_name}"))
                                     .icon_size(IconSize::Small)
                                     .tooltip(Tooltip::text("Open in New Window"))
                                     .on_click(cx.listener(move |picker, _, window, cx| {
@@ -1306,7 +1312,7 @@ impl PickerDelegate for WorktreePickerDelegate {
                                 }))
                                 .child(
                                     IconButton::new(("delete-worktree", ix), IconName::Trash)
-                                        .aria_label("Delete Worktree")
+                                        .aria_label(format!("Delete Worktree: {row_name}"))
                                         .icon_size(IconSize::Small)
                                         .when(force_delete, |this| this.icon_color(Color::Error))
                                         .tooltip(move |_, cx| {
