@@ -2578,6 +2578,11 @@ mod tests {
                 cx,
             )
         });
+        // Pumped before the join: the mock server blocks reading with a
+        // timeout, and the request it is waiting for is sent by a task on this
+        // thread. Joining first means the timeout races the scheduler, which is
+        // why this passed alone and failed under load.
+        cx.run_until_parked();
         match server_thread.join() {
             Ok(Ok(())) => {}
             Ok(Err(error)) => panic!("mock mux server failed: {error}"),
@@ -2700,6 +2705,11 @@ mod tests {
                 cx,
             )
         });
+        // Pumped before the join: the mock server blocks reading with a
+        // timeout, and the request it is waiting for is sent by a task on this
+        // thread. Joining first means the timeout races the scheduler, which is
+        // why this passed alone and failed under load.
+        cx.run_until_parked();
         match server_thread.join() {
             Ok(Ok(())) => {}
             Ok(Err(error)) => panic!("mock mux server failed: {error}"),
