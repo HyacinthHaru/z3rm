@@ -5,6 +5,10 @@ use ui::prelude::*;
 #[derive(IntoElement)]
 pub struct ExtensionCard {
     overridden_by_dev_extension: bool,
+    /// What this card is about. Its contents are labels — name, version,
+    /// authors, description — and a label contributes no accessibility node,
+    /// so without this a card reaches a reader as its buttons and nothing else.
+    aria_label: Option<SharedString>,
     children: SmallVec<[AnyElement; 2]>,
 }
 
@@ -12,8 +16,15 @@ impl ExtensionCard {
     pub fn new() -> Self {
         Self {
             overridden_by_dev_extension: false,
+            aria_label: None,
             children: SmallVec::new(),
         }
+    }
+
+    /// Names the card, which is also what makes it reported as a group at all.
+    pub fn aria_label(mut self, label: impl Into<SharedString>) -> Self {
+        self.aria_label = Some(label.into());
+        self
     }
 
     pub fn overridden_by_dev_extension(mut self, overridden: bool) -> Self {
@@ -30,7 +41,19 @@ impl ParentElement for ExtensionCard {
 
 impl RenderOnce for ExtensionCard {
     fn render(self, _window: &mut Window, cx: &mut App) -> impl IntoElement {
-        div().w_full().child(
+        // Keyed by the name so two cards cannot collide on one id. Always
+        // stateful so both arms have the same type; the role and the name only
+        // appear when the caller supplied one.
+        let label = self.aria_label.clone();
+        div()
+            .id(ElementId::Name(
+                label.clone().unwrap_or_else(|| "extension-card".into()),
+            ))
+            .w_full()
+            .when_some(label, |this, label| {
+                this.role(gpui::Role::Group).aria_label(label)
+            })
+            .child(
             v_flex()
                 .mt_4()
                 .w_full()

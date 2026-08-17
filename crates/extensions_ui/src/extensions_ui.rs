@@ -756,6 +756,12 @@ impl ExtensionsPage {
         let can_configure = !extension.context_servers.is_empty();
 
         ExtensionCard::new()
+            // Name, version and authors are labels on the card, so the card is
+            // the only place they can reach a reader from.
+            .aria_label(format!(
+                "{}, v{}, dev extension",
+                extension.name, extension.version
+            ))
             .child(
                 h_flex()
                     .justify_between()
@@ -905,6 +911,12 @@ impl ExtensionsPage {
         };
 
         ExtensionCard::new()
+            .aria_label(format!(
+                "{}, v{}, by {}",
+                extension.manifest.name,
+                version,
+                extension.manifest.authors.join(", ")
+            ))
             .overridden_by_dev_extension(has_dev_extension)
             .child(
                 h_flex()
@@ -1012,7 +1024,10 @@ impl ExtensionsPage {
                                     SharedString::from(format!("repository-{}", extension.id)),
                                     repository_icon,
                                 )
-                                .aria_label("Visit Extension Repository")
+                                .aria_label(format!(
+                                    "Visit Extension Repository: {}",
+                                    extension.manifest.name
+                                ))
                                 .icon_size(IconSize::Small)
                                 .tooltip(move |_, cx| {
                                     Tooltip::with_meta(
@@ -1036,7 +1051,10 @@ impl ExtensionsPage {
                                         SharedString::from(format!("more-{}", extension.id)),
                                         IconName::Ellipsis,
                                     )
-                                    .aria_label("More extension actions")
+                                    .aria_label(format!(
+                                        "More extension actions: {}",
+                                        extension.manifest.name
+                                    ))
                                     .icon_size(IconSize::Small),
                                 )
                                 .anchor(Anchor::TopRight)
