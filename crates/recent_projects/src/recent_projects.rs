@@ -2623,6 +2623,12 @@ impl gpui::Focusable for RemoteServerProjects {
 impl gpui::EventEmitter<gpui::DismissEvent> for RemoteServerProjects {}
 
 impl workspace::ModalView for RemoteServerProjects {
+    fn a11y_name(&self, _cx: &gpui::App) -> Option<SharedString> {
+        // The whole modal is one message rendered as plain text, which is not
+        // a node, so naming the dialog is the only way it reaches a reader.
+        Some(self.message.clone())
+    }
+
     fn on_before_dismiss(
         &mut self,
         _window: &mut Window,

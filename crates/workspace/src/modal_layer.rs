@@ -68,9 +68,13 @@ pub trait ModalView: ManagedView {
     /// else — the one moment the user most needs to be told where they are.
     /// Labels are not text nodes in GPUI, so nothing can be derived from the
     /// modal's own contents; it has to say so itself.
-    fn a11y_name(&self, _cx: &App) -> Option<SharedString> {
-        None
-    }
+    /// The name announced when the dialog opens.
+    ///
+    /// Required rather than defaulted: a modal is announced the moment it
+    /// appears, and one with no name is announced as "dialog" and nothing
+    /// else. `None` is for a modal that renders bare, where the layer wraps
+    /// nothing for a name to attach to.
+    fn a11y_name(&self, cx: &App) -> Option<SharedString>;
 }
 
 trait ModalViewHandle {

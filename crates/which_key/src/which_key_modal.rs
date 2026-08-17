@@ -293,6 +293,12 @@ impl Focusable for WhichKeyModal {
 }
 
 impl ModalView for WhichKeyModal {
+    fn a11y_name(&self, _cx: &App) -> Option<SharedString> {
+        // Rendered bare, so the modal layer never wraps it in a dialog for a
+        // name to attach to; the overlay names its own contents.
+        None
+    }
+
     fn render_bare(&self) -> bool {
         true
     }

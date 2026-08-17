@@ -5284,7 +5284,11 @@ pub mod tests {
                 self.focus_handle.clone()
             }
         }
-        impl workspace::ModalView for EmptyModalView {}
+        impl workspace::ModalView for EmptyModalView {
+            fn a11y_name(&self, _cx: &App) -> Option<SharedString> {
+                None
+            }
+        }
 
         workspace.update_in(cx, |workspace, window, cx| {
             workspace.toggle_modal(window, cx, |_, cx| EmptyModalView {

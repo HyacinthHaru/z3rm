@@ -7,7 +7,13 @@ use ui_input::{ErasedEditor, ErasedEditorEvent};
 /// The head of a [`Picker`](crate::Picker).
 pub(crate) enum Head {
     /// Picker has an editor that allows the user to filter the list.
-    Editor(Arc<dyn ErasedEditor>),
+    Editor {
+        editor: Arc<dyn ErasedEditor>,
+        /// The placeholder, kept so the picker can name itself with it. A
+        /// picker opened as a modal is announced the moment it appears, and
+        /// the placeholder is the only user-facing title it has.
+        name: SharedString,
+    },
 
     /// Picker has no head, it's just a list of items.
     Empty(Entity<EmptyHead>),
@@ -34,7 +40,10 @@ impl Head {
                 cx,
             )
             .detach();
-        Self::Editor(editor)
+        Self::Editor {
+            editor,
+            name: SharedString::from(placeholder_text.to_string()),
+        }
     }
 
     pub fn empty<V: 'static>(
@@ -47,6 +56,14 @@ impl Head {
         cx.on_blur(&head.focus_handle(cx), window, blur_handler)
             .detach();
         Self::Empty(head)
+    }
+
+    /// What the picker announces itself as when it opens.
+    pub fn a11y_name(&self, cx: &App) -> SharedString {
+        match self {
+            Self::Editor { name, .. } => name.clone(),
+            Self::Empty(head) => head.read(cx).label.clone(),
+        }
     }
 }
 

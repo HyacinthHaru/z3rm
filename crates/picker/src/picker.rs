@@ -422,7 +422,7 @@ pub trait PickerDelegate: Sized + 'static {
 impl<D: PickerDelegate> Focusable for Picker<D> {
     fn focus_handle(&self, cx: &App) -> FocusHandle {
         match &self.head {
-            Head::Editor(editor) => editor.focus_handle(cx),
+            Head::Editor { editor, .. } => editor.focus_handle(cx),
             Head::Empty(head) => head.focus_handle(cx),
         }
     }
@@ -1089,7 +1089,7 @@ impl<D: PickerDelegate> Picker<D> {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let Head::Editor(editor) = &self.head else {
+        let Head::Editor { editor, .. } = &self.head else {
             panic!("unexpected call");
         };
         match event {
@@ -1121,7 +1121,7 @@ impl<D: PickerDelegate> Picker<D> {
 
     pub fn refresh_placeholder(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         match &self.head {
-            Head::Editor(editor) => {
+            Head::Editor { editor, .. } => {
                 let placeholder = self.delegate.placeholder_text(window, cx);
 
                 editor.set_placeholder_text(placeholder.as_ref(), window, cx);
@@ -1223,13 +1223,13 @@ impl<D: PickerDelegate> Picker<D> {
 
     pub fn query(&self, cx: &App) -> String {
         match &self.head {
-            Head::Editor(editor) => editor.text(cx),
+            Head::Editor { editor, .. } => editor.text(cx),
             Head::Empty(_) => "".to_string(),
         }
     }
 
     pub fn set_query(&self, query: &str, window: &mut Window, cx: &mut App) {
-        if let Head::Editor(editor) = &self.head {
+        if let Head::Editor { editor, .. } = &self.head {
             editor.set_text(query, window, cx);
             editor.move_selection_to_end(window, cx);
         }
@@ -1238,7 +1238,7 @@ impl<D: PickerDelegate> Picker<D> {
     /// Selects the entire query, so the next keystroke replaces it (and a single
     /// backspace clears it). Matches the buffer search bar's seeded-query behavior.
     pub fn select_query(&self, window: &mut Window, cx: &mut App) {
-        if let Head::Editor(editor) = &self.head {
+        if let Head::Editor { editor, .. } = &self.head {
             editor.select_all(window, cx);
         }
     }
@@ -2120,5 +2120,12 @@ mod tests {
 }
 
 impl<D: PickerDelegate> EventEmitter<DismissEvent> for Picker<D> {}
-impl<D: PickerDelegate> ModalView for Picker<D> {}
+impl<D: PickerDelegate> ModalView for Picker<D> {
+    fn a11y_name(&self, cx: &App) -> Option<SharedString> {
+        // Every picker in the product opens as a modal, and the dialog the
+        // modal layer wraps it in had no name of its own — so each one was
+        // announced as "dialog" and nothing more.
+        Some(self.head.a11y_name(cx))
+    }
+}
 impl<D: PickerDelegate> ui::FluentBuilder for Picker<D> {}

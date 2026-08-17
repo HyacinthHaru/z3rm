@@ -229,7 +229,7 @@ impl<D: PickerDelegate> Picker<D> {
             .on_action(cx.listener(Self::toggle_multi_select))
             .on_action(cx.listener(Self::multi_select_next))
             .children(match &self.head {
-                Head::Editor(editor) => {
+                Head::Editor { editor, .. } => {
                     if editor_position == PickerEditorPosition::Start {
                         let editor = editor.clone();
                         Some(
@@ -306,7 +306,7 @@ impl<D: PickerDelegate> Picker<D> {
             })
             .children(self.render_footer(window, cx))
             .children(match &self.head {
-                Head::Editor(editor) => {
+                Head::Editor { editor, .. } => {
                     if editor_position == PickerEditorPosition::End {
                         let editor = editor.clone();
                         Some(self.render_editor(&editor, window, cx))
