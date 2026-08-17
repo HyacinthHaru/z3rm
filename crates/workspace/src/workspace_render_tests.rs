@@ -1267,3 +1267,94 @@ async fn pinned_tabs_are_their_own_list(cx: &mut TestAppContext) {
         "the unpinned list starts at one, not after the pinned tabs"
     );
 }
+
+/// Stacked mode runs the tabs down the side and does not use the `TabBar`
+/// component, so the role and name that component supplies are absent unless
+/// the stacked container sets them itself. Tabs in no list lose "2 of 5" and
+/// the bar stops being somewhere a reader can jump to.
+#[gpui::test]
+async fn the_stacked_tab_bar_is_still_a_tab_list(cx: &mut TestAppContext) {
+    init_test(cx);
+    cx.update(|cx| {
+        SettingsStore::update_global(cx, |store, cx| {
+            store.update_user_settings(cx, |settings| {
+                let tab_bar = settings.tab_bar.get_or_insert_default();
+                tab_bar.show = true;
+                // On, to prove the stacked bar ignores it: stacked mode merges
+                // pinned and unpinned into one list, so numbering must not be
+                // split even though the setting asks for separate rows.
+                tab_bar.show_pinned_tabs_in_separate_row = Some(true);
+            });
+        });
+    });
+    let fs = FakeFs::new(cx.executor());
+    fs.insert_tree("/root", json!({ "a.txt": "" })).await;
+    let project = Project::test(fs, [path!("/root").as_ref()], cx).await;
+
+    let (multi_workspace, cx) =
+        cx.add_window_view(|window, cx| MultiWorkspace::test_new(project, window, cx));
+    let workspace = multi_workspace.read_with(cx, |mw, _| mw.workspace().clone());
+    let pane = workspace.read_with(cx, |ws, _| ws.active_pane().clone());
+
+    pane.update_in(cx, |pane, window, cx| {
+        for label in ["pinned.rs", "shell", "logs"] {
+            pane.add_item(
+                Box::new(cx.new(|cx| TestItem::new(cx).with_label(label))),
+                true,
+                true,
+                None,
+                window,
+                cx,
+            );
+        }
+        pane.set_pinned_count(1);
+        pane.set_tabbar_style(crate::layout_projection::TabBarStyle::Stacked, cx);
+    });
+    cx.run_until_parked();
+
+    cx.activate_a11y(cx.window_handle());
+    let json = cx
+        .update(|window, cx| {
+            window.draw(cx).clear(cx);
+            window.debug_a11y_tree_json()
+        })
+        .expect("activation makes the debug tree available");
+    let tree: serde_json::Value = serde_json::from_str(&json).expect("the dump is valid JSON");
+    gpui::a11y_checks::assert_interactive_nodes_are_named(&tree, "stacked tabs");
+    gpui::a11y_checks::assert_no_role_was_discarded(&tree, "stacked tabs");
+    // The check this is really about: a `Tab` outside a `TabList` keeps its
+    // role and loses everything the containment gives it.
+    gpui::a11y_checks::assert_roles_are_contained(&tree, "stacked tabs");
+    gpui::a11y_checks::assert_names_are_distinguishable(&tree, "stacked tabs");
+    gpui::a11y_checks::assert_clickable_elements_are_reachable(&tree, "stacked tabs");
+    gpui::a11y_checks::assert_controls_have_area(&tree, "stacked tabs");
+
+    let nodes = tree["nodes"].as_object().expect("the dump lists nodes");
+    let list = nodes
+        .values()
+        .find(|node| node["aria"]["role"] == "TabList")
+        .expect("the stacked bar is a tab list");
+    assert_eq!(list["aria"]["label"].as_str(), Some("Tabs"));
+    assert_eq!(
+        list["aria"]["orientation"].as_str(),
+        Some("Vertical"),
+        "the tabs run down the side, so up and down are what move between them"
+    );
+
+    let mut set: Vec<(u64, u64)> = nodes
+        .values()
+        .filter(|node| node["aria"]["role"] == "Tab")
+        .map(|node| {
+            (
+                node["aria"]["position_in_set"].as_u64().unwrap_or_default(),
+                node["aria"]["size_of_set"].as_u64().unwrap_or_default(),
+            )
+        })
+        .collect();
+    set.sort_unstable();
+    assert_eq!(
+        set,
+        vec![(1, 3), (2, 3), (3, 3)],
+        "stacked mode is one list, so the pinned tab is numbered with the rest"
+    );
+}

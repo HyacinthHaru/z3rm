@@ -2853,7 +2853,15 @@ impl Pane {
         let has_file_icon = icon.is_some();
 
         let pinned_count = self.pinned_count();
-        let tab_position_in_bar = if pinned_count == 0 {
+        // Only the two-row layout actually puts the pinned tabs in a list of
+        // their own; stacked mode and the single-row bar keep one list, and
+        // numbering as though they were split would be the same mistake in
+        // reverse.
+        let bars_are_split = !self.tabbar_style.is_stacked()
+            && TabBarSettings::get_global(cx).show_pinned_tabs_in_separate_row
+            && pinned_count > 0
+            && pinned_count < self.items.len();
+        let tab_position_in_bar = if !bars_are_split {
             (ix + 1, self.items.len())
         } else if self.is_tab_pinned(ix) {
             (ix + 1, pinned_count)
@@ -3464,6 +3472,15 @@ impl Pane {
 
         v_flex()
             .id("stacked-tab-bar")
+            // Stacked mode does not use the `TabBar` component, so the role and
+            // name it normally supplies have to be set here: without them the
+            // tabs sit in no list at all, and a reader loses "2 of 5" along
+            // with any way to jump to the bar.
+            .role(gpui::Role::TabList)
+            .aria_label("Tabs")
+            // The tabs run down the side, so up and down are what move between
+            // them rather than left and right.
+            .aria_orientation(gpui::accesskit::Orientation::Vertical)
             .h_full()
             .w_32()
             .bg(cx.theme().colors().tab_bar_background)
