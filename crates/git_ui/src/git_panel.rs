@@ -5046,7 +5046,18 @@ impl GitPanel {
                 .justify_between()
                 .child(
                     ButtonLike::new("diff-button")
-                        .aria_label("View Diff")
+                        .aria_label(
+                            if GitPanelSettings::get_global(cx).diff_stats
+                                && diff_stat_total != DiffStat::default()
+                            {
+                                SharedString::from(format!(
+                                    "View Diff, {} added, {} removed",
+                                    diff_stat_total.added, diff_stat_total.deleted
+                                ))
+                            } else {
+                                SharedString::new_static("View Diff")
+                            },
+                        )
                         .child(
                             h_flex()
                                 .gap_1()
@@ -6634,11 +6645,24 @@ impl GitPanel {
             } else {
                 ""
             };
-            if word.is_empty() {
-                SharedString::from(display_name.clone())
+            let mut announced = if word.is_empty() {
+                display_name.clone().to_string()
             } else {
-                SharedString::from(format!("{display_name}, {word}"))
+                format!("{display_name}, {word}")
+            };
+            // The +12 −3 beside the row is a pair of labels, so the size of a
+            // change reaches a reader only through the name — and only when the
+            // panel is set to show it, so the two stay in step.
+            if settings.diff_stats
+                && let Some(stat) = entry.diff_stat
+                && (stat.added > 0 || stat.deleted > 0)
+            {
+                announced.push_str(&format!(
+                    ", {} added, {} removed",
+                    stat.added, stat.deleted
+                ));
             }
+            SharedString::from(announced)
         };
         let selected = self.selected_entry == Some(ix);
         let marked = self.marked_entries.contains(&ix);
@@ -11441,6 +11465,12 @@ mod tests {
             .unwrap();
         let mut cx = VisualTestContext::from_window(window_handle.into(), cx);
 
+        // The panel draws +N −M beside each row when this is on, and the row
+        // has to say the same thing when it does.
+        cx.update(|_, cx| {
+            update_git_panel_settings(cx, |settings| settings.diff_stats = true)
+        });
+
         let panel = workspace.update_in(&mut cx, GitPanel::new);
         workspace.update_in(&mut cx, |workspace, window, cx| {
             workspace.add_panel(panel.clone(), window, cx);
@@ -11483,7 +11513,7 @@ mod tests {
         // icon depending on the setting, and neither reaches a reader.
         assert_eq!(
             current["aria"]["label"].as_str(),
-            Some("tracked, modified")
+            Some("tracked, modified, 1 added, 1 removed")
         );
 
         gpui::a11y_checks::assert_interactive_nodes_are_named(&tree, "git panel");
@@ -11509,7 +11539,7 @@ mod tests {
             .filter_map(|node| node["aria"]["label"].as_str())
             .collect();
         assert!(
-            rows.contains(&"tracked, modified"),
+            rows.contains(&"tracked, modified, 1 added, 1 removed"),
             "every changed file needs a name of its own: {rows:?}"
         );
 
