@@ -3021,6 +3021,11 @@ impl GitGraph {
 
         let is_tree_view = self.changed_files_view_mode.is_tree();
         let view_toggle = IconButton::new("toggle-changed-files-view", IconName::ListTree)
+            .aria_label(if is_tree_view {
+                "Show Flat View"
+            } else {
+                "Show Tree View"
+            })
             .icon_size(IconSize::Small)
             .toggle_state(self.changed_files_view_mode.is_tree())
             .tooltip({
@@ -3054,6 +3059,7 @@ impl GitGraph {
                     .child(
                         div().absolute().top_2().right_2().child(
                             IconButton::new("close-detail", IconName::Close)
+                                .aria_label("Close commit details")
                                 .icon_size(IconSize::Small)
                                 .on_click(cx.listener(move |this, _, _, cx| {
                                     this.selected_entry_idx = None;
@@ -4130,6 +4136,13 @@ impl Render for GitGraph {
                                         .role(gpui::Role::Row)
                                         .aria_row_index(index + 1)
                                         .aria_selected(is_selected)
+                                        // Focus stays on the graph while the
+                                        // arrow keys move the highlight, so the
+                                        // current commit is only announced if
+                                        // it is claimed as current too.
+                                        .when(is_selected, |this| {
+                                            this.aria_active_descendant()
+                                        })
                                         .when_some(announced, |row, announced| {
                                             row.aria_label(announced)
                                         })
@@ -6842,6 +6855,16 @@ mod tests {
         });
         cx.run_until_parked();
 
+        // Highlight a commit: focus stays on the graph while the arrow keys
+        // move the highlight, so the current commit reaches a reader only
+        // through the active-descendant claim.
+        git_graph.update_in(cx, |graph, window, cx| {
+            graph.selected_entry_idx = Some(0);
+            window.focus(&graph.focus_handle, cx);
+            cx.notify();
+        });
+        cx.run_until_parked();
+
         cx.activate_a11y(cx.window_handle());
         let read_rows = |cx: &mut gpui::VisualTestContext| {
             let json = cx
@@ -6900,6 +6923,21 @@ mod tests {
             loaded.iter().all(|row| row.matches(", ").count() >= 3),
             "a row says its subject, author, date and short sha: {loaded:?}"
         );
+
+        let json = cx
+            .update(|window, cx| {
+                window.draw(cx).clear(cx);
+                window.debug_a11y_tree_json()
+            })
+            .expect("activation makes the debug tree available");
+        let tree: serde_json::Value = serde_json::from_str(&json).expect("the dump is valid JSON");
+        let nodes = tree["nodes"].as_object().expect("the dump lists nodes");
+        let current = tree["active_descendant_focus"]
+            .as_str()
+            .and_then(|id| nodes.get(id))
+            .unwrap_or_else(|| panic!("the graph must point at the commit it highlights: {json}"));
+        assert_eq!(current["aria"]["row_index"].as_u64(), Some(1));
+        assert_eq!(current["aria"]["selected"].as_bool(), Some(true));
     }
 
     #[gpui::test]

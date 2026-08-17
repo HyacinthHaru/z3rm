@@ -2002,6 +2002,11 @@ impl Render for KeymapEditor {
 
         v_flex()
             .id("keymap-editor")
+            // An id alone is not enough: without a role this focused root
+            // produces no node, so arrowing through the bindings announced the
+            // whole window instead of the table.
+            .role(gpui::Role::Group)
+            .aria_label("Key bindings editor")
             .track_focus(focus_handle)
             .key_context(self.key_context())
             .on_action(cx.listener(Self::select_next))
@@ -2313,6 +2318,10 @@ impl Render for KeymapEditor {
                                 .role(gpui::Role::Row)
                                 .aria_row_index(row_index + 1)
                                 .aria_selected(is_selected)
+                                // Focus is on the table while the arrow keys
+                                // move the highlight, so the row is only
+                                // announced if it is also claimed as current.
+                                .when(is_selected, |this| this.aria_active_descendant())
                                 .when_some(announced, |this, announced| this.aria_label(announced))
                                 .child(
                                     row.id(row_id.clone())
@@ -4071,6 +4080,16 @@ mod tests {
         });
         cx.run_until_parked();
 
+        // Highlight a row: focus stays on the table while the arrow keys move
+        // the highlight, so the current row reaches a reader only through the
+        // active-descendant claim.
+        keymap_editor.update_in(cx, |editor, window, cx| {
+            editor.selected_index = Some(0);
+            window.focus(&editor.focus_handle, cx);
+            cx.notify();
+        });
+        cx.run_until_parked();
+
         cx.activate_a11y(cx.window_handle());
         let json = cx
             .update(|window, cx| {
@@ -4113,6 +4132,13 @@ mod tests {
             rows.iter().all(|label| label.contains(", ")),
             "a row has to say what it binds and where: {rows:?}"
         );
+
+        let current = tree["active_descendant_focus"]
+            .as_str()
+            .and_then(|id| nodes.get(id))
+            .unwrap_or_else(|| panic!("the table must point at the row it highlights: {json}"));
+        assert_eq!(current["aria"]["row_index"].as_u64(), Some(1));
+        assert_eq!(current["aria"]["selected"].as_bool(), Some(true));
     }
 
     fn visible_rows_for_action(editor: &KeymapEditor, action_name: &str) -> Vec<usize> {
