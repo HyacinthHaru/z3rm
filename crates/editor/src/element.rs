@@ -7822,6 +7822,9 @@ impl Element for EditorElement {
         if let Some(name) = prepaint.a11y_region_name.as_ref() {
             builder.parent_node().set_label(name.to_string());
         }
+        if let Some(description) = prepaint.a11y_description.as_ref() {
+            builder.parent_node().set_description(description.to_string());
+        }
         if let Some(a11y_text) = prepaint.a11y_text.as_ref() {
             // The placeholder is the only name most of these inputs have; the
             // parent node is reachable here, so no element-level plumbing is
@@ -9344,6 +9347,7 @@ impl Element for EditorElement {
                     // A single-line input names itself with its placeholder;
                     // one without a placeholder needs to be told what it is.
                     let a11y_explicit_name = self.editor.read(cx).a11y_label();
+                    let a11y_description = self.editor.read(cx).a11y_description();
                     let a11y_region_name = a11y_explicit_name.or_else(|| {
                         self.focusable_region.then(|| {
                         self.editor
@@ -9394,6 +9398,7 @@ impl Element for EditorElement {
                     EditorLayout {
                         a11y_text,
                         a11y_region_name,
+                        a11y_description,
                         mode,
                         position_map,
                         visible_display_row_range: start_row..end_row,
@@ -9626,6 +9631,7 @@ pub struct EditorLayout {
     /// What a focused full editor announces itself as. Captured during layout
     /// because the accessibility hooks run without a context.
     a11y_region_name: Option<SharedString>,
+    a11y_description: Option<SharedString>,
     position_map: Rc<PositionMap>,
     hitbox: Hitbox,
     gutter_hitbox: Hitbox,

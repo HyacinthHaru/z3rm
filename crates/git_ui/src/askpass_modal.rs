@@ -49,6 +49,10 @@ impl AskPassModal {
                 editor.set_masked(true, cx);
                 editor.set_a11y_label("Password");
             }
+            // The prompt names the host or key being authenticated against and
+            // is the only place it appears; as plain text it is not a node, so
+            // without this the field asks for a secret without saying for what.
+            editor.set_a11y_description(prompt.clone());
             editor
         });
         Self {
@@ -150,5 +154,62 @@ impl Render for AskPassModal {
                     .child(self.editor.clone()),
             )
             .children(self.render_hint(cx))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use gpui::TestAppContext;
+
+    /// The modal asks for a secret. Everything that says *which* secret — the
+    /// repository, the host, the key file — lives in the prompt, and the prompt
+    /// is plain text, which is not an accessibility node. Focus lands in the
+    /// field the moment the modal opens, so if the field does not carry that
+    /// detail nothing announces it at all.
+    #[gpui::test]
+    fn the_password_field_says_what_it_is_for(cx: &mut TestAppContext) {
+        cx.update(|cx| {
+            let settings_store = settings::SettingsStore::test(cx);
+            cx.set_global(settings_store);
+            theme_settings::init(theme::LoadThemes::JustBase, cx);
+            editor::init(cx);
+        });
+
+        let (tx, _rx) = oneshot::channel();
+        let window = cx.add_window(|window, cx| {
+            AskPassModal::new(
+                "git push".into(),
+                "Password for 'https://ada@github.com':".into(),
+                tx,
+                window,
+                cx,
+            )
+        });
+        cx.activate_a11y(window.into());
+
+        let json = cx
+            .update_window(window.into(), |_, window, cx| {
+                window.draw(cx).clear(cx);
+                window.debug_a11y_tree_json()
+            })
+            .expect("the harness window is still open")
+            .expect("activation makes the debug tree available");
+        let tree: serde_json::Value = serde_json::from_str(&json).expect("the dump is valid JSON");
+        gpui::a11y_checks::assert_interactive_nodes_are_named(&tree, "askpass modal");
+        gpui::a11y_checks::assert_names_are_distinguishable(&tree, "askpass modal");
+
+        let field = tree["nodes"]
+            .as_object()
+            .expect("the dump lists nodes")
+            .values()
+            .find(|node| node["aria"]["role"] == "TextInput")
+            .unwrap_or_else(|| panic!("no text input in the tree: {json}"));
+        assert_eq!(field["aria"]["label"].as_str(), Some("Password"));
+        assert_eq!(
+            field["aria"]["description"].as_str(),
+            Some("Password for 'https://ada@github.com':"),
+            "the field says which host is asking"
+        );
     }
 }

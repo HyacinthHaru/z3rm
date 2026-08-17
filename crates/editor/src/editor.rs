@@ -903,6 +903,7 @@ pub struct Editor {
     /// placeholder at all, so without this it is announced as "edit text" and
     /// nothing else.
     a11y_label: Option<SharedString>,
+    a11y_description: Option<SharedString>,
     pub selections: SelectionsCollection,
     /// Manages the scroll position for the given editor.
     ///
@@ -2389,6 +2390,7 @@ impl Editor {
             display_map: display_map.clone(),
             placeholder_display_map: None,
             a11y_label: None,
+            a11y_description: None,
             selections,
             scroll_manager: ScrollManager::new(cx),
             columnar_selection_state: None,
@@ -3210,6 +3212,18 @@ impl Editor {
     /// The name set by [`Self::set_a11y_label`], if any.
     pub fn a11y_label(&self) -> Option<SharedString> {
         self.a11y_label.clone()
+    }
+
+    /// Detail read out after the name. Use it when text next to the input says
+    /// what the input is *for* — which repository is asking for a password,
+    /// which file is being renamed — since that text is not a node on its own.
+    pub fn set_a11y_description(&mut self, description: impl Into<SharedString>) {
+        self.a11y_description = Some(description.into());
+    }
+
+    /// The detail set by [`Self::set_a11y_description`], if any.
+    pub fn a11y_description(&self) -> Option<SharedString> {
+        self.a11y_description.clone()
     }
 
     pub fn placeholder_text(&self, cx: &mut App) -> Option<String> {
