@@ -80,6 +80,12 @@ impl Render for StatusToast {
 
         h_flex()
             .id("status-toast")
+            // The toast layer around this is a polite live region, but a live
+            // region announces the text of what appears inside it, and the
+            // message is a `Label`, which is not a node. Without a name here a
+            // toast arrives saying only "Dismiss".
+            .role(gpui::Role::Group)
+            .aria_label(self.text.clone())
             .elevation_3(cx)
             .gap_2()
             .py_1p5()
@@ -249,5 +255,64 @@ impl Component for StatusToast {
                 .vertical(),
             ])
             .into_any_element()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use gpui::TestAppContext;
+
+    /// A toast is transient status the user never navigates to, so it is only
+    /// ever perceived if it is announced — and what a live region announces is
+    /// the text of the nodes that appear inside it. The message is a `Label`,
+    /// which is not a node, so the toast has to carry the message itself.
+    #[gpui::test]
+    fn a_toast_announces_what_it_says(cx: &mut TestAppContext) {
+        cx.update(|cx| {
+            let settings_store = settings::SettingsStore::test(cx);
+            cx.set_global(settings_store);
+            theme_settings::init(theme::LoadThemes::JustBase, cx);
+        });
+
+        let window = cx.add_window(|_, cx| {
+            let toast = StatusToast::new("Failed to restore notes.md", cx, |this, _| {
+                this.dismiss_button(true)
+            });
+            ToastHost(toast)
+        });
+        cx.activate_a11y(window.into());
+
+        let json = cx
+            .update_window(window.into(), |_, window, cx| {
+                window.draw(cx).clear(cx);
+                window.debug_a11y_tree_json()
+            })
+            .expect("the harness window is still open")
+            .expect("activation makes the debug tree available");
+        let tree: serde_json::Value = serde_json::from_str(&json).expect("the dump is valid JSON");
+        gpui::a11y_checks::assert_interactive_nodes_are_named(&tree, "status toast");
+        gpui::a11y_checks::assert_names_are_distinguishable(&tree, "status toast");
+        gpui::a11y_checks::assert_no_role_was_discarded(&tree, "status toast");
+        gpui::a11y_checks::assert_clickable_elements_are_reachable(&tree, "status toast");
+
+        let announced = tree["nodes"]
+            .as_object()
+            .expect("the dump lists nodes")
+            .values()
+            .filter_map(|node| node["aria"]["label"].as_str())
+            .any(|label| label == "Failed to restore notes.md");
+        assert!(
+            announced,
+            "a toast that arrives saying only \"Dismiss\" has told the user nothing: {json}"
+        );
+    }
+
+    struct ToastHost(Entity<StatusToast>);
+
+    impl Render for ToastHost {
+        fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+            div().size_full().child(self.0.clone())
+        }
     }
 }
