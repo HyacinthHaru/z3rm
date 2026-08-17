@@ -2687,6 +2687,12 @@ mod live_tests {
             .expect("the sidebar window is still open")
             .expect("activation makes the debug tree available");
         let tree: serde_json::Value = serde_json::from_str(&json).expect("the dump is valid JSON");
+        gpui::a11y_checks::assert_interactive_nodes_are_named(&tree, "empty sidebar");
+        gpui::a11y_checks::assert_no_role_was_discarded(&tree, "empty sidebar");
+        gpui::a11y_checks::assert_roles_are_contained(&tree, "empty sidebar");
+        gpui::a11y_checks::assert_focus_reached_the_tree(&tree, "empty sidebar");
+        gpui::a11y_checks::assert_click_targets_are_reachable(&tree, "empty sidebar");
+        gpui::a11y_checks::assert_landmarks_are_distinguishable(&tree, "empty sidebar");
 
         assert!(
             tree["nodes"]
@@ -2735,6 +2741,12 @@ mod live_tests {
             .expect("the sidebar window is still open")
             .expect("activation makes the debug tree available");
         let tree: serde_json::Value = serde_json::from_str(&json).expect("the dump is valid JSON");
+        gpui::a11y_checks::assert_interactive_nodes_are_named(&tree, "filtered sidebar");
+        gpui::a11y_checks::assert_no_role_was_discarded(&tree, "filtered sidebar");
+        gpui::a11y_checks::assert_roles_are_contained(&tree, "filtered sidebar");
+        gpui::a11y_checks::assert_focus_reached_the_tree(&tree, "filtered sidebar");
+        gpui::a11y_checks::assert_click_targets_are_reachable(&tree, "filtered sidebar");
+        gpui::a11y_checks::assert_landmarks_are_distinguishable(&tree, "filtered sidebar");
 
         assert_eq!(
             tree["active_descendant_focus"].as_str(),

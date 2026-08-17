@@ -26,8 +26,8 @@ mod accessibility_tests {
         TreeViewItem,
     };
     use gpui::{
-        AppContext as _, Context, Entity, IntoElement, ParentElement, Render, Styled as _,
-        TestAppContext, Window, div,
+        AppContext as _, Context, Entity, InteractiveElement as _, IntoElement, ParentElement,
+        Render, StatefulInteractiveElement as _, Styled as _, TestAppContext, Window, div,
     };
 
 
@@ -47,8 +47,17 @@ fn the_shared_controls_report_their_state(cx: &mut TestAppContext) {
                 .size_full()
                 .child(Switch::new("mouse-reporting", ToggleState::Selected).aria_label("Mouse reporting"))
                 .child(DropdownMenu::new("shell", "zsh", self.0.clone()))
-                .child(TreeViewItem::new("session", "work").root_item(true).expanded(true))
-                .child(TreeViewItem::new("pane", "vim").toggle_state(true))
+                // The rows sit inside a tree, as they do in the settings
+                // window: a `TreeItem` outside a `Tree` keeps its role and
+                // loses the level and set semantics that go with containment.
+                .child(
+                    div()
+                        .id("sessions")
+                        .role(gpui::Role::Tree)
+                        .aria_label("Sessions")
+                        .child(TreeViewItem::new("session", "work").root_item(true).expanded(true))
+                        .child(TreeViewItem::new("pane", "vim").toggle_state(true)),
+                )
         }
     }
 
@@ -72,6 +81,12 @@ fn the_shared_controls_report_their_state(cx: &mut TestAppContext) {
         .expect("the harness window is still open")
         .expect("activation makes the debug tree available");
     let tree: serde_json::Value = serde_json::from_str(&json).expect("the dump is valid JSON");
+    gpui::a11y_checks::assert_interactive_nodes_are_named(&tree, "shared controls");
+    gpui::a11y_checks::assert_no_role_was_discarded(&tree, "shared controls");
+    gpui::a11y_checks::assert_roles_are_contained(&tree, "shared controls");
+    gpui::a11y_checks::assert_focus_reached_the_tree(&tree, "shared controls");
+    gpui::a11y_checks::assert_click_targets_are_reachable(&tree, "shared controls");
+    gpui::a11y_checks::assert_landmarks_are_distinguishable(&tree, "shared controls");
     let nodes = tree["nodes"].as_object().expect("the dump lists nodes");
 
     let discarded = tree["frame"]["roles_without_id"]
@@ -147,6 +162,12 @@ fn the_shared_controls_report_their_state(cx: &mut TestAppContext) {
             .expect("the harness window is still open")
             .expect("activation makes the debug tree available");
         let tree: serde_json::Value = serde_json::from_str(&json).expect("the dump is valid JSON");
+        gpui::a11y_checks::assert_interactive_nodes_are_named(&tree, "modal headline");
+        gpui::a11y_checks::assert_no_role_was_discarded(&tree, "modal headline");
+        gpui::a11y_checks::assert_roles_are_contained(&tree, "modal headline");
+        gpui::a11y_checks::assert_focus_reached_the_tree(&tree, "modal headline");
+        gpui::a11y_checks::assert_click_targets_are_reachable(&tree, "modal headline");
+        gpui::a11y_checks::assert_landmarks_are_distinguishable(&tree, "modal headline");
 
         assert!(
             tree["nodes"]
@@ -202,6 +223,12 @@ fn the_shared_controls_report_their_state(cx: &mut TestAppContext) {
             .expect("the harness window is still open")
             .expect("activation makes the debug tree available");
         let tree: serde_json::Value = serde_json::from_str(&json).expect("the dump is valid JSON");
+        gpui::a11y_checks::assert_interactive_nodes_are_named(&tree, "disabled controls");
+        gpui::a11y_checks::assert_no_role_was_discarded(&tree, "disabled controls");
+        gpui::a11y_checks::assert_roles_are_contained(&tree, "disabled controls");
+        gpui::a11y_checks::assert_focus_reached_the_tree(&tree, "disabled controls");
+        gpui::a11y_checks::assert_click_targets_are_reachable(&tree, "disabled controls");
+        gpui::a11y_checks::assert_landmarks_are_distinguishable(&tree, "disabled controls");
         let nodes = tree["nodes"].as_object().expect("the dump lists nodes");
 
         let by_name = |name: &str| {

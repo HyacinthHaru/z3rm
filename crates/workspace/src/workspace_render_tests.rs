@@ -319,6 +319,12 @@ async fn test_notifications_are_announced_as_a_live_region(cx: &mut TestAppConte
         })
         .expect("activation makes the debug tree available");
     let tree: serde_json::Value = serde_json::from_str(&json).expect("the dump is valid JSON");
+    gpui::a11y_checks::assert_interactive_nodes_are_named(&tree, "notifications");
+    gpui::a11y_checks::assert_no_role_was_discarded(&tree, "notifications");
+    gpui::a11y_checks::assert_roles_are_contained(&tree, "notifications");
+    gpui::a11y_checks::assert_focus_reached_the_tree(&tree, "notifications");
+    gpui::a11y_checks::assert_click_targets_are_reachable(&tree, "notifications");
+    gpui::a11y_checks::assert_landmarks_are_distinguishable(&tree, "notifications");
 
     let log = tree["nodes"]
         .as_object()
@@ -386,6 +392,12 @@ async fn test_the_zoom_button_can_be_operated_through_its_action(cx: &mut TestAp
         })
         .expect("activation makes the debug tree available");
     let tree: serde_json::Value = serde_json::from_str(&json).expect("the dump is valid JSON");
+    gpui::a11y_checks::assert_interactive_nodes_are_named(&tree, "zoom button");
+    gpui::a11y_checks::assert_no_role_was_discarded(&tree, "zoom button");
+    gpui::a11y_checks::assert_roles_are_contained(&tree, "zoom button");
+    gpui::a11y_checks::assert_focus_reached_the_tree(&tree, "zoom button");
+    gpui::a11y_checks::assert_click_targets_are_reachable(&tree, "zoom button");
+    gpui::a11y_checks::assert_landmarks_are_distinguishable(&tree, "zoom button");
 
     let zoom = tree["nodes"]
         .as_object()
@@ -468,6 +480,12 @@ async fn test_clicking_a_tab_through_its_action_activates_it(cx: &mut TestAppCon
         })
         .expect("activation makes the debug tree available");
     let tree: serde_json::Value = serde_json::from_str(&json).expect("the dump is valid JSON");
+    gpui::a11y_checks::assert_interactive_nodes_are_named(&tree, "tab bar");
+    gpui::a11y_checks::assert_no_role_was_discarded(&tree, "tab bar");
+    gpui::a11y_checks::assert_roles_are_contained(&tree, "tab bar");
+    gpui::a11y_checks::assert_focus_reached_the_tree(&tree, "tab bar");
+    gpui::a11y_checks::assert_click_targets_are_reachable(&tree, "tab bar");
+    gpui::a11y_checks::assert_landmarks_are_distinguishable(&tree, "tab bar");
 
     let first_tab = tree["nodes"]
         .as_object()
@@ -544,6 +562,12 @@ async fn test_split_panes_say_which_one_they_are(cx: &mut TestAppContext) {
         })
         .expect("activation makes the debug tree available");
     let tree: serde_json::Value = serde_json::from_str(&json).expect("the dump is valid JSON");
+    gpui::a11y_checks::assert_interactive_nodes_are_named(&tree, "split panes");
+    gpui::a11y_checks::assert_no_role_was_discarded(&tree, "split panes");
+    gpui::a11y_checks::assert_roles_are_contained(&tree, "split panes");
+    gpui::a11y_checks::assert_focus_reached_the_tree(&tree, "split panes");
+    gpui::a11y_checks::assert_click_targets_are_reachable(&tree, "split panes");
+    gpui::a11y_checks::assert_landmarks_are_distinguishable(&tree, "split panes");
 
     let mut positions: Vec<(u64, u64)> = tree["nodes"]
         .as_object()
@@ -628,6 +652,12 @@ async fn test_the_live_regions_exist_before_they_have_anything_to_say(cx: &mut T
         })
         .expect("activation makes the debug tree available");
     let tree: serde_json::Value = serde_json::from_str(&json).expect("the dump is valid JSON");
+    gpui::a11y_checks::assert_interactive_nodes_are_named(&tree, "idle live regions");
+    gpui::a11y_checks::assert_no_role_was_discarded(&tree, "idle live regions");
+    gpui::a11y_checks::assert_roles_are_contained(&tree, "idle live regions");
+    gpui::a11y_checks::assert_focus_reached_the_tree(&tree, "idle live regions");
+    gpui::a11y_checks::assert_click_targets_are_reachable(&tree, "idle live regions");
+    gpui::a11y_checks::assert_landmarks_are_distinguishable(&tree, "idle live regions");
 
     let live_regions: Vec<(&str, &str)> = tree["nodes"]
         .as_object()
@@ -709,6 +739,12 @@ async fn test_modal_is_announced_as_a_dialog(cx: &mut TestAppContext) {
         })
         .expect("activation makes the debug tree available");
     let tree: serde_json::Value = serde_json::from_str(&json).expect("the dump is valid JSON");
+    gpui::a11y_checks::assert_interactive_nodes_are_named(&tree, "modal layer");
+    gpui::a11y_checks::assert_no_role_was_discarded(&tree, "modal layer");
+    gpui::a11y_checks::assert_roles_are_contained(&tree, "modal layer");
+    gpui::a11y_checks::assert_focus_reached_the_tree(&tree, "modal layer");
+    gpui::a11y_checks::assert_click_targets_are_reachable(&tree, "modal layer");
+    gpui::a11y_checks::assert_landmarks_are_distinguishable(&tree, "modal layer");
 
     let dialog = tree["nodes"]
         .as_object()
@@ -829,6 +865,12 @@ async fn test_an_empty_pane_holding_focus_is_announced(cx: &mut TestAppContext) 
         })
         .expect("activation makes the debug tree available");
     let tree: serde_json::Value = serde_json::from_str(&json).expect("the dump is valid JSON");
+    gpui::a11y_checks::assert_interactive_nodes_are_named(&tree, "empty pane");
+    gpui::a11y_checks::assert_no_role_was_discarded(&tree, "empty pane");
+    gpui::a11y_checks::assert_roles_are_contained(&tree, "empty pane");
+    gpui::a11y_checks::assert_focus_reached_the_tree(&tree, "empty pane");
+    gpui::a11y_checks::assert_click_targets_are_reachable(&tree, "empty pane");
+    gpui::a11y_checks::assert_landmarks_are_distinguishable(&tree, "empty pane");
 
     assert!(
         cx.update(|window, cx| window
@@ -886,6 +928,12 @@ async fn test_the_open_item_is_still_reported_on_later_frames(cx: &mut TestAppCo
             })
             .expect("activation makes the debug tree available");
         let tree: serde_json::Value = serde_json::from_str(&json).expect("the dump is valid JSON");
+        gpui::a11y_checks::assert_interactive_nodes_are_named(&tree, "open item");
+        gpui::a11y_checks::assert_no_role_was_discarded(&tree, "open item");
+        gpui::a11y_checks::assert_roles_are_contained(&tree, "open item");
+        gpui::a11y_checks::assert_focus_reached_the_tree(&tree, "open item");
+        gpui::a11y_checks::assert_click_targets_are_reachable(&tree, "open item");
+        gpui::a11y_checks::assert_landmarks_are_distinguishable(&tree, "open item");
 
         let tabs: Vec<String> = tree["nodes"]
             .as_object()
