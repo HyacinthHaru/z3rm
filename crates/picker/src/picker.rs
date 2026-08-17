@@ -217,11 +217,10 @@ pub trait PickerDelegate: Sized + 'static {
     /// The name announced for a match.
     ///
     /// `render_match` returns arbitrary elements, so the text cannot be derived
-    /// from what was rendered. A delegate that does not supply one leaves its
-    /// options unnamed, which is the previous behavior.
-    fn match_label(&self, _ix: usize, _cx: &App) -> Option<SharedString> {
-        None
-    }
+    /// from what was rendered. Required rather than defaulted: a delegate that
+    /// omits it leaves every row of its list announced as a bare option, and
+    /// two did exactly that for as long as the default existed.
+    fn match_label(&self, ix: usize, cx: &App) -> Option<SharedString>;
 
     fn no_matches_text(&self, _window: &mut Window, _cx: &mut App) -> Option<SharedString> {
         Some("No matches".into())

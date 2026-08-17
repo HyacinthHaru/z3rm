@@ -1827,6 +1827,10 @@ impl PickerDelegate for DevExtensionRebuildPickerDelegate {
         self.matches.len()
     }
 
+    fn match_label(&self, ix: usize, _cx: &App) -> Option<SharedString> {
+        Some(self.matches.get(ix)?.string.clone().into())
+    }
+
     fn selected_index(&self) -> usize {
         self.selected_index
     }

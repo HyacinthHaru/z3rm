@@ -107,6 +107,12 @@ impl PickerDelegate for ExtensionVersionSelectorDelegate {
         self.matches.len()
     }
 
+    // The row's visible text is a `HighlightedLabel`, which is not a node, so
+    // without this the picker offers a list of options with no names.
+    fn match_label(&self, ix: usize, _cx: &App) -> Option<SharedString> {
+        Some(self.matches.get(ix)?.string.clone().into())
+    }
+
     fn selected_index(&self) -> usize {
         self.selected_index
     }
