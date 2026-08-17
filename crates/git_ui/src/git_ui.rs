@@ -1068,7 +1068,18 @@ mod remote_button {
         let should_render_counts = left_icon.is_none() && (ahead_count > 0 || behind_count > 0);
         let is_in_progress = in_progress_operation.is_some();
 
+        // `ButtonLike` takes no name from its children, and every part of this
+        // button is one: the action is a `Label` and so are the ahead/behind
+        // counts, which are the whole reason to press it.
+        let left_label: SharedString = left_label.into();
+        let announced = match (ahead_count, behind_count) {
+            (0, 0) => left_label.to_string(),
+            (ahead, 0) => format!("{left_label}, {ahead} ahead"),
+            (0, behind) => format!("{left_label}, {behind} behind"),
+            (ahead, behind) => format!("{left_label}, {behind} behind, {ahead} ahead"),
+        };
         let left = ButtonLike::new_rounded_left(format!("split-button-left-{}", id))
+            .aria_label(announced)
             .layer(ElevationIndex::ModalSurface)
             .size(ButtonSize::Compact)
             .disabled(is_in_progress)

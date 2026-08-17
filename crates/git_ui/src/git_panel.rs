@@ -7793,7 +7793,10 @@ impl RenderOnce for PanelRepoFooter {
             })
             .into_any_element();
 
-        let branch_selector_button = Button::new("branch-selector", branch_name)
+        let branch_selector_button = Button::new("branch-selector", branch_name.clone())
+            // The branch name alone reads as a label, not a control: nothing in
+            // it says that pressing it switches branches.
+            .aria_label(format!("Switch branch, on {branch_name}"))
             .size(ButtonSize::None)
             .label_size(LabelSize::Small)
             .truncate(true)
