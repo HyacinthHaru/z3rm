@@ -479,6 +479,9 @@ fn init_renderers(cx: &mut App) {
                     Button::new("open-in-settings-file", "Edit in settings.json")
                         .style(ButtonStyle::Outlined)
                         .size(ButtonSize::Medium)
+                        // One per setting that has no inline control, so the
+                        // shared label repeats down the page.
+                        .aria_label(format!("Edit in settings.json: {}", item.title))
                         .tab_index(0_isize)
                         .tooltip(Tooltip::for_action_title_in(
                             "Edit in settings.json",
@@ -988,6 +991,7 @@ impl SettingsPageItem {
                         Button::new("error-warning", warning)
                             .style(ButtonStyle::Outlined)
                             .size(ButtonSize::Medium)
+                            .aria_label(format!("{warning}: {}", setting_item.title))
                             .start_icon(Icon::new(IconName::Debug).color(Color::Error))
                             .tab_index(0_isize)
                             .tooltip(Tooltip::text(setting_item.field.type_name()))
@@ -1091,6 +1095,7 @@ impl SettingsPageItem {
                             }),
                         )
                         .child(render_settings_item_link(
+                            sub_page_link.title.clone(),
                             sub_page_link.title.clone(),
                             sub_page_link.json_path,
                             false,
@@ -1276,6 +1281,7 @@ fn render_settings_item_layout(
         .when(settings_window.sub_page_stack.is_empty(), |this| {
             this.child(render_settings_item_link(
                 description,
+                SharedString::new_static(title),
                 json_path,
                 sub_field,
                 settings_window,
@@ -1351,6 +1357,7 @@ fn render_settings_item(
 
 fn render_settings_item_link(
     id: impl Into<ElementId>,
+    setting_name: SharedString,
     json_path: Option<&'static str>,
     sub_field: bool,
     settings_window: &SettingsWindow,
@@ -1382,7 +1389,9 @@ fn render_settings_item_link(
                 .icon_color(link_icon_color)
                 .icon_size(IconSize::Small)
                 .shape(IconButtonShape::Square)
-                .aria_label("Copy Link")
+                // One of these sits on every row of the page, so the bare
+                // verb repeats as many times as there are settings.
+                .aria_label(format!("Copy Link: {setting_name}"))
                 .tooltip(Tooltip::text("Copy Link"))
                 .when_some(json_path, |this, path| {
                     this.on_click(cx.listener(move |this, _, _, cx| {
@@ -4896,6 +4905,10 @@ pub mod test {
         theme_settings::init(theme::LoadThemes::JustBase, cx);
         editor::init(cx);
         menu::init();
+        // Without the renderers every field falls back to a "NO RENDERER"
+        // placeholder, so a test that walks the window would be walking
+        // warning text rather than the controls it means to check.
+        init_renderers(cx);
         //         language_model::init(cx);
     }
 
@@ -5227,6 +5240,9 @@ pub mod test {
         gpui::a11y_checks::assert_roles_are_contained(&tree, "settings window");
         gpui::a11y_checks::assert_click_targets_are_reachable(&tree, "settings window");
         gpui::a11y_checks::assert_focus_reached_the_tree(&tree, "settings window");
+        // A page is a column of near-identical rows, so this is the window most
+        // likely to offer the same name several times over.
+        gpui::a11y_checks::assert_names_are_distinguishable(&tree, "settings window");
 
         // Guards against the whole check passing because nothing rendered.
         let interactive = nodes
