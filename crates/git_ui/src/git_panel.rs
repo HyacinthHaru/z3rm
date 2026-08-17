@@ -5564,6 +5564,7 @@ impl GitPanel {
             // and the arrow-key conventions that come with containment.
             .id("git-panel-tab-bar")
             .role(gpui::Role::TabList)
+            .aria_label("Git Panel views")
             .h(Tab::container_height(cx))
             .w_full()
             .child(tab(

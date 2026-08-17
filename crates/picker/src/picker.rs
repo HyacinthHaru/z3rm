@@ -1491,6 +1491,9 @@ impl<D: PickerDelegate> Picker<D> {
         div()
             .id("picker-candidates")
             .role(gpui::Role::ListBox)
+            // Deliberately unnamed: the picker's dialog carries its name and
+            // the head carries the prompt, so a third node repeating either
+            // one is noise rather than context.
             .flex()
             .flex_col()
             .flex_grow_1()

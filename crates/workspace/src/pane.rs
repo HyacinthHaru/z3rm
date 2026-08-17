@@ -3542,7 +3542,10 @@ impl Pane {
     ) -> AnyElement {
         let tab_bar = self
             .configure_tab_bar_start(
-                TabBar::new("tab_bar"),
+                // Named for the same reason the split bars are: a reader
+                // offers a tab list as somewhere to jump to, and an unnamed
+                // one says nothing about where that is.
+                TabBar::new("tab_bar").aria_label("Tabs"),
                 navigate_backward,
                 navigate_forward,
                 window,

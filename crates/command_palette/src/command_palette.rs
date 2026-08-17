@@ -924,6 +924,16 @@ mod tests {
             role_count("ListBox") > 0,
             "the command list must be reported as one"
         );
+        // Containers are jump targets. An unnamed one is offered as a
+        // destination that refuses to say where it goes.
+        let named_container = |role: &str| {
+            nodes
+                .values()
+                .find(|node| node["aria"]["role"] == role)
+                .and_then(|node| node["aria"]["label"].as_str())
+                .unwrap_or_else(|| panic!("no {role} in the tree: {json}"))
+        };
+        assert_eq!(named_container("TabList"), "Tabs");
         assert!(
             role_count("ListBoxOption") > 0,
             "the palette had no options to announce"
