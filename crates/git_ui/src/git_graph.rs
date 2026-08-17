@@ -1726,9 +1726,16 @@ impl GitGraph {
             // The same wording the cell shows while the fetch is in flight.
             return Some(format!("Loading…, {short_sha}").into());
         };
+        // Branch and tag names are drawn as chips beside the subject, and a
+        // chip is a label, so they only reach a reader through the row's name.
+        let refs = if commit.data.ref_names.is_empty() {
+            String::new()
+        } else {
+            format!(", {}", commit.data.ref_names.join(", "))
+        };
         Some(
             format!(
-                "{}, {}, {}, {short_sha}",
+                "{}, {}, {}, {short_sha}{refs}",
                 data.subject,
                 data.author_name,
                 format_timestamp(data.commit_timestamp)
@@ -6782,7 +6789,7 @@ mod tests {
                 Arc::new(InitialGraphCommitData {
                     sha: head_sha,
                     parents: smallvec![parent_sha],
-                    ref_names: vec![],
+                    ref_names: vec!["main".into()],
                 }),
                 Arc::new(InitialGraphCommitData {
                     sha: parent_sha,
@@ -6922,6 +6929,12 @@ mod tests {
         assert!(
             loaded.iter().all(|row| row.matches(", ").count() >= 3),
             "a row says its subject, author, date and short sha: {loaded:?}"
+        );
+        // The branch name is drawn as a chip, which is a label and therefore
+        // not a node of its own.
+        assert!(
+            loaded.iter().any(|row| row.ends_with(", main")),
+            "a row carrying a branch has to say so: {loaded:?}"
         );
 
         let json = cx

@@ -81,6 +81,12 @@ pub trait Panel: Focusable + EventEmitter<PanelEvent> + Render + Sized {
     fn icon_label(&self, _window: &Window, _: &App) -> Option<String> {
         None
     }
+    /// What the badge beside the icon means, in words. The badge itself is a
+    /// bare number drawn as a label, so "3" on its own is what a reader gets
+    /// unless the panel says "3 changes".
+    fn icon_label_a11y(&self, window: &Window, cx: &App) -> Option<String> {
+        self.icon_label(window, cx)
+    }
     fn is_zoomed(&self, _window: &Window, _cx: &App) -> bool {
         false
     }
@@ -133,6 +139,7 @@ pub trait PanelHandle: Send + Sync {
     fn icon_tooltip(&self, window: &Window, cx: &App) -> Option<&'static str>;
     fn toggle_action(&self, window: &Window, cx: &App) -> Box<dyn Action>;
     fn icon_label(&self, window: &Window, cx: &App) -> Option<String>;
+    fn icon_label_a11y(&self, window: &Window, cx: &App) -> Option<String>;
     fn panel_focus_handle(&self, cx: &App) -> FocusHandle;
     fn to_any(&self) -> AnyView;
     fn activation_priority(&self, cx: &App) -> u32;
@@ -246,6 +253,10 @@ where
 
     fn icon_label(&self, window: &Window, cx: &App) -> Option<String> {
         self.read(cx).icon_label(window, cx)
+    }
+
+    fn icon_label_a11y(&self, window: &Window, cx: &App) -> Option<String> {
+        self.read(cx).icon_label_a11y(window, cx)
     }
 
     fn to_any(&self) -> AnyView {
@@ -1252,6 +1263,7 @@ impl Render for PanelButtons {
 
                 let focus_handle = dock.focus_handle(cx);
                 let icon_label = entry.panel.icon_label(window, cx);
+                let icon_label_a11y = entry.panel.icon_label_a11y(window, cx);
 
                 Some(
                     right_click_menu(name)
@@ -1346,13 +1358,28 @@ impl Render for PanelButtons {
                         .anchor(menu_anchor)
                         .attach(menu_attach)
                         .trigger(move |is_active, _window, _cx| {
+                            let badge_count = icon_label
+                                .clone()
+                                .filter(|_| !is_active_button)
+                                .and_then(|label| label.parse::<usize>().ok());
+                            let badge_meaning = badge_count
+                                .and(icon_label_a11y.clone())
+                                .filter(|_| !is_active_button);
                             // Include active state in element ID to invalidate the cached
                             // tooltip when panel state changes (e.g., via keyboard shortcut)
                             let button = IconButton::new((name, is_active_button as u64), icon)
                                 .icon_size(IconSize::Small)
                                 .toggle_state(is_active_button)
                                 .tab_index(0isize)
-                                .aria_label(icon_tooltip)
+                                // The badge beside the icon — three unread, two
+                                // problems — is a label, so the count reaches a
+                                // reader only as part of the button's name.
+                                .aria_label(match &badge_meaning {
+                                    Some(meaning) => {
+                                        SharedString::from(format!("{icon_tooltip}, {meaning}"))
+                                    }
+                                    None => SharedString::from(icon_tooltip),
+                                })
                                 .on_click({
                                     let action = action.boxed_clone();
                                     move |_, window, cx| {
@@ -1366,13 +1393,12 @@ impl Render for PanelButtons {
                                     })
                                 });
 
-                            div().relative().child(button).when_some(
-                                icon_label
-                                    .clone()
-                                    .filter(|_| !is_active_button)
-                                    .and_then(|label| label.parse::<usize>().ok()),
-                                |this, count| this.child(CountBadge::new(count)),
-                            )
+                            div()
+                                .relative()
+                                .child(button)
+                                .when_some(badge_count, |this, count| {
+                                    this.child(CountBadge::new(count))
+                                })
                         }),
                 )
             })

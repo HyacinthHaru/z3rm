@@ -7540,6 +7540,14 @@ impl Panel for GitPanel {
         (total > 0).then(|| total.to_string())
     }
 
+    fn icon_label_a11y(&self, window: &Window, cx: &App) -> Option<String> {
+        let total = self.icon_label(window, cx)?;
+        Some(format!(
+            "{total} change{}",
+            if self.changes_count == 1 { "" } else { "s" }
+        ))
+    }
+
     fn toggle_action(&self) -> Box<dyn Action> {
         Box::new(ToggleFocus)
     }
