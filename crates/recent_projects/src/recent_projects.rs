@@ -2872,6 +2872,7 @@ mod tests {
         gpui::a11y_checks::assert_focus_reached_the_tree(&tree, "empty picker");
         gpui::a11y_checks::assert_click_targets_are_reachable(&tree, "empty picker");
         gpui::a11y_checks::assert_landmarks_are_distinguishable(&tree, "empty picker");
+        gpui::a11y_checks::assert_names_are_distinguishable(&tree, "empty picker");
 
         let announced: Vec<&str> = tree["nodes"]
             .as_object()

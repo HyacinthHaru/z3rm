@@ -163,6 +163,7 @@ fn check_a11y(tree: &serde_json::Value, name: &str) {
     gpui::a11y_checks::assert_click_targets_are_reachable(tree, name);
     gpui::a11y_checks::assert_focus_reached_the_tree(tree, name);
     gpui::a11y_checks::assert_landmarks_are_distinguishable(tree, name);
+    gpui::a11y_checks::assert_names_are_distinguishable(tree, name);
 }
 
 fn save_frame(name: &str, image: &RgbaImage, tree: &serde_json::Value) -> Result<()> {

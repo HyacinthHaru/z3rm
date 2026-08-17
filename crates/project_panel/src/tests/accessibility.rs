@@ -78,6 +78,7 @@ async fn the_file_tree_is_exposed_as_a_named_tree(cx: &mut gpui::TestAppContext)
         gpui::a11y_checks::assert_click_targets_are_reachable(&tree, "workspace with a dock");
         gpui::a11y_checks::assert_focus_reached_the_tree(&tree, "workspace with a dock");
         gpui::a11y_checks::assert_landmarks_are_distinguishable(&tree, "workspace with a dock");
+        gpui::a11y_checks::assert_names_are_distinguishable(&tree, "workspace with a dock");
         let file_tree = nodes
             .iter()
             .find(|(_, node)| node["aria"]["label"].as_str() == Some("Project files"))

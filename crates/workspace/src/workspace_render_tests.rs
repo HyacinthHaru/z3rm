@@ -325,6 +325,7 @@ async fn test_notifications_are_announced_as_a_live_region(cx: &mut TestAppConte
     gpui::a11y_checks::assert_focus_reached_the_tree(&tree, "notifications");
     gpui::a11y_checks::assert_click_targets_are_reachable(&tree, "notifications");
     gpui::a11y_checks::assert_landmarks_are_distinguishable(&tree, "notifications");
+    gpui::a11y_checks::assert_names_are_distinguishable(&tree, "notifications");
 
     let log = tree["nodes"]
         .as_object()
@@ -398,6 +399,7 @@ async fn test_the_zoom_button_can_be_operated_through_its_action(cx: &mut TestAp
     gpui::a11y_checks::assert_focus_reached_the_tree(&tree, "zoom button");
     gpui::a11y_checks::assert_click_targets_are_reachable(&tree, "zoom button");
     gpui::a11y_checks::assert_landmarks_are_distinguishable(&tree, "zoom button");
+    gpui::a11y_checks::assert_names_are_distinguishable(&tree, "zoom button");
 
     let zoom = tree["nodes"]
         .as_object()
@@ -485,6 +487,7 @@ async fn test_a_tab_says_it_has_unsaved_changes(cx: &mut TestAppContext) {
     gpui::a11y_checks::assert_focus_reached_the_tree(&tree, "dirty tab");
     gpui::a11y_checks::assert_click_targets_are_reachable(&tree, "dirty tab");
     gpui::a11y_checks::assert_landmarks_are_distinguishable(&tree, "dirty tab");
+    gpui::a11y_checks::assert_names_are_distinguishable(&tree, "dirty tab");
 
     let mut tabs: Vec<&str> = tree["nodes"]
         .as_object()
@@ -563,6 +566,7 @@ async fn test_clicking_a_tab_through_its_action_activates_it(cx: &mut TestAppCon
     gpui::a11y_checks::assert_focus_reached_the_tree(&tree, "tab bar");
     gpui::a11y_checks::assert_click_targets_are_reachable(&tree, "tab bar");
     gpui::a11y_checks::assert_landmarks_are_distinguishable(&tree, "tab bar");
+    gpui::a11y_checks::assert_names_are_distinguishable(&tree, "tab bar");
 
     let first_tab = tree["nodes"]
         .as_object()
@@ -645,6 +649,7 @@ async fn test_split_panes_say_which_one_they_are(cx: &mut TestAppContext) {
     gpui::a11y_checks::assert_focus_reached_the_tree(&tree, "split panes");
     gpui::a11y_checks::assert_click_targets_are_reachable(&tree, "split panes");
     gpui::a11y_checks::assert_landmarks_are_distinguishable(&tree, "split panes");
+    gpui::a11y_checks::assert_names_are_distinguishable(&tree, "split panes");
 
     let mut positions: Vec<(u64, u64)> = tree["nodes"]
         .as_object()
@@ -735,6 +740,7 @@ async fn test_the_live_regions_exist_before_they_have_anything_to_say(cx: &mut T
     gpui::a11y_checks::assert_focus_reached_the_tree(&tree, "idle live regions");
     gpui::a11y_checks::assert_click_targets_are_reachable(&tree, "idle live regions");
     gpui::a11y_checks::assert_landmarks_are_distinguishable(&tree, "idle live regions");
+    gpui::a11y_checks::assert_names_are_distinguishable(&tree, "idle live regions");
 
     let live_regions: Vec<(&str, &str)> = tree["nodes"]
         .as_object()
@@ -822,6 +828,7 @@ async fn test_modal_is_announced_as_a_dialog(cx: &mut TestAppContext) {
     gpui::a11y_checks::assert_focus_reached_the_tree(&tree, "modal layer");
     gpui::a11y_checks::assert_click_targets_are_reachable(&tree, "modal layer");
     gpui::a11y_checks::assert_landmarks_are_distinguishable(&tree, "modal layer");
+    gpui::a11y_checks::assert_names_are_distinguishable(&tree, "modal layer");
 
     let dialog = tree["nodes"]
         .as_object()
@@ -915,6 +922,7 @@ async fn test_every_interactive_node_in_the_window_has_a_name(cx: &mut TestAppCo
     gpui::a11y_checks::assert_click_targets_are_reachable(&tree, "workspace window");
     gpui::a11y_checks::assert_focus_reached_the_tree(&tree, "workspace window");
     gpui::a11y_checks::assert_landmarks_are_distinguishable(&tree, "workspace window");
+    gpui::a11y_checks::assert_names_are_distinguishable(&tree, "workspace window");
 }
 
 /// A pane with no items has nothing inside to take focus, so focus stays on the
@@ -948,6 +956,7 @@ async fn test_an_empty_pane_holding_focus_is_announced(cx: &mut TestAppContext) 
     gpui::a11y_checks::assert_focus_reached_the_tree(&tree, "empty pane");
     gpui::a11y_checks::assert_click_targets_are_reachable(&tree, "empty pane");
     gpui::a11y_checks::assert_landmarks_are_distinguishable(&tree, "empty pane");
+    gpui::a11y_checks::assert_names_are_distinguishable(&tree, "empty pane");
 
     assert!(
         cx.update(|window, cx| window
@@ -1011,6 +1020,7 @@ async fn test_the_open_item_is_still_reported_on_later_frames(cx: &mut TestAppCo
         gpui::a11y_checks::assert_focus_reached_the_tree(&tree, "open item");
         gpui::a11y_checks::assert_click_targets_are_reachable(&tree, "open item");
         gpui::a11y_checks::assert_landmarks_are_distinguishable(&tree, "open item");
+        gpui::a11y_checks::assert_names_are_distinguishable(&tree, "open item");
 
         let tabs: Vec<String> = tree["nodes"]
             .as_object()

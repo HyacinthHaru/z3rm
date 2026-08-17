@@ -87,6 +87,7 @@ fn the_shared_controls_report_their_state(cx: &mut TestAppContext) {
     gpui::a11y_checks::assert_focus_reached_the_tree(&tree, "shared controls");
     gpui::a11y_checks::assert_click_targets_are_reachable(&tree, "shared controls");
     gpui::a11y_checks::assert_landmarks_are_distinguishable(&tree, "shared controls");
+    gpui::a11y_checks::assert_names_are_distinguishable(&tree, "shared controls");
     let nodes = tree["nodes"].as_object().expect("the dump lists nodes");
 
     let discarded = tree["frame"]["roles_without_id"]
@@ -168,6 +169,7 @@ fn the_shared_controls_report_their_state(cx: &mut TestAppContext) {
         gpui::a11y_checks::assert_focus_reached_the_tree(&tree, "modal headline");
         gpui::a11y_checks::assert_click_targets_are_reachable(&tree, "modal headline");
         gpui::a11y_checks::assert_landmarks_are_distinguishable(&tree, "modal headline");
+        gpui::a11y_checks::assert_names_are_distinguishable(&tree, "modal headline");
 
         assert!(
             tree["nodes"]
@@ -229,6 +231,7 @@ fn the_shared_controls_report_their_state(cx: &mut TestAppContext) {
         gpui::a11y_checks::assert_focus_reached_the_tree(&tree, "disabled controls");
         gpui::a11y_checks::assert_click_targets_are_reachable(&tree, "disabled controls");
         gpui::a11y_checks::assert_landmarks_are_distinguishable(&tree, "disabled controls");
+        gpui::a11y_checks::assert_names_are_distinguishable(&tree, "disabled controls");
         let nodes = tree["nodes"].as_object().expect("the dump lists nodes");
 
         let by_name = |name: &str| {

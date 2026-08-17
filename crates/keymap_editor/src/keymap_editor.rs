@@ -1131,6 +1131,20 @@ impl KeymapEditor {
         self.context_menu.is_some()
     }
 
+    /// The action a row is about, used to tell one row's button from the next.
+    /// Every row has one, so a fixed name makes a column of buttons that a user
+    /// cannot ask for or move between by name.
+    fn row_action_name(&self, index: usize) -> Option<SharedString> {
+        let candidate_id = self.matches.get(index)?.candidate_id;
+        Some(
+            self.keybindings
+                .get(candidate_id)?
+                .action()
+                .humanized_name
+                .clone(),
+        )
+    }
+
     fn create_row_button(
         &self,
         index: usize,
@@ -1138,9 +1152,13 @@ impl KeymapEditor {
         is_unbound_by_unbind: bool,
         cx: &mut Context<Self>,
     ) -> IconButton {
+        let row_label = |base: &str| match self.row_action_name(index) {
+            Some(action) => SharedString::from(format!("{base}: {action}")),
+            None => SharedString::from(base.to_string()),
+        };
         if is_unbound_by_unbind {
             base_button_style(index, IconName::Warning)
-                .aria_label("This action is unbound")
+                .aria_label(row_label("This action is unbound"))
                 .icon_color(Color::Warning)
                 .disabled(true)
                 .tooltip(Tooltip::text("This action is unbound"))
@@ -1149,7 +1167,7 @@ impl KeymapEditor {
         {
             if conflict.is_user_keybind_conflict() {
                 base_button_style(index, IconName::Warning)
-                    .aria_label("View conflicts")
+                    .aria_label(row_label("View conflicts"))
                     .icon_color(Color::Warning)
                     .tooltip(|_window, cx| {
                         Tooltip::with_meta(
@@ -1170,7 +1188,7 @@ impl KeymapEditor {
                     }))
             } else if self.search_mode.exact_match() {
                 base_button_style(index, IconName::Info)
-                    .aria_label("Edit this binding")
+                    .aria_label(row_label("Edit this binding"))
                     .tooltip(|_window, cx| {
                         Tooltip::with_meta(
                             "Edit this binding",
@@ -1186,7 +1204,7 @@ impl KeymapEditor {
                     }))
             } else {
                 base_button_style(index, IconName::Info)
-                    .aria_label("Show matching keybinds")
+                    .aria_label(row_label("Show matching keybinds"))
                     .tooltip(|_window, cx|  {
                         Tooltip::with_meta(
                             "Show matching keybinds",
@@ -1207,7 +1225,7 @@ impl KeymapEditor {
             }
         } else {
             base_button_style(index, IconName::Pencil)
-                .aria_label("Edit Keybinding")
+                .aria_label(row_label("Edit Keybinding"))
                 .visible_on_hover(if self.selected_index == Some(index) {
                     "".into()
                 } else if self.show_hover_menus {
@@ -4069,6 +4087,7 @@ mod tests {
         gpui::a11y_checks::assert_focus_reached_the_tree(&tree, "keymap editor");
         gpui::a11y_checks::assert_click_targets_are_reachable(&tree, "keymap editor");
         gpui::a11y_checks::assert_landmarks_are_distinguishable(&tree, "keymap editor");
+        gpui::a11y_checks::assert_names_are_distinguishable(&tree, "keymap editor");
 
         let table = nodes
             .values()

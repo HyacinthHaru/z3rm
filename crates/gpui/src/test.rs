@@ -350,6 +350,42 @@ pub mod a11y_checks {
         }
     }
 
+    /// Panics if two controls in the same container share a role and a name.
+    ///
+    /// A name that is present satisfies [`assert_interactive_nodes_are_named`]
+    /// without being usable: a row of tabs whose close buttons all announce
+    /// "Close Tab" gives a user no way to say which one they mean, and no way
+    /// to tell where they are as they move along the row.
+    #[track_caller]
+    pub fn assert_names_are_distinguishable(tree: &serde_json::Value, context: &str) {
+        // Across the whole frame rather than among direct siblings: the close
+        // button of each tab is a child of its own tab, so a per-parent check
+        // sees one of each and misses the row of identical "Close Tab"s that
+        // the user actually hears.
+        let mut seen: collections::FxHashMap<(&str, &str), usize> =
+            collections::FxHashMap::default();
+        for node in nodes(tree).values() {
+            let Some(role) = node["aria"]["role"].as_str() else {
+                continue;
+            };
+            if !ROLES_NEEDING_A_NAME.contains(&role) {
+                continue;
+            }
+            let name = node["aria"]["label"].as_str().unwrap_or_default();
+            *seen.entry((role, name)).or_default() += 1;
+        }
+        let mut clashes: Vec<String> = seen
+            .into_iter()
+            .filter(|(_, count)| *count > 1)
+            .map(|((role, name), count)| format!("{count} × {role} named {name:?}"))
+            .collect();
+        clashes.sort_unstable();
+        assert!(
+            clashes.is_empty(),
+            "{context}: controls a user cannot tell apart or ask for by name: {clashes:?}"
+        );
+    }
+
     /// Panics if the focused element produced no node.
     ///
     /// A focused element with an id but no role produces no accessibility node,
