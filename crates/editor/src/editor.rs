@@ -904,6 +904,7 @@ pub struct Editor {
     /// nothing else.
     a11y_label: Option<SharedString>,
     a11y_description: Option<SharedString>,
+    a11y_wrapped: bool,
     pub selections: SelectionsCollection,
     /// Manages the scroll position for the given editor.
     ///
@@ -2391,6 +2392,7 @@ impl Editor {
             placeholder_display_map: None,
             a11y_label: None,
             a11y_description: None,
+            a11y_wrapped: false,
             selections,
             scroll_manager: ScrollManager::new(cx),
             columnar_selection_state: None,
@@ -3224,6 +3226,15 @@ impl Editor {
     /// The detail set by [`Self::set_a11y_description`], if any.
     pub fn a11y_description(&self) -> Option<SharedString> {
         self.a11y_description.clone()
+    }
+
+    /// Declare that an element around this editor already carries its role,
+    /// name and text, so the editor should not report itself as an input too.
+    ///
+    /// A wrapper that sets `Role::TextInput` on itself and this editor inside
+    /// it produces two inputs where the user sees one.
+    pub fn set_a11y_wrapped(&mut self, wrapped: bool) {
+        self.a11y_wrapped = wrapped;
     }
 
     pub fn placeholder_text(&self, cx: &mut App) -> Option<String> {
@@ -12283,9 +12294,16 @@ impl Focusable for Editor {
 
 impl Render for Editor {
     fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        // Both flags only decide what this element reports to assistive
+        // technology, so a wrapped editor turns them off and contributes no
+        // node of its own.
         EditorElement::new(&cx.entity(), self.create_style(cx))
-            .single_line(self.mode.is_single_line())
-            .focusable_region(!self.mode.is_single_line() && !self.mode.is_minimap())
+            .single_line(!self.a11y_wrapped && self.mode.is_single_line())
+            .focusable_region(
+                !self.a11y_wrapped
+                    && !self.mode.is_single_line()
+                    && !self.mode.is_minimap(),
+            )
     }
 }
 
@@ -12364,6 +12382,10 @@ impl<T: InvalidationRegion> InvalidationStack<T> {
 struct ErasedEditorImpl(Entity<Editor>);
 
 impl ui_input::ErasedEditor for ErasedEditorImpl {
+    fn set_a11y_wrapped(&self, wrapped: bool, cx: &mut App) {
+        self.0.update(cx, |editor, _| editor.set_a11y_wrapped(wrapped));
+    }
+
     fn text(&self, cx: &App) -> String {
         self.0.read(cx).text(cx)
     }

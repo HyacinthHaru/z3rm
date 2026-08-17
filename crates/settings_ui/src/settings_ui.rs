@@ -1615,6 +1615,10 @@ impl SettingsWindow {
         let search_bar = cx.new(|cx| {
             let mut editor = Editor::single_line(window, cx);
             editor.set_placeholder_text("Search settings…", window, cx);
+            // `render_search` wraps this in a `SearchInput` that carries the
+            // name and the text runs, so the editor reporting itself as an
+            // input too would put two of them where the user sees one.
+            editor.set_a11y_wrapped(true);
             editor
         });
         cx.subscribe(&search_bar, |this, _, event: &EditorEvent, cx| {
@@ -5243,6 +5247,23 @@ pub mod test {
         // A page is a column of near-identical rows, so this is the window most
         // likely to offer the same name several times over.
         gpui::a11y_checks::assert_names_are_distinguishable(&tree, "settings window");
+
+        // One visible search box is one input. The wrapper carries the role,
+        // the name and the text runs; the editor inside it used to report
+        // itself as a second input at the same place on screen.
+        let inputs = nodes
+            .values()
+            .filter(|node| {
+                matches!(
+                    node["aria"]["role"].as_str(),
+                    Some("TextInput") | Some("SearchInput")
+                )
+            })
+            .count();
+        assert_eq!(
+            inputs, 1,
+            "the settings window shows one text box, so it has to report one: {json}"
+        );
         gpui::a11y_checks::assert_clickable_elements_are_reachable(&tree, "settings window");
         gpui::a11y_checks::assert_controls_have_area(&tree, "settings window");
         gpui::a11y_checks::assert_landmarks_are_distinguishable(&tree, "settings window");

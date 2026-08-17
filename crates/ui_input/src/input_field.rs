@@ -59,6 +59,9 @@ impl InputField {
             .expect("ErasedEditorFactory to be initialized");
         let editor = (editor_factory)(window, cx);
         editor.set_placeholder_text(placeholder_text, window, cx);
+        // `render` puts `Role::TextInput`, the name and the text runs on the
+        // element around this editor, so it must not be an input as well.
+        editor.set_a11y_wrapped(true, cx);
 
         Self {
             label: None,

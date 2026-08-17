@@ -22,6 +22,9 @@ pub trait ErasedEditor: 'static {
     fn select_all(&self, window: &mut Window, cx: &mut App);
     fn set_masked(&self, masked: bool, window: &mut Window, cx: &mut App);
     fn set_read_only(&self, read_only: bool, cx: &mut App);
+    /// Declare that the element around this editor already carries its role,
+    /// name and text, so it must not report itself as a second input.
+    fn set_a11y_wrapped(&self, wrapped: bool, cx: &mut App);
     fn set_multiline(&self, max_lines: Option<usize>, window: &mut Window, cx: &mut App);
 
     fn focus_handle(&self, cx: &App) -> FocusHandle;
