@@ -1241,8 +1241,29 @@ impl Render for CommitView {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let is_stash = self.stash.is_some();
 
+        // Subject, author, date and sha are all labels in the header, and a
+        // label contributes no node, so opening a commit reached a reader as a
+        // diff with no idea whose commit it was.
+        let short_sha = self.commit.sha.get(0..7).unwrap_or(&self.commit.sha);
+        let subject = self.commit.message.split('\n').next().unwrap_or_default();
+        let announced = if is_stash {
+            format!("Stash {short_sha}, {subject}")
+        } else if self.commit.author_name.is_empty() {
+            // A commit with no author name would otherwise end in a dangling
+            // "by " with nothing after it.
+            format!("Commit {short_sha}, {subject}")
+        } else {
+            format!(
+                "Commit {short_sha}, {subject}, by {}",
+                self.commit.author_name
+            )
+        };
+
         v_flex()
             .key_context(if is_stash { "StashDiff" } else { "CommitDiff" })
+            .id("commit-view")
+            .role(gpui::Role::Group)
+            .aria_label(announced)
             .on_action(cx.listener(Self::open_file_at_head_action))
             .size_full()
             .bg(cx.theme().colors().editor_background)
@@ -1385,4 +1406,121 @@ fn stash_matches_index(sha: &str, stash_index: usize, repo: &Repository) -> bool
         .get(stash_index)
         .map(|entry| entry.oid.to_string() == sha)
         .unwrap_or(false)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use fs::FakeFs;
+    use git::repository::CommitData;
+    use gpui::{TestAppContext, VisualTestContext};
+    use std::path::Path;
+    use project::Project;
+    use serde_json::json;
+    use smallvec::smallvec;
+    use util::path;
+    use workspace::MultiWorkspace;
+
+    /// Subject, author, date and sha are labels in the header, and a label
+    /// contributes no node, so opening a commit reached a reader as a diff with
+    /// no idea whose commit it was.
+    #[gpui::test]
+    async fn the_commit_view_says_whose_commit_it_is(cx: &mut TestAppContext) {
+        zlog::init_test();
+        cx.update(|cx| {
+            let settings_store = settings::SettingsStore::test(cx);
+            cx.set_global(settings_store);
+            theme_settings::init(theme::LoadThemes::JustBase, cx);
+            editor::init(cx);
+            crate::init(cx);
+        });
+
+        let fs = FakeFs::new(cx.background_executor.clone());
+        fs.insert_tree(
+            path!("/project"),
+            json!({
+                ".git": {},
+                "file.txt": "content",
+            }),
+        )
+        .await;
+        let sha = git::Oid::from_bytes(&[9; 20]).unwrap();
+        fs.set_commit_data(
+            path!("/project/.git").as_ref(),
+            [(
+                CommitData {
+                    sha,
+                    parents: smallvec![],
+                    author_name: "Ada".into(),
+                    author_email: "ada@example.com".into(),
+                    commit_timestamp: 1,
+                    subject: "Name the commit view".into(),
+                    message: "Name the commit view\n\nlonger body".into(),
+                },
+                false,
+            )],
+        );
+
+        let project = Project::test(fs.clone(), [Path::new(path!("/project"))], cx).await;
+        cx.run_until_parked();
+        let repository = project.read_with(cx, |project, cx| {
+            project
+                .active_repository(cx)
+                .expect("should have a repository")
+        });
+
+        let window =
+            cx.add_window(|window, cx| MultiWorkspace::test_new(project.clone(), window, cx));
+        let workspace = window
+            .read_with(cx, |mw, _| mw.workspace().clone())
+            .unwrap();
+        let mut cx = VisualTestContext::from_window(window.into(), cx);
+
+        cx.update(|window, cx| {
+            CommitView::open(
+                sha.to_string(),
+                repository.downgrade(),
+                workspace.downgrade(),
+                None,
+                None,
+                window,
+                cx,
+            );
+        });
+        cx.run_until_parked();
+
+        cx.activate_a11y(cx.window_handle());
+        let json = cx
+            .update(|window, cx| {
+                window.draw(cx).clear(cx);
+                window.debug_a11y_tree_json()
+            })
+            .expect("activation makes the debug tree available");
+        let tree: serde_json::Value = serde_json::from_str(&json).expect("the dump is valid JSON");
+
+        gpui::a11y_checks::assert_interactive_nodes_are_named(&tree, "commit view");
+        gpui::a11y_checks::assert_no_role_was_discarded(&tree, "commit view");
+        gpui::a11y_checks::assert_names_are_distinguishable(&tree, "commit view");
+
+        let names: Vec<&str> = tree["nodes"]
+            .as_object()
+            .expect("the dump lists nodes")
+            .values()
+            .filter_map(|node| node["aria"]["label"].as_str())
+            .collect();
+        // The fake backend answers `show` with its own commit details rather
+        // than the ones seeded above, so the subject is its stand-in — the
+        // point here is that the view names itself after the commit it opened
+        // rather than that the fixture round-trips.
+        assert!(
+            names
+                .iter()
+                .any(|name| name.starts_with("Commit 0909090") && name.len() > "Commit 0909090".len()),
+            "the view has to say which commit it is showing: {names:?}"
+        );
+        assert!(
+            !names.iter().any(|name| name.ends_with("by ")),
+            "a commit with no author must not trail off mid-sentence: {names:?}"
+        );
+    }
 }
