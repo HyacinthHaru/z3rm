@@ -6618,8 +6618,28 @@ impl GitPanel {
         let display_name = entry.display_name(path_style);
 
         // Captured before the render closures take `display_name`, so the
-        // row's announced name survives.
-        let announced_name = display_name.clone();
+        // row's announced name survives. The status beside it is an icon or a
+        // colour on the label depending on the setting, and neither reaches a
+        // reader, so the word goes into the name.
+        let announced_name = {
+            let status = entry.status;
+            let word = if status.is_conflicted() {
+                "conflict"
+            } else if status.is_deleted() {
+                "deleted"
+            } else if status.is_created() {
+                "added"
+            } else if status.is_modified() {
+                "modified"
+            } else {
+                ""
+            };
+            if word.is_empty() {
+                SharedString::from(display_name.clone())
+            } else {
+                SharedString::from(format!("{display_name}, {word}"))
+            }
+        };
         let selected = self.selected_entry == Some(ix);
         let marked = self.marked_entries.contains(&ix);
         let status_style = settings.status_style;
@@ -11451,7 +11471,12 @@ mod tests {
             .unwrap_or_else(|| panic!("the panel must point at the row it highlights: {json}"));
         assert_eq!(current["aria"]["role"].as_str(), Some("ListBoxOption"));
         assert_eq!(current["aria"]["selected"].as_bool(), Some(true));
-        assert_eq!(current["aria"]["label"].as_str(), Some("tracked"));
+        // The status is part of the name: the panel shows it as a colour or an
+        // icon depending on the setting, and neither reaches a reader.
+        assert_eq!(
+            current["aria"]["label"].as_str(),
+            Some("tracked, modified")
+        );
 
         gpui::a11y_checks::assert_interactive_nodes_are_named(&tree, "git panel");
         gpui::a11y_checks::assert_no_role_was_discarded(&tree, "git panel");
@@ -11476,7 +11501,7 @@ mod tests {
             .filter_map(|node| node["aria"]["label"].as_str())
             .collect();
         assert!(
-            rows.contains(&"tracked"),
+            rows.contains(&"tracked, modified"),
             "every changed file needs a name of its own: {rows:?}"
         );
 
