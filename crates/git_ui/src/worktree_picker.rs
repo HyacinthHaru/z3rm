@@ -751,10 +751,18 @@ impl PickerDelegate for WorktreePickerDelegate {
                 Some(SharedString::from(format!("New worktree {name}")))
             }
             WorktreeEntry::Worktree { worktree, .. } => {
-                let path = worktree.path.file_name()?.to_string_lossy().to_string();
+                // The same name the row is drawn with, so the announced and the
+                // visible text cannot drift apart.
+                let main_worktree_path = self
+                    .all_worktrees
+                    .iter()
+                    .find(|candidate| candidate.is_main)
+                    .map(|candidate| candidate.path.as_path());
+                let display_name = worktree.directory_name(main_worktree_path);
+                let name = display_name.lines().next().unwrap_or(&display_name);
                 Some(match worktree.ref_name.as_ref() {
-                    Some(branch) => SharedString::from(format!("{path}, {branch}")),
-                    None => SharedString::from(path),
+                    Some(branch) => SharedString::from(format!("{name}, {branch}")),
+                    None => SharedString::from(name.to_string()),
                 })
             }
         }
