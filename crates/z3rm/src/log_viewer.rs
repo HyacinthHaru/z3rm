@@ -855,6 +855,7 @@ mod tests {
         let tree: serde_json::Value = serde_json::from_str(&json).expect("the dump is valid JSON");
 
         gpui::a11y_checks::assert_interactive_nodes_are_named(&tree, "log viewer");
+        gpui::a11y_checks::assert_names_are_distinguishable(&tree, "log viewer");
         gpui::a11y_checks::assert_no_role_was_discarded(&tree, "log viewer");
         gpui::a11y_checks::assert_roles_are_contained(&tree, "log viewer");
         gpui::a11y_checks::assert_click_targets_are_reachable(&tree, "log viewer");

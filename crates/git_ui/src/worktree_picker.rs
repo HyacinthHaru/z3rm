@@ -1825,6 +1825,7 @@ mod tests {
         let tree: serde_json::Value = serde_json::from_str(&json).expect("the dump is valid JSON");
 
         gpui::a11y_checks::assert_interactive_nodes_are_named(&tree, "worktree picker");
+        gpui::a11y_checks::assert_names_are_distinguishable(&tree, "worktree picker");
         gpui::a11y_checks::assert_no_role_was_discarded(&tree, "worktree picker");
         gpui::a11y_checks::assert_roles_are_contained(&tree, "worktree picker");
         gpui::a11y_checks::assert_click_targets_are_reachable(&tree, "worktree picker");

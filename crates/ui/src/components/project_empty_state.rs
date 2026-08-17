@@ -73,7 +73,11 @@ impl RenderOnce for ProjectEmptyState {
                             .child(Label::new(label).size(LabelSize::Small).color(Color::Muted)),
                     )
                     .child(
+                        // Both the project and git panels show this state at
+                        // once when no folder is open, so the two buttons would
+                        // otherwise appear twice under the same name.
                         Button::new("open_project", "Open Project")
+                            .aria_label(format!("Open Project: {}", self.label))
                             .full_width()
                             .key_binding(self.open_project_key_binding)
                             .when_some(self.on_open_project, |button, handler| {
@@ -89,6 +93,7 @@ impl RenderOnce for ProjectEmptyState {
                     )
                     .child(
                         Button::new("clone_repo", "Clone Repository")
+                            .aria_label(format!("Clone Repository: {}", self.label))
                             .full_width()
                             .when_some(self.on_clone_repo, |button, handler| {
                                 button.on_click(handler)

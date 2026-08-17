@@ -2596,6 +2596,7 @@ mod tests {
             let tree: serde_json::Value =
                 serde_json::from_str(&json).expect("the dump is valid JSON");
             gpui::a11y_checks::assert_interactive_nodes_are_named(&tree, "mux pane");
+            gpui::a11y_checks::assert_names_are_distinguishable(&tree, "mux pane");
             gpui::a11y_checks::assert_no_role_was_discarded(&tree, "mux pane");
             gpui::a11y_checks::assert_roles_are_contained(&tree, "mux pane");
             tree["nodes"]

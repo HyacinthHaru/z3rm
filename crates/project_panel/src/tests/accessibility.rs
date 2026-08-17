@@ -172,6 +172,7 @@ async fn a_modified_file_says_it_is_modified(cx: &mut gpui::TestAppContext) {
     let tree: serde_json::Value = serde_json::from_str(&json).expect("the dump is valid JSON");
 
     gpui::a11y_checks::assert_interactive_nodes_are_named(&tree, "project panel with git status");
+    gpui::a11y_checks::assert_names_are_distinguishable(&tree, "project panel with git status");
     gpui::a11y_checks::assert_no_role_was_discarded(&tree, "project panel with git status");
 
     let mut rows: Vec<&str> = tree["nodes"]
@@ -238,6 +239,7 @@ async fn the_rename_field_says_what_it_is(cx: &mut gpui::TestAppContext) {
     let nodes = tree["nodes"].as_object().expect("the dump lists nodes");
 
     gpui::a11y_checks::assert_interactive_nodes_are_named(&tree, "renaming a file");
+    gpui::a11y_checks::assert_names_are_distinguishable(&tree, "renaming a file");
     gpui::a11y_checks::assert_no_role_was_discarded(&tree, "renaming a file");
     gpui::a11y_checks::assert_focus_reached_the_tree(&tree, "renaming a file");
 
@@ -289,5 +291,6 @@ async fn an_empty_project_panel_says_why_it_is_empty(cx: &mut gpui::TestAppConte
     assert!(explained, "an empty panel has to say why it is empty: {json}");
 
     gpui::a11y_checks::assert_interactive_nodes_are_named(&tree, "empty project panel");
+    gpui::a11y_checks::assert_names_are_distinguishable(&tree, "empty project panel");
     gpui::a11y_checks::assert_no_role_was_discarded(&tree, "empty project panel");
 }

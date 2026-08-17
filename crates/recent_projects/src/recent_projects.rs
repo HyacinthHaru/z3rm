@@ -1340,7 +1340,9 @@ impl PickerDelegate for RecentProjectsDelegate {
                     .gap_1()
                     .child(
                         IconButton::new(("remove-folder", worktree_id.to_usize()), IconName::Close)
-                            .aria_label("Remove Folder from Project")
+                            // One button per row, so the bare action repeats
+                            // once for every folder in the list.
+                            .aria_label(format!("Remove Folder from Project: {name}"))
                             .icon_size(IconSize::Small)
                             .tooltip({
                                 let focus_handle = self.focus_handle.clone();
@@ -1479,6 +1481,7 @@ impl PickerDelegate for RecentProjectsDelegate {
                 };
 
                 let project_group_key = key.clone();
+                let project_group_name: SharedString = ordered_paths.join(", ").into();
                 let is_local = key.host().is_none();
                 let has_multiple_groups = self.window_project_groups.len() >= 2;
                 let secondary_actions = h_flex()
@@ -1486,7 +1489,9 @@ impl PickerDelegate for RecentProjectsDelegate {
                     .when(is_local && has_multiple_groups, |this| {
                         this.child(
                             IconButton::new("move_to_new_window", IconName::ArrowUpRight)
-                                .aria_label("Open in New Window")
+                                .aria_label(format!(
+                                    "Open in New Window: {project_group_name}"
+                                ))
                                 .icon_size(IconSize::Small)
                                 .tooltip({
                                     let focus_handle = self.focus_handle.clone();
@@ -1517,7 +1522,9 @@ impl PickerDelegate for RecentProjectsDelegate {
                     .when(!is_active, |this| {
                         this.child(
                             IconButton::new("remove_open_project", IconName::Close)
-                                .aria_label("Remove Project from Window")
+                                .aria_label(format!(
+                                    "Remove Project from Window: {project_group_name}"
+                                ))
                                 .icon_size(IconSize::Small)
                                 .tooltip({
                                     let focus_handle = self.focus_handle.clone();
@@ -2828,6 +2835,7 @@ mod tests {
         let tree: serde_json::Value = serde_json::from_str(&json).expect("the dump is valid JSON");
 
         gpui::a11y_checks::assert_interactive_nodes_are_named(&tree, "recent projects picker");
+        gpui::a11y_checks::assert_names_are_distinguishable(&tree, "recent projects picker");
         gpui::a11y_checks::assert_no_role_was_discarded(&tree, "recent projects picker");
         gpui::a11y_checks::assert_roles_are_contained(&tree, "recent projects picker");
         gpui::a11y_checks::assert_click_targets_are_reachable(&tree, "recent projects picker");
