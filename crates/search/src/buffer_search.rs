@@ -191,7 +191,11 @@ impl Render for BufferSearchBar {
         // What the counter is announced as, kept apart from what it draws.
         // "1/2" is four characters on screen and "one slash two" out loud, and
         // the other search surfaces already say "5 matches".
-        let mut announced_matches = SharedString::new_static("No matches");
+        //
+        // Empty until there is something to say. A live region announces what
+        // changes inside it, so "No matches" sitting there before anyone has
+        // typed would report a result for a search that has not happened.
+        let mut announced_matches = SharedString::default();
         let match_text = self
             .active_searchable_item
             .as_ref()
@@ -199,6 +203,7 @@ impl Render for BufferSearchBar {
                 if self.query(cx).is_empty() {
                     return None;
                 }
+                announced_matches = SharedString::new_static("No matches");
                 let matches_count = self
                     .searchable_items_with_matches
                     .get(&searchable_item.downgrade())

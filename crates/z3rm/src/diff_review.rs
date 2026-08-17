@@ -335,7 +335,11 @@ impl Render for DiffReview {
                             // in the tree at all and the review cannot be
                             // completed without a mouse.
                             .role(gpui::Role::Button)
-                            .aria_label("Accept (a)")
+                            // The visible label carries the key because the
+                            // button is small; the name does not, because the
+                            // shortcut is already an attribute of its own and
+                            // "Accept (a), button, a" says it twice.
+                            .aria_label("Accept")
                             .aria_keyshortcuts("a")
                             .px_3()
                             .py_1()
@@ -351,7 +355,7 @@ impl Render for DiffReview {
                         div()
                             .id("decline-btn")
                             .role(gpui::Role::Button)
-                            .aria_label("Decline (d)")
+                            .aria_label("Decline")
                             .aria_keyshortcuts("d")
                             .px_3()
                             .py_1()
@@ -596,8 +600,14 @@ mod tests {
             })
             .collect();
         assert!(
-            buttons.contains(&("Accept (a)", false)),
+            buttons.contains(&("Accept", false)),
             "the review cannot be completed without a mouse otherwise: {buttons:?}"
+        );
+        // The key is on the button's face and in `aria-keyshortcuts`; putting
+        // it in the name too makes a reader say it twice.
+        assert!(
+            buttons.iter().all(|(label, _)| !label.contains('(')),
+            "a name must not repeat the shortcut it already carries: {buttons:?}"
         );
         // This review was opened with no restore target, so declining is not
         // available; muted text was the only thing that said so.
