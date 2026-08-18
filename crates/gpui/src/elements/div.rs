@@ -1284,6 +1284,23 @@ pub trait StatefulInteractiveElement: InteractiveElement {
         self
     }
 
+    /// Override the spoken name of this element's *kind* — what a reader says
+    /// in place of "button" or "row".
+    ///
+    /// Reaches all three platforms, which few of the other properties do: it
+    /// is `AXRoleDescription` on macOS, `UIA_LocalizedControlType` on Windows
+    /// and the localized role name on AT-SPI. That makes it the channel for
+    /// distinctions the roles cannot draw — a button that opens a menu, a tree
+    /// row that is a folder — which would otherwise have to be smuggled into
+    /// the label and read as part of the element's name.
+    ///
+    /// It replaces the role's own name, so it has to describe the kind of
+    /// thing this is, not its state or its content.
+    fn aria_role_description(mut self, role_description: impl Into<SharedString>) -> Self {
+        self.interactivity().aria.role_description = Some(role_description.into());
+        self
+    }
+
     /// Set the keyboard shortcut(s) that activate this element, announced by
     /// assistive technology (maps to AccessKit's `keyboard_shortcut`).
     ///
@@ -2047,6 +2064,7 @@ pub(crate) struct AriaProperties {
     pub(crate) author_id: Option<SharedString>,
     pub(crate) label: Option<SharedString>,
     pub(crate) description: Option<SharedString>,
+    pub(crate) role_description: Option<SharedString>,
     pub(crate) keyshortcuts: Option<SharedString>,
     pub(crate) selected: Option<bool>,
     pub(crate) expanded: Option<bool>,
@@ -3450,6 +3468,9 @@ impl Interactivity {
         }
         if let Some(description) = &self.aria.description {
             node.set_description(description.to_string());
+        }
+        if let Some(role_description) = &self.aria.role_description {
+            node.set_role_description(role_description.to_string());
         }
         if let Some(keyshortcuts) = &self.aria.keyshortcuts {
             node.set_keyboard_shortcut(keyshortcuts.to_string());

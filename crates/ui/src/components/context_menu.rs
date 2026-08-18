@@ -1636,12 +1636,13 @@ impl ContextMenu {
                     // `aria_expanded` says both that there is one and whether
                     // it is showing, but it reaches Windows alone — accesskit's
                     // macOS and AT-SPI adapters expose neither `expanded` nor
-                    // `HasPopup`. So the durable half goes in the label, which
-                    // every platform reads, and Windows adds the open state on
-                    // top of it.
+                    // `HasPopup`. The role description reaches all three, and
+                    // "opens a submenu" is what this entry *is*, so it belongs
+                    // there rather than in the entry's name.
+                    .aria_role_description("submenu")
                     .aria_expanded(submenu_is_open)
                     .when(is_active_descendant, |item| item.aria_active_descendant())
-                    .aria_label(format!("{label}, submenu"))
+                    .aria_label(label.clone())
                     .toggle_state(toggle_state)
                     .child(
                         canvas(
@@ -2565,7 +2566,7 @@ mod tests {
         gpui::a11y_checks::assert_interactive_nodes_are_named(&tree, "submenu entry");
         gpui::a11y_checks::assert_names_are_distinguishable(&tree, "submenu entry");
 
-        let mut entries: Vec<(&str, Option<bool>)> = tree["nodes"]
+        let mut entries: Vec<(&str, Option<&str>, Option<bool>)> = tree["nodes"]
             .as_object()
             .expect("the dump lists nodes")
             .values()
@@ -2573,17 +2574,22 @@ mod tests {
             .map(|node| {
                 (
                     node["aria"]["label"].as_str().unwrap_or_default(),
+                    node["aria"]["role_description"].as_str(),
                     node["aria"]["expanded"].as_bool(),
                 )
             })
             .collect();
         entries.sort_unstable();
-        // The name says there is a submenu on every platform; `expanded` says
-        // whether it is open, and reaches Windows alone. Both, because either
-        // on its own leaves a platform unable to tell a submenu from an action.
+        // The role description says there is a submenu, and reaches all three
+        // platforms; `expanded` says whether it is open, and reaches Windows
+        // alone. Both, because either on its own leaves a platform unable to
+        // tell a submenu from an action.
         assert_eq!(
             entries,
-            vec![("Copy", None), ("Split, submenu", Some(false))],
+            vec![
+                ("Copy", None, None),
+                ("Split", Some("submenu"), Some(false))
+            ],
             "only the entry with a submenu says it has one, and says it is closed"
         );
     }

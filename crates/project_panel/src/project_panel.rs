@@ -5504,13 +5504,6 @@ impl ProjectPanel {
         // a reader can reach, so both go into the name.
         let announced_name = {
             let mut name = details.filename.clone().to_string();
-            // Otherwise a folder and a file read identically. `Role::TreeItem`
-            // is an outline row on macOS, which says nothing about what kind of
-            // thing the row is, and `aria_expanded` — which would at least
-            // imply a folder — reaches Windows alone.
-            if kind.is_dir() {
-                name.push_str(", folder");
-            }
             if let Some((_, status, _)) = git_status_indicator(details.git_status) {
                 // A directory's summary is about what is inside it — the dot
                 // beside a folder means "something in here changed", not that
@@ -6026,7 +6019,16 @@ impl ProjectPanel {
                     .aria_selected(announced_selected)
                     .when(announced_selected, ListItem::aria_active_descendant)
                     .aria_level(announced_depth + 1)
-                    .when(kind.is_dir(), |this| this.aria_expanded(announced_expanded))
+                    // Otherwise a folder and a file read identically:
+                    // `Role::TreeItem` is an outline row on macOS, saying
+                    // nothing about what the row holds, and `aria_expanded` —
+                    // which would at least imply a folder — reaches Windows
+                    // alone. This is the kind of thing the row is, so it goes
+                    // in the role description rather than the name.
+                    .when(kind.is_dir(), |this| {
+                        this.aria_role_description("folder")
+                            .aria_expanded(announced_expanded)
+                    })
                     .indent_level(depth)
                     .indent_step_size(px(settings.indent_size))
                     .spacing(match settings.entry_spacing {

@@ -93,7 +93,7 @@ async fn the_file_tree_is_exposed_as_a_named_tree(cx: &mut gpui::TestAppContext)
 
         // Read the rows from inside the tree: a row rendered outside it would keep
         // its role and silently lose the set semantics that go with containment.
-        let mut rows: Vec<(String, u64)> = file_tree.1["children"]
+        let mut rows: Vec<(String, Option<String>, u64)> = file_tree.1["children"]
             .as_array()
             .into_iter()
             .flatten()
@@ -105,6 +105,9 @@ async fn the_file_tree_is_exposed_as_a_named_tree(cx: &mut gpui::TestAppContext)
                         .as_str()
                         .unwrap_or_default()
                         .to_string(),
+                    node["aria"]["role_description"]
+                        .as_str()
+                        .map(str::to_string),
                     node["aria"]["level"].as_u64().unwrap_or_default(),
                 )
             })
@@ -117,21 +120,22 @@ async fn the_file_tree_is_exposed_as_a_named_tree(cx: &mut gpui::TestAppContext)
         );
         assert!(
             rows.iter()
-                .all(|(name, level)| !name.is_empty() && *level >= 1),
+                .all(|(name, _, level)| !name.is_empty() && *level >= 1),
             "every row needs a name and a 1-based depth: {rows:?}"
         );
 
         // A folder and a file are both outline rows on macOS, and `expanded` —
-        // the one property that would imply a folder — reaches Windows alone,
-        // so the name is where the distinction has to survive.
+        // the one property that would imply a folder — reaches Windows alone.
+        // The role description reaches all three, and replaces what a reader
+        // says in place of "row".
         assert!(
             rows.iter()
-                .any(|(name, _)| name.starts_with("src") && name.contains("folder")),
+                .any(|(name, kind, _)| name.starts_with("src") && kind.as_deref() == Some("folder")),
             "a directory row has to say it is one: {rows:?}"
         );
         assert!(
             rows.iter()
-                .any(|(name, _)| name.starts_with("README.md") && !name.contains("folder")),
+                .any(|(name, kind, _)| name.starts_with("README.md") && kind.is_none()),
             "and a file row has to not: {rows:?}"
         );
     }
@@ -213,11 +217,7 @@ async fn a_modified_file_says_it_is_modified(cx: &mut gpui::TestAppContext) {
         rows,
         // A folder's summary is about what is inside it: the dot beside a
         // folder does not mean the folder itself was modified.
-        vec![
-            "edited.rs, modified",
-            "src, folder, contains changes",
-            "untouched.rs",
-        ],
+        vec!["edited.rs, modified", "src, contains changes", "untouched.rs"],
         "the colour beside the name is the only other thing that says this"
     );
 }

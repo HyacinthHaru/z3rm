@@ -59,6 +59,7 @@ pub struct ListItem {
     aria_checked: Option<bool>,
     aria_selected: Option<bool>,
     aria_level: Option<usize>,
+    aria_role_description: Option<SharedString>,
     aria_expanded: Option<bool>,
     aria_active_descendant: bool,
 }
@@ -98,6 +99,7 @@ impl ListItem {
             aria_checked: None,
             aria_selected: None,
             aria_level: None,
+            aria_role_description: None,
             aria_expanded: None,
             aria_active_descendant: false,
         }
@@ -145,6 +147,14 @@ impl ListItem {
     /// [`Self::aria_role`] to be set.
     pub fn aria_selected(mut self, selected: bool) -> Self {
         self.aria_selected = Some(selected);
+        self
+    }
+
+    /// What a reader says in place of this row's role — "folder" rather than
+    /// "row". Unlike most of the aria properties it reaches all three
+    /// platforms, so it is where a distinction the role cannot draw belongs.
+    pub fn aria_role_description(mut self, role_description: impl Into<SharedString>) -> Self {
+        self.aria_role_description = Some(role_description.into());
         self
     }
 
@@ -375,6 +385,9 @@ impl RenderOnce for ListItem {
                     })
                     .when(self.aria_role.is_some(), |this| {
                         this.when_some(self.aria_level, |this, level| this.aria_level(level))
+                            .when_some(self.aria_role_description, |this, role_description| {
+                                this.aria_role_description(role_description)
+                            })
                             .when_some(self.aria_expanded, |this, expanded| {
                                 this.aria_expanded(expanded)
                             })
