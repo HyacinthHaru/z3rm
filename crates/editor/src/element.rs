@@ -7807,11 +7807,11 @@ impl Element for EditorElement {
     }
 
     /// Single-line editors are the app's text inputs — filters, search boxes,
-    /// settings fields — so they are reported as such. A multi-line editor's
-    /// text pattern would have to reflect folds, wrapping and inlays, so it is
-    /// reported as a named region rather than described incorrectly as a flat
-    /// text input: focus lands somewhere, and the user hears where they are,
-    /// without a promise the element cannot keep.
+    /// settings fields — so they are reported as such. A multi-line editor is a
+    /// named region rather than a flat text input, because its buffer offsets
+    /// do not survive folding, wrapping and inlays; the text it carries is the
+    /// rows currently on screen, in display order, which is the thing those
+    /// three have already been applied to.
     fn a11y_role(&self) -> Option<gpui::accesskit::Role> {
         if self.single_line {
             Some(gpui::accesskit::Role::TextInput)
@@ -9377,7 +9377,7 @@ impl Element for EditorElement {
                             .unwrap_or_else(|| SharedString::new_static("Editor"))
                         })
                     });
-                    let a11y_text = self.single_line.then(|| {
+                    let a11y_text = if self.single_line {
                         let (text, selection) = {
                             let editor = self.editor.read(cx);
                             (
@@ -9387,15 +9387,58 @@ impl Element for EditorElement {
                                 ),
                             )
                         };
-                        A11yTextInput {
+                        Some(A11yTextInput {
                             text,
                             placeholder: self
                                 .editor
                                 .update(cx, |editor, cx| editor.placeholder_text(cx)),
                             selection_tail: selection.tail().0,
                             selection_head: selection.head().0,
+                        })
+                    } else if self.focusable_region {
+                        // The rows that are on screen, as they are on screen —
+                        // after folding, wrapping and inlays — rather than the
+                        // buffer. A buffer-offset text pattern would have to
+                        // undo all three to stay truthful about where the caret
+                        // is; these offsets describe what the user is looking
+                        // at, which is what a reader reads. It follows that the
+                        // text changes as the editor scrolls, and that a
+                        // selection outside the visible rows is reported
+                        // collapsed at the top.
+                        let display_snapshot = &position_map.snapshot.display_snapshot;
+                        let mut text = String::new();
+                        for row in start_row.0..end_row.0 {
+                            if !text.is_empty() {
+                                text.push('\n');
+                            }
+                            text.push_str(&display_snapshot.line(DisplayRow(row)));
                         }
-                    });
+                        let selection = self
+                            .editor
+                            .read(cx)
+                            .selections
+                            .newest_display(display_snapshot);
+                        let offset_of = |point: DisplayPoint| -> usize {
+                            if point.row() < start_row || point.row() >= end_row {
+                                return 0;
+                            }
+                            let mut offset = 0;
+                            for row in start_row.0..point.row().0 {
+                                offset += display_snapshot.line(DisplayRow(row)).len() + 1;
+                            }
+                            offset + (point.column() as usize).min(
+                                display_snapshot.line(point.row()).len(),
+                            )
+                        };
+                        Some(A11yTextInput {
+                            text,
+                            placeholder: None,
+                            selection_tail: offset_of(selection.tail()),
+                            selection_head: offset_of(selection.head()),
+                        })
+                    } else {
+                        None
+                    };
 
                     self.editor.update(cx, |editor, _| {
                         editor.last_position_map = Some(position_map.clone());
@@ -12387,6 +12430,56 @@ mod tests {
             .and_then(|id| nodes.get(id))
             .expect("the content must be readable as a text run");
         assert_eq!(run["aria"]["value"].as_str(), Some("needle"));
+    }
+
+    /// A multi-line editor exposed a named region and no text at all, so a
+    /// reader could tell you were in an editor and not what was in it — which
+    /// in a code editor is the whole of the content. The rows it reports are
+    /// the rows on screen, after folding and wrapping, because those are the
+    /// ones the user is looking at.
+    #[gpui::test]
+    async fn test_a_multi_line_editor_exposes_the_rows_on_screen(cx: &mut TestAppContext) {
+        init_test(cx, |_| {});
+        let window = cx.add_window(|window, cx| {
+            let buffer = MultiBuffer::build_simple("fn one() {}\nfn two() {}\n", cx);
+            Editor::new(EditorMode::full(), buffer, None, window, cx)
+        });
+        cx.activate_a11y(window.into());
+
+        let json = cx
+            .update_window(window.into(), |_, window, cx| {
+                window.draw(cx).clear(cx);
+                window.debug_a11y_tree_json()
+            })
+            .expect("the harness window is still open")
+            .expect("activation makes the debug tree available");
+        let tree: serde_json::Value = serde_json::from_str(&json).expect("the dump is valid JSON");
+        let nodes = tree["nodes"].as_object().expect("the dump lists nodes");
+
+        let region = nodes
+            .values()
+            .find(|node| node["aria"]["role"] == "Group")
+            .unwrap_or_else(|| panic!("the editor is a focusable region: {json}"));
+        assert!(
+            region["aria"]["text_selection"].is_object(),
+            "a region carrying text has to say where the caret is: {region}"
+        );
+
+        let runs: Vec<&str> = region["children"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter_map(|id| nodes.get(id.as_str()?))
+            .filter_map(|node| node["aria"]["value"].as_str())
+            .collect();
+        assert!(
+            runs.iter().any(|run| run.contains("fn one()")),
+            "the first line of the buffer has to be readable: {runs:?}"
+        );
+        assert!(
+            runs.iter().any(|run| run.contains("fn two()")),
+            "so does the second: {runs:?}"
+        );
     }
 
     /// The inline prompt is built by hand rather than through `Editor::render`,
