@@ -620,6 +620,18 @@ pub enum ViewEvent {
 
 impl EventEmitter<ViewEvent> for ProjectSearchView {}
 
+/// What the results region is called.
+///
+/// The query, uncut, for the same reason the tab carries it uncut: this is a
+/// region a reader arrives at, and two searches in split panes are told apart
+/// by nothing else.
+fn announced_results_name(query: Option<&str>) -> SharedString {
+    match query.map(|query| query.replace('\n', "")).filter(|query| !query.is_empty()) {
+        Some(query) => format!("Search results, {query}").into(),
+        None => "Search results".into(),
+    }
+}
+
 impl Render for ProjectSearchView {
     fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let mut key_context = KeyContext::default();
@@ -632,7 +644,13 @@ impl Render for ProjectSearchView {
                 // the whole window was announced instead of the results.
                 .id("project-search-results")
                 .role(gpui::Role::Group)
-                .aria_label("Search results")
+                // Named after the query, not "Search results". Two searches
+                // open in split panes are two focusable regions, and the query
+                // is the only thing telling them apart — the same reason the
+                // tab is named after it.
+                .aria_label(announced_results_name(
+                    self.entity.read(cx).last_search_query_text.as_deref(),
+                ))
                 .on_action(cx.listener(Self::open_text_finder))
                 .flex_1()
                 .size_full()
@@ -2840,6 +2858,26 @@ pub fn perform_project_search(
 
 #[cfg(test)]
 pub mod tests {
+
+    /// Two searches open in split panes are two focusable regions, and before
+    /// this both were called "Search results" — so a reader tabbing between
+    /// them heard the same words and could not tell they had moved.
+    #[test]
+    fn the_results_region_is_named_after_its_query() {
+        assert_eq!(
+            super::announced_results_name(Some("fn render")),
+            "Search results, fn render"
+        );
+        // Newlines go for the same reason they go from the tab: a query pasted
+        // out of a file would otherwise be read aloud as two lines.
+        assert_eq!(
+            super::announced_results_name(Some("first\nsecond")),
+            "Search results, firstsecond"
+        );
+        // Nothing searched for yet, and the region still has to say what it is.
+        assert_eq!(super::announced_results_name(None), "Search results");
+        assert_eq!(super::announced_results_name(Some("")), "Search results");
+    }
 
     /// A search tab is titled with the query, cut to fit the strip. That is
     /// the only thing telling one search from another, and two searches that
