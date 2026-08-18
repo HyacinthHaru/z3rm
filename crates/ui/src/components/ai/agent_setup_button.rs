@@ -78,6 +78,7 @@ impl Component for AgentSetupButton {
 impl RenderOnce for AgentSetupButton {
     fn render(self, _window: &mut Window, cx: &mut App) -> impl IntoElement {
         let is_clickable = !self.disabled && self.on_click.is_some();
+        let announced_name = self.name.clone().filter(|_| is_clickable);
 
         let has_top_section = self.icon.is_some() || self.name.is_some();
         let top_section = has_top_section.then(|| {
@@ -102,8 +103,17 @@ impl RenderOnce for AgentSetupButton {
                 .child(state_element)
         });
 
+        // A card built out of an icon, a `Label` and a state element, none of
+        // which is a node, wrapped in a click. Without a role it produced no
+        // node at all, so setting the agent up was reachable by mouse only.
+        // Named only when it has a name and a click: an inert card with
+        // nothing to say stays out of the tree rather than announcing an empty
+        // button.
         v_flex()
             .id(self.id)
+            .when_some(announced_name, |this, name| {
+                this.role(gpui::Role::Button).aria_label(name)
+            })
             .border_1()
             .border_color(cx.theme().colors().border_variant)
             .rounded_sm()
@@ -119,5 +129,72 @@ impl RenderOnce for AgentSetupButton {
             .when_some(self.on_click.filter(|_| is_clickable), |this, on_click| {
                 this.on_click(on_click)
             })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use gpui::TestAppContext;
+
+    /// The card is an icon, a `Label` and a state element wrapped in a click.
+    /// None of those is a node, so without a role the whole thing is absent
+    /// from the tree and setting the agent up is a mouse-only affordance.
+    #[gpui::test]
+    fn a_setup_card_that_does_something_is_named(cx: &mut TestAppContext) {
+        cx.update(|cx| {
+            let settings_store = settings::SettingsStore::test(cx);
+            cx.set_global(settings_store);
+            theme_settings::init(theme::LoadThemes::JustBase, cx);
+        });
+
+        struct Host;
+        impl Render for Host {
+            fn render(&mut self, _: &mut Window, _: &mut gpui::Context<Self>) -> impl IntoElement {
+                div()
+                    .child(
+                        AgentSetupButton::new("connect")
+                            .name("Connect an agent")
+                            .on_click(|_, _, _| {}),
+                    )
+                    // Disabled, so it does nothing and says nothing: a card the
+                    // user cannot act on has no business in the tree.
+                    .child(
+                        AgentSetupButton::new("soon")
+                            .name("Coming soon")
+                            .disabled(true)
+                            .on_click(|_, _, _| {}),
+                    )
+            }
+        }
+
+        let window = cx.add_window(|_, _| Host);
+        cx.activate_a11y(window.into());
+        let json = cx
+            .update_window(window.into(), |_, window, cx| {
+                window.draw(cx).clear(cx);
+                window.debug_a11y_tree_json()
+            })
+            .expect("the harness window is still open")
+            .expect("activation makes the debug tree available");
+        let tree: serde_json::Value = serde_json::from_str(&json).expect("the dump is valid JSON");
+
+        gpui::a11y_checks::assert_interactive_nodes_are_named(&tree, "agent setup");
+        gpui::a11y_checks::assert_no_role_was_discarded(&tree, "agent setup");
+        gpui::a11y_checks::assert_no_aria_was_discarded(&tree, "agent setup");
+        gpui::a11y_checks::assert_clickable_elements_are_reachable(&tree, "agent setup");
+
+        let buttons: Vec<&str> = tree["nodes"]
+            .as_object()
+            .expect("the dump lists nodes")
+            .values()
+            .filter(|node| node["aria"]["role"] == "Button")
+            .filter_map(|node| node["aria"]["label"].as_str())
+            .collect();
+        assert_eq!(
+            buttons,
+            vec!["Connect an agent"],
+            "the card that acts is named; the one that cannot act stays out"
+        );
     }
 }
