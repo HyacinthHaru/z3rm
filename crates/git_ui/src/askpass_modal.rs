@@ -5,6 +5,7 @@ use gpui::{AppContext, DismissEvent, Entity, EventEmitter, Focusable, Styled};
 use ui::{
     ActiveTheme, AnyElement, App, Button, Clickable, Color, Context, DynamicSpacing, Headline,
     HeadlineSize, Icon, IconName, IconSize, InteractiveElement, IntoElement, Label, LabelCommon,
+    StatefulInteractiveElement as _,
     LabelSize, ParentElement, Render, SharedString, StyledExt, StyledTypography, Window, div,
     h_flex, v_flex,
 };
@@ -91,6 +92,12 @@ impl AskPassModal {
         {
             return Some(
             div()
+                // The hint is a `Label` and the only node in it is a button
+                // reading "Learn more" — a reader was offered a link with
+                // nothing saying what it would teach them.
+                .id("askpass-github-hint")
+                .role(gpui::Role::Group)
+                .aria_label("You may need to configure git for Github.")
                 .p_2()
                 .bg(color)
                 .border_t_1()

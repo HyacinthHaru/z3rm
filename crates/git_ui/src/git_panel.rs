@@ -5358,6 +5358,12 @@ impl GitPanel {
 
     fn render_pending_amend(&self, cx: &mut Context<Self>) -> impl IntoElement {
         h_flex()
+            // The explanation is a `Label` and the only node here is a button
+            // reading "Cancel" — so a reader was offered a cancel with nothing
+            // saying what it cancels, or that anything had changed at all.
+            .id("git-panel-pending-amend")
+            .role(gpui::Role::Group)
+            .aria_label("This will update your most recent commit.")
             .py_1p5()
             .px_2()
             .gap_1p5()
