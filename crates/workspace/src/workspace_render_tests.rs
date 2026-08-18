@@ -1080,6 +1080,106 @@ async fn test_the_live_regions_exist_before_they_have_anything_to_say(cx: &mut T
     );
 }
 
+/// Closing a dialog is where a reader gets lost. The modal takes focus when it
+/// opens, and if dismissing it leaves focus on a handle whose element is gone,
+/// the tree has a focus that resolves to nothing — so assistive technology
+/// announces the whole window instead of wherever the user now is. Nothing
+/// closed a modal in a frame test before this.
+#[gpui::test]
+async fn test_focus_lands_somewhere_when_a_modal_closes(cx: &mut TestAppContext) {
+    use gpui::{Context, EventEmitter, InteractiveElement as _, IntoElement, Render,
+        StatefulInteractiveElement as _, Styled as _, Window};
+
+    struct TestModal {
+        focus_handle: gpui::FocusHandle,
+    }
+
+    impl gpui::Focusable for TestModal {
+        fn focus_handle(&self, _: &gpui::App) -> gpui::FocusHandle {
+            self.focus_handle.clone()
+        }
+    }
+    impl EventEmitter<gpui::DismissEvent> for TestModal {}
+    impl crate::ModalView for TestModal {
+        fn a11y_name(&self, _: &gpui::App) -> Option<gpui::SharedString> {
+            Some("Test dialog".into())
+        }
+    }
+    impl Render for TestModal {
+        fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+            gpui::div()
+                .id("test-modal-root")
+                .role(gpui::Role::Group)
+                .aria_label("Test modal")
+                .w(gpui::px(320.))
+                .h(gpui::px(160.))
+                .track_focus(&self.focus_handle)
+        }
+    }
+
+    init_test(cx);
+    let fs = FakeFs::new(cx.executor());
+    fs.insert_tree("/root", json!({ "a.txt": "" })).await;
+    let project = Project::test(fs, [path!("/root").as_ref()], cx).await;
+
+    let (multi_workspace, cx) =
+        cx.add_window_view(|window, cx| MultiWorkspace::test_new(project, window, cx));
+    let workspace = multi_workspace.read_with(cx, |mw, _| mw.workspace().clone());
+
+    workspace.update_in(cx, |workspace, window, cx| {
+        workspace.toggle_modal(window, cx, |_, cx| TestModal {
+            focus_handle: cx.focus_handle(),
+        });
+    });
+    cx.run_until_parked();
+    cx.activate_a11y(cx.window_handle());
+    cx.update(|window, cx| window.draw(cx).clear(cx));
+
+    // Dismissed the way Escape dismisses it, rather than by dropping the
+    // entity: the question is what the product's own path leaves behind.
+    workspace.update_in(cx, |workspace, window, cx| {
+        workspace.toggle_modal(window, cx, |_, cx| TestModal {
+            focus_handle: cx.focus_handle(),
+        });
+    });
+    cx.run_until_parked();
+
+    let json = cx
+        .update(|window, cx| {
+            window.draw(cx).clear(cx);
+            window.debug_a11y_tree_json()
+        })
+        .expect("activation makes the debug tree available");
+    let tree: serde_json::Value = serde_json::from_str(&json).expect("the dump is valid JSON");
+
+    gpui::a11y_checks::assert_focus_reached_the_tree(&tree, "after a modal closes");
+    gpui::a11y_checks::assert_no_role_was_discarded(&tree, "after a modal closes");
+    gpui::a11y_checks::assert_no_aria_was_discarded(&tree, "after a modal closes");
+
+    assert!(
+        !tree["nodes"]
+            .as_object()
+            .expect("the dump lists nodes")
+            .values()
+            .any(|node| node["aria"]["label"] == "Test dialog"),
+        "the dialog has to be gone from the tree, not merely invisible: {json}"
+    );
+
+    // `assert_focus_reached_the_tree` only fails when there *is* a focus and it
+    // resolves to nothing, so it passes just as happily on a window that
+    // focuses nobody. What the user needs is to be told where they now are, so
+    // this asks for the focused node and for it to have a name.
+    let focused = tree["gpui_focus"]
+        .as_str()
+        .and_then(|id| tree["nodes"].get(id))
+        .unwrap_or_else(|| panic!("closing the dialog has to leave focus somewhere: {json}"));
+    assert_eq!(
+        focused["aria"]["label"].as_str(),
+        Some("Empty pane"),
+        "and somewhere that says what it is: {focused}"
+    );
+}
+
 /// A modal captures input and hides everything behind it. Its container had no
 /// role and no id, so the focused element produced no accessibility node at
 /// all: focus was discarded and the whole window announced instead of the
