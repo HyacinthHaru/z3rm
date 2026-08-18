@@ -1597,6 +1597,13 @@ impl ContextMenu {
                 &self.submenu_state,
                 SubmenuState::Open(open_submenu) if open_submenu.item_index == ix
             );
+        // Highlighted and open are the same styling here and different facts:
+        // the row is highlighted while the arrow keys are on it, and open once
+        // its submenu is showing.
+        let submenu_is_open = matches!(
+            &self.submenu_state,
+            SubmenuState::Open(open_submenu) if open_submenu.item_index == ix
+        );
 
         div()
             .id(("context-menu-submenu-trigger", ix))
@@ -1624,6 +1631,11 @@ impl ContextMenu {
                 ListItem::new(ix)
                     .inset(true)
                     .aria_role(Role::MenuItem)
+                    // The chevron is the only thing that says this entry opens
+                    // a submenu rather than doing something, and it is an icon.
+                    // Expanded says both that there is one and whether it is
+                    // showing.
+                    .aria_expanded(submenu_is_open)
                     .when(is_active_descendant, |item| item.aria_active_descendant())
                     .aria_label(label.clone())
                     .toggle_state(toggle_state)
@@ -2515,6 +2527,58 @@ mod tests {
         fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
             div().size_full().child(self.0.clone())
         }
+    }
+
+    /// An entry that opens a submenu draws a chevron and is otherwise an
+    /// ordinary row, so a reader arrowing through the menu could not tell
+    /// "Split" — which opens something — from "Copy", which does something.
+    #[gpui::test]
+    fn a_submenu_entry_says_it_opens_a_submenu(cx: &mut TestAppContext) {
+        cx.update(|cx| {
+            let settings_store = settings::SettingsStore::test(cx);
+            cx.set_global(settings_store);
+            theme_settings::init(theme::LoadThemes::JustBase, cx);
+        });
+
+        let window = cx.add_window(|window, cx| {
+            let menu = ContextMenu::build(window, cx, |menu, _, _| {
+                menu.entry("Copy", None, |_, _| {}).submenu("Split", |menu, _, _| {
+                    menu.entry("Split Right", None, |_, _| {})
+                })
+            });
+            MenuHost(menu)
+        });
+        cx.activate_a11y(window.into());
+
+        let json = cx
+            .update_window(window.into(), |_, window, cx| {
+                window.draw(cx).clear(cx);
+                window.debug_a11y_tree_json()
+            })
+            .expect("the harness window is still open")
+            .expect("activation makes the debug tree available");
+        let tree: serde_json::Value = serde_json::from_str(&json).expect("the dump is valid JSON");
+        gpui::a11y_checks::assert_interactive_nodes_are_named(&tree, "submenu entry");
+        gpui::a11y_checks::assert_names_are_distinguishable(&tree, "submenu entry");
+
+        let mut entries: Vec<(&str, Option<bool>)> = tree["nodes"]
+            .as_object()
+            .expect("the dump lists nodes")
+            .values()
+            .filter(|node| node["aria"]["role"] == "MenuItem")
+            .map(|node| {
+                (
+                    node["aria"]["label"].as_str().unwrap_or_default(),
+                    node["aria"]["expanded"].as_bool(),
+                )
+            })
+            .collect();
+        entries.sort_unstable();
+        assert_eq!(
+            entries,
+            vec![("Copy", None), ("Split", Some(false))],
+            "only the entry with a submenu says it has one, and says it is closed"
+        );
     }
 
     /// Focus stays on the menu while the arrow keys move a highlight through
