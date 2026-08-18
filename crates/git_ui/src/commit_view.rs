@@ -743,7 +743,13 @@ impl CommitView {
                                         .overflow_y_scroll()
                                         .track_scroll(&self.message_scroll_handle)
                                 })
-                                .child(MarkdownElement::new(self.message.clone(), markdown_style)),
+                                .child(
+                                    MarkdownElement::new(self.message.clone(), markdown_style)
+                                        // The one region in this view a reader
+                                        // can enter that is not the diff, and
+                                        // it was announced as a bare group.
+                                        .aria_label("Commit message"),
+                                ),
                         )
                         .vertical_scrollbar_for(&self.message_scroll_handle, window, cx),
                 ),
@@ -1593,6 +1599,15 @@ mod tests {
         assert!(
             !names.iter().any(|name| name.ends_with("by ")),
             "a commit with no author must not trail off mid-sentence: {names:?}"
+        );
+
+        // The message is a markdown view, which is a focusable region whose
+        // content reaches the tree as text runs — so unnamed it announces as a
+        // bare group and the user is told they have arrived somewhere without
+        // being told where.
+        assert!(
+            names.contains(&"Commit message"),
+            "the message region has to say what it is: {names:?}"
         );
 
     }

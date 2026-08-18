@@ -1250,11 +1250,24 @@ pub struct MarkdownElement {
     on_source_click: Option<SourceClickCallback>,
     on_checkbox_toggle: Option<CheckboxToggleCallback>,
     image_resolver: Option<Box<dyn Fn(&str) -> Option<ImageSource>>>,
+    a11y_label: Option<SharedString>,
     show_root_block_markers: bool,
     autoscroll: AutoscrollBehavior,
 }
 
 impl MarkdownElement {
+    /// What a reader is told this view is, when it takes focus.
+    ///
+    /// A markdown view is a focusable region whose content reaches the tree as
+    /// text runs, so without this it is announced as a bare group — the user
+    /// is told they have arrived somewhere and not where. Optional, because a
+    /// markdown view embedded in something already named does not need to say
+    /// it twice.
+    pub fn aria_label(mut self, label: impl Into<SharedString>) -> Self {
+        self.a11y_label = Some(label.into());
+        self
+    }
+
     pub fn new(markdown: Entity<Markdown>, style: MarkdownStyle) -> Self {
         Self {
             markdown,
@@ -1264,6 +1277,7 @@ impl MarkdownElement {
                 wrap_button_visibility: WrapButtonVisibility::Hidden,
                 border: false,
             },
+            a11y_label: None,
             on_url_click: None,
             code_span_link: None,
             on_source_click: None,
@@ -2070,6 +2084,7 @@ pub struct MarkdownPrepaint {
     /// Where each link sits on screen, so it can be announced as a link and
     /// followed without a mouse.
     a11y_links: Vec<(SharedString, Bounds<Pixels>)>,
+    a11y_label: Option<SharedString>,
 }
 
 impl Element for MarkdownElement {
@@ -2097,6 +2112,9 @@ impl Element for MarkdownElement {
         prepaint: &mut Self::PrepaintState,
         builder: &mut gpui::A11ySubtreeBuilder,
     ) {
+        if let Some(label) = prepaint.a11y_label.as_ref() {
+            builder.parent_node().set_label(label.to_string());
+        }
         if let Some((text, tail, head)) = prepaint.a11y_text.as_ref() {
             builder.push_text_runs(text, *tail, *head);
         }
@@ -2894,6 +2912,7 @@ impl Element for MarkdownElement {
             hitbox,
             a11y_text,
             a11y_links,
+            a11y_label: self.a11y_label.clone(),
         }
     }
 
