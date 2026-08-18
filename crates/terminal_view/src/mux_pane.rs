@@ -1846,6 +1846,13 @@ impl Item for MuxPaneView {
         self.terminal.read(cx).title(true).into()
     }
 
+    fn tab_announcement_text(&self, _detail: usize, cx: &App) -> SharedString {
+        // Uncut. `title(true)` stops at 25 characters so a strip can hold
+        // several, and a terminal's title is the command it is running —
+        // several panes deep into the same build differ well past that.
+        self.terminal.read(cx).title(false).into()
+    }
+
     fn suggested_filename(&self, cx: &App) -> SharedString {
         self.terminal.read(cx).title(true).into()
     }

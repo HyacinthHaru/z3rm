@@ -376,6 +376,57 @@ async fn test_notifications_are_announced_as_a_live_region(cx: &mut TestAppConte
     );
 }
 
+/// An item that shortens its title for the strip says so through
+/// `tab_announcement_text`, and `tab_announcement` has to be the thing that
+/// asks. Both halves are one-liners in the items that need it — the commit
+/// view and project search — so what could regress unnoticed is this wiring:
+/// point it back at `tab_content_text` and their own tests still pass.
+#[gpui::test]
+async fn a_tab_announces_the_title_the_item_gives_it(cx: &mut TestAppContext) {
+    init_test(cx);
+    let fs = FakeFs::new(cx.executor());
+    fs.insert_tree("/root", json!({ "a.txt": "" })).await;
+    let project = Project::test(fs, [path!("/root").as_ref()], cx).await;
+
+    let (multi_workspace, cx) =
+        cx.add_window_view(|window, cx| MultiWorkspace::test_new(project, window, cx));
+    let workspace = multi_workspace.read_with(cx, |mw, _| mw.workspace().clone());
+    let pane = workspace.read_with(cx, |ws, _| ws.active_pane().clone());
+
+    pane.update_in(cx, |pane, window, cx| {
+        let item = cx.new(|cx| {
+            let mut item = TestItem::new(cx).with_label("Fix a crash when…");
+            item.tab_announcement =
+                Some("Fix a crash when the mux server goes away".into());
+            item
+        });
+        pane.add_item(Box::new(item), true, true, None, window, cx);
+    });
+    cx.run_until_parked();
+
+    cx.activate_a11y(cx.window_handle());
+    let json = cx
+        .update(|window, cx| {
+            window.draw(cx).clear(cx);
+            window.debug_a11y_tree_json()
+        })
+        .expect("activation makes the debug tree available");
+    let tree: serde_json::Value = serde_json::from_str(&json).expect("the dump is valid JSON");
+
+    let tabs: Vec<&str> = tree["nodes"]
+        .as_object()
+        .expect("the dump lists nodes")
+        .values()
+        .filter(|node| node["aria"]["role"] == "Tab")
+        .filter_map(|node| node["aria"]["label"].as_str())
+        .collect();
+    assert_eq!(
+        tabs,
+        vec!["Fix a crash when the mux server goes away"],
+        "the tab announces what the item said to announce, not what it drew"
+    );
+}
+
 /// A notification is spoken the moment it arrives, over whatever the user was
 /// doing, so a multi-line message — a language server prompt's markdown, an
 /// error with its causes — is a paragraph read aloud unprompted. The stack

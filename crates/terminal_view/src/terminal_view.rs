@@ -1921,6 +1921,17 @@ impl Item for TerminalView {
         terminal.title(detail == 0).into()
     }
 
+    fn tab_announcement_text(&self, _detail: usize, cx: &App) -> SharedString {
+        // A custom title is the user's own words and is never cut, so it is
+        // the same either way. Otherwise uncut: `title(true)` stops at 25
+        // characters for the strip, and a terminal's title is the command it
+        // is running.
+        if let Some(custom_title) = self.custom_title.as_ref().filter(|l| !l.trim().is_empty()) {
+            return custom_title.clone().into();
+        }
+        self.terminal().read(cx).title(false).into()
+    }
+
     fn telemetry_event_text(&self) -> Option<&'static str> {
         None
     }

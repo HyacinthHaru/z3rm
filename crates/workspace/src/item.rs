@@ -1254,6 +1254,10 @@ pub mod test {
         pub nav_history: Option<ItemNavHistory>,
         pub tab_descriptions: Option<Vec<&'static str>>,
         pub tab_detail: Cell<Option<usize>>,
+        /// What the tab announces, when that is not what it draws. `None`
+        /// leaves the default in place, which is what every existing test
+        /// expects.
+        pub tab_announcement: Option<SharedString>,
         serialize: Option<Box<dyn Fn() -> Option<Task<anyhow::Result<()>>>>>,
         focus_handle: gpui::FocusHandle,
         pub child_focus_handles: Vec<gpui::FocusHandle>,
@@ -1345,6 +1349,7 @@ pub mod test {
                 nav_history: None,
                 tab_descriptions: None,
                 tab_detail: Default::default(),
+                tab_announcement: None,
                 workspace_id: Default::default(),
                 focus_handle: cx.focus_handle(),
                 serialize: None,
@@ -1447,6 +1452,12 @@ pub mod test {
             f(*event)
         }
 
+        fn tab_announcement_text(&self, detail: usize, cx: &App) -> SharedString {
+            self.tab_announcement
+                .clone()
+                .unwrap_or_else(|| self.tab_content_text(detail, cx))
+        }
+
         fn tab_content_text(&self, detail: usize, _cx: &App) -> SharedString {
             self.tab_descriptions
                 .as_ref()
@@ -1543,6 +1554,7 @@ pub mod test {
                     nav_history: None,
                     tab_descriptions: None,
                     tab_detail: Default::default(),
+                    tab_announcement: None,
                     workspace_id: self.workspace_id,
                     focus_handle: cx.focus_handle(),
                     serialize: None,
