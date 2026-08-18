@@ -778,6 +778,13 @@ impl A11yNodeBuilder {
         // Attached last, once every node exists: the focused node points at the
         // row it highlights, which is how a reader announces a list the user is
         // filtering from somewhere else.
+        //
+        // No platform adapter reads `active_descendant`; grepping all three for
+        // it finds nothing, which makes this look like a property that goes
+        // nowhere. It is resolved a layer earlier: `accesskit_consumer`'s
+        // `Node::is_focused` answers true for the focused node's active
+        // descendant and false for the focused node itself, so the adapters
+        // announce the row through the focus machinery they already use.
         if let (Some(target), Some(focused_id)) = (self.active_descendant_of_focus, self.focus)
             && self.has_node(target)
             && let Some((_, node)) = self
