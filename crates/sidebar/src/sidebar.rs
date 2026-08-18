@@ -581,11 +581,19 @@ impl ListEntry {
                     detail.push("modified".to_string());
                 }
             }
-            ListEntry::Directory { status, .. } => match status {
-                DirectoryStatus::Loading => detail.push("loading".to_string()),
-                DirectoryStatus::Error(error) => detail.push(error.to_string()),
-                DirectoryStatus::Unloaded | DirectoryStatus::Loaded => {}
-            },
+            ListEntry::Directory {
+                status, expanded, ..
+            } => {
+                // `aria_expanded` below says this too, and reaches Windows
+                // alone — accesskit sets no `AXDisclosing` for an outline row,
+                // so on macOS and Linux a folder gave no sign of being open.
+                detail.push(if *expanded { "expanded" } else { "collapsed" }.to_string());
+                match status {
+                    DirectoryStatus::Loading => detail.push("loading".to_string()),
+                    DirectoryStatus::Error(error) => detail.push(error.to_string()),
+                    DirectoryStatus::Unloaded | DirectoryStatus::Loaded => {}
+                }
+            }
             ListEntry::Tab { .. } => {}
         }
 
@@ -2847,6 +2855,27 @@ mod live_tests {
                 .any(|node| node["aria"]["label"].as_str() == Some("Review changes")),
             "the modified file's review control has to be on screen for this to \
              be checking anything: {files}"
+        );
+
+        // Whether a folder is open decides what the next arrow-down lands on,
+        // and `aria_expanded` — the property that says it — reaches Windows
+        // alone, so the name has to carry it too.
+        let folders: Vec<&str> = files["nodes"]
+            .as_object()
+            .expect("the dump lists nodes")
+            .values()
+            .filter_map(|node| node["aria"]["label"].as_str())
+            .filter(|label| label.starts_with("Folder "))
+            .collect();
+        assert!(
+            !folders.is_empty(),
+            "the file list has to contain a folder for this to check anything: {files}"
+        );
+        assert!(
+            folders
+                .iter()
+                .all(|label| label.contains(", expanded") || label.contains(", collapsed")),
+            "every folder has to say whether it is open: {folders:?}"
         );
 
         let tree = a11y_tree(cx, SidebarMode::Sessions);
