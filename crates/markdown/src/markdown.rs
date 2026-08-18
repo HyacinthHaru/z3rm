@@ -2067,6 +2067,9 @@ impl Styled for MarkdownElement {
 pub struct MarkdownPrepaint {
     hitbox: Hitbox,
     a11y_text: Option<(SharedString, usize, usize)>,
+    /// Where each link sits on screen, so it can be announced as a link and
+    /// followed without a mouse.
+    a11y_links: Vec<(SharedString, Bounds<Pixels>)>,
 }
 
 impl Element for MarkdownElement {
@@ -2096,6 +2099,20 @@ impl Element for MarkdownElement {
     ) {
         if let Some((text, tail, head)) = prepaint.a11y_text.as_ref() {
             builder.push_text_runs(text, *tail, *head);
+        }
+        // After the runs, so a link's node sits beside the text it is part of.
+        // Named with its destination: the source the runs read out already
+        // carries the link's visible text, and what a reader cannot otherwise
+        // get is where it goes.
+        for (index, (destination, bounds)) in prepaint.a11y_links.iter().enumerate() {
+            let mut node = gpui::accesskit::Node::new(gpui::accesskit::Role::Link);
+            node.set_label(destination.to_string());
+            node.add_action(gpui::accesskit::Action::Click);
+            builder.push_child_with_bounds(
+                builder.synthetic_node_id(u64::MAX - index as u64),
+                node,
+                *bounds,
+            );
         }
     }
 
@@ -2845,7 +2862,25 @@ impl Element for MarkdownElement {
             })
         };
 
-        MarkdownPrepaint { hitbox, a11y_text }
+        // A wrapped link spans several boxes; the first is enough to place it
+        // and to click it, since any point inside the link follows it.
+        let a11y_links = rendered_markdown
+            .text
+            .links
+            .iter()
+            .filter_map(|link| {
+                let bounds = rendered_markdown
+                    .text
+                    .bounds_for_source_range(link.source_range.clone());
+                Some((link.destination_url.clone(), *bounds.first()?))
+            })
+            .collect();
+
+        MarkdownPrepaint {
+            hitbox,
+            a11y_text,
+            a11y_links,
+        }
     }
 
     fn paint(
@@ -4210,6 +4245,83 @@ mod tests {
             runs,
             vec![source.to_string()],
             "the source is what reaches the tree"
+        );
+
+        // The link is a node of its own as well. Without it a reader is read
+        // the URL as part of a sentence and has no way to tell it apart from
+        // the prose, ask for a list of links, or follow one.
+        let links: Vec<&str> = tree["nodes"]
+            .as_object()
+            .expect("the dump lists nodes")
+            .values()
+            .filter(|node| node["aria"]["role"] == "Link")
+            .filter_map(|node| node["aria"]["label"].as_str())
+            .collect();
+        assert_eq!(
+            links,
+            vec!["https://example.com"],
+            "the link is announced as one, named with where it goes"
+        );
+    }
+
+    /// A link that a reader can hear and not follow is half a link. The node
+    /// carries the bounds of the rendered link text, so GPUI answers a click on
+    /// it by pressing at that point — which is the same path a mouse takes into
+    /// `source_index_for_position`.
+    #[gpui::test]
+    fn a_markdown_link_can_be_followed_without_a_mouse(cx: &mut TestAppContext) {
+        struct Host(Entity<Markdown>);
+
+        impl Render for Host {
+            fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+                div().child(MarkdownElement::new(self.0.clone(), MarkdownStyle::default()))
+            }
+        }
+
+        ensure_theme_initialized(cx);
+        let source = "Go to [the example](https://example.com) now.";
+        let (_host, cx) = cx.add_window_view(|_, cx| {
+            Host(cx.new(|cx| Markdown::new(source.into(), None, None, cx)))
+        });
+        cx.run_until_parked();
+
+        cx.activate_a11y(cx.window_handle());
+        let json = cx
+            .update(|window, cx| {
+                window.draw(cx).clear(cx);
+                window.debug_a11y_tree_json()
+            })
+            .expect("activation makes the debug tree available");
+        let tree: serde_json::Value = serde_json::from_str(&json).expect("the dump is valid JSON");
+
+        let link = tree["nodes"]
+            .as_object()
+            .expect("the dump lists nodes")
+            .values()
+            .find(|node| node["aria"]["role"] == "Link")
+            .unwrap_or_else(|| panic!("the link reaches the tree: {json}"));
+        let bounds = &link["bounds"];
+        let width = bounds["x1"].as_f64().expect("the link has bounds")
+            - bounds["x0"].as_f64().expect("the link has bounds");
+        assert!(
+            width > 0.0,
+            "a link with no area is one a click can never land in: {link}"
+        );
+        // The rendered link text is "the example", eleven characters of a
+        // forty-five character line, so its box has to be a fraction of the
+        // paragraph rather than the whole of it — otherwise a click on the
+        // link lands somewhere else in the sentence.
+        let paragraph = tree["nodes"]
+            .as_object()
+            .expect("the dump lists nodes")
+            .values()
+            .find(|node| node["aria"]["role"] == "Group")
+            .unwrap_or_else(|| panic!("the markdown view is a group: {json}"));
+        let paragraph_width = paragraph["bounds"]["x1"].as_f64().unwrap_or(f64::MAX)
+            - paragraph["bounds"]["x0"].as_f64().unwrap_or(0.0);
+        assert!(
+            width < paragraph_width,
+            "the box is the link's, not the whole view's: {link}"
         );
     }
 
