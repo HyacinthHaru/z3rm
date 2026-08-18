@@ -800,7 +800,11 @@ pub mod a11y_checks {
 #[cfg(test)]
 mod a11y_check_tests {
     use super::a11y_checks::{
-        assert_clickable_elements_are_reachable, assert_live_regions_can_speak,
+        assert_active_descendant_is_honoured, assert_clickable_elements_are_reachable,
+        assert_controls_have_area, assert_focus_reached_the_tree,
+        assert_interactive_nodes_are_named, assert_landmarks_are_distinguishable,
+        assert_live_regions_can_speak, assert_names_are_distinguishable,
+        assert_no_aria_was_discarded, assert_no_role_was_discarded, assert_roles_are_contained,
     };
     use serde_json::json;
 
@@ -895,6 +899,101 @@ mod a11y_check_tests {
     fn a_live_region_whose_content_is_a_child_is_reported() {
         let tree = live_region_with_child(json!({ "label": "Project saved" }));
         assert_live_regions_can_speak(&tree, "toast layer");
+    }
+
+    /// Every check here is only worth its call sites if it can fail. One of
+    /// them shipped inert — `assert_no_aria_was_discarded` reported nothing at
+    /// all because the trait method it rests on was defaulted and never
+    /// forwarded — and it passed everywhere, which is what an inert check looks
+    /// like from the outside. So each check gets an input it has to reject.
+    #[test]
+    #[should_panic(expected = "bare role")]
+    fn the_unnamed_control_check_can_fail() {
+        let tree = json!({ "nodes": { "0": {
+            "element_id": "save", "aria": { "role": "Button" }
+        }}});
+        assert_interactive_nodes_are_named(&tree, "probe");
+    }
+
+    #[test]
+    #[should_panic(expected = "never became nodes")]
+    fn the_discarded_role_check_can_fail() {
+        let tree = json!({
+            "nodes": {},
+            "frame": { "roles_without_id": ["Button at crates/example.rs:1:1"] },
+        });
+        assert_no_role_was_discarded(&tree, "probe");
+    }
+
+    #[test]
+    #[should_panic(expected = "reached no node")]
+    fn the_discarded_aria_check_can_fail() {
+        let tree = json!({
+            "nodes": {},
+            "frame": { "aria_without_role": ["crates/example.rs:1:1"] },
+        });
+        assert_no_aria_was_discarded(&tree, "probe");
+    }
+
+    #[test]
+    #[should_panic(expected = "one main region")]
+    fn the_landmark_check_can_fail() {
+        let tree = json!({ "nodes": {
+            "0": { "element_id": "a", "aria": { "role": "Main" } },
+            "1": { "element_id": "b", "aria": { "role": "Main" } },
+        }});
+        assert_landmarks_are_distinguishable(&tree, "probe");
+    }
+
+    #[test]
+    #[should_panic(expected = "cannot tell apart")]
+    fn the_name_clash_check_can_fail() {
+        let tree = json!({ "nodes": {
+            "0": { "element_id": "a", "aria": { "role": "Button", "label": "Close" } },
+            "1": { "element_id": "b", "aria": { "role": "Button", "label": "Close" } },
+        }});
+        assert_names_are_distinguishable(&tree, "probe");
+    }
+
+    #[test]
+    #[should_panic(expected = "announced to nobody")]
+    fn the_active_descendant_check_can_fail() {
+        let tree = json!({
+            "nodes": {},
+            "frame": { "active_descendant_without_focus": true },
+        });
+        assert_active_descendant_is_honoured(&tree, "probe");
+    }
+
+    #[test]
+    #[should_panic(expected = "nothing to click")]
+    fn the_control_area_check_can_fail() {
+        let tree = json!({ "nodes": { "0": {
+            "element_id": "save",
+            "aria": { "role": "Button", "label": "Save" },
+            "bounds": { "x0": 10.0, "y0": 10.0, "x1": 10.0, "y1": 20.0 },
+        }}});
+        assert_controls_have_area(&tree, "probe");
+    }
+
+    #[test]
+    #[should_panic(expected = "no accessibility node")]
+    fn the_focus_check_can_fail() {
+        let tree = json!({
+            "nodes": {},
+            "frame": { "focus_without_node": "the focused element never rendered" },
+        });
+        assert_focus_reached_the_tree(&tree, "probe");
+    }
+
+    #[test]
+    #[should_panic(expected = "has no ListBox ancestor")]
+    fn the_containment_check_can_fail() {
+        let tree = json!({ "nodes": {
+            "0": { "element_id": "group", "aria": { "role": "Group" }, "children": ["1"] },
+            "1": { "element_id": "row", "aria": { "role": "ListBoxOption", "label": "a.rs" } },
+        }});
+        assert_roles_are_contained(&tree, "probe");
     }
 
     fn tree(node_rects: &[(f64, f64, f64, f64)], clickable: &[(f64, f64, f64, f64)]) -> serde_json::Value {
