@@ -6139,6 +6139,12 @@ impl GitPanel {
         );
 
         v_flex()
+                // The explanation is a plain label and contributes no node, so
+                // a panel refusing to work reached a reader as an empty panel
+                // with a "Trust Directory" button and no idea what it trusts.
+                .id("git-panel-unsafe-repo")
+                .role(gpui::Role::Group)
+                .aria_label(message.clone())
                 .px_4()
                 .gap_1()
                 .child(Label::new(message).color(Color::Muted))
@@ -6175,6 +6181,11 @@ impl GitPanel {
         let worktree_count = self.project.read(cx).visible_worktrees(cx).count();
         if worktree_count > 0 && self.active_repository.is_none() {
             v_flex()
+                // Same as the other two empty states: the message is a label
+                // and contributes no node of its own.
+                .id("git-panel-uninitialized")
+                .role(gpui::Role::Group)
+                .aria_label("No Git repositories")
                 .gap_1()
                 .items_center()
                 .child(Label::new("No Git Repositories").color(Color::Muted))
@@ -11448,6 +11459,60 @@ mod tests {
     /// sets a role" and "a screen reader sees one" are different claims. Read
     /// the semantics back out of a drawn frame rather than trusting the
     /// builder calls that produce them.
+    /// A project with a worktree and no `.git` is the state the panel renders
+    /// "No Git Repositories" for. That message is a `Label` and so no node, and
+    /// nothing rendered the state in a frame — so an empty panel reached a
+    /// reader as an empty panel, with an "Initialize Repository" button and no
+    /// word about why it was there.
+    #[gpui::test]
+    async fn a_project_with_no_repository_says_so(cx: &mut TestAppContext) {
+        init_test(cx);
+
+        let fs = FakeFs::new(cx.background_executor.clone());
+        fs.insert_tree(path!("/project"), json!({ "tracked": "tracked\n" }))
+            .await;
+
+        let project = Project::test(fs, [Path::new(path!("/project"))], cx).await;
+        let window_handle =
+            cx.add_window(|window, cx| MultiWorkspace::test_new(project.clone(), window, cx));
+        let workspace = window_handle
+            .read_with(cx, |mw, _| mw.workspace().clone())
+            .unwrap();
+        let mut cx = VisualTestContext::from_window(window_handle.into(), cx);
+
+        let panel = workspace.update_in(&mut cx, GitPanel::new);
+        workspace.update_in(&mut cx, |workspace, window, cx| {
+            workspace.add_panel(panel.clone(), window, cx);
+            workspace.open_panel::<GitPanel>(window, cx);
+        });
+        cx.run_until_parked();
+
+        cx.activate_a11y(cx.window_handle());
+        let json = cx
+            .update(|window, cx| {
+                window.draw(cx).clear(cx);
+                window.debug_a11y_tree_json()
+            })
+            .expect("activation makes the debug tree available");
+        let tree: serde_json::Value = serde_json::from_str(&json).expect("the dump is valid JSON");
+
+        gpui::a11y_checks::assert_interactive_nodes_are_named(&tree, "git panel with no repo");
+        gpui::a11y_checks::assert_no_role_was_discarded(&tree, "git panel with no repo");
+        gpui::a11y_checks::assert_no_aria_was_discarded(&tree, "git panel with no repo");
+        gpui::a11y_checks::assert_clickable_elements_are_reachable(&tree, "git panel with no repo");
+
+        let names: Vec<&str> = tree["nodes"]
+            .as_object()
+            .expect("the dump lists nodes")
+            .values()
+            .filter_map(|node| node["aria"]["label"].as_str())
+            .collect();
+        assert!(
+            names.contains(&"No Git repositories"),
+            "an empty panel has to say why it is empty: {names:?}"
+        );
+    }
+
     #[gpui::test]
     async fn the_changed_files_are_exposed_as_a_named_list(cx: &mut TestAppContext) {
         init_test(cx);
