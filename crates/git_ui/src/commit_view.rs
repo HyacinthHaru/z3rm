@@ -1032,6 +1032,24 @@ impl Focusable for CommitView {
     }
 }
 
+/// How much of a commit subject a tab strip can hold.
+const SUBJECT_TAB_CHARS: usize = 20;
+
+/// A commit tab's text, cut to `subject_limit` characters or whole.
+///
+/// The drawn title and the announced one differ only in this, so they are one
+/// function: they were two copies of the same format string, and the reason
+/// they differ is a decision about the tab strip's width rather than about
+/// what a commit is called.
+fn commit_tab_text(sha: &str, message: &str, subject_limit: Option<usize>) -> SharedString {
+    let short_sha = sha.get(0..7).unwrap_or(sha);
+    let subject = message.split('\n').next().unwrap_or_default();
+    match subject_limit {
+        Some(limit) => format!("{short_sha} — {}", truncate_and_trailoff(subject, limit)).into(),
+        None => format!("{short_sha} — {subject}").into(),
+    }
+}
+
 impl Item for CommitView {
     type Event = EditorEvent;
 
@@ -1050,9 +1068,16 @@ impl Item for CommitView {
     }
 
     fn tab_content_text(&self, _detail: usize, _cx: &App) -> SharedString {
-        let short_sha = self.commit.sha.get(0..7).unwrap_or(&*self.commit.sha);
-        let subject = truncate_and_trailoff(self.commit.message.split('\n').next().unwrap(), 20);
-        format!("{short_sha} — {subject}").into()
+        commit_tab_text(&self.commit.sha, &self.commit.message, Some(SUBJECT_TAB_CHARS))
+    }
+
+    fn tab_announcement_text(&self, _detail: usize, _cx: &App) -> SharedString {
+        // Uncut. Twenty characters is a tab strip's budget, and a commit
+        // subject is written to be read from the start — "Fix a crash when
+        // the…" is most of the tabs in a git history and tells them apart from
+        // none of the others. A sighted user hovers for the tooltip that
+        // carries the whole of it; a reader has no hover.
+        commit_tab_text(&self.commit.sha, &self.commit.message, None)
     }
 
     fn tab_tooltip_content(&self, _: &App) -> Option<TabTooltipContent> {
@@ -1422,6 +1447,44 @@ mod tests {
     use util::path;
     use workspace::MultiWorkspace;
 
+    /// A tab strip holds many titles at once and cuts each to twenty
+    /// characters; a reader is given one tab at a time, cannot see the others,
+    /// and has no hover for the tooltip that carries the rest. Commit subjects
+    /// are written to be read from the start, so the cut lands where they stop
+    /// telling each other apart.
+    #[test]
+    fn a_commit_tab_is_cut_for_the_strip_and_not_for_a_reader() {
+        const SHA: &str = "0909090909090909090909090909090909090909";
+        const MESSAGE: &str =
+            "Fix a crash when the mux server goes away mid-attach\n\nlonger body";
+
+        let drawn = commit_tab_text(SHA, MESSAGE, Some(SUBJECT_TAB_CHARS));
+        let announced = commit_tab_text(SHA, MESSAGE, None);
+
+        assert_eq!(drawn, "0909090 — Fix a crash when the…");
+        assert_eq!(
+            announced,
+            "0909090 — Fix a crash when the mux server goes away mid-attach",
+            "a reader is given the whole subject"
+        );
+
+        // The short SHA is not truncation in the same sense — an abbreviated
+        // SHA is how a commit is referred to — so it stays short in both.
+        assert!(announced.starts_with("0909090 — "));
+    }
+
+    /// A subject that fits is not decorated with an ellipsis, and the two
+    /// texts are then the same string.
+    #[test]
+    fn a_short_commit_subject_is_left_alone() {
+        const SHA: &str = "abcdef1234567890";
+        const MESSAGE: &str = "initial commit";
+        assert_eq!(
+            commit_tab_text(SHA, MESSAGE, Some(SUBJECT_TAB_CHARS)),
+            commit_tab_text(SHA, MESSAGE, None)
+        );
+    }
+
     /// Subject, author, date and sha are labels in the header, and a label
     /// contributes no node, so opening a commit reached a reader as a diff with
     /// no idea whose commit it was.
@@ -1531,5 +1594,6 @@ mod tests {
             !names.iter().any(|name| name.ends_with("by ")),
             "a commit with no author must not trail off mid-sentence: {names:?}"
         );
+
     }
 }

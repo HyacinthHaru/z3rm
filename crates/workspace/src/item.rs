@@ -204,6 +204,18 @@ pub trait Item: Focusable + EventEmitter<Self::Event> + Render + Sized {
     /// Returns the textual contents of the tab.
     fn tab_content_text(&self, _detail: usize, _cx: &App) -> SharedString;
 
+    /// What a screen reader is told the tab is, when that differs from what
+    /// the tab draws.
+    ///
+    /// A tab strip shows many titles at once and so cuts them to fit; a reader
+    /// is given one tab at a time and can neither see the rest nor hover for a
+    /// tooltip. An item that shortens its title for the strip should return the
+    /// unshortened one here. Defaulted, because for most items the two are the
+    /// same thing.
+    fn tab_announcement_text(&self, detail: usize, cx: &App) -> SharedString {
+        self.tab_content_text(detail, cx)
+    }
+
     /// Returns the suggested filename for saving this item.
     /// By default, returns the tab content text.
     fn suggested_filename(&self, cx: &App) -> SharedString {
@@ -502,6 +514,7 @@ pub trait ItemHandle: 'static + Send {
     ) -> gpui::Subscription;
     fn tab_content(&self, params: TabContentParams, window: &Window, cx: &App) -> AnyElement;
     fn tab_content_text(&self, detail: usize, cx: &App) -> SharedString;
+    fn tab_announcement_text(&self, detail: usize, cx: &App) -> SharedString;
     fn suggested_filename(&self, cx: &App) -> SharedString;
     fn tab_icon(&self, window: &Window, cx: &App) -> Option<Icon>;
     fn tab_tooltip_text(&self, cx: &App) -> Option<SharedString>;
@@ -650,6 +663,10 @@ impl<T: Item> ItemHandle for Entity<T> {
     }
     fn tab_content_text(&self, detail: usize, cx: &App) -> SharedString {
         self.read(cx).tab_content_text(detail, cx)
+    }
+
+    fn tab_announcement_text(&self, detail: usize, cx: &App) -> SharedString {
+        self.read(cx).tab_announcement_text(detail, cx)
     }
 
     fn suggested_filename(&self, cx: &App) -> SharedString {

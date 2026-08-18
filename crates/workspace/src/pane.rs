@@ -5015,7 +5015,9 @@ pub fn tab_announcement(
     is_preview: bool,
     cx: &App,
 ) -> SharedString {
-    let name = item.tab_content_text(detail, cx);
+    // The announced title, not the drawn one: an item that cuts its title to
+    // fit the strip returns the whole of it here.
+    let name = item.tab_announcement_text(detail, cx);
     let mut parts = vec![name.to_string()];
     // A tab draws each of these and says none of them: a struck-through title
     // for a file that is gone, an italic one for a tab the next file will
