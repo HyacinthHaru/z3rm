@@ -275,6 +275,12 @@ impl Render for ToastLayer {
                     // the same node so it can announce the change.
                     h_flex()
                         .id(("active-toast-container", active_toast.id))
+                        // Its click handler only swallows the press so that
+                        // clicking a toast does not fall through to whatever is
+                        // behind it, and its hover handler only pauses the
+                        // dismiss timer. Neither is an action; the toast's own
+                        // controls are nodes inside this.
+                        .pointer_gesture_only()
                         .occlude()
                         .on_hover(cx.listener(|this, hover_start, _window, cx| {
                             if *hover_start {

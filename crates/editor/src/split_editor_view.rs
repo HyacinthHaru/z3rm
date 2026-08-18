@@ -123,6 +123,12 @@ fn render_resize_handle(
         .child(
             div()
                 .id("split-resize-handle")
+                // A drag grip, the same as the dock's and the picker's. Its
+                // only click handler acts on a double-click and resets the
+                // split; a single click does nothing. Both are pointer
+                // gestures, and without saying so the grip reads as a control
+                // that answers a click and has no effect.
+                .pointer_gesture_only()
                 .absolute()
                 .left(px(-RESIZE_HANDLE_WIDTH / 2.0))
                 .w(px(RESIZE_HANDLE_WIDTH))
