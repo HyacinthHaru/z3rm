@@ -194,7 +194,7 @@ impl Render for RemoteConnectionPrompt {
                         .w_full()
                         .gap_1()
                         .when(window.capslock().on, |this| {
-                            this.aria_label("Caps lock is on.")
+                            this.aria_value("Caps lock is on.")
                                 .child(
                                     Icon::new(IconName::Warning)
                                         .size(IconSize::Small)
@@ -221,7 +221,7 @@ impl Render for RemoteConnectionPrompt {
                     .mt_1()
                     .gap_1()
                     .when_some(self.status_message.clone(), |this, status_message| {
-                        this.aria_label(SharedString::from(format!("{status_message}…")))
+                        this.aria_value(SharedString::from(format!("{status_message}…")))
                             .child(
                                 Icon::new(IconName::LoadCircle)
                                     .size(IconSize::Small)
@@ -799,6 +799,9 @@ mod tests {
             gpui::a11y_checks::assert_clickable_elements_are_reachable(&tree, "remote connection");
             gpui::a11y_checks::assert_controls_have_area(&tree, "remote connection");
             gpui::a11y_checks::assert_active_descendant_is_honoured(&tree, "remote connection");
+            gpui::a11y_checks::assert_live_regions_can_speak(&tree, "remote connection");
+            // The value, not the label: macOS speaks `node.value()` and raises
+            // no announcement at all without one.
             tree["nodes"]
                 .as_object()
                 .expect("the dump lists nodes")
@@ -807,7 +810,7 @@ mod tests {
                 .map(|node| {
                     (
                         node["element_id"].as_str().unwrap_or_default().to_string(),
-                        node["aria"]["label"]
+                        node["aria"]["value"]
                             .as_str()
                             .unwrap_or_default()
                             .to_string(),

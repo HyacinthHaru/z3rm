@@ -161,7 +161,7 @@ impl Render for DiagnosticIndicator {
                     .role(gpui::Role::Status)
                     .aria_live(gpui::accesskit::Live::Polite)
                     .when_some(announced_diagnostic, |this, message| {
-                        this.aria_label(message)
+                        this.aria_value(message)
                     })
                     .children(status),
             )
@@ -344,13 +344,16 @@ mod tests {
             gpui::a11y_checks::assert_landmarks_are_distinguishable(&tree, "diagnostic indicator");
             gpui::a11y_checks::assert_active_descendant_is_honoured(&tree, "diagnostic indicator");
             gpui::a11y_checks::assert_no_role_was_discarded(&tree, "diagnostic indicator");
+            gpui::a11y_checks::assert_live_regions_can_speak(&tree, "diagnostic indicator");
+            // The value, not the label: macOS speaks `node.value()` and raises
+            // no announcement at all without one.
             tree["nodes"]
                 .as_object()
                 .expect("the dump lists nodes")
                 .values()
                 .filter(|node| node["aria"]["live"] == "Polite")
                 .map(|node| {
-                    node["aria"]["label"]
+                    node["aria"]["value"]
                         .as_str()
                         .unwrap_or_default()
                         .to_string()

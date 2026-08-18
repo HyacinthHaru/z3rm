@@ -545,7 +545,7 @@ impl Render for KeystrokeInput {
             .role(gpui::Role::Status)
             .aria_live(gpui::accesskit::Live::Polite)
             .when(is_recording, |this| {
-                this.aria_label(if self.search {
+                this.aria_value(if self.search {
                     "Recording keystrokes to search"
                 } else {
                     "Recording keystrokes"
@@ -1197,8 +1197,10 @@ mod tests {
                         .is_some_and(|id| id.contains("keystroke-input-mode"))
                 })
                 .map(|node| {
+                    // The value, not the label: macOS speaks `node.value()`
+                    // and raises no announcement at all without one.
                     (
-                        node["aria"]["label"].as_str().unwrap_or_default().to_string(),
+                        node["aria"]["value"].as_str().unwrap_or_default().to_string(),
                         node["aria"]["live"].as_str().unwrap_or_default().to_string(),
                     )
                 })

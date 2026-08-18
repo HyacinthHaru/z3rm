@@ -374,7 +374,7 @@ impl Render for MuxConnectionStatusItem {
             .aria_live(gpui::accesskit::Live::Polite)
             .when_some(label, |element, (text, color)| {
                 element
-                    .aria_label(format!("Mux connection: {text}"))
+                    .aria_value(format!("Mux connection: {text}"))
                     .child(ui::Label::new(text).size(ui::LabelSize::Small).color(color))
             })
     }
@@ -3484,6 +3484,7 @@ mod tests {
         gpui::a11y_checks::assert_active_descendant_is_honoured(&tree, "mux connection status");
         gpui::a11y_checks::assert_no_role_was_discarded(&tree, "mux connection status");
         gpui::a11y_checks::assert_roles_are_contained(&tree, "mux connection status");
+        gpui::a11y_checks::assert_live_regions_can_speak(&tree, "mux connection status");
 
         let status = tree["nodes"]
             .as_object()
@@ -3496,8 +3497,10 @@ mod tests {
             Some("Polite"),
             "a status that changes on its own has to be a live region"
         );
+        // The value, not the label: macOS speaks `node.value()` and raises no
+        // announcement at all without one.
         assert_eq!(
-            status["aria"]["label"].as_str(),
+            status["aria"]["value"].as_str(),
             Some("Mux connection: Disconnected"),
             "the announcement has to say what changed, not just \"Disconnected\""
         );

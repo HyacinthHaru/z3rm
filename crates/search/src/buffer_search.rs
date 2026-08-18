@@ -355,7 +355,7 @@ impl Render for BufferSearchBar {
                                 .id("buffer-search-match-count")
                                 .role(gpui::Role::Status)
                                 .aria_live(gpui::accesskit::Live::Polite)
-                                .aria_label(announced_matches)
+                                .aria_value(announced_matches)
                                 .ml_2()
                                 .min_w(rems_from_px(40.))
                                 .child(
@@ -457,7 +457,7 @@ impl Render for BufferSearchBar {
             .role(gpui::Role::Status)
             .aria_live(gpui::accesskit::Live::Polite)
             .when_some(self.query_error.as_ref(), |this, error| {
-                this.aria_label(error.clone()).child(
+                this.aria_value(error.clone()).child(
                     Label::new(error)
                         .size(LabelSize::Small)
                         .color(Color::Error)
@@ -2053,14 +2053,18 @@ mod tests {
         gpui::a11y_checks::assert_clickable_elements_are_reachable(&tree, "buffer search");
         gpui::a11y_checks::assert_controls_have_area(&tree, "buffer search");
         gpui::a11y_checks::assert_active_descendant_is_honoured(&tree, "buffer search");
+        gpui::a11y_checks::assert_live_regions_can_speak(&tree, "buffer search");
 
+        // The value, not the label: macOS speaks `node.value()` and raises no
+        // announcement at all without one, so a label here would be a count
+        // nobody hears.
         let live_regions: Vec<(&str, &str)> = nodes
             .values()
             .filter(|node| node["aria"]["live"] == "Polite")
             .map(|node| {
                 (
                     node["element_id"].as_str().unwrap_or_default(),
-                    node["aria"]["label"].as_str().unwrap_or_default(),
+                    node["aria"]["value"].as_str().unwrap_or_default(),
                 )
             })
             .collect();
@@ -2069,9 +2073,9 @@ mod tests {
             .iter()
             .find(|(id, _)| id.contains("buffer-search-match-count"))
             .unwrap_or_else(|| panic!("the match count has to be announced: {json}"));
-        // The label is what a reader says out loud, not what the bar draws.
-        // "1/2" fits in the toolbar and reads as "one slash two"; the other
-        // search surfaces already announce "5 matches".
+        // The announced text is not what the bar draws. "1/2" fits in the
+        // toolbar and reads as "one slash two"; the other search surfaces
+        // already announce "5 matches".
         assert_eq!(
             count.1, "Match 1 of 2",
             "the count has to be a sentence, not a fraction: {count:?}"
@@ -2082,7 +2086,7 @@ mod tests {
         assert!(
             live_regions
                 .iter()
-                .any(|(id, label)| id.contains("buffer-search-query-error") && label.is_empty()),
+                .any(|(id, value)| id.contains("buffer-search-query-error") && value.is_empty()),
             "the error region has to exist before there is an error: {live_regions:?}"
         );
     }

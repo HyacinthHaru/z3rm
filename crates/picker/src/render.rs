@@ -102,7 +102,7 @@ impl<D: PickerDelegate> Render for Picker<D> {
                     .id("picker-match-count")
                     .role(gpui::Role::Status)
                     .aria_live(gpui::accesskit::Live::Polite)
-                    .aria_label(announced_matches),
+                    .aria_value(announced_matches),
             )
             .child(content)
             .when(self.is_resizable(), |this| {

@@ -243,7 +243,7 @@ impl Render for InputField {
                     .role(gpui::Role::Status)
                     .aria_live(gpui::accesskit::Live::Polite)
                     .when_some(self.error.clone(), |this, error| {
-                        this.aria_label(error.clone()).child(
+                        this.aria_value(error.clone()).child(
                             Label::new(error).size(LabelSize::Small).color(Color::Error),
                         )
                     }),

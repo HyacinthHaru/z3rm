@@ -1881,14 +1881,17 @@ mod tests {
         gpui::a11y_checks::assert_clickable_elements_are_reachable(&tree, "picker");
         gpui::a11y_checks::assert_controls_have_area(&tree, "picker");
         gpui::a11y_checks::assert_active_descendant_is_honoured(&tree, "picker");
+        gpui::a11y_checks::assert_live_regions_can_speak(&tree, "picker");
         let nodes = tree["nodes"].as_object().expect("the dump lists nodes");
 
         // Typing filters the list, so what came back has to be announced from
-        // somewhere: the region exists whether or not there are matches.
+        // somewhere: the region exists whether or not there are matches. The
+        // value, not the label — macOS speaks `node.value()` and raises no
+        // announcement at all without one.
         let counted = nodes
             .values()
             .filter(|node| node["aria"]["live"] == "Polite")
-            .filter_map(|node| node["aria"]["label"].as_str())
+            .filter_map(|node| node["aria"]["value"].as_str())
             .collect::<Vec<_>>();
         assert!(
             counted.contains(&"3 matches"),

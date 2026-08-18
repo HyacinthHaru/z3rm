@@ -264,7 +264,7 @@ impl Render for WhichKeyModal {
             .id("which-key-buffer-panel-scroll")
             .role(gpui::Role::Status)
             .aria_live(gpui::accesskit::Live::Polite)
-            .aria_label(SharedString::from(announced))
+            .aria_value(SharedString::from(announced))
             .occlude()
             .absolute()
             .bottom(bottom_offset)
@@ -424,6 +424,7 @@ mod tests {
         gpui::a11y_checks::assert_active_descendant_is_honoured(&tree, "which-key hint");
         gpui::a11y_checks::assert_no_role_was_discarded(&tree, "which-key hint");
         gpui::a11y_checks::assert_roles_are_contained(&tree, "which-key hint");
+        gpui::a11y_checks::assert_live_regions_can_speak(&tree, "which-key hint");
 
         let hint = tree["nodes"]
             .as_object()
@@ -436,8 +437,10 @@ mod tests {
             Some("Polite"),
             "a hint that appears on its own is only perceived if it is announced"
         );
+        // The value, not the label: macOS speaks `node.value()` and raises no
+        // announcement at all without one.
         assert_eq!(
-            hint["aria"]["label"].as_str(),
+            hint["aria"]["value"].as_str(),
             Some("Prefix ctrl-b, 2 continuations: c New tab, % Split right"),
             "the announcement has to name the prefix and what can follow it"
         );
