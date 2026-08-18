@@ -12728,6 +12728,95 @@ mod tests {
         );
     }
 
+    /// Two editors side by side is the shape that makes a constant region name
+    /// a defect, and nothing rendered it — which is why `"Editor"` survived as
+    /// the name of every editor in the window until it was read rather than
+    /// tested. `assert_focusable_names_are_distinguishable` catches it now.
+    #[gpui::test]
+    async fn test_two_editors_side_by_side_can_be_told_apart(cx: &mut TestAppContext) {
+        init_test(cx, |_| {});
+
+        let fs = fs::FakeFs::new(cx.executor());
+        fs.insert_file(util::path!("/first.rs"), "fn one() {}\n".into())
+            .await;
+        fs.insert_file(util::path!("/second.rs"), "fn two() {}\n".into())
+            .await;
+        let project = project::Project::test(
+            fs,
+            [
+                util::path!("/first.rs").as_ref(),
+                util::path!("/second.rs").as_ref(),
+            ],
+            cx,
+        )
+        .await;
+
+        let mut buffers = Vec::new();
+        for path in [util::path!("/first.rs"), util::path!("/second.rs")] {
+            buffers.push(
+                project
+                    .update(cx, |project, cx| {
+                        project.open_local_buffer(std::path::Path::new(path), cx)
+                    })
+                    .await
+                    .expect("the fixture's files open"),
+            );
+        }
+
+        struct TwoEditors(Vec<Entity<Editor>>);
+        impl Render for TwoEditors {
+            fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+                gpui::div().children(self.0.iter().cloned())
+            }
+        }
+
+        let window = cx.add_window(|window, cx| {
+            let editors = buffers
+                .into_iter()
+                .map(|buffer| {
+                    let multibuffer = cx.new(|cx| MultiBuffer::singleton(buffer, cx));
+                    cx.new(|cx| {
+                        Editor::new(
+                            EditorMode::full(),
+                            multibuffer,
+                            Some(project.clone()),
+                            window,
+                            cx,
+                        )
+                    })
+                })
+                .collect();
+            TwoEditors(editors)
+        });
+        cx.activate_a11y(window.into());
+
+        let json = cx
+            .update_window(window.into(), |_, window, cx| {
+                window.draw(cx).clear(cx);
+                window.debug_a11y_tree_json()
+            })
+            .expect("the harness window is still open")
+            .expect("activation makes the debug tree available");
+        let tree: serde_json::Value = serde_json::from_str(&json).expect("the dump is valid JSON");
+
+        gpui::a11y_checks::assert_focusable_names_are_distinguishable(&tree, "two editors");
+        gpui::a11y_checks::assert_names_are_distinguishable(&tree, "two editors");
+
+        let mut regions: Vec<&str> = tree["nodes"]
+            .as_object()
+            .expect("the dump lists nodes")
+            .values()
+            .filter(|node| node["aria"]["role"] == "Group")
+            .filter_map(|node| node["aria"]["label"].as_str())
+            .collect();
+        regions.sort_unstable();
+        assert_eq!(
+            regions,
+            vec!["first.rs", "second.rs"],
+            "each editor says which file it is on"
+        );
+    }
+
     /// The caret offset is arithmetic over byte lengths of display rows, so a
     /// line of multibyte characters is where it would go wrong — either by
     /// panicking on a character boundary or by pointing somewhere else.

@@ -4699,6 +4699,14 @@ impl Window {
         }
         let node_id = global_id.accesskit_node_id();
         self.a11y.set_focusable(node_id, focus_handle.id);
+        // Advertised as well as routed. `div` does both — `set_focusable`
+        // answers an incoming focus request and `Action::Focus` is what tells
+        // assistive technology it may make one — and an element reporting
+        // itself here was doing only the first, so an editor or a markdown view
+        // offered no actions at all despite being focusable.
+        if let Some(node) = self.a11y.nodes.current_node_mut_if(node_id) {
+            node.add_action(accesskit::Action::Focus);
+        }
         if focus_handle.is_focused(self) {
             self.a11y.set_focus(node_id);
         }

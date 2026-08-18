@@ -673,6 +673,14 @@ impl A11yNodeBuilder {
         self.nodes_stack.last_mut()
     }
 
+    /// The node on top of the stack, but only if it is `node_id`'s.
+    ///
+    /// An element that produced no node of its own leaves its parent's on top,
+    /// and a caller identifying itself by id must not reach that instead.
+    pub(crate) fn current_node_mut_if(&mut self, node_id: NodeId) -> Option<&mut accesskit::Node> {
+        (self.ids_stack.last() == Some(&node_id)).then(|| self.nodes_stack.last_mut())?
+    }
+
     /// Pop the current node off the stack and finalize it into the all_nodes
     /// list.
     pub(crate) fn pop(&mut self) {
