@@ -251,6 +251,12 @@ pub mod a11y_checks {
         "TextInput",
         "Tab",
         "TreeItem",
+        // Containers a reader is offered as a destination. A window with two
+        // of the same kind — pinned tabs beside unpinned ones, a project tree
+        // beside a session tree — offers them a choice it will not explain.
+        "TabList",
+        "Tree",
+        "Table",
     ];
 
     /// Roles that only mean anything inside a matching container. A screen
@@ -1001,6 +1007,35 @@ mod a11y_check_tests {
             "element_id": "save", "aria": { "role": "Button" }
         }}});
         assert_interactive_nodes_are_named(&tree, "probe");
+    }
+
+    fn bare(role: &str) -> serde_json::Value {
+        json!({ "nodes": { "0": { "element_id": "container", "aria": { "role": role } } } })
+    }
+
+    /// The container roles are in that list too, and they are the ones whose
+    /// absence is quiet: a `TabBar` sets `TabList` whether or not it was given
+    /// a name, so an unnamed one is a node announced as a bare "tab list"
+    /// rather than no node at all.
+    ///
+    /// One test each. A loop over the three would panic on the first and prove
+    /// nothing about the other two.
+    #[test]
+    #[should_panic(expected = "bare role")]
+    fn an_unnamed_tab_list_is_reported() {
+        assert_interactive_nodes_are_named(&bare("TabList"), "probe");
+    }
+
+    #[test]
+    #[should_panic(expected = "bare role")]
+    fn an_unnamed_tree_is_reported() {
+        assert_interactive_nodes_are_named(&bare("Tree"), "probe");
+    }
+
+    #[test]
+    #[should_panic(expected = "bare role")]
+    fn an_unnamed_table_is_reported() {
+        assert_interactive_nodes_are_named(&bare("Table"), "probe");
     }
 
     #[test]

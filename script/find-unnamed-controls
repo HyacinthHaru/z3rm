@@ -40,7 +40,7 @@ NAMELESS = r"(?:IconButton|ButtonLike|ToggleButton)::new\w*\("
 ROLE_NEEDS_NAME = re.compile(
     r"Role::(AlertDialog|Button|CheckBox|Dialog|ComboBox|Link|ListBoxOption|MenuItem"
     r"|MenuItemCheckBox|RadioButton|SpinButton|Switch|TextInput|Tab|TreeItem"
-    r"|SearchInput|Slider)\b"
+    r"|SearchInput|Slider|TabList|Tree|Table)\b"
 )
 
 # Component definitions and their previews name themselves at their call sites,
