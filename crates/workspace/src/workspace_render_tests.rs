@@ -1080,6 +1080,65 @@ async fn test_the_live_regions_exist_before_they_have_anything_to_say(cx: &mut T
     );
 }
 
+/// A file that will not open is an error state nothing rendered in a frame.
+/// The view takes focus while carrying no id and no role, so focus moved to a
+/// node that does not exist; and the heading is a bare string with the reason
+/// in a `Label`, so neither reached the tree. A reader was told about the
+/// window, and not that the file had failed or why.
+#[gpui::test]
+async fn test_a_file_that_will_not_open_says_so(cx: &mut TestAppContext) {
+    init_test(cx);
+    let fs = FakeFs::new(cx.executor());
+    fs.insert_tree("/root", json!({ "a.txt": "" })).await;
+    let project = Project::test(fs, [path!("/root").as_ref()], cx).await;
+
+    let (multi_workspace, cx) =
+        cx.add_window_view(|window, cx| MultiWorkspace::test_new(project, window, cx));
+    let workspace = multi_workspace.read_with(cx, |mw, _| mw.workspace().clone());
+    let pane = workspace.read_with(cx, |ws, _| ws.active_pane().clone());
+
+    pane.update_in(cx, |pane, window, cx| {
+        let view = cx.new(|cx| {
+            crate::invalid_item_view::InvalidItemView::new(
+                std::path::Path::new(path!("/root/broken.png")),
+                true,
+                &anyhow::anyhow!("unsupported image format"),
+                window,
+                cx,
+            )
+        });
+        pane.add_item(Box::new(view), true, true, None, window, cx);
+    });
+    cx.run_until_parked();
+
+    cx.activate_a11y(cx.window_handle());
+    let json = cx
+        .update(|window, cx| {
+            window.draw(cx).clear(cx);
+            window.debug_a11y_tree_json()
+        })
+        .expect("activation makes the debug tree available");
+    let tree: serde_json::Value = serde_json::from_str(&json).expect("the dump is valid JSON");
+
+    gpui::a11y_checks::assert_focus_reached_the_tree(&tree, "a file that will not open");
+    gpui::a11y_checks::assert_no_role_was_discarded(&tree, "a file that will not open");
+    gpui::a11y_checks::assert_no_aria_was_discarded(&tree, "a file that will not open");
+    gpui::a11y_checks::assert_interactive_nodes_are_named(&tree, "a file that will not open");
+
+    let names: Vec<&str> = tree["nodes"]
+        .as_object()
+        .expect("the dump lists nodes")
+        .values()
+        .filter_map(|node| node["aria"]["label"].as_str())
+        .collect();
+    assert!(
+        names
+            .iter()
+            .any(|name| *name == "Could not open broken.png: unsupported image format"),
+        "the failure has to say which file and why: {names:?}"
+    );
+}
+
 /// Closing a dialog is where a reader gets lost. The modal takes focus when it
 /// opens, and if dismissing it leaves focus on a handle whose element is gone,
 /// the tree has a focus that resolves to nothing — so assistive technology
