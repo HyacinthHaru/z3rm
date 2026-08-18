@@ -1087,6 +1087,14 @@ impl Element for TerminalElement {
         window: &mut Window,
         cx: &mut App,
     ) -> Self::PrepaintState {
+        // Declared the way a custom element has to. `Interactivity` writes
+        // `Action::Focus` onto the node from its own `write_a11y_info`, which
+        // this element overrides without delegating — and it cannot delegate,
+        // that method being crate-private to gpui. So the surface a
+        // multiplexer's focus lands on advertised no actions at all.
+        if let Some(global_id) = global_id {
+            window.report_a11y_focus_target(global_id, &self.focus);
+        }
         let rem_size = self.rem_size(cx);
         self.interactivity.prepaint(
             global_id,

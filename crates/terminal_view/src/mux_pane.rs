@@ -3668,6 +3668,22 @@ mod tests {
             let tree: serde_json::Value =
                 serde_json::from_str(&json).expect("the dump is valid JSON");
             let nodes = tree["nodes"].as_object().expect("the dump lists nodes");
+            // The surface has to say it can take focus, not merely accept it
+            // when GPUI hands it over: `Action::Focus` is how assistive
+            // technology knows it may ask, and `Interactivity` writes it from a
+            // method this element overrides without delegating.
+            let focused = tree["gpui_focus"]
+                .as_str()
+                .and_then(|id| nodes.get(id))
+                .unwrap_or_else(|| panic!("the terminal holds focus: {json}"));
+            assert!(
+                focused["aria"]["on_action"]
+                    .as_array()
+                    .into_iter()
+                    .flatten()
+                    .any(|action| action == "Focus"),
+                "the focused surface has to advertise that it takes focus: {focused}"
+            );
             gpui::a11y_checks::assert_focus_reached_the_tree(&tree, "hosted terminal");
             let named = nodes
                 .values()
