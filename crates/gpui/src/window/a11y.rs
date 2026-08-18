@@ -439,6 +439,8 @@ impl A11y {
 pub struct A11ySubtreeBuilder<'a> {
     parent_id: NodeId,
     nodes: &'a mut A11yNodeBuilder,
+    node_bounds: &'a mut FxHashMap<NodeId, Bounds<Pixels>>,
+    scale_factor: f32,
     /// Provenance of the real element whose `a11y_synthetic_children` is
     /// running.
     #[cfg(debug_assertions)]
@@ -446,10 +448,17 @@ pub struct A11ySubtreeBuilder<'a> {
 }
 
 impl<'a> A11ySubtreeBuilder<'a> {
-    pub(crate) fn new(parent_id: NodeId, nodes: &'a mut A11yNodeBuilder) -> Self {
+    pub(crate) fn new(
+        parent_id: NodeId,
+        nodes: &'a mut A11yNodeBuilder,
+        node_bounds: &'a mut FxHashMap<NodeId, Bounds<Pixels>>,
+        scale_factor: f32,
+    ) -> Self {
         Self {
             parent_id,
             nodes,
+            node_bounds,
+            scale_factor,
             #[cfg(debug_assertions)]
             creator: debug::NodeCreator::default(),
         }
@@ -478,6 +487,34 @@ impl<'a> A11ySubtreeBuilder<'a> {
     ///
     /// Returns `false` if a node with this id is already present in the tree,
     /// in which case the node is discarded.
+    /// Push a synthetic child that occupies a place on screen.
+    ///
+    /// A synthetic node with bounds is a control as far as a reader is
+    /// concerned — something to route a click to and to scroll into view — and
+    /// this gives it the same treatment a real element gets: the bounds are
+    /// written to the node for the platform, and registered so that GPUI's
+    /// `Action::Click` fallback can synthesize a press at its centre. Without
+    /// the registration the node is announced and cannot be operated.
+    pub fn push_child_with_bounds(
+        &mut self,
+        id: NodeId,
+        mut node: accesskit::Node,
+        bounds: Bounds<Pixels>,
+    ) -> bool {
+        let scale = self.scale_factor;
+        node.set_bounds(accesskit::Rect {
+            x0: (bounds.origin.x.0 * scale) as f64,
+            y0: (bounds.origin.y.0 * scale) as f64,
+            x1: ((bounds.origin.x.0 + bounds.size.width.0) * scale) as f64,
+            y1: ((bounds.origin.y.0 + bounds.size.height.0) * scale) as f64,
+        });
+        let pushed = self.push_child(id, node);
+        if pushed {
+            self.node_bounds.insert(id, bounds);
+        }
+        pushed
+    }
+
     pub fn push_child(&mut self, id: NodeId, node: accesskit::Node) -> bool {
         let pushed = self.nodes.push_leaf(id, node);
         #[cfg(debug_assertions)]
@@ -1524,6 +1561,157 @@ mod activation_tests {
             Some("its element was not rendered this frame"),
             "a null focus has to come with the reason for it"
         );
+    }
+
+    /// A synthetic child that occupies a place on screen has to be operable,
+    /// not merely announced. GPUI answers `Action::Click` by synthesizing a
+    /// press at the node's registered bounds, and only real elements used to
+    /// register any — so a text run standing in for a link inside a paragraph
+    /// could be read out and never followed.
+    #[crate::test]
+    fn a_synthetic_child_with_bounds_can_be_clicked(cx: &mut TestAppContext) {
+        struct LinkInText;
+
+        impl crate::Element for LinkInText {
+            type RequestLayoutState = ();
+            type PrepaintState = ();
+
+            fn id(&self) -> Option<crate::ElementId> {
+                Some(crate::ElementId::Name("paragraph".into()))
+            }
+
+            fn source_location(&self) -> Option<&'static std::panic::Location<'static>> {
+                None
+            }
+
+            fn request_layout(
+                &mut self,
+                _: Option<&crate::GlobalElementId>,
+                _: Option<&crate::InspectorElementId>,
+                window: &mut Window,
+                cx: &mut App,
+            ) -> (crate::LayoutId, ()) {
+                let mut style = crate::Style::default();
+                style.size.width = crate::px(400.).into();
+                style.size.height = crate::px(200.).into();
+                (window.request_layout(style, [], cx), ())
+            }
+
+            fn prepaint(
+                &mut self,
+                _: Option<&crate::GlobalElementId>,
+                _: Option<&crate::InspectorElementId>,
+                _: crate::Bounds<crate::Pixels>,
+                _: &mut (),
+                _: &mut Window,
+                _: &mut App,
+            ) {
+            }
+
+            fn paint(
+                &mut self,
+                _: Option<&crate::GlobalElementId>,
+                _: Option<&crate::InspectorElementId>,
+                _: crate::Bounds<crate::Pixels>,
+                _: &mut (),
+                _: &mut (),
+                _: &mut Window,
+                _: &mut App,
+            ) {
+            }
+
+            fn a11y_role(&self) -> Option<accesskit::Role> {
+                Some(accesskit::Role::Group)
+            }
+
+            fn a11y_synthetic_children(
+                &mut self,
+                _: &mut (),
+                builder: &mut crate::A11ySubtreeBuilder,
+            ) {
+                let mut node = accesskit::Node::new(accesskit::Role::Link);
+                node.set_label("example.com");
+                node.add_action(accesskit::Action::Click);
+                builder.push_child_with_bounds(
+                    builder.synthetic_node_id(0),
+                    node,
+                    crate::Bounds {
+                        origin: crate::point(crate::px(100.), crate::px(50.)),
+                        size: crate::size(crate::px(60.), crate::px(20.)),
+                    },
+                );
+            }
+        }
+
+        impl IntoElement for LinkInText {
+            type Element = Self;
+
+            fn into_element(self) -> Self {
+                self
+            }
+        }
+
+        let pressed: std::rc::Rc<std::cell::Cell<Option<crate::Point<crate::Pixels>>>> =
+            Default::default();
+
+        struct Host(std::rc::Rc<std::cell::Cell<Option<crate::Point<crate::Pixels>>>>);
+        impl Render for Host {
+            fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+                let pressed = self.0.clone();
+                div()
+                    .id("page")
+                    .on_mouse_down(crate::MouseButton::Left, move |event, _, _| {
+                        pressed.set(Some(event.position));
+                    })
+                    .child(LinkInText)
+            }
+        }
+
+        let window = cx.add_window(|_, _| Host(pressed.clone()));
+        cx.activate_a11y(window.into());
+        let json = cx
+            .update_window(window.into(), |_, window, cx| {
+                window.draw(cx).clear(cx);
+                window.debug_a11y_tree_json()
+            })
+            .expect("the window is open")
+            .expect("activation makes the debug tree available");
+        let tree: serde_json::Value = serde_json::from_str(&json).expect("the dump is valid JSON");
+
+        let link = tree["nodes"]
+            .as_object()
+            .expect("the dump lists nodes")
+            .values()
+            .find(|node| node["aria"]["role"] == "Link")
+            .unwrap_or_else(|| panic!("the synthetic link reaches the tree: {json}"));
+        let link_id = accesskit::NodeId(
+            link["accesskit_id"]
+                .as_str()
+                .expect("the node carries an accesskit id")
+                .parse()
+                .expect("the id is a u64"),
+        );
+
+        cx.update_window(window.into(), |_, window, cx| {
+            window.handle_a11y_action(
+                accesskit::ActionRequest {
+                    target_tree: accesskit::TreeId::ROOT,
+                    target_node: link_id,
+                    action: accesskit::Action::Click,
+                    data: None,
+                },
+                cx,
+            );
+        })
+        .expect("the window is open");
+
+        let position = pressed
+            .get()
+            .expect("clicking the link has to reach the page as a press");
+        // The centre of the bounds the element asked for, which is the point
+        // that lands inside the link rather than beside it.
+        assert_eq!(position.x, crate::px(130.));
+        assert_eq!(position.y, crate::px(60.));
     }
 
     /// A custom element can return a role while returning no id — the role is
