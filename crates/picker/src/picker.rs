@@ -227,6 +227,25 @@ pub trait PickerDelegate: Sized + 'static {
     /// two did exactly that for as long as the default existed.
     fn match_label(&self, ix: usize, cx: &App) -> Option<SharedString>;
 
+    /// The keyboard shortcut a row draws beside itself, if it draws one.
+    ///
+    /// Appended to the row's name rather than set as `aria_keyshortcuts`,
+    /// because no accesskit adapter exposes that property — so a shortcut sent
+    /// through it is read by nobody. A row that draws a shortcut and does not
+    /// return it here is a row where a sighted user is told something a reader
+    /// is not, which in a command palette is the whole point of the surface.
+    ///
+    /// Takes a window because resolving which binding applies needs the focus
+    /// context, which is why this is not simply part of `match_label`.
+    fn match_keyboard_shortcut(
+        &self,
+        _ix: usize,
+        _window: &Window,
+        _cx: &App,
+    ) -> Option<SharedString> {
+        None
+    }
+
     fn no_matches_text(&self, _window: &mut Window, _cx: &mut App) -> Option<SharedString> {
         Some("No matches".into())
     }
@@ -1357,7 +1376,10 @@ impl<D: PickerDelegate> Picker<D> {
                     .aria_role_description("option")
                     .aria_selected(is_selected)
                     .when_some(self.delegate.match_label(ix, cx), |this, label| {
-                        this.aria_label(label)
+                        match self.delegate.match_keyboard_shortcut(ix, window, cx) {
+                            Some(shortcut) => this.aria_label(format!("{label}, {shortcut}")),
+                            None => this.aria_label(label),
+                        }
                     })
                     .when_some(
                         self.a11y_positions_in_set.get(ix).copied(),

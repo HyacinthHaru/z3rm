@@ -397,6 +397,20 @@ impl PickerDelegate for CommandPaletteDelegate {
         Some(self.matches.get(ix)?.string.clone().into())
     }
 
+    fn match_keyboard_shortcut(
+        &self,
+        ix: usize,
+        window: &Window,
+        cx: &App,
+    ) -> Option<SharedString> {
+        // The row draws this beside the command's name, and finding out what a
+        // command is bound to is most of what this palette is for. The same
+        // binding the row draws, resolved the same way.
+        let command = self.commands.get(self.matches.get(ix)?.candidate_id)?;
+        KeyBinding::for_action_in(&*command.action, &self.previous_focus_handle, cx)
+            .keyboard_shortcut_text(window, cx)
+    }
+
     fn placeholder_text(&self, _window: &mut Window, _cx: &mut App) -> Arc<str> {
         "Execute a command...".into()
     }
@@ -937,6 +951,28 @@ mod tests {
         assert!(
             role_count("ListBoxOption") > 0,
             "the palette had no options to announce"
+        );
+
+        // A row draws the command and, beside it, what it is bound to. Finding
+        // that out is most of what the palette is for, and `aria_keyshortcuts`
+        // — where a shortcut would normally go — is read by no accesskit
+        // adapter, so it has to be part of the name.
+        let bound: Vec<&str> = nodes
+            .values()
+            .filter(|node| node["aria"]["role"] == "ListBoxOption")
+            .filter_map(|node| node["aria"]["label"].as_str())
+            .filter(|label| label.contains("command palette"))
+            .collect();
+        assert!(
+            !bound.is_empty(),
+            "the palette's own command is in the list for this to check: {json}"
+        );
+        let shortcut = bound
+            .iter()
+            .find_map(|label| label.strip_prefix("command palette: toggle, "));
+        assert!(
+            shortcut.is_some_and(|shortcut| !shortcut.is_empty()),
+            "a row has to say what its command is bound to: {bound:?}"
         );
 
         gpui::a11y_checks::assert_interactive_nodes_are_named(&tree, "open command palette");
