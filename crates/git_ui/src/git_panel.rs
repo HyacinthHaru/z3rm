@@ -6803,6 +6803,9 @@ impl GitPanel {
             // The row's name is the file it is about; without it the panel
             // reads as a list of unidentified entries.
             .role(gpui::Role::ListBoxOption)
+            // accesskit maps `ListBoxOption` to static text on macOS, so
+            // without this a row a user can pick reads like a caption.
+            .aria_role_description("option")
             .aria_label(announced_name)
             .aria_selected(selected)
             // Focus stays on the panel while the arrow keys move a highlight

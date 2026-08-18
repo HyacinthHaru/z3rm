@@ -1339,6 +1339,13 @@ impl<D: PickerDelegate> Picker<D> {
             // from a selected state nobody reads out.
             .when(selectable, |this| {
                 this.role(gpui::Role::ListBoxOption)
+                    // accesskit maps `ListBoxOption` to static text on macOS,
+                    // with no subrole to tell it from a caption, so a row a
+                    // user can pick reads exactly like one they cannot. The
+                    // role description is what says otherwise, and it costs
+                    // nothing elsewhere: it *is* the localized control type on
+                    // Windows, which already reports the ARIA role as "option".
+                    .aria_role_description("option")
                     .aria_selected(is_selected)
                     .when_some(self.delegate.match_label(ix, cx), |this, label| {
                         this.aria_label(label)
@@ -1940,6 +1947,19 @@ mod tests {
             options.iter().filter(|(_, _, selected)| *selected).count(),
             1,
             "exactly one option is current at a time"
+        );
+
+        // The position above reaches Windows and Linux; on macOS accesskit
+        // maps `ListBoxOption` to static text with no subrole, so without this
+        // a row a user can pick is announced exactly like a caption.
+        let kinds: Vec<Option<&str>> = nodes
+            .values()
+            .filter(|node| node["aria"]["role"] == "ListBoxOption")
+            .map(|node| node["aria"]["role_description"].as_str())
+            .collect();
+        assert!(
+            kinds.iter().all(|kind| *kind == Some("option")),
+            "every row has to say what kind of thing it is: {kinds:?}"
         );
 
         // An option with a position but no name is announced as "option 2 of 3"
