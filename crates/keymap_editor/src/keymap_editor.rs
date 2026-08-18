@@ -3204,8 +3204,7 @@ impl Render for KeybindingEditorModal {
                                 .child(self.context_editor.clone())
                                 .when_some(self.error.as_ref(), |this, error| {
                                     this.child(
-                                        Banner::new()
-                                            .aria_label(error.content.clone())
+                                        Banner::new(error.content.clone())
                                             .severity(error.severity)
                                             .child(Label::new(error.content.clone())),
                                     )

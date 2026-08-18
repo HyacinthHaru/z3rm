@@ -3593,9 +3593,8 @@ impl SettingsWindow {
                 if shown_errors.insert(error.clone()) {
                     telemetry::event!("Settings Error Shown", label = label, error = &error);
                 }
-                Banner::new()
+                Banner::new(format!("{label}. {error}"))
                     .severity(Severity::Warning)
-                    .aria_label(format!("{label}. {error}"))
                     .child(
                         v_flex()
                             .my_0p5()
@@ -3666,16 +3665,11 @@ impl SettingsWindow {
 
             if is_restricted {
                 let original_window = self.original_window;
-                restricted_banner = Banner::new()
+                restricted_banner = Banner::new(
+                    "Restricted Mode. This project is in restricted mode. \
+                     Some project settings may not apply.",
+                )
                     .severity(Severity::Warning)
-                    // Unlike the banner above it, this one had no name — so it
-                    // produced no node, both its lines being `Label`s, and the
-                    // only thing reaching a reader was a button reading
-                    // "Manage Trust" with nothing saying what was restricted.
-                    .aria_label(
-                        "Restricted Mode. This project is in restricted mode. \
-                         Some project settings may not apply.",
-                    )
                     .child(
                         v_flex()
                             .my_0p5()
