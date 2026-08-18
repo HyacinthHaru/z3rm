@@ -490,14 +490,8 @@ impl Render for KeystrokeInput {
                 )
         };
 
-        // A pulsing dot and the word "REC" as a `Label`, which is not a node.
-        // Recording changes what every keypress does, so a user who cannot see
-        // the badge has no way to know whether they are typing a keybinding or
-        // driving the editor.
         let recording_indicator = h_flex()
             .id("keystroke-input-recording")
-            .role(gpui::Role::Status)
-            .aria_label("Recording keystrokes")
             .h_4()
             .pr_1()
             .gap_0p5()
@@ -517,8 +511,6 @@ impl Render for KeystrokeInput {
 
         let search_indicator = h_flex()
             .id("keystroke-input-searching")
-            .role(gpui::Role::Status)
-            .aria_label("Recording keystrokes to search")
             .h_4()
             .pr_1()
             .gap_0p5()
@@ -542,8 +534,27 @@ impl Render for KeystrokeInput {
             IconName::PlayFilled
         };
 
+        // Present whether or not anything is being recorded, and empty until
+        // it is. Recording changes what every keypress does — it captures them
+        // instead of running commands — so it has to be announced when it
+        // starts, and a region created at that moment has nothing to diff
+        // against and is never read out. The badge beside it is a pulsing dot
+        // and the word "REC" as a `Label`, neither of which is a node.
+        let recording_announcement = div()
+            .id("keystroke-input-mode")
+            .role(gpui::Role::Status)
+            .aria_live(gpui::accesskit::Live::Polite)
+            .when(is_recording, |this| {
+                this.aria_label(if self.search {
+                    "Recording keystrokes to search"
+                } else {
+                    "Recording keystrokes"
+                })
+            });
+
         h_flex()
             .id("keystroke-input")
+            .child(recording_announcement)
             .track_focus(&self.outer_focus_handle)
             .key_context(Self::key_context())
             .on_action(cx.listener(Self::start_recording))
@@ -1145,6 +1156,82 @@ mod tests {
             cx.add_window(|window, cx| MultiWorkspace::test_new(project.clone(), window, cx));
         let cx = VisualTestContext::from_window(window_handle.into(), cx);
         KeystrokeInputTestHelper::new(cx)
+    }
+
+    /// Recording captures every keypress instead of running the command it is
+    /// bound to, so a user who cannot see the pulsing "REC" badge has no way to
+    /// tell whether the key they are about to press assigns a binding or drives
+    /// the editor. The region has to be there before it has anything to say, or
+    /// the change it reports has nothing to be compared against.
+    ///
+    /// Rendered as the window's own view rather than through the test helper,
+    /// which creates the input without ever putting it on screen.
+    #[gpui::test]
+    async fn recording_is_announced_and_the_region_outlives_it(cx: &mut TestAppContext) {
+        cx.update(|cx| {
+            let settings_store = settings::SettingsStore::test(cx);
+            cx.set_global(settings_store);
+            theme_settings::init(theme::LoadThemes::JustBase, cx);
+        });
+
+        let window = cx.add_window(|window, cx| KeystrokeInput::new(None, window, cx));
+        cx.activate_a11y(window.into());
+
+        let mode_region = |cx: &mut TestAppContext| {
+            let json = cx
+                .update_window(window.into(), |_, window, cx| {
+                    window.draw(cx).clear(cx);
+                    window.debug_a11y_tree_json()
+                })
+                .expect("the harness window is still open")
+                .expect("activation makes the debug tree available");
+            let tree: serde_json::Value =
+                serde_json::from_str(&json).expect("the dump is valid JSON");
+            tree["nodes"]
+                .as_object()
+                .expect("the dump lists nodes")
+                .values()
+                .find(|node| {
+                    node["element_id"]
+                        .as_str()
+                        .is_some_and(|id| id.contains("keystroke-input-mode"))
+                })
+                .map(|node| {
+                    (
+                        node["aria"]["label"].as_str().unwrap_or_default().to_string(),
+                        node["aria"]["live"].as_str().unwrap_or_default().to_string(),
+                    )
+                })
+                .unwrap_or_else(|| panic!("the mode region has to exist: {json}"))
+        };
+
+        assert_eq!(
+            mode_region(cx),
+            ("".to_string(), "Polite".to_string()),
+            "the region is present and quiet before anything is recorded"
+        );
+
+        window
+            .update(cx, |input, window, cx| {
+                input.start_recording(&StartRecording, window, cx);
+            })
+            .expect("the harness window is still open");
+        assert_eq!(
+            mode_region(cx).0,
+            "Recording keystrokes",
+            "arming the recorder has to say so"
+        );
+
+        window
+            .update(cx, |input, window, cx| {
+                input.stop_recording(&StopRecording, window, cx);
+            })
+            .expect("the harness window is still open");
+        assert_eq!(
+            mode_region(cx).0,
+            "",
+            "the region stays and goes quiet, so the next change can be announced"
+        );
     }
 
     #[gpui::test]
