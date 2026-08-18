@@ -1307,10 +1307,10 @@ pub trait StatefulInteractiveElement: InteractiveElement {
     /// Note that this does not create a keymap. It simply instructs assistive
     /// technology what the keymap is.
     ///
-    /// Reaches no platform: none of accesskit's three adapters expose
-    /// `keyboard_shortcut` as of 0.24. Setting it is harmless and correct, and
-    /// it will start being read when an adapter grows support, but do not
-    /// count on the shortcut being announced today.
+    /// None of accesskit's three adapters expose `keyboard_shortcut`, so the
+    /// shortcut is also written to the element's description, which all three
+    /// read. An element that sets a description too is announced as
+    /// `"{description}, {shortcut}"`.
     fn aria_keyshortcuts(mut self, keyshortcuts: impl Into<SharedString>) -> Self {
         self.interactivity().aria.keyshortcuts = Some(keyshortcuts.into());
         self
@@ -3487,8 +3487,21 @@ impl Interactivity {
         if let Some(label) = &self.aria.label {
             node.set_label(label.to_string());
         }
-        if let Some(description) = &self.aria.description {
-            node.set_description(description.to_string());
+        // No accesskit adapter exposes `keyboard_shortcut`, so a shortcut set
+        // only there is dropped. All three read the description, and it is
+        // announced after the name, which is where a shortcut belongs — so the
+        // shortcut goes to both: the description to be heard today, and
+        // `keyboard_shortcut` to be correct when an adapter grows support.
+        let description = match (&self.aria.description, &self.aria.keyshortcuts) {
+            (Some(description), Some(keyshortcuts)) => {
+                Some(format!("{description}, {keyshortcuts}"))
+            }
+            (Some(description), None) => Some(description.to_string()),
+            (None, Some(keyshortcuts)) => Some(keyshortcuts.to_string()),
+            (None, None) => None,
+        };
+        if let Some(description) = description {
+            node.set_description(description);
         }
         if let Some(role_description) = &self.aria.role_description {
             node.set_role_description(role_description.to_string());

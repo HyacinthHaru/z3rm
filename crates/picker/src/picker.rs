@@ -230,10 +230,10 @@ pub trait PickerDelegate: Sized + 'static {
     /// The keyboard shortcut a row draws beside itself, if it draws one.
     ///
     /// Appended to the row's name rather than set as `aria_keyshortcuts`,
-    /// because no accesskit adapter exposes that property — so a shortcut sent
-    /// through it is read by nobody. A row that draws a shortcut and does not
-    /// return it here is a row where a sighted user is told something a reader
-    /// is not, which in a command palette is the whole point of the surface.
+    /// which arrives as a description — a hint, spoken after a pause and
+    /// silenced by a VoiceOver setting. That is the right weight for a button
+    /// whose shortcut is a nicety and the wrong one for a palette, where
+    /// finding out what a command is bound to is the reason to open it.
     ///
     /// Takes a window because resolving which binding applies needs the focus
     /// context, which is why this is not simply part of `match_label`.

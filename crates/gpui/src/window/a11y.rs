@@ -1865,6 +1865,65 @@ mod activation_tests {
         );
     }
 
+    /// `keyboard_shortcut` is written by five call sites and read by none of
+    /// accesskit's three adapters, so a shortcut that lives only there is
+    /// never heard. It has to arrive somewhere a reader looks.
+    #[gpui::test]
+    fn a_keyboard_shortcut_reaches_a_property_a_reader_reads(cx: &mut TestAppContext) {
+        struct Host;
+        impl Render for Host {
+            fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+                div()
+                    .child(
+                        div()
+                            .id("shortcut-only")
+                            .role(accesskit::Role::Button)
+                            .aria_label("Copy")
+                            .aria_keyshortcuts("Command-C"),
+                    )
+                    .child(
+                        div()
+                            .id("shortcut-and-description")
+                            .role(accesskit::Role::Button)
+                            .aria_label("Paste")
+                            .aria_description("Insert the clipboard here")
+                            .aria_keyshortcuts("Command-V"),
+                    )
+            }
+        }
+
+        let window = cx.add_window(|_, _| Host);
+        cx.activate_a11y(window.into());
+        let json = cx
+            .update_window(window.into(), |_, window, cx| {
+                window.draw(cx).clear(cx);
+                window.debug_a11y_tree_json()
+            })
+            .expect("the window is open")
+            .expect("activation makes the debug tree available");
+        let tree: serde_json::Value = serde_json::from_str(&json).expect("the dump is valid JSON");
+
+        let described = |name: &str| -> Option<String> {
+            tree["nodes"]
+                .as_object()?
+                .values()
+                .find(|node| node["aria"]["label"] == name)
+                .and_then(|node| node["aria"]["description"].as_str())
+                .map(str::to_owned)
+        };
+
+        assert_eq!(
+            described("Copy").as_deref(),
+            Some("Command-C"),
+            "a shortcut with nothing else to say becomes the description: {json}"
+        );
+        assert_eq!(
+            described("Paste").as_deref(),
+            Some("Insert the clipboard here, Command-V"),
+            "a shortcut does not displace a description the caller set: {json}"
+        );
+    }
+
     /// A control whose centre is covered by a smaller clickable child is the
     /// shape that makes an advertised `Click` land somewhere else — a close
     /// button inside a tab is the real case. Proven end to end so the check
