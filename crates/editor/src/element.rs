@@ -9374,6 +9374,29 @@ impl Element for EditorElement {
                                 }
                                 None => None,
                             })
+                            // The file this editor is on. It is the node focus
+                            // lands on, and "Editor" was the name of every
+                            // editor in the window — a split, a diff and the
+                            // file beside them announced identically.
+                            //
+                            // The file's name rather than `MultiBuffer::title`,
+                            // which falls back to the buffer's *first line* for
+                            // an unsaved buffer. Naming an editor after a line
+                            // of its own text is worse than naming it "Editor":
+                            // it changes as the user types.
+                            .or_else(|| {
+                                let file_name = self
+                                    .editor
+                                    .read(cx)
+                                    .buffer()
+                                    .read(cx)
+                                    .as_singleton()?
+                                    .read(cx)
+                                    .file()?
+                                    .file_name(cx)
+                                    .to_string();
+                                (!file_name.is_empty()).then(|| SharedString::from(file_name))
+                            })
                             .unwrap_or_else(|| SharedString::new_static("Editor"))
                         })
                     });
@@ -12653,6 +12676,55 @@ mod tests {
         assert_eq!(
             caret, length,
             "a caret below the visible rows reads at the bottom of them, not the top"
+        );
+    }
+
+    /// The editor region is the node focus lands on, and it was named "Editor"
+    /// for every editor in the window — a split, a diff and the file beside
+    /// them all announced the same. It is now the file, when there is one.
+    #[gpui::test]
+    async fn test_an_editor_is_named_after_the_file_it_is_on(cx: &mut TestAppContext) {
+        init_test(cx, |_| {});
+
+        let fs = fs::FakeFs::new(cx.executor());
+        fs.insert_file(
+            util::path!("/notes.md"),
+            "first line\nsecond line\n".into(),
+        )
+        .await;
+        let project = project::Project::test(fs, [util::path!("/notes.md").as_ref()], cx).await;
+        let buffer = project
+            .update(cx, |project, cx| {
+                project.open_local_buffer(std::path::Path::new(util::path!("/notes.md")), cx)
+            })
+            .await
+            .expect("the fixture's file opens");
+
+        let window = cx.add_window(|window, cx| {
+            let multibuffer = cx.new(|cx| MultiBuffer::singleton(buffer, cx));
+            Editor::new(EditorMode::full(), multibuffer, Some(project), window, cx)
+        });
+        cx.activate_a11y(window.into());
+
+        let json = cx
+            .update_window(window.into(), |_, window, cx| {
+                window.draw(cx).clear(cx);
+                window.debug_a11y_tree_json()
+            })
+            .expect("the harness window is still open")
+            .expect("activation makes the debug tree available");
+        let tree: serde_json::Value = serde_json::from_str(&json).expect("the dump is valid JSON");
+
+        let region = tree["nodes"]
+            .as_object()
+            .expect("the dump lists nodes")
+            .values()
+            .find(|node| node["aria"]["role"] == "Group")
+            .unwrap_or_else(|| panic!("the editor is a focusable region: {json}"));
+        assert_eq!(
+            region["aria"]["label"].as_str(),
+            Some("notes.md"),
+            "the region says which file it is on"
         );
     }
 
