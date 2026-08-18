@@ -1836,3 +1836,116 @@ mod tests {
         assert_eq!(renderer.element_key(&anonymous, &path), "vdom-2-1");
     }
 }
+
+#[cfg(test)]
+mod a11y_tests {
+    use super::*;
+    use gpui::{AppContext as _, Render, TestAppContext, Window};
+
+    struct ChromeHost(VDomNode);
+
+    impl Render for ChromeHost {
+        fn render(&mut self, _: &mut Window, cx: &mut gpui::Context<Self>) -> impl IntoElement {
+            let mut renderer = VDomRenderer::new();
+            gpui::div().child(renderer.render(&self.0, cx))
+        }
+    }
+
+    fn tree_of(cx: &mut TestAppContext, chrome: serde_json::Value) -> serde_json::Value {
+        let node = parse_vdom(&chrome).expect("the fixture is valid chrome");
+        let window = cx.add_window(|_, _| ChromeHost(node));
+        cx.activate_a11y(window.into());
+        let json = cx
+            .update_window(window.into(), |_, window, cx| {
+                window.draw(cx).clear(cx);
+                window.debug_a11y_tree_json()
+            })
+            .expect("the harness window is still open")
+            .expect("activation makes the debug tree available");
+        serde_json::from_str(&json).expect("the dump is valid JSON")
+    }
+
+    fn named(tree: &serde_json::Value, role: &str) -> Vec<String> {
+        let mut names: Vec<String> = tree["nodes"]
+            .as_object()
+            .expect("the dump lists nodes")
+            .values()
+            .filter(|node| node["aria"]["role"] == role)
+            .map(|node| {
+                node["aria"]["label"]
+                    .as_str()
+                    .unwrap_or_default()
+                    .to_string()
+            })
+            .collect();
+        names.sort();
+        names
+    }
+
+    /// The bridge turns untrusted extension JSON into chrome, and decides the
+    /// roles and names for all of it. None of that had ever been read back out
+    /// of a drawn frame — the 29 tests beside this one check the parse and the
+    /// styling, so every accessibility decision here was verified only by the
+    /// builder call that made it.
+    #[gpui::test]
+    fn extension_chrome_reaches_the_tree_named(cx: &mut TestAppContext) {
+        let tree = tree_of(
+            cx,
+            serde_json::json!({
+                "type": "div",
+                "props": { "id": "root" },
+                "children": [
+                    { "type": "button", "props": { "id": "split" }, "children": ["Split"] },
+                    {
+                        "type": "div",
+                        "props": { "id": "kill", "onClick": "kill-pane", "aria-label": "Kill pane" },
+                        "children": []
+                    }
+                ]
+            }),
+        );
+
+        gpui::a11y_checks::assert_interactive_nodes_are_named(&tree, "extension chrome");
+        gpui::a11y_checks::assert_names_are_distinguishable(&tree, "extension chrome");
+        gpui::a11y_checks::assert_focusable_names_are_distinguishable(&tree, "extension chrome");
+        gpui::a11y_checks::assert_no_role_was_discarded(&tree, "extension chrome");
+        gpui::a11y_checks::assert_no_aria_was_discarded(&tree, "extension chrome");
+        gpui::a11y_checks::assert_roles_are_contained(&tree, "extension chrome");
+        gpui::a11y_checks::assert_clickable_elements_are_reachable(&tree, "extension chrome");
+        gpui::a11y_checks::assert_live_regions_can_speak(&tree, "extension chrome");
+
+        // `<button>Split</button>` is the idiomatic thing an extension author
+        // writes, and it has to work without them knowing what `aria-label` is.
+        // The second one is a plain `div` that merely takes a click, which the
+        // bridge promotes to a button so the action is not mouse-only.
+        assert_eq!(
+            named(&tree, "Button"),
+            vec!["Kill pane".to_string(), "Split".to_string()],
+            "both controls reach the tree with the name the extension gave them"
+        );
+    }
+
+    /// The boundary of what the bridge can do. An icon-only control has no
+    /// text to fall back on, so naming it is the extension author's job — and
+    /// nothing tells them when they have not. Recorded as the current
+    /// behaviour rather than left to be discovered.
+    #[gpui::test]
+    fn an_icon_only_extension_control_is_left_nameless(cx: &mut TestAppContext) {
+        let tree = tree_of(
+            cx,
+            serde_json::json!({
+                "type": "div",
+                "props": { "id": "root" },
+                "children": [
+                    { "type": "button", "props": { "id": "icon-only" }, "children": [] }
+                ]
+            }),
+        );
+
+        assert_eq!(
+            named(&tree, "Button"),
+            vec![String::new()],
+            "the bridge has nothing to name this with; the extension has to"
+        );
+    }
+}
