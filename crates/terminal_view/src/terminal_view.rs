@@ -1649,7 +1649,9 @@ impl Render for TerminalView {
             // §16.4 a11y: outer div exposes Terminal role + title for non-mux
             // terminal views; the child TerminalElement also carries Terminal.
             .role(gpui::Role::Terminal)
-            .aria_label(self.terminal.read(cx).title(true))
+            // Untruncated: `title(true)` cuts to 25 characters for the tab
+            // strip, and this names the surface a reader is standing in.
+            .aria_label(self.terminal.read(cx).title(false))
             .key_context(self.dispatch_context(cx))
             .on_action(cx.listener(TerminalView::send_text))
             .on_action(cx.listener(TerminalView::send_keystroke))

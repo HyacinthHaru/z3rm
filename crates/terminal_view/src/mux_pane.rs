@@ -1716,7 +1716,11 @@ impl Render for MuxPaneView {
         // Prefix and copy mode both change what every key does. A sighted user
         // sees the hint panel and the selection; without saying so here, the
         // pane announces the same name in all three states.
-        let announced_title = self.terminal.read(cx).title(true);
+        // Untruncated, unlike the tab title beside it. `title(true)` cuts to 25
+        // characters so a tab strip can hold several, and a reader is given one
+        // pane at a time — two panes running long commands that differ past the
+        // cut would otherwise announce identically.
+        let announced_title = self.terminal.read(cx).title(false);
         // Copy mode is the same disjunction the key dispatcher uses: vi mode
         // changes what keys do just as much, and announcing only one of the two
         // would be silent in a state where the keyboard behaves differently.
