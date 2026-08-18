@@ -4201,9 +4201,15 @@ mod tests {
             .filter(|node| node["aria"]["role"] == "TextRun")
             .filter_map(|node| node["aria"]["value"].as_str().map(str::to_string))
             .collect();
-        assert!(
-            runs.iter().any(|run| run.contains("link")),
-            "the rendered text has to reach the tree: {runs:?}"
+        // The **source**, not the rendered text — brackets, URL and backticks
+        // included. That is the element's deliberate choice, and it is worth
+        // pinning because it cuts both ways: a reader is told the destination
+        // of every link, and is also read every character of markdown syntax
+        // that a sighted user never sees.
+        assert_eq!(
+            runs,
+            vec![source.to_string()],
+            "the source is what reaches the tree"
         );
     }
 
