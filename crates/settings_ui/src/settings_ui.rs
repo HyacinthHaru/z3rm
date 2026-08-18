@@ -3589,6 +3589,7 @@ impl SettingsWindow {
                 }
                 Banner::new()
                     .severity(Severity::Warning)
+                    .aria_label(format!("{label}. {error}"))
                     .child(
                         v_flex()
                             .my_0p5()

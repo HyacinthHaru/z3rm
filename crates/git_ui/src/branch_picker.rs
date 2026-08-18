@@ -1225,7 +1225,10 @@ impl PickerDelegate for BranchListDelegate {
                             .id("branch-list-error")
                             .p_1p5()
                             .child(
-                                Banner::new().severity(Severity::Warning).child(
+                                Banner::new()
+                                    .severity(Severity::Warning)
+                                    .aria_label(message.clone())
+                                    .child(
                                     Label::new(message.clone())
                                         .size(LabelSize::Small)
                                         .single_line()

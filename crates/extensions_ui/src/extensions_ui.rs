@@ -1619,6 +1619,7 @@ impl ExtensionsPage {
             .child(
                 Banner::new()
                     .severity(Severity::Success)
+                    .aria_label(label.clone())
                     .child(Label::new(label).mt_0p5())
                     .map(|this| {
                         if vim {

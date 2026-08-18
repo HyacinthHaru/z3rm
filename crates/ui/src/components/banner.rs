@@ -22,6 +22,7 @@ use gpui::{AnyElement, IntoElement, ParentElement, Styled};
 pub struct Banner {
     severity: Severity,
     children: Vec<AnyElement>,
+    aria_label: Option<SharedString>,
     action_slot: Option<AnyElement>,
     wrap_content: bool,
 }
@@ -32,6 +33,7 @@ impl Banner {
         Self {
             severity: Severity::Info,
             children: Vec::new(),
+            aria_label: None,
             action_slot: None,
             wrap_content: false,
         }
@@ -56,6 +58,16 @@ impl Banner {
     }
 }
 
+impl Banner {
+    /// What the banner is announced as. Callers pass the message rather than
+    /// the banner deriving it, because the message is a `Label` among other
+    /// children and there is no text here to read.
+    pub fn aria_label(mut self, label: impl Into<SharedString>) -> Self {
+        self.aria_label = Some(label.into());
+        self
+    }
+}
+
 impl ParentElement for Banner {
     fn extend(&mut self, elements: impl IntoIterator<Item = AnyElement>) {
         self.children.extend(elements)
@@ -64,7 +76,15 @@ impl ParentElement for Banner {
 
 impl RenderOnce for Banner {
     fn render(self, window: &mut Window, cx: &mut App) -> impl IntoElement {
+        // A banner is arbitrary children, so it cannot take a name from them,
+        // and its content is invariably `Label`s. Unnamed it is a coloured box
+        // a reader walks straight past — which is the opposite of what a
+        // warning is for.
         let banner = h_flex()
+            .id("banner")
+            .when_some(self.aria_label, |this, label| {
+                this.role(gpui::Role::Status).aria_label(label)
+            })
             .min_w_0()
             .py_0p5()
             .gap_1p5()

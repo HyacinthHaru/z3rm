@@ -5533,6 +5533,12 @@ impl ProjectPanel {
                     ));
                 }
             }
+            // A symlink is marked with a small arrow on the icon and explained
+            // in a tooltip, so a link and the thing it points at read the same
+            // — and opening one is not the same as opening the other.
+            if details.canonical_path.is_some() {
+                name.push_str(", symbolic link");
+            }
             SharedString::from(name)
         };
         let announced_depth = details.depth;
