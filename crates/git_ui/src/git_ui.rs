@@ -1323,6 +1323,12 @@ impl Render for GitCloneModal {
             )
             .child(
                 h_flex()
+                    // The hint is a `Label` and the only node in this row is a
+                    // button reading "Learn More" — a reader was offered a link
+                    // with nothing saying what it was about.
+                    .id("clone-hint")
+                    .role(gpui::Role::Group)
+                    .aria_label("Clone a repository from GitHub or other sources.")
                     .w_full()
                     .p_2()
                     .gap_0p5()

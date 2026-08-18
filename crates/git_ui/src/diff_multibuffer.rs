@@ -917,6 +917,13 @@ impl Render for DiffMultibuffer {
                 let keybinding_focus_handle = self.focus_handle(cx);
                 el.child(
                     v_flex()
+                        // The reason there is nothing to show is a `Label`, and
+                        // the only node here is a button reading "Close" — so a
+                        // reader was told to close something without being told
+                        // it was empty, or why.
+                        .id("project-diff-empty")
+                        .role(gpui::Role::Group)
+                        .aria_label(empty_label.clone())
                         .gap_1()
                         .child(h_flex().justify_around().child(Label::new(empty_label)))
                         .map(|el| match remote_button {
