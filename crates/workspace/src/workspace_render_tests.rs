@@ -855,6 +855,24 @@ async fn test_split_panes_say_which_one_they_are(cx: &mut TestAppContext) {
         vec![(1, 2), (2, 2)],
         "each pane has to say which of how many it is"
     );
+
+    // And in the name, which is the half that reaches macOS: it exposes
+    // neither `position_in_set` nor `size_of_set`, so the assertion above
+    // passes on a platform where nothing of it is announced.
+    let mut named: Vec<&str> = tree["nodes"]
+        .as_object()
+        .expect("the dump lists nodes")
+        .values()
+        .filter(|node| node["aria"]["role"] == "Group")
+        .filter(|node| node["aria"]["position_in_set"].as_u64().is_some())
+        .filter_map(|node| node["aria"]["label"].as_str())
+        .collect();
+    named.sort_unstable();
+    assert_eq!(
+        named,
+        vec!["Empty pane, pane 2 of 2", "shell, pane 1 of 2"],
+        "the position has to be in the name too, or macOS hears neither"
+    );
 }
 
 /// The welcome screen takes focus when it opens. Its root carried no id and no

@@ -4328,15 +4328,6 @@ impl Render for Pane {
             .active_item()
             .map(|item| item.tab_content_text(0, cx))
             .unwrap_or_else(|| SharedString::new_static("Empty pane"));
-        // Zooming hides every other pane. A sighted user sees that at once;
-        // from the tree it is indistinguishable from a window that only ever
-        // had one pane. Same word the mux pane and the sidebar use for it.
-        let pane_name = if self.zoomed {
-            SharedString::from(format!("{pane_name}, zoomed"))
-        } else {
-            pane_name
-        };
-
         // Which pane of how many is only conveyed by the layout, so two panes
         // running the same program are indistinguishable from the tree. The
         // lookup is over the window's panes, of which there are a handful.
@@ -4348,6 +4339,25 @@ impl Render for Pane {
                 .position(|pane| pane.entity_id() == cx.entity_id())?;
             (panes.len() > 1).then_some((index + 1, panes.len()))
         });
+
+        // In the name as well as in `position_in_set`, because that property
+        // reaches Windows and Linux and not macOS — so on the platform this is
+        // developed on, the fix above for two panes running the same program
+        // was doing nothing. The name is the one channel all three read.
+        let pane_name = match pane_position {
+            Some((position, count)) => {
+                SharedString::from(format!("{pane_name}, pane {position} of {count}"))
+            }
+            None => pane_name,
+        };
+        // Zooming hides every other pane. A sighted user sees that at once;
+        // from the tree it is indistinguishable from a window that only ever
+        // had one pane. Same word the mux pane and the sidebar use for it.
+        let pane_name = if self.zoomed {
+            SharedString::from(format!("{pane_name}, zoomed"))
+        } else {
+            pane_name
+        };
 
         v_flex()
             .id(ElementId::View(cx.entity_id()))
