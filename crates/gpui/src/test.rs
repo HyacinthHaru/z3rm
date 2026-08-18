@@ -312,27 +312,38 @@ pub mod a11y_checks {
         );
     }
 
-    /// Panics if a live region has something to say and no value to say it in.
+    /// Panics if a live region carries content that its platform cannot
+    /// announce.
     ///
     /// This is the one check here that is not about how a tree reads. It is
-    /// about whether a change is spoken at all, and the answer lives in
-    /// `accesskit_macos`: both paths that raise an announcement are guarded by
-    /// `node.value().is_some()`, and the text raised is `node.value()`. A
-    /// region with a label and no value is therefore silent twice over — no
-    /// announcement fires, and the label would not be the text if one did.
-    /// `accesskit_consumer`'s `value()` falls back to the contents of a
-    /// single-line text input and to nothing else, so the role does not supply
-    /// it and neither does the label.
+    /// about whether a change is spoken at all, and no two platforms agree on
+    /// where the text comes from:
+    ///
+    /// * `accesskit_macos` raises an announcement only when `value().is_some()`
+    ///   and speaks `node.value()`.
+    /// * `accesskit_windows` raises `UIA_LiveRegionChangedEventId` only when
+    ///   `name().is_some()`, and `name()` is the label for every role but
+    ///   `Role::Label`.
+    /// * `accesskit_atspi_common` emits `ObjectEvent::Announcement` with
+    ///   `wrapper.name()`, on name change — same as Windows.
+    ///
+    /// So the announced text has to be in **both** the label and the value.
+    /// Either one alone is silence on two platforms or one. `value()` falls
+    /// back to a single-line text input's contents and to nothing else, and
+    /// neither field is ever derived from the role, so nothing supplies the
+    /// missing one.
     ///
     /// A live region with nothing in it is not a defect but the required
     /// shape: a region has to be in the tree before its content arrives, or
-    /// there is no change for the reader to notice. So the check asks whether
-    /// the region carries content *anywhere* — its own label, or a descendant
-    /// with a name — and only then insists the content be in the value.
+    /// there is no change for the reader to notice. Both fields being absent
+    /// is how a region says it has nothing to announce yet.
     #[track_caller]
     pub fn assert_live_regions_can_speak(tree: &serde_json::Value, context: &str) {
         let nodes = nodes(tree);
-        fn has_something_to_say(
+        fn text_of<'a>(node: &'a serde_json::Value, field: &str) -> Option<&'a str> {
+            node["aria"][field].as_str().filter(|text| !text.is_empty())
+        }
+        fn names_something(
             nodes: &serde_json::Map<String, serde_json::Value>,
             node: &serde_json::Value,
             depth: usize,
@@ -342,22 +353,15 @@ pub mod a11y_checks {
             if depth > 64 {
                 return false;
             }
-            if node["aria"]["label"]
-                .as_str()
-                .is_some_and(|label| !label.is_empty())
-            {
-                return true;
-            }
             node["children"]
                 .as_array()
                 .into_iter()
                 .flatten()
                 .filter_map(|id| nodes.get(id.as_str()?))
                 .any(|child| {
-                    child["aria"]["value"]
-                        .as_str()
-                        .is_some_and(|value| !value.is_empty())
-                        || has_something_to_say(nodes, child, depth + 1)
+                    text_of(child, "label").is_some()
+                        || text_of(child, "value").is_some()
+                        || names_something(nodes, child, depth + 1)
                 })
         }
 
@@ -368,19 +372,24 @@ pub mod a11y_checks {
                     .as_str()
                     .is_some_and(|live| live != "Off")
             })
-            .filter(|node| node["aria"]["value"].as_str().is_none_or(str::is_empty))
-            .filter(|node| has_something_to_say(nodes, node, 0))
-            .map(|node| {
-                format!(
-                    "{} (live {}, label {})",
-                    node["element_id"], node["aria"]["live"], node["aria"]["label"]
-                )
+            .filter_map(|node| {
+                let label = text_of(node, "label");
+                let value = text_of(node, "value");
+                let complaint = match (label, value) {
+                    (Some(_), Some(_)) => return None,
+                    // Nothing to announce yet, which is the shape a region has
+                    // to be in before its content arrives.
+                    (None, None) if !names_something(nodes, node, 0) => return None,
+                    (None, None) => "its content is in child nodes, which no platform announces",
+                    (Some(_), None) => "no value, so macOS announces nothing",
+                    (None, Some(_)) => "no label, so Windows and Linux announce nothing",
+                };
+                Some(format!("{} ({complaint})", node["element_id"]))
             })
             .collect();
         assert!(
             mute.is_empty(),
-            "{context}: these live regions have content but no value, so they \
-             announce nothing: {mute:?}"
+            "{context}: these live regions cannot be announced: {mute:?}"
         );
     }
 
@@ -803,27 +812,34 @@ mod a11y_check_tests {
         })
     }
 
-    /// The shape every live region in the app had: polite, labelled, and with
-    /// no value, which raises no announcement at all.
+    /// The shape every live region in the app had, and the shape they were
+    /// briefly moved to. Each is silent on a different set of platforms.
     #[test]
-    #[should_panic(expected = "announce")]
-    fn a_labelled_live_region_with_no_value_is_reported() {
+    #[should_panic(expected = "macOS announces nothing")]
+    fn a_label_without_a_value_is_reported() {
         let tree = live_region(Some("Polite"), Some("12 matches"), None);
         assert_live_regions_can_speak(&tree, "picker");
     }
 
-    /// The text macOS speaks is the value, so a region carrying one is fine
-    /// whether or not it also has a label.
     #[test]
-    fn a_live_region_with_a_value_can_speak() {
-        let tree = live_region(Some("Polite"), Some("Results"), Some("12 matches"));
+    #[should_panic(expected = "Windows and Linux announce nothing")]
+    fn a_value_without_a_label_is_reported() {
+        let tree = live_region(Some("Polite"), None, Some("12 matches"));
         assert_live_regions_can_speak(&tree, "picker");
-        let tree = live_region(Some("Assertive"), None, Some("Disconnected"));
+    }
+
+    /// macOS speaks the value, Windows and Linux the name, so the announced
+    /// text has to be in both.
+    #[test]
+    fn a_region_carrying_the_text_in_both_fields_can_speak() {
+        let tree = live_region(Some("Polite"), Some("12 matches"), Some("12 matches"));
+        assert_live_regions_can_speak(&tree, "picker");
+        let tree = live_region(Some("Assertive"), Some("Disconnected"), Some("Disconnected"));
         assert_live_regions_can_speak(&tree, "connection");
     }
 
     /// A region that is deliberately not live has nothing to announce, so the
-    /// check has no business asking it for a value.
+    /// check has no business asking it for either field.
     #[test]
     fn a_region_that_is_not_live_is_left_alone() {
         let tree = live_region(Some("Off"), Some("Overridden by your organization"), None);
@@ -832,10 +848,10 @@ mod a11y_check_tests {
         assert_live_regions_can_speak(&tree, "markdown");
     }
 
-    /// An empty value is the same silence as no value: `value().is_some()`
+    /// An empty string is the same silence as an absent field: `is_some()`
     /// passes and the announcement raised says nothing.
     #[test]
-    #[should_panic(expected = "announce")]
+    #[should_panic(expected = "macOS announces nothing")]
     fn an_empty_value_is_reported_too() {
         let tree = live_region(Some("Polite"), Some("Recording"), Some(""));
         assert_live_regions_can_speak(&tree, "keystroke input");
@@ -843,7 +859,7 @@ mod a11y_check_tests {
 
     /// The required shape, not a defect: the region has to be in the tree
     /// before its content arrives or there is no change to notice. Empty, it
-    /// has nothing to say and no value is the honest answer.
+    /// has nothing to say and neither field is the honest answer.
     #[test]
     fn an_empty_live_region_waiting_for_content_is_fine() {
         let tree = live_region(Some("Polite"), None, None);
@@ -851,9 +867,9 @@ mod a11y_check_tests {
     }
 
     /// Content hanging off the region as a child node is still content the
-    /// user is meant to hear, and it is still not what gets announced.
+    /// user is meant to hear, and no platform reads a live region's subtree.
     #[test]
-    #[should_panic(expected = "announce")]
+    #[should_panic(expected = "child nodes")]
     fn a_live_region_whose_content_is_a_child_is_reported() {
         let tree = live_region_with_child(json!({ "label": "Project saved" }));
         assert_live_regions_can_speak(&tree, "toast layer");

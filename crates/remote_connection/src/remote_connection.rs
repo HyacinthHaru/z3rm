@@ -194,7 +194,7 @@ impl Render for RemoteConnectionPrompt {
                         .w_full()
                         .gap_1()
                         .when(window.capslock().on, |this| {
-                            this.aria_value("Caps lock is on.")
+                            this.aria_announcement("Caps lock is on.")
                                 .child(
                                     Icon::new(IconName::Warning)
                                         .size(IconSize::Small)
@@ -221,7 +221,7 @@ impl Render for RemoteConnectionPrompt {
                     .mt_1()
                     .gap_1()
                     .when_some(self.status_message.clone(), |this, status_message| {
-                        this.aria_value(SharedString::from(format!("{status_message}…")))
+                        this.aria_announcement(SharedString::from(format!("{status_message}…")))
                             .child(
                                 Icon::new(IconName::LoadCircle)
                                     .size(IconSize::Small)

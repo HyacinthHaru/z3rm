@@ -545,7 +545,7 @@ impl Render for KeystrokeInput {
             .role(gpui::Role::Status)
             .aria_live(gpui::accesskit::Live::Polite)
             .when(is_recording, |this| {
-                this.aria_value(if self.search {
+                this.aria_announcement(if self.search {
                     "Recording keystrokes to search"
                 } else {
                     "Recording keystrokes"

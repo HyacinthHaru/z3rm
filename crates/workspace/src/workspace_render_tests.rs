@@ -342,11 +342,15 @@ async fn test_notifications_are_announced_as_a_live_region(cx: &mut TestAppConte
         Some("Polite"),
         "a notification that arrives on its own has to be announced"
     );
-    assert_eq!(log["aria"]["label"].as_str(), Some("Notifications"));
-    // What is actually spoken. macOS raises an announcement only when the
-    // region has a value and speaks that value, never descending into the
-    // notifications drawn inside it — so the label above names the region and
-    // this is the only thing a user hears when one arrives.
+    // What is actually spoken, and it has to be in both fields: macOS raises
+    // an announcement only when the region has a value and speaks that value,
+    // while Windows and Linux raise theirs on a name change and speak the
+    // name. Neither platform descends into the notifications drawn inside.
+    assert_eq!(
+        log["aria"]["label"].as_str(),
+        Some("the mux server went away"),
+        "the region's name is the announcement, not a standing title"
+    );
     assert_eq!(
         log["aria"]["value"].as_str(),
         Some("the mux server went away"),

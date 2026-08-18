@@ -5567,17 +5567,18 @@ impl Workspace {
                 // read.
                 .role(gpui::Role::Log)
                 .aria_live(gpui::accesskit::Live::Polite)
-                .aria_label("Notifications")
                 // The newest notification's text, because that is the one that
-                // just arrived. macOS speaks the region's own value and never
-                // descends into the notifications drawn inside it, so a name
-                // alone announces nothing at all.
+                // just arrived. No platform descends into the notifications
+                // drawn inside the region, so the text has to be on the region
+                // itself. Deliberately no standing name: the two platforms that
+                // announce on a name change would read a name reverting to
+                // "Notifications" as something to say out loud.
                 .when_some(
                     self.notifications
                         .last()
                         .map(|(_, _, announcement)| announcement)
                         .filter(|announcement| !announcement.is_empty()),
-                    |this, announcement| this.aria_value(announcement.clone()),
+                    |this, announcement| this.aria_announcement(announcement.clone()),
                 )
                 .when(has_notifications, |this| {
                     this.w_112().h_full().flex().flex_col().justify_end().gap_2()

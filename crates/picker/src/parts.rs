@@ -26,7 +26,7 @@ pub fn project_scan_indicator(
             // finishes, so there is nothing to un-say.
             .role(gpui::Role::Status)
             .aria_live(gpui::accesskit::Live::Polite)
-            .aria_value("Project scan in progress, results are incomplete")
+            .aria_announcement("Project scan in progress, results are incomplete")
             .tooltip(Tooltip::text("Project Scan in Progress…"))
             .child(
                 Icon::new(IconName::LoadCircle)

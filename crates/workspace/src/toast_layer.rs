@@ -261,7 +261,7 @@ impl Render for ToastLayer {
                 // it is only ever perceived if it is announced.
                 .role(gpui::Role::Status)
                 .aria_live(gpui::accesskit::Live::Polite)
-                .aria_value(announcement)
+                .aria_announcement(announcement)
                 .absolute()
                 .w_full()
                 .bottom(px(0.))

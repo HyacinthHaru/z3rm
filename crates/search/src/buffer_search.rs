@@ -355,7 +355,7 @@ impl Render for BufferSearchBar {
                                 .id("buffer-search-match-count")
                                 .role(gpui::Role::Status)
                                 .aria_live(gpui::accesskit::Live::Polite)
-                                .aria_value(announced_matches)
+                                .aria_announcement(announced_matches)
                                 .ml_2()
                                 .min_w(rems_from_px(40.))
                                 .child(
@@ -457,7 +457,7 @@ impl Render for BufferSearchBar {
             .role(gpui::Role::Status)
             .aria_live(gpui::accesskit::Live::Polite)
             .when_some(self.query_error.as_ref(), |this, error| {
-                this.aria_value(error.clone()).child(
+                this.aria_announcement(error.clone()).child(
                     Label::new(error)
                         .size(LabelSize::Small)
                         .color(Color::Error)

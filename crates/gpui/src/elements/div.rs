@@ -1396,6 +1396,27 @@ pub trait StatefulInteractiveElement: InteractiveElement {
         self
     }
 
+    /// Set the text a live region announces, on both the label and the value.
+    ///
+    /// The three platforms do not agree on where the announced text comes
+    /// from. `accesskit_macos` raises an announcement only when the node has a
+    /// `value` and speaks that value; `accesskit_windows` and
+    /// `accesskit_atspi_common` raise theirs only when the node has a *name*,
+    /// which is the label for every role but [`Role::Label`], and announce the
+    /// name. Neither field is derived from the other or from the role, so an
+    /// announcement set on one of them alone is silence on the other platforms.
+    ///
+    /// A region with nothing to announce yet should carry neither: it has to be
+    /// in the tree before its content arrives, or there is no change for a
+    /// reader to notice.
+    fn aria_announcement(self, text: impl Into<SharedString>) -> Self
+    where
+        Self: Sized,
+    {
+        let text = text.into();
+        self.aria_label(text.clone()).aria_value(text)
+    }
+
     /// Set the placeholder text reported to assistive technology for this
     /// element, shown when a text input is empty.
     fn aria_placeholder(mut self, placeholder: impl Into<SharedString>) -> Self {

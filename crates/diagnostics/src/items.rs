@@ -161,7 +161,7 @@ impl Render for DiagnosticIndicator {
                     .role(gpui::Role::Status)
                     .aria_live(gpui::accesskit::Live::Polite)
                     .when_some(announced_diagnostic, |this, message| {
-                        this.aria_value(message)
+                        this.aria_announcement(message)
                     })
                     .children(status),
             )

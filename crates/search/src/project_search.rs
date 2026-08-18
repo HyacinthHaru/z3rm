@@ -2437,7 +2437,7 @@ impl Render for ProjectSearchBar {
                     // tree. Polite: it changes while the user types.
                     .role(gpui::Role::Status)
                     .aria_live(gpui::accesskit::Live::Polite)
-                    .aria_value(match (is_search_underway, announced_matches.is_empty()) {
+                    .aria_announcement(match (is_search_underway, announced_matches.is_empty()) {
                         (true, true) => SharedString::new_static("Searching"),
                         (true, false) => format!("Searching, {announced_matches}").into(),
                         (false, _) => announced_matches,
@@ -2657,7 +2657,7 @@ impl Render for ProjectSearchBar {
                 .role(gpui::Role::Status)
                 .aria_live(gpui::accesskit::Live::Polite)
                 .when_some(error, |this, error| {
-                    this.aria_value(SharedString::from(error.clone())).child(
+                    this.aria_announcement(SharedString::from(error.clone())).child(
                         Label::new(error.clone())
                             .size(LabelSize::Small)
                             .color(Color::Error)

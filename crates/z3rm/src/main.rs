@@ -374,7 +374,7 @@ impl Render for MuxConnectionStatusItem {
             .aria_live(gpui::accesskit::Live::Polite)
             .when_some(label, |element, (text, color)| {
                 element
-                    .aria_value(format!("Mux connection: {text}"))
+                    .aria_announcement(format!("Mux connection: {text}"))
                     .child(ui::Label::new(text).size(ui::LabelSize::Small).color(color))
             })
     }

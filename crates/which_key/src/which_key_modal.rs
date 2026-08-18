@@ -264,7 +264,7 @@ impl Render for WhichKeyModal {
             .id("which-key-buffer-panel-scroll")
             .role(gpui::Role::Status)
             .aria_live(gpui::accesskit::Live::Polite)
-            .aria_value(SharedString::from(announced))
+            .aria_announcement(SharedString::from(announced))
             .occlude()
             .absolute()
             .bottom(bottom_offset)
