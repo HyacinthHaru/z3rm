@@ -510,10 +510,17 @@ fn render_mermaid_tab_header(
     let code_markdown = markdown;
 
     h_flex()
+        // Preview and Code are two views of one diagram: choosing one unchooses
+        // the other, which is selection rather than two switches that happen to
+        // disagree.
+        .id("mermaid-tabs")
+        .role(gpui::Role::TabList)
+        .aria_label("Diagram view")
         .gap_0p5()
         .mb_2p5()
         .child(
             Button::new(preview_id, "Preview")
+                .aria_role(gpui::Role::Tab)
                 .label_size(LabelSize::Small)
                 .selected_style(ButtonStyle::Tinted(TintColor::Accent))
                 .toggle_state(!showing_code)
@@ -528,6 +535,7 @@ fn render_mermaid_tab_header(
         )
         .child(
             Button::new(code_id, "Code")
+                .aria_role(gpui::Role::Tab)
                 .label_size(LabelSize::Small)
                 .selected_style(ButtonStyle::Tinted(TintColor::Accent))
                 .toggle_state(showing_code)

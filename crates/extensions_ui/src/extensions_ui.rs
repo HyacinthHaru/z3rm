@@ -2038,6 +2038,12 @@ impl Render for ExtensionsPage {
             .child(
                 h_flex()
                     .id("filter-row")
+                    // Picking one category unpicks the rest, which is selection
+                    // rather than a row of independent switches that happen to
+                    // disagree — and it is what decides which extensions the
+                    // list below is showing.
+                    .role(gpui::Role::TabList)
+                    .aria_label("Extension categories")
                     .gap_2()
                     .py_2p5()
                     .px_4()
@@ -2046,6 +2052,7 @@ impl Render for ExtensionsPage {
                     .overflow_x_scroll()
                     .child(
                         Button::new("filter-all-categories", "All")
+                            .aria_role(gpui::Role::Tab)
                             .when(self.provides_filter.is_none(), |button| {
                                 button.style(ButtonStyle::Filled)
                             })
@@ -2072,6 +2079,7 @@ impl Render for ExtensionsPage {
                                     SharedString::from(format!("filter-category-{}", label));
 
                                 Button::new(button_id, label)
+                                    .aria_role(gpui::Role::Tab)
                                     .style(if self.provides_filter == Some(provides) {
                                         ButtonStyle::Filled
                                     } else {

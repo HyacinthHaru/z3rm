@@ -154,6 +154,10 @@ impl<D: PickerDelegate> Picker<D> {
             .when(preview_visible, |this| {
                 this.child(Divider::vertical().mx_1())
                     .child(
+                        // Left as toggles rather than tabs: unlike the sets
+                        // above, each name already describes a distinct
+                        // placement, so "Preview Below, pressed" says which one
+                        // is chosen without needing the grouping.
                         IconButton::new("picker-preview-below", IconName::DiffUnified)
                             .aria_label("Preview Below")
                             .icon_size(IconSize::Small)
