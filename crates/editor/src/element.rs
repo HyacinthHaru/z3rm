@@ -9377,7 +9377,13 @@ impl Element for EditorElement {
                             .unwrap_or_else(|| SharedString::new_static("Editor"))
                         })
                     });
-                    let a11y_text = if self.single_line {
+                    // Only `a11y_synthetic_children` reads this, and that runs
+                    // only while a frame is being built for a reader. Computing
+                    // it unconditionally copied every visible row into a
+                    // `String` on every frame of every editor.
+                    let a11y_text = if !window.is_a11y_active() {
+                        None
+                    } else if self.single_line {
                         let (text, selection) = {
                             let editor = self.editor.read(cx);
                             (
