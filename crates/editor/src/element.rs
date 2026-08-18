@@ -12482,6 +12482,103 @@ mod tests {
         );
     }
 
+    /// The objection that kept the editor silent for four rounds was that
+    /// buffer offsets do not survive folding. So this checks the case the
+    /// objection was about: with a region folded, the rows a reader is given
+    /// have to be the rows on screen, not the ones the fold is hiding.
+    #[gpui::test]
+    async fn test_a_folded_editor_exposes_what_is_left_on_screen(cx: &mut TestAppContext) {
+        init_test(cx, |_| {});
+        let window = cx.add_window(|window, cx| {
+            let buffer = MultiBuffer::build_simple(
+                "fn one() {\n    hidden_by_the_fold();\n}\nfn two() {}\n",
+                cx,
+            );
+            Editor::new(EditorMode::full(), buffer, None, window, cx)
+        });
+        cx.activate_a11y(window.into());
+
+        let read_runs = |cx: &mut TestAppContext| {
+            let json = cx
+                .update_window(window.into(), |_, window, cx| {
+                    window.draw(cx).clear(cx);
+                    window.debug_a11y_tree_json()
+                })
+                .expect("the harness window is still open")
+                .expect("activation makes the debug tree available");
+            let tree: serde_json::Value =
+                serde_json::from_str(&json).expect("the dump is valid JSON");
+            let nodes = tree["nodes"].as_object().expect("the dump lists nodes").clone();
+            nodes
+                .values()
+                .filter_map(|node| node["aria"]["value"].as_str().map(str::to_string))
+                .collect::<Vec<_>>()
+        };
+
+        let unfolded = read_runs(cx);
+        assert!(
+            unfolded.iter().any(|run| run.contains("hidden_by_the_fold")),
+            "the body is on screen before anything is folded: {unfolded:?}"
+        );
+
+        window
+            .update(cx, |editor, window, cx| {
+                editor.fold_at(MultiBufferRow(0), window, cx);
+            })
+            .expect("the harness window is still open");
+
+        let folded = read_runs(cx);
+        assert!(
+            !folded.iter().any(|run| run.contains("hidden_by_the_fold")),
+            "a folded body is not on screen, so it must not be read out: {folded:?}"
+        );
+        assert!(
+            folded.iter().any(|run| run.contains("fn two()")),
+            "what is still on screen still has to be readable: {folded:?}"
+        );
+    }
+
+    /// The caret offset is arithmetic over byte lengths of display rows, so a
+    /// line of multibyte characters is where it would go wrong — either by
+    /// panicking on a character boundary or by pointing somewhere else.
+    #[gpui::test]
+    async fn test_the_caret_survives_multibyte_rows(cx: &mut TestAppContext) {
+        init_test(cx, |_| {});
+        let window = cx.add_window(|window, cx| {
+            let buffer = MultiBuffer::build_simple("日本語のコード\nfn two() {}\n", cx);
+            let mut editor = Editor::new(EditorMode::full(), buffer, None, window, cx);
+            editor.change_selections(Default::default(), window, cx, |selections| {
+                selections.select_ranges([MultiBufferOffset(9)..MultiBufferOffset(9)]);
+            });
+            editor
+        });
+        cx.activate_a11y(window.into());
+
+        let json = cx
+            .update_window(window.into(), |_, window, cx| {
+                window.draw(cx).clear(cx);
+                window.debug_a11y_tree_json()
+            })
+            .expect("the harness window is still open")
+            .expect("activation makes the debug tree available");
+        let tree: serde_json::Value = serde_json::from_str(&json).expect("the dump is valid JSON");
+        let nodes = tree["nodes"].as_object().expect("the dump lists nodes");
+
+        let region = nodes
+            .values()
+            .find(|node| node["aria"]["role"] == "Group")
+            .unwrap_or_else(|| panic!("the editor is a focusable region: {json}"));
+        let selection = region["aria"]["text_selection"]
+            .as_object()
+            .unwrap_or_else(|| panic!("a region carrying text says where the caret is: {region}"));
+        let index = selection["focus"]["character_index"]
+            .as_u64()
+            .unwrap_or_else(|| panic!("the caret has an index: {selection:?}"));
+        // Three characters in, not nine bytes in: an index into the text a
+        // reader is given, which is what a reader will move by.
+        assert_eq!(index, 3, "the caret is counted in characters: {selection:?}");
+    }
+
     /// The inline prompt is built by hand rather than through `Editor::render`,
     /// which is a second render path for the same widget — the shape that hid
     /// the picker query box being invisible. A prompt the user types into has
