@@ -124,6 +124,13 @@ impl Interactivity {
         button: MouseButton,
         listener: impl Fn(&MouseDownEvent, &mut Window, &mut App) + 'static,
     ) {
+        // Only the primary button makes this a control. A right-click handler
+        // is a context-menu affordance and a middle-click one is a shortcut;
+        // neither is the element's own action, and treating them as such made
+        // the accessibility diagnostic report every context menu in the graph.
+        if button == MouseButton::Left {
+            self.has_primary_mouse_down_listener = true;
+        }
         self.mouse_down_listeners
             .push(Box::new(move |event, phase, hitbox, window, cx| {
                 if phase == DispatchPhase::Bubble
@@ -2063,6 +2070,9 @@ pub struct Interactivity {
     pub(crate) click_listeners: Vec<ClickListener>,
     /// Set by [`InteractiveElement::pointer_gesture_only`]. See there.
     pub(crate) pointer_gesture_only: bool,
+    /// Whether anything answers a primary-button press on this element, which
+    /// is what makes it a control whether or not it uses `on_click`.
+    pub(crate) has_primary_mouse_down_listener: bool,
     pub(crate) aux_click_listeners: Vec<ClickListener>,
     pub(crate) drag_listener: Option<(Arc<dyn Any>, DragListener)>,
     pub(crate) hover_listener: Option<Box<dyn Fn(&bool, &mut Window, &mut App)>>,
@@ -2213,9 +2223,12 @@ impl Interactivity {
             },
         );
 
+        // `on_mouse_down` as well as `on_click`: the editor's diff-review
+        // affordance is driven by the former, and a control is a control
+        // whichever listener answers the press.
         if window.a11y.is_building_frame()
             && !self.pointer_gesture_only
-            && !self.click_listeners.is_empty()
+            && !(self.click_listeners.is_empty() && !self.has_primary_mouse_down_listener)
             && self
                 .override_role
                 .filter(|role| *role != accesskit::Role::GenericContainer)

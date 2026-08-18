@@ -1187,6 +1187,12 @@ impl Editor {
 
         h_flex()
             .id("diff_review_button")
+            // An icon and a tooltip, driven by `on_mouse_down` rather than
+            // `on_click` — which is also why the clickable-elements check does
+            // not see it. Without a role it is a control that exists for the
+            // mouse and for nothing else.
+            .role(gpui::Role::Button)
+            .aria_label("Add review comment")
             .cursor_pointer()
             .w(width - px(1.))
             .h(relative(0.9))

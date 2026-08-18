@@ -1101,6 +1101,11 @@ impl Render for Dock {
             let create_resize_handle = || {
                 let handle = div()
                     .id("resize-handle")
+                    // A drag grip. Its primary-button handler only stops
+                    // propagation, and double-clicking it resets the width —
+                    // both pointer gestures, and resizing a dock is not an
+                    // action a reader should be offered.
+                    .pointer_gesture_only()
                     .on_drag(DraggedDock(position), |dock, _, _, cx| {
                         cx.stop_propagation();
                         cx.new(|_| dock.clone())

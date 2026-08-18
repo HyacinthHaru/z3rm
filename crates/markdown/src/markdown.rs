@@ -2920,6 +2920,10 @@ fn image_fallback_element(
 
     div()
         .id("image-fallback")
+        // The notice is a `Label`, so a picture that failed to load reached a
+        // reader as nothing at all — not as a broken image, but as an absence.
+        .role(gpui::Role::Status)
+        .aria_label(label.clone())
         .min_w_0()
         .child(Label::new(label).color(Color::Warning).underline())
         .tooltip(Tooltip::text(

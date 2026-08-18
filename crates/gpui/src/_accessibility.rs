@@ -302,7 +302,8 @@
 //!   "complementary, complementary" offers destinations and refuses to say
 //!   what they are.
 //! - `assert_clickable_elements_are_reachable` — an element that answers a
-//!   click and contains no node at all. Every other check reasons about nodes;
+//!   primary-button press — `on_click` or `on_mouse_down(Left, …)` — and
+//!   contains no node at all. Every other check reasons about nodes;
 //!   this one is about an element that never became one. Mark a drag handle or
 //!   a double-click on background space with
 //!   [`InteractiveElement::pointer_gesture_only`] so the omission is a decision
