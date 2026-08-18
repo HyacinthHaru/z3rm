@@ -1633,11 +1633,15 @@ impl ContextMenu {
                     .aria_role(Role::MenuItem)
                     // The chevron is the only thing that says this entry opens
                     // a submenu rather than doing something, and it is an icon.
-                    // Expanded says both that there is one and whether it is
-                    // showing.
+                    // `aria_expanded` says both that there is one and whether
+                    // it is showing, but it reaches Windows alone — accesskit's
+                    // macOS and AT-SPI adapters expose neither `expanded` nor
+                    // `HasPopup`. So the durable half goes in the label, which
+                    // every platform reads, and Windows adds the open state on
+                    // top of it.
                     .aria_expanded(submenu_is_open)
                     .when(is_active_descendant, |item| item.aria_active_descendant())
-                    .aria_label(label.clone())
+                    .aria_label(format!("{label}, submenu"))
                     .toggle_state(toggle_state)
                     .child(
                         canvas(
@@ -2574,9 +2578,12 @@ mod tests {
             })
             .collect();
         entries.sort_unstable();
+        // The name says there is a submenu on every platform; `expanded` says
+        // whether it is open, and reaches Windows alone. Both, because either
+        // on its own leaves a platform unable to tell a submenu from an action.
         assert_eq!(
             entries,
-            vec![("Copy", None), ("Split", Some(false))],
+            vec![("Copy", None), ("Split, submenu", Some(false))],
             "only the entry with a submenu says it has one, and says it is closed"
         );
     }

@@ -1289,6 +1289,11 @@ pub trait StatefulInteractiveElement: InteractiveElement {
     ///
     /// Note that this does not create a keymap. It simply instructs assistive
     /// technology what the keymap is.
+    ///
+    /// Reaches no platform: none of accesskit's three adapters expose
+    /// `keyboard_shortcut` as of 0.24. Setting it is harmless and correct, and
+    /// it will start being read when an adapter grows support, but do not
+    /// count on the shortcut being announced today.
     fn aria_keyshortcuts(mut self, keyshortcuts: impl Into<SharedString>) -> Self {
         self.interactivity().aria.keyshortcuts = Some(keyshortcuts.into());
         self
@@ -1357,6 +1362,11 @@ pub trait StatefulInteractiveElement: InteractiveElement {
     }
 
     /// Set the expanded state for this element.
+    ///
+    /// Reaches Windows only: neither the macOS nor the AT-SPI adapter exposes
+    /// `expanded` as of accesskit 0.24. On those platforms a disclosure or
+    /// popover trigger says nothing about whether it is open, so if that
+    /// distinction has to be heard it belongs in the label as well.
     fn aria_expanded(mut self, expanded: bool) -> Self {
         self.interactivity().aria.expanded = Some(expanded);
         self
@@ -1384,6 +1394,8 @@ pub trait StatefulInteractiveElement: InteractiveElement {
 
     /// Set the step by which assistive technology should expect the numeric
     /// value of this element to change (e.g. when incrementing a spin button).
+    ///
+    /// Reaches Windows and Linux only; the macOS adapter does not expose it.
     fn aria_numeric_value_step(mut self, step: f64) -> Self {
         self.interactivity().aria.numeric_value_step = Some(step);
         self
@@ -1443,42 +1455,60 @@ pub trait StatefulInteractiveElement: InteractiveElement {
     }
 
     /// Set the heading level of this element.
+    ///
+    /// Reaches macOS and Windows; the AT-SPI adapter does not expose it, so
+    /// tree depth is not announced on Linux.
     fn aria_level(mut self, level: usize) -> Self {
         self.interactivity().aria.level = Some(level);
         self
     }
 
     /// Set the position in set of this element.
+    ///
+    /// Reaches Windows and Linux only: the macOS adapter does not expose
+    /// `position_in_set` as of accesskit 0.24, so "3 of 12" is not announced
+    /// there however carefully it is computed.
     fn aria_position_in_set(mut self, position: usize) -> Self {
         self.interactivity().aria.position_in_set = Some(position);
         self
     }
 
     /// Set the size of set for this element.
+    ///
+    /// Reaches Windows and Linux only; see [`Self::aria_position_in_set`].
     fn aria_size_of_set(mut self, size: usize) -> Self {
         self.interactivity().aria.size_of_set = Some(size);
         self
     }
 
     /// Set the row index for this element.
+    ///
+    /// Reaches Windows only; neither the macOS nor the AT-SPI adapter exposes
+    /// the table position properties.
     fn aria_row_index(mut self, index: usize) -> Self {
         self.interactivity().aria.row_index = Some(index);
         self
     }
 
     /// Set the column index for this element.
+    ///
+    /// Reaches Windows only; see [`Self::aria_row_index`].
     fn aria_column_index(mut self, index: usize) -> Self {
         self.interactivity().aria.column_index = Some(index);
         self
     }
 
     /// Set the row count for this element.
+    ///
+    /// Reaches no platform as of accesskit 0.24; see [`Self::aria_row_index`].
     fn aria_row_count(mut self, count: usize) -> Self {
         self.interactivity().aria.row_count = Some(count);
         self
     }
 
     /// Set the column count for this element.
+    ///
+    /// Reaches no platform as of accesskit 0.24; see [`Self::aria_row_index`].
     fn aria_column_count(mut self, count: usize) -> Self {
         self.interactivity().aria.column_count = Some(count);
         self
