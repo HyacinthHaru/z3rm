@@ -312,8 +312,7 @@ pub mod a11y_checks {
         );
     }
 
-    /// Panics if a live region has no value, which on macOS means it never
-    /// announces anything.
+    /// Panics if a live region has something to say and no value to say it in.
     ///
     /// This is the one check here that is not about how a tree reads. It is
     /// about whether a change is spoken at all, and the answer lives in
@@ -324,9 +323,45 @@ pub mod a11y_checks {
     /// `accesskit_consumer`'s `value()` falls back to the contents of a
     /// single-line text input and to nothing else, so the role does not supply
     /// it and neither does the label.
+    ///
+    /// A live region with nothing in it is not a defect but the required
+    /// shape: a region has to be in the tree before its content arrives, or
+    /// there is no change for the reader to notice. So the check asks whether
+    /// the region carries content *anywhere* — its own label, or a descendant
+    /// with a name — and only then insists the content be in the value.
     #[track_caller]
     pub fn assert_live_regions_can_speak(tree: &serde_json::Value, context: &str) {
-        let mute: Vec<String> = nodes(tree)
+        let nodes = nodes(tree);
+        fn has_something_to_say(
+            nodes: &serde_json::Map<String, serde_json::Value>,
+            node: &serde_json::Value,
+            depth: usize,
+        ) -> bool {
+            // Cycles are impossible in a tree, but a malformed dump should
+            // fail the assertion rather than the stack.
+            if depth > 64 {
+                return false;
+            }
+            if node["aria"]["label"]
+                .as_str()
+                .is_some_and(|label| !label.is_empty())
+            {
+                return true;
+            }
+            node["children"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .filter_map(|id| nodes.get(id.as_str()?))
+                .any(|child| {
+                    child["aria"]["value"]
+                        .as_str()
+                        .is_some_and(|value| !value.is_empty())
+                        || has_something_to_say(nodes, child, depth + 1)
+                })
+        }
+
+        let mute: Vec<String> = nodes
             .values()
             .filter(|node| {
                 node["aria"]["live"]
@@ -334,6 +369,7 @@ pub mod a11y_checks {
                     .is_some_and(|live| live != "Off")
             })
             .filter(|node| node["aria"]["value"].as_str().is_none_or(str::is_empty))
+            .filter(|node| has_something_to_say(nodes, node, 0))
             .map(|node| {
                 format!(
                     "{} (live {}, label {})",
@@ -343,8 +379,8 @@ pub mod a11y_checks {
             .collect();
         assert!(
             mute.is_empty(),
-            "{context}: these live regions have no value, so they announce \
-             nothing: {mute:?}"
+            "{context}: these live regions have content but no value, so they \
+             announce nothing: {mute:?}"
         );
     }
 
@@ -752,6 +788,21 @@ mod a11y_check_tests {
         json!({ "nodes": { "0": { "element_id": "region", "aria": aria } } })
     }
 
+    /// A live region whose content hangs off it as children, which is how the
+    /// toast layer is built.
+    fn live_region_with_child(child: serde_json::Value) -> serde_json::Value {
+        json!({
+            "nodes": {
+                "0": {
+                    "element_id": "region",
+                    "aria": { "role": "Status", "live": "Polite" },
+                    "children": ["1"],
+                },
+                "1": { "element_id": "content", "aria": child },
+            }
+        })
+    }
+
     /// The shape every live region in the app had: polite, labelled, and with
     /// no value, which raises no announcement at all.
     #[test]
@@ -788,6 +839,24 @@ mod a11y_check_tests {
     fn an_empty_value_is_reported_too() {
         let tree = live_region(Some("Polite"), Some("Recording"), Some(""));
         assert_live_regions_can_speak(&tree, "keystroke input");
+    }
+
+    /// The required shape, not a defect: the region has to be in the tree
+    /// before its content arrives or there is no change to notice. Empty, it
+    /// has nothing to say and no value is the honest answer.
+    #[test]
+    fn an_empty_live_region_waiting_for_content_is_fine() {
+        let tree = live_region(Some("Polite"), None, None);
+        assert_live_regions_can_speak(&tree, "toast layer");
+    }
+
+    /// Content hanging off the region as a child node is still content the
+    /// user is meant to hear, and it is still not what gets announced.
+    #[test]
+    #[should_panic(expected = "announce")]
+    fn a_live_region_whose_content_is_a_child_is_reported() {
+        let tree = live_region_with_child(json!({ "label": "Project saved" }));
+        assert_live_regions_can_speak(&tree, "toast layer");
     }
 
     fn tree(node_rects: &[(f64, f64, f64, f64)], clickable: &[(f64, f64, f64, f64)]) -> serde_json::Value {
