@@ -36,7 +36,14 @@ pub trait ButtonCommon: Clickable + Disableable {
     ///
     /// A menu trigger is a disclosure, not a two-state toggle: without this it
     /// is announced as "not pressed", which says nothing about the menu.
+    /// Reaches Windows alone, so a control that opens something should say so
+    /// through [`Self::aria_role_description`] as well.
     fn aria_expanded(self, expanded: bool) -> Self;
+
+    /// What a reader says in place of "button" — "menu button" for a control
+    /// that opens a menu. Unlike `aria_expanded` this reaches all three
+    /// platforms, so it is where the kind of control belongs.
+    fn aria_role_description(self, role_description: impl Into<SharedString>) -> Self;
 
     /// The tooltip that shows when a user hovers over the button.
     ///
@@ -499,6 +506,7 @@ pub struct ButtonLike {
     size: ButtonSize,
     rounding: Option<ButtonLikeRounding>,
     pub(super) aria_label: Option<SharedString>,
+    pub(super) aria_role_description: Option<SharedString>,
     aria_description: Option<SharedString>,
     pub(super) aria_value: Option<SharedString>,
     pub(super) aria_keyshortcuts: Option<SharedString>,
@@ -532,6 +540,7 @@ impl ButtonLike {
             size: ButtonSize::Default,
             rounding: Some(ButtonLikeRounding::ALL),
             aria_label: None,
+            aria_role_description: None,
             aria_description: None,
             aria_value: None,
             aria_keyshortcuts: None,
@@ -595,6 +604,14 @@ impl ButtonLike {
     }
 
     /// Sets the label announced by assistive technology for this button.
+    /// What a reader says in place of "button" — "menu button" for a control
+    /// that opens a menu. Unlike `aria_expanded` this reaches all three
+    /// platforms, so it is where the kind of control belongs.
+    pub fn aria_role_description(mut self, role_description: impl Into<SharedString>) -> Self {
+        self.aria_role_description = Some(role_description.into());
+        self
+    }
+
     pub fn aria_label(mut self, label: impl Into<SharedString>) -> Self {
         self.aria_label = Some(label.into());
         self
@@ -700,6 +717,10 @@ impl FixedWidth for ButtonLike {
 }
 
 impl ButtonCommon for ButtonLike {
+    fn aria_role_description(self, role_description: impl Into<SharedString>) -> Self {
+        Self::aria_role_description(self, role_description)
+    }
+
     fn aria_expanded(self, expanded: bool) -> Self {
         Self::aria_expanded(self, expanded)
     }
@@ -769,6 +790,9 @@ impl RenderOnce for ButtonLike {
             .id(self.id.clone())
             .role(self.aria_role.unwrap_or(Role::Button))
             .when_some(self.aria_label, |this, label| this.aria_label(label))
+            .when_some(self.aria_role_description, |this, role_description| {
+                this.aria_role_description(role_description)
+            })
             .when_some(self.aria_keyshortcuts, |this, keyshortcuts| {
                 this.aria_keyshortcuts(keyshortcuts)
             })

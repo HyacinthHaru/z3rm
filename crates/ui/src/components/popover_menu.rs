@@ -208,7 +208,13 @@ impl<M: ManagedView> PopoverMenu<M> {
             // not, which describes a two-state control rather than one that
             // opens a menu; saying it is expanded is both the truth and what
             // suppresses the toggle semantics.
-            t.aria_expanded(open)
+            //
+            // `expanded` reaches Windows alone, though, and suppressing the
+            // toggle leaves the other two platforms with a button that says
+            // nothing about the menu at all — worse than the "pressed" it
+            // replaced. The role description is what they do read.
+            t.aria_role_description("menu button")
+                .aria_expanded(open)
                 .toggle_state(open)
                 .when_some(builder, |el, builder| {
                     el.on_click(move |_, window, cx| {
@@ -510,5 +516,71 @@ impl<M: ManagedView> IntoElement for PopoverMenu<M> {
 
     fn into_element(self) -> Self::Element {
         self
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{ContextMenu, IconButton, IconName, Tooltip};
+    use gpui::TestAppContext;
+
+    /// A button that opens a menu is still a button as far as the roles go.
+    /// `aria_expanded` is what says otherwise and it reaches Windows alone, so
+    /// without a role description the other two platforms describe a menu
+    /// trigger exactly as they describe a control that does something.
+    #[gpui::test]
+    fn a_menu_trigger_says_it_opens_a_menu(cx: &mut TestAppContext) {
+        cx.update(|cx| {
+            let settings_store = settings::SettingsStore::test(cx);
+            cx.set_global(settings_store);
+            theme_settings::init(theme::LoadThemes::JustBase, cx);
+        });
+
+        struct Host;
+        impl Render for Host {
+            fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+                PopoverMenu::new("menu")
+                    .menu(move |window, cx| {
+                        Some(ContextMenu::build(window, cx, |menu, _, _| {
+                            menu.entry("Split Right", None, |_, _| {})
+                        }))
+                    })
+                    .trigger_with_tooltip(
+                        IconButton::new("trigger", IconName::Ellipsis).aria_label("Pane options"),
+                        Tooltip::text("Pane options"),
+                    )
+            }
+        }
+
+        let window = cx.add_window(|_, _| Host);
+        cx.activate_a11y(window.into());
+        let json = cx
+            .update_window(window.into(), |_, window, cx| {
+                window.draw(cx).clear(cx);
+                window.debug_a11y_tree_json()
+            })
+            .expect("the harness window is still open")
+            .expect("activation makes the debug tree available");
+        let tree: serde_json::Value = serde_json::from_str(&json).expect("the dump is valid JSON");
+        gpui::a11y_checks::assert_interactive_nodes_are_named(&tree, "menu trigger");
+        gpui::a11y_checks::assert_no_role_was_discarded(&tree, "menu trigger");
+
+        let trigger = tree["nodes"]
+            .as_object()
+            .expect("the dump lists nodes")
+            .values()
+            .find(|node| node["aria"]["label"] == "Pane options")
+            .unwrap_or_else(|| panic!("the trigger reaches the tree: {json}"));
+        assert_eq!(
+            trigger["aria"]["role_description"].as_str(),
+            Some("menu button"),
+            "the one channel all three platforms read has to say what this opens"
+        );
+        assert_eq!(
+            trigger["aria"]["expanded"].as_bool(),
+            Some(false),
+            "and Windows still gets the closed state on top of it"
+        );
     }
 }
