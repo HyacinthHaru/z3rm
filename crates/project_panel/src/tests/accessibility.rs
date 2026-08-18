@@ -120,6 +120,20 @@ async fn the_file_tree_is_exposed_as_a_named_tree(cx: &mut gpui::TestAppContext)
                 .all(|(name, level)| !name.is_empty() && *level >= 1),
             "every row needs a name and a 1-based depth: {rows:?}"
         );
+
+        // A folder and a file are both outline rows on macOS, and `expanded` —
+        // the one property that would imply a folder — reaches Windows alone,
+        // so the name is where the distinction has to survive.
+        assert!(
+            rows.iter()
+                .any(|(name, _)| name.starts_with("src") && name.contains("folder")),
+            "a directory row has to say it is one: {rows:?}"
+        );
+        assert!(
+            rows.iter()
+                .any(|(name, _)| name.starts_with("README.md") && !name.contains("folder")),
+            "and a file row has to not: {rows:?}"
+        );
     }
 }
 
@@ -199,7 +213,11 @@ async fn a_modified_file_says_it_is_modified(cx: &mut gpui::TestAppContext) {
         rows,
         // A folder's summary is about what is inside it: the dot beside a
         // folder does not mean the folder itself was modified.
-        vec!["edited.rs, modified", "src, contains changes", "untouched.rs"],
+        vec![
+            "edited.rs, modified",
+            "src, folder, contains changes",
+            "untouched.rs",
+        ],
         "the colour beside the name is the only other thing that says this"
     );
 }
