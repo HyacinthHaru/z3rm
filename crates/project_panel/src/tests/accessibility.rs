@@ -140,7 +140,46 @@ async fn the_file_tree_is_exposed_as_a_named_tree(cx: &mut gpui::TestAppContext)
                 .any(|(name, kind, _)| name.starts_with("README.md") && kind.is_none()),
             "and a file row has to not: {rows:?}"
         );
+
+        // Whether a folder is open decides what the next arrow-down lands on.
+        // `aria_expanded` says it and reaches Windows alone, so the name has
+        // to say it too or macOS and Linux hear a tree with no state in it.
+        assert!(
+            rows.iter()
+                .any(|(name, _, _)| name == "src, collapsed"),
+            "a closed folder has to say it is closed: {rows:?}"
+        );
     }
+
+    // And the other half: the state has to follow the folder, not be a fixed
+    // word. Expanding through the panel's own action rather than by poking the
+    // set, so this covers the path the keyboard takes.
+    panel.update_in(&mut cx, |panel, window, cx| {
+        panel.select_first(&Default::default(), window, cx);
+        // Past the worktree root, which opens by itself, onto `src`.
+        panel.select_next(&Default::default(), window, cx);
+        panel.expand_selected_entry(&Default::default(), window, cx);
+    });
+    cx.run_until_parked();
+
+    let json = cx
+        .update(|window, cx| {
+            window.draw(cx).clear(cx);
+            window.debug_a11y_tree_json()
+        })
+        .expect("activation makes the debug tree available");
+    let tree: serde_json::Value = serde_json::from_str(&json).expect("the dump is valid JSON");
+    let expanded: Vec<&str> = tree["nodes"]
+        .as_object()
+        .expect("the dump lists nodes")
+        .values()
+        .filter(|node| node["aria"]["role"] == "TreeItem")
+        .filter_map(|node| node["aria"]["label"].as_str())
+        .collect();
+    assert!(
+        expanded.contains(&"src, expanded"),
+        "an opened folder has to say it is open: {expanded:?}"
+    );
 }
 
 /// A modified file is shown in a different colour, with a small "M" beside it
@@ -221,7 +260,11 @@ async fn a_modified_file_says_it_is_modified(cx: &mut gpui::TestAppContext) {
         rows,
         // A folder's summary is about what is inside it: the dot beside a
         // folder does not mean the folder itself was modified.
-        vec!["edited.rs, modified", "src, contains changes", "untouched.rs"],
+        vec![
+            "edited.rs, modified",
+            "src, collapsed, contains changes",
+            "untouched.rs",
+        ],
         "the colour beside the name is the only other thing that says this"
     );
 }

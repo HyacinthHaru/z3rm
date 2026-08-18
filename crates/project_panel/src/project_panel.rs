@@ -5504,6 +5504,19 @@ impl ProjectPanel {
         // a reader can reach, so both go into the name.
         let announced_name = {
             let mut name = details.filename.clone().to_string();
+            // Whether a folder is open decides what the next arrow-down lands
+            // on, and `aria_expanded` below — the property that says it —
+            // reaches Windows alone. `Role::TreeItem` is an outline row on
+            // macOS, where VoiceOver would say this from `AXDisclosing`, which
+            // accesskit does not set. So it goes in the name as well, and
+            // Windows hears it from both.
+            if kind.is_dir() {
+                name.push_str(if details.is_expanded {
+                    ", expanded"
+                } else {
+                    ", collapsed"
+                });
+            }
             if let Some((_, status, _)) = git_status_indicator(details.git_status) {
                 // A directory's summary is about what is inside it — the dot
                 // beside a folder means "something in here changed", not that
