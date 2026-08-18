@@ -697,6 +697,21 @@ impl Focusable for ProjectSearchView {
     }
 }
 
+/// A search tab's text, cut to `query_limit` characters or whole.
+///
+/// The newlines go in both cases: a query pasted from a file would otherwise
+/// draw over two lines and be read aloud as two, and neither is wanted.
+fn search_tab_text(query: Option<&str>, query_limit: Option<usize>) -> SharedString {
+    let Some(query) = query.map(|query| query.replace('\n', "")).filter(|query| !query.is_empty())
+    else {
+        return "Project Search".into();
+    };
+    match query_limit {
+        Some(limit) => util::truncate_and_trailoff(&query, limit).into(),
+        None => query.into(),
+    }
+}
+
 impl Item for ProjectSearchView {
     type Event = ViewEvent;
     fn tab_tooltip_text(&self, cx: &App) -> Option<SharedString> {
@@ -737,20 +752,18 @@ impl Item for ProjectSearchView {
     }
 
     fn tab_content_text(&self, _detail: usize, cx: &App) -> SharedString {
-        let last_query: Option<SharedString> = self
-            .entity
-            .read(cx)
-            .last_search_query_text
-            .as_ref()
-            .map(|query| {
-                let query = query.replace('\n', "");
-                let query_text = util::truncate_and_trailoff(&query, MAX_TAB_TITLE_LEN);
-                query_text.into()
-            });
+        search_tab_text(
+            self.entity.read(cx).last_search_query_text.as_deref(),
+            Some(MAX_TAB_TITLE_LEN),
+        )
+    }
 
-        last_query
-            .filter(|query| !query.is_empty())
-            .unwrap_or_else(|| "Project Search".into())
+    fn tab_announcement_text(&self, _detail: usize, cx: &App) -> SharedString {
+        // Uncut. The query is the only thing telling one search tab from
+        // another, and two searches sharing their first characters are exactly
+        // the pair a user has open at once. The strip has a width to respect;
+        // a reader given one tab at a time does not.
+        search_tab_text(self.entity.read(cx).last_search_query_text.as_deref(), None)
     }
 
     fn telemetry_event_text(&self) -> Option<&'static str> {
@@ -2827,6 +2840,34 @@ pub fn perform_project_search(
 
 #[cfg(test)]
 pub mod tests {
+
+    /// A search tab is titled with the query, cut to fit the strip. That is
+    /// the only thing telling one search from another, and two searches that
+    /// share their opening are exactly the pair someone has open at once — so
+    /// a reader, who is given one tab at a time and cannot hover, gets it
+    /// whole.
+    #[test]
+    fn a_search_tab_is_cut_for_the_strip_and_not_for_a_reader() {
+        const QUERY: &str = "fn render(&mut self, window: &mut Window, cx: &mut Context<Self>)";
+
+        let drawn = super::search_tab_text(Some(QUERY), Some(MAX_TAB_TITLE_LEN));
+        let announced = super::search_tab_text(Some(QUERY), None);
+
+        assert!(
+            drawn.len() < QUERY.len(),
+            "the strip's title is cut: {drawn}"
+        );
+        assert_eq!(announced, QUERY, "the announced one is not");
+
+        // A query pasted out of a file carries newlines, which would draw over
+        // two lines and be read aloud as two. Both drop them.
+        let pasted = super::search_tab_text(Some("first\nsecond"), None);
+        assert_eq!(pasted, "firstsecond");
+
+        // No query yet, and the tab still has to be called something.
+        assert_eq!(super::search_tab_text(None, None), "Project Search");
+        assert_eq!(super::search_tab_text(Some(""), None), "Project Search");
+    }
     use std::{
         path::PathBuf,
         sync::{
