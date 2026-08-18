@@ -1393,6 +1393,65 @@ async fn the_stacked_tab_bar_is_still_a_tab_list(cx: &mut TestAppContext) {
     );
 }
 
+/// A tab draws its state and says none of it: struck through for a file that
+/// is gone, italic for one the next file will replace, a coloured dot for
+/// unsaved work. All three change what the next keystroke does.
+#[gpui::test]
+async fn a_tab_says_the_state_it_draws(cx: &mut TestAppContext) {
+    init_test(cx);
+    let fs = FakeFs::new(cx.executor());
+    fs.insert_tree("/root", json!({ "a.txt": "" })).await;
+    let project = Project::test(fs, [path!("/root").as_ref()], cx).await;
+
+    let (multi_workspace, cx) =
+        cx.add_window_view(|window, cx| MultiWorkspace::test_new(project, window, cx));
+    let workspace = multi_workspace.read_with(cx, |mw, _| mw.workspace().clone());
+    let pane = workspace.read_with(cx, |ws, _| ws.active_pane().clone());
+
+    pane.update_in(cx, |pane, window, cx| {
+        pane.add_item(
+            Box::new(cx.new(|cx| TestItem::new(cx).with_label("saved.rs"))),
+            true,
+            true,
+            None,
+            window,
+            cx,
+        );
+        pane.add_item(
+            Box::new(cx.new(|cx| TestItem::new(cx).with_label("edited.rs").with_dirty(true))),
+            true,
+            true,
+            None,
+            window,
+            cx,
+        );
+    });
+    cx.run_until_parked();
+
+    cx.activate_a11y(cx.window_handle());
+    let json = cx
+        .update(|window, cx| {
+            window.draw(cx).clear(cx);
+            window.debug_a11y_tree_json()
+        })
+        .expect("activation makes the debug tree available");
+    let tree: serde_json::Value = serde_json::from_str(&json).expect("the dump is valid JSON");
+
+    let mut tabs: Vec<&str> = tree["nodes"]
+        .as_object()
+        .expect("the dump lists nodes")
+        .values()
+        .filter(|node| node["aria"]["role"] == "Tab")
+        .filter_map(|node| node["aria"]["label"].as_str())
+        .collect();
+    tabs.sort_unstable();
+    assert_eq!(
+        tabs,
+        vec!["edited.rs, unsaved changes", "saved.rs"],
+        "a dot in the corner is the only other thing that says this"
+    );
+}
+
 /// Opening a dialog moves focus into it; closing one has to give focus back.
 /// Every other accessibility test on this branch reads one frame, and this is
 /// not visible in one: a dialog that leaves focus nowhere looks identical to a

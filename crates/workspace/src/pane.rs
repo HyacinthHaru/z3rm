@@ -2880,7 +2880,7 @@ impl Pane {
             // `tab_content` renders arbitrary elements, so the announced name
             // comes from the item's own text rather than the rendered tab, and
             // carries the state its indicator dot shows in colour alone.
-            .aria_label(tab_announcement(item, detail, cx))
+            .aria_label(tab_announcement(item, detail, is_preview, cx))
             // Pinned tabs render in their own tab bar, so a tab's place is
             // within the bar it is actually in. Numbering across both makes the
             // first unpinned tab "3 of 7" inside a list of five.
@@ -4999,12 +4999,34 @@ pub fn tab_details(items: &[Box<dyn ItemHandle>], _window: &Window, cx: &App) ->
 /// The name a tab announces. The indicator beside it is a coloured dot, which
 /// contributes no accessibility node, so whether the file has unsaved changes
 /// or has moved under the editor reaches a reader only as part of this name.
-pub fn tab_announcement(item: &dyn ItemHandle, detail: usize, cx: &App) -> SharedString {
+pub fn tab_announcement(
+    item: &dyn ItemHandle,
+    detail: usize,
+    is_preview: bool,
+    cx: &App,
+) -> SharedString {
     let name = item.tab_content_text(detail, cx);
+    let mut parts = vec![name.to_string()];
+    // A tab draws each of these and says none of them: a struck-through title
+    // for a file that is gone, an italic one for a tab the next file will
+    // replace, and a coloured dot for unsaved work.
+    if item.has_deleted_file(cx) {
+        parts.push("deleted on disk".to_string());
+    }
     match (item.has_conflict(cx), item.is_dirty(cx)) {
-        (true, _) => SharedString::from(format!("{name}, changed on disk")),
-        (_, true) => SharedString::from(format!("{name}, unsaved changes")),
-        (false, false) => name,
+        (true, _) => parts.push("changed on disk".to_string()),
+        (_, true) => parts.push("unsaved changes".to_string()),
+        (false, false) => {}
+    }
+    // Typing in a preview tab is what makes it permanent, so which kind of tab
+    // it is changes what the next keystroke does.
+    if is_preview {
+        parts.push("preview".to_string());
+    }
+    if parts.len() == 1 {
+        name
+    } else {
+        SharedString::from(parts.join(", "))
     }
 }
 

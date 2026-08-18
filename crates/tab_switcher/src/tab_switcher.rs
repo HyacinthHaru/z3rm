@@ -733,6 +733,9 @@ impl PickerDelegate for TabSwitcherDelegate {
         Some(workspace::pane::tab_announcement(
             tab_match.item.as_ref(),
             tab_match.detail,
+            // The switcher lists tabs rather than drawing them, so it has no
+            // preview styling of its own to contradict.
+            false,
             cx,
         ))
     }

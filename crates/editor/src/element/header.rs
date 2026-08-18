@@ -694,6 +694,16 @@ pub(crate) fn render_buffer_header(
         (_, Some(file)) => file.to_string().into(),
         (_, None) => MultiBuffer::DEFAULT_TITLE.into(),
     };
+    // The header says all of this in colour, and strikes the name through when
+    // the file is gone. `file_status_label_color` is the whole vocabulary, and
+    // none of it survives being read out.
+    let announced_path: SharedString = match file_status {
+        Some(status) if status.is_conflicted() => format!("{announced_path}, conflicted").into(),
+        Some(status) if status.is_deleted() => format!("{announced_path}, deleted").into(),
+        Some(status) if status.is_created() => format!("{announced_path}, added").into(),
+        Some(status) if status.is_modified() => format!("{announced_path}, modified").into(),
+        _ => announced_path,
+    };
     let focus_handle = editor_read.focus_handle(cx);
     let colors = cx.theme().colors();
     // On transparent windows `editor_subheader_background` stacks over the
