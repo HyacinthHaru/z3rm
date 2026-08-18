@@ -4155,6 +4155,58 @@ mod tests {
         });
     }
 
+    /// Markdown is what a language server prompt, a hover and the docs are
+    /// rendered with, and its accessibility had never been read out of a drawn
+    /// frame — the element reports itself as a region carrying its source text,
+    /// and nothing checked that the text arrives.
+    #[gpui::test]
+    fn a_markdown_view_carries_its_text_into_the_tree(cx: &mut TestAppContext) {
+        struct Host(Entity<Markdown>);
+
+        impl Render for Host {
+            fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+                div().child(MarkdownElement::new(self.0.clone(), MarkdownStyle::default()))
+            }
+        }
+
+        ensure_theme_initialized(cx);
+        let source = "A [link](https://example.com) and some `code`.";
+        // Built inside the window, so the element is actually in the tree. A
+        // markdown entity created beside a window that renders something else
+        // draws nothing, and every assertion below would pass over an empty
+        // tree without saying so.
+        let (_host, cx) = cx.add_window_view(|_, cx| {
+            Host(cx.new(|cx| Markdown::new(source.into(), None, None, cx)))
+        });
+        cx.run_until_parked();
+
+        cx.activate_a11y(cx.window_handle());
+        let json = cx
+            .update(|window, cx| {
+                window.draw(cx).clear(cx);
+                window.debug_a11y_tree_json()
+            })
+            .expect("activation makes the debug tree available");
+        let tree: serde_json::Value = serde_json::from_str(&json).expect("the dump is valid JSON");
+        gpui::a11y_checks::assert_no_role_was_discarded(&tree, "markdown");
+        gpui::a11y_checks::assert_no_aria_was_discarded(&tree, "markdown");
+        gpui::a11y_checks::assert_names_are_distinguishable(&tree, "markdown");
+        gpui::a11y_checks::assert_focusable_names_are_distinguishable(&tree, "markdown");
+        gpui::a11y_checks::assert_live_regions_can_speak(&tree, "markdown");
+
+        let runs: Vec<String> = tree["nodes"]
+            .as_object()
+            .expect("the dump lists nodes")
+            .values()
+            .filter(|node| node["aria"]["role"] == "TextRun")
+            .filter_map(|node| node["aria"]["value"].as_str().map(str::to_string))
+            .collect();
+        assert!(
+            runs.iter().any(|run| run.contains("link")),
+            "the rendered text has to reach the tree: {runs:?}"
+        );
+    }
+
     #[gpui::test]
     fn test_code_block_controls_are_unique_across_markdown_entities(cx: &mut TestAppContext) {
         struct TestWindow;

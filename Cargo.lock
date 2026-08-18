@@ -7112,6 +7112,7 @@ dependencies = [
  "log",
  "markup5ever_rcdom",
  "pulldown-cmark 0.13.0",
+ "serde_json",
  "settings",
  "smallvec",
  "stacksafe",

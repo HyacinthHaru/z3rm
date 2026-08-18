@@ -1035,7 +1035,7 @@ async fn test_the_live_regions_exist_before_they_have_anything_to_say(cx: &mut T
 /// dialog the user is now inside.
 #[gpui::test]
 async fn test_modal_is_announced_as_a_dialog(cx: &mut TestAppContext) {
-    use gpui::{Context, EventEmitter, InteractiveElement as _, IntoElement, ParentElement as _,
+    use gpui::{Context, EventEmitter, InteractiveElement as _, IntoElement,
         Render, StatefulInteractiveElement as _, Styled as _, Window};
 
     struct TestModal {

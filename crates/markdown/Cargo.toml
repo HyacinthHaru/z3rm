@@ -79,6 +79,9 @@ workspace = true
 [dev-dependencies.assets]
 workspace = true
 
+[dev-dependencies.serde_json]
+workspace = true
+
 [dev-dependencies.env_logger]
 workspace = true
 
