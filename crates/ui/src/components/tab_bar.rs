@@ -11,27 +11,26 @@ pub struct TabBar {
     children: SmallVec<[AnyElement; 2]>,
     end_children: SmallVec<[AnyElement; 2]>,
     scroll_handle: Option<ScrollHandle>,
-    aria_label: Option<SharedString>,
+    /// Names the list of tabs.
+    ///
+    /// Required rather than a builder, and unlike most of this component's
+    /// options it cannot be left out: the `TabList` role is set either way, so
+    /// a bar with no name is a node announced as a bare "tab list". A window
+    /// with more than one of them — pinned tabs beside unpinned ones — then
+    /// offers a reader two lists it cannot tell apart.
+    aria_label: SharedString,
 }
 
 impl TabBar {
-    pub fn new(id: impl Into<ElementId>) -> Self {
+    pub fn new(id: impl Into<ElementId>, aria_label: impl Into<SharedString>) -> Self {
         Self {
             id: id.into(),
             start_children: SmallVec::new(),
             children: SmallVec::new(),
             end_children: SmallVec::new(),
             scroll_handle: None,
-            aria_label: None,
+            aria_label: aria_label.into(),
         }
-    }
-
-    /// Names the list of tabs. A window with more than one tab bar in it —
-    /// pinned tabs beside unpinned ones — otherwise offers a reader two lists
-    /// it cannot tell apart.
-    pub fn aria_label(mut self, label: impl Into<SharedString>) -> Self {
-        self.aria_label = Some(label.into());
-        self
     }
 
     pub fn track_scroll(mut self, scroll_handle: &ScrollHandle) -> Self {
@@ -143,7 +142,7 @@ impl RenderOnce for TabBar {
                             // the toolbar buttons in the start/end slots stay
                             // outside the set.
                             .role(gpui::Role::TabList)
-                            .when_some(self.aria_label, |this, label| this.aria_label(label))
+                            .aria_label(self.aria_label)
                             .flex_grow_1()
                             .overflow_x_scroll()
                             .when_some(self.scroll_handle, |cx, scroll_handle| {
@@ -190,11 +189,11 @@ impl Component for TabBar {
                     vec![
                         single_example(
                             "Empty TabBar",
-                            TabBar::new("empty_tab_bar").into_any_element(),
+                            TabBar::new("empty_tab_bar", "Tabs").into_any_element(),
                         ),
                         single_example(
                             "With Tabs",
-                            TabBar::new("tab_bar_with_tabs")
+                            TabBar::new("tab_bar_with_tabs", "Tabs")
                                 .child(Tab::new("tab1"))
                                 .child(Tab::new("tab2"))
                                 .child(Tab::new("tab3"))
@@ -206,7 +205,7 @@ impl Component for TabBar {
                     "With Start and End Children",
                     vec![single_example(
                         "Full TabBar",
-                        TabBar::new("full_tab_bar")
+                        TabBar::new("full_tab_bar", "Tabs")
                             .start_child(Button::new("start_button", "Start"))
                             .child(Tab::new("tab1"))
                             .child(Tab::new("tab2"))
@@ -229,7 +228,7 @@ mod tests {
 
     impl Render for TabBarHarness {
         fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
-            TabBar::new("test-tab-bar")
+            TabBar::new("test-tab-bar", "Tabs")
                 .start_child(Button::new("new-tab", "New"))
                 .child(Tab::new("shell").aria_label("shell"))
                 .child(Tab::new("logs").aria_label("logs").toggle_state(true))

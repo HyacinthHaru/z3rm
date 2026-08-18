@@ -3545,7 +3545,7 @@ impl Pane {
                 // Named for the same reason the split bars are: a reader
                 // offers a tab list as somewhere to jump to, and an unnamed
                 // one says nothing about where that is.
-                TabBar::new("tab_bar").aria_label("Tabs"),
+                TabBar::new("tab_bar", "Tabs"),
                 navigate_backward,
                 navigate_forward,
                 window,
@@ -3583,7 +3583,7 @@ impl Pane {
     ) -> AnyElement {
         let pinned_tab_bar = self
             .configure_tab_bar_start(
-                TabBar::new("pinned_tab_bar").aria_label("Pinned tabs"),
+                TabBar::new("pinned_tab_bar", "Pinned tabs"),
                 navigate_backward,
                 navigate_forward,
                 window,
@@ -3603,8 +3603,7 @@ impl Pane {
             .flex_none()
             .child(pinned_tab_bar)
             .child(
-                TabBar::new("unpinned_tab_bar")
-                    .aria_label("Tabs")
+                TabBar::new("unpinned_tab_bar", "Tabs")
                     .child(self.render_unpinned_tabs_container(
                     unpinned_tabs,
                     tab_count,
