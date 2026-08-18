@@ -1299,6 +1299,15 @@ impl<D: PickerDelegate> Picker<D> {
         let item_bounds = self.item_bounds.clone();
         let selectable =
             ix < self.delegate.match_count() && self.delegate.can_select(ix, window, cx);
+        // Whether a row can be landed on and what it is called are decided by
+        // two different delegate methods, and nothing has been keeping them in
+        // step. Where they drift the row is announced as a bare "option": the
+        // file finder's create-file row was selectable and nameless because it
+        // was the one match with no path for `match_label` to fall back on.
+        debug_assert!(
+            !selectable || self.delegate.match_label(ix, cx).is_some(),
+            "picker row {ix} is selectable but has no name to announce"
+        );
 
         let supports_multi_select = self.delegate.supports_multi_select();
         let is_multi_selected = supports_multi_select && self.delegate.is_item_selected(ix);
