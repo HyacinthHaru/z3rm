@@ -3668,6 +3668,14 @@ impl SettingsWindow {
                 let original_window = self.original_window;
                 restricted_banner = Banner::new()
                     .severity(Severity::Warning)
+                    // Unlike the banner above it, this one had no name — so it
+                    // produced no node, both its lines being `Label`s, and the
+                    // only thing reaching a reader was a button reading
+                    // "Manage Trust" with nothing saying what was restricted.
+                    .aria_label(
+                        "Restricted Mode. This project is in restricted mode. \
+                         Some project settings may not apply.",
+                    )
                     .child(
                         v_flex()
                             .my_0p5()
