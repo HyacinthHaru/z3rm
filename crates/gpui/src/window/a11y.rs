@@ -1744,6 +1744,7 @@ mod activation_tests {
 
         crate::test::a11y_checks::assert_landmarks_are_distinguishable(&tree, "two panels");
         crate::test::a11y_checks::assert_names_are_distinguishable(&tree, "two panels");
+        crate::test::a11y_checks::assert_focusable_names_are_distinguishable(&tree, "two panels");
         crate::test::a11y_checks::assert_clickable_elements_are_reachable(&tree, "two panels");
         crate::test::a11y_checks::assert_no_role_was_discarded(&tree, "two panels");
         crate::test::a11y_checks::assert_no_aria_was_discarded(&tree, "two panels");

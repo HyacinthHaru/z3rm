@@ -563,6 +563,7 @@ mod tests {
 
         gpui::a11y_checks::assert_interactive_nodes_are_named(&tree, "diff review");
         gpui::a11y_checks::assert_names_are_distinguishable(&tree, "diff review");
+        gpui::a11y_checks::assert_focusable_names_are_distinguishable(&tree, "diff review");
         gpui::a11y_checks::assert_clickable_elements_are_reachable(&tree, "diff review");
         gpui::a11y_checks::assert_controls_have_area(&tree, "diff review");
         gpui::a11y_checks::assert_landmarks_are_distinguishable(&tree, "diff review");

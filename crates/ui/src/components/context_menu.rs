@@ -2565,6 +2565,7 @@ mod tests {
         let tree: serde_json::Value = serde_json::from_str(&json).expect("the dump is valid JSON");
         gpui::a11y_checks::assert_interactive_nodes_are_named(&tree, "submenu entry");
         gpui::a11y_checks::assert_names_are_distinguishable(&tree, "submenu entry");
+        gpui::a11y_checks::assert_focusable_names_are_distinguishable(&tree, "submenu entry");
 
         let mut entries: Vec<(&str, Option<&str>, Option<bool>)> = tree["nodes"]
             .as_object()
@@ -2635,6 +2636,7 @@ mod tests {
         let tree: serde_json::Value = serde_json::from_str(&json).expect("the dump is valid JSON");
         gpui::a11y_checks::assert_interactive_nodes_are_named(&tree, "context menu");
         gpui::a11y_checks::assert_names_are_distinguishable(&tree, "context menu");
+        gpui::a11y_checks::assert_focusable_names_are_distinguishable(&tree, "context menu");
         gpui::a11y_checks::assert_clickable_elements_are_reachable(&tree, "context menu");
         gpui::a11y_checks::assert_click_targets_are_reachable(&tree, "context menu");
         gpui::a11y_checks::assert_controls_have_area(&tree, "context menu");

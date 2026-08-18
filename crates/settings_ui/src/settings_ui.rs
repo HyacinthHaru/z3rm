@@ -5258,6 +5258,7 @@ pub mod test {
         // A page is a column of near-identical rows, so this is the window most
         // likely to offer the same name several times over.
         gpui::a11y_checks::assert_names_are_distinguishable(&tree, "settings window");
+        gpui::a11y_checks::assert_focusable_names_are_distinguishable(&tree, "settings window");
 
         // One visible search box is one input. The wrapper carries the role,
         // the name and the text runs; the editor inside it used to report

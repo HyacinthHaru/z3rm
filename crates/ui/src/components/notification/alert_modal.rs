@@ -312,6 +312,7 @@ mod tests {
         let tree: serde_json::Value = serde_json::from_str(&json).expect("the dump is valid JSON");
         gpui::a11y_checks::assert_interactive_nodes_are_named(&tree, "alert modal");
         gpui::a11y_checks::assert_names_are_distinguishable(&tree, "alert modal");
+        gpui::a11y_checks::assert_focusable_names_are_distinguishable(&tree, "alert modal");
 
         // The bullets are the whole substance of the warning: what restricted
         // mode actually prevents. A user is asked to trust a workspace on the

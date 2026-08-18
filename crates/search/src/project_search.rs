@@ -3507,6 +3507,7 @@ pub mod tests {
         gpui::a11y_checks::assert_click_targets_are_reachable(&tree, "project search");
         gpui::a11y_checks::assert_landmarks_are_distinguishable(&tree, "project search");
         gpui::a11y_checks::assert_names_are_distinguishable(&tree, "project search");
+        gpui::a11y_checks::assert_focusable_names_are_distinguishable(&tree, "project search");
         gpui::a11y_checks::assert_clickable_elements_are_reachable(&tree, "project search");
         gpui::a11y_checks::assert_controls_have_area(&tree, "project search");
         gpui::a11y_checks::assert_active_descendant_is_honoured(&tree, "project search");
@@ -5836,6 +5837,7 @@ pub mod tests {
         let tree: serde_json::Value = serde_json::from_str(&json).expect("the dump is valid JSON");
         gpui::a11y_checks::assert_interactive_nodes_are_named(&tree, "search results");
         gpui::a11y_checks::assert_names_are_distinguishable(&tree, "search results");
+        gpui::a11y_checks::assert_focusable_names_are_distinguishable(&tree, "search results");
 
         let mut headers: Vec<&str> = tree["nodes"]
             .as_object()

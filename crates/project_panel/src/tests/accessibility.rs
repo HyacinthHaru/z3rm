@@ -80,6 +80,7 @@ async fn the_file_tree_is_exposed_as_a_named_tree(cx: &mut gpui::TestAppContext)
         gpui::a11y_checks::assert_focus_reached_the_tree(&tree, "workspace with a dock");
         gpui::a11y_checks::assert_landmarks_are_distinguishable(&tree, "workspace with a dock");
         gpui::a11y_checks::assert_names_are_distinguishable(&tree, "workspace with a dock");
+        gpui::a11y_checks::assert_focusable_names_are_distinguishable(&tree, "workspace with a dock");
         gpui::a11y_checks::assert_clickable_elements_are_reachable(&tree, "workspace with a dock");
         gpui::a11y_checks::assert_controls_have_area(&tree, "workspace with a dock");
         gpui::a11y_checks::assert_active_descendant_is_honoured(&tree, "workspace with a dock");
@@ -193,6 +194,7 @@ async fn a_modified_file_says_it_is_modified(cx: &mut gpui::TestAppContext) {
 
     gpui::a11y_checks::assert_interactive_nodes_are_named(&tree, "project panel with git status");
     gpui::a11y_checks::assert_names_are_distinguishable(&tree, "project panel with git status");
+    gpui::a11y_checks::assert_focusable_names_are_distinguishable(&tree, "project panel with git status");
     gpui::a11y_checks::assert_clickable_elements_are_reachable(&tree, "project panel with git status");
     gpui::a11y_checks::assert_roles_are_contained(&tree, "project panel with git status");
     gpui::a11y_checks::assert_click_targets_are_reachable(&tree, "project panel with git status");
@@ -267,6 +269,7 @@ async fn the_rename_field_says_what_it_is(cx: &mut gpui::TestAppContext) {
 
     gpui::a11y_checks::assert_interactive_nodes_are_named(&tree, "renaming a file");
     gpui::a11y_checks::assert_names_are_distinguishable(&tree, "renaming a file");
+    gpui::a11y_checks::assert_focusable_names_are_distinguishable(&tree, "renaming a file");
     gpui::a11y_checks::assert_clickable_elements_are_reachable(&tree, "renaming a file");
     gpui::a11y_checks::assert_roles_are_contained(&tree, "renaming a file");
     gpui::a11y_checks::assert_click_targets_are_reachable(&tree, "renaming a file");
@@ -326,6 +329,7 @@ async fn an_empty_project_panel_says_why_it_is_empty(cx: &mut gpui::TestAppConte
 
     gpui::a11y_checks::assert_interactive_nodes_are_named(&tree, "empty project panel");
     gpui::a11y_checks::assert_names_are_distinguishable(&tree, "empty project panel");
+    gpui::a11y_checks::assert_focusable_names_are_distinguishable(&tree, "empty project panel");
     gpui::a11y_checks::assert_clickable_elements_are_reachable(&tree, "empty project panel");
     gpui::a11y_checks::assert_roles_are_contained(&tree, "empty project panel");
     gpui::a11y_checks::assert_click_targets_are_reachable(&tree, "empty project panel");

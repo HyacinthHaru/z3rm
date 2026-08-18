@@ -965,6 +965,7 @@ mod tests {
         gpui::a11y_checks::assert_focus_reached_the_tree(&tree, "title bar");
         gpui::a11y_checks::assert_landmarks_are_distinguishable(&tree, "title bar");
         gpui::a11y_checks::assert_names_are_distinguishable(&tree, "title bar");
+        gpui::a11y_checks::assert_focusable_names_are_distinguishable(&tree, "title bar");
         gpui::a11y_checks::assert_clickable_elements_are_reachable(&tree, "title bar");
         gpui::a11y_checks::assert_controls_have_area(&tree, "title bar");
         gpui::a11y_checks::assert_active_descendant_is_honoured(&tree, "title bar");

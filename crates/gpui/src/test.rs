@@ -415,6 +415,93 @@ pub mod a11y_checks {
         );
     }
 
+    /// Panics if two places the keyboard can land carry the same role and name.
+    ///
+    /// The same argument [`assert_landmarks_are_distinguishable`] makes for
+    /// landmarks, applied to everywhere focus can go. A focusable node is a
+    /// destination, and a reader announces it by name on arrival; two of them
+    /// sharing a name describe one destination where there are two, so the
+    /// user tabs, hears the same words, and cannot tell whether they moved.
+    ///
+    /// Narrower than [`assert_names_are_distinguishable`] in what it looks at
+    /// and wider in which roles: that check is about controls a user asks for
+    /// by name, this one is about containers and surfaces they arrive at —
+    /// two editors both called "Editor", two panes both called "Terminal".
+    #[track_caller]
+    pub fn assert_focusable_names_are_distinguishable(tree: &serde_json::Value, context: &str) {
+        let nodes = nodes(tree);
+        let mut parent_of: collections::FxHashMap<&str, &str> = collections::FxHashMap::default();
+        for (id, node) in nodes {
+            for child in node["children"].as_array().into_iter().flatten() {
+                if let Some(child) = child.as_str() {
+                    parent_of.insert(child, id.as_str());
+                }
+            }
+        }
+
+        let mut seen: collections::FxHashMap<(&str, &str, &str), Vec<&str>> =
+            collections::FxHashMap::default();
+        for (id, node) in nodes {
+            let focusable = node["aria"]["on_action"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .any(|action| action == "Focus");
+            if !focusable {
+                continue;
+            }
+            let Some(name) = node["aria"]["label"].as_str().filter(|name| !name.is_empty()) else {
+                continue;
+            };
+            let role = node["aria"]["role"].as_str().unwrap_or_default();
+            // Rows are told apart by the branch they hang from, which a reader
+            // announces with them, so they are only ambiguous among siblings.
+            // Two files called `main.rs` in different folders are not a defect.
+            let scope = if matches!(role, "TreeItem" | "Row" | "ListBoxOption" | "ListItem") {
+                parent_of.get(id.as_str()).copied().unwrap_or_default()
+            } else {
+                ""
+            };
+            seen.entry((role, name, scope)).or_default().push(id.as_str());
+        }
+
+        let is_ancestor = |ancestor: &str, node: &str| {
+            let mut node = node;
+            // Bounded by the tree's depth; a malformed dump should fail the
+            // assertion rather than loop.
+            for _ in 0..64 {
+                match parent_of.get(node) {
+                    Some(parent) if *parent == ancestor => return true,
+                    Some(parent) => node = *parent,
+                    None => return false,
+                }
+            }
+            false
+        };
+
+        let mut clashes: Vec<String> = seen
+            .into_iter()
+            .filter_map(|((role, name, _), ids)| {
+                // A node nested inside another of the same name is redundant
+                // rather than ambiguous: you cannot be in one without being in
+                // the other, so there are not two destinations to confuse. What
+                // this check is about is the ones you tab between.
+                let siblings: Vec<&str> = ids
+                    .iter()
+                    .copied()
+                    .filter(|id| !ids.iter().any(|other| *other != *id && is_ancestor(other, id)))
+                    .collect();
+                (siblings.len() > 1)
+                    .then(|| format!("{}x {role} named {name:?}", siblings.len()))
+            })
+            .collect();
+        clashes.sort_unstable();
+        assert!(
+            clashes.is_empty(),
+            "{context}: the keyboard lands on these, and they say the same thing: {clashes:?}"
+        );
+    }
+
     /// Landmark roles a reader offers as a way to jump around the window. More
     /// than one of the same landmark is only useful if they can be told apart.
     pub const LANDMARK_ROLES: &[&str] = &["Main", "Complementary", "Navigation", "Banner"];
@@ -801,6 +888,7 @@ pub mod a11y_checks {
 mod a11y_check_tests {
     use super::a11y_checks::{
         assert_active_descendant_is_honoured, assert_clickable_elements_are_reachable,
+        assert_focusable_names_are_distinguishable,
         assert_controls_have_area, assert_focus_reached_the_tree,
         assert_interactive_nodes_are_named, assert_landmarks_are_distinguishable,
         assert_live_regions_can_speak, assert_names_are_distinguishable,
@@ -994,6 +1082,74 @@ mod a11y_check_tests {
             "1": { "element_id": "row", "aria": { "role": "ListBoxOption", "label": "a.rs" } },
         }});
         assert_roles_are_contained(&tree, "probe");
+    }
+
+    fn focusable(id: &str, role: &str, label: &str, children: &[&str]) -> serde_json::Value {
+        json!({
+            "element_id": id,
+            "aria": { "role": role, "label": label, "on_action": ["Focus"] },
+            "children": children,
+        })
+    }
+
+    /// Two panes running the same program, or two editors both called
+    /// "Editor": the keyboard lands on each and a reader says the same words.
+    #[test]
+    #[should_panic(expected = "say the same thing")]
+    fn two_focusable_siblings_with_one_name_are_reported() {
+        let tree = json!({ "nodes": {
+            "0": focusable("left", "Group", "Terminal", &[]),
+            "1": focusable("right", "Group", "Terminal", &[]),
+        }});
+        assert_focusable_names_are_distinguishable(&tree, "panes");
+    }
+
+    /// A pane named after the item inside it. Redundant to hear twice, but not
+    /// two destinations — you cannot be in one without being in the other, so
+    /// there is nothing to confuse.
+    #[test]
+    fn a_focusable_child_repeating_its_parents_name_is_fine() {
+        let tree = json!({ "nodes": {
+            "0": focusable("pane", "Group", "edited", &["1"]),
+            "1": focusable("item", "Group", "edited", &[]),
+        }});
+        assert_focusable_names_are_distinguishable(&tree, "pane and item");
+    }
+
+    /// Rows are told apart by the branch they hang from, and a reader
+    /// announces that with them. Two `main.rs` in different folders are how a
+    /// project looks, not a defect.
+    #[test]
+    fn rows_with_one_name_under_different_parents_are_fine() {
+        let tree = json!({ "nodes": {
+            "0": focusable("src", "Group", "src", &["2"]),
+            "1": focusable("tests", "Group", "tests", &["3"]),
+            "2": focusable("a", "TreeItem", "main.rs", &[]),
+            "3": focusable("b", "TreeItem", "main.rs", &[]),
+        }});
+        assert_focusable_names_are_distinguishable(&tree, "tree");
+    }
+
+    /// …but two of them in the same folder cannot be told apart at all.
+    #[test]
+    #[should_panic(expected = "say the same thing")]
+    fn rows_with_one_name_under_one_parent_are_reported() {
+        let tree = json!({ "nodes": {
+            "0": focusable("src", "Group", "src", &["1", "2"]),
+            "1": focusable("a", "TreeItem", "main.rs", &[]),
+            "2": focusable("b", "TreeItem", "main.rs", &[]),
+        }});
+        assert_focusable_names_are_distinguishable(&tree, "tree");
+    }
+
+    /// Nothing the keyboard can land on, so nothing to tell apart.
+    #[test]
+    fn unfocusable_nodes_sharing_a_name_are_left_alone() {
+        let tree = json!({ "nodes": {
+            "0": { "element_id": "a", "aria": { "role": "Group", "label": "Terminal" } },
+            "1": { "element_id": "b", "aria": { "role": "Group", "label": "Terminal" } },
+        }});
+        assert_focusable_names_are_distinguishable(&tree, "decorative");
     }
 
     fn tree(node_rects: &[(f64, f64, f64, f64)], clickable: &[(f64, f64, f64, f64)]) -> serde_json::Value {

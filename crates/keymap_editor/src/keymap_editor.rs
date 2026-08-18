@@ -4117,6 +4117,7 @@ mod tests {
         gpui::a11y_checks::assert_click_targets_are_reachable(&tree, "keymap editor");
         gpui::a11y_checks::assert_landmarks_are_distinguishable(&tree, "keymap editor");
         gpui::a11y_checks::assert_names_are_distinguishable(&tree, "keymap editor");
+        gpui::a11y_checks::assert_focusable_names_are_distinguishable(&tree, "keymap editor");
 
         // The rows carry their whole text and no cell is a node, so a column
         // count would offer cell-by-cell navigation with nothing to move to.

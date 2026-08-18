@@ -2705,6 +2705,7 @@ mod live_tests {
         gpui::a11y_checks::assert_click_targets_are_reachable(&tree, "empty sidebar");
         gpui::a11y_checks::assert_landmarks_are_distinguishable(&tree, "empty sidebar");
         gpui::a11y_checks::assert_names_are_distinguishable(&tree, "empty sidebar");
+        gpui::a11y_checks::assert_focusable_names_are_distinguishable(&tree, "empty sidebar");
         gpui::a11y_checks::assert_clickable_elements_are_reachable(&tree, "empty sidebar");
 
         // Picking one of these unpicks the other, which is what a tab is. As
@@ -2787,6 +2788,7 @@ mod live_tests {
         gpui::a11y_checks::assert_click_targets_are_reachable(&tree, "filtered sidebar");
         gpui::a11y_checks::assert_landmarks_are_distinguishable(&tree, "filtered sidebar");
         gpui::a11y_checks::assert_names_are_distinguishable(&tree, "filtered sidebar");
+        gpui::a11y_checks::assert_focusable_names_are_distinguishable(&tree, "filtered sidebar");
         gpui::a11y_checks::assert_clickable_elements_are_reachable(&tree, "filtered sidebar");
         gpui::a11y_checks::assert_controls_have_area(&tree, "filtered sidebar");
         gpui::a11y_checks::assert_active_descendant_is_honoured(&tree, "filtered sidebar");
@@ -2828,6 +2830,7 @@ mod live_tests {
         let files = a11y_tree(cx, SidebarMode::Files);
         gpui::a11y_checks::assert_interactive_nodes_are_named(&files, "sidebar files");
         gpui::a11y_checks::assert_names_are_distinguishable(&files, "sidebar files");
+        gpui::a11y_checks::assert_focusable_names_are_distinguishable(&files, "sidebar files");
         gpui::a11y_checks::assert_clickable_elements_are_reachable(&files, "sidebar files");
         gpui::a11y_checks::assert_controls_have_area(&files, "sidebar files");
         gpui::a11y_checks::assert_landmarks_are_distinguishable(&files, "sidebar files");
@@ -2851,6 +2854,7 @@ mod live_tests {
 
         gpui::a11y_checks::assert_interactive_nodes_are_named(&tree, "sidebar panel");
         gpui::a11y_checks::assert_names_are_distinguishable(&tree, "sidebar panel");
+        gpui::a11y_checks::assert_focusable_names_are_distinguishable(&tree, "sidebar panel");
         gpui::a11y_checks::assert_clickable_elements_are_reachable(&tree, "sidebar panel");
         gpui::a11y_checks::assert_controls_have_area(&tree, "sidebar panel");
         gpui::a11y_checks::assert_landmarks_are_distinguishable(&tree, "sidebar panel");

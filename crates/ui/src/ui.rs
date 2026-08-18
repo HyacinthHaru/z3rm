@@ -89,6 +89,7 @@ fn the_shared_controls_report_their_state(cx: &mut TestAppContext) {
     gpui::a11y_checks::assert_click_targets_are_reachable(&tree, "shared controls");
     gpui::a11y_checks::assert_landmarks_are_distinguishable(&tree, "shared controls");
     gpui::a11y_checks::assert_names_are_distinguishable(&tree, "shared controls");
+    gpui::a11y_checks::assert_focusable_names_are_distinguishable(&tree, "shared controls");
     gpui::a11y_checks::assert_clickable_elements_are_reachable(&tree, "shared controls");
     gpui::a11y_checks::assert_controls_have_area(&tree, "shared controls");
     gpui::a11y_checks::assert_active_descendant_is_honoured(&tree, "shared controls");
@@ -175,6 +176,7 @@ fn the_shared_controls_report_their_state(cx: &mut TestAppContext) {
         gpui::a11y_checks::assert_click_targets_are_reachable(&tree, "modal headline");
         gpui::a11y_checks::assert_landmarks_are_distinguishable(&tree, "modal headline");
         gpui::a11y_checks::assert_names_are_distinguishable(&tree, "modal headline");
+        gpui::a11y_checks::assert_focusable_names_are_distinguishable(&tree, "modal headline");
         gpui::a11y_checks::assert_clickable_elements_are_reachable(&tree, "modal headline");
         gpui::a11y_checks::assert_controls_have_area(&tree, "modal headline");
         gpui::a11y_checks::assert_active_descendant_is_honoured(&tree, "modal headline");
@@ -241,6 +243,7 @@ fn the_shared_controls_report_their_state(cx: &mut TestAppContext) {
         gpui::a11y_checks::assert_click_targets_are_reachable(&tree, "disabled controls");
         gpui::a11y_checks::assert_landmarks_are_distinguishable(&tree, "disabled controls");
         gpui::a11y_checks::assert_names_are_distinguishable(&tree, "disabled controls");
+        gpui::a11y_checks::assert_focusable_names_are_distinguishable(&tree, "disabled controls");
         gpui::a11y_checks::assert_clickable_elements_are_reachable(&tree, "disabled controls");
         gpui::a11y_checks::assert_controls_have_area(&tree, "disabled controls");
         gpui::a11y_checks::assert_active_descendant_is_honoured(&tree, "disabled controls");
@@ -319,6 +322,7 @@ fn the_shared_controls_report_their_state(cx: &mut TestAppContext) {
         gpui::a11y_checks::assert_no_role_was_discarded(&tree, "messages");
         gpui::a11y_checks::assert_no_aria_was_discarded(&tree, "messages");
         gpui::a11y_checks::assert_names_are_distinguishable(&tree, "messages");
+        gpui::a11y_checks::assert_focusable_names_are_distinguishable(&tree, "messages");
         gpui::a11y_checks::assert_clickable_elements_are_reachable(&tree, "messages");
         gpui::a11y_checks::assert_roles_are_contained(&tree, "messages");
         gpui::a11y_checks::assert_click_targets_are_reachable(&tree, "messages");
@@ -386,6 +390,7 @@ fn the_shared_controls_report_their_state(cx: &mut TestAppContext) {
 
         gpui::a11y_checks::assert_interactive_nodes_are_named(&tree, "toggle button group");
         gpui::a11y_checks::assert_names_are_distinguishable(&tree, "toggle button group");
+        gpui::a11y_checks::assert_focusable_names_are_distinguishable(&tree, "toggle button group");
         gpui::a11y_checks::assert_clickable_elements_are_reachable(&tree, "toggle button group");
         gpui::a11y_checks::assert_roles_are_contained(&tree, "toggle button group");
         gpui::a11y_checks::assert_click_targets_are_reachable(&tree, "toggle button group");
@@ -465,6 +470,7 @@ fn the_shared_controls_report_their_state(cx: &mut TestAppContext) {
 
         gpui::a11y_checks::assert_interactive_nodes_are_named(&tree, "collapsible sections");
         gpui::a11y_checks::assert_names_are_distinguishable(&tree, "collapsible sections");
+        gpui::a11y_checks::assert_focusable_names_are_distinguishable(&tree, "collapsible sections");
         gpui::a11y_checks::assert_clickable_elements_are_reachable(&tree, "collapsible sections");
         gpui::a11y_checks::assert_no_role_was_discarded(&tree, "collapsible sections");
         gpui::a11y_checks::assert_no_aria_was_discarded(&tree, "collapsible sections");
