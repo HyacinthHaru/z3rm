@@ -139,19 +139,19 @@ impl WhichKeyModal {
 ///
 /// The panel shows a prefix and the keys that can follow it. Split out from
 /// rendering so the wording is testable without standing up a workspace.
+/// What the live region says when a prefix is pressed.
+///
+/// A count rather than the list. This is spoken automatically the moment a
+/// prefix key is held, and a prefix with two dozen continuations would be two
+/// dozen key-action pairs read out over whatever the user was doing. The pairs
+/// themselves are nodes in the panel, so they can be read at whatever pace the
+/// user wants — which is what the panel is for.
 fn announcement(pending_keys: &str, bindings: &[(SharedString, SharedString)]) -> String {
-    if bindings.is_empty() {
-        return format!("Prefix {pending_keys}");
+    match bindings.len() {
+        0 => format!("Prefix {pending_keys}"),
+        1 => format!("Prefix {pending_keys}, 1 continuation"),
+        count => format!("Prefix {pending_keys}, {count} continuations"),
     }
-    format!(
-        "Prefix {pending_keys}, {} continuations: {}",
-        bindings.len(),
-        bindings
-            .iter()
-            .map(|(keys, action)| format!("{keys} {action}"))
-            .collect::<Vec<_>>()
-            .join(", ")
-    )
 }
 
 impl Render for WhichKeyModal {
@@ -220,15 +220,27 @@ impl Render for WhichKeyModal {
                 v_flex()
                     .gap(px(4.))
                     .flex_shrink_0()
-                    .children(self.bindings.iter().map(|(keystrokes, _)| {
-                        div()
-                            .child(
-                                Label::new(keystrokes.clone())
-                                    .size(LabelSize::Default)
-                                    .color(Color::Accent),
-                            )
-                            .text_align(gpui::TextAlign::Right)
-                    })),
+                    // The panel is two parallel columns, so a "row" is not one
+                    // element and cannot become one node. The keystroke cell is
+                    // made the item and carries the whole pair; the action cell
+                    // beside it stays purely visual, having no role and so
+                    // contributing nothing to read twice.
+                    .id("which-key-bindings")
+                    .role(gpui::Role::List)
+                    .children(self.bindings.iter().enumerate().map(
+                        |(index, (keystrokes, action_name))| {
+                            div()
+                                .id(("which-key-binding", index))
+                                .role(gpui::Role::ListItem)
+                                .aria_label(format!("{keystrokes} {action_name}"))
+                                .child(
+                                    Label::new(keystrokes.clone())
+                                        .size(LabelSize::Default)
+                                        .color(Color::Accent),
+                                )
+                                .text_align(gpui::TextAlign::Right)
+                        },
+                    )),
             )
             .child(
                 // Actions column
@@ -360,9 +372,19 @@ mod tests {
             (SharedString::from("c"), SharedString::from("New tab")),
             (SharedString::from("%"), SharedString::from("Split right")),
         ];
+        // A count, not the list. The pairs are nodes in the panel, so a reader
+        // can go through them at their own pace; spoken automatically they
+        // would be two dozen of them over whatever was being read.
         assert_eq!(
             announcement("ctrl-b", &bindings),
-            "Prefix ctrl-b, 2 continuations: c New tab, % Split right"
+            "Prefix ctrl-b, 2 continuations"
+        );
+
+        let one = vec![(SharedString::from("c"), SharedString::from("New tab"))];
+        assert_eq!(
+            announcement("ctrl-b", &one),
+            "Prefix ctrl-b, 1 continuation",
+            "one of them is not one continuations"
         );
     }
 
@@ -443,8 +465,26 @@ mod tests {
         // announcement at all without one.
         assert_eq!(
             hint["aria"]["value"].as_str(),
-            Some("Prefix ctrl-b, 2 continuations: c New tab, % Split right"),
-            "the announcement has to name the prefix and what can follow it"
+            Some("Prefix ctrl-b, 2 continuations"),
+            "the announcement has to name the prefix and how much follows it"
+        );
+
+        // …and the continuations themselves are in the tree, which is what
+        // makes announcing only the count acceptable. They are drawn as two
+        // parallel columns of `Label`s, so before this they were not nodes at
+        // all and the announcement was the only place they existed.
+        let mut bindings: Vec<&str> = tree["nodes"]
+            .as_object()
+            .expect("the dump lists nodes")
+            .values()
+            .filter(|node| node["aria"]["role"] == "ListItem")
+            .filter_map(|node| node["aria"]["label"].as_str())
+            .collect();
+        bindings.sort_unstable();
+        assert_eq!(
+            bindings,
+            vec!["% Split right", "c New tab"],
+            "every continuation has to be readable on its own"
         );
     }
 }
