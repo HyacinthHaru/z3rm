@@ -192,16 +192,12 @@ fn possibly_open_target(
                             active_editor
                                 .downgrade()
                                 .update_in(cx, |editor, window, cx| {
-                                    if let Some(buffer) =
-                                        editor.buffer().read(cx).as_singleton()
-                                    {
+                                    if let Some(buffer) = editor.buffer().read(cx).as_singleton() {
                                         // The external row/column counts characters,
                                         // not bytes; convert so the cursor lands at the
                                         // right UTF-8 byte point on non-ASCII lines.
-                                        let point = buffer
-                                            .read(cx)
-                                            .snapshot()
-                                            .point_from_external_input(
+                                        let point =
+                                            buffer.read(cx).snapshot().point_from_external_input(
                                                 row.saturating_sub(1),
                                                 col.saturating_sub(1),
                                             );

@@ -15,8 +15,8 @@ use language::CursorShape as EditorCursorShape;
 use settings::Settings;
 use std::time::Instant;
 use terminal::{
-    Cell, Color, Content, CursorShape, IndexedCell, Modes, NamedColor, Point, Range, ScrollLineDown,
-    ScrollLineUp, Terminal, TerminalBounds, VisibleImage,
+    Cell, Color, Content, CursorShape, IndexedCell, Modes, NamedColor, Point, Range,
+    ScrollLineDown, ScrollLineUp, Terminal, TerminalBounds, VisibleImage,
     is_app_chosen_exact_color as terminal_is_app_chosen_exact_color, is_default_background_color,
     terminal_settings::TerminalSettings,
 };
@@ -887,7 +887,9 @@ impl TerminalElement {
                 accesskit::Action::ScrollUp,
                 move |_data, window, cx| {
                     terminal_view
-                        .update(cx, |view, cx| view.scroll_line_up(&ScrollLineUp, window, cx))
+                        .update(cx, |view, cx| {
+                            view.scroll_line_up(&ScrollLineUp, window, cx)
+                        })
                         .ok();
                 },
             );
@@ -3209,8 +3211,8 @@ mod tests {
         assert_eq!(past_end.character_index, "git status".chars().count());
 
         // A blank row keeps an empty run, so the caret is addressable there.
-        let blank = terminal_text_position(&lines, (2, 3), &id)
-            .expect("a blank row still carries a run");
+        let blank =
+            terminal_text_position(&lines, (2, 3), &id).expect("a blank row still carries a run");
         assert_eq!(blank.node, fake_id(2, 0));
         assert_eq!(blank.character_index, 0);
 
@@ -3230,8 +3232,7 @@ mod tests {
         let lines = collect_terminal_lines(&runs);
         let id = fake_id;
 
-        let first =
-            terminal_text_position(&lines, (0, 7), &id).expect("caret in first chunk");
+        let first = terminal_text_position(&lines, (0, 7), &id).expect("caret in first chunk");
         assert_eq!(first.node, fake_id(0, 0));
         assert_eq!(first.character_index, 7);
 

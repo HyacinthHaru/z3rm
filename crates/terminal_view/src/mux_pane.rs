@@ -1905,8 +1905,11 @@ mod tests {
     ) -> Result<(), String> {
         use std::io::{Read, Write};
 
+        // Short, because the loop below now uses a timeout to mean "the client
+        // has stopped asking" rather than "give up". A join therefore costs at
+        // most this long after the last request.
         stream
-            .set_read_timeout(Some(std::time::Duration::from_secs(5)))
+            .set_read_timeout(Some(std::time::Duration::from_millis(250)))
             .map_err(|error| format!("set mock mux read timeout: {error}"))?;
 
         // The client also sends a `ResizePane` once its viewport size is known,
@@ -1914,13 +1917,35 @@ mod tests {
         // how many frames were drawn first — which changes when accessibility
         // is active. These tests are about the fetch, so skip past anything
         // else rather than pinning the wire order.
-        let (request_id, fetch) = loop {
+        // Every fetch is answered, not just the first. The client sends a
+        // `ResizePane` once its viewport size is known and can fetch again
+        // afterwards, and a server that answered once and exited left that
+        // second request hanging — the pane then kept its blank local grid.
+        // That is what made two of these tests fail under load and never on
+        // their own.
+        let mut answered = 0usize;
+        'requests: loop {
             let mut prefix = Vec::with_capacity(mux_protocol::MAX_VARINT_LEN);
             loop {
                 let mut byte = [0u8; 1];
-                stream
-                    .read_exact(&mut byte)
-                    .map_err(|error| format!("read initial grid request prefix: {error}"))?;
+                match stream.read_exact(&mut byte) {
+                    Ok(()) => {}
+                    // The client has gone quiet or hung up; either way there is
+                    // nothing left to serve.
+                    Err(error)
+                        if matches!(
+                            error.kind(),
+                            std::io::ErrorKind::WouldBlock
+                                | std::io::ErrorKind::TimedOut
+                                | std::io::ErrorKind::UnexpectedEof
+                        ) =>
+                    {
+                        break 'requests;
+                    }
+                    Err(error) => {
+                        return Err(format!("read initial grid request prefix: {error}"));
+                    }
+                }
                 prefix.push(byte[0]);
                 if byte[0] & 0x80 == 0 {
                     break;
@@ -1957,19 +1982,18 @@ mod tests {
                     ));
                 }
             };
-            match request.body {
-                Some(RequestBody::FetchGridUpdate(fetch)) => break (request.request_id, fetch),
+            let (request_id, fetch) = match request.body {
+                Some(RequestBody::FetchGridUpdate(fetch)) => (request.request_id, fetch),
                 Some(RequestBody::ResizePane(_)) => continue,
                 body => return Err(format!("expected initial FetchGridUpdate, got {body:?}")),
-            }
-        };
+            };
 
-        if fetch.pane_id != expected_pane_id || fetch.since_generation != 0 {
-            return Err(format!(
-                "unexpected initial fetch target/generation: {}@{}",
-                fetch.pane_id, fetch.since_generation
-            ));
-        }
+            if fetch.pane_id != expected_pane_id || fetch.since_generation != 0 {
+                return Err(format!(
+                    "unexpected initial fetch target/generation: {}@{}",
+                    fetch.pane_id, fetch.since_generation
+                ));
+            }
 
         let cells = ["q", "u", "i", "e", "t"]
             .into_iter()
@@ -2030,14 +2054,23 @@ mod tests {
                 })),
             })),
         };
-        let response = mux_protocol::frame(&response)
-            .map_err(|error| format!("encode initial grid response: {error}"))?;
-        stream
-            .write_all(&response)
-            .map_err(|error| format!("write initial grid response: {error}"))?;
-        stream
-            .flush()
-            .map_err(|error| format!("flush initial grid response: {error}"))
+            let response = mux_protocol::frame(&response)
+                .map_err(|error| format!("encode initial grid response: {error}"))?;
+            stream
+                .write_all(&response)
+                .map_err(|error| format!("write initial grid response: {error}"))?;
+            stream
+                .flush()
+                .map_err(|error| format!("flush initial grid response: {error}"))?;
+            answered += 1;
+        }
+
+        // Timing out with nothing served is still a failure: it means the
+        // client never asked, which is the bug this fixture exists to catch.
+        if answered == 0 {
+            return Err("client never requested the initial grid".to_string());
+        }
+        Ok(())
     }
 
     #[cfg(unix)]
@@ -2624,32 +2657,20 @@ mod tests {
             "an idle pane must not claim a mode: {plain}"
         );
 
-        // Settled before the mode is entered, not after. `enter_prefix_mode`
-        // reads the terminal's current DEC modes and passes the prefix key
-        // straight through when a full-screen application owns the keyboard, so
-        // whether prefix mode engages at all depends on how much of the mock
-        // server's snapshot has been applied. Pumping here fixes that state; a
-        // pump afterwards only raced the timeout that leaves the mode again.
-        cx.run_until_parked();
-        let full_screen = view.read_with(cx, |view, cx| {
-            let mode = view.terminal.read(cx).last_content().mode;
-            mode.contains(Modes::ALT_SCREEN)
-                || mode.contains(Modes::BRACKETED_PASTE)
-                || mode.intersects(Modes::MOUSE_MODE)
-        });
-        // Entered directly rather than through `enter_prefix_mode`, which
-        // first asks whether a full-screen application owns the keyboard and
-        // passes the prefix key through when one does. The snapshot this mock
-        // server sends sets `alternate_screen`, so once it has been applied the
-        // pane is running a full-screen application and the mode correctly
-        // never engages — the test only passed by drawing before the snapshot
-        // arrived. What this test is about is what the pane announces for a
+        // Entered directly rather than through `enter_prefix_mode`, which first
+        // asks whether a full-screen application owns the keyboard and passes
+        // the prefix key through when one does. The snapshot this mock server
+        // sends sets `alternate_screen`, so once it has been applied the pane
+        // is running a full-screen application and the mode correctly never
+        // engages. What this test is about is what the pane announces for a
         // state, so it sets the state.
-        assert!(
-            full_screen,
-            "if this fixture stops being full-screen, drive the mode through \
-             `enter_prefix_mode` again"
-        );
+        //
+        // Nothing here waits for that snapshot, and the assertion below is
+        // written so that it does not care whether it has arrived. An earlier
+        // version asserted the fixture was full-screen first, which made the
+        // test depend on bytes having crossed a real socket by a particular
+        // moment; it failed about one run in three under a parallel suite and
+        // never once on its own.
         view.update_in(cx, |view, _window, cx| {
             view.prefix_machine = PrefixModeMachine::new(PrefixModeConfig {
                 timeout_ms: 5_000,
@@ -2664,10 +2685,14 @@ mod tests {
         // was still runnable and the timer did not fire; idle, it did not
         // matter either way. The state is set synchronously and `pane_label`
         // draws, so there is nothing to wait for.
-        assert_eq!(
-            pane_label(cx).as_deref(),
-            Some(format!("{plain}, prefix mode").as_str()),
-            "entering prefix mode has to change what the pane announces"
+        let announced = pane_label(cx).expect("the pane root is still named");
+        // A suffix rather than an equality against the earlier label: the base
+        // name is the terminal's title, which the mock server's snapshot can
+        // change at any point, and this test is about the mode rather than the
+        // title.
+        assert!(
+            announced.ends_with(", prefix mode"),
+            "entering prefix mode has to change what the pane announces: {announced}"
         );
 
         // Copy mode is the other state where the keyboard behaves differently,
@@ -2746,11 +2771,10 @@ mod tests {
         // thread. Joining first means the timeout races the scheduler, which is
         // why this passed alone and failed under load.
         cx.run_until_parked();
-        match server_thread.join() {
-            Ok(Ok(())) => {}
-            Ok(Err(error)) => panic!("mock mux server failed: {error}"),
-            Err(_) => panic!("mock mux server panicked"),
-        }
+        // Joined at the end rather than here. The server now answers every
+        // fetch until the client goes quiet, and the client can fetch again
+        // after the resize that follows its first frames — so joining before
+        // the assertions would kill it while it still had work to do.
         cx.run_until_parked();
 
         cx.activate_a11y(cx.window_handle());
@@ -2784,13 +2808,21 @@ mod tests {
 
         // The grid arrives over the socket after the pane is mounted, so the
         // first frames legitimately have no content and no caret in them.
+        //
+        // A real sleep, which is not the usual advice. `MuxDomain` reads the
+        // socket on an OS thread of its own, so what this waits for is not
+        // scheduled by GPUI at all: `run_until_parked` returns the moment
+        // nothing is runnable and an executor timer only advances the test
+        // clock, neither of which gives that thread wall-clock time to make
+        // progress. `allow_parking` is on above for exactly this reason.
         let mut caret = None;
-        for _ in 0..20 {
+        for _ in 0..500 {
             caret = selection(cx);
             if caret.is_some() {
                 break;
             }
             cx.run_until_parked();
+            std::thread::sleep(std::time::Duration::from_millis(2));
         }
         let caret = caret.expect("the terminal reports a caret once its grid has arrived");
         assert_eq!(
@@ -2810,6 +2842,12 @@ mod tests {
             range.get("focus"),
             "a selection has to be reported as a range, not as a caret: {range:?}"
         );
+
+        match server_thread.join() {
+            Ok(Ok(())) => {}
+            Ok(Err(error)) => panic!("mock mux server failed: {error}"),
+            Err(_) => panic!("mock mux server panicked"),
+        }
     }
 
     /// §15.4 After a reconnect resync, the server-authoritative title/zoom

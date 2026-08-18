@@ -93,8 +93,6 @@ fn resolve_mux_scrollback_offset(
     }
 }
 
-
-
 #[cfg(test)]
 mod mux_scrollback_tests {
     use super::resolve_mux_scrollback_offset;
@@ -2650,7 +2648,6 @@ mod tests {
         });
     }
 
-
     // No active entry, but a worktree, worktree is a file -> parent directory
     #[gpui::test]
     async fn no_active_entry_worktree_is_file(cx: &mut TestAppContext) {
@@ -2876,7 +2873,6 @@ mod tests {
         (project, workspace, window_handle)
     }
 
-
     /// Creates a file in the given worktree and returns its entry.
     async fn create_file_in_worktree(
         worktree: Entity<Worktree>,
@@ -2926,7 +2922,6 @@ mod tests {
         path: impl AsRef<Path>,
         cx: &mut TestAppContext,
     ) -> (Entity<Worktree>, Entry) {
-
         let wt = project
             .update(cx, |project, cx| {
                 project.find_or_create_worktree(path.as_ref(), true, cx)
