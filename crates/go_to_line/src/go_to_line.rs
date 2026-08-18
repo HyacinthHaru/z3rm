@@ -350,6 +350,17 @@ impl Render for GoToLine {
                     .px_2()
                     .py_1()
                     .gap_1()
+                    // This line is the whole answer the modal gives: it says
+                    // which line the query will land on, and it changes on
+                    // every keystroke. A label is not a node, so without a
+                    // live region a reader types a number and is told nothing
+                    // about where it goes. Rendered whether or not the query
+                    // parses — a region that appears together with its first
+                    // message has nothing to diff against and stays silent.
+                    .id("go-to-line-target")
+                    .role(gpui::Role::Status)
+                    .aria_live(gpui::accesskit::Live::Polite)
+                    .aria_announcement(help_text.clone())
                     .child(Label::new(help_text).color(Color::Muted)),
             )
     }
