@@ -9,5 +9,5 @@
 
 crates/extension_host/src/vdom_bridge.rs:render_container — the name comes from the extension's own `aria-label` prop, or from the node's text, applied further down `render_container` than a builder chain reaches.
 crates/extension_host/src/vdom_bridge.rs:render_input — same: `render_input` names the field from the extension's label or placeholder after the role is set.
-crates/keymap_editor/src/keymap_editor.rs:base_button_style — a helper returning a bare `IconButton`; all four callers add `.aria_label(row_label(...))`, which names the row's action.
+crates/keymap_editor/src/keymap_editor.rs:base_button_style — a helper returning a bare `IconButton`; every caller adds `.aria_label(row_label(...))`, which names the row's action. Checked again 2026-08-18: five callers, all named.
 crates/workspace/src/pane.rs:render_tab — the pin and close buttons are named once for both branches after the `match` that chooses between them, as `"{end_slot_tooltip_text}: {tab_name}"`.
