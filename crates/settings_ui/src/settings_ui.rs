@@ -5251,6 +5251,7 @@ pub mod test {
 
         gpui::a11y_checks::assert_interactive_nodes_are_named(&tree, "settings window");
         gpui::a11y_checks::assert_no_role_was_discarded(&tree, "settings window");
+        gpui::a11y_checks::assert_no_aria_was_discarded(&tree, "settings window");
         gpui::a11y_checks::assert_roles_are_contained(&tree, "settings window");
         gpui::a11y_checks::assert_click_targets_are_reachable(&tree, "settings window");
         gpui::a11y_checks::assert_focus_reached_the_tree(&tree, "settings window");

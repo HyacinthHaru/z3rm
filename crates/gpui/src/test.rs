@@ -393,6 +393,28 @@ pub mod a11y_checks {
         );
     }
 
+    /// Panics if an element carries accessibility information but no role, so
+    /// no node was built for it and the information went nowhere.
+    ///
+    /// The mirror image of [`assert_no_role_was_discarded`]: a node needs both
+    /// an id and a role, and neither half fails loudly on its own. A label, a
+    /// live region or a placeholder set on an element with no role is dropped
+    /// in silence, and the call site looks exactly like one that worked.
+    #[track_caller]
+    pub fn assert_no_aria_was_discarded(tree: &serde_json::Value, context: &str) {
+        let discarded = tree
+            .get("frame")
+            .and_then(|frame| frame.get("aria_without_role"))
+            .and_then(serde_json::Value::as_array)
+            .map(Vec::as_slice)
+            .unwrap_or_default();
+        assert!(
+            discarded.is_empty(),
+            "{context}: these elements carry accessibility information that \
+             reached no node, for lack of a role: {discarded:?}"
+        );
+    }
+
     /// Landmark roles a reader offers as a way to jump around the window. More
     /// than one of the same landmark is only useful if they can be told apart.
     pub const LANDMARK_ROLES: &[&str] = &["Main", "Complementary", "Navigation", "Banner"];

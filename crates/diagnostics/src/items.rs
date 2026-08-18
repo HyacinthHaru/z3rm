@@ -344,6 +344,7 @@ mod tests {
             gpui::a11y_checks::assert_landmarks_are_distinguishable(&tree, "diagnostic indicator");
             gpui::a11y_checks::assert_active_descendant_is_honoured(&tree, "diagnostic indicator");
             gpui::a11y_checks::assert_no_role_was_discarded(&tree, "diagnostic indicator");
+            gpui::a11y_checks::assert_no_aria_was_discarded(&tree, "diagnostic indicator");
             gpui::a11y_checks::assert_live_regions_can_speak(&tree, "diagnostic indicator");
             // The value, not the label: macOS speaks `node.value()` and raises
             // no announcement at all without one.

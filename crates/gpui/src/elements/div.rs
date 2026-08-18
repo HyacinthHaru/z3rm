@@ -1871,6 +1871,10 @@ impl Element for Div {
         self.interactivity.write_a11y_info(node);
     }
 
+    fn a11y_has_properties(&self) -> bool {
+        self.interactivity.aria.carries_information()
+    }
+
     fn a11y_synthetic_children(
         &mut self,
         _prepaint: &mut Self::PrepaintState,
@@ -2086,6 +2090,23 @@ pub(crate) struct AriaProperties {
     pub(crate) column_index: Option<usize>,
     pub(crate) row_count: Option<usize>,
     pub(crate) column_count: Option<usize>,
+}
+
+impl AriaProperties {
+    /// Whether anything here only reaches a reader through a node of its own.
+    ///
+    /// Deliberately not a blanket "any field is set": `disabled` and `selected`
+    /// describe a control that has a role by construction, so a bare `div`
+    /// carrying one is not the mistake this is looking for.
+    pub(crate) fn carries_information(&self) -> bool {
+        self.label.is_some()
+            || self.description.is_some()
+            || self.role_description.is_some()
+            || self.value.is_some()
+            || self.placeholder.is_some()
+            || self.live.is_some()
+            || self.keyshortcuts.is_some()
+    }
 }
 
 /// The interactivity struct. Powers all of the general-purpose
@@ -3990,6 +4011,10 @@ where
 
     fn a11y_role(&self) -> Option<accesskit::Role> {
         self.element.a11y_role()
+    }
+
+    fn a11y_has_properties(&self) -> bool {
+        self.element.a11y_has_properties()
     }
 
     fn write_a11y_info(&self, node: &mut accesskit::Node) {

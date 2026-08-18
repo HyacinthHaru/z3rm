@@ -168,6 +168,7 @@ pub(crate) struct A11y {
     /// was discarded. This is the quietest way to lose a node: nothing is
     /// missing from the code, only from the tree.
     roles_without_id_this_frame: Vec<(accesskit::Role, Option<&'static std::panic::Location<'static>>)>,
+    aria_without_role_this_frame: Vec<Option<&'static std::panic::Location<'static>>>,
     /// Elements that answer a click but carry no role, so they produce no node
     /// at all. Nothing else in the tree records them: a check can only reason
     /// about nodes that exist, and these do not.
@@ -200,6 +201,7 @@ impl A11y {
             focus_without_node_this_frame: None,
             focused_element_rendered_this_frame: false,
             roles_without_id_this_frame: Vec::new(),
+            aria_without_role_this_frame: Vec::new(),
             clickable_without_role_this_frame: Vec::new(),
             debug: debug::A11yDebug::default(),
             #[cfg(debug_assertions)]
@@ -221,6 +223,17 @@ impl A11y {
         let site = (role, source_location);
         if !self.roles_without_id_this_frame.contains(&site) {
             self.roles_without_id_this_frame.push(site);
+        }
+    }
+
+    /// Records that an element carries accessibility information but no role,
+    /// so no node was built for it and the information went nowhere.
+    pub(crate) fn note_aria_without_role(
+        &mut self,
+        source_location: Option<&'static std::panic::Location<'static>>,
+    ) {
+        if !self.aria_without_role_this_frame.contains(&source_location) {
+            self.aria_without_role_this_frame.push(source_location);
         }
     }
 
@@ -380,6 +393,14 @@ impl A11y {
             .map(|(role, location)| match location {
                 Some(location) => format!("{role:?} at {location}"),
                 None => format!("{role:?}"),
+            })
+            .collect();
+        frame.aria_without_role = self
+            .aria_without_role_this_frame
+            .drain(..)
+            .map(|location| match location {
+                Some(location) => location.to_string(),
+                None => "unknown location".to_string(),
             })
             .collect();
         frame.clickable_without_role = self
@@ -1603,6 +1624,51 @@ mod activation_tests {
         );
     }
 
+    /// The other half of the same trap. A node needs an id *and* a role, and
+    /// an element with an id and no role builds nothing, so a name or a live
+    /// region set on it is dropped as quietly as a role without an id — with
+    /// the call site looking exactly like one that worked.
+    #[gpui::test]
+    fn aria_on_an_element_with_no_role_is_reported(cx: &mut TestAppContext) {
+        struct Host;
+        impl Render for Host {
+            fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+                div()
+                    .id("named-but-roleless")
+                    .aria_label("Save")
+                    // A sibling doing it right, so the report cannot be passing
+                    // by flagging everything.
+                    .child(div().id("proper").role(accesskit::Role::Button).aria_label("Cancel"))
+            }
+        }
+
+        let window = cx.add_window(|_, _| Host);
+        cx.activate_a11y(window.into());
+        let json = cx
+            .update_window(window.into(), |_, window, cx| {
+                window.draw(cx).clear(cx);
+                window.debug_a11y_tree_json()
+            })
+            .expect("the window is open")
+            .expect("activation makes the debug tree available");
+        let tree: serde_json::Value = serde_json::from_str(&json).expect("the dump is valid JSON");
+
+        let discarded = tree["frame"]["aria_without_role"]
+            .as_array()
+            .expect("the dump lists discarded accessibility information");
+        assert_eq!(
+            discarded.len(),
+            1,
+            "the labelled element with no role is the only one reported: {json}"
+        );
+        assert!(
+            discarded[0]
+                .as_str()
+                .is_some_and(|site| site.contains("a11y.rs")),
+            "the report has to say where the information was lost: {discarded:?}"
+        );
+    }
+
     /// A control whose centre is covered by a smaller clickable child is the
     /// shape that makes an advertised `Click` land somewhere else — a close
     /// button inside a tab is the real case. Proven end to end so the check
@@ -1680,6 +1746,7 @@ mod activation_tests {
         crate::test::a11y_checks::assert_names_are_distinguishable(&tree, "two panels");
         crate::test::a11y_checks::assert_clickable_elements_are_reachable(&tree, "two panels");
         crate::test::a11y_checks::assert_no_role_was_discarded(&tree, "two panels");
+        crate::test::a11y_checks::assert_no_aria_was_discarded(&tree, "two panels");
         crate::test::a11y_checks::assert_roles_are_contained(&tree, "two panels");
         crate::test::a11y_checks::assert_controls_have_area(&tree, "two panels");
         crate::test::a11y_checks::assert_active_descendant_is_honoured(&tree, "two panels");

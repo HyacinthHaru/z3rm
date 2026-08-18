@@ -321,6 +321,7 @@ async fn test_notifications_are_announced_as_a_live_region(cx: &mut TestAppConte
     let tree: serde_json::Value = serde_json::from_str(&json).expect("the dump is valid JSON");
     gpui::a11y_checks::assert_interactive_nodes_are_named(&tree, "notifications");
     gpui::a11y_checks::assert_no_role_was_discarded(&tree, "notifications");
+    gpui::a11y_checks::assert_no_aria_was_discarded(&tree, "notifications");
     gpui::a11y_checks::assert_roles_are_contained(&tree, "notifications");
     gpui::a11y_checks::assert_focus_reached_the_tree(&tree, "notifications");
     gpui::a11y_checks::assert_click_targets_are_reachable(&tree, "notifications");
@@ -462,6 +463,7 @@ async fn test_the_zoom_button_can_be_operated_through_its_action(cx: &mut TestAp
     let tree: serde_json::Value = serde_json::from_str(&json).expect("the dump is valid JSON");
     gpui::a11y_checks::assert_interactive_nodes_are_named(&tree, "zoom button");
     gpui::a11y_checks::assert_no_role_was_discarded(&tree, "zoom button");
+    gpui::a11y_checks::assert_no_aria_was_discarded(&tree, "zoom button");
     gpui::a11y_checks::assert_roles_are_contained(&tree, "zoom button");
     gpui::a11y_checks::assert_focus_reached_the_tree(&tree, "zoom button");
     gpui::a11y_checks::assert_click_targets_are_reachable(&tree, "zoom button");
@@ -582,6 +584,7 @@ async fn test_two_tabs_with_the_same_file_name_are_told_apart(cx: &mut TestAppCo
     gpui::a11y_checks::assert_names_are_distinguishable(&tree, "ambiguous tabs");
     gpui::a11y_checks::assert_clickable_elements_are_reachable(&tree, "ambiguous tabs");
     gpui::a11y_checks::assert_no_role_was_discarded(&tree, "ambiguous tabs");
+    gpui::a11y_checks::assert_no_aria_was_discarded(&tree, "ambiguous tabs");
     gpui::a11y_checks::assert_roles_are_contained(&tree, "ambiguous tabs");
     gpui::a11y_checks::assert_click_targets_are_reachable(&tree, "ambiguous tabs");
     gpui::a11y_checks::assert_controls_have_area(&tree, "ambiguous tabs");
@@ -643,6 +646,7 @@ async fn test_a_tab_says_it_has_unsaved_changes(cx: &mut TestAppContext) {
 
     gpui::a11y_checks::assert_interactive_nodes_are_named(&tree, "dirty tab");
     gpui::a11y_checks::assert_no_role_was_discarded(&tree, "dirty tab");
+    gpui::a11y_checks::assert_no_aria_was_discarded(&tree, "dirty tab");
     gpui::a11y_checks::assert_roles_are_contained(&tree, "dirty tab");
     gpui::a11y_checks::assert_focus_reached_the_tree(&tree, "dirty tab");
     gpui::a11y_checks::assert_click_targets_are_reachable(&tree, "dirty tab");
@@ -729,6 +733,7 @@ async fn test_clicking_a_tab_through_its_action_activates_it(cx: &mut TestAppCon
     let tree: serde_json::Value = serde_json::from_str(&json).expect("the dump is valid JSON");
     gpui::a11y_checks::assert_interactive_nodes_are_named(&tree, "tab bar");
     gpui::a11y_checks::assert_no_role_was_discarded(&tree, "tab bar");
+    gpui::a11y_checks::assert_no_aria_was_discarded(&tree, "tab bar");
     gpui::a11y_checks::assert_roles_are_contained(&tree, "tab bar");
     gpui::a11y_checks::assert_focus_reached_the_tree(&tree, "tab bar");
     gpui::a11y_checks::assert_click_targets_are_reachable(&tree, "tab bar");
@@ -815,6 +820,7 @@ async fn test_split_panes_say_which_one_they_are(cx: &mut TestAppContext) {
     let tree: serde_json::Value = serde_json::from_str(&json).expect("the dump is valid JSON");
     gpui::a11y_checks::assert_interactive_nodes_are_named(&tree, "split panes");
     gpui::a11y_checks::assert_no_role_was_discarded(&tree, "split panes");
+    gpui::a11y_checks::assert_no_aria_was_discarded(&tree, "split panes");
     gpui::a11y_checks::assert_roles_are_contained(&tree, "split panes");
     gpui::a11y_checks::assert_focus_reached_the_tree(&tree, "split panes");
     gpui::a11y_checks::assert_click_targets_are_reachable(&tree, "split panes");
@@ -909,6 +915,7 @@ async fn test_the_live_regions_exist_before_they_have_anything_to_say(cx: &mut T
     let tree: serde_json::Value = serde_json::from_str(&json).expect("the dump is valid JSON");
     gpui::a11y_checks::assert_interactive_nodes_are_named(&tree, "idle live regions");
     gpui::a11y_checks::assert_no_role_was_discarded(&tree, "idle live regions");
+    gpui::a11y_checks::assert_no_aria_was_discarded(&tree, "idle live regions");
     gpui::a11y_checks::assert_roles_are_contained(&tree, "idle live regions");
     gpui::a11y_checks::assert_focus_reached_the_tree(&tree, "idle live regions");
     gpui::a11y_checks::assert_click_targets_are_reachable(&tree, "idle live regions");
@@ -1005,6 +1012,7 @@ async fn test_modal_is_announced_as_a_dialog(cx: &mut TestAppContext) {
     let tree: serde_json::Value = serde_json::from_str(&json).expect("the dump is valid JSON");
     gpui::a11y_checks::assert_interactive_nodes_are_named(&tree, "modal layer");
     gpui::a11y_checks::assert_no_role_was_discarded(&tree, "modal layer");
+    gpui::a11y_checks::assert_no_aria_was_discarded(&tree, "modal layer");
     gpui::a11y_checks::assert_roles_are_contained(&tree, "modal layer");
     gpui::a11y_checks::assert_focus_reached_the_tree(&tree, "modal layer");
     gpui::a11y_checks::assert_click_targets_are_reachable(&tree, "modal layer");
@@ -1136,6 +1144,7 @@ async fn test_every_interactive_node_in_the_window_has_a_name(cx: &mut TestAppCo
         "a real toggle still reports the state it actually has"
     );
     gpui::a11y_checks::assert_no_role_was_discarded(&tree, "workspace window");
+    gpui::a11y_checks::assert_no_aria_was_discarded(&tree, "workspace window");
     gpui::a11y_checks::assert_roles_are_contained(&tree, "workspace window");
     gpui::a11y_checks::assert_click_targets_are_reachable(&tree, "workspace window");
     gpui::a11y_checks::assert_focus_reached_the_tree(&tree, "workspace window");
@@ -1173,6 +1182,7 @@ async fn test_an_empty_pane_holding_focus_is_announced(cx: &mut TestAppContext) 
     let tree: serde_json::Value = serde_json::from_str(&json).expect("the dump is valid JSON");
     gpui::a11y_checks::assert_interactive_nodes_are_named(&tree, "empty pane");
     gpui::a11y_checks::assert_no_role_was_discarded(&tree, "empty pane");
+    gpui::a11y_checks::assert_no_aria_was_discarded(&tree, "empty pane");
     gpui::a11y_checks::assert_roles_are_contained(&tree, "empty pane");
     gpui::a11y_checks::assert_focus_reached_the_tree(&tree, "empty pane");
     gpui::a11y_checks::assert_click_targets_are_reachable(&tree, "empty pane");
@@ -1240,6 +1250,7 @@ async fn test_the_open_item_is_still_reported_on_later_frames(cx: &mut TestAppCo
         let tree: serde_json::Value = serde_json::from_str(&json).expect("the dump is valid JSON");
         gpui::a11y_checks::assert_interactive_nodes_are_named(&tree, "open item");
         gpui::a11y_checks::assert_no_role_was_discarded(&tree, "open item");
+        gpui::a11y_checks::assert_no_aria_was_discarded(&tree, "open item");
         gpui::a11y_checks::assert_roles_are_contained(&tree, "open item");
         gpui::a11y_checks::assert_focus_reached_the_tree(&tree, "open item");
         gpui::a11y_checks::assert_click_targets_are_reachable(&tree, "open item");
@@ -1314,6 +1325,7 @@ async fn pinned_tabs_are_their_own_list(cx: &mut TestAppContext) {
     let tree: serde_json::Value = serde_json::from_str(&json).expect("the dump is valid JSON");
     gpui::a11y_checks::assert_interactive_nodes_are_named(&tree, "pinned tabs");
     gpui::a11y_checks::assert_no_role_was_discarded(&tree, "pinned tabs");
+    gpui::a11y_checks::assert_no_aria_was_discarded(&tree, "pinned tabs");
     gpui::a11y_checks::assert_roles_are_contained(&tree, "pinned tabs");
     gpui::a11y_checks::assert_names_are_distinguishable(&tree, "pinned tabs");
     gpui::a11y_checks::assert_clickable_elements_are_reachable(&tree, "pinned tabs");
@@ -1420,6 +1432,7 @@ async fn the_stacked_tab_bar_is_still_a_tab_list(cx: &mut TestAppContext) {
     let tree: serde_json::Value = serde_json::from_str(&json).expect("the dump is valid JSON");
     gpui::a11y_checks::assert_interactive_nodes_are_named(&tree, "stacked tabs");
     gpui::a11y_checks::assert_no_role_was_discarded(&tree, "stacked tabs");
+    gpui::a11y_checks::assert_no_aria_was_discarded(&tree, "stacked tabs");
     // The check this is really about: a `Tab` outside a `TabList` keeps its
     // role and loses everything the containment gives it.
     gpui::a11y_checks::assert_roles_are_contained(&tree, "stacked tabs");

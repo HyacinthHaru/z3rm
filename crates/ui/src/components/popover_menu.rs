@@ -565,6 +565,7 @@ mod tests {
         let tree: serde_json::Value = serde_json::from_str(&json).expect("the dump is valid JSON");
         gpui::a11y_checks::assert_interactive_nodes_are_named(&tree, "menu trigger");
         gpui::a11y_checks::assert_no_role_was_discarded(&tree, "menu trigger");
+        gpui::a11y_checks::assert_no_aria_was_discarded(&tree, "menu trigger");
 
         let trigger = tree["nodes"]
             .as_object()

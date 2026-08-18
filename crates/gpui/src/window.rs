@@ -3098,6 +3098,7 @@ impl Window {
                 // Filled in by `end_frame`, which owns the diagnostics.
                 focus_without_node: None,
                 roles_without_id: Vec::new(),
+                aria_without_role: Vec::new(),
                 clickable_without_role: Vec::new(),
                 active_descendant_without_focus: false,
             };

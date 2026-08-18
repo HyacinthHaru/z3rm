@@ -316,6 +316,7 @@ mod tests {
         gpui::a11y_checks::assert_interactive_nodes_are_named(&tree, "window controls");
         gpui::a11y_checks::assert_names_are_distinguishable(&tree, "window controls");
         gpui::a11y_checks::assert_no_role_was_discarded(&tree, "window controls");
+        gpui::a11y_checks::assert_no_aria_was_discarded(&tree, "window controls");
         gpui::a11y_checks::assert_clickable_elements_are_reachable(&tree, "window controls");
         gpui::a11y_checks::assert_controls_have_area(&tree, "window controls");
 

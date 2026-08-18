@@ -83,6 +83,7 @@ fn the_shared_controls_report_their_state(cx: &mut TestAppContext) {
     let tree: serde_json::Value = serde_json::from_str(&json).expect("the dump is valid JSON");
     gpui::a11y_checks::assert_interactive_nodes_are_named(&tree, "shared controls");
     gpui::a11y_checks::assert_no_role_was_discarded(&tree, "shared controls");
+    gpui::a11y_checks::assert_no_aria_was_discarded(&tree, "shared controls");
     gpui::a11y_checks::assert_roles_are_contained(&tree, "shared controls");
     gpui::a11y_checks::assert_focus_reached_the_tree(&tree, "shared controls");
     gpui::a11y_checks::assert_click_targets_are_reachable(&tree, "shared controls");
@@ -168,6 +169,7 @@ fn the_shared_controls_report_their_state(cx: &mut TestAppContext) {
         let tree: serde_json::Value = serde_json::from_str(&json).expect("the dump is valid JSON");
         gpui::a11y_checks::assert_interactive_nodes_are_named(&tree, "modal headline");
         gpui::a11y_checks::assert_no_role_was_discarded(&tree, "modal headline");
+        gpui::a11y_checks::assert_no_aria_was_discarded(&tree, "modal headline");
         gpui::a11y_checks::assert_roles_are_contained(&tree, "modal headline");
         gpui::a11y_checks::assert_focus_reached_the_tree(&tree, "modal headline");
         gpui::a11y_checks::assert_click_targets_are_reachable(&tree, "modal headline");
@@ -233,6 +235,7 @@ fn the_shared_controls_report_their_state(cx: &mut TestAppContext) {
         let tree: serde_json::Value = serde_json::from_str(&json).expect("the dump is valid JSON");
         gpui::a11y_checks::assert_interactive_nodes_are_named(&tree, "disabled controls");
         gpui::a11y_checks::assert_no_role_was_discarded(&tree, "disabled controls");
+        gpui::a11y_checks::assert_no_aria_was_discarded(&tree, "disabled controls");
         gpui::a11y_checks::assert_roles_are_contained(&tree, "disabled controls");
         gpui::a11y_checks::assert_focus_reached_the_tree(&tree, "disabled controls");
         gpui::a11y_checks::assert_click_targets_are_reachable(&tree, "disabled controls");
@@ -314,6 +317,7 @@ fn the_shared_controls_report_their_state(cx: &mut TestAppContext) {
 
         gpui::a11y_checks::assert_interactive_nodes_are_named(&tree, "messages");
         gpui::a11y_checks::assert_no_role_was_discarded(&tree, "messages");
+        gpui::a11y_checks::assert_no_aria_was_discarded(&tree, "messages");
         gpui::a11y_checks::assert_names_are_distinguishable(&tree, "messages");
         gpui::a11y_checks::assert_clickable_elements_are_reachable(&tree, "messages");
         gpui::a11y_checks::assert_roles_are_contained(&tree, "messages");
@@ -389,6 +393,7 @@ fn the_shared_controls_report_their_state(cx: &mut TestAppContext) {
         gpui::a11y_checks::assert_landmarks_are_distinguishable(&tree, "toggle button group");
         gpui::a11y_checks::assert_active_descendant_is_honoured(&tree, "toggle button group");
         gpui::a11y_checks::assert_no_role_was_discarded(&tree, "toggle button group");
+        gpui::a11y_checks::assert_no_aria_was_discarded(&tree, "toggle button group");
 
         let mut buttons: Vec<(&str, Option<&str>)> = tree["nodes"]
             .as_object()
@@ -462,6 +467,7 @@ fn the_shared_controls_report_their_state(cx: &mut TestAppContext) {
         gpui::a11y_checks::assert_names_are_distinguishable(&tree, "collapsible sections");
         gpui::a11y_checks::assert_clickable_elements_are_reachable(&tree, "collapsible sections");
         gpui::a11y_checks::assert_no_role_was_discarded(&tree, "collapsible sections");
+        gpui::a11y_checks::assert_no_aria_was_discarded(&tree, "collapsible sections");
         gpui::a11y_checks::assert_roles_are_contained(&tree, "collapsible sections");
         gpui::a11y_checks::assert_click_targets_are_reachable(&tree, "collapsible sections");
         gpui::a11y_checks::assert_controls_have_area(&tree, "collapsible sections");

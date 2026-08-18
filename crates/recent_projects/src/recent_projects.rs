@@ -2855,6 +2855,7 @@ mod tests {
         gpui::a11y_checks::assert_landmarks_are_distinguishable(&tree, "recent projects picker");
         gpui::a11y_checks::assert_active_descendant_is_honoured(&tree, "recent projects picker");
         gpui::a11y_checks::assert_no_role_was_discarded(&tree, "recent projects picker");
+        gpui::a11y_checks::assert_no_aria_was_discarded(&tree, "recent projects picker");
         gpui::a11y_checks::assert_roles_are_contained(&tree, "recent projects picker");
         gpui::a11y_checks::assert_click_targets_are_reachable(&tree, "recent projects picker");
         gpui::a11y_checks::assert_focus_reached_the_tree(&tree, "recent projects picker");
@@ -2922,6 +2923,7 @@ mod tests {
         let tree: serde_json::Value = serde_json::from_str(&json).expect("the dump is valid JSON");
         gpui::a11y_checks::assert_interactive_nodes_are_named(&tree, "empty picker");
         gpui::a11y_checks::assert_no_role_was_discarded(&tree, "empty picker");
+        gpui::a11y_checks::assert_no_aria_was_discarded(&tree, "empty picker");
         gpui::a11y_checks::assert_roles_are_contained(&tree, "empty picker");
         gpui::a11y_checks::assert_focus_reached_the_tree(&tree, "empty picker");
         gpui::a11y_checks::assert_click_targets_are_reachable(&tree, "empty picker");

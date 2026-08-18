@@ -2699,6 +2699,7 @@ mod live_tests {
         let tree: serde_json::Value = serde_json::from_str(&json).expect("the dump is valid JSON");
         gpui::a11y_checks::assert_interactive_nodes_are_named(&tree, "empty sidebar");
         gpui::a11y_checks::assert_no_role_was_discarded(&tree, "empty sidebar");
+        gpui::a11y_checks::assert_no_aria_was_discarded(&tree, "empty sidebar");
         gpui::a11y_checks::assert_roles_are_contained(&tree, "empty sidebar");
         gpui::a11y_checks::assert_focus_reached_the_tree(&tree, "empty sidebar");
         gpui::a11y_checks::assert_click_targets_are_reachable(&tree, "empty sidebar");
@@ -2780,6 +2781,7 @@ mod live_tests {
         let tree: serde_json::Value = serde_json::from_str(&json).expect("the dump is valid JSON");
         gpui::a11y_checks::assert_interactive_nodes_are_named(&tree, "filtered sidebar");
         gpui::a11y_checks::assert_no_role_was_discarded(&tree, "filtered sidebar");
+        gpui::a11y_checks::assert_no_aria_was_discarded(&tree, "filtered sidebar");
         gpui::a11y_checks::assert_roles_are_contained(&tree, "filtered sidebar");
         gpui::a11y_checks::assert_focus_reached_the_tree(&tree, "filtered sidebar");
         gpui::a11y_checks::assert_click_targets_are_reachable(&tree, "filtered sidebar");
@@ -2831,6 +2833,7 @@ mod live_tests {
         gpui::a11y_checks::assert_landmarks_are_distinguishable(&files, "sidebar files");
         gpui::a11y_checks::assert_active_descendant_is_honoured(&files, "sidebar files");
         gpui::a11y_checks::assert_no_role_was_discarded(&files, "sidebar files");
+        gpui::a11y_checks::assert_no_aria_was_discarded(&files, "sidebar files");
         gpui::a11y_checks::assert_roles_are_contained(&files, "sidebar files");
         gpui::a11y_checks::assert_click_targets_are_reachable(&files, "sidebar files");
         assert!(
@@ -2853,6 +2856,7 @@ mod live_tests {
         gpui::a11y_checks::assert_landmarks_are_distinguishable(&tree, "sidebar panel");
         gpui::a11y_checks::assert_active_descendant_is_honoured(&tree, "sidebar panel");
         gpui::a11y_checks::assert_no_role_was_discarded(&tree, "sidebar panel");
+        gpui::a11y_checks::assert_no_aria_was_discarded(&tree, "sidebar panel");
         gpui::a11y_checks::assert_roles_are_contained(&tree, "sidebar panel");
         gpui::a11y_checks::assert_click_targets_are_reachable(&tree, "sidebar panel");
         gpui::a11y_checks::assert_focus_reached_the_tree(&tree, "sidebar panel");

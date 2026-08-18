@@ -119,6 +119,17 @@ pub trait Element: 'static + IntoElement {
     /// See the [accessibility guide](crate::_accessibility) for an overview.
     fn write_a11y_info(&self, _node: &mut accesskit::Node) {}
 
+    /// Whether this element carries accessibility information that only reaches
+    /// a reader through a node of its own.
+    ///
+    /// A node is built only for an element with both an id and a role, so a
+    /// label or a live region set on an element with neither is dropped without
+    /// a word. This reports the elements worth complaining about; see
+    /// [`crate::a11y_checks::assert_no_aria_was_discarded`].
+    fn a11y_has_properties(&self) -> bool {
+        false
+    }
+
     /// Add synthetic child nodes to an [`Element`] that has an
     /// [`.id()`][Element::id] and a [`.role()`][Element::a11y_role].
     ///
@@ -370,6 +381,14 @@ impl<E: Element> Drawable<E> {
                         window
                             .a11y
                             .note_role_without_id(role, self.element.source_location());
+                    }
+                    // The other half of the same trap: an id without a role
+                    // builds no node either, so anything set on it is dropped
+                    // just as quietly.
+                    if self.element.a11y_role().is_none() && self.element.a11y_has_properties() {
+                        window
+                            .a11y
+                            .note_aria_without_role(self.element.source_location());
                     }
                     if let Some(global_id) = global_id.as_ref() {
                         if let Some(role) = self.element.a11y_role() {

@@ -2045,6 +2045,7 @@ mod tests {
 
         gpui::a11y_checks::assert_interactive_nodes_are_named(&tree, "buffer search");
         gpui::a11y_checks::assert_no_role_was_discarded(&tree, "buffer search");
+        gpui::a11y_checks::assert_no_aria_was_discarded(&tree, "buffer search");
         gpui::a11y_checks::assert_roles_are_contained(&tree, "buffer search");
         gpui::a11y_checks::assert_focus_reached_the_tree(&tree, "buffer search");
         gpui::a11y_checks::assert_click_targets_are_reachable(&tree, "buffer search");

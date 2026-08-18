@@ -336,6 +336,7 @@ mod tests {
         crate::test::a11y_checks::assert_names_are_distinguishable(&tree, "prompt");
         crate::test::a11y_checks::assert_clickable_elements_are_reachable(&tree, "prompt");
         crate::test::a11y_checks::assert_no_role_was_discarded(&tree, "prompt");
+        crate::test::a11y_checks::assert_no_aria_was_discarded(&tree, "prompt");
         crate::test::a11y_checks::assert_controls_have_area(&tree, "prompt");
 
         let nodes = tree["nodes"].as_object().expect("the dump lists nodes");

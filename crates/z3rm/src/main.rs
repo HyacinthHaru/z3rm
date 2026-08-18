@@ -3413,6 +3413,7 @@ mod tests {
         gpui::a11y_checks::assert_names_are_distinguishable(&tree, "two panels");
         gpui::a11y_checks::assert_clickable_elements_are_reachable(&tree, "two panels");
         gpui::a11y_checks::assert_no_role_was_discarded(&tree, "two panels");
+        gpui::a11y_checks::assert_no_aria_was_discarded(&tree, "two panels");
         gpui::a11y_checks::assert_roles_are_contained(&tree, "two panels");
         gpui::a11y_checks::assert_focus_reached_the_tree(&tree, "two panels");
         gpui::a11y_checks::assert_active_descendant_is_honoured(&tree, "two panels");
@@ -3483,6 +3484,7 @@ mod tests {
         gpui::a11y_checks::assert_landmarks_are_distinguishable(&tree, "mux connection status");
         gpui::a11y_checks::assert_active_descendant_is_honoured(&tree, "mux connection status");
         gpui::a11y_checks::assert_no_role_was_discarded(&tree, "mux connection status");
+        gpui::a11y_checks::assert_no_aria_was_discarded(&tree, "mux connection status");
         gpui::a11y_checks::assert_roles_are_contained(&tree, "mux connection status");
         gpui::a11y_checks::assert_live_regions_can_speak(&tree, "mux connection status");
 

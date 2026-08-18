@@ -30,6 +30,9 @@ pub(crate) struct FrameDebugInfo {
     /// Roles that never became nodes because their element had no id. Filled in
     /// by `end_frame`, which owns the diagnostic.
     pub roles_without_id: Vec<String>,
+    /// Elements that carry accessibility information but no role, so no node
+    /// was built and the information went nowhere.
+    pub aria_without_role: Vec<String>,
     /// Elements that answer a click but produced no node at all. Nothing else
     /// in the dump records them: every other diagnostic is about nodes, and
     /// these have none.
@@ -49,6 +52,7 @@ struct CapturedFrame {
     scale_factor: f32,
     focus_without_node: Option<&'static str>,
     roles_without_id: Vec<String>,
+    aria_without_role: Vec<String>,
     clickable_without_role: Vec<ClickableWithoutRole>,
     active_descendant_without_focus: bool,
 }
@@ -116,6 +120,7 @@ impl A11yDebug {
             scale_factor: frame.scale_factor,
             focus_without_node: frame.focus_without_node,
             roles_without_id: frame.roles_without_id,
+            aria_without_role: frame.aria_without_role,
             clickable_without_role: frame.clickable_without_role,
             active_descendant_without_focus: frame.active_descendant_without_focus,
         });
@@ -175,6 +180,7 @@ impl A11yDebug {
                 "scale_factor": frame.scale_factor,
                 "focus_without_node": frame.focus_without_node,
                 "roles_without_id": frame.roles_without_id,
+                "aria_without_role": frame.aria_without_role,
                 "clickable_without_role": frame
                     .clickable_without_role
                     .iter()

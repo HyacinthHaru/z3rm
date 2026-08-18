@@ -2641,6 +2641,7 @@ mod tests {
         gpui::a11y_checks::assert_landmarks_are_distinguishable(&tree, "context menu");
         gpui::a11y_checks::assert_active_descendant_is_honoured(&tree, "context menu");
         gpui::a11y_checks::assert_no_role_was_discarded(&tree, "context menu");
+        gpui::a11y_checks::assert_no_aria_was_discarded(&tree, "context menu");
         gpui::a11y_checks::assert_roles_are_contained(&tree, "context menu");
         let nodes = tree["nodes"].as_object().expect("the dump lists nodes");
 
