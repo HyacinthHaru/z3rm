@@ -779,11 +779,21 @@ fn mux_pane_renders_terminal_grid_and_exposes_a11y_tree() -> Result<()> {
         "MuxPaneView must expose a Role::Terminal node, roles seen: {:?}",
         a11y_role_summary(&tree)
     );
+    // The terminal's own title, not a fixed string. This is the node focus
+    // lands on when a pane is entered, so a constant here meant every terminal
+    // in the window announced identically. The mock server's pane has no PTY,
+    // so the title is the default.
     assert!(
         terminals
             .iter()
-            .any(|node| a11y_string_field(node, "label").as_deref() == Some("terminal output")),
-        "the TerminalElement surface must be labelled"
+            .any(|node| a11y_string_field(node, "label").as_deref() == Some("Terminal")),
+        "the TerminalElement surface must be labelled with what it is running"
+    );
+    assert!(
+        terminals
+            .iter()
+            .any(|node| a11y_string_field(node, "role_description").as_deref() == Some("terminal")),
+        "and has to say it is a terminal, which `AXTextArea` does not"
     );
 
     let text_runs = a11y_text_run_values(&tree);
