@@ -188,7 +188,15 @@ impl Focusable for AnnouncementToastNotification {
 
 impl EventEmitter<DismissEvent> for AnnouncementToastNotification {}
 impl EventEmitter<SuppressEvent> for AnnouncementToastNotification {}
-impl Notification for AnnouncementToastNotification {}
+impl Notification for AnnouncementToastNotification {
+    fn announcement(&self, _cx: &App) -> SharedString {
+        // The bullet items are left out: an announcement that arrives while
+        // the user is working somewhere else has to be short enough to be
+        // worth interrupting for, and the notification itself carries the
+        // rest for whoever goes to read it.
+        format!("{}. {}", self.content.heading, self.content.description).into()
+    }
+}
 
 impl Render for AnnouncementToastNotification {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {

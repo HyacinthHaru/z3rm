@@ -5568,13 +5568,24 @@ impl Workspace {
                 .role(gpui::Role::Log)
                 .aria_live(gpui::accesskit::Live::Polite)
                 .aria_label("Notifications")
+                // The newest notification's text, because that is the one that
+                // just arrived. macOS speaks the region's own value and never
+                // descends into the notifications drawn inside it, so a name
+                // alone announces nothing at all.
+                .when_some(
+                    self.notifications
+                        .last()
+                        .map(|(_, _, announcement)| announcement)
+                        .filter(|announcement| !announcement.is_empty()),
+                    |this, announcement| this.aria_value(announcement.clone()),
+                )
                 .when(has_notifications, |this| {
                     this.w_112().h_full().flex().flex_col().justify_end().gap_2()
                 })
                 .children(
                     self.notifications
                         .iter()
-                        .map(|(_, notification)| notification.clone().into_any_element()),
+                        .map(|(_, notification, _)| notification.clone().into_any_element()),
                 ),
         )
     }
@@ -6278,7 +6289,7 @@ impl Workspace {
             ))
             .on_action(cx.listener(
                 |workspace: &mut Workspace, _: &SuppressNotification, _, cx| {
-                    if let Some((notification_id, _)) = workspace.notifications.pop() {
+                    if let Some((notification_id, _, _)) = workspace.notifications.pop() {
                         workspace.suppress_notification(&notification_id, cx);
                     }
                 },
@@ -7348,7 +7359,7 @@ impl Workspace {
 
     pub fn cancel(&mut self, _: &menu::Cancel, window: &mut Window, cx: &mut Context<Self>) {
         if cx.stop_active_drag(window) {
-        } else if let Some((notification_id, _)) = self.notifications.pop() {
+        } else if let Some((notification_id, _, _)) = self.notifications.pop() {
             dismiss_app_notification(&notification_id, cx);
         } else {
             cx.propagate();
@@ -7935,7 +7946,7 @@ impl Render for Workspace {
         let notification_entities = self
             .notifications
             .iter()
-            .map(|(_, notification)| notification.entity_id())
+            .map(|(_, notification, _)| notification.entity_id())
             .collect::<Vec<_>>();
         let bottom_dock_layout = WorkspaceSettings::get_global(cx).bottom_dock_layout;
 

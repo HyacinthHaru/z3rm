@@ -21,11 +21,15 @@ use util::ResultExt;
 
 #[derive(Default)]
 pub struct Notifications {
-    notifications: Vec<(NotificationId, AnyView)>,
+    notifications: Vec<(NotificationId, AnyView, SharedString)>,
 }
 
 impl Deref for Notifications {
-    type Target = Vec<(NotificationId, AnyView)>;
+    /// The third field is the text a screen reader announces when the
+    /// notification arrives. It is carried here rather than read out of the
+    /// view because a live region announces its own value and never descends
+    /// into what the notification draws.
+    type Target = Vec<(NotificationId, AnyView, SharedString)>;
 
     fn deref(&self) -> &Self::Target {
         &self.notifications
@@ -66,6 +70,13 @@ impl NotificationId {
 pub trait Notification:
     EventEmitter<DismissEvent> + EventEmitter<SuppressEvent> + Focusable + Render
 {
+    /// The text announced when the notification appears, or empty when the
+    /// notification has no text to announce.
+    ///
+    /// A notification arrives away from wherever the user is working, so it is
+    /// only perceived if it is announced, and macOS speaks a live region's own
+    /// `value` — not the text the notification draws inside itself.
+    fn announcement(&self, cx: &App) -> SharedString;
 }
 
 pub struct SuppressEvent;
@@ -75,7 +86,7 @@ impl Workspace {
     pub fn notification_ids(&self) -> Vec<NotificationId> {
         self.notifications
             .iter()
-            .map(|(id, _)| id)
+            .map(|(id, _, _)| id)
             .cloned()
             .collect()
     }
@@ -88,6 +99,7 @@ impl Workspace {
     ) {
         self.show_notification_without_handling_dismiss_events(&id, cx, |cx| {
             let notification = build_notification(cx);
+            let announcement = notification.read(cx).announcement(cx);
             cx.subscribe(&notification, {
                 let id = id.clone();
                 move |this, _, _: &DismissEvent, cx| {
@@ -136,27 +148,28 @@ impl Workspace {
                     }
                 }
             }
-            notification.into()
+            (notification.into(), announcement)
         });
     }
 
     /// Shows a notification in this workspace's window. Caller must handle dismiss.
     ///
     /// This exists so that the `build_notification` closures stored for app notifications can
-    /// return `AnyView`. Subscribing to events from an `AnyView` is not supported, so instead that
+    /// return `AnyView` with the text to announce alongside it. Subscribing to events from an `AnyView` is not supported, so instead that
     /// responsibility is pushed to the caller where the `V` type is known.
     pub(crate) fn show_notification_without_handling_dismiss_events(
         &mut self,
         id: &NotificationId,
         cx: &mut Context<Self>,
-        build_notification: impl FnOnce(&mut Context<Self>) -> AnyView,
+        build_notification: impl FnOnce(&mut Context<Self>) -> (AnyView, SharedString),
     ) {
         if self.suppressed_notifications.contains(id) {
             return;
         }
         self.dismiss_notification(id, cx);
+        let (notification, announcement) = build_notification(cx);
         self.notifications
-            .push((id.clone(), build_notification(cx)));
+            .push((id.clone(), notification, announcement));
         cx.notify();
     }
 
@@ -169,7 +182,7 @@ impl Workspace {
     }
 
     pub fn dismiss_notification(&mut self, id: &NotificationId, cx: &mut Context<Self>) {
-        self.notifications.retain(|(existing_id, _)| {
+        self.notifications.retain(|(existing_id, _, _)| {
             if existing_id == id {
                 cx.notify();
                 false
@@ -281,7 +294,16 @@ impl Focusable for LanguageServerPrompt {
     }
 }
 
-impl Notification for LanguageServerPrompt {}
+impl Notification for LanguageServerPrompt {
+    fn announcement(&self, _cx: &App) -> SharedString {
+        match &self.request {
+            Some(request) => {
+                format!("{}: {}", request.lsp_name, request.message).into()
+            }
+            None => SharedString::default(),
+        }
+    }
+}
 
 impl LanguageServerPrompt {
     pub fn new(request: LanguageServerPromptRequest, cx: &mut App) -> Self {
@@ -695,7 +717,18 @@ pub mod simple_message_notification {
     impl EventEmitter<DismissEvent> for MessageNotification {}
     impl EventEmitter<SuppressEvent> for MessageNotification {}
 
-    impl Notification for MessageNotification {}
+    impl Notification for MessageNotification {
+        fn announcement(&self, _cx: &App) -> SharedString {
+            match (self.title.as_ref(), self.announcement.as_ref()) {
+                (Some(title), Some(message)) => format!("{title}. {message}").into(),
+                (Some(title), None) => title.clone(),
+                (None, Some(message)) => message.clone(),
+                // Built through `new_from_builder`, which draws arbitrary
+                // elements and keeps no text to announce.
+                (None, None) => SharedString::default(),
+            }
+        }
+    }
 
     impl FluentBuilder for MessageNotification {}
 
@@ -1167,18 +1200,14 @@ pub mod simple_message_notification {
                 );
 
             // The title and the message body are plain text, which contributes
-            // no accessibility node, so without a name here the live region
-            // around the stack announces that a notification arrived and not
-            // what it says.
-            let announcement = match (self.title.as_ref(), self.announcement.as_ref()) {
-                (Some(title), Some(message)) => Some(SharedString::from(format!("{title}. {message}"))),
-                (Some(title), None) => Some(title.clone()),
-                (None, message) => message.cloned(),
-            };
+            // no accessibility node, so without a name here a user who goes
+            // looking for the notification finds an unnamed group. This is the
+            // same text the stack announces, so the two cannot drift.
+            let announcement = Notification::announcement(self, cx);
 
             div()
                 .id("message-notification-wrapper")
-                .when_some(announcement, |this, announcement| {
+                .when(!announcement.is_empty(), |this| {
                     // Deliberately not `Alert`, which carries an implicit
                     // assertive live region: the stack around it is polite, and
                     // an error that already happened does not justify cutting
@@ -1473,7 +1502,7 @@ static GLOBAL_APP_NOTIFICATIONS: LazyLock<Mutex<AppNotifications>> = LazyLock::n
 struct AppNotifications {
     app_notifications: Vec<(
         NotificationId,
-        Arc<dyn Fn(&mut Context<Workspace>) -> AnyView + Send + Sync>,
+        Arc<dyn Fn(&mut Context<Workspace>) -> (AnyView, SharedString) + Send + Sync>,
     )>,
 }
 
@@ -1481,7 +1510,7 @@ impl AppNotifications {
     pub fn insert(
         &mut self,
         id: NotificationId,
-        build_notification: Arc<dyn Fn(&mut Context<Workspace>) -> AnyView + Send + Sync>,
+        build_notification: Arc<dyn Fn(&mut Context<Workspace>) -> (AnyView, SharedString) + Send + Sync>,
     ) {
         self.remove(&id);
         self.app_notifications.push((id, build_notification))
@@ -1504,8 +1533,9 @@ pub fn show_app_notification<V: Notification + 'static>(
     // Defer notification creation so that windows on the stack can be returned to GPUI
     cx.defer(move |cx| {
         // Handle dismiss events by removing the notification from all workspaces.
-        let build_notification: Arc<dyn Fn(&mut Context<Workspace>) -> AnyView + Send + Sync> =
-            Arc::new({
+        let build_notification: Arc<
+            dyn Fn(&mut Context<Workspace>) -> (AnyView, SharedString) + Send + Sync,
+        > = Arc::new({
                 let id = id.clone();
                 move |cx| {
                     let notification = build_notification(cx);
@@ -1523,7 +1553,8 @@ pub fn show_app_notification<V: Notification + 'static>(
                         }
                     })
                     .detach();
-                    notification.into()
+                    let announcement = notification.read(cx).announcement(cx);
+                    (notification.into(), announcement)
                 }
             });
 

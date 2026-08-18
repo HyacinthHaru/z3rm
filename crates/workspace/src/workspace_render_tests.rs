@@ -329,6 +329,7 @@ async fn test_notifications_are_announced_as_a_live_region(cx: &mut TestAppConte
     gpui::a11y_checks::assert_clickable_elements_are_reachable(&tree, "notifications");
     gpui::a11y_checks::assert_controls_have_area(&tree, "notifications");
     gpui::a11y_checks::assert_active_descendant_is_honoured(&tree, "notifications");
+    gpui::a11y_checks::assert_live_regions_can_speak(&tree, "notifications");
 
     let log = tree["nodes"]
         .as_object()
@@ -342,9 +343,19 @@ async fn test_notifications_are_announced_as_a_live_region(cx: &mut TestAppConte
         "a notification that arrives on its own has to be announced"
     );
     assert_eq!(log["aria"]["label"].as_str(), Some("Notifications"));
-    // A live region announces what is inside it, and the notification body is
-    // plain text that contributes no node of its own, so the region can exist
-    // and still have nothing to read out.
+    // What is actually spoken. macOS raises an announcement only when the
+    // region has a value and speaks that value, never descending into the
+    // notifications drawn inside it — so the label above names the region and
+    // this is the only thing a user hears when one arrives.
+    assert_eq!(
+        log["aria"]["value"].as_str(),
+        Some("the mux server went away"),
+        "the newest notification's text has to be the region's value"
+    );
+
+    // Separately, whoever goes looking for the notification has to find it
+    // named. The body is plain text and contributes no node of its own, so
+    // this is the wrapper's label rather than anything the region announces.
     let nodes = tree["nodes"].as_object().expect("the dump lists nodes");
     let announced: Vec<&str> = log["children"]
         .as_array()
@@ -356,6 +367,55 @@ async fn test_notifications_are_announced_as_a_live_region(cx: &mut TestAppConte
     assert!(
         announced.contains(&"the mux server went away"),
         "the region has to contain what the notification says: {announced:?}"
+    );
+}
+
+/// Notifications stack, and the one that just arrived is the one a user needs
+/// to hear. The region carries a single value, so it has to be the newest.
+#[gpui::test]
+async fn test_the_newest_notification_is_the_one_announced(cx: &mut TestAppContext) {
+    init_test(cx);
+    let fs = FakeFs::new(cx.executor());
+    fs.insert_tree("/root", json!({ "a.txt": "" })).await;
+    let project = Project::test(fs, [path!("/root").as_ref()], cx).await;
+
+    let (multi_workspace, cx) =
+        cx.add_window_view(|window, cx| MultiWorkspace::test_new(project, window, cx));
+    let workspace = multi_workspace.read_with(cx, |mw, _| mw.workspace().clone());
+
+    for message in ["the mux server went away", "the language server crashed"] {
+        workspace.update(cx, |workspace, cx| {
+            workspace.show_notification(crate::NotificationId::named(message.into()), cx, |cx| {
+                cx.new(|cx| {
+                    crate::notifications::simple_message_notification::MessageNotification::new(
+                        message, cx,
+                    )
+                })
+            });
+        });
+        cx.run_until_parked();
+    }
+
+    cx.activate_a11y(cx.window_handle());
+    let json = cx
+        .update(|window, cx| {
+            window.draw(cx).clear(cx);
+            window.debug_a11y_tree_json()
+        })
+        .expect("activation makes the debug tree available");
+    let tree: serde_json::Value = serde_json::from_str(&json).expect("the dump is valid JSON");
+    gpui::a11y_checks::assert_live_regions_can_speak(&tree, "notifications");
+
+    let log = tree["nodes"]
+        .as_object()
+        .expect("the dump lists nodes")
+        .values()
+        .find(|node| node["aria"]["role"] == "Log")
+        .expect("the notification stack must be reported as a log");
+    assert_eq!(
+        log["aria"]["value"].as_str(),
+        Some("the language server crashed"),
+        "the second notification is the one that just arrived"
     );
 }
 
