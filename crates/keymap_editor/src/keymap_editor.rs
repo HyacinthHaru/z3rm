@@ -1260,7 +1260,14 @@ impl KeymapEditor {
             (FilterState::All, SearchMode::Normal) => "No matches found for the provided query",
         };
 
-        Label::new(hint).color(Color::Muted).into_any_element()
+        // The hint is a `Label`, which contributes no node, so a search that
+        // matched nothing reached a reader as an empty list with no reason.
+        gpui::div()
+            .id("keymap-no-matches")
+            .role(gpui::Role::Group)
+            .aria_label(hint)
+            .child(Label::new(hint).color(Color::Muted))
+            .into_any_element()
     }
 
     fn select_next(&mut self, _: &menu::SelectNext, window: &mut Window, cx: &mut Context<Self>) {
@@ -4062,6 +4069,66 @@ mod tests {
     /// Every cell in the table holds a label, and a label contributes no node,
     /// so the whole list of bindings was absent: no table, no rows, and no way
     /// to hear what any binding runs or where it applies.
+    /// A search that matches nothing renders a hint instead of the table, and the
+    /// hint is a `Label` — which contributes no node. So the state a user is in
+    /// when they most need telling why the list is empty reached them as an
+    /// empty list. Nothing rendered this state in a frame.
+    #[gpui::test]
+    async fn a_search_that_matches_nothing_says_so(cx: &mut TestAppContext) {
+        let keymap_content = r#"[
+    {
+        "context": "Editor",
+        "bindings": {
+            "alt-cmd-shift-c": "zed::OpenKeymap"
+        }
+    }
+]"#;
+        let (_fs, keymap_editor, workspace, mut cx) =
+            setup_keymap_editor(cx, keymap_content).await;
+        let cx = &mut cx;
+
+        workspace.update_in(cx, |workspace, window, cx| {
+            workspace.add_item_to_active_pane(
+                Box::new(keymap_editor.clone()),
+                None,
+                true,
+                window,
+                cx,
+            );
+        });
+        cx.run_until_parked();
+
+        keymap_editor.update_in(cx, |editor, window, cx| {
+            editor.filter_editor.update(cx, |filter, cx| {
+                filter.set_text("no such binding anywhere", window, cx)
+            });
+        });
+        cx.run_until_parked();
+
+        cx.activate_a11y(cx.window_handle());
+        let json = cx
+            .update(|window, cx| {
+                window.draw(cx).clear(cx);
+                window.debug_a11y_tree_json()
+            })
+            .expect("activation makes the debug tree available");
+        let tree: serde_json::Value = serde_json::from_str(&json).expect("the dump is valid JSON");
+
+        gpui::a11y_checks::assert_no_role_was_discarded(&tree, "keymap with no matches");
+        gpui::a11y_checks::assert_no_aria_was_discarded(&tree, "keymap with no matches");
+
+        let names: Vec<&str> = tree["nodes"]
+            .as_object()
+            .expect("the dump lists nodes")
+            .values()
+            .filter_map(|node| node["aria"]["label"].as_str())
+            .collect();
+        assert!(
+            names.contains(&"No matches found for the provided query"),
+            "an empty list has to say why it is empty: {names:?}"
+        );
+    }
+
     #[gpui::test]
     async fn the_binding_table_names_itself_and_its_rows(cx: &mut TestAppContext) {
         let keymap_content = r#"[

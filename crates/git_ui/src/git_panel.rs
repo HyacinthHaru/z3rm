@@ -5618,6 +5618,11 @@ impl GitPanel {
 
     fn render_history_placeholder(message: &'static str) -> impl IntoElement {
         h_flex()
+            // The message is a `Label` and contributes no node, so a history
+            // that is loading, empty or broken read as blank either way.
+            .id("git-panel-history-placeholder")
+            .role(gpui::Role::Group)
+            .aria_label(message)
             .flex_1()
             .justify_center()
             .child(Label::new(message).color(Color::Muted))

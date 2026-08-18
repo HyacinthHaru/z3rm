@@ -3311,6 +3311,12 @@ impl SettingsWindow {
         let search_query = self.search_bar.read(cx).text(cx);
 
         v_flex()
+            // Both lines are `Label`s and contribute no node, so a search that
+            // matched nothing said nothing — and the query it did not match is
+            // the part that tells the user what to change.
+            .id("settings-no-results")
+            .role(gpui::Role::Group)
+            .aria_label(format!("No settings match \"{search_query}\""))
             .size_full()
             .items_center()
             .justify_center()
