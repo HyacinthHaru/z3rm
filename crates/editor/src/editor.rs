@@ -4560,7 +4560,16 @@ impl Editor {
             SharedString::from("Right-click for more options")
         };
         IconButton::new(("breakpoint_indicator", row.0 as usize), icon)
-            .aria_label(primary_action_text)
+            .aria_label(if is_rejected {
+                // The warning badge is the only thing that says this breakpoint
+                // will never be hit, and why is in a tooltip. `IconButton` has
+                // no description, so the name carries both.
+                SharedString::new_static(
+                    "Unset breakpoint, rejected: no executable code on this line",
+                )
+            } else {
+                SharedString::new_static(primary_action_text)
+            })
             .icon_size(IconSize::XSmall)
             .size(ui::ButtonSize::None)
             .when(is_rejected, |this| {

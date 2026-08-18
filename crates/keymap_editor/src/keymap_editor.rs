@@ -1692,7 +1692,15 @@ impl KeymapEditor {
             })
             .trigger_with_tooltip(
                 IconButton::new("KeymapEditorFilterMenuButton", IconName::Sliders)
-                    .aria_label("Filters")
+                    // The dot is the only thing that says some of your
+                    // keybindings conflict, and it is a coloured circle.
+                    .aria_label(
+                        if self.keybinding_conflict_state.any_user_binding_conflicts() {
+                            "Filters, some keybindings conflict"
+                        } else {
+                            "Filters"
+                        },
+                    )
                     .icon_size(IconSize::Small)
                     .when(
                         self.keybinding_conflict_state.any_user_binding_conflicts(),

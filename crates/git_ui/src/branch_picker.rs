@@ -1257,7 +1257,14 @@ impl PickerDelegate for BranchListDelegate {
                                     }))
                                     .trigger(
                                         IconButton::new("branch-filter", IconName::ListFilter)
-                                            .aria_label("Filter branches")
+                                            // A filter is why the list is
+                                            // short, and the dot saying one is
+                                            // set is a coloured circle.
+                                            .aria_label(if branch_filter == BranchFilter::All {
+                                                "Filter branches"
+                                            } else {
+                                                "Filter branches, a filter is set"
+                                            })
                                             .toggle_state(branch_filter != BranchFilter::All)
                                             .when(branch_filter != BranchFilter::All, |this| {
                                                 this.indicator(Indicator::dot().color(Color::Info))
