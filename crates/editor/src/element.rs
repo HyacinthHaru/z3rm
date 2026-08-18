@@ -9408,9 +9408,9 @@ impl Element for EditorElement {
                         // undo all three to stay truthful about where the caret
                         // is; these offsets describe what the user is looking
                         // at, which is what a reader reads. It follows that the
-                        // text changes as the editor scrolls, and that a
-                        // selection outside the visible rows is reported
-                        // collapsed at the top.
+                        // text changes as the editor scrolls, and that a caret
+                        // scrolled out of view is reported at whichever end it
+                        // went past, rather than at the top in both cases.
                         let display_snapshot = &position_map.snapshot.display_snapshot;
                         let mut text = String::new();
                         for row in start_row.0..end_row.0 {
@@ -9424,9 +9424,13 @@ impl Element for EditorElement {
                             .read(cx)
                             .selections
                             .newest_display(display_snapshot);
+                        let text_length = text.len();
                         let offset_of = |point: DisplayPoint| -> usize {
-                            if point.row() < start_row || point.row() >= end_row {
+                            if point.row() < start_row {
                                 return 0;
+                            }
+                            if point.row() >= end_row {
+                                return text_length;
                             }
                             let mut offset = 0;
                             for row in start_row.0..point.row().0 {
@@ -12541,6 +12545,112 @@ mod tests {
         assert!(
             folded.iter().any(|run| run.contains("fn two()")),
             "what is still on screen still has to be readable: {folded:?}"
+        );
+    }
+
+    /// A caret scrolled out of view still has to be reported somewhere, and
+    /// the only honest answer is the end it went past. Reporting both ends at
+    /// the top puts the caret at the first visible row when it is actually
+    /// hundreds of rows below, which is worse than saying nothing.
+    #[gpui::test]
+    async fn test_a_caret_scrolled_out_of_view_reads_at_the_end_it_went_past(
+        cx: &mut TestAppContext,
+    ) {
+        init_test(cx, |_| {});
+        let window = cx.add_window(|window, cx| {
+            let text = (0..300)
+                .map(|row| format!("line {row}"))
+                .collect::<Vec<_>>()
+                .join("\n");
+            let buffer = MultiBuffer::build_simple(&text, cx);
+            Editor::new(EditorMode::full(), buffer, None, window, cx)
+        });
+        cx.activate_a11y(window.into());
+
+        // Returns the caret's position and the length of the text the reader
+        // was given, both as counts of characters from the start of the
+        // visible text. The caret arrives split across the text runs it is
+        // chunked into — `{node: "b", character_index: 110}` means 110
+        // characters into the second run, not into the text — so resolving it
+        // means walking the runs the caret's node comes after.
+        fn caret_and_length(
+            cx: &mut TestAppContext,
+            window: gpui::AnyWindowHandle,
+            editor: &Entity<Editor>,
+            caret_row: u32,
+            scroll_top: f64,
+        ) -> (usize, usize) {
+            cx.update_window(window, |_, window, cx| {
+                editor.update(cx, |editor, cx| {
+                    editor.change_selections(SelectionEffects::no_scroll(), window, cx, |s| {
+                        let caret = DisplayPoint::new(DisplayRow(caret_row), 0);
+                        s.select_display_ranges([caret..caret]);
+                    });
+                    editor.set_scroll_position(gpui::Point::new(0., scroll_top), window, cx);
+                });
+                window.draw(cx).clear(cx);
+                let json = window
+                    .debug_a11y_tree_json()
+                    .expect("activation makes the debug tree available");
+                let tree: serde_json::Value =
+                    serde_json::from_str(&json).expect("the dump is valid JSON");
+                let nodes = tree["nodes"]
+                    .as_object()
+                    .expect("the dump lists nodes")
+                    .clone();
+                let region = nodes
+                    .values()
+                    .find(|node| node["aria"]["role"] == "Group")
+                    .unwrap_or_else(|| panic!("the editor is a focusable region: {json}"))
+                    .clone();
+                let focus = &region["aria"]["text_selection"]["focus"];
+                let focus_node = focus["node"]
+                    .as_str()
+                    .unwrap_or_else(|| panic!("the caret names the run it is in: {region}"));
+                let mut caret = focus["character_index"]
+                    .as_u64()
+                    .unwrap_or_else(|| panic!("the caret has an index: {region}"))
+                    as usize;
+                let mut length = 0;
+                let mut before_caret = true;
+                for id in region["children"].as_array().into_iter().flatten() {
+                    let Some(id) = id.as_str() else { continue };
+                    let Some(run) = nodes.get(id) else { continue };
+                    let Some(value) = run["aria"]["value"].as_str() else {
+                        continue;
+                    };
+                    if id == focus_node {
+                        before_caret = false;
+                    } else if before_caret {
+                        caret += value.chars().count();
+                    }
+                    length += value.chars().count();
+                }
+                (caret, length)
+            })
+            .expect("the harness window is still open")
+        }
+
+        let editor = window
+            .update(cx, |editor, _, cx| cx.entity().clone())
+            .expect("the harness window is still open");
+
+        // Scrolled to the bottom with the caret on the first row: the caret is
+        // above everything on screen.
+        let (caret, length) = caret_and_length(cx, window.into(), &editor, 0, 250.);
+        assert!(length > 0, "the reader is given the rows that are on screen");
+        assert_eq!(
+            caret, 0,
+            "a caret above the visible rows reads at the top of them"
+        );
+
+        // Scrolled to the top with the caret on the last row: the caret is
+        // below everything on screen. The buffer is ASCII, so the character
+        // count of the runs is the byte length the offset is computed in.
+        let (caret, length) = caret_and_length(cx, window.into(), &editor, 299, 0.);
+        assert_eq!(
+            caret, length,
+            "a caret below the visible rows reads at the bottom of them, not the top"
         );
     }
 
