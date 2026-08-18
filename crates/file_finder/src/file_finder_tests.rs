@@ -4495,6 +4495,46 @@ async fn open_queried_buffer(
     history_items
 }
 
+/// The create-file row draws `"Create File: …"` as a `Label`, which is no
+/// node, and it is the one match with no path to fall back on — so it was the
+/// only row in the picker announced with no name at all. It is also the row
+/// that creates a file.
+#[gpui::test]
+async fn the_create_file_row_says_what_it_creates(cx: &mut TestAppContext) {
+    let app_state = init_test(cx);
+    app_state
+        .fs
+        .as_fake()
+        .insert_tree(
+            path!("/src"),
+            json!({ "test": { "first.rs": "// first" } }),
+        )
+        .await;
+
+    let project = Project::test(app_state.fs.clone(), [path!("/src").as_ref()], cx).await;
+    let (multi_workspace, cx) =
+        cx.add_window_view(|window, cx| MultiWorkspace::test_new(project, window, cx));
+    let workspace = multi_workspace.read_with(cx, |mw, _| mw.workspace().clone());
+
+    let picker = open_file_picker(&workspace, cx);
+    simulate_input(cx, "brand_new.rs");
+
+    picker.update_in(cx, |finder, _window, cx| {
+        let index = finder
+            .delegate
+            .matches
+            .matches
+            .iter()
+            .position(|entry| matches!(entry, Match::CreateNew(_)))
+            .expect("a query matching nothing offers to create it");
+        assert_eq!(
+            finder.delegate.match_label(index, cx).as_deref(),
+            Some("Create file: brand_new.rs"),
+            "the row that creates a file has to say so"
+        );
+    });
+}
+
 pub(crate) fn init_test(cx: &mut TestAppContext) -> Arc<AppState> {
     cx.update(|cx| {
         // `AppState::test` does not install the settings store, and every

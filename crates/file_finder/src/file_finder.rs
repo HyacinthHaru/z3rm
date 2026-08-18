@@ -1688,8 +1688,19 @@ impl PickerDelegate for FileFinderDelegate {
     }
 
     fn match_label(&self, ix: usize, _cx: &App) -> Option<SharedString> {
-        let path = self.matches.get(ix)?.relative_path()?;
-        Some(path.as_unix_str().to_string().into())
+        match self.matches.get(ix)? {
+            // Drawn as a `Label`, which is no node, and it has no relative path
+            // to fall back on — so the row that creates a file was the one row
+            // here announced with no name at all.
+            Match::CreateNew(project_path) => Some(
+                format!(
+                    "Create file: {}",
+                    project_path.path.display(PathStyle::local())
+                )
+                .into(),
+            ),
+            other => Some(other.relative_path()?.as_unix_str().to_string().into()),
+        }
     }
 
     fn placeholder_text(&self, _window: &mut Window, _cx: &mut App) -> Arc<str> {
