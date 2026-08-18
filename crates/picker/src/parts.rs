@@ -16,6 +16,11 @@ pub fn project_scan_indicator(
     (has_query && is_project_scan_running).then(|| {
         h_flex()
             .id("project-scan-indicator")
+            // A spinner and a tooltip, neither of which is a node: while the
+            // scan runs the list is incomplete, and a reader had no way to know
+            // that the results in front of them are provisional.
+            .role(gpui::Role::Status)
+            .aria_label("Project scan in progress, results are incomplete")
             .tooltip(Tooltip::text("Project Scan in Progress…"))
             .child(
                 Icon::new(IconName::LoadCircle)

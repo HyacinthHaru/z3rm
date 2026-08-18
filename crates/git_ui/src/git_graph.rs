@@ -2886,10 +2886,16 @@ impl GitGraph {
                                 ),
                                 |this| {
                                     this.child(
-                                        Icon::new(IconName::ArrowCircle)
-                                            .color(Color::Accent)
-                                            .size(IconSize::Small)
-                                            .with_rotate_animation(2)
+                                        div()
+                                            .id("commit-search-running")
+                                            .role(gpui::Role::Status)
+                                            .aria_label("Searching commits")
+                                            .child(
+                                                Icon::new(IconName::ArrowCircle)
+                                                    .color(Color::Accent)
+                                                    .size(IconSize::Small)
+                                                    .with_rotate_animation(2),
+                                            )
                                             .into_any_element(),
                                     )
                                 },
@@ -2900,10 +2906,19 @@ impl GitGraph {
 
     fn render_loading_spinner(&self, cx: &App) -> AnyElement {
         let rems = TextSize::Large.rems(cx);
-        Icon::new(IconName::LoadCircle)
-            .size(IconSize::Custom(rems))
-            .color(Color::Accent)
-            .with_rotate_animation(3)
+        // The spinner is an icon, which is not a node: without this the panel
+        // is an empty region while it loads and reads as having nothing in it
+        // rather than as not being ready.
+        div()
+            .id("commit-details-loading")
+            .role(gpui::Role::Status)
+            .aria_label("Loading commit details")
+            .child(
+                Icon::new(IconName::LoadCircle)
+                    .size(IconSize::Custom(rems))
+                    .color(Color::Accent)
+                    .with_rotate_animation(3),
+            )
             .into_any_element()
     }
 

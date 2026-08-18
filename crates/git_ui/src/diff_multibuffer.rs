@@ -886,11 +886,21 @@ impl Render for DiffMultibuffer {
             .size_full()
             .when(is_empty && is_loading, |el| {
                 let rems = TextSize::Large.rems(cx);
+                // An empty pane and a spinning icon look different and read the
+                // same, because the icon is not a node: "still loading" and
+                // "there is nothing here" are opposite answers to whether the
+                // user should wait.
                 el.child(
-                    Icon::new(IconName::LoadCircle)
-                        .size(IconSize::Custom(rems))
-                        .color(Color::Accent)
-                        .with_rotate_animation(3)
+                    div()
+                        .id("git-diff-loading")
+                        .role(gpui::Role::Status)
+                        .aria_label("Loading changes")
+                        .child(
+                            Icon::new(IconName::LoadCircle)
+                                .size(IconSize::Custom(rems))
+                                .color(Color::Accent)
+                                .with_rotate_animation(3),
+                        )
                         .into_any_element(),
                 )
             })

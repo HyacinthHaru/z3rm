@@ -764,9 +764,18 @@ impl PickerDelegate for WorktreePickerDelegate {
                     .map(|candidate| candidate.path.as_path());
                 let display_name = worktree.directory_name(main_worktree_path);
                 let name = display_name.lines().next().unwrap_or(&display_name);
-                Some(match worktree.ref_name.as_ref() {
-                    Some(branch) => SharedString::from(format!("{name}, {branch}")),
-                    None => SharedString::from(name.to_string()),
+                let named = match worktree.ref_name.as_ref() {
+                    Some(branch) => format!("{name}, {branch}"),
+                    None => name.to_string(),
+                };
+                // A row being deleted swaps its buttons for a spinner and the
+                // word "Deleting…", both of which are drawn and neither of
+                // which is a node. Without this the row reads as available
+                // while it is on its way out.
+                Some(if self.deleting_worktree_paths.contains(&worktree.path) {
+                    SharedString::from(format!("{named}, deleting"))
+                } else {
+                    SharedString::from(named)
                 })
             }
         }
