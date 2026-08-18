@@ -139,6 +139,16 @@ impl ToastView for StatusToast {
         self.action.clone()
     }
 
+    fn announcement(&self, _cx: &App) -> SharedString {
+        // The action's label is part of it: a toast offering "Undo" that
+        // announces only what happened leaves the user with no idea that
+        // anything can be done about it before it disappears.
+        match &self.action {
+            Some(action) => format!("{}. {}", self.text, action.label).into(),
+            None => self.text.clone(),
+        }
+    }
+
     fn auto_dismiss(&self) -> bool {
         self.auto_dismiss
     }

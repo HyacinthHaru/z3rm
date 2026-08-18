@@ -45,6 +45,13 @@ pub fn init(cx: &mut App) {
 pub trait ToastView: ManagedView {
     fn action(&self) -> Option<ToastAction>;
 
+    /// The text announced when the toast appears.
+    ///
+    /// The layer cannot derive this from what the toast draws: macOS speaks a
+    /// live region's own `value` and never looks at the subtree, so the text
+    /// has to reach the layer as a string.
+    fn announcement(&self, cx: &App) -> SharedString;
+
     fn auto_dismiss(&self) -> bool {
         true
     }
@@ -74,11 +81,16 @@ impl ToastAction {
 
 trait ToastViewHandle {
     fn view(&self) -> AnyView;
+    fn announcement(&self, cx: &App) -> SharedString;
 }
 
 impl<V: ToastView> ToastViewHandle for Entity<V> {
     fn view(&self) -> AnyView {
         self.clone().into()
+    }
+
+    fn announcement(&self, cx: &App) -> SharedString {
+        self.read(cx).announcement(cx)
     }
 }
 
@@ -237,6 +249,10 @@ impl Render for ToastLayer {
                     .aria_live(gpui::accesskit::Live::Polite),
             );
         };
+        // What a reader hears when the toast arrives. The toast's own text is
+        // drawn by child elements, and a live region announces its `value` and
+        // nothing below it, so the text has to be lifted onto the region.
+        let announcement = active_toast.toast.announcement(cx);
 
         div().absolute().size_full().bottom_0().left_0().child(
             v_flex()
@@ -245,6 +261,7 @@ impl Render for ToastLayer {
                 // it is only ever perceived if it is announced.
                 .role(gpui::Role::Status)
                 .aria_live(gpui::accesskit::Live::Polite)
+                .aria_value(announcement)
                 .absolute()
                 .w_full()
                 .bottom(px(0.))
@@ -280,5 +297,109 @@ impl Render for ToastLayer {
                         .animate_in(AnimationDirection::FromBottom, true),
                 ),
         )
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use gpui::{Context, EventEmitter, Focusable, Render, TestAppContext, Window};
+
+    struct TestToast {
+        focus_handle: FocusHandle,
+    }
+
+    impl EventEmitter<DismissEvent> for TestToast {}
+
+    impl Focusable for TestToast {
+        fn focus_handle(&self, _cx: &App) -> FocusHandle {
+            self.focus_handle.clone()
+        }
+    }
+
+    impl Render for TestToast {
+        fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+            div().child("Project saved")
+        }
+    }
+
+    impl ToastView for TestToast {
+        fn action(&self) -> Option<ToastAction> {
+            None
+        }
+
+        fn announcement(&self, _cx: &App) -> SharedString {
+            SharedString::new_static("Project saved")
+        }
+    }
+
+    /// A toast is on screen for ten seconds and is never focused, so a reader
+    /// perceives it only if it is announced. macOS announces a live region's
+    /// own value and never reads its subtree, so the toast drawing its text as
+    /// a child is not enough on its own.
+    #[gpui::test]
+    async fn a_toast_announces_its_text_through_the_region(cx: &mut TestAppContext) {
+        cx.update(|cx| {
+            let settings_store = settings::SettingsStore::test(cx);
+            cx.set_global(settings_store);
+            theme::init(theme::LoadThemes::JustBase, cx);
+        });
+
+        let window = cx.add_window(|_, _| ToastLayer::new());
+        cx.activate_a11y(window.into());
+
+        let region = |cx: &mut TestAppContext| -> (String, String) {
+            let json = cx
+                .update_window(window.into(), |_, window, cx| {
+                    window.draw(cx).clear(cx);
+                    window.debug_a11y_tree_json()
+                })
+                .expect("the harness window is still open")
+                .expect("activation makes the debug tree available");
+            let tree: serde_json::Value =
+                serde_json::from_str(&json).expect("the dump is valid JSON");
+            gpui::a11y_checks::assert_live_regions_can_speak(&tree, "toast layer");
+            let node = tree["nodes"]
+                .as_object()
+                .expect("the dump lists nodes")
+                .values()
+                .find(|node| {
+                    node["element_id"]
+                        .as_str()
+                        .is_some_and(|id| id.contains("toast-layer-container"))
+                })
+                .unwrap_or_else(|| panic!("the toast region has to exist: {json}"))
+                .clone();
+            (
+                node["aria"]["live"].as_str().unwrap_or_default().to_string(),
+                node["aria"]["value"]
+                    .as_str()
+                    .unwrap_or_default()
+                    .to_string(),
+            )
+        };
+
+        // The region has to be in the tree before the toast is, or the change
+        // that follows has nothing to diff against.
+        assert_eq!(
+            region(cx),
+            ("Polite".to_string(), String::new()),
+            "the region is present and silent before there is a toast"
+        );
+
+        window
+            .update(cx, |toast_layer, _, cx| {
+                let toast = cx.new(|cx| TestToast {
+                    focus_handle: cx.focus_handle(),
+                });
+                toast_layer.toggle_toast(cx, toast);
+            })
+            .expect("the harness window is still open");
+
+        assert_eq!(
+            region(cx),
+            ("Polite".to_string(), "Project saved".to_string()),
+            "the toast's text has to be the region's value, which is what macOS speaks"
+        );
     }
 }
