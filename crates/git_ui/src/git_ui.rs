@@ -977,6 +977,29 @@ mod remote_button {
         )
     }
 
+    /// The name the push/pull button is announced by.
+    ///
+    /// Kept as a function so it can be checked without rendering: every part
+    /// of that button is a `Label` child, so what a reader hears cannot be
+    /// derived from anything the element itself carries.
+    pub(crate) fn announced_remote_button(
+        label: &str,
+        ahead_count: usize,
+        behind_count: usize,
+        in_progress_operation: Option<RemoteOperationKind>,
+    ) -> String {
+        let counts = match (ahead_count, behind_count) {
+            (0, 0) => label.to_string(),
+            (ahead, 0) => format!("{label}, {ahead} ahead"),
+            (0, behind) => format!("{label}, {behind} behind"),
+            (ahead, behind) => format!("{label}, {behind} behind, {ahead} ahead"),
+        };
+        match in_progress_operation {
+            Some(operation) => format!("{counts}, {}", in_progress_tooltip(operation)),
+            None => counts,
+        }
+    }
+
     fn in_progress_tooltip(operation: RemoteOperationKind) -> &'static str {
         match operation {
             RemoteOperationKind::Fetch => "Fetch in Progress…",
@@ -1072,12 +1095,15 @@ mod remote_button {
         // button is one: the action is a `Label` and so are the ahead/behind
         // counts, which are the whole reason to press it.
         let left_label: SharedString = left_label.into();
-        let announced = match (ahead_count, behind_count) {
-            (0, 0) => left_label.to_string(),
-            (ahead, 0) => format!("{left_label}, {ahead} ahead"),
-            (0, behind) => format!("{left_label}, {behind} behind"),
-            (ahead, behind) => format!("{left_label}, {behind} behind, {ahead} ahead"),
-        };
+        // Every part of this button is a `Label` child, and `ButtonLike` takes
+        // no name from its children: the action, the ahead/behind counts, and
+        // the spinner that replaces the icon while the operation runs.
+        let announced = announced_remote_button(
+            &left_label,
+            ahead_count,
+            behind_count,
+            in_progress_operation,
+        );
         let left = ButtonLike::new_rounded_left(format!("split-button-left-{}", id))
             .aria_label(announced)
             .layer(ElevationIndex::ModalSurface)
@@ -1436,5 +1462,30 @@ mod view_commit_tests {
 
         assert!(!initial_modal_state);
         assert!(final_modal_state);
+    }
+
+    /// The push button is the one place the working tree's state against the
+    /// remote is written down, and every part of it — the action, the counts,
+    /// the spinner that replaces the icon while it runs — is a `Label` child,
+    /// which names nothing.
+    #[test]
+    fn the_remote_button_says_what_it_does_and_where_it_is() {
+        use crate::remote_button::announced_remote_button;
+        use crate::git_panel::RemoteOperationKind;
+
+        assert_eq!(announced_remote_button("Fetch", 0, 0, None), "Fetch");
+        assert_eq!(announced_remote_button("Push", 3, 0, None), "Push, 3 ahead");
+        assert_eq!(announced_remote_button("Pull", 0, 2, None), "Pull, 2 behind");
+        assert_eq!(
+            announced_remote_button("Pull", 3, 2, None),
+            "Pull, 2 behind, 3 ahead"
+        );
+        // Running is not the same as unavailable. The button disables itself
+        // while the operation is in flight, and "disabled" on its own describes
+        // a button that cannot be pressed rather than one already working.
+        assert_eq!(
+            announced_remote_button("Push", 3, 0, Some(RemoteOperationKind::Push)),
+            "Push, 3 ahead, Push in Progress…"
+        );
     }
 }
