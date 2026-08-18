@@ -2021,6 +2021,57 @@ mod tests {
     /// The match count and the query error are plain labels, and a label
     /// contributes no accessibility node, so the two things that say whether a
     /// search found anything were reported to nobody.
+    /// The query error is a live region, so it is spoken the moment an invalid
+    /// pattern is typed — which happens on the way to a valid one, character by
+    /// character. Several regex crates render a syntax error across three lines
+    /// with a caret pointing at the offending character, and a caret line read
+    /// aloud is noise. This asserts the one-line shape rather than assuming it
+    /// survives a change of engine.
+    #[gpui::test]
+    async fn an_invalid_pattern_is_announced_in_one_line(cx: &mut TestAppContext) {
+        let (_editor, search_bar, cx) = init_test(cx);
+        search_bar.update_in(cx, |search_bar, window, cx| {
+            search_bar.toggle_search_option(SearchOptions::REGEX, window, cx);
+        });
+        search_bar
+            .update_in(cx, |search_bar, window, cx| {
+                search_bar.search("(foo", None, true, window, cx)
+            })
+            .await
+            .expect_err("an unclosed group is not a valid pattern");
+        cx.run_until_parked();
+
+        cx.activate_a11y(cx.window_handle());
+        let json = cx
+            .update(|window, cx| {
+                window.draw(cx).clear(cx);
+                window.debug_a11y_tree_json()
+            })
+            .expect("activation makes the debug tree available");
+        let tree: serde_json::Value = serde_json::from_str(&json).expect("the dump is valid JSON");
+        gpui::a11y_checks::assert_live_regions_can_speak(&tree, "invalid pattern");
+
+        let announced = tree["nodes"]
+            .as_object()
+            .expect("the dump lists nodes")
+            .values()
+            .find(|node| {
+                node["element_id"]
+                    .as_str()
+                    .is_some_and(|id| id.contains("buffer-search-query-error"))
+            })
+            .and_then(|node| node["aria"]["value"].as_str())
+            .unwrap_or_else(|| panic!("the error region has to carry the message: {json}"));
+        assert!(
+            !announced.contains('\n'),
+            "an announcement read aloud has to be one line: {announced:?}"
+        );
+        assert!(
+            announced.contains("parenthesis"),
+            "and has to say what is wrong, not just that something is: {announced:?}"
+        );
+    }
+
     #[gpui::test]
     async fn the_search_bar_announces_its_matches(cx: &mut TestAppContext) {
         let (_editor, search_bar, cx) = init_test(cx);
