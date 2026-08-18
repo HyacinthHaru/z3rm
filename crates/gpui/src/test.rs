@@ -312,6 +312,42 @@ pub mod a11y_checks {
         );
     }
 
+    /// Panics if a live region has no value, which on macOS means it never
+    /// announces anything.
+    ///
+    /// This is the one check here that is not about how a tree reads. It is
+    /// about whether a change is spoken at all, and the answer lives in
+    /// `accesskit_macos`: both paths that raise an announcement are guarded by
+    /// `node.value().is_some()`, and the text raised is `node.value()`. A
+    /// region with a label and no value is therefore silent twice over — no
+    /// announcement fires, and the label would not be the text if one did.
+    /// `accesskit_consumer`'s `value()` falls back to the contents of a
+    /// single-line text input and to nothing else, so the role does not supply
+    /// it and neither does the label.
+    #[track_caller]
+    pub fn assert_live_regions_can_speak(tree: &serde_json::Value, context: &str) {
+        let mute: Vec<String> = nodes(tree)
+            .values()
+            .filter(|node| {
+                node["aria"]["live"]
+                    .as_str()
+                    .is_some_and(|live| live != "Off")
+            })
+            .filter(|node| node["aria"]["value"].as_str().is_none_or(str::is_empty))
+            .map(|node| {
+                format!(
+                    "{} (live {}, label {})",
+                    node["element_id"], node["aria"]["live"], node["aria"]["label"]
+                )
+            })
+            .collect();
+        assert!(
+            mute.is_empty(),
+            "{context}: these live regions have no value, so they announce \
+             nothing: {mute:?}"
+        );
+    }
+
     /// Landmark roles a reader offers as a way to jump around the window. More
     /// than one of the same landmark is only useful if they can be told apart.
     pub const LANDMARK_ROLES: &[&str] = &["Main", "Complementary", "Navigation", "Banner"];
@@ -696,8 +732,63 @@ pub mod a11y_checks {
 
 #[cfg(test)]
 mod a11y_check_tests {
-    use super::a11y_checks::assert_clickable_elements_are_reachable;
+    use super::a11y_checks::{
+        assert_clickable_elements_are_reachable, assert_live_regions_can_speak,
+    };
     use serde_json::json;
+
+    fn live_region(live: Option<&str>, label: Option<&str>, value: Option<&str>) -> serde_json::Value {
+        let mut aria = serde_json::Map::new();
+        aria.insert("role".into(), json!("Status"));
+        if let Some(live) = live {
+            aria.insert("live".into(), json!(live));
+        }
+        if let Some(label) = label {
+            aria.insert("label".into(), json!(label));
+        }
+        if let Some(value) = value {
+            aria.insert("value".into(), json!(value));
+        }
+        json!({ "nodes": { "0": { "element_id": "region", "aria": aria } } })
+    }
+
+    /// The shape every live region in the app had: polite, labelled, and with
+    /// no value, which raises no announcement at all.
+    #[test]
+    #[should_panic(expected = "announce")]
+    fn a_labelled_live_region_with_no_value_is_reported() {
+        let tree = live_region(Some("Polite"), Some("12 matches"), None);
+        assert_live_regions_can_speak(&tree, "picker");
+    }
+
+    /// The text macOS speaks is the value, so a region carrying one is fine
+    /// whether or not it also has a label.
+    #[test]
+    fn a_live_region_with_a_value_can_speak() {
+        let tree = live_region(Some("Polite"), Some("Results"), Some("12 matches"));
+        assert_live_regions_can_speak(&tree, "picker");
+        let tree = live_region(Some("Assertive"), None, Some("Disconnected"));
+        assert_live_regions_can_speak(&tree, "connection");
+    }
+
+    /// A region that is deliberately not live has nothing to announce, so the
+    /// check has no business asking it for a value.
+    #[test]
+    fn a_region_that_is_not_live_is_left_alone() {
+        let tree = live_region(Some("Off"), Some("Overridden by your organization"), None);
+        assert_live_regions_can_speak(&tree, "settings");
+        let tree = live_region(None, Some("Failed to load"), None);
+        assert_live_regions_can_speak(&tree, "markdown");
+    }
+
+    /// An empty value is the same silence as no value: `value().is_some()`
+    /// passes and the announcement raised says nothing.
+    #[test]
+    #[should_panic(expected = "announce")]
+    fn an_empty_value_is_reported_too() {
+        let tree = live_region(Some("Polite"), Some("Recording"), Some(""));
+        assert_live_regions_can_speak(&tree, "keystroke input");
+    }
 
     fn tree(node_rects: &[(f64, f64, f64, f64)], clickable: &[(f64, f64, f64, f64)]) -> serde_json::Value {
         let nodes: serde_json::Map<String, serde_json::Value> = node_rects
