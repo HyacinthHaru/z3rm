@@ -1861,6 +1861,41 @@ mod tests {
         );
     }
 
+    /// A resizable picker draws four drag grips around itself, and their
+    /// primary-button handler only swallows the press so the modal does not
+    /// dismiss under it. That is a pointer gesture rather than an action, and
+    /// nothing rendered one in a frame before this — so the grips read as four
+    /// controls that answer a click and do nothing.
+    #[gpui::test]
+    async fn test_a_resizable_picker_offers_no_grips_to_a_reader(cx: &mut TestAppContext) {
+        init_test(cx);
+
+        let (picker, cx) = cx.add_window_view(|window, cx| {
+            Picker::uniform_list(TestDelegate::new(vec![true, true]), window, cx).resizable(true)
+        });
+        picker.update_in(cx, |picker, window, cx| {
+            window.focus(&picker.focus_handle(cx), cx);
+            cx.notify();
+        });
+        cx.run_until_parked();
+
+        cx.activate_a11y(cx.window_handle());
+        let json = cx
+            .update(|window, cx| {
+                window.draw(cx).clear(cx);
+                window.debug_a11y_tree_json()
+            })
+            .expect("activation makes the debug tree available");
+        let tree: serde_json::Value = serde_json::from_str(&json).expect("the dump is valid JSON");
+
+        gpui::a11y_checks::assert_clickable_elements_are_reachable(&tree, "resizable picker");
+        gpui::a11y_checks::assert_interactive_nodes_are_named(&tree, "resizable picker");
+        gpui::a11y_checks::assert_no_role_was_discarded(&tree, "resizable picker");
+        gpui::a11y_checks::assert_no_aria_was_discarded(&tree, "resizable picker");
+        gpui::a11y_checks::assert_names_are_distinguishable(&tree, "resizable picker");
+        gpui::a11y_checks::assert_controls_have_area(&tree, "resizable picker");
+    }
+
     /// Keyboard focus stays in the query input while the selection moves, so a
     /// picker is only usable with a screen reader if the list reports itself as
     /// one and the current row is the active descendant.
