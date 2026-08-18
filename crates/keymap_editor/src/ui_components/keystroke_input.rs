@@ -490,7 +490,14 @@ impl Render for KeystrokeInput {
                 )
         };
 
+        // A pulsing dot and the word "REC" as a `Label`, which is not a node.
+        // Recording changes what every keypress does, so a user who cannot see
+        // the badge has no way to know whether they are typing a keybinding or
+        // driving the editor.
         let recording_indicator = h_flex()
+            .id("keystroke-input-recording")
+            .role(gpui::Role::Status)
+            .aria_label("Recording keystrokes")
             .h_4()
             .pr_1()
             .gap_0p5()
@@ -509,6 +516,9 @@ impl Render for KeystrokeInput {
             );
 
         let search_indicator = h_flex()
+            .id("keystroke-input-searching")
+            .role(gpui::Role::Status)
+            .aria_label("Recording keystrokes to search")
             .h_4()
             .pr_1()
             .gap_0p5()

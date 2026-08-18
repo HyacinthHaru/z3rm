@@ -1322,6 +1322,15 @@ fn render_settings_item(
                         "{}-organization-configuration-warning",
                         setting_item.title
                     ))
+                    // A warning icon and a tooltip, neither of which is a node:
+                    // a setting the user cannot change read exactly like one
+                    // they can, so the only way to find out was to change it
+                    // and watch it not stick.
+                    .role(gpui::Role::Status)
+                    .aria_label(format!(
+                        "{}: overridden by your organization",
+                        setting_item.title
+                    ))
                     .child(
                         Icon::new(IconName::Warning)
                             .size(IconSize::Small)
