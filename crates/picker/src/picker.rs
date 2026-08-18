@@ -2005,6 +2005,10 @@ mod tests {
             .filter(|node| node["aria"]["role"] == "ListBoxOption")
             .map(|node| node["aria"]["role_description"].as_str())
             .collect();
+        // The count first: `all` over an empty list is true, so a fixture
+        // that stopped rendering rows would satisfy the check below without
+        // any row having said anything.
+        assert_eq!(kinds.len(), 3, "the three rows are on screen: {kinds:?}");
         assert!(
             kinds.iter().all(|kind| *kind == Some("option")),
             "every row has to say what kind of thing it is: {kinds:?}"

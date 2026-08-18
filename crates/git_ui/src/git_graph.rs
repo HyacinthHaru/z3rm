@@ -6936,11 +6936,19 @@ mod tests {
             let nodes = tree["nodes"].as_object().expect("the dump lists nodes");
             // A name that is a bare identifier is read out character by
             // character and never says what pressing it does.
-            for label in nodes
+            let button_labels: Vec<&str> = nodes
                 .values()
                 .filter(|node| node["aria"]["role"] == "Button")
                 .filter_map(|node| node["aria"]["label"].as_str())
-            {
+                .collect();
+            // A loop over nothing asserts nothing, and this is the kind of
+            // check that would go on passing after the buttons stopped being
+            // rendered.
+            assert!(
+                !button_labels.is_empty(),
+                "the graph has to have drawn its buttons for this to check them"
+            );
+            for label in button_labels {
                 assert!(
                     !label.chars().all(|c| c.is_ascii_hexdigit()) || label.len() < 8,
                     "a button named only by a hash spells it out: {label:?}"

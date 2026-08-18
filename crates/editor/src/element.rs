@@ -12943,13 +12943,22 @@ mod tests {
         gpui::a11y_checks::assert_no_aria_was_discarded(&tree, "editor");
         gpui::a11y_checks::assert_roles_are_contained(&tree, "editor");
 
+        // The editor is in the tree first. This is a negative assertion, and
+        // an empty tree satisfies it without an editor having been rendered at
+        // all.
+        let roles: Vec<&str> = tree["nodes"]
+            .as_object()
+            .expect("the dump lists nodes")
+            .values()
+            .filter_map(|node| node["aria"]["role"].as_str())
+            .collect();
         assert!(
-            tree["nodes"]
-                .as_object()
-                .expect("the dump lists nodes")
-                .values()
-                .all(|node| node["aria"]["role"] != "TextInput"),
-            "a full editor must not claim to be a text input"
+            roles.contains(&"Group"),
+            "the editor reaches the tree as a region: {roles:?}"
+        );
+        assert!(
+            !roles.contains(&"TextInput"),
+            "a full editor must not claim to be a text input: {roles:?}"
         );
 
         assert_eq!(
