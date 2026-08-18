@@ -140,12 +140,21 @@ impl ToastView for StatusToast {
     }
 
     fn announcement(&self, _cx: &App) -> SharedString {
+        // The first line only. Callers pass raw error text straight through —
+        // `git_ui::clone` hands over a clone failure and `z3rm::daemon` a
+        // daemon error, and git writes several lines to stderr — and this is
+        // spoken the moment the toast appears, over whatever the user was
+        // doing. The toast keeps drawing the whole thing.
+        let summary = self
+            .text
+            .split_once('\n')
+            .map_or(&*self.text, |(first, _)| first);
         // The action's label is part of it: a toast offering "Undo" that
         // announces only what happened leaves the user with no idea that
         // anything can be done about it before it disappears.
         match &self.action {
-            Some(action) => format!("{}. {}", self.text, action.label).into(),
-            None => self.text.clone(),
+            Some(action) => format!("{summary}. {}", action.label).into(),
+            None => SharedString::from(summary.to_string()),
         }
     }
 
@@ -318,6 +327,60 @@ mod tests {
             announced,
             "a toast that arrives saying only \"Dismiss\" has told the user nothing: {json}"
         );
+    }
+
+    /// Callers pass raw error text straight in — `git_ui::clone` hands over a
+    /// clone failure, `z3rm::daemon` a daemon error — and git writes several
+    /// lines to stderr. A toast is announced the moment it appears, over
+    /// whatever the user was doing, so what is spoken stops at the first line
+    /// while the toast goes on drawing the whole thing.
+    #[gpui::test]
+    fn a_toast_announces_the_first_line_of_a_long_error(cx: &mut TestAppContext) {
+        cx.update(|cx| {
+            let settings_store = settings::SettingsStore::test(cx);
+            cx.set_global(settings_store);
+            theme_settings::init(theme::LoadThemes::JustBase, cx);
+        });
+
+        const ERROR: &str =
+            "fatal: repository not found\nhint: check the remote URL\nhint: and your credentials";
+        let toast = cx.update(|cx| StatusToast::new(ERROR, cx, |this, _| this));
+        cx.update(|cx| {
+            assert_eq!(
+                workspace::ToastView::announcement(toast.read(cx), cx).as_ref(),
+                "fatal: repository not found",
+                "the announcement stops at the first line"
+            );
+            assert_eq!(
+                toast.read(cx).text.as_ref(),
+                ERROR,
+                "and the toast still draws all of it"
+            );
+        });
+    }
+
+    /// The action's label is part of the announcement, and has to survive the
+    /// cut: a toast offering "Undo" that says only what happened leaves the
+    /// user unaware anything can be done before it disappears.
+    #[gpui::test]
+    fn a_cut_announcement_still_offers_its_action(cx: &mut TestAppContext) {
+        cx.update(|cx| {
+            let settings_store = settings::SettingsStore::test(cx);
+            cx.set_global(settings_store);
+            theme_settings::init(theme::LoadThemes::JustBase, cx);
+        });
+
+        let toast = cx.update(|cx| {
+            StatusToast::new("Deleted notes.md\nfrom the project panel", cx, |this, _| {
+                this.action("Undo", |_, _| {})
+            })
+        });
+        cx.update(|cx| {
+            assert_eq!(
+                workspace::ToastView::announcement(toast.read(cx), cx).as_ref(),
+                "Deleted notes.md. Undo"
+            );
+        });
     }
 
     struct ToastHost(Entity<StatusToast>);
