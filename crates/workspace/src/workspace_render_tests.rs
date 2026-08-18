@@ -376,6 +376,66 @@ async fn test_notifications_are_announced_as_a_live_region(cx: &mut TestAppConte
     );
 }
 
+/// A notification is spoken the moment it arrives, over whatever the user was
+/// doing, so a multi-line message — a language server prompt's markdown, an
+/// error with its causes — is a paragraph read aloud unprompted. The stack
+/// announces the first line; the notification itself keeps the whole message
+/// as its name, which is what a reader gets when they go to it.
+#[gpui::test]
+async fn a_multi_line_notification_announces_only_its_first_line(cx: &mut TestAppContext) {
+    init_test(cx);
+    let fs = FakeFs::new(cx.executor());
+    fs.insert_tree("/root", json!({ "a.txt": "" })).await;
+    let project = Project::test(fs, [path!("/root").as_ref()], cx).await;
+
+    let (multi_workspace, cx) =
+        cx.add_window_view(|window, cx| MultiWorkspace::test_new(project, window, cx));
+    let workspace = multi_workspace.read_with(cx, |mw, _| mw.workspace().clone());
+
+    const MESSAGE: &str = "could not push to origin\ncaused by: permission denied";
+    workspace.update(cx, |workspace, cx| {
+        struct MultiLine;
+        workspace.show_notification(crate::NotificationId::unique::<MultiLine>(), cx, |cx| {
+            cx.new(|cx| {
+                crate::notifications::simple_message_notification::MessageNotification::new(
+                    MESSAGE, cx,
+                )
+            })
+        });
+    });
+    cx.run_until_parked();
+
+    cx.activate_a11y(cx.window_handle());
+    let json = cx
+        .update(|window, cx| {
+            window.draw(cx).clear(cx);
+            window.debug_a11y_tree_json()
+        })
+        .expect("activation makes the debug tree available");
+    let tree: serde_json::Value = serde_json::from_str(&json).expect("the dump is valid JSON");
+    gpui::a11y_checks::assert_live_regions_can_speak(&tree, "multi-line notification");
+    let nodes = tree["nodes"].as_object().expect("the dump lists nodes");
+
+    let log = nodes
+        .values()
+        .find(|node| node["aria"]["role"] == "Log")
+        .expect("the notification stack must be reported as a log");
+    assert_eq!(
+        log["aria"]["value"].as_str(),
+        Some("could not push to origin"),
+        "the announcement stops at the first line"
+    );
+
+    let named = nodes
+        .values()
+        .filter_map(|node| node["aria"]["label"].as_str())
+        .any(|label| label == MESSAGE);
+    assert!(
+        named,
+        "and the notification itself keeps the whole message for whoever reads it: {json}"
+    );
+}
+
 /// Notifications stack, and the one that just arrived is the one a user needs
 /// to hear. The region carries a single value, so it has to be the newest.
 #[gpui::test]

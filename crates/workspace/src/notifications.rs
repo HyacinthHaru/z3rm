@@ -67,6 +67,17 @@ impl NotificationId {
     }
 }
 
+/// The first line of a message, for announcing it.
+///
+/// A notification is spoken the moment it arrives, over whatever the user was
+/// doing. Language server prompts carry markdown and workspace errors carry
+/// their causes, so the whole text is a paragraph read aloud unprompted. The
+/// notification itself keeps the full text as its name, which is what a reader
+/// gets when they go to it.
+fn first_line(message: &str) -> &str {
+    message.split_once('\n').map_or(message, |(first, _)| first)
+}
+
 pub trait Notification:
     EventEmitter<DismissEvent> + EventEmitter<SuppressEvent> + Focusable + Render
 {
@@ -298,7 +309,7 @@ impl Notification for LanguageServerPrompt {
     fn announcement(&self, _cx: &App) -> SharedString {
         match &self.request {
             Some(request) => {
-                format!("{}: {}", request.lsp_name, request.message).into()
+                format!("{}: {}", request.lsp_name, first_line(&request.message)).into()
             }
             None => SharedString::default(),
         }
@@ -720,9 +731,11 @@ pub mod simple_message_notification {
     impl Notification for MessageNotification {
         fn announcement(&self, _cx: &App) -> SharedString {
             match (self.title.as_ref(), self.announcement.as_ref()) {
-                (Some(title), Some(message)) => format!("{title}. {message}").into(),
+                (Some(title), Some(message)) => {
+                    format!("{title}. {}", super::first_line(message)).into()
+                }
                 (Some(title), None) => title.clone(),
-                (None, Some(message)) => message.clone(),
+                (None, Some(message)) => super::first_line(message).into(),
                 // Built through `new_from_builder`, which draws arbitrary
                 // elements and keeps no text to announce.
                 (None, None) => SharedString::default(),
@@ -1201,18 +1214,27 @@ pub mod simple_message_notification {
 
             // The title and the message body are plain text, which contributes
             // no accessibility node, so without a name here a user who goes
-            // looking for the notification finds an unnamed group. This is the
-            // same text the stack announces, so the two cannot drift.
-            let announcement = Notification::announcement(self, cx);
+            // looking for the notification finds an unnamed group.
+            //
+            // The whole message, unlike `Notification::announcement`, which is
+            // cut to its first line. The two differ on purpose: the stack
+            // speaks its announcement unprompted, over whatever the user was
+            // doing, while this is what they get when they go and read it.
+            let name: SharedString = match (self.title.as_ref(), self.announcement.as_ref()) {
+                (Some(title), Some(message)) => format!("{title}. {message}").into(),
+                (Some(title), None) => title.clone(),
+                (None, Some(message)) => message.clone(),
+                (None, None) => SharedString::default(),
+            };
 
             div()
                 .id("message-notification-wrapper")
-                .when(!announcement.is_empty(), |this| {
+                .when(!name.is_empty(), |this| {
                     // Deliberately not `Alert`, which carries an implicit
                     // assertive live region: the stack around it is polite, and
                     // an error that already happened does not justify cutting
                     // off whatever is being read.
-                    this.role(gpui::Role::Group).aria_label(announcement)
+                    this.role(gpui::Role::Group).aria_label(name)
                 })
                 .opacity(opacity)
                 .child(
