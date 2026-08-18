@@ -2101,12 +2101,9 @@ impl Element for MarkdownElement {
             builder.push_text_runs(text, *tail, *head);
         }
         // After the runs, so a link's node sits beside the text it is part of.
-        // Named with its destination: the source the runs read out already
-        // carries the link's visible text, and what a reader cannot otherwise
-        // get is where it goes.
-        for (index, (destination, bounds)) in prepaint.a11y_links.iter().enumerate() {
+        for (index, (name, bounds)) in prepaint.a11y_links.iter().enumerate() {
             let mut node = gpui::accesskit::Node::new(gpui::accesskit::Role::Link);
-            node.set_label(destination.to_string());
+            node.set_label(name.to_string());
             node.add_action(gpui::accesskit::Action::Click);
             builder.push_child_with_bounds(
                 builder.synthetic_node_id(u64::MAX - index as u64),
@@ -2864,6 +2861,15 @@ impl Element for MarkdownElement {
 
         // A wrapped link spans several boxes; the first is enough to place it
         // and to click it, since any point inside the link follows it.
+        //
+        // Named with its rendered text, which is what ARIA calls a link's name
+        // and what the user sees. Naming it with the destination instead reads
+        // well until a page links twice to the same place, at which point two
+        // interchangeable links look like a defect to
+        // `assert_names_are_distinguishable` — while two *different* links
+        // sharing a word, which is the ambiguity worth hearing about, would
+        // have looked fine. The destination is in the source the text runs
+        // already read out.
         let a11y_links = rendered_markdown
             .text
             .links
@@ -2872,7 +2878,15 @@ impl Element for MarkdownElement {
                 let bounds = rendered_markdown
                     .text
                     .bounds_for_source_range(link.source_range.clone());
-                Some((link.destination_url.clone(), *bounds.first()?))
+                let text = rendered_markdown
+                    .text
+                    .text_for_range(link.source_range.clone());
+                let name = if text.is_empty() {
+                    link.destination_url.clone()
+                } else {
+                    SharedString::from(text)
+                };
+                Some((name, *bounds.first()?))
             })
             .collect();
 
@@ -4259,8 +4273,53 @@ mod tests {
             .collect();
         assert_eq!(
             links,
-            vec!["https://example.com"],
-            "the link is announced as one, named with where it goes"
+            vec!["link"],
+            "the link is announced as one, named with the words it is made of"
+        );
+    }
+
+    /// Two links to one place are interchangeable, and naming links with
+    /// their destination made them look like a defect to
+    /// `assert_names_are_distinguishable` — while two links reading "here"
+    /// that go to different places, which is the ambiguity worth hearing
+    /// about, would have passed. Naming them with their text gets both right,
+    /// so both are checked here.
+    #[gpui::test]
+    fn links_are_told_apart_by_their_words_not_their_destinations(cx: &mut TestAppContext) {
+        struct Host(Entity<Markdown>);
+        impl Render for Host {
+            fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+                div().child(MarkdownElement::new(self.0.clone(), MarkdownStyle::default()))
+            }
+        }
+        ensure_theme_initialized(cx);
+        let source = "See [here](https://example.com) and [there](https://example.com).";
+        let (_h, cx) = cx.add_window_view(|_, cx| {
+            Host(cx.new(|cx| Markdown::new(source.into(), None, None, cx)))
+        });
+        cx.run_until_parked();
+        cx.activate_a11y(cx.window_handle());
+        let json = cx
+            .update(|window, cx| {
+                window.draw(cx).clear(cx);
+                window.debug_a11y_tree_json()
+            })
+            .expect("tree");
+        let tree: serde_json::Value = serde_json::from_str(&json).expect("json");
+        gpui::a11y_checks::assert_names_are_distinguishable(&tree, "two links");
+
+        let mut links: Vec<&str> = tree["nodes"]
+            .as_object()
+            .expect("the dump lists nodes")
+            .values()
+            .filter(|node| node["aria"]["role"] == "Link")
+            .filter_map(|node| node["aria"]["label"].as_str())
+            .collect();
+        links.sort_unstable();
+        assert_eq!(
+            links,
+            vec!["here", "there"],
+            "one destination, two links, two names"
         );
     }
 
