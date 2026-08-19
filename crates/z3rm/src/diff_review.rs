@@ -385,8 +385,18 @@ impl Render for DiffReview {
                     }),
             );
 
-        // Diff body
-        let mut body = div().flex().flex_col().py_1().px_2().size_full();
+        // Diff body. This is what Accept and Decline act on, and every line of
+        // it was drawn as plain text — so the two buttons were the whole of
+        // the review as far as a reader was concerned, and the change being
+        // approved could not be read before approving it.
+        let mut body = div()
+            .id("diff-review-lines")
+            .role(gpui::Role::List)
+            .flex()
+            .flex_col()
+            .py_1()
+            .px_2()
+            .size_full();
         for (i, line) in diff_lines.iter().enumerate() {
             let (text, color) = match line {
                 DiffLine::Unchanged(t) => (t.as_str(), fg),
@@ -406,8 +416,20 @@ impl Render for DiffReview {
                 DiffLine::Removed(_) => "- ",
                 DiffLine::Modified { .. } => "~ ",
             };
+            // The prefix is the whole of what marks a line as added or removed:
+            // one character, and a background colour. Spelled out here because
+            // "+" reads as "plus" at best and is skipped at worst.
+            let kind = match line {
+                DiffLine::Unchanged(_) => "Unchanged",
+                DiffLine::Added(_) => "Added",
+                DiffLine::Removed(_) => "Removed",
+                DiffLine::Modified { .. } => "Modified",
+            };
             body = body.child(
                 div()
+                    .id(("diff-line", i))
+                    .role(gpui::Role::ListItem)
+                    .aria_label(SharedString::from(format!("{kind} {}: {text}", i + 1)))
                     .flex()
                     .flex_row()
                     .w_full()
@@ -432,10 +454,14 @@ impl Render for DiffReview {
             // open reviews are told apart.
             .id("diff-review")
             .role(gpui::Role::Group)
-            .aria_label(SharedString::from(format!(
-                "Diff review: {}",
-                self.file_path.display()
-            )))
+            // Deletion is marked by a red "Deleted" label, which is not a
+            // node, so without it here the review of a file that is about to
+            // disappear reads exactly like the review of an edit.
+            .aria_label(SharedString::from(if self.is_deleted() {
+                format!("Diff review: {}, file deleted", self.file_path.display())
+            } else {
+                format!("Diff review: {}", self.file_path.display())
+            }))
             .track_focus(&self.focus_handle)
             .size_full()
             .bg(bg)
@@ -616,6 +642,30 @@ mod tests {
         assert!(
             buttons.contains(&("Decline", true)),
             "an inert control has to say it is inert: {buttons:?}"
+        );
+
+        // The buttons act on the diff, and the diff was drawn as plain text —
+        // so a reader was asked to approve a change it could not be shown.
+        // Asserted against what is on screen: a modified line draws its new
+        // text only, so that is what the name carries.
+        let lines: Vec<&str> = tree["nodes"]
+            .as_object()
+            .expect("the dump lists nodes")
+            .values()
+            .filter(|node| node["aria"]["role"] == "ListItem")
+            .filter_map(|node| node["aria"]["label"].as_str())
+            .collect();
+        assert!(
+            lines.iter().any(|line| line.contains("two")),
+            "the text the file would end up with has to be readable: {lines:?}"
+        );
+        // The marker for added and removed is one character and a background
+        // colour, neither of which survives into a name on its own.
+        assert!(
+            lines
+                .iter()
+                .any(|line| line.starts_with("Added") || line.starts_with("Modified")),
+            "a line has to say what is happening to it: {lines:?}"
         );
     }
 
