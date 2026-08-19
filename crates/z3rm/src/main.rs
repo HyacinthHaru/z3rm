@@ -3423,6 +3423,8 @@ mod tests {
         gpui::a11y_checks::assert_clickable_elements_are_reachable(&tree, "two panels");
         gpui::a11y_checks::assert_no_role_was_discarded(&tree, "two panels");
         gpui::a11y_checks::assert_no_aria_was_discarded(&tree, "two panels");
+        let handle = cx.window_handle();
+        gpui::a11y_checks::assert_every_tab_stop_reaches_the_tree(&mut cx.cx, handle, "two panels");
         gpui::a11y_checks::assert_roles_are_contained(&tree, "two panels");
         gpui::a11y_checks::assert_focus_reached_the_tree(&tree, "two panels");
         gpui::a11y_checks::assert_active_descendant_is_honoured(&tree, "two panels");

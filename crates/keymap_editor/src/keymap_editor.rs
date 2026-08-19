@@ -4184,6 +4184,8 @@ mod tests {
         gpui::a11y_checks::assert_landmarks_are_distinguishable(&tree, "keymap editor");
         gpui::a11y_checks::assert_names_are_distinguishable(&tree, "keymap editor");
         gpui::a11y_checks::assert_focusable_names_are_distinguishable(&tree, "keymap editor");
+        let handle = cx.window_handle();
+        gpui::a11y_checks::assert_every_tab_stop_reaches_the_tree(cx, handle, "keymap editor");
 
         // The rows carry their whole text and no cell is a node, so a column
         // count would offer cell-by-cell navigation with nothing to move to.

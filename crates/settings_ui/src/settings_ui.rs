@@ -5334,6 +5334,12 @@ pub mod test {
             "and it has to say which page was arrived at"
         );
 
+        // Every tab stop, not just the two focus targets checked above: a
+        // keyboard user reaches all of them and a focus assertion only ever
+        // judges the one the test aimed at.
+        let handle = cx.window_handle();
+        gpui::a11y_checks::assert_every_tab_stop_reaches_the_tree(cx, handle, "settings window");
+
 
         // Guards against the whole check passing because nothing rendered.
         let interactive = nodes

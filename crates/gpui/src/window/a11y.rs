@@ -1820,6 +1820,37 @@ mod activation_tests {
         );
     }
 
+    /// The check that finds tab stops with no node, proven against a window
+    /// that has one. Without this, a check that quietly matched nothing would
+    /// read exactly like a clean window.
+    #[gpui::test]
+    #[should_panic(expected = "tabbing lands on elements with no accessibility node")]
+    fn a_tab_stop_with_no_node_is_reported(cx: &mut TestAppContext) {
+        struct Host;
+        impl Render for Host {
+            fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+                let named = cx.focus_handle().tab_index(0).tab_stop(true);
+                let stranded = cx.focus_handle().tab_index(1).tab_stop(true);
+                let _ = window;
+                div()
+                    .child(
+                        div()
+                            .id("named")
+                            .role(accesskit::Role::Button)
+                            .aria_label("Save")
+                            .track_focus(&named),
+                    )
+                    // An id and no role: focusable, tabbable, and absent from
+                    // the tree.
+                    .child(div().id("stranded").track_focus(&stranded))
+            }
+        }
+
+        let window = cx.add_window(|_, _| Host);
+        cx.activate_a11y(window.into());
+        crate::a11y_checks::assert_every_tab_stop_reaches_the_tree(cx, window.into(), "probe");
+    }
+
     /// The other half of the same trap. A node needs an id *and* a role, and
     /// an element with an id and no role builds nothing, so a name or a live
     /// region set on it is dropped as quietly as a role without an id — with

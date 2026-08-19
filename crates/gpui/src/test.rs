@@ -842,6 +842,59 @@ pub mod a11y_checks {
         );
     }
 
+    /// Panics if tabbing through the window ever lands on an element that
+    /// built no accessibility node.
+    ///
+    /// [`assert_focus_reached_the_tree`] only ever judges the one element the
+    /// test happened to focus, so a window with several focusable regions is
+    /// covered by whichever one the test picked. This drives every tab stop in
+    /// turn, which is what a keyboard user does. Two defects on this branch —
+    /// the keystroke recorder and the settings content region — were reachable
+    /// by tab and invisible to a focus check aimed elsewhere.
+    #[track_caller]
+    pub fn assert_every_tab_stop_reaches_the_tree(
+        cx: &mut crate::TestAppContext,
+        window: crate::AnyWindowHandle,
+        context: &str,
+    ) {
+        use crate::AppContext as _;
+        let dump = |cx: &mut crate::TestAppContext| -> serde_json::Value {
+            let json = cx
+                .update_window(window, |_, window, cx| {
+                    window.draw(cx).clear(cx);
+                    window.debug_a11y_tree_json()
+                })
+                .expect("the window is still open")
+                .expect("accessibility has to be active for this check");
+            serde_json::from_str(&json).expect("the dump is valid JSON")
+        };
+
+        let tree = dump(cx);
+        let stops = tree["frame"]["tab_stop_count"].as_u64().unwrap_or_default();
+        assert!(
+            stops > 0,
+            "{context}: no tab stops, so this check proves nothing"
+        );
+
+        let mut stranded: Vec<String> = Vec::new();
+        for stop in 0..stops {
+            cx.update_window(window, |_, window, cx| window.focus_next(cx))
+                .expect("the window is still open");
+            let tree = dump(cx);
+            if let Some(reason) = tree["frame"]["focus_without_node"].as_str() {
+                // By the element it is on rather than by index: the index is
+                // only meaningful while the frame is unchanged, and focusing
+                // can scroll a list and renumber the rest.
+                stranded.push(format!("stop {stop} ({reason})"));
+            }
+        }
+        assert!(
+            stranded.is_empty(),
+            "{context}: tabbing lands on elements with no accessibility node, \
+             so arriving at them announces the window: {stranded:?}"
+        );
+    }
+
     /// Panics if a containment-dependent node has no matching container among
     /// its ancestors.
     #[track_caller]
