@@ -12415,6 +12415,15 @@ impl ui_input::ErasedEditor for ErasedEditorImpl {
         });
     }
 
+    fn set_a11y_label(&self, label: &str, cx: &mut App) {
+        self.0.update(cx, |this, _| this.set_a11y_label(label.to_string()));
+    }
+
+    fn set_a11y_description(&self, description: &str, cx: &mut App) {
+        self.0
+            .update(cx, |this, _| this.set_a11y_description(description.to_string()));
+    }
+
     fn set_multiline(&self, max_lines: Option<usize>, _window: &mut Window, cx: &mut App) {
         self.0.update(cx, |this, cx| {
             if let Some(max_lines) = max_lines {

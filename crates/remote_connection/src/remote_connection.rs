@@ -93,14 +93,16 @@ impl RemoteConnectionPrompt {
         self.is_masked = !is_yes_no;
         self.editor.set_masked(self.is_masked, window, cx);
         // Focus moves straight to this field below, and the question is drawn
-        // beside it rather than being its name — so without a placeholder it
-        // announces as an unnamed box, with nothing to say whether it wants a
-        // password or a yes-or-no answer about an unrecognised host.
-        self.editor.set_placeholder_text(
-            if is_yes_no { "yes or no" } else { "Password" },
-            window,
-            cx,
-        );
+        // beside it rather than being its name — so without this it announces
+        // as an unnamed box, with nothing to say whether it wants a password
+        // or a yes-or-no answer about an unrecognised host. Named rather than
+        // given a placeholder, which would put grey text in the field for
+        // everyone to fix something only a reader suffers from.
+        self.editor
+            .set_a11y_label(if is_yes_no { "Answer" } else { "Password" }, cx);
+        // The prompt names the host or key being authenticated against and is
+        // the only place it appears, matching what the git askpass modal does.
+        self.editor.set_a11y_description(&prompt, cx);
 
         let markdown = cx.new(|cx| Markdown::new_text(prompt.into(), cx));
         self.prompt = Some((markdown, tx));
@@ -853,6 +855,66 @@ mod tests {
                 .any(|(id, label)| id.contains("remote-connection-status")
                     && label == "Connecting…"),
             "the status has to be announced once there is one: {connecting:?}"
+        );
+    }
+
+    /// The field that collects an SSH password. Focus jumps straight to it and
+    /// the question is drawn beside it rather than in it, so on its own it is
+    /// an unnamed box — with nothing to distinguish "type your password" from
+    /// "decide whether you trust this host key".
+    #[gpui::test]
+    fn the_password_field_says_what_it_is_asking_for(cx: &mut TestAppContext) {
+        cx.update(|cx| {
+            let settings_store = settings::SettingsStore::test(cx);
+            cx.set_global(settings_store);
+            theme_settings::init(theme::LoadThemes::JustBase, cx);
+            editor::init(cx);
+        });
+
+        let window = cx.add_window(|window, cx| {
+            RemoteConnectionPrompt::new("host.example".to_string(), None, false, false, window, cx)
+        });
+        cx.activate_a11y(window.into());
+
+        let (tx, _rx) = oneshot::channel();
+        window
+            .update(cx, |prompt, window, cx| {
+                prompt.set_prompt(
+                    "host.example's password:".to_string(),
+                    tx,
+                    window,
+                    cx,
+                );
+            })
+            .expect("the prompt window is still open");
+
+        let json = cx
+            .update_window(window.into(), |_, window, cx| {
+                window.draw(cx).clear(cx);
+                window.debug_a11y_tree_json()
+            })
+            .expect("the prompt window is still open")
+            .expect("activation makes the debug tree available");
+        let tree: serde_json::Value = serde_json::from_str(&json).expect("the dump is valid JSON");
+        gpui::a11y_checks::assert_interactive_nodes_are_named(&tree, "password prompt");
+
+        let field = tree["nodes"]
+            .as_object()
+            .expect("the dump lists nodes")
+            .values()
+            .find(|node| node["aria"]["role"] == "PasswordInput")
+            .unwrap_or_else(|| {
+                panic!("a masked field has to report itself as one: {json}")
+            });
+        assert_eq!(
+            field["aria"]["label"].as_str(),
+            Some("Password"),
+            "the field has to say what it wants"
+        );
+        assert_eq!(
+            field["aria"]["description"].as_str(),
+            Some("host.example's password:"),
+            "and which host is asking, since that is drawn beside it and nowhere else"
         );
     }
 }
