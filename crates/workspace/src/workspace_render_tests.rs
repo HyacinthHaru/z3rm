@@ -477,6 +477,39 @@ async fn a_multi_line_notification_announces_only_its_first_line(cx: &mut TestAp
         "the announcement stops at the first line"
     );
 
+    // A failure and a piece of news arrive through the same component and are
+    // told apart by a red warning icon, which is not a node and carries no
+    // text. The severity has to be in the words.
+    workspace.update(cx, |workspace, cx| {
+        struct Failure;
+        workspace.show_notification(crate::NotificationId::unique::<Failure>(), cx, |cx| {
+            cx.new(|cx| {
+                crate::notifications::simple_message_notification::MessageNotification::
+                    from_workspace_error("could not reach the mux server", cx)
+            })
+        });
+    });
+    cx.run_until_parked();
+    let failure_json = cx
+        .update(|window, cx| {
+            window.draw(cx).clear(cx);
+            window.debug_a11y_tree_json()
+        })
+        .expect("activation makes the debug tree available");
+    let failure_tree: serde_json::Value =
+        serde_json::from_str(&failure_json).expect("the dump is valid JSON");
+    let failure_log = failure_tree["nodes"]
+        .as_object()
+        .expect("the dump lists nodes")
+        .values()
+        .find(|node| node["aria"]["role"] == "Log")
+        .expect("the notification stack must be reported as a log");
+    assert_eq!(
+        failure_log["aria"]["value"].as_str(),
+        Some("Error: could not reach the mux server"),
+        "an error has to say it is one: {failure_json}"
+    );
+
     let named = nodes
         .values()
         .filter_map(|node| node["aria"]["label"].as_str())

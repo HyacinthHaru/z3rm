@@ -309,7 +309,20 @@ impl Notification for LanguageServerPrompt {
     fn announcement(&self, _cx: &App) -> SharedString {
         match &self.request {
             Some(request) => {
-                format!("{}: {}", request.lsp_name, first_line(&request.message)).into()
+                // The level is drawn as the icon and its colour and appears
+                // nowhere in the text, so a critical prompt and an
+                // informational one read identically without this.
+                let level = match request.level {
+                    PromptLevel::Info => "",
+                    PromptLevel::Warning => "Warning: ",
+                    PromptLevel::Critical => "Error: ",
+                };
+                format!(
+                    "{level}{}: {}",
+                    request.lsp_name,
+                    first_line(&request.message)
+                )
+                .into()
             }
             None => SharedString::default(),
         }
@@ -714,6 +727,10 @@ pub mod simple_message_notification {
         /// rendered as plain text, which contributes no accessibility node, so
         /// the live region around it would otherwise have nothing to read out.
         announcement: Option<SharedString>,
+        /// Set when the notification reports a failure. It is drawn as a red
+        /// warning icon, which is not a node and carries no text, so without
+        /// this an error reads exactly like an informational message.
+        severity: Option<ErrorSeverity>,
         title: Option<SharedString>,
         scroll_handle: ScrollHandle,
         auto_hide: Option<AutoHideState>,
@@ -730,15 +747,25 @@ pub mod simple_message_notification {
 
     impl Notification for MessageNotification {
         fn announcement(&self, _cx: &App) -> SharedString {
-            match (self.title.as_ref(), self.announcement.as_ref()) {
+            let body = match (self.title.as_ref(), self.announcement.as_ref()) {
                 (Some(title), Some(message)) => {
-                    format!("{title}. {}", super::first_line(message)).into()
+                    format!("{title}. {}", super::first_line(message))
                 }
-                (Some(title), None) => title.clone(),
-                (None, Some(message)) => super::first_line(message).into(),
+                (Some(title), None) => title.to_string(),
+                (None, Some(message)) => super::first_line(message).to_string(),
                 // Built through `new_from_builder`, which draws arbitrary
                 // elements and keeps no text to announce.
-                (None, None) => SharedString::default(),
+                (None, None) => return SharedString::default(),
+            };
+            match self.severity {
+                // Matches how `Callout` names the same three states, so the
+                // words a reader hears for a failure do not depend on which
+                // component happened to draw it.
+                Some(ErrorSeverity::Critical) | Some(ErrorSeverity::Error) => {
+                    format!("Error: {body}").into()
+                }
+                Some(ErrorSeverity::Warning) => format!("Warning: {body}").into(),
+                None => body.into(),
             }
         }
     }
@@ -783,6 +810,7 @@ pub mod simple_message_notification {
                 show_close_button: true,
                 show_suppress_button: true,
                 announcement: None,
+                severity: None,
                 title: None,
                 focus_handle: cx.focus_handle(),
                 scroll_handle: ScrollHandle::new(),
@@ -933,6 +961,11 @@ pub mod simple_message_notification {
             self
         }
 
+        fn with_severity(mut self, severity: ErrorSeverity) -> Self {
+            self.severity = Some(severity);
+            self
+        }
+
         fn auto_dismiss(mut self, severity: ErrorSeverity, cx: &mut Context<Self>) -> Self {
             if let Some(delay) = severity.auto_dismiss_delay() {
                 self.auto_hide = Some(AutoHideState::new(delay, cx));
@@ -947,6 +980,7 @@ pub mod simple_message_notification {
             let secondary_action = error.secondary_action();
 
             Self::new(primary_message.clone(), cx)
+                .with_severity(severity)
                 .content_icon(IconName::Warning, Color::Error)
                 .button_style(ButtonStyle::Outlined)
                 .copy_text(primary_message)
