@@ -5026,7 +5026,9 @@ pub fn tab_announcement(
     }
     match (item.has_conflict(cx), item.is_dirty(cx)) {
         (true, _) => parts.push("changed on disk".to_string()),
-        (_, true) => parts.push("unsaved changes".to_string()),
+        // Asked of the item rather than assumed: the same dot means unsaved
+        // work on an editor and a rung bell on a terminal.
+        (_, true) => parts.push(item.dirty_announcement_text(cx).to_string()),
         (false, false) => {}
     }
     // Typing in a preview tab is what makes it permanent, so which kind of tab

@@ -2082,6 +2082,15 @@ impl Item for TerminalView {
         }
     }
 
+    /// A terminal has nothing to save, so the dot the tab draws for `is_dirty`
+    /// means something else here entirely — the announcement has to match.
+    fn dirty_announcement_text(&self, cx: &App) -> SharedString {
+        match self.terminal.read(cx).task() {
+            Some(_) => SharedString::new_static("running"),
+            None => SharedString::new_static("bell"),
+        }
+    }
+
     fn has_conflict(&self, _cx: &App) -> bool {
         false
     }
@@ -2540,6 +2549,34 @@ mod tests {
             let input_log = terminal.update(cx, |terminal, _| terminal.take_input_log());
             assert_eq!(input_log, vec![b"foo".to_vec()]);
         });
+    }
+
+    #[gpui::test]
+    async fn a_bell_is_not_announced_as_unsaved_work(cx: &mut TestAppContext) {
+        let (project, _workspace, window_handle) = init_test_with_window(cx).await;
+        let (_pane, _terminal, terminal_view) =
+            add_display_only_terminal(&project, window_handle, true, cx);
+
+        let mut cx = VisualTestContext::from_window(window_handle.into(), cx);
+        cx.run_until_parked();
+
+        // A terminal reports `is_dirty` for a rung bell, which the tab draws
+        // as the same coloured dot an unsaved file gets. The dot is not a
+        // node, so the words are the only version a reader receives — and
+        // "unsaved changes" describes a state a terminal cannot be in.
+        let (dirty, announced) = terminal_view.update(&mut cx, |view, cx| {
+            view.has_bell = true;
+            (
+                workspace::Item::is_dirty(view, cx),
+                workspace::Item::dirty_announcement_text(view, cx),
+            )
+        });
+        assert!(dirty, "the bell is what puts the dot on the tab");
+        assert_eq!(
+            announced.as_ref(),
+            "bell",
+            "so the dot has to be explained as the bell it is"
+        );
     }
 
     #[gpui::test]

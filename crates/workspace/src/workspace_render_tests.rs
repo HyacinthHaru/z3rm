@@ -746,6 +746,23 @@ async fn test_a_tab_says_it_has_unsaved_changes(cx: &mut TestAppContext) {
                 cx,
             );
         }
+        // The same dot, meaning something else. A terminal reports `is_dirty`
+        // when it rang the bell or is still running, and announcing that as
+        // unsaved work is worse than announcing nothing: it describes a state
+        // the item cannot be in and offers a save that does not exist.
+        pane.add_item(
+            Box::new(cx.new(|cx| {
+                TestItem::new(cx)
+                    .with_label("bash")
+                    .with_dirty(true)
+                    .with_dirty_announcement("bell")
+            })),
+            true,
+            true,
+            None,
+            window,
+            cx,
+        );
     });
     cx.run_until_parked();
 
@@ -781,7 +798,7 @@ async fn test_a_tab_says_it_has_unsaved_changes(cx: &mut TestAppContext) {
     tabs.sort();
     assert_eq!(
         tabs,
-        vec!["edited, unsaved changes", "saved"],
+        vec!["bash, bell", "edited, unsaved changes", "saved"],
         "the dot beside the name is the only other thing that says this"
     );
 
@@ -798,7 +815,7 @@ async fn test_a_tab_says_it_has_unsaved_changes(cx: &mut TestAppContext) {
     close_buttons.sort();
     assert_eq!(
         close_buttons,
-        vec!["Close Tab: edited", "Close Tab: saved"],
+        vec!["Close Tab: bash", "Close Tab: edited", "Close Tab: saved"],
         "each close button says which tab it closes"
     );
 }

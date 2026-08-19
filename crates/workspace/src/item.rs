@@ -216,6 +216,17 @@ pub trait Item: Focusable + EventEmitter<Self::Event> + Render + Sized {
         self.tab_content_text(detail, cx)
     }
 
+    /// What the tab's dirty indicator means for this item.
+    ///
+    /// The indicator is a coloured dot, so the words are the only version a
+    /// reader gets, and [`Item::is_dirty`] does not mean the same thing
+    /// everywhere: a terminal is "dirty" when it rang the bell or is still
+    /// running a task, which is not unsaved work and must not be announced as
+    /// though it were.
+    fn dirty_announcement_text(&self, _cx: &App) -> SharedString {
+        SharedString::new_static("unsaved changes")
+    }
+
     /// Returns the suggested filename for saving this item.
     /// By default, returns the tab content text.
     fn suggested_filename(&self, cx: &App) -> SharedString {
@@ -515,6 +526,7 @@ pub trait ItemHandle: 'static + Send {
     fn tab_content(&self, params: TabContentParams, window: &Window, cx: &App) -> AnyElement;
     fn tab_content_text(&self, detail: usize, cx: &App) -> SharedString;
     fn tab_announcement_text(&self, detail: usize, cx: &App) -> SharedString;
+    fn dirty_announcement_text(&self, cx: &App) -> SharedString;
     fn suggested_filename(&self, cx: &App) -> SharedString;
     fn tab_icon(&self, window: &Window, cx: &App) -> Option<Icon>;
     fn tab_tooltip_text(&self, cx: &App) -> Option<SharedString>;
@@ -667,6 +679,10 @@ impl<T: Item> ItemHandle for Entity<T> {
 
     fn tab_announcement_text(&self, detail: usize, cx: &App) -> SharedString {
         self.read(cx).tab_announcement_text(detail, cx)
+    }
+
+    fn dirty_announcement_text(&self, cx: &App) -> SharedString {
+        self.read(cx).dirty_announcement_text(cx)
     }
 
     fn suggested_filename(&self, cx: &App) -> SharedString {
@@ -1258,6 +1274,7 @@ pub mod test {
         /// leaves the default in place, which is what every existing test
         /// expects.
         pub tab_announcement: Option<SharedString>,
+        pub dirty_announcement: Option<SharedString>,
         serialize: Option<Box<dyn Fn() -> Option<Task<anyhow::Result<()>>>>>,
         focus_handle: gpui::FocusHandle,
         pub child_focus_handles: Vec<gpui::FocusHandle>,
@@ -1350,6 +1367,7 @@ pub mod test {
                 tab_descriptions: None,
                 tab_detail: Default::default(),
                 tab_announcement: None,
+                dirty_announcement: None,
                 workspace_id: Default::default(),
                 focus_handle: cx.focus_handle(),
                 serialize: None,
@@ -1379,6 +1397,11 @@ pub mod test {
 
         pub fn with_dirty(mut self, dirty: bool) -> Self {
             self.is_dirty = dirty;
+            self
+        }
+
+        pub fn with_dirty_announcement(mut self, announcement: impl Into<SharedString>) -> Self {
+            self.dirty_announcement = Some(announcement.into());
             self
         }
 
@@ -1456,6 +1479,12 @@ pub mod test {
             self.tab_announcement
                 .clone()
                 .unwrap_or_else(|| self.tab_content_text(detail, cx))
+        }
+
+        fn dirty_announcement_text(&self, _cx: &App) -> SharedString {
+            self.dirty_announcement
+                .clone()
+                .unwrap_or_else(|| SharedString::new_static("unsaved changes"))
         }
 
         fn tab_content_text(&self, detail: usize, _cx: &App) -> SharedString {
@@ -1555,6 +1584,7 @@ pub mod test {
                     tab_descriptions: None,
                     tab_detail: Default::default(),
                     tab_announcement: None,
+                    dirty_announcement: self.dirty_announcement.clone(),
                     workspace_id: self.workspace_id,
                     focus_handle: cx.focus_handle(),
                     serialize: None,
