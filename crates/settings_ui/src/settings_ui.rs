@@ -3711,8 +3711,21 @@ impl SettingsWindow {
             }
         }
 
+        // `push_sub_page` and `pop_sub_page` both move focus here, so this is
+        // the element a reader arrives at when it enters or leaves a settings
+        // page — and it had an id and no role, which builds no node, so what
+        // was announced was the window. Named after the page being shown, so
+        // the arrival says which one.
+        let region_name = match self.sub_page_stack.last() {
+            Some(sub_page) => {
+                SharedString::from(format!("Settings: {}", sub_page.link.title))
+            }
+            None => SharedString::from(format!("Settings: {}", self.current_page().title)),
+        };
         v_flex()
             .id("settings-ui-page")
+            .role(Role::Group)
+            .aria_label(region_name)
             .on_action(cx.listener(|this, _: &menu::SelectNext, window, cx| {
                 if !this.sub_page_stack.is_empty() {
                     // Keep Tab navigation within the sub-page content. Global
@@ -5288,6 +5301,39 @@ pub mod test {
         gpui::a11y_checks::assert_controls_have_area(&tree, "settings window");
         gpui::a11y_checks::assert_landmarks_are_distinguishable(&tree, "settings window");
         gpui::a11y_checks::assert_active_descendant_is_honoured(&tree, "settings window");
+
+        // Opening or closing a settings sub-page focuses the content region
+        // rather than any control inside it, so that element is what a reader
+        // arrives at. It is a different focus target from the one checked
+        // above, and nothing else exercises it.
+        let content = cx
+            .update(|window, cx| {
+                let handle = _settings_window
+                    .read(cx)
+                    .content_focus_handle
+                    .focus_handle(cx);
+                window.focus(&handle, cx);
+                window.draw(cx).clear(cx);
+                window.debug_a11y_tree_json()
+            })
+            .expect("activation makes the debug tree available");
+        let content_tree: serde_json::Value =
+            serde_json::from_str(&content).expect("the dump is valid JSON");
+        gpui::a11y_checks::assert_focus_reached_the_tree(&content_tree, "settings content");
+        assert_eq!(
+            content_tree["frame"]["focus_without_node"].as_str(),
+            None,
+            "arriving at a settings page must not announce the window: {content}"
+        );
+        let focused = content_tree["gpui_focus"]
+            .as_str()
+            .unwrap_or_else(|| panic!("the content region holds focus: {content}"));
+        assert_eq!(
+            content_tree["nodes"][focused]["aria"]["label"].as_str(),
+            Some("Settings: General"),
+            "and it has to say which page was arrived at"
+        );
+
 
         // Guards against the whole check passing because nothing rendered.
         let interactive = nodes
