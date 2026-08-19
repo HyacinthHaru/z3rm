@@ -3321,6 +3321,7 @@ mod tests {
         );
     }
 
+    #[gpui::test]
     async fn two_panels_open_at_once_stay_distinguishable(cx: &mut gpui::TestAppContext) {
         use fs::FakeFs;
         use git_ui::git_panel::GitPanel;
