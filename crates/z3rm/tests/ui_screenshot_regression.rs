@@ -50,6 +50,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 use terminal_view::mux_pane::MuxPaneView;
+use workspace::notifications::simple_message_notification::MessageNotification;
 
 // ============================================================================
 // Harness
@@ -1486,6 +1487,68 @@ fn terminal_semantic_scroll_actions_move_viewport() -> Result<()> {
     Ok(())
 }
 
+/// A failure and a piece of news arrive through the same component, told apart
+/// on screen by a red warning icon. An icon is not a node and carries no text,
+/// so the screenshot and the a11y dump beside it are the two halves of the
+/// evidence: the frame shows what a sighted user sees, the tree shows what a
+/// reader is told.
+fn notification_severity_reaches_the_reader() -> Result<()> {
+    struct Stack {
+        failure: Entity<MessageNotification>,
+        news: Entity<MessageNotification>,
+    }
+
+    impl Render for Stack {
+        fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+            div()
+                .size_full()
+                .bg(theme::ActiveTheme::theme(&**cx).colors().background)
+                .p(px(16.0))
+                .flex()
+                .flex_col()
+                .gap(px(12.0))
+                .child(self.failure.clone())
+                .child(self.news.clone())
+        }
+    }
+
+    let mut cx = headless_app()?;
+    let window = cx.open_window(size(px(520.0), px(260.0)), |_, cx| {
+        let failure = cx.new(|cx| {
+            MessageNotification::from_workspace_error("could not reach the mux server", cx)
+        });
+        let news = cx.new(|cx| MessageNotification::new("Updated to z3rm 1.12", cx));
+        cx.new(|_| Stack { failure, news })
+    })?;
+
+    let (image, tree) = draw_frame(&mut cx, window.into())?;
+    save_frame("notification_severity", &image, &tree)?;
+
+    let announcements: Vec<String> = a11y_nodes(&tree)
+        .into_iter()
+        .filter_map(|(_, node)| a11y_string_field(node, "label"))
+        .collect();
+    assert!(
+        announcements
+            .iter()
+            .any(|text| text == "Error: could not reach the mux server"),
+        "the failure has to say it is one; got {announcements:?}"
+    );
+    assert!(
+        announcements
+            .iter()
+            .any(|text| text == "Updated to z3rm 1.12"),
+        "and an ordinary message must not be dressed up as an error; got {announcements:?}"
+    );
+    // Both notifications are drawn, so the frame is not a single flat fill and
+    // the red error accent is actually on screen rather than merely described.
+    assert!(
+        distinct_colors(&image) > 8,
+        "the frame collapsed to a flat fill, so the screenshot proves nothing"
+    );
+    Ok(())
+}
+
 fn headless_renderer_produces_real_pixels() -> Result<()> {
     // Guards the harness: a blank software or GPU frame makes every other
     // visual assertion meaningless.
@@ -1619,6 +1682,10 @@ fn main() {
         (
             "headless_renderer_produces_real_pixels",
             headless_renderer_produces_real_pixels,
+        ),
+        (
+            "notification_severity_reaches_the_reader",
+            notification_severity_reaches_the_reader,
         ),
     ];
 
