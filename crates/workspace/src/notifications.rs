@@ -1078,10 +1078,33 @@ pub mod simple_message_notification {
             let show_suppress_button = self.show_suppress_button;
             let show_close_button = self.show_close_button;
             let suppress = show_suppress_button && window.modifiers().shift;
-            let (close_id, close_icon, close_label) = if suppress {
-                ("suppress", IconName::Minimize, "Suppress notification")
+            // Several notifications stack at once, so a bare "Dismiss
+            // notification" gives a reader a list of identical buttons with no
+            // way to tell which one closes what. Naming the subject is the
+            // only thing that distinguishes them.
+            let subject = match (self.title.as_ref(), self.announcement.as_ref()) {
+                (Some(title), _) => Some(title.to_string()),
+                (None, Some(message)) => Some(super::first_line(message).to_string()),
+                (None, None) => None,
+            };
+            let (close_id, close_icon, close_label): (_, _, SharedString) = if suppress {
+                (
+                    "suppress",
+                    IconName::Minimize,
+                    match &subject {
+                        Some(subject) => format!("Suppress notification: {subject}").into(),
+                        None => "Suppress notification".into(),
+                    },
+                )
             } else {
-                ("close", IconName::Close, "Dismiss notification")
+                (
+                    "close",
+                    IconName::Close,
+                    match &subject {
+                        Some(subject) => format!("Dismiss notification: {subject}").into(),
+                        None => "Dismiss notification".into(),
+                    },
+                )
             };
 
             let main_content = (self.build_content)(window, cx);
@@ -1254,11 +1277,26 @@ pub mod simple_message_notification {
             // cut to its first line. The two differ on purpose: the stack
             // speaks its announcement unprompted, over whatever the user was
             // doing, while this is what they get when they go and read it.
-            let name: SharedString = match (self.title.as_ref(), self.announcement.as_ref()) {
+            let spoken: SharedString = match (self.title.as_ref(), self.announcement.as_ref()) {
                 (Some(title), Some(message)) => format!("{title}. {message}").into(),
                 (Some(title), None) => title.clone(),
                 (None, Some(message)) => message.clone(),
                 (None, None) => SharedString::default(),
+            };
+            // Severity is drawn as a coloured icon and appears nowhere in the
+            // text, so a reader arriving at the notification later would not
+            // learn it is a failure. Prefixed the same way as the
+            // announcement, so both surfaces name the state identically.
+            let name: SharedString = if spoken.is_empty() {
+                spoken
+            } else {
+                match self.severity {
+                    Some(ErrorSeverity::Critical) | Some(ErrorSeverity::Error) => {
+                        format!("Error: {spoken}").into()
+                    }
+                    Some(ErrorSeverity::Warning) => format!("Warning: {spoken}").into(),
+                    _ => spoken,
+                }
             };
 
             div()
