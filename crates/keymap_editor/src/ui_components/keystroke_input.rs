@@ -574,7 +574,7 @@ impl Render for KeystrokeInput {
             (true, true) => Some(SharedString::from(mode)),
             (true, false) => Some(format!("{mode}: {captured}").into()),
             (false, true) => None,
-            (false, false) => Some(SharedString::from(captured)),
+            (false, false) => Some(SharedString::from(captured.clone())),
         };
         let recording_announcement = div()
             .id("keystroke-input-mode")
@@ -584,8 +584,19 @@ impl Render for KeystrokeInput {
                 this.aria_announcement(announcement)
             });
 
+        // Both focus handles land on elements that had no role, so arriving at
+        // the control that sets every keybinding in the app announced the
+        // window rather than the field. `Focusable` hands out the outer handle
+        // and `start_recording` focuses the inner one, so both need a node.
+        let purpose = SharedString::from(if self.search {
+            "Search by keystroke"
+        } else {
+            "Keybinding"
+        });
         h_flex()
             .id("keystroke-input")
+            .role(gpui::Role::Group)
+            .aria_label(purpose.clone())
             .child(recording_announcement)
             .track_focus(&self.outer_focus_handle)
             .key_context(Self::key_context())
@@ -634,6 +645,13 @@ impl Render for KeystrokeInput {
             .child(
                 h_flex()
                     .id("keystroke-input-inner")
+                    // A text field whose value is the binding, which is how
+                    // the platform's own shortcut recorders report themselves.
+                    .role(gpui::Role::TextInput)
+                    .aria_label(purpose)
+                    .when(!captured.is_empty(), |this| {
+                        this.aria_value(SharedString::from(captured.clone()))
+                    })
                     .track_focus(&self.inner_focus_handle)
                     .on_modifiers_changed(cx.listener(Self::on_modifiers_changed))
                     .when(!self.search, |this| {
@@ -1265,6 +1283,73 @@ mod tests {
             mode_region(cx).0,
             "",
             "the region stays and goes quiet, so the next change can be announced"
+        );
+    }
+
+    /// Arriving at the control is its own announcement. Both focus handles
+    /// pointed at elements with no role, so tabbing to the field that sets
+    /// every keybinding in the app announced the window instead of the field —
+    /// and `start_recording`, which focuses the inner element, made it worse by
+    /// moving focus somewhere equally silent.
+    #[gpui::test]
+    async fn focusing_the_field_lands_on_something_named(cx: &mut TestAppContext) {
+        cx.update(|cx| {
+            let settings_store = settings::SettingsStore::test(cx);
+            cx.set_global(settings_store);
+            theme_settings::init(theme::LoadThemes::JustBase, cx);
+        });
+
+        let window = cx.add_window(|window, cx| KeystrokeInput::new(None, window, cx));
+        cx.activate_a11y(window.into());
+
+        let focused_name = |cx: &mut TestAppContext| -> (Option<String>, Option<String>) {
+            let json = cx
+                .update_window(window.into(), |_, window, cx| {
+                    window.draw(cx).clear(cx);
+                    window.debug_a11y_tree_json()
+                })
+                .expect("the harness window is still open")
+                .expect("activation makes the debug tree available");
+            let tree: serde_json::Value =
+                serde_json::from_str(&json).expect("the dump is valid JSON");
+            assert_eq!(
+                tree["frame"]["focus_without_node"].as_str(),
+                None,
+                "focus has to land on a node at all: {json}"
+            );
+            let focused = tree["gpui_focus"]
+                .as_str()
+                .unwrap_or_else(|| panic!("something has to hold focus: {json}"))
+                .to_owned();
+            let node = &tree["nodes"][&focused];
+            (
+                node["aria"]["label"].as_str().map(str::to_owned),
+                node["aria"]["role"].as_str().map(str::to_owned),
+            )
+        };
+
+        window
+            .update(cx, |input, window, cx| {
+                window.focus(&input.outer_focus_handle.clone(), cx);
+            })
+            .expect("the harness window is still open");
+        assert_eq!(
+            focused_name(cx),
+            (Some("Keybinding".to_string()), Some("Group".to_string())),
+            "tabbing to the widget has to say what it is"
+        );
+
+        // Recording moves focus to the inner element, which is where the
+        // keystrokes actually land.
+        window
+            .update(cx, |input, window, cx| {
+                input.start_recording(&StartRecording, window, cx);
+            })
+            .expect("the harness window is still open");
+        assert_eq!(
+            focused_name(cx),
+            (Some("Keybinding".to_string()), Some("TextInput".to_string())),
+            "and so does the element recording hands focus to"
         );
     }
 
