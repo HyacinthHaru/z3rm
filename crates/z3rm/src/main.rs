@@ -358,10 +358,15 @@ impl Render for MuxConnectionStatusItem {
     fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
         use ui::prelude::*;
 
-        let label = match self.state {
-            MuxConnectionState::Connected => None,
-            MuxConnectionState::Disconnected => Some(("Disconnected", ui::Color::Error)),
-            MuxConnectionState::Reconnecting => Some(("Reconnecting…", ui::Color::Warning)),
+        // Recovery is announced but not drawn. The status bar goes back to
+        // showing nothing once the connection returns, which is right for a
+        // user who can see the pane responding again and wrong for one who was
+        // told the connection dropped and is never told otherwise — clearing
+        // the announcement leaves them believing they are still detached.
+        let (state_text, visible_color) = match self.state {
+            MuxConnectionState::Connected => ("Connected", None),
+            MuxConnectionState::Disconnected => ("Disconnected", Some(ui::Color::Error)),
+            MuxConnectionState::Reconnecting => ("Reconnecting…", Some(ui::Color::Warning)),
         };
         // Losing the connection is conveyed only by this text and its color, and
         // it happens while the user is working somewhere else entirely. A polite
@@ -372,10 +377,13 @@ impl Render for MuxConnectionStatusItem {
             .id("mux-connection-status")
             .role(gpui::Role::Status)
             .aria_live(gpui::accesskit::Live::Polite)
-            .when_some(label, |element, (text, color)| {
-                element
-                    .aria_announcement(format!("Mux connection: {text}"))
-                    .child(ui::Label::new(text).size(ui::LabelSize::Small).color(color))
+            .aria_announcement(format!("Mux connection: {state_text}"))
+            .when_some(visible_color, |element, color| {
+                element.child(
+                    ui::Label::new(state_text)
+                        .size(ui::LabelSize::Small)
+                        .color(color),
+                )
             })
     }
 }
@@ -3507,6 +3515,63 @@ mod tests {
             status["aria"]["value"].as_str(),
             Some("Mux connection: Disconnected"),
             "the announcement has to say what changed, not just \"Disconnected\""
+        );
+    }
+
+    /// The all-clear, not the alarm. Nothing is drawn once the connection is
+    /// back, and if the announcement is dropped along with the text then a
+    /// reader who was told the session detached is never told it returned.
+    #[gpui::test]
+    async fn mux_reconnection_is_announced_even_though_nothing_is_drawn(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        cx.update(|cx| {
+            let settings_store = settings::SettingsStore::test(cx);
+            cx.set_global(settings_store);
+            theme_settings::init(theme::LoadThemes::JustBase, cx);
+        });
+        let window = cx.add_window(|_, _| super::MuxConnectionStatusItem {
+            state: super::MuxConnectionState::Disconnected,
+        });
+        cx.activate_a11y(window.into());
+
+        let announcement = |cx: &mut gpui::TestAppContext| -> Option<String> {
+            let json = cx
+                .update_window(window.into(), |_, window, cx| {
+                    window.draw(cx).clear(cx);
+                    window.debug_a11y_tree_json()
+                })
+                .expect("the status window is still open")
+                .expect("activation makes the debug tree available");
+            let tree: serde_json::Value =
+                serde_json::from_str(&json).expect("the dump is valid JSON");
+            gpui::a11y_checks::assert_live_regions_can_speak(&tree, "mux reconnection");
+            tree["nodes"]
+                .as_object()
+                .expect("the dump lists nodes")
+                .values()
+                .find(|node| node["aria"]["role"] == "Status")
+                .and_then(|node| node["aria"]["value"].as_str())
+                .map(str::to_owned)
+        };
+
+        assert_eq!(
+            announcement(cx).as_deref(),
+            Some("Mux connection: Disconnected"),
+            "the drop is the precondition: without it the recovery says nothing"
+        );
+
+        window
+            .update(cx, |item, _, cx| {
+                item.state = super::MuxConnectionState::Connected;
+                cx.notify();
+            })
+            .expect("the status window is still open");
+
+        assert_eq!(
+            announcement(cx).as_deref(),
+            Some("Mux connection: Connected"),
+            "coming back is the half a reader cannot see for themselves"
         );
     }
 
