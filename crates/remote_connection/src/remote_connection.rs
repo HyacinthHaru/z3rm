@@ -92,6 +92,15 @@ impl RemoteConnectionPrompt {
         self.is_password_prompt = !is_yes_no;
         self.is_masked = !is_yes_no;
         self.editor.set_masked(self.is_masked, window, cx);
+        // Focus moves straight to this field below, and the question is drawn
+        // beside it rather than being its name — so without a placeholder it
+        // announces as an unnamed box, with nothing to say whether it wants a
+        // password or a yes-or-no answer about an unrecognised host.
+        self.editor.set_placeholder_text(
+            if is_yes_no { "yes or no" } else { "Password" },
+            window,
+            cx,
+        );
 
         let markdown = cx.new(|cx| Markdown::new_text(prompt.into(), cx));
         self.prompt = Some((markdown, tx));

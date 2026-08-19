@@ -257,6 +257,9 @@ pub mod a11y_checks {
         "TabList",
         "Tree",
         "Table",
+        // A password field announced as "secure text field" and nothing else
+        // gives no clue what it is guarding.
+        "PasswordInput",
     ];
 
     /// Roles that only mean anything inside a matching container. A screen
@@ -1036,6 +1039,12 @@ mod a11y_check_tests {
     #[should_panic(expected = "bare role")]
     fn an_unnamed_table_is_reported() {
         assert_interactive_nodes_are_named(&bare("Table"), "probe");
+    }
+
+    #[test]
+    #[should_panic(expected = "bare role")]
+    fn an_unnamed_password_field_is_reported() {
+        assert_interactive_nodes_are_named(&bare("PasswordInput"), "probe");
     }
 
     #[test]

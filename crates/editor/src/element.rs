@@ -7834,6 +7834,15 @@ impl Element for EditorElement {
             builder.parent_node().set_description(description.to_string());
         }
         if let Some(a11y_text) = prepaint.a11y_text.as_ref() {
+            // Overrides the `TextInput` from `a11y_role`, which cannot see the
+            // display map. The role is what tells a reader to stop echoing
+            // characters out loud, so a masked field reported as ordinary text
+            // reads the password back to the room.
+            if a11y_text.masked {
+                builder
+                    .parent_node()
+                    .set_role(gpui::accesskit::Role::PasswordInput);
+            }
             // The placeholder is the only name most of these inputs have; the
             // parent node is reachable here, so no element-level plumbing is
             // needed to reach it.
@@ -9407,22 +9416,39 @@ impl Element for EditorElement {
                     let a11y_text = if !window.is_a11y_active() {
                         None
                     } else if self.single_line {
-                        let (text, selection) = {
+                        let (text, selection, masked) = {
                             let editor = self.editor.read(cx);
                             (
                                 editor.text(cx),
                                 editor.selections.newest::<MultiBufferOffset>(
                                     &position_map.snapshot.display_snapshot,
                                 ),
+                                editor.display_map.read(cx).masked,
                             )
                         };
+                        // A masked editor draws one `*` per character. Pushing
+                        // what it actually holds would put the password itself
+                        // into the accessibility tree, where a reader echoes it
+                        // as it is typed and anything holding an accessibility
+                        // permission can read it straight back out.
+                        let text = if masked {
+                            "*".repeat(text.chars().count())
+                        } else {
+                            text
+                        };
+                        // Masking is one `*` per character, so these only stay
+                        // aligned for single-byte text — the same caveat the
+                        // drawing code carries. Clamped rather than trusted,
+                        // because `push_text_runs` slices with them.
+                        let clamp = |offset: usize| offset.min(text.len());
                         Some(A11yTextInput {
-                            text,
                             placeholder: self
                                 .editor
                                 .update(cx, |editor, cx| editor.placeholder_text(cx)),
-                            selection_tail: selection.tail().0,
-                            selection_head: selection.head().0,
+                            selection_tail: clamp(selection.tail().0),
+                            selection_head: clamp(selection.head().0),
+                            text,
+                            masked,
                         })
                     } else if self.focusable_region {
                         // The rows that are on screen, as they are on screen —
@@ -9468,6 +9494,7 @@ impl Element for EditorElement {
                             placeholder: None,
                             selection_tail: offset_of(selection.tail()),
                             selection_head: offset_of(selection.head()),
+                            masked: false,
                         })
                     } else {
                         None
@@ -9708,6 +9735,10 @@ struct A11yTextInput {
     placeholder: Option<String>,
     selection_tail: usize,
     selection_head: usize,
+    /// Whether the editor is drawing `*` instead of its content. Carried here
+    /// because the accessibility hooks run without a context and so cannot ask
+    /// the display map themselves.
+    masked: bool,
 }
 
 pub struct EditorLayout {
@@ -12406,6 +12437,61 @@ mod tests {
         assert_eq!(
             calculate_wrap_width(SoftWrap::Bounded(200), px(400.0), em_width),
             Some(px(400.0)),
+        );
+    }
+
+    /// A masked editor is what the remote-connection modal collects an SSH
+    /// password in. It drew `*` and reported the real text, so the password
+    /// sat in the accessibility tree — read back by anything holding an
+    /// accessibility permission, and echoed aloud as it was typed, because a
+    /// plain text input is a role readers echo.
+    #[gpui::test]
+    async fn test_a_masked_editor_does_not_put_its_secret_in_the_tree(cx: &mut TestAppContext) {
+        init_test(cx, |_| {});
+        let window = cx.add_window(|window, cx| {
+            let buffer = MultiBuffer::build_simple("hunter2", cx);
+            let mut editor = Editor::new(EditorMode::SingleLine, buffer, None, window, cx);
+            editor.set_masked(true, cx);
+            editor
+        });
+
+        cx.activate_a11y(window.into());
+        let json = cx
+            .update_window(window.into(), |_, window, cx| {
+                window.draw(cx).clear(cx);
+                window.debug_a11y_tree_json()
+            })
+            .expect("the editor window is still open")
+            .expect("activation makes the debug tree available");
+        let tree: serde_json::Value = serde_json::from_str(&json).expect("the dump is valid JSON");
+
+        assert!(
+            !json.contains("hunter2"),
+            "the password must not appear anywhere in the tree: {json}"
+        );
+
+        let roles: Vec<&str> = tree["nodes"]
+            .as_object()
+            .expect("the dump lists nodes")
+            .values()
+            .filter_map(|node| node["aria"]["role"].as_str())
+            .collect();
+        assert!(
+            roles.contains(&"PasswordInput"),
+            "the role is what stops a reader echoing each character: {roles:?}"
+        );
+        // The field still has to have a length, or the caret has nowhere to be
+        // and review reports an empty box rather than a filled one.
+        let runs: Vec<&str> = tree["nodes"]
+            .as_object()
+            .expect("the dump lists nodes")
+            .values()
+            .filter(|node| node["aria"]["role"] == "TextRun")
+            .filter_map(|node| node["aria"]["value"].as_str())
+            .collect();
+        assert_eq!(
+            runs, vec!["*******"],
+            "what is drawn is seven asterisks, and that is what has to be reported"
         );
     }
 
