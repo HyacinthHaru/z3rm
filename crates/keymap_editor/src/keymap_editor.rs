@@ -4557,3 +4557,60 @@ mod tests {
         ));
     }
 }
+
+/// `InputField` is the app's plain text field — the keymap editor's context
+/// box, the "Folder to trust" prompt in the security modal. It marked its
+/// editor `a11y_wrapped`, promising that the element around it carried the
+/// role, name and text, and then carried none of the three. The field kept
+/// working only because the erased render path ignored the flag; honouring it,
+/// as `impl Render for Editor` already did, would have deleted the node.
+#[cfg(test)]
+mod input_field_tests {
+    use gpui::{AppContext as _, TestAppContext, VisualContext as _};
+    use ui_input::InputField;
+
+    #[gpui::test]
+    async fn an_input_field_is_a_named_text_input(cx: &mut TestAppContext) {
+        cx.update(|cx| {
+            let settings_store = settings::SettingsStore::test(cx);
+            cx.set_global(settings_store);
+            theme_settings::init(theme::LoadThemes::JustBase, cx);
+            editor::init(cx);
+        });
+        let window = cx.add_window(|window, cx| InputField::new(window, cx, "Folder to trust"));
+        cx.activate_a11y(window.into());
+
+        let json = cx
+            .update_window(window.into(), |_, window, cx| {
+                window.draw(cx).clear(cx);
+                window.debug_a11y_tree_json()
+            })
+            .expect("the field window is still open")
+            .expect("activation makes the debug tree available");
+        let tree: serde_json::Value = serde_json::from_str(&json).expect("the dump is valid JSON");
+        gpui::a11y_checks::assert_interactive_nodes_are_named(&tree, "input field");
+        gpui::a11y_checks::assert_no_role_was_discarded(&tree, "input field");
+        gpui::a11y_checks::assert_no_aria_was_discarded(&tree, "input field");
+
+        // Asserted by hand as well: the checks above find no fault with a
+        // control that produced no node at all, which is exactly the failure
+        // this guards against.
+        let field = tree["nodes"]
+            .as_object()
+            .expect("the dump lists nodes")
+            .values()
+            .find(|node| node["aria"]["role"] == "TextInput")
+            .unwrap_or_else(|| panic!("the field has to be in the tree at all: {json}"));
+        assert_eq!(
+            field["aria"]["placeholder"].as_str(),
+            Some("Folder to trust"),
+            "the placeholder is the only name this field has"
+        );
+        assert!(
+            field["aria"]["on_action"]
+                .as_array()
+                .is_some_and(|actions| actions.iter().any(|action| action == "Focus")),
+            "a field a reader cannot move focus to cannot be filled in: {field}"
+        );
+    }
+}

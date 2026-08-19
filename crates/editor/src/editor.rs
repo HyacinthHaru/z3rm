@@ -12467,9 +12467,13 @@ impl ui_input::ErasedEditor for ErasedEditorImpl {
         // The erased editor is always a single-line input — a picker's query
         // box, a settings field — and rendering it without saying so gives it
         // no id and no role, so focus lands on nothing and the field cannot be
-        // read at all.
+        // read at all. Unless a wrapper has claimed those semantics, which is
+        // what `set_a11y_wrapped` says and what `impl Render for Editor`
+        // already honours; ignoring it here left the flag silently inert on
+        // this path.
+        let a11y_wrapped = self.0.read(cx).a11y_wrapped;
         EditorElement::new(&self.0, editor_style)
-            .single_line(true)
+            .single_line(!a11y_wrapped)
             .into_any()
     }
 
