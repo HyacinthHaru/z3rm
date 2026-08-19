@@ -359,8 +359,13 @@ impl KeystrokeInput {
         cx.notify();
     }
 
-    fn render_keystrokes(&self, is_recording: bool) -> impl Iterator<Item = Div> {
-        let keystrokes = if let Some(placeholders) = self.placeholder_keystrokes.as_ref()
+    /// The keystrokes currently on screen: what has been captured, or the
+    /// binding already in place when nothing has been and recording is not
+    /// under way. Shared with the announcement so the two cannot drift — a
+    /// region that reads out something other than what is drawn is worse than
+    /// one that reads out nothing.
+    fn displayed_keystrokes(&self, is_recording: bool) -> &[KeybindingKeystroke] {
+        if let Some(placeholders) = self.placeholder_keystrokes.as_ref()
             && self.keystrokes.is_empty()
         {
             if is_recording {
@@ -370,8 +375,11 @@ impl KeystrokeInput {
             }
         } else {
             &self.keystrokes
-        };
-        keystrokes.iter().map(move |keystroke| {
+        }
+    }
+
+    fn render_keystrokes(&self, is_recording: bool) -> impl Iterator<Item = Div> {
+        self.displayed_keystrokes(is_recording).iter().map(move |keystroke| {
             h_flex().children(ui::render_keybinding_keystroke(
                 keystroke,
                 Some(Color::Default),
@@ -540,16 +548,40 @@ impl Render for KeystrokeInput {
         // starts, and a region created at that moment has nothing to diff
         // against and is never read out. The badge beside it is a pulsing dot
         // and the word "REC" as a `Label`, neither of which is a node.
+        //
+        // The keystrokes go here too. They are drawn as key glyphs, which are
+        // not nodes either, so without this a user records a binding, presses
+        // the combination, and is never told what was taken — nor, on the way
+        // back, what the field already holds.
+        //
+        // Spelled out rather than via `Display`, which renders the glyph form:
+        // "⌘⇧K" is what the eye reads, and handing it to a reader gambles on
+        // the reader knowing three symbols that are not letters.
+        let captured = self
+            .displayed_keystrokes(is_recording)
+            .iter()
+            .map(|keystroke| {
+                ui::text_for_keystroke(keystroke.modifiers(), keystroke.key(), cx)
+            })
+            .collect::<Vec<_>>()
+            .join(" ");
+        let mode = if self.search {
+            "Recording keystrokes to search"
+        } else {
+            "Recording keystrokes"
+        };
+        let announcement = match (is_recording, captured.is_empty()) {
+            (true, true) => Some(SharedString::from(mode)),
+            (true, false) => Some(format!("{mode}: {captured}").into()),
+            (false, true) => None,
+            (false, false) => Some(SharedString::from(captured)),
+        };
         let recording_announcement = div()
             .id("keystroke-input-mode")
             .role(gpui::Role::Status)
             .aria_live(gpui::accesskit::Live::Polite)
-            .when(is_recording, |this| {
-                this.aria_announcement(if self.search {
-                    "Recording keystrokes to search"
-                } else {
-                    "Recording keystrokes"
-                })
+            .when_some(announcement, |this, announcement| {
+                this.aria_announcement(announcement)
             });
 
         h_flex()
@@ -1233,6 +1265,81 @@ mod tests {
             mode_region(cx).0,
             "",
             "the region stays and goes quiet, so the next change can be announced"
+        );
+    }
+
+    /// A captured binding is drawn as key glyphs, and a glyph is not a node.
+    /// Without the keystrokes in the region a user arms the recorder, presses
+    /// the combination, and is told only that recording is under way — never
+    /// what it took, and so never whether it took the right thing.
+    #[gpui::test]
+    async fn the_captured_keystrokes_are_announced(cx: &mut TestAppContext) {
+        cx.update(|cx| {
+            let settings_store = settings::SettingsStore::test(cx);
+            cx.set_global(settings_store);
+            theme_settings::init(theme::LoadThemes::JustBase, cx);
+        });
+
+        let window = cx.add_window(|window, cx| KeystrokeInput::new(None, window, cx));
+        cx.activate_a11y(window.into());
+
+        let announced = |cx: &mut TestAppContext| -> String {
+            let json = cx
+                .update_window(window.into(), |_, window, cx| {
+                    window.draw(cx).clear(cx);
+                    window.debug_a11y_tree_json()
+                })
+                .expect("the harness window is still open")
+                .expect("activation makes the debug tree available");
+            let tree: serde_json::Value =
+                serde_json::from_str(&json).expect("the dump is valid JSON");
+            tree["nodes"]
+                .as_object()
+                .expect("the dump lists nodes")
+                .values()
+                .find(|node| {
+                    node["element_id"]
+                        .as_str()
+                        .is_some_and(|id| id.contains("keystroke-input-mode"))
+                })
+                .map(|node| node["aria"]["value"].as_str().unwrap_or_default().to_string())
+                .unwrap_or_else(|| panic!("the mode region has to exist: {json}"))
+        };
+
+        window
+            .update(cx, |input, window, cx| {
+                input.start_recording(&StartRecording, window, cx);
+            })
+            .expect("the harness window is still open");
+        assert_eq!(
+            announced(cx),
+            "Recording keystrokes",
+            "the precondition: recording is armed and nothing is captured yet"
+        );
+
+        let keystroke = to_gpui_keystroke(
+            Keystroke::parse("cmd-shift-k").expect("cmd-shift-k is a valid keystroke"),
+        );
+        window
+            .update(cx, |input, window, cx| {
+                input.handle_keystroke(&keystroke, window, cx);
+            })
+            .expect("the harness window is still open");
+
+        let captured = announced(cx);
+        let listed = captured
+            .strip_prefix("Recording keystrokes: ")
+            .unwrap_or_else(|| panic!("the region still has to say it is recording: {captured:?}"));
+        assert!(
+            listed.contains("Shift") && listed.ends_with('K'),
+            "the region has to name the key that was captured: {captured:?}"
+        );
+        // Asserted separately from the text above, which a glyph form would
+        // also satisfy for the key itself while dropping every modifier into a
+        // symbol. The modifier names are the part a reader cannot guess.
+        assert!(
+            !listed.chars().any(|character| "⌘⇧⌥⌃".contains(character)),
+            "glyphs are what the eye reads; the region has to spell them: {captured:?}"
         );
     }
 
