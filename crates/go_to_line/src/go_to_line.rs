@@ -878,6 +878,88 @@ mod tests {
         })
     }
 
+    /// The help line is the only answer this modal gives, and it is a plain
+    /// label, which is not a node. Typing a line number produced silence.
+    #[gpui::test]
+    async fn the_target_line_is_announced_as_it_is_typed(cx: &mut TestAppContext) {
+        init_test(cx);
+        let fs = FakeFs::new(cx.executor());
+        fs.insert_tree(path!("/dir"), json!({ "a.rs": "one\ntwo\nthree\nfour\nfive\n" }))
+            .await;
+        let project = Project::test(fs, [path!("/dir").as_ref()], cx).await;
+        let (multi_workspace, cx) =
+            cx.add_window_view(|window, cx| MultiWorkspace::test_new(project.clone(), window, cx));
+        let workspace = multi_workspace.read_with(cx, |mw, _| mw.workspace().clone());
+        let worktree_id = workspace.update(cx, |workspace, cx| {
+            workspace.project().update(cx, |project, cx| {
+                project.worktrees(cx).next().unwrap().read(cx).id()
+            })
+        });
+        workspace
+            .update_in(cx, |workspace, window, cx| {
+                workspace.open_path(
+                    (worktree_id, rel_path("a.rs").into()),
+                    None,
+                    true,
+                    window,
+                    cx,
+                )
+            })
+            .await
+            .unwrap()
+            .downcast::<Editor>()
+            .unwrap();
+
+        let _go_to_line_view = open_go_to_line_view(&workspace, cx);
+        cx.activate_a11y(cx.window_handle());
+
+        let announced = |cx: &mut VisualTestContext| -> (String, String) {
+            let json = cx
+                .update(|window, cx| {
+                    window.draw(cx).clear(cx);
+                    window.debug_a11y_tree_json()
+                })
+                .expect("activation makes the debug tree available");
+            let tree: serde_json::Value =
+                serde_json::from_str(&json).expect("the dump is valid JSON");
+            gpui::a11y_checks::assert_live_regions_can_speak(&tree, "go to line");
+            let region = tree["nodes"]
+                .as_object()
+                .expect("the dump lists nodes")
+                .values()
+                .find(|node| {
+                    node["element_id"]
+                        .as_str()
+                        .is_some_and(|id| id.contains("go-to-line-target"))
+                })
+                .unwrap_or_else(|| panic!("the help line has to be a region: {json}"));
+            (
+                // The value, not the label: macOS speaks `node.value()` and
+                // raises no announcement at all without one.
+                region["aria"]["value"].as_str().unwrap_or_default().to_owned(),
+                region["aria"]["live"].as_str().unwrap_or_default().to_owned(),
+            )
+        };
+
+        let (before, live) = announced(cx);
+        assert_eq!(live, "Polite", "it has to be a live region to be spoken");
+        assert!(
+            !before.is_empty(),
+            "the region has to exist and hold the current position before anything is typed"
+        );
+
+        cx.simulate_input("4");
+        let (after, _) = announced(cx);
+        assert_eq!(
+            after, "Go to line 4",
+            "typing a number has to say where it lands"
+        );
+        assert_ne!(
+            before, after,
+            "an announcement that never changes is never spoken"
+        );
+    }
+
     fn highlighted_display_rows(editor: &Entity<Editor>, cx: &mut VisualTestContext) -> Vec<u32> {
         editor.update_in(cx, |editor, window, cx| {
             editor

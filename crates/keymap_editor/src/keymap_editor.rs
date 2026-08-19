@@ -4593,6 +4593,10 @@ mod input_field_tests {
         gpui::a11y_checks::assert_interactive_nodes_are_named(&tree, "input field");
         gpui::a11y_checks::assert_no_role_was_discarded(&tree, "input field");
         gpui::a11y_checks::assert_no_aria_was_discarded(&tree, "input field");
+        // The field's error line is a live region owned by `ui_input`, which
+        // has no test harness of its own — this is the only place it is
+        // rendered under a check.
+        gpui::a11y_checks::assert_live_regions_can_speak(&tree, "input field");
 
         // Asserted by hand as well: the checks above find no fault with a
         // control that produced no node at all, which is exactly the failure

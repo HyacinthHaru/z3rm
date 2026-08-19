@@ -1237,6 +1237,7 @@ mod tests {
                 .expect("activation makes the debug tree available");
             let tree: serde_json::Value =
                 serde_json::from_str(&json).expect("the dump is valid JSON");
+            gpui::a11y_checks::assert_live_regions_can_speak(&tree, "keystroke input");
             tree["nodes"]
                 .as_object()
                 .expect("the dump lists nodes")
@@ -1378,6 +1379,7 @@ mod tests {
                 .expect("activation makes the debug tree available");
             let tree: serde_json::Value =
                 serde_json::from_str(&json).expect("the dump is valid JSON");
+            gpui::a11y_checks::assert_live_regions_can_speak(&tree, "keystroke input");
             tree["nodes"]
                 .as_object()
                 .expect("the dump lists nodes")
