@@ -194,6 +194,15 @@ mod tests {
             )
         });
         cx.activate_a11y(window.into());
+        // Typed in, so the assertion below that the secret stays out of the
+        // tree is about something that was actually there to leak.
+        window
+            .update(cx, |modal, window, cx| {
+                modal
+                    .editor
+                    .update(cx, |editor, cx| editor.set_text("hunter2", window, cx));
+            })
+            .expect("the harness window is still open");
 
         let json = cx
             .update_window(window.into(), |_, window, cx| {
@@ -215,13 +224,19 @@ mod tests {
         gpui::a11y_checks::assert_landmarks_are_distinguishable(&tree, "askpass modal");
         gpui::a11y_checks::assert_active_descendant_is_honoured(&tree, "askpass modal");
 
+        // `PasswordInput`, not `TextInput`: the editor is masked, and the role
+        // is what stops a reader echoing the secret aloud as it is typed.
         let field = tree["nodes"]
             .as_object()
             .expect("the dump lists nodes")
             .values()
-            .find(|node| node["aria"]["role"] == "TextInput")
-            .unwrap_or_else(|| panic!("no text input in the tree: {json}"));
+            .find(|node| node["aria"]["role"] == "PasswordInput")
+            .unwrap_or_else(|| panic!("no password input in the tree: {json}"));
         assert_eq!(field["aria"]["label"].as_str(), Some("Password"));
+        assert!(
+            !json.contains("hunter2"),
+            "the secret must not reach the tree: {json}"
+        );
         assert_eq!(
             field["aria"]["description"].as_str(),
             Some("Password for 'https://ada@github.com':"),
