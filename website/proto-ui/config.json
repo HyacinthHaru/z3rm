@@ -1,0 +1,23 @@
+{
+  "version": 1,
+  "rootDir": "./proto-ui",
+  "stylesDir": "./src/styles",
+  "styles": {
+    "enabled": false,
+    "preset": null
+  },
+  "adapters": {
+    "wc": {
+      "package": "@proto.ui/adapter-web-component"
+    }
+  },
+  "components": {
+    "wc": [
+      "base-button",
+      "base-dialog",
+      "base-select",
+      "base-tabs",
+      "base-toggle"
+    ]
+  }
+}

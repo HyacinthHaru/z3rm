@@ -1,0 +1,28 @@
+@import "./tokens.css";
+
+* { box-sizing: border-box; }
+html { scroll-behavior: smooth; background: var(--surface-app); }
+body { margin: 0; min-width: 320px; color: var(--text-primary); background: var(--surface-app); font: 400 16px/1.6 var(--font-ui); text-rendering: optimizeLegibility; }
+a { color: inherit; text-decoration-color: var(--border-strong); text-underline-offset: .2em; }
+a:hover { text-decoration-color: var(--accent-blue); }
+button, select, input, textarea { font: inherit; }
+button, [role="button"], a, select, input, textarea { outline: none; }
+:focus-visible { outline: 2px solid var(--focus-ring); outline-offset: 3px; }
+::selection { color: var(--text-primary); background: var(--accent-blue-soft); }
+img, svg { display: block; max-width: 100%; }
+code, pre, kbd { font-family: var(--font-mono); }
+code { font-size: .9em; }
+pre { overflow: auto; margin: 1.5rem 0; padding: 1rem 1.125rem; border: 1px solid var(--border-muted); border-radius: var(--radius-control); background: var(--surface-panel); font-size: .875rem; line-height: 1.6; }
+h1, h2, h3 { font-family: var(--font-display); font-weight: 600; line-height: 1.08; letter-spacing: -.035em; text-wrap: balance; }
+h1 { font-size: clamp(3.2rem, 9vw, 7.5rem); }
+h2 { font-size: clamp(2rem, 4vw, 3.7rem); }
+h3 { font-size: clamp(1.2rem, 2vw, 1.65rem); letter-spacing: -.02em; }
+p { text-wrap: pretty; }
+.sr-only { position: absolute; width: 1px; height: 1px; padding: 0; margin: -1px; overflow: hidden; clip: rect(0, 0, 0, 0); white-space: nowrap; border: 0; }
+.skip-link { position: fixed; z-index: 1000; top: .75rem; left: .75rem; padding: .6rem .8rem; transform: translateY(-200%); border: 1px solid var(--border-strong); border-radius: var(--radius-control); background: var(--surface-panel); }
+.skip-link:focus { transform: none; }
+.pui-control { min-height: 2.25rem; display: inline-flex; align-items: center; justify-content: center; gap: .45rem; padding: .45rem .75rem; border: 1px solid var(--border-muted); border-radius: var(--radius-control); color: var(--text-primary); background: var(--surface-panel); box-shadow: 0 1px 1px rgb(0 0 0 / 4%); cursor: pointer; }
+.pui-control:hover { border-color: var(--border-strong); background: var(--surface-hover); }
+.pui-control[data-variant="primary"] { color: #fff; border-color: #385f8b; background: #416f9f; }
+.pui-control[data-variant="primary"]:hover { background: #365f8b; }
+@media (prefers-reduced-motion: reduce) { *, *::before, *::after { scroll-behavior: auto !important; animation-duration: .01ms !important; animation-iteration-count: 1 !important; transition-duration: .01ms !important; } }
