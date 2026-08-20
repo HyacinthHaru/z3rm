@@ -4,8 +4,8 @@ import test from "node:test";
 
 const root = new URL("../", import.meta.url);
 
-test("Proto UI web component facades register the site controls", async () => {
-  const source = await readFile(new URL("proto-ui/components/wc/index.ts", root), "utf8");
+test("Proto UI prototype adapters register the site controls", async () => {
+  const source = await readFile(new URL("src/scripts/proto-ui-components.ts", root), "utf8");
   for (const element of ["proto-ui-base-button", "proto-ui-base-tabs-root", "proto-ui-base-select-root", "proto-ui-base-dialog-root", "proto-ui-base-toggle"]) {
     assert.match(source, new RegExp(element));
   }

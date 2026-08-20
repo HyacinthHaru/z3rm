@@ -37,3 +37,27 @@ test("implementation status renders verified evidence rows", async ({ page }) =>
   await expect(page.locator("#z3rm-mux-001")).toContainText("Verified");
   await expect(page.locator(".status-row")).toHaveCount(13);
 });
+
+test("GPUI WASM demo and Proto UI controls work together", async ({ page }) => {
+  await page.goto("en/");
+  const demo = page.locator("[data-z3rm-wasm-demo]");
+  await expect(demo).toContainText("One mux snapshot");
+
+  const frame = page.frameLocator('iframe[title="Z3rm GPUI WebAssembly session projection"]');
+  await expect(frame.locator("canvas")).toBeVisible({ timeout: 120_000 });
+
+  const contractTab = page.getByRole("tab", { name: "Data contract" });
+  await contractTab.scrollIntoViewIfNeeded();
+  await contractTab.click();
+  await expect(demo.locator(".contract-panel")).toContainText("SessionSnapshot");
+  await page.getByRole("tab", { name: "Session" }).click();
+
+  await demo.locator("proto-ui-base-dialog-trigger").click();
+  await expect(page.getByRole("dialog")).toContainText("What is actually running");
+  await page.locator("proto-ui-base-dialog-close").click();
+
+  await demo.locator("proto-ui-base-select-trigger").click();
+  await page.locator("proto-ui-base-select-item").filter({ hasText: "observe" }).click();
+  await expect(demo.locator("iframe")).toHaveAttribute("src", /window=window-1/);
+  await expect(frame.locator("canvas")).toBeVisible({ timeout: 120_000 });
+});

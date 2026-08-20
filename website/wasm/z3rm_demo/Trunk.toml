@@ -1,0 +1,9 @@
+[build]
+target = "index.html"
+dist = "../../public/gpui-demo"
+public_url = "./"
+
+[serve]
+addresses = ["127.0.0.1"]
+port = 8090
+open = false

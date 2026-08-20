@@ -1,0 +1,21 @@
+[package]
+name = "z3rm_web_demo"
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+[[bin]]
+name = "z3rm_web_demo"
+path = "main.rs"
+
+[workspace]
+
+[dependencies]
+serde = "1"
+anyhow = "1"
+console_error_panic_hook = "0.1"
+gpui = { path = "../../../crates/gpui" }
+gpui_web = { path = "../../../crates/gpui_web", default-features = false }
+log = "0.4"
+mux_protocol = { path = "../../../crates/mux_protocol" }
+web-sys = { version = "0.3", features = ["Location", "Window"] }

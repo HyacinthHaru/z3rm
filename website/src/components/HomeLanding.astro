@@ -1,4 +1,5 @@
 ---
+import Z3rmWasmDemo from "./Z3rmWasmDemo.astro";
 type Props = { lang: "en" | "zh" };
 const { lang } = Astro.props;
 const base = import.meta.env.BASE_URL.replace(/\/$/, "");
@@ -71,8 +72,10 @@ const copy = lang === "zh" ? {
     <figure class="diagram"><img src={media("session-lifecycle.svg")} alt={copy.lifecycle} width="1200" height="430" /></figure>
   </section>
 
+  <Z3rmWasmDemo lang={lang} />
+
   <section class="evidence section-shell">
-    <div class="section-heading"><p class="section-index">04 / RENDERER</p><div><h2>{copy.surfaces}</h2><p>{copy.surfacesBody}</p></div></div>
+    <div class="section-heading"><p class="section-index">05 / RENDERER</p><div><h2>{copy.surfaces}</h2><p>{copy.surfacesBody}</p></div></div>
     <div class="evidence-grid">
       <figure><img src={media("z3rm-terminal-grid.png")} alt={copy.terminal} width="1440" height="800" /><figcaption><b>{copy.terminal}</b><code>ui_screenshot_regression</code></figcaption></figure>
       <figure class="chrome-capture"><img src={media("z3rm-extension-status-bar.png")} alt={copy.chrome} width="1120" height="160" /><figcaption><b>{copy.chrome}</b><code>Z3RM-EXT-001</code></figcaption></figure>
@@ -80,7 +83,7 @@ const copy = lang === "zh" ? {
   </section>
 
   <section class="snapshot section-shell">
-    <div><p class="section-index">05 / RECOVERY</p><h2>{copy.snapshot}</h2><p>{copy.snapshotBody}</p><a class="text-action" href={href("concepts/shadow-snapshots/")}>Z3RM-SNAPSHOT-001 <span aria-hidden="true">→</span></a></div>
+    <div><p class="section-index">06 / RECOVERY</p><h2>{copy.snapshot}</h2><p>{copy.snapshotBody}</p><a class="text-action" href={href("concepts/shadow-snapshots/")}>Z3RM-SNAPSHOT-001 <span aria-hidden="true">→</span></a></div>
     <div class="wal-visual" aria-hidden="true"><span>SEQ 1048</span><i></i><span>WAL FSYNC</span><i></i><span>RESTORE</span><i></i><span>FILE</span></div>
   </section>
 
@@ -91,7 +94,7 @@ const copy = lang === "zh" ? {
 
   <section class="status-link section-shell"><a href={href("implementation-status/")}><span>{copy.inspect}</span><b>{copy.auditCount}</b><i aria-hidden="true">→</i></a></section>
 
-  <section class="final-cta section-shell"><p class="section-index">06 / START</p><h2>{copy.final}</h2><p>{copy.finalBody}</p><a class="primary-action" href={href("quick-start/")}>{copy.start}</a></section>
+  <section class="final-cta section-shell"><p class="section-index">07 / START</p><h2>{copy.final}</h2><p>{copy.finalBody}</p><a class="primary-action" href={href("quick-start/")}>{copy.start}</a></section>
 </main>
 
 <style>

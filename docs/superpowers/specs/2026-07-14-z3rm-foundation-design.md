@@ -1037,6 +1037,8 @@ All decisions below were resolved through structured grilling and are Day 0 bind
 - **pane_group geometry logic migrates entirely to mux_server.** Split tree, resize math, size ratios — all server-side.
 - **Client workspace = layout renderer + GPUI item container.** Receives layout snapshot → creates GPUI views at server-specified positions/sizes → forwards user interactions (drag, resize) as RPCs to server.
 - **Client workspace holds no layout calculation logic.** It is a stateless layout renderer.
+- **Window/pane projection is lossless.** The mux server's visible hierarchy is reproduced one-for-one in GPUI: every mux window becomes exactly one GUI tab; every pane leaf becomes exactly one GPUI pane; and window order, active window, split axis, child order, size ratios, focused pane, pane title, and terminal cell geometry are preserved. The GUI must not regroup, flatten, collapse, reorder, or independently resize this hierarchy. A layout created or changed through TUI-compatible keybindings, CLI commands, another client, or reconnect must therefore appear in the GUI with the same tab/pane partition and proportions, modulo only the server-authoritative min-fit scaling required by the attached clients.
+- **Projection reconciliation is atomic.** A full attach snapshot or `SessionLayoutChanged` update replaces the GUI tab/pane projection as one transaction. Grid generations for all visible leaves are applied against that same layout revision, so users never observe a new layout containing stale or mismatched pane identities.
 
 ### 16.10 Clipboard
 
@@ -1060,7 +1062,7 @@ All decisions below were resolved through structured grilling and are Day 0 bind
 ### 16.13 Testing (Day 0)
 
 - **Unit tests:** shadow_snapshot (WAL replay, version tree CRUD, delta chain replay, GC invariants), mux_protocol (serialization round-trip, version negotiation), grid sync (generation counter logic, diff application).
-- **End-to-end integration test:** daemon spawn → create session → spawn pane → type input → fetch grid → split pane → detach → reattach → verify state matches.
+- **End-to-end integration test:** daemon spawn → create multiple windows and recursively split panes through TUI-compatible/CLI controls → attach the GPUI client → verify a one-to-one tab/pane projection (window order, active window, split axes, child order, ratios, focus, titles, and pane identities) → type input → fetch grid → detach → mutate layout from another client → reattach → atomically verify the complete authoritative layout and all pane state.
 
 ### 16.14 Logging and Diagnostics
 

@@ -23,7 +23,7 @@ test("documentation shell has navigable document landmarks", async () => {
 
 test("site layout registers Proto UI web components", async () => {
   const layout = await source("src/layouts/SiteLayout.astro");
-  assert.match(layout, /proto-ui\/components\/wc\/index/);
+  assert.match(layout, /scripts\/proto-ui-components/);
   assert.match(layout, /<SiteHeader/);
   assert.match(layout, /<SiteFooter/);
 });

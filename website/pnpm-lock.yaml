@@ -14,6 +14,9 @@ importers:
       '@proto.ui/adapter-web-component':
         specifier: 0.2.0
         version: 0.2.0
+      '@proto.ui/core':
+        specifier: 0.2.0
+        version: 0.2.0
       '@proto.ui/prototypes-base':
         specifier: 0.2.0
         version: 0.2.0

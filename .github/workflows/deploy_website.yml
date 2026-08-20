@@ -7,6 +7,11 @@ on:
       - ".github/workflows/deploy_website.yml"
       - "docs/implementation-status/**"
       - "website/**"
+      - "crates/gpui/**"
+      - "crates/gpui_web/**"
+      - "crates/gpui_wgpu/**"
+      - "crates/mux_protocol/**"
+      - "crates/workspace/src/layout_projection.rs"
   workflow_dispatch:
 
 permissions:
@@ -35,6 +40,18 @@ jobs:
           node-version: 24
           cache: pnpm
           cache-dependency-path: website/pnpm-lock.yaml
+      - name: Install WebAssembly build tools
+        shell: bash
+        run: |
+          rustup target add wasm32-unknown-unknown
+          curl --fail --location --output /tmp/trunk.tar.gz \
+            https://github.com/trunk-rs/trunk/releases/download/v0.21.14/trunk-x86_64-unknown-linux-gnu.tar.gz
+          echo "f2b4680cd239693a646a2795e4633c625328d7b2a044fbe749fa3a2fe9e7036b  /tmp/trunk.tar.gz" | sha256sum --check
+          tar --extract --gzip --file /tmp/trunk.tar.gz --directory /tmp
+          sudo install /tmp/trunk /usr/local/bin/trunk
+      - name: Build GPUI WebAssembly demo
+        run: pnpm build:wasm
+        working-directory: website
       - name: Install dependencies
         run: pnpm install --frozen-lockfile
         working-directory: website
