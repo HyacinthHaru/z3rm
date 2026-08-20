@@ -2,6 +2,7 @@
 import { getCollection, render, type CollectionEntry } from "astro:content";
 import DocsLayout from "../../layouts/DocsLayout.astro";
 import SiteLayout from "../../layouts/SiteLayout.astro";
+import StatusMatrix from "../../components/StatusMatrix.astro";
 
 type Props = { entry: CollectionEntry<"docs">; lang: "en" | "zh"; pairedPath: string };
 
@@ -30,6 +31,7 @@ const base = import.meta.env.BASE_URL.replace(/\/$/, "");
 const canonical = new URL(`${base}/${lang}/${Astro.params.slug ? `${Astro.params.slug}/` : ""}`, Astro.site);
 const alternate = new URL(`${base}${pairedPath}${pairedPath.endsWith("/") ? "" : "/"}`, Astro.site);
 const isHome = entry.data.section === "home";
+const isImplementationStatus = entry.data.translationKey === "implementation-status";
 ---
 {isHome ? (
   <SiteLayout title={entry.data.title} description={entry.data.description} {lang} {pairedPath} {canonical} {alternate}>
@@ -38,6 +40,7 @@ const isHome = entry.data.section === "home";
 ) : (
   <DocsLayout {entry} {entries} {headings} {lang} {pairedPath} {canonical} {alternate}>
     <Content />
+    {isImplementationStatus && <StatusMatrix {lang} />}
   </DocsLayout>
 )}
 

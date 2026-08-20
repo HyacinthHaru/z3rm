@@ -1,0 +1,124 @@
+{
+  "schemaVersion": 1,
+  "specification": "docs/superpowers/specs/2026-07-14-z3rm-foundation-design.md",
+  "auditedCommit": "ed5ba12e1fa1a569c660e6a0ecef59d66cd7d8e7",
+  "requirements": [
+    {
+      "id": "Z3RM-MUX-001",
+      "spec": "§1.2, §3.1–3.4",
+      "claim": {"en": "mux_server owns PTYs, terminal grids, scrollback, and layout authority.", "zh": "mux_server 持有 PTY、终端 grid、scrollback 与布局权威。"},
+      "implementation": ["crates/mux_server/src/pane.rs", "crates/mux_server/src/connection.rs", "crates/mux/src/mux.rs"],
+      "verification": ["cargo test -p mux_server --lib", "cargo test -p mux --tests"],
+      "status": "verified",
+      "issue": null
+    },
+    {
+      "id": "Z3RM-MUX-002",
+      "spec": "§3.3",
+      "claim": {"en": "Grid publication is generation-atomic and uses row-level diffs.", "zh": "Grid 发布以 generation 为原子边界，并使用行级 diff。"},
+      "implementation": ["crates/mux_server/src/pane.rs", "crates/mux_protocol/src/mux_protocol.rs"],
+      "verification": ["cargo test -p mux_server snapshot_and_scrollback_share_one_authoritative_grid", "cargo test -p mux_server structured_snapshot_reconstructs_history_and_display_offset"],
+      "status": "verified",
+      "issue": null
+    },
+    {
+      "id": "Z3RM-MUX-003",
+      "spec": "§3.4, §15.4, §15.12",
+      "claim": {"en": "Reconnect reconciles from a complete authoritative session snapshot.", "zh": "重连通过完整权威 session snapshot 进行一致性恢复。"},
+      "implementation": ["crates/mux/src/mux.rs", "crates/terminal_view/src/mux_pane.rs"],
+      "verification": ["cargo test -p mux --test reconnect_e2e", "cargo test -p z3rm --test ui_screenshot_regression reconnect"],
+      "status": "verified",
+      "issue": null
+    },
+    {
+      "id": "Z3RM-MUX-004",
+      "spec": "§3.5, §16.1",
+      "claim": {"en": "The daemon keeps sessions alive by default until explicitly killed.", "zh": "Daemon 默认保持 session，直到显式终止。"},
+      "implementation": ["crates/mux_server/src/settings.rs", "crates/mux_server/src/server.rs"],
+      "verification": ["cargo test -p mux_server --lib keep_alive", "z3rm new -s docs-smoke && z3rm detach && z3rm has-session -t docs-smoke"],
+      "status": "verified",
+      "issue": null
+    },
+    {
+      "id": "Z3RM-CLI-001",
+      "spec": "§3.10",
+      "claim": {"en": "The CLI supports tmux-style session, window, pane, input, capture, search, file, snapshot, and clipboard operations.", "zh": "CLI 支持类似 tmux 的 session、window、pane、输入、抓取、搜索、文件、snapshot 与 clipboard 操作。"},
+      "implementation": ["crates/z3rm/src/cli.rs", "crates/z3rm/src/cli/dispatch.rs"],
+      "verification": ["cargo test -p z3rm cli::", "z3rm --help"],
+      "status": "verified",
+      "issue": null
+    },
+    {
+      "id": "Z3RM-CLI-002",
+      "spec": "§3.10 target and format compatibility",
+      "claim": {"en": "CLI targeting and format strings expose stable session/window/pane discovery for automation.", "zh": "CLI target 与格式字符串为自动化提供稳定的 session/window/pane 发现方式。"},
+      "implementation": ["crates/z3rm/src/cli/target.rs", "crates/z3rm/src/cli/format.rs"],
+      "verification": ["cargo test -p z3rm cli::tests::format", "cargo test -p z3rm cli::tests::target"],
+      "status": "verified",
+      "issue": null
+    },
+    {
+      "id": "Z3RM-SCROLL-001",
+      "spec": "§3.3, §15.13",
+      "claim": {"en": "Scrollback, command history, search, and display offset derive from the server terminal.", "zh": "Scrollback、命令历史、搜索与 display offset 均来自服务器终端。"},
+      "implementation": ["crates/mux_server/src/pane.rs", "crates/mux_server/src/connection.rs", "crates/terminal_view/src/mux_pane.rs"],
+      "verification": ["cargo test -p mux_server full_history_rotation_advances_history_version", "cargo test -p mux --test scrollback_search_e2e"],
+      "status": "verified",
+      "issue": null
+    },
+    {
+      "id": "Z3RM-SNAPSHOT-001",
+      "spec": "§4.3–4.9",
+      "claim": {"en": "Shadow snapshots use monotonic sequence ordering, WAL-before-restore durability, bounded rope deltas, and FIFO GC.", "zh": "Shadow snapshot 使用单调序列、restore 前 WAL 持久化、有界 Rope delta 与 FIFO GC。"},
+      "implementation": ["crates/shadow_snapshot/src/wal.rs", "crates/shadow_snapshot/src/watcher.rs", "crates/shadow_snapshot/src/version_store.rs"],
+      "verification": ["cargo test -p shadow_snapshot", "cargo test -p mux --test shadow_snapshot_e2e"],
+      "status": "verified",
+      "issue": null
+    },
+    {
+      "id": "Z3RM-REMOTE-001",
+      "spec": "§3.2, §15.4",
+      "claim": {"en": "Local and SSH sessions use the same framed mux protocol and authoritative snapshot model.", "zh": "本机与 SSH session 使用相同 framed mux protocol 与权威 snapshot 模型。"},
+      "implementation": ["crates/mux/src/mux.rs", "crates/remote_connection/src/remote_connection.rs"],
+      "verification": ["cargo test -p mux --tests", "cargo test -p remote_connection"],
+      "status": "verified",
+      "issue": null
+    },
+    {
+      "id": "Z3RM-REVIEW-001",
+      "spec": "§1.2, §2.1",
+      "claim": {"en": "Z3rm provides a read-only file tree and diff review workflow for agent changes.", "zh": "Z3rm 为 Agent 修改提供只读文件树与 diff review 工作流。"},
+      "implementation": ["crates/z3rm/src/diff_review.rs", "crates/project_panel/src/project_panel.rs", "crates/editor/src/editor.rs"],
+      "verification": ["cargo test -p z3rm diff_review", "cargo test -p project_panel --lib"],
+      "status": "verified",
+      "issue": null
+    },
+    {
+      "id": "Z3RM-EXT-001",
+      "spec": "§5.2–5.6, §16.8",
+      "claim": {"en": "QuickJS extensions run off the render thread with declared sides, capabilities, limits, and JSON chrome.", "zh": "QuickJS extension 在渲染线程外运行，并声明 side、capability、limit 与 JSON chrome。"},
+      "implementation": ["crates/quickjs_runtime/src/quickjs_runtime.rs", "crates/mux_server/src/extension_host.rs", "crates/extension_host/src/vdom_bridge.rs", "crates/z3rm/src/quickjs_extensions.rs"],
+      "verification": ["cargo test -p quickjs_runtime", "cargo test -p mux_server extension_host", "cargo test -p extension_host vdom"],
+      "status": "experimental",
+      "issue": null
+    },
+    {
+      "id": "Z3RM-FALLBACK-001",
+      "spec": "§5.4, §15.7",
+      "claim": {"en": "Core mux commands remain reachable through native controls when extension chrome is unavailable.", "zh": "Extension chrome 不可用时，核心 mux 命令仍可通过原生控制到达。"},
+      "implementation": ["assets/keymaps/default-linux.json", "assets/keymaps/default-macos.json", "assets/keymaps/default-windows.json", "crates/z3rm/src/main.rs"],
+      "verification": ["cargo test -p z3rm native_fallback", "script/check-a11y-regressions --a11y"],
+      "status": "verified",
+      "issue": null
+    },
+    {
+      "id": "Z3RM-A11Y-001",
+      "spec": "§15 accessibility and verification requirements",
+      "claim": {"en": "Terminal, workspace, picker, and review surfaces expose deterministic accessibility semantics.", "zh": "Terminal、workspace、picker 与 review 界面提供确定性的无障碍语义。"},
+      "implementation": ["crates/gpui/src/window/a11y.rs", "crates/terminal_view/src/mux_pane.rs", "script/check-a11y-regressions"],
+      "verification": ["script/check-a11y-regressions --a11y", "script/find-unnamed-controls"],
+      "status": "verified",
+      "issue": null
+    }
+  ]
+}

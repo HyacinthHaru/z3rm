@@ -1,0 +1,47 @@
+---
+import matrix from "../../../docs/implementation-status/z3rm-foundation.json";
+type Props = { lang: "en" | "zh" };
+const { lang } = Astro.props;
+const statusLabel = {
+  verified: lang === "zh" ? "已验证" : "Verified",
+  experimental: lang === "zh" ? "实验性" : "Experimental",
+  missing: lang === "zh" ? "缺失" : "Missing",
+  divergent: lang === "zh" ? "有偏差" : "Divergent",
+  "not-user-visible": lang === "zh" ? "内部约束" : "Internal",
+};
+---
+<div class="status-matrix">
+  {matrix.requirements.map((requirement) => (
+    <article id={requirement.id.toLowerCase()} class="status-row">
+      <header>
+        <code>{requirement.id}</code>
+        <span class="status" data-status={requirement.status}>{statusLabel[requirement.status]}</span>
+      </header>
+      <p>{requirement.claim[lang]}</p>
+      <details>
+        <summary>{lang === "zh" ? "证据" : "Evidence"}</summary>
+        <dl>
+          <dt>Spec</dt><dd>{requirement.spec}</dd>
+          <dt>{lang === "zh" ? "实现" : "Implementation"}</dt><dd>{requirement.implementation.map((path) => <code>{path}</code>)}</dd>
+          <dt>{lang === "zh" ? "验证" : "Verification"}</dt><dd>{requirement.verification.map((command) => <code>{command}</code>)}</dd>
+        </dl>
+        {requirement.issue && <p><a href={requirement.issue}>{lang === "zh" ? "查看问题" : "View issue"}</a></p>}
+      </details>
+    </article>
+  ))}
+</div>
+<style>
+  .status-matrix { margin-top: 2.5rem; border-top: 1px solid var(--border-muted); }
+  .status-row { padding: 1.2rem 0; border-bottom: 1px solid var(--border-muted); }
+  .status-row header { display: flex; align-items: center; justify-content: space-between; gap: 1rem; }
+  .status-row p { margin: .65rem 0; }
+  .status { font: 500 .68rem/1 var(--font-mono); text-transform: uppercase; }
+  .status[data-status="verified"] { color: var(--accent-green); }
+  .status[data-status="experimental"] { color: var(--accent-amber); }
+  .status[data-status="missing"], .status[data-status="divergent"] { color: var(--accent-coral); }
+  details { color: var(--text-secondary); font-size: .82rem; }
+  summary { cursor: pointer; }
+  dl { display: grid; grid-template-columns: 7rem minmax(0, 1fr); gap: .45rem 1rem; }
+  dt { color: var(--text-muted); } dd { margin: 0; display: flex; flex-direction: column; gap: .2rem; min-width: 0; }
+  dd code { overflow-wrap: anywhere; }
+</style>
