@@ -2,7 +2,7 @@
 import matrix from "../../../docs/implementation-status/z3rm-foundation.json";
 type Props = { lang: "en" | "zh" };
 const { lang } = Astro.props;
-const statusLabel = {
+const statusLabel: Record<string, string> = {
   verified: lang === "zh" ? "已验证" : "Verified",
   experimental: lang === "zh" ? "实验性" : "Experimental",
   missing: lang === "zh" ? "缺失" : "Missing",

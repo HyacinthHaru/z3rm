@@ -20,6 +20,7 @@
     "astro": "6.3.1"
   },
   "devDependencies": {
+    "@astrojs/check": "0.9.10",
     "@axe-core/playwright": "4.11.0",
     "@playwright/test": "1.55.0",
     "@types/node": "22.18.3",
