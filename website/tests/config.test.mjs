@@ -12,9 +12,9 @@ test("Astro config targets the GitHub Pages project path", async () => {
   assert.match(config, /output:\s*["']static["']/);
 });
 
-test("both public locales have an index route", async () => {
+test("both public locales have home content", async () => {
   for (const locale of ["en", "zh"]) {
-    const page = await readFile(new URL(`src/pages/${locale}/index.astro`, root), "utf8");
+    const page = await readFile(new URL(`src/content/docs/${locale}/index.md`, root), "utf8");
     assert.match(page, /Z3rm/);
   }
 });

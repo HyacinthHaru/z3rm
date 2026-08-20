@@ -1,0 +1,45 @@
+---
+import { getCollection, render, type CollectionEntry } from "astro:content";
+import "../../styles/global.css";
+
+type Props = { entry: CollectionEntry<"docs">; lang: "en" | "zh"; pairedPath: string };
+
+export async function getStaticPaths() {
+  const entries = await getCollection("docs");
+  return entries.map((entry) => {
+    const [lang, ...parts] = entry.id.split("/");
+    const routeParts = parts.at(-1) === "index" ? parts.slice(0, -1) : parts;
+    const otherLang = lang === "en" ? "zh" : "en";
+    const pair = entries.find((candidate) =>
+      candidate.data.translationKey === entry.data.translationKey && candidate.id.startsWith(`${otherLang}/`)
+    );
+    const pairParts = pair?.id.split("/").slice(1) ?? routeParts;
+    const pairedRoute = pairParts.at(-1) === "index" ? pairParts.slice(0, -1) : pairParts;
+    return {
+      params: { lang, slug: routeParts.length ? routeParts.join("/") : undefined },
+      props: { entry, lang, pairedPath: `/${otherLang}/${pairedRoute.join("/")}` },
+    };
+  });
+}
+
+const { entry, lang, pairedPath } = Astro.props;
+const { Content } = await render(entry);
+const base = import.meta.env.BASE_URL.replace(/\/$/, "");
+const canonical = new URL(`${base}/${lang}/${Astro.params.slug ? `${Astro.params.slug}/` : ""}`, Astro.site);
+const alternate = new URL(`${base}${pairedPath}${pairedPath.endsWith("/") ? "" : "/"}`, Astro.site);
+---
+<!doctype html>
+<html lang={lang === "zh" ? "zh-CN" : "en"}>
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width" />
+    <meta name="description" content={entry.data.description} />
+    <link rel="canonical" href={canonical} />
+    <link rel="alternate" hreflang={lang === "en" ? "zh-CN" : "en-US"} href={alternate} />
+    <title>{entry.data.title}</title>
+  </head>
+  <body>
+    <a class="skip-link" href="#content">{lang === "zh" ? "跳到正文" : "Skip to content"}</a>
+    <main id="content"><Content /></main>
+  </body>
+</html>
