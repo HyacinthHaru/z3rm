@@ -4772,6 +4772,7 @@ impl GitPanel {
         PopoverMenu::new(id.into())
             .trigger_with_tooltip(
                 IconButton::new("view-options-menu-trigger", IconName::Sliders)
+                    .aria_label("View Options")
                     .icon_size(IconSize::Small),
                 Tooltip::text("View Options"),
             )
@@ -4799,6 +4800,7 @@ impl GitPanel {
         } else {
             Some(
                 IconButton::new("co-authors", icon)
+                    .aria_label(tooltip_label)
                     .shape(ui::IconButtonShape::Square)
                     .icon_color(Color::Disabled)
                     .selected_icon_color(Color::Selected)
@@ -4839,6 +4841,7 @@ impl GitPanel {
         PopoverMenu::new(id.into())
             .trigger(crate::render_split_button_chevron_trigger(
                 "commit-split-button-right",
+                "More commit actions",
                 menu_open,
             ))
             .with_handle(self.commit_menu_handle.clone())
@@ -4963,6 +4966,7 @@ impl GitPanel {
         PopoverMenu::new(id.into())
             .trigger(crate::render_split_button_chevron_trigger(
                 "changes-actions-split-button-right",
+                "More actions for changed files",
                 menu_open,
             ))
             .with_handle(self.changes_actions_menu_handle.clone())
@@ -4994,6 +4998,7 @@ impl GitPanel {
 
         SplitButton::new(
             ButtonLike::new_rounded_left("git-changes-actions-split-button-left")
+                .aria_label(text)
                 .layer(ElevationIndex::ModalSurface)
                 .size(ButtonSize::Compact)
                 .child(Label::new(text).size(LabelSize::Small).mr_0p5())
@@ -5043,6 +5048,18 @@ impl GitPanel {
                 .justify_between()
                 .child(
                     ButtonLike::new("diff-button")
+                        .aria_label(
+                            if GitPanelSettings::get_global(cx).diff_stats
+                                && diff_stat_total != DiffStat::default()
+                            {
+                                SharedString::from(format!(
+                                    "View Diff, {} added, {} removed",
+                                    diff_stat_total.added, diff_stat_total.deleted
+                                ))
+                            } else {
+                                SharedString::new_static("View Diff")
+                            },
+                        )
                         .child(
                             h_flex()
                                 .gap_1()
@@ -5224,6 +5241,13 @@ impl GitPanel {
                                         )
                                         .single_line(
                                             self.commit_editor.read(cx).mode().is_single_line(),
+                                        )
+                                        // An auto-height editor is not single
+                                        // line, so without this the commit box
+                                        // has no node and focus on it is
+                                        // dropped.
+                                        .focusable_region(
+                                            !self.commit_editor.read(cx).mode().is_single_line(),
                                         ),
                                     ),
                             )
@@ -5274,6 +5298,7 @@ impl GitPanel {
             }))
             .child(SplitButton::new(
                 ButtonLike::new_rounded_left(format!("split-button-left-{}", title))
+                    .aria_label(title)
                     .layer(ElevationIndex::ModalSurface)
                     .size(ButtonSize::Compact)
                     .disabled(!can_commit || self.modal_open)
@@ -5333,6 +5358,12 @@ impl GitPanel {
 
     fn render_pending_amend(&self, cx: &mut Context<Self>) -> impl IntoElement {
         h_flex()
+            // The explanation is a `Label` and the only node here is a button
+            // reading "Cancel" — so a reader was offered a cancel with nothing
+            // saying what it cancels, or that anything had changed at all.
+            .id("git-panel-pending-amend")
+            .role(gpui::Role::Group)
+            .aria_label("This will update your most recent commit.")
             .py_1p5()
             .px_2()
             .gap_1p5()
@@ -5379,6 +5410,14 @@ impl GitPanel {
                 .child(
                     div()
                         .id("commit-msg-hover")
+                        // Opens the commit, but nothing said so: the subject is
+                        // a label, which is not a node, and the container had
+                        // no role, so the whole line was absent from the tree.
+                        .role(gpui::Role::Button)
+                        .aria_label(SharedString::from(format!(
+                            "Most recent commit: {}",
+                            commit.subject
+                        )))
                         .cursor_pointer()
                         .px_1()
                         .rounded_sm()
@@ -5425,6 +5464,7 @@ impl GitPanel {
                             let has_unstaged = self.has_unstaged_changes();
                             this.child(
                                 IconButton::new("undo", IconName::Undo)
+                                    .aria_label("Uncommit")
                                     .icon_size(IconSize::Small)
                                     .tooltip(move |_window, cx| {
                                         Tooltip::with_meta(
@@ -5447,6 +5487,7 @@ impl GitPanel {
                         })
                         .child(
                             IconButton::new("git-graph-button", IconName::GitGraph)
+                                .aria_label("Open Git Graph")
                                 .icon_size(IconSize::Small)
                                 .tooltip(|_window, cx| {
                                     Tooltip::for_action(
@@ -5467,17 +5508,33 @@ impl GitPanel {
         let active_tab = self.active_tab;
 
         let focus_handle = self.focus_handle.clone();
+        // Two tabs, both rendered by the closure below, so the set sizes stay
+        // in one place with the children they describe.
+        const TAB_COUNT: usize = 2;
         let tab = |id: ElementId,
+                   position: usize,
                    active: bool,
                    show_changes: bool,
                    label: SharedString,
                    set_active_tab: GitPanelTab,
                    tooltip_action: Box<dyn Action>| {
             let focus_handle = focus_handle.clone();
+            let count = (show_changes && self.changes_count > 0).then_some(self.changes_count);
+            // The count is a second label beside the name, and a label is not a
+            // node, so it only reaches a reader as part of the tab's own name.
+            let announced = match count {
+                Some(count) => SharedString::from(format!("{label} ({count})")),
+                None => label.clone(),
+            };
 
             h_flex()
                 .cursor_pointer()
                 .id(id)
+                .role(gpui::Role::Tab)
+                .aria_label(announced)
+                .aria_selected(active)
+                .aria_position_in_set(position)
+                .aria_size_of_set(TAB_COUNT)
                 .h_full()
                 .py_1()
                 .gap_1()
@@ -5490,9 +5547,9 @@ impl GitPanel {
                         .border_color(cx.theme().colors().border.opacity(0.6))
                 })
                 .child(Label::new(label.clone()).when(!active, |this| this.color(Color::Muted)))
-                .when(show_changes && self.changes_count > 0, |this| {
+                .when_some(count, |this, count| {
                     this.child(
-                        Label::new(format!("({})", self.changes_count))
+                        Label::new(format!("({})", count))
                             .size(LabelSize::Small)
                             .color(Color::Muted),
                     )
@@ -5509,10 +5566,16 @@ impl GitPanel {
 
         h_flex()
             .relative()
+            // A `Tab` outside a `TabList` keeps its role and loses "1 of 2"
+            // and the arrow-key conventions that come with containment.
+            .id("git-panel-tab-bar")
+            .role(gpui::Role::TabList)
+            .aria_label("Git Panel views")
             .h(Tab::container_height(cx))
             .w_full()
             .child(tab(
                 ElementId::Name("changes-tab".into()),
+                1,
                 active_tab == GitPanelTab::Changes,
                 true,
                 "Changes".into(),
@@ -5526,6 +5589,7 @@ impl GitPanel {
             )
             .child(tab(
                 ElementId::Name("history-tab".into()),
+                2,
                 active_tab != GitPanelTab::Changes,
                 false,
                 "History".into(),
@@ -5560,6 +5624,11 @@ impl GitPanel {
 
     fn render_history_placeholder(message: &'static str) -> impl IntoElement {
         h_flex()
+            // The message is a `Label` and contributes no node, so a history
+            // that is loading, empty or broken read as blank either way.
+            .id("git-panel-history-placeholder")
+            .role(gpui::Role::Group)
+            .aria_label(message)
             .flex_1()
             .justify_center()
             .child(Label::new(message).color(Color::Muted))
@@ -6041,6 +6110,11 @@ impl GitPanel {
         let show_branch_diff = self.changes_count == 0 && !self.is_on_main_branch(cx);
 
         v_flex()
+            // The message is a plain label and contributes no node of its own,
+            // so without a name here an empty panel reads as nothing at all.
+            .id("git-panel-no-changes")
+            .role(gpui::Role::Group)
+            .aria_label("No changes to commit")
             .gap_1()
             .items_center()
             .child(Label::new("No changes to commit").color(Color::Muted))
@@ -6076,6 +6150,12 @@ impl GitPanel {
         );
 
         v_flex()
+                // The explanation is a plain label and contributes no node, so
+                // a panel refusing to work reached a reader as an empty panel
+                // with a "Trust Directory" button and no idea what it trusts.
+                .id("git-panel-unsafe-repo")
+                .role(gpui::Role::Group)
+                .aria_label(message.clone())
                 .px_4()
                 .gap_1()
                 .child(Label::new(message).color(Color::Muted))
@@ -6112,6 +6192,11 @@ impl GitPanel {
         let worktree_count = self.project.read(cx).visible_worktrees(cx).count();
         if worktree_count > 0 && self.active_repository.is_none() {
             v_flex()
+                // Same as the other two empty states: the message is a label
+                // and contributes no node of its own.
+                .id("git-panel-uninitialized")
+                .role(gpui::Role::Group)
+                .aria_label("No Git repositories")
                 .gap_1()
                 .items_center()
                 .child(Label::new("No Git Repositories").color(Color::Muted))
@@ -6403,6 +6488,13 @@ impl GitPanel {
                 .into_any_element()
             } else {
                 Checkbox::new(checkbox_id, toggle_state)
+                    .aria_label(match section {
+                        Section::Conflict => "Stage all conflicts",
+                        Section::Tracked => "Stage all tracked changes",
+                        Section::New => "Stage all new files",
+                        Section::Staged => "Unstage all",
+                        Section::Unstaged => "Stage all",
+                    })
                     .disabled(!has_write_access)
                     .fill()
                     .elevation(ElevationIndex::Surface)
@@ -6561,6 +6653,42 @@ impl GitPanel {
         let git_path_style = ProjectSettings::get_global(cx).git.path_style;
         let display_name = entry.display_name(path_style);
 
+        // Captured before the render closures take `display_name`, so the
+        // row's announced name survives. The status beside it is an icon or a
+        // colour on the label depending on the setting, and neither reaches a
+        // reader, so the word goes into the name.
+        let announced_name = {
+            let status = entry.status;
+            let word = if status.is_conflicted() {
+                "conflict"
+            } else if status.is_deleted() {
+                "deleted"
+            } else if status.is_created() {
+                "added"
+            } else if status.is_modified() {
+                "modified"
+            } else {
+                ""
+            };
+            let mut announced = if word.is_empty() {
+                display_name.clone().to_string()
+            } else {
+                format!("{display_name}, {word}")
+            };
+            // The +12 −3 beside the row is a pair of labels, so the size of a
+            // change reaches a reader only through the name — and only when the
+            // panel is set to show it, so the two stay in step.
+            if settings.diff_stats
+                && let Some(stat) = entry.diff_stat
+                && (stat.added > 0 || stat.deleted > 0)
+            {
+                announced.push_str(&format!(
+                    ", {} added, {} removed",
+                    stat.added, stat.deleted
+                ));
+            }
+            SharedString::from(announced)
+        };
         let selected = self.selected_entry == Some(ix);
         let marked = self.marked_entries.contains(&ix);
         let status_style = settings.status_style;
@@ -6599,6 +6727,7 @@ impl GitPanel {
             Color::Muted
         };
 
+        let staged_label: SharedString = format!("Stage {display_name}").into();
         let id: ElementId = ElementId::Name(format!("entry_{}_{}", display_name, ix).into());
         let checkbox_wrapper_id: ElementId =
             ElementId::Name(format!("entry_{}_{}_checkbox_wrapper", display_name, ix).into());
@@ -6693,6 +6822,18 @@ impl GitPanel {
 
         h_flex()
             .id(id)
+            // The row's name is the file it is about; without it the panel
+            // reads as a list of unidentified entries.
+            .role(gpui::Role::ListBoxOption)
+            // accesskit maps `ListBoxOption` to static text on macOS, so
+            // without this a row a user can pick reads like a caption.
+            .aria_role_description("option")
+            .aria_label(announced_name)
+            .aria_selected(selected)
+            // Focus stays on the panel while the arrow keys move a highlight
+            // through it, so the current row is only announced if it is also
+            // claimed as the active descendant.
+            .when(selected, |this| this.aria_active_descendant())
             .h(self.list_item_height())
             .w_full()
             .pl_3()
@@ -6771,6 +6912,7 @@ impl GitPanel {
                         .into_any_element()
                     } else {
                         Checkbox::new(checkbox_id, is_staged)
+                            .aria_label(staged_label.clone())
                             .disabled(!has_write_access)
                             .fill()
                             .elevation(ElevationIndex::Surface)
@@ -7262,6 +7404,11 @@ impl Render for GitPanel {
 
         v_flex()
             .id("git_panel")
+            // Without a role this focused root produces no accessibility node,
+            // so focus is discarded and the whole window is announced instead
+            // of the panel.
+            .role(gpui::Role::ListBox)
+            .aria_label("Changed files")
             .key_context(self.dispatch_context(window, cx))
             .track_focus(&self.focus_handle)
             .when(has_write_access, |this| {
@@ -7443,6 +7590,14 @@ impl Panel for GitPanel {
         }
         let total = self.changes_count;
         (total > 0).then(|| total.to_string())
+    }
+
+    fn icon_label_a11y(&self, window: &Window, cx: &App) -> Option<String> {
+        let total = self.icon_label(window, cx)?;
+        Some(format!(
+            "{total} change{}",
+            if self.changes_count == 1 { "" } else { "s" }
+        ))
     }
 
     fn toggle_action(&self) -> Box<dyn Action> {
@@ -7663,7 +7818,10 @@ impl RenderOnce for PanelRepoFooter {
             })
             .into_any_element();
 
-        let branch_selector_button = Button::new("branch-selector", branch_name)
+        let branch_selector_button = Button::new("branch-selector", branch_name.clone())
+            // The branch name alone reads as a label, not a control: nothing in
+            // it says that pressing it switches branches.
+            .aria_label(format!("Switch branch, on {branch_name}"))
             .size(ButtonSize::None)
             .label_size(LabelSize::Small)
             .truncate(true)
@@ -11306,5 +11464,282 @@ mod tests {
         panel.update_in(&mut cx, |panel, window, cx| {
             assert!(panel.commit_editor.focus_handle(cx).is_focused(window));
         });
+    }
+
+    /// A role only becomes a node when its element also has an id, so "the code
+    /// sets a role" and "a screen reader sees one" are different claims. Read
+    /// the semantics back out of a drawn frame rather than trusting the
+    /// builder calls that produce them.
+    /// A project with a worktree and no `.git` is the state the panel renders
+    /// "No Git Repositories" for. That message is a `Label` and so no node, and
+    /// nothing rendered the state in a frame — so an empty panel reached a
+    /// reader as an empty panel, with an "Initialize Repository" button and no
+    /// word about why it was there.
+    #[gpui::test]
+    async fn a_project_with_no_repository_says_so(cx: &mut TestAppContext) {
+        init_test(cx);
+
+        let fs = FakeFs::new(cx.background_executor.clone());
+        fs.insert_tree(path!("/project"), json!({ "tracked": "tracked\n" }))
+            .await;
+
+        let project = Project::test(fs, [Path::new(path!("/project"))], cx).await;
+        let window_handle =
+            cx.add_window(|window, cx| MultiWorkspace::test_new(project.clone(), window, cx));
+        let workspace = window_handle
+            .read_with(cx, |mw, _| mw.workspace().clone())
+            .unwrap();
+        let mut cx = VisualTestContext::from_window(window_handle.into(), cx);
+
+        let panel = workspace.update_in(&mut cx, GitPanel::new);
+        workspace.update_in(&mut cx, |workspace, window, cx| {
+            workspace.add_panel(panel.clone(), window, cx);
+            workspace.open_panel::<GitPanel>(window, cx);
+        });
+        cx.run_until_parked();
+
+        cx.activate_a11y(cx.window_handle());
+        let json = cx
+            .update(|window, cx| {
+                window.draw(cx).clear(cx);
+                window.debug_a11y_tree_json()
+            })
+            .expect("activation makes the debug tree available");
+        let tree: serde_json::Value = serde_json::from_str(&json).expect("the dump is valid JSON");
+
+        gpui::a11y_checks::assert_interactive_nodes_are_named(&tree, "git panel with no repo");
+        gpui::a11y_checks::assert_no_role_was_discarded(&tree, "git panel with no repo");
+        gpui::a11y_checks::assert_no_aria_was_discarded(&tree, "git panel with no repo");
+        gpui::a11y_checks::assert_clickable_elements_are_reachable(&tree, "git panel with no repo");
+
+        let names: Vec<&str> = tree["nodes"]
+            .as_object()
+            .expect("the dump lists nodes")
+            .values()
+            .filter_map(|node| node["aria"]["label"].as_str())
+            .collect();
+        assert!(
+            names.contains(&"No Git repositories"),
+            "an empty panel has to say why it is empty: {names:?}"
+        );
+    }
+
+    #[gpui::test]
+    async fn the_changed_files_are_exposed_as_a_named_list(cx: &mut TestAppContext) {
+        init_test(cx);
+
+        let fs = FakeFs::new(cx.background_executor.clone());
+        fs.insert_tree(
+            path!("/project"),
+            json!({
+                ".git": {},
+                "tracked": "tracked\n",
+            }),
+        )
+        .await;
+        fs.set_head_and_index_for_repo(
+            path!("/project/.git").as_ref(),
+            &[("tracked", "old tracked\n".into())],
+        );
+
+        let project = Project::test(fs, [Path::new(path!("/project"))], cx).await;
+        let window_handle =
+            cx.add_window(|window, cx| MultiWorkspace::test_new(project.clone(), window, cx));
+        let workspace = window_handle
+            .read_with(cx, |mw, _| mw.workspace().clone())
+            .unwrap();
+        let mut cx = VisualTestContext::from_window(window_handle.into(), cx);
+
+        // The panel draws +N −M beside each row when this is on, and the row
+        // has to say the same thing when it does.
+        cx.update(|_, cx| {
+            update_git_panel_settings(cx, |settings| settings.diff_stats = true)
+        });
+
+        let panel = workspace.update_in(&mut cx, GitPanel::new);
+        workspace.update_in(&mut cx, |workspace, window, cx| {
+            workspace.add_panel(panel.clone(), window, cx);
+            workspace.open_panel::<GitPanel>(window, cx);
+        });
+        await_git_panel_entries(&panel, &mut cx).await;
+
+        // Focus stays on the panel while the arrow keys move a highlight through
+        // it, so the current row reaches a reader only through the selected
+        // state and the active descendant.
+        let entry_index = panel
+            .read_with(&cx, |panel, _| {
+                entry_index_for_repo_path(panel, &repo_path("tracked"))
+            })
+            .expect("the tracked file has a row");
+        panel.update_in(&mut cx, |panel, window, cx| {
+            window.focus(&panel.focus_handle, cx);
+            panel.selected_entry = Some(entry_index);
+            cx.notify();
+        });
+        cx.run_until_parked();
+
+        cx.activate_a11y(cx.window_handle());
+        let json = cx
+            .update(|window, cx| {
+                window.draw(cx).clear(cx);
+                window.debug_a11y_tree_json()
+            })
+            .expect("activation makes the debug tree available");
+        let tree: serde_json::Value = serde_json::from_str(&json).expect("the dump is valid JSON");
+        let nodes = tree["nodes"].as_object().expect("the dump lists nodes");
+
+        let current = tree["active_descendant_focus"]
+            .as_str()
+            .and_then(|id| nodes.get(id))
+            .unwrap_or_else(|| panic!("the panel must point at the row it highlights: {json}"));
+        assert_eq!(current["aria"]["role"].as_str(), Some("ListBoxOption"));
+        assert_eq!(current["aria"]["selected"].as_bool(), Some(true));
+        // The status is part of the name: the panel shows it as a colour or an
+        // icon depending on the setting, and neither reaches a reader.
+        assert_eq!(
+            current["aria"]["label"].as_str(),
+            Some("tracked, modified, 1 added, 1 removed")
+        );
+
+        gpui::a11y_checks::assert_interactive_nodes_are_named(&tree, "git panel");
+        gpui::a11y_checks::assert_names_are_distinguishable(&tree, "git panel");
+        gpui::a11y_checks::assert_focusable_names_are_distinguishable(&tree, "git panel");
+        gpui::a11y_checks::assert_clickable_elements_are_reachable(&tree, "git panel");
+        gpui::a11y_checks::assert_controls_have_area(&tree, "git panel");
+        gpui::a11y_checks::assert_landmarks_are_distinguishable(&tree, "git panel");
+        gpui::a11y_checks::assert_active_descendant_is_honoured(&tree, "git panel");
+        gpui::a11y_checks::assert_no_role_was_discarded(&tree, "git panel");
+        gpui::a11y_checks::assert_no_aria_was_discarded(&tree, "git panel");
+        gpui::a11y_checks::assert_roles_are_contained(&tree, "git panel");
+        gpui::a11y_checks::assert_click_targets_are_reachable(&tree, "git panel");
+        gpui::a11y_checks::assert_focus_reached_the_tree(&tree, "git panel");
+
+        let changes = nodes
+            .values()
+            .find(|node| node["aria"]["label"].as_str() == Some("Changed files"))
+            .expect("the panel must be reported as a named list");
+        assert_eq!(changes["aria"]["role"].as_str(), Some("ListBox"));
+
+        // Read the rows from inside the list: a row rendered outside it keeps
+        // its role but loses the set semantics that go with containment.
+        let rows: Vec<&str> = changes["children"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter_map(|id| id.as_str().and_then(|id| nodes.get(id)))
+            .filter(|node| node["aria"]["role"] == "ListBoxOption")
+            .filter_map(|node| node["aria"]["label"].as_str())
+            .collect();
+        assert!(
+            rows.contains(&"tracked, modified, 1 added, 1 removed"),
+            "every changed file needs a name of its own: {rows:?}"
+        );
+
+        // The tab bar is two clickable containers, so the checks above have
+        // nothing to fault when it is missing from the tree entirely.
+        let mut tabs: Vec<(&str, bool, u64)> = nodes
+            .values()
+            .filter(|node| node["aria"]["role"] == "Tab")
+            .map(|node| {
+                (
+                    node["aria"]["label"].as_str().unwrap_or_default(),
+                    node["aria"]["selected"].as_bool().unwrap_or(false),
+                    node["aria"]["position_in_set"].as_u64().unwrap_or_default(),
+                )
+            })
+            .collect();
+        tabs.sort_by_key(|(_, _, position)| *position);
+        let (changes_name, changes_selected, changes_position) =
+            *tabs.first().expect("the panel has a tab bar: {json}");
+        assert!(
+            changes_name.starts_with("Changes"),
+            "the first tab announces itself and its count: {tabs:?}"
+        );
+        assert!(
+            changes_selected && changes_position == 1,
+            "the open tab has to say it is the open one: {tabs:?}"
+        );
+        assert_eq!(
+            tabs.get(1).map(|(name, selected, position)| (
+                *name,
+                *selected,
+                *position
+            )),
+            Some(("History", false, 2)),
+            "both tabs have to be reachable and counted: {tabs:?}"
+        );
+    }
+
+    /// The commit box is an auto-height editor rendered as an `EditorElement`
+    /// outside `Editor::render`, so it had no id and no node: the user could
+    /// type into it while a reader had nothing to report about where they were.
+    #[gpui::test]
+    async fn the_commit_message_box_is_a_focusable_region(cx: &mut TestAppContext) {
+        init_test(cx);
+
+        let fs = FakeFs::new(cx.background_executor.clone());
+        fs.insert_tree(
+            path!("/project"),
+            json!({
+                ".git": {},
+                "tracked": "tracked\n",
+            }),
+        )
+        .await;
+        fs.set_head_and_index_for_repo(
+            path!("/project/.git").as_ref(),
+            &[("tracked", "old tracked\n".into())],
+        );
+
+        let project = Project::test(fs, [Path::new(path!("/project"))], cx).await;
+        let window_handle =
+            cx.add_window(|window, cx| MultiWorkspace::test_new(project.clone(), window, cx));
+        let workspace = window_handle
+            .read_with(cx, |mw, _| mw.workspace().clone())
+            .unwrap();
+        let mut cx = VisualTestContext::from_window(window_handle.into(), cx);
+
+        let panel = workspace.update_in(&mut cx, GitPanel::new);
+        workspace.update_in(&mut cx, |workspace, window, cx| {
+            workspace.add_panel(panel.clone(), window, cx);
+            workspace.open_panel::<GitPanel>(window, cx);
+        });
+        await_git_panel_entries(&panel, &mut cx).await;
+
+        panel.update_in(&mut cx, |panel, window, cx| {
+            window.focus(&panel.commit_editor.focus_handle(cx), cx);
+        });
+        cx.run_until_parked();
+
+        cx.activate_a11y(cx.window_handle());
+        let json = cx
+            .update(|window, cx| {
+                window.draw(cx).clear(cx);
+                window.debug_a11y_tree_json()
+            })
+            .expect("activation makes the debug tree available");
+        let tree: serde_json::Value = serde_json::from_str(&json).expect("the dump is valid JSON");
+        let nodes = tree["nodes"].as_object().expect("the dump lists nodes");
+
+        gpui::a11y_checks::assert_focus_reached_the_tree(&tree, "git panel commit box");
+
+        let focused = tree["gpui_focus"]
+            .as_str()
+            .and_then(|id| nodes.get(id))
+            .unwrap_or_else(|| panic!("focus in the commit box must land on a node: {json}"));
+        assert_eq!(focused["aria"]["role"].as_str(), Some("Group"));
+        // A multi-line editor is reported as a named region rather than as a
+        // text input, and the placeholder is the only name this one has — it
+        // holds the suggested commit message, so it is read from the editor
+        // rather than written out here.
+        let placeholder: SharedString = panel
+            .update_in(&mut cx, |panel, _window, cx| {
+                panel
+                    .commit_editor
+                    .update(cx, |editor, cx| editor.placeholder_text(cx))
+            })
+            .map(SharedString::from)
+            .expect("the commit box has a placeholder");
+        assert_eq!(focused["aria"]["label"].as_str(), Some(placeholder.as_ref()));
     }
 }

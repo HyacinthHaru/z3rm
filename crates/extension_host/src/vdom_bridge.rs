@@ -580,6 +580,24 @@ impl VDomRenderer {
         // remain stateless while buttons expose keyboard and accessibility
         // semantics equivalent to a native control.
         if click.is_none() && !is_button {
+            // A node holding nothing but text is the extension's label, and
+            // text contributes no accessibility node of its own — so a status
+            // bar of spans reaches a reader as its buttons and nothing else.
+            // Only leaf text nodes are named: a container with element children
+            // would repeat everything its children already say.
+            let text = node
+                .children
+                .iter()
+                .all(|child| matches!(child, VDomChild::Text(_)))
+                .then(|| accessible_name(node))
+                .flatten();
+            if let Some(text) = text {
+                let element = self.style_and_fill(div().id(self.element_id(node, path)), node, path, cx);
+                return element
+                    .role(Role::Label)
+                    .aria_label(SharedString::from(text))
+                    .into_any_element();
+            }
             let element = self.style_and_fill(div(), node, path, cx);
             return element.into_any_element();
         }
@@ -588,6 +606,13 @@ impl VDomRenderer {
             self.style_and_fill(div().id(self.element_id(node, path)), node, path, cx);
         if let Some(label) = accessible_name(node) {
             element = element.aria_label(SharedString::from(label));
+        }
+        // `class: "selected"` is how an extension marks the row a user is on,
+        // and `apply_classes` gives it a background colour. Colour is not
+        // information: without this the chosen row is indistinguishable from
+        // every other one, which is the whole point of marking it.
+        if is_selected_class(node) {
+            element = element.aria_selected(true);
         }
 
         let button_focus_handle = if is_button {
@@ -606,6 +631,15 @@ impl VDomRenderer {
                 .tab_stop(true)
                 .track_focus(focus_handle)
                 .cursor_pointer();
+        } else if click.is_some() {
+            // An extension that hangs `onClick` on a plain node built a control
+            // whatever it called it. Without a role it produces no node at all,
+            // so it is neither announced nor clickable by assistive technology
+            // — the `Click` action GPUI registers for the listener has nowhere
+            // to live. The tab stop stays with `type: "button"`, because
+            // putting arbitrary nodes into the keyboard order is a decision for
+            // whoever designs the extension API, not a side effect of naming.
+            element = element.role(Role::Button);
         }
 
         if let (Some(invocation), Some(dispatch)) = (click.clone(), self.dispatch.clone()) {
@@ -688,6 +722,12 @@ impl VDomRenderer {
         {
             element = element.aria_label(SharedString::from(aria_label));
         }
+        // What is typed in it is drawn as a child string, which contributes no
+        // node, so a filled field announced its name and nothing about its
+        // contents.
+        if !value.is_empty() {
+            element = element.aria_value(SharedString::from(value.clone()));
+        }
         element = apply_styles(element, node, &self.palette);
 
         if let (Some(invocation), Some(dispatch)) = (change, self.dispatch.clone()) {
@@ -726,7 +766,45 @@ impl VDomRenderer {
                 }
             }
         }
-        let mut container = apply_styles(div().relative(), node, &self.palette);
+        // A display list paints straight to draw-ops, so nothing about it
+        // reaches assistive technology unless it is named here. The name is the
+        // text the region draws, which is what a clock or a meter is.
+        //
+        // Deliberately `Group` rather than `Status`: `Status` carries an
+        // implicit polite live region, and these are the high-frequency widgets
+        // (§5.4) — a clock announcing itself every tick would make the app
+        // unusable with a screen reader.
+        let drawn_text = self
+            .display_lists
+            .get(region_id)
+            .map(|ops| {
+                ops.iter()
+                    .filter_map(|op| match op {
+                        DrawOp::DrawText { text, .. } => Some(text.trim()),
+                        _ => None,
+                    })
+                    .filter(|text| !text.is_empty())
+                    .collect::<Vec<_>>()
+                    .join(" ")
+            })
+            .filter(|text| !text.is_empty());
+        let name = explicit_aria_label(node)
+            .map(str::to_owned)
+            .or(drawn_text);
+
+        let mut container = apply_styles(
+            div()
+                .id(SharedString::from(format!("display-list:{region_id}")))
+                .relative(),
+            node,
+            &self.palette,
+        );
+        if let Some(name) = name {
+            container = container
+                .role(Role::Group)
+                .aria_label(SharedString::from(name));
+        }
+
         let Some(ops) = self.display_lists.get(region_id) else {
             return container.into_any_element();
         };
@@ -919,6 +997,21 @@ fn apply_styles<E: Styled>(mut element: E, node: &VDomNode, palette: &VDomPalett
     }
 
     apply_classes(element, node, palette)
+}
+
+/// Whether an extension marked this node as the chosen one.
+///
+/// Read separately from `apply_classes`, which turns the same class into a
+/// background colour, because the two go to different audiences.
+fn is_selected_class(node: &VDomNode) -> bool {
+    node.props
+        .get("class")
+        .and_then(|value| value.as_str())
+        .is_some_and(|classes| {
+            classes
+                .split_whitespace()
+                .any(|class| matches!(class, "selected" | "active"))
+        })
 }
 
 /// Semantic classes extensions use for state that has no inline-style
@@ -1350,6 +1443,38 @@ mod tests {
         );
     }
 
+    /// An extension marks the row a user is on with `class: "selected"`, and
+    /// the bridge turns that into a background colour. Colour reaches sighted
+    /// users; nothing reached anyone else, so the chosen row was
+    /// indistinguishable from the rest of the list.
+    #[test]
+    fn a_selected_class_reaches_the_tree_and_not_only_the_theme() {
+        for class in ["selected", "active", "dim selected", "selected emphasis"] {
+            let node = parse_vdom(&serde_json::json!({
+                "type": "div",
+                "props": { "class": class },
+            }))
+            .expect("parse");
+            assert!(
+                is_selected_class(&node),
+                "{class:?} marks the chosen row and has to say so"
+            );
+        }
+        for class in ["dim", "emphasis", "", "selectable", "inactive"] {
+            let node = parse_vdom(&serde_json::json!({
+                "type": "div",
+                "props": { "class": class },
+            }))
+            .expect("parse");
+            assert!(
+                !is_selected_class(&node),
+                "{class:?} does not mark anything as chosen"
+            );
+        }
+        let bare = parse_vdom(&serde_json::json!({ "type": "div" })).expect("parse");
+        assert!(!is_selected_class(&bare), "a node with no class is not chosen");
+    }
+
     #[test]
     fn renderer_stores_display_lists_by_region_id() {
         let mut renderer = VDomRenderer::new();
@@ -1709,5 +1834,118 @@ mod tests {
             children: Vec::new(),
         };
         assert_eq!(renderer.element_key(&anonymous, &path), "vdom-2-1");
+    }
+}
+
+#[cfg(test)]
+mod a11y_tests {
+    use super::*;
+    use gpui::{AppContext as _, Render, TestAppContext, Window};
+
+    struct ChromeHost(VDomNode);
+
+    impl Render for ChromeHost {
+        fn render(&mut self, _: &mut Window, cx: &mut gpui::Context<Self>) -> impl IntoElement {
+            let mut renderer = VDomRenderer::new();
+            gpui::div().child(renderer.render(&self.0, cx))
+        }
+    }
+
+    fn tree_of(cx: &mut TestAppContext, chrome: serde_json::Value) -> serde_json::Value {
+        let node = parse_vdom(&chrome).expect("the fixture is valid chrome");
+        let window = cx.add_window(|_, _| ChromeHost(node));
+        cx.activate_a11y(window.into());
+        let json = cx
+            .update_window(window.into(), |_, window, cx| {
+                window.draw(cx).clear(cx);
+                window.debug_a11y_tree_json()
+            })
+            .expect("the harness window is still open")
+            .expect("activation makes the debug tree available");
+        serde_json::from_str(&json).expect("the dump is valid JSON")
+    }
+
+    fn named(tree: &serde_json::Value, role: &str) -> Vec<String> {
+        let mut names: Vec<String> = tree["nodes"]
+            .as_object()
+            .expect("the dump lists nodes")
+            .values()
+            .filter(|node| node["aria"]["role"] == role)
+            .map(|node| {
+                node["aria"]["label"]
+                    .as_str()
+                    .unwrap_or_default()
+                    .to_string()
+            })
+            .collect();
+        names.sort();
+        names
+    }
+
+    /// The bridge turns untrusted extension JSON into chrome, and decides the
+    /// roles and names for all of it. None of that had ever been read back out
+    /// of a drawn frame — the 29 tests beside this one check the parse and the
+    /// styling, so every accessibility decision here was verified only by the
+    /// builder call that made it.
+    #[gpui::test]
+    fn extension_chrome_reaches_the_tree_named(cx: &mut TestAppContext) {
+        let tree = tree_of(
+            cx,
+            serde_json::json!({
+                "type": "div",
+                "props": { "id": "root" },
+                "children": [
+                    { "type": "button", "props": { "id": "split" }, "children": ["Split"] },
+                    {
+                        "type": "div",
+                        "props": { "id": "kill", "onClick": "kill-pane", "aria-label": "Kill pane" },
+                        "children": []
+                    }
+                ]
+            }),
+        );
+
+        gpui::a11y_checks::assert_interactive_nodes_are_named(&tree, "extension chrome");
+        gpui::a11y_checks::assert_names_are_distinguishable(&tree, "extension chrome");
+        gpui::a11y_checks::assert_focusable_names_are_distinguishable(&tree, "extension chrome");
+        gpui::a11y_checks::assert_no_role_was_discarded(&tree, "extension chrome");
+        gpui::a11y_checks::assert_no_aria_was_discarded(&tree, "extension chrome");
+        gpui::a11y_checks::assert_roles_are_contained(&tree, "extension chrome");
+        gpui::a11y_checks::assert_clickable_elements_are_reachable(&tree, "extension chrome");
+        gpui::a11y_checks::assert_live_regions_can_speak(&tree, "extension chrome");
+
+        // `<button>Split</button>` is the idiomatic thing an extension author
+        // writes, and it has to work without them knowing what `aria-label` is.
+        // The second one is a plain `div` that merely takes a click, which the
+        // bridge promotes to a button so the action is not mouse-only.
+        assert_eq!(
+            named(&tree, "Button"),
+            vec!["Kill pane".to_string(), "Split".to_string()],
+            "both controls reach the tree with the name the extension gave them"
+        );
+    }
+
+    /// The boundary of what the bridge can do. An icon-only control has no
+    /// text to fall back on, so naming it is the extension author's job — and
+    /// nothing tells them when they have not. Recorded as the current
+    /// behaviour rather than left to be discovered.
+    #[gpui::test]
+    fn an_icon_only_extension_control_is_left_nameless(cx: &mut TestAppContext) {
+        let tree = tree_of(
+            cx,
+            serde_json::json!({
+                "type": "div",
+                "props": { "id": "root" },
+                "children": [
+                    { "type": "button", "props": { "id": "icon-only" }, "children": [] }
+                ]
+            }),
+        );
+
+        assert_eq!(
+            named(&tree, "Button"),
+            vec![String::new()],
+            "the bridge has nothing to name this with; the extension has to"
+        );
     }
 }

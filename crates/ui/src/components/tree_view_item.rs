@@ -192,6 +192,10 @@ impl RenderOnce for TreeViewItem {
                         if self.root_item {
                             this.child(
                                 Disclosure::new("toggle", self.expanded)
+                                    .aria_label(format!(
+                                        "{}: {label}",
+                                        if self.expanded { "Collapse" } else { "Expand" }
+                                    ))
                                     .when_some(self.on_toggle.clone(), |disclosure, on_toggle| {
                                         disclosure.on_toggle_expanded(on_toggle)
                                     })

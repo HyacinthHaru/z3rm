@@ -1250,11 +1250,24 @@ pub struct MarkdownElement {
     on_source_click: Option<SourceClickCallback>,
     on_checkbox_toggle: Option<CheckboxToggleCallback>,
     image_resolver: Option<Box<dyn Fn(&str) -> Option<ImageSource>>>,
+    a11y_label: Option<SharedString>,
     show_root_block_markers: bool,
     autoscroll: AutoscrollBehavior,
 }
 
 impl MarkdownElement {
+    /// What a reader is told this view is, when it takes focus.
+    ///
+    /// A markdown view is a focusable region whose content reaches the tree as
+    /// text runs, so without this it is announced as a bare group — the user
+    /// is told they have arrived somewhere and not where. Optional, because a
+    /// markdown view embedded in something already named does not need to say
+    /// it twice.
+    pub fn aria_label(mut self, label: impl Into<SharedString>) -> Self {
+        self.a11y_label = Some(label.into());
+        self
+    }
+
     pub fn new(markdown: Entity<Markdown>, style: MarkdownStyle) -> Self {
         Self {
             markdown,
@@ -1264,6 +1277,7 @@ impl MarkdownElement {
                 wrap_button_visibility: WrapButtonVisibility::Hidden,
                 border: false,
             },
+            a11y_label: None,
             on_url_click: None,
             code_span_link: None,
             on_source_click: None,
@@ -2062,16 +2076,59 @@ impl Styled for MarkdownElement {
     }
 }
 
+/// What a markdown view contributes to the accessibility tree, captured during
+/// prepaint because the accessibility hooks run without a context.
+pub struct MarkdownPrepaint {
+    hitbox: Hitbox,
+    a11y_text: Option<(SharedString, usize, usize)>,
+    /// Where each link sits on screen, so it can be announced as a link and
+    /// followed without a mouse.
+    a11y_links: Vec<(SharedString, Bounds<Pixels>)>,
+    a11y_label: Option<SharedString>,
+}
+
 impl Element for MarkdownElement {
     type RequestLayoutState = RenderedMarkdown;
-    type PrepaintState = Hitbox;
+    type PrepaintState = MarkdownPrepaint;
 
     fn id(&self) -> Option<ElementId> {
-        None
+        Some(ElementId::View(self.markdown.entity_id()))
     }
 
     fn source_location(&self) -> Option<&'static core::panic::Location<'static>> {
         None
+    }
+
+    /// Reported as a region carrying its text rather than as any richer
+    /// pattern: the rendered layout is wrapped and styled, but the source is
+    /// what the user would read aloud, and a markdown view that contributes no
+    /// nodes leaves the live regions it sits inside with nothing to announce.
+    fn a11y_role(&self) -> Option<gpui::accesskit::Role> {
+        Some(gpui::accesskit::Role::Group)
+    }
+
+    fn a11y_synthetic_children(
+        &mut self,
+        prepaint: &mut Self::PrepaintState,
+        builder: &mut gpui::A11ySubtreeBuilder,
+    ) {
+        if let Some(label) = prepaint.a11y_label.as_ref() {
+            builder.parent_node().set_label(label.to_string());
+        }
+        if let Some((text, tail, head)) = prepaint.a11y_text.as_ref() {
+            builder.push_text_runs(text, *tail, *head);
+        }
+        // After the runs, so a link's node sits beside the text it is part of.
+        for (index, (name, bounds)) in prepaint.a11y_links.iter().enumerate() {
+            let mut node = gpui::accesskit::Node::new(gpui::accesskit::Role::Link);
+            node.set_label(name.to_string());
+            node.add_action(gpui::accesskit::Action::Click);
+            builder.push_child_with_bounds(
+                builder.synthetic_node_id(u64::MAX - index as u64),
+                node,
+                *bounds,
+            );
+        }
     }
 
     fn request_layout(
@@ -2793,12 +2850,70 @@ impl Element for MarkdownElement {
     ) -> Self::PrepaintState {
         let focus_handle = self.markdown.read(cx).focus_handle.clone();
         window.set_focus_handle(&focus_handle, cx);
+        // Registering the handle is only half of it: without naming the node
+        // that carries the focus, a focused markdown view produces no node and
+        // the whole window gets announced instead.
+        if let Some(global_id) = _id {
+            window.report_a11y_focus_target(global_id, &focus_handle);
+        }
         window.set_view_id(self.markdown.entity_id());
 
         let hitbox = window.insert_hitbox(bounds, HitboxBehavior::Normal);
         rendered_markdown.element.prepaint(window, cx);
         self.autoscroll(&rendered_markdown.text, window, cx);
-        hitbox
+
+        let a11y_text = {
+            let markdown = self.markdown.read(cx);
+            let source = markdown.source().clone();
+            (!source.is_empty()).then(|| {
+                let selection = &markdown.selection;
+                let (tail, head) = if selection.reversed {
+                    (selection.end, selection.start)
+                } else {
+                    (selection.start, selection.end)
+                };
+                let clamp = |offset: usize| offset.min(source.len());
+                (source.clone(), clamp(tail), clamp(head))
+            })
+        };
+
+        // A wrapped link spans several boxes; the first is enough to place it
+        // and to click it, since any point inside the link follows it.
+        //
+        // Named with its rendered text, which is what ARIA calls a link's name
+        // and what the user sees. Naming it with the destination instead reads
+        // well until a page links twice to the same place, at which point two
+        // interchangeable links look like a defect to
+        // `assert_names_are_distinguishable` — while two *different* links
+        // sharing a word, which is the ambiguity worth hearing about, would
+        // have looked fine. The destination is in the source the text runs
+        // already read out.
+        let a11y_links = rendered_markdown
+            .text
+            .links
+            .iter()
+            .filter_map(|link| {
+                let bounds = rendered_markdown
+                    .text
+                    .bounds_for_source_range(link.source_range.clone());
+                let text = rendered_markdown
+                    .text
+                    .text_for_range(link.source_range.clone());
+                let name = if text.is_empty() {
+                    link.destination_url.clone()
+                } else {
+                    SharedString::from(text)
+                };
+                Some((name, *bounds.first()?))
+            })
+            .collect();
+
+        MarkdownPrepaint {
+            hitbox,
+            a11y_text,
+            a11y_links,
+            a11y_label: self.a11y_label.clone(),
+        }
     }
 
     fn paint(
@@ -2807,10 +2922,11 @@ impl Element for MarkdownElement {
         _inspector_id: Option<&gpui::InspectorElementId>,
         _bounds: Bounds<Pixels>,
         rendered_markdown: &mut Self::RequestLayoutState,
-        hitbox: &mut Self::PrepaintState,
+        prepaint: &mut Self::PrepaintState,
         window: &mut Window,
         cx: &mut App,
     ) {
+        let hitbox = &mut prepaint.hitbox;
         let mut context = KeyContext::default();
         context.add("Markdown");
         window.set_key_context(context);
@@ -2872,6 +2988,10 @@ fn image_fallback_element(
 
     div()
         .id("image-fallback")
+        // The notice is a `Label`, so a picture that failed to load reached a
+        // reader as nothing at all — not as a broken image, but as an absence.
+        .role(gpui::Role::Status)
+        .aria_label(label.clone())
         .min_w_0()
         .child(Label::new(label).color(Color::Warning).underline())
         .tooltip(Tooltip::text(
@@ -2949,6 +3069,7 @@ fn render_wrap_code_block_button(
     );
 
     IconButton::new(button_id, icon)
+        .aria_label(tooltip.clone())
         .icon_size(IconSize::Small)
         .icon_color(Color::Muted)
         .tooltip(Tooltip::text(tooltip))
@@ -4100,6 +4221,186 @@ mod tests {
                 theme_settings::init(theme::LoadThemes::JustBase, cx);
             }
         });
+    }
+
+    /// Markdown is what a language server prompt, a hover and the docs are
+    /// rendered with, and its accessibility had never been read out of a drawn
+    /// frame — the element reports itself as a region carrying its source text,
+    /// and nothing checked that the text arrives.
+    #[gpui::test]
+    fn a_markdown_view_carries_its_text_into_the_tree(cx: &mut TestAppContext) {
+        struct Host(Entity<Markdown>);
+
+        impl Render for Host {
+            fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+                div().child(MarkdownElement::new(self.0.clone(), MarkdownStyle::default()))
+            }
+        }
+
+        ensure_theme_initialized(cx);
+        let source = "A [link](https://example.com) and some `code`.";
+        // Built inside the window, so the element is actually in the tree. A
+        // markdown entity created beside a window that renders something else
+        // draws nothing, and every assertion below would pass over an empty
+        // tree without saying so.
+        let (_host, cx) = cx.add_window_view(|_, cx| {
+            Host(cx.new(|cx| Markdown::new(source.into(), None, None, cx)))
+        });
+        cx.run_until_parked();
+
+        cx.activate_a11y(cx.window_handle());
+        let json = cx
+            .update(|window, cx| {
+                window.draw(cx).clear(cx);
+                window.debug_a11y_tree_json()
+            })
+            .expect("activation makes the debug tree available");
+        let tree: serde_json::Value = serde_json::from_str(&json).expect("the dump is valid JSON");
+        gpui::a11y_checks::assert_no_role_was_discarded(&tree, "markdown");
+        gpui::a11y_checks::assert_no_aria_was_discarded(&tree, "markdown");
+        gpui::a11y_checks::assert_names_are_distinguishable(&tree, "markdown");
+        gpui::a11y_checks::assert_focusable_names_are_distinguishable(&tree, "markdown");
+        gpui::a11y_checks::assert_live_regions_can_speak(&tree, "markdown");
+
+        let runs: Vec<String> = tree["nodes"]
+            .as_object()
+            .expect("the dump lists nodes")
+            .values()
+            .filter(|node| node["aria"]["role"] == "TextRun")
+            .filter_map(|node| node["aria"]["value"].as_str().map(str::to_string))
+            .collect();
+        // The **source**, not the rendered text — brackets, URL and backticks
+        // included. That is the element's deliberate choice, and it is worth
+        // pinning because it cuts both ways: a reader is told the destination
+        // of every link, and is also read every character of markdown syntax
+        // that a sighted user never sees.
+        assert_eq!(
+            runs,
+            vec![source.to_string()],
+            "the source is what reaches the tree"
+        );
+
+        // The link is a node of its own as well. Without it a reader is read
+        // the URL as part of a sentence and has no way to tell it apart from
+        // the prose, ask for a list of links, or follow one.
+        let links: Vec<&str> = tree["nodes"]
+            .as_object()
+            .expect("the dump lists nodes")
+            .values()
+            .filter(|node| node["aria"]["role"] == "Link")
+            .filter_map(|node| node["aria"]["label"].as_str())
+            .collect();
+        assert_eq!(
+            links,
+            vec!["link"],
+            "the link is announced as one, named with the words it is made of"
+        );
+    }
+
+    /// Two links to one place are interchangeable, and naming links with
+    /// their destination made them look like a defect to
+    /// `assert_names_are_distinguishable` — while two links reading "here"
+    /// that go to different places, which is the ambiguity worth hearing
+    /// about, would have passed. Naming them with their text gets both right,
+    /// so both are checked here.
+    #[gpui::test]
+    fn links_are_told_apart_by_their_words_not_their_destinations(cx: &mut TestAppContext) {
+        struct Host(Entity<Markdown>);
+        impl Render for Host {
+            fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+                div().child(MarkdownElement::new(self.0.clone(), MarkdownStyle::default()))
+            }
+        }
+        ensure_theme_initialized(cx);
+        let source = "See [here](https://example.com) and [there](https://example.com).";
+        let (_h, cx) = cx.add_window_view(|_, cx| {
+            Host(cx.new(|cx| Markdown::new(source.into(), None, None, cx)))
+        });
+        cx.run_until_parked();
+        cx.activate_a11y(cx.window_handle());
+        let json = cx
+            .update(|window, cx| {
+                window.draw(cx).clear(cx);
+                window.debug_a11y_tree_json()
+            })
+            .expect("tree");
+        let tree: serde_json::Value = serde_json::from_str(&json).expect("json");
+        gpui::a11y_checks::assert_names_are_distinguishable(&tree, "two links");
+
+        let mut links: Vec<&str> = tree["nodes"]
+            .as_object()
+            .expect("the dump lists nodes")
+            .values()
+            .filter(|node| node["aria"]["role"] == "Link")
+            .filter_map(|node| node["aria"]["label"].as_str())
+            .collect();
+        links.sort_unstable();
+        assert_eq!(
+            links,
+            vec!["here", "there"],
+            "one destination, two links, two names"
+        );
+    }
+
+    /// A link that a reader can hear and not follow is half a link. The node
+    /// carries the bounds of the rendered link text, so GPUI answers a click on
+    /// it by pressing at that point — which is the same path a mouse takes into
+    /// `source_index_for_position`.
+    #[gpui::test]
+    fn a_markdown_link_can_be_followed_without_a_mouse(cx: &mut TestAppContext) {
+        struct Host(Entity<Markdown>);
+
+        impl Render for Host {
+            fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+                div().child(MarkdownElement::new(self.0.clone(), MarkdownStyle::default()))
+            }
+        }
+
+        ensure_theme_initialized(cx);
+        let source = "Go to [the example](https://example.com) now.";
+        let (_host, cx) = cx.add_window_view(|_, cx| {
+            Host(cx.new(|cx| Markdown::new(source.into(), None, None, cx)))
+        });
+        cx.run_until_parked();
+
+        cx.activate_a11y(cx.window_handle());
+        let json = cx
+            .update(|window, cx| {
+                window.draw(cx).clear(cx);
+                window.debug_a11y_tree_json()
+            })
+            .expect("activation makes the debug tree available");
+        let tree: serde_json::Value = serde_json::from_str(&json).expect("the dump is valid JSON");
+
+        let link = tree["nodes"]
+            .as_object()
+            .expect("the dump lists nodes")
+            .values()
+            .find(|node| node["aria"]["role"] == "Link")
+            .unwrap_or_else(|| panic!("the link reaches the tree: {json}"));
+        let bounds = &link["bounds"];
+        let width = bounds["x1"].as_f64().expect("the link has bounds")
+            - bounds["x0"].as_f64().expect("the link has bounds");
+        assert!(
+            width > 0.0,
+            "a link with no area is one a click can never land in: {link}"
+        );
+        // The rendered link text is "the example", eleven characters of a
+        // forty-five character line, so its box has to be a fraction of the
+        // paragraph rather than the whole of it — otherwise a click on the
+        // link lands somewhere else in the sentence.
+        let paragraph = tree["nodes"]
+            .as_object()
+            .expect("the dump lists nodes")
+            .values()
+            .find(|node| node["aria"]["role"] == "Group")
+            .unwrap_or_else(|| panic!("the markdown view is a group: {json}"));
+        let paragraph_width = paragraph["bounds"]["x1"].as_f64().unwrap_or(f64::MAX)
+            - paragraph["bounds"]["x0"].as_f64().unwrap_or(0.0);
+        assert!(
+            width < paragraph_width,
+            "the box is the link's, not the whole view's: {link}"
+        );
     }
 
     #[gpui::test]

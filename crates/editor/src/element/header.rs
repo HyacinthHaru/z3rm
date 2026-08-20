@@ -686,6 +686,24 @@ pub(crate) fn render_buffer_header(
     } else {
         (None, None)
     };
+    // The name every control in this header is distinguished by. A multibuffer
+    // draws one header per file from all over the project, so the file name on
+    // its own leaves two `main.rs` headers a reader cannot tell apart.
+    let announced_path: SharedString = match (parent_path.as_deref(), filename.as_deref()) {
+        (Some(parent), Some(file)) if !parent.is_empty() => format!("{parent}{file}").into(),
+        (_, Some(file)) => file.to_string().into(),
+        (_, None) => MultiBuffer::DEFAULT_TITLE.into(),
+    };
+    // The header says all of this in colour, and strikes the name through when
+    // the file is gone. `file_status_label_color` is the whole vocabulary, and
+    // none of it survives being read out.
+    let announced_path: SharedString = match file_status {
+        Some(status) if status.is_conflicted() => format!("{announced_path}, conflicted").into(),
+        Some(status) if status.is_deleted() => format!("{announced_path}, deleted").into(),
+        Some(status) if status.is_created() => format!("{announced_path}, added").into(),
+        Some(status) if status.is_modified() => format!("{announced_path}, modified").into(),
+        _ => announced_path,
+    };
     let focus_handle = editor_read.focus_handle(cx);
     let colors = cx.theme().colors();
     // On transparent windows `editor_subheader_background` stacks over the
@@ -745,6 +763,13 @@ pub(crate) fn render_buffer_header(
                             .rounded_xs()
                             .child(
                                 ButtonLike::new("toggle-buffer-fold")
+                                    // Icon-only, with the action written down
+                                    // only in a tooltip, and one per file: even
+                                    // a bare "Fold" would repeat down the view.
+                                    .aria_label(format!(
+                                        "{} {announced_path}",
+                                        if is_folded { "Unfold" } else { "Fold" }
+                                    ))
                                     .style(ButtonStyle::Transparent)
                                     .height(button_size.into())
                                     .width(button_size)
@@ -826,16 +851,26 @@ pub(crate) fn render_buffer_header(
                                     .map(SharedString::from)
                                     .unwrap_or_else(|| MultiBuffer::DEFAULT_TITLE.into());
 
-                                let full_path = match parent_path.as_deref() {
-                                    Some(parent) if !parent.is_empty() => {
-                                        format!("{}{}", parent, filename.as_str())
-                                    }
-                                    _ => filename.as_str().to_string(),
-                                };
+                                let full_path = announced_path.to_string();
 
                                 path_header
                                     .child(
                                         ButtonLike::new("filename-button")
+                                            // The tooltip is the only place the
+                                            // action is written down, and a
+                                            // tooltip is not an accessible
+                                            // description, so the name carries
+                                            // both.
+                                            //
+                                            // The full path rather than the
+                                            // file name: a multibuffer is a
+                                            // list of files from all over the
+                                            // project, and "Open main.rs" twice
+                                            // is two headers a user cannot tell
+                                            // apart. The directory is on screen
+                                            // beside this as a plain label,
+                                            // which is not a node.
+                                            .aria_label(format!("Open {full_path}"))
                                             .when(ItemSettings::get_global(cx).file_icons, |this| {
                                                 let path = std::path::Path::new(filename.as_str());
                                                 let icon = FileIcons::get_icon(path, cx)
@@ -925,6 +960,13 @@ pub(crate) fn render_buffer_header(
                                 })
                                 .when(show_open_file_button, |this| {
                                     this.child(
+                                        // Deliberately left with its visible
+                                        // label as its name: it does the same
+                                        // thing as the file name beside it, and
+                                        // only appears on the selected header,
+                                        // so naming it after the file too would
+                                        // put two identically named buttons in
+                                        // one header.
                                         Button::new("open-file-button", "Open File")
                                             .style(ButtonStyle::OutlinedCustom(
                                                 cx.theme().colors().border.opacity(0.6),

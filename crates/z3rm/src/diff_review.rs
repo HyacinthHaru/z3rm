@@ -330,6 +330,17 @@ impl Render for DiffReview {
                     .child(
                         div()
                             .id("accept-btn")
+                            // Hand-built out of a div rather than a `Button`,
+                            // so nothing gives it a role: without one it is not
+                            // in the tree at all and the review cannot be
+                            // completed without a mouse.
+                            .role(gpui::Role::Button)
+                            // The visible label carries the key because the
+                            // button is small; the name does not, because the
+                            // shortcut is already an attribute of its own and
+                            // "Accept (a), button, a" says it twice.
+                            .aria_label("Accept")
+                            .aria_keyshortcuts("a")
                             .px_3()
                             .py_1()
                             .rounded_md()
@@ -343,6 +354,9 @@ impl Render for DiffReview {
                     .child(if self.can_decline() {
                         div()
                             .id("decline-btn")
+                            .role(gpui::Role::Button)
+                            .aria_label("Decline")
+                            .aria_keyshortcuts("d")
                             .px_3()
                             .py_1()
                             .rounded_md()
@@ -355,6 +369,13 @@ impl Render for DiffReview {
                     } else {
                         div()
                             .id("decline-unavailable")
+                            // Still a button in the layout, just an inert one:
+                            // muted text is the only thing that said so, and it
+                            // says it to sighted users alone.
+                            .role(gpui::Role::Button)
+                            .aria_label("Decline")
+                            .aria_description("No snapshot to restore from")
+                            .aria_disabled(true)
                             .px_3()
                             .py_1()
                             .rounded_md()
@@ -364,8 +385,18 @@ impl Render for DiffReview {
                     }),
             );
 
-        // Diff body
-        let mut body = div().flex().flex_col().py_1().px_2().size_full();
+        // Diff body. This is what Accept and Decline act on, and every line of
+        // it was drawn as plain text — so the two buttons were the whole of
+        // the review as far as a reader was concerned, and the change being
+        // approved could not be read before approving it.
+        let mut body = div()
+            .id("diff-review-lines")
+            .role(gpui::Role::List)
+            .flex()
+            .flex_col()
+            .py_1()
+            .px_2()
+            .size_full();
         for (i, line) in diff_lines.iter().enumerate() {
             let (text, color) = match line {
                 DiffLine::Unchanged(t) => (t.as_str(), fg),
@@ -385,8 +416,20 @@ impl Render for DiffReview {
                 DiffLine::Removed(_) => "- ",
                 DiffLine::Modified { .. } => "~ ",
             };
+            // The prefix is the whole of what marks a line as added or removed:
+            // one character, and a background colour. Spelled out here because
+            // "+" reads as "plus" at best and is skipped at worst.
+            let kind = match line {
+                DiffLine::Unchanged(_) => "Unchanged",
+                DiffLine::Added(_) => "Added",
+                DiffLine::Removed(_) => "Removed",
+                DiffLine::Modified { .. } => "Modified",
+            };
             body = body.child(
                 div()
+                    .id(("diff-line", i))
+                    .role(gpui::Role::ListItem)
+                    .aria_label(SharedString::from(format!("{kind} {}: {text}", i + 1)))
                     .flex()
                     .flex_row()
                     .w_full()
@@ -406,6 +449,19 @@ impl Render for DiffReview {
         }
 
         div()
+            // Same shape as the log viewer: without a role this focused root
+            // yields no accessibility node at all. Named by the file so two
+            // open reviews are told apart.
+            .id("diff-review")
+            .role(gpui::Role::Group)
+            // Deletion is marked by a red "Deleted" label, which is not a
+            // node, so without it here the review of a file that is about to
+            // disappear reads exactly like the review of an edit.
+            .aria_label(SharedString::from(if self.is_deleted() {
+                format!("Diff review: {}, file deleted", self.file_path.display())
+            } else {
+                format!("Diff review: {}", self.file_path.display())
+            }))
             .track_focus(&self.focus_handle)
             .size_full()
             .bg(bg)
@@ -494,6 +550,124 @@ impl Item for DiffReview {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A focused element with no role produces no accessibility node, so
+    /// opening this view discarded focus and screen readers announced the whole
+    /// window instead of the review.
+    #[gpui::test]
+    async fn the_review_is_announced_by_the_file_it_reviews(cx: &mut gpui::TestAppContext) {
+        cx.update(|cx| {
+            let settings_store = settings::SettingsStore::test(cx);
+            cx.set_global(settings_store);
+            theme_settings::init(theme::LoadThemes::JustBase, cx);
+        });
+
+        let window = cx.add_window(|_, cx| {
+            DiffReview::new(
+                PathBuf::from("src/main.rs"),
+                "one\n".to_string(),
+                "two\n".to_string(),
+                None,
+                cx,
+            )
+        });
+        cx.activate_a11y(window.into());
+
+        let focus_handle = window
+            .update(cx, |review, _, _| review.focus_handle.clone())
+            .expect("the review window is still open");
+        let json = cx
+            .update_window(window.into(), |_, window, cx| {
+                window.focus(&focus_handle, cx);
+                window.draw(cx).clear(cx);
+                window.debug_a11y_tree_json()
+            })
+            .expect("the review window is still open")
+            .expect("activation makes the debug tree available");
+        let tree: serde_json::Value =
+            serde_json::from_str(&json).expect("the dump is valid JSON");
+
+        gpui::a11y_checks::assert_interactive_nodes_are_named(&tree, "diff review");
+        gpui::a11y_checks::assert_names_are_distinguishable(&tree, "diff review");
+        gpui::a11y_checks::assert_focusable_names_are_distinguishable(&tree, "diff review");
+        gpui::a11y_checks::assert_clickable_elements_are_reachable(&tree, "diff review");
+        gpui::a11y_checks::assert_controls_have_area(&tree, "diff review");
+        gpui::a11y_checks::assert_landmarks_are_distinguishable(&tree, "diff review");
+        gpui::a11y_checks::assert_active_descendant_is_honoured(&tree, "diff review");
+        gpui::a11y_checks::assert_no_role_was_discarded(&tree, "diff review");
+        gpui::a11y_checks::assert_no_aria_was_discarded(&tree, "diff review");
+        gpui::a11y_checks::assert_roles_are_contained(&tree, "diff review");
+        gpui::a11y_checks::assert_click_targets_are_reachable(&tree, "diff review");
+        gpui::a11y_checks::assert_focus_reached_the_tree(&tree, "diff review");
+
+        assert_eq!(
+            tree["frame"]["focus_without_node"].as_str(),
+            None,
+            "the review carries a role now, so its focus must reach the tree"
+        );
+        let focused = tree["gpui_focus"].as_str().expect("the review holds focus");
+        assert_eq!(
+            tree["nodes"][focused]["aria"]["label"].as_str(),
+            Some("Diff review: src/main.rs"),
+            "two open reviews are only told apart by the file they review"
+        );
+
+        // The checks above pass on a control that is missing entirely — there
+        // is no node to find fault with — so the buttons have to be asserted
+        // present by name. Both are hand-built divs rather than `Button`s.
+        let buttons: Vec<(&str, bool)> = tree["nodes"]
+            .as_object()
+            .expect("the dump lists nodes")
+            .values()
+            .filter(|node| node["aria"]["role"] == "Button")
+            .map(|node| {
+                (
+                    node["aria"]["label"].as_str().unwrap_or_default(),
+                    node["aria"]["disabled"].as_bool().unwrap_or(false),
+                )
+            })
+            .collect();
+        assert!(
+            buttons.contains(&("Accept", false)),
+            "the review cannot be completed without a mouse otherwise: {buttons:?}"
+        );
+        // The key is on the button's face and in `aria-keyshortcuts`; putting
+        // it in the name too makes a reader say it twice.
+        assert!(
+            buttons.iter().all(|(label, _)| !label.contains('(')),
+            "a name must not repeat the shortcut it already carries: {buttons:?}"
+        );
+        // This review was opened with no restore target, so declining is not
+        // available; muted text was the only thing that said so.
+        assert!(
+            buttons.contains(&("Decline", true)),
+            "an inert control has to say it is inert: {buttons:?}"
+        );
+
+        // The buttons act on the diff, and the diff was drawn as plain text —
+        // so a reader was asked to approve a change it could not be shown.
+        // Asserted against what is on screen: a modified line draws its new
+        // text only, so that is what the name carries.
+        let lines: Vec<&str> = tree["nodes"]
+            .as_object()
+            .expect("the dump lists nodes")
+            .values()
+            .filter(|node| node["aria"]["role"] == "ListItem")
+            .filter_map(|node| node["aria"]["label"].as_str())
+            .collect();
+        assert!(
+            lines.iter().any(|line| line.contains("two")),
+            "the text the file would end up with has to be readable: {lines:?}"
+        );
+        // The marker for added and removed is one character and a background
+        // colour, neither of which survives into a name on its own.
+        assert!(
+            lines
+                .iter()
+                .any(|line| line.starts_with("Added") || line.starts_with("Modified")),
+            "a line has to say what is happening to it: {lines:?}"
+        );
+    }
 
     /// Renders a diff as compact tags so assertions read like a unified diff:
     /// `" x"` unchanged, `"+x"` added, `"-x"` removed, `"~old>new"` modified.

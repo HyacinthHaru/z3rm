@@ -959,8 +959,23 @@ impl Render for BufferDiagnosticsEditor {
             div().size_full().child(self.editor.clone())
         };
 
+        // Same as the project-wide view: a focused root with no id and no role
+        // produces no node, and the counts beside it are labels, which produce
+        // none either.
+        let name = match (self.summary.error_count, self.summary.warning_count) {
+            (0, 0) => SharedString::new_static("File diagnostics, no problems"),
+            (errors, warnings) => SharedString::from(format!(
+                "File diagnostics, {errors} error{}, {warnings} warning{}",
+                if errors == 1 { "" } else { "s" },
+                if warnings == 1 { "" } else { "s" },
+            )),
+        };
+
         div()
             .key_context("Diagnostics")
+            .id("buffer-diagnostics")
+            .role(gpui::Role::Group)
+            .aria_label(name)
             .track_focus(&self.focus_handle(cx))
             .size_full()
             .child(child)

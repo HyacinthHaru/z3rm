@@ -1,0 +1,167 @@
+#!/usr/bin/env python3
+"""Find controls that can never have an accessible name.
+
+`assert_interactive_nodes_are_named` only sees what a frame test renders, and
+the two worst omissions on this branch — the pinned tab bar's drop target and
+the git push button — were in states no test rendered. This looks at the source
+instead, so a control is checked whether or not anything draws it.
+
+It reports two things a rendered frame cannot distinguish from a healthy one:
+
+  * A component that cannot take a name from its children, constructed without
+    `aria_label`. `IconButton` is an icon; `ButtonLike` wrapping a `Label` still
+    has no name of its own. `Button` is excluded: it derives its name from its
+    visible label.
+  * A role that needs a name, set on an element with no name to give it.
+
+The patterns are the point, and they are the limit. This script has twice been
+wrong by omission — first by only matching `::new(` and missing
+`ButtonLike::new_rounded_left`, then by stopping a builder chain at a `match`
+arm and reading a named control as unnamed. Widen it when you find the next
+one, and report the pattern alongside the count.
+
+Candidates the script cannot see the name of are listed, with a reason, in
+`script/unnamed-controls-allowed.txt`. Anything not in that file is reported.
+
+Usage: script/find-unnamed-controls
+Exits non-zero when an unlisted control is found.
+"""
+
+import pathlib
+import re
+import subprocess
+import sys
+
+# Components with no text of their own to fall back on.
+NAMELESS = r"(?:IconButton|ButtonLike|ToggleButton)::new\w*\("
+
+# Roles a reader announces as a bare role when they carry no name. Kept in step
+# with `gpui::a11y_checks::ROLES_NEEDING_A_NAME`.
+ROLE_NEEDS_NAME = re.compile(
+    r"Role::(AlertDialog|Button|CheckBox|Dialog|ComboBox|Link|ListBoxOption|MenuItem"
+    r"|MenuItemCheckBox|RadioButton|SpinButton|Switch|TextInput|Tab|TreeItem"
+    r"|SearchInput|Slider|TabList|Tree|Table)\b"
+)
+
+# Component definitions and their previews name themselves at their call sites,
+# so a name is not expected where the component is declared.
+SKIP_PREFIXES = ("crates/ui/src/components/", "crates/gpui/src/")
+SKIP_SUBSTRINGS = ("/examples/", "theme_preview")
+
+NAMED = ("aria_label", "aria_role", "aria_placeholder", "aria_value")
+
+ALLOWLIST = pathlib.Path(__file__).with_name("unnamed-controls-allowed.txt")
+
+
+def allowed() -> set[str]:
+    """`path:function` entries whose name arrives out of the script's reach."""
+    if not ALLOWLIST.exists():
+        return set()
+    entries = set()
+    for line in ALLOWLIST.read_text().split("\n"):
+        line = line.strip()
+        if not line or line.startswith("#"):
+            continue
+        entries.add(line.split("—")[0].strip())
+    return entries
+
+
+def builder_chain(lines: list[str], start: int) -> str:
+    """The construction line plus everything that continues its builder chain.
+
+    Continuation is by indentation, with two exceptions that cost real time to
+    learn: a line that only closes a block, and a line that starts a new method
+    call, both continue the chain. `pane.rs` names its tab buttons after a
+    `match` and `keymap_editor` names them in a helper's caller, so a walk that
+    stopped at the first dedent read three named controls as unnamed.
+    """
+    indent = len(lines[start]) - len(lines[start].lstrip())
+    chain = [lines[start]]
+    for i in range(start + 1, min(start + 80, len(lines))):
+        line = lines[i]
+        stripped = line.strip()
+        closes_a_block = stripped and all(c in "})],;" for c in stripped)
+        if (
+            stripped
+            and not closes_a_block
+            and not stripped.startswith(".")
+            and (len(line) - len(line.lstrip())) < indent
+        ):
+            break
+        chain.append(line)
+    return "\n".join(chain)
+
+
+def enclosing_fn(lines: list[str], start: int) -> str:
+    """The nearest `fn` above the construction.
+
+    Nearest, not outermost: a control built inside a nested helper is reported
+    under that helper's name. The path and line are exact, so read them first
+    and treat the function as a hint — including when keying the allowlist.
+    """
+    for i in range(start, -1, -1):
+        match = re.match(r"\s*(?:pub(?:\(\w+\))?\s+)?fn\s+(\w+)", lines[i])
+        if match:
+            return match.group(1)
+    return "?"
+
+
+def search(pattern: str) -> list[tuple[str, int]]:
+    found = subprocess.run(
+        ["grep", "-rn", "-E", pattern, "crates", "--include=*.rs"],
+        capture_output=True,
+        text=True,
+    ).stdout
+    sites = []
+    for line in found.strip().split("\n"):
+        if not line:
+            continue
+        path, lineno, _ = line.split(":", 2)
+        if path.startswith(SKIP_PREFIXES) or any(s in path for s in SKIP_SUBSTRINGS):
+            continue
+        sites.append((path, int(lineno)))
+    return sites
+
+
+def main() -> int:
+    known = allowed()
+    findings = []
+
+    def report(path: str, lineno: int, lines: list[str], why: str) -> None:
+        function = enclosing_fn(lines, lineno - 1)
+        if f"{path}:{function}" in known:
+            return
+        findings.append(f"{path}:{lineno}  in {function}  — {why}")
+
+    for path, lineno in search(NAMELESS):
+        lines = pathlib.Path(path).read_text().split("\n")
+        if any(marker in builder_chain(lines, lineno - 1) for marker in NAMED):
+            continue
+        report(path, lineno, lines, "icon-only control with no name")
+
+    for path, lineno in search(r"\.(aria_)?role\("):
+        lines = pathlib.Path(path).read_text().split("\n")
+        if not ROLE_NEEDS_NAME.search(lines[lineno - 1]):
+            continue
+        if any(marker in builder_chain(lines, lineno - 1) for marker in NAMED):
+            continue
+        report(path, lineno, lines, "role needing a name, set without one")
+
+    if not findings:
+        print("No controls found that cannot be named.")
+        return 0
+
+    print(f"{len(findings)} control(s) with no name available:")
+    for finding in sorted(findings):
+        print(f"  {finding}")
+    print(
+        "\nEach is a candidate, not a verdict: a name added in a helper, or "
+        "further from the construction than a builder chain reaches, reads as "
+        "missing here. Check it, then either name the control or add it to "
+        f"{ALLOWLIST.name} with the reason."
+    )
+    return 1
+
+
+if __name__ == "__main__":
+    sys.exit(main())

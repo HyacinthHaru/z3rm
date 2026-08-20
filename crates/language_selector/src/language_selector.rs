@@ -103,7 +103,11 @@ impl Focusable for LanguageSelector {
 }
 
 impl EventEmitter<DismissEvent> for LanguageSelector {}
-impl ModalView for LanguageSelector {}
+impl ModalView for LanguageSelector {
+    fn a11y_name(&self, _cx: &gpui::App) -> Option<gpui::SharedString> {
+        Some("Languages".into())
+    }
+}
 
 pub struct LanguageSelectorDelegate {
     language_selector: WeakEntity<LanguageSelector>,
@@ -203,6 +207,14 @@ impl PickerDelegate for LanguageSelectorDelegate {
 
     fn placeholder_text(&self, _window: &mut Window, _cx: &mut App) -> Arc<str> {
         "Select a language…".into()
+    }
+
+    /// Named from the same helper the row renders with, so the current
+    /// language keeps its "(current)" suffix — which is the one thing that
+    /// tells it apart from every other row.
+    fn match_label(&self, ix: usize, cx: &App) -> Option<SharedString> {
+        let (label, _) = self.language_data_for_match(self.matches.get(ix)?, cx);
+        Some(label.into())
     }
 
     fn match_count(&self) -> usize {

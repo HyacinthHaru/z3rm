@@ -21,11 +21,15 @@ use util::ResultExt;
 
 #[derive(Default)]
 pub struct Notifications {
-    notifications: Vec<(NotificationId, AnyView)>,
+    notifications: Vec<(NotificationId, AnyView, SharedString)>,
 }
 
 impl Deref for Notifications {
-    type Target = Vec<(NotificationId, AnyView)>;
+    /// The third field is the text a screen reader announces when the
+    /// notification arrives. It is carried here rather than read out of the
+    /// view because a live region announces its own value and never descends
+    /// into what the notification draws.
+    type Target = Vec<(NotificationId, AnyView, SharedString)>;
 
     fn deref(&self) -> &Self::Target {
         &self.notifications
@@ -63,9 +67,27 @@ impl NotificationId {
     }
 }
 
+/// The first line of a message, for announcing it.
+///
+/// A notification is spoken the moment it arrives, over whatever the user was
+/// doing. Language server prompts carry markdown and workspace errors carry
+/// their causes, so the whole text is a paragraph read aloud unprompted. The
+/// notification itself keeps the full text as its name, which is what a reader
+/// gets when they go to it.
+fn first_line(message: &str) -> &str {
+    message.split_once('\n').map_or(message, |(first, _)| first)
+}
+
 pub trait Notification:
     EventEmitter<DismissEvent> + EventEmitter<SuppressEvent> + Focusable + Render
 {
+    /// The text announced when the notification appears, or empty when the
+    /// notification has no text to announce.
+    ///
+    /// A notification arrives away from wherever the user is working, so it is
+    /// only perceived if it is announced, and macOS speaks a live region's own
+    /// `value` — not the text the notification draws inside itself.
+    fn announcement(&self, cx: &App) -> SharedString;
 }
 
 pub struct SuppressEvent;
@@ -75,7 +97,7 @@ impl Workspace {
     pub fn notification_ids(&self) -> Vec<NotificationId> {
         self.notifications
             .iter()
-            .map(|(id, _)| id)
+            .map(|(id, _, _)| id)
             .cloned()
             .collect()
     }
@@ -88,6 +110,7 @@ impl Workspace {
     ) {
         self.show_notification_without_handling_dismiss_events(&id, cx, |cx| {
             let notification = build_notification(cx);
+            let announcement = notification.read(cx).announcement(cx);
             cx.subscribe(&notification, {
                 let id = id.clone();
                 move |this, _, _: &DismissEvent, cx| {
@@ -136,27 +159,28 @@ impl Workspace {
                     }
                 }
             }
-            notification.into()
+            (notification.into(), announcement)
         });
     }
 
     /// Shows a notification in this workspace's window. Caller must handle dismiss.
     ///
     /// This exists so that the `build_notification` closures stored for app notifications can
-    /// return `AnyView`. Subscribing to events from an `AnyView` is not supported, so instead that
+    /// return `AnyView` with the text to announce alongside it. Subscribing to events from an `AnyView` is not supported, so instead that
     /// responsibility is pushed to the caller where the `V` type is known.
     pub(crate) fn show_notification_without_handling_dismiss_events(
         &mut self,
         id: &NotificationId,
         cx: &mut Context<Self>,
-        build_notification: impl FnOnce(&mut Context<Self>) -> AnyView,
+        build_notification: impl FnOnce(&mut Context<Self>) -> (AnyView, SharedString),
     ) {
         if self.suppressed_notifications.contains(id) {
             return;
         }
         self.dismiss_notification(id, cx);
+        let (notification, announcement) = build_notification(cx);
         self.notifications
-            .push((id.clone(), build_notification(cx)));
+            .push((id.clone(), notification, announcement));
         cx.notify();
     }
 
@@ -169,7 +193,7 @@ impl Workspace {
     }
 
     pub fn dismiss_notification(&mut self, id: &NotificationId, cx: &mut Context<Self>) {
-        self.notifications.retain(|(existing_id, _)| {
+        self.notifications.retain(|(existing_id, _, _)| {
             if existing_id == id {
                 cx.notify();
                 false
@@ -281,7 +305,29 @@ impl Focusable for LanguageServerPrompt {
     }
 }
 
-impl Notification for LanguageServerPrompt {}
+impl Notification for LanguageServerPrompt {
+    fn announcement(&self, _cx: &App) -> SharedString {
+        match &self.request {
+            Some(request) => {
+                // The level is drawn as the icon and its colour and appears
+                // nowhere in the text, so a critical prompt and an
+                // informational one read identically without this.
+                let level = match request.level {
+                    PromptLevel::Info => "",
+                    PromptLevel::Warning => "Warning: ",
+                    PromptLevel::Critical => "Error: ",
+                };
+                format!(
+                    "{level}{}: {}",
+                    request.lsp_name,
+                    first_line(&request.message)
+                )
+                .into()
+            }
+            None => SharedString::default(),
+        }
+    }
+}
 
 impl LanguageServerPrompt {
     pub fn new(request: LanguageServerPromptRequest, cx: &mut App) -> Self {
@@ -336,10 +382,10 @@ impl Render for LanguageServerPrompt {
         };
 
         let suppress = window.modifiers().shift;
-        let (close_id, close_icon) = if suppress {
-            ("suppress", IconName::Minimize)
+        let (close_id, close_icon, close_label) = if suppress {
+            ("suppress", IconName::Minimize, "Suppress notification")
         } else {
-            ("close", IconName::Close)
+            ("close", IconName::Close, "Dismiss notification")
         };
 
         div()
@@ -377,6 +423,8 @@ impl Render for LanguageServerPrompt {
                                     )
                                     .child(
                                         IconButton::new(close_id, close_icon)
+                            .aria_label(close_label)
+                                            .aria_label(close_label)
                                             .tooltip(move |_window, cx| {
                                                 if suppress {
                                                     Tooltip::with_meta(
@@ -675,6 +723,14 @@ pub mod simple_message_notification {
         more_info_url: Option<Arc<str>>,
         show_close_button: bool,
         show_suppress_button: bool,
+        /// What the notification says, kept so it can be announced. The body is
+        /// rendered as plain text, which contributes no accessibility node, so
+        /// the live region around it would otherwise have nothing to read out.
+        announcement: Option<SharedString>,
+        /// Set when the notification reports a failure. It is drawn as a red
+        /// warning icon, which is not a node and carries no text, so without
+        /// this an error reads exactly like an informational message.
+        severity: Option<ErrorSeverity>,
         title: Option<SharedString>,
         scroll_handle: ScrollHandle,
         auto_hide: Option<AutoHideState>,
@@ -689,7 +745,30 @@ pub mod simple_message_notification {
     impl EventEmitter<DismissEvent> for MessageNotification {}
     impl EventEmitter<SuppressEvent> for MessageNotification {}
 
-    impl Notification for MessageNotification {}
+    impl Notification for MessageNotification {
+        fn announcement(&self, _cx: &App) -> SharedString {
+            let body = match (self.title.as_ref(), self.announcement.as_ref()) {
+                (Some(title), Some(message)) => {
+                    format!("{title}. {}", super::first_line(message))
+                }
+                (Some(title), None) => title.to_string(),
+                (None, Some(message)) => super::first_line(message).to_string(),
+                // Built through `new_from_builder`, which draws arbitrary
+                // elements and keeps no text to announce.
+                (None, None) => return SharedString::default(),
+            };
+            match self.severity {
+                // Matches how `Callout` names the same three states, so the
+                // words a reader hears for a failure do not depend on which
+                // component happened to draw it.
+                Some(ErrorSeverity::Critical) | Some(ErrorSeverity::Error) => {
+                    format!("Error: {body}").into()
+                }
+                Some(ErrorSeverity::Warning) => format!("Warning: {body}").into(),
+                None => body.into(),
+            }
+        }
+    }
 
     impl FluentBuilder for MessageNotification {}
 
@@ -699,9 +778,12 @@ pub mod simple_message_notification {
             S: Into<SharedString>,
         {
             let message = message.into();
-            Self::new_from_builder(cx, move |_, _| {
+            let announcement = message.clone();
+            let mut this = Self::new_from_builder(cx, move |_, _| {
                 Label::new(message.clone()).into_any_element()
-            })
+            });
+            this.announcement = Some(announcement);
+            this
         }
 
         pub fn new_from_builder<F>(cx: &mut App, content: F) -> MessageNotification
@@ -727,6 +809,8 @@ pub mod simple_message_notification {
                 more_info_url: None,
                 show_close_button: true,
                 show_suppress_button: true,
+                announcement: None,
+                severity: None,
                 title: None,
                 focus_handle: cx.focus_handle(),
                 scroll_handle: ScrollHandle::new(),
@@ -877,6 +961,11 @@ pub mod simple_message_notification {
             self
         }
 
+        fn with_severity(mut self, severity: ErrorSeverity) -> Self {
+            self.severity = Some(severity);
+            self
+        }
+
         fn auto_dismiss(mut self, severity: ErrorSeverity, cx: &mut Context<Self>) -> Self {
             if let Some(delay) = severity.auto_dismiss_delay() {
                 self.auto_hide = Some(AutoHideState::new(delay, cx));
@@ -891,6 +980,7 @@ pub mod simple_message_notification {
             let secondary_action = error.secondary_action();
 
             Self::new(primary_message.clone(), cx)
+                .with_severity(severity)
                 .content_icon(IconName::Warning, Color::Error)
                 .button_style(ButtonStyle::Outlined)
                 .copy_text(primary_message)
@@ -988,10 +1078,33 @@ pub mod simple_message_notification {
             let show_suppress_button = self.show_suppress_button;
             let show_close_button = self.show_close_button;
             let suppress = show_suppress_button && window.modifiers().shift;
-            let (close_id, close_icon) = if suppress {
-                ("suppress", IconName::Minimize)
+            // Several notifications stack at once, so a bare "Dismiss
+            // notification" gives a reader a list of identical buttons with no
+            // way to tell which one closes what. Naming the subject is the
+            // only thing that distinguishes them.
+            let subject = match (self.title.as_ref(), self.announcement.as_ref()) {
+                (Some(title), _) => Some(title.to_string()),
+                (None, Some(message)) => Some(super::first_line(message).to_string()),
+                (None, None) => None,
+            };
+            let (close_id, close_icon, close_label): (_, _, SharedString) = if suppress {
+                (
+                    "suppress",
+                    IconName::Minimize,
+                    match &subject {
+                        Some(subject) => format!("Suppress notification: {subject}").into(),
+                        None => "Suppress notification".into(),
+                    },
+                )
             } else {
-                ("close", IconName::Close)
+                (
+                    "close",
+                    IconName::Close,
+                    match &subject {
+                        Some(subject) => format!("Dismiss notification: {subject}").into(),
+                        None => "Dismiss notification".into(),
+                    },
+                )
             };
 
             let main_content = (self.build_content)(window, cx);
@@ -1010,6 +1123,7 @@ pub mod simple_message_notification {
                 .when(show_close_button, |el| {
                     el.child(
                         IconButton::new(close_id, close_icon)
+                            .aria_label(close_label)
                             .tooltip(move |_window, cx| {
                                 if suppress {
                                     Tooltip::with_meta(
@@ -1155,8 +1269,45 @@ pub mod simple_message_notification {
                         .when(has_suffix, |this| this.child(suffix)),
                 );
 
+            // The title and the message body are plain text, which contributes
+            // no accessibility node, so without a name here a user who goes
+            // looking for the notification finds an unnamed group.
+            //
+            // The whole message, unlike `Notification::announcement`, which is
+            // cut to its first line. The two differ on purpose: the stack
+            // speaks its announcement unprompted, over whatever the user was
+            // doing, while this is what they get when they go and read it.
+            let spoken: SharedString = match (self.title.as_ref(), self.announcement.as_ref()) {
+                (Some(title), Some(message)) => format!("{title}. {message}").into(),
+                (Some(title), None) => title.clone(),
+                (None, Some(message)) => message.clone(),
+                (None, None) => SharedString::default(),
+            };
+            // Severity is drawn as a coloured icon and appears nowhere in the
+            // text, so a reader arriving at the notification later would not
+            // learn it is a failure. Prefixed the same way as the
+            // announcement, so both surfaces name the state identically.
+            let name: SharedString = if spoken.is_empty() {
+                spoken
+            } else {
+                match self.severity {
+                    Some(ErrorSeverity::Critical) | Some(ErrorSeverity::Error) => {
+                        format!("Error: {spoken}").into()
+                    }
+                    Some(ErrorSeverity::Warning) => format!("Warning: {spoken}").into(),
+                    _ => spoken,
+                }
+            };
+
             div()
                 .id("message-notification-wrapper")
+                .when(!name.is_empty(), |this| {
+                    // Deliberately not `Alert`, which carries an implicit
+                    // assertive live region: the stack around it is polite, and
+                    // an error that already happened does not justify cutting
+                    // off whatever is being read.
+                    this.role(gpui::Role::Group).aria_label(name)
+                })
                 .opacity(opacity)
                 .child(
                     v_flex()
@@ -1445,7 +1596,7 @@ static GLOBAL_APP_NOTIFICATIONS: LazyLock<Mutex<AppNotifications>> = LazyLock::n
 struct AppNotifications {
     app_notifications: Vec<(
         NotificationId,
-        Arc<dyn Fn(&mut Context<Workspace>) -> AnyView + Send + Sync>,
+        Arc<dyn Fn(&mut Context<Workspace>) -> (AnyView, SharedString) + Send + Sync>,
     )>,
 }
 
@@ -1453,7 +1604,7 @@ impl AppNotifications {
     pub fn insert(
         &mut self,
         id: NotificationId,
-        build_notification: Arc<dyn Fn(&mut Context<Workspace>) -> AnyView + Send + Sync>,
+        build_notification: Arc<dyn Fn(&mut Context<Workspace>) -> (AnyView, SharedString) + Send + Sync>,
     ) {
         self.remove(&id);
         self.app_notifications.push((id, build_notification))
@@ -1476,8 +1627,9 @@ pub fn show_app_notification<V: Notification + 'static>(
     // Defer notification creation so that windows on the stack can be returned to GPUI
     cx.defer(move |cx| {
         // Handle dismiss events by removing the notification from all workspaces.
-        let build_notification: Arc<dyn Fn(&mut Context<Workspace>) -> AnyView + Send + Sync> =
-            Arc::new({
+        let build_notification: Arc<
+            dyn Fn(&mut Context<Workspace>) -> (AnyView, SharedString) + Send + Sync,
+        > = Arc::new({
                 let id = id.clone();
                 move |cx| {
                     let notification = build_notification(cx);
@@ -1495,7 +1647,8 @@ pub fn show_app_notification<V: Notification + 'static>(
                         }
                     })
                     .detach();
-                    notification.into()
+                    let announcement = notification.read(cx).announcement(cx);
+                    (notification.into(), announcement)
                 }
             });
 

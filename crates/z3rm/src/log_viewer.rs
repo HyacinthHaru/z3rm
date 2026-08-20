@@ -423,6 +423,15 @@ impl LogViewer {
         let element_background = colors.element_background;
 
         let level_str = entry.level.name().to_string();
+        // Timestamp, level, source and message are four `Label`s, none of which
+        // is a node, so the viewer's own name was the only thing in it: a
+        // reader entering the log heard "Log viewer" and then nothing at all.
+        // The level first, because it is what a reader is scanning for and it
+        // is otherwise carried by an icon and a colour.
+        let announced = format!(
+            "{level_str} {} {}: {}",
+            entry.timestamp, entry.source, entry.message
+        );
         let level_color_val = level_color.clone();
         let timestamp = entry.timestamp.clone();
         let source = entry.source.clone();
@@ -431,6 +440,8 @@ impl LogViewer {
 
         v_flex()
             .id(filtered_index)
+            .role(gpui::Role::ListItem)
+            .aria_label(announced)
             .group("log-entry")
             .cursor_pointer()
             .font_buffer(cx)
@@ -599,6 +610,12 @@ impl Focusable for LogViewer {
 impl Render for LogViewer {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         v_flex()
+            // A focused element with no role produces no accessibility node,
+            // so opening this view discarded focus and screen readers announced
+            // the whole window instead of the log.
+            .id("log-viewer")
+            .role(gpui::Role::Group)
+            .aria_label("Log viewer")
             .track_focus(&self.focus_handle)
             .size_full()
             .bg(cx.theme().colors().editor_background)
@@ -639,9 +656,15 @@ impl Render for LogViewer {
                     .size_full()
                     .flex_grow_1()
                     .child(
-                        list(self.list_state.clone(), cx.processor(Self::render_entry))
-                            .with_sizing_behavior(gpui::ListSizingBehavior::Auto)
-                            .size_full(),
+                        div()
+                            .id("log-entries")
+                            .role(gpui::Role::List)
+                            .size_full()
+                            .child(
+                                list(self.list_state.clone(), cx.processor(Self::render_entry))
+                                    .with_sizing_behavior(gpui::ListSizingBehavior::Auto)
+                                    .size_full(),
+                            ),
                     )
                     .vertical_scrollbar_for(&self.list_state, window, cx)
                     .into_any()
@@ -818,5 +841,122 @@ mod tests {
         assert!(matches(&entries[1], ""));
         assert!(matches(&entries[0], "hello"));
         assert!(!matches(&entries[1], "hello"));
+    }
+
+    /// The log viewer is where a user goes when something has gone wrong, so
+    /// it is a bad place to be silent. Read out of a drawn frame rather than
+    /// from the builder call: a role only becomes a node when its element also
+    /// has an id, and focus lands here when the view opens.
+    /// The viewer's own name was the only thing in it. Timestamp, level, source
+    /// and message are four `Label`s, none of which is a node, so a reader
+    /// entering the log heard "Log viewer" and then nothing — every line of it
+    /// unreadable. Nothing rendered a viewer with entries in it.
+    #[gpui::test]
+    async fn the_log_lines_can_be_read(cx: &mut gpui::TestAppContext) {
+        cx.update(|cx| {
+            let settings_store = settings::SettingsStore::test(cx);
+            cx.set_global(settings_store);
+            theme_settings::init(theme::LoadThemes::JustBase, cx);
+        });
+
+        let window = cx.add_window(|window, cx| {
+            let mut viewer = LogViewer::new(window, cx);
+            viewer.entries = vec![LogEntry {
+                timestamp: "2026-08-18T10:15:00+08:00".into(),
+                level: LogLevel::Error,
+                source: "mux_server::connection:42".into(),
+                message: "the peer hung up".into(),
+            }];
+            viewer.recompute_filtered_indices();
+            viewer
+        });
+        cx.activate_a11y(window.into());
+
+        let json = cx
+            .update_window(window.into(), |_, window, cx| {
+                window.draw(cx).clear(cx);
+                window.debug_a11y_tree_json()
+            })
+            .expect("the harness window is still open")
+            .expect("activation makes the debug tree available");
+        let tree: serde_json::Value = serde_json::from_str(&json).expect("the dump is valid JSON");
+
+        gpui::a11y_checks::assert_roles_are_contained(&tree, "log viewer with entries");
+        gpui::a11y_checks::assert_no_role_was_discarded(&tree, "log viewer with entries");
+        gpui::a11y_checks::assert_no_aria_was_discarded(&tree, "log viewer with entries");
+
+        let lines: Vec<&str> = tree["nodes"]
+            .as_object()
+            .expect("the dump lists nodes")
+            .values()
+            .filter(|node| node["aria"]["role"] == "ListItem")
+            .filter_map(|node| node["aria"]["label"].as_str())
+            .collect();
+        assert_eq!(
+            lines,
+            vec![
+                "ERROR 2026-08-18T10:15:00+08:00 mux_server::connection:42: the peer hung up"
+            ],
+            "a log line has to be readable, level first"
+        );
+    }
+
+    #[gpui::test]
+    async fn the_log_viewer_is_announced_and_names_its_controls(cx: &mut gpui::TestAppContext) {
+        cx.update(|cx| {
+            let settings_store = settings::SettingsStore::test(cx);
+            cx.set_global(settings_store);
+            theme_settings::init(theme::LoadThemes::JustBase, cx);
+        });
+
+        let window = cx.add_window(|window, cx| LogViewer::new(window, cx));
+        cx.activate_a11y(window.into());
+
+        let json = cx
+            .update_window(window.into(), |view, window, cx| {
+                if let Ok(viewer) = view.downcast::<LogViewer>() {
+                    let handle = viewer.read(cx).focus_handle.clone();
+                    window.focus(&handle, cx);
+                }
+                window.draw(cx).clear(cx);
+                window.debug_a11y_tree_json()
+            })
+            .expect("the log window is still open")
+            .expect("activation makes the debug tree available");
+        let tree: serde_json::Value = serde_json::from_str(&json).expect("the dump is valid JSON");
+
+        gpui::a11y_checks::assert_interactive_nodes_are_named(&tree, "log viewer");
+        gpui::a11y_checks::assert_names_are_distinguishable(&tree, "log viewer");
+        gpui::a11y_checks::assert_focusable_names_are_distinguishable(&tree, "log viewer");
+        gpui::a11y_checks::assert_clickable_elements_are_reachable(&tree, "log viewer");
+        gpui::a11y_checks::assert_controls_have_area(&tree, "log viewer");
+        gpui::a11y_checks::assert_landmarks_are_distinguishable(&tree, "log viewer");
+        gpui::a11y_checks::assert_active_descendant_is_honoured(&tree, "log viewer");
+        gpui::a11y_checks::assert_no_role_was_discarded(&tree, "log viewer");
+        gpui::a11y_checks::assert_no_aria_was_discarded(&tree, "log viewer");
+        gpui::a11y_checks::assert_roles_are_contained(&tree, "log viewer");
+        gpui::a11y_checks::assert_click_targets_are_reachable(&tree, "log viewer");
+        gpui::a11y_checks::assert_focus_reached_the_tree(&tree, "log viewer");
+
+        // The filter checkboxes are the only controls here; a viewer that
+        // announces its own name and nothing inside it is no more usable than
+        // one that announces nothing.
+        let checkboxes: Vec<&str> = tree["nodes"]
+            .as_object()
+            .expect("the dump lists nodes")
+            .values()
+            .filter(|node| node["aria"]["role"] == "CheckBox")
+            .filter_map(|node| node["aria"]["label"].as_str())
+            .collect();
+        assert!(
+            checkboxes.len() >= 5,
+            "every log level filter has to be reachable: {checkboxes:?}"
+        );
+
+        let focused = tree["gpui_focus"]
+            .as_str()
+            .and_then(|id| tree["nodes"].get(id))
+            .expect("the focus must name a node in the dump");
+        assert_eq!(focused["aria"]["label"].as_str(), Some("Log viewer"));
     }
 }

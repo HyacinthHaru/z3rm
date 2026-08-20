@@ -119,7 +119,11 @@ impl Render for RepositorySelector {
     }
 }
 
-impl ModalView for RepositorySelector {}
+impl ModalView for RepositorySelector {
+    fn a11y_name(&self, _cx: &gpui::App) -> Option<gpui::SharedString> {
+        Some("Repositories".into())
+    }
+}
 
 pub struct RepositorySelectorDelegate {
     repository_selector: WeakEntity<RepositorySelector>,
@@ -150,6 +154,13 @@ impl PickerDelegate for RepositorySelectorDelegate {
 
     fn name() -> &'static str {
         "repository selector"
+    }
+
+    /// Rows are announced by the repository they point at. Without this every
+    /// row in the list is a bare "option".
+    fn match_label(&self, ix: usize, cx: &App) -> Option<SharedString> {
+        let repository = self.filtered_repositories.get(ix)?;
+        Some(repository.read(cx).display_name())
     }
 
     fn match_count(&self) -> usize {

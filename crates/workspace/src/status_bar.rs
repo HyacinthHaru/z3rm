@@ -260,7 +260,7 @@ impl StatusBar {
                 )
                 .icon_size(IconSize::Small)
                 .tab_index(0isize)
-                .aria_label("Open threads sidebar")
+                .aria_label(sidebar_toggle_label(has_notifications))
                 .when(has_notifications, |this| {
                     this.indicator(Indicator::dot().color(Color::Accent))
                         .indicator_border_color(Some(indicator_border))
@@ -286,6 +286,17 @@ impl StatusBar {
             .when(!on_right, |this| {
                 this.child(Divider::vertical().color(ui::DividerColor::Border))
             })
+    }
+}
+
+/// A background pane that rang the bell shows up here as an accent dot, which
+/// is the only indication anywhere outside the sidebar. Said in the button's
+/// name so it is not purely visual.
+fn sidebar_toggle_label(has_notifications: bool) -> &'static str {
+    if has_notifications {
+        "Open threads sidebar, notifications"
+    } else {
+        "Open threads sidebar"
     }
 }
 
@@ -502,5 +513,21 @@ impl<T: StatusItemView> StatusItemViewHandle for Entity<T> {
 impl From<&dyn StatusItemViewHandle> for AnyView {
     fn from(val: &dyn StatusItemViewHandle) -> Self {
         val.to_any()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::sidebar_toggle_label;
+
+    /// The dot in the status bar is the only sign that a pane the user is not
+    /// looking at rang the bell, and a dot is not available to a screen reader.
+    #[test]
+    fn the_sidebar_toggle_says_when_a_pane_rang() {
+        assert_eq!(sidebar_toggle_label(false), "Open threads sidebar");
+        assert_eq!(
+            sidebar_toggle_label(true),
+            "Open threads sidebar, notifications"
+        );
     }
 }

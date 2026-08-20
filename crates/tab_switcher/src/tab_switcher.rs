@@ -56,7 +56,11 @@ pub struct TabSwitcher {
     init_modifiers: Option<Modifiers>,
 }
 
-impl ModalView for TabSwitcher {}
+impl ModalView for TabSwitcher {
+    fn a11y_name(&self, _cx: &gpui::App) -> Option<gpui::SharedString> {
+        Some("Open Tabs".into())
+    }
+}
 
 pub fn init(cx: &mut App) {
     cx.observe_new(TabSwitcher::register).detach();
@@ -722,6 +726,20 @@ impl PickerDelegate for TabSwitcherDelegate {
         "tab switcher"
     }
 
+    fn match_label(&self, ix: usize, cx: &App) -> Option<SharedString> {
+        let tab_match = self.matches.get(ix)?;
+        // Same name the tab itself announces, including the state its
+        // indicator dot shows in colour alone.
+        Some(workspace::pane::tab_announcement(
+            tab_match.item.as_ref(),
+            tab_match.detail,
+            // The switcher lists tabs rather than drawing them, so it has no
+            // preview styling of its own to contradict.
+            false,
+            cx,
+        ))
+    }
+
     fn placeholder_text(&self, _window: &mut Window, _cx: &mut App) -> Arc<str> {
         "Search all tabs…".into()
     }
@@ -866,6 +884,12 @@ impl PickerDelegate for TabSwitcherDelegate {
             )
             .child(
                 IconButton::new("close_tab", IconName::Close)
+                    // Every row has one of these, so "Close" on its own would
+                    // be the same name repeated down the whole list.
+                    .aria_label(match self.match_label(ix, cx) {
+                        Some(label) => format!("Close {label}"),
+                        None => "Close tab".to_string(),
+                    })
                     .icon_size(IconSize::Small)
                     .icon_color(indicator_color)
                     .tooltip(Tooltip::for_action_title("Close", &CloseSelectedItem))

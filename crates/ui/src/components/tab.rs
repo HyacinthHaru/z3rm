@@ -37,6 +37,11 @@ pub struct Tab {
     close_side: TabCloseSide,
     start_slot: Option<AnyElement>,
     end_slot: Option<AnyElement>,
+    /// The tab's name for assistive technology. Tabs render arbitrary content,
+    /// so the text has to be supplied rather than derived.
+    aria_label: Option<SharedString>,
+    aria_position_in_set: Option<usize>,
+    aria_size_of_set: Option<usize>,
     children: SmallVec<[AnyElement; 2]>,
 }
 
@@ -48,12 +53,30 @@ impl Tab {
                 .id(id.clone())
                 .debug_selector(|| format!("TAB-{}", id)),
             selected: false,
+            aria_label: None,
+            aria_position_in_set: None,
+            aria_size_of_set: None,
             position: TabPosition::First,
             close_side: TabCloseSide::End,
             start_slot: None,
             end_slot: None,
             children: SmallVec::new(),
         }
+    }
+
+    /// Sets this tab's place in its bar, announced as "2 of 5". Without it a
+    /// reader can tell a tab is selected but not how many others there are or
+    /// where in them it sits.
+    pub fn aria_position(mut self, position: usize, count: usize) -> Self {
+        self.aria_position_in_set = Some(position);
+        self.aria_size_of_set = Some(count);
+        self
+    }
+
+    /// Sets the name announced for this tab.
+    pub fn aria_label(mut self, label: impl Into<SharedString>) -> Self {
+        self.aria_label = Some(label.into());
+        self
     }
 
     pub fn position(mut self, position: TabPosition) -> Self {
@@ -142,6 +165,15 @@ impl RenderOnce for Tab {
         };
 
         self.div
+            // A tab that is not reported as one leaves the user with no idea
+            // that a set of them exists, nor which is current.
+            .role(gpui::Role::Tab)
+            .aria_selected(self.selected)
+            .when_some(self.aria_label, |this, label| this.aria_label(label))
+            .when_some(self.aria_position_in_set, |this, position| {
+                this.aria_position_in_set(position)
+            })
+            .when_some(self.aria_size_of_set, |this, count| this.aria_size_of_set(count))
             .h(Tab::container_height(cx))
             .bg(tab_bg)
             .border_color(cx.theme().colors().border)

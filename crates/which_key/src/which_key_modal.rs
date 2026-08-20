@@ -135,6 +135,25 @@ impl WhichKeyModal {
     }
 }
 
+/// What assistive technology announces when the hint appears.
+///
+/// The panel shows a prefix and the keys that can follow it. Split out from
+/// rendering so the wording is testable without standing up a workspace.
+/// What the live region says when a prefix is pressed.
+///
+/// A count rather than the list. This is spoken automatically the moment a
+/// prefix key is held, and a prefix with two dozen continuations would be two
+/// dozen key-action pairs read out over whatever the user was doing. The pairs
+/// themselves are nodes in the panel, so they can be read at whatever pace the
+/// user wants — which is what the panel is for.
+fn announcement(pending_keys: &str, bindings: &[(SharedString, SharedString)]) -> String {
+    match bindings.len() {
+        0 => format!("Prefix {pending_keys}"),
+        1 => format!("Prefix {pending_keys}, 1 continuation"),
+        count => format!("Prefix {pending_keys}, {count} continuations"),
+    }
+}
+
 impl Render for WhichKeyModal {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let has_rows = !self.bindings.is_empty();
@@ -201,15 +220,27 @@ impl Render for WhichKeyModal {
                 v_flex()
                     .gap(px(4.))
                     .flex_shrink_0()
-                    .children(self.bindings.iter().map(|(keystrokes, _)| {
-                        div()
-                            .child(
-                                Label::new(keystrokes.clone())
-                                    .size(LabelSize::Default)
-                                    .color(Color::Accent),
-                            )
-                            .text_align(gpui::TextAlign::Right)
-                    })),
+                    // The panel is two parallel columns, so a "row" is not one
+                    // element and cannot become one node. The keystroke cell is
+                    // made the item and carries the whole pair; the action cell
+                    // beside it stays purely visual, having no role and so
+                    // contributing nothing to read twice.
+                    .id("which-key-bindings")
+                    .role(gpui::Role::List)
+                    .children(self.bindings.iter().enumerate().map(
+                        |(index, (keystrokes, action_name))| {
+                            div()
+                                .id(("which-key-binding", index))
+                                .role(gpui::Role::ListItem)
+                                .aria_label(format!("{keystrokes} {action_name}"))
+                                .child(
+                                    Label::new(keystrokes.clone())
+                                        .size(LabelSize::Default)
+                                        .color(Color::Accent),
+                                )
+                                .text_align(gpui::TextAlign::Right)
+                        },
+                    )),
             )
             .child(
                 // Actions column
@@ -235,8 +266,17 @@ impl Render for WhichKeyModal {
                     })),
             );
 
+        // The hint appears on its own the moment a prefix is pressed and
+        // disappears again, so it is only ever perceived if it is announced.
+        // Polite rather than assertive: it is a reminder, not something that
+        // should interrupt whatever is being read.
+        let announced = announcement(&self.pending_keys, &self.bindings);
+
         div()
             .id("which-key-buffer-panel-scroll")
+            .role(gpui::Role::Status)
+            .aria_live(gpui::accesskit::Live::Polite)
+            .aria_announcement(SharedString::from(announced))
             .occlude()
             .absolute()
             .bottom(bottom_offset)
@@ -265,6 +305,12 @@ impl Focusable for WhichKeyModal {
 }
 
 impl ModalView for WhichKeyModal {
+    fn a11y_name(&self, _cx: &App) -> Option<SharedString> {
+        // Rendered bare, so the modal layer never wraps it in a dialog for a
+        // name to attach to; the overlay names its own contents.
+        None
+    }
+
     fn render_bare(&self) -> bool {
         true
     }
@@ -305,4 +351,140 @@ fn group_bindings(
     }
 
     result
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{WhichKeyModal, announcement};
+    use gpui::{
+        AppContext as _, Context, Entity, IntoElement, ParentElement as _, Render, SharedString,
+        TestAppContext, WeakEntity, Window, div,
+    };
+
+    /// The hint appears on its own and vanishes again, so what it announces is
+    /// the whole of what a screen-reader user gets from it: which prefix is
+    /// pending and what can follow.
+    #[test]
+    fn the_announcement_names_the_prefix_and_its_continuations() {
+        assert_eq!(announcement("ctrl-b", &[]), "Prefix ctrl-b");
+
+        let bindings = vec![
+            (SharedString::from("c"), SharedString::from("New tab")),
+            (SharedString::from("%"), SharedString::from("Split right")),
+        ];
+        // A count, not the list. The pairs are nodes in the panel, so a reader
+        // can go through them at their own pace; spoken automatically they
+        // would be two dozen of them over whatever was being read.
+        assert_eq!(
+            announcement("ctrl-b", &bindings),
+            "Prefix ctrl-b, 2 continuations"
+        );
+
+        let one = vec![(SharedString::from("c"), SharedString::from("New tab"))];
+        assert_eq!(
+            announcement("ctrl-b", &one),
+            "Prefix ctrl-b, 1 continuation",
+            "one of them is not one continuations"
+        );
+    }
+
+    /// The hint is a live region, and a live region announces what is inside
+    /// it. Reading the semantics back out of a drawn frame rather than out of
+    /// the builder call: a role only becomes a node when its element also has
+    /// an id, and the modal renders bare, without the dialog wrapper that
+    /// would otherwise carry it.
+    #[gpui::test]
+    fn the_pending_prefix_reaches_the_tree_as_a_live_region(cx: &mut TestAppContext) {
+        cx.update(|cx| {
+            let settings_store = settings::SettingsStore::test(cx);
+            cx.set_global(settings_store);
+            theme_settings::init(theme::LoadThemes::JustBase, cx);
+        });
+
+        struct Host(Entity<WhichKeyModal>);
+        impl Render for Host {
+            fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+                div().child(self.0.clone())
+            }
+        }
+
+        let window = cx.add_window(|window, cx| {
+            let modal = cx.new(|cx| {
+                let mut modal = WhichKeyModal::new(WeakEntity::new_invalid(), window, cx);
+                modal.pending_keys = SharedString::new_static("ctrl-b");
+                modal.bindings = vec![
+                    (
+                        SharedString::new_static("c"),
+                        SharedString::new_static("New tab"),
+                    ),
+                    (
+                        SharedString::new_static("%"),
+                        SharedString::new_static("Split right"),
+                    ),
+                ];
+                modal
+            });
+            Host(modal)
+        });
+        let cx = &mut gpui::VisualTestContext::from_window(window.into(), cx);
+        cx.run_until_parked();
+        cx.activate_a11y(cx.window_handle());
+
+        let json = cx
+            .update(|window, cx| {
+                window.draw(cx).clear(cx);
+                window.debug_a11y_tree_json()
+            })
+            .expect("activation makes the debug tree available");
+        let tree: serde_json::Value = serde_json::from_str(&json).expect("the dump is valid JSON");
+        gpui::a11y_checks::assert_interactive_nodes_are_named(&tree, "which-key hint");
+        gpui::a11y_checks::assert_names_are_distinguishable(&tree, "which-key hint");
+        gpui::a11y_checks::assert_focusable_names_are_distinguishable(&tree, "which-key hint");
+        gpui::a11y_checks::assert_clickable_elements_are_reachable(&tree, "which-key hint");
+        gpui::a11y_checks::assert_click_targets_are_reachable(&tree, "which-key hint");
+        gpui::a11y_checks::assert_controls_have_area(&tree, "which-key hint");
+        gpui::a11y_checks::assert_landmarks_are_distinguishable(&tree, "which-key hint");
+        gpui::a11y_checks::assert_active_descendant_is_honoured(&tree, "which-key hint");
+        gpui::a11y_checks::assert_no_role_was_discarded(&tree, "which-key hint");
+        gpui::a11y_checks::assert_no_aria_was_discarded(&tree, "which-key hint");
+        gpui::a11y_checks::assert_roles_are_contained(&tree, "which-key hint");
+        gpui::a11y_checks::assert_live_regions_can_speak(&tree, "which-key hint");
+
+        let hint = tree["nodes"]
+            .as_object()
+            .expect("the dump lists nodes")
+            .values()
+            .find(|node| node["aria"]["role"] == "Status")
+            .unwrap_or_else(|| panic!("the hint must reach the tree: {json}"));
+        assert_eq!(
+            hint["aria"]["live"].as_str(),
+            Some("Polite"),
+            "a hint that appears on its own is only perceived if it is announced"
+        );
+        // The value, not the label: macOS speaks `node.value()` and raises no
+        // announcement at all without one.
+        assert_eq!(
+            hint["aria"]["value"].as_str(),
+            Some("Prefix ctrl-b, 2 continuations"),
+            "the announcement has to name the prefix and how much follows it"
+        );
+
+        // …and the continuations themselves are in the tree, which is what
+        // makes announcing only the count acceptable. They are drawn as two
+        // parallel columns of `Label`s, so before this they were not nodes at
+        // all and the announcement was the only place they existed.
+        let mut bindings: Vec<&str> = tree["nodes"]
+            .as_object()
+            .expect("the dump lists nodes")
+            .values()
+            .filter(|node| node["aria"]["role"] == "ListItem")
+            .filter_map(|node| node["aria"]["label"].as_str())
+            .collect();
+        bindings.sort_unstable();
+        assert_eq!(
+            bindings,
+            vec!["% Split right", "c New tab"],
+            "every continuation has to be readable on its own"
+        );
+    }
 }

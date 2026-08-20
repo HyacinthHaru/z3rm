@@ -352,6 +352,14 @@ workspace = true
 workspace = true
 features = [ "test-support"]
 
+[dev-dependencies.fs]
+workspace = true
+features = [ "test-support"]
+
+[dev-dependencies.git_ui]
+workspace = true
+features = [ "test-support"]
+
 [dev-dependencies.gpui]
 workspace = true
 features = [ "input-latency-histogram", "test-support"]

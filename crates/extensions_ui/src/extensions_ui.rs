@@ -756,6 +756,12 @@ impl ExtensionsPage {
         let can_configure = !extension.context_servers.is_empty();
 
         ExtensionCard::new()
+            // Name, version and authors are labels on the card, so the card is
+            // the only place they can reach a reader from.
+            .aria_label(format!(
+                "{}, v{}, dev extension",
+                extension.name, extension.version
+            ))
             .child(
                 h_flex()
                     .justify_between()
@@ -866,6 +872,7 @@ impl ExtensionsPage {
                             SharedString::from(format!("repository-{}", extension.id)),
                             repository_icon,
                         )
+                        .aria_label("Visit Extension Repository")
                         .icon_color(Color::Accent)
                         .icon_size(IconSize::Small)
                         .on_click(cx.listener({
@@ -904,6 +911,12 @@ impl ExtensionsPage {
         };
 
         ExtensionCard::new()
+            .aria_label(format!(
+                "{}, v{}, by {}",
+                extension.manifest.name,
+                version,
+                extension.manifest.authors.join(", ")
+            ))
             .overridden_by_dev_extension(has_dev_extension)
             .child(
                 h_flex()
@@ -1011,6 +1024,10 @@ impl ExtensionsPage {
                                     SharedString::from(format!("repository-{}", extension.id)),
                                     repository_icon,
                                 )
+                                .aria_label(format!(
+                                    "Visit Extension Repository: {}",
+                                    extension.manifest.name
+                                ))
                                 .icon_size(IconSize::Small)
                                 .tooltip(move |_, cx| {
                                     Tooltip::with_meta(
@@ -1034,6 +1051,10 @@ impl ExtensionsPage {
                                         SharedString::from(format!("more-{}", extension.id)),
                                         IconName::Ellipsis,
                                     )
+                                    .aria_label(format!(
+                                        "More extension actions: {}",
+                                        extension.manifest.name
+                                    ))
                                     .icon_size(IconSize::Small),
                                 )
                                 .anchor(Anchor::TopRight)
@@ -1492,6 +1513,11 @@ impl ExtensionsPage {
         };
 
         h_flex()
+            // The message is a plain label and contributes no node of its own,
+            // so without a name here the list reads as empty with no reason.
+            .id("extensions-empty")
+            .role(gpui::Role::Group)
+            .aria_label(message.clone())
             .py_4()
             .gap_1p5()
             .when(self.fetch_failed, |this| {
@@ -1591,7 +1617,7 @@ impl ExtensionsPage {
             .pt_4()
             .px_4()
             .child(
-                Banner::new()
+                Banner::new(label.clone())
                     .severity(Severity::Success)
                     .child(Label::new(label).mt_0p5())
                     .map(|this| {
@@ -1801,6 +1827,10 @@ impl PickerDelegate for DevExtensionRebuildPickerDelegate {
         self.matches.len()
     }
 
+    fn match_label(&self, ix: usize, _cx: &App) -> Option<SharedString> {
+        Some(self.matches.get(ix)?.string.clone().into())
+    }
+
     fn selected_index(&self) -> usize {
         self.selected_index
     }
@@ -2008,6 +2038,12 @@ impl Render for ExtensionsPage {
             .child(
                 h_flex()
                     .id("filter-row")
+                    // Picking one category unpicks the rest, which is selection
+                    // rather than a row of independent switches that happen to
+                    // disagree — and it is what decides which extensions the
+                    // list below is showing.
+                    .role(gpui::Role::TabList)
+                    .aria_label("Extension categories")
                     .gap_2()
                     .py_2p5()
                     .px_4()
@@ -2016,6 +2052,7 @@ impl Render for ExtensionsPage {
                     .overflow_x_scroll()
                     .child(
                         Button::new("filter-all-categories", "All")
+                            .aria_role(gpui::Role::Tab)
                             .when(self.provides_filter.is_none(), |button| {
                                 button.style(ButtonStyle::Filled)
                             })
@@ -2042,6 +2079,7 @@ impl Render for ExtensionsPage {
                                     SharedString::from(format!("filter-category-{}", label));
 
                                 Button::new(button_id, label)
+                                    .aria_role(gpui::Role::Tab)
                                     .style(if self.provides_filter == Some(provides) {
                                         ButtonStyle::Filled
                                     } else {

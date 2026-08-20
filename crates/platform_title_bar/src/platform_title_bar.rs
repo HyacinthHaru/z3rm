@@ -193,6 +193,12 @@ impl Render for PlatformTitleBar {
         let sidebar = self.sidebar_render_state(cx);
 
         let title_bar = h_flex()
+            // The one banner landmark in the window: the project, branch and
+            // connection controls live here, and without a landmark there is
+            // no way to jump to them.
+            .id("platform-title-bar")
+            .role(gpui::Role::Banner)
+            .aria_label("Title bar")
             .window_control_area(WindowControlArea::Drag)
             .w_full()
             .h(height)

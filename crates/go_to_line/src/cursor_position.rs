@@ -154,6 +154,41 @@ impl CursorPosition {
         });
     }
 
+    /// The selection statistics as words, for the accessible name.
+    ///
+    /// `write_position` writes them into the visible label, where a "Short"
+    /// setting abbreviates them to "3 l, 42 c" and the parentheses do the
+    /// grouping. Neither survives being read out, and how much is selected is
+    /// exactly what a user who cannot see the highlight needs.
+    fn announced_selection(&self) -> Option<String> {
+        if self.selected_count
+            <= (SelectionStats {
+                selections: 1,
+                ..Default::default()
+            })
+        {
+            return None;
+        }
+        let SelectionStats {
+            lines,
+            characters,
+            selections,
+        } = self.selected_count;
+        let parts: Vec<String> = [
+            (selections > 1).then_some((selections, "selection")),
+            (lines > 1).then_some((lines, "line")),
+            (characters > 0).then_some((characters, "character")),
+        ]
+        .into_iter()
+        .flatten()
+        .map(|(count, name)| {
+            let plural = if count > 1 { "s" } else { "" };
+            format!("{count} {name}{plural}")
+        })
+        .collect();
+        (!parts.is_empty()).then(|| parts.join(", "))
+    }
+
     fn write_position(&self, text: &mut String, cx: &App) {
         if self.selected_count
             <= (SelectionStats {
@@ -197,6 +232,11 @@ impl CursorPosition {
     }
 
     #[cfg(test)]
+    pub(crate) fn announced_selection_for_test(&self) -> Option<String> {
+        self.announced_selection()
+    }
+
+    #[cfg(test)]
     pub(crate) fn selection_stats(&self) -> &SelectionStats {
         &self.selected_count
     }
@@ -226,10 +266,15 @@ impl Render for CursorPosition {
                 Button::new("go-to-line-column", text)
                     .label_size(LabelSize::Small)
                     .tab_index(0isize)
-                    .aria_label(format!(
-                        "Line {}, column {}",
-                        position.line, position.character
-                    ))
+                    .aria_label(match self.announced_selection() {
+                        Some(selection) => format!(
+                            "Line {}, column {}, {selection} selected",
+                            position.line, position.character
+                        ),
+                        None => {
+                            format!("Line {}, column {}", position.line, position.character)
+                        }
+                    })
                     .on_click(cx.listener(|this, _, window, cx| {
                         if let Some(workspace) = this.workspace.upgrade() {
                             workspace.update(cx, |workspace, cx| {

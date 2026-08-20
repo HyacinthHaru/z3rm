@@ -30,7 +30,11 @@ pub struct SettingsProfileSelector {
     picker: Entity<Picker<SettingsProfileSelectorDelegate>>,
 }
 
-impl ModalView for SettingsProfileSelector {}
+impl ModalView for SettingsProfileSelector {
+    fn a11y_name(&self, _cx: &gpui::App) -> Option<gpui::SharedString> {
+        Some("Settings Profiles".into())
+    }
+}
 
 impl EventEmitter<DismissEvent> for SettingsProfileSelector {}
 
@@ -156,6 +160,14 @@ impl PickerDelegate for SettingsProfileSelectorDelegate {
 
     fn placeholder_text(&self, _: &mut Window, _: &mut App) -> std::sync::Arc<str> {
         "Select a settings profile...".into()
+    }
+
+    /// Named the way the row is drawn: the profile with no name renders as
+    /// "Disabled", and announcing its empty match string instead would leave
+    /// that row nameless.
+    fn match_label(&self, ix: usize, _cx: &App) -> Option<SharedString> {
+        let mat = self.matches.get(ix)?;
+        Some(display_name(self.profile_names.get(mat.candidate_id)?).into())
     }
 
     fn match_count(&self) -> usize {

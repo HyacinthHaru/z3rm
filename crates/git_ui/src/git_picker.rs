@@ -391,7 +391,13 @@ impl GitPicker {
     }
 }
 
-impl ModalView for GitPicker {}
+impl ModalView for GitPicker {
+    fn a11y_name(&self, _cx: &gpui::App) -> Option<gpui::SharedString> {
+        // Which tab is open is the only thing that distinguishes one of these
+        // from another, and it is what the visible tab bar says.
+        Some(self.tab.to_string().into())
+    }
+}
 impl EventEmitter<DismissEvent> for GitPicker {}
 
 impl Focusable for GitPicker {

@@ -408,6 +408,7 @@ impl RenameBranchModal {
         let editor = cx.new(|cx| {
             let mut editor = Editor::single_line(window, cx);
             editor.set_text(current_branch.clone(), window, cx);
+            editor.set_a11y_label("Branch name");
             editor
         });
         Self {
@@ -448,7 +449,11 @@ impl RenameBranchModal {
 }
 
 impl EventEmitter<DismissEvent> for RenameBranchModal {}
-impl ModalView for RenameBranchModal {}
+impl ModalView for RenameBranchModal {
+    fn a11y_name(&self, _cx: &gpui::App) -> Option<gpui::SharedString> {
+        Some("Rename Branch".into())
+    }
+}
 impl Focusable for RenameBranchModal {
     fn focus_handle(&self, cx: &App) -> FocusHandle {
         self.editor.focus_handle(cx)
@@ -666,7 +671,11 @@ impl RefPickerModal {
 }
 
 impl EventEmitter<DismissEvent> for RefPickerModal {}
-impl ModalView for RefPickerModal {}
+impl ModalView for RefPickerModal {
+    fn a11y_name(&self, _cx: &gpui::App) -> Option<gpui::SharedString> {
+        Some("Git References".into())
+    }
+}
 impl Focusable for RefPickerModal {
     fn focus_handle(&self, cx: &App) -> FocusHandle {
         self.editor.focus_handle(cx)
@@ -968,6 +977,29 @@ mod remote_button {
         )
     }
 
+    /// The name the push/pull button is announced by.
+    ///
+    /// Kept as a function so it can be checked without rendering: every part
+    /// of that button is a `Label` child, so what a reader hears cannot be
+    /// derived from anything the element itself carries.
+    pub(crate) fn announced_remote_button(
+        label: &str,
+        ahead_count: usize,
+        behind_count: usize,
+        in_progress_operation: Option<RemoteOperationKind>,
+    ) -> String {
+        let counts = match (ahead_count, behind_count) {
+            (0, 0) => label.to_string(),
+            (ahead, 0) => format!("{label}, {ahead} ahead"),
+            (0, behind) => format!("{label}, {behind} behind"),
+            (ahead, behind) => format!("{label}, {behind} behind, {ahead} ahead"),
+        };
+        match in_progress_operation {
+            Some(operation) => format!("{counts}, {}", in_progress_tooltip(operation)),
+            None => counts,
+        }
+    }
+
     fn in_progress_tooltip(operation: RemoteOperationKind) -> &'static str {
         match operation {
             RemoteOperationKind::Fetch => "Fetch in Progress…",
@@ -1003,6 +1035,7 @@ mod remote_button {
         PopoverMenu::new(id.into())
             .trigger(crate::render_split_button_chevron_trigger(
                 "split-button-right",
+                "More git actions",
                 menu_open,
             ))
             .with_handle(menu_handle)
@@ -1058,7 +1091,21 @@ mod remote_button {
         let should_render_counts = left_icon.is_none() && (ahead_count > 0 || behind_count > 0);
         let is_in_progress = in_progress_operation.is_some();
 
+        // `ButtonLike` takes no name from its children, and every part of this
+        // button is one: the action is a `Label` and so are the ahead/behind
+        // counts, which are the whole reason to press it.
+        let left_label: SharedString = left_label.into();
+        // Every part of this button is a `Label` child, and `ButtonLike` takes
+        // no name from its children: the action, the ahead/behind counts, and
+        // the spinner that replaces the icon while the operation runs.
+        let announced = announced_remote_button(
+            &left_label,
+            ahead_count,
+            behind_count,
+            in_progress_operation,
+        );
         let left = ButtonLike::new_rounded_left(format!("split-button-left-{}", id))
+            .aria_label(announced)
             .layer(ElevationIndex::ModalSurface)
             .size(ButtonSize::Compact)
             .disabled(is_in_progress)
@@ -1116,8 +1163,12 @@ mod remote_button {
     }
 }
 
+/// The chevron half of a split button. `ButtonLike` takes its children as
+/// opaque elements, so unlike [`Button`] it cannot name itself from a label —
+/// a chevron with no name is announced as a bare "button".
 pub(crate) fn render_split_button_chevron_trigger(
     id: impl Into<ElementId>,
+    label: impl Into<SharedString>,
     menu_open: bool,
 ) -> ButtonLike {
     let chevron_button_size = rems_from_px(20.);
@@ -1128,6 +1179,10 @@ pub(crate) fn render_split_button_chevron_trigger(
     };
 
     ButtonLike::new_rounded_right(id)
+        // Named by the caller: several of these are on screen at once, and
+        // "More actions" three times over is three buttons a user cannot ask
+        // for by name or tell apart while moving between them.
+        .aria_label(label)
         .layer(ElevationIndex::ModalSurface)
         .selected_style(ButtonStyle::Tinted(TintColor::Accent))
         .width(chevron_button_size)
@@ -1268,6 +1323,12 @@ impl Render for GitCloneModal {
             )
             .child(
                 h_flex()
+                    // The hint is a `Label` and the only node in this row is a
+                    // button reading "Learn More" — a reader was offered a link
+                    // with nothing saying what it was about.
+                    .id("clone-hint")
+                    .role(gpui::Role::Group)
+                    .aria_label("Clone a repository from GitHub or other sources.")
                     .w_full()
                     .p_2()
                     .gap_0p5()
@@ -1302,7 +1363,11 @@ impl Render for GitCloneModal {
 
 impl EventEmitter<DismissEvent> for GitCloneModal {}
 
-impl ModalView for GitCloneModal {}
+impl ModalView for GitCloneModal {
+    fn a11y_name(&self, _cx: &gpui::App) -> Option<gpui::SharedString> {
+        Some("Clone Repository".into())
+    }
+}
 
 #[cfg(test)]
 mod view_commit_tests {
@@ -1403,5 +1468,30 @@ mod view_commit_tests {
 
         assert!(!initial_modal_state);
         assert!(final_modal_state);
+    }
+
+    /// The push button is the one place the working tree's state against the
+    /// remote is written down, and every part of it — the action, the counts,
+    /// the spinner that replaces the icon while it runs — is a `Label` child,
+    /// which names nothing.
+    #[test]
+    fn the_remote_button_says_what_it_does_and_where_it_is() {
+        use crate::remote_button::announced_remote_button;
+        use crate::git_panel::RemoteOperationKind;
+
+        assert_eq!(announced_remote_button("Fetch", 0, 0, None), "Fetch");
+        assert_eq!(announced_remote_button("Push", 3, 0, None), "Push, 3 ahead");
+        assert_eq!(announced_remote_button("Pull", 0, 2, None), "Pull, 2 behind");
+        assert_eq!(
+            announced_remote_button("Pull", 3, 2, None),
+            "Pull, 2 behind, 3 ahead"
+        );
+        // Running is not the same as unavailable. The button disables itself
+        // while the operation is in flight, and "disabled" on its own describes
+        // a button that cannot be pressed rather than one already working.
+        assert_eq!(
+            announced_remote_button("Push", 3, 0, Some(RemoteOperationKind::Push)),
+            "Push, 3 ahead, Push in Progress…"
+        );
     }
 }

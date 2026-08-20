@@ -80,6 +80,12 @@ impl Render for StatusToast {
 
         h_flex()
             .id("status-toast")
+            // The toast layer around this is a polite live region, but a live
+            // region announces the text of what appears inside it, and the
+            // message is a `Label`, which is not a node. Without a name here a
+            // toast arrives saying only "Dismiss".
+            .role(gpui::Role::Group)
+            .aria_label(self.text.clone())
             .elevation_3(cx)
             .gap_2()
             .py_1p5()
@@ -113,6 +119,7 @@ impl Render for StatusToast {
                 let handle = self.this_handle.clone();
                 this.child(
                     IconButton::new("dismiss", IconName::Close)
+                .aria_label("Dismiss")
                         .shape(ui::IconButtonShape::Square)
                         .icon_size(IconSize::Small)
                         .icon_color(Color::Muted)
@@ -130,6 +137,25 @@ impl Render for StatusToast {
 impl ToastView for StatusToast {
     fn action(&self) -> Option<ToastAction> {
         self.action.clone()
+    }
+
+    fn announcement(&self, _cx: &App) -> SharedString {
+        // The first line only. Callers pass raw error text straight through —
+        // `git_ui::clone` hands over a clone failure and `z3rm::daemon` a
+        // daemon error, and git writes several lines to stderr — and this is
+        // spoken the moment the toast appears, over whatever the user was
+        // doing. The toast keeps drawing the whole thing.
+        let summary = self
+            .text
+            .split_once('\n')
+            .map_or(&*self.text, |(first, _)| first);
+        // The action's label is part of it: a toast offering "Undo" that
+        // announces only what happened leaves the user with no idea that
+        // anything can be done about it before it disappears.
+        match &self.action {
+            Some(action) => format!("{summary}. {}", action.label).into(),
+            None => SharedString::from(summary.to_string()),
+        }
     }
 
     fn auto_dismiss(&self) -> bool {
@@ -248,5 +274,120 @@ impl Component for StatusToast {
                 .vertical(),
             ])
             .into_any_element()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use gpui::TestAppContext;
+
+    /// A toast is transient status the user never navigates to, so it is only
+    /// ever perceived if it is announced — and what a live region announces is
+    /// the text of the nodes that appear inside it. The message is a `Label`,
+    /// which is not a node, so the toast has to carry the message itself.
+    #[gpui::test]
+    fn a_toast_announces_what_it_says(cx: &mut TestAppContext) {
+        cx.update(|cx| {
+            let settings_store = settings::SettingsStore::test(cx);
+            cx.set_global(settings_store);
+            theme_settings::init(theme::LoadThemes::JustBase, cx);
+        });
+
+        let window = cx.add_window(|_, cx| {
+            let toast = StatusToast::new("Failed to restore notes.md", cx, |this, _| {
+                this.dismiss_button(true)
+            });
+            ToastHost(toast)
+        });
+        cx.activate_a11y(window.into());
+
+        let json = cx
+            .update_window(window.into(), |_, window, cx| {
+                window.draw(cx).clear(cx);
+                window.debug_a11y_tree_json()
+            })
+            .expect("the harness window is still open")
+            .expect("activation makes the debug tree available");
+        let tree: serde_json::Value = serde_json::from_str(&json).expect("the dump is valid JSON");
+        gpui::a11y_checks::assert_interactive_nodes_are_named(&tree, "status toast");
+        gpui::a11y_checks::assert_names_are_distinguishable(&tree, "status toast");
+        gpui::a11y_checks::assert_focusable_names_are_distinguishable(&tree, "status toast");
+        gpui::a11y_checks::assert_no_role_was_discarded(&tree, "status toast");
+        gpui::a11y_checks::assert_no_aria_was_discarded(&tree, "status toast");
+        gpui::a11y_checks::assert_clickable_elements_are_reachable(&tree, "status toast");
+
+        let announced = tree["nodes"]
+            .as_object()
+            .expect("the dump lists nodes")
+            .values()
+            .filter_map(|node| node["aria"]["label"].as_str())
+            .any(|label| label == "Failed to restore notes.md");
+        assert!(
+            announced,
+            "a toast that arrives saying only \"Dismiss\" has told the user nothing: {json}"
+        );
+    }
+
+    /// Callers pass raw error text straight in — `git_ui::clone` hands over a
+    /// clone failure, `z3rm::daemon` a daemon error — and git writes several
+    /// lines to stderr. A toast is announced the moment it appears, over
+    /// whatever the user was doing, so what is spoken stops at the first line
+    /// while the toast goes on drawing the whole thing.
+    #[gpui::test]
+    fn a_toast_announces_the_first_line_of_a_long_error(cx: &mut TestAppContext) {
+        cx.update(|cx| {
+            let settings_store = settings::SettingsStore::test(cx);
+            cx.set_global(settings_store);
+            theme_settings::init(theme::LoadThemes::JustBase, cx);
+        });
+
+        const ERROR: &str =
+            "fatal: repository not found\nhint: check the remote URL\nhint: and your credentials";
+        let toast = cx.update(|cx| StatusToast::new(ERROR, cx, |this, _| this));
+        cx.update(|cx| {
+            assert_eq!(
+                workspace::ToastView::announcement(toast.read(cx), cx).as_ref(),
+                "fatal: repository not found",
+                "the announcement stops at the first line"
+            );
+            assert_eq!(
+                toast.read(cx).text.as_ref(),
+                ERROR,
+                "and the toast still draws all of it"
+            );
+        });
+    }
+
+    /// The action's label is part of the announcement, and has to survive the
+    /// cut: a toast offering "Undo" that says only what happened leaves the
+    /// user unaware anything can be done before it disappears.
+    #[gpui::test]
+    fn a_cut_announcement_still_offers_its_action(cx: &mut TestAppContext) {
+        cx.update(|cx| {
+            let settings_store = settings::SettingsStore::test(cx);
+            cx.set_global(settings_store);
+            theme_settings::init(theme::LoadThemes::JustBase, cx);
+        });
+
+        let toast = cx.update(|cx| {
+            StatusToast::new("Deleted notes.md\nfrom the project panel", cx, |this, _| {
+                this.action("Undo", |_, _| {})
+            })
+        });
+        cx.update(|cx| {
+            assert_eq!(
+                workspace::ToastView::announcement(toast.read(cx), cx).as_ref(),
+                "Deleted notes.md. Undo"
+            );
+        });
+    }
+
+    struct ToastHost(Entity<StatusToast>);
+
+    impl Render for ToastHost {
+        fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+            div().size_full().child(self.0.clone())
+        }
     }
 }

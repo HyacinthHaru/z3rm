@@ -3,8 +3,8 @@ use std::{path::Path, sync::Arc};
 use gpui::{EventEmitter, FocusHandle, Focusable};
 use ui::{
     App, Button, ButtonCommon, ButtonStyle, Clickable, Context, FluentBuilder, InteractiveElement,
-    KeyBinding, Label, LabelCommon, LabelSize, ParentElement, Render, SharedString, Styled as _,
-    Window, h_flex, v_flex,
+    KeyBinding, Label, LabelCommon, LabelSize, ParentElement, Render, SharedString,
+    StatefulInteractiveElement as _, Styled as _, Window, h_flex, v_flex,
 };
 use zed_actions::workspace::OpenWithSystem;
 
@@ -78,7 +78,23 @@ impl Focusable for InvalidItemView {
 impl Render for InvalidItemView {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl gpui::IntoElement {
         let abs_path = self.abs_path.clone();
+        // The heading is a bare string and the reason is a `Label`, neither of
+        // which is a node, and the root takes focus while carrying no id and no
+        // role — so opening a file that fails moved focus to nothing, and the
+        // reader was told about the window instead of being told the file would
+        // not open, or why.
+        let announced = match abs_path.file_name() {
+            Some(name) => format!(
+                "Could not open {}: {}",
+                name.to_string_lossy(),
+                self.error
+            ),
+            None => format!("Could not open file: {}", self.error),
+        };
         v_flex()
+            .id("invalid-item")
+            .role(gpui::Role::Group)
+            .aria_label(announced)
             .size_full()
             .track_focus(&self.focus_handle(cx))
             .flex_none()

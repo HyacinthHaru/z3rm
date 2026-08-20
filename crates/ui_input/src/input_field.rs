@@ -58,6 +58,11 @@ impl InputField {
             .get()
             .expect("ErasedEditorFactory to be initialized");
         let editor = (editor_factory)(window, cx);
+        // The placeholder is what names the field: `render` wraps the editor
+        // in layout and a label, none of which is a node, so the editor has to
+        // report itself. It is deliberately *not* marked `a11y_wrapped` —
+        // that flag is a promise the wrapper carries the role, name and text,
+        // and this one carries none of the three.
         editor.set_placeholder_text(placeholder_text, window, cx);
 
         Self {
@@ -213,6 +218,7 @@ impl Render for InputField {
                                     IconName::EyeOff
                                 },
                             )
+                            .aria_label(if is_masked { "Show" } else { "Hide" })
                             .icon_size(IconSize::Small)
                             .icon_color(Color::Muted)
                             .tooltip(Tooltip::text(if is_masked { "Show" } else { "Hide" }))
@@ -228,9 +234,22 @@ impl Render for InputField {
                         )
                     }),
             )
-            .when_some(self.error.clone(), |this, error| {
-                this.child(Label::new(error).size(LabelSize::Small).color(Color::Error))
-            })
+            // The message is a plain label and contributes no node, so a field
+            // that has gone red says nothing at all. Rendered whether or not
+            // there is an error: a live region that appears together with its
+            // message has nothing to diff against, so it announces nothing —
+            // which is what the old shape did, comment notwithstanding.
+            .child(
+                div()
+                    .id("input-field-error")
+                    .role(gpui::Role::Status)
+                    .aria_live(gpui::accesskit::Live::Polite)
+                    .when_some(self.error.clone(), |this, error| {
+                        this.aria_announcement(error.clone()).child(
+                            Label::new(error).size(LabelSize::Small).color(Color::Error),
+                        )
+                    }),
+            )
     }
 }
 

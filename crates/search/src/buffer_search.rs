@@ -127,6 +127,7 @@ impl Render for BufferSearchBar {
 
             let collapse_expand_icon_button = |id| {
                 IconButton::new(id, icon)
+                    .aria_label(tooltip_label)
                     .icon_size(IconSize::Small)
                     .tooltip(move |_, cx| {
                         Tooltip::for_action_in(
@@ -187,6 +188,14 @@ impl Render for BufferSearchBar {
         });
 
         let mut color_override = None;
+        // What the counter is announced as, kept apart from what it draws.
+        // "1/2" is four characters on screen and "one slash two" out loud, and
+        // the other search surfaces already say "5 matches".
+        //
+        // Empty until there is something to say. A live region announces what
+        // changes inside it, so "No matches" sitting there before anyone has
+        // typed would report a result for a search that has not happened.
+        let mut announced_matches = SharedString::default();
         let match_text = self
             .active_searchable_item
             .as_ref()
@@ -194,12 +203,15 @@ impl Render for BufferSearchBar {
                 if self.query(cx).is_empty() {
                     return None;
                 }
+                announced_matches = SharedString::new_static("No matches");
                 let matches_count = self
                     .searchable_items_with_matches
                     .get(&searchable_item.downgrade())
                     .map(|(matches, _)| matches.len())
                     .unwrap_or(0);
                 if let Some(match_ix) = self.active_match_index {
+                    announced_matches =
+                        format!("Match {} of {}", match_ix + 1, matches_count).into();
                     Some(format!("{}/{}", match_ix + 1, matches_count))
                 } else {
                     color_override = Some(Color::Error); // No matches found
@@ -282,6 +294,7 @@ impl Render for BufferSearchBar {
                         "buffer-search-bar-toggle-search-selection-button",
                         IconName::Quote,
                     )
+                    .aria_label("Toggle Search Selection")
                     .style(ButtonStyle::Subtle)
                     .shape(IconButtonShape::Square)
                     .when(self.selection_search_enabled.is_some(), |button| {
@@ -332,15 +345,29 @@ impl Render for BufferSearchBar {
                         query_focus.clone(),
                     ))
                     .when(!narrow_mode, |this| {
-                        this.child(div().ml_2().min_w(rems_from_px(40.)).child(
-                            Label::new(match_text).size(LabelSize::Small).color(
-                                if self.active_match_index.is_some() {
-                                    Color::Default
-                                } else {
-                                    Color::Disabled
-                                },
-                            ),
-                        ))
+                        this.child(
+                            div()
+                                // "3/17" is a label, and a label is not a node,
+                                // so the one thing that says whether the query
+                                // found anything reached nobody. Polite: it
+                                // changes on every keystroke, and interrupting
+                                // someone who is typing is worse than waiting.
+                                .id("buffer-search-match-count")
+                                .role(gpui::Role::Status)
+                                .aria_live(gpui::accesskit::Live::Polite)
+                                .aria_announcement(announced_matches)
+                                .ml_2()
+                                .min_w(rems_from_px(40.))
+                                .child(
+                                    Label::new(match_text).size(LabelSize::Small).color(
+                                        if self.active_match_index.is_some() {
+                                            Color::Default
+                                        } else {
+                                            Color::Disabled
+                                        },
+                                    ),
+                                ),
+                        )
                     });
 
                 el.when(select_all, |el| {
@@ -421,13 +448,23 @@ impl Render for BufferSearchBar {
             key_context.add("in_replace");
         }
 
-        let query_error_line = self.query_error.as_ref().map(|error| {
-            Label::new(error)
-                .size(LabelSize::Small)
-                .color(Color::Error)
-                .mt_neg_1()
-                .ml_2()
-        });
+        // Rendered whether or not there is an error to show. A live region
+        // announces changes made *inside* it, so one that appears at the same
+        // moment as the message has nothing to compare against — an invalid
+        // regex would be reported to nobody.
+        let query_error_line = div()
+            .id("buffer-search-query-error")
+            .role(gpui::Role::Status)
+            .aria_live(gpui::accesskit::Live::Polite)
+            .when_some(self.query_error.as_ref(), |this, error| {
+                this.aria_announcement(error.clone()).child(
+                    Label::new(error)
+                        .size(LabelSize::Small)
+                        .color(Color::Error)
+                        .mt_neg_1()
+                        .ml_2(),
+                )
+            });
 
         let search_line =
             h_flex()
@@ -501,7 +538,7 @@ impl Render for BufferSearchBar {
                 this.on_action(cx.listener(Self::toggle_selection))
             })
             .child(search_line)
-            .children(query_error_line)
+            .child(query_error_line)
             .children(replace_line)
             .into_any_element()
     }
@@ -1979,6 +2016,132 @@ mod tests {
         let cx = VisualTestContext::from_window(*window, cx).into_mut();
 
         (editor.unwrap(), search_bar, cx)
+    }
+
+    /// The match count and the query error are plain labels, and a label
+    /// contributes no accessibility node, so the two things that say whether a
+    /// search found anything were reported to nobody.
+    /// The query error is a live region, so it is spoken the moment an invalid
+    /// pattern is typed — which happens on the way to a valid one, character by
+    /// character. Several regex crates render a syntax error across three lines
+    /// with a caret pointing at the offending character, and a caret line read
+    /// aloud is noise. This asserts the one-line shape rather than assuming it
+    /// survives a change of engine.
+    #[gpui::test]
+    async fn an_invalid_pattern_is_announced_in_one_line(cx: &mut TestAppContext) {
+        let (_editor, search_bar, cx) = init_test(cx);
+        search_bar.update_in(cx, |search_bar, window, cx| {
+            search_bar.toggle_search_option(SearchOptions::REGEX, window, cx);
+        });
+        search_bar
+            .update_in(cx, |search_bar, window, cx| {
+                search_bar.search("(foo", None, true, window, cx)
+            })
+            .await
+            .expect_err("an unclosed group is not a valid pattern");
+        cx.run_until_parked();
+
+        cx.activate_a11y(cx.window_handle());
+        let json = cx
+            .update(|window, cx| {
+                window.draw(cx).clear(cx);
+                window.debug_a11y_tree_json()
+            })
+            .expect("activation makes the debug tree available");
+        let tree: serde_json::Value = serde_json::from_str(&json).expect("the dump is valid JSON");
+        gpui::a11y_checks::assert_live_regions_can_speak(&tree, "invalid pattern");
+
+        let announced = tree["nodes"]
+            .as_object()
+            .expect("the dump lists nodes")
+            .values()
+            .find(|node| {
+                node["element_id"]
+                    .as_str()
+                    .is_some_and(|id| id.contains("buffer-search-query-error"))
+            })
+            .and_then(|node| node["aria"]["value"].as_str())
+            .unwrap_or_else(|| panic!("the error region has to carry the message: {json}"));
+        assert!(
+            !announced.contains('\n'),
+            "an announcement read aloud has to be one line: {announced:?}"
+        );
+        assert!(
+            announced.contains("parenthesis"),
+            "and has to say what is wrong, not just that something is: {announced:?}"
+        );
+    }
+
+    #[gpui::test]
+    async fn the_search_bar_announces_its_matches(cx: &mut TestAppContext) {
+        let (_editor, search_bar, cx) = init_test(cx);
+
+        search_bar
+            .update_in(cx, |search_bar, window, cx| {
+                search_bar.search("expression", None, true, window, cx)
+            })
+            .await
+            .unwrap();
+        cx.run_until_parked();
+
+        cx.activate_a11y(cx.window_handle());
+        let json = cx
+            .update(|window, cx| {
+                window.draw(cx).clear(cx);
+                window.debug_a11y_tree_json()
+            })
+            .expect("activation makes the debug tree available");
+        let tree: serde_json::Value = serde_json::from_str(&json).expect("the dump is valid JSON");
+        let nodes = tree["nodes"].as_object().expect("the dump lists nodes");
+
+        gpui::a11y_checks::assert_interactive_nodes_are_named(&tree, "buffer search");
+        gpui::a11y_checks::assert_no_role_was_discarded(&tree, "buffer search");
+        gpui::a11y_checks::assert_no_aria_was_discarded(&tree, "buffer search");
+        gpui::a11y_checks::assert_roles_are_contained(&tree, "buffer search");
+        gpui::a11y_checks::assert_focus_reached_the_tree(&tree, "buffer search");
+        gpui::a11y_checks::assert_click_targets_are_reachable(&tree, "buffer search");
+        gpui::a11y_checks::assert_landmarks_are_distinguishable(&tree, "buffer search");
+        gpui::a11y_checks::assert_names_are_distinguishable(&tree, "buffer search");
+        gpui::a11y_checks::assert_focusable_names_are_distinguishable(&tree, "buffer search");
+        gpui::a11y_checks::assert_clickable_elements_are_reachable(&tree, "buffer search");
+        gpui::a11y_checks::assert_controls_have_area(&tree, "buffer search");
+        gpui::a11y_checks::assert_active_descendant_is_honoured(&tree, "buffer search");
+        gpui::a11y_checks::assert_live_regions_can_speak(&tree, "buffer search");
+
+        // The value, not the label: macOS speaks `node.value()` and raises no
+        // announcement at all without one, so a label here would be a count
+        // nobody hears.
+        let live_regions: Vec<(&str, &str)> = nodes
+            .values()
+            .filter(|node| node["aria"]["live"] == "Polite")
+            .map(|node| {
+                (
+                    node["element_id"].as_str().unwrap_or_default(),
+                    node["aria"]["value"].as_str().unwrap_or_default(),
+                )
+            })
+            .collect();
+
+        let count = live_regions
+            .iter()
+            .find(|(id, _)| id.contains("buffer-search-match-count"))
+            .unwrap_or_else(|| panic!("the match count has to be announced: {json}"));
+        // The announced text is not what the bar draws. "1/2" fits in the
+        // toolbar and reads as "one slash two"; the other search surfaces
+        // already announce "5 matches".
+        assert_eq!(
+            count.1, "Match 1 of 2",
+            "the count has to be a sentence, not a fraction: {count:?}"
+        );
+
+        // Present with no error in it: a region created at the same moment as
+        // its message has nothing to diff against, so it is never announced.
+        assert!(
+            live_regions
+                .iter()
+                .any(|(id, value)| id.contains("buffer-search-query-error") && value.is_empty()),
+            "the error region has to exist before there is an error: {live_regions:?}"
+        );
     }
 
     #[perf]

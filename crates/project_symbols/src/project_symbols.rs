@@ -115,6 +115,10 @@ impl PickerDelegate for ProjectSymbolsDelegate {
     fn name() -> &'static str {
         "project symbols"
     }
+    fn match_label(&self, ix: usize, _cx: &App) -> Option<SharedString> {
+        Some(self.matches.get(ix)?.string.clone().into())
+    }
+
     fn placeholder_text(&self, _window: &mut Window, _cx: &mut App) -> Arc<str> {
         "Search project symbols...".into()
     }
@@ -419,6 +423,63 @@ mod tests {
             assert_eq!(picker.delegate.matches[0].string, "안녕");
             assert!(picker.delegate.render_match(0, false, window, cx).is_some());
         });
+    }
+
+    /// The symbol picker is opened straight into the modal layer as a bare
+    /// `Picker`, with no wrapper view of its own to name the dialog. A dialog
+    /// with no name is announced as "dialog" and nothing else, which is all a
+    /// user gets at the moment the modal takes their focus.
+    #[gpui::test]
+    async fn the_symbol_picker_names_the_dialog_it_opens(cx: &mut TestAppContext) {
+        init_test(cx);
+
+        let fs = FakeFs::new(cx.executor());
+        fs.insert_tree(path!("/dir"), json!({ "test.rs": "" })).await;
+        let project = Project::test(fs, [path!("/dir").as_ref()], cx).await;
+        let (multi_workspace, cx) =
+            cx.add_window_view(|window, cx| MultiWorkspace::test_new(project.clone(), window, cx));
+        let workspace = multi_workspace.read_with(cx, |mw, _| mw.workspace().clone());
+
+        workspace.update_in(cx, |workspace, window, cx| {
+            let handle = cx.entity().downgrade();
+            let project = project.clone();
+            workspace.toggle_modal(window, cx, move |window, cx| {
+                let delegate = ProjectSymbolsDelegate::new(handle, project.clone());
+                Picker::uniform_list(delegate, window, cx)
+            });
+        });
+        cx.run_until_parked();
+
+        cx.activate_a11y(cx.window_handle());
+        let json = cx
+            .update(|window, cx| {
+                window.draw(cx).clear(cx);
+                window.debug_a11y_tree_json()
+            })
+            .expect("activation makes the debug tree available");
+        let tree: serde_json::Value = serde_json::from_str(&json).expect("the dump is valid JSON");
+
+        gpui::a11y_checks::assert_interactive_nodes_are_named(&tree, "project symbols");
+        gpui::a11y_checks::assert_names_are_distinguishable(&tree, "project symbols");
+        gpui::a11y_checks::assert_focusable_names_are_distinguishable(&tree, "project symbols");
+        gpui::a11y_checks::assert_clickable_elements_are_reachable(&tree, "project symbols");
+        gpui::a11y_checks::assert_no_role_was_discarded(&tree, "project symbols");
+        gpui::a11y_checks::assert_no_aria_was_discarded(&tree, "project symbols");
+        gpui::a11y_checks::assert_roles_are_contained(&tree, "project symbols");
+        gpui::a11y_checks::assert_focus_reached_the_tree(&tree, "project symbols");
+        gpui::a11y_checks::assert_active_descendant_is_honoured(&tree, "project symbols");
+
+        let dialog = tree["nodes"]
+            .as_object()
+            .expect("the dump lists nodes")
+            .values()
+            .find(|node| node["aria"]["role"] == "Dialog")
+            .expect("an open picker is a modal dialog");
+        assert_eq!(
+            dialog["aria"]["label"].as_str(),
+            Some("Search project symbols..."),
+            "the picker names the dialog with the same prompt the user can see"
+        );
     }
 
     fn init_test(cx: &mut TestAppContext) {

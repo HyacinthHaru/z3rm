@@ -82,7 +82,11 @@ pub struct ChangedFileSelector {
     picker: Entity<Picker<ChangedFileSelectorDelegate>>,
 }
 
-impl ModalView for ChangedFileSelector {}
+impl ModalView for ChangedFileSelector {
+    fn a11y_name(&self, _cx: &gpui::App) -> Option<gpui::SharedString> {
+        Some("Changed Files".into())
+    }
+}
 
 impl EventEmitter<DismissEvent> for ChangedFileSelector {}
 
@@ -188,6 +192,10 @@ impl PickerDelegate for ChangedFileSelectorDelegate {
 
     fn name() -> &'static str {
         "changed file selector"
+    }
+
+    fn match_label(&self, ix: usize, _cx: &App) -> Option<SharedString> {
+        Some(self.matches.get(ix)?.string.clone().into())
     }
 
     fn placeholder_text(&self, _window: &mut Window, _cx: &mut App) -> Arc<str> {

@@ -105,6 +105,13 @@ impl RenderOnce for AlertModal {
                 this.track_focus(&focus_handle)
             })
             .id(self.id)
+            // A focused element with no role produces no accessibility node, so
+            // opening this modal discarded focus and left screen readers
+            // announcing the whole window. `Group` rather than `Dialog`: the
+            // modal layer already wraps this in one, and nesting dialogs would
+            // describe two modal contexts where there is one.
+            .role(gpui::Role::Group)
+            .when_some(self.title.clone(), |this, title| this.aria_label(title))
             .elevation_3(cx)
             .w(width)
             .bg(cx.theme().colors().elevated_surface_background)
@@ -246,5 +253,108 @@ Review .zed/settings.json for any extensions or commands configured by this proj
                     )]),
                 ])
                 .into_any_element()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use gpui::TestAppContext;
+
+    struct AlertHarness {
+        focus_handle: gpui::FocusHandle,
+    }
+
+    impl Render for AlertHarness {
+        fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+            // Shaped like the security modal this component actually carries:
+            // a title and a list of what restricted mode prevents. An empty
+            // child proved the modal reached the tree and nothing about what
+            // the user is being asked to decide.
+            AlertModal::new("harness-alert")
+                .title("Unrecognized Project")
+                .track_focus(&self.focus_handle)
+                .child(
+                    v_flex()
+                        .child(ListBulletItem::new("Project settings from being applied"))
+                        .child(ListBulletItem::new("Language servers from running"))
+                        .child(ListBulletItem::new("MCP integrations from installing")),
+                )
+        }
+    }
+
+    /// A focused element with an id but no role produces no accessibility node,
+    /// so opening a modal discarded focus and left screen readers announcing
+    /// the whole window instead of the prompt.
+    #[gpui::test]
+    fn a_focused_alert_modal_reaches_the_accessibility_tree(cx: &mut TestAppContext) {
+        cx.update(|cx| {
+            let settings_store = settings::SettingsStore::test(cx);
+            cx.set_global(settings_store);
+            theme_settings::init(theme::LoadThemes::JustBase, cx);
+        });
+        let window = cx.add_window(|_, cx| AlertHarness {
+            focus_handle: cx.focus_handle(),
+        });
+        cx.activate_a11y(window.into());
+
+        let focus_handle = window
+            .update(cx, |harness, _, _| harness.focus_handle.clone())
+            .expect("the harness window is still open");
+        let json = cx
+            .update_window(window.into(), |_, window, cx| {
+                window.focus(&focus_handle, cx);
+                window.draw(cx).clear(cx);
+                window.debug_a11y_tree_json()
+            })
+            .expect("the harness window is still open")
+            .expect("activation makes the debug tree available");
+        let tree: serde_json::Value = serde_json::from_str(&json).expect("the dump is valid JSON");
+        gpui::a11y_checks::assert_interactive_nodes_are_named(&tree, "alert modal");
+        gpui::a11y_checks::assert_names_are_distinguishable(&tree, "alert modal");
+        gpui::a11y_checks::assert_focusable_names_are_distinguishable(&tree, "alert modal");
+
+        // The bullets are the whole substance of the warning: what restricted
+        // mode actually prevents. A user is asked to trust a workspace on the
+        // strength of this list, so it has to be readable.
+        let mut bullets: Vec<&str> = tree["nodes"]
+            .as_object()
+            .expect("the dump lists nodes")
+            .values()
+            .filter(|node| node["aria"]["role"] == "ListItem")
+            .filter_map(|node| node["aria"]["label"].as_str())
+            .collect();
+        bullets.sort_unstable();
+        assert_eq!(
+            bullets,
+            vec![
+                "Language servers from running",
+                "MCP integrations from installing",
+                "Project settings from being applied",
+            ],
+            "a security decision cannot rest on a list the user cannot read"
+        );
+        gpui::a11y_checks::assert_clickable_elements_are_reachable(&tree, "alert modal");
+        gpui::a11y_checks::assert_click_targets_are_reachable(&tree, "alert modal");
+        gpui::a11y_checks::assert_controls_have_area(&tree, "alert modal");
+        gpui::a11y_checks::assert_landmarks_are_distinguishable(&tree, "alert modal");
+        gpui::a11y_checks::assert_active_descendant_is_honoured(&tree, "alert modal");
+        gpui::a11y_checks::assert_no_role_was_discarded(&tree, "alert modal");
+        gpui::a11y_checks::assert_no_aria_was_discarded(&tree, "alert modal");
+        gpui::a11y_checks::assert_roles_are_contained(&tree, "alert modal");
+
+        assert_eq!(
+            tree["frame"]["focus_without_node"].as_str(),
+            None,
+            "the modal carries a role now, so its focus must reach the tree"
+        );
+        let focused = tree["gpui_focus"]
+            .as_str()
+            .expect("the modal holds focus");
+        assert_eq!(
+            tree["nodes"][focused]["aria"]["label"].as_str(),
+            Some("Unrecognized Project"),
+            "the modal must be announced by its title"
+        );
     }
 }

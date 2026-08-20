@@ -17,7 +17,11 @@ pub struct ExtensionVersionSelector {
     picker: Entity<Picker<ExtensionVersionSelectorDelegate>>,
 }
 
-impl ModalView for ExtensionVersionSelector {}
+impl ModalView for ExtensionVersionSelector {
+    fn a11y_name(&self, _cx: &gpui::App) -> Option<gpui::SharedString> {
+        Some("Extension Versions".into())
+    }
+}
 
 impl EventEmitter<DismissEvent> for ExtensionVersionSelector {}
 
@@ -101,6 +105,12 @@ impl PickerDelegate for ExtensionVersionSelectorDelegate {
 
     fn match_count(&self) -> usize {
         self.matches.len()
+    }
+
+    // The row's visible text is a `HighlightedLabel`, which is not a node, so
+    // without this the picker offers a list of options with no names.
+    fn match_label(&self, ix: usize, _cx: &App) -> Option<SharedString> {
+        Some(self.matches.get(ix)?.string.clone().into())
     }
 
     fn selected_index(&self) -> usize {

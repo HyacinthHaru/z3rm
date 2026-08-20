@@ -152,6 +152,10 @@ impl RenderOnce for SettingsInputField {
 
             move |window, cx| {
                 let mut editor = Editor::single_line(window, cx);
+                // The element around this one carries `Role::TextInput`, its
+                // name and its text runs, so the editor must not report itself
+                // as a second input inside it.
+                editor.set_a11y_wrapped(true);
                 let editor_focus_handle = editor.focus_handle(cx);
                 if let Some(text) = initial_text {
                     editor.set_text(text, window, cx);

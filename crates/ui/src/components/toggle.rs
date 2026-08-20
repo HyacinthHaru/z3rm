@@ -49,6 +49,7 @@ pub struct Checkbox {
     filled: bool,
     visualization: bool,
     label: Option<SharedString>,
+    aria_label: Option<SharedString>,
     label_size: LabelSize,
     label_color: Color,
     tooltip: Option<Box<dyn Fn(&mut Window, &mut App) -> AnyView>>,
@@ -56,6 +57,14 @@ pub struct Checkbox {
 }
 
 impl Checkbox {
+    /// Sets the name announced for this checkbox, for the common case where
+    /// the visible label belongs to a neighbouring element rather than to the
+    /// checkbox itself.
+    pub fn aria_label(mut self, label: impl Into<SharedString>) -> Self {
+        self.aria_label = Some(label.into());
+        self
+    }
+
     /// Creates a new [`Checkbox`].
     pub fn new(id: impl Into<ElementId>, checked: ToggleState) -> Self {
         Self {
@@ -67,6 +76,7 @@ impl Checkbox {
             filled: false,
             visualization: false,
             label: None,
+            aria_label: None,
             label_size: LabelSize::Default,
             label_color: Color::Muted,
             tooltip: None,
@@ -219,6 +229,20 @@ impl RenderOnce for Checkbox {
         let checkbox = h_flex()
             .group(group_id.clone())
             .id(self.id.clone())
+            // Without a role this produces no accessibility node at all, so a
+            // checkbox is neither readable nor operable — and its checked state
+            // is the whole of what it says.
+            .role(Role::CheckBox)
+            .when_some(
+                self.aria_label.clone().or_else(|| self.label.clone()),
+                |this, label| this.aria_label(label),
+            )
+            .aria_toggled(match self.toggle_state {
+                ToggleState::Selected => Toggled::True,
+                ToggleState::Indeterminate => Toggled::Mixed,
+                ToggleState::Unselected => Toggled::False,
+            })
+            .aria_disabled(self.disabled)
             .size(size)
             .justify_center()
             .child(
@@ -487,6 +511,7 @@ impl RenderOnce for Switch {
                 ToggleState::Indeterminate => Toggled::Mixed,
                 ToggleState::Unselected => Toggled::False,
             })
+            .aria_disabled(self.disabled)
             .p(px(1.0))
             .border_2()
             .border_color(cx.theme().colors().border_transparent)
@@ -658,6 +683,7 @@ impl RenderOnce for SwitchField {
             .map(|(tooltip_fn, label)| {
                 h_flex().gap_0p5().child(Label::new(label)).child(
                     IconButton::new("tooltip_button", IconName::Info)
+                        .aria_label("More information")
                         .icon_size(IconSize::XSmall)
                         .icon_color(Color::Muted)
                         .shape(crate::IconButtonShape::Square)

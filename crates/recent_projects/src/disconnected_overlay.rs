@@ -9,6 +9,10 @@ use workspace::{
 
 use crate::open_remote_project;
 
+/// Shown as the heading and announced as the dialog's name, so the two cannot
+/// drift apart.
+const HEADLINE: &str = "Disconnected";
+
 enum Host {
     CollabGuestProject,
     RemoteServerProject(RemoteConnectionOptions, bool),
@@ -28,6 +32,10 @@ impl Focusable for DisconnectedOverlay {
     }
 }
 impl ModalView for DisconnectedOverlay {
+    fn a11y_name(&self, _cx: &gpui::App) -> Option<gpui::SharedString> {
+        Some(HEADLINE.into())
+    }
+
     fn on_before_dismiss(
         &mut self,
         _window: &mut Window,
@@ -180,8 +188,11 @@ impl Render for DisconnectedOverlay {
                 Modal::new("disconnected", None)
                     .header(
                         ModalHeader::new()
-                            .show_dismiss_button(true)
-                            .child(Headline::new("Disconnected").size(HeadlineSize::Small)),
+                            // Set as the headline rather than as a child so the
+                            // dialog can name itself with it; the rendering is
+                            // the same `Headline` either way.
+                            .headline(HEADLINE)
+                            .show_dismiss_button(true),
                     )
                     .section(Section::new().child(Label::new(message)))
                     .footer(

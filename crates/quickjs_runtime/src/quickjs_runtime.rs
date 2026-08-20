@@ -3049,11 +3049,15 @@ mod tests {
     #[test]
     fn confine_to_root_anchors_relative_paths_and_denies_escapes() -> Result<()> {
         let temp = tempfile::tempdir()?;
-        let home = temp.path().join("home");
+        // Canonicalized because `confine_to_root` canonicalizes, and on macOS
+        // the temp directory lives under `/var`, which is a symlink to
+        // `/private/var` — so the two sides would never compare equal.
+        let temp_root = temp.path().canonicalize()?;
+        let home = temp_root.join("home");
         std::fs::create_dir_all(home.join("docs"))?;
         std::fs::write(home.join("docs").join("note.txt"), "secret")?;
         // 兄弟目录: 组件级 starts_with 必须拒绝, 前缀字符串比较会误放行。
-        let sibling = temp.path().join("home-other");
+        let sibling = temp_root.join("home-other");
         std::fs::create_dir_all(&sibling)?;
 
         // 相对路径锚定到主目录。

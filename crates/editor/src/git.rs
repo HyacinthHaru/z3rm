@@ -1187,6 +1187,12 @@ impl Editor {
 
         h_flex()
             .id("diff_review_button")
+            // An icon and a tooltip, driven by `on_mouse_down` rather than
+            // `on_click` — which is also why the clickable-elements check does
+            // not see it. Without a role it is a control that exists for the
+            // mouse and for nothing else.
+            .role(gpui::Role::Button)
+            .aria_label("Add review comment")
             .cursor_pointer()
             .w(width - px(1.))
             .h(relative(0.9))
@@ -1481,6 +1487,7 @@ impl Editor {
                     let parent_editor = cx.entity().downgrade();
                     let inline_editor = cx.new(|cx| {
                         let mut editor = Editor::single_line(window, cx);
+                        editor.set_a11y_label("Review comment");
                         editor.set_text(&*comment_text, window, cx);
                         // Select all text for easy replacement
                         editor.select_all(&crate::actions::SelectAll, window, cx);
@@ -2567,6 +2574,7 @@ impl Editor {
                             .gap_1()
                             .child(
                                 IconButton::new("diff-review-close", IconName::Close)
+                                    .aria_label("Close review")
                                     .icon_color(ui::Color::Muted)
                                     .icon_size(action_icon_size)
                                     .tooltip(Tooltip::text("Close"))
@@ -2577,6 +2585,7 @@ impl Editor {
                             )
                             .child(
                                 IconButton::new("diff-review-add", IconName::Return)
+                                    .aria_label("Add comment")
                                     .icon_color(ui::Color::Muted)
                                     .icon_size(action_icon_size)
                                     .tooltip(Tooltip::text("Add comment"))
@@ -2614,6 +2623,13 @@ impl Editor {
         colors: &theme::ThemeColors,
     ) -> impl IntoElement {
         let comment_count = comments.len();
+        // The chevron is an icon and the count is a label, and neither is a
+        // node, so this header only reaches a reader through its own name.
+        let header_name = format!(
+            "{} Comment{}",
+            comment_count,
+            if comment_count == 1 { "" } else { "s" }
+        );
 
         v_flex()
             .w_full()
@@ -2622,6 +2638,9 @@ impl Editor {
             .child(
                 h_flex()
                     .id("review-comments-header")
+                    .role(gpui::Role::Button)
+                    .aria_label(header_name.clone())
+                    .aria_expanded(expanded)
                     .w_full()
                     .items_center()
                     .gap_1()
@@ -2646,13 +2665,9 @@ impl Editor {
                         .color(ui::Color::Muted),
                     )
                     .child(
-                        Label::new(format!(
-                            "{} Comment{}",
-                            comment_count,
-                            if comment_count == 1 { "" } else { "s" }
-                        ))
-                        .size(LabelSize::Small)
-                        .color(Color::Muted),
+                        Label::new(header_name)
+                            .size(LabelSize::Small)
+                            .color(Color::Muted),
                     ),
             )
             // Comments list (when expanded)
@@ -2737,6 +2752,7 @@ impl Editor {
                             format!("diff-review-cancel-edit-{comment_id}"),
                             IconName::Close,
                         )
+                        .aria_label("Cancel edit")
                         .icon_color(ui::Color::Muted)
                         .icon_size(action_icon_size)
                         .tooltip(Tooltip::text("Cancel"))
@@ -2754,6 +2770,7 @@ impl Editor {
                             format!("diff-review-confirm-edit-{comment_id}"),
                             IconName::Return,
                         )
+                        .aria_label("Confirm edit")
                         .icon_color(ui::Color::Muted)
                         .icon_size(action_icon_size)
                         .tooltip(Tooltip::text("Confirm"))
@@ -3071,6 +3088,7 @@ pub fn render_diff_hunk_controls(
             |el| {
                 el.child(
                     IconButton::new(("next-hunk", row as u64), IconName::ArrowDown)
+                        .aria_label("Next Hunk")
                         .shape(IconButtonShape::Square)
                         .icon_size(IconSize::Small)
                         // .disabled(!has_multiple_hunks)
@@ -3102,6 +3120,7 @@ pub fn render_diff_hunk_controls(
                 )
                 .child(
                     IconButton::new(("prev-hunk", row as u64), IconName::ArrowUp)
+                        .aria_label("Previous Hunk")
                         .shape(IconButtonShape::Square)
                         .icon_size(IconSize::Small)
                         // .disabled(!has_multiple_hunks)

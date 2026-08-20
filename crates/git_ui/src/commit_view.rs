@@ -640,6 +640,7 @@ impl CommitView {
                                                 )
                                                 .closed_icon(IconName::ExpandVertical)
                                                 .opened_icon(IconName::FoldVertical)
+                                                .aria_label(expand_tooltip)
                                                 .tooltip(Tooltip::text(expand_tooltip))
                                                 .on_click(cx.listener(|this, _, _, cx| {
                                                     this.message_expanded = !this.message_expanded;
@@ -742,7 +743,13 @@ impl CommitView {
                                         .overflow_y_scroll()
                                         .track_scroll(&self.message_scroll_handle)
                                 })
-                                .child(MarkdownElement::new(self.message.clone(), markdown_style)),
+                                .child(
+                                    MarkdownElement::new(self.message.clone(), markdown_style)
+                                        // The one region in this view a reader
+                                        // can enter that is not the diff, and
+                                        // it was announced as a bare group.
+                                        .aria_label("Commit message"),
+                                ),
                         )
                         .vertical_scrollbar_for(&self.message_scroll_handle, window, cx),
                 ),
@@ -1031,6 +1038,24 @@ impl Focusable for CommitView {
     }
 }
 
+/// How much of a commit subject a tab strip can hold.
+const SUBJECT_TAB_CHARS: usize = 20;
+
+/// A commit tab's text, cut to `subject_limit` characters or whole.
+///
+/// The drawn title and the announced one differ only in this, so they are one
+/// function: they were two copies of the same format string, and the reason
+/// they differ is a decision about the tab strip's width rather than about
+/// what a commit is called.
+fn commit_tab_text(sha: &str, message: &str, subject_limit: Option<usize>) -> SharedString {
+    let short_sha = sha.get(0..7).unwrap_or(sha);
+    let subject = message.split('\n').next().unwrap_or_default();
+    match subject_limit {
+        Some(limit) => format!("{short_sha} — {}", truncate_and_trailoff(subject, limit)).into(),
+        None => format!("{short_sha} — {subject}").into(),
+    }
+}
+
 impl Item for CommitView {
     type Event = EditorEvent;
 
@@ -1049,9 +1074,16 @@ impl Item for CommitView {
     }
 
     fn tab_content_text(&self, _detail: usize, _cx: &App) -> SharedString {
-        let short_sha = self.commit.sha.get(0..7).unwrap_or(&*self.commit.sha);
-        let subject = truncate_and_trailoff(self.commit.message.split('\n').next().unwrap(), 20);
-        format!("{short_sha} — {subject}").into()
+        commit_tab_text(&self.commit.sha, &self.commit.message, Some(SUBJECT_TAB_CHARS))
+    }
+
+    fn tab_announcement_text(&self, _detail: usize, _cx: &App) -> SharedString {
+        // Uncut. Twenty characters is a tab strip's budget, and a commit
+        // subject is written to be read from the start — "Fix a crash when
+        // the…" is most of the tabs in a git history and tells them apart from
+        // none of the others. A sighted user hovers for the tooltip that
+        // carries the whole of it; a reader has no hover.
+        commit_tab_text(&self.commit.sha, &self.commit.message, None)
     }
 
     fn tab_tooltip_content(&self, _: &App) -> Option<TabTooltipContent> {
@@ -1241,8 +1273,29 @@ impl Render for CommitView {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let is_stash = self.stash.is_some();
 
+        // Subject, author, date and sha are all labels in the header, and a
+        // label contributes no node, so opening a commit reached a reader as a
+        // diff with no idea whose commit it was.
+        let short_sha = self.commit.sha.get(0..7).unwrap_or(&self.commit.sha);
+        let subject = self.commit.message.split('\n').next().unwrap_or_default();
+        let announced = if is_stash {
+            format!("Stash {short_sha}, {subject}")
+        } else if self.commit.author_name.is_empty() {
+            // A commit with no author name would otherwise end in a dangling
+            // "by " with nothing after it.
+            format!("Commit {short_sha}, {subject}")
+        } else {
+            format!(
+                "Commit {short_sha}, {subject}, by {}",
+                self.commit.author_name
+            )
+        };
+
         v_flex()
             .key_context(if is_stash { "StashDiff" } else { "CommitDiff" })
+            .id("commit-view")
+            .role(gpui::Role::Group)
+            .aria_label(announced)
             .on_action(cx.listener(Self::open_file_at_head_action))
             .size_full()
             .bg(cx.theme().colors().editor_background)
@@ -1311,6 +1364,7 @@ impl Render for CommitViewToolbar {
             })
             .child(
                 IconButton::new("buffer-search", IconName::MagnifyingGlass)
+                        .aria_label("Buffer Search")
                     .icon_size(IconSize::Small)
                     .tooltip(move |_, cx| {
                         Tooltip::for_action(
@@ -1329,6 +1383,7 @@ impl Render for CommitViewToolbar {
             .when(!is_stash, |this| {
                 this.child(
                     IconButton::new("show-in-git-graph", IconName::GitGraph)
+                        .aria_label("Show in Git Graph")
                         .icon_size(IconSize::Small)
                         .tooltip(Tooltip::text("Show in Git Graph"))
                         .on_click(move |_, window, cx| {
@@ -1344,6 +1399,7 @@ impl Render for CommitViewToolbar {
                     let icon = crate::get_provider_icon(provider_name.as_str());
 
                     IconButton::new("view_on_provider", icon)
+                        .aria_label(format!("View on {provider_name}"))
                         .icon_size(IconSize::Small)
                         .tooltip(Tooltip::text(format!("View on {}", provider_name)))
                         .on_click(move |_, _, cx| cx.open_url(&url))
@@ -1382,4 +1438,177 @@ fn stash_matches_index(sha: &str, stash_index: usize, repo: &Repository) -> bool
         .get(stash_index)
         .map(|entry| entry.oid.to_string() == sha)
         .unwrap_or(false)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use fs::FakeFs;
+    use git::repository::CommitData;
+    use gpui::{TestAppContext, VisualTestContext};
+    use std::path::Path;
+    use project::Project;
+    use serde_json::json;
+    use smallvec::smallvec;
+    use util::path;
+    use workspace::MultiWorkspace;
+
+    /// A tab strip holds many titles at once and cuts each to twenty
+    /// characters; a reader is given one tab at a time, cannot see the others,
+    /// and has no hover for the tooltip that carries the rest. Commit subjects
+    /// are written to be read from the start, so the cut lands where they stop
+    /// telling each other apart.
+    #[test]
+    fn a_commit_tab_is_cut_for_the_strip_and_not_for_a_reader() {
+        const SHA: &str = "0909090909090909090909090909090909090909";
+        const MESSAGE: &str =
+            "Fix a crash when the mux server goes away mid-attach\n\nlonger body";
+
+        let drawn = commit_tab_text(SHA, MESSAGE, Some(SUBJECT_TAB_CHARS));
+        let announced = commit_tab_text(SHA, MESSAGE, None);
+
+        assert_eq!(drawn, "0909090 — Fix a crash when the…");
+        assert_eq!(
+            announced,
+            "0909090 — Fix a crash when the mux server goes away mid-attach",
+            "a reader is given the whole subject"
+        );
+
+        // The short SHA is not truncation in the same sense — an abbreviated
+        // SHA is how a commit is referred to — so it stays short in both.
+        assert!(announced.starts_with("0909090 — "));
+    }
+
+    /// A subject that fits is not decorated with an ellipsis, and the two
+    /// texts are then the same string.
+    #[test]
+    fn a_short_commit_subject_is_left_alone() {
+        const SHA: &str = "abcdef1234567890";
+        const MESSAGE: &str = "initial commit";
+        assert_eq!(
+            commit_tab_text(SHA, MESSAGE, Some(SUBJECT_TAB_CHARS)),
+            commit_tab_text(SHA, MESSAGE, None)
+        );
+    }
+
+    /// Subject, author, date and sha are labels in the header, and a label
+    /// contributes no node, so opening a commit reached a reader as a diff with
+    /// no idea whose commit it was.
+    #[gpui::test]
+    async fn the_commit_view_says_whose_commit_it_is(cx: &mut TestAppContext) {
+        zlog::init_test();
+        cx.update(|cx| {
+            let settings_store = settings::SettingsStore::test(cx);
+            cx.set_global(settings_store);
+            theme_settings::init(theme::LoadThemes::JustBase, cx);
+            editor::init(cx);
+            crate::init(cx);
+        });
+
+        let fs = FakeFs::new(cx.background_executor.clone());
+        fs.insert_tree(
+            path!("/project"),
+            json!({
+                ".git": {},
+                "file.txt": "content",
+            }),
+        )
+        .await;
+        let sha = git::Oid::from_bytes(&[9; 20]).unwrap();
+        fs.set_commit_data(
+            path!("/project/.git").as_ref(),
+            [(
+                CommitData {
+                    sha,
+                    parents: smallvec![],
+                    author_name: "Ada".into(),
+                    author_email: "ada@example.com".into(),
+                    commit_timestamp: 1,
+                    subject: "Name the commit view".into(),
+                    message: "Name the commit view\n\nlonger body".into(),
+                },
+                false,
+            )],
+        );
+
+        let project = Project::test(fs.clone(), [Path::new(path!("/project"))], cx).await;
+        cx.run_until_parked();
+        let repository = project.read_with(cx, |project, cx| {
+            project
+                .active_repository(cx)
+                .expect("should have a repository")
+        });
+
+        let window =
+            cx.add_window(|window, cx| MultiWorkspace::test_new(project.clone(), window, cx));
+        let workspace = window
+            .read_with(cx, |mw, _| mw.workspace().clone())
+            .unwrap();
+        let mut cx = VisualTestContext::from_window(window.into(), cx);
+
+        cx.update(|window, cx| {
+            CommitView::open(
+                sha.to_string(),
+                repository.downgrade(),
+                workspace.downgrade(),
+                None,
+                None,
+                window,
+                cx,
+            );
+        });
+        cx.run_until_parked();
+
+        cx.activate_a11y(cx.window_handle());
+        let json = cx
+            .update(|window, cx| {
+                window.draw(cx).clear(cx);
+                window.debug_a11y_tree_json()
+            })
+            .expect("activation makes the debug tree available");
+        let tree: serde_json::Value = serde_json::from_str(&json).expect("the dump is valid JSON");
+
+        gpui::a11y_checks::assert_interactive_nodes_are_named(&tree, "commit view");
+        gpui::a11y_checks::assert_no_role_was_discarded(&tree, "commit view");
+        gpui::a11y_checks::assert_no_aria_was_discarded(&tree, "commit view");
+        gpui::a11y_checks::assert_names_are_distinguishable(&tree, "commit view");
+        gpui::a11y_checks::assert_focusable_names_are_distinguishable(&tree, "commit view");
+        gpui::a11y_checks::assert_clickable_elements_are_reachable(&tree, "commit view");
+        gpui::a11y_checks::assert_roles_are_contained(&tree, "commit view");
+        gpui::a11y_checks::assert_click_targets_are_reachable(&tree, "commit view");
+        gpui::a11y_checks::assert_controls_have_area(&tree, "commit view");
+        gpui::a11y_checks::assert_landmarks_are_distinguishable(&tree, "commit view");
+        gpui::a11y_checks::assert_active_descendant_is_honoured(&tree, "commit view");
+
+        let names: Vec<&str> = tree["nodes"]
+            .as_object()
+            .expect("the dump lists nodes")
+            .values()
+            .filter_map(|node| node["aria"]["label"].as_str())
+            .collect();
+        // The fake backend answers `show` with its own commit details rather
+        // than the ones seeded above, so the subject is its stand-in — the
+        // point here is that the view names itself after the commit it opened
+        // rather than that the fixture round-trips.
+        assert!(
+            names
+                .iter()
+                .any(|name| name.starts_with("Commit 0909090") && name.len() > "Commit 0909090".len()),
+            "the view has to say which commit it is showing: {names:?}"
+        );
+        assert!(
+            !names.iter().any(|name| name.ends_with("by ")),
+            "a commit with no author must not trail off mid-sentence: {names:?}"
+        );
+
+        // The message is a markdown view, which is a focusable region whose
+        // content reaches the tree as text runs — so unnamed it announces as a
+        // bare group and the user is told they have arrived somewhere without
+        // being told where.
+        assert!(
+            names.contains(&"Commit message"),
+            "the message region has to say what it is: {names:?}"
+        );
+
+    }
 }

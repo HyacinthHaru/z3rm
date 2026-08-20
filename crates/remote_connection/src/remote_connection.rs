@@ -92,6 +92,17 @@ impl RemoteConnectionPrompt {
         self.is_password_prompt = !is_yes_no;
         self.is_masked = !is_yes_no;
         self.editor.set_masked(self.is_masked, window, cx);
+        // Focus moves straight to this field below, and the question is drawn
+        // beside it rather than being its name — so without this it announces
+        // as an unnamed box, with nothing to say whether it wants a password
+        // or a yes-or-no answer about an unrecognised host. Named rather than
+        // given a placeholder, which would put grey text in the field for
+        // everyone to fix something only a reader suffers from.
+        self.editor
+            .set_a11y_label(if is_yes_no { "Answer" } else { "Password" }, cx);
+        // The prompt names the host or key being authenticated against and is
+        // the only place it appears, matching what the git askpass modal does.
+        self.editor.set_a11y_description(&prompt, cx);
 
         let markdown = cx.new(|cx| Markdown::new_text(prompt.into(), cx));
         self.prompt = Some((markdown, tx));
@@ -165,6 +176,7 @@ impl Render for RemoteConnectionPrompt {
                                 .when(is_password_prompt, |this| {
                                     this.child(
                                         IconButton::new("toggle_mask", masked_password_icon)
+                                            .aria_label(masked_password_tooltip)
                                             .icon_size(IconSize::Small)
                                             .tooltip(Tooltip::text(masked_password_tooltip))
                                             .on_click(cx.listener(|this, _, window, cx| {
@@ -178,48 +190,64 @@ impl Render for RemoteConnectionPrompt {
                         )
                         .child(div().flex_1().child(self.editor.render(window, cx))),
                 )
-                .when(window.capslock().on, |this| {
-                    this.child(
-                        h_flex()
-                            .py_0p5()
-                            .min_w_0()
-                            .w_full()
-                            .gap_1()
-                            .child(
-                                Icon::new(IconName::Warning)
-                                    .size(IconSize::Small)
-                                    .color(Color::Muted),
-                            )
-                            .child(
-                                Label::new("Caps lock is on.")
-                                    .size(LabelSize::Small)
-                                    .color(Color::Muted),
-                            ),
-                    )
-                })
-            })
-            .when_some(self.status_message.clone(), |this, status_message| {
-                this.child(
+                // Rendered whether or not caps lock is on: a live region that
+                // appears together with its message has nothing to compare
+                // against, so the warning would be announced to nobody — and a
+                // rejected password with no explanation is exactly what this
+                // warning exists to prevent.
+                .child(
                     h_flex()
+                        .id("remote-connection-capslock")
+                        .role(gpui::Role::Status)
+                        .aria_live(gpui::accesskit::Live::Polite)
+                        .py_0p5()
                         .min_w_0()
                         .w_full()
-                        .mt_1()
                         .gap_1()
-                        .child(
-                            Icon::new(IconName::LoadCircle)
-                                .size(IconSize::Small)
-                                .color(Color::Muted)
-                                .with_rotate_animation(2),
-                        )
-                        .child(
-                            Label::new(format!("{}…", status_message))
-                                .size(LabelSize::Small)
-                                .color(Color::Muted)
-                                .truncate()
-                                .flex_1(),
-                        ),
+                        .when(window.capslock().on, |this| {
+                            this.aria_announcement("Caps lock is on.")
+                                .child(
+                                    Icon::new(IconName::Warning)
+                                        .size(IconSize::Small)
+                                        .color(Color::Muted),
+                                )
+                                .child(
+                                    Label::new("Caps lock is on.")
+                                        .size(LabelSize::Small)
+                                        .color(Color::Muted),
+                                )
+                        }),
                 )
             })
+            // Also unconditional, for the same reason. The spinner beside it
+            // says "still going" only to people who can see it, so the status
+            // is the only thing that reports progress at all.
+            .child(
+                h_flex()
+                    .id("remote-connection-status")
+                    .role(gpui::Role::Status)
+                    .aria_live(gpui::accesskit::Live::Polite)
+                    .min_w_0()
+                    .w_full()
+                    .mt_1()
+                    .gap_1()
+                    .when_some(self.status_message.clone(), |this, status_message| {
+                        this.aria_announcement(SharedString::from(format!("{status_message}…")))
+                            .child(
+                                Icon::new(IconName::LoadCircle)
+                                    .size(IconSize::Small)
+                                    .color(Color::Muted)
+                                    .with_rotate_animation(2),
+                            )
+                            .child(
+                                Label::new(format!("{}…", status_message))
+                                    .size(LabelSize::Small)
+                                    .color(Color::Muted)
+                                    .truncate()
+                                    .flex_1(),
+                            )
+                    }),
+            )
     }
 }
 
@@ -241,14 +269,16 @@ impl RemoteConnectionModal {
                 (options.distro_name.clone(), None, true, false)
             }
             RemoteConnectionOptions::Docker(options) => (options.name.clone(), None, false, true),
-            // §8.1 Mock variant 仅在 remote crate 的 test-support feature 启用时存在。
-            // remote_connection 自己的 cfg(test) 与 remote 的 feature 启用不同步,
-            // 所以用 unconditional wildcard 兜底,Mock 走默认路径 (空 connection_string)。
-            #[cfg(any(test, feature = "test-support"))]
+            // The `Mock` variant exists only when the `remote` crate is built
+            // with its `test-support` feature. Gating on this crate's own `test`
+            // cfg does not imply that — `cargo test -p remote_connection` sets
+            // `test` here while `remote` is still built without it — so the arm
+            // is gated on the feature that actually pulls the variant in.
+            #[cfg(feature = "test-support")]
             RemoteConnectionOptions::Mock(options) => {
                 (format!("mock-{}", options.id), None, false, false)
             }
-            #[cfg(not(any(test, feature = "test-support")))]
+            #[cfg(not(feature = "test-support"))]
             _ => (String::new(), None, false, false),
         };
         Self {
@@ -418,6 +448,10 @@ impl Focusable for RemoteConnectionModal {
 impl EventEmitter<DismissEvent> for RemoteConnectionModal {}
 
 impl ModalView for RemoteConnectionModal {
+    fn a11y_name(&self, _cx: &gpui::App) -> Option<gpui::SharedString> {
+        Some("Remote Connection".into())
+    }
+
     fn on_before_dismiss(
         &mut self,
         _window: &mut Window,
@@ -731,3 +765,156 @@ pub fn connect(
 }
 
 use anyhow::Context as _;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use gpui::TestAppContext;
+
+    /// Connecting to a host reports progress with a spinner and a line of
+    /// text, and both were invisible: the spinner is an icon and the line is a
+    /// label, neither of which contributes an accessibility node. The caps lock
+    /// warning had the same problem, which is worse — it exists precisely to
+    /// explain a password that is about to be rejected.
+    #[gpui::test]
+    fn the_connection_status_is_announced(cx: &mut TestAppContext) {
+        cx.update(|cx| {
+            let settings_store = settings::SettingsStore::test(cx);
+            cx.set_global(settings_store);
+            theme_settings::init(theme::LoadThemes::JustBase, cx);
+            editor::init(cx);
+        });
+
+        let window = cx.add_window(|window, cx| {
+            RemoteConnectionPrompt::new("host.example".to_string(), None, false, false, window, cx)
+        });
+        cx.activate_a11y(window.into());
+
+        let read = |cx: &mut TestAppContext| {
+            let json = cx
+                .update_window(window.into(), |_, window, cx| {
+                    window.draw(cx).clear(cx);
+                    window.debug_a11y_tree_json()
+                })
+                .expect("the prompt window is still open")
+                .expect("activation makes the debug tree available");
+            let tree: serde_json::Value =
+                serde_json::from_str(&json).expect("the dump is valid JSON");
+            gpui::a11y_checks::assert_interactive_nodes_are_named(&tree, "remote connection");
+            gpui::a11y_checks::assert_no_role_was_discarded(&tree, "remote connection");
+            gpui::a11y_checks::assert_no_aria_was_discarded(&tree, "remote connection");
+            gpui::a11y_checks::assert_roles_are_contained(&tree, "remote connection");
+            gpui::a11y_checks::assert_focus_reached_the_tree(&tree, "remote connection");
+            gpui::a11y_checks::assert_click_targets_are_reachable(&tree, "remote connection");
+            gpui::a11y_checks::assert_landmarks_are_distinguishable(&tree, "remote connection");
+            gpui::a11y_checks::assert_names_are_distinguishable(&tree, "remote connection");
+            gpui::a11y_checks::assert_focusable_names_are_distinguishable(&tree, "remote connection");
+            gpui::a11y_checks::assert_clickable_elements_are_reachable(&tree, "remote connection");
+            gpui::a11y_checks::assert_controls_have_area(&tree, "remote connection");
+            gpui::a11y_checks::assert_active_descendant_is_honoured(&tree, "remote connection");
+            gpui::a11y_checks::assert_live_regions_can_speak(&tree, "remote connection");
+            // The value, not the label: macOS speaks `node.value()` and raises
+            // no announcement at all without one.
+            tree["nodes"]
+                .as_object()
+                .expect("the dump lists nodes")
+                .values()
+                .filter(|node| node["aria"]["live"] == "Polite")
+                .map(|node| {
+                    (
+                        node["element_id"].as_str().unwrap_or_default().to_string(),
+                        node["aria"]["value"]
+                            .as_str()
+                            .unwrap_or_default()
+                            .to_string(),
+                    )
+                })
+                .collect::<Vec<_>>()
+        };
+
+        // Before there is anything to say: the regions have to be there
+        // already, or the change that follows has nothing to diff against.
+        let quiet = read(cx);
+        assert!(
+            quiet
+                .iter()
+                .any(|(id, label)| id.contains("remote-connection-status") && label.is_empty()),
+            "the status region has to exist before it has a status: {quiet:?}"
+        );
+
+        window
+            .update(cx, |prompt, _, cx| {
+                prompt.set_status(Some("Connecting".to_string()), cx);
+            })
+            .expect("the prompt window is still open");
+
+        let connecting = read(cx);
+        assert!(
+            connecting
+                .iter()
+                .any(|(id, label)| id.contains("remote-connection-status")
+                    && label == "Connecting…"),
+            "the status has to be announced once there is one: {connecting:?}"
+        );
+    }
+
+    /// The field that collects an SSH password. Focus jumps straight to it and
+    /// the question is drawn beside it rather than in it, so on its own it is
+    /// an unnamed box — with nothing to distinguish "type your password" from
+    /// "decide whether you trust this host key".
+    #[gpui::test]
+    fn the_password_field_says_what_it_is_asking_for(cx: &mut TestAppContext) {
+        cx.update(|cx| {
+            let settings_store = settings::SettingsStore::test(cx);
+            cx.set_global(settings_store);
+            theme_settings::init(theme::LoadThemes::JustBase, cx);
+            editor::init(cx);
+        });
+
+        let window = cx.add_window(|window, cx| {
+            RemoteConnectionPrompt::new("host.example".to_string(), None, false, false, window, cx)
+        });
+        cx.activate_a11y(window.into());
+
+        let (tx, _rx) = oneshot::channel();
+        window
+            .update(cx, |prompt, window, cx| {
+                prompt.set_prompt(
+                    "host.example's password:".to_string(),
+                    tx,
+                    window,
+                    cx,
+                );
+            })
+            .expect("the prompt window is still open");
+
+        let json = cx
+            .update_window(window.into(), |_, window, cx| {
+                window.draw(cx).clear(cx);
+                window.debug_a11y_tree_json()
+            })
+            .expect("the prompt window is still open")
+            .expect("activation makes the debug tree available");
+        let tree: serde_json::Value = serde_json::from_str(&json).expect("the dump is valid JSON");
+        gpui::a11y_checks::assert_interactive_nodes_are_named(&tree, "password prompt");
+
+        let field = tree["nodes"]
+            .as_object()
+            .expect("the dump lists nodes")
+            .values()
+            .find(|node| node["aria"]["role"] == "PasswordInput")
+            .unwrap_or_else(|| {
+                panic!("a masked field has to report itself as one: {json}")
+            });
+        assert_eq!(
+            field["aria"]["label"].as_str(),
+            Some("Password"),
+            "the field has to say what it wants"
+        );
+        assert_eq!(
+            field["aria"]["description"].as_str(),
+            Some("host.example's password:"),
+            "and which host is asking, since that is drawn beside it and nowhere else"
+        );
+    }
+}

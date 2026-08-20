@@ -479,6 +479,9 @@ fn init_renderers(cx: &mut App) {
                     Button::new("open-in-settings-file", "Edit in settings.json")
                         .style(ButtonStyle::Outlined)
                         .size(ButtonSize::Medium)
+                        // One per setting that has no inline control, so the
+                        // shared label repeats down the page.
+                        .aria_label(format!("Edit in settings.json: {}", item.title))
                         .tab_index(0_isize)
                         .tooltip(Tooltip::for_action_title_in(
                             "Edit in settings.json",
@@ -988,6 +991,7 @@ impl SettingsPageItem {
                         Button::new("error-warning", warning)
                             .style(ButtonStyle::Outlined)
                             .size(ButtonSize::Medium)
+                            .aria_label(format!("{warning}: {}", setting_item.title))
                             .start_icon(Icon::new(IconName::Debug).color(Color::Error))
                             .tab_index(0_isize)
                             .tooltip(Tooltip::text(setting_item.field.type_name()))
@@ -1091,6 +1095,7 @@ impl SettingsPageItem {
                             }),
                         )
                         .child(render_settings_item_link(
+                            sub_page_link.title.clone(),
                             sub_page_link.title.clone(),
                             sub_page_link.json_path,
                             false,
@@ -1276,6 +1281,7 @@ fn render_settings_item_layout(
         .when(settings_window.sub_page_stack.is_empty(), |this| {
             this.child(render_settings_item_link(
                 description,
+                SharedString::new_static(title),
                 json_path,
                 sub_field,
                 settings_window,
@@ -1316,6 +1322,15 @@ fn render_settings_item(
                         "{}-organization-configuration-warning",
                         setting_item.title
                     ))
+                    // A warning icon and a tooltip, neither of which is a node:
+                    // a setting the user cannot change read exactly like one
+                    // they can, so the only way to find out was to change it
+                    // and watch it not stick.
+                    .role(gpui::Role::Status)
+                    .aria_label(format!(
+                        "{}: overridden by your organization",
+                        setting_item.title
+                    ))
                     .child(
                         Icon::new(IconName::Warning)
                             .size(IconSize::Small)
@@ -1351,6 +1366,7 @@ fn render_settings_item(
 
 fn render_settings_item_link(
     id: impl Into<ElementId>,
+    setting_name: SharedString,
     json_path: Option<&'static str>,
     sub_field: bool,
     settings_window: &SettingsWindow,
@@ -1382,7 +1398,9 @@ fn render_settings_item_link(
                 .icon_color(link_icon_color)
                 .icon_size(IconSize::Small)
                 .shape(IconButtonShape::Square)
-                .aria_label("Copy Link")
+                // One of these sits on every row of the page, so the bare
+                // verb repeats as many times as there are settings.
+                .aria_label(format!("Copy Link: {setting_name}"))
                 .tooltip(Tooltip::text("Copy Link"))
                 .when_some(json_path, |this, path| {
                     this.on_click(cx.listener(move |this, _, _, cx| {
@@ -1606,6 +1624,10 @@ impl SettingsWindow {
         let search_bar = cx.new(|cx| {
             let mut editor = Editor::single_line(window, cx);
             editor.set_placeholder_text("Search settings…", window, cx);
+            // `render_search` wraps this in a `SearchInput` that carries the
+            // name and the text runs, so the editor reporting itself as an
+            // input too would put two of them where the user sees one.
+            editor.set_a11y_wrapped(true);
             editor
         });
         cx.subscribe(&search_bar, |this, _, event: &EditorEvent, cx| {
@@ -3289,6 +3311,12 @@ impl SettingsWindow {
         let search_query = self.search_bar.read(cx).text(cx);
 
         v_flex()
+            // Both lines are `Label`s and contribute no node, so a search that
+            // matched nothing said nothing — and the query it did not match is
+            // the part that tells the user what to change.
+            .id("settings-no-results")
+            .role(gpui::Role::Group)
+            .aria_label(format!("No settings match \"{search_query}\""))
             .size_full()
             .items_center()
             .justify_center()
@@ -3509,6 +3537,7 @@ impl SettingsWindow {
                         .gap_1()
                         .child(
                             IconButton::new("back-btn", IconName::ArrowLeft)
+                                .aria_label("Back")
                                 .icon_size(IconSize::Small)
                                 .shape(IconButtonShape::Square)
                                 .on_click(cx.listener(|this, _, window, cx| {
@@ -3564,7 +3593,7 @@ impl SettingsWindow {
                 if shown_errors.insert(error.clone()) {
                     telemetry::event!("Settings Error Shown", label = label, error = &error);
                 }
-                Banner::new()
+                Banner::new(format!("{label}. {error}"))
                     .severity(Severity::Warning)
                     .child(
                         v_flex()
@@ -3636,7 +3665,10 @@ impl SettingsWindow {
 
             if is_restricted {
                 let original_window = self.original_window;
-                restricted_banner = Banner::new()
+                restricted_banner = Banner::new(
+                    "Restricted Mode. This project is in restricted mode. \
+                     Some project settings may not apply.",
+                )
                     .severity(Severity::Warning)
                     .child(
                         v_flex()
@@ -3679,8 +3711,21 @@ impl SettingsWindow {
             }
         }
 
+        // `push_sub_page` and `pop_sub_page` both move focus here, so this is
+        // the element a reader arrives at when it enters or leaves a settings
+        // page — and it had an id and no role, which builds no node, so what
+        // was announced was the window. Named after the page being shown, so
+        // the arrival says which one.
+        let region_name = match self.sub_page_stack.last() {
+            Some(sub_page) => {
+                SharedString::from(format!("Settings: {}", sub_page.link.title))
+            }
+            None => SharedString::from(format!("Settings: {}", self.current_page().title)),
+        };
         v_flex()
             .id("settings-ui-page")
+            .role(Role::Group)
+            .aria_label(region_name)
             .on_action(cx.listener(|this, _: &menu::SelectNext, window, cx| {
                 if !this.sub_page_stack.is_empty() {
                     // Keep Tab navigation within the sub-page content. Global
@@ -4049,6 +4094,11 @@ impl Render for SettingsWindow {
                 .child(
                     div()
                         .id("settings-window")
+                        // This element takes focus when the window opens, and a
+                        // focused element with no role produces no node, so the
+                        // whole window was announced instead of the settings.
+                        .role(gpui::Role::Group)
+                        .aria_label("Settings")
                         .key_context("SettingsWindow")
                         .track_focus(&self.focus_handle)
                         .on_action(cx.listener(|this, _: &OpenCurrentFile, window, cx| {
@@ -4890,6 +4940,10 @@ pub mod test {
         theme_settings::init(theme::LoadThemes::JustBase, cx);
         editor::init(cx);
         menu::init();
+        // Without the renderers every field falls back to a "NO RENDERER"
+        // placeholder, so a test that walks the window would be walking
+        // warning text rather than the controls it means to check.
+        init_renderers(cx);
         //         language_model::init(cx);
     }
 
@@ -5189,6 +5243,119 @@ pub mod test {
         > Appearance & Behavior
         "
     );
+
+    /// The settings window is full of controls whose semantics were written but
+    /// never read back out of a frame. A role only becomes a node when its
+    /// element also has an id, so a role set on an id-less element is discarded
+    /// with no node, no warning, and no difference in the code that asked.
+    #[gpui::test]
+    fn the_settings_window_exposes_named_controls(cx: &mut gpui::TestAppContext) {
+        let (_settings_window, cx) = cx.add_window_view(|window, cx| {
+            register_settings(cx);
+            SettingsWindow::new(None, window, cx)
+        });
+        cx.run_until_parked();
+
+        cx.activate_a11y(cx.window_handle());
+        // Focused before the dump so the focus check is not vacuous: with
+        // nothing focused it passes on any tree at all.
+        let json = cx
+            .update(|window, cx| {
+                let handle = _settings_window.read(cx).focus_handle.clone();
+                window.focus(&handle, cx);
+                window.draw(cx).clear(cx);
+                window.debug_a11y_tree_json()
+            })
+            .expect("activation makes the debug tree available");
+        let tree: serde_json::Value = serde_json::from_str(&json).expect("the dump is valid JSON");
+        let nodes = tree["nodes"].as_object().expect("the dump lists nodes");
+
+        gpui::a11y_checks::assert_interactive_nodes_are_named(&tree, "settings window");
+        gpui::a11y_checks::assert_no_role_was_discarded(&tree, "settings window");
+        gpui::a11y_checks::assert_no_aria_was_discarded(&tree, "settings window");
+        gpui::a11y_checks::assert_roles_are_contained(&tree, "settings window");
+        gpui::a11y_checks::assert_click_targets_are_reachable(&tree, "settings window");
+        gpui::a11y_checks::assert_focus_reached_the_tree(&tree, "settings window");
+        // A page is a column of near-identical rows, so this is the window most
+        // likely to offer the same name several times over.
+        gpui::a11y_checks::assert_names_are_distinguishable(&tree, "settings window");
+        gpui::a11y_checks::assert_focusable_names_are_distinguishable(&tree, "settings window");
+
+        // One visible search box is one input. The wrapper carries the role,
+        // the name and the text runs; the editor inside it used to report
+        // itself as a second input at the same place on screen.
+        let inputs = nodes
+            .values()
+            .filter(|node| {
+                matches!(
+                    node["aria"]["role"].as_str(),
+                    Some("TextInput") | Some("SearchInput")
+                )
+            })
+            .count();
+        assert_eq!(
+            inputs, 1,
+            "the settings window shows one text box, so it has to report one: {json}"
+        );
+        gpui::a11y_checks::assert_clickable_elements_are_reachable(&tree, "settings window");
+        gpui::a11y_checks::assert_controls_have_area(&tree, "settings window");
+        gpui::a11y_checks::assert_landmarks_are_distinguishable(&tree, "settings window");
+        gpui::a11y_checks::assert_active_descendant_is_honoured(&tree, "settings window");
+
+        // Opening or closing a settings sub-page focuses the content region
+        // rather than any control inside it, so that element is what a reader
+        // arrives at. It is a different focus target from the one checked
+        // above, and nothing else exercises it.
+        let content = cx
+            .update(|window, cx| {
+                let handle = _settings_window
+                    .read(cx)
+                    .content_focus_handle
+                    .focus_handle(cx);
+                window.focus(&handle, cx);
+                window.draw(cx).clear(cx);
+                window.debug_a11y_tree_json()
+            })
+            .expect("activation makes the debug tree available");
+        let content_tree: serde_json::Value =
+            serde_json::from_str(&content).expect("the dump is valid JSON");
+        gpui::a11y_checks::assert_focus_reached_the_tree(&content_tree, "settings content");
+        assert_eq!(
+            content_tree["frame"]["focus_without_node"].as_str(),
+            None,
+            "arriving at a settings page must not announce the window: {content}"
+        );
+        let focused = content_tree["gpui_focus"]
+            .as_str()
+            .unwrap_or_else(|| panic!("the content region holds focus: {content}"));
+        assert_eq!(
+            content_tree["nodes"][focused]["aria"]["label"].as_str(),
+            Some("Settings: General"),
+            "and it has to say which page was arrived at"
+        );
+
+        // Every tab stop, not just the two focus targets checked above: a
+        // keyboard user reaches all of them and a focus assertion only ever
+        // judges the one the test aimed at.
+        let handle = cx.window_handle();
+        gpui::a11y_checks::assert_every_tab_stop_reaches_the_tree(cx, handle, "settings window");
+
+
+        // Guards against the whole check passing because nothing rendered.
+        let interactive = nodes
+            .values()
+            .filter(|node| {
+                node["aria"]["role"].as_str().is_some_and(|role| {
+                    gpui::a11y_checks::ROLES_NEEDING_A_NAME.contains(&role)
+                })
+            })
+            .count();
+        assert!(
+            interactive > 10,
+            "the settings window rendered almost no controls, so this check \
+             would pass on an empty window: {json}"
+        );
+    }
 
     #[gpui::test]
     fn navbar_double_click_toggle(cx: &mut gpui::TestAppContext) {

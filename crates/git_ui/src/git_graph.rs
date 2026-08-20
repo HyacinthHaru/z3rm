@@ -119,7 +119,11 @@ impl CommitTagPicker {
 }
 
 impl EventEmitter<DismissEvent> for CommitTagPicker {}
-impl ModalView for CommitTagPicker {}
+impl ModalView for CommitTagPicker {
+    fn a11y_name(&self, _cx: &gpui::App) -> Option<gpui::SharedString> {
+        Some("Commit Tags".into())
+    }
+}
 
 impl Focusable for CommitTagPicker {
     fn focus_handle(&self, cx: &App) -> FocusHandle {
@@ -148,6 +152,12 @@ impl PickerDelegate for CommitTagPickerDelegate {
 
     fn placeholder_text(&self, _window: &mut Window, _cx: &mut App) -> Arc<str> {
         "Copy Tag".into()
+    }
+
+    /// Rows are announced by the tag they name. Without this every tag in the
+    /// list is a bare "option".
+    fn match_label(&self, ix: usize, _cx: &App) -> Option<SharedString> {
+        self.tag_names.get(ix).cloned()
     }
 
     fn match_count(&self) -> usize {
@@ -1703,6 +1713,37 @@ impl GitGraph {
         self.context_menu.is_some()
     }
 
+    /// What a row says about itself. Every cell holds a label, and a label
+    /// contributes no accessibility node, so this is the only thing a reader
+    /// has to go on when moving through the history.
+    fn row_announcement(&self, index: usize, cx: &App) -> Option<SharedString> {
+        let commit = self.graph_data.commits.get(index)?;
+        let short_sha = commit.data.sha.display_short();
+        let data = self
+            .get_repository(cx)
+            .and_then(|repository| repository.read(cx).cached_commit_data(&commit.data.sha).cloned());
+        let Some(CommitDataState::Loaded(data)) = data else {
+            // The same wording the cell shows while the fetch is in flight.
+            return Some(format!("Loading…, {short_sha}").into());
+        };
+        // Branch and tag names are drawn as chips beside the subject, and a
+        // chip is a label, so they only reach a reader through the row's name.
+        let refs = if commit.data.ref_names.is_empty() {
+            String::new()
+        } else {
+            format!(", {}", commit.data.ref_names.join(", "))
+        };
+        Some(
+            format!(
+                "{}, {}, {}, {short_sha}{refs}",
+                data.subject,
+                data.author_name,
+                format_timestamp(data.commit_timestamp)
+            )
+            .into(),
+        )
+    }
+
     /// Checks whether a ref name from git's `%D` decoration
     ///  format refers to the currently checked-out branch.
     fn is_head_ref(ref_name: &str, head_branch_name: &Option<SharedString>) -> bool {
@@ -2776,6 +2817,7 @@ impl GitGraph {
                     .child({
                         let focus_handle = self.focus_handle.clone();
                         IconButton::new("git-graph-search-prev", IconName::ChevronLeft)
+                            .aria_label("Select Previous Match")
                             .shape(ui::IconButtonShape::Square)
                             .icon_size(IconSize::Small)
                             .tooltip(move |_, cx| {
@@ -2799,6 +2841,7 @@ impl GitGraph {
                     .child({
                         let focus_handle = self.focus_handle.clone();
                         IconButton::new("git-graph-search-next", IconName::ChevronRight)
+                            .aria_label("Select Next Match")
                             .shape(ui::IconButtonShape::Square)
                             .icon_size(IconSize::Small)
                             .tooltip(move |_, cx| {
@@ -2843,10 +2886,16 @@ impl GitGraph {
                                 ),
                                 |this| {
                                     this.child(
-                                        Icon::new(IconName::ArrowCircle)
-                                            .color(Color::Accent)
-                                            .size(IconSize::Small)
-                                            .with_rotate_animation(2)
+                                        div()
+                                            .id("commit-search-running")
+                                            .role(gpui::Role::Status)
+                                            .aria_label("Searching commits")
+                                            .child(
+                                                Icon::new(IconName::ArrowCircle)
+                                                    .color(Color::Accent)
+                                                    .size(IconSize::Small)
+                                                    .with_rotate_animation(2),
+                                            )
                                             .into_any_element(),
                                     )
                                 },
@@ -2857,10 +2906,19 @@ impl GitGraph {
 
     fn render_loading_spinner(&self, cx: &App) -> AnyElement {
         let rems = TextSize::Large.rems(cx);
-        Icon::new(IconName::LoadCircle)
-            .size(IconSize::Custom(rems))
-            .color(Color::Accent)
-            .with_rotate_animation(3)
+        // The spinner is an icon, which is not a node: without this the panel
+        // is an empty region while it loads and reads as having nothing in it
+        // rather than as not being ready.
+        div()
+            .id("commit-details-loading")
+            .role(gpui::Role::Status)
+            .aria_label("Loading commit details")
+            .child(
+                Icon::new(IconName::LoadCircle)
+                    .size(IconSize::Custom(rems))
+                    .color(Color::Accent)
+                    .with_rotate_animation(3),
+            )
             .into_any_element()
     }
 
@@ -2985,6 +3043,11 @@ impl GitGraph {
 
         let is_tree_view = self.changed_files_view_mode.is_tree();
         let view_toggle = IconButton::new("toggle-changed-files-view", IconName::ListTree)
+            .aria_label(if is_tree_view {
+                "Show Flat View"
+            } else {
+                "Show Tree View"
+            })
             .icon_size(IconSize::Small)
             .toggle_state(self.changed_files_view_mode.is_tree())
             .tooltip({
@@ -3018,6 +3081,7 @@ impl GitGraph {
                     .child(
                         div().absolute().top_2().right_2().child(
                             IconButton::new("close-detail", IconName::Close)
+                                .aria_label("Close commit details")
                                 .icon_size(IconSize::Small)
                                 .on_click(cx.listener(move |this, _, _, cx| {
                                     this.selected_entry_idx = None;
@@ -3075,6 +3139,9 @@ impl GitGraph {
 
                                 this.child(
                                     Button::new("author-email-copy", author_email.clone())
+                                        // The address alone never says that
+                                        // pressing it copies anything.
+                                        .aria_label(format!("Copy email {author_email}"))
                                         .start_icon(
                                             Icon::new(icon).size(IconSize::Small).color(icon_color),
                                         )
@@ -3122,6 +3189,14 @@ impl GitGraph {
                                 };
 
                                 Button::new("sha-button", &full_sha)
+                                    // The visible label is the whole hash,
+                                    // truncated on screen. As a name it is read
+                                    // out digit by digit — forty of them — and
+                                    // never says what pressing it does.
+                                    .aria_label(format!(
+                                        "Copy commit SHA {}",
+                                        full_sha.chars().take(7).collect::<String>()
+                                    ))
                                     .start_icon(
                                         Icon::new(icon).size(IconSize::Small).color(icon_color),
                                     )
@@ -3812,6 +3887,7 @@ impl GitGraph {
             .child(
                 div()
                     .id("commit-view-split-resize-handle")
+                    .pointer_gesture_only()
                     .absolute()
                     .left(px(-RESIZE_HANDLE_WIDTH / 2.0))
                     .w(px(RESIZE_HANDLE_WIDTH))
@@ -4037,6 +4113,16 @@ impl Render for GitGraph {
 
                             let graph_canvas = div()
                                 .id("graph-canvas")
+                                // Painted rather than built from elements, so
+                                // nothing inside it becomes a node. It sits
+                                // inside the focusable region already named
+                                // "Commit graph", so a second node borrowing
+                                // that name would describe two places where
+                                // there is one; the click that selects a commit
+                                // from the picture is a pointer gesture, and
+                                // the table beside it is the path that works
+                                // from the keyboard.
+                                .pointer_gesture_only()
                                 .size_full()
                                 .overflow_hidden()
                                 .cursor_pointer()
@@ -4060,6 +4146,7 @@ impl Render for GitGraph {
                                 }));
 
                             let commits_table = Table::new(4)
+                                .aria_label("Commits")
                                 .interactable(&self.table_interaction_state)
                                 .hide_row_borders()
                                 .hide_row_hover()
@@ -4084,7 +4171,25 @@ impl Render for GitGraph {
                                         cx.theme().colors().element_hover
                                     };
 
+                                    let announced = weak
+                                        .read_with(cx, |this, cx| this.row_announcement(index, cx))
+                                        .ok()
+                                        .flatten();
+
                                     row.h(row_height)
+                                        .role(gpui::Role::Row)
+                                        .aria_row_index(index + 1)
+                                        .aria_selected(is_selected)
+                                        // Focus stays on the graph while the
+                                        // arrow keys move the highlight, so the
+                                        // current commit is only announced if
+                                        // it is claimed as current too.
+                                        .when(is_selected, |this| {
+                                            this.aria_active_descendant()
+                                        })
+                                        .when_some(announced, |row, announced| {
+                                            row.aria_label(announced)
+                                        })
                                         .cursor_pointer()
                                         .when(is_selected || is_context_menu_target, |row| {
                                             row.bg(selected_bg)
@@ -4217,6 +4322,11 @@ impl Render for GitGraph {
 
         div()
             .key_context("GitGraph")
+            // A focused element with no id and no role produces no node, so
+            // opening the graph announced the whole window instead of it.
+            .id("git-graph")
+            .role(gpui::Role::Group)
+            .aria_label("Commit graph")
             .track_focus(&self.focus_handle)
             .size_full()
             .bg(cx.theme().colors().editor_background)
@@ -6689,6 +6799,230 @@ mod tests {
                 computed_row_height, measured_item_height,
             );
         });
+    }
+
+    /// Every cell in the commit table holds a label, and a label contributes no
+    /// accessibility node, so the history announced nothing at all: no table,
+    /// no rows, and no way to hear what any commit was.
+    #[gpui::test]
+    async fn the_commit_table_names_its_rows(cx: &mut TestAppContext) {
+        init_test(cx);
+
+        let fs = FakeFs::new(cx.executor());
+        fs.insert_tree(
+            Path::new("/project"),
+            serde_json::json!({
+                ".git": {},
+                "file.txt": "content",
+            }),
+        )
+        .await;
+
+        let head_sha = Oid::from_bytes(&[7; 20]).unwrap();
+        let parent_sha = Oid::from_bytes(&[8; 20]).unwrap();
+        fs.set_graph_commits(
+            Path::new("/project/.git"),
+            vec![
+                Arc::new(InitialGraphCommitData {
+                    sha: head_sha,
+                    parents: smallvec![parent_sha],
+                    ref_names: vec!["main".into()],
+                }),
+                Arc::new(InitialGraphCommitData {
+                    sha: parent_sha,
+                    parents: smallvec![],
+                    ref_names: vec![],
+                }),
+            ],
+        );
+        fs.set_commit_data(
+            Path::new("/project/.git"),
+            [
+                (
+                    CommitData {
+                        sha: head_sha,
+                        parents: smallvec![parent_sha],
+                        author_name: "Ada".into(),
+                        author_email: "ada@example.com".into(),
+                        commit_timestamp: 2,
+                        subject: "Name the commit rows".into(),
+                        message: "Name the commit rows".into(),
+                    },
+                    false,
+                ),
+                (
+                    CommitData {
+                        sha: parent_sha,
+                        parents: smallvec![],
+                        author_name: "Ada".into(),
+                        author_email: "ada@example.com".into(),
+                        commit_timestamp: 1,
+                        subject: "Add the graph".into(),
+                        message: "Add the graph".into(),
+                    },
+                    false,
+                ),
+            ],
+        );
+
+        let project = Project::test(fs.clone(), [Path::new("/project")], cx).await;
+        cx.run_until_parked();
+
+        let repository = project.read_with(cx, |project, cx| {
+            project
+                .active_repository(cx)
+                .expect("should have a repository")
+        });
+
+        let (multi_workspace, cx) = cx.add_window_view(|window, cx| {
+            workspace::MultiWorkspace::test_new(project.clone(), window, cx)
+        });
+        let workspace = multi_workspace.read_with(&*cx, |multi, _| multi.workspace().clone());
+
+        let git_graph = cx.new_window_entity(|window, cx| {
+            GitGraph::new(
+                repository.read(cx).id,
+                project.read(cx).git_store().clone(),
+                workspace.downgrade(),
+                None,
+                window,
+                cx,
+            )
+        });
+        cx.run_until_parked();
+
+        // Drawn only as an item in a pane; built on its own it never reaches a
+        // frame, so the tree would be empty for reasons that have nothing to do
+        // with the table.
+        workspace.update_in(cx, |workspace, window, cx| {
+            workspace.add_item_to_active_pane(Box::new(git_graph.clone()), None, true, window, cx);
+        });
+        cx.run_until_parked();
+
+        // Highlight a commit: focus stays on the graph while the arrow keys
+        // move the highlight, so the current commit reaches a reader only
+        // through the active-descendant claim.
+        git_graph.update_in(cx, |graph, window, cx| {
+            graph.selected_entry_idx = Some(0);
+            window.focus(&graph.focus_handle, cx);
+            cx.notify();
+        });
+        cx.run_until_parked();
+
+        cx.activate_a11y(cx.window_handle());
+        let read_rows = |cx: &mut gpui::VisualTestContext| {
+            let json = cx
+                .update(|window, cx| {
+                    window.draw(cx).clear(cx);
+                    window.debug_a11y_tree_json()
+                })
+                .expect("activation makes the debug tree available");
+            let tree: serde_json::Value =
+                serde_json::from_str(&json).expect("the dump is valid JSON");
+
+            gpui::a11y_checks::assert_interactive_nodes_are_named(&tree, "git graph");
+            gpui::a11y_checks::assert_no_role_was_discarded(&tree, "git graph");
+            gpui::a11y_checks::assert_no_aria_was_discarded(&tree, "git graph");
+            gpui::a11y_checks::assert_roles_are_contained(&tree, "git graph");
+            gpui::a11y_checks::assert_focus_reached_the_tree(&tree, "git graph");
+            gpui::a11y_checks::assert_click_targets_are_reachable(&tree, "git graph");
+            gpui::a11y_checks::assert_landmarks_are_distinguishable(&tree, "git graph");
+            gpui::a11y_checks::assert_names_are_distinguishable(&tree, "git graph");
+            gpui::a11y_checks::assert_focusable_names_are_distinguishable(&tree, "git graph");
+            gpui::a11y_checks::assert_clickable_elements_are_reachable(&tree, "git graph");
+            gpui::a11y_checks::assert_controls_have_area(&tree, "git graph");
+            gpui::a11y_checks::assert_active_descendant_is_honoured(&tree, "git graph");
+
+            let nodes = tree["nodes"].as_object().expect("the dump lists nodes");
+            // A name that is a bare identifier is read out character by
+            // character and never says what pressing it does.
+            let button_labels: Vec<&str> = nodes
+                .values()
+                .filter(|node| node["aria"]["role"] == "Button")
+                .filter_map(|node| node["aria"]["label"].as_str())
+                .collect();
+            // A loop over nothing asserts nothing, and this is the kind of
+            // check that would go on passing after the buttons stopped being
+            // rendered.
+            assert!(
+                !button_labels.is_empty(),
+                "the graph has to have drawn its buttons for this to check them"
+            );
+            for label in button_labels {
+                assert!(
+                    !label.chars().all(|c| c.is_ascii_hexdigit()) || label.len() < 8,
+                    "a button named only by a hash spells it out: {label:?}"
+                );
+            }
+            // One region is the commit graph. A node inside it borrowing the
+            // same name describes two places where there is one, and the
+            // name-distinguishability check cannot see it — the two have
+            // different roles, or the same role in an ancestor relationship.
+            assert_eq!(
+                nodes
+                    .values()
+                    .filter(|node| node["aria"]["label"] == "Commit graph")
+                    .count(),
+                1,
+                "only the focusable region is the commit graph"
+            );
+            let table_named = nodes
+                .values()
+                .any(|node| node["aria"]["role"] == "Table" && node["aria"]["label"] == "Commits");
+            let rows: Vec<String> = nodes
+                .values()
+                .filter(|node| node["aria"]["role"] == "Row")
+                .filter_map(|node| node["aria"]["label"].as_str().map(str::to_string))
+                .collect();
+            (table_named, rows)
+        };
+
+        // Commit subjects arrive asynchronously, and a row says "Loading…"
+        // until they do — which is what the cell shows too.
+        let mut loaded = Vec::new();
+        let mut last_seen = Vec::new();
+        let mut table_named = false;
+        for _ in 0..20 {
+            let (named, rows) = read_rows(cx);
+            table_named |= named;
+            last_seen = rows.clone();
+            if !rows.is_empty() && rows.iter().all(|row| !row.starts_with("Loading…")) {
+                loaded = rows;
+                break;
+            }
+            cx.run_until_parked();
+        }
+
+        assert!(table_named, "the history has to be reported as a table");
+        assert!(
+            !loaded.is_empty(),
+            "the visible commits have to be reported as rows, last seen: {last_seen:?}"
+        );
+        assert!(
+            loaded.iter().all(|row| row.matches(", ").count() >= 3),
+            "a row says its subject, author, date and short sha: {loaded:?}"
+        );
+        // The branch name is drawn as a chip, which is a label and therefore
+        // not a node of its own.
+        assert!(
+            loaded.iter().any(|row| row.ends_with(", main")),
+            "a row carrying a branch has to say so: {loaded:?}"
+        );
+
+        let json = cx
+            .update(|window, cx| {
+                window.draw(cx).clear(cx);
+                window.debug_a11y_tree_json()
+            })
+            .expect("activation makes the debug tree available");
+        let tree: serde_json::Value = serde_json::from_str(&json).expect("the dump is valid JSON");
+        let nodes = tree["nodes"].as_object().expect("the dump lists nodes");
+        let current = tree["active_descendant_focus"]
+            .as_str()
+            .and_then(|id| nodes.get(id))
+            .unwrap_or_else(|| panic!("the graph must point at the commit it highlights: {json}"));
+        assert_eq!(current["aria"]["row_index"].as_u64(), Some(1));
+        assert_eq!(current["aria"]["selected"].as_bool(), Some(true));
     }
 
     #[gpui::test]

@@ -10,7 +10,7 @@ use gpui::{AnyElement, IntoElement, ParentElement, Styled};
 /// use ui::prelude::*;
 /// use ui::{Banner, Button, Icon, IconName, IconSize, Label, Severity};
 ///
-/// Banner::new()
+/// Banner::new("This is a success message")
 ///     .severity(Severity::Success)
 ///     .children([Label::new("This is a success message")])
 ///     .action_slot(
@@ -22,16 +22,25 @@ use gpui::{AnyElement, IntoElement, ParentElement, Styled};
 pub struct Banner {
     severity: Severity,
     children: Vec<AnyElement>,
+    /// What a reader is told the banner says.
+    ///
+    /// Required rather than a builder. A banner is arbitrary children, which
+    /// are invariably `Label`s and so contribute no node, so an unnamed banner
+    /// is a coloured box a reader walks straight past — and four of the five in
+    /// the product remembered to name it, which is the wrong ratio for
+    /// something a caller has to remember.
+    aria_label: SharedString,
     action_slot: Option<AnyElement>,
     wrap_content: bool,
 }
 
 impl Banner {
     /// Creates a new `Banner` component with default styling.
-    pub fn new() -> Self {
+    pub fn new(aria_label: impl Into<SharedString>) -> Self {
         Self {
             severity: Severity::Info,
             children: Vec::new(),
+            aria_label: aria_label.into(),
             action_slot: None,
             wrap_content: false,
         }
@@ -64,7 +73,14 @@ impl ParentElement for Banner {
 
 impl RenderOnce for Banner {
     fn render(self, window: &mut Window, cx: &mut App) -> impl IntoElement {
+        // A banner is arbitrary children, so it cannot take a name from them,
+        // and its content is invariably `Label`s. Unnamed it is a coloured box
+        // a reader walks straight past — which is the opposite of what a
+        // warning is for.
         let banner = h_flex()
+            .id("banner")
+            .role(gpui::Role::Status)
+            .aria_label(self.aria_label)
             .min_w_0()
             .py_0p5()
             .gap_1p5()
@@ -143,13 +159,13 @@ impl Component for Banner {
         let severity_examples = vec![
             single_example(
                 "Default",
-                Banner::new()
+                Banner::new("This is a default banner with no customization")
                     .child(Label::new("This is a default banner with no customization"))
                     .into_any_element(),
             ),
             single_example(
                 "Info",
-                Banner::new()
+                Banner::new("This is an informational message")
                     .severity(Severity::Info)
                     .child(Label::new("This is an informational message"))
                     .action_slot(
@@ -160,7 +176,7 @@ impl Component for Banner {
             ),
             single_example(
                 "Success",
-                Banner::new()
+                Banner::new("Operation completed successfully")
                     .severity(Severity::Success)
                     .child(Label::new("Operation completed successfully"))
                     .action_slot(Button::new("dismiss", "Dismiss"))
@@ -168,7 +184,7 @@ impl Component for Banner {
             ),
             single_example(
                 "Warning",
-                Banner::new()
+                Banner::new("Your settings file uses deprecated settings")
                     .severity(Severity::Warning)
                     .child(Label::new("Your settings file uses deprecated settings"))
                     .action_slot(Button::new("update", "Update Settings"))
@@ -176,7 +192,7 @@ impl Component for Banner {
             ),
             single_example(
                 "Error",
-                Banner::new()
+                Banner::new("Connection error: unable to connect to server")
                     .severity(Severity::Error)
                     .child(Label::new("Connection error: unable to connect to server"))
                     .action_slot(Button::new("reconnect", "Retry"))

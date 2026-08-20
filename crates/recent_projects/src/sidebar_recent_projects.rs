@@ -14,7 +14,6 @@ use util::{ResultExt, paths::PathExt};
 use workspace::{
     MultiWorkspace, OpenMode, OpenOptions, OpenVisible, ProjectGroupKey, RecentWorkspace,
     SerializedWorkspaceLocation, Workspace, WorkspaceDb,
-
 };
 
 use zed_actions::OpenRemote;
@@ -136,6 +135,10 @@ impl PickerDelegate for SidebarRecentProjectsDelegate {
 
     fn name() -> &'static str {
         "sidebar recent projects"
+    }
+
+    fn match_label(&self, ix: usize, _cx: &App) -> Option<SharedString> {
+        Some(self.filtered_workspaces.get(ix)?.string.clone().into())
     }
 
     fn placeholder_text(&self, _window: &mut Window, _cx: &mut App) -> Arc<str> {
@@ -422,6 +425,9 @@ impl PickerDelegate for SidebarRecentProjectsDelegate {
                     };
 
                     ButtonLike::new("open_local_folder")
+                            // `ButtonLike` cannot take a name from its
+                            // children, and the child here is a `Label`.
+                            .aria_label("Open Local Folders")
                         .child(
                             h_flex()
                                 .w_full()
@@ -437,6 +443,7 @@ impl PickerDelegate for SidebarRecentProjectsDelegate {
                 })
                 .child(
                     ButtonLike::new("open_remote_folder")
+                            .aria_label("Open Remote Folder")
                         .child(
                             h_flex()
                                 .w_full()

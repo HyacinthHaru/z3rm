@@ -5,6 +5,7 @@ use gpui::{AppContext, DismissEvent, Entity, EventEmitter, Focusable, Styled};
 use ui::{
     ActiveTheme, AnyElement, App, Button, Clickable, Color, Context, DynamicSpacing, Headline,
     HeadlineSize, Icon, IconName, IconSize, InteractiveElement, IntoElement, Label, LabelCommon,
+    StatefulInteractiveElement as _,
     LabelSize, ParentElement, Render, SharedString, StyledExt, StyledTypography, Window, div,
     h_flex, v_flex,
 };
@@ -20,7 +21,12 @@ pub(crate) struct AskPassModal {
 }
 
 impl EventEmitter<DismissEvent> for AskPassModal {}
-impl ModalView for AskPassModal {}
+impl ModalView for AskPassModal {
+    fn a11y_name(&self, _cx: &App) -> Option<SharedString> {
+        // The same string the modal shows as its headline.
+        Some(self.operation.clone())
+    }
+}
 impl Focusable for AskPassModal {
     fn focus_handle(&self, cx: &App) -> gpui::FocusHandle {
         self.editor.focus_handle(cx)
@@ -39,9 +45,15 @@ impl AskPassModal {
             let mut editor = Editor::single_line(window, cx);
             if prompt.contains("yes/no") || prompt.contains("Username") {
                 editor.set_masked(false, cx);
+                editor.set_a11y_label("Answer");
             } else {
                 editor.set_masked(true, cx);
+                editor.set_a11y_label("Password");
             }
+            // The prompt names the host or key being authenticated against and
+            // is the only place it appears; as plain text it is not a node, so
+            // without this the field asks for a secret without saying for what.
+            editor.set_a11y_description(prompt.clone());
             editor
         });
         Self {
@@ -80,6 +92,12 @@ impl AskPassModal {
         {
             return Some(
             div()
+                // The hint is a `Label` and the only node in it is a button
+                // reading "Learn more" — a reader was offered a link with
+                // nothing saying what it would teach them.
+                .id("askpass-github-hint")
+                .role(gpui::Role::Group)
+                .aria_label("You may need to configure git for Github.")
                 .p_2()
                 .bg(color)
                 .border_t_1()
@@ -143,5 +161,86 @@ impl Render for AskPassModal {
                     .child(self.editor.clone()),
             )
             .children(self.render_hint(cx))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use gpui::TestAppContext;
+
+    /// The modal asks for a secret. Everything that says *which* secret — the
+    /// repository, the host, the key file — lives in the prompt, and the prompt
+    /// is plain text, which is not an accessibility node. Focus lands in the
+    /// field the moment the modal opens, so if the field does not carry that
+    /// detail nothing announces it at all.
+    #[gpui::test]
+    fn the_password_field_says_what_it_is_for(cx: &mut TestAppContext) {
+        cx.update(|cx| {
+            let settings_store = settings::SettingsStore::test(cx);
+            cx.set_global(settings_store);
+            theme_settings::init(theme::LoadThemes::JustBase, cx);
+            editor::init(cx);
+        });
+
+        let (tx, _rx) = oneshot::channel();
+        let window = cx.add_window(|window, cx| {
+            AskPassModal::new(
+                "git push".into(),
+                "Password for 'https://ada@github.com':".into(),
+                tx,
+                window,
+                cx,
+            )
+        });
+        cx.activate_a11y(window.into());
+        // Typed in, so the assertion below that the secret stays out of the
+        // tree is about something that was actually there to leak.
+        window
+            .update(cx, |modal, window, cx| {
+                modal
+                    .editor
+                    .update(cx, |editor, cx| editor.set_text("hunter2", window, cx));
+            })
+            .expect("the harness window is still open");
+
+        let json = cx
+            .update_window(window.into(), |_, window, cx| {
+                window.draw(cx).clear(cx);
+                window.debug_a11y_tree_json()
+            })
+            .expect("the harness window is still open")
+            .expect("activation makes the debug tree available");
+        let tree: serde_json::Value = serde_json::from_str(&json).expect("the dump is valid JSON");
+        gpui::a11y_checks::assert_interactive_nodes_are_named(&tree, "askpass modal");
+        gpui::a11y_checks::assert_names_are_distinguishable(&tree, "askpass modal");
+        gpui::a11y_checks::assert_focusable_names_are_distinguishable(&tree, "askpass modal");
+        gpui::a11y_checks::assert_clickable_elements_are_reachable(&tree, "askpass modal");
+        gpui::a11y_checks::assert_no_role_was_discarded(&tree, "askpass modal");
+        gpui::a11y_checks::assert_no_aria_was_discarded(&tree, "askpass modal");
+        gpui::a11y_checks::assert_roles_are_contained(&tree, "askpass modal");
+        gpui::a11y_checks::assert_click_targets_are_reachable(&tree, "askpass modal");
+        gpui::a11y_checks::assert_controls_have_area(&tree, "askpass modal");
+        gpui::a11y_checks::assert_landmarks_are_distinguishable(&tree, "askpass modal");
+        gpui::a11y_checks::assert_active_descendant_is_honoured(&tree, "askpass modal");
+
+        // `PasswordInput`, not `TextInput`: the editor is masked, and the role
+        // is what stops a reader echoing the secret aloud as it is typed.
+        let field = tree["nodes"]
+            .as_object()
+            .expect("the dump lists nodes")
+            .values()
+            .find(|node| node["aria"]["role"] == "PasswordInput")
+            .unwrap_or_else(|| panic!("no password input in the tree: {json}"));
+        assert_eq!(field["aria"]["label"].as_str(), Some("Password"));
+        assert!(
+            !json.contains("hunter2"),
+            "the secret must not reach the tree: {json}"
+        );
+        assert_eq!(
+            field["aria"]["description"].as_str(),
+            Some("Password for 'https://ada@github.com':"),
+            "the field says which host is asking"
+        );
     }
 }

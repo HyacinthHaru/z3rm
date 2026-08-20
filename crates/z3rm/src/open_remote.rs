@@ -65,7 +65,11 @@ pub struct RemoteHostSelector {
     picker: Entity<Picker<RemoteHostSelectorDelegate>>,
 }
 
-impl ModalView for RemoteHostSelector {}
+impl ModalView for RemoteHostSelector {
+    fn a11y_name(&self, _cx: &gpui::App) -> Option<gpui::SharedString> {
+        Some("Remote Hosts".into())
+    }
+}
 
 impl EventEmitter<DismissEvent> for RemoteHostSelector {}
 
@@ -124,6 +128,10 @@ impl PickerDelegate for RemoteHostSelectorDelegate {
 
     fn name() -> &'static str {
         "remote host selector"
+    }
+
+    fn match_label(&self, ix: usize, _cx: &App) -> Option<SharedString> {
+        Some(self.matches.get(ix)?.string.clone().into())
     }
 
     fn placeholder_text(&self, _window: &mut Window, _cx: &mut App) -> Arc<str> {

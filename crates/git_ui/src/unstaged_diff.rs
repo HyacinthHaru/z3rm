@@ -764,6 +764,7 @@ impl Render for UnstagedDiffToolbar {
                 h_group_sm()
                     .child(
                         IconButton::new("up", IconName::ArrowUp)
+                .aria_label("Go to Previous Hunk")
                             .icon_size(IconSize::Small)
                             .disabled(!button_states.prev_next)
                             .tooltip(Tooltip::for_action_title_in(
@@ -777,6 +778,7 @@ impl Render for UnstagedDiffToolbar {
                     )
                     .child(
                         IconButton::new("down", IconName::ArrowDown)
+                .aria_label("Go to Next Hunk")
                             .icon_size(IconSize::Small)
                             .disabled(!button_states.prev_next)
                             .tooltip(Tooltip::for_action_title_in(

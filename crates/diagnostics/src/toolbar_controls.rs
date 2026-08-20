@@ -60,6 +60,7 @@ impl Render for ToolbarControls {
             .gap_1()
             .child({
                 IconButton::new("toggle_search", IconName::MagnifyingGlass)
+                    .aria_label("Buffer Search")
                     .icon_size(IconSize::Small)
                     .tooltip(Tooltip::for_action_title(
                         "Buffer Search",
@@ -72,6 +73,7 @@ impl Render for ToolbarControls {
             .when(is_agent_enabled, |this| {
                 this.child(
                     IconButton::new("inline_assist", IconName::ZedAssistant)
+                    .aria_label("Inline Assist")
                         .icon_size(IconSize::Small)
                         .tooltip(Tooltip::for_action_title(
                             "Inline Assist",
@@ -86,6 +88,7 @@ impl Render for ToolbarControls {
                 if is_updating {
                     div.child(
                         IconButton::new("stop-updating", IconName::Stop)
+                    .aria_label("Stop Diagnostics Update")
                             .icon_color(Color::Error)
                             .icon_size(IconSize::Small)
                             .tooltip(Tooltip::for_action_title(
@@ -102,6 +105,7 @@ impl Render for ToolbarControls {
                 } else {
                     div.child(
                         IconButton::new("refresh-diagnostics", IconName::ArrowCircle)
+                    .aria_label("Refresh Diagnostics")
                             .icon_size(IconSize::Small)
                             .tooltip(Tooltip::for_action_title(
                                 "Refresh Diagnostics",
@@ -119,6 +123,7 @@ impl Render for ToolbarControls {
             })
             .child(
                 IconButton::new("toggle-warnings", IconName::Warning)
+                    .aria_label(warning_tooltip)
                     .icon_color(warning_color)
                     .icon_size(IconSize::Small)
                     .tooltip(Tooltip::text(warning_tooltip))

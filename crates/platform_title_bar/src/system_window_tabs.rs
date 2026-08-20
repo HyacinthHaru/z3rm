@@ -251,6 +251,7 @@ impl SystemWindowTabs {
                         })
                         .child(
                             IconButton::new("close", IconName::Close)
+                                .aria_label("Close Window Tab")
                                 .shape(IconButtonShape::Square)
                                 .icon_color(Color::Muted)
                                 .icon_size(IconSize::XSmall)
@@ -479,6 +480,7 @@ impl Render for SystemWindowTabs {
                     .border_color(cx.theme().colors().border)
                     .child(
                         IconButton::new("plus", IconName::Plus)
+                            .aria_label("New Window Tab")
                             .icon_size(IconSize::Small)
                             .icon_color(Color::Muted)
                             .on_click(|_event, window, cx| {

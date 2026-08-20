@@ -147,6 +147,11 @@ pub struct Picker<D: PickerDelegate> {
     picker_bounds: Rc<Cell<Option<Bounds<Pixels>>>>,
     /// Bounds tracking for items (for aside positioning) - maps item index to bounds
     item_bounds: Rc<RefCell<HashMap<usize, Bounds<Pixels>>>>,
+    /// For each row, its place among the rows a user can actually land on, and
+    /// how many of those there are. Recomputed per frame, and only while a
+    /// screen reader is attached, because it costs a pass over every match.
+    a11y_positions_in_set: Vec<usize>,
+    a11y_size_of_set: usize,
     shape_loaded_from_persistence: bool,
     /// Handle for the default footer's Actions popover menu. Used to keep the
     /// picker open while that menu has focus.
@@ -214,6 +219,33 @@ pub trait PickerDelegate: Sized + 'static {
         None
     }
     fn placeholder_text(&self, _window: &mut Window, _cx: &mut App) -> Arc<str>;
+    /// The name announced for a match.
+    ///
+    /// `render_match` returns arbitrary elements, so the text cannot be derived
+    /// from what was rendered. Required rather than defaulted: a delegate that
+    /// omits it leaves every row of its list announced as a bare option, and
+    /// two did exactly that for as long as the default existed.
+    fn match_label(&self, ix: usize, cx: &App) -> Option<SharedString>;
+
+    /// The keyboard shortcut a row draws beside itself, if it draws one.
+    ///
+    /// Appended to the row's name rather than set as `aria_keyshortcuts`,
+    /// which arrives as a description — a hint, spoken after a pause and
+    /// silenced by a VoiceOver setting. That is the right weight for a button
+    /// whose shortcut is a nicety and the wrong one for a palette, where
+    /// finding out what a command is bound to is the reason to open it.
+    ///
+    /// Takes a window because resolving which binding applies needs the focus
+    /// context, which is why this is not simply part of `match_label`.
+    fn match_keyboard_shortcut(
+        &self,
+        _ix: usize,
+        _window: &Window,
+        _cx: &App,
+    ) -> Option<SharedString> {
+        None
+    }
+
     fn no_matches_text(&self, _window: &mut Window, _cx: &mut App) -> Option<SharedString> {
         Some("No matches".into())
     }
@@ -414,7 +446,7 @@ pub trait PickerDelegate: Sized + 'static {
 impl<D: PickerDelegate> Focusable for Picker<D> {
     fn focus_handle(&self, cx: &App) -> FocusHandle {
         match &self.head {
-            Head::Editor(editor) => editor.focus_handle(cx),
+            Head::Editor { editor, .. } => editor.focus_handle(cx),
             Head::Empty(head) => head.focus_handle(cx),
         }
     }
@@ -502,7 +534,7 @@ impl<D: PickerDelegate> Picker<D> {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Self {
-        let head = Head::empty(Self::on_empty_head_blur, window, cx);
+        let head = Head::empty(D::name().into(), Self::on_empty_head_blur, window, cx);
 
         Self::new(delegate, ContainerKind::UniformList, head, None, window, cx)
     }
@@ -511,7 +543,7 @@ impl<D: PickerDelegate> Picker<D> {
     /// The picker allows the user to perform search items by text.
     /// If `PickerDelegate::render_match` only returns items with the same height, use `Picker::uniform_list` as its implementation is optimized for that.
     pub fn nonsearchable_list(delegate: D, window: &mut Window, cx: &mut Context<Self>) -> Self {
-        let head = Head::empty(Self::on_empty_head_blur, window, cx);
+        let head = Head::empty(D::name().into(), Self::on_empty_head_blur, window, cx);
 
         Self::new(delegate, ContainerKind::List, head, None, window, cx)
     }
@@ -583,6 +615,8 @@ impl<D: PickerDelegate> Picker<D> {
             }),
             default_shape,
             show_scrollbar: false,
+            a11y_positions_in_set: Vec::new(),
+            a11y_size_of_set: 0,
             presentation: Presentation::Modal {
                 resizable: has_preview,
             },
@@ -1081,7 +1115,7 @@ impl<D: PickerDelegate> Picker<D> {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let Head::Editor(editor) = &self.head else {
+        let Head::Editor { editor, .. } = &self.head else {
             panic!("unexpected call");
         };
         match event {
@@ -1113,7 +1147,7 @@ impl<D: PickerDelegate> Picker<D> {
 
     pub fn refresh_placeholder(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         match &self.head {
-            Head::Editor(editor) => {
+            Head::Editor { editor, .. } => {
                 let placeholder = self.delegate.placeholder_text(window, cx);
 
                 editor.set_placeholder_text(placeholder.as_ref(), window, cx);
@@ -1215,13 +1249,13 @@ impl<D: PickerDelegate> Picker<D> {
 
     pub fn query(&self, cx: &App) -> String {
         match &self.head {
-            Head::Editor(editor) => editor.text(cx),
+            Head::Editor { editor, .. } => editor.text(cx),
             Head::Empty(_) => "".to_string(),
         }
     }
 
     pub fn set_query(&self, query: &str, window: &mut Window, cx: &mut App) {
-        if let Head::Editor(editor) = &self.head {
+        if let Head::Editor { editor, .. } = &self.head {
             editor.set_text(query, window, cx);
             editor.move_selection_to_end(window, cx);
         }
@@ -1230,7 +1264,7 @@ impl<D: PickerDelegate> Picker<D> {
     /// Selects the entire query, so the next keystroke replaces it (and a single
     /// backspace clears it). Matches the buffer search bar's seeded-query behavior.
     pub fn select_query(&self, window: &mut Window, cx: &mut App) {
-        if let Head::Editor(editor) = &self.head {
+        if let Head::Editor { editor, .. } = &self.head {
             editor.select_all(window, cx);
         }
     }
@@ -1251,6 +1285,30 @@ impl<D: PickerDelegate> Picker<D> {
         }
     }
 
+    /// Numbers the rows a user can land on, skipping separators and section
+    /// headers. Announcing "3 of 27" where 27 counts rows the arrow keys refuse
+    /// to stop on describes a list the user cannot reach the end of.
+    pub(crate) fn recompute_a11y_set_positions(
+        &mut self,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if !window.is_a11y_active() {
+            return;
+        }
+        let match_count = self.delegate.match_count();
+        self.a11y_positions_in_set.clear();
+        self.a11y_positions_in_set.reserve(match_count);
+        let mut selectable_so_far = 0;
+        for ix in 0..match_count {
+            if self.delegate.can_select(ix, window, cx) {
+                selectable_so_far += 1;
+            }
+            self.a11y_positions_in_set.push(selectable_so_far);
+        }
+        self.a11y_size_of_set = selectable_so_far;
+    }
+
     fn render_element(
         &self,
         window: &mut Window,
@@ -1260,6 +1318,15 @@ impl<D: PickerDelegate> Picker<D> {
         let item_bounds = self.item_bounds.clone();
         let selectable =
             ix < self.delegate.match_count() && self.delegate.can_select(ix, window, cx);
+        // Whether a row can be landed on and what it is called are decided by
+        // two different delegate methods, and nothing has been keeping them in
+        // step. Where they drift the row is announced as a bare "option": the
+        // file finder's create-file row was selectable and nameless because it
+        // was the one match with no path for `match_label` to fall back on.
+        debug_assert!(
+            !selectable || self.delegate.match_label(ix, cx).is_some(),
+            "picker row {ix} is selectable but has no name to announce"
+        );
 
         let supports_multi_select = self.delegate.supports_multi_select();
         let is_multi_selected = supports_multi_select && self.delegate.is_item_selected(ix);
@@ -1284,9 +1351,50 @@ impl<D: PickerDelegate> Picker<D> {
             multi_select_active && selectable && item_with_checkbox.is_none();
         let focus_handle = self.focus_handle(cx);
 
+        let is_selected = ix == self.delegate.selected_index();
+
         div()
             .id(("item", ix))
+            // Only rows the user can actually land on are options. A section
+            // header rendered as one would be counted in "3 of 12" and offered
+            // as a target the arrow keys skip over, and it has no name of its
+            // own to be announced by.
+            //
+            // Keyboard focus stays in the query input, which is a sibling of
+            // this list rather than an ancestor. GPUI points the focused node
+            // at the claiming row in that case, so typing a query announces the
+            // row the arrow keys are on rather than leaving it to be inferred
+            // from a selected state nobody reads out.
+            .when(selectable, |this| {
+                this.role(gpui::Role::ListBoxOption)
+                    // accesskit maps `ListBoxOption` to static text on macOS,
+                    // with no subrole to tell it from a caption, so a row a
+                    // user can pick reads exactly like one they cannot. The
+                    // role description is what says otherwise, and it costs
+                    // nothing elsewhere: it *is* the localized control type on
+                    // Windows, which already reports the ARIA role as "option".
+                    .aria_role_description("option")
+                    .aria_selected(is_selected)
+                    .when_some(self.delegate.match_label(ix, cx), |this, label| {
+                        match self.delegate.match_keyboard_shortcut(ix, window, cx) {
+                            Some(shortcut) => this.aria_label(format!("{label}, {shortcut}")),
+                            None => this.aria_label(label),
+                        }
+                    })
+                    .when_some(
+                        self.a11y_positions_in_set.get(ix).copied(),
+                        |this, position| {
+                            this.aria_position_in_set(position)
+                                .aria_size_of_set(self.a11y_size_of_set)
+                        },
+                    )
+                    .when(is_selected, |this| this.aria_active_descendant())
+            })
             .when(selectable, |this| this.cursor_pointer())
+            // A row the user cannot land on is a separator or a section header.
+            // It still answers a click, because the click is attached to every
+            // row, but there is nothing there for a reader to operate.
+            .when(!selectable, |this| this.pointer_gesture_only())
             .when(use_fallback_indicator, |this| {
                 this.hover(|s| s.bg(cx.theme().colors().ghost_element_hover))
             })
@@ -1414,6 +1522,24 @@ impl<D: PickerDelegate> Picker<D> {
     }
 
     fn render_element_container(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        // The list elements are custom, so the role lives on a wrapper that
+        // parents the options rather than on the list itself.
+        // The wrapper has to be a flex column that can shrink, or the list
+        // inside it stops growing and its scroll height collapses.
+        div()
+            .id("picker-candidates")
+            .role(gpui::Role::ListBox)
+            // Deliberately unnamed: the picker's dialog carries its name and
+            // the head carries the prompt, so a third node repeating either
+            // one is noise rather than context.
+            .flex()
+            .flex_col()
+            .flex_grow_1()
+            .min_h_0()
+            .child(self.render_element_list(cx))
+    }
+
+    fn render_element_list(&self, cx: &mut Context<Self>) -> impl IntoElement {
         // When the picker shrinks to fit its content, the list infers its size
         // from its items. When it fills its full height (preview visible), the
         // list fills the available space.
@@ -1583,6 +1709,10 @@ mod tests {
             self.items.len()
         }
 
+        fn match_label(&self, ix: usize, _cx: &App) -> Option<SharedString> {
+            Some(format!("item {ix}").into())
+        }
+
         fn selected_index(&self) -> usize {
             self.selected_index
         }
@@ -1691,6 +1821,241 @@ mod tests {
             theme_settings::init(theme::LoadThemes::JustBase, cx);
             editor::init(cx);
         });
+    }
+
+    /// A non-searchable picker has no query field, so its invisible head holds
+    /// focus. Without a role that head produced no accessibility node, and
+    /// opening the picker announced the whole window instead.
+    ///
+    /// The head was also mounted twice per frame — once at each editor
+    /// position — which put one focusable entity in the tree twice and made any
+    /// id inside it a duplicate.
+    #[gpui::test]
+    async fn test_a_nonsearchable_picker_head_holds_focus_in_the_tree(cx: &mut TestAppContext) {
+        init_test(cx);
+
+        let (picker, cx) = cx.add_window_view(|window, cx| {
+            Picker::nonsearchable_uniform_list(TestDelegate::new(vec![true, true]), window, cx)
+        });
+        cx.run_until_parked();
+
+        cx.activate_a11y(cx.window_handle());
+        let picker_focus = picker.read_with(cx, |picker, cx| picker.focus_handle(cx));
+        let json = cx
+            .update(|window, cx| {
+                window.focus(&picker_focus, cx);
+                window.draw(cx).clear(cx);
+                window.debug_a11y_tree_json()
+            })
+            .expect("activation makes the debug tree available");
+        let tree: serde_json::Value = serde_json::from_str(&json).expect("the dump is valid JSON");
+        gpui::a11y_checks::assert_interactive_nodes_are_named(&tree, "picker");
+        gpui::a11y_checks::assert_names_are_distinguishable(&tree, "picker");
+        gpui::a11y_checks::assert_focusable_names_are_distinguishable(&tree, "picker");
+        gpui::a11y_checks::assert_clickable_elements_are_reachable(&tree, "picker");
+        gpui::a11y_checks::assert_click_targets_are_reachable(&tree, "picker");
+        gpui::a11y_checks::assert_controls_have_area(&tree, "picker");
+        gpui::a11y_checks::assert_landmarks_are_distinguishable(&tree, "picker");
+        gpui::a11y_checks::assert_active_descendant_is_honoured(&tree, "picker");
+        gpui::a11y_checks::assert_no_role_was_discarded(&tree, "picker");
+        gpui::a11y_checks::assert_no_aria_was_discarded(&tree, "picker");
+        gpui::a11y_checks::assert_roles_are_contained(&tree, "picker");
+        let nodes = tree["nodes"].as_object().expect("the dump lists nodes");
+
+        assert_eq!(
+            tree["frame"]["focus_without_node"].as_str(),
+            None,
+            "the head carries a role now, so its focus must reach the tree"
+        );
+        let focused = tree["gpui_focus"].as_str().expect("the head holds focus");
+        assert_eq!(
+            nodes[focused]["aria"]["label"].as_str(),
+            Some("test"),
+            "the picker is announced by its delegate's name"
+        );
+        assert_eq!(
+            nodes
+                .values()
+                .filter(|node| node["aria"]["label"].as_str() == Some("test"))
+                .count(),
+            1,
+            "the head must be mounted once, not at both editor positions"
+        );
+    }
+
+    /// A resizable picker draws four drag grips around itself, and their
+    /// primary-button handler only swallows the press so the modal does not
+    /// dismiss under it. That is a pointer gesture rather than an action, and
+    /// nothing rendered one in a frame before this — so the grips read as four
+    /// controls that answer a click and do nothing.
+    #[gpui::test]
+    async fn test_a_resizable_picker_offers_no_grips_to_a_reader(cx: &mut TestAppContext) {
+        init_test(cx);
+
+        let (picker, cx) = cx.add_window_view(|window, cx| {
+            Picker::uniform_list(TestDelegate::new(vec![true, true]), window, cx).resizable(true)
+        });
+        picker.update_in(cx, |picker, window, cx| {
+            window.focus(&picker.focus_handle(cx), cx);
+            cx.notify();
+        });
+        cx.run_until_parked();
+
+        cx.activate_a11y(cx.window_handle());
+        let json = cx
+            .update(|window, cx| {
+                window.draw(cx).clear(cx);
+                window.debug_a11y_tree_json()
+            })
+            .expect("activation makes the debug tree available");
+        let tree: serde_json::Value = serde_json::from_str(&json).expect("the dump is valid JSON");
+
+        gpui::a11y_checks::assert_clickable_elements_are_reachable(&tree, "resizable picker");
+        gpui::a11y_checks::assert_interactive_nodes_are_named(&tree, "resizable picker");
+        gpui::a11y_checks::assert_no_role_was_discarded(&tree, "resizable picker");
+        gpui::a11y_checks::assert_no_aria_was_discarded(&tree, "resizable picker");
+        gpui::a11y_checks::assert_names_are_distinguishable(&tree, "resizable picker");
+        gpui::a11y_checks::assert_controls_have_area(&tree, "resizable picker");
+    }
+
+    /// Keyboard focus stays in the query input while the selection moves, so a
+    /// picker is only usable with a screen reader if the list reports itself as
+    /// one and the current row is the active descendant.
+    #[gpui::test]
+    async fn test_matches_are_exposed_as_a_list_box(cx: &mut TestAppContext) {
+        init_test(cx);
+
+        let (picker, cx) = cx.add_window_view(|window, cx| {
+            Picker::uniform_list(TestDelegate::new(vec![true, true, true]), window, cx)
+        });
+        picker.update_in(cx, |picker, window, cx| {
+            picker.delegate.selected_index = 1;
+            // Focused the way a picker always is in use: the query input holds
+            // the keyboard, and the row the arrow keys are on is announced from
+            // there. Without focus there is nothing for the claim to hang on.
+            window.focus(&picker.focus_handle(cx), cx);
+            cx.notify();
+        });
+        cx.run_until_parked();
+
+        cx.activate_a11y(cx.window_handle());
+        let json = cx
+            .update(|window, cx| {
+                window.draw(cx).clear(cx);
+                window.debug_a11y_tree_json()
+            })
+            .expect("activation makes the debug tree available");
+        let tree: serde_json::Value = serde_json::from_str(&json).expect("the dump is valid JSON");
+        gpui::a11y_checks::assert_interactive_nodes_are_named(&tree, "picker");
+        gpui::a11y_checks::assert_no_role_was_discarded(&tree, "picker");
+        gpui::a11y_checks::assert_no_aria_was_discarded(&tree, "picker");
+        gpui::a11y_checks::assert_roles_are_contained(&tree, "picker");
+        gpui::a11y_checks::assert_focus_reached_the_tree(&tree, "picker");
+        gpui::a11y_checks::assert_click_targets_are_reachable(&tree, "picker");
+        gpui::a11y_checks::assert_landmarks_are_distinguishable(&tree, "picker");
+        gpui::a11y_checks::assert_names_are_distinguishable(&tree, "picker");
+        gpui::a11y_checks::assert_focusable_names_are_distinguishable(&tree, "picker");
+        gpui::a11y_checks::assert_clickable_elements_are_reachable(&tree, "picker");
+        gpui::a11y_checks::assert_controls_have_area(&tree, "picker");
+        gpui::a11y_checks::assert_active_descendant_is_honoured(&tree, "picker");
+        gpui::a11y_checks::assert_live_regions_can_speak(&tree, "picker");
+        let nodes = tree["nodes"].as_object().expect("the dump lists nodes");
+
+        // Typing filters the list, so what came back has to be announced from
+        // somewhere: the region exists whether or not there are matches. The
+        // value, not the label — macOS speaks `node.value()` and raises no
+        // announcement at all without one.
+        let counted = nodes
+            .values()
+            .filter(|node| node["aria"]["live"] == "Polite")
+            .filter_map(|node| node["aria"]["value"].as_str())
+            .collect::<Vec<_>>();
+        assert!(
+            counted.contains(&"3 matches"),
+            "the picker has to say how many matches it found: {counted:?}"
+        );
+
+        // The query input points at the row the arrow keys are on: focus stays
+        // where typing goes, and the row is announced from there.
+        let focused = tree["gpui_focus"]
+            .as_str()
+            .and_then(|id| nodes.get(id))
+            .unwrap_or_else(|| panic!("the query input holds focus: {json}"));
+        let highlighted = focused["aria"]["active_descendant"]
+            .as_str()
+            .and_then(|id| nodes.get(id))
+            .unwrap_or_else(|| panic!("the input has to point at the current row: {json}"));
+        assert_eq!(highlighted["aria"]["position_in_set"].as_u64(), Some(2));
+
+        let list_box = nodes
+            .iter()
+            .find(|(_, node)| node["aria"]["role"] == "ListBox")
+            .map(|(id, _)| id.clone())
+            .expect("the match list must be reported as a list box");
+
+        let options: Vec<(u64, u64, bool)> = nodes[&list_box]["children"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter_map(|id| id.as_str().and_then(|id| nodes.get(id)))
+            .filter(|node| node["aria"]["role"] == "ListBoxOption")
+            .map(|node| {
+                (
+                    node["aria"]["position_in_set"].as_u64().unwrap_or_default(),
+                    node["aria"]["size_of_set"].as_u64().unwrap_or_default(),
+                    node["aria"]["selected"].as_bool().unwrap_or(false),
+                )
+            })
+            .collect();
+        assert_eq!(
+            options,
+            vec![(1, 3, false), (2, 3, true), (3, 3, false)],
+            "each option must report where it sits in the list and whether it is current"
+        );
+
+        assert_eq!(
+            options.iter().filter(|(_, _, selected)| *selected).count(),
+            1,
+            "exactly one option is current at a time"
+        );
+
+        // The position above reaches Windows and Linux; on macOS accesskit
+        // maps `ListBoxOption` to static text with no subrole, so without this
+        // a row a user can pick is announced exactly like a caption.
+        let kinds: Vec<Option<&str>> = nodes
+            .values()
+            .filter(|node| node["aria"]["role"] == "ListBoxOption")
+            .map(|node| node["aria"]["role_description"].as_str())
+            .collect();
+        // The count first: `all` over an empty list is true, so a fixture
+        // that stopped rendering rows would satisfy the check below without
+        // any row having said anything.
+        assert_eq!(kinds.len(), 3, "the three rows are on screen: {kinds:?}");
+        assert!(
+            kinds.iter().all(|kind| *kind == Some("option")),
+            "every row has to say what kind of thing it is: {kinds:?}"
+        );
+
+        // An option with a position but no name is announced as "option 2 of 3"
+        // with nothing to identify it.
+        let unnamed = nodes
+            .values()
+            .filter(|node| node["aria"]["role"] == "ListBoxOption")
+            .filter(|node| node["aria"]["label"].as_str().is_none_or(str::is_empty))
+            .count();
+        assert_eq!(unnamed, 0, "a delegate that supplies labels must reach the tree");
+
+        // Every option must be inside the list box, not merely present in the
+        // frame: "option 2 of 3" comes from containment.
+        let options_in_frame = nodes
+            .values()
+            .filter(|node| node["aria"]["role"] == "ListBoxOption")
+            .count();
+        assert_eq!(
+            options.len(),
+            options_in_frame,
+            "every option in the frame must be inside the list box"
+        );
     }
 
     #[gpui::test]
@@ -1896,5 +2261,12 @@ mod tests {
 }
 
 impl<D: PickerDelegate> EventEmitter<DismissEvent> for Picker<D> {}
-impl<D: PickerDelegate> ModalView for Picker<D> {}
+impl<D: PickerDelegate> ModalView for Picker<D> {
+    fn a11y_name(&self, cx: &App) -> Option<SharedString> {
+        // Every picker in the product opens as a modal, and the dialog the
+        // modal layer wraps it in had no name of its own — so each one was
+        // announced as "dialog" and nothing more.
+        Some(self.head.a11y_name(cx))
+    }
+}
 impl<D: PickerDelegate> ui::FluentBuilder for Picker<D> {}

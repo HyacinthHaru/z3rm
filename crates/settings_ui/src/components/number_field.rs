@@ -511,6 +511,19 @@ impl<T: NumberFieldType> RenderOnce for NumberField<T> {
                 .child(Icon::new(icon).size(IconSize::Small))
         };
 
+        // A settings page renders one number field per setting, so "Increment"
+        // on its own repeats down the page with nothing to tell the copies
+        // apart. The field's own name is the only thing that distinguishes them.
+        let control_name = {
+            let field_name = self.aria_label.clone();
+            move |action: &str| -> SharedString {
+                match field_name.as_ref() {
+                    Some(field_name) => format!("{action}: {field_name}").into(),
+                    None => action.to_string().into(),
+                }
+            }
+        };
+
         h_flex()
             .id(self.id.clone())
             .role(Role::SpinButton)
@@ -570,7 +583,7 @@ impl<T: NumberFieldType> RenderOnce for NumberField<T> {
                 this.child(
                     IconButton::new("reset", IconName::RotateCcw)
                         .icon_size(IconSize::Small)
-                        .aria_label("Reset to Default")
+                        .aria_label(control_name("Reset to Default"))
                         .when_some(self.tab_index, |this, _| this.tab_index(0isize))
                         .on_click(on_reset),
                 )
@@ -595,7 +608,7 @@ impl<T: NumberFieldType> RenderOnce for NumberField<T> {
                             base_button(IconName::Dash)
                                 .id((self.id.clone(), "decrement_button"))
                                 .role(Role::Button)
-                                .aria_label("Decrement")
+                                .aria_label(control_name("Decrement"))
                                 .rounded_tl_sm()
                                 .rounded_bl_sm()
                                 .when_some(self.tab_index, |this, _| this.tab_index(0isize))
@@ -811,7 +824,7 @@ impl<T: NumberFieldType> RenderOnce for NumberField<T> {
                             base_button(IconName::Plus)
                                 .id((self.id.clone(), "increment_button"))
                                 .role(Role::Button)
-                                .aria_label("Increment")
+                                .aria_label(control_name("Increment"))
                                 .rounded_tr_sm()
                                 .rounded_br_sm()
                                 .when_some(self.tab_index, |this, _| this.tab_index(0isize))
@@ -867,5 +880,82 @@ impl Component for NumberField<usize> {
                 ),
             ])
             .into_any_element()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use gpui::{Context, IntoElement, Render, TestAppContext, Window};
+
+    /// A number field is three buttons wrapped around a value, and a settings
+    /// page stacks one per setting. Named only after what they do, the copies
+    /// are indistinguishable: "increment" tells a user nothing about *what*.
+    #[gpui::test]
+    fn a_number_field_names_its_buttons_after_the_setting(cx: &mut TestAppContext) {
+        struct FieldsHost;
+
+        impl Render for FieldsHost {
+            fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+                v_flex()
+                    .child(
+                        NumberField::new("buffer-font-size", 14usize, window, cx)
+                            .aria_label("Buffer font size"),
+                    )
+                    .child(
+                        NumberField::new("ui-font-size", 16usize, window, cx)
+                            .aria_label("UI font size"),
+                    )
+            }
+        }
+
+        cx.update(|cx| {
+            let settings_store = settings::SettingsStore::test(cx);
+            cx.set_global(settings_store);
+            theme_settings::init(theme::LoadThemes::JustBase, cx);
+        });
+
+        let window = cx.add_window(|_, _| FieldsHost);
+        cx.activate_a11y(window.into());
+
+        let json = cx
+            .update_window(window.into(), |_, window, cx| {
+                window.draw(cx).clear(cx);
+                window.debug_a11y_tree_json()
+            })
+            .expect("the harness window is still open")
+            .expect("activation makes the debug tree available");
+        let tree: serde_json::Value = serde_json::from_str(&json).expect("the dump is valid JSON");
+
+        gpui::a11y_checks::assert_interactive_nodes_are_named(&tree, "number fields");
+        gpui::a11y_checks::assert_names_are_distinguishable(&tree, "number fields");
+        gpui::a11y_checks::assert_focusable_names_are_distinguishable(&tree, "number fields");
+        gpui::a11y_checks::assert_clickable_elements_are_reachable(&tree, "number fields");
+        gpui::a11y_checks::assert_no_role_was_discarded(&tree, "number fields");
+        gpui::a11y_checks::assert_no_aria_was_discarded(&tree, "number fields");
+        gpui::a11y_checks::assert_roles_are_contained(&tree, "number fields");
+        gpui::a11y_checks::assert_click_targets_are_reachable(&tree, "number fields");
+        gpui::a11y_checks::assert_controls_have_area(&tree, "number fields");
+        gpui::a11y_checks::assert_landmarks_are_distinguishable(&tree, "number fields");
+        gpui::a11y_checks::assert_active_descendant_is_honoured(&tree, "number fields");
+
+        let mut buttons: Vec<&str> = tree["nodes"]
+            .as_object()
+            .expect("the dump lists nodes")
+            .values()
+            .filter(|node| node["aria"]["role"] == "Button")
+            .filter_map(|node| node["aria"]["label"].as_str())
+            .collect();
+        buttons.sort();
+        assert_eq!(
+            buttons,
+            vec![
+                "Decrement: Buffer font size",
+                "Decrement: UI font size",
+                "Increment: Buffer font size",
+                "Increment: UI font size",
+            ],
+            "each button says which setting it changes"
+        );
     }
 }

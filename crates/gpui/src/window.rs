@@ -3095,9 +3095,18 @@ impl Window {
                 viewport_size: self.viewport_size,
                 scale_factor: self.scale_factor,
                 tab_stop_count: self.next_frame.tab_stops.tab_stop_count(),
-                // Filled in by `end_frame`, which owns the diagnostic.
+                // Filled in by `end_frame`, which owns the diagnostics.
                 focus_without_node: None,
+                roles_without_id: Vec::new(),
+                aria_without_role: Vec::new(),
+                clickable_without_role: Vec::new(),
+                active_descendant_without_focus: false,
             };
+            // A focused handle whose element never rendered leaves the tree
+            // with no focus and no reason for it.
+            if self.focus.is_some() {
+                self.a11y.note_focus_element_not_rendered();
+            }
             // clear the builder state regardless
             let tree_update = self.a11y.end_frame(frame_info);
 
@@ -4666,8 +4675,41 @@ impl Window {
         self.invalidator.debug_assert_prepaint();
         if focus_handle.is_focused(self) {
             self.next_frame.focus = Some(focus_handle.id);
+            if self.a11y.is_building_frame() {
+                self.a11y.note_focused_element_rendered();
+            }
         }
         self.next_frame.dispatch_tree.set_focus_id(focus_handle.id);
+    }
+
+    /// Report that `global_id`'s accessibility node is where `focus_handle`
+    /// lives, so focus has somewhere to land.
+    ///
+    /// [`Self::set_focus_handle`] only registers the handle for dispatch.
+    /// `div` follows it with this claim internally; a custom [`Element`] that
+    /// tracks focus itself has to say so, or the focused element produces no
+    /// node and screen readers announce the whole window instead.
+    pub fn report_a11y_focus_target(
+        &mut self,
+        global_id: &GlobalElementId,
+        focus_handle: &FocusHandle,
+    ) {
+        if !self.a11y.is_building_frame() {
+            return;
+        }
+        let node_id = global_id.accesskit_node_id();
+        self.a11y.set_focusable(node_id, focus_handle.id);
+        // Advertised as well as routed. `div` does both — `set_focusable`
+        // answers an incoming focus request and `Action::Focus` is what tells
+        // assistive technology it may make one — and an element reporting
+        // itself here was doing only the first, so an editor or a markdown view
+        // offered no actions at all despite being focusable.
+        if let Some(node) = self.a11y.nodes.current_node_mut_if(node_id) {
+            node.add_action(accesskit::Action::Focus);
+        }
+        if focus_handle.is_focused(self) {
+            self.a11y.set_focus(node_id);
+        }
     }
 
     /// Sets the view id for the current element, which will be used to manage view caching.

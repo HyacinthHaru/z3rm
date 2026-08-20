@@ -446,6 +446,12 @@ impl<D: PickerDelegate> Picker<D> {
                 )
             })
             .block_mouse_except_scroll()
+            // A drag grip, the same as the dock's. Its primary-button handler
+            // only swallows the press so the modal does not dismiss under it,
+            // and resizing a picker is a pointer gesture rather than an action
+            // a reader should be offered — but without saying so, the handle
+            // reads as a control that answers a click and does nothing.
+            .pointer_gesture_only()
             .on_mouse_down(MouseButton::Left, do_nothing)
             .on_drag(
                 ResizeDrag::<S>::start_new(

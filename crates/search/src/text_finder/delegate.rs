@@ -727,6 +727,7 @@ impl PickerDelegate for Delegate {
                 ("text-finder-search-option", option as usize),
                 option.icon(),
             )
+            .aria_label(label)
             .icon_size(IconSize::Small)
             .toggle_state(active.contains(options))
             .tooltip(move |_window, cx| Tooltip::for_action_in(label, action, &focus_handle, cx))
@@ -784,6 +785,23 @@ impl PickerDelegate for Delegate {
             ),
             picker::PickerAction::button("Open as Tab", super::ToProjectSearch.boxed_clone()),
         ]
+    }
+
+    /// Rows are announced by the file and line they point at; headers and
+    /// separators are not selectable, so naming them would offer rows the
+    /// arrow keys skip. Without this every result is a bare "option".
+    fn match_label(&self, ix: usize, _cx: &App) -> Option<SharedString> {
+        match self.entries.get(ix)? {
+            Entry::Header(_) | Entry::Separator => None,
+            Entry::Match(match_ix) => {
+                let search_match = self.matches.get(*match_ix)?;
+                let file = search_match.path.path.file_name()?;
+                Some(SharedString::from(format!(
+                    "{file}, line {}",
+                    search_match.line_number
+                )))
+            }
+        }
     }
 
     fn match_count(&self) -> usize {
@@ -1094,6 +1112,10 @@ impl Delegate {
                                                 ("text-finder-fold", ix),
                                                 !is_collapsed,
                                             )
+                                            .aria_label(format!(
+                                                "{}: {file_name}",
+                                                if is_collapsed { "Unfold" } else { "Fold" }
+                                            ))
                                             .tooltip(move |_window, cx| {
                                                 let (label, action): (_, &dyn gpui::Action) =
                                                     if is_collapsed {

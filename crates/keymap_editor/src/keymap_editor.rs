@@ -1131,6 +1131,20 @@ impl KeymapEditor {
         self.context_menu.is_some()
     }
 
+    /// The action a row is about, used to tell one row's button from the next.
+    /// Every row has one, so a fixed name makes a column of buttons that a user
+    /// cannot ask for or move between by name.
+    fn row_action_name(&self, index: usize) -> Option<SharedString> {
+        let candidate_id = self.matches.get(index)?.candidate_id;
+        Some(
+            self.keybindings
+                .get(candidate_id)?
+                .action()
+                .humanized_name
+                .clone(),
+        )
+    }
+
     fn create_row_button(
         &self,
         index: usize,
@@ -1138,8 +1152,13 @@ impl KeymapEditor {
         is_unbound_by_unbind: bool,
         cx: &mut Context<Self>,
     ) -> IconButton {
+        let row_label = |base: &str| match self.row_action_name(index) {
+            Some(action) => SharedString::from(format!("{base}: {action}")),
+            None => SharedString::from(base.to_string()),
+        };
         if is_unbound_by_unbind {
             base_button_style(index, IconName::Warning)
+                .aria_label(row_label("This action is unbound"))
                 .icon_color(Color::Warning)
                 .disabled(true)
                 .tooltip(Tooltip::text("This action is unbound"))
@@ -1148,6 +1167,7 @@ impl KeymapEditor {
         {
             if conflict.is_user_keybind_conflict() {
                 base_button_style(index, IconName::Warning)
+                    .aria_label(row_label("View conflicts"))
                     .icon_color(Color::Warning)
                     .tooltip(|_window, cx| {
                         Tooltip::with_meta(
@@ -1168,6 +1188,7 @@ impl KeymapEditor {
                     }))
             } else if self.search_mode.exact_match() {
                 base_button_style(index, IconName::Info)
+                    .aria_label(row_label("Edit this binding"))
                     .tooltip(|_window, cx| {
                         Tooltip::with_meta(
                             "Edit this binding",
@@ -1183,6 +1204,7 @@ impl KeymapEditor {
                     }))
             } else {
                 base_button_style(index, IconName::Info)
+                    .aria_label(row_label("Show matching keybinds"))
                     .tooltip(|_window, cx|  {
                         Tooltip::with_meta(
                             "Show matching keybinds",
@@ -1203,6 +1225,7 @@ impl KeymapEditor {
             }
         } else {
             base_button_style(index, IconName::Pencil)
+                .aria_label(row_label("Edit Keybinding"))
                 .visible_on_hover(if self.selected_index == Some(index) {
                     "".into()
                 } else if self.show_hover_menus {
@@ -1237,7 +1260,14 @@ impl KeymapEditor {
             (FilterState::All, SearchMode::Normal) => "No matches found for the provided query",
         };
 
-        Label::new(hint).color(Color::Muted).into_any_element()
+        // The hint is a `Label`, which contributes no node, so a search that
+        // matched nothing reached a reader as an empty list with no reason.
+        gpui::div()
+            .id("keymap-no-matches")
+            .role(gpui::Role::Group)
+            .aria_label(hint)
+            .child(Label::new(hint).color(Color::Muted))
+            .into_any_element()
     }
 
     fn select_next(&mut self, _: &menu::SelectNext, window: &mut Window, cx: &mut Context<Self>) {
@@ -1669,6 +1699,15 @@ impl KeymapEditor {
             })
             .trigger_with_tooltip(
                 IconButton::new("KeymapEditorFilterMenuButton", IconName::Sliders)
+                    // The dot is the only thing that says some of your
+                    // keybindings conflict, and it is a coloured circle.
+                    .aria_label(
+                        if self.keybinding_conflict_state.any_user_binding_conflicts() {
+                            "Filters, some keybindings conflict"
+                        } else {
+                            "Filters"
+                        },
+                    )
                     .icon_size(IconSize::Small)
                     .when(
                         self.keybinding_conflict_state.any_user_binding_conflicts(),
@@ -1948,6 +1987,7 @@ impl Render for KeymapEditor {
     fn render(&mut self, _window: &mut Window, cx: &mut ui::Context<Self>) -> impl ui::IntoElement {
         if let SearchMode::KeyStroke { exact_match } = self.search_mode {
             let button = IconButton::new("keystrokes-exact-match", IconName::CaseSensitive)
+                .aria_label("Toggle Exact Match Mode")
                 .tooltip(move |_window, cx| {
                     Tooltip::for_action(
                         "Toggle Exact Match Mode",
@@ -1977,6 +2017,11 @@ impl Render for KeymapEditor {
 
         v_flex()
             .id("keymap-editor")
+            // An id alone is not enough: without a role this focused root
+            // produces no node, so arrowing through the bindings announced the
+            // whole window instead of the table.
+            .role(gpui::Role::Group)
+            .aria_label("Key bindings editor")
             .track_focus(focus_handle)
             .key_context(self.key_context())
             .on_action(cx.listener(Self::select_next))
@@ -2037,6 +2082,7 @@ impl Render for KeymapEditor {
                                             "KeymapEditorKeystrokeSearchButton",
                                             IconName::Keyboard,
                                         )
+                                        .aria_label("Search by Keystrokes")
                                         .icon_size(IconSize::Small)
                                         .toggle_state(matches!(
                                             search_mode,
@@ -2107,6 +2153,7 @@ impl Render for KeymapEditor {
             )
             .child(
                 Table::new(COLS)
+                    .aria_label("Key bindings")
                     .interactable(&self.table_interaction_state)
                     .striped()
                     .empty_table_callback({
@@ -2256,8 +2303,41 @@ impl Render for KeymapEditor {
 
                             let row_id = row_group_id(row_index);
 
+                            // Every cell holds a label, and a label is not a
+                            // node, so the row is only readable if it says what
+                            // it holds: the binding, what it runs and where.
+                            let announced = candidate_id
+                                .and_then(|candidate_id| this.keybindings.get(candidate_id))
+                                .map(|binding| {
+                                    let action = binding.action().humanized_name.clone();
+                                    let keystrokes = binding
+                                        .keystroke_text()
+                                        .cloned()
+                                        .unwrap_or_else(|| SharedString::new_static("Unbound"));
+                                    let context = binding.context().map(|context| {
+                                        context
+                                            .local_str()
+                                            .map(SharedString::from)
+                                            .unwrap_or(KeybindContextString::GLOBAL)
+                                    });
+                                    match context {
+                                        Some(context) => {
+                                            format!("{action}, {keystrokes}, {context}")
+                                        }
+                                        None => format!("{action}, {keystrokes}"),
+                                    }
+                                });
+
                             div()
                                 .id(("keymap-row-wrapper", row_index))
+                                .role(gpui::Role::Row)
+                                .aria_row_index(row_index + 1)
+                                .aria_selected(is_selected)
+                                // Focus is on the table while the arrow keys
+                                // move the highlight, so the row is only
+                                // announced if it is also claimed as current.
+                                .when(is_selected, |this| this.aria_active_descendant())
+                                .when_some(announced, |this, announced| this.aria_label(announced))
                                 .child(
                                     row.id(row_id.clone())
                                         .when(!is_unbound_by_unbind, |row| {
@@ -2465,7 +2545,11 @@ struct KeybindingEditorModal {
     focus_state: KeybindingEditorModalFocusState,
 }
 
-impl ModalView for KeybindingEditorModal {}
+impl ModalView for KeybindingEditorModal {
+    fn a11y_name(&self, _cx: &gpui::App) -> Option<gpui::SharedString> {
+        Some("Edit Keybinding".into())
+    }
+}
 
 impl EventEmitter<DismissEvent> for KeybindingEditorModal {}
 
@@ -3120,7 +3204,7 @@ impl Render for KeybindingEditorModal {
                                 .child(self.context_editor.clone())
                                 .when_some(self.error.as_ref(), |this, error| {
                                     this.child(
-                                        Banner::new()
+                                        Banner::new(error.content.clone())
                                             .severity(error.severity)
                                             .child(Label::new(error.content.clone())),
                                     )
@@ -3943,7 +4027,12 @@ mod tests {
     async fn setup_keymap_editor(
         cx: &mut TestAppContext,
         keymap_content: &str,
-    ) -> (Arc<FakeFs>, Entity<KeymapEditor>, VisualTestContext) {
+    ) -> (
+        Arc<FakeFs>,
+        Entity<KeymapEditor>,
+        Entity<Workspace>,
+        VisualTestContext,
+    ) {
         cx.update(|cx| {
             let settings_store = SettingsStore::test(cx);
             cx.set_global(settings_store);
@@ -3973,7 +4062,206 @@ mod tests {
         let keymap_editor = cx
             .update(|window, cx| cx.new(|cx| KeymapEditor::new(workspace.downgrade(), window, cx)));
         cx.run_until_parked();
-        (fs, keymap_editor, cx)
+        (fs, keymap_editor, workspace, cx)
+    }
+
+    /// Every cell in the table holds a label, and a label contributes no node,
+    /// so the whole list of bindings was absent: no table, no rows, and no way
+    /// to hear what any binding runs or where it applies.
+    /// A search that matches nothing renders a hint instead of the table, and the
+    /// hint is a `Label` — which contributes no node. So the state a user is in
+    /// when they most need telling why the list is empty reached them as an
+    /// empty list. Nothing rendered this state in a frame.
+    #[gpui::test]
+    async fn a_search_that_matches_nothing_says_so(cx: &mut TestAppContext) {
+        let keymap_content = r#"[
+    {
+        "context": "Editor",
+        "bindings": {
+            "alt-cmd-shift-c": "zed::OpenKeymap"
+        }
+    }
+]"#;
+        let (_fs, keymap_editor, workspace, mut cx) =
+            setup_keymap_editor(cx, keymap_content).await;
+        let cx = &mut cx;
+
+        workspace.update_in(cx, |workspace, window, cx| {
+            workspace.add_item_to_active_pane(
+                Box::new(keymap_editor.clone()),
+                None,
+                true,
+                window,
+                cx,
+            );
+        });
+        cx.run_until_parked();
+
+        keymap_editor.update_in(cx, |editor, window, cx| {
+            editor.filter_editor.update(cx, |filter, cx| {
+                filter.set_text("no such binding anywhere", window, cx)
+            });
+        });
+        cx.run_until_parked();
+
+        cx.activate_a11y(cx.window_handle());
+        let json = cx
+            .update(|window, cx| {
+                window.draw(cx).clear(cx);
+                window.debug_a11y_tree_json()
+            })
+            .expect("activation makes the debug tree available");
+        let tree: serde_json::Value = serde_json::from_str(&json).expect("the dump is valid JSON");
+
+        gpui::a11y_checks::assert_no_role_was_discarded(&tree, "keymap with no matches");
+        gpui::a11y_checks::assert_no_aria_was_discarded(&tree, "keymap with no matches");
+
+        let names: Vec<&str> = tree["nodes"]
+            .as_object()
+            .expect("the dump lists nodes")
+            .values()
+            .filter_map(|node| node["aria"]["label"].as_str())
+            .collect();
+        assert!(
+            names.contains(&"No matches found for the provided query"),
+            "an empty list has to say why it is empty: {names:?}"
+        );
+    }
+
+    #[gpui::test]
+    async fn the_binding_table_names_itself_and_its_rows(cx: &mut TestAppContext) {
+        let keymap_content = r#"[
+    {
+        "context": "Editor",
+        "bindings": {
+            "alt-cmd-shift-c": "zed::OpenKeymap"
+        }
+    }
+]"#;
+        let (_fs, keymap_editor, workspace, mut cx) =
+            setup_keymap_editor(cx, keymap_content).await;
+        let cx = &mut cx;
+
+        // The editor is only drawn once it is an item in a pane; created on its
+        // own it never reaches a frame.
+        workspace.update_in(cx, |workspace, window, cx| {
+            workspace.add_item_to_active_pane(
+                Box::new(keymap_editor.clone()),
+                None,
+                true,
+                window,
+                cx,
+            );
+        });
+        cx.run_until_parked();
+
+        // Highlight a row: focus stays on the table while the arrow keys move
+        // the highlight, so the current row reaches a reader only through the
+        // active-descendant claim.
+        keymap_editor.update_in(cx, |editor, window, cx| {
+            editor.selected_index = Some(0);
+            window.focus(&editor.focus_handle, cx);
+            cx.notify();
+        });
+        cx.run_until_parked();
+
+        cx.activate_a11y(cx.window_handle());
+        let json = cx
+            .update(|window, cx| {
+                window.draw(cx).clear(cx);
+                window.debug_a11y_tree_json()
+            })
+            .expect("activation makes the debug tree available");
+        let tree: serde_json::Value = serde_json::from_str(&json).expect("the dump is valid JSON");
+        let nodes = tree["nodes"].as_object().expect("the dump lists nodes");
+
+        gpui::a11y_checks::assert_interactive_nodes_are_named(&tree, "keymap editor");
+        gpui::a11y_checks::assert_no_role_was_discarded(&tree, "keymap editor");
+        gpui::a11y_checks::assert_no_aria_was_discarded(&tree, "keymap editor");
+        gpui::a11y_checks::assert_roles_are_contained(&tree, "keymap editor");
+        gpui::a11y_checks::assert_focus_reached_the_tree(&tree, "keymap editor");
+        gpui::a11y_checks::assert_click_targets_are_reachable(&tree, "keymap editor");
+        gpui::a11y_checks::assert_landmarks_are_distinguishable(&tree, "keymap editor");
+        gpui::a11y_checks::assert_names_are_distinguishable(&tree, "keymap editor");
+        gpui::a11y_checks::assert_focusable_names_are_distinguishable(&tree, "keymap editor");
+        let handle = cx.window_handle();
+        gpui::a11y_checks::assert_every_tab_stop_reaches_the_tree(cx, handle, "keymap editor");
+
+        // The rows carry their whole text and no cell is a node, so a column
+        // count would offer cell-by-cell navigation with nothing to move to.
+        // The row count is real: it says how long the table is while the list
+        // is virtualised.
+        let table = tree["nodes"]
+            .as_object()
+            .expect("the dump lists nodes")
+            .values()
+            .find(|node| node["aria"]["role"] == "Table")
+            .expect("the key bindings are a table");
+        assert!(
+            table["aria"]["row_count"].as_u64().is_some_and(|rows| rows > 0),
+            "the table says how long it is: {table}"
+        );
+        assert_eq!(
+            table["aria"]["column_count"].as_u64(),
+            None,
+            "a table with no cell nodes must not promise columns to move between"
+        );
+        gpui::a11y_checks::assert_clickable_elements_are_reachable(&tree, "keymap editor");
+        gpui::a11y_checks::assert_controls_have_area(&tree, "keymap editor");
+        gpui::a11y_checks::assert_active_descendant_is_honoured(&tree, "keymap editor");
+
+        let table = nodes
+            .values()
+            .find(|node| node["aria"]["role"] == "Table")
+            .unwrap_or_else(|| panic!("the bindings must be reported as a table: {json}"));
+        assert_eq!(table["aria"]["label"].as_str(), Some("Key bindings"));
+
+        let rows: Vec<&str> = nodes
+            .values()
+            .filter(|node| node["aria"]["role"] == "Row")
+            .filter_map(|node| node["aria"]["label"].as_str())
+            .collect();
+        assert!(
+            !rows.is_empty(),
+            "the visible bindings must be reported as rows: {json}"
+        );
+        // A row reads the action, the platform's spoken modifier names, and
+        // the context. The concrete modifier vocabulary differs by platform:
+        // Command/Option on macOS, Super/Alt on Linux, and Win/Alt on Windows.
+        // The context is omitted when absent, and an unbound action says
+        // "Unbound", so every row must contain an action and binding state.
+        for row in &rows {
+            let (action, rest) = row
+                .split_once(", ")
+                .unwrap_or_else(|| panic!("a row has to say what it binds: {row:?}"));
+            assert!(
+                !action.is_empty() && !rest.is_empty(),
+                "a row must not name an action and then trail off: {row:?}"
+            );
+        }
+
+        let current = tree["active_descendant_focus"]
+            .as_str()
+            .and_then(|id| nodes.get(id))
+            .unwrap_or_else(|| panic!("the table must point at the row it highlights: {json}"));
+        assert_eq!(current["aria"]["row_index"].as_u64(), Some(1));
+        assert_eq!(current["aria"]["selected"].as_bool(), Some(true));
+        // The concrete shape the loop above can only approximate, on the one
+        // row this test controls. Keep the expected vocabulary independent of
+        // the formatter under test while accounting for platform conventions.
+        let modifiers = if cfg!(target_os = "macos") {
+            "Command-Option-Shift"
+        } else if cfg!(target_os = "windows") {
+            "Win-Alt-Shift"
+        } else {
+            "Super-Alt-Shift"
+        };
+        let expected = format!("zed: open keymap, {modifiers}-C, Editor");
+        assert_eq!(
+            current["aria"]["label"].as_str(),
+            Some(expected.as_str()),
+            "the highlighted row says the action, the keystroke and the context"
+        );
     }
 
     fn visible_rows_for_action(editor: &KeymapEditor, action_name: &str) -> Vec<usize> {
@@ -4003,7 +4291,7 @@ mod tests {
         }
     }
 ]"#;
-        let (fs, keymap_editor, mut cx) = setup_keymap_editor(cx, keymap_content).await;
+        let (fs, keymap_editor, _workspace, mut cx) = setup_keymap_editor(cx, keymap_content).await;
         let cx = &mut cx;
 
         let rows = keymap_editor.read_with(cx, |editor, _| {
@@ -4058,7 +4346,7 @@ mod tests {
         }
     }
 ]"#;
-        let (fs, keymap_editor, mut cx) = setup_keymap_editor(cx, keymap_content).await;
+        let (fs, keymap_editor, _workspace, mut cx) = setup_keymap_editor(cx, keymap_content).await;
         let cx = &mut cx;
 
         let rows = keymap_editor.read_with(cx, |editor, _| {
@@ -4278,5 +4566,66 @@ mod tests {
             0,
             &binding_then_unbind,
         ));
+    }
+}
+
+/// `InputField` is the app's plain text field — the keymap editor's context
+/// box, the "Folder to trust" prompt in the security modal. It marked its
+/// editor `a11y_wrapped`, promising that the element around it carried the
+/// role, name and text, and then carried none of the three. The field kept
+/// working only because the erased render path ignored the flag; honouring it,
+/// as `impl Render for Editor` already did, would have deleted the node.
+#[cfg(test)]
+mod input_field_tests {
+    use gpui::{AppContext as _, TestAppContext, VisualContext as _};
+    use ui_input::InputField;
+
+    #[gpui::test]
+    async fn an_input_field_is_a_named_text_input(cx: &mut TestAppContext) {
+        cx.update(|cx| {
+            let settings_store = settings::SettingsStore::test(cx);
+            cx.set_global(settings_store);
+            theme_settings::init(theme::LoadThemes::JustBase, cx);
+            editor::init(cx);
+        });
+        let window = cx.add_window(|window, cx| InputField::new(window, cx, "Folder to trust"));
+        cx.activate_a11y(window.into());
+
+        let json = cx
+            .update_window(window.into(), |_, window, cx| {
+                window.draw(cx).clear(cx);
+                window.debug_a11y_tree_json()
+            })
+            .expect("the field window is still open")
+            .expect("activation makes the debug tree available");
+        let tree: serde_json::Value = serde_json::from_str(&json).expect("the dump is valid JSON");
+        gpui::a11y_checks::assert_interactive_nodes_are_named(&tree, "input field");
+        gpui::a11y_checks::assert_no_role_was_discarded(&tree, "input field");
+        gpui::a11y_checks::assert_no_aria_was_discarded(&tree, "input field");
+        // The field's error line is a live region owned by `ui_input`, which
+        // has no test harness of its own — this is the only place it is
+        // rendered under a check.
+        gpui::a11y_checks::assert_live_regions_can_speak(&tree, "input field");
+
+        // Asserted by hand as well: the checks above find no fault with a
+        // control that produced no node at all, which is exactly the failure
+        // this guards against.
+        let field = tree["nodes"]
+            .as_object()
+            .expect("the dump lists nodes")
+            .values()
+            .find(|node| node["aria"]["role"] == "TextInput")
+            .unwrap_or_else(|| panic!("the field has to be in the tree at all: {json}"));
+        assert_eq!(
+            field["aria"]["placeholder"].as_str(),
+            Some("Folder to trust"),
+            "the placeholder is the only name this field has"
+        );
+        assert!(
+            field["aria"]["on_action"]
+                .as_array()
+                .is_some_and(|actions| actions.iter().any(|action| action == "Focus")),
+            "a field a reader cannot move focus to cannot be filled in: {field}"
+        );
     }
 }

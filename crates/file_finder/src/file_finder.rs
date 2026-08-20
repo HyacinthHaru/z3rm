@@ -94,7 +94,11 @@ actions!(
     ]
 );
 
-impl ModalView for FileFinder {}
+impl ModalView for FileFinder {
+    fn a11y_name(&self, _cx: &gpui::App) -> Option<gpui::SharedString> {
+        Some("File Finder".into())
+    }
+}
 
 pub struct FileFinder {
     picker: Entity<Picker<FileFinderDelegate>>,
@@ -1683,6 +1687,22 @@ impl PickerDelegate for FileFinderDelegate {
         "file finder"
     }
 
+    fn match_label(&self, ix: usize, _cx: &App) -> Option<SharedString> {
+        match self.matches.get(ix)? {
+            // Drawn as a `Label`, which is no node, and it has no relative path
+            // to fall back on — so the row that creates a file was the one row
+            // here announced with no name at all.
+            Match::CreateNew(project_path) => Some(
+                format!(
+                    "Create file: {}",
+                    project_path.path.display(PathStyle::local())
+                )
+                .into(),
+            ),
+            other => Some(other.relative_path()?.as_unix_str().to_string().into()),
+        }
+    }
+
     fn placeholder_text(&self, _window: &mut Window, _cx: &mut App) -> Arc<str> {
         "Search project files...".into()
     }
@@ -1703,6 +1723,9 @@ impl PickerDelegate for FileFinderDelegate {
         };
 
         let filter_button = IconButton::new("filter-ignored", IconName::FileIgnored)
+            // Icon-only, with its meaning only in a tooltip. The label also
+            // flips with the state, which the toggle state alone does not say.
+            .aria_label(tooltip_label)
             .icon_size(IconSize::Small)
             .toggle_state(including_ignored)
             .tooltip(move |_window, cx| {

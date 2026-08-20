@@ -69,6 +69,14 @@ impl IconButton {
         self
     }
 
+    /// What a reader says in place of "button" — "menu button" for a control
+    /// that opens a menu. Unlike `aria_expanded` this reaches all three
+    /// platforms, so it is where the kind of control belongs.
+    pub fn aria_role_description(mut self, role_description: impl Into<SharedString>) -> Self {
+        self.base = self.base.aria_role_description(role_description);
+        self
+    }
+
     /// Registers a handler for an accessibility action (e.g.
     /// [`gpui::accesskit::Action::Expand`]) dispatched by assistive technology.
     pub fn on_a11y_action(
@@ -187,6 +195,14 @@ impl FixedWidth for IconButton {
 }
 
 impl ButtonCommon for IconButton {
+    fn aria_expanded(self, expanded: bool) -> Self {
+        Self::aria_expanded(self, expanded)
+    }
+
+    fn aria_role_description(self, role_description: impl Into<SharedString>) -> Self {
+        Self::aria_role_description(self, role_description)
+    }
+
     fn id(&self) -> &ElementId {
         self.base.id()
     }

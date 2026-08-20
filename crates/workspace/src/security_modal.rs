@@ -56,6 +56,10 @@ impl Focusable for SecurityModal {
 impl EventEmitter<DismissEvent> for SecurityModal {}
 
 impl ModalView for SecurityModal {
+    fn a11y_name(&self, _cx: &App) -> Option<SharedString> {
+        Some(self.header_label())
+    }
+
     fn fade_out_background(&self) -> bool {
         true
     }
@@ -83,12 +87,7 @@ impl Render for SecurityModal {
             return v_flex().into_any_element();
         }
 
-        let restricted_count = self.restricted_paths.len();
-        let header_label: SharedString = if restricted_count == 1 {
-            "Unrecognized Project".into()
-        } else {
-            format!("Unrecognized Projects ({})", restricted_count).into()
-        };
+        let header_label = self.header_label();
 
         let trust_label = self.build_trust_label();
 
@@ -100,6 +99,9 @@ impl Render for SecurityModal {
             .then(|| self.trust_path_input.clone());
 
         AlertModal::new("security-modal")
+            // The heading is rendered inside `header` as elements, so the modal
+            // needs the text separately to be announced by name.
+            .title(header_label.clone())
             .width(rems(40.))
             .key_context("SecurityModal")
             .track_focus(&self.focus_handle(cx))
@@ -445,6 +447,17 @@ impl SecurityModal {
 
     pub fn dismiss(&mut self, cx: &mut Context<Self>) {
         cx.emit(DismissEvent);
+    }
+
+    /// The modal's heading, which is also the name the dialog announces itself
+    /// with, so the two cannot drift apart.
+    fn header_label(&self) -> SharedString {
+        let restricted_count = self.restricted_paths.len();
+        if restricted_count == 1 {
+            "Unrecognized Project".into()
+        } else {
+            format!("Unrecognized Projects ({})", restricted_count).into()
+        }
     }
 
     /// The sole untrusted, non-file project, when exactly one is being prompted

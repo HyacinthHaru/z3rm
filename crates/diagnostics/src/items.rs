@@ -59,6 +59,24 @@ impl Render for DiagnosticIndicator {
                 }),
         };
 
+        // The message under the cursor changes as the cursor moves, and the
+        // button carrying it appears and disappears with it. Announced from a
+        // region that is always present, so moving onto a broken line says what
+        // is wrong with it instead of silently swapping a button in and out.
+        let announced_diagnostic = self.current_diagnostic.as_ref().map(|diagnostic| {
+            let severity = match diagnostic.severity {
+                lsp::DiagnosticSeverity::ERROR => "Error",
+                lsp::DiagnosticSeverity::WARNING => "Warning",
+                lsp::DiagnosticSeverity::INFORMATION => "Information",
+                _ => "Hint",
+            };
+            let message = diagnostic
+                .message
+                .split_once('\n')
+                .map_or(&*diagnostic.message, |(first, _)| first);
+            SharedString::from(format!("{severity}: {message}"))
+        });
+
         let status = if let Some(diagnostic) = &self.current_diagnostic {
             let message = diagnostic
                 .message
@@ -137,7 +155,16 @@ impl Render for DiagnosticIndicator {
                         }
                     })),
             )
-            .children(status)
+            .child(
+                div()
+                    .id("diagnostic-message-status")
+                    .role(gpui::Role::Status)
+                    .aria_live(gpui::accesskit::Live::Polite)
+                    .when_some(announced_diagnostic, |this, message| {
+                        this.aria_announcement(message)
+                    })
+                    .children(status),
+            )
     }
 }
 
@@ -266,5 +293,99 @@ impl StatusItemView for DiagnosticIndicator {
         Some(HideStatusItem::new(|settings| {
             settings.diagnostics.get_or_insert_default().button = Some(false);
         }))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use gpui::{TestAppContext, WeakEntity};
+
+    /// The message under the cursor is shown in the status bar and changes as
+    /// the cursor moves, and the button carrying it comes and goes with it.
+    /// Nothing announced any of that, so arrowing onto a broken line said
+    /// nothing about what was wrong with it.
+    #[gpui::test]
+    fn the_diagnostic_under_the_cursor_is_announced(cx: &mut TestAppContext) {
+        cx.update(|cx| {
+            let settings_store = settings::SettingsStore::test(cx);
+            cx.set_global(settings_store);
+            theme_settings::init(theme::LoadThemes::JustBase, cx);
+            ProjectSettings::register(cx);
+        });
+
+        let window = cx.add_window(|_, _| DiagnosticIndicator {
+            summary: project::DiagnosticSummary::default(),
+            workspace: WeakEntity::new_invalid(),
+            current_diagnostic: None,
+            active_editor: None,
+            _observe_active_editor: None,
+            diagnostics_update: Task::ready(()),
+            diagnostic_summary_update: Task::ready(()),
+        });
+        cx.activate_a11y(window.into());
+
+        let read = |cx: &mut TestAppContext| {
+            let json = cx
+                .update_window(window.into(), |_, window, cx| {
+                    window.draw(cx).clear(cx);
+                    window.debug_a11y_tree_json()
+                })
+                .expect("the indicator window is still open")
+                .expect("activation makes the debug tree available");
+            let tree: serde_json::Value =
+                serde_json::from_str(&json).expect("the dump is valid JSON");
+            gpui::a11y_checks::assert_interactive_nodes_are_named(&tree, "diagnostic indicator");
+            gpui::a11y_checks::assert_names_are_distinguishable(&tree, "diagnostic indicator");
+            gpui::a11y_checks::assert_focusable_names_are_distinguishable(&tree, "diagnostic indicator");
+            gpui::a11y_checks::assert_clickable_elements_are_reachable(&tree, "diagnostic indicator");
+            gpui::a11y_checks::assert_roles_are_contained(&tree, "diagnostic indicator");
+            gpui::a11y_checks::assert_click_targets_are_reachable(&tree, "diagnostic indicator");
+            gpui::a11y_checks::assert_controls_have_area(&tree, "diagnostic indicator");
+            gpui::a11y_checks::assert_landmarks_are_distinguishable(&tree, "diagnostic indicator");
+            gpui::a11y_checks::assert_active_descendant_is_honoured(&tree, "diagnostic indicator");
+            gpui::a11y_checks::assert_no_role_was_discarded(&tree, "diagnostic indicator");
+            gpui::a11y_checks::assert_no_aria_was_discarded(&tree, "diagnostic indicator");
+            gpui::a11y_checks::assert_live_regions_can_speak(&tree, "diagnostic indicator");
+            // The value, not the label: macOS speaks `node.value()` and raises
+            // no announcement at all without one.
+            tree["nodes"]
+                .as_object()
+                .expect("the dump lists nodes")
+                .values()
+                .filter(|node| node["aria"]["live"] == "Polite")
+                .map(|node| {
+                    node["aria"]["value"]
+                        .as_str()
+                        .unwrap_or_default()
+                        .to_string()
+                })
+                .collect::<Vec<_>>()
+        };
+
+        // Present and empty first: a region that appears together with its
+        // message has nothing to diff against and announces nothing.
+        assert_eq!(
+            read(cx),
+            vec![String::new()],
+            "the region has to exist before there is a diagnostic"
+        );
+
+        window
+            .update(cx, |indicator, _, cx| {
+                indicator.current_diagnostic = Some(Diagnostic {
+                    severity: lsp::DiagnosticSeverity::ERROR,
+                    message: "expected `;`\nnote: elsewhere".to_string(),
+                    ..Default::default()
+                });
+                cx.notify();
+            })
+            .expect("the indicator window is still open");
+
+        assert_eq!(
+            read(cx),
+            vec!["Error: expected `;`".to_string()],
+            "the severity and the first line of the message are what a reader needs"
+        );
     }
 }

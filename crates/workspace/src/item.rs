@@ -204,6 +204,29 @@ pub trait Item: Focusable + EventEmitter<Self::Event> + Render + Sized {
     /// Returns the textual contents of the tab.
     fn tab_content_text(&self, _detail: usize, _cx: &App) -> SharedString;
 
+    /// What a screen reader is told the tab is, when that differs from what
+    /// the tab draws.
+    ///
+    /// A tab strip shows many titles at once and so cuts them to fit; a reader
+    /// is given one tab at a time and can neither see the rest nor hover for a
+    /// tooltip. An item that shortens its title for the strip should return the
+    /// unshortened one here. Defaulted, because for most items the two are the
+    /// same thing.
+    fn tab_announcement_text(&self, detail: usize, cx: &App) -> SharedString {
+        self.tab_content_text(detail, cx)
+    }
+
+    /// What the tab's dirty indicator means for this item.
+    ///
+    /// The indicator is a coloured dot, so the words are the only version a
+    /// reader gets, and [`Item::is_dirty`] does not mean the same thing
+    /// everywhere: a terminal is "dirty" when it rang the bell or is still
+    /// running a task, which is not unsaved work and must not be announced as
+    /// though it were.
+    fn dirty_announcement_text(&self, _cx: &App) -> SharedString {
+        SharedString::new_static("unsaved changes")
+    }
+
     /// Returns the suggested filename for saving this item.
     /// By default, returns the tab content text.
     fn suggested_filename(&self, cx: &App) -> SharedString {
@@ -502,6 +525,8 @@ pub trait ItemHandle: 'static + Send {
     ) -> gpui::Subscription;
     fn tab_content(&self, params: TabContentParams, window: &Window, cx: &App) -> AnyElement;
     fn tab_content_text(&self, detail: usize, cx: &App) -> SharedString;
+    fn tab_announcement_text(&self, detail: usize, cx: &App) -> SharedString;
+    fn dirty_announcement_text(&self, cx: &App) -> SharedString;
     fn suggested_filename(&self, cx: &App) -> SharedString;
     fn tab_icon(&self, window: &Window, cx: &App) -> Option<Icon>;
     fn tab_tooltip_text(&self, cx: &App) -> Option<SharedString>;
@@ -650,6 +675,14 @@ impl<T: Item> ItemHandle for Entity<T> {
     }
     fn tab_content_text(&self, detail: usize, cx: &App) -> SharedString {
         self.read(cx).tab_content_text(detail, cx)
+    }
+
+    fn tab_announcement_text(&self, detail: usize, cx: &App) -> SharedString {
+        self.read(cx).tab_announcement_text(detail, cx)
+    }
+
+    fn dirty_announcement_text(&self, cx: &App) -> SharedString {
+        self.read(cx).dirty_announcement_text(cx)
     }
 
     fn suggested_filename(&self, cx: &App) -> SharedString {
@@ -1237,6 +1270,11 @@ pub mod test {
         pub nav_history: Option<ItemNavHistory>,
         pub tab_descriptions: Option<Vec<&'static str>>,
         pub tab_detail: Cell<Option<usize>>,
+        /// What the tab announces, when that is not what it draws. `None`
+        /// leaves the default in place, which is what every existing test
+        /// expects.
+        pub tab_announcement: Option<SharedString>,
+        pub dirty_announcement: Option<SharedString>,
         serialize: Option<Box<dyn Fn() -> Option<Task<anyhow::Result<()>>>>>,
         focus_handle: gpui::FocusHandle,
         pub child_focus_handles: Vec<gpui::FocusHandle>,
@@ -1328,6 +1366,8 @@ pub mod test {
                 nav_history: None,
                 tab_descriptions: None,
                 tab_detail: Default::default(),
+                tab_announcement: None,
+                dirty_announcement: None,
                 workspace_id: Default::default(),
                 focus_handle: cx.focus_handle(),
                 serialize: None,
@@ -1357,6 +1397,11 @@ pub mod test {
 
         pub fn with_dirty(mut self, dirty: bool) -> Self {
             self.is_dirty = dirty;
+            self
+        }
+
+        pub fn with_dirty_announcement(mut self, announcement: impl Into<SharedString>) -> Self {
+            self.dirty_announcement = Some(announcement.into());
             self
         }
 
@@ -1398,7 +1443,15 @@ pub mod test {
 
     impl Render for TestItem {
         fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-            let parent = gpui::div().track_focus(&self.focus_handle(cx));
+            // Real items carry an id and a role, so focus landing on one
+            // produces a node. Without that here, every workspace test would
+            // look like a window whose focus is dropped.
+            use gpui::StatefulInteractiveElement as _;
+            let parent = gpui::div()
+                .id(gpui::ElementId::View(cx.entity_id()))
+                .role(gpui::Role::Group)
+                .aria_label(SharedString::from(self.label.clone()))
+                .track_focus(&self.focus_handle(cx));
             self.child_focus_handles
                 .iter()
                 .fold(parent, |parent, child_handle| {
@@ -1422,6 +1475,18 @@ pub mod test {
             f(*event)
         }
 
+        fn tab_announcement_text(&self, detail: usize, cx: &App) -> SharedString {
+            self.tab_announcement
+                .clone()
+                .unwrap_or_else(|| self.tab_content_text(detail, cx))
+        }
+
+        fn dirty_announcement_text(&self, _cx: &App) -> SharedString {
+            self.dirty_announcement
+                .clone()
+                .unwrap_or_else(|| SharedString::new_static("unsaved changes"))
+        }
+
         fn tab_content_text(&self, detail: usize, _cx: &App) -> SharedString {
             self.tab_descriptions
                 .as_ref()
@@ -1429,7 +1494,9 @@ pub mod test {
                     let description = *descriptions.get(detail).or_else(|| descriptions.last())?;
                     description.into()
                 })
-                .unwrap_or_default()
+                // Falling back to the label keeps an item that was given a name
+                // from reaching the tab bar as an unnamed tab.
+                .unwrap_or(self.label.as_str())
                 .into()
         }
 
@@ -1516,6 +1583,8 @@ pub mod test {
                     nav_history: None,
                     tab_descriptions: None,
                     tab_detail: Default::default(),
+                    tab_announcement: None,
+                    dirty_announcement: self.dirty_announcement.clone(),
                     workspace_id: self.workspace_id,
                     focus_handle: cx.focus_handle(),
                     serialize: None,

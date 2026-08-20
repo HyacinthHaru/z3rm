@@ -371,6 +371,10 @@ pub struct Table {
     /// Optional per-column visibility mask. When set, it overrides any filter derived from the
     /// column width config. Columns whose entry is `true` are hidden.
     column_filter: Option<TableRow<bool>>,
+    /// What this table is called. Set it to have the table reported as one:
+    /// without it the rows are a stack of unrelated cells, and a cell's text is
+    /// a label, which contributes no node of its own.
+    aria_label: Option<SharedString>,
 }
 
 impl Table {
@@ -391,7 +395,16 @@ impl Table {
             column_width_config: ColumnWidthConfig::auto(),
             pinned_cols: 0,
             column_filter: None,
+            aria_label: None,
         }
+    }
+
+    /// Names the table, which is also what makes it reported as a table at all.
+    /// Rows still have to name themselves — a cell holds an opaque element, so
+    /// this component cannot read the text out of one.
+    pub fn aria_label(mut self, label: impl Into<SharedString>) -> Self {
+        self.aria_label = Some(label.into());
+        self
     }
 
     /// Sets a per-column visibility mask. Columns whose entry is `true` are filtered out (hidden).
@@ -609,6 +622,9 @@ fn render_header_cell(
             shared_element_id.clone(),
             header_idx as u64,
         ))
+        // The only click a header cell answers is a double-click to reset the
+        // column width — a pointer gesture, not a control.
+        .pointer_gesture_only()
         .when_some(resize_info.cloned(), |this, info| {
             if info.resize_behavior[header_idx].is_resizable() {
                 this.on_click(move |event, window, cx| {
@@ -1168,6 +1184,8 @@ impl RenderOnce for Table {
 
         let is_resizable = resizable_entity.is_some();
 
+        let total_row_count = table_context.total_row_count;
+        let aria_label = self.aria_label.clone();
         let table = div()
             .when_some(table_width, |this, width| this.w(width))
             .h_full()
@@ -1360,9 +1378,30 @@ impl RenderOnce for Table {
             content
                 .track_focus(&state.read(cx).focus_handle)
                 .id(("table", state.entity_id()))
+                .when_some(aria_label, |this, label| {
+                    // A row count is honest even while the list is virtualised:
+                    // it says how long the table is, and the visible rows are
+                    // real nodes. A column count is not, because no cell in
+                    // this table is a node — callers put a row's whole text on
+                    // the row. Declaring columns offers cell-by-cell navigation
+                    // that finds nothing to move to.
+                    this.role(gpui::Role::Table)
+                        .aria_label(label)
+                        .aria_row_count(total_row_count)
+                })
                 .into_any_element()
         } else {
-            table.into_any_element()
+            match aria_label {
+                // Keyed by the name so two tables in one view cannot collide on
+                // a shared id and lose one of the two nodes.
+                Some(label) => table
+                    .id(ElementId::Name(label.clone()))
+                    .role(gpui::Role::Table)
+                    .aria_label(label)
+                    .aria_row_count(total_row_count)
+                    .into_any_element(),
+                None => table.into_any_element(),
+            }
         }
     }
 }

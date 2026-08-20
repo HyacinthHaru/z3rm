@@ -5548,28 +5548,47 @@ impl Workspace {
         self.update_window_edited(window, cx);
     }
 
-    fn render_notifications(&self, _window: &mut Window, _cx: &mut Context<Self>) -> Option<Div> {
-        if self.notifications.is_empty() {
-            None
-        } else {
-            Some(
-                div()
-                    .absolute()
-                    .right_3()
-                    .bottom_3()
-                    .w_112()
-                    .h_full()
-                    .flex()
-                    .flex_col()
-                    .justify_end()
-                    .gap_2()
-                    .children(
-                        self.notifications
-                            .iter()
-                            .map(|(_, notification)| notification.clone().into_any_element()),
-                    ),
-            )
-        }
+    fn render_notifications(&self, _window: &mut Window, _cx: &mut Context<Self>) -> Div {
+        let has_notifications = !self.notifications.is_empty();
+
+        // Rendered even when there is nothing to show. A live region announces
+        // changes made *inside* it, so a region that appears at the same moment
+        // as its first notification has nothing to compare against; it has to
+        // already be in the tree when the notification arrives. While empty it
+        // takes no space, so it cannot cover the workspace beneath it.
+        div().absolute().right_3().bottom_3().child(
+            div()
+                .id("workspace-notifications")
+                // Notifications appear on their own, away from wherever the
+                // user is working, and several can stack up — which is what
+                // `Log` describes and what a live region makes audible.
+                // Polite rather than assertive: an error that already
+                // happened does not justify cutting off whatever is being
+                // read.
+                .role(gpui::Role::Log)
+                .aria_live(gpui::accesskit::Live::Polite)
+                // The newest notification's text, because that is the one that
+                // just arrived. No platform descends into the notifications
+                // drawn inside the region, so the text has to be on the region
+                // itself. Deliberately no standing name: the two platforms that
+                // announce on a name change would read a name reverting to
+                // "Notifications" as something to say out loud.
+                .when_some(
+                    self.notifications
+                        .last()
+                        .map(|(_, _, announcement)| announcement)
+                        .filter(|announcement| !announcement.is_empty()),
+                    |this, announcement| this.aria_announcement(announcement.clone()),
+                )
+                .when(has_notifications, |this| {
+                    this.w_112().h_full().flex().flex_col().justify_end().gap_2()
+                })
+                .children(
+                    self.notifications
+                        .iter()
+                        .map(|(_, notification, _)| notification.clone().into_any_element()),
+                ),
+        )
     }
 
     // RPC handlers
@@ -6271,7 +6290,7 @@ impl Workspace {
             ))
             .on_action(cx.listener(
                 |workspace: &mut Workspace, _: &SuppressNotification, _, cx| {
-                    if let Some((notification_id, _)) = workspace.notifications.pop() {
+                    if let Some((notification_id, _, _)) = workspace.notifications.pop() {
                         workspace.suppress_notification(&notification_id, cx);
                     }
                 },
@@ -7013,11 +7032,23 @@ impl Workspace {
         let dock_is_open = dock.read(cx).is_open();
         let a11y_active = window.is_a11y_active();
 
+        // Named after the panel it is showing, not just where it sits: a
+        // landmark list reading "left dock, right dock" offers two
+        // destinations and refuses to say what either one holds.
+        let dock_label = match dock
+            .read(cx)
+            .active_panel()
+            .and_then(|panel| panel.icon_tooltip(window, cx))
+        {
+            Some(panel_name) => SharedString::from(format!("{dock_label}: {panel_name}")),
+            None => SharedString::from(dock_label),
+        };
+
         let mut container = div()
             .id(dock_element_id)
             .when(dock_is_open, |this| {
                 this.role(gpui::Role::Complementary)
-                    .aria_label(dock_label)
+                    .aria_label(dock_label.clone())
                     .when(a11y_active, |this| {
                         this.track_focus(self.region_focus_handles.dock(position))
                     })
@@ -7329,7 +7360,7 @@ impl Workspace {
 
     pub fn cancel(&mut self, _: &menu::Cancel, window: &mut Window, cx: &mut Context<Self>) {
         if cx.stop_active_drag(window) {
-        } else if let Some((notification_id, _)) = self.notifications.pop() {
+        } else if let Some((notification_id, _, _)) = self.notifications.pop() {
             dismiss_app_notification(&notification_id, cx);
         } else {
             cx.propagate();
@@ -7916,7 +7947,7 @@ impl Render for Workspace {
         let notification_entities = self
             .notifications
             .iter()
-            .map(|(_, notification)| notification.entity_id())
+            .map(|(_, notification, _)| notification.entity_id())
             .collect::<Vec<_>>();
         let bottom_dock_layout = WorkspaceSettings::get_global(cx).bottom_dock_layout;
 
@@ -7949,7 +7980,11 @@ impl Render for Workspace {
                         .track_focus(&self.titlebar_focus_handle)
                         .tab_group()
                         .role(gpui::Role::Toolbar)
-                        .aria_label("Title bar")
+                        // Not "Title bar": the banner landmark around this is
+                        // already called that, and a reader announcing the same
+                        // name twice for one strip describes two places where
+                        // there is one.
+                        .aria_label("Title bar controls")
                         .on_key_down(cx.listener(
                             |workspace, event: &gpui::KeyDownEvent, window, cx| {
                                 if event.keystroke.modifiers.modified() {
@@ -8343,7 +8378,7 @@ impl Render for Workspace {
                                     None => div.top_2().bottom_2().left_2().right_2().border_1(),
                                 })
                             }))
-                            .children(self.render_notifications(window, cx)),
+                            .child(self.render_notifications(window, cx)),
                     )
                     .when(self.status_bar_visible(cx), |parent| {
                         parent.child(self.status_bar.clone())

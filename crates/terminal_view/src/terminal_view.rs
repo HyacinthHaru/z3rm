@@ -93,8 +93,6 @@ fn resolve_mux_scrollback_offset(
     }
 }
 
-
-
 #[cfg(test)]
 mod mux_scrollback_tests {
     use super::resolve_mux_scrollback_offset;
@@ -1049,6 +1047,14 @@ impl TerminalView {
     }
 
     /// §12 进入复制模式 (Plan 31)
+    /// Enter copy mode without dispatching the action, for tests that need the
+    /// state rather than the key routing that normally produces it.
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn enter_copy_mode_for_test(&mut self, cx: &mut Context<Self>) {
+        copy_mode::enter_copy_mode(&self.terminal, &mut self.copy_mode_state, cx);
+        cx.notify();
+    }
+
     fn enter_copy_mode(&mut self, _: &EnterCopyMode, _: &mut Window, cx: &mut Context<Self>) {
         copy_mode::enter_copy_mode(&self.terminal, &mut self.copy_mode_state, cx);
         cx.notify();
@@ -1326,6 +1332,7 @@ impl TerminalView {
         let task_id = task.spawned_task.id.clone();
         Some(
             IconButton::new("rerun-icon", IconName::Rerun)
+                .aria_label("Rerun task")
                 .icon_size(IconSize::Small)
                 .size(ButtonSize::Compact)
                 .icon_color(Color::Default)
@@ -1642,7 +1649,9 @@ impl Render for TerminalView {
             // §16.4 a11y: outer div exposes Terminal role + title for non-mux
             // terminal views; the child TerminalElement also carries Terminal.
             .role(gpui::Role::Terminal)
-            .aria_label(self.terminal.read(cx).title(true))
+            // Untruncated: `title(true)` cuts to 25 characters for the tab
+            // strip, and this names the surface a reader is standing in.
+            .aria_label(self.terminal.read(cx).title(false))
             .key_context(self.dispatch_context(cx))
             .on_action(cx.listener(TerminalView::send_text))
             .on_action(cx.listener(TerminalView::send_keystroke))
@@ -1912,6 +1921,17 @@ impl Item for TerminalView {
         terminal.title(detail == 0).into()
     }
 
+    fn tab_announcement_text(&self, _detail: usize, cx: &App) -> SharedString {
+        // A custom title is the user's own words and is never cut, so it is
+        // the same either way. Otherwise uncut: `title(true)` stops at 25
+        // characters for the strip, and a terminal's title is the command it
+        // is running.
+        if let Some(custom_title) = self.custom_title.as_ref().filter(|l| !l.trim().is_empty()) {
+            return custom_title.clone().into();
+        }
+        self.terminal().read(cx).title(false).into()
+    }
+
     fn telemetry_event_text(&self) -> Option<&'static str> {
         None
     }
@@ -2059,6 +2079,15 @@ impl Item for TerminalView {
         match self.terminal.read(cx).task() {
             Some(task) => task.status == TaskStatus::Running,
             None => self.has_bell(),
+        }
+    }
+
+    /// A terminal has nothing to save, so the dot the tab draws for `is_dirty`
+    /// means something else here entirely — the announcement has to match.
+    fn dirty_announcement_text(&self, cx: &App) -> SharedString {
+        match self.terminal.read(cx).task() {
+            Some(_) => SharedString::new_static("running"),
+            None => SharedString::new_static("bell"),
         }
     }
 
@@ -2523,6 +2552,34 @@ mod tests {
     }
 
     #[gpui::test]
+    async fn a_bell_is_not_announced_as_unsaved_work(cx: &mut TestAppContext) {
+        let (project, _workspace, window_handle) = init_test_with_window(cx).await;
+        let (_pane, _terminal, terminal_view) =
+            add_display_only_terminal(&project, window_handle, true, cx);
+
+        let mut cx = VisualTestContext::from_window(window_handle.into(), cx);
+        cx.run_until_parked();
+
+        // A terminal reports `is_dirty` for a rung bell, which the tab draws
+        // as the same coloured dot an unsaved file gets. The dot is not a
+        // node, so the words are the only version a reader receives — and
+        // "unsaved changes" describes a state a terminal cannot be in.
+        let (dirty, announced) = terminal_view.update(&mut cx, |view, cx| {
+            view.has_bell = true;
+            (
+                workspace::Item::is_dirty(view, cx),
+                workspace::Item::dirty_announcement_text(view, cx),
+            )
+        });
+        assert!(dirty, "the bell is what puts the dot on the tab");
+        assert_eq!(
+            announced.as_ref(),
+            "bell",
+            "so the dot has to be explained as the bell it is"
+        );
+    }
+
+    #[gpui::test]
     async fn shift_up_scrolls_history_in_normal_screen(cx: &mut TestAppContext) {
         let (project, _workspace, window_handle) = init_test_with_window(cx).await;
         cx.update(load_default_keymap);
@@ -2640,7 +2697,6 @@ mod tests {
             assert_eq!(res, None);
         });
     }
-
 
     // No active entry, but a worktree, worktree is a file -> parent directory
     #[gpui::test]
@@ -2867,7 +2923,6 @@ mod tests {
         (project, workspace, window_handle)
     }
 
-
     /// Creates a file in the given worktree and returns its entry.
     async fn create_file_in_worktree(
         worktree: Entity<Worktree>,
@@ -2917,7 +2972,6 @@ mod tests {
         path: impl AsRef<Path>,
         cx: &mut TestAppContext,
     ) -> (Entity<Worktree>, Entry) {
-
         let wt = project
             .update(cx, |project, cx| {
                 project.find_or_create_worktree(path.as_ref(), true, cx)

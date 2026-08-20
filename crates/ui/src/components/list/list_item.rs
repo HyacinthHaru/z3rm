@@ -57,7 +57,9 @@ pub struct ListItem {
     aria_label: Option<SharedString>,
     aria_keyshortcuts: Option<SharedString>,
     aria_checked: Option<bool>,
+    aria_selected: Option<bool>,
     aria_level: Option<usize>,
+    aria_role_description: Option<SharedString>,
     aria_expanded: Option<bool>,
     aria_active_descendant: bool,
 }
@@ -95,7 +97,9 @@ impl ListItem {
             aria_label: None,
             aria_keyshortcuts: None,
             aria_checked: None,
+            aria_selected: None,
             aria_level: None,
+            aria_role_description: None,
             aria_expanded: None,
             aria_active_descendant: false,
         }
@@ -139,6 +143,21 @@ impl ListItem {
     /// as "level N". Requires [`Self::aria_role`] to be set. Levels are
     /// 1-based, so a root item is level 1. [`Self::indent_level`] only controls
     /// visual indentation and carries no meaning for screen readers.
+    /// Sets whether this item is the current one in its list. Requires
+    /// [`Self::aria_role`] to be set.
+    pub fn aria_selected(mut self, selected: bool) -> Self {
+        self.aria_selected = Some(selected);
+        self
+    }
+
+    /// What a reader says in place of this row's role — "folder" rather than
+    /// "row". Unlike most of the aria properties it reaches all three
+    /// platforms, so it is where a distinction the role cannot draw belongs.
+    pub fn aria_role_description(mut self, role_description: impl Into<SharedString>) -> Self {
+        self.aria_role_description = Some(role_description.into());
+        self
+    }
+
     pub fn aria_level(mut self, level: usize) -> Self {
         self.aria_level = Some(level);
         self
@@ -312,6 +331,7 @@ impl ParentElement for ListItem {
 
 impl RenderOnce for ListItem {
     fn render(self, _window: &mut Window, cx: &mut App) -> impl IntoElement {
+        let disclosure_label = self.aria_label.clone();
         h_flex()
             .id(self.id)
             .when_some(self.group_name, |this, group| this.group(group))
@@ -356,11 +376,18 @@ impl RenderOnce for ListItem {
                         |this| this.aria_active_descendant(),
                     )
                     .when_some(self.aria_label, |this, label| this.aria_label(label))
+                    .aria_disabled(self.disabled)
+                    .when_some(self.aria_selected, |this, selected| {
+                        this.aria_selected(selected)
+                    })
                     .when_some(self.aria_keyshortcuts, |this, keyshortcuts| {
                         this.aria_keyshortcuts(keyshortcuts)
                     })
                     .when(self.aria_role.is_some(), |this| {
                         this.when_some(self.aria_level, |this, level| this.aria_level(level))
+                            .when_some(self.aria_role_description, |this, role_description| {
+                                this.aria_role_description(role_description)
+                            })
                             .when_some(self.aria_expanded, |this, expanded| {
                                 this.aria_expanded(expanded)
                             })
@@ -438,6 +465,12 @@ impl RenderOnce for ListItem {
                             })
                             .child(
                                 Disclosure::new("toggle", is_open)
+                                    .when_some(disclosure_label, |disclosure, label| {
+                                        disclosure.aria_label(format!(
+                                            "{}: {label}",
+                                            if is_open { "Collapse" } else { "Expand" }
+                                        ))
+                                    })
                                     .on_toggle_expanded(self.on_toggle),
                             )
                     }))

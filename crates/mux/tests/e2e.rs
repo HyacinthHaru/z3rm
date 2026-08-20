@@ -756,6 +756,15 @@ async fn e2e_reattaching_the_same_window_is_silent() -> Result<()> {
     window.create_and_attach_window(&session_id).await?;
     let window_id = window.window_id();
 
+    // A round-trip on the observer before subscribing, for the same reason
+    // there is one after the re-attach below. The creation's own `WindowAdded`
+    // travels to the observer on the same socket as this response and is
+    // dispatched to whatever subscribers exist when the router reaches it — so
+    // subscribing while it is still in flight hands the creation's event to the
+    // subscriber below, where it is indistinguishable from a re-announcement.
+    // Under load that is what happened, about one run in twelve.
+    observer.list_sessions().await?;
+
     let notifications = observer.subscribe();
     window.attach(&session_id, AttachMode::Shared).await?;
 

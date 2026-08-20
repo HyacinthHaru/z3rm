@@ -32,7 +32,11 @@ pub fn init(cx: &mut App) {
     cx.observe_new(CommandPalette::register).detach();
 }
 
-impl ModalView for CommandPalette {}
+impl ModalView for CommandPalette {
+    fn a11y_name(&self, _cx: &gpui::App) -> Option<gpui::SharedString> {
+        Some("Command Palette".into())
+    }
+}
 
 pub struct CommandPalette {
     picker: Entity<Picker<CommandPaletteDelegate>>,
@@ -387,6 +391,24 @@ impl PickerDelegate for CommandPaletteDelegate {
 
     fn name() -> &'static str {
         "command palette"
+    }
+
+    fn match_label(&self, ix: usize, _cx: &App) -> Option<SharedString> {
+        Some(self.matches.get(ix)?.string.clone().into())
+    }
+
+    fn match_keyboard_shortcut(
+        &self,
+        ix: usize,
+        window: &Window,
+        cx: &App,
+    ) -> Option<SharedString> {
+        // The row draws this beside the command's name, and finding out what a
+        // command is bound to is most of what this palette is for. The same
+        // binding the row draws, resolved the same way.
+        let command = self.commands.get(self.matches.get(ix)?.candidate_id)?;
+        KeyBinding::for_action_in(&*command.action, &self.previous_focus_handle, cx)
+            .keyboard_shortcut_text(window, cx)
     }
 
     fn placeholder_text(&self, _window: &mut Window, _cx: &mut App) -> Arc<str> {
@@ -866,6 +888,136 @@ mod tests {
         assert!(is_zed_link("ZED://workspace/project"));
         assert!(!is_zed_link("https://zed.dev"));
         assert!(!is_zed_link("zed:file/src/main.rs"));
+    }
+
+    /// The command palette is a core surface (§15.7) and the one a keyboard-only
+    /// user reaches for first. Checks what it actually exposes: a list box of
+    /// named options inside a dialog, with no control announced as a bare role.
+    #[gpui::test]
+    async fn test_the_open_palette_exposes_named_options(cx: &mut TestAppContext) {
+        let app_state = init_test(cx);
+        let db = cx.update(|cx| persistence::CommandPaletteDB::global(cx));
+        db.clear_all().await.unwrap();
+        let project = Project::test(app_state.fs.clone(), [], cx).await;
+        let (multi_workspace, cx) =
+            cx.add_window_view(|window, cx| MultiWorkspace::test_new(project.clone(), window, cx));
+        let workspace = multi_workspace.read_with(cx, |mw, _| mw.workspace().clone());
+
+        let editor = cx.new_window_entity(|window, cx| {
+            let mut editor = Editor::single_line(window, cx);
+            // Named like the inputs this stands in for: a single-line editor
+            // with no placeholder is announced as "edit text" and nothing else.
+            editor.set_a11y_label("Test input");
+            editor
+        });
+        workspace.update_in(cx, |workspace, window, cx| {
+            workspace.add_item_to_active_pane(Box::new(editor.clone()), None, true, window, cx);
+            editor.update(cx, |editor, cx| window.focus(&editor.focus_handle(cx), cx))
+        });
+        cx.simulate_keystrokes("cmd-shift-p");
+        cx.run_until_parked();
+
+        cx.activate_a11y(cx.window_handle());
+        let json = cx
+            .update(|window, cx| {
+                window.draw(cx).clear(cx);
+                window.debug_a11y_tree_json()
+            })
+            .expect("activation makes the debug tree available");
+        let tree: serde_json::Value = serde_json::from_str(&json).expect("the dump is valid JSON");
+        let nodes = tree["nodes"].as_object().expect("the dump lists nodes");
+
+        let role_count = |role: &str| {
+            nodes
+                .values()
+                .filter(|node| node["aria"]["role"] == role)
+                .count()
+        };
+        assert!(role_count("Dialog") > 0, "an open palette is a modal dialog");
+        assert!(
+            role_count("ListBox") > 0,
+            "the command list must be reported as one"
+        );
+        // Containers are jump targets. An unnamed one is offered as a
+        // destination that refuses to say where it goes.
+        let named_container = |role: &str| {
+            nodes
+                .values()
+                .find(|node| node["aria"]["role"] == role)
+                .and_then(|node| node["aria"]["label"].as_str())
+                .unwrap_or_else(|| panic!("no {role} in the tree: {json}"))
+        };
+        assert_eq!(named_container("TabList"), "Tabs");
+        assert!(
+            role_count("ListBoxOption") > 0,
+            "the palette had no options to announce"
+        );
+
+        // A row draws the command and, beside it, what it is bound to. Finding
+        // that out is most of what the palette is for, and `aria_keyshortcuts`
+        // — where a shortcut would normally go — is read by no accesskit
+        // adapter, so it has to be part of the name.
+        let bound: Vec<&str> = nodes
+            .values()
+            .filter(|node| node["aria"]["role"] == "ListBoxOption")
+            .filter_map(|node| node["aria"]["label"].as_str())
+            .filter(|label| label.contains("command palette"))
+            .collect();
+        assert!(
+            !bound.is_empty(),
+            "the palette's own command is in the list for this to check: {json}"
+        );
+        let shortcut = bound
+            .iter()
+            .find_map(|label| label.strip_prefix("command palette: toggle, "));
+        assert!(
+            shortcut.is_some_and(|shortcut| !shortcut.is_empty()),
+            "a row has to say what its command is bound to: {bound:?}"
+        );
+
+        gpui::a11y_checks::assert_interactive_nodes_are_named(&tree, "open command palette");
+        gpui::a11y_checks::assert_names_are_distinguishable(&tree, "open command palette");
+        gpui::a11y_checks::assert_focusable_names_are_distinguishable(&tree, "open command palette");
+        gpui::a11y_checks::assert_clickable_elements_are_reachable(&tree, "open command palette");
+        gpui::a11y_checks::assert_controls_have_area(&tree, "open command palette");
+        gpui::a11y_checks::assert_landmarks_are_distinguishable(&tree, "open command palette");
+        gpui::a11y_checks::assert_active_descendant_is_honoured(&tree, "open command palette");
+        gpui::a11y_checks::assert_no_role_was_discarded(&tree, "open command palette");
+        gpui::a11y_checks::assert_no_aria_was_discarded(&tree, "open command palette");
+        gpui::a11y_checks::assert_roles_are_contained(&tree, "open command palette");
+        gpui::a11y_checks::assert_click_targets_are_reachable(&tree, "open command palette");
+        gpui::a11y_checks::assert_focus_reached_the_tree(&tree, "open command palette");
+        let focused = tree["gpui_focus"]
+            .as_str()
+            .and_then(|id| nodes.get(id))
+            .expect("the focus must name a node in the dump");
+        assert_eq!(
+            focused["aria"]["role"].as_str(),
+            Some("TextInput"),
+            "typing in the palette has to land somewhere a reader can follow"
+        );
+
+        // Focus is in the query editor, which is not an ancestor of the match
+        // rows, so GPUI cannot report the highlighted match without misstating
+        // where the keyboard is. Pinned rather than asserted as correct: typing
+        // in the palette announces the query but never which command is about
+        // to run.
+        assert_eq!(
+            tree["active_descendant_focus"].as_str(),
+            None,
+            "a match cannot be reported as focused while the query holds the keyboard"
+        );
+        let selected: Vec<&str> = nodes
+            .values()
+            .filter(|node| node["aria"]["role"] == "ListBoxOption")
+            .filter(|node| node["aria"]["selected"].as_bool() == Some(true))
+            .filter_map(|node| node["aria"]["label"].as_str())
+            .collect();
+        assert_eq!(
+            selected.len(),
+            1,
+            "exactly one match is current, and it has to say so: {selected:?}"
+        );
     }
 
     #[gpui::test]

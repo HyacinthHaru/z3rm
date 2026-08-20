@@ -2821,6 +2821,11 @@ impl Pane {
 
         let read_only_toggle = |toggleable: bool| {
             IconButton::new("toggle_read_only", IconName::FileLock)
+                .aria_label(if toggleable {
+                    "Unlock File"
+                } else {
+                    "Locked File"
+                })
                 .size(ButtonSize::None)
                 .shape(IconButtonShape::Square)
                 .icon_color(Color::Muted)
@@ -2847,8 +2852,39 @@ impl Pane {
 
         let has_file_icon = icon.is_some();
 
+        let pinned_count = self.pinned_count();
+        // Only the two-row layout actually puts the pinned tabs in a list of
+        // their own; stacked mode and the single-row bar keep one list, and
+        // numbering as though they were split would be the same mistake in
+        // reverse.
+        let bars_are_split = !self.tabbar_style.is_stacked()
+            && TabBarSettings::get_global(cx).show_pinned_tabs_in_separate_row
+            && pinned_count > 0
+            && pinned_count < self.items.len();
+        let tab_position_in_bar = if !bars_are_split {
+            (ix + 1, self.items.len())
+        } else if self.is_tab_pinned(ix) {
+            (ix + 1, pinned_count)
+        } else {
+            (
+                ix + 1 - pinned_count,
+                self.items.len().saturating_sub(pinned_count),
+            )
+        };
+
         let capability = item.capability(cx);
+        // Every tab has a close button, so "Close Tab" on its own is the same
+        // name repeated across the whole bar.
+        let tab_name = item.tab_content_text(detail, cx);
         let tab = Tab::new(ix)
+            // `tab_content` renders arbitrary elements, so the announced name
+            // comes from the item's own text rather than the rendered tab, and
+            // carries the state its indicator dot shows in colour alone.
+            .aria_label(tab_announcement(item, detail, is_preview, cx))
+            // Pinned tabs render in their own tab bar, so a tab's place is
+            // within the bar it is actually in. Numbering across both makes the
+            // first unpinned tab "3 of 7" inside a list of five.
+            .aria_position(tab_position_in_bar.0, tab_position_in_bar.1)
             .position(if is_first_item {
                 TabPosition::First
             } else if is_last_item {
@@ -2976,6 +3012,7 @@ impl Pane {
                             .detach_and_log_err(cx);
                     }))
                 }
+                .aria_label(format!("{end_slot_tooltip_text}: {tab_name}"))
                 .map(|this| {
                     if is_active {
                         let focus_handle = focus_handle.clone();
@@ -3306,6 +3343,7 @@ impl Pane {
 
         let navigate_backward = IconButton::new("navigate_backward", IconName::ArrowLeft)
             .icon_size(IconSize::Small)
+            .aria_label("Go Back")
             .on_click({
                 let entity = cx.entity();
                 move |_, window, cx| {
@@ -3329,6 +3367,7 @@ impl Pane {
 
         let navigate_forward = IconButton::new("navigate_forward", IconName::ArrowRight)
             .icon_size(IconSize::Small)
+            .aria_label("Go Forward")
             .on_click({
                 let entity = cx.entity();
                 move |_, window, cx| {
@@ -3433,6 +3472,15 @@ impl Pane {
 
         v_flex()
             .id("stacked-tab-bar")
+            // Stacked mode does not use the `TabBar` component, so the role and
+            // name it normally supplies have to be set here: without them the
+            // tabs sit in no list at all, and a reader loses "2 of 5" along
+            // with any way to jump to the bar.
+            .role(gpui::Role::TabList)
+            .aria_label("Tabs")
+            // The tabs run down the side, so up and down are what move between
+            // them rather than left and right.
+            .aria_orientation(gpui::accesskit::Orientation::Vertical)
             .h_full()
             .w_32()
             .bg(cx.theme().colors().tab_bar_background)
@@ -3494,7 +3542,10 @@ impl Pane {
     ) -> AnyElement {
         let tab_bar = self
             .configure_tab_bar_start(
-                TabBar::new("tab_bar"),
+                // Named for the same reason the split bars are: a reader
+                // offers a tab list as somewhere to jump to, and an unnamed
+                // one says nothing about where that is.
+                TabBar::new("tab_bar", "Tabs"),
                 navigate_backward,
                 navigate_forward,
                 window,
@@ -3532,7 +3583,7 @@ impl Pane {
     ) -> AnyElement {
         let pinned_tab_bar = self
             .configure_tab_bar_start(
-                TabBar::new("pinned_tab_bar"),
+                TabBar::new("pinned_tab_bar", "Pinned tabs"),
                 navigate_backward,
                 navigate_forward,
                 window,
@@ -3552,7 +3603,8 @@ impl Pane {
             .flex_none()
             .child(pinned_tab_bar)
             .child(
-                TabBar::new("unpinned_tab_bar").child(self.render_unpinned_tabs_container(
+                TabBar::new("unpinned_tab_bar", "Tabs")
+                    .child(self.render_unpinned_tabs_container(
                     unpinned_tabs,
                     tab_count,
                     cx,
@@ -3586,6 +3638,7 @@ impl Pane {
     ) -> impl IntoElement {
         div()
             .id("tab_bar_drop_target")
+            .pointer_gesture_only()
             .min_w_6()
             .h(Tab::container_height(cx))
             .flex_grow_1()
@@ -3629,6 +3682,7 @@ impl Pane {
     fn render_pinned_tab_bar_drop_target(&self, cx: &mut Context<Pane>) -> impl IntoElement {
         div()
             .id("pinned_tabs_border")
+            .pointer_gesture_only()
             .debug_selector(|| "pinned_tabs_border".into())
             .min_w_6()
             .h(Tab::container_height(cx))
@@ -4164,7 +4218,9 @@ fn default_render_tab_bar_buttons(
         .child(
             PopoverMenu::new("pane-tab-bar-popover-menu")
                 .trigger_with_tooltip(
-                    IconButton::new("plus", IconName::Plus).icon_size(IconSize::Small),
+                    IconButton::new("plus", IconName::Plus)
+                        .icon_size(IconSize::Small)
+                        .aria_label("New"),
                     Tooltip::text("New…"),
                 )
                 .anchor(Anchor::TopRight)
@@ -4189,6 +4245,7 @@ fn default_render_tab_bar_buttons(
             PopoverMenu::new("pane-tab-bar-split")
                 .trigger_with_tooltip(
                     IconButton::new("split", IconName::Split)
+                        .aria_label("Split Pane")
                         .icon_size(IconSize::Small)
                         .disabled(!can_clone && !can_split_move),
                     Tooltip::text("Split Pane"),
@@ -4217,6 +4274,7 @@ fn default_render_tab_bar_buttons(
             let zoomed = pane.is_zoomed();
             IconButton::new("toggle_zoom", IconName::Maximize)
                 .icon_size(IconSize::Small)
+                .aria_label(if zoomed { "Zoom Out" } else { "Zoom In" })
                 .toggle_state(zoomed)
                 .selected_icon(IconName::Minimize)
                 .on_click(cx.listener(|pane, _, window, cx| {
@@ -4261,7 +4319,52 @@ impl Render for Pane {
         // degrade gracefully below.
         let project = self.project.upgrade();
 
+        // Focus lands here whenever the pane has nothing inside to take it — an
+        // empty pane, or one whose item has not claimed focus yet. Without an id
+        // and a role that focus produces no node and the whole window gets
+        // announced instead of the pane.
+        let pane_name = self
+            .active_item()
+            .map(|item| item.tab_content_text(0, cx))
+            .unwrap_or_else(|| SharedString::new_static("Empty pane"));
+        // Which pane of how many is only conveyed by the layout, so two panes
+        // running the same program are indistinguishable from the tree. The
+        // lookup is over the window's panes, of which there are a handful.
+        let pane_position = self.workspace.upgrade().and_then(|workspace| {
+            let workspace = workspace.read(cx);
+            let panes = workspace.panes();
+            let index = panes
+                .iter()
+                .position(|pane| pane.entity_id() == cx.entity_id())?;
+            (panes.len() > 1).then_some((index + 1, panes.len()))
+        });
+
+        // In the name as well as in `position_in_set`, because that property
+        // reaches Windows and Linux and not macOS — so on the platform this is
+        // developed on, the fix above for two panes running the same program
+        // was doing nothing. The name is the one channel all three read.
+        let pane_name = match pane_position {
+            Some((position, count)) => {
+                SharedString::from(format!("{pane_name}, pane {position} of {count}"))
+            }
+            None => pane_name,
+        };
+        // Zooming hides every other pane. A sighted user sees that at once;
+        // from the tree it is indistinguishable from a window that only ever
+        // had one pane. Same word the mux pane and the sidebar use for it.
+        let pane_name = if self.zoomed {
+            SharedString::from(format!("{pane_name}, zoomed"))
+        } else {
+            pane_name
+        };
+
         v_flex()
+            .id(ElementId::View(cx.entity_id()))
+            .role(gpui::Role::Group)
+            .aria_label(pane_name)
+            .when_some(pane_position, |this, (position, count)| {
+                this.aria_position_in_set(position).aria_size_of_set(count)
+            })
             .key_context(key_context)
             .track_focus(&self.focus_handle(cx))
             .size_full()
@@ -4900,6 +5003,44 @@ pub fn tab_details(items: &[Box<dyn ItemHandle>], _window: &Window, cx: &App) ->
     util::disambiguate::compute_disambiguation_details(items, |item, detail| {
         item.tab_content_text(detail, cx)
     })
+}
+
+/// The name a tab announces. The indicator beside it is a coloured dot, which
+/// contributes no accessibility node, so whether the file has unsaved changes
+/// or has moved under the editor reaches a reader only as part of this name.
+pub fn tab_announcement(
+    item: &dyn ItemHandle,
+    detail: usize,
+    is_preview: bool,
+    cx: &App,
+) -> SharedString {
+    // The announced title, not the drawn one: an item that cuts its title to
+    // fit the strip returns the whole of it here.
+    let name = item.tab_announcement_text(detail, cx);
+    let mut parts = vec![name.to_string()];
+    // A tab draws each of these and says none of them: a struck-through title
+    // for a file that is gone, an italic one for a tab the next file will
+    // replace, and a coloured dot for unsaved work.
+    if item.has_deleted_file(cx) {
+        parts.push("deleted on disk".to_string());
+    }
+    match (item.has_conflict(cx), item.is_dirty(cx)) {
+        (true, _) => parts.push("changed on disk".to_string()),
+        // Asked of the item rather than assumed: the same dot means unsaved
+        // work on an editor and a rung bell on a terminal.
+        (_, true) => parts.push(item.dirty_announcement_text(cx).to_string()),
+        (false, false) => {}
+    }
+    // Typing in a preview tab is what makes it permanent, so which kind of tab
+    // it is changes what the next keystroke does.
+    if is_preview {
+        parts.push("preview".to_string());
+    }
+    if parts.len() == 1 {
+        name
+    } else {
+        SharedString::from(parts.join(", "))
+    }
 }
 
 pub fn render_item_indicator(item: Box<dyn ItemHandle>, cx: &App) -> Option<Indicator> {

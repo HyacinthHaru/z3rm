@@ -353,6 +353,7 @@ impl RenderOnce for ThreadItem {
         };
 
         let title = self.title;
+        let announced_title = title.clone();
         let highlight_positions = self.highlight_positions;
 
         let title_label = if let Some(title_slot) = self.title_slot {
@@ -424,8 +425,17 @@ impl RenderOnce for ThreadItem {
             || has_diff_stats
             || has_timestamp;
 
+        // A thread's title, timestamp, status and change counts are all drawn
+        // as `Label`s, none of which is a node, and the row takes a click — so
+        // without a role and a name the whole item is absent from the tree and
+        // the thread it opens can only be reached with a mouse. The name is
+        // the same title the row draws; the count and the status change while
+        // the agent works and are not part of what the row *is*.
         v_flex()
             .id(self.id.clone())
+            .role(gpui::Role::ListBoxOption)
+            .aria_label(announced_title)
+            .aria_selected(self.selected)
             .cursor_pointer()
             .group("thread-item")
             .relative()
@@ -984,5 +994,82 @@ impl Component for ThreadItem {
         example_group(thread_item_examples)
             .vertical()
             .into_any_element()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use gpui::TestAppContext;
+
+    /// A thread row draws its title, timestamp, status and change counts as
+    /// `Label`s — none of which is a node — and takes a click. Without a role
+    /// and a name the whole row is absent from the tree, so the thread it opens
+    /// can only be reached with a mouse.
+    #[gpui::test]
+    fn a_thread_row_is_an_option_a_reader_can_reach(cx: &mut TestAppContext) {
+        cx.update(|cx| {
+            let settings_store = settings::SettingsStore::test(cx);
+            cx.set_global(settings_store);
+            theme_settings::init(theme::LoadThemes::JustBase, cx);
+        });
+
+        struct Host;
+        impl Render for Host {
+            fn render(&mut self, _: &mut Window, _: &mut gpui::Context<Self>) -> impl IntoElement {
+                // In a list, which is where a row of this kind belongs and what
+                // `Role::ListBoxOption` is announced relative to.
+                div()
+                    .id("threads")
+                    .role(gpui::Role::ListBox)
+                    .aria_label("Threads")
+                    .child(
+                        ThreadItem::new("first", "Fix the mux reconnect")
+                            .selected(true)
+                            .on_click(|_, _, _| {}),
+                    )
+                    .child(ThreadItem::new("second", "Rename the pane").on_click(|_, _, _| {}))
+            }
+        }
+
+        let window = cx.add_window(|_, _| Host);
+        cx.activate_a11y(window.into());
+        let json = cx
+            .update_window(window.into(), |_, window, cx| {
+                window.draw(cx).clear(cx);
+                window.debug_a11y_tree_json()
+            })
+            .expect("the harness window is still open")
+            .expect("activation makes the debug tree available");
+        let tree: serde_json::Value = serde_json::from_str(&json).expect("the dump is valid JSON");
+
+        gpui::a11y_checks::assert_interactive_nodes_are_named(&tree, "thread list");
+        gpui::a11y_checks::assert_names_are_distinguishable(&tree, "thread list");
+        gpui::a11y_checks::assert_roles_are_contained(&tree, "thread list");
+        gpui::a11y_checks::assert_no_role_was_discarded(&tree, "thread list");
+        gpui::a11y_checks::assert_no_aria_was_discarded(&tree, "thread list");
+        gpui::a11y_checks::assert_clickable_elements_are_reachable(&tree, "thread list");
+
+        let mut rows: Vec<(&str, Option<bool>)> = tree["nodes"]
+            .as_object()
+            .expect("the dump lists nodes")
+            .values()
+            .filter(|node| node["aria"]["role"] == "ListBoxOption")
+            .map(|node| {
+                (
+                    node["aria"]["label"].as_str().unwrap_or_default(),
+                    node["aria"]["selected"].as_bool(),
+                )
+            })
+            .collect();
+        rows.sort_unstable();
+        assert_eq!(
+            rows,
+            vec![
+                ("Fix the mux reconnect", Some(true)),
+                ("Rename the pane", Some(false))
+            ],
+            "each row says what it is and whether it is the current one"
+        );
     }
 }

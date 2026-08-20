@@ -32,6 +32,19 @@ pub trait ButtonCommon: Clickable + Disableable {
     /// that are consistently sized with buttons.
     fn size(self, size: ButtonSize) -> Self;
 
+    /// Whether the popup this button controls is open.
+    ///
+    /// A menu trigger is a disclosure, not a two-state toggle: without this it
+    /// is announced as "not pressed", which says nothing about the menu.
+    /// Reaches Windows alone, so a control that opens something should say so
+    /// through [`Self::aria_role_description`] as well.
+    fn aria_expanded(self, expanded: bool) -> Self;
+
+    /// What a reader says in place of "button" — "menu button" for a control
+    /// that opens a menu. Unlike `aria_expanded` this reaches all three
+    /// platforms, so it is where the kind of control belongs.
+    fn aria_role_description(self, role_description: impl Into<SharedString>) -> Self;
+
     /// The tooltip that shows when a user hovers over the button.
     ///
     /// Nearly all interactable elements should have a tooltip. Some example
@@ -493,6 +506,7 @@ pub struct ButtonLike {
     size: ButtonSize,
     rounding: Option<ButtonLikeRounding>,
     pub(super) aria_label: Option<SharedString>,
+    pub(super) aria_role_description: Option<SharedString>,
     aria_description: Option<SharedString>,
     pub(super) aria_value: Option<SharedString>,
     pub(super) aria_keyshortcuts: Option<SharedString>,
@@ -526,6 +540,7 @@ impl ButtonLike {
             size: ButtonSize::Default,
             rounding: Some(ButtonLikeRounding::ALL),
             aria_label: None,
+            aria_role_description: None,
             aria_description: None,
             aria_value: None,
             aria_keyshortcuts: None,
@@ -589,6 +604,14 @@ impl ButtonLike {
     }
 
     /// Sets the label announced by assistive technology for this button.
+    /// What a reader says in place of "button" — "menu button" for a control
+    /// that opens a menu. Unlike `aria_expanded` this reaches all three
+    /// platforms, so it is where the kind of control belongs.
+    pub fn aria_role_description(mut self, role_description: impl Into<SharedString>) -> Self {
+        self.aria_role_description = Some(role_description.into());
+        self
+    }
+
     pub fn aria_label(mut self, label: impl Into<SharedString>) -> Self {
         self.aria_label = Some(label.into());
         self
@@ -694,6 +717,14 @@ impl FixedWidth for ButtonLike {
 }
 
 impl ButtonCommon for ButtonLike {
+    fn aria_role_description(self, role_description: impl Into<SharedString>) -> Self {
+        Self::aria_role_description(self, role_description)
+    }
+
+    fn aria_expanded(self, expanded: bool) -> Self {
+        Self::aria_expanded(self, expanded)
+    }
+
     fn id(&self) -> &ElementId {
         &self.id
     }
@@ -759,6 +790,9 @@ impl RenderOnce for ButtonLike {
             .id(self.id.clone())
             .role(self.aria_role.unwrap_or(Role::Button))
             .when_some(self.aria_label, |this, label| this.aria_label(label))
+            .when_some(self.aria_role_description, |this, role_description| {
+                this.aria_role_description(role_description)
+            })
             .when_some(self.aria_keyshortcuts, |this, keyshortcuts| {
                 this.aria_keyshortcuts(keyshortcuts)
             })
@@ -769,13 +803,36 @@ impl RenderOnce for ButtonLike {
             .when_some(self.aria_expanded, |this, expanded| {
                 this.aria_expanded(expanded)
             })
-            .when_some(self.toggled, |this, toggled| {
-                this.aria_toggled(if toggled {
-                    Toggled::True
-                } else {
-                    Toggled::False
-                })
-            })
+            // A disabled button keeps its node — it is still part of the
+            // layout the user is reading — but it has to say that pressing it
+            // does nothing, which greying it out only says to people who can
+            // see it.
+            .aria_disabled(self.disabled)
+            // A tab is chosen, not pressed: picking one unpicks its siblings,
+            // which is what `selected` means and what `pressed` does not.
+            .when(
+                matches!(self.aria_role, Some(Role::Tab | Role::ListBoxOption)),
+                |this| this.aria_selected(self.selected),
+            )
+            // Not both: `expanded` describes a control that opens something,
+            // `toggled` a control that is pressed or not. A node carrying both
+            // is announced as a toggle button that is also expanded, which
+            // describes no control that exists. `toggle_state` is how a
+            // disclosure and a popover trigger get their pressed *styling*, so
+            // the two arrive together by construction.
+            .when(
+                self.aria_expanded.is_none()
+                    && !matches!(self.aria_role, Some(Role::Tab | Role::ListBoxOption)),
+                |this| {
+                    this.when_some(self.toggled, |this, toggled| {
+                        this.aria_toggled(if toggled {
+                            Toggled::True
+                        } else {
+                            Toggled::False
+                        })
+                    })
+                },
+            )
             .when_some(self.tab_index, |this, tab_index| this.tab_index(tab_index))
             .when_some(self.focus_handle, |this, focus_handle| {
                 this.track_focus(&focus_handle)

@@ -32,6 +32,10 @@ pub struct GoToLine {
 }
 
 impl ModalView for GoToLine {
+    fn a11y_name(&self, _cx: &App) -> Option<gpui::SharedString> {
+        Some("Go to Line".into())
+    }
+
     fn on_before_dismiss(
         &mut self,
         _window: &mut Window,
@@ -107,6 +111,9 @@ impl GoToLine {
 
         let line_editor = cx.new(|cx| {
             let mut editor = Editor::single_line(window, cx);
+            // The hint below it is a label, which is not a node, so the field
+            // has to say what it takes.
+            editor.set_a11y_label("Line and column");
             let editor_handle = cx.entity().downgrade();
             editor
                 .register_action::<Tab>({
@@ -343,6 +350,17 @@ impl Render for GoToLine {
                     .px_2()
                     .py_1()
                     .gap_1()
+                    // This line is the whole answer the modal gives: it says
+                    // which line the query will land on, and it changes on
+                    // every keystroke. A label is not a node, so without a
+                    // live region a reader types a number and is told nothing
+                    // about where it goes. Rendered whether or not the query
+                    // parses — a region that appears together with its first
+                    // message has nothing to diff against and stays silent.
+                    .id("go-to-line-target")
+                    .role(gpui::Role::Status)
+                    .aria_live(gpui::accesskit::Live::Polite)
+                    .aria_announcement(help_text.clone())
                     .child(Label::new(help_text).color(Color::Muted)),
             )
     }
@@ -616,6 +634,22 @@ mod tests {
                     .selection_stats(),
                 "After selecting a text with multibyte unicode characters, the character count should be correct"
             );
+            // The visible label puts this in parentheses, and abbreviates it to
+            // "3 c" under the Short setting. Neither survives being read out,
+            // and how much is selected is what a user who cannot see the
+            // highlight most needs to know.
+            assert_eq!(
+                workspace
+                    .status_bar()
+                    .read(cx)
+                    .item_of_type::<CursorPosition>()
+                    .expect("missing cursor position item")
+                    .read(cx)
+                    .announced_selection_for_test()
+                    .as_deref(),
+                Some("3 characters"),
+                "the size of a selection has to be said, not only drawn"
+            );
         });
     }
 
@@ -842,6 +876,88 @@ mod tests {
         workspace.update(cx, |workspace, cx| {
             workspace.active_modal::<GoToLine>(cx).unwrap()
         })
+    }
+
+    /// The help line is the only answer this modal gives, and it is a plain
+    /// label, which is not a node. Typing a line number produced silence.
+    #[gpui::test]
+    async fn the_target_line_is_announced_as_it_is_typed(cx: &mut TestAppContext) {
+        init_test(cx);
+        let fs = FakeFs::new(cx.executor());
+        fs.insert_tree(path!("/dir"), json!({ "a.rs": "one\ntwo\nthree\nfour\nfive\n" }))
+            .await;
+        let project = Project::test(fs, [path!("/dir").as_ref()], cx).await;
+        let (multi_workspace, cx) =
+            cx.add_window_view(|window, cx| MultiWorkspace::test_new(project.clone(), window, cx));
+        let workspace = multi_workspace.read_with(cx, |mw, _| mw.workspace().clone());
+        let worktree_id = workspace.update(cx, |workspace, cx| {
+            workspace.project().update(cx, |project, cx| {
+                project.worktrees(cx).next().unwrap().read(cx).id()
+            })
+        });
+        workspace
+            .update_in(cx, |workspace, window, cx| {
+                workspace.open_path(
+                    (worktree_id, rel_path("a.rs").into()),
+                    None,
+                    true,
+                    window,
+                    cx,
+                )
+            })
+            .await
+            .unwrap()
+            .downcast::<Editor>()
+            .unwrap();
+
+        let _go_to_line_view = open_go_to_line_view(&workspace, cx);
+        cx.activate_a11y(cx.window_handle());
+
+        let announced = |cx: &mut VisualTestContext| -> (String, String) {
+            let json = cx
+                .update(|window, cx| {
+                    window.draw(cx).clear(cx);
+                    window.debug_a11y_tree_json()
+                })
+                .expect("activation makes the debug tree available");
+            let tree: serde_json::Value =
+                serde_json::from_str(&json).expect("the dump is valid JSON");
+            gpui::a11y_checks::assert_live_regions_can_speak(&tree, "go to line");
+            let region = tree["nodes"]
+                .as_object()
+                .expect("the dump lists nodes")
+                .values()
+                .find(|node| {
+                    node["element_id"]
+                        .as_str()
+                        .is_some_and(|id| id.contains("go-to-line-target"))
+                })
+                .unwrap_or_else(|| panic!("the help line has to be a region: {json}"));
+            (
+                // The value, not the label: macOS speaks `node.value()` and
+                // raises no announcement at all without one.
+                region["aria"]["value"].as_str().unwrap_or_default().to_owned(),
+                region["aria"]["live"].as_str().unwrap_or_default().to_owned(),
+            )
+        };
+
+        let (before, live) = announced(cx);
+        assert_eq!(live, "Polite", "it has to be a live region to be spoken");
+        assert!(
+            !before.is_empty(),
+            "the region has to exist and hold the current position before anything is typed"
+        );
+
+        cx.simulate_input("4");
+        let (after, _) = announced(cx);
+        assert_eq!(
+            after, "Go to line 4",
+            "typing a number has to say where it lands"
+        );
+        assert_ne!(
+            before, after,
+            "an announcement that never changes is never spoken"
+        );
     }
 
     fn highlighted_display_rows(editor: &Entity<Editor>, cx: &mut VisualTestContext) -> Vec<u32> {

@@ -633,6 +633,10 @@ pub struct RecentProjects {
 }
 
 impl ModalView for RecentProjects {
+    fn a11y_name(&self, _cx: &gpui::App) -> Option<gpui::SharedString> {
+        Some("Recent Projects".into())
+    }
+
     fn on_before_dismiss(
         &mut self,
         window: &mut Window,
@@ -959,6 +963,34 @@ impl PickerDelegate for RecentProjectsDelegate {
 
     fn name() -> &'static str {
         "recent projects"
+    }
+
+    fn match_label(&self, ix: usize, _cx: &App) -> Option<SharedString> {
+        // Headers are not selectable, so naming them would announce a row the
+        // user cannot reach.
+        match self.filtered_entries.get(ix)? {
+            ProjectPickerEntry::Header(_) => None,
+            ProjectPickerEntry::OpenFolder { index, .. } => {
+                Some(self.open_folders.get(*index)?.name.clone())
+            }
+            // Not `matched.string`: with an empty query — the state the picker
+            // opens in — entries are built with no match string at all, while
+            // the row on screen still shows a name derived from the candidate.
+            // Reading the string would announce every row as a bare option
+            // until the user typed something.
+            ProjectPickerEntry::ProjectGroup(matched) => {
+                let group = self.window_project_groups.get(matched.candidate_id)?;
+                let paths = path_list_label(group.path_list())?;
+                Some(match group.host() {
+                    Some(host) => SharedString::from(format!("{paths} ({host})")),
+                    None => paths,
+                })
+            }
+            ProjectPickerEntry::RecentProject(matched) => {
+                let workspace = self.workspaces.get(matched.candidate_id)?;
+                path_list_label(&workspace.identity_paths)
+            }
+        }
     }
 
     fn placeholder_text(&self, _window: &mut Window, _cx: &mut App) -> Arc<str> {
@@ -1308,6 +1340,9 @@ impl PickerDelegate for RecentProjectsDelegate {
                     .gap_1()
                     .child(
                         IconButton::new(("remove-folder", worktree_id.to_usize()), IconName::Close)
+                            // One button per row, so the bare action repeats
+                            // once for every folder in the list.
+                            .aria_label(format!("Remove Folder from Project: {name}"))
                             .icon_size(IconSize::Small)
                             .tooltip({
                                 let focus_handle = self.focus_handle.clone();
@@ -1446,6 +1481,7 @@ impl PickerDelegate for RecentProjectsDelegate {
                 };
 
                 let project_group_key = key.clone();
+                let project_group_name: SharedString = ordered_paths.join(", ").into();
                 let is_local = key.host().is_none();
                 let has_multiple_groups = self.window_project_groups.len() >= 2;
                 let secondary_actions = h_flex()
@@ -1453,6 +1489,9 @@ impl PickerDelegate for RecentProjectsDelegate {
                     .when(is_local && has_multiple_groups, |this| {
                         this.child(
                             IconButton::new("move_to_new_window", IconName::ArrowUpRight)
+                                .aria_label(format!(
+                                    "Open in New Window: {project_group_name}"
+                                ))
                                 .icon_size(IconSize::Small)
                                 .tooltip({
                                     let focus_handle = self.focus_handle.clone();
@@ -1483,6 +1522,9 @@ impl PickerDelegate for RecentProjectsDelegate {
                     .when(!is_active, |this| {
                         this.child(
                             IconButton::new("remove_open_project", IconName::Close)
+                                .aria_label(format!(
+                                    "Remove Project from Window: {project_group_name}"
+                                ))
                                 .icon_size(IconSize::Small)
                                 .tooltip({
                                     let focus_handle = self.focus_handle.clone();
@@ -1617,6 +1659,7 @@ impl PickerDelegate for RecentProjectsDelegate {
                     .when(is_local, |this| {
                         this.child(
                             IconButton::new("add_to_workspace", IconName::FolderInclude)
+                                .aria_label(tooltip_title)
                                 .icon_size(IconSize::Small)
                                 .tooltip({
                                     let focus_handle = self.focus_handle.clone();
@@ -1646,6 +1689,7 @@ impl PickerDelegate for RecentProjectsDelegate {
                     })
                     .child(
                         IconButton::new("alternate_open", secondary_confirm_icon)
+                            .aria_label(secondary_confirm_tooltip)
                             .icon_size(IconSize::Small)
                             .tooltip({
                                 move |_, cx| {
@@ -1666,6 +1710,7 @@ impl PickerDelegate for RecentProjectsDelegate {
                     )
                     .child(
                         IconButton::new("delete", IconName::Close)
+                            .aria_label("Remove from Recent Projects")
                             .icon_size(IconSize::Small)
                             .tooltip({
                                 let focus_handle = self.focus_handle.clone();
@@ -1761,6 +1806,9 @@ impl PickerDelegate for RecentProjectsDelegate {
                     .border_color(cx.theme().colors().border_variant)
                     .child({
                         ButtonLike::new("open_local_folder")
+                            // `ButtonLike` cannot take a name from its
+                            // children, and the child here is a `Label`.
+                            .aria_label("Open Local Folders")
                             .child(
                                 h_flex()
                                     .w_full()
@@ -1790,6 +1838,7 @@ impl PickerDelegate for RecentProjectsDelegate {
                     })
                     .child(
                         ButtonLike::new("open_remote_folder")
+                            .aria_label("Open Remote Folder")
                             .child(
                                 h_flex()
                                     .w_full()
@@ -2578,6 +2627,12 @@ impl gpui::Focusable for RemoteServerProjects {
 impl gpui::EventEmitter<gpui::DismissEvent> for RemoteServerProjects {}
 
 impl workspace::ModalView for RemoteServerProjects {
+    fn a11y_name(&self, _cx: &gpui::App) -> Option<SharedString> {
+        // The whole modal is one message rendered as plain text, which is not
+        // a node, so naming the dialog is the only way it reaches a reader.
+        Some(self.message.clone())
+    }
+
     fn on_before_dismiss(
         &mut self,
         _window: &mut Window,
@@ -2770,6 +2825,127 @@ mod tests {
         });
         draw(cx);
         (picker, cx)
+    }
+
+    /// The picker's rows carry per-project controls that no test had read out
+    /// of a frame. `ButtonLike` and `IconButton` cannot name themselves from
+    /// their children, so a control with a visible icon and a tooltip is still
+    /// announced as a bare "button".
+    #[gpui::test]
+    fn the_project_picker_names_what_it_shows(cx: &mut TestAppContext) {
+        let (picker, cx) = build_picker(cx);
+
+        cx.activate_a11y(cx.window_handle());
+        let json = cx
+            .update(|window, cx| {
+                // Opening the picker puts the keyboard in its query editor, and
+                // the highlighted row is reported relative to that focus. A
+                // frame with nothing focused is a state the user never sees.
+                window.focus(&picker.focus_handle(cx), cx);
+                window.draw(cx).clear(cx);
+                window.debug_a11y_tree_json()
+            })
+            .expect("activation makes the debug tree available");
+        let tree: serde_json::Value = serde_json::from_str(&json).expect("the dump is valid JSON");
+
+        gpui::a11y_checks::assert_interactive_nodes_are_named(&tree, "recent projects picker");
+        gpui::a11y_checks::assert_names_are_distinguishable(&tree, "recent projects picker");
+        gpui::a11y_checks::assert_focusable_names_are_distinguishable(&tree, "recent projects picker");
+        gpui::a11y_checks::assert_clickable_elements_are_reachable(&tree, "recent projects picker");
+        gpui::a11y_checks::assert_controls_have_area(&tree, "recent projects picker");
+        gpui::a11y_checks::assert_landmarks_are_distinguishable(&tree, "recent projects picker");
+        gpui::a11y_checks::assert_active_descendant_is_honoured(&tree, "recent projects picker");
+        gpui::a11y_checks::assert_no_role_was_discarded(&tree, "recent projects picker");
+        gpui::a11y_checks::assert_no_aria_was_discarded(&tree, "recent projects picker");
+        gpui::a11y_checks::assert_roles_are_contained(&tree, "recent projects picker");
+        gpui::a11y_checks::assert_click_targets_are_reachable(&tree, "recent projects picker");
+        gpui::a11y_checks::assert_focus_reached_the_tree(&tree, "recent projects picker");
+
+        // The list is section headers interleaved with projects, and the arrow
+        // keys stop only on the projects. Counting the headers would describe a
+        // list whose end the user can never reach.
+        let mut set: Vec<(u64, u64)> = tree["nodes"]
+            .as_object()
+            .expect("the dump lists nodes")
+            .values()
+            .filter(|node| node["aria"]["role"] == "ListBoxOption")
+            .map(|node| {
+                (
+                    node["aria"]["position_in_set"].as_u64().unwrap_or_default(),
+                    node["aria"]["size_of_set"].as_u64().unwrap_or_default(),
+                )
+            })
+            .collect();
+        set.sort_unstable();
+        let sizes: Vec<u64> = set.iter().map(|(_, size)| *size).collect();
+        let positions: Vec<u64> = set.iter().map(|(position, _)| *position).collect();
+        assert!(
+            sizes.iter().all(|size| *size == sizes[0]),
+            "every option is in the same set: {set:?}"
+        );
+        assert_eq!(
+            positions,
+            (1..=positions.len() as u64).collect::<Vec<_>>(),
+            "the options are numbered from one with no gaps where a header was: {set:?}"
+        );
+
+        let options = tree["nodes"]
+            .as_object()
+            .expect("the dump lists nodes")
+            .values()
+            .filter(|node| node["aria"]["role"] == "ListBoxOption")
+            .count();
+        assert!(
+            options > 0,
+            "the picker rendered no options, so this check would pass on an empty list: {json}"
+        );
+    }
+
+    /// A search that finds nothing is a state the user has to be told about.
+    /// The message is a plain label, which contributes no node, so the picker
+    /// would otherwise go silent rather than say it found nothing.
+    #[gpui::test]
+    fn a_picker_that_finds_nothing_says_so(cx: &mut TestAppContext) {
+        let (picker, cx) = build_picker(cx);
+
+        picker.update_in(cx, |picker, window, cx| {
+            picker.set_query("zzzzzzzz-no-such-project", window, cx);
+        });
+        cx.run_until_parked();
+        draw(cx);
+
+        cx.activate_a11y(cx.window_handle());
+        let json = cx
+            .update(|window, cx| {
+                window.draw(cx).clear(cx);
+                window.debug_a11y_tree_json()
+            })
+            .expect("activation makes the debug tree available");
+        let tree: serde_json::Value = serde_json::from_str(&json).expect("the dump is valid JSON");
+        gpui::a11y_checks::assert_interactive_nodes_are_named(&tree, "empty picker");
+        gpui::a11y_checks::assert_no_role_was_discarded(&tree, "empty picker");
+        gpui::a11y_checks::assert_no_aria_was_discarded(&tree, "empty picker");
+        gpui::a11y_checks::assert_roles_are_contained(&tree, "empty picker");
+        gpui::a11y_checks::assert_focus_reached_the_tree(&tree, "empty picker");
+        gpui::a11y_checks::assert_click_targets_are_reachable(&tree, "empty picker");
+        gpui::a11y_checks::assert_landmarks_are_distinguishable(&tree, "empty picker");
+        gpui::a11y_checks::assert_names_are_distinguishable(&tree, "empty picker");
+        gpui::a11y_checks::assert_focusable_names_are_distinguishable(&tree, "empty picker");
+        gpui::a11y_checks::assert_clickable_elements_are_reachable(&tree, "empty picker");
+        gpui::a11y_checks::assert_controls_have_area(&tree, "empty picker");
+        gpui::a11y_checks::assert_active_descendant_is_honoured(&tree, "empty picker");
+
+        let announced: Vec<&str> = tree["nodes"]
+            .as_object()
+            .expect("the dump lists nodes")
+            .values()
+            .filter(|node| node["aria"]["role"] == "Status")
+            .filter_map(|node| node["aria"]["label"].as_str())
+            .collect();
+        assert!(
+            !announced.is_empty(),
+            "an empty result list has to say it is empty: {json}"
+        );
     }
 
     fn scroll_to_and_select(
@@ -3337,4 +3513,14 @@ mod tests {
             "remote project group confirm should surface an error notification"
         );
     }
+}
+
+/// The paths a project row shows, joined the way they read aloud.
+fn path_list_label(paths: &PathList) -> Option<SharedString> {
+    let joined = paths
+        .ordered_paths()
+        .map(|path| path.compact().to_string_lossy().to_string())
+        .collect::<Vec<_>>()
+        .join(", ");
+    (!joined.is_empty()).then(|| SharedString::from(joined))
 }

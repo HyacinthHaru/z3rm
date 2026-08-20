@@ -581,11 +581,19 @@ impl ListEntry {
                     detail.push("modified".to_string());
                 }
             }
-            ListEntry::Directory { status, .. } => match status {
-                DirectoryStatus::Loading => detail.push("loading".to_string()),
-                DirectoryStatus::Error(error) => detail.push(error.to_string()),
-                DirectoryStatus::Unloaded | DirectoryStatus::Loaded => {}
-            },
+            ListEntry::Directory {
+                status, expanded, ..
+            } => {
+                // `aria_expanded` below says this too, and reaches Windows
+                // alone — accesskit sets no `AXDisclosing` for an outline row,
+                // so on macOS and Linux a folder gave no sign of being open.
+                detail.push(if *expanded { "expanded" } else { "collapsed" }.to_string());
+                match status {
+                    DirectoryStatus::Loading => detail.push("loading".to_string()),
+                    DirectoryStatus::Error(error) => detail.push(error.to_string()),
+                    DirectoryStatus::Unloaded | DirectoryStatus::Loaded => {}
+                }
+            }
             ListEntry::Tab { .. } => {}
         }
 
@@ -1331,6 +1339,7 @@ impl Sidebar {
             .when_some(review_target, |element, (session_id, path)| {
                 element.end_slot(
                     IconButton::new(("sidebar-review", index), IconName::Diff)
+                        .aria_label("Review changes")
                         .icon_size(IconSize::Small)
                         .tooltip(Tooltip::text("Review changes"))
                         .on_click(cx.listener(move |this, _, window, cx| {
@@ -1372,10 +1381,19 @@ impl Sidebar {
             .py_2()
             .gap_2()
             .child(
+                // These two choose which list the panel shows, and choosing one
+                // unchooses the other. As pressed/unpressed toggles a reader
+                // describes two independent switches that happen to disagree,
+                // and never says "1 of 2". The git panel's Changes/History pair
+                // is the same control and is already modelled this way.
                 h_flex()
+                    .id("sidebar-mode-tabs")
+                    .role(gpui::Role::TabList)
+                    .aria_label("Sidebar views")
                     .gap_1()
                     .child(
                         Button::new("sidebar-sessions-mode", "Sessions")
+                            .aria_role(gpui::Role::Tab)
                             .label_size(LabelSize::Small)
                             .toggle_state(self.mode == SidebarMode::Sessions)
                             .on_click(cx.listener(|this, _, _, cx| {
@@ -1384,6 +1402,7 @@ impl Sidebar {
                     )
                     .child(
                         Button::new("sidebar-files-mode", "Files")
+                            .aria_role(gpui::Role::Tab)
                             .label_size(LabelSize::Small)
                             .toggle_state(self.mode == SidebarMode::Files)
                             .on_click(cx.listener(|this, _, _, cx| {
@@ -1402,6 +1421,11 @@ impl Sidebar {
         };
         v_flex()
             .id("sidebar-empty")
+            // The message is a plain label, which contributes no node of its
+            // own, so without a name here an empty sidebar reads as nothing at
+            // all rather than as "no matching files".
+            .role(gpui::Role::Group)
+            .aria_label(message)
             .w_full()
             .flex_1()
             .justify_center()
@@ -2525,6 +2549,24 @@ mod live_tests {
             );
             sidebar.sessions = sessions();
             sidebar.mode = mode;
+            // In file mode a modified file grows a second control, which is the
+            // only place that control appears — a fixture without one checks a
+            // strictly smaller screen than the user sees.
+            if mode == SidebarMode::Files {
+                let entry = |name: &str, is_modified: bool| mux_protocol::DirEntry {
+                    name: name.to_string(),
+                    is_dir: false,
+                    size: 42,
+                    is_modified,
+                };
+                let mut tree = FileTree::new("session-a", "/workspace");
+                tree.start_loading("/workspace");
+                tree.complete_loading(
+                    "/workspace",
+                    vec![entry("notes.txt", true), entry("README.md", false)],
+                );
+                sidebar.file_tree = Some(tree);
+            }
             sidebar.selected_index = Some(3);
             sidebar.rebuild_entries(cx);
             sidebar
@@ -2629,6 +2671,260 @@ mod live_tests {
             nodes[active]["aria"]["label"].as_str(),
             Some("Pane cargo watch"),
             "the active descendant must be the row the sidebar's cursor is on"
+        );
+    }
+
+    /// An empty list is a state the user has to be told about — they filtered
+    /// something away, or nothing is there yet. The message is a plain label,
+    /// which contributes no accessibility node, so an empty panel would
+    /// otherwise be indistinguishable from a broken one.
+    #[gpui::test]
+    async fn an_empty_sidebar_says_why_it_is_empty(cx: &mut TestAppContext) {
+        init_test(cx);
+        let domain = test_domain();
+        let window = cx.add_window(move |window, cx| {
+            let mut sidebar = Sidebar::new(
+                domain,
+                "session-a".to_string(),
+                None,
+                Rc::new(|_request, _window, _cx| {}),
+                window,
+                cx,
+            );
+            sidebar.sessions = Vec::new();
+            sidebar.rebuild_entries(cx);
+            sidebar
+        });
+        cx.activate_a11y(window.into());
+
+        let json = cx
+            .update_window(window.into(), |_, window, cx| {
+                window.draw(cx).clear(cx);
+                window.debug_a11y_tree_json()
+            })
+            .expect("the sidebar window is still open")
+            .expect("activation makes the debug tree available");
+        let tree: serde_json::Value = serde_json::from_str(&json).expect("the dump is valid JSON");
+        gpui::a11y_checks::assert_interactive_nodes_are_named(&tree, "empty sidebar");
+        gpui::a11y_checks::assert_no_role_was_discarded(&tree, "empty sidebar");
+        gpui::a11y_checks::assert_no_aria_was_discarded(&tree, "empty sidebar");
+        gpui::a11y_checks::assert_roles_are_contained(&tree, "empty sidebar");
+        gpui::a11y_checks::assert_focus_reached_the_tree(&tree, "empty sidebar");
+        gpui::a11y_checks::assert_click_targets_are_reachable(&tree, "empty sidebar");
+        gpui::a11y_checks::assert_landmarks_are_distinguishable(&tree, "empty sidebar");
+        gpui::a11y_checks::assert_names_are_distinguishable(&tree, "empty sidebar");
+        gpui::a11y_checks::assert_focusable_names_are_distinguishable(&tree, "empty sidebar");
+        gpui::a11y_checks::assert_clickable_elements_are_reachable(&tree, "empty sidebar");
+
+        // Picking one of these unpicks the other, which is what a tab is. As
+        // pressed/unpressed toggles they describe two independent switches that
+        // happen to disagree.
+        let mut views: Vec<(&str, Option<bool>, Option<&str>)> = tree["nodes"]
+            .as_object()
+            .expect("the dump lists nodes")
+            .values()
+            .filter(|node| node["aria"]["role"] == "Tab")
+            .map(|node| {
+                (
+                    node["aria"]["label"].as_str().unwrap_or_default(),
+                    node["aria"]["selected"].as_bool(),
+                    node["aria"]["toggled"].as_str(),
+                )
+            })
+            .collect();
+        views.sort_unstable();
+        assert_eq!(
+            views,
+            vec![("Files", Some(false), None), ("Sessions", Some(true), None)],
+            "the sidebar's views are chosen, not pressed"
+        );
+        gpui::a11y_checks::assert_controls_have_area(&tree, "empty sidebar");
+        gpui::a11y_checks::assert_active_descendant_is_honoured(&tree, "empty sidebar");
+
+        assert!(
+            tree["nodes"]
+                .as_object()
+                .expect("the dump lists nodes")
+                .values()
+                .any(|node| node["aria"]["label"].as_str() == Some("No mux sessions")),
+            "an empty sidebar has to say so: {json}"
+        );
+    }
+
+    /// Typing in the filter and arrowing through the results is the sidebar's
+    /// keyboard-first flow. Focus is in the filter, which is not an ancestor of
+    /// the rows, so reporting a row as focused would misstate where the
+    /// keyboard is — the filter points at the highlighted row instead, which is
+    /// how a reader announces both.
+    #[gpui::test]
+    async fn filtering_announces_the_highlighted_row_from_the_filter(cx: &mut TestAppContext) {
+        init_test(cx);
+        let domain = test_domain();
+        let window = cx.add_window(move |window, cx| {
+            let mut sidebar = Sidebar::new(
+                domain,
+                "session-a".to_string(),
+                Some(&snapshot()),
+                Rc::new(|_request, _window, _cx| {}),
+                window,
+                cx,
+            );
+            sidebar.sessions = sessions();
+            sidebar.selected_index = Some(3);
+            sidebar.rebuild_entries(cx);
+            sidebar
+        });
+        cx.activate_a11y(window.into());
+
+        let json = cx
+            .update_window(window.into(), |view, window, cx| {
+                if let Ok(sidebar) = view.downcast::<Sidebar>() {
+                    let filter = sidebar.read(cx).filter_editor.focus_handle(cx);
+                    window.focus(&filter, cx);
+                }
+                window.draw(cx).clear(cx);
+                window.debug_a11y_tree_json()
+            })
+            .expect("the sidebar window is still open")
+            .expect("activation makes the debug tree available");
+        let tree: serde_json::Value = serde_json::from_str(&json).expect("the dump is valid JSON");
+        gpui::a11y_checks::assert_interactive_nodes_are_named(&tree, "filtered sidebar");
+        gpui::a11y_checks::assert_no_role_was_discarded(&tree, "filtered sidebar");
+        gpui::a11y_checks::assert_no_aria_was_discarded(&tree, "filtered sidebar");
+        gpui::a11y_checks::assert_roles_are_contained(&tree, "filtered sidebar");
+        gpui::a11y_checks::assert_focus_reached_the_tree(&tree, "filtered sidebar");
+        gpui::a11y_checks::assert_click_targets_are_reachable(&tree, "filtered sidebar");
+        gpui::a11y_checks::assert_landmarks_are_distinguishable(&tree, "filtered sidebar");
+        gpui::a11y_checks::assert_names_are_distinguishable(&tree, "filtered sidebar");
+        gpui::a11y_checks::assert_focusable_names_are_distinguishable(&tree, "filtered sidebar");
+        gpui::a11y_checks::assert_clickable_elements_are_reachable(&tree, "filtered sidebar");
+        gpui::a11y_checks::assert_controls_have_area(&tree, "filtered sidebar");
+        gpui::a11y_checks::assert_active_descendant_is_honoured(&tree, "filtered sidebar");
+
+        assert_eq!(
+            tree["active_descendant_focus"].as_str(),
+            None,
+            "a row cannot be reported as focused while the filter holds the keyboard"
+        );
+        assert_eq!(
+            tree["frame"]["active_descendant_without_focus"].as_bool(),
+            Some(false),
+            "the claim is carried by the focused node, not dropped"
+        );
+
+        let nodes = tree["nodes"].as_object().expect("the dump lists nodes");
+        let focused = tree["gpui_focus"]
+            .as_str()
+            .and_then(|id| nodes.get(id))
+            .unwrap_or_else(|| panic!("the filter holds focus: {json}"));
+        let highlighted = focused["aria"]["active_descendant"]
+            .as_str()
+            .and_then(|id| nodes.get(id))
+            .unwrap_or_else(|| {
+                panic!("the filter has to point at the row it highlights: {json}")
+            });
+        assert_eq!(highlighted["aria"]["selected"].as_bool(), Some(true));
+    }
+
+    /// A node with an interactive role and no name is announced as a bare
+    /// "button" or "tree item" with nothing to tell it apart. Checked across
+    /// the whole rendered panel rather than per element, so a row or control
+    /// added later cannot quietly skip it.
+    #[gpui::test]
+    async fn every_interactive_node_in_the_panel_has_a_name(cx: &mut TestAppContext) {
+        // Checked in both modes: the file list carries a per-row control that
+        // the session list has no equivalent of, so one mode is not a proxy for
+        // the other.
+        let files = a11y_tree(cx, SidebarMode::Files);
+        gpui::a11y_checks::assert_interactive_nodes_are_named(&files, "sidebar files");
+        gpui::a11y_checks::assert_names_are_distinguishable(&files, "sidebar files");
+        gpui::a11y_checks::assert_focusable_names_are_distinguishable(&files, "sidebar files");
+        gpui::a11y_checks::assert_clickable_elements_are_reachable(&files, "sidebar files");
+        gpui::a11y_checks::assert_controls_have_area(&files, "sidebar files");
+        gpui::a11y_checks::assert_landmarks_are_distinguishable(&files, "sidebar files");
+        gpui::a11y_checks::assert_active_descendant_is_honoured(&files, "sidebar files");
+        gpui::a11y_checks::assert_no_role_was_discarded(&files, "sidebar files");
+        gpui::a11y_checks::assert_no_aria_was_discarded(&files, "sidebar files");
+        gpui::a11y_checks::assert_roles_are_contained(&files, "sidebar files");
+        gpui::a11y_checks::assert_click_targets_are_reachable(&files, "sidebar files");
+        assert!(
+            files["nodes"]
+                .as_object()
+                .expect("the dump lists nodes")
+                .values()
+                .any(|node| node["aria"]["label"].as_str() == Some("Review changes")),
+            "the modified file's review control has to be on screen for this to \
+             be checking anything: {files}"
+        );
+
+        // Whether a folder is open decides what the next arrow-down lands on,
+        // and `aria_expanded` — the property that says it — reaches Windows
+        // alone, so the name has to carry it too.
+        let folders: Vec<&str> = files["nodes"]
+            .as_object()
+            .expect("the dump lists nodes")
+            .values()
+            .filter_map(|node| node["aria"]["label"].as_str())
+            .filter(|label| label.starts_with("Folder "))
+            .collect();
+        assert!(
+            !folders.is_empty(),
+            "the file list has to contain a folder for this to check anything: {files}"
+        );
+        assert!(
+            folders
+                .iter()
+                .all(|label| label.contains(", expanded") || label.contains(", collapsed")),
+            "every folder has to say whether it is open: {folders:?}"
+        );
+
+        let tree = a11y_tree(cx, SidebarMode::Sessions);
+        let nodes = tree["nodes"].as_object().expect("the dump lists nodes");
+
+        gpui::a11y_checks::assert_interactive_nodes_are_named(&tree, "sidebar panel");
+        gpui::a11y_checks::assert_names_are_distinguishable(&tree, "sidebar panel");
+        gpui::a11y_checks::assert_focusable_names_are_distinguishable(&tree, "sidebar panel");
+        gpui::a11y_checks::assert_clickable_elements_are_reachable(&tree, "sidebar panel");
+        gpui::a11y_checks::assert_controls_have_area(&tree, "sidebar panel");
+        gpui::a11y_checks::assert_landmarks_are_distinguishable(&tree, "sidebar panel");
+        gpui::a11y_checks::assert_active_descendant_is_honoured(&tree, "sidebar panel");
+        gpui::a11y_checks::assert_no_role_was_discarded(&tree, "sidebar panel");
+        gpui::a11y_checks::assert_no_aria_was_discarded(&tree, "sidebar panel");
+        gpui::a11y_checks::assert_roles_are_contained(&tree, "sidebar panel");
+        gpui::a11y_checks::assert_click_targets_are_reachable(&tree, "sidebar panel");
+        gpui::a11y_checks::assert_focus_reached_the_tree(&tree, "sidebar panel");
+
+        // A screen reader derives "item 2 of 5" and the arrow-key conventions
+        // from containment, so a row outside its tree loses all of it.
+        let mut parent_of = std::collections::HashMap::new();
+        for (id, node) in nodes {
+            for child in node["children"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .filter_map(|child| child.as_str())
+            {
+                parent_of.insert(child.to_string(), id.clone());
+            }
+        }
+        let orphaned: Vec<&str> = nodes
+            .iter()
+            .filter(|(_, node)| node["aria"]["role"] == "TreeItem")
+            .filter(|(id, _)| {
+                let mut ancestor = parent_of.get(*id);
+                while let Some(current) = ancestor {
+                    if nodes[current]["aria"]["role"] == "Tree" {
+                        return false;
+                    }
+                    ancestor = parent_of.get(current);
+                }
+                true
+            })
+            .map(|(id, _)| id.as_str())
+            .collect();
+        assert!(
+            orphaned.is_empty(),
+            "these rows have no Tree ancestor: {orphaned:?}"
         );
     }
 

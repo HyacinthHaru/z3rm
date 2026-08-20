@@ -100,8 +100,20 @@ impl RenderOnce for AnnouncementToast {
         let has_illustration = self.illustration.is_some();
         let illustration = self.illustration;
 
+        // The heading and the description are a `Headline` and a `Label`, and
+        // neither contributes a node, so without a name here the toast reaches
+        // a reader as three unexplained buttons.
+        let announced = [self.heading.clone(), self.description.clone()]
+            .into_iter()
+            .flatten()
+            .map(|part| part.to_string())
+            .collect::<Vec<_>>()
+            .join(". ");
+
         v_flex()
             .id("announcement-toast")
+            .role(gpui::Role::Group)
+            .when(!announced.is_empty(), |this| this.aria_label(announced))
             .occlude()
             .relative()
             .w_full()
@@ -148,6 +160,7 @@ impl RenderOnce for AnnouncementToast {
             .child(
                 div().absolute().top_1().right_1().child(
                     IconButton::new("dismiss", IconName::Close)
+                        .aria_label("Dismiss announcement")
                         .icon_size(IconSize::Small)
                         .on_click(self.dismiss_on_click),
                 ),

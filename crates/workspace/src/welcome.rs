@@ -98,6 +98,9 @@ impl RenderOnce for SectionButton {
         let action_ref: &dyn Action = &*self.action;
 
         ButtonLike::new(id)
+            // `ButtonLike` takes its children as opaque elements, so unlike
+            // `Button` it cannot fall back to the label it is showing.
+            .aria_label(self.label.clone())
             .tab_index(self.tab_index as isize)
             .full_width()
             .size(ButtonSize::Medium)
@@ -405,6 +408,12 @@ impl Render for WelcomePage {
         };
 
         h_flex()
+            // This element takes focus when the view opens, so without an id
+            // and a role that focus produces no node and the whole window is
+            // announced instead of the screen the user just landed on.
+            .id("welcome")
+            .role(gpui::Role::Group)
+            .aria_label(welcome_label)
             .key_context("Welcome")
             .track_focus(&self.focus_handle(cx))
             .on_action(cx.listener(Self::select_previous))

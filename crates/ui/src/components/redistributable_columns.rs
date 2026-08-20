@@ -681,6 +681,7 @@ pub(crate) fn render_column_resize_divider(
 
         let mut resize_handle = div()
             .id("column-resize-handle")
+            .pointer_gesture_only()
             .absolute()
             .left_neg_0p5()
             .w(px(RESIZE_COLUMN_WIDTH))

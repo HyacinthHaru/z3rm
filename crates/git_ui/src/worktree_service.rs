@@ -221,6 +221,15 @@ impl ToastView for WorktreeFetchFailedToast {
         None
     }
 
+    fn announcement(&self, _cx: &gpui::App) -> SharedString {
+        match &self.worktree_name {
+            Some(worktree_name) => {
+                format!("Failed to {} in {worktree_name}", self.operation).into()
+            }
+            None => format!("Failed to {}", self.operation).into(),
+        }
+    }
+
     fn auto_dismiss(&self) -> bool {
         false
     }
@@ -300,6 +309,7 @@ impl Render for WorktreeFetchFailedToast {
             )
             .child(
                 IconButton::new("dismiss-worktree-fetch-failed-toast", IconName::Close)
+                    .aria_label("Dismiss")
                     .shape(ui::IconButtonShape::Square)
                     .icon_size(IconSize::Small)
                     .icon_color(Color::Muted)

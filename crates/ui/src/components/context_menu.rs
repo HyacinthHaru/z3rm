@@ -1597,6 +1597,13 @@ impl ContextMenu {
                 &self.submenu_state,
                 SubmenuState::Open(open_submenu) if open_submenu.item_index == ix
             );
+        // Highlighted and open are the same styling here and different facts:
+        // the row is highlighted while the arrow keys are on it, and open once
+        // its submenu is showing.
+        let submenu_is_open = matches!(
+            &self.submenu_state,
+            SubmenuState::Open(open_submenu) if open_submenu.item_index == ix
+        );
 
         div()
             .id(("context-menu-submenu-trigger", ix))
@@ -1624,6 +1631,16 @@ impl ContextMenu {
                 ListItem::new(ix)
                     .inset(true)
                     .aria_role(Role::MenuItem)
+                    // The chevron is the only thing that says this entry opens
+                    // a submenu rather than doing something, and it is an icon.
+                    // `aria_expanded` says both that there is one and whether
+                    // it is showing, but it reaches Windows alone — accesskit's
+                    // macOS and AT-SPI adapters expose neither `expanded` nor
+                    // `HasPopup`. The role description reaches all three, and
+                    // "opens a submenu" is what this entry *is*, so it belongs
+                    // there rather than in the entry's name.
+                    .aria_role_description("submenu")
+                    .aria_expanded(submenu_is_open)
                     .when(is_active_descendant, |item| item.aria_active_descendant())
                     .aria_label(label.clone())
                     .toggle_state(toggle_state)
@@ -2096,6 +2113,7 @@ impl ContextMenu {
                         |el, (((icon, action), title), handler)| {
                             el.end_slot({
                                 let icon_button = IconButton::new("end-slot-icon", *icon)
+                                    .aria_label(title.clone())
                                     .shape(IconButtonShape::Square)
                                     .style(ButtonStyle::Subtle)
                                     .tooltip({
@@ -2507,4 +2525,155 @@ mod tests {
             );
         });
     }
+
+    struct MenuHost(Entity<ContextMenu>);
+
+    impl Render for MenuHost {
+        fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+            div().size_full().child(self.0.clone())
+        }
+    }
+
+    /// An entry that opens a submenu draws a chevron and is otherwise an
+    /// ordinary row, so a reader arrowing through the menu could not tell
+    /// "Split" — which opens something — from "Copy", which does something.
+    #[gpui::test]
+    fn a_submenu_entry_says_it_opens_a_submenu(cx: &mut TestAppContext) {
+        cx.update(|cx| {
+            let settings_store = settings::SettingsStore::test(cx);
+            cx.set_global(settings_store);
+            theme_settings::init(theme::LoadThemes::JustBase, cx);
+        });
+
+        let window = cx.add_window(|window, cx| {
+            let menu = ContextMenu::build(window, cx, |menu, _, _| {
+                menu.entry("Copy", None, |_, _| {}).submenu("Split", |menu, _, _| {
+                    menu.entry("Split Right", None, |_, _| {})
+                })
+            });
+            MenuHost(menu)
+        });
+        cx.activate_a11y(window.into());
+
+        let json = cx
+            .update_window(window.into(), |_, window, cx| {
+                window.draw(cx).clear(cx);
+                window.debug_a11y_tree_json()
+            })
+            .expect("the harness window is still open")
+            .expect("activation makes the debug tree available");
+        let tree: serde_json::Value = serde_json::from_str(&json).expect("the dump is valid JSON");
+        gpui::a11y_checks::assert_interactive_nodes_are_named(&tree, "submenu entry");
+        gpui::a11y_checks::assert_names_are_distinguishable(&tree, "submenu entry");
+        gpui::a11y_checks::assert_focusable_names_are_distinguishable(&tree, "submenu entry");
+
+        let mut entries: Vec<(&str, Option<&str>, Option<bool>)> = tree["nodes"]
+            .as_object()
+            .expect("the dump lists nodes")
+            .values()
+            .filter(|node| node["aria"]["role"] == "MenuItem")
+            .map(|node| {
+                (
+                    node["aria"]["label"].as_str().unwrap_or_default(),
+                    node["aria"]["role_description"].as_str(),
+                    node["aria"]["expanded"].as_bool(),
+                )
+            })
+            .collect();
+        entries.sort_unstable();
+        // The role description says there is a submenu, and reaches all three
+        // platforms; `expanded` says whether it is open, and reaches Windows
+        // alone. Both, because either on its own leaves a platform unable to
+        // tell a submenu from an action.
+        assert_eq!(
+            entries,
+            vec![
+                ("Copy", None, None),
+                ("Split", Some("submenu"), Some(false))
+            ],
+            "only the entry with a submenu says it has one, and says it is closed"
+        );
+    }
+
+    /// Focus stays on the menu while the arrow keys move a highlight through
+    /// it, so which entry is current reaches assistive technology only through
+    /// the active descendant. GPUI honours that claim only when the claiming
+    /// node has a focused ancestor, which is a condition the builder call
+    /// cannot show — it has to be read back out of a drawn frame.
+    #[gpui::test]
+    fn the_selected_entry_is_the_menus_active_descendant(cx: &mut TestAppContext) {
+        cx.update(|cx| {
+            let settings_store = settings::SettingsStore::test(cx);
+            cx.set_global(settings_store);
+            theme_settings::init(theme::LoadThemes::JustBase, cx);
+        });
+
+        let window = cx.add_window(|window, cx| {
+            let menu = ContextMenu::build(window, cx, |menu, _, _| {
+                menu.entry("Split Right", None, |_, _| {})
+                    .entry("Split Down", None, |_, _| {})
+            });
+            MenuHost(menu)
+        });
+        cx.activate_a11y(window.into());
+
+        window
+            .update(cx, |host, window, cx| {
+                host.0.update(cx, |menu, cx| {
+                    window.focus(&menu.focus_handle(cx), cx);
+                    menu.select_first(&Default::default(), window, cx);
+                });
+            })
+            .expect("the harness window is still open");
+
+        let json = cx
+            .update_window(window.into(), |_, window, cx| {
+                window.draw(cx).clear(cx);
+                window.debug_a11y_tree_json()
+            })
+            .expect("the harness window is still open")
+            .expect("activation makes the debug tree available");
+        let tree: serde_json::Value = serde_json::from_str(&json).expect("the dump is valid JSON");
+        gpui::a11y_checks::assert_interactive_nodes_are_named(&tree, "context menu");
+        gpui::a11y_checks::assert_names_are_distinguishable(&tree, "context menu");
+        gpui::a11y_checks::assert_focusable_names_are_distinguishable(&tree, "context menu");
+        gpui::a11y_checks::assert_clickable_elements_are_reachable(&tree, "context menu");
+        gpui::a11y_checks::assert_click_targets_are_reachable(&tree, "context menu");
+        gpui::a11y_checks::assert_controls_have_area(&tree, "context menu");
+        gpui::a11y_checks::assert_landmarks_are_distinguishable(&tree, "context menu");
+        gpui::a11y_checks::assert_active_descendant_is_honoured(&tree, "context menu");
+        gpui::a11y_checks::assert_no_role_was_discarded(&tree, "context menu");
+        gpui::a11y_checks::assert_no_aria_was_discarded(&tree, "context menu");
+        gpui::a11y_checks::assert_roles_are_contained(&tree, "context menu");
+        let nodes = tree["nodes"].as_object().expect("the dump lists nodes");
+
+        let menu = nodes
+            .iter()
+            .find(|(_, node)| node["aria"]["role"] == "Menu")
+            .map(|(id, node)| (id.clone(), node.clone()))
+            .expect("the menu must be reported as a menu");
+
+        let entries: Vec<String> = nodes
+            .values()
+            .filter(|node| node["aria"]["role"] == "MenuItem")
+            .filter_map(|node| node["aria"]["label"].as_str().map(str::to_string))
+            .collect();
+        assert!(
+            entries.contains(&"Split Right".to_string())
+                && entries.contains(&"Split Down".to_string()),
+            "every entry needs a name of its own: {entries:?}"
+        );
+
+        assert_eq!(
+            tree["gpui_focus"].as_str(),
+            Some(menu.0.as_str()),
+            "the menu itself holds focus while a highlight moves inside it"
+        );
+        let active = tree["active_descendant_focus"]
+            .as_str()
+            .and_then(|id| nodes.get(id))
+            .expect("the menu must point at the entry it has highlighted");
+        assert_eq!(active["aria"]["label"].as_str(), Some("Split Right"));
+    }
+
 }

@@ -119,6 +119,17 @@ pub trait Element: 'static + IntoElement {
     /// See the [accessibility guide](crate::_accessibility) for an overview.
     fn write_a11y_info(&self, _node: &mut accesskit::Node) {}
 
+    /// Whether this element carries accessibility information that only reaches
+    /// a reader through a node of its own.
+    ///
+    /// A node is built only for an element with both an id and a role, so a
+    /// label or a live region set on an element with neither is dropped without
+    /// a word. This reports the elements worth complaining about; see
+    /// [`crate::a11y_checks::assert_no_aria_was_discarded`].
+    fn a11y_has_properties(&self) -> bool {
+        false
+    }
+
     /// Add synthetic child nodes to an [`Element`] that has an
     /// [`.id()`][Element::id] and a [`.role()`][Element::a11y_role].
     ///
@@ -364,6 +375,21 @@ impl<E: Element> Drawable<E> {
                 let bounds = window.layout_bounds(layout_id);
                 let mut pushed_a11y_node = false;
                 if window.a11y.is_building_frame() {
+                    if global_id.is_none()
+                        && let Some(role) = self.element.a11y_role()
+                    {
+                        window
+                            .a11y
+                            .note_role_without_id(role, self.element.source_location());
+                    }
+                    // The other half of the same trap: an id without a role
+                    // builds no node either, so anything set on it is dropped
+                    // just as quietly.
+                    if self.element.a11y_role().is_none() && self.element.a11y_has_properties() {
+                        window
+                            .a11y
+                            .note_aria_without_role(self.element.source_location());
+                    }
                     if let Some(global_id) = global_id.as_ref() {
                         if let Some(role) = self.element.a11y_role() {
                             let node_id = global_id.accesskit_node_id();
@@ -423,9 +449,13 @@ impl<E: Element> Drawable<E> {
                             element_id: global_id.0.last().map(|id| format!("{id:?}")),
                             source_location: self.element.source_location(),
                         };
+                        let scale_factor = window.scale_factor();
+                        let a11y = &mut window.a11y;
                         let mut builder = A11ySubtreeBuilder::new(
                             global_id.accesskit_node_id(),
-                            &mut window.a11y.nodes,
+                            &mut a11y.nodes,
+                            &mut a11y.node_bounds,
+                            scale_factor,
                         );
                         #[cfg(debug_assertions)]
                         {

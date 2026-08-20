@@ -80,6 +80,10 @@ fn toggle_icon_theme_selector(
 }
 
 impl ModalView for ThemeSelector {
+    fn a11y_name(&self, _cx: &gpui::App) -> Option<gpui::SharedString> {
+        Some("Themes".into())
+    }
+
     fn on_before_dismiss(
         &mut self,
         _window: &mut Window,
@@ -384,6 +388,12 @@ impl PickerDelegate for ThemeSelectorDelegate {
 
     fn placeholder_text(&self, _window: &mut Window, _cx: &mut App) -> Arc<str> {
         "Select Theme...".into()
+    }
+
+    /// Rows are announced by the text they show. Without this every row in the
+    /// list is a bare "option".
+    fn match_label(&self, ix: usize, _cx: &App) -> Option<SharedString> {
+        Some(self.matches.get(ix)?.string.clone().into())
     }
 
     fn match_count(&self) -> usize {

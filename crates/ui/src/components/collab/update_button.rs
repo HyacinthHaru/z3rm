@@ -180,6 +180,7 @@ impl RenderOnce for UpdateButton {
                 this.child(
                     div().border_l_1().border_color(border_color).child(
                         IconButton::new("dismiss-update-button", IconName::Close)
+            .aria_label("Dismiss")
                             .icon_size(IconSize::Indicator)
                             .when_some(self.on_dismiss, |this, handler| this.on_click(handler))
                             .tooltip(Tooltip::text("Dismiss")),

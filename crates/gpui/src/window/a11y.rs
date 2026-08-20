@@ -158,6 +158,22 @@ pub(crate) struct A11y {
     /// Set for the frame in which focus was dropped for lack of a node, so the
     /// debug dump can explain an otherwise silent `gpui_focus: null`.
     focus_without_node_this_frame: Option<&'static str>,
+    /// Whether the focused element registered its focus handle this frame,
+    /// which distinguishes an element that never rendered from one that
+    /// rendered and simply produced no node.
+    focused_element_rendered_this_frame: bool,
+    /// Whether a node claimed to be the active descendant this frame without
+    /// the focused node being one of its ancestors, so the claim was dropped.
+    /// Elements that set a role this frame but had no element id, so the role
+    /// was discarded. This is the quietest way to lose a node: nothing is
+    /// missing from the code, only from the tree.
+    roles_without_id_this_frame: Vec<(accesskit::Role, Option<&'static std::panic::Location<'static>>)>,
+    aria_without_role_this_frame: Vec<Option<&'static std::panic::Location<'static>>>,
+    /// Elements that answer a click but carry no role, so they produce no node
+    /// at all. Nothing else in the tree records them: a check can only reason
+    /// about nodes that exist, and these do not.
+    clickable_without_role_this_frame:
+        Vec<(Option<&'static std::panic::Location<'static>>, accesskit::Rect)>,
     /// Retains the last tree update (and, in debug builds, per-node provenance)
     /// so it can be dumped via [`crate::Window::debug_a11y_tree_json`].
     debug: debug::A11yDebug,
@@ -183,10 +199,61 @@ impl A11y {
             window_title,
             last_focus_without_node: None,
             focus_without_node_this_frame: None,
+            focused_element_rendered_this_frame: false,
+            roles_without_id_this_frame: Vec::new(),
+            aria_without_role_this_frame: Vec::new(),
+            clickable_without_role_this_frame: Vec::new(),
             debug: debug::A11yDebug::default(),
             #[cfg(debug_assertions)]
             view_type_names: FxHashMap::default(),
         }
+    }
+
+    /// Records that an element asked for a role but had no element id, so its
+    /// node could not be created. Node ids are derived from the element id, so
+    /// a role on its own produces nothing at all.
+    pub(crate) fn note_role_without_id(
+        &mut self,
+        role: accesskit::Role,
+        source_location: Option<&'static std::panic::Location<'static>>,
+    ) {
+        // Kept unformatted until the frame ends: this runs for every element
+        // that asks for a role without an id, on every frame a screen reader is
+        // attached.
+        let site = (role, source_location);
+        if !self.roles_without_id_this_frame.contains(&site) {
+            self.roles_without_id_this_frame.push(site);
+        }
+    }
+
+    /// Records that an element carries accessibility information but no role,
+    /// so no node was built for it and the information went nowhere.
+    pub(crate) fn note_aria_without_role(
+        &mut self,
+        source_location: Option<&'static std::panic::Location<'static>>,
+    ) {
+        if !self.aria_without_role_this_frame.contains(&source_location) {
+            self.aria_without_role_this_frame.push(source_location);
+        }
+    }
+
+    /// Records that an element takes a click but was given no role, so it
+    /// produced no accessibility node and the action it offers is reachable by
+    /// mouse only.
+    /// The bounds travel with the site because they are what makes the report
+    /// usable: an element with no node of its own is harmless if something
+    /// inside it does have one, and only the geometry can say so.
+    ///
+    /// Every instance is kept, not one per source location. A `render_match`
+    /// that draws fifty rows is one location with fifty rectangles, and a row
+    /// with nothing in it is a defect whether or not its neighbours are fine.
+    pub(crate) fn note_clickable_without_role(
+        &mut self,
+        source_location: Option<&'static std::panic::Location<'static>>,
+        bounds: accesskit::Rect,
+    ) {
+        self.clickable_without_role_this_frame
+            .push((source_location, bounds));
     }
 
     /// Logs (once per focus change) that the focused element is not exposed to
@@ -257,7 +324,14 @@ impl A11y {
             // The focused element is properly exposed; reset the dedup so a
             // later focus on a node-less element logs again.
             self.last_focus_without_node = None;
-            self.nodes.set_focus(node_id);
+            let claiming_handle = self.focus_ids.get(&node_id).copied();
+            let same_handle_as_previous = self
+                .nodes
+                .focus
+                .and_then(|previous| self.focus_ids.get(&previous).copied())
+                .zip(claiming_handle)
+                .is_some_and(|(previous, claiming)| previous == claiming);
+            self.nodes.set_focus(node_id, same_handle_as_previous);
         } else {
             // The element registered a focus handle and an id, but never got a
             // node because it has no role.
@@ -268,19 +342,11 @@ impl A11y {
     }
 
     pub(crate) fn set_active_descendant(&mut self, node_id: NodeId) {
-        // The active descendant must be a descendant of the focused container,
-        // not the focused node itself.
-        if self.nodes.node_is_focused(node_id) {
-            if cfg!(debug_assertions) {
-                panic!("set_active_descendant called on the focused node");
-            } else {
-                log::warn!("a11y: set_active_descendant called on the focused node ({node_id:?})");
-            }
-            return;
-        }
-        if self.nodes.has_node(node_id) && self.nodes.focus_is_ancestor_of_current() {
-            self.nodes.set_active_descendant(node_id);
-        }
+        // Only recorded here. Where the claim lands depends on where focus is,
+        // and the focused element may not be prepainted until later in the
+        // frame, so deciding now would make the outcome depend on sibling
+        // order. Resolved in `A11yNodeBuilder::finalize`.
+        self.nodes.claim_active_descendant(node_id);
     }
 
     /// Clear per-frame state and push the root node to start a new frame.
@@ -291,10 +357,66 @@ impl A11y {
         self.nodes.begin_frame(self.window_title.as_ref());
     }
 
+    /// Record that the window has a focused handle but no element claimed it
+    /// this frame.
+    ///
+    /// Distinct from [`Self::note_focus_without_node`], which fires when the
+    /// focused element *did* render and simply lacked an id or a role. Here the
+    /// element was not rendered at all, so nothing reports anything and the
+    /// dump would otherwise show a null focus with no explanation — the same
+    /// silence that made this class of bug hard to see in the first place.
+    /// Records that the focused element rendered, whether or not it produced a
+    /// node. An element can register a focus handle without going through the
+    /// interactivity path that reports a missing id, so without this the
+    /// end-of-frame diagnostic would blame a render that did happen.
+    pub(crate) fn note_focused_element_rendered(&mut self) {
+        self.focused_element_rendered_this_frame = true;
+    }
+
+    pub(crate) fn note_focus_element_not_rendered(&mut self) {
+        if self.nodes.focus.is_none() && self.focus_without_node_this_frame.is_none() {
+            self.focus_without_node_this_frame = Some(if self.focused_element_rendered_this_frame {
+                "its element rendered but produced no accessibility node"
+            } else {
+                "its element was not rendered this frame"
+            });
+        }
+    }
+
     /// Finalize the tree and produce a [`TreeUpdate`] for the platform adapter.
     pub(crate) fn end_frame(&mut self, mut frame: debug::FrameDebugInfo) -> TreeUpdate {
         let update = self.nodes.finalize();
         frame.focus_without_node = self.focus_without_node_this_frame.take();
+        frame.roles_without_id = self
+            .roles_without_id_this_frame
+            .drain(..)
+            .map(|(role, location)| match location {
+                Some(location) => format!("{role:?} at {location}"),
+                None => format!("{role:?}"),
+            })
+            .collect();
+        frame.aria_without_role = self
+            .aria_without_role_this_frame
+            .drain(..)
+            .map(|location| match location {
+                Some(location) => location.to_string(),
+                None => "unknown location".to_string(),
+            })
+            .collect();
+        frame.clickable_without_role = self
+            .clickable_without_role_this_frame
+            .drain(..)
+            .map(|(location, bounds)| debug::ClickableWithoutRole {
+                source_location: match location {
+                    Some(location) => location.to_string(),
+                    None => "<unknown source location>".to_string(),
+                },
+                bounds,
+            })
+            .collect();
+        frame.active_descendant_without_focus =
+            std::mem::take(&mut self.nodes.active_descendant_without_focus);
+        self.focused_element_rendered_this_frame = false;
         self.debug.capture(
             &update,
             self.nodes.focus,
@@ -317,6 +439,8 @@ impl A11y {
 pub struct A11ySubtreeBuilder<'a> {
     parent_id: NodeId,
     nodes: &'a mut A11yNodeBuilder,
+    node_bounds: &'a mut FxHashMap<NodeId, Bounds<Pixels>>,
+    scale_factor: f32,
     /// Provenance of the real element whose `a11y_synthetic_children` is
     /// running.
     #[cfg(debug_assertions)]
@@ -324,10 +448,17 @@ pub struct A11ySubtreeBuilder<'a> {
 }
 
 impl<'a> A11ySubtreeBuilder<'a> {
-    pub(crate) fn new(parent_id: NodeId, nodes: &'a mut A11yNodeBuilder) -> Self {
+    pub(crate) fn new(
+        parent_id: NodeId,
+        nodes: &'a mut A11yNodeBuilder,
+        node_bounds: &'a mut FxHashMap<NodeId, Bounds<Pixels>>,
+        scale_factor: f32,
+    ) -> Self {
         Self {
             parent_id,
             nodes,
+            node_bounds,
+            scale_factor,
             #[cfg(debug_assertions)]
             creator: debug::NodeCreator::default(),
         }
@@ -356,6 +487,34 @@ impl<'a> A11ySubtreeBuilder<'a> {
     ///
     /// Returns `false` if a node with this id is already present in the tree,
     /// in which case the node is discarded.
+    /// Push a synthetic child that occupies a place on screen.
+    ///
+    /// A synthetic node with bounds is a control as far as a reader is
+    /// concerned — something to route a click to and to scroll into view — and
+    /// this gives it the same treatment a real element gets: the bounds are
+    /// written to the node for the platform, and registered so that GPUI's
+    /// `Action::Click` fallback can synthesize a press at its centre. Without
+    /// the registration the node is announced and cannot be operated.
+    pub fn push_child_with_bounds(
+        &mut self,
+        id: NodeId,
+        mut node: accesskit::Node,
+        bounds: Bounds<Pixels>,
+    ) -> bool {
+        let scale = self.scale_factor;
+        node.set_bounds(accesskit::Rect {
+            x0: (bounds.origin.x.0 * scale) as f64,
+            y0: (bounds.origin.y.0 * scale) as f64,
+            x1: ((bounds.origin.x.0 + bounds.size.width.0) * scale) as f64,
+            y1: ((bounds.origin.y.0 + bounds.size.height.0) * scale) as f64,
+        });
+        let pushed = self.push_child(id, node);
+        if pushed {
+            self.node_bounds.insert(id, bounds);
+        }
+        pushed
+    }
+
     pub fn push_child(&mut self, id: NodeId, node: accesskit::Node) -> bool {
         let pushed = self.nodes.push_leaf(id, node);
         #[cfg(debug_assertions)]
@@ -393,6 +552,8 @@ impl<'a> A11ySubtreeBuilder<'a> {
         self.parent_node().set_text_selection(selection);
     }
 
+    /// The node of the element that owns this subtree, so callers can set
+    /// properties that describe the synthetic children as a whole.
     pub fn parent_node(&mut self) -> &mut accesskit::Node {
         self.nodes
             .current_node_mut()
@@ -419,6 +580,19 @@ pub(crate) struct A11yNodeBuilder {
     /// pattern, which allows a focused container to act as if a descendant is
     /// focused.
     active_descendant: Option<NodeId>,
+    /// A claim made from outside the focused node's subtree — a list filtered
+    /// from its own input is the usual shape. Focus stays where the keyboard
+    /// is, and the focused node points at the highlighted row instead, which is
+    /// what a reader needs to announce it.
+    active_descendant_of_focus: Option<NodeId>,
+    /// Claims and the ancestors of the nodes that made them, held until every
+    /// node exists. Several widgets can remain rendered with a highlighted
+    /// row; once focus is known, only the claim owned by the focused subtree
+    /// is eligible. When focus lives outside every claiming subtree, exactly
+    /// one claim may be attached to the focused node.
+    pending_active_descendants: SmallVec<[(NodeId, SmallVec<[NodeId; 16]>); 4]>,
+    /// Set in `finalize` when a claim had no focus anywhere to attach to.
+    active_descendant_without_focus: bool,
     #[cfg(debug_assertions)]
     node_info: FxHashMap<NodeId, debug::NodeDebugInfo>,
 }
@@ -433,6 +607,9 @@ impl A11yNodeBuilder {
             seen_ids: FxHashSet::default(),
             focus: None,
             active_descendant: None,
+            active_descendant_of_focus: None,
+            pending_active_descendants: SmallVec::new(),
+            active_descendant_without_focus: false,
             #[cfg(debug_assertions)]
             node_info: FxHashMap::default(),
         }
@@ -497,6 +674,14 @@ impl A11yNodeBuilder {
         self.nodes_stack.last_mut()
     }
 
+    /// The node on top of the stack, but only if it is `node_id`'s.
+    ///
+    /// An element that produced no node of its own leaves its parent's on top,
+    /// and a caller identifying itself by id must not reach that instead.
+    pub(crate) fn current_node_mut_if(&mut self, node_id: NodeId) -> Option<&mut accesskit::Node> {
+        (self.ids_stack.last() == Some(&node_id)).then(|| self.nodes_stack.last_mut())?
+    }
+
     /// Pop the current node off the stack and finalize it into the all_nodes
     /// list.
     pub(crate) fn pop(&mut self) {
@@ -525,6 +710,9 @@ impl A11yNodeBuilder {
         self.nodes_stack.push(root_node);
         self.focus = None;
         self.active_descendant = None;
+        self.active_descendant_of_focus = None;
+        self.pending_active_descendants.clear();
+        self.active_descendant_without_focus = false;
     }
 
     /// Returns whether a node with the given ID has been pushed in this frame.
@@ -532,41 +720,104 @@ impl A11yNodeBuilder {
         id == ROOT_NODE_ID || self.seen_ids.contains(&id)
     }
 
-    /// Returns whether `id` is the node currently reported as focused.
-    pub(crate) fn node_is_focused(&self, id: NodeId) -> bool {
-        self.focus == Some(id)
-    }
-
-    pub(crate) fn focus_is_ancestor_of_current(&self) -> bool {
-        let Some(focus) = self.focus else {
-            return false;
-        };
-
-        // The current node is on top of the stack; everything below it is an
+    /// Record a claim along with the claiming node's ancestors, to be resolved
+    /// once the whole frame and its focus are known.
+    pub(crate) fn claim_active_descendant(&mut self, id: NodeId) {
+        // The claiming node is on top of the stack; everything below it is an
         // ancestor.
         let ancestor_count = self.ids_stack.len().saturating_sub(1);
-        self.ids_stack[..ancestor_count].contains(&focus)
+        let ancestors = SmallVec::from_slice(&self.ids_stack[..ancestor_count]);
+        if !self
+            .pending_active_descendants
+            .iter()
+            .any(|(existing, existing_ancestors)| {
+                *existing == id && *existing_ancestors == ancestors
+            })
+        {
+            self.pending_active_descendants.push((id, ancestors));
+        }
     }
 
-    pub(crate) fn set_active_descendant(&mut self, id: NodeId) {
-        if self
-            .active_descendant
-            .is_some_and(|existing| existing != id)
-        {
+    /// Decide where the frame's active-descendant claim lands, now that every
+    /// node has been pushed and focus is known.
+    fn resolve_active_descendant(&mut self) {
+        let claims = std::mem::take(&mut self.pending_active_descendants);
+        let Some(focus) = self.focus else {
+            self.active_descendant_without_focus =
+                claims.iter().any(|(target, _)| self.has_node(*target));
+            return;
+        };
+
+        let mut focused_claims = SmallVec::<[NodeId; 4]>::new();
+        let mut external_claims = SmallVec::<[NodeId; 4]>::new();
+        for (target, ancestors) in claims {
+            if !self.has_node(target) {
+                continue;
+            }
+            if focus == target {
+                if cfg!(debug_assertions) {
+                    panic!("set_active_descendant called on the focused node");
+                } else {
+                    log::warn!(
+                        "a11y: set_active_descendant called on the focused node ({target:?})"
+                    );
+                }
+                continue;
+            }
+
+            let candidates = if ancestors.contains(&focus) {
+                &mut focused_claims
+            } else {
+                &mut external_claims
+            };
+            if !candidates.contains(&target) {
+                candidates.push(target);
+            }
+        }
+
+        let (candidates, destination) = if focused_claims.is_empty() {
+            (&external_claims, "focused node")
+        } else {
+            (&focused_claims, "focused subtree")
+        };
+        if candidates.len() > 1 {
             if cfg!(debug_assertions) {
-                panic!("active descendant claimed by multiple nodes in one frame");
+                panic!(
+                    "multiple active descendants claimed by the same {destination}: {candidates:?}"
+                );
             } else {
                 log::warn!(
-                    "a11y: multiple nodes claimed the active descendant this frame; \
-                     using last-wins ({id:?})"
+                    "a11y: multiple active descendants claimed by the same {destination}; \
+                     using last-wins ({:?})",
+                    candidates.last()
                 );
             }
         }
-        self.active_descendant = Some(id);
+        let Some(target) = candidates.last().copied() else {
+            return;
+        };
+
+        if focused_claims.is_empty() {
+            // A highlight in a list the user filters from a separate input:
+            // focus is in the input, which is not an ancestor of the row, so
+            // reporting the row as focused would misstate where typing goes.
+            self.active_descendant_of_focus = Some(target);
+        } else {
+            self.active_descendant = Some(target);
+        }
     }
 
-    pub(crate) fn set_focus(&mut self, id: NodeId) {
-        if self.focus.is_some() {
+    /// Report `id` as the focused node.
+    ///
+    /// `same_handle_as_previous` tells whether this claim comes from the same
+    /// focus handle as the last one this frame. Nesting an element that tracks
+    /// a handle inside another element tracking the same handle is a normal
+    /// GPUI pattern — a terminal surface inside its labelled pane, say — and
+    /// both report focus. The innermost claim wins, since it is the more
+    /// specific target. Two *different* handles claiming focus in one frame is
+    /// a real bug and still fails loudly.
+    pub(crate) fn set_focus(&mut self, id: NodeId, same_handle_as_previous: bool) {
+        if self.focus.is_some() && !same_handle_as_previous {
             if cfg!(debug_assertions) {
                 panic!("set_focus called more than once in a single frame");
             } else {
@@ -581,6 +832,7 @@ impl A11yNodeBuilder {
 
     fn finalize(&mut self) -> TreeUpdate {
         self.frame_open = false;
+        self.resolve_active_descendant();
         // Stack should contain only the root node
         debug_assert_eq!(self.ids_stack.len(), 1);
         debug_assert_eq!(self.ids_stack[0], ROOT_NODE_ID);
@@ -613,6 +865,26 @@ impl A11yNodeBuilder {
 
             _ => self.focus.unwrap_or(ROOT_NODE_ID),
         };
+
+        // Attached last, once every node exists: the focused node points at the
+        // row it highlights, which is how a reader announces a list the user is
+        // filtering from somewhere else.
+        //
+        // No platform adapter reads `active_descendant`; grepping all three for
+        // it finds nothing, which makes this look like a property that goes
+        // nowhere. It is resolved a layer earlier: `accesskit_consumer`'s
+        // `Node::is_focused` answers true for the focused node's active
+        // descendant and false for the focused node itself, so the adapters
+        // announce the row through the focus machinery they already use.
+        if let (Some(target), Some(focused_id)) = (self.active_descendant_of_focus, self.focus)
+            && self.has_node(target)
+            && let Some((_, node)) = self
+                .all_nodes
+                .iter_mut()
+                .find(|(id, _)| *id == focused_id)
+        {
+            node.set_active_descendant(target);
+        }
 
         let nodes = std::mem::take(&mut self.all_nodes);
         let update = TreeUpdate {
@@ -674,6 +946,29 @@ impl A11yNodeBuilder {
 
 #[cfg(test)]
 mod tests {
+    /// Nesting an element that tracks a focus handle inside another element
+    /// tracking the same handle is a normal GPUI pattern — a terminal surface
+    /// inside its labelled pane — and both report focus. The inner one is the
+    /// more specific target, so it wins rather than tripping the invariant.
+    #[test]
+    fn nested_elements_sharing_a_focus_handle_report_the_innermost() {
+        let mut builder = new_builder();
+
+        let outer = NodeId(1);
+        let inner = NodeId(2);
+        builder.push(outer, test_node());
+        builder.push(inner, test_node());
+
+        builder.set_focus(outer, false);
+        builder.set_focus(inner, true);
+
+        assert_eq!(
+            builder.focus,
+            Some(inner),
+            "the innermost element tracking the handle is what should be announced"
+        );
+    }
+
     /// An element can be laid out while no frame is open — a measurement pass
     /// calling `prepaint_as_root`, for instance. A node pushed then has no
     /// tree to join, and pushing anyway trips the "node pushed before
@@ -733,13 +1028,12 @@ mod tests {
         let item = NodeId(2);
 
         assert!(builder.push(container, test_node()));
-        builder.set_focus(container);
+        builder.set_focus(container, false);
         assert!(builder.push(item, test_node()));
 
         // The item is on top of the stack; the focused container is its
         // ancestor, so the claim is honored.
-        assert!(builder.focus_is_ancestor_of_current());
-        builder.set_active_descendant(item);
+        builder.claim_active_descendant(item);
 
         builder.pop(); // item
         builder.pop(); // container
@@ -755,20 +1049,127 @@ mod tests {
         let item = NodeId(3);
 
         assert!(builder.push(container, test_node()));
-        builder.set_focus(container);
+        builder.set_focus(container, false);
         assert!(builder.push(group, test_node()));
         assert!(builder.push(item, test_node()));
 
         // The item is a grandchild of the focused container; depth doesn't
         // matter, the focused ancestor is still on the stack.
-        assert!(builder.focus_is_ancestor_of_current());
-        builder.set_active_descendant(item);
+        builder.claim_active_descendant(item);
 
         builder.pop(); // item
         builder.pop(); // group
         builder.pop(); // container
         let update = builder.finalize();
         assert_eq!(update.focus, item);
+    }
+
+    /// The list-plus-filter shape: the keyboard is in the input, the highlight
+    /// is in a list beside it. Focus has to stay on the input — saying the row
+    /// is focused would be a lie about where typing goes — so the input points
+    /// at the row instead, and a reader announces both.
+    #[test]
+    fn a_claim_from_another_subtree_lands_on_the_focused_node() {
+        let mut builder = new_builder();
+        let input = NodeId(1);
+        let list = NodeId(2);
+        let row = NodeId(3);
+
+        assert!(builder.push(input, test_node()));
+        builder.set_focus(input, false);
+        builder.pop();
+
+        assert!(builder.push(list, test_node()));
+        assert!(builder.push(row, test_node()));
+        builder.claim_active_descendant(row);
+        builder.pop();
+        builder.pop();
+
+        let update = builder.finalize();
+        assert_eq!(update.focus, input, "the keyboard is still in the input");
+        let focused_node = update
+            .nodes
+            .iter()
+            .find(|(id, _)| *id == input)
+            .map(|(_, node)| node)
+            .expect("the focused node is in the tree");
+        assert_eq!(
+            focused_node.active_descendant(),
+            Some(row),
+            "the input has to point at the row it is highlighting"
+        );
+    }
+
+    /// The same shape as the test above, with the two subtrees swapped: the
+    /// list is prepainted before the input that focus lands in. Resolving the
+    /// claim where it was made saw no focus yet and threw it away, so whether a
+    /// picker announced its highlighted row came down to sibling order.
+    #[test]
+    fn a_claim_made_before_focus_exists_still_lands() {
+        let mut builder = new_builder();
+        let list = NodeId(1);
+        let row = NodeId(2);
+        let input = NodeId(3);
+
+        assert!(builder.push(list, test_node()));
+        assert!(builder.push(row, test_node()));
+        builder.claim_active_descendant(row);
+        builder.pop();
+        builder.pop();
+
+        assert!(builder.push(input, test_node()));
+        builder.set_focus(input, false);
+        builder.pop();
+
+        let update = builder.finalize();
+        assert_eq!(update.focus, input, "the keyboard is still in the input");
+        assert!(
+            !builder.active_descendant_without_focus,
+            "the focus arrived later in the frame, which is not the same as never"
+        );
+        let focused_node = update
+            .nodes
+            .iter()
+            .find(|(id, _)| *id == input)
+            .map(|(_, node)| node)
+            .expect("the focused node is in the tree");
+        assert_eq!(
+            focused_node.active_descendant(),
+            Some(row),
+            "the input has to point at the row it is highlighting"
+        );
+    }
+
+    /// Several widgets can remain rendered with their own highlighted row,
+    /// but only the claim owned by the focused subtree describes the keyboard
+    /// position. An open context menu must therefore win over the project tree
+    /// behind it rather than making the whole frame ambiguous.
+    #[test]
+    fn focused_subtree_claim_wins_over_an_unfocused_sibling_claim() {
+        let mut builder = new_builder();
+        let background_list = NodeId(1);
+        let background_row = NodeId(2);
+        let focused_list = NodeId(3);
+        let focused_row = NodeId(4);
+
+        assert!(builder.push(background_list, test_node()));
+        assert!(builder.push(background_row, test_node()));
+        builder.claim_active_descendant(background_row);
+        builder.pop();
+        builder.pop();
+
+        assert!(builder.push(focused_list, test_node()));
+        builder.set_focus(focused_list, false);
+        assert!(builder.push(focused_row, test_node()));
+        builder.claim_active_descendant(focused_row);
+        builder.pop();
+        builder.pop();
+
+        let update = builder.finalize();
+        assert_eq!(
+            update.focus, focused_row,
+            "the highlighted row owned by the focused list is the active descendant"
+        );
     }
 
     #[test]
@@ -782,7 +1183,7 @@ mod tests {
         // First subtree holds real focus.
         assert!(builder.push(focused_container, test_node()));
         assert!(builder.push(focused_leaf, test_node()));
-        builder.set_focus(focused_leaf);
+        builder.set_focus(focused_leaf, false);
         builder.pop(); // focused_leaf
         builder.pop(); // focused_container
 
@@ -790,7 +1191,6 @@ mod tests {
         // focus is not on any of its ancestors, so the gate rejects it.
         assert!(builder.push(other_container, test_node()));
         assert!(builder.push(other_item, test_node()));
-        assert!(!builder.focus_is_ancestor_of_current());
         builder.pop(); // other_item
         builder.pop(); // other_container
 
@@ -807,14 +1207,18 @@ mod tests {
         assert!(builder.push(container, test_node()));
         assert!(builder.push(item, test_node()));
 
-        // Nothing is focused (focus defaults to the root window node), so the
-        // gate rejects the claim.
-        assert!(!builder.focus_is_ancestor_of_current());
+        // Nothing is focused, so there is no keyboard position for the claim
+        // to describe and nowhere to hang it.
+        builder.claim_active_descendant(item);
         builder.pop();
         builder.pop();
 
         let update = builder.finalize();
         assert_eq!(update.focus, ROOT_NODE_ID);
+        assert!(
+            builder.active_descendant_without_focus,
+            "a claim with no focus anywhere has to be reported, not dropped"
+        );
     }
 
     #[test]
@@ -823,45 +1227,39 @@ mod tests {
         let focused = NodeId(1);
 
         assert!(builder.push(focused, test_node()));
-        builder.set_focus(focused);
+        builder.set_focus(focused, false);
         builder.pop();
 
         let update = builder.finalize();
         assert_eq!(update.focus, focused);
     }
 
-    #[test]
-    fn focus_is_ancestor_excludes_self_and_non_ancestors() {
-        let mut builder = new_builder();
-        let container = NodeId(1);
-        let item = NodeId(2);
-
-        assert!(builder.push(container, test_node()));
-        builder.set_focus(container);
-
-        // With the focused container itself on top, it is not its own (strict)
-        // ancestor, so the gate is false.
-        assert!(!builder.focus_is_ancestor_of_current());
-
-        assert!(builder.push(item, test_node()));
-        // Now the focused container is a strict ancestor of the item on top.
-        assert!(builder.focus_is_ancestor_of_current());
-
-        builder.pop();
-        builder.pop();
-    }
-
-    // The double-claim guard panics only in debug builds; in release it falls
-    // back to last-wins with a warning.
+    // Two unrelated lists cannot both attach a highlighted row to the same
+    // separately-focused input. Unlike an unfocused background claim beside a
+    // focused subtree, neither has ownership evidence, so the frame is
+    // genuinely ambiguous.
     #[test]
     #[cfg_attr(
         debug_assertions,
-        should_panic(expected = "active descendant claimed by multiple nodes")
+        should_panic(expected = "multiple active descendants claimed by the same focused node")
     )]
-    fn multiple_active_descendant_claims_panic_in_debug() {
+    fn multiple_external_active_descendant_claims_panic_in_debug() {
         let mut builder = new_builder();
-        builder.set_active_descendant(NodeId(1));
-        builder.set_active_descendant(NodeId(2));
+        let input = NodeId(1);
+
+        assert!(builder.push(input, test_node()));
+        builder.set_focus(input, false);
+        builder.pop();
+
+        for (list, row) in [(NodeId(2), NodeId(3)), (NodeId(4), NodeId(5))] {
+            assert!(builder.push(list, test_node()));
+            assert!(builder.push(row, test_node()));
+            builder.claim_active_descendant(row);
+            builder.pop();
+            builder.pop();
+        }
+
+        builder.finalize();
     }
 
     // Setting focus twice in one frame means two elements both claimed window
@@ -873,8 +1271,8 @@ mod tests {
     )]
     fn setting_focus_twice_panics_in_debug() {
         let mut builder = new_builder();
-        builder.set_focus(NodeId(1));
-        builder.set_focus(NodeId(2));
+        builder.set_focus(NodeId(1), false);
+        builder.set_focus(NodeId(2), false);
     }
 
     // Focusing a node that was never registered as focusable is a bug: panic in
@@ -903,15 +1301,16 @@ mod tests {
         a11y.set_focusable(node, FocusId::default());
         a11y.set_focus(node);
         a11y.set_active_descendant(node);
+        a11y.nodes.finalize();
     }
 
     // Two sibling children of a focused container both claim the active
-    // descendant (both pass the focus gate). The second claim is a bug: panic
-    // in debug, last-wins + warn in release.
+    // descendant. Both have the same focused owner, so the frame is genuinely
+    // ambiguous: panic in debug, last-wins + warn in release.
     #[test]
     #[cfg_attr(
         debug_assertions,
-        should_panic(expected = "active descendant claimed by multiple nodes")
+        should_panic(expected = "multiple active descendants claimed by the same focused subtree")
     )]
     fn two_siblings_claiming_active_descendant() {
         let mut a11y = new_a11y();
@@ -932,6 +1331,7 @@ mod tests {
         a11y.nodes.pop(); // second
 
         a11y.nodes.pop(); // container
+        a11y.nodes.finalize();
     }
 
     // Node A is focused; node C (a child of the unfocused node B) claims the
@@ -1109,5 +1509,606 @@ mod a11y_text_run_tests {
         selection_head: usize,
     ) {
         let _ = build_a11y_text_runs(&text, selection_tail, selection_head, NodeId);
+    }
+}
+
+#[cfg(test)]
+mod activation_tests {
+    use crate::{
+        App, AppContext as _, Context, Entity, InteractiveElement, IntoElement, ParentElement,
+        Render, StatefulInteractiveElement as _, StyleRefinement, TestAppContext, Window, div,
+    };
+
+    struct Child;
+    impl Render for Child {
+        fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+            div()
+                .id("cached-child")
+                .role(crate::accesskit::Role::Button)
+                .aria_label("Cached child")
+        }
+    }
+
+    struct Root(Entity<Child>);
+    impl Render for Root {
+        fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+            div().child(self.0.clone().cached(StyleRefinement::default()))
+        }
+    }
+
+    /// A screen reader usually attaches to a window that has already been
+    /// drawn, so it meets a warm view cache. A cached view replays its recorded
+    /// prepaint instead of running it again, and only a real prepaint pushes
+    /// nodes — so the first frame after activation would otherwise report an
+    /// empty tree for exactly the content the user is already looking at.
+    #[crate::test]
+    fn activating_mid_session_still_reports_cached_views(cx: &mut TestAppContext) {
+        let window = cx.add_window(|_, cx| Root(cx.new(|_| Child)));
+        cx.update_window(window.into(), |_, window, cx| {
+            window.draw(cx).clear(cx);
+        })
+        .expect("the window is open");
+
+        cx.activate_a11y(window.into());
+        let json = cx
+            .update_window(window.into(), |_, window, cx| {
+                window.draw(cx).clear(cx);
+                window.debug_a11y_tree_json()
+            })
+            .expect("the window is open")
+            .expect("activation makes the debug tree available");
+        let tree: serde_json::Value = serde_json::from_str(&json).expect("the dump is valid JSON");
+
+        assert!(
+            tree["nodes"]
+                .as_object()
+                .expect("the dump lists nodes")
+                .values()
+                .any(|node| node["aria"]["label"].as_str() == Some("Cached child")),
+            "a cached subtree must reach the tree on the first frame after activation: {json}"
+        );
+    }
+
+    /// The tree is rebuilt from scratch every frame, so a cached view must
+    /// keep contributing on frames where nothing about it changed. Otherwise
+    /// any unrelated redraw — a blinking cursor, a hover — would delete the
+    /// stable content from under the reader.
+    #[crate::test]
+    fn a_cached_view_keeps_reporting_on_later_frames(cx: &mut TestAppContext) {
+        let window = cx.add_window(|_, cx| Root(cx.new(|_| Child)));
+        cx.update_window(window.into(), |_, window, cx| {
+            window.draw(cx).clear(cx);
+        })
+        .expect("the window is open");
+        cx.activate_a11y(window.into());
+
+        for frame in 1..=3 {
+            let json = cx
+                .update_window(window.into(), |_, window, cx| {
+                    window.draw(cx).clear(cx);
+                    window.debug_a11y_tree_json()
+                })
+                .expect("the window is open")
+                .expect("activation makes the debug tree available");
+            let tree: serde_json::Value =
+                serde_json::from_str(&json).expect("the dump is valid JSON");
+            assert!(
+                tree["nodes"]
+                    .as_object()
+                    .expect("the dump lists nodes")
+                    .values()
+                    .any(|node| node["aria"]["label"].as_str() == Some("Cached child")),
+                "the cached subtree vanished on frame {frame}: {json}"
+            );
+        }
+    }
+
+    /// Focus can point at an element that never rendered — a collapsed panel, a
+    /// pane behind a zoomed one. The dump has to say so: a null focus with no
+    /// reason is indistinguishable from having no focus at all.
+    #[crate::test]
+    fn focus_on_an_element_that_never_rendered_says_so(cx: &mut TestAppContext) {
+        struct Hidden {
+            focus_handle: crate::FocusHandle,
+        }
+        impl Render for Hidden {
+            fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+                // Deliberately renders nothing that tracks the handle.
+                div()
+            }
+        }
+
+        let window = cx.add_window(|_, cx| Hidden {
+            focus_handle: cx.focus_handle(),
+        });
+        let focus_handle = window
+            .read_with(cx, |view, _| view.focus_handle.clone())
+            .expect("the window is open");
+        cx.activate_a11y(window.into());
+
+        let json = cx
+            .update_window(window.into(), |_, window, cx| {
+                window.focus(&focus_handle, cx);
+                window.draw(cx).clear(cx);
+                window.debug_a11y_tree_json()
+            })
+            .expect("the window is open")
+            .expect("activation makes the debug tree available");
+        let tree: serde_json::Value = serde_json::from_str(&json).expect("the dump is valid JSON");
+
+        assert_eq!(tree["gpui_focus"].as_str(), None);
+        assert_eq!(
+            tree["frame"]["focus_without_node"].as_str(),
+            Some("its element was not rendered this frame"),
+            "a null focus has to come with the reason for it"
+        );
+    }
+
+    /// A synthetic child that occupies a place on screen has to be operable,
+    /// not merely announced. GPUI answers `Action::Click` by synthesizing a
+    /// press at the node's registered bounds, and only real elements used to
+    /// register any — so a text run standing in for a link inside a paragraph
+    /// could be read out and never followed.
+    #[crate::test]
+    fn a_synthetic_child_with_bounds_can_be_clicked(cx: &mut TestAppContext) {
+        struct LinkInText;
+
+        impl crate::Element for LinkInText {
+            type RequestLayoutState = ();
+            type PrepaintState = ();
+
+            fn id(&self) -> Option<crate::ElementId> {
+                Some(crate::ElementId::Name("paragraph".into()))
+            }
+
+            fn source_location(&self) -> Option<&'static std::panic::Location<'static>> {
+                None
+            }
+
+            fn request_layout(
+                &mut self,
+                _: Option<&crate::GlobalElementId>,
+                _: Option<&crate::InspectorElementId>,
+                window: &mut Window,
+                cx: &mut App,
+            ) -> (crate::LayoutId, ()) {
+                let mut style = crate::Style::default();
+                style.size.width = crate::px(400.).into();
+                style.size.height = crate::px(200.).into();
+                (window.request_layout(style, [], cx), ())
+            }
+
+            fn prepaint(
+                &mut self,
+                _: Option<&crate::GlobalElementId>,
+                _: Option<&crate::InspectorElementId>,
+                _: crate::Bounds<crate::Pixels>,
+                _: &mut (),
+                _: &mut Window,
+                _: &mut App,
+            ) {
+            }
+
+            fn paint(
+                &mut self,
+                _: Option<&crate::GlobalElementId>,
+                _: Option<&crate::InspectorElementId>,
+                _: crate::Bounds<crate::Pixels>,
+                _: &mut (),
+                _: &mut (),
+                _: &mut Window,
+                _: &mut App,
+            ) {
+            }
+
+            fn a11y_role(&self) -> Option<accesskit::Role> {
+                Some(accesskit::Role::Group)
+            }
+
+            fn a11y_synthetic_children(
+                &mut self,
+                _: &mut (),
+                builder: &mut crate::A11ySubtreeBuilder,
+            ) {
+                let mut node = accesskit::Node::new(accesskit::Role::Link);
+                node.set_label("example.com");
+                node.add_action(accesskit::Action::Click);
+                builder.push_child_with_bounds(
+                    builder.synthetic_node_id(0),
+                    node,
+                    crate::Bounds {
+                        origin: crate::point(crate::px(100.), crate::px(50.)),
+                        size: crate::size(crate::px(60.), crate::px(20.)),
+                    },
+                );
+            }
+        }
+
+        impl IntoElement for LinkInText {
+            type Element = Self;
+
+            fn into_element(self) -> Self {
+                self
+            }
+        }
+
+        let pressed: std::rc::Rc<std::cell::Cell<Option<crate::Point<crate::Pixels>>>> =
+            Default::default();
+
+        struct Host(std::rc::Rc<std::cell::Cell<Option<crate::Point<crate::Pixels>>>>);
+        impl Render for Host {
+            fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+                let pressed = self.0.clone();
+                div()
+                    .id("page")
+                    .on_mouse_down(crate::MouseButton::Left, move |event, _, _| {
+                        pressed.set(Some(event.position));
+                    })
+                    .child(LinkInText)
+            }
+        }
+
+        let window = cx.add_window(|_, _| Host(pressed.clone()));
+        cx.activate_a11y(window.into());
+        let json = cx
+            .update_window(window.into(), |_, window, cx| {
+                window.draw(cx).clear(cx);
+                window.debug_a11y_tree_json()
+            })
+            .expect("the window is open")
+            .expect("activation makes the debug tree available");
+        let tree: serde_json::Value = serde_json::from_str(&json).expect("the dump is valid JSON");
+
+        let link = tree["nodes"]
+            .as_object()
+            .expect("the dump lists nodes")
+            .values()
+            .find(|node| node["aria"]["role"] == "Link")
+            .unwrap_or_else(|| panic!("the synthetic link reaches the tree: {json}"));
+        let link_id = accesskit::NodeId(
+            link["accesskit_id"]
+                .as_str()
+                .expect("the node carries an accesskit id")
+                .parse()
+                .expect("the id is a u64"),
+        );
+
+        cx.update_window(window.into(), |_, window, cx| {
+            window.handle_a11y_action(
+                accesskit::ActionRequest {
+                    target_tree: accesskit::TreeId::ROOT,
+                    target_node: link_id,
+                    action: accesskit::Action::Click,
+                    data: None,
+                },
+                cx,
+            );
+        })
+        .expect("the window is open");
+
+        let position = pressed
+            .get()
+            .expect("clicking the link has to reach the page as a press");
+        // The centre of the bounds the element asked for, which is the point
+        // that lands inside the link rather than beside it.
+        assert_eq!(position.x, crate::px(130.));
+        assert_eq!(position.y, crate::px(60.));
+    }
+
+    /// A custom element can return a role while returning no id — the role is
+    /// then discarded with no node, no warning, and no visible difference in
+    /// the code that asked for it. That is the quietest way to lose a node, so
+    /// the dump has to name the site.
+    #[crate::test]
+    fn a_role_without_an_element_id_is_reported(cx: &mut TestAppContext) {
+        struct RolefulButIdless;
+
+        impl crate::Element for RolefulButIdless {
+            type RequestLayoutState = ();
+            type PrepaintState = ();
+
+            fn id(&self) -> Option<crate::ElementId> {
+                None
+            }
+
+            fn source_location(&self) -> Option<&'static std::panic::Location<'static>> {
+                None
+            }
+
+            fn request_layout(
+                &mut self,
+                _: Option<&crate::GlobalElementId>,
+                _: Option<&crate::InspectorElementId>,
+                window: &mut Window,
+                cx: &mut App,
+            ) -> (crate::LayoutId, ()) {
+                (window.request_layout(crate::Style::default(), [], cx), ())
+            }
+
+            fn prepaint(
+                &mut self,
+                _: Option<&crate::GlobalElementId>,
+                _: Option<&crate::InspectorElementId>,
+                _: crate::Bounds<crate::Pixels>,
+                _: &mut (),
+                _: &mut Window,
+                _: &mut App,
+            ) {
+            }
+
+            fn paint(
+                &mut self,
+                _: Option<&crate::GlobalElementId>,
+                _: Option<&crate::InspectorElementId>,
+                _: crate::Bounds<crate::Pixels>,
+                _: &mut (),
+                _: &mut (),
+                _: &mut Window,
+                _: &mut App,
+            ) {
+            }
+
+            fn a11y_role(&self) -> Option<accesskit::Role> {
+                Some(accesskit::Role::Button)
+            }
+        }
+
+        impl IntoElement for RolefulButIdless {
+            type Element = Self;
+
+            fn into_element(self) -> Self {
+                self
+            }
+        }
+
+        struct Host;
+        impl Render for Host {
+            fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+                div().child(RolefulButIdless)
+            }
+        }
+
+        let window = cx.add_window(|_, _| Host);
+        cx.activate_a11y(window.into());
+        let json = cx
+            .update_window(window.into(), |_, window, cx| {
+                window.draw(cx).clear(cx);
+                window.debug_a11y_tree_json()
+            })
+            .expect("the window is open")
+            .expect("activation makes the debug tree available");
+        let tree: serde_json::Value = serde_json::from_str(&json).expect("the dump is valid JSON");
+
+        let discarded = tree["frame"]["roles_without_id"]
+            .as_array()
+            .expect("the dump lists discarded roles");
+        assert_eq!(
+            discarded.len(),
+            1,
+            "the discarded role must be named, not silently dropped: {json}"
+        );
+        assert!(
+            discarded[0].as_str().is_some_and(|site| site.contains("Button")),
+            "the report has to say which role was lost: {discarded:?}"
+        );
+    }
+
+    /// The check that finds tab stops with no node, proven against a window
+    /// that has one. Without this, a check that quietly matched nothing would
+    /// read exactly like a clean window.
+    #[gpui::test]
+    #[should_panic(expected = "tabbing lands on elements with no accessibility node")]
+    fn a_tab_stop_with_no_node_is_reported(cx: &mut TestAppContext) {
+        struct Host;
+        impl Render for Host {
+            fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+                let named = cx.focus_handle().tab_index(0).tab_stop(true);
+                let stranded = cx.focus_handle().tab_index(1).tab_stop(true);
+                let _ = window;
+                div()
+                    .child(
+                        div()
+                            .id("named")
+                            .role(accesskit::Role::Button)
+                            .aria_label("Save")
+                            .track_focus(&named),
+                    )
+                    // An id and no role: focusable, tabbable, and absent from
+                    // the tree.
+                    .child(div().id("stranded").track_focus(&stranded))
+            }
+        }
+
+        let window = cx.add_window(|_, _| Host);
+        cx.activate_a11y(window.into());
+        crate::a11y_checks::assert_every_tab_stop_reaches_the_tree(cx, window.into(), "probe");
+    }
+
+    /// The other half of the same trap. A node needs an id *and* a role, and
+    /// an element with an id and no role builds nothing, so a name or a live
+    /// region set on it is dropped as quietly as a role without an id — with
+    /// the call site looking exactly like one that worked.
+    #[gpui::test]
+    fn aria_on_an_element_with_no_role_is_reported(cx: &mut TestAppContext) {
+        struct Host;
+        impl Render for Host {
+            fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+                div()
+                    .id("named-but-roleless")
+                    .aria_label("Save")
+                    // A sibling doing it right, so the report cannot be passing
+                    // by flagging everything.
+                    .child(div().id("proper").role(accesskit::Role::Button).aria_label("Cancel"))
+            }
+        }
+
+        let window = cx.add_window(|_, _| Host);
+        cx.activate_a11y(window.into());
+        let json = cx
+            .update_window(window.into(), |_, window, cx| {
+                window.draw(cx).clear(cx);
+                window.debug_a11y_tree_json()
+            })
+            .expect("the window is open")
+            .expect("activation makes the debug tree available");
+        let tree: serde_json::Value = serde_json::from_str(&json).expect("the dump is valid JSON");
+
+        let discarded = tree["frame"]["aria_without_role"]
+            .as_array()
+            .expect("the dump lists discarded accessibility information");
+        assert_eq!(
+            discarded.len(),
+            1,
+            "the labelled element with no role is the only one reported: {json}"
+        );
+        assert!(
+            discarded[0]
+                .as_str()
+                .is_some_and(|site| site.contains("a11y.rs")),
+            "the report has to say where the information was lost: {discarded:?}"
+        );
+    }
+
+    /// `keyboard_shortcut` is written by five call sites and read by none of
+    /// accesskit's three adapters, so a shortcut that lives only there is
+    /// never heard. It has to arrive somewhere a reader looks.
+    #[gpui::test]
+    fn a_keyboard_shortcut_reaches_a_property_a_reader_reads(cx: &mut TestAppContext) {
+        struct Host;
+        impl Render for Host {
+            fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+                div()
+                    .child(
+                        div()
+                            .id("shortcut-only")
+                            .role(accesskit::Role::Button)
+                            .aria_label("Copy")
+                            .aria_keyshortcuts("Command-C"),
+                    )
+                    .child(
+                        div()
+                            .id("shortcut-and-description")
+                            .role(accesskit::Role::Button)
+                            .aria_label("Paste")
+                            .aria_description("Insert the clipboard here")
+                            .aria_keyshortcuts("Command-V"),
+                    )
+            }
+        }
+
+        let window = cx.add_window(|_, _| Host);
+        cx.activate_a11y(window.into());
+        let json = cx
+            .update_window(window.into(), |_, window, cx| {
+                window.draw(cx).clear(cx);
+                window.debug_a11y_tree_json()
+            })
+            .expect("the window is open")
+            .expect("activation makes the debug tree available");
+        let tree: serde_json::Value = serde_json::from_str(&json).expect("the dump is valid JSON");
+
+        let described = |name: &str| -> Option<String> {
+            tree["nodes"]
+                .as_object()?
+                .values()
+                .find(|node| node["aria"]["label"] == name)
+                .and_then(|node| node["aria"]["description"].as_str())
+                .map(str::to_owned)
+        };
+
+        assert_eq!(
+            described("Copy").as_deref(),
+            Some("Command-C"),
+            "a shortcut with nothing else to say becomes the description: {json}"
+        );
+        assert_eq!(
+            described("Paste").as_deref(),
+            Some("Insert the clipboard here, Command-V"),
+            "a shortcut does not displace a description the caller set: {json}"
+        );
+    }
+
+    /// A control whose centre is covered by a smaller clickable child is the
+    /// shape that makes an advertised `Click` land somewhere else — a close
+    /// button inside a tab is the real case. Proven end to end so the check
+    /// cannot quietly become vacuous.
+    #[crate::test]
+    #[should_panic(expected = "would click")]
+    fn a_click_target_covered_by_its_own_child_is_reported(cx: &mut TestAppContext) {
+        use crate::Styled as _;
+
+        struct Nested;
+        impl Render for Nested {
+            fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+                div()
+                    .id("outer")
+                    .role(accesskit::Role::Button)
+                    .aria_label("Outer")
+                    .w(crate::px(100.0))
+                    .h(crate::px(100.0))
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .on_click(|_, _, _| {})
+                    .child(
+                        div()
+                            .id("inner")
+                            .role(accesskit::Role::Button)
+                            .aria_label("Inner")
+                            .w(crate::px(40.0))
+                            .h(crate::px(40.0))
+                            .on_click(|_, _, _| {}),
+                    )
+            }
+        }
+
+        let window = cx.add_window(|_, _| Nested);
+        cx.activate_a11y(window.into());
+        let json = cx
+            .update_window(window.into(), |_, window, cx| {
+                window.draw(cx).clear(cx);
+                window.debug_a11y_tree_json()
+            })
+            .expect("the window is open")
+            .expect("activation makes the debug tree available");
+        let tree: serde_json::Value = serde_json::from_str(&json).expect("the dump is valid JSON");
+
+        crate::test::a11y_checks::assert_click_targets_are_reachable(&tree, "nested click targets");
+    }
+
+    /// Two landmarks of the same kind with the same name — or none — offer a
+    /// reader destinations and then refuse to say what they are.
+    #[crate::test]
+    #[should_panic(expected = "cannot be told apart")]
+    fn landmarks_that_cannot_be_told_apart_are_reported(cx: &mut TestAppContext) {
+        struct TwoPanels;
+        impl Render for TwoPanels {
+            fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+                div()
+                    .child(div().id("left").role(accesskit::Role::Complementary))
+                    .child(div().id("right").role(accesskit::Role::Complementary))
+            }
+        }
+
+        let window = cx.add_window(|_, _| TwoPanels);
+        cx.activate_a11y(window.into());
+        let json = cx
+            .update_window(window.into(), |_, window, cx| {
+                window.draw(cx).clear(cx);
+                window.debug_a11y_tree_json()
+            })
+            .expect("the window is open")
+            .expect("activation makes the debug tree available");
+        let tree: serde_json::Value = serde_json::from_str(&json).expect("the dump is valid JSON");
+
+        crate::test::a11y_checks::assert_landmarks_are_distinguishable(&tree, "two panels");
+        crate::test::a11y_checks::assert_names_are_distinguishable(&tree, "two panels");
+        crate::test::a11y_checks::assert_focusable_names_are_distinguishable(&tree, "two panels");
+        crate::test::a11y_checks::assert_clickable_elements_are_reachable(&tree, "two panels");
+        crate::test::a11y_checks::assert_no_role_was_discarded(&tree, "two panels");
+        crate::test::a11y_checks::assert_no_aria_was_discarded(&tree, "two panels");
+        crate::test::a11y_checks::assert_roles_are_contained(&tree, "two panels");
+        crate::test::a11y_checks::assert_controls_have_area(&tree, "two panels");
+        crate::test::a11y_checks::assert_active_descendant_is_honoured(&tree, "two panels");
     }
 }

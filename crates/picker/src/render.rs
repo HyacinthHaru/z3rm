@@ -27,6 +27,7 @@ pub mod window_controls;
 impl<D: PickerDelegate> Render for Picker<D> {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         self.finish_any_completed_resize(window, cx);
+        self.recompute_a11y_set_positions(window, cx);
         // toggle between BelowForced and Right based on whether it'd clamp if
         // horizontal
         let rendered_layout = self.preview_layout_rendered(window);
@@ -78,8 +79,31 @@ impl<D: PickerDelegate> Render for Picker<D> {
             .preview_layout_rendered(window)
             .unwrap_or(Layout::Hidden);
 
+        // Typing filters the list, and nothing said what came back: the rows
+        // change under a reader that is looking at the query input. Rendered
+        // whether or not there are matches, because a region that appears with
+        // its message has nothing to diff against. Polite, since it changes on
+        // every keystroke.
+        let match_count = self.delegate.match_count();
+        let announced_matches = if match_count == 0 {
+            self.delegate
+                .no_matches_text(window, cx)
+                .unwrap_or_else(|| SharedString::new_static("No matches"))
+        } else if match_count == 1 {
+            SharedString::new_static("1 match")
+        } else {
+            SharedString::from(format!("{match_count} matches"))
+        };
+
         div()
             .relative()
+            .child(
+                div()
+                    .id("picker-match-count")
+                    .role(gpui::Role::Status)
+                    .aria_live(gpui::accesskit::Live::Polite)
+                    .aria_announcement(announced_matches),
+            )
             .child(content)
             .when(self.is_resizable(), |this| {
                 this.left(self.shape.horizontal_offset(window))
@@ -131,6 +155,7 @@ impl<D: PickerDelegate> Picker<D> {
         let active = self.select_instead_of_open;
         let focus_handle = self.focus_handle(cx);
         IconButton::new("picker-multi-select-toggle", IconName::FileMultiple)
+            .aria_label("Toggle Multi Select")
             .icon_size(IconSize::Small)
             .toggle_state(active)
             .tooltip(move |_window, cx| {
@@ -205,7 +230,7 @@ impl<D: PickerDelegate> Picker<D> {
             .on_action(cx.listener(Self::toggle_multi_select))
             .on_action(cx.listener(Self::multi_select_next))
             .children(match &self.head {
-                Head::Editor(editor) => {
+                Head::Editor { editor, .. } => {
                     if editor_position == PickerEditorPosition::Start {
                         let editor = editor.clone();
                         Some(
@@ -219,7 +244,12 @@ impl<D: PickerDelegate> Picker<D> {
                         None
                     }
                 }
-                Head::Empty(empty_head) => Some(h_flex().child(empty_head.clone())),
+                // Gated the same way the editor is: without this the head is
+                // mounted here *and* at the end position, putting one focusable
+                // entity in the tree twice and duplicating every element id
+                // inside it.
+                Head::Empty(empty_head) => (editor_position == PickerEditorPosition::Start)
+                    .then(|| h_flex().child(empty_head.clone())),
             })
             .when(self.delegate.match_count() > 0, |el| {
                 el.child(
@@ -262,6 +292,11 @@ impl<D: PickerDelegate> Picker<D> {
                     el.child(
                         v_flex().flex_grow_1().py_2().child(
                             ListItem::new("empty_state")
+                                // The message is a plain label and contributes
+                                // no node, so a picker that found nothing would
+                                // otherwise be silent rather than say so.
+                                .aria_role(gpui::Role::Status)
+                                .aria_label(text.clone())
                                 .inset(true)
                                 .spacing(ListItemSpacing::Sparse)
                                 .disabled(true)
@@ -272,7 +307,7 @@ impl<D: PickerDelegate> Picker<D> {
             })
             .children(self.render_footer(window, cx))
             .children(match &self.head {
-                Head::Editor(editor) => {
+                Head::Editor { editor, .. } => {
                     if editor_position == PickerEditorPosition::End {
                         let editor = editor.clone();
                         Some(self.render_editor(&editor, window, cx))
@@ -280,7 +315,8 @@ impl<D: PickerDelegate> Picker<D> {
                         None
                     }
                 }
-                Head::Empty(empty_head) => Some(div().child(empty_head.clone())),
+                Head::Empty(empty_head) => (editor_position == PickerEditorPosition::End)
+                    .then(|| div().child(empty_head.clone())),
             });
 
         let Some(aside) = aside else {

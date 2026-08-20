@@ -4037,6 +4037,61 @@ mod tests {
         });
     }
 
+    /// `title(true)` cuts to 25 characters so a tab strip can hold several of
+    /// them; `title(false)` does not. That distinction is what stands between a
+    /// screen reader being given a pane's name and being given the first 25
+    /// characters of it, so it is checked rather than assumed from the
+    /// parameter's name.
+    #[gpui::test]
+    async fn a_task_title_is_cut_only_when_the_caller_asks(cx: &mut TestAppContext) {
+        cx.update(|cx| {
+            let settings_store = settings::SettingsStore::test(cx);
+            cx.set_global(settings_store);
+        });
+        let terminal = cx.new(|cx| {
+            TerminalBuilder::new_display_only(
+                SettingsCursorShape::default(),
+                AlternateScroll::On,
+                None,
+                0,
+                cx.background_executor(),
+                PathStyle::local(),
+            )
+            .subscribe(cx)
+        });
+
+        const LABEL: &str = "cargo test --workspace --all-targets --features runtime_shaders";
+        let (_completion_tx, completion_rx) = async_channel::bounded(1);
+        terminal.update(cx, |terminal, _| {
+            terminal.task = Some(TaskState {
+                status: TaskStatus::Running,
+                completion_rx,
+                spawned_task: SpawnInTerminal {
+                    label: LABEL.to_string(),
+                    full_label: LABEL.to_string(),
+                    ..Default::default()
+                },
+            });
+        });
+
+        terminal.read_with(cx, |terminal, _| {
+            assert_eq!(
+                terminal.title(false),
+                LABEL,
+                "the untruncated title is the whole label"
+            );
+            let cut = terminal.title(true);
+            assert!(
+                cut.len() < LABEL.len(),
+                "the truncating call has to actually cut: {cut}"
+            );
+            assert!(
+                LABEL.starts_with(cut.trim_end_matches('\u{2026}')),
+                "and cut from the end, so the two agree as far as the cut goes: {cut}"
+            );
+        });
+    }
+
     #[test]
     fn test_init_command_startup_marker_commands_do_not_contain_marker() {
         let marker_id = 42;

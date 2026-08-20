@@ -32896,7 +32896,11 @@ impl Focusable for EmptyModalView {
     }
 }
 
-impl workspace::ModalView for EmptyModalView {}
+impl workspace::ModalView for EmptyModalView {
+    fn a11y_name(&self, _cx: &App) -> Option<SharedString> {
+        None
+    }
+}
 
 impl EmptyModalView {
     fn new(cx: &App) -> Self {

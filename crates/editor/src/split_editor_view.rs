@@ -123,6 +123,12 @@ fn render_resize_handle(
         .child(
             div()
                 .id("split-resize-handle")
+                // A drag grip, the same as the dock's and the picker's. Its
+                // only click handler acts on a double-click and resets the
+                // split; a single click does nothing. Both are pointer
+                // gestures, and without saying so the grip reads as a control
+                // that answers a click and has no effect.
+                .pointer_gesture_only()
                 .absolute()
                 .left(px(-RESIZE_HANDLE_WIDTH / 2.0))
                 .w(px(RESIZE_HANDLE_WIDTH))
@@ -154,8 +160,11 @@ impl RenderOnce for SplitEditorView {
         let lhs_editor = splittable_editor.lhs_editor().unwrap().clone();
         let rhs_editor = splittable_editor.rhs_editor().clone();
 
-        let mut lhs = EditorElement::new(&lhs_editor, self.style.clone());
-        let mut rhs = EditorElement::new(&rhs_editor, self.style.clone());
+        // Both halves are full editors the user tabs between, and neither goes
+        // through `Editor::render`, so without this they have no node for that
+        // focus to land on.
+        let mut lhs = EditorElement::new(&lhs_editor, self.style.clone()).focusable_region(true);
+        let mut rhs = EditorElement::new(&rhs_editor, self.style.clone()).focusable_region(true);
 
         lhs.set_split_side(SplitSide::Left);
         rhs.set_split_side(SplitSide::Right);

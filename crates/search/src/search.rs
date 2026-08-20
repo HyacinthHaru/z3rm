@@ -145,6 +145,7 @@ impl SearchOption {
             (label, matches!(search_source, SearchSource::Buffer) as u32),
             self.icon(),
         )
+        .aria_label(label)
         .map(|button| match search_source {
             SearchSource::Buffer => {
                 let focus_handle = focus_handle.clone();

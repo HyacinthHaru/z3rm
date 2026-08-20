@@ -886,11 +886,21 @@ impl Render for DiffMultibuffer {
             .size_full()
             .when(is_empty && is_loading, |el| {
                 let rems = TextSize::Large.rems(cx);
+                // An empty pane and a spinning icon look different and read the
+                // same, because the icon is not a node: "still loading" and
+                // "there is nothing here" are opposite answers to whether the
+                // user should wait.
                 el.child(
-                    Icon::new(IconName::LoadCircle)
-                        .size(IconSize::Custom(rems))
-                        .color(Color::Accent)
-                        .with_rotate_animation(3)
+                    div()
+                        .id("git-diff-loading")
+                        .role(gpui::Role::Status)
+                        .aria_label("Loading changes")
+                        .child(
+                            Icon::new(IconName::LoadCircle)
+                                .size(IconSize::Custom(rems))
+                                .color(Color::Accent)
+                                .with_rotate_animation(3),
+                        )
                         .into_any_element(),
                 )
             })
@@ -907,6 +917,13 @@ impl Render for DiffMultibuffer {
                 let keybinding_focus_handle = self.focus_handle(cx);
                 el.child(
                     v_flex()
+                        // The reason there is nothing to show is a `Label`, and
+                        // the only node here is a button reading "Close" — so a
+                        // reader was told to close something without being told
+                        // it was empty, or why.
+                        .id("project-diff-empty")
+                        .role(gpui::Role::Group)
+                        .aria_label(empty_label.clone())
                         .gap_1()
                         .child(h_flex().justify_around().child(Label::new(empty_label)))
                         .map(|el| match remote_button {

@@ -124,6 +124,13 @@ impl Interactivity {
         button: MouseButton,
         listener: impl Fn(&MouseDownEvent, &mut Window, &mut App) + 'static,
     ) {
+        // Only the primary button makes this a control. A right-click handler
+        // is a context-menu affordance and a middle-click one is a shortcut;
+        // neither is the element's own action, and treating them as such made
+        // the accessibility diagnostic report every context menu in the graph.
+        if button == MouseButton::Left {
+            self.has_primary_mouse_down_listener = true;
+        }
         self.mouse_down_listeners
             .push(Box::new(move |event, phase, hitbox, window, cx| {
                 if phase == DispatchPhase::Bubble
@@ -1173,6 +1180,19 @@ pub trait InteractiveElement: Sized {
         self
     }
 
+    /// Declare that this element's click handler is a pointer gesture rather
+    /// than a control: a drag handle, a double-click on background space, a
+    /// resize grip. Such an element is deliberately not in the accessibility
+    /// tree, and whatever it does is expected to be reachable another way.
+    ///
+    /// This exists so that a clickable element with no node is a *choice* on
+    /// the record rather than an oversight — see
+    /// `gpui::a11y_checks::assert_clickable_elements_are_reachable`.
+    fn pointer_gesture_only(mut self) -> Self {
+        self.interactivity().pointer_gesture_only = true;
+        self
+    }
+
     /// Set the bounds of this element as a window control area for the platform window.
     /// The fluent API equivalent to [`Interactivity::window_control_area`].
     fn window_control_area(mut self, area: WindowControlArea) -> Self {
@@ -1264,11 +1284,33 @@ pub trait StatefulInteractiveElement: InteractiveElement {
         self
     }
 
+    /// Override the spoken name of this element's *kind* — what a reader says
+    /// in place of "button" or "row".
+    ///
+    /// Reaches all three platforms, which few of the other properties do: it
+    /// is `AXRoleDescription` on macOS, `UIA_LocalizedControlType` on Windows
+    /// and the localized role name on AT-SPI. That makes it the channel for
+    /// distinctions the roles cannot draw — a button that opens a menu, a tree
+    /// row that is a folder — which would otherwise have to be smuggled into
+    /// the label and read as part of the element's name.
+    ///
+    /// It replaces the role's own name, so it has to describe the kind of
+    /// thing this is, not its state or its content.
+    fn aria_role_description(mut self, role_description: impl Into<SharedString>) -> Self {
+        self.interactivity().aria.role_description = Some(role_description.into());
+        self
+    }
+
     /// Set the keyboard shortcut(s) that activate this element, announced by
     /// assistive technology (maps to AccessKit's `keyboard_shortcut`).
     ///
     /// Note that this does not create a keymap. It simply instructs assistive
     /// technology what the keymap is.
+    ///
+    /// None of accesskit's three adapters expose `keyboard_shortcut`, so the
+    /// shortcut is also written to the element's description, which all three
+    /// read. An element that sets a description too is announced as
+    /// `"{description}, {shortcut}"`.
     fn aria_keyshortcuts(mut self, keyshortcuts: impl Into<SharedString>) -> Self {
         self.interactivity().aria.keyshortcuts = Some(keyshortcuts.into());
         self
@@ -1317,9 +1359,41 @@ pub trait StatefulInteractiveElement: InteractiveElement {
         self
     }
 
+    /// Marks this element as modal: assistive technology treats everything
+    /// outside it as inert, so the user cannot wander out of a dialog that is
+    /// capturing input.
+    fn aria_modal(mut self) -> Self {
+        self.interactivity().aria.modal = true;
+        self
+    }
+
+    /// Marks this element as a live region: assistive technology announces its
+    /// contents when they change, without the user having to move focus there.
+    ///
+    /// Use [`accesskit::Live::Polite`] for status that can wait for a pause in
+    /// speech, and [`accesskit::Live::Assertive`] only for changes a user must
+    /// hear immediately, since those interrupt whatever is being read.
+    fn aria_live(mut self, live: accesskit::Live) -> Self {
+        self.interactivity().aria.live = Some(live);
+        self
+    }
+
     /// Set the expanded state for this element.
+    ///
+    /// Reaches Windows only: neither the macOS nor the AT-SPI adapter exposes
+    /// `expanded` as of accesskit 0.24. On those platforms a disclosure or
+    /// popover trigger says nothing about whether it is open, so if that
+    /// distinction has to be heard it belongs in the label as well.
     fn aria_expanded(mut self, expanded: bool) -> Self {
         self.interactivity().aria.expanded = Some(expanded);
+        self
+    }
+
+    /// Mark this element as present but not operable. A control that is only
+    /// greyed out is announced as an ordinary one, so the user activates it and
+    /// nothing happens.
+    fn aria_disabled(mut self, disabled: bool) -> Self {
+        self.interactivity().aria.disabled = disabled;
         self
     }
 
@@ -1337,6 +1411,8 @@ pub trait StatefulInteractiveElement: InteractiveElement {
 
     /// Set the step by which assistive technology should expect the numeric
     /// value of this element to change (e.g. when incrementing a spin button).
+    ///
+    /// Reaches Windows and Linux only; the macOS adapter does not expose it.
     fn aria_numeric_value_step(mut self, step: f64) -> Self {
         self.interactivity().aria.numeric_value_step = Some(step);
         self
@@ -1347,6 +1423,27 @@ pub trait StatefulInteractiveElement: InteractiveElement {
     fn aria_value(mut self, value: impl Into<SharedString>) -> Self {
         self.interactivity().aria.value = Some(value.into());
         self
+    }
+
+    /// Set the text a live region announces, on both the label and the value.
+    ///
+    /// The three platforms do not agree on where the announced text comes
+    /// from. `accesskit_macos` raises an announcement only when the node has a
+    /// `value` and speaks that value; `accesskit_windows` and
+    /// `accesskit_atspi_common` raise theirs only when the node has a *name*,
+    /// which is the label for every role but [`Role::Label`], and announce the
+    /// name. Neither field is derived from the other or from the role, so an
+    /// announcement set on one of them alone is silence on the other platforms.
+    ///
+    /// A region with nothing to announce yet should carry neither: it has to be
+    /// in the tree before its content arrives, or there is no change for a
+    /// reader to notice.
+    fn aria_announcement(self, text: impl Into<SharedString>) -> Self
+    where
+        Self: Sized,
+    {
+        let text = text.into();
+        self.aria_label(text.clone()).aria_value(text)
     }
 
     /// Set the placeholder text reported to assistive technology for this
@@ -1375,42 +1472,60 @@ pub trait StatefulInteractiveElement: InteractiveElement {
     }
 
     /// Set the heading level of this element.
+    ///
+    /// Reaches macOS and Windows; the AT-SPI adapter does not expose it, so
+    /// tree depth is not announced on Linux.
     fn aria_level(mut self, level: usize) -> Self {
         self.interactivity().aria.level = Some(level);
         self
     }
 
     /// Set the position in set of this element.
+    ///
+    /// Reaches Windows and Linux only: the macOS adapter does not expose
+    /// `position_in_set` as of accesskit 0.24, so "3 of 12" is not announced
+    /// there however carefully it is computed.
     fn aria_position_in_set(mut self, position: usize) -> Self {
         self.interactivity().aria.position_in_set = Some(position);
         self
     }
 
     /// Set the size of set for this element.
+    ///
+    /// Reaches Windows and Linux only; see [`Self::aria_position_in_set`].
     fn aria_size_of_set(mut self, size: usize) -> Self {
         self.interactivity().aria.size_of_set = Some(size);
         self
     }
 
     /// Set the row index for this element.
+    ///
+    /// Reaches Windows only; neither the macOS nor the AT-SPI adapter exposes
+    /// the table position properties.
     fn aria_row_index(mut self, index: usize) -> Self {
         self.interactivity().aria.row_index = Some(index);
         self
     }
 
     /// Set the column index for this element.
+    ///
+    /// Reaches Windows only; see [`Self::aria_row_index`].
     fn aria_column_index(mut self, index: usize) -> Self {
         self.interactivity().aria.column_index = Some(index);
         self
     }
 
     /// Set the row count for this element.
+    ///
+    /// Reaches no platform as of accesskit 0.24; see [`Self::aria_row_index`].
     fn aria_row_count(mut self, count: usize) -> Self {
         self.interactivity().aria.row_count = Some(count);
         self
     }
 
     /// Set the column count for this element.
+    ///
+    /// Reaches no platform as of accesskit 0.24; see [`Self::aria_row_index`].
     fn aria_column_count(mut self, count: usize) -> Self {
         self.interactivity().aria.column_count = Some(count);
         self
@@ -1756,6 +1871,10 @@ impl Element for Div {
         self.interactivity.write_a11y_info(node);
     }
 
+    fn a11y_has_properties(&self) -> bool {
+        self.interactivity.aria.carries_information()
+    }
+
     fn a11y_synthetic_children(
         &mut self,
         _prepaint: &mut Self::PrepaintState,
@@ -1949,9 +2068,13 @@ pub(crate) struct AriaProperties {
     pub(crate) author_id: Option<SharedString>,
     pub(crate) label: Option<SharedString>,
     pub(crate) description: Option<SharedString>,
+    pub(crate) role_description: Option<SharedString>,
     pub(crate) keyshortcuts: Option<SharedString>,
     pub(crate) selected: Option<bool>,
     pub(crate) expanded: Option<bool>,
+    pub(crate) disabled: bool,
+    pub(crate) live: Option<accesskit::Live>,
+    pub(crate) modal: bool,
     pub(crate) toggled: Option<accesskit::Toggled>,
     pub(crate) numeric_value: Option<f64>,
     pub(crate) min_numeric_value: Option<f64>,
@@ -1967,6 +2090,23 @@ pub(crate) struct AriaProperties {
     pub(crate) column_index: Option<usize>,
     pub(crate) row_count: Option<usize>,
     pub(crate) column_count: Option<usize>,
+}
+
+impl AriaProperties {
+    /// Whether anything here only reaches a reader through a node of its own.
+    ///
+    /// Deliberately not a blanket "any field is set": `disabled` and `selected`
+    /// describe a control that has a role by construction, so a bare `div`
+    /// carrying one is not the mistake this is looking for.
+    pub(crate) fn carries_information(&self) -> bool {
+        self.label.is_some()
+            || self.description.is_some()
+            || self.role_description.is_some()
+            || self.value.is_some()
+            || self.placeholder.is_some()
+            || self.live.is_some()
+            || self.keyshortcuts.is_some()
+    }
 }
 
 /// The interactivity struct. Powers all of the general-purpose
@@ -2018,6 +2158,11 @@ pub struct Interactivity {
     pub(crate) drop_listeners: Vec<(TypeId, DropListener)>,
     pub(crate) can_drop_predicate: Option<CanDropPredicate>,
     pub(crate) click_listeners: Vec<ClickListener>,
+    /// Set by [`InteractiveElement::pointer_gesture_only`]. See there.
+    pub(crate) pointer_gesture_only: bool,
+    /// Whether anything answers a primary-button press on this element, which
+    /// is what makes it a control whether or not it uses `on_click`.
+    pub(crate) has_primary_mouse_down_listener: bool,
     pub(crate) aux_click_listeners: Vec<ClickListener>,
     pub(crate) drag_listener: Option<(Arc<dyn Any>, DragListener)>,
     pub(crate) hover_listener: Option<Box<dyn Fn(&bool, &mut Window, &mut App)>>,
@@ -2167,6 +2312,29 @@ impl Interactivity {
                 }
             },
         );
+
+        // `on_mouse_down` as well as `on_click`: the editor's diff-review
+        // affordance is driven by the former, and a control is a control
+        // whichever listener answers the press.
+        if window.a11y.is_building_frame()
+            && !self.pointer_gesture_only
+            && !(self.click_listeners.is_empty() && !self.has_primary_mouse_down_listener)
+            && self
+                .override_role
+                .filter(|role| *role != accesskit::Role::GenericContainer)
+                .is_none()
+        {
+            let scale = window.scale_factor();
+            window.a11y.note_clickable_without_role(
+                self.source_location(),
+                accesskit::Rect {
+                    x0: (bounds.origin.x.0 * scale) as f64,
+                    y0: (bounds.origin.y.0 * scale) as f64,
+                    x1: ((bounds.origin.x.0 + bounds.size.width.0) * scale) as f64,
+                    y1: ((bounds.origin.y.0 + bounds.size.height.0) * scale) as f64,
+                },
+            );
+        }
 
         if let Some(focus_handle) = self.tracked_focus_handle.as_ref() {
             window.set_focus_handle(focus_handle, cx);
@@ -3319,8 +3487,24 @@ impl Interactivity {
         if let Some(label) = &self.aria.label {
             node.set_label(label.to_string());
         }
-        if let Some(description) = &self.aria.description {
-            node.set_description(description.to_string());
+        // No accesskit adapter exposes `keyboard_shortcut`, so a shortcut set
+        // only there is dropped. All three read the description, and it is
+        // announced after the name, which is where a shortcut belongs — so the
+        // shortcut goes to both: the description to be heard today, and
+        // `keyboard_shortcut` to be correct when an adapter grows support.
+        let description = match (&self.aria.description, &self.aria.keyshortcuts) {
+            (Some(description), Some(keyshortcuts)) => {
+                Some(format!("{description}, {keyshortcuts}"))
+            }
+            (Some(description), None) => Some(description.to_string()),
+            (None, Some(keyshortcuts)) => Some(keyshortcuts.to_string()),
+            (None, None) => None,
+        };
+        if let Some(description) = description {
+            node.set_description(description);
+        }
+        if let Some(role_description) = &self.aria.role_description {
+            node.set_role_description(role_description.to_string());
         }
         if let Some(keyshortcuts) = &self.aria.keyshortcuts {
             node.set_keyboard_shortcut(keyshortcuts.to_string());
@@ -3328,8 +3512,17 @@ impl Interactivity {
         if let Some(selected) = self.aria.selected {
             node.set_selected(selected);
         }
+        if let Some(live) = self.aria.live {
+            node.set_live(live);
+        }
+        if self.aria.modal {
+            node.set_modal();
+        }
         if let Some(expanded) = self.aria.expanded {
             node.set_expanded(expanded);
+        }
+        if self.aria.disabled {
+            node.set_disabled();
         }
         if let Some(toggled) = self.aria.toggled {
             node.set_toggled(toggled);
@@ -3831,6 +4024,10 @@ where
 
     fn a11y_role(&self) -> Option<accesskit::Role> {
         self.element.a11y_role()
+    }
+
+    fn a11y_has_properties(&self) -> bool {
+        self.element.a11y_has_properties()
     }
 
     fn write_a11y_info(&self, node: &mut accesskit::Node) {
@@ -4804,6 +5001,26 @@ mod tests {
         assert_eq!(node.min_numeric_value(), Some(6.0));
         assert_eq!(node.max_numeric_value(), Some(72.0));
         assert_eq!(node.numeric_value_step(), Some(1.0));
+    }
+
+    /// A status that changes while the user is working elsewhere is only
+    /// announced if it is marked as a live region; without it the change is
+    /// silent, and the element carries no signal that anything happened.
+    #[test]
+    fn test_write_a11y_info_live_region() {
+        let mut interactivity = Interactivity::default();
+        let mut node = accesskit::Node::new(accesskit::Role::Status);
+        interactivity.write_a11y_info(&mut node);
+        assert_eq!(
+            node.live(),
+            None,
+            "an element that never asked must not be announced on change"
+        );
+
+        interactivity.aria.live = Some(accesskit::Live::Polite);
+        let mut node = accesskit::Node::new(accesskit::Role::Status);
+        interactivity.write_a11y_info(&mut node);
+        assert_eq!(node.live(), Some(accesskit::Live::Polite));
     }
 
     /// Two focusable, clickable elements ("a" and "b") used to exercise the

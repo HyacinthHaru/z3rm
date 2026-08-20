@@ -83,7 +83,11 @@ impl Focusable for LineEndingSelector {
 }
 
 impl EventEmitter<DismissEvent> for LineEndingSelector {}
-impl ModalView for LineEndingSelector {}
+impl ModalView for LineEndingSelector {
+    fn a11y_name(&self, _cx: &gpui::App) -> Option<gpui::SharedString> {
+        Some("Line Endings".into())
+    }
+}
 
 struct LineEndingSelectorDelegate {
     line_ending_selector: WeakEntity<LineEndingSelector>,
@@ -117,6 +121,10 @@ impl PickerDelegate for LineEndingSelectorDelegate {
 
     fn name() -> &'static str {
         "line ending selector"
+    }
+
+    fn match_label(&self, ix: usize, _cx: &App) -> Option<SharedString> {
+        Some(self.matches.get(ix)?.label().into())
     }
 
     fn placeholder_text(&self, _window: &mut Window, _cx: &mut App) -> Arc<str> {

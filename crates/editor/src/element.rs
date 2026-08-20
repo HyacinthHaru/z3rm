@@ -248,6 +248,9 @@ pub struct EditorElement {
     /// because [`Element::id`] and [`Element::a11y_role`] run without a context
     /// and so cannot read the editor's mode.
     single_line: bool,
+    /// Whether this element renders a full editor that the user can focus, as
+    /// opposed to a single-line input, a minimap, or an inline prompt.
+    focusable_region: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -265,6 +268,7 @@ impl EditorElement {
             style,
             split_side: None,
             single_line: false,
+            focusable_region: false,
         }
     }
 
@@ -272,6 +276,15 @@ impl EditorElement {
     /// gives it text-input accessibility semantics.
     pub fn single_line(mut self, single_line: bool) -> Self {
         self.single_line = single_line;
+        self
+    }
+
+    /// Marks this element as a full editor the user can focus, which is what
+    /// gives it a node for that focus to land on. An element that mirrors
+    /// another editor's content — a minimap — leaves it off, because focus
+    /// lands on the editor being mirrored.
+    pub fn focusable_region(mut self, focusable_region: bool) -> Self {
+        self.focusable_region = focusable_region;
         self
     }
 
@@ -2632,6 +2645,7 @@ impl EditorElement {
                 };
 
                 let toggle = IconButton::new(("expand", ix), icon_name)
+                    .aria_label("Expand Excerpt")
                     .icon_color(Color::Custom(cx.theme().colors().editor_line_number))
                     .icon_size(IconSize::Custom(rems(editor_font_size / window.rem_size())))
                     .width(width)
@@ -6698,6 +6712,13 @@ pub fn render_breadcrumb_text(
         );
     }
 
+    // The button below draws the breadcrumbs as children, which name nothing.
+    // This is both where the user is and what the button acts on.
+    let breadcrumb_text = segments
+        .iter()
+        .map(|segment| segment.text.replace('\n', " "))
+        .collect::<Vec<_>>()
+        .join(" › ");
     let highlighted_segments = segments.into_iter().enumerate().map(|(index, segment)| {
         let mut text_style = window.text_style();
         if let Some(font) = &breadcrumb_font {
@@ -6752,6 +6773,7 @@ pub fn render_breadcrumb_text(
             .when(!multibuffer_header, |this| this.overflow_x_scroll())
             .child(
                 ButtonLike::new("toggle outline view")
+                    .aria_label(format!("Outline: {breadcrumb_text}"))
                     .child(breadcrumbs)
                     .when(multibuffer_header, |this| {
                         this.style(ButtonStyle::Transparent)
@@ -7776,7 +7798,7 @@ impl Element for EditorElement {
     /// that, so a text input with no id can carry no semantics at all. Multi-
     /// line editors keep the previous stateless behavior.
     fn id(&self) -> Option<ElementId> {
-        self.single_line
+        (self.single_line || self.focusable_region)
             .then(|| ElementId::View(self.editor.entity_id()))
     }
 
@@ -7785,11 +7807,19 @@ impl Element for EditorElement {
     }
 
     /// Single-line editors are the app's text inputs — filters, search boxes,
-    /// settings fields — so they are reported as such. Multi-line editors need
-    /// folds, wrapping and inlays reflected in the text pattern and are left
-    /// unexposed rather than described incorrectly.
+    /// settings fields — so they are reported as such. A multi-line editor is a
+    /// named region rather than a flat text input, because its buffer offsets
+    /// do not survive folding, wrapping and inlays; the text it carries is the
+    /// rows currently on screen, in display order, which is the thing those
+    /// three have already been applied to.
     fn a11y_role(&self) -> Option<gpui::accesskit::Role> {
-        self.single_line.then_some(gpui::accesskit::Role::TextInput)
+        if self.single_line {
+            Some(gpui::accesskit::Role::TextInput)
+        } else if self.focusable_region {
+            Some(gpui::accesskit::Role::Group)
+        } else {
+            None
+        }
     }
 
     fn a11y_synthetic_children(
@@ -7797,7 +7827,22 @@ impl Element for EditorElement {
         prepaint: &mut Self::PrepaintState,
         builder: &mut gpui::A11ySubtreeBuilder,
     ) {
+        if let Some(name) = prepaint.a11y_region_name.as_ref() {
+            builder.parent_node().set_label(name.to_string());
+        }
+        if let Some(description) = prepaint.a11y_description.as_ref() {
+            builder.parent_node().set_description(description.to_string());
+        }
         if let Some(a11y_text) = prepaint.a11y_text.as_ref() {
+            // Overrides the `TextInput` from `a11y_role`, which cannot see the
+            // display map. The role is what tells a reader to stop echoing
+            // characters out loud, so a masked field reported as ordinary text
+            // reads the password back to the room.
+            if a11y_text.masked {
+                builder
+                    .parent_node()
+                    .set_role(gpui::accesskit::Role::PasswordInput);
+            }
             // The placeholder is the only name most of these inputs have; the
             // parent node is reachable here, so no element-level plumbing is
             // needed to reach it.
@@ -7889,7 +7934,7 @@ impl Element for EditorElement {
 
     fn prepaint(
         &mut self,
-        _: Option<&GlobalElementId>,
+        global_id: Option<&GlobalElementId>,
         _inspector_id: Option<&gpui::InspectorElementId>,
         bounds: Bounds<Pixels>,
         request_layout: &mut Self::RequestLayoutState,
@@ -7910,6 +7955,12 @@ impl Element for EditorElement {
             let focus_handle = self.editor.focus_handle(cx);
             window.set_view_id(self.editor.entity_id());
             window.set_focus_handle(&focus_handle, cx);
+            // Registering the handle is only half of it: without naming the
+            // node that carries the focus, a focused editor produces no node
+            // and screen readers fall back to announcing the whole window.
+            if let Some(global_id) = global_id {
+                window.report_a11y_focus_target(global_id, &focus_handle);
+            }
         }
 
         let rem_size = self.rem_size(cx);
@@ -9310,25 +9361,144 @@ impl Element for EditorElement {
                     // Captured here because the accessibility hooks run without
                     // a context, and a single-line editor's whole content is
                     // small enough to snapshot per frame.
-                    let a11y_text = self.single_line.then(|| {
-                        let (text, selection) = {
+                    // A single-line input names itself with its placeholder;
+                    // one without a placeholder needs to be told what it is.
+                    let a11y_explicit_name = self.editor.read(cx).a11y_label();
+                    let a11y_description = self.editor.read(cx).a11y_description();
+                    let a11y_region_name = a11y_explicit_name.or_else(|| {
+                        self.focusable_region.then(|| {
+                        self.editor
+                            .update(cx, |editor, cx| editor.placeholder_text(cx))
+                            .map(SharedString::from)
+                            // The two halves of a split diff have no
+                            // placeholder between them, and "Editor" twice
+                            // gives the user no way to tell which half they
+                            // are in.
+                            .or_else(|| match self.split_side {
+                                Some(SplitSide::Left) => {
+                                    Some(SharedString::new_static("Original side of the diff"))
+                                }
+                                Some(SplitSide::Right) => {
+                                    Some(SharedString::new_static("Modified side of the diff"))
+                                }
+                                None => None,
+                            })
+                            // The file this editor is on. It is the node focus
+                            // lands on, and "Editor" was the name of every
+                            // editor in the window — a split, a diff and the
+                            // file beside them announced identically.
+                            //
+                            // The file's name rather than `MultiBuffer::title`,
+                            // which falls back to the buffer's *first line* for
+                            // an unsaved buffer. Naming an editor after a line
+                            // of its own text is worse than naming it "Editor":
+                            // it changes as the user types.
+                            .or_else(|| {
+                                let file_name = self
+                                    .editor
+                                    .read(cx)
+                                    .buffer()
+                                    .read(cx)
+                                    .as_singleton()?
+                                    .read(cx)
+                                    .file()?
+                                    .file_name(cx)
+                                    .to_string();
+                                (!file_name.is_empty()).then(|| SharedString::from(file_name))
+                            })
+                            .unwrap_or_else(|| SharedString::new_static("Editor"))
+                        })
+                    });
+                    // Only `a11y_synthetic_children` reads this, and that runs
+                    // only while a frame is being built for a reader. Computing
+                    // it unconditionally copied every visible row into a
+                    // `String` on every frame of every editor.
+                    let a11y_text = if !window.is_a11y_active() {
+                        None
+                    } else if self.single_line {
+                        let (text, selection, masked) = {
                             let editor = self.editor.read(cx);
                             (
                                 editor.text(cx),
                                 editor.selections.newest::<MultiBufferOffset>(
                                     &position_map.snapshot.display_snapshot,
                                 ),
+                                editor.display_map.read(cx).masked,
                             )
                         };
-                        A11yTextInput {
-                            text,
+                        // A masked editor draws one `*` per character. Pushing
+                        // what it actually holds would put the password itself
+                        // into the accessibility tree, where a reader echoes it
+                        // as it is typed and anything holding an accessibility
+                        // permission can read it straight back out.
+                        let text = if masked {
+                            "*".repeat(text.chars().count())
+                        } else {
+                            text
+                        };
+                        // Masking is one `*` per character, so these only stay
+                        // aligned for single-byte text — the same caveat the
+                        // drawing code carries. Clamped rather than trusted,
+                        // because `push_text_runs` slices with them.
+                        let clamp = |offset: usize| offset.min(text.len());
+                        Some(A11yTextInput {
                             placeholder: self
                                 .editor
                                 .update(cx, |editor, cx| editor.placeholder_text(cx)),
-                            selection_tail: selection.tail().0,
-                            selection_head: selection.head().0,
+                            selection_tail: clamp(selection.tail().0),
+                            selection_head: clamp(selection.head().0),
+                            text,
+                            masked,
+                        })
+                    } else if self.focusable_region {
+                        // The rows that are on screen, as they are on screen —
+                        // after folding, wrapping and inlays — rather than the
+                        // buffer. A buffer-offset text pattern would have to
+                        // undo all three to stay truthful about where the caret
+                        // is; these offsets describe what the user is looking
+                        // at, which is what a reader reads. It follows that the
+                        // text changes as the editor scrolls, and that a caret
+                        // scrolled out of view is reported at whichever end it
+                        // went past, rather than at the top in both cases.
+                        let display_snapshot = &position_map.snapshot.display_snapshot;
+                        let mut text = String::new();
+                        for row in start_row.0..end_row.0 {
+                            if !text.is_empty() {
+                                text.push('\n');
+                            }
+                            text.push_str(&display_snapshot.line(DisplayRow(row)));
                         }
-                    });
+                        let selection = self
+                            .editor
+                            .read(cx)
+                            .selections
+                            .newest_display(display_snapshot);
+                        let text_length = text.len();
+                        let offset_of = |point: DisplayPoint| -> usize {
+                            if point.row() < start_row {
+                                return 0;
+                            }
+                            if point.row() >= end_row {
+                                return text_length;
+                            }
+                            let mut offset = 0;
+                            for row in start_row.0..point.row().0 {
+                                offset += display_snapshot.line(DisplayRow(row)).len() + 1;
+                            }
+                            offset + (point.column() as usize).min(
+                                display_snapshot.line(point.row()).len(),
+                            )
+                        };
+                        Some(A11yTextInput {
+                            text,
+                            placeholder: None,
+                            selection_tail: offset_of(selection.tail()),
+                            selection_head: offset_of(selection.head()),
+                            masked: false,
+                        })
+                    } else {
+                        None
+                    };
 
                     self.editor.update(cx, |editor, _| {
                         editor.last_position_map = Some(position_map.clone());
@@ -9338,6 +9508,8 @@ impl Element for EditorElement {
 
                     EditorLayout {
                         a11y_text,
+                        a11y_region_name,
+                        a11y_description,
                         mode,
                         position_map,
                         visible_display_row_range: start_row..end_row,
@@ -9563,10 +9735,18 @@ struct A11yTextInput {
     placeholder: Option<String>,
     selection_tail: usize,
     selection_head: usize,
+    /// Whether the editor is drawing `*` instead of its content. Carried here
+    /// because the accessibility hooks run without a context and so cannot ask
+    /// the display map themselves.
+    masked: bool,
 }
 
 pub struct EditorLayout {
     a11y_text: Option<A11yTextInput>,
+    /// What a focused full editor announces itself as. Captured during layout
+    /// because the accessibility hooks run without a context.
+    a11y_region_name: Option<SharedString>,
+    a11y_description: Option<SharedString>,
     position_map: Rc<PositionMap>,
     hitbox: Hitbox,
     gutter_hitbox: Hitbox,
@@ -12260,6 +12440,61 @@ mod tests {
         );
     }
 
+    /// A masked editor is what the remote-connection modal collects an SSH
+    /// password in. It drew `*` and reported the real text, so the password
+    /// sat in the accessibility tree — read back by anything holding an
+    /// accessibility permission, and echoed aloud as it was typed, because a
+    /// plain text input is a role readers echo.
+    #[gpui::test]
+    async fn test_a_masked_editor_does_not_put_its_secret_in_the_tree(cx: &mut TestAppContext) {
+        init_test(cx, |_| {});
+        let window = cx.add_window(|window, cx| {
+            let buffer = MultiBuffer::build_simple("hunter2", cx);
+            let mut editor = Editor::new(EditorMode::SingleLine, buffer, None, window, cx);
+            editor.set_masked(true, cx);
+            editor
+        });
+
+        cx.activate_a11y(window.into());
+        let json = cx
+            .update_window(window.into(), |_, window, cx| {
+                window.draw(cx).clear(cx);
+                window.debug_a11y_tree_json()
+            })
+            .expect("the editor window is still open")
+            .expect("activation makes the debug tree available");
+        let tree: serde_json::Value = serde_json::from_str(&json).expect("the dump is valid JSON");
+
+        assert!(
+            !json.contains("hunter2"),
+            "the password must not appear anywhere in the tree: {json}"
+        );
+
+        let roles: Vec<&str> = tree["nodes"]
+            .as_object()
+            .expect("the dump lists nodes")
+            .values()
+            .filter_map(|node| node["aria"]["role"].as_str())
+            .collect();
+        assert!(
+            roles.contains(&"PasswordInput"),
+            "the role is what stops a reader echoing each character: {roles:?}"
+        );
+        // The field still has to have a length, or the caret has nowhere to be
+        // and review reports an empty box rather than a filled one.
+        let runs: Vec<&str> = tree["nodes"]
+            .as_object()
+            .expect("the dump lists nodes")
+            .values()
+            .filter(|node| node["aria"]["role"] == "TextRun")
+            .filter_map(|node| node["aria"]["value"].as_str())
+            .collect();
+        assert_eq!(
+            runs, vec!["*******"],
+            "what is drawn is seven asterisks, and that is what has to be reported"
+        );
+    }
+
     /// Filters, search boxes and settings fields are all single-line editors.
     /// The element used to return no id, and accessibility nodes are keyed off
     /// `GlobalElementId`, so none of them could produce a node no matter what
@@ -12286,6 +12521,17 @@ mod tests {
             .expect("the editor window is still open")
             .expect("activation makes the debug tree available");
         let tree: serde_json::Value = serde_json::from_str(&json).expect("the dump is valid JSON");
+        gpui::a11y_checks::assert_interactive_nodes_are_named(&tree, "editor");
+        gpui::a11y_checks::assert_names_are_distinguishable(&tree, "editor");
+        gpui::a11y_checks::assert_focusable_names_are_distinguishable(&tree, "editor");
+        gpui::a11y_checks::assert_clickable_elements_are_reachable(&tree, "editor");
+        gpui::a11y_checks::assert_click_targets_are_reachable(&tree, "editor");
+        gpui::a11y_checks::assert_controls_have_area(&tree, "editor");
+        gpui::a11y_checks::assert_landmarks_are_distinguishable(&tree, "editor");
+        gpui::a11y_checks::assert_active_descendant_is_honoured(&tree, "editor");
+        gpui::a11y_checks::assert_no_role_was_discarded(&tree, "editor");
+        gpui::a11y_checks::assert_no_aria_was_discarded(&tree, "editor");
+        gpui::a11y_checks::assert_roles_are_contained(&tree, "editor");
         let nodes = tree["nodes"].as_object().expect("the dump lists nodes");
 
         let input = nodes
@@ -12307,8 +12553,446 @@ mod tests {
         assert_eq!(run["aria"]["value"].as_str(), Some("needle"));
     }
 
-    /// A multi-line editor's text pattern has to reflect folds, wrapping and
-    /// inlays, so it is deliberately not described as a flat text input.
+    /// A multi-line editor exposed a named region and no text at all, so a
+    /// reader could tell you were in an editor and not what was in it — which
+    /// in a code editor is the whole of the content. The rows it reports are
+    /// the rows on screen, after folding and wrapping, because those are the
+    /// ones the user is looking at.
+    #[gpui::test]
+    async fn test_a_multi_line_editor_exposes_the_rows_on_screen(cx: &mut TestAppContext) {
+        init_test(cx, |_| {});
+        let window = cx.add_window(|window, cx| {
+            let buffer = MultiBuffer::build_simple("fn one() {}\nfn two() {}\n", cx);
+            Editor::new(EditorMode::full(), buffer, None, window, cx)
+        });
+        cx.activate_a11y(window.into());
+
+        let json = cx
+            .update_window(window.into(), |_, window, cx| {
+                window.draw(cx).clear(cx);
+                window.debug_a11y_tree_json()
+            })
+            .expect("the harness window is still open")
+            .expect("activation makes the debug tree available");
+        let tree: serde_json::Value = serde_json::from_str(&json).expect("the dump is valid JSON");
+        let nodes = tree["nodes"].as_object().expect("the dump lists nodes");
+
+        let region = nodes
+            .values()
+            .find(|node| node["aria"]["role"] == "Group")
+            .unwrap_or_else(|| panic!("the editor is a focusable region: {json}"));
+        assert!(
+            region["aria"]["text_selection"].is_object(),
+            "a region carrying text has to say where the caret is: {region}"
+        );
+
+        let runs: Vec<&str> = region["children"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter_map(|id| nodes.get(id.as_str()?))
+            .filter_map(|node| node["aria"]["value"].as_str())
+            .collect();
+        assert!(
+            runs.iter().any(|run| run.contains("fn one()")),
+            "the first line of the buffer has to be readable: {runs:?}"
+        );
+        assert!(
+            runs.iter().any(|run| run.contains("fn two()")),
+            "so does the second: {runs:?}"
+        );
+    }
+
+    /// The objection that kept the editor silent for four rounds was that
+    /// buffer offsets do not survive folding. So this checks the case the
+    /// objection was about: with a region folded, the rows a reader is given
+    /// have to be the rows on screen, not the ones the fold is hiding.
+    #[gpui::test]
+    async fn test_a_folded_editor_exposes_what_is_left_on_screen(cx: &mut TestAppContext) {
+        init_test(cx, |_| {});
+        let window = cx.add_window(|window, cx| {
+            let buffer = MultiBuffer::build_simple(
+                "fn one() {\n    hidden_by_the_fold();\n}\nfn two() {}\n",
+                cx,
+            );
+            Editor::new(EditorMode::full(), buffer, None, window, cx)
+        });
+        cx.activate_a11y(window.into());
+
+        let read_runs = |cx: &mut TestAppContext| {
+            let json = cx
+                .update_window(window.into(), |_, window, cx| {
+                    window.draw(cx).clear(cx);
+                    window.debug_a11y_tree_json()
+                })
+                .expect("the harness window is still open")
+                .expect("activation makes the debug tree available");
+            let tree: serde_json::Value =
+                serde_json::from_str(&json).expect("the dump is valid JSON");
+            let nodes = tree["nodes"].as_object().expect("the dump lists nodes").clone();
+            nodes
+                .values()
+                .filter_map(|node| node["aria"]["value"].as_str().map(str::to_string))
+                .collect::<Vec<_>>()
+        };
+
+        let unfolded = read_runs(cx);
+        assert!(
+            unfolded.iter().any(|run| run.contains("hidden_by_the_fold")),
+            "the body is on screen before anything is folded: {unfolded:?}"
+        );
+
+        window
+            .update(cx, |editor, window, cx| {
+                editor.fold_at(MultiBufferRow(0), window, cx);
+            })
+            .expect("the harness window is still open");
+
+        let folded = read_runs(cx);
+        assert!(
+            !folded.iter().any(|run| run.contains("hidden_by_the_fold")),
+            "a folded body is not on screen, so it must not be read out: {folded:?}"
+        );
+        assert!(
+            folded.iter().any(|run| run.contains("fn two()")),
+            "what is still on screen still has to be readable: {folded:?}"
+        );
+    }
+
+    /// A caret scrolled out of view still has to be reported somewhere, and
+    /// the only honest answer is the end it went past. Reporting both ends at
+    /// the top puts the caret at the first visible row when it is actually
+    /// hundreds of rows below, which is worse than saying nothing.
+    #[gpui::test]
+    async fn test_a_caret_scrolled_out_of_view_reads_at_the_end_it_went_past(
+        cx: &mut TestAppContext,
+    ) {
+        init_test(cx, |_| {});
+        let window = cx.add_window(|window, cx| {
+            let text = (0..300)
+                .map(|row| format!("line {row}"))
+                .collect::<Vec<_>>()
+                .join("\n");
+            let buffer = MultiBuffer::build_simple(&text, cx);
+            Editor::new(EditorMode::full(), buffer, None, window, cx)
+        });
+        cx.activate_a11y(window.into());
+
+        // Returns the caret's position and the length of the text the reader
+        // was given, both as counts of characters from the start of the
+        // visible text. The caret arrives split across the text runs it is
+        // chunked into — `{node: "b", character_index: 110}` means 110
+        // characters into the second run, not into the text — so resolving it
+        // means walking the runs the caret's node comes after.
+        fn caret_and_length(
+            cx: &mut TestAppContext,
+            window: gpui::AnyWindowHandle,
+            editor: &Entity<Editor>,
+            caret_row: u32,
+            scroll_top: f64,
+        ) -> (usize, usize) {
+            cx.update_window(window, |_, window, cx| {
+                editor.update(cx, |editor, cx| {
+                    editor.change_selections(SelectionEffects::no_scroll(), window, cx, |s| {
+                        let caret = DisplayPoint::new(DisplayRow(caret_row), 0);
+                        s.select_display_ranges([caret..caret]);
+                    });
+                    editor.set_scroll_position(gpui::Point::new(0., scroll_top), window, cx);
+                });
+                window.draw(cx).clear(cx);
+                let json = window
+                    .debug_a11y_tree_json()
+                    .expect("activation makes the debug tree available");
+                let tree: serde_json::Value =
+                    serde_json::from_str(&json).expect("the dump is valid JSON");
+                let nodes = tree["nodes"]
+                    .as_object()
+                    .expect("the dump lists nodes")
+                    .clone();
+                let region = nodes
+                    .values()
+                    .find(|node| node["aria"]["role"] == "Group")
+                    .unwrap_or_else(|| panic!("the editor is a focusable region: {json}"))
+                    .clone();
+                let focus = &region["aria"]["text_selection"]["focus"];
+                let focus_node = focus["node"]
+                    .as_str()
+                    .unwrap_or_else(|| panic!("the caret names the run it is in: {region}"));
+                let mut caret = focus["character_index"]
+                    .as_u64()
+                    .unwrap_or_else(|| panic!("the caret has an index: {region}"))
+                    as usize;
+                let mut length = 0;
+                let mut before_caret = true;
+                for id in region["children"].as_array().into_iter().flatten() {
+                    let Some(id) = id.as_str() else { continue };
+                    let Some(run) = nodes.get(id) else { continue };
+                    let Some(value) = run["aria"]["value"].as_str() else {
+                        continue;
+                    };
+                    if id == focus_node {
+                        before_caret = false;
+                    } else if before_caret {
+                        caret += value.chars().count();
+                    }
+                    length += value.chars().count();
+                }
+                (caret, length)
+            })
+            .expect("the harness window is still open")
+        }
+
+        let editor = window
+            .update(cx, |editor, _, cx| cx.entity().clone())
+            .expect("the harness window is still open");
+
+        // Scrolled to the bottom with the caret on the first row: the caret is
+        // above everything on screen.
+        let (caret, length) = caret_and_length(cx, window.into(), &editor, 0, 250.);
+        assert!(length > 0, "the reader is given the rows that are on screen");
+        assert_eq!(
+            caret, 0,
+            "a caret above the visible rows reads at the top of them"
+        );
+
+        // Scrolled to the top with the caret on the last row: the caret is
+        // below everything on screen. The buffer is ASCII, so the character
+        // count of the runs is the byte length the offset is computed in.
+        let (caret, length) = caret_and_length(cx, window.into(), &editor, 299, 0.);
+        assert_eq!(
+            caret, length,
+            "a caret below the visible rows reads at the bottom of them, not the top"
+        );
+    }
+
+    /// The editor region is the node focus lands on, and it was named "Editor"
+    /// for every editor in the window — a split, a diff and the file beside
+    /// them all announced the same. It is now the file, when there is one.
+    #[gpui::test]
+    async fn test_an_editor_is_named_after_the_file_it_is_on(cx: &mut TestAppContext) {
+        init_test(cx, |_| {});
+
+        let fs = fs::FakeFs::new(cx.executor());
+        fs.insert_file(
+            util::path!("/notes.md"),
+            "first line\nsecond line\n".into(),
+        )
+        .await;
+        let project = project::Project::test(fs, [util::path!("/notes.md").as_ref()], cx).await;
+        let buffer = project
+            .update(cx, |project, cx| {
+                project.open_local_buffer(std::path::Path::new(util::path!("/notes.md")), cx)
+            })
+            .await
+            .expect("the fixture's file opens");
+
+        let window = cx.add_window(|window, cx| {
+            let multibuffer = cx.new(|cx| MultiBuffer::singleton(buffer, cx));
+            Editor::new(EditorMode::full(), multibuffer, Some(project), window, cx)
+        });
+        cx.activate_a11y(window.into());
+
+        let json = cx
+            .update_window(window.into(), |_, window, cx| {
+                window.draw(cx).clear(cx);
+                window.debug_a11y_tree_json()
+            })
+            .expect("the harness window is still open")
+            .expect("activation makes the debug tree available");
+        let tree: serde_json::Value = serde_json::from_str(&json).expect("the dump is valid JSON");
+
+        let region = tree["nodes"]
+            .as_object()
+            .expect("the dump lists nodes")
+            .values()
+            .find(|node| node["aria"]["role"] == "Group")
+            .unwrap_or_else(|| panic!("the editor is a focusable region: {json}"));
+        assert_eq!(
+            region["aria"]["label"].as_str(),
+            Some("notes.md"),
+            "the region says which file it is on"
+        );
+    }
+
+    /// Two editors side by side is the shape that makes a constant region name
+    /// a defect, and nothing rendered it — which is why `"Editor"` survived as
+    /// the name of every editor in the window until it was read rather than
+    /// tested. `assert_focusable_names_are_distinguishable` catches it now.
+    #[gpui::test]
+    async fn test_two_editors_side_by_side_can_be_told_apart(cx: &mut TestAppContext) {
+        init_test(cx, |_| {});
+
+        let fs = fs::FakeFs::new(cx.executor());
+        fs.insert_file(util::path!("/first.rs"), "fn one() {}\n".into())
+            .await;
+        fs.insert_file(util::path!("/second.rs"), "fn two() {}\n".into())
+            .await;
+        let project = project::Project::test(
+            fs,
+            [
+                util::path!("/first.rs").as_ref(),
+                util::path!("/second.rs").as_ref(),
+            ],
+            cx,
+        )
+        .await;
+
+        let mut buffers = Vec::new();
+        for path in [util::path!("/first.rs"), util::path!("/second.rs")] {
+            buffers.push(
+                project
+                    .update(cx, |project, cx| {
+                        project.open_local_buffer(std::path::Path::new(path), cx)
+                    })
+                    .await
+                    .expect("the fixture's files open"),
+            );
+        }
+
+        struct TwoEditors(Vec<Entity<Editor>>);
+        impl Render for TwoEditors {
+            fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+                gpui::div().children(self.0.iter().cloned())
+            }
+        }
+
+        let window = cx.add_window(|window, cx| {
+            let editors = buffers
+                .into_iter()
+                .map(|buffer| {
+                    let multibuffer = cx.new(|cx| MultiBuffer::singleton(buffer, cx));
+                    cx.new(|cx| {
+                        Editor::new(
+                            EditorMode::full(),
+                            multibuffer,
+                            Some(project.clone()),
+                            window,
+                            cx,
+                        )
+                    })
+                })
+                .collect();
+            TwoEditors(editors)
+        });
+        cx.activate_a11y(window.into());
+
+        let json = cx
+            .update_window(window.into(), |_, window, cx| {
+                window.draw(cx).clear(cx);
+                window.debug_a11y_tree_json()
+            })
+            .expect("the harness window is still open")
+            .expect("activation makes the debug tree available");
+        let tree: serde_json::Value = serde_json::from_str(&json).expect("the dump is valid JSON");
+
+        gpui::a11y_checks::assert_focusable_names_are_distinguishable(&tree, "two editors");
+        gpui::a11y_checks::assert_names_are_distinguishable(&tree, "two editors");
+
+        let mut regions: Vec<&str> = tree["nodes"]
+            .as_object()
+            .expect("the dump lists nodes")
+            .values()
+            .filter(|node| node["aria"]["role"] == "Group")
+            .filter_map(|node| node["aria"]["label"].as_str())
+            .collect();
+        regions.sort_unstable();
+        assert_eq!(
+            regions,
+            vec!["first.rs", "second.rs"],
+            "each editor says which file it is on"
+        );
+    }
+
+    /// The caret offset is arithmetic over byte lengths of display rows, so a
+    /// line of multibyte characters is where it would go wrong — either by
+    /// panicking on a character boundary or by pointing somewhere else.
+    #[gpui::test]
+    async fn test_the_caret_survives_multibyte_rows(cx: &mut TestAppContext) {
+        init_test(cx, |_| {});
+        let window = cx.add_window(|window, cx| {
+            let buffer = MultiBuffer::build_simple("日本語のコード\nfn two() {}\n", cx);
+            let mut editor = Editor::new(EditorMode::full(), buffer, None, window, cx);
+            editor.change_selections(Default::default(), window, cx, |selections| {
+                selections.select_ranges([MultiBufferOffset(9)..MultiBufferOffset(9)]);
+            });
+            editor
+        });
+        cx.activate_a11y(window.into());
+
+        let json = cx
+            .update_window(window.into(), |_, window, cx| {
+                window.draw(cx).clear(cx);
+                window.debug_a11y_tree_json()
+            })
+            .expect("the harness window is still open")
+            .expect("activation makes the debug tree available");
+        let tree: serde_json::Value = serde_json::from_str(&json).expect("the dump is valid JSON");
+        let nodes = tree["nodes"].as_object().expect("the dump lists nodes");
+
+        let region = nodes
+            .values()
+            .find(|node| node["aria"]["role"] == "Group")
+            .unwrap_or_else(|| panic!("the editor is a focusable region: {json}"));
+        let selection = region["aria"]["text_selection"]
+            .as_object()
+            .unwrap_or_else(|| panic!("a region carrying text says where the caret is: {region}"));
+        let index = selection["focus"]["character_index"]
+            .as_u64()
+            .unwrap_or_else(|| panic!("the caret has an index: {selection:?}"));
+        // Three characters in, not nine bytes in: an index into the text a
+        // reader is given, which is what a reader will move by.
+        assert_eq!(index, 3, "the caret is counted in characters: {selection:?}");
+    }
+
+    /// The inline prompt is built by hand rather than through `Editor::render`,
+    /// which is a second render path for the same widget — the shape that hid
+    /// the picker query box being invisible. A prompt the user types into has
+    /// to be somewhere focus can land.
+    #[gpui::test]
+    async fn test_the_inline_prompt_is_a_focusable_region(cx: &mut TestAppContext) {
+        init_test(cx, |_| {});
+        let window = cx.add_window(|window, cx| {
+            let buffer = MultiBuffer::build_simple("one\ntwo", cx);
+            Editor::new(EditorMode::full(), buffer, None, window, cx)
+        });
+
+        window
+            .update(cx, |editor, window, cx| {
+                let anchor = editor.selections.newest_anchor().head();
+                editor.add_edit_block(anchor, "one", "Rename to…", None, None, window, cx);
+            })
+            .expect("the editor window is still open");
+        cx.run_until_parked();
+
+        cx.activate_a11y(window.into());
+        let json = cx
+            .update_window(window.into(), |_, window, cx| {
+                window.draw(cx).clear(cx);
+                window.debug_a11y_tree_json()
+            })
+            .expect("the editor window is still open")
+            .expect("activation makes the debug tree available");
+        let tree: serde_json::Value = serde_json::from_str(&json).expect("the dump is valid JSON");
+        gpui::a11y_checks::assert_interactive_nodes_are_named(&tree, "editor");
+        gpui::a11y_checks::assert_names_are_distinguishable(&tree, "editor");
+        gpui::a11y_checks::assert_focusable_names_are_distinguishable(&tree, "editor");
+        gpui::a11y_checks::assert_clickable_elements_are_reachable(&tree, "editor");
+        gpui::a11y_checks::assert_click_targets_are_reachable(&tree, "editor");
+        gpui::a11y_checks::assert_controls_have_area(&tree, "editor");
+        gpui::a11y_checks::assert_landmarks_are_distinguishable(&tree, "editor");
+        gpui::a11y_checks::assert_active_descendant_is_honoured(&tree, "editor");
+        gpui::a11y_checks::assert_no_role_was_discarded(&tree, "editor");
+        gpui::a11y_checks::assert_no_aria_was_discarded(&tree, "editor");
+        gpui::a11y_checks::assert_roles_are_contained(&tree, "editor");
+
+        gpui::a11y_checks::assert_focus_reached_the_tree(&tree, "inline prompt");
+    }
+
+    /// A multi-line editor's text pattern would have to reflect folds, wrapping
+    /// and inlays, so it is deliberately not described as a flat text input.
+    /// It still has to be somewhere focus can land: registering a focus handle
+    /// is only half of it, and without a node the whole window gets announced
+    /// instead of the editor the user is typing into.
     #[gpui::test]
     async fn test_multi_line_editor_is_not_described_as_a_text_input(cx: &mut TestAppContext) {
         init_test(cx, |_| {});
@@ -12322,21 +13006,57 @@ mod tests {
         // other test sharing this binary.
         cx.activate_a11y(window.into());
         let json = cx
-            .update_window(window.into(), |_, window, cx| {
+            .update_window(window.into(), |view, window, cx| {
+                if let Ok(editor) = view.downcast::<Editor>() {
+                    let handle = editor.read(cx).focus_handle(cx);
+                    window.focus(&handle, cx);
+                }
                 window.draw(cx).clear(cx);
                 window.debug_a11y_tree_json()
             })
             .expect("the editor window is still open")
             .expect("activation makes the debug tree available");
         let tree: serde_json::Value = serde_json::from_str(&json).expect("the dump is valid JSON");
+        gpui::a11y_checks::assert_interactive_nodes_are_named(&tree, "editor");
+        gpui::a11y_checks::assert_names_are_distinguishable(&tree, "editor");
+        gpui::a11y_checks::assert_focusable_names_are_distinguishable(&tree, "editor");
+        gpui::a11y_checks::assert_clickable_elements_are_reachable(&tree, "editor");
+        gpui::a11y_checks::assert_click_targets_are_reachable(&tree, "editor");
+        gpui::a11y_checks::assert_controls_have_area(&tree, "editor");
+        gpui::a11y_checks::assert_landmarks_are_distinguishable(&tree, "editor");
+        gpui::a11y_checks::assert_active_descendant_is_honoured(&tree, "editor");
+        gpui::a11y_checks::assert_no_role_was_discarded(&tree, "editor");
+        gpui::a11y_checks::assert_no_aria_was_discarded(&tree, "editor");
+        gpui::a11y_checks::assert_roles_are_contained(&tree, "editor");
 
+        // The editor is in the tree first. This is a negative assertion, and
+        // an empty tree satisfies it without an editor having been rendered at
+        // all.
+        let roles: Vec<&str> = tree["nodes"]
+            .as_object()
+            .expect("the dump lists nodes")
+            .values()
+            .filter_map(|node| node["aria"]["role"].as_str())
+            .collect();
         assert!(
-            tree["nodes"]
-                .as_object()
-                .expect("the dump lists nodes")
-                .values()
-                .all(|node| node["aria"]["role"] != "TextInput"),
-            "a full editor must not claim to be a text input"
+            roles.contains(&"Group"),
+            "the editor reaches the tree as a region: {roles:?}"
         );
+        assert!(
+            !roles.contains(&"TextInput"),
+            "a full editor must not claim to be a text input: {roles:?}"
+        );
+
+        assert_eq!(
+            tree["frame"]["focus_without_node"].as_str(),
+            None,
+            "the focused editor has to reach the tree"
+        );
+        let focused = tree["gpui_focus"]
+            .as_str()
+            .and_then(|id| tree["nodes"].get(id))
+            .expect("the focus must name a node in the dump");
+        assert_eq!(focused["aria"]["role"].as_str(), Some("Group"));
+        assert_eq!(focused["aria"]["label"].as_str(), Some("Editor"));
     }
 }

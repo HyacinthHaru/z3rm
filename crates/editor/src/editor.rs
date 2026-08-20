@@ -898,6 +898,13 @@ pub struct Editor {
     /// Handles soft wraps, folds, fake inlay text insertions, etc.
     pub display_map: Entity<DisplayMap>,
     placeholder_display_map: Option<Entity<DisplayMap>>,
+    /// What this editor is called, for inputs whose placeholder is not the
+    /// answer: a rename field pre-filled with the current name shows no
+    /// placeholder at all, so without this it is announced as "edit text" and
+    /// nothing else.
+    a11y_label: Option<SharedString>,
+    a11y_description: Option<SharedString>,
+    a11y_wrapped: bool,
     pub selections: SelectionsCollection,
     /// Manages the scroll position for the given editor.
     ///
@@ -2383,6 +2390,9 @@ impl Editor {
             buffer: multi_buffer.clone(),
             display_map: display_map.clone(),
             placeholder_display_map: None,
+            a11y_label: None,
+            a11y_description: None,
+            a11y_wrapped: false,
             selections,
             scroll_manager: ScrollManager::new(cx),
             columnar_selection_state: None,
@@ -3192,6 +3202,39 @@ impl Editor {
 
     pub fn set_semantics_provider(&mut self, provider: Option<Rc<dyn SemanticsProvider>>) {
         self.semantics_provider = provider;
+    }
+
+    /// Name this editor for assistive technology. Use it for inputs that carry
+    /// no placeholder — the visible label sits beside them, and a label is not
+    /// an accessibility node.
+    pub fn set_a11y_label(&mut self, label: impl Into<SharedString>) {
+        self.a11y_label = Some(label.into());
+    }
+
+    /// The name set by [`Self::set_a11y_label`], if any.
+    pub fn a11y_label(&self) -> Option<SharedString> {
+        self.a11y_label.clone()
+    }
+
+    /// Detail read out after the name. Use it when text next to the input says
+    /// what the input is *for* — which repository is asking for a password,
+    /// which file is being renamed — since that text is not a node on its own.
+    pub fn set_a11y_description(&mut self, description: impl Into<SharedString>) {
+        self.a11y_description = Some(description.into());
+    }
+
+    /// The detail set by [`Self::set_a11y_description`], if any.
+    pub fn a11y_description(&self) -> Option<SharedString> {
+        self.a11y_description.clone()
+    }
+
+    /// Declare that an element around this editor already carries its role,
+    /// name and text, so the editor should not report itself as an input too.
+    ///
+    /// A wrapper that sets `Role::TextInput` on itself and this editor inside
+    /// it produces two inputs where the user sees one.
+    pub fn set_a11y_wrapped(&mut self, wrapped: bool) {
+        self.a11y_wrapped = wrapped;
     }
 
     pub fn placeholder_text(&self, cx: &mut App) -> Option<String> {
@@ -4147,6 +4190,9 @@ impl Editor {
     fn render_bookmark(&self, row: DisplayRow, cx: &mut Context<Self>) -> IconButton {
         let focus_handle = self.focus_handle.clone();
         IconButton::new(("bookmark indicator", row.0 as usize), IconName::Bookmark)
+            // Icon-only: the action is written down in a tooltip, which is not
+            // a name, so this was announced as a bare "button".
+            .aria_label("Remove Bookmark")
             .icon_size(IconSize::XSmall)
             .size(ui::ButtonSize::None)
             .icon_color(Color::Info)
@@ -4514,6 +4560,16 @@ impl Editor {
             SharedString::from("Right-click for more options")
         };
         IconButton::new(("breakpoint_indicator", row.0 as usize), icon)
+            .aria_label(if is_rejected {
+                // The warning badge is the only thing that says this breakpoint
+                // will never be hit, and why is in a tooltip. `IconButton` has
+                // no description, so the name carries both.
+                SharedString::new_static(
+                    "Unset breakpoint, rejected: no executable code on this line",
+                )
+            } else {
+                SharedString::new_static(primary_action_text)
+            })
             .icon_size(IconSize::XSmall)
             .size(ui::ButtonSize::None)
             .when(is_rejected, |this| {
@@ -4587,6 +4643,7 @@ impl Editor {
         let focus_handle = self.focus_handle.clone();
         let has_context_menu = self.has_mouse_context_menu();
         IconButton::new(("add_breakpoint_button", row.0 as usize), intent.icon())
+            .aria_label(intent.as_str())
             .icon_size(IconSize::XSmall)
             .size(ui::ButtonSize::None)
             .icon_color(intent.color())
@@ -12246,8 +12303,16 @@ impl Focusable for Editor {
 
 impl Render for Editor {
     fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        // Both flags only decide what this element reports to assistive
+        // technology, so a wrapped editor turns them off and contributes no
+        // node of its own.
         EditorElement::new(&cx.entity(), self.create_style(cx))
-            .single_line(self.mode.is_single_line())
+            .single_line(!self.a11y_wrapped && self.mode.is_single_line())
+            .focusable_region(
+                !self.a11y_wrapped
+                    && !self.mode.is_single_line()
+                    && !self.mode.is_minimap(),
+            )
     }
 }
 
@@ -12326,6 +12391,10 @@ impl<T: InvalidationRegion> InvalidationStack<T> {
 struct ErasedEditorImpl(Entity<Editor>);
 
 impl ui_input::ErasedEditor for ErasedEditorImpl {
+    fn set_a11y_wrapped(&self, wrapped: bool, cx: &mut App) {
+        self.0.update(cx, |editor, _| editor.set_a11y_wrapped(wrapped));
+    }
+
     fn text(&self, cx: &App) -> String {
         self.0.read(cx).text(cx)
     }
@@ -12344,6 +12413,15 @@ impl ui_input::ErasedEditor for ErasedEditorImpl {
         self.0.update(cx, |this, cx| {
             this.set_placeholder_text(text, window, cx);
         });
+    }
+
+    fn set_a11y_label(&self, label: &str, cx: &mut App) {
+        self.0.update(cx, |this, _| this.set_a11y_label(label.to_string()));
+    }
+
+    fn set_a11y_description(&self, description: &str, cx: &mut App) {
+        self.0
+            .update(cx, |this, _| this.set_a11y_description(description.to_string()));
     }
 
     fn set_multiline(&self, max_lines: Option<usize>, _window: &mut Window, cx: &mut App) {
@@ -12386,7 +12464,17 @@ impl ui_input::ErasedEditor for ErasedEditorImpl {
             text: text_style,
             ..Default::default()
         };
-        EditorElement::new(&self.0, editor_style).into_any()
+        // The erased editor is always a single-line input — a picker's query
+        // box, a settings field — and rendering it without saying so gives it
+        // no id and no role, so focus lands on nothing and the field cannot be
+        // read at all. Unless a wrapper has claimed those semantics, which is
+        // what `set_a11y_wrapped` says and what `impl Render for Editor`
+        // already honours; ignoring it here left the flag silently inert on
+        // this path.
+        let a11y_wrapped = self.0.read(cx).a11y_wrapped;
+        EditorElement::new(&self.0, editor_style)
+            .single_line(!a11y_wrapped)
+            .into_any()
     }
 
     fn as_any(&self) -> &dyn Any {
@@ -12818,6 +12906,9 @@ impl PromptEditor {
             line_height: relative(settings.buffer_line_height.value()),
             ..Default::default()
         };
+        // Built here rather than through `Editor::render`, so it has to be told
+        // it is a focusable region: without that it has no id and no role, and
+        // typing into the prompt announces nothing.
         EditorElement::new(
             &self.prompt,
             EditorStyle {
@@ -12827,11 +12918,13 @@ impl PromptEditor {
                 ..Default::default()
             },
         )
+        .focusable_region(true)
     }
 
     fn render_close_button(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let focus_handle = self.prompt.focus_handle(cx);
         IconButton::new("cancel", IconName::Close)
+            .aria_label("Cancel")
             .icon_color(Color::Muted)
             .shape(IconButtonShape::Square)
             .tooltip(move |_window, cx| {
@@ -12845,6 +12938,7 @@ impl PromptEditor {
     fn render_confirm_button(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let focus_handle = self.prompt.focus_handle(cx);
         IconButton::new("confirm", IconName::Return)
+            .aria_label("Confirm")
             .icon_color(Color::Muted)
             .shape(IconButtonShape::Square)
             .tooltip(move |_window, cx| {

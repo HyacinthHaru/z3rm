@@ -50,6 +50,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 use terminal_view::mux_pane::MuxPaneView;
+use workspace::notifications::simple_message_notification::MessageNotification;
 
 // ============================================================================
 // Harness
@@ -155,9 +156,25 @@ fn save_a11y_tree(name: &str, tree: &serde_json::Value) -> Result<PathBuf> {
 }
 
 /// Write both artifacts for a scenario.
+/// The checks every captured frame has to pass, whether or not it is saved.
+fn check_a11y(tree: &serde_json::Value, name: &str) {
+    gpui::a11y_checks::assert_interactive_nodes_are_named(tree, name);
+    gpui::a11y_checks::assert_roles_are_contained(tree, name);
+    gpui::a11y_checks::assert_no_role_was_discarded(tree, name);
+    gpui::a11y_checks::assert_click_targets_are_reachable(tree, name);
+    gpui::a11y_checks::assert_focus_reached_the_tree(tree, name);
+    gpui::a11y_checks::assert_landmarks_are_distinguishable(tree, name);
+    gpui::a11y_checks::assert_names_are_distinguishable(tree, name);
+    gpui::a11y_checks::assert_clickable_elements_are_reachable(tree, name);
+    gpui::a11y_checks::assert_controls_have_area(tree, name);
+    gpui::a11y_checks::assert_active_descendant_is_honoured(tree, name);
+}
+
 fn save_frame(name: &str, image: &RgbaImage, tree: &serde_json::Value) -> Result<()> {
     save_screenshot(name, image)?;
     save_a11y_tree(name, tree)?;
+    // Checked here rather than per scenario so a new scenario cannot forget it.
+    check_a11y(tree, name);
     Ok(())
 }
 
@@ -763,11 +780,21 @@ fn mux_pane_renders_terminal_grid_and_exposes_a11y_tree() -> Result<()> {
         "MuxPaneView must expose a Role::Terminal node, roles seen: {:?}",
         a11y_role_summary(&tree)
     );
+    // The terminal's own title, not a fixed string. This is the node focus
+    // lands on when a pane is entered, so a constant here meant every terminal
+    // in the window announced identically. The mock server's pane has no PTY,
+    // so the title is the default.
     assert!(
         terminals
             .iter()
-            .any(|node| a11y_string_field(node, "label").as_deref() == Some("terminal output")),
-        "the TerminalElement surface must be labelled"
+            .any(|node| a11y_string_field(node, "label").as_deref() == Some("Terminal")),
+        "the TerminalElement surface must be labelled with what it is running"
+    );
+    assert!(
+        terminals
+            .iter()
+            .any(|node| a11y_string_field(node, "role_description").as_deref() == Some("terminal")),
+        "and has to say it is a terminal, which `AXTextArea` does not"
     );
 
     let text_runs = a11y_text_run_values(&tree);
@@ -1071,6 +1098,10 @@ fn extension_chrome_semantic_button_dispatches_command() -> Result<()> {
     let window = open_chrome_with_dispatch(&mut cx, status_bar_vdom()?, dispatch)?;
     draw_frame(&mut cx, window.into())?;
     let (_, tree) = draw_frame(&mut cx, window.into())?;
+    // Only `save_frame` runs these, and this scenario does not save one, so
+    // without this the extension chrome is checked for dispatch but never for
+    // whether a reader could find the thing being dispatched.
+    check_a11y(&tree, "extension chrome button");
 
     let button = a11y_nodes_with_role(&tree, "Button")
         .into_iter()
@@ -1099,6 +1130,104 @@ fn extension_chrome_semantic_button_dispatches_command() -> Result<()> {
     );
     Ok(())
 }
+/// Chrome shapes the golden status-bar frame does not contain. Kept in its own
+/// fixture and deliberately not saved: perturbing a screenshot baseline to
+/// assert a semantic property means the next person has to regenerate an image
+/// on another platform to land an unrelated change.
+fn semantic_chrome_vdom() -> Result<VDomNode> {
+    let json = serde_json::json!({
+        "type": "div",
+        "props": { "id": "semantic-chrome" },
+        "style": { "flexDirection": "row", "gap": "8px", "padding": "6px" },
+        "children": [
+            { "type": "span", "props": { "id": "session-name" }, "children": ["session: main"] },
+            {
+                // A plain node made clickable: an extension can call it what it
+                // likes, but it is a control and has to reach the tree as one.
+                //
+                // Marked chosen the way an extension marks a row: the class
+                // gives it a background colour, and the state has to reach a
+                // reader as well as the theme.
+                "type": "div",
+                "props": {
+                    "id": "zoom-toggle",
+                    "onClick": "z3rm.pane.zoom",
+                    "class": "selected"
+                },
+                "style": { "padding": "6px" },
+                "children": ["Zoom"]
+            },
+            {
+                "type": "input",
+                "props": {
+                    "id": "filter-input",
+                    "value": "pane-2",
+                    "placeholder": "filter panes",
+                    "onChange": "z3rm.status-bar.filter"
+                },
+                "style": { "width": "140px", "height": "24px" }
+            }
+        ]
+    });
+    extension_host::vdom_bridge::parse_vdom(&json).map_err(|error| anyhow::anyhow!("{error}"))
+}
+
+fn extension_chrome_exposes_its_controls_and_text() -> Result<()> {
+    let mut cx = headless_app()?;
+    let window = open_chrome(&mut cx, semantic_chrome_vdom()?)?;
+
+    draw_frame(&mut cx, window.into())?;
+    let (_, tree) = draw_frame(&mut cx, window.into())?;
+    check_a11y(&tree, "extension_chrome_exposes_its_controls_and_text");
+
+    let mut buttons: Vec<String> = a11y_nodes_with_role(&tree, "Button")
+        .iter()
+        .filter_map(|node| a11y_string_field(node, "label"))
+        .collect();
+    buttons.sort();
+    assert_eq!(
+        buttons,
+        vec!["Zoom".to_string()],
+        "a node with an onClick is a control whatever it is typed as"
+    );
+    // The same node carries `class: "selected"`. That draws a background and
+    // says nothing on its own; being the chosen one is state, and state has to
+    // reach a reader.
+    let selected: Vec<bool> = a11y_nodes_with_role(&tree, "Button")
+        .iter()
+        .filter_map(|node| node.get("aria")?.get("selected")?.as_bool())
+        .collect();
+    assert_eq!(
+        selected,
+        vec![true],
+        "an extension marking a row chosen must not say it in colour alone"
+    );
+
+    let labels: Vec<String> = a11y_nodes_with_role(&tree, "Label")
+        .iter()
+        .filter_map(|node| a11y_string_field(node, "label"))
+        .collect();
+    assert!(
+        labels.iter().any(|label| label == "session: main"),
+        "the extension's own text has to reach the tree: {labels:?}"
+    );
+
+    let input = a11y_nodes_with_role(&tree, "TextInput");
+    let input = input.first().context("the input must be exposed")?;
+    assert_eq!(
+        a11y_string_field(input, "label"),
+        Some("filter panes".to_string()),
+        "a filled field keeps the name it had when it was empty"
+    );
+    assert_eq!(
+        a11y_string_field(input, "value"),
+        Some("pane-2".to_string()),
+        "and reports what is in it as its value"
+    );
+
+    Ok(())
+}
+
 fn extension_chrome_vdom_renders_status_bar() -> Result<()> {
     let mut cx = headless_app()?;
     let window = open_chrome(&mut cx, status_bar_vdom()?)?;
@@ -1158,6 +1287,18 @@ fn extension_chrome_vdom_renders_status_bar() -> Result<()> {
         "expected rasterized label glyphs in the status bar, found {glyph_pixels}"
     );
 
+    // The extension's own text: spans carrying labels rather than controls.
+    // They contribute no node on their own, so the bridge has to name them or
+    // the status bar reaches a reader as its buttons and nothing else.
+    let labels: Vec<String> = a11y_nodes_with_role(&tree, "Label")
+        .iter()
+        .filter_map(|node| a11y_string_field(node, "label"))
+        .collect();
+    assert!(
+        labels.iter().any(|label| label == "session: main"),
+        "the extension's own text has to reach the tree: {labels:?}"
+    );
+
     let roles = a11y_role_summary(&tree);
     assert!(
         roles.iter().any(|role| role == "Button"),
@@ -1189,6 +1330,21 @@ fn extension_chrome_vdom_renders_status_bar() -> Result<()> {
             .and_then(|node| a11y_string_field(node, "label")),
         Some("filter panes".to_string()),
         "the input's accessible name must fall back to its placeholder"
+    );
+
+    // §5.4 A display list paints straight to draw-ops, so the only thing a
+    // screen reader can read is the text it draws — here the meter's "42%".
+    let meter = a11y_nodes(&tree)
+        .into_iter()
+        .find(|(_, node)| a11y_string_field(node, "label").as_deref() == Some("42%"))
+        .map(|(_, node)| node)
+        .expect("a display-list region must be named by the text it draws");
+    assert_eq!(
+        meter
+            .get("aria")
+            .and_then(|aria| aria.get("live")),
+        None,
+        "a high-frequency widget must not announce itself on every repaint"
     );
     assert_eq!(
         a11y_nodes_with_role(&tree, "TextInput").len(),
@@ -1239,8 +1395,12 @@ fn extension_chrome_display_list_updates_without_touching_vdom() -> Result<()> {
         Ok(())
     })??;
 
-    let (after, _) = draw_frame(&mut cx, window.into())?;
-    save_screenshot("extension_chrome_display_list_shrunk", &after)?;
+    let (after, after_tree) = draw_frame(&mut cx, window.into())?;
+    save_frame(
+        "extension_chrome_display_list_shrunk",
+        &after,
+        &after_tree,
+    )?;
     let after_fill = count_near_color(&after, meter, 4);
 
     assert!(
@@ -1327,13 +1487,75 @@ fn terminal_semantic_scroll_actions_move_viewport() -> Result<()> {
     Ok(())
 }
 
+/// A failure and a piece of news arrive through the same component, told apart
+/// on screen by a red warning icon. An icon is not a node and carries no text,
+/// so the screenshot and the a11y dump beside it are the two halves of the
+/// evidence: the frame shows what a sighted user sees, the tree shows what a
+/// reader is told.
+fn notification_severity_reaches_the_reader() -> Result<()> {
+    struct Stack {
+        failure: Entity<MessageNotification>,
+        news: Entity<MessageNotification>,
+    }
+
+    impl Render for Stack {
+        fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+            div()
+                .size_full()
+                .bg(theme::ActiveTheme::theme(&**cx).colors().background)
+                .p(px(16.0))
+                .flex()
+                .flex_col()
+                .gap(px(12.0))
+                .child(self.failure.clone())
+                .child(self.news.clone())
+        }
+    }
+
+    let mut cx = headless_app()?;
+    let window = cx.open_window(size(px(520.0), px(260.0)), |_, cx| {
+        let failure = cx.new(|cx| {
+            MessageNotification::from_workspace_error("could not reach the mux server", cx)
+        });
+        let news = cx.new(|cx| MessageNotification::new("Updated to z3rm 1.12", cx));
+        cx.new(|_| Stack { failure, news })
+    })?;
+
+    let (image, tree) = draw_frame(&mut cx, window.into())?;
+    save_frame("notification_severity", &image, &tree)?;
+
+    let announcements: Vec<String> = a11y_nodes(&tree)
+        .into_iter()
+        .filter_map(|(_, node)| a11y_string_field(node, "label"))
+        .collect();
+    assert!(
+        announcements
+            .iter()
+            .any(|text| text == "Error: could not reach the mux server"),
+        "the failure has to say it is one; got {announcements:?}"
+    );
+    assert!(
+        announcements
+            .iter()
+            .any(|text| text == "Updated to z3rm 1.12"),
+        "and an ordinary message must not be dressed up as an error; got {announcements:?}"
+    );
+    // Both notifications are drawn, so the frame is not a single flat fill and
+    // the red error accent is actually on screen rather than merely described.
+    assert!(
+        distinct_colors(&image) > 8,
+        "the frame collapsed to a flat fill, so the screenshot proves nothing"
+    );
+    Ok(())
+}
+
 fn headless_renderer_produces_real_pixels() -> Result<()> {
     // Guards the harness: a blank software or GPU frame makes every other
     // visual assertion meaningless.
     let mut cx = headless_app()?;
     let window = cx.open_window(size(px(100.0), px(100.0)), |_, cx| cx.new(|_| Swatch))?;
-    let (image, _) = draw_frame(&mut cx, window.into())?;
-    save_screenshot("harness_swatch", &image)?;
+    let (image, tree) = draw_frame(&mut cx, window.into())?;
+    save_frame("harness_swatch", &image, &tree)?;
     let green = count_near_color(&image, [0, 255, 0], 2);
     #[cfg(target_os = "linux")]
     assert_eq!(
@@ -1410,6 +1632,7 @@ fn pane_output_dirty_signal_pulls_authoritative_grid() -> Result<()> {
         magenta > 200,
         "the updated grid's accent row must reach the framebuffer; magenta pixels: {magenta}"
     );
+    check_a11y(&tree, "pane after a dirty signal");
     let runs = a11y_text_run_values(&tree);
     assert!(
         runs.iter().any(|value| value.contains(UPDATED_MARKER)),
@@ -1437,6 +1660,10 @@ fn main() {
             extension_chrome_vdom_renders_status_bar,
         ),
         (
+            "extension_chrome_exposes_its_controls_and_text",
+            extension_chrome_exposes_its_controls_and_text,
+        ),
+        (
             "extension_chrome_semantic_button_dispatches_command",
             extension_chrome_semantic_button_dispatches_command,
         ),
@@ -1455,6 +1682,10 @@ fn main() {
         (
             "headless_renderer_produces_real_pixels",
             headless_renderer_produces_real_pixels,
+        ),
+        (
+            "notification_severity_reaches_the_reader",
+            notification_severity_reaches_the_reader,
         ),
     ];
 

@@ -620,6 +620,18 @@ pub enum ViewEvent {
 
 impl EventEmitter<ViewEvent> for ProjectSearchView {}
 
+/// What the results region is called.
+///
+/// The query, uncut, for the same reason the tab carries it uncut: this is a
+/// region a reader arrives at, and two searches in split panes are told apart
+/// by nothing else.
+fn announced_results_name(query: Option<&str>) -> SharedString {
+    match query.map(|query| query.replace('\n', "")).filter(|query| !query.is_empty()) {
+        Some(query) => format!("Search results, {query}").into(),
+        None => "Search results".into(),
+    }
+}
+
 impl Render for ProjectSearchView {
     fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let mut key_context = KeyContext::default();
@@ -628,6 +640,17 @@ impl Render for ProjectSearchView {
         if self.has_matches() {
             div()
                 .key_context(key_context)
+                // A focused root with no id and no role produces no node, so
+                // the whole window was announced instead of the results.
+                .id("project-search-results")
+                .role(gpui::Role::Group)
+                // Named after the query, not "Search results". Two searches
+                // open in split panes are two focusable regions, and the query
+                // is the only thing telling them apart — the same reason the
+                // tab is named after it.
+                .aria_label(announced_results_name(
+                    self.entity.read(cx).last_search_query_text.as_deref(),
+                ))
                 .on_action(cx.listener(Self::open_text_finder))
                 .flex_1()
                 .size_full()
@@ -636,7 +659,7 @@ impl Render for ProjectSearchView {
         } else {
             let model = self.entity.read(cx);
 
-            let heading_text = match model.search_state {
+            let heading = match model.search_state {
                 SearchState::Running(SearchActivity::WaitingForScan) => "Loading project…",
                 SearchState::Running(SearchActivity::Searching) => "Searching…",
                 SearchState::Completed(SearchCompletion::NoResults) => "No Results",
@@ -645,7 +668,7 @@ impl Render for ProjectSearchView {
 
             let heading_text = div()
                 .justify_center()
-                .child(Label::new(heading_text).size(LabelSize::Large));
+                .child(Label::new(heading).size(LabelSize::Large));
 
             let page_content: Option<AnyElement> = match model.search_state {
                 SearchState::Idle => Some(self.landing_text_minor(cx).into_any_element()),
@@ -661,6 +684,12 @@ impl Render for ProjectSearchView {
 
             h_flex()
                 .key_context(key_context)
+                // Same as the results branch, and the heading beside it —
+                // "Searching…", "No Results" — is a label, so the state of the
+                // search only reaches a reader through this name.
+                .id("project-search-landing")
+                .role(gpui::Role::Group)
+                .aria_label(SharedString::from(format!("Project search: {heading}")))
                 .on_action(cx.listener(Self::open_text_finder))
                 .size_full()
                 .items_center()
@@ -683,6 +712,21 @@ impl Render for ProjectSearchView {
 impl Focusable for ProjectSearchView {
     fn focus_handle(&self, _: &App) -> gpui::FocusHandle {
         self.focus_handle.clone()
+    }
+}
+
+/// A search tab's text, cut to `query_limit` characters or whole.
+///
+/// The newlines go in both cases: a query pasted from a file would otherwise
+/// draw over two lines and be read aloud as two, and neither is wanted.
+fn search_tab_text(query: Option<&str>, query_limit: Option<usize>) -> SharedString {
+    let Some(query) = query.map(|query| query.replace('\n', "")).filter(|query| !query.is_empty())
+    else {
+        return "Project Search".into();
+    };
+    match query_limit {
+        Some(limit) => util::truncate_and_trailoff(&query, limit).into(),
+        None => query.into(),
     }
 }
 
@@ -726,20 +770,18 @@ impl Item for ProjectSearchView {
     }
 
     fn tab_content_text(&self, _detail: usize, cx: &App) -> SharedString {
-        let last_query: Option<SharedString> = self
-            .entity
-            .read(cx)
-            .last_search_query_text
-            .as_ref()
-            .map(|query| {
-                let query = query.replace('\n', "");
-                let query_text = util::truncate_and_trailoff(&query, MAX_TAB_TITLE_LEN);
-                query_text.into()
-            });
+        search_tab_text(
+            self.entity.read(cx).last_search_query_text.as_deref(),
+            Some(MAX_TAB_TITLE_LEN),
+        )
+    }
 
-        last_query
-            .filter(|query| !query.is_empty())
-            .unwrap_or_else(|| "Project Search".into())
+    fn tab_announcement_text(&self, _detail: usize, cx: &App) -> SharedString {
+        // Uncut. The query is the only thing telling one search tab from
+        // another, and two searches sharing their first characters are exactly
+        // the pair a user has open at once. The strip has a width to respect;
+        // a reader given one tab at a time does not.
+        search_tab_text(self.entity.read(cx).last_search_query_text.as_deref(), None)
     }
 
     fn telemetry_event_text(&self) -> Option<&'static str> {
@@ -2327,6 +2369,12 @@ impl Render for ProjectSearchBar {
             _ => None,
         };
 
+        // What the counter is announced as, kept apart from what it draws.
+        // "3/17" belongs in a toolbar; out loud it is "three slash seventeen".
+        // Empty until there is something to report: this is a live region, and
+        // a count sitting in it before anyone has searched announces a result
+        // for a search that has not happened.
+        let mut announced_matches = SharedString::default();
         let match_text = search
             .active_match_index
             .and_then(|index| {
@@ -2334,6 +2382,11 @@ impl Render for ProjectSearchBar {
                 let match_quantity = project_search.match_ranges.len();
                 if match_quantity > 0 {
                     debug_assert!(match_quantity >= index);
+                    announced_matches = if limit_reached {
+                        format!("Match {index} of {match_quantity} or more").into()
+                    } else {
+                        format!("Match {index} of {match_quantity}").into()
+                    };
                     if limit_reached {
                         Some(format!("{index}/{match_quantity}+"))
                     } else {
@@ -2410,6 +2463,16 @@ impl Render for ProjectSearchBar {
             .child(
                 div()
                     .id("matches")
+                    // "3/17" is a label, and the spinner beside it is an icon,
+                    // so neither the count nor "still searching" reached the
+                    // tree. Polite: it changes while the user types.
+                    .role(gpui::Role::Status)
+                    .aria_live(gpui::accesskit::Live::Polite)
+                    .aria_announcement(match (is_search_underway, announced_matches.is_empty()) {
+                        (true, true) => SharedString::new_static("Searching"),
+                        (true, false) => format!("Searching, {announced_matches}").into(),
+                        (false, _) => announced_matches,
+                    })
                     .ml_2()
                     .min_w(rems_from_px(40.))
                     .child(
@@ -2444,6 +2507,7 @@ impl Render for ProjectSearchBar {
             .min_w_64()
             .child(
                 IconButton::new("project-search-filter-button", IconName::Filter)
+            .aria_label("Toggle Filters")
                     .shape(IconButtonShape::Square)
                     .tooltip(|_window, cx| {
                         Tooltip::for_action("Toggle Filters", &ToggleFilters, cx)
@@ -2491,6 +2555,7 @@ impl Render for ProjectSearchBar {
         };
 
         let expand_button = IconButton::new("project-search-collapse-expand", icon)
+            .aria_label(tooltip_label)
             .shape(IconButtonShape::Square)
             .tooltip(move |_, cx| {
                 Tooltip::for_action_in(
@@ -2576,6 +2641,7 @@ impl Render for ProjectSearchBar {
                 .min_w_64()
                 .child(
                     IconButton::new("project-search-opened-only", IconName::FolderSearch)
+                        .aria_label("Only Search Open Files")
                         .shape(IconButtonShape::Square)
                         .toggle_state(self.is_opened_only_enabled(cx))
                         .tooltip(Tooltip::text("Only Search Open Files"))
@@ -2613,28 +2679,37 @@ impl Render for ProjectSearchBar {
             key_context.add("in_replace");
         }
 
-        let query_error_line = search
-            .panels_with_errors
-            .get(&InputPanel::Query)
-            .map(|error| {
-                Label::new(error)
-                    .size(LabelSize::Small)
-                    .color(Color::Error)
-                    .mt_neg_1()
-                    .ml_2()
-            });
+        // Both lines are rendered whether or not there is an error in them: a
+        // live region that appears at the same moment as its message has
+        // nothing to compare against, so it announces nothing at all.
+        let error_line = |id: &'static str, error: Option<&String>| {
+            div()
+                .id(id)
+                .role(gpui::Role::Status)
+                .aria_live(gpui::accesskit::Live::Polite)
+                .when_some(error, |this, error| {
+                    this.aria_announcement(SharedString::from(error.clone())).child(
+                        Label::new(error.clone())
+                            .size(LabelSize::Small)
+                            .color(Color::Error)
+                            .mt_neg_1()
+                            .ml_2(),
+                    )
+                })
+        };
 
-        let filter_error_line = search
-            .panels_with_errors
-            .get(&InputPanel::Include)
-            .or_else(|| search.panels_with_errors.get(&InputPanel::Exclude))
-            .map(|error| {
-                Label::new(error)
-                    .size(LabelSize::Small)
-                    .color(Color::Error)
-                    .mt_neg_1()
-                    .ml_2()
-            });
+        let query_error_line = error_line(
+            "project-search-query-error",
+            search.panels_with_errors.get(&InputPanel::Query),
+        );
+
+        let filter_error_line = error_line(
+            "project-search-filter-error",
+            search
+                .panels_with_errors
+                .get(&InputPanel::Include)
+                .or_else(|| search.panels_with_errors.get(&InputPanel::Exclude)),
+        );
 
         v_flex()
             .gap_2()
@@ -2681,10 +2756,10 @@ impl Render for ProjectSearchBar {
             .on_action(cx.listener(Self::select_prev_match))
             .on_action(cx.listener(Self::open_text_finder))
             .child(search_line)
-            .children(query_error_line)
+            .child(query_error_line)
             .children(replace_line)
             .children(filter_line)
-            .children(filter_error_line)
+            .child(filter_error_line)
             .into_any_element()
     }
 }
@@ -2783,6 +2858,54 @@ pub fn perform_project_search(
 
 #[cfg(test)]
 pub mod tests {
+
+    /// Two searches open in split panes are two focusable regions, and before
+    /// this both were called "Search results" — so a reader tabbing between
+    /// them heard the same words and could not tell they had moved.
+    #[test]
+    fn the_results_region_is_named_after_its_query() {
+        assert_eq!(
+            super::announced_results_name(Some("fn render")),
+            "Search results, fn render"
+        );
+        // Newlines go for the same reason they go from the tab: a query pasted
+        // out of a file would otherwise be read aloud as two lines.
+        assert_eq!(
+            super::announced_results_name(Some("first\nsecond")),
+            "Search results, firstsecond"
+        );
+        // Nothing searched for yet, and the region still has to say what it is.
+        assert_eq!(super::announced_results_name(None), "Search results");
+        assert_eq!(super::announced_results_name(Some("")), "Search results");
+    }
+
+    /// A search tab is titled with the query, cut to fit the strip. That is
+    /// the only thing telling one search from another, and two searches that
+    /// share their opening are exactly the pair someone has open at once — so
+    /// a reader, who is given one tab at a time and cannot hover, gets it
+    /// whole.
+    #[test]
+    fn a_search_tab_is_cut_for_the_strip_and_not_for_a_reader() {
+        const QUERY: &str = "fn render(&mut self, window: &mut Window, cx: &mut Context<Self>)";
+
+        let drawn = super::search_tab_text(Some(QUERY), Some(MAX_TAB_TITLE_LEN));
+        let announced = super::search_tab_text(Some(QUERY), None);
+
+        assert!(
+            drawn.len() < QUERY.len(),
+            "the strip's title is cut: {drawn}"
+        );
+        assert_eq!(announced, QUERY, "the announced one is not");
+
+        // A query pasted out of a file carries newlines, which would draw over
+        // two lines and be read aloud as two. Both drop them.
+        let pasted = super::search_tab_text(Some("first\nsecond"), None);
+        assert_eq!(pasted, "firstsecond");
+
+        // No query yet, and the tab still has to be called something.
+        assert_eq!(super::search_tab_text(None, None), "Project Search");
+        assert_eq!(super::search_tab_text(Some(""), None), "Project Search");
+    }
     use std::{
         path::PathBuf,
         sync::{
@@ -3410,6 +3533,105 @@ pub mod tests {
             has_any_folded,
             "Should report folds after manually folding one buffer"
         );
+    }
+
+    /// The view tracks focus on roots with no id and no role, so opening a
+    /// search announced the whole window; the heading that says whether it is
+    /// searching, found nothing, or is waiting for a query is a label, which
+    /// contributes no node of its own.
+    #[gpui::test]
+    async fn the_project_search_says_what_state_it_is_in(cx: &mut TestAppContext) {
+        init_test(cx);
+
+        let fs = FakeFs::new(cx.background_executor.clone());
+        fs.insert_tree("/dir", json!({ "one.rs": "const ONE: usize = 1;" }))
+            .await;
+        let project = Project::test(fs.clone(), ["/dir".as_ref()], cx).await;
+        let window = cx.add_window(|window, cx| MultiWorkspace::test_new(project, window, cx));
+        let workspace = window
+            .read_with(cx, |mw, _| mw.workspace().clone())
+            .unwrap();
+        let cx = &mut VisualTestContext::from_window(window.into(), cx);
+        let search_bar = window.build_entity(cx, |_, _| ProjectSearchBar::new());
+
+        workspace.update_in(cx, move |workspace, window, cx| {
+            workspace.panes()[0].update(cx, |pane, cx| {
+                pane.toolbar()
+                    .update(cx, |toolbar, cx| toolbar.add_item(search_bar, window, cx))
+            });
+            ProjectSearchView::deploy_search(
+                workspace,
+                &workspace::DeploySearch::default(),
+                window,
+                cx,
+            )
+        });
+        cx.run_until_parked();
+
+        cx.activate_a11y(cx.window_handle());
+        let json = cx
+            .update(|window, cx| {
+                window.draw(cx).clear(cx);
+                window.debug_a11y_tree_json()
+            })
+            .expect("activation makes the debug tree available");
+        let tree: serde_json::Value = serde_json::from_str(&json).expect("the dump is valid JSON");
+        let nodes = tree["nodes"].as_object().expect("the dump lists nodes");
+
+        gpui::a11y_checks::assert_interactive_nodes_are_named(&tree, "project search");
+        gpui::a11y_checks::assert_no_role_was_discarded(&tree, "project search");
+        gpui::a11y_checks::assert_no_aria_was_discarded(&tree, "project search");
+        gpui::a11y_checks::assert_roles_are_contained(&tree, "project search");
+        gpui::a11y_checks::assert_focus_reached_the_tree(&tree, "project search");
+        gpui::a11y_checks::assert_click_targets_are_reachable(&tree, "project search");
+        gpui::a11y_checks::assert_landmarks_are_distinguishable(&tree, "project search");
+        gpui::a11y_checks::assert_names_are_distinguishable(&tree, "project search");
+        gpui::a11y_checks::assert_focusable_names_are_distinguishable(&tree, "project search");
+        gpui::a11y_checks::assert_clickable_elements_are_reachable(&tree, "project search");
+        gpui::a11y_checks::assert_controls_have_area(&tree, "project search");
+        gpui::a11y_checks::assert_active_descendant_is_honoured(&tree, "project search");
+
+        let named: Vec<&str> = nodes
+            .values()
+            .filter_map(|node| node["aria"]["label"].as_str())
+            .collect();
+        assert!(
+            named.contains(&"Project search: Search All Files"),
+            "the landing state has to say it is waiting for a query: {named:?}"
+        );
+
+        // Both error lines and the match count exist with nothing in them yet:
+        // a live region created at the same moment as its message has nothing
+        // to diff against and is never announced.
+        let quiet_regions: Vec<(&str, &str)> = nodes
+            .values()
+            .filter(|node| node["aria"]["live"] == "Polite")
+            .filter_map(|node| {
+                Some((
+                    node["element_id"].as_str()?,
+                    node["aria"]["label"].as_str().unwrap_or_default(),
+                ))
+            })
+            .collect();
+        for region in [
+            "project-search-query-error",
+            "project-search-filter-error",
+            "matches",
+        ] {
+            let found = quiet_regions
+                .iter()
+                .find(|(id, _)| id.contains(region))
+                .unwrap_or_else(|| {
+                    panic!("{region} has to exist before it has anything to say: {quiet_regions:?}")
+                });
+            // Existing is half of it. The match count used to sit here reading
+            // "0/0" before anyone had searched, which is a live region
+            // reporting a result for a search that has not happened.
+            assert_eq!(
+                found.1, "",
+                "{region} must say nothing until there is something to say"
+            );
+        }
     }
 
     #[perf]
@@ -5169,7 +5391,11 @@ pub mod tests {
                 self.focus_handle.clone()
             }
         }
-        impl workspace::ModalView for EmptyModalView {}
+        impl workspace::ModalView for EmptyModalView {
+            fn a11y_name(&self, _cx: &App) -> Option<SharedString> {
+                None
+            }
+        }
 
         workspace.update_in(cx, |workspace, window, cx| {
             workspace.toggle_modal(window, cx, |_, cx| EmptyModalView {
@@ -5646,6 +5872,71 @@ pub mod tests {
                 });
             });
         });
+    }
+
+    /// Search results are a multibuffer: one header per file, from all over the
+    /// project. The header names itself with the file name alone, so two files
+    /// called `main.rs` give a reader two headers it cannot tell apart — and
+    /// the directory that separates them is on screen right beside each one,
+    /// as a plain label, which is not a node.
+    #[gpui::test]
+    async fn two_files_with_one_name_get_headers_that_differ(cx: &mut TestAppContext) {
+        init_test(cx);
+
+        let fs = FakeFs::new(cx.background_executor.clone());
+        fs.insert_tree(
+            path!("/dir"),
+            json!({
+                "app": { "main.rs": "const NEEDLE: usize = 1;" },
+                "tests": { "main.rs": "const NEEDLE: usize = 2;" },
+            }),
+        )
+        .await;
+        let project = Project::test(fs.clone(), [path!("/dir").as_ref()], cx).await;
+        let window =
+            cx.add_window(|window, cx| MultiWorkspace::test_new(project.clone(), window, cx));
+        let workspace = window
+            .read_with(cx, |mw, _| mw.workspace().clone())
+            .unwrap();
+        let search = cx.new(|cx| ProjectSearch::new(project, cx));
+        let search_view = cx.add_window(|window, cx| {
+            ProjectSearchView::new(workspace.downgrade(), search, window, cx, None)
+        });
+
+        perform_search(search_view, "NEEDLE", cx);
+
+        cx.activate_a11y(search_view.into());
+        let json = cx
+            .update_window(search_view.into(), |_, window, cx| {
+                window.draw(cx).clear(cx);
+                window.debug_a11y_tree_json()
+            })
+            .unwrap()
+            .expect("activation makes the debug tree available");
+        let tree: serde_json::Value = serde_json::from_str(&json).expect("the dump is valid JSON");
+        gpui::a11y_checks::assert_interactive_nodes_are_named(&tree, "search results");
+        gpui::a11y_checks::assert_names_are_distinguishable(&tree, "search results");
+        gpui::a11y_checks::assert_focusable_names_are_distinguishable(&tree, "search results");
+
+        let mut headers: Vec<&str> = tree["nodes"]
+            .as_object()
+            .expect("the dump lists nodes")
+            .values()
+            .filter_map(|node| node["aria"]["label"].as_str())
+            .filter(|label| label.contains("main.rs"))
+            .collect();
+        headers.sort_unstable();
+        headers.dedup();
+        assert_eq!(
+            headers,
+            vec![
+                "Fold app/main.rs",
+                "Fold tests/main.rs",
+                "Open app/main.rs",
+                "Open tests/main.rs",
+            ],
+            "every control in a header has to say which file it acts on"
+        );
     }
 
     fn perform_search(

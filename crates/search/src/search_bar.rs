@@ -49,6 +49,8 @@ pub(super) fn render_action_button(
         SharedString::from(format!("{id_prefix}-{}", action.name())),
         icon,
     )
+    // Every search toggle goes through here, so this one name covers them all.
+    .aria_label(tooltip)
     .shape(IconButtonShape::Square)
     .on_click({
         let focus_handle = focus_handle.clone();
@@ -130,7 +132,13 @@ pub(crate) fn render_text_input(
         editor_style.syntax = app.theme().syntax().clone();
     }
 
-    EditorElement::new(editor, editor_style).single_line(editor.read(app).mode().is_single_line())
+    let single_line = editor.read(app).mode().is_single_line();
+    EditorElement::new(editor, editor_style)
+        .single_line(single_line)
+        // The project search query and replacement boxes are auto-height, not
+        // single line, so without this they carry no id, produce no node, and
+        // focus in them lands on nothing at all.
+        .focusable_region(!single_line)
 }
 
 /// This element makes all search inputs align as if they were in the same column

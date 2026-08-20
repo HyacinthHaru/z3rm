@@ -510,6 +510,21 @@ impl TestAppContext {
         self.test_window(window).simulate_a11y_activation();
     }
 
+    /// Sends an AccessKit action through the platform callback, the way a
+    /// screen reader would.
+    ///
+    /// A node that advertises an action but cannot be operated by it reads as
+    /// working right up until someone tries, so the dispatch path needs
+    /// checking from the crates that build the chrome, not only from GPUI.
+    /// Returns whether a callback was registered and invoked.
+    pub fn simulate_a11y_action(
+        &self,
+        window: AnyWindowHandle,
+        request: accesskit::ActionRequest,
+    ) -> bool {
+        self.test_window(window).simulate_a11y_action(request)
+    }
+
     /// Returns the `TestWindow` backing the given handle.
     pub(crate) fn test_window(&self, window: AnyWindowHandle) -> TestWindow {
         self.app
@@ -727,6 +742,11 @@ pub struct VisualTestContext {
 }
 
 impl VisualTestContext {
+    /// The handle of the window this context drives.
+    pub fn window_handle(&self) -> AnyWindowHandle {
+        self.window
+    }
+
     /// Provides a `Window` and `App` for the duration of the closure.
     pub fn update<R>(&mut self, f: impl FnOnce(&mut Window, &mut App) -> R) -> R {
         self.cx

@@ -1712,6 +1712,37 @@ impl Render for MuxPaneView {
 
         // §16.4 a11y: the root exposes the pane title as a labelled group,
         // while the TerminalElement child owns the Terminal/TextRun tree.
+        //
+        // Prefix and copy mode both change what every key does. A sighted user
+        // sees the hint panel and the selection; without saying so here, the
+        // pane announces the same name in all three states.
+        // Untruncated, unlike the tab title beside it. `title(true)` cuts to 25
+        // characters so a tab strip can hold several, and a reader is given one
+        // pane at a time — two panes running long commands that differ past the
+        // cut would otherwise announce identically.
+        let announced_title = self.terminal.read(cx).title(false);
+        // Copy mode is the same disjunction the key dispatcher uses: vi mode
+        // changes what keys do just as much, and announcing only one of the two
+        // would be silent in a state where the keyboard behaves differently.
+        let in_copy_mode = self.terminal_view.read(cx).copy_mode_state().active
+            || self.terminal.read(cx).vi_mode_enabled();
+        let mut states: Vec<&str> = Vec::new();
+        if self.is_prefix_mode() {
+            states.push("prefix mode");
+        } else if in_copy_mode {
+            states.push("copy mode");
+        }
+        // Zooming hides every other pane. A sighted user sees that at once; from
+        // the tree it is indistinguishable from a window that only ever had one
+        // pane. Same word the sidebar uses for it.
+        if self.zoomed {
+            states.push("zoomed");
+        }
+        let announced_title = if states.is_empty() {
+            announced_title
+        } else {
+            format!("{announced_title}, {}", states.join(", "))
+        };
 
         div()
             .size_full()
@@ -1719,7 +1750,7 @@ impl Render for MuxPaneView {
             .id("mux-pane-root")
             .track_focus(&self.focus_handle)
             .role(gpui::Role::Group)
-            .aria_label(self.terminal.read(cx).title(true))
+            .aria_label(SharedString::from(announced_title))
             .key_context(dispatch_context)
             .bg(colors.editor_background)
             .child(
@@ -1815,6 +1846,13 @@ impl Item for MuxPaneView {
         self.terminal.read(cx).title(true).into()
     }
 
+    fn tab_announcement_text(&self, _detail: usize, cx: &App) -> SharedString {
+        // Uncut. `title(true)` stops at 25 characters so a strip can hold
+        // several, and a terminal's title is the command it is running —
+        // several panes deep into the same build differ well past that.
+        self.terminal.read(cx).title(false).into()
+    }
+
     fn suggested_filename(&self, cx: &App) -> SharedString {
         self.terminal.read(cx).title(true).into()
     }
@@ -1878,62 +1916,95 @@ mod tests {
     ) -> Result<(), String> {
         use std::io::{Read, Write};
 
+        // Short, because the loop below now uses a timeout to mean "the client
+        // has stopped asking" rather than "give up". A join therefore costs at
+        // most this long after the last request.
         stream
-            .set_read_timeout(Some(std::time::Duration::from_secs(5)))
+            .set_read_timeout(Some(std::time::Duration::from_millis(250)))
             .map_err(|error| format!("set mock mux read timeout: {error}"))?;
 
-        let mut prefix = Vec::with_capacity(mux_protocol::MAX_VARINT_LEN);
-        loop {
-            let mut byte = [0u8; 1];
+        // The client also sends a `ResizePane` once its viewport size is known,
+        // and whether that lands before or after the initial fetch depends on
+        // how many frames were drawn first — which changes when accessibility
+        // is active. These tests are about the fetch, so skip past anything
+        // else rather than pinning the wire order.
+        // Every fetch is answered, not just the first. The client sends a
+        // `ResizePane` once its viewport size is known and can fetch again
+        // afterwards, and a server that answered once and exited left that
+        // second request hanging — the pane then kept its blank local grid.
+        // That is what made two of these tests fail under load and never on
+        // their own.
+        let mut answered = 0usize;
+        'requests: loop {
+            let mut prefix = Vec::with_capacity(mux_protocol::MAX_VARINT_LEN);
+            loop {
+                let mut byte = [0u8; 1];
+                match stream.read_exact(&mut byte) {
+                    Ok(()) => {}
+                    // The client has gone quiet or hung up; either way there is
+                    // nothing left to serve.
+                    Err(error)
+                        if matches!(
+                            error.kind(),
+                            std::io::ErrorKind::WouldBlock
+                                | std::io::ErrorKind::TimedOut
+                                | std::io::ErrorKind::UnexpectedEof
+                        ) =>
+                    {
+                        break 'requests;
+                    }
+                    Err(error) => {
+                        return Err(format!("read initial grid request prefix: {error}"));
+                    }
+                }
+                prefix.push(byte[0]);
+                if byte[0] & 0x80 == 0 {
+                    break;
+                }
+                if prefix.len() == mux_protocol::MAX_VARINT_LEN {
+                    return Err("initial grid request used an overlong frame prefix".to_string());
+                }
+            }
+
+            let (raw_len, prefix_len) = mux_protocol::parse_len_prefix(&prefix)
+                .map_err(|error| format!("parse initial grid request prefix: {error}"))?
+                .ok_or_else(|| "initial grid request prefix was incomplete".to_string())?;
+            let payload_len = mux_protocol::check_frame_len(raw_len)
+                .map_err(|error| format!("validate initial grid request length: {error}"))?;
+            let mut framed = prefix;
+            framed.resize(prefix_len + payload_len, 0);
             stream
-                .read_exact(&mut byte)
-                .map_err(|error| format!("read initial grid request prefix: {error}"))?;
-            prefix.push(byte[0]);
-            if byte[0] & 0x80 == 0 {
-                break;
-            }
-            if prefix.len() == mux_protocol::MAX_VARINT_LEN {
-                return Err("initial grid request used an overlong frame prefix".to_string());
-            }
-        }
+                .read_exact(&mut framed[prefix_len..])
+                .map_err(|error| format!("read initial grid request payload: {error}"))?;
 
-        let (raw_len, prefix_len) = mux_protocol::parse_len_prefix(&prefix)
-            .map_err(|error| format!("parse initial grid request prefix: {error}"))?
-            .ok_or_else(|| "initial grid request prefix was incomplete".to_string())?;
-        let payload_len = mux_protocol::check_frame_len(raw_len)
-            .map_err(|error| format!("validate initial grid request length: {error}"))?;
-        let mut framed = prefix;
-        framed.resize(prefix_len + payload_len, 0);
-        stream
-            .read_exact(&mut framed[prefix_len..])
-            .map_err(|error| format!("read initial grid request payload: {error}"))?;
-
-        let (envelope, consumed) = mux_protocol::unframe(&framed)
-            .map_err(|error| format!("decode initial grid request: {error}"))?;
-        if consumed != framed.len() {
-            return Err(format!(
-                "initial grid request left {} trailing bytes",
-                framed.len() - consumed
-            ));
-        }
-        let request = match envelope.payload {
-            Some(EnvelopePayload::Request(request)) => request,
-            payload => {
+            let (envelope, consumed) = mux_protocol::unframe(&framed)
+                .map_err(|error| format!("decode initial grid request: {error}"))?;
+            if consumed != framed.len() {
                 return Err(format!(
-                    "expected initial request envelope, got {payload:?}"
+                    "initial grid request left {} trailing bytes",
+                    framed.len() - consumed
                 ));
             }
-        };
-        let fetch = match request.body {
-            Some(RequestBody::FetchGridUpdate(fetch)) => fetch,
-            body => return Err(format!("expected initial FetchGridUpdate, got {body:?}")),
-        };
-        if fetch.pane_id != expected_pane_id || fetch.since_generation != 0 {
-            return Err(format!(
-                "unexpected initial fetch target/generation: {}@{}",
-                fetch.pane_id, fetch.since_generation
-            ));
-        }
+            let request = match envelope.payload {
+                Some(EnvelopePayload::Request(request)) => request,
+                payload => {
+                    return Err(format!(
+                        "expected initial request envelope, got {payload:?}"
+                    ));
+                }
+            };
+            let (request_id, fetch) = match request.body {
+                Some(RequestBody::FetchGridUpdate(fetch)) => (request.request_id, fetch),
+                Some(RequestBody::ResizePane(_)) => continue,
+                body => return Err(format!("expected initial FetchGridUpdate, got {body:?}")),
+            };
+
+            if fetch.pane_id != expected_pane_id || fetch.since_generation != 0 {
+                return Err(format!(
+                    "unexpected initial fetch target/generation: {}@{}",
+                    fetch.pane_id, fetch.since_generation
+                ));
+            }
 
         let cells = ["q", "u", "i", "e", "t"]
             .into_iter()
@@ -1965,7 +2036,7 @@ mod tests {
         let response = Envelope {
             version: Some(mux_protocol::PROTOCOL_VERSION),
             payload: Some(EnvelopePayload::Response(Response {
-                request_id: request.request_id,
+                request_id,
                 body: Some(ResponseBody::GridUpdate(FetchGridUpdateResponse {
                     from_generation: 0,
                     to_generation: 7,
@@ -1994,14 +2065,23 @@ mod tests {
                 })),
             })),
         };
-        let response = mux_protocol::frame(&response)
-            .map_err(|error| format!("encode initial grid response: {error}"))?;
-        stream
-            .write_all(&response)
-            .map_err(|error| format!("write initial grid response: {error}"))?;
-        stream
-            .flush()
-            .map_err(|error| format!("flush initial grid response: {error}"))
+            let response = mux_protocol::frame(&response)
+                .map_err(|error| format!("encode initial grid response: {error}"))?;
+            stream
+                .write_all(&response)
+                .map_err(|error| format!("write initial grid response: {error}"))?;
+            stream
+                .flush()
+                .map_err(|error| format!("flush initial grid response: {error}"))?;
+            answered += 1;
+        }
+
+        // Timing out with nothing served is still a failure: it means the
+        // client never asked, which is the bug this fixture exists to catch.
+        if answered == 0 {
+            return Err("client never requested the initial grid".to_string());
+        }
+        Ok(())
     }
 
     #[cfg(unix)]
@@ -2263,14 +2343,21 @@ mod tests {
             .set_read_timeout(Some(std::time::Duration::from_secs(5)))
             .map_err(|error| format!("set race server read timeout: {error}"))?;
 
-        let first = read_test_envelope(&mut stream, "first grid request")?;
-        let first = match first.payload {
-            Some(EnvelopePayload::Request(request)) => request,
-            payload => return Err(format!("expected first request, got {payload:?}")),
-        };
-        let first_fetch = match first.body {
-            Some(RequestBody::FetchGridUpdate(fetch)) => fetch,
-            body => return Err(format!("expected first grid fetch, got {body:?}")),
+        // The viewport-size `ResizePane` may land before the initial fetch
+        // depending on how many frames were drawn first, which changes when
+        // accessibility is active. This test is about the fetch/dirty race, so
+        // skip anything else rather than pinning the wire order.
+        let (first_request_id, first_fetch) = loop {
+            let first = read_test_envelope(&mut stream, "first grid request")?;
+            let first = match first.payload {
+                Some(EnvelopePayload::Request(request)) => request,
+                payload => return Err(format!("expected first request, got {payload:?}")),
+            };
+            match first.body {
+                Some(RequestBody::FetchGridUpdate(fetch)) => break (first.request_id, fetch),
+                Some(RequestBody::ResizePane(_)) => continue,
+                body => return Err(format!("expected first grid fetch, got {body:?}")),
+            }
         };
         if first_fetch.pane_id != "race-pane" || first_fetch.since_generation != 0 {
             return Err(format!(
@@ -2287,7 +2374,7 @@ mod tests {
             .map_err(|error| format!("wait to release first response: {error}"))?;
         write_test_envelope(
             &mut stream,
-            &grid_response(first.request_id, 0, 7, 0),
+            &grid_response(first_request_id, 0, 7, 0),
             "first grid response",
         )?;
 
@@ -2497,6 +2584,283 @@ mod tests {
             assert!(content.mode.contains(Modes::APP_CURSOR));
             assert!(content.mode.contains(Modes::BRACKETED_PASTE));
         });
+    }
+
+    /// Prefix and copy mode change what every key does. A sighted user sees the
+    /// hint panel or the selection; without saying so in the pane's name, the
+    /// pane announces identically in all three states.
+    #[cfg(unix)]
+    #[gpui::test]
+    async fn prefix_mode_changes_what_the_pane_announces(cx: &mut TestAppContext) {
+        cx.executor().allow_parking();
+        cx.update(|cx| {
+            let settings_store = SettingsStore::test(cx);
+            cx.set_global(settings_store);
+            theme_settings::init(theme::LoadThemes::JustBase, cx);
+        });
+
+        let (client, server) = match std::os::unix::net::UnixStream::pair() {
+            Ok(pair) => pair,
+            Err(error) => panic!("create mock mux socket pair: {error}"),
+        };
+        if let Err(error) = client.set_nonblocking(true) {
+            panic!("set mock mux client nonblocking: {error}");
+        }
+        let domain = match MuxDomain::connect_with_blocking_stream(client) {
+            Ok(domain) => std::sync::Arc::new(domain),
+            Err(error) => panic!("connect mock mux domain: {error}"),
+        };
+        let server_thread = std::thread::spawn(move || serve_initial_grid(server, "quiet-pane"));
+
+        let (view, cx) = cx.add_window_view(|window, cx| {
+            MuxPaneView::new(
+                "quiet-pane".to_string(),
+                domain,
+                WeakEntity::new_invalid(),
+                WeakEntity::new_invalid(),
+                window,
+                cx,
+            )
+        });
+        // Pumped before the join: the mock server blocks reading with a
+        // timeout, and the request it is waiting for is sent by a task on this
+        // thread. Joining first means the timeout races the scheduler, which is
+        // why this passed alone and failed under load.
+        cx.run_until_parked();
+        match server_thread.join() {
+            Ok(Ok(())) => {}
+            Ok(Err(error)) => panic!("mock mux server failed: {error}"),
+            Err(_) => panic!("mock mux server panicked"),
+        }
+        cx.run_until_parked();
+
+        cx.activate_a11y(cx.window_handle());
+        let pane_label = |cx: &mut gpui::VisualTestContext| {
+            let json = cx
+                .update(|window, cx| {
+                    window.draw(cx).clear(cx);
+                    window.debug_a11y_tree_json()
+                })
+                .expect("activation makes the debug tree available");
+            let tree: serde_json::Value =
+                serde_json::from_str(&json).expect("the dump is valid JSON");
+            gpui::a11y_checks::assert_interactive_nodes_are_named(&tree, "mux pane");
+            gpui::a11y_checks::assert_names_are_distinguishable(&tree, "mux pane");
+            gpui::a11y_checks::assert_focusable_names_are_distinguishable(&tree, "mux pane");
+            gpui::a11y_checks::assert_clickable_elements_are_reachable(&tree, "mux pane");
+            gpui::a11y_checks::assert_click_targets_are_reachable(&tree, "mux pane");
+            gpui::a11y_checks::assert_controls_have_area(&tree, "mux pane");
+            gpui::a11y_checks::assert_landmarks_are_distinguishable(&tree, "mux pane");
+            gpui::a11y_checks::assert_active_descendant_is_honoured(&tree, "mux pane");
+            gpui::a11y_checks::assert_no_role_was_discarded(&tree, "mux pane");
+            gpui::a11y_checks::assert_no_aria_was_discarded(&tree, "mux pane");
+            gpui::a11y_checks::assert_roles_are_contained(&tree, "mux pane");
+            tree["nodes"]
+                .as_object()
+                .expect("the dump lists nodes")
+                .values()
+                .find(|node| node["element_id"].as_str() == Some("Name(\"mux-pane-root\")"))
+                .and_then(|node| node["aria"]["label"].as_str().map(str::to_string))
+        };
+
+        let plain = pane_label(cx).expect("the pane root is named");
+        assert!(
+            !plain.contains("prefix mode"),
+            "an idle pane must not claim a mode: {plain}"
+        );
+
+        // Entered directly rather than through `enter_prefix_mode`, which first
+        // asks whether a full-screen application owns the keyboard and passes
+        // the prefix key through when one does. The snapshot this mock server
+        // sends sets `alternate_screen`, so once it has been applied the pane
+        // is running a full-screen application and the mode correctly never
+        // engages. What this test is about is what the pane announces for a
+        // state, so it sets the state.
+        //
+        // Nothing here waits for that snapshot, and the assertion below is
+        // written so that it does not care whether it has arrived. An earlier
+        // version asserted the fixture was full-screen first, which made the
+        // test depend on bytes having crossed a real socket by a particular
+        // moment; it failed about one run in three under a parallel suite and
+        // never once on its own.
+        view.update_in(cx, |view, _window, cx| {
+            view.prefix_machine = PrefixModeMachine::new(PrefixModeConfig {
+                timeout_ms: 5_000,
+                full_screen_passthrough: false,
+            });
+            view.prefix_machine.on_prefix_key();
+            cx.notify();
+        });
+        // Deliberately not pumped: prefix mode arms a timeout that leaves it
+        // again, and the test executor advances timers when it would otherwise
+        // park. Pumping here raced that timeout — under load, something else
+        // was still runnable and the timer did not fire; idle, it did not
+        // matter either way. The state is set synchronously and `pane_label`
+        // draws, so there is nothing to wait for.
+        let announced = pane_label(cx).expect("the pane root is still named");
+        // A suffix rather than an equality against the earlier label: the base
+        // name is the terminal's title, which the mock server's snapshot can
+        // change at any point, and this test is about the mode rather than the
+        // title.
+        assert!(
+            announced.ends_with(", prefix mode"),
+            "entering prefix mode has to change what the pane announces: {announced}"
+        );
+
+        // Copy mode is the other state where the keyboard behaves differently,
+        // and it is reached from a different code path, so it needs its own
+        // check rather than being assumed from the prefix case.
+        view.update_in(cx, |view, _window, cx| {
+            // Leave prefix mode the way a timeout would, so the next assertion
+            // is about copy mode rather than a leftover prefix.
+            view.prefix_machine.on_timeout();
+            view.terminal_view.update(cx, |terminal_view, cx| {
+                terminal_view.enter_copy_mode_for_test(cx);
+            });
+        });
+        cx.run_until_parked();
+
+        assert_eq!(
+            pane_label(cx).as_deref(),
+            Some(format!("{plain}, copy mode").as_str()),
+            "entering copy mode has to change what the pane announces"
+        );
+
+        // Zooming is orthogonal to the keyboard modes and hides every other
+        // pane, so it has to be announced alongside whichever mode is active
+        // rather than replacing it.
+        view.update_in(cx, |view, _window, cx| {
+            view.set_zoomed_from_snapshot(true, cx);
+        });
+        cx.run_until_parked();
+
+        assert_eq!(
+            pane_label(cx).as_deref(),
+            Some(format!("{plain}, copy mode, zoomed").as_str()),
+            "a zoomed pane looks nothing like an unzoomed one and has to say so"
+        );
+    }
+
+    /// Copy mode exists so the user can select terminal output. A collapsed
+    /// caret is checked elsewhere; a real selection takes a different path,
+    /// and it is the one that makes copy mode worth entering with a screen
+    /// reader.
+    #[cfg(unix)]
+    #[gpui::test]
+    async fn a_terminal_selection_is_reported_as_a_text_range(cx: &mut TestAppContext) {
+        cx.executor().allow_parking();
+        cx.update(|cx| {
+            let settings_store = SettingsStore::test(cx);
+            cx.set_global(settings_store);
+            theme_settings::init(theme::LoadThemes::JustBase, cx);
+        });
+
+        let (client, server) = match std::os::unix::net::UnixStream::pair() {
+            Ok(pair) => pair,
+            Err(error) => panic!("create mock mux socket pair: {error}"),
+        };
+        if let Err(error) = client.set_nonblocking(true) {
+            panic!("set mock mux client nonblocking: {error}");
+        }
+        let domain = match MuxDomain::connect_with_blocking_stream(client) {
+            Ok(domain) => std::sync::Arc::new(domain),
+            Err(error) => panic!("connect mock mux domain: {error}"),
+        };
+        let server_thread = std::thread::spawn(move || serve_initial_grid(server, "quiet-pane"));
+
+        let (view, cx) = cx.add_window_view(|window, cx| {
+            MuxPaneView::new(
+                "quiet-pane".to_string(),
+                domain,
+                WeakEntity::new_invalid(),
+                WeakEntity::new_invalid(),
+                window,
+                cx,
+            )
+        });
+        // Pumped before the join: the mock server blocks reading with a
+        // timeout, and the request it is waiting for is sent by a task on this
+        // thread. Joining first means the timeout races the scheduler, which is
+        // why this passed alone and failed under load.
+        cx.run_until_parked();
+        // Joined at the end rather than here. The server now answers every
+        // fetch until the client goes quiet, and the client can fetch again
+        // after the resize that follows its first frames — so joining before
+        // the assertions would kill it while it still had work to do.
+        cx.run_until_parked();
+
+        cx.activate_a11y(cx.window_handle());
+        let selection = |cx: &mut gpui::VisualTestContext| {
+            let json = cx
+                .update(|window, cx| {
+                    window.draw(cx).clear(cx);
+                    window.debug_a11y_tree_json()
+                })
+                .expect("activation makes the debug tree available");
+            let tree: serde_json::Value =
+                serde_json::from_str(&json).expect("the dump is valid JSON");
+            gpui::a11y_checks::assert_interactive_nodes_are_named(&tree, "terminal selection");
+            gpui::a11y_checks::assert_no_role_was_discarded(&tree, "terminal selection");
+            gpui::a11y_checks::assert_no_aria_was_discarded(&tree, "terminal selection");
+            gpui::a11y_checks::assert_roles_are_contained(&tree, "terminal selection");
+            gpui::a11y_checks::assert_focus_reached_the_tree(&tree, "terminal selection");
+            gpui::a11y_checks::assert_click_targets_are_reachable(&tree, "terminal selection");
+            gpui::a11y_checks::assert_landmarks_are_distinguishable(&tree, "terminal selection");
+            gpui::a11y_checks::assert_names_are_distinguishable(&tree, "terminal selection");
+            gpui::a11y_checks::assert_focusable_names_are_distinguishable(&tree, "terminal selection");
+            gpui::a11y_checks::assert_clickable_elements_are_reachable(&tree, "terminal selection");
+            gpui::a11y_checks::assert_controls_have_area(&tree, "terminal selection");
+            gpui::a11y_checks::assert_active_descendant_is_honoured(&tree, "terminal selection");
+            tree["nodes"]
+                .as_object()
+                .expect("the dump lists nodes")
+                .values()
+                .find(|node| node["aria"]["role"] == "Terminal")
+                .and_then(|node| node["aria"]["text_selection"].as_object().cloned())
+        };
+
+        // The grid arrives over the socket after the pane is mounted, so the
+        // first frames legitimately have no content and no caret in them.
+        //
+        // A real sleep, which is not the usual advice. `MuxDomain` reads the
+        // socket on an OS thread of its own, so what this waits for is not
+        // scheduled by GPUI at all: `run_until_parked` returns the moment
+        // nothing is runnable and an executor timer only advances the test
+        // clock, neither of which gives that thread wall-clock time to make
+        // progress. `allow_parking` is on above for exactly this reason.
+        let mut caret = None;
+        for _ in 0..500 {
+            caret = selection(cx);
+            if caret.is_some() {
+                break;
+            }
+            cx.run_until_parked();
+            std::thread::sleep(std::time::Duration::from_millis(2));
+        }
+        let caret = caret.expect("the terminal reports a caret once its grid has arrived");
+        assert_eq!(
+            caret.get("anchor"),
+            caret.get("focus"),
+            "with nothing selected the caret is collapsed: {caret:?}"
+        );
+
+        view.update(cx, |view, cx| {
+            view.terminal.update(cx, |terminal, _| terminal.select_all());
+        });
+        cx.run_until_parked();
+
+        let range = selection(cx).expect("the terminal still reports a selection");
+        assert_ne!(
+            range.get("anchor"),
+            range.get("focus"),
+            "a selection has to be reported as a range, not as a caret: {range:?}"
+        );
+
+        match server_thread.join() {
+            Ok(Ok(())) => {}
+            Ok(Err(error)) => panic!("mock mux server failed: {error}"),
+            Err(_) => panic!("mock mux server panicked"),
+        }
     }
 
     /// §15.4 After a reconnect resync, the server-authoritative title/zoom
@@ -3214,5 +3578,154 @@ mod tests {
             Err(_) => Vec::new(),
         };
         assert!(again.is_empty(), "buffer must be empty after drain");
+    }
+
+    /// A terminal in the real window lives inside the workspace pane group,
+    /// which is a cached view. Every mux pane test above renders the view in a
+    /// window of its own, so none of them exercise the path the product takes —
+    /// the one where a cached subtree that stopped prepainting would drop out
+    /// of the tree entirely.
+    #[cfg(unix)]
+    #[gpui::test]
+    async fn a_terminal_in_a_workspace_pane_is_announced_on_every_frame(cx: &mut TestAppContext) {
+        cx.executor().allow_parking();
+        let params = cx.update(workspace::AppState::test);
+        cx.update(|cx| {
+            let settings_store = SettingsStore::test(cx);
+            cx.set_global(settings_store);
+            theme_settings::init(theme::LoadThemes::JustBase, cx);
+        });
+
+        let project = project::Project::test(params.fs.clone(), [], cx).await;
+        let window_handle = cx
+            .add_window(|window, cx| workspace::MultiWorkspace::test_new(project, window, cx));
+        let workspace = window_handle
+            .read_with(cx, |multi_workspace, _| multi_workspace.workspace().clone())
+            .expect("the window is open");
+        let cx = &mut gpui::VisualTestContext::from_window(window_handle.into(), cx);
+
+        // Started only once the workspace exists: the mock server reads with a
+        // timeout, and building a project and a window takes longer than it.
+        let (client, server) = match std::os::unix::net::UnixStream::pair() {
+            Ok(pair) => pair,
+            Err(error) => panic!("create mock mux socket pair: {error}"),
+        };
+        if let Err(error) = client.set_nonblocking(true) {
+            panic!("set mock mux client nonblocking: {error}");
+        }
+        let domain = match MuxDomain::connect_with_blocking_stream(client) {
+            Ok(domain) => std::sync::Arc::new(domain),
+            Err(error) => panic!("connect mock mux domain: {error}"),
+        };
+        let server_thread = std::thread::spawn(move || serve_initial_grid(server, "hosted-pane"));
+
+        let pane_view = cx.update(|window, cx| {
+            cx.new(|cx| {
+                MuxPaneView::new(
+                    "hosted-pane".to_string(),
+                    domain,
+                    WeakEntity::new_invalid(),
+                    WeakEntity::new_invalid(),
+                    window,
+                    cx,
+                )
+            })
+        });
+        // The pane only asks for its grid once it is on screen, so the mock
+        // server is joined after the item has been mounted and drawn.
+        let pane = workspace.read_with(cx, |workspace, _| workspace.active_pane().clone());
+        pane.update_in(cx, |pane, window, cx| {
+            pane.add_item(Box::new(pane_view), true, true, None, window, cx);
+        });
+        cx.run_until_parked();
+        match server_thread.join() {
+            Ok(Ok(())) => {}
+            Ok(Err(error)) => panic!("mock mux server failed: {error}"),
+            Err(_) => panic!("mock mux server panicked"),
+        }
+        cx.run_until_parked();
+
+        // Focused so the tree check below is about a focused pane rather than
+        // an idle one: focus is where a reader starts.
+        pane.update_in(cx, |pane, window, cx| {
+            pane.focus_active_item(window, cx);
+        });
+        cx.run_until_parked();
+
+        cx.activate_a11y(cx.window_handle());
+
+        // The grid arrives over the socket after the pane is mounted, so the
+        // first frames legitimately have nothing to say. Once the text is
+        // there it must stay there: the pane group is a cached view, and a
+        // cached subtree that stopped prepainting would drop out of the tree.
+        let read_frame = |cx: &mut gpui::VisualTestContext| {
+            let json = cx
+                .update(|window, cx| {
+                    window.draw(cx).clear(cx);
+                    window.debug_a11y_tree_json()
+                })
+                .expect("activation makes the debug tree available");
+            let tree: serde_json::Value =
+                serde_json::from_str(&json).expect("the dump is valid JSON");
+            let nodes = tree["nodes"].as_object().expect("the dump lists nodes");
+            // The surface has to say it can take focus, not merely accept it
+            // when GPUI hands it over: `Action::Focus` is how assistive
+            // technology knows it may ask, and `Interactivity` writes it from a
+            // method this element overrides without delegating.
+            let focused = tree["gpui_focus"]
+                .as_str()
+                .and_then(|id| nodes.get(id))
+                .unwrap_or_else(|| panic!("the terminal holds focus: {json}"));
+            assert!(
+                focused["aria"]["on_action"]
+                    .as_array()
+                    .into_iter()
+                    .flatten()
+                    .any(|action| action == "Focus"),
+                "the focused surface has to advertise that it takes focus: {focused}"
+            );
+            gpui::a11y_checks::assert_focus_reached_the_tree(&tree, "hosted terminal");
+            let named = nodes
+                .values()
+                .find(|node| node["element_id"].as_str() == Some("Name(\"mux-pane-root\")"))
+                .and_then(|node| node["aria"]["label"].as_str())
+                .unwrap_or_default()
+                .to_string();
+            let text_runs: Vec<String> = nodes
+                .values()
+                .filter(|node| node["aria"]["role"] == "TextRun")
+                .filter_map(|node| node["aria"]["value"].as_str().map(str::to_string))
+                .collect();
+            (named, text_runs)
+        };
+
+        // The first cell carries a combining acute accent, so the plain word is
+        // not a substring of what the terminal reports.
+        const SERVED_GRID_TEXT: &str = "q\u{301}uiet";
+
+        let mut settled = None;
+        for _ in 0..20 {
+            let frame = read_frame(cx);
+            if frame.1.iter().any(|value| value.contains(SERVED_GRID_TEXT)) {
+                settled = Some(frame);
+                break;
+            }
+            cx.run_until_parked();
+        }
+        let (named, text_runs) =
+            settled.expect("the served grid text never reached the accessibility tree");
+        assert!(!named.is_empty(), "the hosted terminal must be announced");
+
+        for frame in 1..=2 {
+            let (named, text_runs_again) = read_frame(cx);
+            assert!(
+                !named.is_empty(),
+                "the pane lost its name on redraw {frame}"
+            );
+            assert_eq!(
+                text_runs_again, text_runs,
+                "the grid stopped reaching the tree on redraw {frame}"
+            );
+        }
     }
 }

@@ -15,8 +15,8 @@ use language::CursorShape as EditorCursorShape;
 use settings::Settings;
 use std::time::Instant;
 use terminal::{
-    Cell, Color, Content, CursorShape, IndexedCell, Modes, NamedColor, Point, Range, ScrollLineDown,
-    ScrollLineUp, Terminal, TerminalBounds, VisibleImage,
+    Cell, Color, Content, CursorShape, IndexedCell, Modes, NamedColor, Point, Range,
+    ScrollLineDown, ScrollLineUp, Terminal, TerminalBounds, VisibleImage,
     is_app_chosen_exact_color as terminal_is_app_chosen_exact_color, is_default_background_color,
     terminal_settings::TerminalSettings,
 };
@@ -57,6 +57,9 @@ pub struct LayoutState {
     content_mode: ContentMode,
     /// kitty graphics / OSC 1337 图像叠加层, 已按 z-index 排好绘制顺序。
     images: Vec<(VisibleImage, std::sync::Arc<gpui::RenderImage>)>,
+    /// What this surface is called, captured here because the accessibility
+    /// hooks run without a context to read the terminal from.
+    a11y_name: gpui::SharedString,
 }
 
 /// Helper struct for converting terminal cursor points to displayed cursor points.
@@ -887,7 +890,9 @@ impl TerminalElement {
                 accesskit::Action::ScrollUp,
                 move |_data, window, cx| {
                     terminal_view
-                        .update(cx, |view, cx| view.scroll_line_up(&ScrollLineUp, window, cx))
+                        .update(cx, |view, cx| {
+                            view.scroll_line_up(&ScrollLineUp, window, cx)
+                        })
                         .ok();
                 },
             );
@@ -986,8 +991,9 @@ impl Element for TerminalElement {
     }
 
     fn write_a11y_info(&self, node: &mut accesskit::Node) {
-        // Stable, translatable-ish label so the surface is not nameless. The
-        // pane title is announced by the parent; this only names the content.
+        // A fallback only. `a11y_synthetic_children` replaces this with the
+        // terminal's title, which it can do because it runs after prepaint has
+        // read it; this is what the node says if that never happens.
         node.set_label("terminal output".to_string());
     }
 
@@ -1006,6 +1012,20 @@ impl Element for TerminalElement {
         prepaint: &mut Self::PrepaintState,
         builder: &mut A11ySubtreeBuilder,
     ) {
+        // The name, set here rather than in `write_a11y_info`, which has no
+        // context to read the terminal from. This is the node focus lands on
+        // when a pane is entered, and it used to say "terminal output" for
+        // every terminal in the window — so switching panes moved focus from
+        // one identically-named surface to another and said nothing about
+        // which. The pane's own title is on the group around it, and relying
+        // on a platform to announce that group change is the assumption this
+        // branch has repeatedly found to be wrong.
+        builder
+            .parent_node()
+            .set_label(prepaint.a11y_name.to_string());
+        // `Role::Terminal` is an `AXTextArea` on macOS, which does not say
+        // "terminal" — and the role description is read on all three platforms.
+        builder.parent_node().set_role_description("terminal");
         push_terminal_line_text_runs(
             builder,
             &prepaint.batched_text_runs,
@@ -1067,6 +1087,14 @@ impl Element for TerminalElement {
         window: &mut Window,
         cx: &mut App,
     ) -> Self::PrepaintState {
+        // Declared the way a custom element has to. `Interactivity` writes
+        // `Action::Focus` onto the node from its own `write_a11y_info`, which
+        // this element overrides without delegating — and it cannot delegate,
+        // that method being crate-private to gpui. So the surface a
+        // multiplexer's focus lands on advertised no actions at all.
+        if let Some(global_id) = global_id {
+            window.report_a11y_focus_target(global_id, &self.focus);
+        }
         let rem_size = self.rem_size(cx);
         self.interactivity.prepaint(
             global_id,
@@ -1489,6 +1517,17 @@ impl Element for TerminalElement {
                     base_text_style: text_style,
                     content_mode,
                     images: resolve_terminal_images(&self.terminal, cx),
+                    // Uncut: the tab strip's 25-character budget is not this
+                    // surface's problem, and this is the name a reader is given
+                    // when focus lands here.
+                    a11y_name: {
+                        let title = self.terminal.read(cx).title(false);
+                        if title.is_empty() {
+                            gpui::SharedString::new_static("terminal output")
+                        } else {
+                            gpui::SharedString::from(title)
+                        }
+                    },
                 }
             },
         )
@@ -3209,8 +3248,8 @@ mod tests {
         assert_eq!(past_end.character_index, "git status".chars().count());
 
         // A blank row keeps an empty run, so the caret is addressable there.
-        let blank = terminal_text_position(&lines, (2, 3), &id)
-            .expect("a blank row still carries a run");
+        let blank =
+            terminal_text_position(&lines, (2, 3), &id).expect("a blank row still carries a run");
         assert_eq!(blank.node, fake_id(2, 0));
         assert_eq!(blank.character_index, 0);
 
@@ -3230,8 +3269,7 @@ mod tests {
         let lines = collect_terminal_lines(&runs);
         let id = fake_id;
 
-        let first =
-            terminal_text_position(&lines, (0, 7), &id).expect("caret in first chunk");
+        let first = terminal_text_position(&lines, (0, 7), &id).expect("caret in first chunk");
         assert_eq!(first.node, fake_id(0, 0));
         assert_eq!(first.character_index, 7);
 

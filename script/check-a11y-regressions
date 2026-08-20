@@ -1,0 +1,126 @@
+#!/usr/bin/env bash
+# Compare the workspace test failures against the known-failing baseline by
+# NAME, not by count.
+#
+# A matching count is not a matching set: the mux e2e suites alternate between
+# passing and failing under a loaded parallel run, so a real regression can slip
+# in while the total stays the same. This is exactly how a picker layout
+# regression went unnoticed for eleven rounds of accessibility work.
+#
+# Usage: script/check-a11y-regressions [--a11y]
+#   --a11y  run with accessibility active, which exercises code paths nothing
+#           else does (see crates/gpui/src/window/a11y.rs).
+set -uo pipefail
+
+BASELINE_FILE="$(dirname "$0")/a11y-regression-baseline.txt"
+
+if [[ "${1:-}" == "--a11y" ]]; then
+    export Z3RM_A11Y_BUILD_HEADLESS=1
+fi
+
+# Workspace tests spawn the real client and mux server, but `cargo test` does
+# not build binary targets for integration tests. Resolve Cargo's effective
+# target directory (including config and `CARGO_TARGET_DIR`), build both
+# helpers, and pass absolute paths to the full run and isolated re-runs.
+target_dir=$(cargo metadata --format-version=1 --no-deps \
+    | python3 -c 'import json, sys; print(json.load(sys.stdin)["target_directory"])')
+if ! cargo build -p mux_server --bin z3rm-server; then
+    echo "Failed to build z3rm-server for integration tests."
+    exit 1
+fi
+if ! cargo build -p z3rm --bin z3rm; then
+    echo "Failed to build z3rm for integration tests."
+    exit 1
+fi
+
+server_bin="$target_dir/debug/z3rm-server"
+client_bin="$target_dir/debug/z3rm"
+if [[ -f "$server_bin.exe" ]]; then
+    server_bin="$server_bin.exe"
+fi
+if [[ -f "$client_bin.exe" ]]; then
+    client_bin="$client_bin.exe"
+fi
+if [[ ! -f "$server_bin" || ! -f "$client_bin" ]]; then
+    echo "Cargo reported target directory $target_dir, but helper binaries are missing:"
+    echo "  $server_bin"
+    echo "  $client_bin"
+    exit 1
+fi
+export Z3RM_SERVER_BIN="$server_bin"
+export Z3RM_BIN="$client_bin"
+
+# The re-run below compiles again, so it reports on whatever the tree looks
+# like then rather than on what actually failed. Editing during a run turns a
+# real regression into a reassuring "passes alone".
+tree_before=$(git status --porcelain=v1; git rev-parse HEAD)
+
+output=$(cargo test --workspace --features gpui_platform/runtime_shaders --no-fail-fast 2>&1)
+
+# A crate whose tests do not compile runs none of them, and contributes no
+# failing test names — so without this it looks exactly like a clean crate.
+if printf '%s\n' "$output" | grep -qE '^error(\[E[0-9]+\])?: |^error: could not compile'; then
+    echo "Some tests did not compile, so their results are missing entirely:"
+    printf '%s\n' "$output" | grep -E '^error(\[E[0-9]+\])?: |^error: could not compile' | sort -u | head -20
+    exit 1
+fi
+# Only the names listed under cargo's own "failures:" heading, and only lines
+# shaped like a test path. Matching every indented lowercase line swept up
+# panic text too: "mux server error: pane not found" became six test names,
+# each of which then "passed alone" because it matched no test at all.
+failures=$(printf '%s\n' "$output" \
+    | awk '/^failures:$/ {collecting = 1; next}
+           /^$/ {collecting = 0}
+           collecting && /^    [a-z_][a-z0-9_]*(::[a-z0-9_]+)*$/ {sub(/^ +/, ""); print}' \
+    | sort -u)
+
+baseline=$(grep -vE '^\s*(#|$)' "$BASELINE_FILE" | sort -u)
+
+new=$(comm -13 <(printf '%s\n' "$baseline") <(printf '%s\n' "$failures"))
+fixed=$(comm -23 <(printf '%s\n' "$baseline") <(printf '%s\n' "$failures"))
+
+if [[ -n "$fixed" ]]; then
+    echo "These baseline failures now pass; drop them from the baseline:"
+    printf '  %s\n' $fixed
+fi
+
+if [[ -n "$new" && "$(git status --porcelain=v1; git rev-parse HEAD)" != "$tree_before" ]]; then
+    echo "The working tree changed while the suite ran, so these failures cannot"
+    echo "be re-checked against the code that produced them:"
+    printf '  %s\n' $new
+    exit 1
+fi
+
+if [[ -n "$new" ]]; then
+    # The mux suites spawn real servers and sockets and go flaky under a loaded
+    # parallel run, so a first failure is a candidate, not a verdict. Re-run
+    # each one on its own before calling it a regression.
+    confirmed=()
+    while IFS= read -r name; do
+        [[ -n "$name" ]] || continue
+        rerun=$(cargo test --workspace --features gpui_platform/runtime_shaders \
+            -- --exact "$name" 2>&1)
+        status=$?
+        # A filter that matches nothing exits 0 with every count at zero, which
+        # would read as "passes alone" and quietly bless a real failure.
+        ran=$(printf '%s\n' "$rerun" \
+            | grep -oE '^test result: [a-z]+\. [0-9]+ passed' \
+            | grep -oE '[0-9]+' | awk '{total += $1} END {print total + 0}')
+        if [[ "$status" -eq 0 && "$ran" -gt 0 ]]; then
+            echo "Flaky under load, passes alone: $name"
+        elif [[ "$status" -eq 0 ]]; then
+            echo "Re-run matched no test at all, so nothing was verified: $name"
+            confirmed+=("$name")
+        else
+            confirmed+=("$name")
+        fi
+    done <<< "$new" 
+
+    if [[ ${#confirmed[@]} -gt 0 ]]; then
+        echo "New failures not in the baseline:"
+        printf '  %s\n' "${confirmed[@]}"
+        exit 1
+    fi
+fi
+
+echo "No new failures."

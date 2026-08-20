@@ -514,6 +514,11 @@ impl TitleBar {
                 })
                 .trigger(
                     ButtonLike::new("remote_project")
+                        // Nothing but an icon and a status dot, so without this
+                        // it announces as a bare button — and the host it is
+                        // connected to is not written down anywhere else the
+                        // tree can reach.
+                        .aria_label(format!("{tooltip_title}: {nickname}"))
                         .selected_style(ButtonStyle::Tinted(TintColor::Accent))
                         .child(
                             h_flex().gap_2().max_w_32().child(
@@ -590,6 +595,13 @@ impl TitleBar {
         } else {
             "Open Recent Project".to_string()
         };
+        // A `Button` takes its accessible name from its visible label, so
+        // truncating before constructing one truncates what a reader is told:
+        // two projects whose names differ past the cut announce identically.
+        // The ellipsis is for the width of the title bar, not for the reader.
+        let announced_name = name
+            .clone()
+            .unwrap_or_else(|| SharedString::new_static("Open Recent Project"));
 
         let is_sidebar_open = self
             .multi_workspace
@@ -608,7 +620,12 @@ impl TitleBar {
 
         if is_sidebar_open && is_threads_list_view_active {
             return self
-                .render_recent_projects_popover(display_name, is_project_selected, cx)
+                .render_recent_projects_popover(
+                    display_name,
+                    announced_name,
+                    is_project_selected,
+                    cx,
+                )
                 .into_any_element();
         }
 
@@ -637,6 +654,7 @@ impl TitleBar {
             })
             .trigger(
                 Button::new("project_name_trigger", display_name)
+                    .aria_label(announced_name)
                     .label_size(LabelSize::Small)
                     .tab_index(0isize)
                     .when(self.worktree_count(cx) > 1, |this| {
@@ -656,6 +674,9 @@ impl TitleBar {
     fn render_recent_projects_popover(
         &self,
         display_name: String,
+        // The untruncated name, which is what the button announces; see the
+        // note where `display_name` is cut.
+        announced_name: SharedString,
         is_project_selected: bool,
         cx: &mut Context<Self>,
     ) -> impl IntoElement {
@@ -686,6 +707,7 @@ impl TitleBar {
             })
             .trigger(
                 Button::new("project_name_trigger", display_name)
+                    .aria_label(announced_name)
                     .label_size(LabelSize::Small)
                     .tab_index(0isize)
                     .when(self.worktree_count(cx) > 1, |this| {
@@ -709,25 +731,39 @@ impl TitleBar {
     ) -> Option<AnyElement> {
         let workspace = self.workspace.upgrade()?;
 
-        let (branch_name, icon_info, is_detached_head) = {
+        let (branch_name, announced_branch_name, icon_info, is_detached_head) = {
             let repo = repository.read(cx);
 
             let is_detached_head = repo.branch.is_none();
 
+            let short_sha = || {
+                repo.head_commit.as_ref().map(|commit| {
+                    commit
+                        .sha
+                        .chars()
+                        .take(MAX_SHORT_SHA_LENGTH)
+                        .collect::<String>()
+                })
+            };
             let branch_name = repo
                 .branch
                 .as_ref()
                 .map(|branch| branch.name())
                 .map(|name| util::truncate_and_trailoff(name, MAX_BRANCH_NAME_LENGTH))
-                .or_else(|| {
-                    repo.head_commit.as_ref().map(|commit| {
-                        commit
-                            .sha
-                            .chars()
-                            .take(MAX_SHORT_SHA_LENGTH)
-                            .collect::<String>()
-                    })
-                });
+                .or_else(short_sha);
+            // A `Button` takes its accessible name from its visible label, so
+            // the ellipsis meant for the title bar's width would otherwise be
+            // what a reader is told the branch is called — and long branch
+            // names share a prefix far more often than project names do.
+            //
+            // The short SHA is not truncation in the same sense: an abbreviated
+            // SHA is how the commit is referred to, so it is announced as it is
+            // shown.
+            let announced_branch_name = repo
+                .branch
+                .as_ref()
+                .map(|branch| branch.name().to_string())
+                .or_else(short_sha);
 
             let status = repo.status_summary();
             let tracked = status.index + status.worktree;
@@ -743,7 +779,12 @@ impl TitleBar {
                 (IconName::GitBranch, Color::Muted)
             };
 
-            (branch_name, icon_info, is_detached_head)
+            (
+                branch_name,
+                announced_branch_name,
+                icon_info,
+                is_detached_head,
+            )
         };
 
         let settings = TitleBarSettings::get_global(cx);
@@ -820,6 +861,9 @@ impl TitleBar {
                         )
                 } else {
                     Button::new("project_branch_trigger", branch_name)
+                        .when_some(announced_branch_name.clone(), |this, announced| {
+                            this.aria_label(announced)
+                        })
                         .selected_style(ButtonStyle::Tinted(TintColor::Accent))
                         .label_size(LabelSize::Small)
                         .color(Color::Muted)
@@ -862,5 +906,160 @@ impl TitleBar {
                 })
                 .into_any_element(),
         )
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use fs::FakeFs;
+    use gpui::TestAppContext;
+    use serde_json::json;
+
+    /// The bar holds the project name, the branch and the connection controls,
+    /// and had no role at all, so there was no landmark to jump to and the
+    /// remote-project button announced as a bare "button".
+    #[gpui::test]
+    async fn the_title_bar_is_a_named_landmark(cx: &mut TestAppContext) {
+        cx.update(|cx| {
+            let settings_store = settings::SettingsStore::test(cx);
+            cx.set_global(settings_store);
+            theme_settings::init(theme::LoadThemes::JustBase, cx);
+        });
+
+        let fs = FakeFs::new(cx.executor());
+        fs.insert_tree("/project", json!({ "main.rs": "" })).await;
+        let project = project::Project::test(fs, ["/project".as_ref()], cx).await;
+        let window =
+            cx.add_window(|window, cx| MultiWorkspace::test_new(project.clone(), window, cx));
+        let workspace = window
+            .read_with(cx, |multi_workspace, _| {
+                multi_workspace.workspace().clone()
+            })
+            .unwrap();
+        let mut cx = gpui::VisualTestContext::from_window(window.into(), cx);
+
+        // Installed the way the app installs it, so the test covers the path
+        // the product takes rather than a bar rendered on its own.
+        workspace.update_in(&mut cx, |workspace, window, cx| {
+            let title_bar =
+                cx.new(|cx| TitleBar::new("title-bar", workspace, None, window, cx));
+            workspace.set_titlebar_item(title_bar.into(), window, cx);
+        });
+        cx.run_until_parked();
+
+        cx.activate_a11y(cx.window_handle());
+        let json = cx
+            .update(|window, cx| {
+                window.draw(cx).clear(cx);
+                window.debug_a11y_tree_json()
+            })
+            .expect("activation makes the debug tree available");
+        let tree: serde_json::Value = serde_json::from_str(&json).expect("the dump is valid JSON");
+
+        gpui::a11y_checks::assert_interactive_nodes_are_named(&tree, "title bar");
+        gpui::a11y_checks::assert_no_role_was_discarded(&tree, "title bar");
+        gpui::a11y_checks::assert_no_aria_was_discarded(&tree, "title bar");
+        gpui::a11y_checks::assert_roles_are_contained(&tree, "title bar");
+        gpui::a11y_checks::assert_click_targets_are_reachable(&tree, "title bar");
+        gpui::a11y_checks::assert_focus_reached_the_tree(&tree, "title bar");
+        gpui::a11y_checks::assert_landmarks_are_distinguishable(&tree, "title bar");
+        gpui::a11y_checks::assert_names_are_distinguishable(&tree, "title bar");
+        gpui::a11y_checks::assert_focusable_names_are_distinguishable(&tree, "title bar");
+        gpui::a11y_checks::assert_clickable_elements_are_reachable(&tree, "title bar");
+        gpui::a11y_checks::assert_controls_have_area(&tree, "title bar");
+        gpui::a11y_checks::assert_active_descendant_is_honoured(&tree, "title bar");
+
+        let banner = tree["nodes"]
+            .as_object()
+            .expect("the dump lists nodes")
+            .values()
+            .find(|node| node["aria"]["role"] == "Banner")
+            .unwrap_or_else(|| panic!("the title bar is the window's banner landmark: {json}"));
+        assert_eq!(banner["aria"]["label"].as_str(), Some("Title bar"));
+
+        // The banner landmark and the toolbar inside it are two containers for
+        // one strip. Sharing a name describes two places where there is one,
+        // and `assert_names_are_distinguishable` cannot see it: they have
+        // different roles.
+        let mut containers: Vec<&str> = tree["nodes"]
+            .as_object()
+            .expect("the dump lists nodes")
+            .values()
+            .filter(|node| matches!(node["aria"]["role"].as_str(), Some("Banner") | Some("Toolbar")))
+            .filter_map(|node| node["aria"]["label"].as_str())
+            .collect();
+        containers.sort_unstable();
+        assert_eq!(
+            containers,
+            vec!["Status bar", "Title bar", "Title bar controls"],
+            "each container in the window has to say which one it is"
+        );
+    }
+
+    /// The title bar cuts the project name to `MAX_PROJECT_NAME_LENGTH` so it
+    /// fits, and a `Button` takes its accessible name from its visible label —
+    /// so the ellipsis meant for the layout became what a reader was told the
+    /// project is called. Two checkouts of the same repository differ in the
+    /// part that gets cut.
+    #[gpui::test]
+    async fn a_long_project_name_is_announced_in_full(cx: &mut TestAppContext) {
+        cx.update(|cx| {
+            let settings_store = settings::SettingsStore::test(cx);
+            cx.set_global(settings_store);
+            theme_settings::init(theme::LoadThemes::JustBase, cx);
+        });
+
+        const LONG_NAME: &str = "a-project-whose-name-is-comfortably-past-forty-characters";
+        assert!(
+            LONG_NAME.len() > MAX_PROJECT_NAME_LENGTH,
+            "the fixture only means anything if the name is cut"
+        );
+
+        let fs = FakeFs::new(cx.executor());
+        fs.insert_tree(format!("/{LONG_NAME}"), json!({ "main.rs": "" }))
+            .await;
+        let project =
+            project::Project::test(fs, [format!("/{LONG_NAME}").as_ref()], cx).await;
+        let window =
+            cx.add_window(|window, cx| MultiWorkspace::test_new(project.clone(), window, cx));
+        let workspace = window
+            .read_with(cx, |multi_workspace, _| {
+                multi_workspace.workspace().clone()
+            })
+            .unwrap();
+        let mut cx = gpui::VisualTestContext::from_window(window.into(), cx);
+
+        workspace.update_in(&mut cx, |workspace, window, cx| {
+            let title_bar =
+                cx.new(|cx| TitleBar::new("title-bar", workspace, None, window, cx));
+            workspace.set_titlebar_item(title_bar.into(), window, cx);
+        });
+        cx.run_until_parked();
+
+        cx.activate_a11y(cx.window_handle());
+        let json = cx
+            .update(|window, cx| {
+                window.draw(cx).clear(cx);
+                window.debug_a11y_tree_json()
+            })
+            .expect("activation makes the debug tree available");
+        let tree: serde_json::Value = serde_json::from_str(&json).expect("the dump is valid JSON");
+
+        let trigger = tree["nodes"]
+            .as_object()
+            .expect("the dump lists nodes")
+            .values()
+            .find(|node| {
+                node["element_id"]
+                    .as_str()
+                    .is_some_and(|id| id.contains("project_name_trigger"))
+            })
+            .unwrap_or_else(|| panic!("the project name reaches the tree: {json}"));
+        assert_eq!(
+            trigger["aria"]["label"].as_str(),
+            Some(LONG_NAME),
+            "the reader is told the whole name, ellipsis or not"
+        );
     }
 }

@@ -113,6 +113,17 @@ impl Render for ZedPromptRenderer {
         let settings = ThemeSettings::get_global(cx);
 
         let dialog = v_flex()
+            // Same as the fallback renderer: a focused element with no role
+            // yields no accessibility node, so the question is never announced.
+            .id("prompt-dialog")
+            .role(gpui::Role::AlertDialog)
+            .aria_modal()
+            .aria_label(self.message.read(cx).source().clone())
+            // Same reason as the fallback renderer: the consequence is in the
+            // detail, and a dialog is announced by its name when it opens.
+            .when_some(self.detail.as_ref(), |this, detail| {
+                this.aria_description(detail.read(cx).source().clone())
+            })
             .key_context("Prompt")
             .cursor_default()
             .track_focus(&self.focus)

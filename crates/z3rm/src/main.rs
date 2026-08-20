@@ -358,14 +358,33 @@ impl Render for MuxConnectionStatusItem {
     fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
         use ui::prelude::*;
 
-        let label = match self.state {
-            MuxConnectionState::Connected => None,
-            MuxConnectionState::Disconnected => Some(("Disconnected", ui::Color::Error)),
-            MuxConnectionState::Reconnecting => Some(("Reconnecting…", ui::Color::Warning)),
+        // Recovery is announced but not drawn. The status bar goes back to
+        // showing nothing once the connection returns, which is right for a
+        // user who can see the pane responding again and wrong for one who was
+        // told the connection dropped and is never told otherwise — clearing
+        // the announcement leaves them believing they are still detached.
+        let (state_text, visible_color) = match self.state {
+            MuxConnectionState::Connected => ("Connected", None),
+            MuxConnectionState::Disconnected => ("Disconnected", Some(ui::Color::Error)),
+            MuxConnectionState::Reconnecting => ("Reconnecting…", Some(ui::Color::Warning)),
         };
-        gpui::div().when_some(label, |element, (text, color)| {
-            element.child(ui::Label::new(text).size(ui::LabelSize::Small).color(color))
-        })
+        // Losing the connection is conveyed only by this text and its color, and
+        // it happens while the user is working somewhere else entirely. A polite
+        // live region is what tells a screen reader to announce the change
+        // without the user having to go looking for it; assertive would cut off
+        // whatever they were reading for something they cannot act on instantly.
+        gpui::div()
+            .id("mux-connection-status")
+            .role(gpui::Role::Status)
+            .aria_live(gpui::accesskit::Live::Polite)
+            .aria_announcement(format!("Mux connection: {state_text}"))
+            .when_some(visible_color, |element, color| {
+                element.child(
+                    ui::Label::new(state_text)
+                        .size(ui::LabelSize::Small)
+                        .color(color),
+                )
+            })
     }
 }
 
@@ -3195,8 +3214,369 @@ fn main() {
 
 #[cfg(test)]
 mod tests {
-    use gpui::App;
+    use gpui::{App, AppContext as _};
     use settings::{KeymapFile, KeymapFileLoadResult, Settings as _};
+
+    /// Every accessibility test in the workspace draws one surface at a time,
+    /// so nothing has ever checked what happens when two of them are open
+    /// together: a name that is unique within a panel can still collide with a
+    /// name in the panel beside it, and two docks are two landmarks.
+    #[gpui::test]
+    /// `workspace` pins where focus goes when a tab closes, but it does so
+    /// with a `TestItem`, which is a focus handle and nothing else. A real
+    /// editor owns its own focus, its own element, and the accessibility node
+    /// that focus has to land on — so the plumbing being right there says
+    /// nothing about it being right here.
+    #[gpui::test]
+    async fn closing_a_real_editor_leaves_focus_in_the_tree(cx: &mut gpui::TestAppContext) {
+        use fs::FakeFs;
+        use gpui::VisualTestContext;
+        use project::Project;
+        use serde_json::json;
+        use workspace::MultiWorkspace;
+
+        zlog::init_test();
+        cx.update(|cx| {
+            let settings_store = settings::SettingsStore::test(cx);
+            cx.set_global(settings_store);
+            theme_settings::init(theme::LoadThemes::JustBase, cx);
+            editor::init(cx);
+        });
+
+        let fs = FakeFs::new(cx.executor());
+        fs.insert_tree("/project", json!({ "main.rs": "fn main() {}\n" }))
+            .await;
+        let project = Project::test(fs, ["/project".as_ref()], cx).await;
+        let window =
+            cx.add_window(|window, cx| MultiWorkspace::test_new(project.clone(), window, cx));
+        let workspace = window
+            .read_with(cx, |mw, _| mw.workspace().clone())
+            .unwrap();
+        let mut cx = VisualTestContext::from_window(window.into(), cx);
+
+        workspace.update_in(&mut cx, |workspace, window, cx| {
+            let project = workspace.project().clone();
+            for text in ["fn one() {}\n", "fn two() {}\n"] {
+                let buffer = cx.new(|cx| language::Buffer::local(text, cx));
+                let editor = cx.new(|cx| {
+                    editor::Editor::for_buffer(buffer, Some(project.clone()), window, cx)
+                });
+                workspace.add_item_to_active_pane(Box::new(editor), None, true, window, cx);
+            }
+        });
+        cx.run_until_parked();
+
+        cx.activate_a11y(cx.window_handle());
+        let focus_reaches_tree = |cx: &mut VisualTestContext| {
+            let json = cx
+                .update(|window, cx| {
+                    window.draw(cx).clear(cx);
+                    window.debug_a11y_tree_json()
+                })
+                .expect("activation makes the debug tree available");
+            let tree: serde_json::Value =
+                serde_json::from_str(&json).expect("the dump is valid JSON");
+            gpui::a11y_checks::assert_focus_reached_the_tree(&tree, "closing a real editor");
+            let role = tree["gpui_focus"]
+                .as_str()
+                .and_then(|id| tree["nodes"].get(id))
+                .and_then(|node| node["aria"]["role"].as_str())
+                .map(str::to_string);
+            (role, tree)
+        };
+
+        let (before, _) = focus_reaches_tree(&mut cx);
+        assert!(
+            before.is_some(),
+            "the open editor holds focus and is a node before anything closes"
+        );
+
+        let pane = workspace.read_with(&cx, |workspace, _| workspace.active_pane().clone());
+        pane.update_in(&mut cx, |pane, window, cx| {
+            pane.close_active_item(&workspace::CloseActiveItem::default(), window, cx)
+                .detach();
+        });
+        cx.run_until_parked();
+
+        let (after, tree) = focus_reaches_tree(&mut cx);
+        assert!(
+            after.is_some(),
+            "focus after closing a real editor has to be on a node: {}",
+            serde_json::to_string(&tree["frame"]).unwrap_or_default()
+        );
+
+        // Closing the last one is the case with no obvious answer: there is no
+        // next tab to fall back to, and an empty pane is the only thing left.
+        pane.update_in(&mut cx, |pane, window, cx| {
+            pane.close_active_item(&workspace::CloseActiveItem::default(), window, cx)
+                .detach();
+        });
+        cx.run_until_parked();
+
+        let (empty, tree) = focus_reaches_tree(&mut cx);
+        assert!(
+            empty.is_some(),
+            "closing the last editor must not leave focus without a node: {}",
+            serde_json::to_string(&tree["frame"]).unwrap_or_default()
+        );
+    }
+
+    #[gpui::test]
+    async fn two_panels_open_at_once_stay_distinguishable(cx: &mut gpui::TestAppContext) {
+        use fs::FakeFs;
+        use git_ui::git_panel::GitPanel;
+        use gpui::VisualTestContext;
+        use project::Project;
+        use project_panel::ProjectPanel;
+        use serde_json::json;
+        use workspace::MultiWorkspace;
+        use workspace::dock::{Panel as _, PanelHandle as _};
+
+        zlog::init_test();
+        cx.update(|cx| {
+            let settings_store = settings::SettingsStore::test(cx);
+            cx.set_global(settings_store);
+            theme_settings::init(theme::LoadThemes::JustBase, cx);
+            editor::init(cx);
+            git_ui::init(cx);
+            project_panel::init(cx);
+        });
+
+        let fs = FakeFs::new(cx.executor());
+        fs.insert_tree(
+            "/project",
+            json!({
+                ".git": {},
+                "main.rs": "fn main() {}\n",
+            }),
+        )
+        .await;
+        fs.set_head_and_index_for_repo("/project/.git".as_ref(), &[("main.rs", "old\n".into())]);
+
+        let project = Project::test(fs, ["/project".as_ref()], cx).await;
+        let window =
+            cx.add_window(|window, cx| MultiWorkspace::test_new(project.clone(), window, cx));
+        let workspace = window
+            .read_with(cx, |mw, _| mw.workspace().clone())
+            .unwrap();
+        let mut cx = VisualTestContext::from_window(window.into(), cx);
+
+        // Both panels are built the way the app builds them, through the
+        // loaders that also read serialized state, rather than through a
+        // constructor a test can reach and the product cannot.
+        let project_panel = cx
+            .update(|window, cx| {
+                let workspace = workspace.downgrade();
+                window.spawn(cx, async move |cx| {
+                    ProjectPanel::load(workspace, cx.clone()).await
+                })
+            })
+            .await
+            .expect("the project panel loads");
+        let git_panel = workspace.update_in(&mut cx, GitPanel::new_test);
+        workspace.update_in(&mut cx, |workspace, window, cx| {
+            // One on each side, so both are drawn: two panels in one dock means
+            // only the active one renders, which is the single-surface case
+            // every other test already covers.
+            project_panel.update(cx, |panel, cx| {
+                panel.set_position(workspace::dock::DockPosition::Left, window, cx)
+            });
+            git_panel.update(cx, |panel, cx| {
+                panel.set_position(workspace::dock::DockPosition::Right, window, cx)
+            });
+            workspace.add_panel(project_panel.clone(), window, cx);
+            workspace.add_panel(git_panel.clone(), window, cx);
+            workspace.open_panel::<ProjectPanel>(window, cx);
+            workspace.open_panel::<GitPanel>(window, cx);
+        });
+        cx.run_until_parked();
+
+        // With the centre empty the frame is two panels and a status bar; the
+        // tab bar and its per-tab controls only exist once something is open,
+        // and those are the controls most likely to repeat a name.
+        workspace.update_in(&mut cx, |workspace, window, cx| {
+            for label in ["main.rs", "notes.md"] {
+                workspace.add_item_to_active_pane(
+                    Box::new(cx.new(|cx| {
+                        workspace::item::test::TestItem::new(cx).with_label(label)
+                    })),
+                    None,
+                    true,
+                    window,
+                    cx,
+                );
+            }
+        });
+        cx.run_until_parked();
+
+        cx.activate_a11y(cx.window_handle());
+        let json = cx
+            .update(|window, cx| {
+                window.draw(cx).clear(cx);
+                window.debug_a11y_tree_json()
+            })
+            .expect("activation makes the debug tree available");
+        let tree: serde_json::Value = serde_json::from_str(&json).expect("the dump is valid JSON");
+
+        gpui::a11y_checks::assert_interactive_nodes_are_named(&tree, "two panels");
+        gpui::a11y_checks::assert_names_are_distinguishable(&tree, "two panels");
+        gpui::a11y_checks::assert_focusable_names_are_distinguishable(&tree, "two panels");
+        gpui::a11y_checks::assert_clickable_elements_are_reachable(&tree, "two panels");
+        gpui::a11y_checks::assert_no_role_was_discarded(&tree, "two panels");
+        gpui::a11y_checks::assert_no_aria_was_discarded(&tree, "two panels");
+        let handle = cx.window_handle();
+        gpui::a11y_checks::assert_every_tab_stop_reaches_the_tree(&mut cx.cx, handle, "two panels");
+        gpui::a11y_checks::assert_roles_are_contained(&tree, "two panels");
+        gpui::a11y_checks::assert_focus_reached_the_tree(&tree, "two panels");
+        gpui::a11y_checks::assert_active_descendant_is_honoured(&tree, "two panels");
+        gpui::a11y_checks::assert_click_targets_are_reachable(&tree, "two panels");
+        gpui::a11y_checks::assert_controls_have_area(&tree, "two panels");
+        gpui::a11y_checks::assert_landmarks_are_distinguishable(&tree, "two panels");
+
+        let names: Vec<&str> = tree["nodes"]
+            .as_object()
+            .expect("the dump lists nodes")
+            .values()
+            .filter_map(|node| node["aria"]["label"].as_str())
+            .collect();
+        for panel in ["Project files", "Changed files"] {
+            assert!(
+                names.contains(&panel),
+                "both panels have to be in the tree at once: {names:?}"
+            );
+        }
+
+        // The landmark list is how a reader jumps between regions, so it has to
+        // say what each one holds rather than only where it sits.
+        let mut landmarks: Vec<&str> = tree["nodes"]
+            .as_object()
+            .expect("the dump lists nodes")
+            .values()
+            .filter(|node| node["aria"]["role"] == "Complementary")
+            .filter_map(|node| node["aria"]["label"].as_str())
+            .collect();
+        landmarks.sort();
+        assert_eq!(
+            landmarks,
+            vec!["Left dock: Project Panel", "Right dock: Git Panel"],
+            "a landmark that only says where it sits offers a destination and \
+             refuses to say what is there"
+        );
+    }
+
+    /// Losing the mux connection is shown as small coloured text in the status
+    /// bar, while the user is working inside a pane. Without a live region the
+    /// change is never announced, so a screen-reader user keeps typing into a
+    /// session that is no longer attached.
+    #[gpui::test]
+    async fn mux_connection_state_is_announced_when_it_changes(cx: &mut gpui::TestAppContext) {
+        cx.update(|cx| {
+            let settings_store = settings::SettingsStore::test(cx);
+            cx.set_global(settings_store);
+            theme_settings::init(theme::LoadThemes::JustBase, cx);
+        });
+        let window = cx.add_window(|_, _| super::MuxConnectionStatusItem {
+            state: super::MuxConnectionState::Disconnected,
+        });
+        cx.activate_a11y(window.into());
+
+        let json = cx
+            .update_window(window.into(), |_, window, cx| {
+                window.draw(cx).clear(cx);
+                window.debug_a11y_tree_json()
+            })
+            .expect("the status window is still open")
+            .expect("activation makes the debug tree available");
+        let tree: serde_json::Value = serde_json::from_str(&json).expect("the dump is valid JSON");
+        gpui::a11y_checks::assert_interactive_nodes_are_named(&tree, "mux connection status");
+        gpui::a11y_checks::assert_names_are_distinguishable(&tree, "mux connection status");
+        gpui::a11y_checks::assert_focusable_names_are_distinguishable(&tree, "mux connection status");
+        gpui::a11y_checks::assert_clickable_elements_are_reachable(&tree, "mux connection status");
+        gpui::a11y_checks::assert_click_targets_are_reachable(&tree, "mux connection status");
+        gpui::a11y_checks::assert_controls_have_area(&tree, "mux connection status");
+        gpui::a11y_checks::assert_landmarks_are_distinguishable(&tree, "mux connection status");
+        gpui::a11y_checks::assert_active_descendant_is_honoured(&tree, "mux connection status");
+        gpui::a11y_checks::assert_no_role_was_discarded(&tree, "mux connection status");
+        gpui::a11y_checks::assert_no_aria_was_discarded(&tree, "mux connection status");
+        gpui::a11y_checks::assert_roles_are_contained(&tree, "mux connection status");
+        gpui::a11y_checks::assert_live_regions_can_speak(&tree, "mux connection status");
+
+        let status = tree["nodes"]
+            .as_object()
+            .expect("the dump lists nodes")
+            .values()
+            .find(|node| node["aria"]["role"] == "Status")
+            .expect("the connection indicator must be reported as a status");
+        assert_eq!(
+            status["aria"]["live"].as_str(),
+            Some("Polite"),
+            "a status that changes on its own has to be a live region"
+        );
+        // The value, not the label: macOS speaks `node.value()` and raises no
+        // announcement at all without one.
+        assert_eq!(
+            status["aria"]["value"].as_str(),
+            Some("Mux connection: Disconnected"),
+            "the announcement has to say what changed, not just \"Disconnected\""
+        );
+    }
+
+    /// The all-clear, not the alarm. Nothing is drawn once the connection is
+    /// back, and if the announcement is dropped along with the text then a
+    /// reader who was told the session detached is never told it returned.
+    #[gpui::test]
+    async fn mux_reconnection_is_announced_even_though_nothing_is_drawn(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        cx.update(|cx| {
+            let settings_store = settings::SettingsStore::test(cx);
+            cx.set_global(settings_store);
+            theme_settings::init(theme::LoadThemes::JustBase, cx);
+        });
+        let window = cx.add_window(|_, _| super::MuxConnectionStatusItem {
+            state: super::MuxConnectionState::Disconnected,
+        });
+        cx.activate_a11y(window.into());
+
+        let announcement = |cx: &mut gpui::TestAppContext| -> Option<String> {
+            let json = cx
+                .update_window(window.into(), |_, window, cx| {
+                    window.draw(cx).clear(cx);
+                    window.debug_a11y_tree_json()
+                })
+                .expect("the status window is still open")
+                .expect("activation makes the debug tree available");
+            let tree: serde_json::Value =
+                serde_json::from_str(&json).expect("the dump is valid JSON");
+            gpui::a11y_checks::assert_live_regions_can_speak(&tree, "mux reconnection");
+            tree["nodes"]
+                .as_object()
+                .expect("the dump lists nodes")
+                .values()
+                .find(|node| node["aria"]["role"] == "Status")
+                .and_then(|node| node["aria"]["value"].as_str())
+                .map(str::to_owned)
+        };
+
+        assert_eq!(
+            announcement(cx).as_deref(),
+            Some("Mux connection: Disconnected"),
+            "the drop is the precondition: without it the recovery says nothing"
+        );
+
+        window
+            .update(cx, |item, _, cx| {
+                item.state = super::MuxConnectionState::Connected;
+                cx.notify();
+            })
+            .expect("the status window is still open");
+
+        assert_eq!(
+            announcement(cx).as_deref(),
+            Some("Mux connection: Connected"),
+            "coming back is the half a reader cannot see for themselves"
+        );
+    }
 
     #[gpui::test]
     fn mux_keymap_profiles_load(cx: &mut App) {

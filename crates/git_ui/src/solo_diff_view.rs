@@ -624,6 +624,7 @@ impl Render for SoloDiffStyleToolbar {
             .gap_1()
             .child(
                 IconButton::new("solo-diff-toggle-excerpts", expand_icon)
+                    .aria_label(expand_tooltip)
                     .icon_size(IconSize::Small)
                     .tooltip(Tooltip::text(expand_tooltip))
                     .on_click(cx.listener(|this, _, _, cx| {
@@ -733,6 +734,7 @@ impl Render for SoloDiffGitToolbar {
                 h_group_sm()
                     .child(
                         IconButton::new("up", IconName::ArrowUp)
+                .aria_label("Go to Previous Hunk")
                             .icon_size(IconSize::Small)
                             .disabled(!button_states.prev_next)
                             .tooltip(Tooltip::for_action_title_in(
@@ -746,6 +748,7 @@ impl Render for SoloDiffGitToolbar {
                     )
                     .child(
                         IconButton::new("down", IconName::ArrowDown)
+                .aria_label("Go to Next Hunk")
                             .icon_size(IconSize::Small)
                             .disabled(!button_states.prev_next)
                             .tooltip(Tooltip::for_action_title_in(

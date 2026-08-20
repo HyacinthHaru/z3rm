@@ -115,7 +115,11 @@ impl Focusable for EncodingSelector {
 }
 
 impl EventEmitter<DismissEvent> for EncodingSelector {}
-impl ModalView for EncodingSelector {}
+impl ModalView for EncodingSelector {
+    fn a11y_name(&self, _cx: &gpui::App) -> Option<gpui::SharedString> {
+        Some("File Encoding".into())
+    }
+}
 
 pub struct EncodingSelectorDelegate {
     encoding_selector: WeakEntity<EncodingSelector>,
@@ -226,6 +230,12 @@ impl PickerDelegate for EncodingSelectorDelegate {
 
     fn placeholder_text(&self, _window: &mut Window, _cx: &mut App) -> Arc<str> {
         "Reopen with encoding...".into()
+    }
+
+    /// Named from the same helper the row renders with, so the current
+    /// encoding keeps its "(current)" suffix.
+    fn match_label(&self, ix: usize, cx: &App) -> Option<gpui::SharedString> {
+        Some(self.render_data_for_match(self.matches.get(ix)?, cx).into())
     }
 
     fn match_count(&self) -> usize {
