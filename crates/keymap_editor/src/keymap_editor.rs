@@ -4225,11 +4225,11 @@ mod tests {
             !rows.is_empty(),
             "the visible bindings must be reported as rows: {json}"
         );
-        // A row reads "zed: open keymap, Command-Option-Shift-C, Editor" — the
-        // action, what presses it, and where it applies. The context is absent
-        // for a binding that has none, and the keystroke is the word "Unbound"
-        // when there is none, so what every row shares is the action and one of
-        // those two, never the action alone.
+        // A row reads the action, the platform's spoken modifier names, and
+        // the context. The concrete modifier vocabulary differs by platform:
+        // Command/Option on macOS, Super/Alt on Linux, and Win/Alt on Windows.
+        // The context is omitted when absent, and an unbound action says
+        // "Unbound", so every row must contain an action and binding state.
         for row in &rows {
             let (action, rest) = row
                 .split_once(", ")
@@ -4247,10 +4247,19 @@ mod tests {
         assert_eq!(current["aria"]["row_index"].as_u64(), Some(1));
         assert_eq!(current["aria"]["selected"].as_bool(), Some(true));
         // The concrete shape the loop above can only approximate, on the one
-        // row this test controls.
+        // row this test controls. Keep the expected vocabulary independent of
+        // the formatter under test while accounting for platform conventions.
+        let modifiers = if cfg!(target_os = "macos") {
+            "Command-Option-Shift"
+        } else if cfg!(target_os = "windows") {
+            "Win-Alt-Shift"
+        } else {
+            "Super-Alt-Shift"
+        };
+        let expected = format!("zed: open keymap, {modifiers}-C, Editor");
         assert_eq!(
             current["aria"]["label"].as_str(),
-            Some("zed: open keymap, Command-Option-Shift-C, Editor"),
+            Some(expected.as_str()),
             "the highlighted row says the action, the keystroke and the context"
         );
     }

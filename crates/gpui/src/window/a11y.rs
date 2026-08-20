@@ -585,11 +585,12 @@ pub(crate) struct A11yNodeBuilder {
     /// is, and the focused node points at the highlighted row instead, which is
     /// what a reader needs to announce it.
     active_descendant_of_focus: Option<NodeId>,
-    /// A claim and the ancestors of the node that made it, held until every
-    /// node exists. Whether the claim becomes the reported focus or a pointer
-    /// hung off the focused node depends on where focus turns out to be, which
-    /// is not known while the frame is still being built.
-    pending_active_descendant: Option<(NodeId, SmallVec<[NodeId; 16]>)>,
+    /// Claims and the ancestors of the nodes that made them, held until every
+    /// node exists. Several widgets can remain rendered with a highlighted
+    /// row; once focus is known, only the claim owned by the focused subtree
+    /// is eligible. When focus lives outside every claiming subtree, exactly
+    /// one claim may be attached to the focused node.
+    pending_active_descendants: SmallVec<[(NodeId, SmallVec<[NodeId; 16]>); 4]>,
     /// Set in `finalize` when a claim had no focus anywhere to attach to.
     active_descendant_without_focus: bool,
     #[cfg(debug_assertions)]
@@ -607,7 +608,7 @@ impl A11yNodeBuilder {
             focus: None,
             active_descendant: None,
             active_descendant_of_focus: None,
-            pending_active_descendant: None,
+            pending_active_descendants: SmallVec::new(),
             active_descendant_without_focus: false,
             #[cfg(debug_assertions)]
             node_info: FxHashMap::default(),
@@ -710,7 +711,7 @@ impl A11yNodeBuilder {
         self.focus = None;
         self.active_descendant = None;
         self.active_descendant_of_focus = None;
-        self.pending_active_descendant = None;
+        self.pending_active_descendants.clear();
         self.active_descendant_without_focus = false;
     }
 
@@ -720,65 +721,89 @@ impl A11yNodeBuilder {
     }
 
     /// Record a claim along with the claiming node's ancestors, to be resolved
-    /// once the whole frame is known.
+    /// once the whole frame and its focus are known.
     pub(crate) fn claim_active_descendant(&mut self, id: NodeId) {
-        if self
-            .pending_active_descendant
-            .as_ref()
-            .is_some_and(|(existing, _)| *existing != id)
-        {
-            if cfg!(debug_assertions) {
-                panic!("active descendant claimed by multiple nodes in one frame");
-            } else {
-                log::warn!(
-                    "a11y: multiple nodes claimed the active descendant this frame; \
-                     using last-wins ({id:?})"
-                );
-            }
-        }
         // The claiming node is on top of the stack; everything below it is an
         // ancestor.
         let ancestor_count = self.ids_stack.len().saturating_sub(1);
-        self.pending_active_descendant =
-            Some((id, SmallVec::from_slice(&self.ids_stack[..ancestor_count])));
+        let ancestors = SmallVec::from_slice(&self.ids_stack[..ancestor_count]);
+        if !self
+            .pending_active_descendants
+            .iter()
+            .any(|(existing, existing_ancestors)| {
+                *existing == id && *existing_ancestors == ancestors
+            })
+        {
+            self.pending_active_descendants.push((id, ancestors));
+        }
     }
 
     /// Decide where the frame's active-descendant claim lands, now that every
     /// node has been pushed and focus is known.
     fn resolve_active_descendant(&mut self) {
-        let Some((target, ancestors)) = self.pending_active_descendant.take() else {
-            return;
-        };
-        if !self.has_node(target) {
-            return;
-        }
-        if self.focus == Some(target) {
-            // The claim would report the node as focused via itself, which says
-            // nothing and hides the mistake.
-            if cfg!(debug_assertions) {
-                panic!("set_active_descendant called on the focused node");
-            } else {
-                log::warn!("a11y: set_active_descendant called on the focused node ({target:?})");
-            }
-            return;
-        }
+        let claims = std::mem::take(&mut self.pending_active_descendants);
         let Some(focus) = self.focus else {
-            // Nothing is focused at all, so there is nothing to hang the claim
-            // on and no keyboard position to describe. Recorded rather than
-            // dropped in silence, which is how the picker's call stayed a
-            // no-op for so long.
-            self.active_descendant_without_focus = true;
+            self.active_descendant_without_focus =
+                claims.iter().any(|(target, _)| self.has_node(*target));
             return;
         };
-        if ancestors.contains(&focus) {
-            self.active_descendant = Some(target);
+
+        let mut focused_claims = SmallVec::<[NodeId; 4]>::new();
+        let mut external_claims = SmallVec::<[NodeId; 4]>::new();
+        for (target, ancestors) in claims {
+            if !self.has_node(target) {
+                continue;
+            }
+            if focus == target {
+                if cfg!(debug_assertions) {
+                    panic!("set_active_descendant called on the focused node");
+                } else {
+                    log::warn!(
+                        "a11y: set_active_descendant called on the focused node ({target:?})"
+                    );
+                }
+                continue;
+            }
+
+            let candidates = if ancestors.contains(&focus) {
+                &mut focused_claims
+            } else {
+                &mut external_claims
+            };
+            if !candidates.contains(&target) {
+                candidates.push(target);
+            }
+        }
+
+        let (candidates, destination) = if focused_claims.is_empty() {
+            (&external_claims, "focused node")
         } else {
+            (&focused_claims, "focused subtree")
+        };
+        if candidates.len() > 1 {
+            if cfg!(debug_assertions) {
+                panic!(
+                    "multiple active descendants claimed by the same {destination}: {candidates:?}"
+                );
+            } else {
+                log::warn!(
+                    "a11y: multiple active descendants claimed by the same {destination}; \
+                     using last-wins ({:?})",
+                    candidates.last()
+                );
+            }
+        }
+        let Some(target) = candidates.last().copied() else {
+            return;
+        };
+
+        if focused_claims.is_empty() {
             // A highlight in a list the user filters from a separate input:
             // focus is in the input, which is not an ancestor of the row, so
-            // reporting the row as focused would misstate where the keyboard
-            // is. The focused node points at the row instead — the same shape
-            // as a combo box — and the reader announces both.
+            // reporting the row as focused would misstate where typing goes.
             self.active_descendant_of_focus = Some(target);
+        } else {
+            self.active_descendant = Some(target);
         }
     }
 
@@ -1115,6 +1140,38 @@ mod tests {
         );
     }
 
+    /// Several widgets can remain rendered with their own highlighted row,
+    /// but only the claim owned by the focused subtree describes the keyboard
+    /// position. An open context menu must therefore win over the project tree
+    /// behind it rather than making the whole frame ambiguous.
+    #[test]
+    fn focused_subtree_claim_wins_over_an_unfocused_sibling_claim() {
+        let mut builder = new_builder();
+        let background_list = NodeId(1);
+        let background_row = NodeId(2);
+        let focused_list = NodeId(3);
+        let focused_row = NodeId(4);
+
+        assert!(builder.push(background_list, test_node()));
+        assert!(builder.push(background_row, test_node()));
+        builder.claim_active_descendant(background_row);
+        builder.pop();
+        builder.pop();
+
+        assert!(builder.push(focused_list, test_node()));
+        builder.set_focus(focused_list, false);
+        assert!(builder.push(focused_row, test_node()));
+        builder.claim_active_descendant(focused_row);
+        builder.pop();
+        builder.pop();
+
+        let update = builder.finalize();
+        assert_eq!(
+            update.focus, focused_row,
+            "the highlighted row owned by the focused list is the active descendant"
+        );
+    }
+
     #[test]
     fn active_descendant_ignored_when_focus_in_other_subtree() {
         let mut builder = new_builder();
@@ -1177,17 +1234,32 @@ mod tests {
         assert_eq!(update.focus, focused);
     }
 
-    // The double-claim guard panics only in debug builds; in release it falls
-    // back to last-wins with a warning.
+    // Two unrelated lists cannot both attach a highlighted row to the same
+    // separately-focused input. Unlike an unfocused background claim beside a
+    // focused subtree, neither has ownership evidence, so the frame is
+    // genuinely ambiguous.
     #[test]
     #[cfg_attr(
         debug_assertions,
-        should_panic(expected = "active descendant claimed by multiple nodes")
+        should_panic(expected = "multiple active descendants claimed by the same focused node")
     )]
-    fn multiple_active_descendant_claims_panic_in_debug() {
+    fn multiple_external_active_descendant_claims_panic_in_debug() {
         let mut builder = new_builder();
-        builder.claim_active_descendant(NodeId(1));
-        builder.claim_active_descendant(NodeId(2));
+        let input = NodeId(1);
+
+        assert!(builder.push(input, test_node()));
+        builder.set_focus(input, false);
+        builder.pop();
+
+        for (list, row) in [(NodeId(2), NodeId(3)), (NodeId(4), NodeId(5))] {
+            assert!(builder.push(list, test_node()));
+            assert!(builder.push(row, test_node()));
+            builder.claim_active_descendant(row);
+            builder.pop();
+            builder.pop();
+        }
+
+        builder.finalize();
     }
 
     // Setting focus twice in one frame means two elements both claimed window
@@ -1233,12 +1305,12 @@ mod tests {
     }
 
     // Two sibling children of a focused container both claim the active
-    // descendant (both pass the focus gate). The second claim is a bug: panic
-    // in debug, last-wins + warn in release.
+    // descendant. Both have the same focused owner, so the frame is genuinely
+    // ambiguous: panic in debug, last-wins + warn in release.
     #[test]
     #[cfg_attr(
         debug_assertions,
-        should_panic(expected = "active descendant claimed by multiple nodes")
+        should_panic(expected = "multiple active descendants claimed by the same focused subtree")
     )]
     fn two_siblings_claiming_active_descendant() {
         let mut a11y = new_a11y();
@@ -1259,6 +1331,7 @@ mod tests {
         a11y.nodes.pop(); // second
 
         a11y.nodes.pop(); // container
+        a11y.nodes.finalize();
     }
 
     // Node A is focused; node C (a child of the unfocused node B) claims the

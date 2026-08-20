@@ -1,8 +1,2 @@
-# Tests already failing at the branch point (34c034625d), verified there.
-#
-# shadow_snapshot_rpc_round_trip: a file written before the watcher was armed
-# is reported by list_changed_files as changed. That is a real behavioural
-# failure in the snapshot watcher rather than a test artefact, and it is
-# unrelated to this branch — but it is worth someone's attention rather than
-# living here forever.
-shadow_snapshot_rpc_round_trip
+# Test names that are known to fail on the branch point, one per line.
+# Keep this list empty when the baseline is clean.

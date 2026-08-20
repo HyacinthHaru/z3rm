@@ -18,6 +18,38 @@ if [[ "${1:-}" == "--a11y" ]]; then
     export Z3RM_A11Y_BUILD_HEADLESS=1
 fi
 
+# Workspace tests spawn the real client and mux server, but `cargo test` does
+# not build binary targets for integration tests. Resolve Cargo's effective
+# target directory (including config and `CARGO_TARGET_DIR`), build both
+# helpers, and pass absolute paths to the full run and isolated re-runs.
+target_dir=$(cargo metadata --format-version=1 --no-deps \
+    | python3 -c 'import json, sys; print(json.load(sys.stdin)["target_directory"])')
+if ! cargo build -p mux_server --bin z3rm-server; then
+    echo "Failed to build z3rm-server for integration tests."
+    exit 1
+fi
+if ! cargo build -p z3rm --bin z3rm; then
+    echo "Failed to build z3rm for integration tests."
+    exit 1
+fi
+
+server_bin="$target_dir/debug/z3rm-server"
+client_bin="$target_dir/debug/z3rm"
+if [[ -f "$server_bin.exe" ]]; then
+    server_bin="$server_bin.exe"
+fi
+if [[ -f "$client_bin.exe" ]]; then
+    client_bin="$client_bin.exe"
+fi
+if [[ ! -f "$server_bin" || ! -f "$client_bin" ]]; then
+    echo "Cargo reported target directory $target_dir, but helper binaries are missing:"
+    echo "  $server_bin"
+    echo "  $client_bin"
+    exit 1
+fi
+export Z3RM_SERVER_BIN="$server_bin"
+export Z3RM_BIN="$client_bin"
+
 # The re-run below compiles again, so it reports on whatever the tree looks
 # like then rather than on what actually failed. Editing during a run turns a
 # real regression into a reassuring "passes alone".

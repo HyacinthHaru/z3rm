@@ -6029,8 +6029,14 @@ impl ProjectPanel {
                     // Focus stays on the panel while the arrow keys move a
                     // highlight through it, so the current row reaches a reader
                     // only through the selected state and the active descendant.
+                    // An open context menu owns focus and announces its own row;
+                    // leaving the hidden tree's claim active would make two
+                    // unrelated lists compete for the same focused node.
                     .aria_selected(announced_selected)
-                    .when(announced_selected, ListItem::aria_active_descendant)
+                    .when(
+                        announced_selected && self.context_menu.is_none(),
+                        ListItem::aria_active_descendant,
+                    )
                     .aria_level(announced_depth + 1)
                     // Otherwise a folder and a file read identically:
                     // `Role::TreeItem` is an outline row on macOS, saying
