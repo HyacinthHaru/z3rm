@@ -1,0 +1,23 @@
+---
+type Heading = { depth: number; slug: string; text: string };
+type Props = { headings: Heading[]; lang: "en" | "zh" };
+const { headings, lang } = Astro.props;
+const visible = headings.filter((heading) => heading.depth === 2 || heading.depth === 3);
+---
+{visible.length > 1 && (
+  <nav class="page-toc" aria-label={lang === "zh" ? "本页内容" : "On this page"}>
+    <h2>{lang === "zh" ? "本页内容" : "On this page"}</h2>
+    <ol>
+      {visible.map((heading) => <li class:list={{ nested: heading.depth === 3 }}><a href={`#${heading.slug}`}>{heading.text}</a></li>)}
+    </ol>
+  </nav>
+)}
+<style>
+  .page-toc { position: sticky; top: 5rem; padding-left: 1rem; border-left: 1px solid var(--border-muted); }
+  .page-toc h2 { margin: 0 0 .65rem; color: var(--text-muted); font-size: .7rem; letter-spacing: .08em; text-transform: uppercase; }
+  .page-toc ol { list-style: none; margin: 0; padding: 0; }
+  .page-toc li { margin: .4rem 0; font-size: .78rem; line-height: 1.3; }
+  .page-toc li.nested { padding-left: .75rem; }
+  .page-toc a { color: var(--text-secondary); text-decoration: none; }
+  .page-toc a:hover { color: var(--text-primary); }
+</style>

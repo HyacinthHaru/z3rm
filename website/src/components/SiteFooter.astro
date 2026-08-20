@@ -1,0 +1,22 @@
+---
+type Props = { lang: "en" | "zh" };
+const { lang } = Astro.props;
+const base = import.meta.env.BASE_URL.replace(/\/$/, "");
+---
+<footer class="site-footer">
+  <div>
+    <p><strong>Z3rm</strong> <span>{lang === "zh" ? "读作 zerm" : "pronounced zerm"}</span></p>
+    <p>{lang === "zh" ? "GPU 渲染终端与持久多路复用器。" : "A GPU-rendered terminal and persistent multiplexer."}</p>
+  </div>
+  <nav aria-label={lang === "zh" ? "页脚" : "Footer"}>
+    <a href={`${base}/${lang}/quick-start/`}>{lang === "zh" ? "快速开始" : "Quick start"}</a>
+    <a href={`${base}/${lang}/implementation-status/`}>{lang === "zh" ? "实现状态" : "Implementation status"}</a>
+    <a href="https://github.com/cyjin-yl/z3rm">GitHub</a>
+  </nav>
+</footer>
+<style>
+  .site-footer { width: min(calc(100% - 2rem), var(--page-width)); margin: 6rem auto 0; padding: 2rem 0 3rem; display: flex; justify-content: space-between; gap: 2rem; border-top: 1px solid var(--border-muted); color: var(--text-secondary); font-size: .82rem; }
+  .site-footer p { margin: .2rem 0; } .site-footer strong { color: var(--text-primary); font-family: var(--font-mono); }
+  .site-footer nav { display: flex; flex-wrap: wrap; align-content: flex-start; gap: 1rem; }
+  @media (max-width: 620px) { .site-footer { flex-direction: column; } }
+</style>

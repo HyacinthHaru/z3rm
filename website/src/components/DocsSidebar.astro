@@ -1,0 +1,36 @@
+---
+import type { CollectionEntry } from "astro:content";
+type Props = { entries: CollectionEntry<"docs">[]; lang: "en" | "zh"; currentId: string };
+const { entries, lang, currentId } = Astro.props;
+const base = import.meta.env.BASE_URL.replace(/\/$/, "");
+const sectionLabels = lang === "zh"
+  ? { features: "功能", guide: "指南", concepts: "概念", reference: "参考", support: "支持", status: "状态", home: "首页" }
+  : { features: "Features", guide: "Guides", concepts: "Concepts", reference: "Reference", support: "Support", status: "Status", home: "Home" };
+const sections = [...new Set(entries.map((entry) => entry.data.section))].filter((section) => section !== "home");
+const routeFor = (entry: CollectionEntry<"docs">) => {
+  const parts = entry.id.split("/").slice(1);
+  if (parts.at(-1) === "index") parts.pop();
+  return `${base}/${lang}/${parts.join("/")}${parts.length ? "/" : ""}`;
+};
+---
+<nav class="docs-sidebar" aria-label={lang === "zh" ? "文档目录" : "Documentation"}>
+  {sections.map((section) => (
+    <section>
+      <h2>{sectionLabels[section]}</h2>
+      <ul>
+        {entries.filter((entry) => entry.data.section === section).sort((a, b) => a.data.order - b.data.order).map((entry) => (
+          <li><a href={routeFor(entry)} aria-current={entry.id === currentId ? "page" : undefined}>{entry.data.navTitle ?? entry.data.title}</a></li>
+        ))}
+      </ul>
+    </section>
+  ))}
+</nav>
+<style>
+  .docs-sidebar { position: sticky; top: 5rem; max-height: calc(100vh - 6rem); overflow: auto; padding-right: 1rem; }
+  .docs-sidebar section + section { margin-top: 1.5rem; }
+  .docs-sidebar h2 { margin: 0 0 .5rem; color: var(--text-muted); font-size: .7rem; font-weight: 600; letter-spacing: .08em; text-transform: uppercase; }
+  .docs-sidebar ul { list-style: none; margin: 0; padding: 0; }
+  .docs-sidebar a { display: block; margin: .12rem 0; padding: .35rem .5rem; border-radius: var(--radius-control); color: var(--text-secondary); font-size: .84rem; line-height: 1.3; text-decoration: none; }
+  .docs-sidebar a:hover { color: var(--text-primary); background: var(--surface-hover); }
+  .docs-sidebar a[aria-current="page"] { color: var(--text-primary); background: var(--surface-selected); }
+</style>

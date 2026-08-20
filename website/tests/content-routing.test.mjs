@@ -27,9 +27,11 @@ test("content schema requires translation and navigation metadata", async () => 
   for (const field of ["translationKey", "section", "order", "status"]) assert.match(source, new RegExp(field));
 });
 
-test("one dynamic route renders all localized documents", async () => {
-  const source = await readFile(new URL("src/pages/[lang]/[...slug].astro", root), "utf8");
-  assert.match(source, /getStaticPaths/);
-  assert.match(source, /render\(/);
-  assert.match(source, /hreflang/);
+test("one dynamic route renders all localized documents with alternate links", async () => {
+  const route = await readFile(new URL("src/pages/[lang]/[...slug].astro", root), "utf8");
+  const layout = await readFile(new URL("src/layouts/SiteLayout.astro", root), "utf8");
+  assert.match(route, /getStaticPaths/);
+  assert.match(route, /render\(/);
+  assert.match(route, /alternate/);
+  assert.match(layout, /hreflang/);
 });

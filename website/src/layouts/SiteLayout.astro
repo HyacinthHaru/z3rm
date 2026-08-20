@@ -1,0 +1,43 @@
+---
+import SiteFooter from "../components/SiteFooter.astro";
+import SiteHeader from "../components/SiteHeader.astro";
+import "../styles/global.css";
+
+type Props = {
+  title: string;
+  description: string;
+  lang: "en" | "zh";
+  pairedPath: string;
+  canonical: URL;
+  alternate: URL;
+};
+const { title, description, lang, pairedPath, canonical, alternate } = Astro.props;
+---
+<!doctype html>
+<html lang={lang === "zh" ? "zh-CN" : "en"}>
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width" />
+    <meta name="description" content={description} />
+    <meta name="theme-color" content="#17191d" />
+    <link rel="canonical" href={canonical} />
+    <link rel="alternate" hreflang={lang === "en" ? "zh-CN" : "en-US"} href={alternate} />
+    <link rel="alternate" hreflang="x-default" href={canonical} />
+    <title>{title}</title>
+    <script is:inline>
+      const storedTheme = localStorage.getItem("z3rm-theme");
+      document.documentElement.dataset.theme = storedTheme === "light" || storedTheme === "dark"
+        ? storedTheme
+        : matchMedia("(prefers-color-scheme: dark)").matches ? "dark" : "light";
+    </script>
+  </head>
+  <body>
+    <a class="skip-link" href="#content">{lang === "zh" ? "跳到正文" : "Skip to content"}</a>
+    <SiteHeader {lang} {pairedPath} />
+    <slot />
+    <SiteFooter {lang} />
+    <script>
+      import "../../proto-ui/components/wc/index";
+    </script>
+  </body>
+</html>

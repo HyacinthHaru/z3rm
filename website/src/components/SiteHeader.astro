@@ -1,0 +1,56 @@
+---
+type Props = { lang: "en" | "zh"; pairedPath: string };
+const { lang, pairedPath } = Astro.props;
+const base = import.meta.env.BASE_URL.replace(/\/$/, "");
+const labels = lang === "zh"
+  ? { features: "功能", guides: "指南", reference: "参考", status: "实现状态", theme: "切换主题", language: "English" }
+  : { features: "Features", guides: "Guides", reference: "Reference", status: "Status", theme: "Toggle theme", language: "简体中文" };
+const href = (path: string) => `${base}/${lang}/${path}`;
+---
+<header class="site-header">
+  <nav class="site-nav" aria-label={lang === "zh" ? "主导航" : "Primary"}>
+    <a class="wordmark" href={href("")} aria-label={lang === "zh" ? "Z3rm 首页，读作 zerm" : "Z3rm home, pronounced zerm"}>
+      <span aria-hidden="true">z<span class="wordmark-three">3</span>rm</span>
+    </a>
+    <div class="nav-links">
+      <a href={href("features/")}>{labels.features}</a>
+      <a href={href("guide/for-humans/")}>{labels.guides}</a>
+      <a href={href("reference/cli/")}>{labels.reference}</a>
+      <a href={href("implementation-status/")}>{labels.status}</a>
+    </div>
+    <div class="nav-actions">
+      <a class="locale-link" href={`${base}${pairedPath}`} data-locale={lang === "zh" ? "en" : "zh"}>{labels.language}</a>
+      <proto-ui-base-toggle class="pui-control theme-toggle" aria-label={labels.theme} title={labels.theme}>
+        <span aria-hidden="true">◐</span>
+      </proto-ui-base-toggle>
+      <a class="github-link" href="https://github.com/cyjin-yl/z3rm">GitHub</a>
+    </div>
+  </nav>
+</header>
+
+<script>
+  const localeLink = document.querySelector<HTMLAnchorElement>(".locale-link");
+  localeLink?.addEventListener("click", () => {
+    const locale = localeLink.dataset.locale;
+    if (locale) localStorage.setItem("z3rm-locale", locale);
+  });
+  document.querySelector(".theme-toggle")?.addEventListener("click", () => {
+    const root = document.documentElement;
+    const next = root.dataset.theme === "dark" ? "light" : "dark";
+    root.dataset.theme = next;
+    localStorage.setItem("z3rm-theme", next);
+  });
+</script>
+
+<style>
+  .site-header { position: sticky; z-index: 50; top: 0; border-bottom: 1px solid var(--border-muted); background: var(--surface-app); }
+  .site-nav { width: min(calc(100% - 2rem), var(--page-width)); min-height: 3.65rem; margin: 0 auto; display: grid; grid-template-columns: auto 1fr auto; align-items: center; gap: 2rem; }
+  .wordmark { font: 600 1.08rem/1 var(--font-mono); letter-spacing: -.06em; text-decoration: none; }
+  .wordmark-three { color: var(--accent-blue); }
+  .nav-links, .nav-actions { display: flex; align-items: center; gap: 1.15rem; }
+  .nav-links a, .nav-actions a { color: var(--text-secondary); font-size: .82rem; font-weight: 500; text-decoration: none; }
+  .nav-links a:hover, .nav-actions a:hover { color: var(--text-primary); }
+  .nav-actions { justify-content: flex-end; }
+  .theme-toggle { min-width: 2.25rem; padding: .35rem; }
+  @media (max-width: 760px) { .site-nav { grid-template-columns: auto 1fr; gap: 1rem; } .nav-links { display: none; } .nav-actions { gap: .75rem; } .github-link { display: none; } }
+</style>
