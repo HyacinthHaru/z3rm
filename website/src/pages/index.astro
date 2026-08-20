@@ -1,0 +1,23 @@
+---
+const base = import.meta.env.BASE_URL.replace(/\/$/, "");
+---
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width" />
+    <meta name="robots" content="noindex" />
+    <title>Z3rm</title>
+    <noscript><meta http-equiv="refresh" content={`0; url=${base}/en/`} /></noscript>
+  </head>
+  <body>
+    <p><a href={`${base}/en/`}>English</a> · <a href={`${base}/zh/`}>简体中文</a></p>
+    <script is:inline define:vars={{ base }}>
+      const stored = localStorage.getItem("z3rm-locale");
+      const locale = stored === "zh" || stored === "en"
+        ? stored
+        : navigator.language.toLowerCase().startsWith("zh") ? "zh" : "en";
+      location.replace(`${base}/${locale}/`);
+    </script>
+  </body>
+</html>
