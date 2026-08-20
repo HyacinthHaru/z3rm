@@ -17,7 +17,7 @@ const copy = lang === "zh" ? {
   surfaces: "真实渲染证据", surfacesBody: "这些画面来自 Z3rm 自己的 GPUI 无头渲染回归，不是营销稿或浏览器仿制。",
   terminal: "结构化终端网格", chrome: "QuickJS 扩展状态栏", snapshot: "影子快照", snapshotBody: "独立于 Git 的细粒度版本链，使用 WAL、单调序号和有界 delta；拒绝或撤销前先持久化恢复意图。",
   forHumans: "给人类", forHumansBody: "键盘优先的窗格、滚动历史、搜索、分离与重连。", forAgents: "给 Agent", forAgentsBody: "显式目标、稳定格式和可观察的会话控制。",
-  inspect: "查看完整实现状态", final: "从一个不会消失的会话开始。", finalBody: "先用 CLI 建立工作区，再按需要打开 GPU 界面或从远程接入。"
+  inspect: "查看完整实现状态", auditCount: "12 项已验证 · 1 项实验性", final: "从一个不会消失的会话开始。", finalBody: "先用 CLI 建立工作区，再按需要打开 GPU 界面或从远程接入。"
 } : {
   eyebrow: "GPU terminal · persistent sessions · agent control",
   title: "Your shells outlive the window.",
@@ -31,7 +31,7 @@ const copy = lang === "zh" ? {
   surfaces: "Evidence from the real renderer", surfacesBody: "These frames come from Z3rm's own GPUI headless regression harness—not a marketing mock or a terminal recreated in the browser.",
   terminal: "Structured terminal grid", chrome: "QuickJS extension status bar", snapshot: "Shadow snapshots", snapshotBody: "Fine-grained history independent of Git, with a WAL, monotonic sequence numbers, and bounded deltas. Restore intent is durable before files change.",
   forHumans: "For humans", forHumansBody: "Keyboard-first panes, scrollback, search, detach, and reconnect.", forAgents: "For agents", forAgentsBody: "Explicit targets, stable formats, and observable session control.",
-  inspect: "Inspect the full implementation status", final: "Start with a session that stays.", finalBody: "Create the workspace from the CLI, then open the GPU view or attach remotely when you need it."
+  inspect: "Inspect the full implementation status", auditCount: "12 verified · 1 experimental", final: "Start with a session that stays.", finalBody: "Create the workspace from the CLI, then open the GPU view or attach remotely when you need it."
 };
 ---
 <main id="content" class="landing">
@@ -89,7 +89,7 @@ const copy = lang === "zh" ? {
     <a href={href("guide/for-agents/")}><span>A</span><div><h3>{copy.forAgents}</h3><p>{copy.forAgentsBody}</p></div><b>↗</b></a>
   </section>
 
-  <section class="status-link section-shell"><a href={href("implementation-status/")}><span>{copy.inspect}</span><b>17 verified requirements</b><i aria-hidden="true">→</i></a></section>
+  <section class="status-link section-shell"><a href={href("implementation-status/")}><span>{copy.inspect}</span><b>{copy.auditCount}</b><i aria-hidden="true">→</i></a></section>
 
   <section class="final-cta section-shell"><p class="section-index">06 / START</p><h2>{copy.final}</h2><p>{copy.finalBody}</p><a class="primary-action" href={href("quick-start/")}>{copy.start}</a></section>
 </main>
