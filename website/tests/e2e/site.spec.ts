@@ -3,6 +3,7 @@ import { expect, test } from "@playwright/test";
 
 for (const locale of ["en", "zh"] as const) {
   test(`${locale} landing is navigable and accessible`, async ({ page }) => {
+    await page.addInitScript(() => localStorage.setItem("z3rm-theme", "light"));
     await page.goto(`${locale}/`);
     await expect(page.locator("h1")).toContainText(locale === "zh" ? "Shell" : "shells");
     await expect(page.locator('img[src*="z3rm-terminal-grid.png"]').first()).toHaveAttribute("alt", /.+/);
