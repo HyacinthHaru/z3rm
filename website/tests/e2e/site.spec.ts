@@ -25,6 +25,27 @@ test("language and theme preferences survive navigation", async ({ page }) => {
   await expect(page.locator("html")).toHaveAttribute("data-theme", "dark");
 });
 
+test("theme toggle keeps pointer and keyboard activation semantically synchronized", async ({ page }) => {
+  await page.addInitScript(() => localStorage.setItem("z3rm-theme", "light"));
+  await page.goto("en/");
+
+  const toggle = page.getByRole("button", { name: "Toggle theme" });
+  await expect(toggle).toHaveAttribute("aria-pressed", "false");
+
+  await toggle.focus();
+  await page.keyboard.press("Space");
+  await expect(page.locator("html")).toHaveAttribute("data-theme", "dark");
+  await expect(toggle).toHaveAttribute("aria-pressed", "true");
+
+  await page.keyboard.press("Enter");
+  await expect(page.locator("html")).toHaveAttribute("data-theme", "light");
+  await expect(toggle).toHaveAttribute("aria-pressed", "false");
+
+  await toggle.click();
+  await expect(page.locator("html")).toHaveAttribute("data-theme", "dark");
+  await expect(toggle).toHaveAttribute("aria-pressed", "true");
+});
+
 test("documentation routes expose navigation landmarks", async ({ page }) => {
   await page.goto("en/reference/cli/");
   await expect(page.getByRole("heading", { level: 1 })).toContainText("CLI");

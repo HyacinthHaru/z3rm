@@ -29,17 +29,31 @@ const href = (path: string) => `${base}/${lang}/${path}`;
 </header>
 
 <script>
+  import { setElementProps } from "@proto.ui/adapter-web-component";
+
   const localeLink = document.querySelector<HTMLAnchorElement>(".locale-link");
   localeLink?.addEventListener("click", () => {
     const locale = localeLink.dataset.locale;
     if (locale) localStorage.setItem("z3rm-locale", locale);
   });
-  document.querySelector(".theme-toggle")?.addEventListener("click", () => {
+
+  // The theme toggle is a Proto UI toggle: keyboard activation (Space/Enter)
+  // emits `activeChange`, not a DOM click, so the theme is applied from the
+  // component's own event. `defaultActive` is initialized from the current
+  // theme so `aria-pressed` matches what a reader sees on arrival.
+  const themeToggle = document.querySelector<HTMLElement>(".theme-toggle");
+  const applyTheme = () => {
     const root = document.documentElement;
     const next = root.dataset.theme === "dark" ? "light" : "dark";
     root.dataset.theme = next;
     localStorage.setItem("z3rm-theme", next);
-  });
+  };
+  if (themeToggle) {
+    setElementProps(themeToggle, {
+      defaultActive: document.documentElement.dataset.theme === "dark",
+    });
+    themeToggle.addEventListener("activeChange", applyTheme);
+  }
 </script>
 
 <style>
