@@ -178,10 +178,6 @@ PaneDirty(pane_id) → fetch_grid_update(generation)</code></pre>
   .demo-controls { display: flex; align-items: end; justify-content: space-between; gap: 1rem; margin-bottom: 1rem; }
   .demo-controls label { display: grid; gap: .35rem; color: var(--text-muted); font: 600 .68rem/1 var(--font-mono); letter-spacing: .08em; text-transform: uppercase; }
   .demo-select { position: relative; display: block; min-width: 15rem; }
-  proto-ui-base-select-trigger { display: flex; min-height: 2.5rem; align-items: center; padding: .55rem .75rem; border: 1px solid var(--border-strong); color: var(--text-primary); background: var(--surface-app); cursor: pointer; }
-  proto-ui-base-select-content { position: absolute; z-index: 40; display: grid; width: max-content; min-width: 15rem; margin-top: .3rem; padding: .35rem; border: 1px solid var(--border-strong); background: var(--surface-elevated); box-shadow: var(--shadow-window); }
-  proto-ui-base-select-item { display: block; padding: .65rem .75rem; color: var(--text-secondary); cursor: pointer; font: .78rem/1.2 var(--font-mono); }
-  proto-ui-base-select-item:hover, proto-ui-base-select-item[data-pui-active] { color: var(--text-primary); background: var(--surface-hover); }
   .demo-actions { display: flex; align-items: center; gap: .5rem; }
   .demo-actions proto-ui-base-button, proto-ui-base-dialog-trigger { border-color: var(--border-strong); color: var(--text-primary); background: var(--surface-app); }
   .gpui-frame { overflow: hidden; border: 1px solid var(--border-strong); background: #101215; }
@@ -192,7 +188,6 @@ PaneDirty(pane_id) → fetch_grid_update(generation)</code></pre>
   .frame-bar span:nth-child(3) { background: #6f9672; }
   .frame-bar b { margin-left: .5rem; font-weight: 400; }
   .gpui-frame iframe { display: block; width: 100%; height: clamp(430px, 62vw, 610px); border: 0; background: #101215; }
-  proto-ui-base-dialog-mask { position: fixed; inset: 0; z-index: 80; background: rgb(0 0 0 / 55%); }
   .demo-dialog { position: fixed; z-index: 81; top: 50%; left: 50%; width: min(34rem, calc(100vw - 2rem)); transform: translate(-50%, -50%); padding: 1.5rem; border: 1px solid var(--border-strong); background: var(--surface-elevated); box-shadow: var(--shadow-window); }
   proto-ui-base-dialog-title { display: block; font-size: 1.3rem; font-weight: 700; }
   proto-ui-base-dialog-description { display: block; margin: .85rem 0 1.25rem; color: var(--text-secondary); line-height: 1.6; }
