@@ -38,11 +38,13 @@ const copy = lang === "zh" ? {
 };
 ---
 
-<section class="wasm-demo section-shell" id="live-gpui" data-z3rm-wasm-demo>
-  <div class="demo-heading">
+<section class="wasm-demo section-shell visual-section" id="live-gpui" data-z3rm-wasm-demo>
+  <div class="demo-heading section-heading">
     <p class="section-index">04 / {copy.eyebrow}</p>
-    <h2>{copy.title}</h2>
-    <p>{copy.body}</p>
+    <div>
+      <h2>{copy.title}</h2>
+      <p>{copy.body}</p>
+    </div>
   </div>
 
   <proto-ui-base-tabs-root class="demo-tabs">
@@ -165,10 +167,18 @@ PaneDirty(pane_id) → fetch_grid_update(generation)</code></pre>
 </script>
 
 <style>
-  .wasm-demo { margin-top: var(--section-gap-tight); }
-  .demo-heading { max-width: 760px; }
-  .demo-heading h2 { font-size: clamp(2rem, 5vw, 4.4rem); line-height: .95; letter-spacing: -.055em; margin: .65rem 0 1.1rem; }
-  .demo-heading > p:last-child { color: var(--text-secondary); max-width: 68ch; }
+  .wasm-demo { padding-block: var(--section-gap-tight); border-top: 1px solid var(--border-muted); }
+  /* Astro scoping keeps HomeLanding's .section-index/.section-heading rules
+     from reaching this component, so mirror the editorial micro-label and
+     grid here. */
+  .demo-heading.section-heading { display: grid; grid-template-columns: minmax(7rem,.35fr) 1fr; gap: 2rem; align-items: end; margin-bottom: 3rem; }
+  .demo-heading.section-heading p { margin-bottom: 0; }
+  .section-index { color: var(--accent-blue); font: 600 .68rem/1.4 var(--font-mono); letter-spacing: .13em; text-transform: uppercase; }
+  .section-heading p { margin-bottom: 0; }
+  .contract-panel > p.section-index { color: var(--accent-blue); font: 600 .68rem/1.4 var(--font-mono); letter-spacing: .13em; text-transform: uppercase; margin-bottom: 0; }
+  .demo-heading h2 { font-size: clamp(1.8rem, 3.6vw, 3.4rem); line-height: .98; letter-spacing: -.045em; margin: .6rem 0 1rem; }
+  .demo-heading > div > p:last-child { color: var(--text-secondary); max-width: 68ch; margin-bottom: 0; }
+  @media (max-width: 900px) { .demo-heading.section-heading { grid-template-columns: 1fr; gap: .8rem; } }
   .demo-tabs { display: block; margin-top: 2.5rem; border: 1px solid var(--border-strong); background: var(--surface-panel); box-shadow: var(--shadow-window); }
   .demo-tabs-list { display: flex; gap: .25rem; padding: .45rem; border-bottom: 1px solid var(--border-muted); background: var(--surface-app); }
   .demo-tabs-trigger, .demo-actions proto-ui-base-button, proto-ui-base-dialog-trigger, proto-ui-base-dialog-close { display: inline-flex; align-items: center; justify-content: center; min-height: 2.2rem; padding: .45rem .8rem; border: 1px solid transparent; cursor: pointer; font: 600 .76rem/1 var(--font-mono); letter-spacing: .04em; color: var(--text-secondary); }
