@@ -158,3 +158,19 @@ test("embedded demo does not hijack the landing page keyboard order", async ({ p
   });
   expect(focused.text).not.toContain("Z3RM-SNAPSHOT-001");
 });
+
+test("dialog returns focus to its trigger on close", async ({ page }) => {
+  await page.goto("en/");
+  const trigger = page.locator("proto-ui-base-dialog-trigger");
+  await trigger.scrollIntoViewIfNeeded();
+  await expect(trigger).toBeVisible();
+
+  await page.evaluate(() => { document.documentElement.style.scrollBehavior='auto'; document.querySelector('.demo-tabs').scrollIntoView({block:'center'}); });
+  await trigger.click();
+  const dialog = page.locator(".demo-dialog");
+  await expect(dialog).toBeVisible();
+
+  await page.keyboard.press("Escape");
+  await expect(dialog).not.toBeVisible();
+  await expect(trigger).toBeFocused();
+});

@@ -137,6 +137,30 @@ PaneDirty(pane_id) → fetch_grid_update(generation)</code></pre>
       iframe.src = source.toString();
     });
 
+    // WAI-ARIA dialog pattern: on close, focus returns to the element that
+    // opened it, so keyboard users are not teleported to the page top.
+    let dialogOpener: HTMLElement | null = null;
+    dialogRoot?.addEventListener("openChange", (event) => {
+      const open = (event as CustomEvent<{ open?: boolean }>).detail?.open;
+      if (open) {
+        const trigger = section.querySelector<HTMLElement>("proto-ui-base-dialog-trigger");
+        dialogOpener =
+          document.activeElement instanceof HTMLElement && section.contains(document.activeElement)
+            ? document.activeElement
+            : trigger;
+      } else if (dialogOpener) {
+        // The base prototype restores focus into its (now hidden) content
+        // after the close transition; re-assert after that settles.
+        const opener = dialogOpener;
+        dialogOpener = null;
+        window.setTimeout(() => {
+          if (!section.contains(document.activeElement) || document.querySelector(".demo-dialog")?.contains(document.activeElement)) {
+            opener.focus();
+          }
+        }, 160);
+      }
+    });
+
   }
 </script>
 
