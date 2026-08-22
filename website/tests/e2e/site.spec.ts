@@ -237,3 +237,16 @@ test("docs sidebar marks the current page", async ({ page }) => {
   );
   expect(marked).toBe(1);
 });
+
+test("root path redirects by the stored locale", async ({ page }) => {
+  // zh: init script forces zh on every load so the first landing is stable.
+  await page.addInitScript(() => localStorage.setItem("z3rm-locale", "zh"));
+  await page.goto("/z3rm/");
+  await expect(page).toHaveURL(/\/z3rm\/zh\/$/);
+});
+
+test("root path redirect flips to the newly stored locale", async ({ page }) => {
+  await page.addInitScript(() => localStorage.setItem("z3rm-locale", "en"));
+  await page.goto("/z3rm/");
+  await expect(page).toHaveURL(/\/z3rm\/en\/$/);
+});
