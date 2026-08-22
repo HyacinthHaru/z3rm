@@ -208,12 +208,22 @@ test("theme toggle shows pressed feedback and stays aria-pressed synced", async 
   await toggle.scrollIntoViewIfNeeded();
 
   const restBg = await toggle.evaluate((element) => getComputedStyle(element).backgroundColor);
+  const selectedBg = await toggle.evaluate(() => {
+    const probe = document.createElement("span");
+    probe.style.background = "var(--surface-selected)";
+    document.body.append(probe);
+    const value = getComputedStyle(probe).backgroundColor;
+    probe.remove();
+    return value;
+  });
   const box = await toggle.boundingBox();
   await page.mouse.move(box!.x + box!.width / 2, box!.y + box!.height / 2);
   await page.mouse.down();
   const pressedBg = await toggle.evaluate((element) => getComputedStyle(element).backgroundColor);
   await page.mouse.up();
 
-  expect(pressedBg).not.toBe(restBg);
+  // Press must step past hover to the selected surface — a bare "differs
+  // from rest" would pass on hover styling alone.
+  expect(pressedBg).toBe(selectedBg);
   await expect(page.locator("html")).toHaveAttribute("data-theme", /light|dark/);
 });

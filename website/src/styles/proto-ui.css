@@ -127,6 +127,10 @@ proto-ui-base-dialog-content {
 proto-ui-base-button:active,
 proto-ui-base-dialog-trigger:active,
 proto-ui-base-toggle:active,
-proto-ui-base-tabs-trigger:active {
+proto-ui-base-tabs-trigger:active,
+proto-ui-base-button:hover:active,
+proto-ui-base-dialog-trigger:hover:active,
+proto-ui-base-toggle:hover:active,
+proto-ui-base-tabs-trigger:hover:active {
   background: var(--surface-selected);
 }
