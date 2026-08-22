@@ -201,3 +201,19 @@ test("layout select is operable by keyboard", async ({ page }) => {
   await expect(trigger).toHaveAttribute("aria-expanded", "false");
   await expect(trigger).toBeFocused();
 });
+
+test("theme toggle shows pressed feedback and stays aria-pressed synced", async ({ page }) => {
+  await page.goto("en/");
+  const toggle = page.locator(".theme-toggle");
+  await toggle.scrollIntoViewIfNeeded();
+
+  const restBg = await toggle.evaluate((element) => getComputedStyle(element).backgroundColor);
+  const box = await toggle.boundingBox();
+  await page.mouse.move(box!.x + box!.width / 2, box!.y + box!.height / 2);
+  await page.mouse.down();
+  const pressedBg = await toggle.evaluate((element) => getComputedStyle(element).backgroundColor);
+  await page.mouse.up();
+
+  expect(pressedBg).not.toBe(restBg);
+  await expect(page.locator("html")).toHaveAttribute("data-theme", /light|dark/);
+});

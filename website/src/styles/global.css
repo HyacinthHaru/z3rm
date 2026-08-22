@@ -22,6 +22,8 @@ p { text-wrap: pretty; }
 .skip-link { position: fixed; z-index: 1000; top: .75rem; left: .75rem; padding: .6rem .8rem; transform: translateY(-200%); border: 1px solid var(--border-strong); border-radius: var(--radius-control); background: var(--surface-panel); }
 .skip-link:focus { transform: none; }
 .pui-control { min-height: 2.25rem; display: inline-flex; align-items: center; justify-content: center; gap: .45rem; padding: .45rem .75rem; border: 1px solid var(--border-muted); border-radius: var(--radius-control); color: var(--text-primary); background: var(--surface-panel); box-shadow: 0 1px 1px rgb(0 0 0 / 4%); cursor: pointer; }
+.pui-control:hover { background: var(--surface-hover); }
+.pui-control:active { background: var(--surface-selected); }
 .pui-control:hover { border-color: var(--border-strong); background: var(--surface-hover); }
 .pui-control[data-variant="primary"] { color: #fff; border-color: #385f8b; background: #416f9f; }
 .pui-control[data-variant="primary"]:hover { background: #365f8b; }

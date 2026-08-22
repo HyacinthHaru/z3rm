@@ -121,3 +121,12 @@ proto-ui-base-dialog-content {
   background: var(--surface-elevated);
   box-shadow: var(--shadow-window);
 }
+
+/* Pressed feedback: a control visibly responds between hover and release.
+   Toggled state itself is communicated by aria-pressed + the themed UI. */
+proto-ui-base-button:active,
+proto-ui-base-dialog-trigger:active,
+proto-ui-base-toggle:active,
+proto-ui-base-tabs-trigger:active {
+  background: var(--surface-selected);
+}
