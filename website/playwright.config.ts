@@ -16,7 +16,7 @@ export default defineConfig({
     { name: "mobile-chromium", use: { ...devices["Pixel 5"] } },
   ],
   webServer: {
-    command: "pnpm dev --host 127.0.0.1 --port 4331 --strictPort",
+    command: "pnpm exec astro preview --host 127.0.0.1 --port 4331",
     url: "http://127.0.0.1:4328/z3rm/en/",
     reuseExistingServer: true,
     timeout: 120_000,

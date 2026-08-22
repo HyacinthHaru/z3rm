@@ -61,11 +61,11 @@ jobs:
       - name: Check content and types
         run: pnpm check
         working-directory: website
-      - name: Run browser verification
-        run: pnpm exec playwright test --project chromium
-        working-directory: website
       - name: Build static site
         run: pnpm build
+        working-directory: website
+      - name: Run browser verification
+        run: pnpm exec playwright test --project chromium
         working-directory: website
       - name: Configure Pages
         uses: actions/configure-pages@983d7736d9b0ae728b81ab479565c72886d7745b
