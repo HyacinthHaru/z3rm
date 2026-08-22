@@ -227,3 +227,13 @@ test("theme toggle shows pressed feedback and stays aria-pressed synced", async 
   expect(pressedBg).toBe(selectedBg);
   await expect(page.locator("html")).toHaveAttribute("data-theme", /light|dark/);
 });
+
+test("docs sidebar marks the current page", async ({ page }) => {
+  await page.goto("en/guide/for-humans/");
+  const links = page.locator(".sidebar-column a");
+  await expect(links).not.toHaveCount(0);
+  const marked = await links.evaluateAll((els) =>
+    els.filter((el) => el.getAttribute("aria-current") === "page").length,
+  );
+  expect(marked).toBe(1);
+});
