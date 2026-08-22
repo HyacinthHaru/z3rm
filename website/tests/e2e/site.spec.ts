@@ -147,10 +147,14 @@ test("embedded demo does not hijack the landing page keyboard order", async ({ p
   // Give the demo time to boot and (previously) steal focus.
   await page.waitForTimeout(2500);
   await page.keyboard.press("Tab");
-  const focused = await page.evaluate(() => ({
-    text: (document.activeElement.textContent || "").trim().slice(0, 24),
-    cls: (document.activeElement.className || "").toString().slice(0, 20),
-    inHeader: !!document.activeElement.closest("header"),
-  }));
+  const focused = await page.evaluate(() => {
+    const el = document.activeElement;
+    if (!el) return { text: "", cls: "", inHeader: false };
+    return {
+      text: (el.textContent || "").trim().slice(0, 24),
+      cls: (el.className || "").toString().slice(0, 20),
+      inHeader: !!el.closest("header"),
+    };
+  });
   expect(focused.text).not.toContain("Z3RM-SNAPSHOT-001");
 });
