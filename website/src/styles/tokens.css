@@ -25,6 +25,10 @@
   --font-mono: "Lilex", "SFMono-Regular", Consolas, "Liberation Mono", monospace;
   --page-width: 1180px;
   --text-width: 720px;
+  /* Section rhythm: one scale for vertical spacing on the landing page, so
+     sections breathe evenly instead of accumulating ad-hoc margins. */
+  --section-gap: clamp(5rem, 10vw, 8rem);
+  --section-gap-tight: clamp(3rem, 6vw, 4.5rem);
 }
 
 [data-theme="dark"] {
