@@ -36,24 +36,37 @@ const visible = headings.filter((heading) => heading.depth === 2 || heading.dept
       }
     };
 
-    let visible: Element[] = [];
-    const observer = new IntersectionObserver(
-      (entries) => {
-        for (const entry of entries) {
-          if (entry.isIntersecting) {
-            visible.push(entry.target);
-          } else {
-            visible = visible.filter((heading) => heading !== entry.target);
+    function update() {
+      // The reader's section: the last heading that has crossed the upper
+      // quarter of the viewport. If none has (very top of a page), fall back
+      // to the first heading on screen so something is always marked once
+      // scrolling begins.
+      const probe = Math.max(1, window.innerHeight * 0.1);
+      let current: Element | null = null;
+      for (const heading of targets) {
+        if (heading.getBoundingClientRect().top <= probe) {
+          current = heading;
+        } else {
+          break;
+        }
+      }
+      if (current === null) {
+        for (const heading of targets) {
+          if (heading.getBoundingClientRect().bottom > 0) {
+            current = heading;
+            break;
           }
         }
-        const current = visible
-          .slice()
-          .sort((a, b) => a.getBoundingClientRect().top - b.getBoundingClientRect().top)[0] ?? null;
-        mark(current);
-      },
+      }
+      mark(current);
+    }
+    const observer = new IntersectionObserver(
+      () => update(),
       { rootMargin: "0px 0px -70% 0px" },
     );
     for (const heading of targets) observer.observe(heading);
+
+    window.addEventListener("resize", update, { passive: true });
   }
 
   watchCurrentSection(document);

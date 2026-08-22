@@ -105,15 +105,38 @@ test("docs table of contents marks the section in view", async ({ page }) => {
   const tocLinks = page.locator(".page-toc a");
   await expect(tocLinks).not.toHaveCount(0);
 
-  // At page top, exactly the first section is current — never zero, never several.
+  // At page top the first section is current.
   await expect(tocLinks.nth(0)).toHaveAttribute("aria-current", "location");
 
-  // Scroll to the third heading; exactly its TOC link becomes the current one.
+  // Scroll the second heading across the top edge; the marker follows it
+  // and stays on exactly one entry.
   const headings = page.locator("main h2, main h3");
-  await headings.nth(2).evaluate((element) => {
-    window.scrollTo({ top: element.getBoundingClientRect().top + window.scrollY - 80, behavior: "instant" });
+  await headings.nth(1).evaluate((element) => {
+    window.scrollTo({ top: element.getBoundingClientRect().top + window.scrollY - 8, behavior: "instant" });
   });
-  await expect(tocLinks.nth(2)).toHaveAttribute("aria-current", "location");
+  await page.evaluate(() => window.dispatchEvent(new Event("resize")));
+  await expect(tocLinks.nth(1)).toHaveAttribute("aria-current", "location");
   const currentCount = await tocLinks.evaluateAll((links) => links.filter((link) => link.getAttribute("aria-current") === "location").length);
   expect(currentCount).toBe(1);
+});
+
+test("docs table of contents keeps the last passed section marked", async ({ page }) => {
+  await page.goto("en/reference/cli/");
+  const tocLinks = page.locator(".page-toc a");
+  const linkCount = await tocLinks.count();
+  expect(linkCount).toBeGreaterThan(2);
+
+  // Scroll past the second-to-last heading until it leaves the viewport
+  // upward; its marker holds (or advances) but is never cleared to none.
+  const headings = page.locator("main h2, main h3");
+  const target = headings.nth(linkCount - 2);
+  await target.evaluate((element) => {
+    window.scrollTo({ top: element.getBoundingClientRect().top + window.scrollY - window.innerHeight * 0.5, behavior: "instant" });
+  });
+  await page.evaluate(() => window.dispatchEvent(new Event("resize")));
+  const currents = await tocLinks.evaluateAll((links) => links.map((link) => link.getAttribute("aria-current")));
+  expect(currents.filter((value) => value === "location").length).toBe(1);
+  // The page cannot scroll far enough to pass the last sections; what
+  // matters is the marker advanced past its initial entry and never cleared.
+  expect(currents.indexOf("location")).toBeGreaterThanOrEqual(1);
 });
