@@ -157,9 +157,13 @@ impl WebWindow {
         input_style.set_property("width", "1px").ok();
         input_style.set_property("height", "1px").ok();
         input_style.set_property("opacity", "0").ok();
+        // No boot-time focus(): stealing focus on load hijacks the host
+        // page's keyboard order when the app is embedded in an iframe —
+        // every Tab on the landing page started after the demo. The input
+        // is focused by canvas `pointerdown` instead, which is the only
+        // moment keyboard capture is actually wanted.
         body.append_child(&input_element)
             .map_err(|e| anyhow::anyhow!("Failed to append input to body: {e:?}"))?;
-        input_element.focus().ok();
 
         let display: Rc<dyn PlatformDisplay> = Rc::new(WebDisplay::new(browser_window.clone()));
 

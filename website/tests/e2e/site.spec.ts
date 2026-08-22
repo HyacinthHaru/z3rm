@@ -140,3 +140,17 @@ test("docs table of contents keeps the last passed section marked", async ({ pag
   // matters is the marker advanced past its initial entry and never cleared.
   expect(currents.indexOf("location")).toBeGreaterThanOrEqual(1);
 });
+
+test("embedded demo does not hijack the landing page keyboard order", async ({ page }) => {
+  await page.goto("en/");
+  await expect(page.locator('iframe[title="Z3rm GPUI WebAssembly session projection"]')).toBeAttached();
+  // Give the demo time to boot and (previously) steal focus.
+  await page.waitForTimeout(2500);
+  await page.keyboard.press("Tab");
+  const focused = await page.evaluate(() => ({
+    text: (document.activeElement.textContent || "").trim().slice(0, 24),
+    cls: (document.activeElement.className || "").toString().slice(0, 20),
+    inHeader: !!document.activeElement.closest("header"),
+  }));
+  expect(focused.text).not.toContain("Z3RM-SNAPSHOT-001");
+});
