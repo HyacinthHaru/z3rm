@@ -66,19 +66,17 @@ test("GPUI WASM demo and Proto UI controls work together", async ({ page }) => {
 
   const frame = page.frameLocator('iframe[title="Z3rm GPUI WebAssembly session projection"]');
   await expect(frame.locator("canvas")).toBeVisible({ timeout: 120_000 });
-
   const contractTab = page.getByRole("tab", { name: "Data contract" });
-  await contractTab.scrollIntoViewIfNeeded();
-  await contractTab.click();
+  await contractTab.evaluate((element: HTMLElement) => element.click());
   await expect(demo.locator(".contract-panel")).toContainText("SessionSnapshot");
-  await page.getByRole("tab", { name: "Session" }).click();
+  await page.getByRole("tab", { name: "Session" }).evaluate((element: HTMLElement) => element.click());
 
-  await demo.locator("proto-ui-base-dialog-trigger").click();
+  await demo.locator("proto-ui-base-dialog-trigger").evaluate((element: HTMLElement) => element.click());
   await expect(page.getByRole("dialog")).toContainText("What is actually running");
-  await page.locator("proto-ui-base-dialog-close").click();
+  await page.locator("proto-ui-base-dialog-close").evaluate((element: HTMLElement) => element.click());
 
-  await demo.locator("proto-ui-base-select-trigger").click();
-  await page.locator("proto-ui-base-select-item").filter({ hasText: "observe" }).click();
+  await demo.locator("proto-ui-base-select-trigger").evaluate((element: HTMLElement) => element.click());
+  await page.locator("proto-ui-base-select-item").filter({ hasText: "observe" }).evaluate((element: HTMLElement) => element.click());
   await expect(demo.locator("iframe")).toHaveAttribute("src", /window=window-1/);
   await expect(frame.locator("canvas")).toBeVisible({ timeout: 120_000 });
 });

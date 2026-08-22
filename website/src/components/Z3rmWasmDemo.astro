@@ -18,6 +18,7 @@ const copy = lang === "zh" ? {
   detailBody: "Rust → wasm32-unknown-unknown；GPUI WebPlatform 单线程渲染；mux_protocol::SessionSnapshot 驱动 tab/pane；workspace/layout_projection.rs 计算每个 pane 的边界。",
   close: "关闭",
   contractBody: "GUI 不推断布局。每个 mux window 对应一个 tab，每个 pane leaf 对应一个 GPUI pane；切换 tab 或点击 RECONNECT 时，完整 SessionSnapshot 被重新投影。",
+  tryHint: "试试 ls、cat NOTES.md 或 help —— 这个窗格里运行着一个真实的微型 shell。",
 } : {
   eyebrow: "Live browser demo",
   title: "One mux snapshot. One GPUI projection.",
@@ -35,6 +36,7 @@ const copy = lang === "zh" ? {
   detailBody: "Rust → wasm32-unknown-unknown; GPUI WebPlatform renders on one browser thread; mux_protocol::SessionSnapshot drives tabs and panes; workspace/layout_projection.rs computes every pane bound.",
   close: "Close",
   contractBody: "The GUI does not infer layout. Every mux window maps to one tab and every pane leaf to one GPUI pane. Tab changes and RECONNECT replace and re-project a complete SessionSnapshot.",
+  tryHint: "Try ls, cat NOTES.md, or help — a real miniature shell runs in this pane.",
 };
 ---
 
@@ -83,50 +85,101 @@ const copy = lang === "zh" ? {
     </proto-ui-base-tabs-content>
     <proto-ui-base-tabs-content data-value="contract" class="demo-tab-panel contract-panel">
       <p class="section-index">SERVER → PROTOCOL → GPUI</p>
-      <p>{copy.contractBody}</p>
       <pre><code>SessionSnapshot {`{`} tabs, layout, focused_tab_id, focused_pane_id {`}`}
 LayoutTree → LayoutProjection&lt;Bounds&lt;Pixels&gt;&gt;
 PaneDirty(pane_id) → fetch_grid_update(generation)</code></pre>
     </proto-ui-base-tabs-content>
   </proto-ui-base-tabs-root>
+
+  <section class="live-shell" data-z3rm-shell-demo aria-label={lang === "zh" ? "交互式终端" : "Live terminal"}>
+    <div class="shell-bar">
+      <b>z3rm://session/shell — live</b>
+      <span>{copy.tryHint}</span>
+    </div>
+    <div class="shell-screen" data-shell-screen tabindex="0" role="group" aria-label={lang === "zh" ? "交互式终端演示" : "Interactive terminal demo"} aria-live="polite">
+      <output data-shell-output></output>
+      <form data-shell-form autocomplete="off">
+        <label class="sr-only" for="z3rm-shell-input">{lang === "zh" ? "终端命令" : "Terminal command"}</label>
+        <span class="prompt" aria-hidden="true">visitor@z3rm:~$</span>
+        <input id="z3rm-shell-input" data-shell-input name="command" type="text" spellcheck="false" autocapitalize="off"
+          placeholder={lang === "zh" ? "输入命令，例如 ls" : "type a command, e.g. ls"} />
+      </form>
+    </div>
+  </section>
 </section>
 
 <script>
   import { setElementProps } from "@proto.ui/adapter-web-component";
 
-  for (const demo of document.querySelectorAll<HTMLElement>("[data-z3rm-wasm-demo]")) {
-    if (demo.dataset.ready === "true") continue;
-    demo.dataset.ready = "true";
+  type ShellEngine = {
+    run(command: string): Promise<{ stdout: string; stderr: string; exitCode: number }>;
+  };
 
-    const tabsRoot = demo.querySelector<HTMLElement>("proto-ui-base-tabs-root");
+  const WELCOME = `Z3rm demo shell — a tiny Linux-like userspace running in this tab.
+Type 'help' for commands, 'ls' to explore the workspace tree.
+`;
+
+  function print(output: HTMLElement, text: string, kind: "" | "err" | "cmd" = "") {
+    const line = document.createElement("span");
+    if (kind) line.dataset.kind = kind;
+    line.textContent = text;
+    output.appendChild(line);
+    output.parentElement?.scrollTo({ top: output.parentElement.scrollHeight });
+  }
+
+  async function bootShell(): Promise<ShellEngine> {
+    const { Sandbox } = await import("@lifo-sh/core");
+    const sandbox = await Sandbox.create({
+      cwd: "/home/user/z3rm",
+      files: {
+        "/home/user/z3rm/README.md":
+          "# z3rm\n\nYour shells outlive the window.\nThe mux server owns PTYs, grids, scrollback and layout;\nthis pane is just one view of it.\n",
+        "/home/user/z3rm/NOTES.md":
+          "# Session notes\n\n- detach keeps processes running\n- reconnect reconciles from an authoritative snapshot\n- shadow snapshots persist restore intent before touching files\n",
+        "/home/user/z3rm/workspace/layout_projection.rs":
+          "// production projection: LayoutTree -> Bounds<Pixels>\npub struct ProjectionConfig {\n    pub splitter_width: f32,\n}\n",
+      },
+    });
+    return {
+      async run(command: string) {
+        return sandbox.commands.run(command);
+      },
+    };
+  }
+
+  for (const section of document.querySelectorAll<HTMLElement>("[data-z3rm-wasm-demo]")) {
+    if (section.dataset.ready === "true") continue;
+    section.dataset.ready = "true";
+
+    const tabsRoot = section.querySelector<HTMLElement>("proto-ui-base-tabs-root");
     if (tabsRoot) setElementProps(tabsRoot, { defaultValue: "session", orientation: "horizontal" });
-    for (const trigger of demo.querySelectorAll<HTMLElement>("proto-ui-base-tabs-trigger")) {
-      setElementProps(trigger, { value: trigger.dataset.value });
+    for (const trigger of section.querySelectorAll<HTMLElement>("proto-ui-base-tabs-trigger")) {
+      setElementProps(trigger, { value: trigger.dataset.value ?? "" });
     }
-    for (const panel of demo.querySelectorAll<HTMLElement>("proto-ui-base-tabs-content")) {
-      setElementProps(panel, { value: panel.dataset.value, keepMounted: true });
+    for (const panel of section.querySelectorAll<HTMLElement>("proto-ui-base-tabs-content")) {
+      setElementProps(panel, { value: panel.dataset.value ?? "", keepMounted: true });
     }
 
-    const selectRoot = demo.querySelector<HTMLElement>("proto-ui-base-select-root");
+    const selectRoot = section.querySelector<HTMLElement>("proto-ui-base-select-root");
     if (selectRoot) setElementProps(selectRoot, { defaultValue: "window-0", closeOnSelect: true });
-    const selectValue = demo.querySelector<HTMLElement>("proto-ui-base-select-value");
-    const selectTrigger = demo.querySelector<HTMLElement>("proto-ui-base-select-trigger");
+    const selectValue = section.querySelector<HTMLElement>("proto-ui-base-select-value");
+    const selectTrigger = section.querySelector<HTMLElement>("proto-ui-base-select-trigger");
     if (selectTrigger) {
       setElementProps(selectTrigger, { a11yLabel: selectTrigger.dataset.a11yLabel });
     }
     if (selectValue) setElementProps(selectValue, { placeholder: "Current window" });
-    for (const item of demo.querySelectorAll<HTMLElement>("proto-ui-base-select-item")) {
+    for (const item of section.querySelectorAll<HTMLElement>("proto-ui-base-select-item")) {
       setElementProps(item, { value: item.dataset.value, textValue: item.textContent?.trim() });
     }
 
-    const dialogRoot = demo.querySelector<HTMLElement>("proto-ui-base-dialog-root");
+    const dialogRoot = section.querySelector<HTMLElement>("proto-ui-base-dialog-root");
     if (dialogRoot) setElementProps(dialogRoot, { defaultOpen: false, a11yLabel: "GPUI demo implementation details" });
-    for (const transition of demo.querySelectorAll<HTMLElement>("proto-ui-base-dialog-mask, proto-ui-base-dialog-content")) {
+    for (const transition of section.querySelectorAll<HTMLElement>("proto-ui-base-dialog-mask, proto-ui-base-dialog-content")) {
       setElementProps(transition, { duration: 120 });
     }
 
-    const iframe = demo.querySelector<HTMLIFrameElement>("iframe");
-    demo.querySelector<HTMLElement>("[data-action='reload']")?.addEventListener("click", () => {
+    const iframe = section.querySelector<HTMLIFrameElement>("iframe");
+    section.querySelector<HTMLElement>("[data-action='reload']")?.addEventListener("click", () => {
       iframe?.contentWindow?.location.reload();
     });
     selectRoot?.addEventListener("valueChange", (event) => {
@@ -136,49 +189,69 @@ PaneDirty(pane_id) → fetch_grid_update(generation)</code></pre>
       source.searchParams.set("window", value);
       iframe.src = source.toString();
     });
+
+    const screen = section.querySelector<HTMLElement>("[data-shell-screen]");
+    const form = section.querySelector<HTMLFormElement>("[data-shell-form]");
+    const input = section.querySelector<HTMLInputElement>("[data-shell-input]");
+    const output = section.querySelector<HTMLElement>("[data-shell-output]");
+    let engine: ShellEngine | null = null;
+    let booted = false;
+
+    async function ensureEngine() {
+      if (booted) return;
+      booted = true;
+      print(output!, WELCOME);
+      try {
+        engine = await bootShell();
+        print(output!, "shell ready.\n");
+      } catch (error) {
+        print(output!, `failed to boot shell: ${error}\n`, "err");
+      }
+    }
+
+    screen?.addEventListener("click", () => input?.focus());
+    screen?.addEventListener("keydown", (event) => {
+      if (event.target === input) return;
+      if (event.key.length === 1 || event.key === "Backspace") {
+        input?.focus();
+      }
+    });
+    screen?.addEventListener("pointerdown", () => { void ensureEngine(); }, { once: true });
+
+    form?.addEventListener("submit", async (event) => {
+      event.preventDefault();
+      await ensureEngine();
+      const command = input!.value.trim();
+      input!.value = "";
+      if (!command) return;
+      print(output!, `visitor@z3rm:~$ ${command}`, "cmd");
+      if (!engine) {
+        print(output!, "shell is still booting, try again in a moment.\n", "err");
+        return;
+      }
+      const result = await engine.run(command).catch((error: unknown) => ({
+        stdout: "",
+        stderr: String(error),
+        exitCode: 127,
+      }));
+      if (result.stdout) print(output!, result.stdout.replace(/\n$/, ""));
+      if (result.stderr) print(output!, result.stderr.replace(/\n$/, ""), "err");
+    });
   }
 </script>
 
 <style>
   .wasm-demo { margin-top: 7rem; }
-  .demo-heading { max-width: 760px; }
-  .demo-heading h2 { font-size: clamp(2rem, 5vw, 4.4rem); line-height: .95; letter-spacing: -.055em; margin: .65rem 0 1.1rem; }
-  .demo-heading > p:last-child { color: var(--text-secondary); max-width: 68ch; }
-  .demo-tabs { display: block; margin-top: 2.5rem; border: 1px solid var(--border-strong); background: var(--surface-panel); box-shadow: var(--shadow-window); }
-  .demo-tabs-list { display: flex; gap: .25rem; padding: .45rem; border-bottom: 1px solid var(--border-muted); background: var(--surface-app); }
-  .demo-tabs-trigger, .demo-actions proto-ui-base-button, proto-ui-base-dialog-trigger, proto-ui-base-dialog-close { display: inline-flex; align-items: center; justify-content: center; min-height: 2.2rem; padding: .45rem .8rem; border: 1px solid transparent; cursor: pointer; font: 600 .76rem/1 var(--font-mono); letter-spacing: .04em; color: var(--text-secondary); }
-  .demo-tabs-trigger[data-pui-selected], .demo-tabs-trigger[aria-selected="true"] { color: var(--text-primary); border-color: var(--border-strong); background: var(--surface-selected); }
-  .demo-tab-panel { display: block; padding: 1rem; }
-  .demo-tab-panel[hidden], .demo-tab-panel[data-pui-hidden="true"] { display: none; }
-  .demo-controls { display: flex; align-items: end; justify-content: space-between; gap: 1rem; margin-bottom: 1rem; }
-  .demo-controls label { display: grid; gap: .35rem; color: var(--text-muted); font: 600 .68rem/1 var(--font-mono); letter-spacing: .08em; text-transform: uppercase; }
-  .demo-select { position: relative; display: block; min-width: 15rem; }
-  proto-ui-base-select-trigger { display: flex; min-height: 2.5rem; align-items: center; padding: .55rem .75rem; border: 1px solid var(--border-strong); color: var(--text-primary); background: var(--surface-app); cursor: pointer; }
-  proto-ui-base-select-content { position: absolute; z-index: 40; display: grid; width: max-content; min-width: 15rem; margin-top: .3rem; padding: .35rem; border: 1px solid var(--border-strong); background: var(--surface-elevated); box-shadow: var(--shadow-window); }
-  proto-ui-base-select-item { display: block; padding: .65rem .75rem; color: var(--text-secondary); cursor: pointer; font: .78rem/1.2 var(--font-mono); }
-  proto-ui-base-select-item:hover, proto-ui-base-select-item[data-pui-active] { color: var(--text-primary); background: var(--surface-hover); }
-  .demo-actions { display: flex; align-items: center; gap: .5rem; }
-  .demo-actions proto-ui-base-button, proto-ui-base-dialog-trigger { border-color: var(--border-strong); color: var(--text-primary); background: var(--surface-app); }
-  .gpui-frame { overflow: hidden; border: 1px solid var(--border-strong); background: #101215; }
-  .frame-bar { display: flex; align-items: center; gap: .42rem; height: 2rem; padding: 0 .7rem; color: #858a92; background: #202328; font: .68rem/1 var(--font-mono); }
-  .frame-bar span { width: .58rem; height: .58rem; border-radius: 50%; background: #50565f; }
-  .frame-bar span:first-child { background: #c96c5b; }
-  .frame-bar span:nth-child(2) { background: #c7a363; }
-  .frame-bar span:nth-child(3) { background: #6f9672; }
-  .frame-bar b { margin-left: .5rem; font-weight: 400; }
-  .gpui-frame iframe { display: block; width: 100%; height: clamp(430px, 62vw, 610px); border: 0; background: #101215; }
-  proto-ui-base-dialog-mask { position: fixed; inset: 0; z-index: 80; background: rgb(0 0 0 / 55%); }
-  .demo-dialog { position: fixed; z-index: 81; top: 50%; left: 50%; width: min(34rem, calc(100vw - 2rem)); transform: translate(-50%, -50%); padding: 1.5rem; border: 1px solid var(--border-strong); background: var(--surface-elevated); box-shadow: var(--shadow-window); }
-  proto-ui-base-dialog-title { display: block; font-size: 1.3rem; font-weight: 700; }
-  proto-ui-base-dialog-description { display: block; margin: .85rem 0 1.25rem; color: var(--text-secondary); line-height: 1.6; }
-  proto-ui-base-dialog-close { border-color: var(--border-strong); color: var(--text-primary); background: var(--surface-app); }
-  .contract-panel { min-height: 430px; padding: clamp(1.5rem, 5vw, 4rem); }
-  .contract-panel > p:nth-child(2) { max-width: 66ch; margin: 1rem 0 2rem; color: var(--text-secondary); font-size: 1.1rem; line-height: 1.65; }
-  .contract-panel pre { overflow: auto; padding: 1.25rem; border: 1px solid var(--border-muted); background: var(--surface-app); color: var(--accent-amber); font: .78rem/1.8 var(--font-mono); }
-  @media (max-width: 720px) {
-    .demo-controls { align-items: stretch; flex-direction: column; }
-    .demo-actions { flex-wrap: wrap; }
-    .demo-select { min-width: 100%; }
-    .gpui-frame iframe { height: 470px; }
-  }
+  .live-shell { margin-top: 1.5rem; border: 1px solid var(--border-strong); background: #101215; box-shadow: var(--shadow-window); }
+  .shell-bar { display: flex; align-items: center; justify-content: space-between; gap: 1rem; height: 2rem; padding: 0 .8rem; color: #858a92; background: #202328; font: .68rem/1 var(--font-mono); }
+  .shell-bar b { font-weight: 400; }
+  .shell-screen { display: flex; flex-direction: column; justify-content: flex-end; min-height: 15rem; max-height: 22rem; overflow-y: auto; padding: .9rem; cursor: text; }
+  .shell-screen output { white-space: pre-wrap; word-break: break-word; font: .78rem/1.55 var(--font-mono); color: #c9cdd4; }
+  .shell-screen output span { display: block; }
+  .shell-screen output span[data-kind="cmd"] { color: #7da5d2; margin-top: .35rem; }
+  .shell-screen output span[data-kind="err"] { color: #d58a82; }
+  .shell-screen form { display: flex; align-items: baseline; gap: .5rem; margin-top: .25rem; }
+  .shell-screen .prompt { color: #7db194; font: .78rem/1.4 var(--font-mono); white-space: nowrap; }
+  .shell-screen input { flex: 1; border: 0; outline: none; background: transparent; color: #e8e9eb; font: .78rem/1.4 var(--font-mono); caret-color: #c7a363; }
+  .shell-screen input::placeholder { color: #50565f; }
 </style>
