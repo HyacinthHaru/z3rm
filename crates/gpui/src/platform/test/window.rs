@@ -12,6 +12,7 @@ use parking_lot::Mutex;
 use raw_window_handle::{HasDisplayHandle, HasWindowHandle};
 use std::{
     cell::Cell,
+    path::PathBuf,
     rc::{Rc, Weak},
     sync::{self, Arc},
 };
@@ -28,30 +29,36 @@ pub(crate) struct TestWindowState {
     sprite_atlas: Arc<dyn PlatformAtlas>,
     renderer: Option<Box<dyn PlatformHeadlessRenderer>>,
     pub(crate) should_close_handler: Option<Box<dyn FnMut() -> bool>>,
+    a11y_action_callback: Option<Box<dyn Fn(accesskit::ActionRequest) + Send + 'static>>,
+    a11y_activation_callback: Option<Box<dyn Fn() -> Option<accesskit::TreeUpdate> + Send + 'static>>,
     hit_test_window_control_callback: Option<Box<dyn FnMut() -> Option<WindowControlArea>>>,
     input_callback: Option<Box<dyn FnMut(PlatformInput) -> DispatchEventResult>>,
     active_status_change_callback: Option<Box<dyn FnMut(bool)>>,
     hover_status_change_callback: Option<Box<dyn FnMut(bool)>>,
     resize_callback: Option<Box<dyn FnMut(Size<Pixels>, f32)>>,
     moved_callback: Option<Box<dyn FnMut()>>,
-    a11y_action_callback: Option<Box<dyn Fn(accesskit::ActionRequest) + Send + 'static>>,
     appearance_change_callback: Option<Box<dyn FnMut()>>,
-    a11y_activation_callback: Option<Box<dyn Fn() -> Option<accesskit::TreeUpdate> + Send + 'static>>,
     request_frame_callback: Option<Box<dyn FnMut(RequestFrameOptions)>>,
     frame_wake_count: Rc<Cell<usize>>,
+    frame_scheduled: bool,
+    frame_callback_pending: bool,
     input_handler: Option<PlatformInputHandler>,
     is_fullscreen: bool,
     appearance: WindowAppearance,
+    external_drag_files: Vec<(PathBuf, bool)>,
+    start_external_drag_result: bool,
 }
 
 #[derive(Clone)]
 pub struct TestWindow(pub(crate) Rc<Mutex<TestWindowState>>);
 
+// Test windows are not backed by a real platform window, so there is no raw
+// handle to report; `NotSupported` is `raw_window_handle`'s variant for exactly this.
 impl HasWindowHandle for TestWindow {
     fn window_handle(
         &self,
     ) -> Result<raw_window_handle::WindowHandle<'_>, raw_window_handle::HandleError> {
-        unimplemented!("Test Windows are not backed by a real platform window")
+        Err(raw_window_handle::HandleError::NotSupported)
     }
 }
 
@@ -59,7 +66,7 @@ impl HasDisplayHandle for TestWindow {
     fn display_handle(
         &self,
     ) -> Result<raw_window_handle::DisplayHandle<'_>, raw_window_handle::HandleError> {
-        unimplemented!("Test Windows are not backed by a real platform window")
+        Err(raw_window_handle::HandleError::NotSupported)
     }
 }
 
@@ -82,7 +89,6 @@ impl TestWindow {
             handle,
             sprite_atlas,
             renderer,
-            a11y_activation_callback: None,
             title: params
                 .titlebar
                 .as_ref()
@@ -90,20 +96,47 @@ impl TestWindow {
             edited: false,
             document_path: None,
             should_close_handler: None,
+            a11y_action_callback: None,
+            a11y_activation_callback: None,
             hit_test_window_control_callback: None,
             input_callback: None,
             active_status_change_callback: None,
             hover_status_change_callback: None,
             resize_callback: None,
             moved_callback: None,
-            a11y_action_callback: None,
             appearance_change_callback: None,
             request_frame_callback: None,
             frame_wake_count: Rc::new(Cell::new(0)),
+            frame_scheduled: false,
+            frame_callback_pending: false,
             input_handler: None,
             is_fullscreen: false,
             appearance: WindowAppearance::Light,
+            external_drag_files: Vec::new(),
+            start_external_drag_result: false,
         })))
+    }
+    pub fn simulate_scheduled_frame(&self) -> bool {
+        let callback = {
+            let mut state = self.0.lock();
+            if !std::mem::take(&mut state.frame_scheduled) {
+                return false;
+            }
+            state.frame_callback_pending = false;
+            state.request_frame_callback.take()
+        };
+        let Some(mut callback) = callback else {
+            self.0.lock().frame_scheduled = true;
+            return false;
+        };
+
+        callback(RequestFrameOptions::default());
+        self.0.lock().request_frame_callback = Some(callback);
+        true
+    }
+
+    pub fn frame_scheduled(&self) -> bool {
+        self.0.lock().frame_scheduled
     }
 
     pub fn simulate_resize(&mut self, size: Size<Pixels>) {
@@ -127,16 +160,6 @@ impl TestWindow {
         drop(lock);
         callback(active);
         self.0.lock().active_status_change_callback = Some(callback);
-    }
-
-    /// Activate accessibility for this window only, as the platform adapter
-    /// would.
-    pub fn simulate_a11y_activation(&self) {
-        let callback = self.0.lock().a11y_activation_callback.take();
-        if let Some(callback) = callback {
-            let _ = callback();
-            self.0.lock().a11y_activation_callback = Some(callback);
-        }
     }
 
     pub fn simulate_appearance_change(&self, appearance: WindowAppearance) {
@@ -178,21 +201,12 @@ impl TestWindow {
         !result.propagate
     }
 
-    /// Simulates a semantic action request from a screen reader (e.g. an
-    /// AT-SPI client). The request is delivered through the genuine AccessKit
-    /// action callback installed by [`crate::Window::new`], so it flows
-    /// through the production action channel into
-    /// `Window::handle_a11y_action`. Returns `true` when a callback was
-    /// registered and invoked, `false` when none is present.
-    pub fn simulate_a11y_action(&mut self, request: accesskit::ActionRequest) -> bool {
-        let mut lock = self.0.lock();
-        let Some(callback) = lock.a11y_action_callback.take() else {
-            return false;
-        };
-        drop(lock);
-        callback(request);
-        self.0.lock().a11y_action_callback = Some(callback);
-        true
+    pub fn external_drag_files(&self) -> Vec<(PathBuf, bool)> {
+        self.0.lock().external_drag_files.clone()
+    }
+
+    pub fn set_start_external_drag_result(&self, result: bool) {
+        self.0.lock().start_external_drag_result = result;
     }
 }
 
@@ -347,6 +361,13 @@ impl PlatformWindow for TestWindow {
         self.0.lock().request_frame_callback = Some(callback);
     }
 
+    fn schedule_frame(&self) {
+        let mut state = self.0.lock();
+        if !state.frame_callback_pending {
+            state.frame_scheduled = true;
+        }
+    }
+
     fn on_input(&self, callback: Box<dyn FnMut(crate::PlatformInput) -> DispatchEventResult>) {
         self.0.lock().input_callback = Some(callback)
     }
@@ -387,29 +408,23 @@ impl PlatformWindow for TestWindow {
             action,
             deactivation: _,
         } = callbacks;
-        // §15.11 Headless a11y capture: by default TestWindow leaves the
-        // a11y active flag untouched (the real adapter is absent). When a
-        // process opts in via `Z3RM_A11Y_BUILD_HEADLESS`, immediately fire
-        // the activation callback so `active_flag` flips and the per-frame
-        // tree construction runs. The returned `TreeUpdate` is dropped: the
-        // in-memory builder keeps its own copy for `debug_a11y_tree_json`.
+        // §15.11 Headless a11y capture: when a process opts in via
+        // `Z3RM_A11Y_BUILD_HEADLESS`, immediately fire the activation callback
+        // so `active_flag` flips and per-frame tree construction runs.
         if std::env::var("Z3RM_A11Y_BUILD_HEADLESS").is_ok() {
             let _ = activation();
         }
-        // Retained so a single test can opt in without an environment
-        // variable, which would apply to every window in the process and
-        // change the behavior of unrelated tests sharing the binary.
+        // Retained so tests can drive the genuine callbacks installed by
+        // `Window::new` instead of a parallel fake channel.
         self.0.lock().a11y_activation_callback = Some(activation);
-        // §15.12 Semantic actions: retain the action callback (it was
-        // previously dropped, so tests could not inject actions). It is the
-        // genuine callback installed by `Window::new`, so requests injected
-        // via `simulate_a11y_action` still flow through the production
-        // action channel into `Window::handle_a11y_action`.
         self.0.lock().a11y_action_callback = Some(action);
     }
+
     fn draw(&self, scene: &Scene) {
         let scale_factor = self.scale_factor();
         let mut state = self.0.lock();
+        state.frame_callback_pending = true;
+        state.frame_scheduled = true;
         let device_size: Size<DevicePixels> = state.bounds.size.to_device_pixels(scale_factor);
         if let Some(renderer) = &mut state.renderer {
             renderer.render_scene(scene, device_size).warn_on_err();
@@ -448,6 +463,20 @@ impl PlatformWindow for TestWindow {
 
     fn start_window_move(&self) {
         unimplemented!()
+    }
+
+    fn can_start_external_drag(&self) -> bool {
+        true
+    }
+
+    fn start_external_drag(&self, payload: &crate::ExternalDragPayload) -> bool {
+        let mut state = self.0.lock();
+        match payload {
+            crate::ExternalDragPayload::Files(paths) => {
+                state.external_drag_files.extend_from_slice(paths.entries());
+            }
+        }
+        state.start_external_drag_result
     }
 
     fn update_ime_position(&self, _bounds: Bounds<Pixels>) {}
@@ -519,5 +548,35 @@ impl PlatformAtlas for TestAtlas {
     fn remove(&self, key: &AtlasKey) {
         let mut state = self.0.lock();
         state.tiles.remove(key);
+    }
+
+    fn contains(&self, key: &AtlasKey) -> bool {
+        self.0.lock().tiles.contains_key(key)
+    }
+}
+
+impl TestWindow {
+    /// Simulate an assistive technology activating the window, exercising the
+    /// platform's a11y activation callback.
+    pub fn simulate_a11y_activation(&self) {
+        let callback = self.0.lock().a11y_activation_callback.take();
+        if let Some(callback) = callback {
+            let _ = callback();
+            self.0.lock().a11y_activation_callback = Some(callback);
+        }
+    }
+
+    /// Simulate an accessibility action request arriving from the platform,
+    /// e.g. a screen reader activating an element. Returns whether a handler
+    /// consumed it.
+    pub fn simulate_a11y_action(&mut self, request: accesskit::ActionRequest) -> bool {
+        let mut lock = self.0.lock();
+        let Some(callback) = lock.a11y_action_callback.take() else {
+            return false;
+        };
+        drop(lock);
+        callback(request);
+        self.0.lock().a11y_action_callback = Some(callback);
+        true
     }
 }

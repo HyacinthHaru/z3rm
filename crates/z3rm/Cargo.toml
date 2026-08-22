@@ -113,7 +113,7 @@ workspace = true
 
 [dependencies.gpui]
 workspace = true
-features = [ "input-latency-histogram"]
+features = [ "profiler"]
 
 [dependencies.gpui_platform]
 workspace = true
@@ -362,7 +362,7 @@ features = [ "test-support"]
 
 [dev-dependencies.gpui]
 workspace = true
-features = [ "input-latency-histogram", "test-support"]
+features = [ "profiler", "test-support"]
 
 [dev-dependencies.itertools]
 workspace = true
@@ -435,11 +435,11 @@ workspace = true
 
 [target."cfg(target_os = \"windows\")".dependencies.gpui]
 workspace = true
-features = [ "input-latency-histogram", "windows-manifest"]
+features = [ "profiler", "windows-manifest"]
 
 [target."cfg(any(target_os = \"linux\", target_os = \"freebsd\"))".dependencies.gpui]
 workspace = true
-features = [ "input-latency-histogram", "wayland", "x11"]
+features = [ "profiler", "wayland", "x11"]
 
 [target."cfg(any(target_os = \"linux\", target_os = \"freebsd\"))".build-dependencies.image]
 workspace = true

@@ -143,9 +143,13 @@ impl WebWindow {
             .map_err(|e| anyhow::anyhow!("Failed to create input element: {e:?}"))?
             .dyn_into()
             .map_err(|e| anyhow::anyhow!("Created element is not an input: {e:?}"))?;
+        // The helper input captures keyboard for the canvas. Without a label
+        // it reads as an unlabeled form control to accessibility scanners, so
+        // mark it as presentation-only.
         input_element
             .set_attribute("aria-label", "GPUI keyboard input")
-            .map_err(|error| anyhow::anyhow!("Failed to label GPUI keyboard input: {error:?}"))?;
+            .ok();
+        input_element.set_attribute("tabindex", "-1").ok();
         let input_style = input_element.style();
         input_style.set_property("position", "fixed").ok();
         input_style.set_property("top", "0").ok();
@@ -791,10 +795,6 @@ impl PlatformWindow for WebWindow {
         }
 
         self.inner.state.borrow_mut().renderer.draw(scene);
-    }
-
-    fn completed_frame(&self) {
-        // On web, presentation happens automatically via wgpu surface present
     }
 
     fn sprite_atlas(&self) -> Arc<dyn PlatformAtlas> {

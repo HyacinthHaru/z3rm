@@ -691,6 +691,31 @@ impl ExternalPaths {
     }
 }
 
+/// Data offered to the platform when an internal drag leaves the window and is
+/// promoted to a native drag session.
+#[derive(Debug, Clone, Eq, PartialEq)]
+pub enum ExternalDragPayload {
+    /// Real on-disk paths, handed to the platform as an outbound file drag.
+    Files(FileDragPaths),
+}
+
+/// Paths handed to the platform for a native file drag. Directory metadata is
+/// provided by the caller to avoid querying it when the platform drag starts.
+#[derive(Debug, Clone, Default, Eq, PartialEq)]
+pub struct FileDragPaths(SmallVec<[(PathBuf, bool); 2]>);
+
+impl FileDragPaths {
+    /// Creates a native file-drag payload from paths paired with whether each path is a directory.
+    pub fn new(entries: impl IntoIterator<Item = (PathBuf, bool)>) -> Self {
+        Self(entries.into_iter().collect())
+    }
+
+    /// The dragged paths, each paired with whether it is a directory.
+    pub fn entries(&self) -> &[(PathBuf, bool)] {
+        &self.0
+    }
+}
+
 impl Render for ExternalPaths {
     fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
         // the platform will render icons for the dragged files
@@ -720,6 +745,8 @@ pub enum FileDropEvent {
     },
     /// The user has stopped dragging the files over the window.
     Exited,
+    /// The platform-owned drag session has ended.
+    Ended,
 }
 
 impl Sealed for FileDropEvent {}
@@ -791,6 +818,25 @@ impl PlatformInput {
             PlatformInput::Pinch(_) => None,
             PlatformInput::FileDrop(_) => None,
             PlatformInput::Touch(_) => None,
+        }
+    }
+
+    /// A short static name for this input's variant, for diagnostics and
+    /// telemetry.
+    pub fn kind_name(&self) -> &'static str {
+        match self {
+            PlatformInput::KeyDown(_) => "key_down",
+            PlatformInput::KeyUp(_) => "key_up",
+            PlatformInput::ModifiersChanged(_) => "modifiers_changed",
+            PlatformInput::MouseDown(_) => "mouse_down",
+            PlatformInput::MouseUp(_) => "mouse_up",
+            PlatformInput::MousePressure(_) => "mouse_pressure",
+            PlatformInput::MouseMove(_) => "mouse_move",
+            PlatformInput::MouseExited(_) => "mouse_exited",
+            PlatformInput::ScrollWheel(_) => "scroll_wheel",
+            PlatformInput::Pinch(_) => "pinch",
+            PlatformInput::FileDrop(_) => "file_drop",
+            PlatformInput::Touch(_) => "touch",
         }
     }
 

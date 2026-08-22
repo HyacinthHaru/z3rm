@@ -278,7 +278,7 @@ impl<P: LinuxClient + 'static> Platform for LinuxPlatform<P> {
         self.inner.compositor_name()
     }
 
-    fn restart(&self, binary_path: Option<PathBuf>) {
+    fn restart(&self, binary_path: Option<PathBuf>, arguments: Vec<OsString>) {
         use std::os::unix::process::CommandExt as _;
 
         // get the process id of the current process
@@ -305,7 +305,13 @@ impl<P: LinuxClient + 'static> Platform for LinuxPlatform<P> {
                 sleep 0.1
             done
 
-            "$1"
+            app_path="$1"
+            shift
+            if (($# > 0)); then
+                exec "$app_path" "$@"
+            else
+                exec "$app_path"
+            fi
             "#;
 
         #[allow(
@@ -318,6 +324,7 @@ impl<P: LinuxClient + 'static> Platform for LinuxPlatform<P> {
             .arg(script)
             .arg(&app_pid)
             .arg(&app_path)
+            .args(arguments)
             .process_group(0)
             .spawn();
 

@@ -318,7 +318,7 @@ impl Element for Img {
 
                             if let Some(state) = &mut state {
                                 state.frame_index = state.frame_index.min(max_frame_index);
-                                if frame_count > 1 {
+                                if frame_count > 1 && !cx.reduce_motion() {
                                     if window.is_window_active() {
                                         let current_time = Instant::now();
                                         if let Some(last_frame_time) = state.last_frame_time {
@@ -382,6 +382,7 @@ impl Element for Img {
                             if global_id.is_some()
                                 && data.frame_count() > 1
                                 && window.is_window_active()
+                                && !cx.reduce_motion()
                             {
                                 window.request_animation_frame();
                             }
@@ -580,6 +581,17 @@ impl ImageSource {
             }
             ImageSource::Custom(_) | ImageSource::Render(_) => {}
             ImageSource::Image(data) => cx.remove_asset::<AssetLogger<ImageDecoder>>(data),
+        }
+    }
+
+    /// Check whether this image source is present in the asset system (loading
+    /// or loaded), without fetching it.
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn is_asset_cached(&self, cx: &App) -> bool {
+        match self {
+            ImageSource::Resource(resource) => cx.has_asset::<ImgResourceLoader>(resource),
+            ImageSource::Custom(_) | ImageSource::Render(_) => false,
+            ImageSource::Image(data) => cx.has_asset::<AssetLogger<ImageDecoder>>(data),
         }
     }
 }

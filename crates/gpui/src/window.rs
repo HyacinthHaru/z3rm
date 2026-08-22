@@ -1,5 +1,9 @@
+#[cfg(feature = "profiler")]
+use crate::DebugFrameOverlayMode;
 #[cfg(any(feature = "inspector", debug_assertions))]
 use crate::Inspector;
+#[cfg(feature = "profiler")]
+use crate::profiler;
 use crate::{
     Action, AnyDrag, AnyElement, AnyImageCache, AnyTooltip, AnyView, App, AppContext, Arena, Asset,
     AsyncWindowContext, AtlasTile, AvailableSpace, Background, BorderStyle, Bounds, BoxShadow,
@@ -17,7 +21,7 @@ use crate::{
     SystemWindowTabController, TabStopMap, TaffyLayoutEngine, Task, TextRenderingMode, TextStyle,
     TextStyleRefinement, ThermalState, TransformationMatrix, Underline, UnderlineStyle,
     WindowAppearance, WindowBackgroundAppearance, WindowBounds, WindowControls, WindowDecorations,
-    WindowOptions, WindowParams, WindowTextSystem, point, prelude::*, profiler, px, rems, size,
+    WindowOptions, WindowParams, WindowTextSystem, point, prelude::*, px, rems, size,
     transparent_black,
 };
 
@@ -30,8 +34,6 @@ use futures::FutureExt;
 use futures::channel::oneshot;
 use gpui_util::post_inc;
 use gpui_util::{ResultExt, measure};
-#[cfg(feature = "input-latency-histogram")]
-use hdrhistogram::Histogram;
 use itertools::FoldWhile::{Continue, Done};
 use itertools::Itertools;
 use parking_lot::RwLock;
@@ -115,18 +117,23 @@ impl DispatchPhase {
 }
 
 struct WindowInvalidatorInner {
+    #[cfg(feature = "profiler")]
+    pub window_id: WindowId,
     pub dirty: bool,
     pub draw_phase: DrawPhase,
     pub dirty_views: FxHashSet<EntityId>,
     pub update_count: usize,
+    #[cfg(feature = "profiler")]
     pub frame_dirty: FrameDirtyAccumulator,
     pub platform_waker: Option<Rc<dyn Fn()>>,
 }
 
 /// Per-frame invalidation bookkeeping, drained at draw time and emitted to the
 /// frame profiler. Tracks when the current frame first became dirty and how
-/// many invalidations were coalesced into it. Only populated while
-/// `profiler::frame_trace_enabled()` is set.
+/// many invalidations were coalesced into it, whenever the profiler is
+/// compiled in. Retention of the resulting per-frame records is what
+/// `profiler::trace_enabled()` controls, not this measurement.
+#[cfg(feature = "profiler")]
 #[derive(Default)]
 struct FrameDirtyAccumulator {
     dirty_at: Option<Instant>,
@@ -139,13 +146,16 @@ pub(crate) struct WindowInvalidator {
 }
 
 impl WindowInvalidator {
-    pub fn new() -> Self {
+    pub fn new(#[allow(unused_variables)] window_id: WindowId) -> Self {
         WindowInvalidator {
             inner: Rc::new(RefCell::new(WindowInvalidatorInner {
+                #[cfg(feature = "profiler")]
+                window_id,
                 dirty: true,
                 draw_phase: DrawPhase::None,
                 dirty_views: FxHashSet::default(),
                 update_count: 0,
+                #[cfg(feature = "profiler")]
                 frame_dirty: FrameDirtyAccumulator::default(),
                 platform_waker: None,
             })),
@@ -157,11 +167,18 @@ impl WindowInvalidator {
         inner.update_count += 1;
         inner.dirty_views.insert(entity);
         if inner.draw_phase == DrawPhase::None {
-            Self::record_frame_dirty(&mut inner);
+            #[cfg(feature = "profiler")]
+            let dirty_at = Self::record_frame_dirty(&mut inner);
             let became_dirty = !inner.dirty;
             inner.dirty = true;
             let waker = became_dirty.then(|| inner.platform_waker.clone()).flatten();
+            #[cfg(feature = "profiler")]
+            let window_id = inner.window_id;
             drop(inner);
+            #[cfg(feature = "profiler")]
+            if became_dirty {
+                profiler::journal::record_frame_pending(window_id, dirty_at);
+            }
             cx.push_effect(Effect::Notify { emitter: entity });
             if let Some(waker) = waker {
                 waker();
@@ -182,10 +199,17 @@ impl WindowInvalidator {
         inner.dirty = dirty;
         if dirty {
             inner.update_count += 1;
-            Self::record_frame_dirty(&mut inner);
         }
+        #[cfg(feature = "profiler")]
+        let dirty_at = dirty.then(|| Self::record_frame_dirty(&mut inner));
         let waker = became_dirty.then(|| inner.platform_waker.clone()).flatten();
+        #[cfg(feature = "profiler")]
+        let window_id = inner.window_id;
         drop(inner);
+        #[cfg(feature = "profiler")]
+        if became_dirty && let Some(dirty_at) = dirty_at {
+            profiler::journal::record_frame_pending(window_id, dirty_at);
+        }
         if let Some(waker) = waker {
             waker();
         }
@@ -219,13 +243,14 @@ impl WindowInvalidator {
         self.inner.borrow().update_count
     }
 
-    fn record_frame_dirty(inner: &mut WindowInvalidatorInner) {
-        if profiler::frame_trace_enabled() {
-            inner.frame_dirty.dirty_at.get_or_insert_with(Instant::now);
-            inner.frame_dirty.invalidations += 1;
-        }
+    #[cfg(feature = "profiler")]
+    fn record_frame_dirty(inner: &mut WindowInvalidatorInner) -> Instant {
+        let dirty_at = *inner.frame_dirty.dirty_at.get_or_insert_with(Instant::now);
+        inner.frame_dirty.invalidations += 1;
+        dirty_at
     }
 
+    #[cfg(feature = "profiler")]
     fn take_frame_dirty(&self) -> FrameDirtyAccumulator {
         mem::take(&mut self.inner.borrow_mut().frame_dirty)
     }
@@ -1110,6 +1135,8 @@ pub struct Window {
     pub(crate) removed: bool,
     pub(crate) platform_window: Box<dyn PlatformWindow>,
     display_id: Option<DisplayId>,
+    is_resizable: bool,
+    is_minimizable: bool,
     sprite_atlas: Arc<dyn PlatformAtlas>,
     text_system: Arc<WindowTextSystem>,
     text_rendering_mode: Rc<Cell<TextRenderingMode>>,
@@ -1135,10 +1162,11 @@ pub struct Window {
     next_hitbox_id: HitboxId,
     pub(crate) next_tooltip_id: TooltipId,
     pub(crate) tooltip_bounds: Option<TooltipBounds>,
-    next_frame_callbacks: Rc<RefCell<Vec<FrameCallback>>>,
+    pub(crate) next_frame_callbacks: Rc<RefCell<Vec<FrameCallback>>>,
     pub(crate) dirty_views: FxHashSet<EntityId>,
     focus_listeners: SubscriberSet<(), AnyWindowFocusListener>,
     pub(crate) focus_lost_listeners: SubscriberSet<(), AnyObserver>,
+    focus_lost_path: SmallVec<[FocusId; 8]>,
     default_prevented: bool,
     mouse_position: Point<Pixels>,
     mouse_hit_test: HitTest,
@@ -1155,8 +1183,8 @@ pub struct Window {
     /// Tracks recent input event timestamps to determine if input is arriving at a high rate.
     /// Used to selectively enable VRR optimization only when input rate exceeds 60fps.
     pub(crate) input_rate_tracker: Rc<RefCell<InputRateTracker>>,
-    #[cfg(feature = "input-latency-histogram")]
-    input_latency_tracker: InputLatencyTracker,
+    #[cfg(feature = "profiler")]
+    window_profiler: profiler::WindowProfiler,
     last_input_modality: InputModality,
     pub(crate) refreshing: bool,
     pub(crate) activation_observers: SubscriberSet<(), AnyObserver>,
@@ -1175,6 +1203,8 @@ pub struct Window {
     captured_hitbox: Option<HitboxId>,
     #[cfg(any(feature = "inspector", debug_assertions))]
     inspector: Option<Entity<Inspector>>,
+    #[cfg(feature = "profiler")]
+    debug_frame_overlay: crate::debug_overlay::DebugFrameOverlay,
     pub(crate) a11y: A11y,
 }
 
@@ -1226,88 +1256,6 @@ impl InputRateTracker {
     fn prune_old_timestamps(&mut self, now: Instant) {
         self.timestamps
             .retain(|&t| now.duration_since(t) <= self.window);
-    }
-}
-
-/// A point-in-time snapshot of the input-latency histograms for a window,
-/// suitable for external formatting.
-#[cfg(feature = "input-latency-histogram")]
-pub struct InputLatencySnapshot {
-    /// Histogram of input-to-frame latency samples, in nanoseconds.
-    pub latency_histogram: Histogram<u64>,
-    /// Histogram of input events coalesced per rendered frame.
-    pub events_per_frame_histogram: Histogram<u64>,
-    /// Count of input events that arrived mid-draw and were excluded from
-    /// latency recording.
-    pub mid_draw_events_dropped: u64,
-}
-
-/// Records the time between when the first input event in a frame is dispatched
-/// and when the resulting frame is presented, capturing worst-case latency when
-/// multiple events are coalesced into a single frame.
-#[cfg(feature = "input-latency-histogram")]
-struct InputLatencyTracker {
-    /// Timestamp of the first unrendered input event in the current frame;
-    /// cleared when a frame is presented.
-    first_input_at: Option<Instant>,
-    /// Count of input events received since the last frame was presented.
-    pending_input_count: u64,
-    /// Histogram of input-to-frame latency samples, in nanoseconds.
-    latency_histogram: Histogram<u64>,
-    /// Histogram of input events coalesced per rendered frame.
-    events_per_frame_histogram: Histogram<u64>,
-    /// Count of input events that arrived mid-draw and were excluded from
-    /// latency recording because their effects won't appear until the next frame.
-    mid_draw_events_dropped: u64,
-}
-
-#[cfg(feature = "input-latency-histogram")]
-impl InputLatencyTracker {
-    fn new() -> Result<Self> {
-        Ok(Self {
-            first_input_at: None,
-            pending_input_count: 0,
-            latency_histogram: Histogram::new(3)
-                .map_err(|e| anyhow!("Failed to create input latency histogram: {e}"))?,
-            events_per_frame_histogram: Histogram::new(3)
-                .map_err(|e| anyhow!("Failed to create events per frame histogram: {e}"))?,
-            mid_draw_events_dropped: 0,
-        })
-    }
-
-    /// Record that an input event was dispatched at the given time.
-    /// Only the first event's timestamp per frame is retained (worst-case latency).
-    fn record_input(&mut self, dispatch_time: Instant) {
-        self.first_input_at.get_or_insert(dispatch_time);
-        self.pending_input_count += 1;
-    }
-
-    /// Record that an input event arrived during a draw phase and was excluded
-    /// from latency tracking.
-    fn record_mid_draw_input(&mut self) {
-        self.mid_draw_events_dropped += 1;
-    }
-
-    /// Record that a frame was presented, flushing pending latency and coalescing samples.
-    fn record_frame_presented(&mut self) {
-        if let Some(first_input_at) = self.first_input_at.take() {
-            let latency_nanos = first_input_at.elapsed().as_nanos() as u64;
-            self.latency_histogram.record(latency_nanos).ok();
-        }
-        if self.pending_input_count > 0 {
-            self.events_per_frame_histogram
-                .record(self.pending_input_count)
-                .ok();
-            self.pending_input_count = 0;
-        }
-    }
-
-    fn snapshot(&self) -> InputLatencySnapshot {
-        InputLatencySnapshot {
-            latency_histogram: self.latency_histogram.clone(),
-            events_per_frame_histogram: self.events_per_frame_histogram.clone(),
-            mid_draw_events_dropped: self.mid_draw_events_dropped,
-        }
     }
 }
 
@@ -1412,6 +1360,7 @@ impl Window {
             kind,
             is_movable,
             app_owns_titlebar_drag,
+            inactive_frame_interval,
             is_resizable,
             is_minimizable,
             display_id,
@@ -1469,7 +1418,7 @@ impl Window {
         let scale_factor = platform_window.scale_factor();
         let appearance = platform_window.appearance();
         let text_system = Arc::new(WindowTextSystem::new(cx.text_system().clone()));
-        let invalidator = WindowInvalidator::new();
+        let invalidator = WindowInvalidator::new(handle.window_id());
         let active = Rc::new(Cell::new(platform_window.is_active()));
         let hovered = Rc::new(Cell::new(platform_window.is_hovered()));
         let needs_present = Rc::new(Cell::new(false));
@@ -1488,7 +1437,7 @@ impl Window {
         }
 
         let accessibility_force_disabled = cx.accessibility_force_disabled;
-        let a11y_active_flag = Arc::new(AtomicBool::new(std::env::var("Z3RM_A11Y_FORCE").is_ok()));
+        let a11y_active_flag = Arc::new(AtomicBool::new(false));
 
         #[cfg(not(target_family = "wasm"))]
         if !accessibility_force_disabled {
@@ -1590,6 +1539,8 @@ impl Window {
             let input_rate_tracker = input_rate_tracker.clone();
             let mut deferred_force_render = false;
             move |request_frame_options| {
+                #[cfg(feature = "profiler")]
+                let _foreground_turn = profiler::journal::foreground_turn();
                 // This must be checked before anything else: if this request
                 // arrived re-entrantly while a draw is on this thread's stack
                 // (e.g. via a nested message pump in the Windows window
@@ -1629,7 +1580,7 @@ impl Window {
                 {
                     None
                 } else if !active.get() && !input_rate_tracker.borrow_mut().is_high_rate() {
-                    Some(Duration::from_micros(33333))
+                    inactive_frame_interval
                 } else if let Some(ThermalState::Critical | ThermalState::Serious) = thermal_state {
                     Some(Duration::from_micros(16667))
                 } else {
@@ -1643,12 +1594,11 @@ impl Window {
                     {
                         // Don't lose a pending forced render to throttling.
                         deferred_force_render |= force_render;
-                        // Must still complete the frame on platforms that require it.
-                        // On Wayland, `surface.frame()` was already called to request the
-                        // next frame callback, so we must call `surface.commit()` (via
-                        // `complete_frame`) or the compositor won't send another callback.
+                        // Deferred by throttling: ask demand-driven platforms to retry.
                         handle
-                            .update(&mut cx, |_, window, _| window.complete_frame())
+                            .update(&mut cx, |_, window, _| {
+                                window.platform_window.schedule_frame();
+                            })
                             .log_err();
                         // The demand that entered this branch (a deferred forced
                         // render or pending next-frame callbacks) is still
@@ -1701,7 +1651,11 @@ impl Window {
 
                 handle
                     .update(&mut cx, |_, window, _| {
-                        window.complete_frame();
+                        if window.invalidator.is_dirty()
+                            || !window.next_frame_callbacks.borrow().is_empty()
+                        {
+                            window.platform_window.schedule_frame();
+                        }
                     })
                     .log_err();
 
@@ -1877,6 +1831,8 @@ impl Window {
             removed: false,
             platform_window,
             display_id,
+            is_resizable,
+            is_minimizable,
             sprite_atlas,
             text_system,
             text_rendering_mode: cx.text_rendering_mode.clone(),
@@ -1901,6 +1857,7 @@ impl Window {
             dirty_views: FxHashSet::default(),
             focus_listeners: SubscriberSet::new(),
             focus_lost_listeners: SubscriberSet::new(),
+            focus_lost_path: SmallVec::new(),
             default_prevented: true,
             mouse_position,
             mouse_hit_test: HitTest::default(),
@@ -1915,8 +1872,8 @@ impl Window {
             hovered,
             needs_present,
             input_rate_tracker,
-            #[cfg(feature = "input-latency-histogram")]
-            input_latency_tracker: InputLatencyTracker::new()?,
+            #[cfg(feature = "profiler")]
+            window_profiler: profiler::WindowProfiler::new(handle.window_id())?,
             last_input_modality: InputModality::Mouse,
             refreshing: false,
             activation_observers: SubscriberSet::new(),
@@ -1932,6 +1889,8 @@ impl Window {
             captured_hitbox: None,
             #[cfg(any(feature = "inspector", debug_assertions))]
             inspector: None,
+            #[cfg(feature = "profiler")]
+            debug_frame_overlay: crate::debug_overlay::DebugFrameOverlay::new(),
             a11y: A11y::new(
                 a11y_active_flag,
                 accessibility_force_disabled,
@@ -2076,6 +2035,17 @@ impl Window {
             .and_then(|id| FocusHandle::for_id(id, &cx.focus_handles))
     }
 
+    /// While focus-lost listeners are being dispatched, returns the closest ancestor of the
+    /// previously focused element that can still receive focus, making it a suitable target
+    /// for focus restoration. Returns `None` at all other times, or when no such ancestor exists.
+    pub fn focus_lost_restore_target(&self, cx: &App) -> Option<FocusHandle> {
+        let (_leaf, ancestors) = self.focus_lost_path.split_last()?;
+        ancestors.iter().rev().find_map(|id| {
+            self.rendered_frame.dispatch_tree.focusable_node_id(*id)?;
+            FocusHandle::for_id(*id, &cx.focus_handles)
+        })
+    }
+
     /// Move focus to the element associated with the given [`FocusHandle`].
     pub fn focus(&mut self, handle: &FocusHandle, cx: &mut App) {
         if !self.focus_enabled || self.focus == Some(handle.id) {
@@ -2185,9 +2155,11 @@ impl Window {
         self.platform_window.set_exclusive_edge(edge);
     }
 
-    /// Start a window resize operation (Wayland)
+    /// Start an interactive window resize operation if this window is resizable.
     pub fn start_window_resize(&self, edge: ResizeEdge) {
-        self.platform_window.start_window_resize(edge);
+        if self.is_resizable {
+            self.platform_window.start_window_resize(edge);
+        }
     }
 
     /// Linux (wayland) only: Set the window's input region, the area that receives pointer
@@ -2382,6 +2354,7 @@ impl Window {
     /// Schedule the given closure to be run directly after the current frame is rendered.
     pub fn on_next_frame(&self, callback: impl FnOnce(&mut Window, &mut App) + 'static) {
         RefCell::borrow_mut(&self.next_frame_callbacks).push(Box::new(callback));
+        self.platform_window.schedule_frame();
         // Next-frame callbacks create frame demand without dirtying the
         // window, so the platform's frame source must be woken explicitly.
         self.invalidator.wake_platform();
@@ -2393,9 +2366,29 @@ impl Window {
     /// It will cause the window to redraw on the next frame, even if no other changes have occurred.
     ///
     /// If called from within a view, it will notify that view on the next frame. Otherwise, it will refresh the entire window.
+    ///
+    /// Callers driving purely decorative animations (spinners, pulses, and the
+    /// like) should prefer [`AnimationExt::with_animation`](crate::AnimationExt::with_animation),
+    /// which automatically respects [`App::reduce_motion`]. When using this
+    /// method directly for decorative motion, check [`App::reduce_motion`]
+    /// and skip the frame request when it is set.
     pub fn request_animation_frame(&self) {
         let entity = self.current_view();
         self.on_next_frame(move |_, cx| cx.notify(entity));
+    }
+
+    /// Runs all callbacks scheduled via [`Self::on_next_frame`], returning how many ran.
+    ///
+    /// Tests have no platform frame loop, so this simulates the delivery of the
+    /// next frame.
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn simulate_next_frame(&mut self, cx: &mut App) -> usize {
+        let callbacks = self.next_frame_callbacks.take();
+        let count = callbacks.len();
+        for callback in callbacks {
+            callback(self, cx);
+        }
+        count
     }
 
     /// Spawn the future returned by the given closure on the application thread pool.
@@ -2467,6 +2460,15 @@ impl Window {
             .render_to_image(&self.rendered_frame.scene)
     }
 
+    /// Returns the quads in the most recently rendered frame's scene, so tests can assert on
+    /// painted output without rasterizing the frame. Quad bounds are in scaled pixels and are
+    /// not clipped; each quad carries the content mask it will be clipped to when drawn. Quads
+    /// whose bounds don't intersect their content mask are culled at paint time and won't appear.
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn painted_quads(&self) -> Vec<Quad> {
+        self.rendered_frame.scene.quads.clone()
+    }
+
     /// Set the content size of the window.
     pub fn resize(&mut self, size: Size<Pixels>) {
         self.platform_window.resize(size);
@@ -2475,6 +2477,13 @@ impl Window {
     /// Returns whether or not the window is currently fullscreen
     pub fn is_fullscreen(&self) -> bool {
         self.platform_window.is_fullscreen()
+    }
+
+    /// Returns whether the window is currently in simple (borderless) fullscreen,
+    /// where it covers the entire screen including the menu bar and notch area.
+    /// Always `false` on platforms other than macOS.
+    pub fn is_simple_fullscreen(&self) -> bool {
+        self.platform_window.is_simple_fullscreen()
     }
 
     pub(crate) fn appearance_changed(&mut self, cx: &mut App) {
@@ -2555,7 +2564,17 @@ impl Window {
         self.platform_window.window_decorations()
     }
 
-    /// Returns which window controls are currently visible (Wayland)
+    /// Returns whether this window is resizable.
+    pub fn is_resizable(&self) -> bool {
+        self.is_resizable
+    }
+
+    /// Returns whether this window is minimizable.
+    pub fn is_minimizable(&self) -> bool {
+        self.is_minimizable
+    }
+
+    /// Returns the controls supported by the platform.
     pub fn window_controls(&self) -> WindowControls {
         self.platform_window.window_controls()
     }
@@ -2612,6 +2631,13 @@ impl Window {
     /// be rendered as two pixels on screen.
     pub fn scale_factor(&self) -> f32 {
         self.scale_factor
+    }
+
+    /// Overrides the display scale factor for tests.
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn set_scale_factor(&mut self, scale_factor: f32) {
+        self.scale_factor = scale_factor;
+        self.refresh();
     }
 
     /// The size of an em for the base font of the application. Adjusting this value allows the
@@ -2822,18 +2848,16 @@ impl Window {
         self.capslock
     }
 
-    fn complete_frame(&self) {
-        self.platform_window.completed_frame();
-    }
-
     /// Produces a new frame and assigns it to `rendered_frame`. To actually show
     /// the contents of the new [`Scene`], use [`Self::present`].
     #[profiling::function]
     pub fn draw(&mut self, cx: &mut App) -> ArenaClearNeeded {
-        // Drain unconditionally so a stale first-invalidation timestamp can't
-        // leak into a later frame across enable/disable of frame tracing.
+        // Drain every draw in profiler builds so a previous frame's
+        // first-invalidation timestamp can't be attributed to this one.
+        #[cfg(feature = "profiler")]
         let frame_dirty = self.invalidator.take_frame_dirty();
-        let draw_started_at = profiler::frame_trace_enabled().then(Instant::now);
+        #[cfg(feature = "profiler")]
+        self.window_profiler.begin_draw();
 
         // Set up the per-App arena for element allocation during this draw.
         // This ensures that multiple test Apps have isolated arenas.
@@ -2864,6 +2888,16 @@ impl Window {
         }
         if !cx.mode.skip_drawing() {
             self.draw_roots(cx);
+            #[cfg(feature = "profiler")]
+            {
+                let viewport_size = self.viewport_size;
+                let scale_factor = self.scale_factor();
+                self.debug_frame_overlay.paint(
+                    &mut self.next_frame.scene,
+                    viewport_size,
+                    scale_factor,
+                );
+            }
         }
         self.dirty_views.clear();
         self.next_frame.window_active = self.active.get();
@@ -2894,14 +2928,22 @@ impl Window {
         self.next_frame.clear();
         let current_focus_path = self.rendered_frame.focus_path();
         let current_window_active = self.rendered_frame.window_active;
+        let mut focus_before_listeners = self.focus;
 
         if previous_focus_path != current_focus_path
             || previous_window_active != current_window_active
         {
             if !previous_focus_path.is_empty() && current_focus_path.is_empty() {
+                self.focus_lost_path = previous_focus_path.clone();
                 self.focus_lost_listeners
                     .clone()
                     .retain(&(), |listener| listener(self, cx));
+                self.focus_lost_path = SmallVec::new();
+                // The focus-lost fallback (e.g. a workspace refocusing itself) may target
+                // an element that isn't part of the element tree, in which case scheduling
+                // a redraw below would dispatch focus-lost again, looping forever. Only
+                // track focus movement caused by the focus listeners.
+                focus_before_listeners = self.focus;
             }
 
             let event = WindowFocusEvent {
@@ -2926,16 +2968,21 @@ impl Window {
         self.reset_cursor_style(cx);
         self.refreshing = false;
         self.invalidator.set_phase(DrawPhase::None);
+        // Focus listeners may move focus (e.g. a dock forwarding focus to its active
+        // panel). `Window::focus` suppresses `refresh` while a draw is in progress, so
+        // schedule another frame here to render the new focus state and dispatch the
+        // resulting focus events.
+        if self.focus != focus_before_listeners {
+            self.refresh();
+        }
         self.needs_present.set(true);
 
-        if let Some(draw_start) = draw_started_at {
-            profiler::record_frame_timing(profiler::FrameTiming {
-                window_id: self.handle.window_id(),
-                dirty_at: frame_dirty.dirty_at,
-                invalidations: frame_dirty.invalidations,
-                draw_start,
-                draw_end: Instant::now(),
-            });
+        #[cfg(feature = "profiler")]
+        {
+            let draw_duration = self
+                .window_profiler
+                .end_draw(frame_dirty.dirty_at, frame_dirty.invalidations);
+            self.debug_frame_overlay.record_frame(draw_duration);
         }
 
         // Exit the scope to obtain the arena-clear token this draw owes; the
@@ -2967,9 +3014,18 @@ impl Window {
 
     #[profiling::function]
     fn present(&mut self) {
+        #[cfg(feature = "profiler")]
+        let _foreground_turn = profiler::journal::foreground_turn();
+        #[cfg(feature = "profiler")]
+        let present_start = Instant::now();
         self.platform_window.draw(&self.rendered_frame.scene);
-        #[cfg(feature = "input-latency-histogram")]
-        self.input_latency_tracker.record_frame_presented();
+        #[cfg(feature = "profiler")]
+        self.window_profiler.record_present(
+            present_start,
+            Instant::now(),
+            self.active.get(),
+            !self.next_frame_callbacks.borrow().is_empty(),
+        );
         self.needs_present.set(false);
         profiling::finish_frame!();
     }
@@ -2979,7 +3035,7 @@ impl Window {
     /// Benchmarks drive drawing synchronously rather than through a platform
     /// frame-request loop, so they call this after each measured update to
     /// submit the frame like production presentation would.
-    #[cfg(feature = "bench")]
+    #[cfg(any(feature = "bench", all(test, feature = "profiler")))]
     pub fn present_if_needed(&mut self) {
         if self.needs_present.get() {
             self.present();
@@ -2987,9 +3043,43 @@ impl Window {
     }
 
     /// Returns a snapshot of the current input-latency histograms.
-    #[cfg(feature = "input-latency-histogram")]
-    pub fn input_latency_snapshot(&self) -> InputLatencySnapshot {
-        self.input_latency_tracker.snapshot()
+    #[cfg(feature = "profiler")]
+    pub fn input_latency_snapshot(&self) -> profiler::InputLatencySnapshot {
+        self.window_profiler.input_latency_snapshot()
+    }
+
+    /// Returns a snapshot of the current frame-duration histograms.
+    #[cfg(feature = "profiler")]
+    pub fn frame_duration_snapshot(&self) -> profiler::FrameDurationSnapshot {
+        self.window_profiler.frame_duration_snapshot()
+    }
+
+    /// Returns the current mode of the debug frame overlay.
+    #[cfg(feature = "profiler")]
+    pub fn debug_frame_overlay_mode(&self) -> DebugFrameOverlayMode {
+        self.debug_frame_overlay.mode()
+    }
+
+    /// Sets the mode of the debug frame overlay and schedules a redraw.
+    #[cfg(feature = "profiler")]
+    pub fn set_debug_frame_overlay_mode(&mut self, mode: DebugFrameOverlayMode) {
+        self.debug_frame_overlay.set_mode(mode);
+        self.refresh();
+    }
+
+    /// Advances the debug frame overlay through its hidden, frame-time-only,
+    /// and detailed modes.
+    #[cfg(feature = "profiler")]
+    pub fn cycle_debug_frame_overlay_mode(&mut self) {
+        self.set_debug_frame_overlay_mode(self.debug_frame_overlay.mode().next());
+    }
+
+    /// Clears the debug frame overlay's frame-time statistics, except for the
+    /// total frame count, and schedules a redraw.
+    #[cfg(feature = "profiler")]
+    pub fn reset_debug_frame_overlay_stats(&mut self) {
+        self.debug_frame_overlay.reset_stats();
+        self.refresh();
     }
 
     fn draw_roots(&mut self, cx: &mut App) {
@@ -4542,6 +4632,21 @@ impl Window {
         Ok(())
     }
 
+    /// Returns whether every frame of an image is present in the sprite atlas.
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn has_image_atlas_entry(&self, data: &RenderImage) -> bool {
+        data.frame_count() > 0
+            && (0..data.frame_count()).all(|frame_index| {
+                self.sprite_atlas.contains(
+                    &RenderImageParams {
+                        image_id: data.id,
+                        frame_index,
+                    }
+                    .into(),
+                )
+            })
+    }
+
     /// Add a node to the layout tree for the current frame. Takes the `Style` of the element for which
     /// layout is being requested, along with the layout ids of any children. This method is called during
     /// calls to the [`Element::request_layout`] trait method and enables any element to participate in layout.
@@ -4680,36 +4785,6 @@ impl Window {
             }
         }
         self.next_frame.dispatch_tree.set_focus_id(focus_handle.id);
-    }
-
-    /// Report that `global_id`'s accessibility node is where `focus_handle`
-    /// lives, so focus has somewhere to land.
-    ///
-    /// [`Self::set_focus_handle`] only registers the handle for dispatch.
-    /// `div` follows it with this claim internally; a custom [`Element`] that
-    /// tracks focus itself has to say so, or the focused element produces no
-    /// node and screen readers announce the whole window instead.
-    pub fn report_a11y_focus_target(
-        &mut self,
-        global_id: &GlobalElementId,
-        focus_handle: &FocusHandle,
-    ) {
-        if !self.a11y.is_building_frame() {
-            return;
-        }
-        let node_id = global_id.accesskit_node_id();
-        self.a11y.set_focusable(node_id, focus_handle.id);
-        // Advertised as well as routed. `div` does both — `set_focusable`
-        // answers an incoming focus request and `Action::Focus` is what tells
-        // assistive technology it may make one — and an element reporting
-        // itself here was doing only the first, so an editor or a markdown view
-        // offered no actions at all despite being focusable.
-        if let Some(node) = self.a11y.nodes.current_node_mut_if(node_id) {
-            node.add_action(accesskit::Action::Focus);
-        }
-        if focus_handle.is_focused(self) {
-            self.a11y.set_focus(node_id);
-        }
     }
 
     /// Sets the view id for the current element, which will be used to manage view caching.
@@ -4946,8 +5021,8 @@ impl Window {
     /// Dispatch a mouse or keyboard event on the window.
     #[profiling::function]
     pub fn dispatch_event(&mut self, event: PlatformInput, cx: &mut App) -> DispatchEventResult {
-        #[cfg(feature = "input-latency-histogram")]
-        let dispatch_time = Instant::now();
+        #[cfg(feature = "profiler")]
+        self.window_profiler.begin_input(event.kind_name());
         let update_count_before = self.invalidator.update_count();
         // Track input modality for focus-visible styling and hover suppression.
         // Hover is suppressed during keyboard modality so that keyboard navigation
@@ -5013,12 +5088,14 @@ impl Window {
             PlatformInput::FileDrop(file_drop) => match file_drop {
                 FileDropEvent::Entered { position, paths } => {
                     self.mouse_position = position;
-                    if cx.active_drag.is_none() {
+                    let source_window = self.handle.window_id();
+                    if !cx.restore_platform_drag(source_window) && cx.active_drag.is_none() {
                         cx.active_drag = Some(AnyDrag {
                             value: Arc::new(paths.clone()),
                             view: cx.new(|_| paths).into(),
                             cursor_offset: position,
                             cursor_style: None,
+                            external_payload_source: None,
                         });
                     }
                     PlatformInput::MouseMove(MouseMoveEvent {
@@ -5046,8 +5123,16 @@ impl Window {
                     })
                 }
                 FileDropEvent::Exited => {
-                    cx.active_drag.take();
+                    if !cx.hand_restored_drag_to_platform(self.handle.window_id()) {
+                        cx.active_drag.take();
+                    }
+                    self.refresh();
                     PlatformInput::FileDrop(FileDropEvent::Exited)
+                }
+                FileDropEvent::Ended => {
+                    cx.end_platform_drag(self.handle.window_id());
+                    self.refresh();
+                    PlatformInput::FileDrop(FileDropEvent::Ended)
                 }
             },
             PlatformInput::Touch(touch) => PlatformInput::Touch(touch),
@@ -5060,19 +5145,50 @@ impl Window {
             self.dispatch_key_event(any_key_event, cx);
         }
 
-        if self.invalidator.update_count() > update_count_before {
+        // Must run after the move is dispatched: the platform owns the gesture afterwards, so this
+        // is the last chance for drag listeners to see the pointer leave and reset their state.
+        self.promote_external_drag_to_platform(&event, cx);
+
+        let caused_invalidation = self.invalidator.update_count() > update_count_before;
+        if caused_invalidation {
             self.input_rate_tracker.borrow_mut().record_input();
-            #[cfg(feature = "input-latency-histogram")]
-            if self.invalidator.not_drawing() {
-                self.input_latency_tracker.record_input(dispatch_time);
-            } else {
-                self.input_latency_tracker.record_mid_draw_input();
-            }
         }
+        #[cfg(feature = "profiler")]
+        self.window_profiler.end_input(caused_invalidation);
 
         DispatchEventResult {
             propagate: cx.propagate_event,
             default_prevented: self.default_prevented,
+        }
+    }
+
+    fn promote_external_drag_to_platform(&mut self, event: &PlatformInput, cx: &mut App) {
+        let PlatformInput::MouseMove(mouse_move) = event else {
+            return;
+        };
+        if mouse_move.pressed_button != Some(MouseButton::Left) {
+            return;
+        }
+        if Bounds::new(Point::default(), self.viewport_size).contains(&mouse_move.position) {
+            return;
+        }
+        if !self.platform_window.can_start_external_drag() {
+            return;
+        }
+        let Some(payload_source) = cx
+            .active_drag
+            .as_mut()
+            .and_then(|drag| drag.external_payload_source.take())
+        else {
+            return;
+        };
+        let Some(payload) = payload_source(self, cx) else {
+            return;
+        };
+        if self.platform_window.start_external_drag(&payload)
+            && cx.hand_active_drag_to_platform(self.handle.window_id())
+        {
+            self.refresh();
         }
     }
 
@@ -5483,9 +5599,11 @@ impl Window {
             .remove(&action.as_any().type_id())
         {
             for listener in &global_listeners {
-                profiler::update_running_action(action, cx);
+                #[cfg(feature = "profiler")]
+                self.window_profiler.begin_action_handler(action, cx);
                 listener(action.as_any(), DispatchPhase::Capture, cx);
-                profiler::save_action_timing();
+                #[cfg(feature = "profiler")]
+                self.window_profiler.end_action_handler();
                 if !cx.propagate_event {
                     break;
                 }
@@ -5515,9 +5633,11 @@ impl Window {
             {
                 let any_action = action.as_any();
                 if action_type == any_action.type_id() {
-                    profiler::update_running_action(action, cx);
+                    #[cfg(feature = "profiler")]
+                    self.window_profiler.begin_action_handler(action, cx);
                     listener(any_action, DispatchPhase::Capture, self, cx);
-                    profiler::save_action_timing();
+                    #[cfg(feature = "profiler")]
+                    self.window_profiler.end_action_handler();
 
                     if !cx.propagate_event {
                         return;
@@ -5537,9 +5657,11 @@ impl Window {
                 let any_action = action.as_any();
                 if action_type == any_action.type_id() {
                     cx.propagate_event = false; // Actions stop propagation by default during the bubble phase
-                    profiler::update_running_action(action, cx);
+                    #[cfg(feature = "profiler")]
+                    self.window_profiler.begin_action_handler(action, cx);
                     listener(any_action, DispatchPhase::Bubble, self, cx);
-                    profiler::save_action_timing();
+                    #[cfg(feature = "profiler")]
+                    self.window_profiler.end_action_handler();
 
                     if !cx.propagate_event {
                         return;
@@ -5556,9 +5678,11 @@ impl Window {
             for listener in global_listeners.iter().rev() {
                 cx.propagate_event = false; // Actions stop propagation by default during the bubble phase
 
-                profiler::update_running_action(action, cx);
+                #[cfg(feature = "profiler")]
+                self.window_profiler.begin_action_handler(action, cx);
                 listener(action.as_any(), DispatchPhase::Bubble, cx);
-                profiler::save_action_timing();
+                #[cfg(feature = "profiler")]
+                self.window_profiler.end_action_handler();
                 if !cx.propagate_event {
                     break;
                 }
@@ -5615,6 +5739,14 @@ impl Window {
         self.platform_window.toggle_fullscreen();
     }
 
+    /// Toggle simple (borderless) fullscreen, where the window covers the entire
+    /// screen including the menu bar and, on notched displays, the area around the
+    /// notch. Unlike [`Window::toggle_fullscreen`], this does not move the window
+    /// into its own Mission Control space. Only has an effect on macOS.
+    pub fn toggle_simple_fullscreen(&self) {
+        self.platform_window.toggle_simple_fullscreen();
+    }
+
     /// Updates the IME panel position suggestions for languages like japanese, chinese.
     pub fn invalidate_character_coordinates(&self) {
         self.on_next_frame(|window, cx| {
@@ -5625,10 +5757,6 @@ impl Window {
                 window.platform_window.set_input_handler(input_handler);
             }
         });
-    }
-
-    pub(crate) fn has_active_prompt(&self) -> bool {
-        self.prompt.is_some()
     }
 
     /// Present a platform dialog.
@@ -5686,6 +5814,14 @@ impl Window {
         let handle = (prompt_builder)(level, message, detail, answers, handle, self, cx);
         self.prompt = Some(handle);
         receiver
+    }
+
+    /// Returns whether a prompt rendered by GPUI is currently active in this window.
+    ///
+    /// This is only true for prompts rendered in the window (see
+    /// [`App::set_prompt_builder`]), not for platform-native prompt dialogs.
+    pub fn has_active_prompt(&self) -> bool {
+        self.prompt.is_some()
     }
 
     /// Returns the current context stack.
@@ -5892,7 +6028,8 @@ impl Window {
     /// Perform titlebar double-click action.
     /// This is macOS specific.
     pub fn titlebar_double_click(&self) {
-        self.platform_window.titlebar_double_click();
+        self.platform_window
+            .titlebar_double_click(self.is_resizable, self.is_minimizable);
     }
 
     /// Gets the window's title at the platform level.
@@ -5954,6 +6091,28 @@ impl Window {
     /// next tree update is sent to the platform.
     ///
     /// See the [accessibility guide](crate::_accessibility) for an overview.
+    /// Report `focus_handle` as the accessibility focus target for the element
+    /// at `global_id`, advertising it as focusable and focused when it holds
+    /// focus. Elements that render no interactive node of their own (markdown
+    /// views, editors inside blocks) call this so readers can reach them.
+    pub fn report_a11y_focus_target(
+        &mut self,
+        global_id: &GlobalElementId,
+        focus_handle: &FocusHandle,
+    ) {
+        if !self.a11y.is_building_frame() {
+            return;
+        }
+        let node_id = global_id.accesskit_node_id();
+        self.a11y.set_focusable(node_id, focus_handle.id);
+        if let Some(node) = self.a11y.nodes.current_node_mut_if(node_id) {
+            node.add_action(accesskit::Action::Focus);
+        }
+        if focus_handle.is_focused(self) {
+            self.a11y.set_focus(node_id);
+        }
+    }
+
     pub fn is_a11y_active(&self) -> bool {
         self.a11y.is_active()
     }
@@ -6755,26 +6914,20 @@ pub fn outline(
 
 #[cfg(test)]
 mod tests {
+    use std::{
+        cell::{Cell, RefCell},
+        path::PathBuf,
+        rc::Rc,
+    };
 
     use crate::{
-        AppContext as _, Bounds, Context, FocusHandle, InteractiveElement as _, IntoElement,
-        ParentElement as _, Pixels, Render, RequestFrameOptions,
-        StatefulInteractiveElement as _, Styled as _, TestAppContext, Window, WindowAppearance,
-        WindowOptions, accesskit, canvas, div, px, size,
+        AnyWindowHandle, AppContext as _, Bounds, Context, DragMoveEvent, Empty,
+        ExternalDragPayload, ExternalPaths, FileDragPaths, FileDropEvent, FocusHandle,
+        InputEvent as _, InteractiveElement as _, IntoElement, MouseButton, MouseDownEvent,
+        MouseMoveEvent, ParentElement, Pixels, Point, Render, RequestFrameOptions,
+        StatefulInteractiveElement as _, Styled, TestAppContext, Window, WindowAppearance,
+        WindowOptions, canvas, div, point, px, size,
     };
-    use std::{
-        cell::Cell,
-        rc::Rc,
-        sync::{LazyLock, Mutex, MutexGuard},
-    };
-
-    static HEADLESS_A11Y_ENV_LOCK: LazyLock<Mutex<()>> = LazyLock::new(|| Mutex::new(()));
-
-    fn headless_a11y_env_guard() -> MutexGuard<'static, ()> {
-        HEADLESS_A11Y_ENV_LOCK
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-    }
 
     struct EmptyView;
 
@@ -6802,15 +6955,24 @@ mod tests {
                         }
                     },
                 ))
+                // Siblings painted after the canvas: their elements were
+                // allocated in the arena before the nested draw, so they detect
+                // a mid-draw arena clear when painted afterwards.
                 .child(div().child("after"))
         }
     }
 
+    /// Opening a window synchronously draws it and requests an element arena
+    /// clear. When that happens from within another window's draw (here: from
+    /// an element's paint), the clear must be deferred until the outer draw
+    /// finishes, or the outer draw's arena-allocated elements would be freed
+    /// out from under it.
     #[test]
     fn test_window_opened_during_draw_defers_arena_clear() {
         let mut cx = TestAppContext::single();
 
         let opened = Rc::new(Cell::new(false));
+        // add_window draws once, which runs the nested open_window mid-draw.
         let window = cx.add_window({
             let opened = opened.clone();
             move |_, _| OpensWindowOnPaint { opened }
@@ -6819,6 +6981,8 @@ mod tests {
         assert!(opened.get());
         assert_eq!(cx.windows().len(), 2);
 
+        // The deferred clear must actually run once the outer draw unwinds:
+        // subsequent draws of both windows work against a fresh arena.
         cx.update_window(window.into(), |_, window, cx| window.draw(cx).clear(cx))
             .unwrap();
     }
@@ -6918,6 +7082,25 @@ mod tests {
     }
 
     #[gpui::test]
+    fn test_window_reports_no_raw_handle_instead_of_panicking(cx: &mut TestAppContext) {
+        use raw_window_handle::{HandleError, HasDisplayHandle as _, HasWindowHandle as _};
+
+        let window = cx.add_window(|_, _| EmptyView);
+        window
+            .update(cx, |_, window, _| {
+                assert!(matches!(
+                    window.window_handle(),
+                    Err(HandleError::NotSupported)
+                ));
+                assert!(matches!(
+                    window.display_handle(),
+                    Err(HandleError::NotSupported)
+                ));
+            })
+            .unwrap();
+    }
+
+    #[gpui::test]
     fn test_appearance_change_runs_after_app_update(cx: &mut TestAppContext) {
         let window = cx.add_window(|_, _| EmptyView);
         let observed_appearance = Rc::new(Cell::new(None));
@@ -6940,6 +7123,80 @@ mod tests {
         cx.run_until_parked();
 
         assert_eq!(observed_appearance.get(), Some(WindowAppearance::Dark));
+    }
+
+    #[gpui::test]
+    fn queued_frame_callback_wakes_a_parked_render_loop(cx: &mut TestAppContext) {
+        let window = cx.add_window(|_, _| Empty);
+        let test_window = cx.test_window(window.into());
+
+        assert!(test_window.simulate_scheduled_frame());
+        assert!(test_window.simulate_scheduled_frame());
+        assert!(!test_window.frame_scheduled());
+
+        cx.update_window(window.into(), |_, window, _| {
+            window.active.set(true);
+            window.on_next_frame(|_, _| {});
+        })
+        .unwrap();
+        assert!(
+            test_window.frame_scheduled(),
+            "queuing work on a parked window must wake the render loop"
+        );
+
+        assert!(test_window.simulate_scheduled_frame());
+        assert!(
+            test_window.frame_scheduled(),
+            "presenting the frame must await one compositor callback"
+        );
+        assert!(test_window.simulate_scheduled_frame());
+        assert!(!test_window.frame_scheduled());
+    }
+
+    #[gpui::test]
+    fn pending_presentation_wakes_a_parked_render_loop(cx: &mut TestAppContext) {
+        let window = cx.add_window(|_, _| Empty);
+        let test_window = cx.test_window(window.into());
+
+        assert!(test_window.simulate_scheduled_frame());
+        assert!(test_window.simulate_scheduled_frame());
+        assert!(!test_window.frame_scheduled());
+
+        cx.update_window(window.into(), |_, window, cx| window.draw(cx).clear(cx))
+            .unwrap();
+
+        assert!(
+            test_window.frame_scheduled(),
+            "a rendered scene awaiting presentation must wake the render loop"
+        );
+    }
+
+    #[gpui::test]
+    fn callback_queued_during_a_frame_requests_a_follow_up(cx: &mut TestAppContext) {
+        let window = cx.add_window(|_, _| Empty);
+        let test_window = cx.test_window(window.into());
+
+        let callback_ran = Rc::new(Cell::new(false));
+        cx.update_window(window.into(), |_, window, _| {
+            // Inactive windows are frame-rate throttled, which would defer the
+            // ticks this test drives manually.
+            window.active.set(true);
+            let callback_ran = callback_ran.clone();
+            window.on_next_frame(move |window, _| {
+                window.on_next_frame(move |_, _| callback_ran.set(true));
+            });
+        })
+        .unwrap();
+
+        assert!(test_window.simulate_scheduled_frame());
+        assert!(!callback_ran.get());
+        assert!(
+            test_window.frame_scheduled(),
+            "a callback queued mid-frame must schedule a follow-up before the loop parks"
+        );
+
+        assert!(test_window.simulate_scheduled_frame());
+        assert!(callback_ran.get());
     }
 
     struct RootView {
@@ -7007,391 +7264,368 @@ mod tests {
         assert_eq!(child_bounds.get().size, size(px(300.), px(200.)));
     }
 
-    /// A TestWindow that has not hosted a real AccessKit adapter leaves the
-    /// per-frame a11y builder inactive, so `debug_a11y_tree_json` returns
-    /// None. Setting `Z3RM_A11Y_BUILD_HEADLESS` makes `TestWindow::a11y_init`
-    /// flip the active flag and pump the in-memory builder so the tree can be
-    /// dumped headlessly (§15.11 / `DumpAccessibilityTree` action).
-    #[test]
-    fn headless_a11y_env_var_activates_debug_tree() {
-        // SAFETY: testenv isolation — this test is the only toucher of the
-        // env var on its thread, and TestAppContext owns its own state.
-        let _headless_a11y_env_guard = headless_a11y_env_guard();
-        unsafe {
-            std::env::set_var("Z3RM_A11Y_BUILD_HEADLESS", "1");
-        }
-        let mut cx = TestAppContext::single();
-        let window = cx.add_window(|_, _| RootView {
-            explicit_size: false,
-            child_bounds: Rc::new(Cell::new(Bounds::default())),
-        });
-        let json = cx
-            .update_window(window.into(), |_, window, cx| {
-                window.draw(cx).clear(cx);
-                window.debug_a11y_tree_json()
-            })
-            .unwrap();
-        unsafe {
-            std::env::remove_var("Z3RM_A11Y_BUILD_HEADLESS");
-        }
-        assert!(
-            json.is_some(),
-            "debug_a11y_tree_json must be Some under Z3RM_A11Y_BUILD_HEADLESS after a frame"
-        );
-        // §16.4 the dumped tree must be valid JSON containing a Window root
-        // node, proving the a11y tree structure is well-formed for downstream
-        // TerminalElement/TextRun assertions.
-        let json = json.expect("checked Some above");
-        let parsed: serde_json::Value =
-            serde_json::from_str(&json).expect("a11y tree JSON must be parseable");
-        assert!(parsed.is_object(), "a11y tree root must be a JSON object");
-        // The tree contains nodes keyed by NodeId; verify at least one node
-        // carries Role::Window (the root).
-        let json_str = parsed.to_string();
-        assert!(
-            json_str.contains("Window"),
-            "a11y tree must contain a Window role node, got: {}",
-            &json_str[..200.min(json_str.len())]
-        );
+    struct FileDragView {
+        path: PathBuf,
+        observed_drag_moves: Rc<RefCell<Vec<Point<Pixels>>>>,
+        observed_drops: Rc<RefCell<Vec<PathBuf>>>,
     }
 
-    /// §16.4 stress: rapid draw cycles must not panic and the a11y tree
-    /// must remain well-formed across N frames. Simulates a high-frequency
-    /// terminal output scenario where PaneDirty fires every frame.
-    #[test]
-    fn headless_a11y_stress_rapid_draw_cycles() {
-        let _headless_a11y_env_guard = headless_a11y_env_guard();
-        unsafe {
-            std::env::set_var("Z3RM_A11Y_BUILD_HEADLESS", "1");
-        }
-        let mut cx = TestAppContext::single();
-        let window = cx.add_window(|_, _| RootView {
-            explicit_size: false,
-            child_bounds: Rc::new(Cell::new(Bounds::default())),
-        });
-        for _ in 0..100 {
-            let json = cx
-                .update_window(window.into(), |_, window, cx| {
-                    window.draw(cx).clear(cx);
-                    window.debug_a11y_tree_json()
+    impl Render for FileDragView {
+        fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+            div()
+                .id("file-drag")
+                .size_full()
+                .on_drag(self.path.clone(), |_, _, _, cx| cx.new(|_| Empty))
+                .external_drag_payload(|path: &PathBuf, _, _| {
+                    Some(ExternalDragPayload::Files(FileDragPaths::new([(
+                        path.clone(),
+                        true,
+                    )])))
                 })
-                .unwrap();
-            assert!(json.is_some(), "a11y tree must be available every frame");
-        }
-        unsafe {
-            std::env::remove_var("Z3RM_A11Y_BUILD_HEADLESS");
-        }
-    }
-
-    struct ActionRootView {
-        clicked: Rc<Cell<bool>>,
-    }
-
-    impl Render for ActionRootView {
-        fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
-            let clicked = self.clicked.clone();
-            div().size_full().child(
-                div()
-                    .id("a11y-button")
-                    .role(accesskit::Role::Button)
-                    .w(px(100.))
-                    .h(px(40.))
-                    .on_click(move |_event, _window, _app| clicked.set(true)),
-            )
+                .on_drag_move({
+                    let observed_drag_moves = self.observed_drag_moves.clone();
+                    move |event: &DragMoveEvent<PathBuf>, _, _| {
+                        observed_drag_moves.borrow_mut().push(event.event.position);
+                    }
+                })
+                .on_drop({
+                    let observed_drops = self.observed_drops.clone();
+                    move |path: &PathBuf, _, _| observed_drops.borrow_mut().push(path.clone())
+                })
         }
     }
 
-    struct DeclarativeActionRootView {
-        activated: Rc<Cell<bool>>,
-    }
-
-    impl Render for DeclarativeActionRootView {
-        fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
-            let activated = self.activated.clone();
-            div().size_full().child(
-                div()
-                    .id("declarative-a11y-button")
-                    .role(accesskit::Role::Button)
-                    .w(px(100.))
-                    .h(px(40.))
-                    .on_a11y_action(accesskit::Action::Click, move |_data, _window, _cx| {
-                        activated.set(true)
-                    }),
-            )
+    #[gpui::test]
+    fn file_drag_is_promoted_once_and_restored_in_source_window(cx: &mut TestAppContext) {
+        struct Drag {
+            window: AnyWindowHandle,
+            observed_drag_moves: Rc<RefCell<Vec<Point<Pixels>>>>,
+            observed_drops: Rc<RefCell<Vec<PathBuf>>>,
         }
-    }
 
-    #[test]
-    fn declarative_a11y_action_reaches_element_listener() {
-        let _headless_a11y_env_guard = headless_a11y_env_guard();
-        unsafe {
-            std::env::set_var("Z3RM_A11Y_BUILD_HEADLESS", "1");
-        }
-        let mut cx = TestAppContext::single();
-        let activated = Rc::new(Cell::new(false));
-        let window = cx.add_window({
-            let activated = activated.clone();
-            move |_, _| DeclarativeActionRootView { activated }
-        });
+        fn start_drag(cx: &mut TestAppContext, path: PathBuf, platform_result: bool) -> Drag {
+            let observed_drag_moves = Rc::new(RefCell::new(Vec::new()));
+            let observed_drops = Rc::new(RefCell::new(Vec::new()));
+            let window: AnyWindowHandle = cx
+                .add_window({
+                    let observed_drag_moves = observed_drag_moves.clone();
+                    let observed_drops = observed_drops.clone();
+                    move |_, _| FileDragView {
+                        path,
+                        observed_drag_moves,
+                        observed_drops,
+                    }
+                })
+                .into();
+            cx.test_window(window)
+                .set_start_external_drag_result(platform_result);
 
-        let tree_json = cx
-            .update_window(window.into(), |_, window, cx| {
+            let update_result = cx.update_window(window, |_, window, cx| {
                 window.draw(cx).clear(cx);
-                window.debug_a11y_tree_json()
-            })
-            .unwrap()
-            .expect("a11y tree must be available under Z3RM_A11Y_BUILD_HEADLESS");
-        let button_id = button_a11y_node_id(&tree_json);
-        let delivered =
-            cx.test_window(window.into())
-                .simulate_a11y_action(accesskit::ActionRequest {
-                    target_tree: accesskit::TreeId::ROOT,
-                    target_node: button_id,
-                    action: accesskit::Action::Click,
-                    data: None,
-                });
-        assert!(
-            delivered,
-            "TestWindow must preserve the AccessKit action callback"
-        );
-        cx.run_until_parked();
-        assert!(activated.get(), "declarative element listener must run");
-        unsafe {
-            std::env::remove_var("Z3RM_A11Y_BUILD_HEADLESS");
-        }
-    }
+                window.dispatch_event(
+                    MouseDownEvent {
+                        position: point(px(10.), px(10.)),
+                        button: MouseButton::Left,
+                        modifiers: Default::default(),
+                        click_count: 1,
+                        first_mouse: false,
+                    }
+                    .to_platform_input(),
+                    cx,
+                );
+                window.dispatch_event(
+                    MouseMoveEvent {
+                        position: point(px(20.), px(20.)),
+                        pressed_button: Some(MouseButton::Left),
+                        modifiers: Default::default(),
+                    }
+                    .to_platform_input(),
+                    cx,
+                );
+                assert!(cx.active_drag.is_some());
+            });
+            assert!(
+                update_result.is_ok(),
+                "failed to start drag: {update_result:?}"
+            );
 
-    /// Extracts the `accesskit::NodeId` the built tree assigned to the
-    /// Button node from a `debug_a11y_tree_json` dump. Using the identity
-    /// the tree actually produced (rather than a re-derived guess) makes the
-    /// semantic-action tests verify stable node identity end to end.
-    fn button_a11y_node_id(tree_json: &str) -> accesskit::NodeId {
-        let parsed: serde_json::Value =
-            serde_json::from_str(tree_json).expect("a11y tree JSON must parse");
-        let nodes = parsed["nodes"]
-            .as_object()
-            .expect("a11y tree JSON must contain a nodes object");
-        for node in nodes.values() {
-            if node["aria"]["role"].as_str() == Some("Button") {
-                let id = node["accesskit_id"]
-                    .as_str()
-                    .expect("node must carry an accesskit_id");
-                return accesskit::NodeId(id.parse().expect("accesskit_id must be a u64"));
+            assert!(cx.test_window(window).external_drag_files().is_empty());
+            Drag {
+                window,
+                observed_drag_moves,
+                observed_drops,
             }
         }
-        panic!("a11y tree must contain a Button node");
-    }
 
-    /// §15.12 Semantic actions: `TestWindow::a11y_init` must preserve the
-    /// AccessKit action callback (it was previously dropped), so a screen
-    /// reader action can be injected deterministically. The injected request
-    /// must travel through the production callback into
-    /// `Window::handle_a11y_action` and invoke the listener registered with
-    /// `Window::on_a11y_action` for the exact node id the built tree
-    /// produced — stable node identity, not an inspection-only path.
-    #[test]
-    fn a11y_semantic_action_reaches_registered_listener() {
-        // SAFETY: testenv isolation — this test is the only toucher of the
-        // env var on its thread, and TestAppContext owns its own state.
-        let _headless_a11y_env_guard = headless_a11y_env_guard();
-        unsafe {
-            std::env::set_var("Z3RM_A11Y_BUILD_HEADLESS", "1");
-        }
-        let mut cx = TestAppContext::single();
-        let window = cx.add_window(|_, _| ActionRootView {
-            clicked: Rc::new(Cell::new(false)),
+        let successful_path = PathBuf::from("/tmp/successful-drag");
+        let successful = start_drag(cx, successful_path.clone(), true);
+        let outside_position = point(px(-1.), px(20.));
+        let update_result = cx.update_window(successful.window, |_, window, cx| {
+            window.dispatch_event(
+                MouseMoveEvent {
+                    position: outside_position,
+                    pressed_button: Some(MouseButton::Left),
+                    modifiers: Default::default(),
+                }
+                .to_platform_input(),
+                cx,
+            );
+            assert!(cx.active_drag.is_none());
         });
-
-        // Draw once so the in-memory a11y builder produces the tree, then
-        // read the node id the tree assigned to the button. Registering the
-        // listener after the last draw matters: `begin_frame` clears
-        // `action_listeners` at the start of each frame.
-        let tree_json = cx
-            .update_window(window.into(), |_, window, cx| {
-                window.draw(cx).clear(cx);
-                window.debug_a11y_tree_json()
-            })
-            .unwrap()
-            .expect("a11y tree must be available under Z3RM_A11Y_BUILD_HEADLESS");
-        let button_id = button_a11y_node_id(&tree_json);
-        cx.run_until_parked();
-
-        let action_received = Rc::new(Cell::new(false));
-        cx.update_window(window.into(), |_, window, _cx| {
-            window.on_a11y_action(button_id, accesskit::Action::Click, {
-                let action_received = action_received.clone();
-                move |_data, _window, _cx| action_received.set(true)
-            });
-        })
-        .unwrap();
-
-        // Inject the semantic action through the preserved platform callback.
-        let delivered =
-            cx.test_window(window.into())
-                .simulate_a11y_action(accesskit::ActionRequest {
-                    target_tree: accesskit::TreeId::ROOT,
-                    target_node: button_id,
-                    action: accesskit::Action::Click,
-                    data: None,
-                });
         assert!(
-            delivered,
-            "TestWindow must preserve the AccessKit action callback"
+            update_result.is_ok(),
+            "failed to promote drag: {update_result:?}"
         );
-        // Pump the GPUI dispatcher so the production action channel task
-        // delivers the request to `Window::handle_a11y_action`.
-        cx.run_until_parked();
-
-        assert!(
-            action_received.get(),
-            "a11y action must reach the listener registered for node {button_id:?}"
+        assert_eq!(
+            cx.test_window(successful.window).external_drag_files(),
+            [(successful_path.clone(), true)]
         );
-        unsafe {
-            std::env::remove_var("Z3RM_A11Y_BUILD_HEADLESS");
-        }
-    }
+        // Views must still see the move that leaves the window, otherwise they never learn to tear
+        // down the drag state they built up while the pointer was inside.
+        assert_eq!(
+            successful.observed_drag_moves.borrow().last(),
+            Some(&outside_position)
+        );
 
-    /// Semantic value actions must reach the same production action channel as
-    /// Click. This keeps the non-click part of the AccessKit action matrix
-    /// deterministic without relying on a platform accessibility daemon.
-    #[test]
-    fn a11y_increment_and_decrement_actions_reach_listener() {
-        let _headless_a11y_env_guard = headless_a11y_env_guard();
-        unsafe {
-            std::env::set_var("Z3RM_A11Y_BUILD_HEADLESS", "1");
-        }
-        let mut cx = TestAppContext::single();
-        let window = cx.add_window(|_, _| ActionRootView {
-            clicked: Rc::new(Cell::new(false)),
+        let destination: AnyWindowHandle = cx.add_window(|_, _| EmptyView).into();
+        let reentry_position = point(px(30.), px(30.));
+        let external_paths = || ExternalPaths([successful_path.clone()].into_iter().collect());
+        let update_result = cx.update_window(destination, |_, window, cx| {
+            window.dispatch_event(
+                FileDropEvent::Entered {
+                    position: reentry_position,
+                    paths: external_paths(),
+                }
+                .to_platform_input(),
+                cx,
+            );
+            assert!(
+                cx.active_drag
+                    .as_ref()
+                    .is_some_and(|drag| drag.value.downcast_ref::<ExternalPaths>().is_some())
+            );
+            window.dispatch_event(FileDropEvent::Exited.to_platform_input(), cx);
+            assert!(cx.active_drag.is_none());
         });
-        let tree_json = cx
-            .update_window(window.into(), |_, window, cx| {
-                let arena_clear_needed = window.draw(cx);
-                arena_clear_needed.clear(cx);
-                window.debug_a11y_tree_json()
-            })
-            .unwrap()
-            .expect("a11y tree must be available under Z3RM_A11Y_BUILD_HEADLESS");
-        let button_id = button_a11y_node_id(&tree_json);
-        cx.run_until_parked();
-        let increments = Rc::new(Cell::new(0u32));
-        let decrements = Rc::new(Cell::new(0u32));
-        let focused = Rc::new(Cell::new(0u32));
-        let value = Rc::new(Cell::new(None::<f64>));
-        cx.update_window(window.into(), |_, window, _cx| {
-            let increments_for_listener = increments.clone();
-            window.on_a11y_action(
-                button_id,
-                accesskit::Action::Increment,
-                move |_data, _window, _cx| {
-                    increments_for_listener.set(increments_for_listener.get() + 1);
-                },
+        assert!(
+            update_result.is_ok(),
+            "failed to handle drag in destination window: {update_result:?}"
+        );
+
+        let update_result = cx.update_window(successful.window, |_, window, cx| {
+            window.dispatch_event(
+                FileDropEvent::Entered {
+                    position: reentry_position,
+                    paths: external_paths(),
+                }
+                .to_platform_input(),
+                cx,
             );
-            let decrements_for_listener = decrements.clone();
-            window.on_a11y_action(
-                button_id,
-                accesskit::Action::Decrement,
-                move |_data, _window, _cx| {
-                    decrements_for_listener.set(decrements_for_listener.get() + 1);
-                },
+            assert!(
+                cx.active_drag
+                    .as_ref()
+                    .is_some_and(|drag| drag.value.downcast_ref::<PathBuf>().is_some())
             );
-            let focused_for_listener = focused.clone();
-            window.on_a11y_action(
-                button_id,
-                accesskit::Action::Focus,
-                move |_data, _window, _cx| {
-                    focused_for_listener.set(focused_for_listener.get() + 1);
-                },
+            assert_eq!(
+                successful.observed_drag_moves.borrow().last(),
+                Some(&reentry_position)
             );
-            let value_for_listener = value.clone();
-            window.on_a11y_action(
-                button_id,
-                accesskit::Action::SetValue,
-                move |data, _window, _cx| {
-                    if let Some(accesskit::ActionData::NumericValue(next)) = data {
-                        value_for_listener.set(Some(*next));
+
+            window.dispatch_event(FileDropEvent::Exited.to_platform_input(), cx);
+            assert!(cx.active_drag.is_none());
+
+            window.dispatch_event(
+                FileDropEvent::Entered {
+                    position: reentry_position,
+                    paths: external_paths(),
+                }
+                .to_platform_input(),
+                cx,
+            );
+            assert!(
+                cx.active_drag
+                    .as_ref()
+                    .is_some_and(|drag| drag.value.downcast_ref::<PathBuf>().is_some())
+            );
+
+            window.dispatch_event(
+                FileDropEvent::Submit {
+                    position: reentry_position,
+                }
+                .to_platform_input(),
+                cx,
+            );
+            assert_eq!(
+                successful.observed_drops.borrow().as_slice(),
+                std::slice::from_ref(&successful_path)
+            );
+            assert!(cx.active_drag.is_none());
+
+            window.dispatch_event(FileDropEvent::Exited.to_platform_input(), cx);
+            assert!(cx.active_drag.is_none());
+            window.dispatch_event(FileDropEvent::Ended.to_platform_input(), cx);
+            assert!(cx.active_drag.is_none());
+
+            window.dispatch_event(
+                FileDropEvent::Entered {
+                    position: reentry_position,
+                    paths: external_paths(),
+                }
+                .to_platform_input(),
+                cx,
+            );
+            assert!(
+                cx.active_drag
+                    .as_ref()
+                    .is_some_and(|drag| drag.value.downcast_ref::<ExternalPaths>().is_some())
+            );
+            window.dispatch_event(FileDropEvent::Exited.to_platform_input(), cx);
+        });
+        assert!(
+            update_result.is_ok(),
+            "failed to restore drag in source window: {update_result:?}"
+        );
+
+        let cancelled_path = PathBuf::from("/tmp/cancelled-drag");
+        let cancelled = start_drag(cx, cancelled_path.clone(), true);
+        let update_result = cx.update_window(cancelled.window, |_, window, cx| {
+            window.dispatch_event(
+                MouseMoveEvent {
+                    position: outside_position,
+                    pressed_button: Some(MouseButton::Left),
+                    modifiers: Default::default(),
+                }
+                .to_platform_input(),
+                cx,
+            );
+            assert!(cx.active_drag.is_none());
+
+            window.dispatch_event(
+                FileDropEvent::Entered {
+                    position: reentry_position,
+                    paths: ExternalPaths([cancelled_path].into_iter().collect()),
+                }
+                .to_platform_input(),
+                cx,
+            );
+            assert!(
+                cx.active_drag
+                    .as_ref()
+                    .is_some_and(|drag| drag.value.downcast_ref::<PathBuf>().is_some())
+            );
+            assert!(cx.stop_active_drag(window));
+            assert!(cx.active_drag.is_none());
+        });
+        assert!(
+            update_result.is_ok(),
+            "failed to cancel restored drag: {update_result:?}"
+        );
+        assert!(!cx.update(|cx| cx.end_platform_drag(cancelled.window.window_id())));
+
+        let removed_path = PathBuf::from("/tmp/removed-window-drag");
+        let removed = start_drag(cx, removed_path, true);
+        let removed_window_id = removed.window.window_id();
+        let update_result = cx.update_window(removed.window, |_, window, cx| {
+            window.dispatch_event(
+                MouseMoveEvent {
+                    position: outside_position,
+                    pressed_button: Some(MouseButton::Left),
+                    modifiers: Default::default(),
+                }
+                .to_platform_input(),
+                cx,
+            );
+            assert!(cx.active_drag.is_none());
+            window.remove_window();
+        });
+        assert!(
+            update_result.is_ok(),
+            "failed to remove drag source window: {update_result:?}"
+        );
+        assert!(!cx.update(|cx| cx.end_platform_drag(removed_window_id)));
+
+        let failed_path = PathBuf::from("/tmp/failed-drag");
+        let failed = start_drag(cx, failed_path.clone(), false);
+        let update_result = cx.update_window(failed.window, |_, window, cx| {
+            for x_position in [-1., -2.] {
+                window.dispatch_event(
+                    MouseMoveEvent {
+                        position: point(px(x_position), px(20.)),
+                        pressed_button: Some(MouseButton::Left),
+                        modifiers: Default::default(),
                     }
-                },
-            );
-        })
-        .unwrap();
+                    .to_platform_input(),
+                    cx,
+                );
+            }
+            assert!(cx.active_drag.is_some());
+        });
+        assert!(
+            update_result.is_ok(),
+            "failed to retain drag after platform failure: {update_result:?}"
+        );
+        assert_eq!(
+            cx.test_window(failed.window).external_drag_files(),
+            [(failed_path, true)]
+        );
+    }
 
-        for (action, data) in [
-            (accesskit::Action::Increment, None),
-            (accesskit::Action::Decrement, None),
-            (accesskit::Action::Increment, None),
-            (accesskit::Action::Focus, None),
-            (
-                accesskit::Action::SetValue,
-                Some(accesskit::ActionData::NumericValue(42.0)),
-            ),
-        ] {
-            assert!(cx.test_window(window.into()).simulate_a11y_action(
-                accesskit::ActionRequest {
-                    target_tree: accesskit::TreeId::ROOT,
-                    target_node: button_id,
-                    action,
-                    data,
-                },
-            ));
-        }
-        cx.run_until_parked();
-        assert_eq!(increments.get(), 2);
-        assert_eq!(decrements.get(), 1);
-        assert_eq!(focused.get(), 1);
-        assert_eq!(value.get(), Some(42.0));
-        unsafe {
-            std::env::remove_var("Z3RM_A11Y_BUILD_HEADLESS");
+    struct FocusForwarder {
+        a: FocusHandle,
+        b: FocusHandle,
+    }
+
+    impl Render for FocusForwarder {
+        fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+            div()
+                .size_full()
+                .child(div().w(px(50.)).h(px(50.)).track_focus(&self.a))
+                .child(div().w(px(50.)).h(px(50.)).track_focus(&self.b))
         }
     }
-    /// §15.12 Built-in action handling: with no listener registered for a
-    /// node, `Action::Click` must still produce the real GPUI event effect —
-    /// synthesized mouse down/up at the node's bounds center — firing the
-    /// element's actual click handler.
-    #[test]
-    fn a11y_click_action_dispatches_real_click_event() {
-        // SAFETY: testenv isolation — this test is the only toucher of the
-        // env var on its thread, and TestAppContext owns its own state.
-        let _headless_a11y_env_guard = headless_a11y_env_guard();
-        unsafe {
-            std::env::set_var("Z3RM_A11Y_BUILD_HEADLESS", "1");
-        }
-        let mut cx = TestAppContext::single();
-        let clicked = Rc::new(Cell::new(false));
+
+    /// When a focus listener moves focus again (e.g. a dock forwarding focus to its
+    /// active panel), the resulting focus events must be dispatched without waiting
+    /// for an unrelated redraw of the window.
+    #[gpui::test]
+    fn test_focus_moved_by_focus_listener_is_dispatched(cx: &mut TestAppContext) {
+        let b_focus_count = Rc::new(Cell::new(0));
         let window = cx.add_window({
-            let clicked = clicked.clone();
-            move |_, _| ActionRootView { clicked }
+            let b_focus_count = b_focus_count.clone();
+            move |window, cx| {
+                let a = cx.focus_handle();
+                let b = cx.focus_handle();
+                cx.on_focus(&a, window, |this: &mut FocusForwarder, window, cx| {
+                    let b = this.b.clone();
+                    window.focus(&b, cx);
+                })
+                .detach();
+                cx.on_focus(&b, window, move |_, _, _| {
+                    b_focus_count.set(b_focus_count.get() + 1);
+                })
+                .detach();
+                FocusForwarder { a, b }
+            }
         });
 
-        let tree_json = cx
-            .update_window(window.into(), |_, window, cx| {
-                window.draw(cx).clear(cx);
-                window.debug_a11y_tree_json()
+        window
+            .update(cx, |_, window, _| window.activate_window())
+            .unwrap();
+        cx.executor().run_until_parked();
+
+        window
+            .update(cx, |this, window, cx| {
+                let a = this.a.clone();
+                window.focus(&a, cx);
             })
-            .unwrap()
-            .expect("a11y tree must be available under Z3RM_A11Y_BUILD_HEADLESS");
-        let button_id = button_a11y_node_id(&tree_json);
+            .unwrap();
+        cx.executor().run_until_parked();
 
-        let delivered =
-            cx.test_window(window.into())
-                .simulate_a11y_action(accesskit::ActionRequest {
-                    target_tree: accesskit::TreeId::ROOT,
-                    target_node: button_id,
-                    action: accesskit::Action::Click,
-                    data: None,
-                });
-        assert!(
-            delivered,
-            "TestWindow must preserve the AccessKit action callback"
-        );
-        cx.run_until_parked();
-
-        assert!(
-            clicked.get(),
-            "a11y Click must dispatch a real mouse click to the element at the node's bounds"
-        );
-        unsafe {
-            std::env::remove_var("Z3RM_A11Y_BUILD_HEADLESS");
-        }
+        window
+            .update(cx, |this, window, _| {
+                assert!(this.b.is_focused(window));
+            })
+            .unwrap();
+        assert_eq!(b_focus_count.get(), 1);
     }
 }
