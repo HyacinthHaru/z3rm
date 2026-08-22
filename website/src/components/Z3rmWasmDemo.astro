@@ -137,53 +137,6 @@ PaneDirty(pane_id) → fetch_grid_update(generation)</code></pre>
       iframe.src = source.toString();
     });
 
-    const screen = section.querySelector<HTMLElement>("[data-shell-screen]");
-    const form = section.querySelector<HTMLFormElement>("[data-shell-form]");
-    const input = section.querySelector<HTMLInputElement>("[data-shell-input]");
-    const output = section.querySelector<HTMLElement>("[data-shell-output]");
-    let engine: ShellEngine | null = null;
-    let booted = false;
-
-    async function ensureEngine() {
-      if (booted) return;
-      booted = true;
-      print(output!, WELCOME);
-      try {
-        engine = await bootShell();
-        print(output!, "shell ready.\n");
-      } catch (error) {
-        print(output!, `failed to boot shell: ${error}\n`, "err");
-      }
-    }
-
-    screen?.addEventListener("click", () => input?.focus());
-    screen?.addEventListener("keydown", (event) => {
-      if (event.target === input) return;
-      if (event.key.length === 1 || event.key === "Backspace") {
-        input?.focus();
-      }
-    });
-    screen?.addEventListener("pointerdown", () => { void ensureEngine(); }, { once: true });
-
-    form?.addEventListener("submit", async (event) => {
-      event.preventDefault();
-      await ensureEngine();
-      const command = input!.value.trim();
-      input!.value = "";
-      if (!command) return;
-      print(output!, `visitor@z3rm:~$ ${command}`, "cmd");
-      if (!engine) {
-        print(output!, "shell is still booting, try again in a moment.\n", "err");
-        return;
-      }
-      const result = await engine.run(command).catch((error: unknown) => ({
-        stdout: "",
-        stderr: String(error),
-        exitCode: 127,
-      }));
-      if (result.stdout) print(output!, result.stdout.replace(/\n$/, ""));
-      if (result.stderr) print(output!, result.stderr.replace(/\n$/, ""), "err");
-    });
   }
 </script>
 
