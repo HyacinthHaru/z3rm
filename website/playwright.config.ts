@@ -8,7 +8,7 @@ export default defineConfig({
   retries: process.env.CI ? 2 : 0,
   reporter: process.env.CI ? "github" : "line",
   use: {
-    baseURL: "http://127.0.0.1:4328/z3rm/",
+    baseURL: "http://127.0.0.1:4331/z3rm/",
     trace: "retain-on-failure",
   },
   projects: [
@@ -17,7 +17,7 @@ export default defineConfig({
   ],
   webServer: {
     command: "pnpm exec astro preview --host 127.0.0.1 --port 4331",
-    url: "http://127.0.0.1:4328/z3rm/en/",
+    url: "http://127.0.0.1:4331/z3rm/en/",
     reuseExistingServer: true,
     timeout: 120_000,
   },
