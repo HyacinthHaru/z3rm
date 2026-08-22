@@ -15,16 +15,16 @@
 //! and Tailwind-like styling that you can use to build your own custom elements. Div is
 //! constructed by combining these two systems into an all-in-one element.
 
-use crate::PinchEvent;
 use crate::{
     Action, AnyDrag, AnyElement, AnyTooltip, AnyView, App, Bounds, ClickEvent, DispatchPhase,
-    Display, Element, ElementId, Entity, EntityId, FocusHandle, Global, GlobalElementId, Hitbox,
-    HitboxBehavior, HitboxId, InspectorElementId, IntoElement, IsZero, KeyContext, KeyDownEvent,
-    KeyUpEvent, KeyboardButton, KeyboardClickEvent, LayoutId, ModifiersChangedEvent, MouseButton,
-    MouseClickEvent, MouseDownEvent, MouseExitEvent, MouseMoveEvent, MousePressureEvent,
-    MouseUpEvent, Overflow, ParentElement, Pixels, Point, Render, ScrollWheelEvent, SharedString,
-    Size, Style, StyleRefinement, Styled, Task, TooltipId, Visibility, Window, WindowControlArea,
-    point, px, size,
+    Display, Element, ElementId, Entity, EntityId, ExternalDragPayload, ExternalDragPayloadSource,
+    FocusHandle, Global, GlobalElementId, Hitbox, HitboxBehavior, HitboxId, InspectorElementId,
+    IntoElement, IsZero, KeyContext, KeyDownEvent, KeyUpEvent, KeyboardButton, KeyboardClickEvent,
+    LayoutId, ModifiersChangedEvent, MouseButton, MouseClickEvent, MouseDownEvent, MouseExitEvent,
+    MouseMoveEvent, MousePressureEvent, MouseUpEvent, OngoingScroll, Overflow, ParentElement,
+    PinchEvent, Pixels, Point, Render, ScrollWheelEvent, SharedString, Size, Style,
+    StyleRefinement, Styled, Task, TooltipId, Visibility, Window, WindowControlArea, point, px,
+    size,
 };
 use collections::HashMap;
 use gpui_util::ResultExt;
@@ -124,13 +124,6 @@ impl Interactivity {
         button: MouseButton,
         listener: impl Fn(&MouseDownEvent, &mut Window, &mut App) + 'static,
     ) {
-        // Only the primary button makes this a control. A right-click handler
-        // is a context-menu affordance and a middle-click one is a shortcut;
-        // neither is the element's own action, and treating them as such made
-        // the accessibility diagnostic report every context menu in the graph.
-        if button == MouseButton::Left {
-            self.has_primary_mouse_down_listener = true;
-        }
         self.mouse_down_listeners
             .push(Box::new(move |event, phase, hitbox, window, cx| {
                 if phase == DispatchPhase::Bubble
@@ -140,16 +133,6 @@ impl Interactivity {
                     (listener)(event, window, cx)
                 }
             }));
-    }
-
-    /// Bind the given callback to an accessibility action on this element,
-    /// the imperative API equivalent of [`InteractiveElement::on_a11y_action`].
-    pub fn on_a11y_action(
-        &mut self,
-        action: accesskit::Action,
-        listener: impl FnMut(Option<&accesskit::ActionData>, &mut Window, &mut App) + 'static,
-    ) {
-        self.a11y_action_listeners.push((action, Box::new(listener)));
     }
 
     /// Bind the given callback to the mouse down event for any button, during the capture phase.
@@ -622,12 +605,41 @@ impl Interactivity {
             self.drag_listener.is_none(),
             "calling on_drag more than once on the same element is not supported"
         );
-        self.drag_listener = Some((
-            Arc::new(value),
-            Box::new(move |value, offset, window, cx| {
+        self.drag_listener = Some(DragListener {
+            value: Arc::new(value),
+            render: Box::new(move |value, offset, window, cx| {
                 constructor(value.downcast_ref().unwrap(), offset, window, cx).into()
             }),
-        ));
+            external_payload: None,
+        });
+    }
+
+    /// Registers a callback resolving a payload to offer the platform if a drag started by this
+    /// element leaves the window. It is invoked at most once per drag gesture, when the pointer
+    /// exits the viewport. Must be called after [`Self::on_drag`], with the same dragged value
+    /// type `T`.
+    pub fn external_drag_payload<T>(
+        &mut self,
+        resolver: impl Fn(&T, &mut Window, &mut App) -> Option<ExternalDragPayload> + 'static,
+    ) where
+        Self: Sized,
+        T: 'static,
+    {
+        let Some(drag_listener) = self.drag_listener.as_mut() else {
+            debug_assert!(false, "external_drag_payload must be called after on_drag");
+            return;
+        };
+        debug_assert!(
+            drag_listener.value.as_ref().type_id() == TypeId::of::<T>(),
+            "external_drag_payload must use the same dragged value type as on_drag"
+        );
+        debug_assert!(
+            drag_listener.external_payload.is_none(),
+            "calling external_drag_payload more than once on the same element is not supported"
+        );
+        drag_listener.external_payload = Some(Box::new(move |value, window, cx| {
+            resolver(value.downcast_ref::<T>()?, window, cx)
+        }));
     }
 
     /// Bind the given callback on the hover start and end events of this element. Note that the boolean
@@ -698,6 +710,17 @@ impl Interactivity {
 
     /// Set the bounds of this element as a window control area for the platform window.
     /// The imperative API equivalent to [`InteractiveElement::window_control_area`]
+    /// Bind the given callback to an accessibility action requested on this
+    /// element — e.g. a reader activating the element from a screen reader.
+    /// The imperative API equivalent of [`InteractiveElement::on_a11y_action`].
+    pub fn on_a11y_action(
+        &mut self,
+        action: accesskit::Action,
+        listener: impl FnMut(Option<&accesskit::ActionData>, &mut Window, &mut App) + 'static,
+    ) {
+        self.a11y_action_listeners.push((action, Box::new(listener)));
+    }
+
     pub fn window_control_area(&mut self, area: WindowControlArea) {
         self.window_control = Some(area);
     }
@@ -750,7 +773,7 @@ pub trait InteractiveElement: Sized {
     /// the first tab stop inside it while having the container element itself be unreachable via the keyboard.
     /// Should only be used with `tab_index`.
     fn tab_stop(mut self, tab_stop: bool) -> Self {
-        self.interactivity().tab_stop = Some(tab_stop);
+        self.interactivity().tab_stop = tab_stop;
         self
     }
 
@@ -761,7 +784,7 @@ pub trait InteractiveElement: Sized {
     fn tab_index(mut self, index: isize) -> Self {
         self.interactivity().focusable = true;
         self.interactivity().tab_index = Some(index);
-        self.interactivity().tab_stop = Some(true);
+        self.interactivity().tab_stop = true;
         self
     }
 
@@ -1180,19 +1203,6 @@ pub trait InteractiveElement: Sized {
         self
     }
 
-    /// Declare that this element's click handler is a pointer gesture rather
-    /// than a control: a drag handle, a double-click on background space, a
-    /// resize grip. Such an element is deliberately not in the accessibility
-    /// tree, and whatever it does is expected to be reachable another way.
-    ///
-    /// This exists so that a clickable element with no node is a *choice* on
-    /// the record rather than an oversight — see
-    /// `gpui::a11y_checks::assert_clickable_elements_are_reachable`.
-    fn pointer_gesture_only(mut self) -> Self {
-        self.interactivity().pointer_gesture_only = true;
-        self
-    }
-
     /// Set the bounds of this element as a window control area for the platform window.
     /// The fluent API equivalent to [`Interactivity::window_control_area`].
     fn window_control_area(mut self, area: WindowControlArea) -> Self {
@@ -1284,6 +1294,29 @@ pub trait StatefulInteractiveElement: InteractiveElement {
         self
     }
 
+    /// Set the keyboard shortcut(s) that activate this element, announced by
+    /// assistive technology (maps to AccessKit's `keyboard_shortcut`).
+    ///
+    /// Note that this does not create a keymap. It simply instructs assistive
+    /// technology what the keymap is.
+    fn aria_keyshortcuts(mut self, keyshortcuts: impl Into<SharedString>) -> Self {
+        self.interactivity().aria.keyshortcuts = Some(keyshortcuts.into());
+        self
+    }
+
+    /// Declare that this element's click handler is a pointer gesture rather
+    /// than a control: a drag handle, a double-click on background space, a
+    /// resize grip. Such an element is deliberately not in the accessibility
+    /// tree, and whatever it does is expected to be reachable another way.
+    ///
+    /// This exists so that a clickable element with no node is a *choice* on
+    /// the record rather than an oversight — see
+    /// `gpui::a11y_checks::assert_clickable_elements_are_reachable`.
+    fn pointer_gesture_only(mut self) -> Self {
+        self.interactivity().pointer_gesture_only = true;
+        self
+    }
+
     /// Override the spoken name of this element's *kind* — what a reader says
     /// in place of "button" or "row".
     ///
@@ -1301,19 +1334,52 @@ pub trait StatefulInteractiveElement: InteractiveElement {
         self
     }
 
-    /// Set the keyboard shortcut(s) that activate this element, announced by
-    /// assistive technology (maps to AccessKit's `keyboard_shortcut`).
-    ///
-    /// Note that this does not create a keymap. It simply instructs assistive
-    /// technology what the keymap is.
-    ///
-    /// None of accesskit's three adapters expose `keyboard_shortcut`, so the
-    /// shortcut is also written to the element's description, which all three
-    /// read. An element that sets a description too is announced as
-    /// `"{description}, {shortcut}"`.
-    fn aria_keyshortcuts(mut self, keyshortcuts: impl Into<SharedString>) -> Self {
-        self.interactivity().aria.keyshortcuts = Some(keyshortcuts.into());
+    /// Marks this element as modal: assistive technology treats everything
+    /// outside it as inert, so the user cannot wander out of a dialog that is
+    /// capturing input.
+    fn aria_modal(mut self) -> Self {
+        self.interactivity().aria.modal = true;
         self
+    }
+
+    /// Marks this element as a live region: assistive technology announces its
+    /// contents when they change, without the user having to move focus there.
+    ///
+    /// Use [`accesskit::Live::Polite`] for status that can wait for a pause in
+    /// speech, and [`accesskit::Live::Assertive`] only for changes a user must
+    /// hear immediately, since those interrupt whatever is being read.
+    fn aria_live(mut self, live: accesskit::Live) -> Self {
+        self.interactivity().aria.live = Some(live);
+        self
+    }
+
+    /// Mark this element as present but not operable. A control that is only
+    /// greyed out is announced as an ordinary one, so the user activates it and
+    /// nothing happens.
+    fn aria_disabled(mut self, disabled: bool) -> Self {
+        self.interactivity().aria.disabled = disabled;
+        self
+    }
+
+    /// Set the text a live region announces, on both the label and the value.
+    ///
+    /// The three platforms do not agree on where the announced text comes
+    /// from. `accesskit_macos` raises an announcement only when the node has a
+    /// `value` and speaks that value; `accesskit_windows` and
+    /// `accesskit_atspi_common` raise theirs only when the node has a *name*,
+    /// which is the label for every role but [`Role::Label`], and announce the
+    /// name. Neither field is derived from the other or from the role, so an
+    /// announcement set on one of them alone is silence on the other platforms.
+    ///
+    /// A region with nothing to announce yet should carry neither: it has to be
+    /// in the tree before its content arrives, or there is no change for a
+    /// reader to notice.
+    fn aria_announcement(self, text: impl Into<SharedString>) -> Self
+    where
+        Self: Sized,
+    {
+        let text = text.into();
+        self.aria_label(text.clone()).aria_value(text)
     }
 
     /// Report this element as the focused node in the accessibility tree,
@@ -1359,41 +1425,9 @@ pub trait StatefulInteractiveElement: InteractiveElement {
         self
     }
 
-    /// Marks this element as modal: assistive technology treats everything
-    /// outside it as inert, so the user cannot wander out of a dialog that is
-    /// capturing input.
-    fn aria_modal(mut self) -> Self {
-        self.interactivity().aria.modal = true;
-        self
-    }
-
-    /// Marks this element as a live region: assistive technology announces its
-    /// contents when they change, without the user having to move focus there.
-    ///
-    /// Use [`accesskit::Live::Polite`] for status that can wait for a pause in
-    /// speech, and [`accesskit::Live::Assertive`] only for changes a user must
-    /// hear immediately, since those interrupt whatever is being read.
-    fn aria_live(mut self, live: accesskit::Live) -> Self {
-        self.interactivity().aria.live = Some(live);
-        self
-    }
-
     /// Set the expanded state for this element.
-    ///
-    /// Reaches Windows only: neither the macOS nor the AT-SPI adapter exposes
-    /// `expanded` as of accesskit 0.24. On those platforms a disclosure or
-    /// popover trigger says nothing about whether it is open, so if that
-    /// distinction has to be heard it belongs in the label as well.
     fn aria_expanded(mut self, expanded: bool) -> Self {
         self.interactivity().aria.expanded = Some(expanded);
-        self
-    }
-
-    /// Mark this element as present but not operable. A control that is only
-    /// greyed out is announced as an ordinary one, so the user activates it and
-    /// nothing happens.
-    fn aria_disabled(mut self, disabled: bool) -> Self {
-        self.interactivity().aria.disabled = disabled;
         self
     }
 
@@ -1411,8 +1445,6 @@ pub trait StatefulInteractiveElement: InteractiveElement {
 
     /// Set the step by which assistive technology should expect the numeric
     /// value of this element to change (e.g. when incrementing a spin button).
-    ///
-    /// Reaches Windows and Linux only; the macOS adapter does not expose it.
     fn aria_numeric_value_step(mut self, step: f64) -> Self {
         self.interactivity().aria.numeric_value_step = Some(step);
         self
@@ -1423,27 +1455,6 @@ pub trait StatefulInteractiveElement: InteractiveElement {
     fn aria_value(mut self, value: impl Into<SharedString>) -> Self {
         self.interactivity().aria.value = Some(value.into());
         self
-    }
-
-    /// Set the text a live region announces, on both the label and the value.
-    ///
-    /// The three platforms do not agree on where the announced text comes
-    /// from. `accesskit_macos` raises an announcement only when the node has a
-    /// `value` and speaks that value; `accesskit_windows` and
-    /// `accesskit_atspi_common` raise theirs only when the node has a *name*,
-    /// which is the label for every role but [`Role::Label`], and announce the
-    /// name. Neither field is derived from the other or from the role, so an
-    /// announcement set on one of them alone is silence on the other platforms.
-    ///
-    /// A region with nothing to announce yet should carry neither: it has to be
-    /// in the tree before its content arrives, or there is no change for a
-    /// reader to notice.
-    fn aria_announcement(self, text: impl Into<SharedString>) -> Self
-    where
-        Self: Sized,
-    {
-        let text = text.into();
-        self.aria_label(text.clone()).aria_value(text)
     }
 
     /// Set the placeholder text reported to assistive technology for this
@@ -1472,60 +1483,42 @@ pub trait StatefulInteractiveElement: InteractiveElement {
     }
 
     /// Set the heading level of this element.
-    ///
-    /// Reaches macOS and Windows; the AT-SPI adapter does not expose it, so
-    /// tree depth is not announced on Linux.
     fn aria_level(mut self, level: usize) -> Self {
         self.interactivity().aria.level = Some(level);
         self
     }
 
     /// Set the position in set of this element.
-    ///
-    /// Reaches Windows and Linux only: the macOS adapter does not expose
-    /// `position_in_set` as of accesskit 0.24, so "3 of 12" is not announced
-    /// there however carefully it is computed.
     fn aria_position_in_set(mut self, position: usize) -> Self {
         self.interactivity().aria.position_in_set = Some(position);
         self
     }
 
     /// Set the size of set for this element.
-    ///
-    /// Reaches Windows and Linux only; see [`Self::aria_position_in_set`].
     fn aria_size_of_set(mut self, size: usize) -> Self {
         self.interactivity().aria.size_of_set = Some(size);
         self
     }
 
     /// Set the row index for this element.
-    ///
-    /// Reaches Windows only; neither the macOS nor the AT-SPI adapter exposes
-    /// the table position properties.
     fn aria_row_index(mut self, index: usize) -> Self {
         self.interactivity().aria.row_index = Some(index);
         self
     }
 
     /// Set the column index for this element.
-    ///
-    /// Reaches Windows only; see [`Self::aria_row_index`].
     fn aria_column_index(mut self, index: usize) -> Self {
         self.interactivity().aria.column_index = Some(index);
         self
     }
 
     /// Set the row count for this element.
-    ///
-    /// Reaches no platform as of accesskit 0.24; see [`Self::aria_row_index`].
     fn aria_row_count(mut self, count: usize) -> Self {
         self.interactivity().aria.row_count = Some(count);
         self
     }
 
     /// Set the column count for this element.
-    ///
-    /// Reaches no platform as of accesskit 0.24; see [`Self::aria_row_index`].
     fn aria_column_count(mut self, count: usize) -> Self {
         self.interactivity().aria.column_count = Some(count);
         self
@@ -1569,6 +1562,14 @@ pub trait StatefulInteractiveElement: InteractiveElement {
     /// Set the overflow y to scroll.
     fn overflow_y_scroll(mut self) -> Self {
         self.interactivity().base_style.overflow.y = Some(Overflow::Scroll);
+        self
+    }
+
+    /// Restrict scrolling of this element to the axis of the input gesture.
+    ///
+    /// See [`Style::restrict_scroll_to_axis`](crate::Style::restrict_scroll_to_axis) for details.
+    fn restrict_scroll_to_axis(mut self) -> Self {
+        self.interactivity().base_style.restrict_scroll_to_axis = Some(true);
         self
     }
 
@@ -1657,6 +1658,23 @@ pub trait StatefulInteractiveElement: InteractiveElement {
         self
     }
 
+    /// Registers a callback resolving a payload to offer the platform if a drag started by this
+    /// element leaves the window. It is invoked at most once per drag gesture, when the pointer
+    /// exits the viewport. Must be called after [`Self::on_drag`], with the same dragged value
+    /// type `T`.
+    /// The fluent API equivalent to [`Interactivity::external_drag_payload`].
+    fn external_drag_payload<T>(
+        mut self,
+        resolver: impl Fn(&T, &mut Window, &mut App) -> Option<ExternalDragPayload> + 'static,
+    ) -> Self
+    where
+        Self: Sized,
+        T: 'static,
+    {
+        self.interactivity().external_drag_payload(resolver);
+        self
+    }
+
     /// Bind the given callback on the hover start and end events of this element. Note that the boolean
     /// passed to the callback is true when the hover starts and false when it ends.
     /// Transitions caused by layout changes under a stationary mouse also invoke the callback.
@@ -1725,8 +1743,14 @@ pub(crate) type PinchListener =
 
 pub(crate) type ClickListener = Rc<dyn Fn(&ClickEvent, &mut Window, &mut App) + 'static>;
 
-pub(crate) type DragListener =
-    Box<dyn Fn(&dyn Any, Point<Pixels>, &mut Window, &mut App) -> AnyView + 'static>;
+pub(crate) struct DragListener {
+    value: Arc<dyn Any>,
+    render: Box<dyn Fn(&dyn Any, Point<Pixels>, &mut Window, &mut App) -> AnyView + 'static>,
+    external_payload: Option<ExternalDragPayloadResolver>,
+}
+
+type ExternalDragPayloadResolver =
+    Box<dyn Fn(&dyn Any, &mut Window, &mut App) -> Option<ExternalDragPayload> + 'static>;
 
 type DropListener = Box<dyn Fn(&dyn Any, &mut Window, &mut App) + 'static>;
 
@@ -2069,12 +2093,12 @@ pub(crate) struct AriaProperties {
     pub(crate) label: Option<SharedString>,
     pub(crate) description: Option<SharedString>,
     pub(crate) role_description: Option<SharedString>,
+    pub(crate) disabled: bool,
+    pub(crate) modal: bool,
+    pub(crate) live: Option<accesskit::Live>,
     pub(crate) keyshortcuts: Option<SharedString>,
     pub(crate) selected: Option<bool>,
     pub(crate) expanded: Option<bool>,
-    pub(crate) disabled: bool,
-    pub(crate) live: Option<accesskit::Live>,
-    pub(crate) modal: bool,
     pub(crate) toggled: Option<accesskit::Toggled>,
     pub(crate) numeric_value: Option<f64>,
     pub(crate) min_numeric_value: Option<f64>,
@@ -2094,10 +2118,6 @@ pub(crate) struct AriaProperties {
 
 impl AriaProperties {
     /// Whether anything here only reaches a reader through a node of its own.
-    ///
-    /// Deliberately not a blanket "any field is set": `disabled` and `selected`
-    /// describe a control that has a role by construction, so a bare `div`
-    /// carrying one is not the mistake this is looking for.
     pub(crate) fn carries_information(&self) -> bool {
         self.label.is_some()
             || self.description.is_some()
@@ -2121,6 +2141,8 @@ pub struct Interactivity {
     /// was created for the interactive element.
     pub hovered: Option<bool>,
     pub(crate) tooltip_id: Option<TooltipId>,
+    /// Set by [`InteractiveElement::pointer_gesture_only`]. See there.
+    pub(crate) pointer_gesture_only: bool,
     pub(crate) content_size: Size<Pixels>,
     pub(crate) key_context: Option<KeyContext>,
     pub(crate) focusable: bool,
@@ -2128,6 +2150,7 @@ pub struct Interactivity {
     pub(crate) tracked_scroll_handle: Option<ScrollHandle>,
     pub(crate) scroll_anchor: Option<ScrollAnchor>,
     pub(crate) scroll_offset: Option<Rc<RefCell<Point<Pixels>>>>,
+    pub(crate) ongoing_scroll: Option<Rc<RefCell<OngoingScroll>>>,
     pub(crate) group: Option<SharedString>,
     /// The base style of the element, before any modifications are applied
     /// by focus, active, etc.
@@ -2158,13 +2181,8 @@ pub struct Interactivity {
     pub(crate) drop_listeners: Vec<(TypeId, DropListener)>,
     pub(crate) can_drop_predicate: Option<CanDropPredicate>,
     pub(crate) click_listeners: Vec<ClickListener>,
-    /// Set by [`InteractiveElement::pointer_gesture_only`]. See there.
-    pub(crate) pointer_gesture_only: bool,
-    /// Whether anything answers a primary-button press on this element, which
-    /// is what makes it a control whether or not it uses `on_click`.
-    pub(crate) has_primary_mouse_down_listener: bool,
     pub(crate) aux_click_listeners: Vec<ClickListener>,
-    pub(crate) drag_listener: Option<(Arc<dyn Any>, DragListener)>,
+    pub(crate) drag_listener: Option<DragListener>,
     pub(crate) hover_listener: Option<Box<dyn Fn(&bool, &mut Window, &mut App)>>,
     pub(crate) tooltip_builder: Option<TooltipBuilder>,
     pub(crate) tooltip_show_delay: Option<Duration>,
@@ -2172,9 +2190,7 @@ pub struct Interactivity {
     pub(crate) hitbox_behavior: HitboxBehavior,
     pub(crate) tab_index: Option<isize>,
     pub(crate) tab_group: bool,
-    // `None` means the element never asked; only an explicit request may
-    // overwrite the flag on a focus handle supplied via `track_focus`.
-    pub(crate) tab_stop: Option<bool>,
+    pub(crate) tab_stop: bool,
 
     pub(crate) a11y_action_listeners:
         Vec<(accesskit::Action, crate::window::a11y::A11yActionListener)>,
@@ -2242,33 +2258,23 @@ impl Interactivity {
                     && self.tracked_focus_handle.is_none()
                     && let Some(element_state) = element_state.as_mut()
                 {
-                    self.tracked_focus_handle = Some(
-                        element_state
-                            .focus_handle
-                            .get_or_insert_with(|| cx.focus_handle())
-                            .clone()
-                            .tab_stop(self.tab_stop.unwrap_or(false)),
-                    );
-                }
+                    let mut handle = element_state
+                        .focus_handle
+                        .get_or_insert_with(|| cx.focus_handle())
+                        .clone()
+                        .tab_stop(self.tab_stop);
 
-                // A handle supplied via `track_focus` also has to pick up the
-                // element's tab semantics, otherwise `.tab_stop(..)`/`.tab_index(..)`
-                // are silently dropped and the element never enters the tab order.
-                // Only explicit requests are propagated, so callers that configure
-                // the handle directly keep their settings.
-                if let Some(handle) = self.tracked_focus_handle.take() {
-                    let handle = match self.tab_stop {
-                        Some(tab_stop) => handle.tab_stop(tab_stop),
-                        None => handle,
-                    };
-                    self.tracked_focus_handle = Some(match self.tab_index {
-                        Some(index) => handle.tab_index(index),
-                        None => handle,
-                    });
+                    if let Some(index) = self.tab_index {
+                        handle = handle.tab_index(index);
+                    }
+
+                    self.tracked_focus_handle = Some(handle);
                 }
 
                 if let Some(scroll_handle) = self.tracked_scroll_handle.as_ref() {
-                    self.scroll_offset = Some(scroll_handle.0.borrow().offset.clone());
+                    let scroll_handle_state = scroll_handle.0.borrow();
+                    self.scroll_offset = Some(scroll_handle_state.offset.clone());
+                    self.ongoing_scroll = Some(scroll_handle_state.ongoing_scroll.clone());
                 } else if (self.base_style.overflow.x == Some(Overflow::Scroll)
                     || self.base_style.overflow.y == Some(Overflow::Scroll))
                     && let Some(element_state) = element_state.as_mut()
@@ -2277,6 +2283,12 @@ impl Interactivity {
                         element_state
                             .scroll_offset
                             .get_or_insert_with(Rc::default)
+                            .clone(),
+                    );
+                    self.ongoing_scroll = Some(
+                        element_state
+                            .ongoing_scroll
+                            .get_or_insert_with(|| Rc::new(RefCell::new(OngoingScroll::default())))
                             .clone(),
                     );
                 }
@@ -2313,33 +2325,10 @@ impl Interactivity {
             },
         );
 
-        // `on_mouse_down` as well as `on_click`: the editor's diff-review
-        // affordance is driven by the former, and a control is a control
-        // whichever listener answers the press.
-        if window.a11y.is_building_frame()
-            && !self.pointer_gesture_only
-            && !(self.click_listeners.is_empty() && !self.has_primary_mouse_down_listener)
-            && self
-                .override_role
-                .filter(|role| *role != accesskit::Role::GenericContainer)
-                .is_none()
-        {
-            let scale = window.scale_factor();
-            window.a11y.note_clickable_without_role(
-                self.source_location(),
-                accesskit::Rect {
-                    x0: (bounds.origin.x.0 * scale) as f64,
-                    y0: (bounds.origin.y.0 * scale) as f64,
-                    x1: ((bounds.origin.x.0 + bounds.size.width.0) * scale) as f64,
-                    y1: ((bounds.origin.y.0 + bounds.size.height.0) * scale) as f64,
-                },
-            );
-        }
-
         if let Some(focus_handle) = self.tracked_focus_handle.as_ref() {
             window.set_focus_handle(focus_handle, cx);
 
-            if window.a11y.is_building_frame() {
+            if window.a11y.is_active() {
                 if let Some(global_id) = global_id {
                     let node_id = global_id.accesskit_node_id();
                     window.a11y.set_focusable(node_id, focus_handle.id);
@@ -2357,7 +2346,7 @@ impl Interactivity {
             }
         }
 
-        if self.report_active_descendant_focus && window.a11y.is_building_frame() {
+        if self.report_active_descendant_focus && window.a11y.is_active() {
             if let Some(global_id) = global_id {
                 window
                     .a11y
@@ -2433,6 +2422,7 @@ impl Interactivity {
             || self.has_pinch_listeners()
             || self.drag_listener.is_some()
             || !self.drop_listeners.is_empty()
+            || !self.drag_over_styles.is_empty()
             || self.tooltip_builder.is_some()
             || window.is_inspector_picking(cx)
     }
@@ -2530,7 +2520,7 @@ impl Interactivity {
                         .insert(debug_selector.clone(), bounds);
                 }
 
-                self.paint_hover_group_handler(element_state.as_ref(), window, cx);
+                self.paint_hover_group_handler(window, cx);
 
                 if style.visibility == Visibility::Hidden {
                     return ((), element_state);
@@ -2597,7 +2587,7 @@ impl Interactivity {
 
                                         self.paint_keyboard_listeners(window, cx);
 
-                                        if window.a11y.is_building_frame() {
+                                        if window.a11y.is_active() {
                                             if let Some(global_id) = global_id {
                                                 if !self.a11y_action_listeners.is_empty() {
                                                     let node_id = global_id.accesskit_node_id();
@@ -2862,6 +2852,29 @@ impl Interactivity {
             });
         }
 
+        if let Some(group_hover) = self.group_hover_style.as_ref() {
+            if let Some(group_hitbox_id) = GroupHitboxes::get(&group_hover.group, cx) {
+                let hover_state = element_state
+                    .as_ref()
+                    .and_then(|element| element.hover_state.as_ref())
+                    .cloned();
+                let current_view = window.current_view();
+
+                window.on_mouse_event(move |_: &MouseMoveEvent, phase, window, cx| {
+                    let group_hovered = group_hitbox_id.is_hovered(window);
+                    let was_group_hovered = hover_state
+                        .as_ref()
+                        .is_some_and(|state| state.borrow().group);
+                    if phase == DispatchPhase::Capture && group_hovered != was_group_hovered {
+                        if let Some(hover_state) = &hover_state {
+                            hover_state.borrow_mut().group = group_hovered;
+                            cx.notify(current_view);
+                        }
+                    }
+                });
+            }
+        }
+
         let drag_cursor_style = self.base_style.as_ref().mouse_cursor;
 
         let mut drag_listener = mem::take(&mut self.drag_listener);
@@ -2950,18 +2963,31 @@ impl Interactivity {
                         if let Some(mouse_down) = pending_mouse_down.clone()
                             && !cx.has_active_drag()
                             && (event.position - mouse_down.position).magnitude() > DRAG_THRESHOLD
-                            && let Some((drag_value, drag_listener)) = drag_listener.take()
+                            && let Some(listener) = drag_listener.take()
                             && mouse_down.button == MouseButton::Left
                         {
                             *clicked_state.borrow_mut() = ElementClickedState::default();
                             let cursor_offset = event.position - hitbox.origin;
-                            let drag =
-                                (drag_listener)(drag_value.as_ref(), cursor_offset, window, cx);
+                            let drag = (listener.render)(
+                                listener.value.as_ref(),
+                                cursor_offset,
+                                window,
+                                cx,
+                            );
+                            let external_payload_source =
+                                listener.external_payload.map(|external_payload| {
+                                    let value = listener.value.clone();
+                                    Box::new(move |window: &mut Window, cx: &mut App| {
+                                        external_payload(value.as_ref(), window, cx)
+                                    })
+                                        as ExternalDragPayloadSource
+                                });
                             cx.active_drag = Some(AnyDrag {
                                 view: drag,
-                                value: drag_value,
+                                value: listener.value,
                                 cursor_offset,
                                 cursor_style: drag_cursor_style,
+                                external_payload_source,
                             });
                             pending_mouse_down.take();
                             window.refresh();
@@ -3253,35 +3279,18 @@ impl Interactivity {
         }
     }
 
-    fn paint_hover_group_handler(
-        &self,
-        element_state: Option<&InteractiveElementState>,
-        window: &mut Window,
-        cx: &mut App,
-    ) {
+    fn paint_hover_group_handler(&self, window: &mut Window, cx: &mut App) {
         let group_hitbox = self
             .group_hover_style
             .as_ref()
             .and_then(|group_hover| GroupHitboxes::get(&group_hover.group, cx));
 
         if let Some(group_hitbox) = group_hitbox {
-            let hover_state = element_state
-                .and_then(|element| element.hover_state.as_ref())
-                .cloned();
-            let mut was_hovered = group_hitbox.is_hovered(window);
+            let was_hovered = group_hitbox.is_hovered(window);
             let current_view = window.current_view();
             window.on_mouse_event(move |_: &MouseMoveEvent, phase, window, cx| {
                 let hovered = group_hitbox.is_hovered(window);
-                let was_group_hovered = hover_state
-                    .as_ref()
-                    .map(|state| state.borrow().group)
-                    .unwrap_or(was_hovered);
-                if phase == DispatchPhase::Capture && hovered != was_group_hovered {
-                    if let Some(hover_state) = &hover_state {
-                        hover_state.borrow_mut().group = hovered;
-                    } else {
-                        was_hovered = hovered;
-                    }
+                if phase == DispatchPhase::Capture && hovered != was_hovered {
                     cx.notify(current_view);
                 }
             });
@@ -3296,6 +3305,7 @@ impl Interactivity {
         _cx: &mut App,
     ) {
         if let Some(scroll_offset) = self.scroll_offset.clone() {
+            let ongoing_scroll = self.ongoing_scroll.clone();
             let overflow = style.overflow;
             let allow_concurrent_scroll = style.allow_concurrent_scroll;
             let restrict_scroll_to_axis = style.restrict_scroll_to_axis;
@@ -3306,24 +3316,35 @@ impl Interactivity {
                 if phase == DispatchPhase::Bubble && hitbox.should_handle_scroll(window) {
                     let mut scroll_offset = scroll_offset.borrow_mut();
                     let old_scroll_offset = *scroll_offset;
-                    let delta = event.delta.pixel_delta(line_height);
+                    let mut delta = event.delta.pixel_delta(line_height);
 
-                    let mut delta_x = Pixels::ZERO;
-                    if overflow.x == Overflow::Scroll {
-                        if !delta.x.is_zero() {
-                            delta_x = delta.x;
-                        } else if !restrict_scroll_to_axis && overflow.y != Overflow::Scroll {
-                            delta_x = delta.y;
-                        }
+                    if restrict_scroll_to_axis
+                        && event.delta.precise()
+                        && let Some(ongoing_scroll) = &ongoing_scroll
+                    {
+                        ongoing_scroll
+                            .borrow_mut()
+                            .filter(&mut delta, event.touch_phase);
                     }
-                    let mut delta_y = Pixels::ZERO;
-                    if overflow.y == Overflow::Scroll {
-                        if !delta.y.is_zero() {
-                            delta_y = delta.y;
-                        } else if !restrict_scroll_to_axis && overflow.x != Overflow::Scroll {
-                            delta_y = delta.x;
+
+                    let mut delta_x = match overflow.x {
+                        Overflow::Scroll if !delta.x.is_zero() => delta.x,
+                        Overflow::Scroll
+                            if !restrict_scroll_to_axis && overflow.y != Overflow::Scroll =>
+                        {
+                            delta.y
                         }
-                    }
+                        _ => Pixels::ZERO,
+                    };
+                    let mut delta_y = match overflow.y {
+                        Overflow::Scroll if !delta.y.is_zero() => delta.y,
+                        Overflow::Scroll
+                            if !restrict_scroll_to_axis && overflow.x != Overflow::Scroll =>
+                        {
+                            delta.x
+                        }
+                        _ => Pixels::ZERO,
+                    };
                     if !allow_concurrent_scroll && !delta_x.is_zero() && !delta_y.is_zero() {
                         if delta_x.abs() > delta_y.abs() {
                             delta_y = Pixels::ZERO;
@@ -3503,26 +3524,14 @@ impl Interactivity {
         if let Some(description) = description {
             node.set_description(description);
         }
-        if let Some(role_description) = &self.aria.role_description {
-            node.set_role_description(role_description.to_string());
-        }
         if let Some(keyshortcuts) = &self.aria.keyshortcuts {
             node.set_keyboard_shortcut(keyshortcuts.to_string());
         }
         if let Some(selected) = self.aria.selected {
             node.set_selected(selected);
         }
-        if let Some(live) = self.aria.live {
-            node.set_live(live);
-        }
-        if self.aria.modal {
-            node.set_modal();
-        }
         if let Some(expanded) = self.aria.expanded {
             node.set_expanded(expanded);
-        }
-        if self.aria.disabled {
-            node.set_disabled();
         }
         if let Some(toggled) = self.aria.toggled {
             node.set_toggled(toggled);
@@ -3569,6 +3578,18 @@ impl Interactivity {
         if let Some(count) = self.aria.column_count {
             node.set_column_count(count);
         }
+        if let Some(role_description) = &self.aria.role_description {
+            node.set_role_description(role_description.to_string());
+        }
+        if self.aria.disabled {
+            node.set_disabled();
+        }
+        if self.aria.modal {
+            node.set_modal();
+        }
+        if let Some(live) = self.aria.live {
+            node.set_live(live);
+        }
         if !self.click_listeners.is_empty() {
             node.add_action(accesskit::Action::Click);
         }
@@ -3599,6 +3620,7 @@ pub struct InteractiveElementState {
     /// blur). `None` means no activation key is pending.
     pub(crate) pending_keyboard_down: Option<Rc<RefCell<Option<u64>>>>,
     pub(crate) scroll_offset: Option<Rc<RefCell<Point<Pixels>>>>,
+    ongoing_scroll: Option<Rc<RefCell<OngoingScroll>>>,
     pub(crate) active_tooltip: Option<Rc<RefCell<Option<ActiveTooltip>>>>,
 }
 
@@ -4026,12 +4048,12 @@ where
         self.element.a11y_role()
     }
 
-    fn a11y_has_properties(&self) -> bool {
-        self.element.a11y_has_properties()
-    }
-
     fn write_a11y_info(&self, node: &mut accesskit::Node) {
         self.element.write_a11y_info(node);
+    }
+
+    fn a11y_has_properties(&self) -> bool {
+        self.element.a11y_has_properties()
     }
 
     fn a11y_synthetic_children(
@@ -4138,6 +4160,7 @@ impl ScrollAnchor {
 #[derive(Default, Debug)]
 struct ScrollHandleState {
     offset: Rc<RefCell<Point<Pixels>>>,
+    ongoing_scroll: Rc<RefCell<OngoingScroll>>,
     bounds: Bounds<Pixels>,
     max_offset: Point<Pixels>,
     child_bounds: Vec<Bounds<Pixels>>,
@@ -4966,6 +4989,7 @@ mod tests {
             "mouse down over an active prompt should not fire mouse-down-out listeners"
         );
     }
+
     #[test]
     fn test_accessibility_id_builder_writes_author_id() {
         let mut element = div()
@@ -5001,26 +5025,6 @@ mod tests {
         assert_eq!(node.min_numeric_value(), Some(6.0));
         assert_eq!(node.max_numeric_value(), Some(72.0));
         assert_eq!(node.numeric_value_step(), Some(1.0));
-    }
-
-    /// A status that changes while the user is working elsewhere is only
-    /// announced if it is marked as a live region; without it the change is
-    /// silent, and the element carries no signal that anything happened.
-    #[test]
-    fn test_write_a11y_info_live_region() {
-        let mut interactivity = Interactivity::default();
-        let mut node = accesskit::Node::new(accesskit::Role::Status);
-        interactivity.write_a11y_info(&mut node);
-        assert_eq!(
-            node.live(),
-            None,
-            "an element that never asked must not be announced on change"
-        );
-
-        interactivity.aria.live = Some(accesskit::Live::Polite);
-        let mut node = accesskit::Node::new(accesskit::Role::Status);
-        interactivity.write_a11y_info(&mut node);
-        assert_eq!(node.live(), Some(accesskit::Live::Polite));
     }
 
     /// Two focusable, clickable elements ("a" and "b") used to exercise the
@@ -5293,44 +5297,42 @@ mod tests {
         assert_eq!(focused, Some(item_b.id));
     }
 
-    struct TrackedTabStop {
-        first: FocusHandle,
-        second: FocusHandle,
-    }
+    struct ContentSizedGrid;
 
-    impl Render for TrackedTabStop {
+    impl Render for ContentSizedGrid {
         fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
-            div()
-                .child(div().track_focus(&self.first))
-                .child(div().track_focus(&self.second).tab_stop(true))
+            let widths = [px(100.), px(200.), px(50.)];
+            div().size_full().child(
+                div()
+                    .w_full()
+                    .grid()
+                    .grid_cols_max_content(widths.len() as u16)
+                    .children(widths.into_iter().enumerate().map(|(index, width)| {
+                        div()
+                            .debug_selector(move || format!("cell-{index}"))
+                            .w(width)
+                            .h(px(10.))
+                    })),
+            )
         }
     }
 
-    /// An element that supplies its own focus handle through `track_focus` must
-    /// still honor [`InteractiveElement::tab_stop`]. The element-level flag used
-    /// to be applied only when no handle was tracked, so this combination left
-    /// the element out of the tab order without any diagnostic.
-    #[test]
-    fn element_tab_stop_applies_to_a_tracked_focus_handle() {
-        let mut cx = TestAppContext::single();
-        let (first, second) = cx.update(|cx| (cx.focus_handle().tab_stop(true), cx.focus_handle()));
-        let window: AnyWindowHandle = cx
-            .add_window({
-                let (first, second) = (first.clone(), second.clone());
-                move |_, _| TrackedTabStop { first, second }
-            })
-            .into();
-        cx.update_window(window, |_, window, cx| window.draw(cx).clear(cx))
+    #[gpui::test]
+    fn grid_cols_max_content_sizes_columns_to_their_content(cx: &mut TestAppContext) {
+        let window = cx.add_window(|_, _| ContentSizedGrid);
+        cx.update_window(window.into(), |_, window, cx| window.draw(cx).clear(cx))
             .unwrap();
 
-        let focused = cx
-            .update_window(window, |_, window, cx| {
-                window.focus(&first, cx);
-                window.focus_next(cx);
-                window.focused(cx).map(|handle| handle.id)
+        let mut bounds = |selector: &'static str| {
+            cx.update_window(window.into(), |_, window, _| {
+                window.rendered_frame.debug_bounds.get(selector).copied()
             })
-            .unwrap();
+            .unwrap()
+            .unwrap_or_else(|| panic!("{selector} was not rendered"))
+        };
 
-        assert_eq!(focused, Some(second.id));
+        assert_eq!(bounds("cell-0").origin.x, px(0.));
+        assert_eq!(bounds("cell-1").origin.x, px(100.));
+        assert_eq!(bounds("cell-2").origin.x, px(300.));
     }
 }

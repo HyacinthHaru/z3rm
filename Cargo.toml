@@ -170,6 +170,9 @@ tree-sitter-regex = "0.24"
 tree-sitter-ruby = "0.23"
 tree-sitter-rust = "0.24.2"
 tracing = "0.1.40"
+flume = "0.12"
+swash = "0.2"
+etagere = "0.2"
 unicase = "2.6"
 unicode-bidi = { version = "0.3.18", default-features = false, features = [
     "hardcoded-data",

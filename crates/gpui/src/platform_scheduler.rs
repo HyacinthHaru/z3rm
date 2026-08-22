@@ -2,9 +2,10 @@ use crate::{PlatformDispatcher, RunnableMeta};
 use async_task::Runnable;
 use chrono::{DateTime, Utc};
 use futures::channel::oneshot;
+use scheduler::Instant;
 use scheduler::{
-    BackgroundExecutor, Clock, Instant, LocalExecutor, Priority, Scheduler, SessionId, SpawnTime,
-    Task, TestScheduler, Timer, spawn_dedicated_thread,
+    Clock, LocalExecutor, Priority, Scheduler, SessionId, Task, TestScheduler, Timer,
+    spawn_dedicated_thread,
 };
 #[cfg(not(target_family = "wasm"))]
 use std::task::{Context, Poll};
@@ -27,6 +28,8 @@ pub struct PlatformScheduler {
     dispatcher: Arc<dyn PlatformDispatcher>,
     clock: Arc<PlatformClock>,
     next_session_id: AtomicU16,
+    #[cfg(feature = "profiler")]
+    foreground_runnables: crate::profiler::journal::ForegroundRunnableCounter,
 }
 
 impl PlatformScheduler {
@@ -35,6 +38,8 @@ impl PlatformScheduler {
             dispatcher: dispatcher.clone(),
             clock: Arc::new(PlatformClock { dispatcher }),
             next_session_id: AtomicU16::new(0),
+            #[cfg(feature = "profiler")]
+            foreground_runnables: crate::profiler::journal::foreground_runnable_counter(),
         }
     }
 
@@ -50,6 +55,13 @@ impl PlatformScheduler {
 
     fn next_session_id(&self) -> SessionId {
         SessionId::new(self.next_session_id.fetch_add(1, Ordering::SeqCst))
+    }
+
+    #[cfg(feature = "profiler")]
+    pub(crate) fn foreground_runnable_counter(
+        &self,
+    ) -> crate::profiler::journal::ForegroundRunnableCounter {
+        self.foreground_runnables.clone()
     }
 }
 
@@ -104,6 +116,8 @@ impl Scheduler for PlatformScheduler {
     }
 
     fn schedule_local(&self, _session_id: SessionId, runnable: Runnable<RunnableMeta>) {
+        #[cfg(feature = "profiler")]
+        self.foreground_runnables.queued();
         self.dispatcher
             .dispatch_on_main_thread(runnable, Priority::default());
     }
@@ -188,6 +202,7 @@ impl Clock for PlatformClock {
 mod tests {
     use super::*;
     use crate::RunnableVariant;
+    use scheduler::BackgroundExecutor;
     use std::time::Instant as StdInstant;
 
     // `spawn_dedicated` shouldn't touch the platform dispatcher at all;
@@ -210,6 +225,26 @@ mod tests {
         fn spawn_realtime(&self, _f: Box<dyn FnOnce() + Send>) {
             panic!("SmokeDispatcher does not implement realtime");
         }
+    }
+
+    #[test]
+    fn dedicated_executor_tasks_share_one_thread() {
+        let background =
+            BackgroundExecutor::new(Arc::new(PlatformScheduler::new(Arc::new(SmokeDispatcher))));
+        let dedicated = scheduler::DedicatedExecutor::new(&background);
+
+        let first = dedicated.spawn(async { std::thread::current().id() });
+        let second = dedicated.spawn(async { std::thread::current().id() });
+
+        let first = futures::executor::block_on(first);
+        let second = futures::executor::block_on(second);
+
+        assert_eq!(first, second, "tasks must share the dedicated thread");
+        assert_ne!(
+            first,
+            std::thread::current().id(),
+            "dedicated tasks must not run on the spawning thread"
+        );
     }
 
     #[test]

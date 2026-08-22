@@ -9,6 +9,7 @@ use mux_protocol::{
     SessionSnapshot, SplitNode, TabInfo, TerminalSize, layout_node,
 };
 use std::{cell::RefCell, rc::Rc, sync::Arc};
+use z3rm_web::WebTerminal;
 
 #[path = "../../../crates/workspace/src/layout_projection.rs"]
 mod layout_projection;
@@ -232,8 +233,40 @@ impl Render for Z3rmDemo {
     }
 }
 
+thread_local! {
+    /// One real emulator per pane. Each renders through the same vendored
+    /// alacritty grid the native client uses (z3rm_web::WebTerminal), fed with
+    /// the pane's session transcript as PTY-style bytes.
+    static PANE_TERMINALS: RefCell<std::collections::HashMap<String, WebTerminal>> =
+        RefCell::new(std::collections::HashMap::new());
+}
+
+fn pane_terminal(pane_id: &str) -> WebTerminal {
+    let mut terminal = WebTerminal::new(120, 32);
+    if let Some(bytes) = pane_transcript_bytes(pane_id) {
+        terminal.feed(bytes);
+    }
+    terminal
+}
+
+fn pane_transcript_bytes(pane_id: &str) -> Option<&'static [u8]> {
+    match pane_id {
+        "pane-editor" => Some(b"$ z3rm attach -t work\r\nattached: work/window-0/pane-editor\r\n\r\nserver snapshot generation 1842\r\nlayout: left_right [0.62, 0.38]\r\nhistory: 4,096 rows \xc2\xb7 authoritative\r\n"),
+        "pane-tests" => Some(b"$ cargo test -p mux_server --lib\r\nrunning 128 tests\r\ntest layout::wire_depth ... ok\r\ntest reconnect::snapshot ... ok\r\ntest result: ok. 128 passed\r\n"),
+        "pane-logs" => Some(b"$ z3rm list-panes -F '#{pane_id} #{pane_generation}'\r\npane-logs 907\r\npane-metrics 332\r\n\r\nPaneDirty(pane-logs) \xe2\x86\x92 fetch_grid_update(906)\r\n"),
+        "pane-metrics" => Some(b"mux-server  uptime 19h42m\r\nsessions    3\r\nwindows     8\r\npanes       17\r\nclients     2\r\n"),
+        "pane-shell" => Some(b"$ printf 'state survives the window\\n'\r\nstate survives the window\r\n$ _"),
+        _ => None,
+    }
+}
+
 fn render_pane(pane: &PaneInfo, focused: bool) -> impl IntoElement {
-    let lines = terminal_lines(&pane.id);
+    let lines = PANE_TERMINALS.with(|slot| {
+        let mut map = slot.borrow_mut();
+        map.entry(pane.id.clone())
+            .or_insert_with(|| pane_terminal(&pane.id))
+            .viewport_lines()
+    });
     div()
         .size_full()
         .flex()
@@ -271,45 +304,6 @@ fn render_pane(pane: &PaneInfo, focused: bool) -> impl IntoElement {
         )
 }
 
-fn terminal_lines(pane_id: &str) -> Vec<&'static str> {
-    match pane_id {
-        "pane-editor" => vec![
-            "$ z3rm attach -t work",
-            "attached: work/window-0/pane-editor",
-            "",
-            "server snapshot generation 1842",
-            "layout: left_right [0.62, 0.38]",
-            "history: 4,096 rows · authoritative",
-        ],
-        "pane-tests" => vec![
-            "$ cargo test -p mux_server --lib",
-            "running 128 tests",
-            "test layout::wire_depth ... ok",
-            "test reconnect::snapshot ... ok",
-            "test result: ok. 128 passed",
-        ],
-        "pane-logs" => vec![
-            "$ z3rm list-panes -F '#{pane_id} #{pane_generation}'",
-            "pane-logs 907",
-            "pane-metrics 332",
-            "",
-            "PaneDirty(pane-logs) → fetch_grid_update(906)",
-        ],
-        "pane-metrics" => vec![
-            "mux-server  uptime 19h42m",
-            "sessions    3",
-            "windows     8",
-            "panes       17",
-            "clients     2",
-        ],
-        "pane-shell" => vec![
-            "$ printf 'state survives the window\\n'",
-            "state survives the window",
-            "$ _",
-        ],
-        _ => vec!["$ _"],
-    }
-}
 
 fn server_snapshot(focused_tab_id: &str, focused_pane_id: &str) -> SessionSnapshot {
     let tabs = vec![

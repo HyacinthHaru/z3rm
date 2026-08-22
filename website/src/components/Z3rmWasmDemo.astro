@@ -18,7 +18,6 @@ const copy = lang === "zh" ? {
   detailBody: "Rust → wasm32-unknown-unknown；GPUI WebPlatform 单线程渲染；mux_protocol::SessionSnapshot 驱动 tab/pane；workspace/layout_projection.rs 计算每个 pane 的边界。",
   close: "关闭",
   contractBody: "GUI 不推断布局。每个 mux window 对应一个 tab，每个 pane leaf 对应一个 GPUI pane；切换 tab 或点击 RECONNECT 时，完整 SessionSnapshot 被重新投影。",
-  tryHint: "试试 ls、cat NOTES.md 或 help —— 这个窗格里运行着一个真实的微型 shell。",
 } : {
   eyebrow: "Live browser demo",
   title: "One mux snapshot. One GPUI projection.",
@@ -36,7 +35,6 @@ const copy = lang === "zh" ? {
   detailBody: "Rust → wasm32-unknown-unknown; GPUI WebPlatform renders on one browser thread; mux_protocol::SessionSnapshot drives tabs and panes; workspace/layout_projection.rs computes every pane bound.",
   close: "Close",
   contractBody: "The GUI does not infer layout. Every mux window maps to one tab and every pane leaf to one GPUI pane. Tab changes and RECONNECT replace and re-project a complete SessionSnapshot.",
-  tryHint: "Try ls, cat NOTES.md, or help — a real miniature shell runs in this pane.",
 };
 ---
 
@@ -91,61 +89,10 @@ PaneDirty(pane_id) → fetch_grid_update(generation)</code></pre>
     </proto-ui-base-tabs-content>
   </proto-ui-base-tabs-root>
 
-  <section class="live-shell" data-z3rm-shell-demo aria-label={lang === "zh" ? "交互式终端" : "Live terminal"}>
-    <div class="shell-bar">
-      <b>z3rm://session/shell — live</b>
-      <span>{copy.tryHint}</span>
-    </div>
-    <div class="shell-screen" data-shell-screen tabindex="0" role="group" aria-label={lang === "zh" ? "交互式终端演示" : "Interactive terminal demo"} aria-live="polite">
-      <output data-shell-output></output>
-      <form data-shell-form autocomplete="off">
-        <label class="sr-only" for="z3rm-shell-input">{lang === "zh" ? "终端命令" : "Terminal command"}</label>
-        <span class="prompt" aria-hidden="true">visitor@z3rm:~$</span>
-        <input id="z3rm-shell-input" data-shell-input name="command" type="text" spellcheck="false" autocapitalize="off"
-          placeholder={lang === "zh" ? "输入命令，例如 ls" : "type a command, e.g. ls"} />
-      </form>
-    </div>
-  </section>
 </section>
 
 <script>
   import { setElementProps } from "@proto.ui/adapter-web-component";
-
-  type ShellEngine = {
-    run(command: string): Promise<{ stdout: string; stderr: string; exitCode: number }>;
-  };
-
-  const WELCOME = `Z3rm demo shell — a tiny Linux-like userspace running in this tab.
-Type 'help' for commands, 'ls' to explore the workspace tree.
-`;
-
-  function print(output: HTMLElement, text: string, kind: "" | "err" | "cmd" = "") {
-    const line = document.createElement("span");
-    if (kind) line.dataset.kind = kind;
-    line.textContent = text;
-    output.appendChild(line);
-    output.parentElement?.scrollTo({ top: output.parentElement.scrollHeight });
-  }
-
-  async function bootShell(): Promise<ShellEngine> {
-    const { Sandbox } = await import("@lifo-sh/core");
-    const sandbox = await Sandbox.create({
-      cwd: "/home/user/z3rm",
-      files: {
-        "/home/user/z3rm/README.md":
-          "# z3rm\n\nYour shells outlive the window.\nThe mux server owns PTYs, grids, scrollback and layout;\nthis pane is just one view of it.\n",
-        "/home/user/z3rm/NOTES.md":
-          "# Session notes\n\n- detach keeps processes running\n- reconnect reconciles from an authoritative snapshot\n- shadow snapshots persist restore intent before touching files\n",
-        "/home/user/z3rm/workspace/layout_projection.rs":
-          "// production projection: LayoutTree -> Bounds<Pixels>\npub struct ProjectionConfig {\n    pub splitter_width: f32,\n}\n",
-      },
-    });
-    return {
-      async run(command: string) {
-        return sandbox.commands.run(command);
-      },
-    };
-  }
 
   for (const section of document.querySelectorAll<HTMLElement>("[data-z3rm-wasm-demo]")) {
     if (section.dataset.ready === "true") continue;
@@ -242,16 +189,4 @@ Type 'help' for commands, 'ls' to explore the workspace tree.
 
 <style>
   .wasm-demo { margin-top: 7rem; }
-  .live-shell { margin-top: 1.5rem; border: 1px solid var(--border-strong); background: #101215; box-shadow: var(--shadow-window); }
-  .shell-bar { display: flex; align-items: center; justify-content: space-between; gap: 1rem; height: 2rem; padding: 0 .8rem; color: #858a92; background: #202328; font: .68rem/1 var(--font-mono); }
-  .shell-bar b { font-weight: 400; }
-  .shell-screen { display: flex; flex-direction: column; justify-content: flex-end; min-height: 15rem; max-height: 22rem; overflow-y: auto; padding: .9rem; cursor: text; }
-  .shell-screen output { white-space: pre-wrap; word-break: break-word; font: .78rem/1.55 var(--font-mono); color: #c9cdd4; }
-  .shell-screen output span { display: block; }
-  .shell-screen output span[data-kind="cmd"] { color: #7da5d2; margin-top: .35rem; }
-  .shell-screen output span[data-kind="err"] { color: #d58a82; }
-  .shell-screen form { display: flex; align-items: baseline; gap: .5rem; margin-top: .25rem; }
-  .shell-screen .prompt { color: #7db194; font: .78rem/1.4 var(--font-mono); white-space: nowrap; }
-  .shell-screen input { flex: 1; border: 0; outline: none; background: transparent; color: #e8e9eb; font: .78rem/1.4 var(--font-mono); caret-color: #c7a363; }
-  .shell-screen input::placeholder { color: #50565f; }
 </style>

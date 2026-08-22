@@ -19,7 +19,7 @@ demo-shell = []
 
 [dependencies]
 
-alacritty_terminal.workspace = true
+alacritty_terminal = { path = "alacritty_web", default-features = false }
 anyhow.workspace = true
 log.workspace = true
 mux_protocol.workspace = true

@@ -80,3 +80,22 @@ test("GPUI WASM demo and Proto UI controls work together", async ({ page }) => {
   await expect(demo.locator("iframe")).toHaveAttribute("src", /window=window-1/);
   await expect(frame.locator("canvas")).toBeVisible({ timeout: 120_000 });
 });
+
+test("GPUI WASM panes render a real terminal grid", async ({ page }) => {
+  await page.goto("en/");
+  const frame = page.frameLocator('iframe[title="Z3rm GPUI WebAssembly session projection"]');
+  await expect(frame.locator("canvas")).toBeVisible({ timeout: 120_000 });
+  const received = await frame.locator("html").evaluate(() => {
+    const bindings = (window as Window & {
+      wasmBindings?: {
+        receive_shell_bytes?: (bytes: Uint8Array) => void;
+        receive_shell_result?: (command: string, stdout: string, stderr: string, exitCode: number) => void;
+        terminal_viewport?: () => string;
+      };
+    }).wasmBindings;
+    if (!bindings?.receive_shell_result || !bindings.terminal_viewport) return null;
+    bindings.receive_shell_result("echo demo", "demo output line\n", "", 0);
+    return bindings.terminal_viewport();
+  });
+  expect(received).toContain("demo output line");
+});
