@@ -18,4 +18,5 @@ gpui = { path = "../../../crates/gpui" }
 gpui_web = { path = "../../../crates/gpui_web", default-features = false }
 log = "0.4"
 mux_protocol = { path = "../../../crates/mux_protocol" }
+z3rm_web = { path = "../../../crates/z3rm_web", default-features = false }
 web-sys = { version = "0.3", features = ["Location", "Window"] }

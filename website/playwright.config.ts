@@ -8,7 +8,7 @@ export default defineConfig({
   retries: process.env.CI ? 2 : 0,
   reporter: process.env.CI ? "github" : "line",
   use: {
-    baseURL: "http://127.0.0.1:4321/z3rm/",
+    baseURL: "http://127.0.0.1:4328/z3rm/",
     trace: "retain-on-failure",
   },
   projects: [
@@ -16,8 +16,8 @@ export default defineConfig({
     { name: "mobile-chromium", use: { ...devices["Pixel 5"] } },
   ],
   webServer: {
-    command: "pnpm dev --host 127.0.0.1",
-    url: "http://127.0.0.1:4321/z3rm/en/",
+    command: "pnpm dev --host 127.0.0.1 --port 4331 --strictPort",
+    url: "http://127.0.0.1:4328/z3rm/en/",
     reuseExistingServer: true,
     timeout: 120_000,
   },
