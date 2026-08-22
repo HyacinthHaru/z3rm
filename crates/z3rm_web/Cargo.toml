@@ -1,0 +1,36 @@
+[package]
+name = "z3rm_web"
+version = "0.1.0"
+edition.workspace = true
+publish.workspace = true
+license = "Apache-2.0"
+
+[lints]
+workspace = true
+
+[lib]
+path = "src/z3rm_web.rs"
+test = false
+doctest = false
+
+[features]
+default = ["demo-shell"]
+demo-shell = []
+
+[dependencies]
+
+alacritty_terminal.workspace = true
+anyhow.workspace = true
+log.workspace = true
+mux_protocol.workspace = true
+parking_lot.workspace = true
+wasm-bindgen.workspace = true
+web-sys = { version = "0.3", features = [
+    "BinaryType",
+    "console",
+    "Location",
+    "MessageEvent",
+    "WebSocket",
+    "Window",
+] }
+js-sys.workspace = true

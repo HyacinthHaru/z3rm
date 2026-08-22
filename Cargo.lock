@@ -170,6 +170,30 @@ dependencies = [
 [[package]]
 name = "alacritty_terminal"
 version = "0.26.1-dev"
+dependencies = [
+ "base64 0.22.1",
+ "bitflags 2.13.0",
+ "home",
+ "libc",
+ "log",
+ "miow",
+ "parking_lot",
+ "piper",
+ "polling 3.11.0",
+ "regex-automata",
+ "rustix 1.1.2",
+ "rustix-openpty",
+ "serde",
+ "serde_json",
+ "signal-hook",
+ "unicode-width",
+ "vte",
+ "windows-sys 0.59.0",
+]
+
+[[package]]
+name = "alacritty_terminal"
+version = "0.26.1-dev"
 source = "git+https://github.com/zed-industries/alacritty?rev=4c129667ce56611becdc82de6e28218c80e2e88f#4c129667ce56611becdc82de6e28218c80e2e88f"
 dependencies = [
  "base64 0.22.1",
@@ -7560,7 +7584,7 @@ dependencies = [
 name = "mux_server"
 version = "0.1.0"
 dependencies = [
- "alacritty_terminal",
+ "alacritty_terminal 0.26.1-dev (git+https://github.com/zed-industries/alacritty?rev=4c129667ce56611becdc82de6e28218c80e2e88f)",
  "anyhow",
  "base64 0.22.1",
  "blake3",
@@ -12832,7 +12856,7 @@ dependencies = [
 name = "terminal"
 version = "0.1.0"
 dependencies = [
- "alacritty_terminal",
+ "alacritty_terminal 0.26.1-dev (git+https://github.com/zed-industries/alacritty?rev=4c129667ce56611becdc82de6e28218c80e2e88f)",
  "anyhow",
  "async-channel 2.5.0",
  "base64 0.22.1",
@@ -17100,6 +17124,20 @@ name = "z3rm_macros_types"
 version = "0.1.0"
 dependencies = [
  "inventory",
+]
+
+[[package]]
+name = "z3rm_web"
+version = "0.1.0"
+dependencies = [
+ "alacritty_terminal 0.26.1-dev (git+https://github.com/zed-industries/alacritty?rev=4c129667ce56611becdc82de6e28218c80e2e88f)",
+ "anyhow",
+ "js-sys",
+ "log",
+ "mux_protocol",
+ "parking_lot",
+ "wasm-bindgen",
+ "web-sys",
 ]
 
 [[package]]
