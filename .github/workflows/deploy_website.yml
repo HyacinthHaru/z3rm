@@ -64,9 +64,20 @@ jobs:
       - name: Build static site
         run: pnpm build
         working-directory: website
+      - name: Serve built site
+        run: |
+          nohup pnpm exec astro preview --host 127.0.0.1 --port 4331 &
+          for i in $(seq 1 60); do
+            curl -sf http://127.0.0.1:4331/z3rm/en/ > /dev/null && break
+            sleep 2
+          done
+          curl -f http://127.0.0.1:4331/z3rm/en/ > /dev/null
+        working-directory: website
       - name: Run browser verification
         run: pnpm exec playwright test --project chromium
         working-directory: website
+        env:
+          PLAYWRIGHT_TEST_BASE_URL: http://127.0.0.1:4331/z3rm/
       - name: Configure Pages
         uses: actions/configure-pages@983d7736d9b0ae728b81ab479565c72886d7745b
       - name: Upload Pages artifact
