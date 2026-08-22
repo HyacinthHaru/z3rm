@@ -165,7 +165,7 @@ test("dialog returns focus to its trigger on close", async ({ page }) => {
   await trigger.scrollIntoViewIfNeeded();
   await expect(trigger).toBeVisible();
 
-  await page.evaluate(() => { document.documentElement.style.scrollBehavior='auto'; document.querySelector('.demo-tabs').scrollIntoView({block:'center'}); });
+  await page.evaluate(() => { document.documentElement.style.scrollBehavior='auto'; document.querySelector('.demo-tabs')?.scrollIntoView({block:'center'}); });
   await trigger.click();
   const dialog = page.locator(".demo-dialog");
   await expect(dialog).toBeVisible();
