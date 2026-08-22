@@ -142,4 +142,44 @@ PaneDirty(pane_id) → fetch_grid_update(generation)</code></pre>
 
 <style>
   .wasm-demo { margin-top: 7rem; }
+  .demo-heading { max-width: 760px; }
+  .demo-heading h2 { font-size: clamp(2rem, 5vw, 4.4rem); line-height: .95; letter-spacing: -.055em; margin: .65rem 0 1.1rem; }
+  .demo-heading > p:last-child { color: var(--text-secondary); max-width: 68ch; }
+  .demo-tabs { display: block; margin-top: 2.5rem; border: 1px solid var(--border-strong); background: var(--surface-panel); box-shadow: var(--shadow-window); }
+  .demo-tabs-list { display: flex; gap: .25rem; padding: .45rem; border-bottom: 1px solid var(--border-muted); background: var(--surface-app); }
+  .demo-tabs-trigger, .demo-actions proto-ui-base-button, proto-ui-base-dialog-trigger, proto-ui-base-dialog-close { display: inline-flex; align-items: center; justify-content: center; min-height: 2.2rem; padding: .45rem .8rem; border: 1px solid transparent; cursor: pointer; font: 600 .76rem/1 var(--font-mono); letter-spacing: .04em; color: var(--text-secondary); }
+  .demo-tabs-trigger[data-pui-selected], .demo-tabs-trigger[aria-selected="true"] { color: var(--text-primary); border-color: var(--border-strong); background: var(--surface-selected); }
+  .demo-tab-panel { display: block; padding: 1rem; }
+  .demo-tab-panel[hidden], .demo-tab-panel[data-pui-hidden="true"] { display: none; }
+  .demo-controls { display: flex; align-items: end; justify-content: space-between; gap: 1rem; margin-bottom: 1rem; }
+  .demo-controls label { display: grid; gap: .35rem; color: var(--text-muted); font: 600 .68rem/1 var(--font-mono); letter-spacing: .08em; text-transform: uppercase; }
+  .demo-select { position: relative; display: block; min-width: 15rem; }
+  proto-ui-base-select-trigger { display: flex; min-height: 2.5rem; align-items: center; padding: .55rem .75rem; border: 1px solid var(--border-strong); color: var(--text-primary); background: var(--surface-app); cursor: pointer; }
+  proto-ui-base-select-content { position: absolute; z-index: 40; display: grid; width: max-content; min-width: 15rem; margin-top: .3rem; padding: .35rem; border: 1px solid var(--border-strong); background: var(--surface-elevated); box-shadow: var(--shadow-window); }
+  proto-ui-base-select-item { display: block; padding: .65rem .75rem; color: var(--text-secondary); cursor: pointer; font: .78rem/1.2 var(--font-mono); }
+  proto-ui-base-select-item:hover, proto-ui-base-select-item[data-pui-active] { color: var(--text-primary); background: var(--surface-hover); }
+  .demo-actions { display: flex; align-items: center; gap: .5rem; }
+  .demo-actions proto-ui-base-button, proto-ui-base-dialog-trigger { border-color: var(--border-strong); color: var(--text-primary); background: var(--surface-app); }
+  .gpui-frame { overflow: hidden; border: 1px solid var(--border-strong); background: #101215; }
+  .frame-bar { display: flex; align-items: center; gap: .42rem; height: 2rem; padding: 0 .7rem; color: #858a92; background: #202328; font: .68rem/1 var(--font-mono); }
+  .frame-bar span { width: .58rem; height: .58rem; border-radius: 50%; background: #50565f; }
+  .frame-bar span:first-child { background: #c96c5b; }
+  .frame-bar span:nth-child(2) { background: #c7a363; }
+  .frame-bar span:nth-child(3) { background: #6f9672; }
+  .frame-bar b { margin-left: .5rem; font-weight: 400; }
+  .gpui-frame iframe { display: block; width: 100%; height: clamp(430px, 62vw, 610px); border: 0; background: #101215; }
+  proto-ui-base-dialog-mask { position: fixed; inset: 0; z-index: 80; background: rgb(0 0 0 / 55%); }
+  .demo-dialog { position: fixed; z-index: 81; top: 50%; left: 50%; width: min(34rem, calc(100vw - 2rem)); transform: translate(-50%, -50%); padding: 1.5rem; border: 1px solid var(--border-strong); background: var(--surface-elevated); box-shadow: var(--shadow-window); }
+  proto-ui-base-dialog-title { display: block; font-size: 1.3rem; font-weight: 700; }
+  proto-ui-base-dialog-description { display: block; margin: .85rem 0 1.25rem; color: var(--text-secondary); line-height: 1.6; }
+  proto-ui-base-dialog-close { border-color: var(--border-strong); color: var(--text-primary); background: var(--surface-app); }
+  .contract-panel { min-height: 430px; padding: clamp(1.5rem, 5vw, 4rem); }
+  .contract-panel > p:nth-child(2) { max-width: 66ch; margin: 1rem 0 2rem; color: var(--text-secondary); font-size: 1.1rem; line-height: 1.65; }
+  .contract-panel pre { overflow: auto; padding: 1.25rem; border: 1px solid var(--border-muted); background: var(--surface-app); color: var(--accent-amber); font: .78rem/1.8 var(--font-mono); }
+  @media (max-width: 720px) {
+    .demo-controls { align-items: stretch; flex-direction: column; }
+    .demo-actions { flex-wrap: wrap; }
+    .demo-select { min-width: 100%; }
+    .gpui-frame iframe { height: 470px; }
+  }
 </style>
