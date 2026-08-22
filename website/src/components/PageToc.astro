@@ -12,6 +12,65 @@ const visible = headings.filter((heading) => heading.depth === 2 || heading.dept
     </ol>
   </nav>
 )}
+
+<script>
+  // Track which heading the reader is in and mirror it onto its TOC link as
+  // `aria-current="location"` plus a visible marker, so a sticky TOC says
+  // where you are instead of only where you could go.
+  function watchCurrentSection(doc: Document) {
+    const links = Array.from(doc.querySelectorAll<HTMLAnchorElement>(".page-toc a"));
+    if (links.length === 0) return;
+    const targets = links
+      .map((link) => doc.getElementById(decodeURIComponent(link.hash.slice(1))))
+      .filter((heading): heading is HTMLElement => heading !== null);
+    if (targets.length === 0) return;
+
+    const mark = (current: Element | null) => {
+      for (const link of links) {
+        const isCurrent = current !== null && link.hash === `#${current.id}`;
+        if (isCurrent) {
+          link.setAttribute("aria-current", "location");
+        } else {
+          link.removeAttribute("aria-current");
+        }
+      }
+    };
+
+    function update() {
+      // The reader's section: the last heading that has crossed the upper
+      // quarter of the viewport. If none has (very top of a page), fall back
+      // to the first heading on screen so something is always marked once
+      // scrolling begins.
+      const probe = Math.max(1, window.innerHeight * 0.1);
+      let current: Element | null = null;
+      for (const heading of targets) {
+        if (heading.getBoundingClientRect().top <= probe) {
+          current = heading;
+        } else {
+          break;
+        }
+      }
+      if (current === null) {
+        for (const heading of targets) {
+          if (heading.getBoundingClientRect().bottom > 0) {
+            current = heading;
+            break;
+          }
+        }
+      }
+      mark(current);
+    }
+    const observer = new IntersectionObserver(
+      () => update(),
+      { rootMargin: "0px 0px -70% 0px" },
+    );
+    for (const heading of targets) observer.observe(heading);
+
+    window.addEventListener("resize", update, { passive: true });
+  }
+
+  watchCurrentSection(document);
+</script>
 <style>
   .page-toc { position: sticky; top: 5rem; padding-left: 1rem; border-left: 1px solid var(--border-muted); }
   .page-toc h2 { margin: 0 0 .65rem; color: var(--text-muted); font-size: .7rem; letter-spacing: .08em; text-transform: uppercase; }
@@ -20,4 +79,5 @@ const visible = headings.filter((heading) => heading.depth === 2 || heading.dept
   .page-toc li.nested { padding-left: .75rem; }
   .page-toc a { color: var(--text-secondary); text-decoration: none; }
   .page-toc a:hover { color: var(--text-primary); }
+  .page-toc a[aria-current="location"] { color: var(--accent-blue); font-weight: 600; }
 </style>
