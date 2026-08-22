@@ -105,8 +105,10 @@ const copy = lang === "zh" ? {
   h1 { max-width: 12ch; margin: .8rem 0 1.4rem; font: 560 clamp(3rem, 5.2vw, 5.4rem)/.94 var(--font-sans); letter-spacing: -.065em; }
   .lead { max-width: 40rem; color: var(--text-secondary); font-size: clamp(1rem, 1.4vw, 1.2rem); line-height: 1.65; }
   .hero-actions { display: flex; align-items: center; flex-wrap: wrap; gap: 1.25rem; margin-top: 2rem; }
-  .primary-action { display: inline-flex; min-height: 2.8rem; align-items: center; padding: 0 1.15rem; color: #fff; background: var(--accent-blue); text-decoration: none; font-size: .84rem; font-weight: 650; }
-  .primary-action:hover { background: #1d66bb; }
+  .primary-action { display: inline-flex; min-height: 2.8rem; align-items: center; padding: 0 1.15rem; color: #fff; background: #2d5c94; text-decoration: none; font-size: .84rem; font-weight: 650; }
+  .primary-action:hover { background: #24496f; }
+  :global([data-theme="dark"]) .primary-action { color: #10141a; background: var(--accent-blue); }
+  :global([data-theme="dark"]) .primary-action:hover { background: #93b7de; }
   .text-action { color: var(--text-primary); text-decoration: none; font-size: .86rem; font-weight: 600; }
   .install-command { display: inline-block; margin-top: 1.6rem; color: var(--text-muted); font-size: .76rem; }
   .terminal-frame { margin: 0; overflow: hidden; border: 1px solid var(--border-strong); background: #0d1117; box-shadow: var(--shadow-window); transform: perspective(1300px) rotateY(-2deg); }
