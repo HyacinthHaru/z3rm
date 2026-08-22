@@ -174,3 +174,30 @@ test("dialog returns focus to its trigger on close", async ({ page }) => {
   await expect(dialog).not.toBeVisible();
   await expect(trigger).toBeFocused();
 });
+
+test("layout select is operable by keyboard", async ({ page }) => {
+  await page.goto("en/");
+  const trigger = page.locator("proto-ui-base-select-trigger");
+  await trigger.scrollIntoViewIfNeeded();
+  await trigger.focus();
+
+  // Open, move to the last option, commit.
+  await expect(trigger).toHaveAttribute("aria-expanded", "false");
+  await page.keyboard.press("Enter");
+  await expect(page.locator("[role=option]")).toHaveCount(3);
+  await expect(trigger).toHaveAttribute("aria-expanded", "true");
+  await page.keyboard.press("ArrowDown");
+  await page.keyboard.press("ArrowDown");
+  await page.keyboard.press("Enter");
+
+  // Menu closed, value committed, demo iframe re-projected with the choice.
+  await expect(trigger).toHaveAttribute("aria-expanded", "false");
+  const src = await page.locator('iframe[title="Z3rm GPUI WebAssembly session projection"]').getAttribute("src");
+  expect(src).toContain("window=window-2");
+
+  // Escape path: reopen and dismiss; focus returns to the trigger.
+  await page.keyboard.press("Enter");
+  await page.keyboard.press("Escape");
+  await expect(trigger).toHaveAttribute("aria-expanded", "false");
+  await expect(trigger).toBeFocused();
+});
