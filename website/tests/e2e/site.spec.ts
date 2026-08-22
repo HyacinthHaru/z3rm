@@ -99,3 +99,21 @@ test("GPUI WASM panes render a real terminal grid", async ({ page }) => {
   });
   expect(received).toContain("demo output line");
 });
+
+test("docs table of contents marks the section in view", async ({ page }) => {
+  await page.goto("en/reference/cli/");
+  const tocLinks = page.locator(".page-toc a");
+  await expect(tocLinks).not.toHaveCount(0);
+
+  // At page top, exactly the first section is current — never zero, never several.
+  await expect(tocLinks.nth(0)).toHaveAttribute("aria-current", "location");
+
+  // Scroll to the third heading; exactly its TOC link becomes the current one.
+  const headings = page.locator("main h2, main h3");
+  await headings.nth(2).evaluate((element) => {
+    window.scrollTo({ top: element.getBoundingClientRect().top + window.scrollY - 80, behavior: "instant" });
+  });
+  await expect(tocLinks.nth(2)).toHaveAttribute("aria-current", "location");
+  const currentCount = await tocLinks.evaluateAll((links) => links.filter((link) => link.getAttribute("aria-current") === "location").length);
+  expect(currentCount).toBe(1);
+});
