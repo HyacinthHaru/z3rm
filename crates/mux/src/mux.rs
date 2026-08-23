@@ -32,15 +32,17 @@ use mux_protocol::{
 };
 
 // §16.6 SSH 远程连接模块（Plan 19）。
-#[cfg(feature = "ssh")]
+#[cfg(all(feature = "ssh", not(target_family = "wasm")))]
 mod remote_install;
-#[cfg(feature = "ssh")]
+#[cfg(all(feature = "ssh", not(target_family = "wasm")))]
 mod ssh;
 mod sync;
+#[cfg(target_family = "wasm")]
+mod web_io;
 
-#[cfg(feature = "ssh")]
+#[cfg(all(feature = "ssh", not(target_family = "wasm")))]
 pub use remote_install::{auto_install_server, ensure_remote_server};
-#[cfg(feature = "ssh")]
+#[cfg(all(feature = "ssh", not(target_family = "wasm")))]
 pub use ssh::{SshConnectionOptions, SshSession, connect_ssh};
 pub use sync::sync_extensions_to_remote;
 
@@ -70,6 +72,11 @@ pub struct MuxDomain {
     /// KillSession keybindings so the GUI targets the attached session rather
     /// than an arbitrary `list_sessions().first()`.
     last_attached_session_id: parking_lot::RwLock<Option<String>>,
+    /// wasm single-process transport driver. Native transports run the I/O
+    /// worker on a dedicated thread; the wasm build pumps the in-memory
+    /// stream from the browser event loop instead.
+    #[cfg(target_family = "wasm")]
+    wasm_io: parking_lot::Mutex<Option<Arc<web_io::WasmIoShared>>>,
 }
 
 impl Drop for MuxDomain {
@@ -93,11 +100,18 @@ impl Drop for MuxDomain {
 ///
 /// 旧实现用 `win-{pid}`, 同一个进程的每个窗口都会撞成同一个 ID, 服务端根本
 /// 分不出是哪个窗口在 attach。格式与服务端 `handle_new_window` 保持一致。
+#[cfg(not(target_family = "wasm"))]
 fn mint_window_id() -> String {
     format!("win-{}-{}", std::process::id(), nanoid::nanoid!())
 }
+/// wasm has no process id; the browser tab hosts exactly one client process,
+/// so a nanoid suffix keeps the window id unique.
+#[cfg(target_family = "wasm")]
+fn mint_window_id() -> String {
+    format!("win-wasm-{}", nanoid::nanoid!())
+}
 /// §9 内部状态：请求 ID 计数器、待处理请求、订阅者列表、写通道。
-struct DomainInner {
+pub(crate) struct DomainInner {
     next_request_id: AtomicU64,
     pending_requests: HashMap<u64, PendingRequest>,
     /// §9 通知订阅者列表。subscribe() 添加新记录, 路由器 fan-out 到所有。
@@ -112,7 +126,7 @@ struct DomainInner {
 /// A pending request remembers the transport epoch it was registered against,
 /// so the router only fulfills it with a response from the same epoch and a
 /// draining stale worker cannot close a sender owned by the new transport.
-struct PendingRequest {
+pub(crate) struct PendingRequest {
     sender: async_channel::Sender<Response>,
     transport_epoch: u64,
 }
@@ -136,7 +150,7 @@ impl Drop for PendingRequestGuard {
     }
 }
 
-fn take_pending_response_sender(
+pub(crate) fn take_pending_response_sender(
     inner: &mut DomainInner,
     request_id: u64,
     worker_epoch: u64,
@@ -151,7 +165,7 @@ fn take_pending_response_sender(
         .map(|request| request.sender)
 }
 
-fn drain_pending_requests_for_epoch(
+pub(crate) fn drain_pending_requests_for_epoch(
     inner: &mut DomainInner,
     worker_epoch: u64,
 ) -> Vec<async_channel::Sender<Response>> {
@@ -178,11 +192,18 @@ pub struct SubscriberSender {
     pub sender: async_channel::Sender<Notification>,
     /// Panes whose `PaneDirty` could not be enqueued because the queue was full.
     pub dirty_latches: Arc<parking_lot::Mutex<HashSet<String>>>,
+    /// wasm-only overflow for reliable notifications. The browser is
+    /// single-threaded, so the native "block the I/O thread" backpressure
+    /// would deadlock; instead reliable events queue here (unbounded but
+    /// bounded in practice by pane count) and the receiver drains them in
+    /// FIFO order after the channel.
+    #[cfg(target_family = "wasm")]
+    pub reliable_overflow: Arc<parking_lot::Mutex<VecDeque<Notification>>>,
 }
 
 /// Drop subscriber records whose queue sender has been closed, so a dropped
 /// receiver stops consuming router work (and its latch stops growing).
-fn prune_closed_subscribers(subscribers: &mut Vec<SubscriberSender>) {
+pub(crate) fn prune_closed_subscribers(subscribers: &mut Vec<SubscriberSender>) {
     subscribers.retain(|subscriber| !subscriber.sender.is_closed());
 }
 
@@ -194,17 +215,40 @@ fn prune_closed_subscribers(subscribers: &mut Vec<SubscriberSender>) {
 /// `PaneOutputChunk` drops outright on a full queue, while a full-queue
 /// `PaneDirty` records the pane in the subscriber's latch for the receiver to
 /// synthesize once the queue drains.
-fn fan_out_notification(subscribers: &[SubscriberSender], notification: &Notification) {
+pub(crate) fn fan_out_notification(subscribers: &[SubscriberSender], notification: &Notification) {
     let reliable = notification_requires_reliable_delivery(notification);
     for subscriber in subscribers {
         if reliable {
             // §3.1 / §3.4 reliable path: block the dedicated I/O
             // thread instead of dropping lifecycle state or PTY bytes.
+            #[cfg(not(target_family = "wasm"))]
             if let Err(error) = subscriber.sender.send_blocking(notification.clone()) {
                 tracing::debug!(
                     ?error,
                     "reliable notification subscriber closed before delivery"
                 );
+            }
+            // wasm is single-threaded: blocking the only thread would
+            // deadlock. Overflow keeps at-least-once semantics and global
+            // FIFO (the receiver drains the channel first, then overflow).
+            #[cfg(target_family = "wasm")]
+            {
+                let mut overflow = subscriber.reliable_overflow.lock();
+                if overflow.is_empty() {
+                    match subscriber.sender.try_send(notification.clone()) {
+                        Ok(()) => continue,
+                        Err(async_channel::TrySendError::Full(_)) => {
+                            overflow.push_back(notification.clone());
+                        }
+                        Err(async_channel::TrySendError::Closed(_)) => {
+                            tracing::debug!(
+                                "reliable notification subscriber closed before delivery"
+                            );
+                        }
+                    }
+                } else {
+                    overflow.push_back(notification.clone());
+                }
             }
         } else if let Err(error) = subscriber.sender.try_send(notification.clone()) {
             match error {
@@ -272,6 +316,7 @@ pub enum MuxTransport {
 /// §9 连接到本地 mux_server。
 /// §15.3 使用 interprocess crate 的 local socket 抽象:
 /// Unix → Unix domain socket, Windows → named pipe。
+#[cfg(not(target_family = "wasm"))]
 async fn run_blocking_operation<T>(
     thread_name: &'static str,
     operation: impl FnOnce() -> Result<T> + Send + 'static,
@@ -298,6 +343,7 @@ where
         .map_err(|_| anyhow::anyhow!("{thread_name} thread exited without returning a result"))?
 }
 
+#[cfg(not(target_family = "wasm"))]
 fn connect_local_blocking(path: &Path) -> Result<MuxDomain> {
     #[cfg(unix)]
     {
@@ -325,11 +371,13 @@ fn connect_local_blocking(path: &Path) -> Result<MuxDomain> {
     }
 }
 
+#[cfg(not(target_family = "wasm"))]
 async fn connect_local_once(path: &Path) -> Result<MuxDomain> {
     let path = path.to_path_buf();
     run_blocking_operation("mux-connect", move || connect_local_blocking(&path)).await
 }
 
+#[cfg(not(target_family = "wasm"))]
 pub async fn connect_local(socket_path: Option<&Path>) -> Result<MuxDomain> {
     let path = socket_path
         .map(Path::to_path_buf)
@@ -364,8 +412,55 @@ pub async fn connect_local(socket_path: Option<&Path>) -> Result<MuxDomain> {
         }
     }
 }
+/// Local sockets do not exist in the browser; the wasm client connects to an
+/// in-process mux_server over an in-memory stream instead.
+#[cfg(target_family = "wasm")]
+pub async fn connect_local(_socket_path: Option<&Path>) -> Result<MuxDomain> {
+    Err(anyhow::anyhow!(
+        "local mux sockets are unavailable on wasm; use MuxDomain::connect_in_memory"
+    ))
+}
+
+/// Race a response channel against a timeout without tying the caller to a
+/// specific executor (GPUI's executor has no Tokio reactor; wasm has no smol).
+#[cfg(not(target_family = "wasm"))]
+async fn race_recv_with_timeout(
+    rx: async_channel::Receiver<Response>,
+    timeout: Duration,
+) -> Option<std::result::Result<Response, async_channel::RecvError>> {
+    smol::future::or(async { Some(rx.recv().await) }, async {
+        smol::Timer::after(timeout).await;
+        None
+    })
+    .await
+}
+
+/// Race a response channel against a timeout without tying the caller to a
+/// specific executor (GPUI's executor has no Tokio reactor; wasm has no smol).
+#[cfg(target_family = "wasm")]
+async fn race_recv_with_timeout(
+    rx: async_channel::Receiver<Response>,
+    timeout: Duration,
+) -> Option<std::result::Result<Response, async_channel::RecvError>> {
+    use std::future::poll_fn;
+    use std::task::Poll;
+    let millis = u32::try_from(timeout.as_millis()).unwrap_or(u32::MAX);
+    let mut receive = std::pin::pin!(rx.recv());
+    let mut timer = std::pin::pin!(gloo_timers::future::TimeoutFuture::new(millis));
+    poll_fn(|cx| {
+        if let Poll::Ready(value) = receive.as_mut().poll(cx) {
+            return Poll::Ready(Some(value));
+        }
+        if timer.as_mut().poll(cx).is_ready() {
+            return Poll::Ready(None);
+        }
+        Poll::Pending
+    })
+    .await
+}
 
 /// §16.1 默认 socket 路径 (与 mux_server 对齐)。
+#[cfg(not(target_family = "wasm"))]
 fn default_socket_path() -> std::path::PathBuf {
     if let Ok(p) = std::env::var("Z3RM_MUX_SOCKET") {
         return std::path::PathBuf::from(p);
@@ -391,6 +486,7 @@ impl<T: std::io::Read + std::io::Write> ReadWrite for T {}
 /// I/O thread can be bound to an existing `Arc<RwLock<DomainInner>>` rather
 /// than a freshly-created one. Mirrors the stale-socket retry that
 /// `connect_local` performs.
+#[cfg(not(target_family = "wasm"))]
 fn connect_local_stream(socket_path: Option<&Path>) -> Result<Box<dyn ReadWrite + Send>> {
     let path = match socket_path {
         Some(p) => p.to_path_buf(),
@@ -447,6 +543,7 @@ fn connect_local_stream(socket_path: Option<&Path>) -> Result<Box<dyn ReadWrite 
 // ============================================================================
 
 impl MuxDomain {
+    #[cfg(not(target_family = "wasm"))]
     pub fn connect_with_stream(stream: interprocess::local_socket::Stream) -> Result<Self> {
         let (write_tx, write_rx) = std::sync::mpsc::sync_channel(WRITE_QUEUE_CAPACITY);
 
@@ -481,6 +578,7 @@ impl MuxDomain {
     }
 
     /// Connect using any blocking Read+Write stream (e.g., UnixStream with non-blocking set).
+    #[cfg(not(target_family = "wasm"))]
     pub fn connect_with_blocking_stream<S: std::io::Read + std::io::Write + Send + 'static>(
         stream: S,
     ) -> Result<Self> {
@@ -522,6 +620,7 @@ impl MuxDomain {
         }
     }
 
+    #[cfg(not(target_family = "wasm"))]
     fn io_and_router_loop<S: std::io::Read + std::io::Write + Send + 'static>(
         mut stream: S,
         write_rx: std::sync::mpsc::Receiver<Vec<u8>>,
@@ -583,34 +682,8 @@ impl MuxDomain {
                     }
 
                     match envelope.payload {
-                        Some(EnvelopePayload::Response(resp)) => {
-                            let request_id = resp.request_id;
-                            let sender = take_pending_response_sender(
-                                &mut inner.write(),
-                                resp.request_id,
-                                worker_epoch,
-                            );
-                            if let Some(sender) = sender
-                                && sender.try_send(resp).is_err()
-                            {
-                                tracing::debug!(
-                                    request_id,
-                                    "request future dropped before response delivery"
-                                );
-                            }
-                        }
-                        Some(EnvelopePayload::Notification(notif)) => {
-                            // Clone the live records so a blocking reliable
-                            // delivery does not hold the subscriber lock.
-                            let senders = {
-                                let mut subscribers = subscribers.lock();
-                                prune_closed_subscribers(&mut subscribers);
-                                subscribers.iter().cloned().collect::<Vec<_>>()
-                            };
-                            fan_out_notification(&senders, &notif);
-                        }
-                        Some(EnvelopePayload::Request(_)) => {
-                            tracing::trace!("unexpected request from server");
+                        Some(payload) => {
+                            Self::route_envelope_payload(payload, &inner, &subscribers, worker_epoch)
                         }
                         None => {
                             tracing::warn!("envelope with no payload");
@@ -633,7 +706,46 @@ impl MuxDomain {
     }
 
     /// Generic frame reader for any Read+Write stream.
-    fn read_next_frame_generic<S: std::io::Read + std::io::Write>(
+    /// Route a decoded envelope: responses resolve their pending request,
+    /// notifications fan out to subscribers. Shared by the native I/O thread
+    /// and the wasm in-memory pump so both keep identical semantics.
+    pub(crate) fn route_envelope_payload(
+        payload: EnvelopePayload,
+        inner: &Arc<parking_lot::RwLock<DomainInner>>,
+        subscribers: &Arc<parking_lot::Mutex<Vec<SubscriberSender>>>,
+        worker_epoch: u64,
+    ) {
+        match payload {
+            EnvelopePayload::Response(resp) => {
+                let request_id = resp.request_id;
+                let sender =
+                    take_pending_response_sender(&mut inner.write(), resp.request_id, worker_epoch);
+                if let Some(sender) = sender
+                    && sender.try_send(resp).is_err()
+                {
+                    tracing::debug!(
+                        request_id,
+                        "request future dropped before response delivery"
+                    );
+                }
+            }
+            EnvelopePayload::Notification(notif) => {
+                // Clone the live records so a blocking reliable
+                // delivery does not hold the subscriber lock.
+                let senders = {
+                    let mut subscribers = subscribers.lock();
+                    prune_closed_subscribers(&mut subscribers);
+                    subscribers.iter().cloned().collect::<Vec<_>>()
+                };
+                fan_out_notification(&senders, &notif);
+            }
+            EnvelopePayload::Request(_) => {
+                tracing::trace!("unexpected request from server");
+            }
+        }
+    }
+
+    pub(crate) fn read_next_frame_generic<S: std::io::Read + std::io::Write>(
         stream: &mut S,
         buf: &mut Vec<u8>,
     ) -> std::io::Result<Option<Vec<u8>>> {
@@ -747,13 +859,16 @@ impl MuxDomain {
                 return Err(anyhow::anyhow!("mux write channel disconnected"));
             }
         }
+        // The wasm in-memory transport has no I/O thread to wake; pump it
+        // directly so the queued frame is written and any synchronous reply
+        // is routed before we start awaiting.
+        #[cfg(target_family = "wasm")]
+        if let Some(io) = self.wasm_io.lock().as_ref() {
+            io.pump();
+        }
         // This future is also polled by GPUI's executor, where no Tokio reactor
         // exists, so the timeout must be executor-neutral.
-        let response = smol::future::or(async { Some(rx.recv().await) }, async {
-            smol::Timer::after(timeout).await;
-            None
-        })
-        .await;
+        let response = race_recv_with_timeout(rx, timeout).await;
         match response {
             Some(Ok(resp)) => {
                 if let Some(ResponseBody::Error(err)) = &resp.body
@@ -1483,13 +1598,19 @@ impl MuxDomain {
     pub fn subscribe(&self) -> NotificationReceiver {
         let (tx, rx) = async_channel::bounded(NOTIFICATION_QUEUE_CAPACITY);
         let dirty_latches = Arc::new(parking_lot::Mutex::new(HashSet::new()));
+        #[cfg(target_family = "wasm")]
+        let reliable_overflow = Arc::new(parking_lot::Mutex::new(VecDeque::new()));
         self.inner.read().subscribers.lock().push(SubscriberSender {
             sender: tx,
             dirty_latches: dirty_latches.clone(),
+            #[cfg(target_family = "wasm")]
+            reliable_overflow: reliable_overflow.clone(),
         });
         NotificationReceiver {
             queue: rx,
             dirty_latches,
+            #[cfg(target_family = "wasm")]
+            reliable_overflow,
         }
     }
 
@@ -1556,6 +1677,7 @@ impl MuxDomain {
     /// broadcasts a synthetic `SessionLayoutChanged` derived from the full
     /// authoritative snapshot returned by the server — observers reconcile
     /// from the snapshot rather than racing the at-least-once push path.
+    #[cfg(not(target_family = "wasm"))]
     pub async fn reconnect_at_path_in_place(
         &self,
         path: &Path,
@@ -1625,6 +1747,7 @@ impl MuxDomain {
 
     /// Reconnect at the socket selected by the original local connection or the
     /// last successful path-selectable reconnect.
+    #[cfg(not(target_family = "wasm"))]
     pub async fn reconnect_local_in_place(
         &self,
         session_id: &str,
@@ -1637,6 +1760,30 @@ impl MuxDomain {
             .unwrap_or_else(default_socket_path);
         self.reconnect_at_path_in_place(&path, session_id, attach_mode)
             .await
+    }
+    /// The in-memory wasm transport never drops, so reconnect is meaningless.
+    #[cfg(target_family = "wasm")]
+    pub async fn reconnect_at_path_in_place(
+        &self,
+        _path: &Path,
+        _session_id: &str,
+        _attach_mode: AttachMode,
+    ) -> Result<()> {
+        Err(anyhow::anyhow!(
+            "in-place reconnect is unavailable on the in-memory wasm transport"
+        ))
+    }
+
+    /// The in-memory wasm transport never drops, so reconnect is meaningless.
+    #[cfg(target_family = "wasm")]
+    pub async fn reconnect_local_in_place(
+        &self,
+        _session_id: &str,
+        _attach_mode: AttachMode,
+    ) -> Result<()> {
+        Err(anyhow::anyhow!(
+            "in-place reconnect is unavailable on the in-memory wasm transport"
+        ))
     }
 }
 
@@ -1703,6 +1850,8 @@ fn validate_read_file_byte_page(
 pub struct NotificationReceiver {
     queue: async_channel::Receiver<Notification>,
     dirty_latches: Arc<parking_lot::Mutex<HashSet<String>>>,
+    #[cfg(target_family = "wasm")]
+    reliable_overflow: Arc<parking_lot::Mutex<VecDeque<Notification>>>,
 }
 
 impl NotificationReceiver {
@@ -1715,6 +1864,10 @@ impl NotificationReceiver {
         match self.queue.try_recv() {
             Ok(notification) => Ok(notification),
             Err(async_channel::TryRecvError::Empty) => {
+                #[cfg(target_family = "wasm")]
+                if let Some(notification) = self.take_reliable_overflow() {
+                    return Ok(notification);
+                }
                 if let Some(notification) = self.take_latched_dirty() {
                     Ok(notification)
                 } else {
@@ -1732,14 +1885,26 @@ impl NotificationReceiver {
     pub fn try_recv(&self) -> Result<Notification, async_channel::TryRecvError> {
         match self.queue.try_recv() {
             Ok(notification) => Ok(notification),
-            Err(async_channel::TryRecvError::Empty) => self
-                .take_latched_dirty()
-                .ok_or(async_channel::TryRecvError::Empty),
+            Err(async_channel::TryRecvError::Empty) => {
+                #[cfg(target_family = "wasm")]
+                if let Some(notification) = self.take_reliable_overflow() {
+                    return Ok(notification);
+                }
+                self.take_latched_dirty()
+                    .ok_or(async_channel::TryRecvError::Empty)
+            }
             Err(error @ async_channel::TryRecvError::Closed) => Err(error),
         }
     }
 
     /// Synthesize one `PaneDirty` for a latched pane, if any remains.
+    /// Pop the oldest overflowed reliable notification (wasm only). The
+    /// ordinary channel is already empty when this runs, so FIFO is kept.
+    #[cfg(target_family = "wasm")]
+    fn take_reliable_overflow(&self) -> Option<Notification> {
+        self.reliable_overflow.lock().pop_front()
+    }
+
     ///
     /// The pane is removed from the latch, so a burst of dropped dirty events
     /// for one pane still produces exactly one synthesized notification.

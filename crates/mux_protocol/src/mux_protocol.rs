@@ -13,6 +13,7 @@ pub mod proto {
 }
 
 pub mod input;
+pub mod mem_transport;
 pub use proto::*;
 
 // §3.10 当前协议版本：major 用于破坏性变更，minor 用于新增字段。

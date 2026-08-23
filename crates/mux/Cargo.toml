@@ -10,7 +10,6 @@ path = "src/mux.rs"
 
 [dependencies]
 mux_protocol = { workspace = true }
-interprocess = { workspace = true }
 nanoid = { workspace = true }
 prost = { workspace = true }
 anyhow = { workspace = true }
@@ -23,14 +22,22 @@ tar = "0.4"
 flate2 = "1.0"
 serde_json = "1.0"
 serde = { version = "1.0", features = ["derive"] }
-tempfile = { workspace = true }
-which = { workspace = true }
 async-channel = "2.3"
+
+[target.'cfg(not(target_family = "wasm"))'.dependencies]
+interprocess = { workspace = true }
 smol = "1.3"
-tokio = { workspace = true, features = ["rt", "process", "io-util", "time", "macros"] }
+tokio = { workspace = true, features = ["rt", "process", "io-util", "time", "macros"], optional = true }
+tempfile = { workspace = true, optional = true }
+which = { workspace = true, optional = true }
+
+[target.'cfg(target_family = "wasm")'.dependencies]
+gloo-timers = { version = "0.3", features = ["futures"] }
+getrandom = { version = "0.3.4", features = ["wasm_js"] }
+getrandom02 = { package = "getrandom", version = "0.2", features = ["js"] }
 
 [features]
-ssh = []
+ssh = ["dep:tokio", "dep:tempfile", "dep:which"]
 
 [dev-dependencies]
 async-channel = "2.3"

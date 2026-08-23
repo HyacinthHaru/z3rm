@@ -19,7 +19,8 @@
     "@proto.ui/adapter-web-component": "0.2.0",
     "@proto.ui/core": "0.2.0",
     "@proto.ui/prototypes-base": "0.2.0",
-    "astro": "6.3.1"
+    "astro": "6.3.1",
+    "v86": "0.5.441"
   },
   "devDependencies": {
     "@astrojs/check": "0.9.10",
