@@ -250,3 +250,15 @@ test("root path redirect flips to the newly stored locale", async ({ page }) => 
   await page.goto("/z3rm/");
   await expect(page).toHaveURL(/\/z3rm\/en\/$/);
 });
+test("install command has a working copy button", async ({ page }) => {
+  await page.goto("en/");
+  const code = page.locator("[data-install-command]");
+  const button = page.locator("[data-copy-install]");
+  await expect(button).toHaveAttribute("aria-label", "Copy install command");
+
+  // Intercept the clipboard API (headless grants it) and click.
+  await button.click();
+  const value = await page.evaluate(() => (window as unknown as { __z3rmCopied?: string }).__z3rmCopied);
+  expect(value).toBe("cargo install z3rm");
+  await expect(page.locator("[data-copy-confirm]")).toHaveAttribute("aria-live", "polite");
+});

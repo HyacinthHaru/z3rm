@@ -10,6 +10,7 @@ const copy = lang === "zh" ? {
   title: "你的 Shell，不随窗口消失。",
   lead: "Z3rm 把终端渲染、tmux 级多路复用、远程连接和可审计的文件快照放进同一个工作空间。",
   start: "5 分钟开始", guides: "阅读指南", install: "cargo install z3rm",
+  copy: "复制", copyInstall: "复制安装命令", copied: "已复制",
   verified: "经实现与回归测试验证", server: "服务端权威", reconnect: "随处重连", protocol: "人和 Agent 共用协议",
   thesisKicker: "不是又一个终端皮肤", thesis: "窗口只是视图。会话才是工作。",
   thesisBody: "PTY、网格、滚动历史、布局和生命周期都由 mux server 持有。关闭 GUI、切换机器或通过 SSH 接入时，状态不会被重新解释。",
@@ -24,6 +25,7 @@ const copy = lang === "zh" ? {
   title: "Your shells outlive the window.",
   lead: "Z3rm puts GPU terminal rendering, tmux-class multiplexing, remote access, and auditable file snapshots in one workspace.",
   start: "Start in 5 minutes", guides: "Read the guides", install: "cargo install z3rm",
+  copy: "Copy", copyInstall: "Copy install command", copied: "Copied",
   verified: "Verified in implementation and regression tests", server: "Server authoritative", reconnect: "Reconnect anywhere", protocol: "One protocol for humans and agents",
   thesisKicker: "Not another terminal skin", thesis: "The window is a view. The session is the work.",
   thesisBody: "PTYs, grids, scrollback, layout, and lifecycle live in the mux server. Close the GUI, change machines, or arrive over SSH without asking a client to reinterpret state.",
@@ -45,7 +47,13 @@ const copy = lang === "zh" ? {
         <a class="primary-action" href={href("quick-start/")}>{copy.start}</a>
         <a class="text-action" href={href("guide/for-humans/")}>{copy.guides} <span aria-hidden="true">→</span></a>
       </div>
-      <code class="install-command">$ {copy.install}</code>
+      <div class="install-snippet">
+        <code class="install-command" data-install-command>$ {copy.install}</code>
+        <button type="button" class="copy-install" data-copy-install aria-label={copy.copyInstall ?? "Copy install command"}>
+          <span data-copy-label>{copy.copy ?? "Copy"}</span>
+        </button>
+        <span class="copy-confirm" data-copy-confirm role="status" aria-live="polite"></span>
+      </div>
     </div>
     <figure class="terminal-frame">
       <div class="frame-bar"><span></span><span></span><span></span><small>z3rm · work:1</small></div>
@@ -97,6 +105,42 @@ const copy = lang === "zh" ? {
   <section class="final-cta section-shell"><p class="section-index">07 / START</p><h2>{copy.final}</h2><p>{copy.finalBody}</p><a class="primary-action" href={href("quick-start/")}>{copy.start}</a></section>
 </main>
 
+<script>
+  // One-tap copy for the primary install command. The confirm message is a
+  // polite live region so screen readers hear the result of the action.
+  const installButton = document.querySelector<HTMLButtonElement>("[data-copy-install]");
+  const installCommand = document.querySelector<HTMLElement>("[data-install-command]");
+  const confirm = document.querySelector<HTMLElement>("[data-copy-confirm]");
+  const copyLabel = document.querySelector<HTMLElement>("[data-copy-label]");
+  if (installButton && installCommand) {
+    installButton.addEventListener("click", async () => {
+      const text = installCommand.textContent?.replace(/^\$\s*/, "").trim() ?? "";
+      (window as unknown as { __z3rmCopied?: string }).__z3rmCopied = text;
+      try {
+        await navigator.clipboard.writeText(text);
+      } catch {
+        const area = document.createElement("textarea");
+        area.value = text;
+        area.setAttribute("readonly", "");
+        area.style.position = "fixed";
+        area.style.opacity = "0";
+        document.body.append(area);
+        area.select();
+        document.execCommand("copy");
+        area.remove();
+      }
+      const done = copyLabel?.dataset.done ?? "Copied";
+      const rest = copyLabel?.textContent ?? "Copy";
+      if (copyLabel) copyLabel.textContent = done;
+      if (confirm) confirm.textContent = done;
+      window.setTimeout(() => {
+        if (copyLabel) copyLabel.textContent = rest;
+        if (confirm) confirm.textContent = "";
+      }, 1600);
+    });
+  }
+</script>
+
 <style>
   .landing { overflow: hidden; }
   .section-shell { width: min(calc(100% - 2rem), var(--page-width)); margin-inline: auto; }
@@ -111,6 +155,13 @@ const copy = lang === "zh" ? {
   :global([data-theme="dark"]) .primary-action:hover { background: #93b7de; }
   .text-action { color: var(--text-primary); text-decoration: none; font-size: .86rem; font-weight: 600; }
   .install-command { display: inline-block; margin-top: 1.6rem; color: var(--text-muted); font-size: .76rem; }
+  .install-snippet { display: flex; align-items: center; gap: .6rem; margin-top: 1.6rem; }
+  .install-snippet .install-command { margin-top: 0; }
+  .copy-install { min-height: 2rem; padding: .3rem .7rem; border: 1px solid var(--border-muted); border-radius: var(--radius-control); color: var(--text-primary); background: var(--surface-panel); cursor: pointer; font: 600 .72rem/1 var(--font-mono); }
+  .copy-install:hover { background: var(--surface-hover); }
+  .copy-install:active, .copy-install:hover:active { background: var(--surface-selected); }
+  .copy-confirm { color: var(--accent-green); font: 600 .72rem/1 var(--font-mono); }
+  .copy-confirm:empty { display: none; }
   .terminal-frame { margin: 0; overflow: hidden; border: 1px solid var(--border-strong); background: #0d1117; box-shadow: var(--shadow-window); transform: perspective(1300px) rotateY(-2deg); }
   .frame-bar { height: 2.2rem; display: flex; align-items: center; gap: .4rem; padding: 0 .8rem; border-bottom: 1px solid #28303b; background: #171c24; }
   .frame-bar span { width: .52rem; height: .52rem; border: 1px solid #566172; border-radius: 50%; }
