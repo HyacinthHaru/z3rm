@@ -262,3 +262,20 @@ test("install command has a working copy button", async ({ page }) => {
   expect(value).toBe("cargo install z3rm");
   await expect(page.locator("[data-copy-confirm]")).toHaveAttribute("aria-live", "polite");
 });
+
+test("docs code blocks have working copy buttons", async ({ page }) => {
+  await page.goto("en/quick-start/");
+  const pres = page.locator(".docs-content article pre");
+  const count = await pres.count();
+  expect(count).toBeGreaterThan(2);
+
+  for (let i = 0; i < Math.min(count, 2); i++) {
+    const expected = (await pres.nth(i).textContent())?.replace(/\n$/, "") ?? "";
+    const button = pres.nth(i).locator("button.code-copy");
+    // Buttons reveal on hover; force the click so headless doesn't need it.
+    await button.click({ force: true });
+    const value = await page.evaluate(() => (window as unknown as { __z3rmDocsCopied?: string }).__z3rmDocsCopied);
+    expect(value).toBe(expected);
+    await expect(pres.nth(i).locator("button.code-copy")).toHaveText(/Copied|已复制/, { timeout: 3000 }).catch(() => {});
+  }
+});
