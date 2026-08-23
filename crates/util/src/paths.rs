@@ -30,8 +30,17 @@ pub fn home_dir() -> &'static PathBuf {
             } else {
                 PathBuf::from("/home/zed")
             }
+        } else if cfg!(target_arch = "wasm32") {
+            PathBuf::from("/home/user")
         } else {
-            dirs::home_dir().expect("failed to determine home directory")
+            #[cfg(not(target_arch = "wasm32"))]
+            {
+                dirs::home_dir().expect("failed to determine home directory")
+            }
+            #[cfg(target_arch = "wasm32")]
+            {
+                unreachable!("wasm handled above")
+            }
         }
     })
 }
@@ -91,8 +100,8 @@ pub trait PathExt {
     /// Will provide back the extensions joined together such as tar.gz or stories.tsx
     fn multiple_extensions(&self) -> Option<String>;
 
-    /// Try to make a shell-safe representation of the path.
-    #[cfg(not(target_family = "wasm"))]
+    /// Try to make a shell-safe representation of the path. On wasm there is
+    /// no shell, so the path is returned as-is.
     fn try_shell_safe(&self, shell_kind: crate::shell::ShellKind) -> anyhow::Result<String>;
 }
 
@@ -174,6 +183,12 @@ impl<T: AsRef<Path>> PathExt for T {
         }
 
         Some(parts.into_iter().join("."))
+    }
+
+    #[cfg(target_family = "wasm")]
+    fn try_shell_safe(&self, _shell_kind: crate::shell::ShellKind) -> anyhow::Result<String> {
+        // No shell on wasm; the path is used as-is.
+        Ok(self.as_ref().to_string_lossy().into_owned())
     }
 
     #[cfg(not(target_family = "wasm"))]

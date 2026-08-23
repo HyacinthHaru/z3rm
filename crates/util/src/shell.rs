@@ -102,9 +102,17 @@ pub fn get_windows_bash() -> Option<String> {
 
     fn find_bash_in_git() -> Option<PathBuf> {
         // /path/to/git/cmd/git.exe/../../bin/bash.exe
-        let git = which::which("git").ok()?;
-        let git_bash = git.parent()?.parent()?.join("bin").join("bash.exe");
-        git_bash.exists().then_some(git_bash)
+        #[cfg(target_arch = "wasm32")]
+        {
+            let _ = std::path::PathBuf::new();
+            return None;
+        }
+        #[cfg(not(target_arch = "wasm32"))]
+        {
+            let git = which::which("git").ok()?;
+            let git_bash = git.parent()?.parent()?.join("bin").join("bash.exe");
+            git_bash.exists().then_some(git_bash)
+        }
     }
 
     static BASH: LazyLock<Option<String>> = LazyLock::new(|| {

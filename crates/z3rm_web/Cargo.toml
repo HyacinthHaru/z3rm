@@ -18,7 +18,8 @@ default = ["demo-shell"]
 demo-shell = []
 
 [dependencies]
-
+gpui.workspace = true
+serde.workspace = true
 alacritty_terminal = { path = "alacritty_web", default-features = false }
 anyhow.workspace = true
 log.workspace = true

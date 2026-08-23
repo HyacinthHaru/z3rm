@@ -20,15 +20,10 @@ path = "tests/integration/fs_tests.rs"
 [dependencies]
 anyhow.workspace = true
 async-channel.workspace = true
-async-std.workspace = true
-async-tar.workspace = true
 async-trait.workspace = true
 collections.workspace = true
 futures.workspace = true
-git.workspace = true
 gpui.workspace = true
-ignore.workspace = true
-libc.workspace = true
 log.workspace = true
 parking_lot.workspace = true
 paths.workspace = true
@@ -37,12 +32,19 @@ proto.workspace = true
 thiserror.workspace = true
 serde.workspace = true
 serde_json.workspace = true
-smol.workspace = true
 telemetry.workspace = true
-tempfile.workspace = true
 text.workspace = true
 time.workspace = true
 util.workspace = true
+
+[target.'cfg(not(target_family = "wasm"))'.dependencies]
+async-std.workspace = true
+async-tar.workspace = true
+git.workspace = true
+ignore.workspace = true
+libc.workspace = true
+smol.workspace = true
+tempfile.workspace = true
 is_executable = "1.0.5"
 notify = "9.0.0-rc.4"
 trash = { git = "https://github.com/zed-industries/trash-rs", rev = "47761739192828a66b11a94ba5420b82d63c03c5" }

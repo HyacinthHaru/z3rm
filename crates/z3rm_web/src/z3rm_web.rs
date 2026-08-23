@@ -10,7 +10,11 @@ pub fn version() -> &'static str {
 
 
 mod web_terminal;
+pub mod wasm_shell;
+pub mod session_view;
 
+pub use wasm_shell::WasmShell;
+pub use session_view::Z3rmSessionView;
 pub use web_terminal::WebTerminal;
 
 mod web_terminal_tests {

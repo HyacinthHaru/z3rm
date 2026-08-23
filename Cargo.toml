@@ -930,7 +930,7 @@ features = [ "display", "parse", "serde",]
 
 [workspace.dependencies.tree-sitter]
 version = "0.26.9"
-features = [ "wasm",]
+default-features = false
 
 [workspace.dependencies.tree-sitter-cpp]
 git = "https://github.com/tree-sitter/tree-sitter-cpp"
@@ -1141,6 +1141,8 @@ rev = "faecbc33db4f59313e5225ef766bfd9e54a54cfd"
 git = "https://github.com/zed-industries/livekit-rust-sdks"
 rev = "d0e27be0cdad89eadab3e36207cda0a2b6e359ee"
 
+[patch."https://github.com/zed-industries/alacritty"]
+alacritty_terminal = { path = "crates/z3rm_web/alacritty_web" }
 [workspace.lints.clippy.style]
 level = "allow"
 priority = -1
