@@ -243,7 +243,7 @@ impl VirtualFs {
 /// Interactive Linux-like shell running inside the WASM demo.
 pub struct WasmShell {
     vfs: VirtualFs,
-    line_buffer: String,
+    line_buffer: Vec<char>,
     cursor_pos: usize,
     history: Vec<String>,
     history_idx: Option<usize>,
@@ -255,7 +255,7 @@ impl WasmShell {
     pub fn new() -> Self {
         Self {
             vfs: VirtualFs::new(),
-            line_buffer: String::new(),
+            line_buffer: Vec::new(),
             cursor_pos: 0,
             history: Vec::new(),
             history_idx: None,
@@ -284,16 +284,101 @@ impl WasmShell {
             .to_string()
     }
 
-    /// Handle raw input character or escape sequence. Returns ANSI byte stream to feed to terminal.
+    /// Handle raw input string or escape sequence. Returns ANSI byte stream to feed to terminal.
     pub fn handle_input(&mut self, input: &str) -> String {
         let mut output = String::new();
+
+        // Handle special multi-byte ANSI sequences directly
+        match input {
+            // Left arrow: move cursor left
+            "\x1b[D" => {
+                if self.cursor_pos > 0 {
+                    self.cursor_pos -= 1;
+                    output.push_str("\x1b[D");
+                }
+                return output;
+            }
+            // Right arrow: move cursor right
+            "\x1b[C" => {
+                if self.cursor_pos < self.line_buffer.len() {
+                    self.cursor_pos += 1;
+                    output.push_str("\x1b[C");
+                }
+                return output;
+            }
+            // Home: move cursor to start of line
+            "\x1b[H" => {
+                if self.cursor_pos > 0 {
+                    output.push_str(&format!("\x1b[{}D", self.cursor_pos));
+                    self.cursor_pos = 0;
+                }
+                return output;
+            }
+            // End: move cursor to end of line
+            "\x1b[F" => {
+                let remaining = self.line_buffer.len() - self.cursor_pos;
+                if remaining > 0 {
+                    output.push_str(&format!("\x1b[{}C", remaining));
+                    self.cursor_pos = self.line_buffer.len();
+                }
+                return output;
+            }
+            // Up arrow: history backward
+            "\x1b[A" => {
+                if !self.history.is_empty() {
+                    let next_idx = match self.history_idx {
+                        None => self.history.len().saturating_sub(1),
+                        Some(idx) => idx.saturating_sub(1),
+                    };
+                    self.history_idx = Some(next_idx);
+                    let cmd = &self.history[next_idx];
+                    // Clear current line on screen
+                    if self.cursor_pos > 0 {
+                        output.push_str(&format!("\x1b[{}D", self.cursor_pos));
+                    }
+                    output.push_str("\x1b[K");
+                    output.push_str(cmd);
+                    self.line_buffer = cmd.chars().collect();
+                    self.cursor_pos = self.line_buffer.len();
+                }
+                return output;
+            }
+            // Down arrow: history forward
+            "\x1b[B" => {
+                if let Some(idx) = self.history_idx {
+                    if idx + 1 < self.history.len() {
+                        let next_idx = idx + 1;
+                        self.history_idx = Some(next_idx);
+                        let cmd = &self.history[next_idx];
+                        if self.cursor_pos > 0 {
+                            output.push_str(&format!("\x1b[{}D", self.cursor_pos));
+                        }
+                        output.push_str("\x1b[K");
+                        output.push_str(cmd);
+                        self.line_buffer = cmd.chars().collect();
+                        self.cursor_pos = self.line_buffer.len();
+                    } else {
+                        self.history_idx = None;
+                        if self.cursor_pos > 0 {
+                            output.push_str(&format!("\x1b[{}D", self.cursor_pos));
+                        }
+                        output.push_str("\x1b[K");
+                        self.line_buffer.clear();
+                        self.cursor_pos = 0;
+                    }
+                }
+                return output;
+            }
+            _ => {}
+        }
 
         for c in input.chars() {
             match c {
                 // Enter / Return: execute command
                 '\r' | '\n' => {
                     output.push_str("\r\n");
-                    let command = self.line_buffer.trim().to_string();
+                    let command: String = self.line_buffer.iter().collect();
+                    let command = command.trim().to_string();
                     if !command.is_empty() {
                         self.history.push(command.clone());
                     }
@@ -318,10 +403,10 @@ impl WasmShell {
                         self.cursor_pos -= 1;
                         self.line_buffer.remove(self.cursor_pos);
                         output.push_str("\x08\x1b[K");
-                        let remaining = &self.line_buffer[self.cursor_pos..];
+                        let remaining: String = self.line_buffer[self.cursor_pos..].iter().collect();
                         if !remaining.is_empty() {
-                            output.push_str(remaining);
-                            output.push_str(&format!("\x1b[{}D", remaining.len()));
+                            output.push_str(&remaining);
+                            output.push_str(&format!("\x1b[{}D", self.line_buffer.len() - self.cursor_pos));
                         }
                     }
                 }
@@ -337,7 +422,8 @@ impl WasmShell {
                 '\x0c' => {
                     output.push_str("\x1b[2J\x1b[H");
                     output.push_str(&self.format_prompt());
-                    output.push_str(&self.line_buffer);
+                    let line_str: String = self.line_buffer.iter().collect();
+                    output.push_str(&line_str);
                     if self.cursor_pos < self.line_buffer.len() {
                         output.push_str(&format!(
                             "\x1b[{}D",
@@ -347,8 +433,8 @@ impl WasmShell {
                 }
                 // Tab (HT = 9): autocomplete
                 '\t' => {
-                    let word = self
-                        .line_buffer
+                    let current_str: String = self.line_buffer.iter().collect();
+                    let word = current_str
                         .split_whitespace()
                         .last()
                         .unwrap_or("")
@@ -362,8 +448,10 @@ impl WasmShell {
                                 .collect();
                             if matches.len() == 1 {
                                 let completion = &matches[0][word.len()..];
-                                self.line_buffer.push_str(completion);
-                                self.cursor_pos += completion.len();
+                                for ch in completion.chars() {
+                                    self.line_buffer.insert(self.cursor_pos, ch);
+                                    self.cursor_pos += 1;
+                                }
                                 output.push_str(completion);
                             } else if matches.len() > 1 {
                                 output.push_str("\r\n");
@@ -372,7 +460,8 @@ impl WasmShell {
                                 }
                                 output.push_str("\r\n");
                                 output.push_str(&self.format_prompt());
-                                output.push_str(&self.line_buffer);
+                                let line_str: String = self.line_buffer.iter().collect();
+                                output.push_str(&line_str);
                             }
                         }
                     }
@@ -381,10 +470,11 @@ impl WasmShell {
                 c if !c.is_control() => {
                     self.line_buffer.insert(self.cursor_pos, c);
                     self.cursor_pos += 1;
-                    let remaining = &self.line_buffer[self.cursor_pos - 1..];
-                    output.push_str(remaining);
-                    if remaining.len() > 1 {
-                        output.push_str(&format!("\x1b[{}D", remaining.len() - 1));
+                    let remaining: String = self.line_buffer[self.cursor_pos - 1..].iter().collect();
+                    output.push_str(&remaining);
+                    let trailing_chars = self.line_buffer.len() - self.cursor_pos;
+                    if trailing_chars > 0 {
+                        output.push_str(&format!("\x1b[{}D", trailing_chars));
                     }
                 }
                 _ => {}
@@ -392,7 +482,6 @@ impl WasmShell {
         }
         output
     }
-
     /// Execute a shell command string and return the formatted ANSI output.
     pub fn execute_command(&mut self, cmd_line: &str) -> String {
         let parts: Vec<&str> = cmd_line.split_whitespace().collect();

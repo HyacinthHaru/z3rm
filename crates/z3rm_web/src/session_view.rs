@@ -5,15 +5,15 @@
 //! cursor, and the authoritative status bar — directly through GPUI's WebPlatform.
 
 use gpui::{
-    Bounds, Context, Empty, FocusHandle, InteractiveElement, IntoElement, KeyDownEvent,
-    ParentElement, Pixels, Render, SharedString, StatefulInteractiveElement, Styled, Window,
+    Bounds, Context, FocusHandle, InteractiveElement, IntoElement, KeyDownEvent,
+    ParentElement, Pixels, Render, StatefulInteractiveElement, Styled, Window,
     div, point, px, rgb, size,
 };
 use mux_protocol::{
     LayoutNode as ProtoLayoutNode, LayoutTree as ProtoLayoutTree, PaneInfo, PaneLeaf,
     SessionSnapshot, SplitNode, TabInfo, TerminalSize, layout_node,
 };
-use std::{cell::RefCell, collections::HashMap, rc::Rc};
+use std::{cell::RefCell, collections::HashMap};
 
 use crate::wasm_shell::WasmShell;
 use crate::web_terminal::WebTerminal;
@@ -418,30 +418,27 @@ fn render_pane_content(
         .take(32)
         .map(|(row_idx, line_text)| {
             let is_cursor_row = is_focused && row_idx == cursor_row;
-            if is_cursor_row && cursor_col <= line_text.len() {
-                let before = &line_text[..cursor_col];
-                let after = if cursor_col < line_text.len() {
-                    &line_text[cursor_col + 1..]
+            let chars: Vec<char> = line_text.chars().collect();
+            if is_cursor_row && cursor_col <= chars.len() {
+                let before: String = chars[..cursor_col].iter().collect();
+                let cursor_char = chars.get(cursor_col).copied().unwrap_or(' ');
+                let after: String = if cursor_col < chars.len() {
+                    chars[cursor_col + 1..].iter().collect()
                 } else {
-                    ""
-                };
-                let cursor_char = if cursor_col < line_text.len() {
-                    line_text.chars().nth(cursor_col).unwrap_or(' ')
-                } else {
-                    ' '
+                    String::new()
                 };
 
                 div()
                     .flex()
                     .items_center()
-                    .child(before.to_string())
+                    .child(before)
                     .child(
                         div()
                             .bg(rgb(0xc7a363))
                             .text_color(rgb(0x101215))
                             .child(cursor_char.to_string()),
                     )
-                    .child(after.to_string())
+                    .child(after)
             } else {
                 div().child(if line_text.is_empty() {
                     " ".to_string()
