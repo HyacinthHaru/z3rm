@@ -126,17 +126,31 @@ const copy = lang === "zh" ? {
         area.style.opacity = "0";
         document.body.append(area);
         area.select();
-        document.execCommand("copy");
+        try {
+          document.execCommand("copy");
+        } catch {
+          // Clipboard unavailable (permissions/no focus): the confirmation
+          // simply won't appear; nothing to clean up beyond the helper.
+        }
         area.remove();
       }
+      // The resting label is captured up-front so a rapid second click
+      // (mid-confirmation) cannot capture "Copied" as its own rest state.
+      if (!installButton.dataset.restLabel && copyLabel) {
+        installButton.dataset.restLabel = copyLabel.textContent ?? "";
+      }
       const done = copyLabel?.dataset.done ?? "Copied";
-      const rest = copyLabel?.textContent ?? "Copy";
+      const rest = installButton.dataset.restLabel ?? "Copy";
       if (copyLabel) copyLabel.textContent = done;
       if (confirm) confirm.textContent = done;
-      window.setTimeout(() => {
-        if (copyLabel) copyLabel.textContent = rest;
-        if (confirm) confirm.textContent = "";
-      }, 1600);
+      window.clearTimeout(Number(installButton.dataset.resetTimer));
+      installButton.dataset.resetTimer = String(
+        window.setTimeout(() => {
+          if (copyLabel) copyLabel.textContent = rest;
+          if (confirm) confirm.textContent = "";
+          delete installButton.dataset.resetTimer;
+        }, 1600),
+      );
     });
   }
 </script>
