@@ -1,17 +1,27 @@
+#[cfg(not(target_family = "wasm"))]
 use std::io::Write;
 
+#[cfg(not(target_family = "wasm"))]
+use crate::{RemoteArch, RemoteOs, RemotePlatform};
+#[cfg(not(target_family = "wasm"))]
 use crate::{
-    RemoteArch, RemoteOs, RemotePlatform,
     json_log::LogRecord,
     protocol::{MESSAGE_LEN_SIZE, message_len_from_buffer, read_message_with_len, write_message},
 };
-use anyhow::{Context as _, Result};
+#[cfg(not(target_family = "wasm"))]
+use anyhow::Context as _;
+#[cfg(not(target_family = "wasm"))]
+use anyhow::Result;
+#[cfg(not(target_family = "wasm"))]
 use futures::{
     AsyncReadExt as _, FutureExt as _, StreamExt as _,
     channel::mpsc::{Sender, UnboundedReceiver, UnboundedSender},
 };
+#[cfg(not(target_family = "wasm"))]
 use gpui::{AppContext as _, AsyncApp, Task};
+#[cfg(not(target_family = "wasm"))]
 use rpc::proto::Envelope;
+#[cfg(not(target_family = "wasm"))]
 use util::command::Child;
 
 pub mod docker;
@@ -22,6 +32,7 @@ pub mod wsl;
 
 /// Parses the output of `uname -sm` to determine the remote platform.
 /// Takes the last line to skip possible shell initialization output.
+#[cfg(not(target_family = "wasm"))]
 fn parse_platform(output: &str) -> Result<RemotePlatform> {
     let output = output.trim();
     let uname = output.rsplit_once('\n').map_or(output, |(_, last)| last);
@@ -59,6 +70,7 @@ fn parse_platform(output: &str) -> Result<RemotePlatform> {
 /// its detected OS.
 ///
 /// The output is parsed by [`parse_os_version`].
+#[cfg(not(target_family = "wasm"))]
 pub(crate) fn os_version_command(os: RemoteOs) -> (&'static str, &'static [&'static str]) {
     match os {
         // Matches the `/etc/os-release` parsing in `client::telemetry::os_version`.
@@ -76,6 +88,7 @@ pub(crate) fn os_version_command(os: RemoteOs) -> (&'static str, &'static [&'sta
 /// is the product version (e.g. `"15.6.1"`); for Windows it is the
 /// `major.minor.build` version (e.g. `"10.0.19045"`). Returns `None` if nothing
 /// usable could be parsed.
+#[cfg(not(target_family = "wasm"))]
 pub(crate) fn parse_os_version(os: RemoteOs, output: &str) -> Option<String> {
     let output = output.trim();
     if output.is_empty() {
@@ -101,6 +114,7 @@ pub(crate) fn parse_os_version(os: RemoteOs, output: &str) -> Option<String> {
 /// Scans for the first dotted run of integers (rather than relying on the
 /// surrounding, potentially localized, text) and drops the trailing revision so
 /// the format matches `client::telemetry::os_version` on Windows.
+#[cfg(not(target_family = "wasm"))]
 fn parse_windows_version(output: &str) -> Option<String> {
     output
         .split(|c: char| !c.is_ascii_digit() && c != '.')
@@ -114,6 +128,7 @@ fn parse_windows_version(output: &str) -> Option<String> {
 
 /// Parses the output of `echo $SHELL` to determine the remote shell.
 /// Takes the last line to skip possible shell initialization output.
+#[cfg(not(target_family = "wasm"))]
 fn parse_shell(output: &str, fallback_shell: &str) -> String {
     let output = output.trim();
     let shell = output.rsplit_once('\n').map_or(output, |(_, last)| last);
@@ -125,6 +140,7 @@ fn parse_shell(output: &str, fallback_shell: &str) -> String {
     }
 }
 
+#[cfg(not(target_family = "wasm"))]
 fn handle_rpc_messages_over_child_process_stdio(
     mut remote_proxy_process: Child,
     incoming_tx: UnboundedSender<Envelope>,
@@ -238,6 +254,7 @@ fn handle_rpc_messages_over_child_process_stdio(
     })
 }
 
+#[cfg(not(target_family = "wasm"))]
 #[cfg(any(debug_assertions, feature = "build-remote-server-binary"))]
 async fn build_remote_server_from_source(
     platform: &crate::RemotePlatform,
@@ -437,6 +454,7 @@ async fn build_remote_server_from_source(
     Ok(Some(path))
 }
 
+#[cfg(not(target_family = "wasm"))]
 #[cfg(any(debug_assertions, feature = "build-remote-server-binary"))]
 async fn which(
     binary_name: impl AsRef<str>,

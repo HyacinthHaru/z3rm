@@ -1,14 +1,14 @@
 #[cfg(any(test, feature = "test-support"))]
 use crate::transport::mock::ConnectGuard;
+#[cfg(not(target_family = "wasm"))]
+use crate::transport::{
+    docker::DockerExecConnection, ssh::SshRemoteConnection, wsl::WslRemoteConnection,
+};
 use crate::{
     SshConnectionOptions,
     protocol::MessageId,
     proxy::ProxyLaunchError,
-    transport::{
-        docker::{DockerConnectionOptions, DockerExecConnection},
-        ssh::SshRemoteConnection,
-        wsl::{WslConnectionOptions, WslRemoteConnection},
-    },
+    transport::{docker::DockerConnectionOptions, wsl::WslConnectionOptions},
 };
 use anyhow::{Context as _, Result, anyhow};
 use askpass::EncryptedPassword;
@@ -1262,24 +1262,31 @@ impl ConnectionPool {
         let task = cx
             .spawn({
                 let opts = opts.clone();
+                #[cfg(not(target_family = "wasm"))]
                 let delegate = delegate.clone();
                 async move |cx| {
                     let connection = match opts.clone() {
+                        #[cfg(not(target_family = "wasm"))]
                         RemoteConnectionOptions::Ssh(opts) => {
                             SshRemoteConnection::new(opts, delegate, cx)
                                 .await
                                 .map(|connection| Arc::new(connection) as Arc<dyn RemoteConnection>)
                         }
+                        #[cfg(not(target_family = "wasm"))]
                         RemoteConnectionOptions::Wsl(opts) => {
                             WslRemoteConnection::new(opts, delegate, cx)
                                 .await
                                 .map(|connection| Arc::new(connection) as Arc<dyn RemoteConnection>)
                         }
+                        #[cfg(not(target_family = "wasm"))]
                         RemoteConnectionOptions::Docker(opts) => {
                             DockerExecConnection::new(opts, delegate, cx)
                                 .await
                                 .map(|connection| Arc::new(connection) as Arc<dyn RemoteConnection>)
                         }
+                        // ssh, wsl and docker each need to spawn a process.
+                        #[cfg(target_family = "wasm")]
+                        _ => Err(anyhow!("cannot open a remote connection from the web")),
                         #[cfg(any(test, feature = "test-support"))]
                         RemoteConnectionOptions::Mock(opts) => match cx.update(|cx| {
                             cx.default_global::<crate::transport::mock::MockConnectionRegistry>()
@@ -1904,7 +1911,7 @@ impl ChannelClient {
     }
 
     async fn resync(&self, timeout: Duration) -> Result<()> {
-        smol::future::or(
+        futures_lite::future::or(
             async {
                 self.request_internal(proto::FlushBufferedMessages {}, false)
                     .await?;
@@ -1926,7 +1933,7 @@ impl ChannelClient {
     }
 
     async fn ping(&self, timeout: Duration) -> Result<()> {
-        smol::future::or(
+        futures_lite::future::or(
             async {
                 self.request(proto::Ping {}).await?;
                 Ok(())

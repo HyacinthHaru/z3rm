@@ -1,29 +1,41 @@
+#[cfg(not(target_family = "wasm"))]
 use crate::commit::{CommitDiffObject, CommitDiffObjectKind, parse_git_diff_raw};
 use crate::stash::GitStash;
 use crate::status::{DiffTreeType, GitStatus, TreeDiff};
 use crate::{Oid, RunHook, SHORT_SHA_LENGTH};
-use anyhow::{Context as _, Result, anyhow, bail};
+#[cfg(not(target_family = "wasm"))]
+use anyhow::bail;
+use anyhow::{Context as _, Result, anyhow};
 use async_channel::Sender;
 use collections::HashMap;
+use futures::FutureExt as _;
 use futures::channel::oneshot;
 use futures::future::BoxFuture;
-use futures::io::BufWriter;
-use futures::{AsyncWriteExt, FutureExt as _, select_biased};
-use gpui::{AppContext as _, AsyncApp, BackgroundExecutor, SharedString, Task};
+#[cfg(not(target_family = "wasm"))]
+use futures::io::{AsyncBufReadExt, AsyncReadExt, BufReader, BufWriter};
+#[cfg(not(target_family = "wasm"))]
+use futures::{AsyncWriteExt, select_biased};
+#[cfg(not(target_family = "wasm"))]
+use gpui::{AppContext as _, BackgroundExecutor};
+use gpui::{AsyncApp, SharedString, Task};
+#[cfg(not(target_family = "wasm"))]
 use parking_lot::Mutex;
 use rope::Rope;
 use schemars::JsonSchema;
 use serde::Deserialize;
 use smallvec::SmallVec;
-use smol::io::{AsyncBufReadExt, AsyncReadExt, BufReader};
 use text::LineEnding;
 
 use std::borrow::Cow;
+#[cfg(not(target_family = "wasm"))]
 use std::collections::HashSet;
 use std::ffi::{OsStr, OsString};
+#[cfg(not(target_family = "wasm"))]
 use std::sync::atomic::AtomicBool;
 
-use std::process::{ExitStatus, Output};
+#[cfg(not(target_family = "wasm"))]
+use std::process::ExitStatus;
+use std::process::Output;
 use std::str::FromStr;
 use std::time::SystemTime;
 use std::{
@@ -32,14 +44,21 @@ use std::{
     sync::Arc,
 };
 use sum_tree::MapSeekTarget;
+#[cfg(not(target_family = "wasm"))]
 use thiserror::Error;
+#[cfg(not(target_family = "wasm"))]
+use util::ResultExt;
+#[cfg(not(target_family = "wasm"))]
 use util::command::{Stdio, new_command};
+use util::paths;
 use util::paths::PathStyle;
 use util::rel_path::RelPath;
-use util::{ResultExt, paths};
+#[cfg(not(target_family = "wasm"))]
 use uuid::Uuid;
 
-pub use askpass::{AskPassDelegate, AskPassResult, AskPassSession};
+#[cfg(not(target_family = "wasm"))]
+pub use askpass::AskPassSession;
+pub use askpass::{AskPassDelegate, AskPassResult};
 
 pub const REMOTE_CANCELLED_BY_USER: &str = "Operation cancelled by user";
 
@@ -157,7 +176,7 @@ impl CommitDataReader {
         executor: BackgroundExecutor,
         resolve: impl 'static + Send + Sync + Fn(Oid) -> Result<CommitData>,
     ) -> Self {
-        let (request_tx, request_rx) = smol::channel::bounded::<CommitDataRequest>(64);
+        let (request_tx, request_rx) = async_channel::bounded::<CommitDataRequest>(64);
         let resolve = Arc::new(resolve);
         let delay_executor = executor.clone();
         let task = executor.spawn(async move {
@@ -572,12 +591,14 @@ pub fn is_binary_content(content: &[u8]) -> bool {
     content[..check_len].contains(&0)
 }
 
+#[cfg(not(target_family = "wasm"))]
 struct LoadedCommitObject {
     text: String,
     is_binary: bool,
 }
 
-async fn read_commit_blob<R: smol::io::AsyncBufRead + Unpin>(
+#[cfg(not(target_family = "wasm"))]
+async fn read_commit_blob<R: futures::io::AsyncBufRead + Unpin>(
     stdout: &mut R,
     info_line: &mut String,
     newline: &mut [u8; 1],
@@ -605,7 +626,8 @@ async fn read_commit_blob<R: smol::io::AsyncBufRead + Unpin>(
     })
 }
 
-async fn load_commit_object<R: smol::io::AsyncBufRead + Unpin>(
+#[cfg(not(target_family = "wasm"))]
+async fn load_commit_object<R: futures::io::AsyncBufRead + Unpin>(
     object: Option<CommitDiffObject<'_>>,
     stdout: &mut R,
     info_line: &mut String,
@@ -675,6 +697,7 @@ impl std::fmt::Display for FetchOptions {
     }
 }
 
+#[cfg(not(target_family = "wasm"))]
 /// Modifies .git/info/exclude temporarily
 pub struct GitExcludeOverride {
     git_exclude_path: PathBuf,
@@ -682,6 +705,7 @@ pub struct GitExcludeOverride {
     added_excludes: Option<String>,
 }
 
+#[cfg(not(target_family = "wasm"))]
 impl GitExcludeOverride {
     const START_BLOCK_MARKER: &str = "\n\n#  ====== Auto-added by Zed: =======\n";
     const END_BLOCK_MARKER: &str = "\n#  ====== End of auto-added by Zed =======\n";
@@ -762,6 +786,7 @@ impl GitExcludeOverride {
     }
 }
 
+#[cfg(not(target_family = "wasm"))]
 impl Drop for GitExcludeOverride {
     fn drop(&mut self) {
         if self.added_excludes.is_some() {
@@ -1201,6 +1226,7 @@ impl std::fmt::Debug for dyn GitRepository {
     }
 }
 
+#[cfg(not(target_family = "wasm"))]
 pub struct RealGitRepository {
     pub git_dir: PathBuf,
     pub common_dir: PathBuf,
@@ -1232,6 +1258,7 @@ impl RefEdit {
     }
 }
 
+#[cfg(not(target_family = "wasm"))]
 impl RealGitRepository {
     pub fn new(
         dotgit_path: &Path,
@@ -1379,6 +1406,7 @@ pub struct GitCommitTemplate {
     pub template: String,
 }
 
+#[cfg(not(target_family = "wasm"))]
 pub async fn get_git_committer(cx: &AsyncApp) -> GitCommitter {
     if cfg!(any(feature = "test-support", test)) {
         return GitCommitter {
@@ -1420,6 +1448,15 @@ pub async fn get_git_committer(cx: &AsyncApp) -> GitCommitter {
     .await
 }
 
+#[cfg(target_family = "wasm")]
+pub async fn get_git_committer(_cx: &AsyncApp) -> GitCommitter {
+    GitCommitter {
+        name: None,
+        email: None,
+    }
+}
+
+#[cfg(not(target_family = "wasm"))]
 impl GitRepository for RealGitRepository {
     fn path(&self) -> PathBuf {
         self.git_dir.clone()
@@ -3345,6 +3382,7 @@ impl GitRepository for RealGitRepository {
     }
 }
 
+#[cfg(not(target_family = "wasm"))]
 async fn run_commit_data_reader(
     git: GitBinary,
     request_rx: async_channel::Receiver<CommitDataRequest>,
@@ -3390,7 +3428,8 @@ async fn run_commit_data_reader(
     Ok(())
 }
 
-async fn read_single_commit_response<R: smol::io::AsyncBufRead + Unpin>(
+#[cfg(not(target_family = "wasm"))]
+async fn read_single_commit_response<R: futures::io::AsyncBufRead + Unpin>(
     stdout: &mut R,
     sha: &Oid,
 ) -> Result<CommitData> {
@@ -3427,6 +3466,7 @@ async fn read_single_commit_response<R: smol::io::AsyncBufRead + Unpin>(
         .ok_or_else(|| anyhow!("failed to parse commit {}", sha))
 }
 
+#[cfg(not(target_family = "wasm"))]
 fn parse_file_history_changed_files_output(
     output: &str,
     queried_paths: &[RepoPath],
@@ -3460,6 +3500,7 @@ fn parse_file_history_changed_files_output(
     histories
 }
 
+#[cfg(not(target_family = "wasm"))]
 fn parse_initial_graph_output<'a>(
     lines: impl Iterator<Item = &'a str>,
 ) -> Vec<Arc<InitialGraphCommitData>> {
@@ -3495,6 +3536,7 @@ fn parse_initial_graph_output<'a>(
         .collect()
 }
 
+#[cfg(not(target_family = "wasm"))]
 fn git_status_args(path_prefixes: &[RepoPath]) -> Vec<OsString> {
     let mut args = vec![
         OsString::from("status"),
@@ -3514,6 +3556,7 @@ fn git_status_args(path_prefixes: &[RepoPath]) -> Vec<OsString> {
     args
 }
 
+#[cfg(not(target_family = "wasm"))]
 /// Temporarily git-ignore commonly ignored files and files over 2MB
 async fn exclude_files(git: &GitBinary) -> Result<GitExcludeOverride> {
     const MAX_SIZE: u64 = 2 * 1024 * 1024; // 2 MB
@@ -3552,6 +3595,7 @@ async fn exclude_files(git: &GitBinary) -> Result<GitExcludeOverride> {
     Ok(excludes)
 }
 
+#[cfg(not(target_family = "wasm"))]
 pub(crate) struct GitBinary {
     git_binary_path: PathBuf,
     working_directory: PathBuf,
@@ -3562,6 +3606,7 @@ pub(crate) struct GitBinary {
     is_trusted: bool,
 }
 
+#[cfg(not(target_family = "wasm"))]
 impl GitBinary {
     pub(crate) fn new(
         git_binary_path: PathBuf,
@@ -3712,6 +3757,7 @@ impl GitBinary {
     }
 }
 
+#[cfg(not(target_family = "wasm"))]
 #[derive(Error, Debug)]
 #[error("Git command failed:\n{stdout}{stderr}\n")]
 struct GitBinaryCommandError {
@@ -3720,6 +3766,7 @@ struct GitBinaryCommandError {
     status: ExitStatus,
 }
 
+#[cfg(not(target_family = "wasm"))]
 async fn run_git_command(
     env: Arc<HashMap<String, String>>,
     ask_pass: AskPassDelegate,
@@ -3752,6 +3799,7 @@ async fn run_git_command(
     }
 }
 
+#[cfg(not(target_family = "wasm"))]
 async fn run_askpass_command(
     mut ask_pass: AskPassSession,
     git_process: util::command::Child,
@@ -5715,7 +5763,7 @@ mod tests {
         let git = repo.git_binary();
 
         let graph_commits = async || {
-            let (tx, rx) = smol::channel::unbounded();
+            let (tx, rx) = async_channel::unbounded();
             repo.initial_graph_data(LogSource::All, LogOrder::DateOrder, tx)
                 .await
                 .unwrap();

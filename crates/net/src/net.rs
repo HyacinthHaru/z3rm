@@ -1,3 +1,4 @@
+#[cfg(not(target_family = "wasm"))]
 pub mod async_net;
 #[cfg(target_os = "windows")]
 pub mod listener;
@@ -12,12 +13,12 @@ mod util;
 pub use listener::*;
 #[cfg(target_os = "windows")]
 pub use socket::*;
-#[cfg(not(target_os = "windows"))]
+#[cfg(all(not(target_os = "windows"), not(target_family = "wasm")))]
 pub use std::os::unix::net::{UnixListener, UnixStream};
 #[cfg(target_os = "windows")]
 pub use stream::*;
 
-#[cfg(test)]
+#[cfg(all(test, not(target_family = "wasm")))]
 mod tests {
     use std::io::{Read, Write};
 

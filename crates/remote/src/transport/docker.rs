@@ -1,29 +1,47 @@
+#[cfg(not(target_family = "wasm"))]
 use anyhow::Context;
+#[cfg(not(target_family = "wasm"))]
 use anyhow::Result;
+#[cfg(not(target_family = "wasm"))]
 use anyhow::anyhow;
+#[cfg(not(target_family = "wasm"))]
 use async_trait::async_trait;
+#[cfg(not(target_family = "wasm"))]
 use collections::HashMap;
+#[cfg(not(target_family = "wasm"))]
 use parking_lot::Mutex;
+#[cfg(not(target_family = "wasm"))]
 use release_channel::{AppCommitSha, AppVersion, ReleaseChannel};
+#[cfg(not(target_family = "wasm"))]
 use semver::Version as SemanticVersion;
 use std::collections::BTreeMap;
+#[cfg(not(target_family = "wasm"))]
 use std::time::Instant;
+#[cfg(not(target_family = "wasm"))]
 use std::{
     path::{Path, PathBuf},
     sync::Arc,
 };
+#[cfg(not(target_family = "wasm"))]
 use util::ResultExt;
+#[cfg(not(target_family = "wasm"))]
 use util::command::Stdio;
+#[cfg(not(target_family = "wasm"))]
 use util::shell::ShellKind;
+#[cfg(not(target_family = "wasm"))]
 use util::{
     paths::{PathStyle, RemotePathBuf},
     rel_path::RelPath,
 };
 
+#[cfg(not(target_family = "wasm"))]
 use futures::channel::mpsc::{Sender, UnboundedReceiver, UnboundedSender};
+#[cfg(not(target_family = "wasm"))]
 use gpui::{App, AppContext, AsyncApp, Task};
+#[cfg(not(target_family = "wasm"))]
 use rpc::proto::Envelope;
 
+#[cfg(not(target_family = "wasm"))]
 use crate::{
     RemoteArch, RemoteClientDelegate, RemoteConnection, RemoteConnectionOptions, RemoteOs,
     RemotePlatform,
@@ -52,6 +70,7 @@ pub struct DockerConnectionOptions {
     pub remote_env: BTreeMap<String, String>,
 }
 
+#[cfg(not(target_family = "wasm"))]
 pub(crate) struct DockerExecConnection {
     proxy_process: Mutex<Option<u32>>,
     remote_dir_for_server: String,
@@ -63,6 +82,7 @@ pub(crate) struct DockerExecConnection {
     shell: String,
 }
 
+#[cfg(not(target_family = "wasm"))]
 impl DockerExecConnection {
     pub async fn new(
         connection_options: DockerConnectionOptions,
@@ -642,6 +662,7 @@ impl DockerExecConnection {
 }
 
 #[async_trait(?Send)]
+#[cfg(not(target_family = "wasm"))]
 impl RemoteConnection for DockerExecConnection {
     fn has_wsl_interop(&self) -> bool {
         false
