@@ -1,44 +1,31 @@
 pub mod kvp;
-#[cfg(not(target_family = "wasm"))]
 pub mod query;
 
 // Re-export
 pub use anyhow;
-#[cfg(not(target_family = "wasm"))]
 use anyhow::Context as _;
 pub use gpui;
-use gpui::{App, AppContext};
-#[cfg(not(target_family = "wasm"))]
-use gpui::Global;
+use gpui::{App, AppContext, Global};
 pub use indoc::indoc;
 pub use inventory;
 pub use paths::database_dir;
-#[cfg(not(target_family = "wasm"))]
 pub use sqlez;
-#[cfg(not(target_family = "wasm"))]
 pub use sqlez_macros;
 pub use uuid;
 
 pub use release_channel::RELEASE_CHANNEL;
 use release_channel::ReleaseChannel;
-#[cfg(not(target_family = "wasm"))]
 use sqlez::domain::Migrator;
-#[cfg(not(target_family = "wasm"))]
 use sqlez::thread_safe_connection::ThreadSafeConnection;
-#[cfg(not(target_family = "wasm"))]
 use sqlez_macros::sql;
-#[cfg(not(target_family = "wasm"))]
 use std::fs::create_dir_all;
 use std::future::Future;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::AtomicBool;
 use std::sync::LazyLock;
-#[cfg(not(target_family = "wasm"))]
+use std::sync::atomic::AtomicBool;
 use std::sync::atomic::Ordering;
 use util::ResultExt;
-#[cfg(not(target_family = "wasm"))]
 use util::maybe;
-#[cfg(not(target_family = "wasm"))]
 use zed_env_vars::ZED_STATELESS;
 
 /// A migration registered via `static_connection!` and collected at link time.
@@ -53,17 +40,13 @@ inventory::collect!(DomainMigration);
 
 /// The shared database connection backing all domain-specific DB wrappers.
 /// Set as a GPUI global per-App. Falls back to a shared LazyLock if not set.
-#[cfg(not(target_family = "wasm"))]
 pub struct AppDatabase(pub ThreadSafeConnection);
 
-#[cfg(not(target_family = "wasm"))]
 impl Global for AppDatabase {}
 
 /// Migrator that runs all inventory-registered domain migrations.
-#[cfg(not(target_family = "wasm"))]
 pub struct AppMigrator;
 
-#[cfg(not(target_family = "wasm"))]
 impl Migrator for AppMigrator {
     fn migrate(connection: &sqlez::connection::Connection) -> anyhow::Result<()> {
         let registrations: Vec<&DomainMigration> = inventory::iter::<DomainMigration>().collect();
@@ -76,7 +59,6 @@ impl Migrator for AppMigrator {
     }
 }
 
-#[cfg(not(target_family = "wasm"))]
 impl AppDatabase {
     /// Opens the production database and runs all inventory-registered
     /// migrations in dependency order.
@@ -110,7 +92,6 @@ impl AppDatabase {
     }
 }
 
-#[cfg(not(target_family = "wasm"))]
 fn topological_sort<'a>(registrations: &[&'a DomainMigration]) -> Vec<&'a DomainMigration> {
     let mut sorted: Vec<&DomainMigration> = Vec::new();
     let mut visited: std::collections::HashSet<&str> = std::collections::HashSet::new();
@@ -140,15 +121,13 @@ fn topological_sort<'a>(registrations: &[&'a DomainMigration]) -> Vec<&'a Domain
 }
 
 /// Shared fallback `AppDatabase` used when no per-App global is set.
-#[cfg(all(any(test, feature = "test-support"), not(target_family = "wasm")))]
+#[cfg(any(test, feature = "test-support"))]
 static TEST_APP_DATABASE: LazyLock<AppDatabase> = LazyLock::new(AppDatabase::test_new);
 
-#[cfg(not(target_family = "wasm"))]
 const CONNECTION_INITIALIZE_QUERY: &str = sql!(
     PRAGMA foreign_keys=TRUE;
 );
 
-#[cfg(not(target_family = "wasm"))]
 const DB_INITIALIZE_QUERY: &str = sql!(
     PRAGMA journal_mode=WAL;
     PRAGMA busy_timeout=500;
@@ -156,7 +135,6 @@ const DB_INITIALIZE_QUERY: &str = sql!(
     PRAGMA synchronous=NORMAL;
 );
 
-#[cfg(not(target_family = "wasm"))]
 const FALLBACK_DB_NAME: &str = "FALLBACK_MEMORY_DB";
 
 const DB_FILE_NAME: &str = "db.sqlite";
@@ -195,7 +173,6 @@ pub fn db_path(db_dir: &Path, scope: impl DbScope) -> PathBuf {
 /// This will retry a couple times if there are failures. If opening fails once, the db directory
 /// is moved to a backup folder and a new one is created. If that fails, a shared in memory db is created.
 /// In either case, static variables are set so that the user can be notified.
-#[cfg(not(target_family = "wasm"))]
 pub async fn open_db<M: Migrator + 'static>(
     db_dir: &Path,
     scope: impl DbScope,
@@ -227,7 +204,6 @@ pub async fn open_db<M: Migrator + 'static>(
     open_fallback_db::<M>().await
 }
 
-#[cfg(not(target_family = "wasm"))]
 async fn open_main_db<M: Migrator>(db_path: &Path) -> Option<ThreadSafeConnection> {
     log::trace!("Opening database {}", db_path.display());
     ThreadSafeConnection::builder::<M>(db_path.to_string_lossy().as_ref(), true)
@@ -238,7 +214,6 @@ async fn open_main_db<M: Migrator>(db_path: &Path) -> Option<ThreadSafeConnectio
         .log_err()
 }
 
-#[cfg(not(target_family = "wasm"))]
 async fn open_fallback_db<M: Migrator>() -> ThreadSafeConnection {
     log::warn!("Opening fallback in-memory database");
     ThreadSafeConnection::builder::<M>(FALLBACK_DB_NAME, false)
@@ -251,7 +226,7 @@ async fn open_fallback_db<M: Migrator>() -> ThreadSafeConnection {
         )
 }
 
-#[cfg(all(any(test, feature = "test-support"), not(target_family = "wasm")))]
+#[cfg(any(test, feature = "test-support"))]
 pub async fn open_test_db<M: Migrator>(db_name: &str) -> ThreadSafeConnection {
     use sqlez::thread_safe_connection::locking_queue;
 
@@ -270,7 +245,6 @@ pub async fn open_test_db<M: Migrator>(db_name: &str) -> ThreadSafeConnection {
 /// Arguments:
 /// - type of connection wrapper
 /// - dependencies, whose migrations should be run prior to this domain's migrations
-#[cfg(not(target_family = "wasm"))]
 #[macro_export]
 macro_rules! static_connection {
     ($t:ident, [ $($d:ty),* ]) => {
@@ -320,7 +294,7 @@ where
         .detach()
 }
 
-#[cfg(all(test, not(target_family = "wasm")))]
+#[cfg(test)]
 mod tests {
     use std::thread;
 

@@ -23,15 +23,10 @@ inventory.workspace = true
 log.workspace = true
 paths.workspace = true
 release_channel.workspace = true
-util.workspace = true
-uuid.workspace = true
-
-# SQLite is a C build and cannot target wasm32-unknown-unknown. The browser
-# build gets the in-memory key-value store in `kvp::wasm` instead, behind the
-# same public surface.
-[target.'cfg(not(target_family = "wasm"))'.dependencies]
 sqlez.workspace = true
 sqlez_macros.workspace = true
+util.workspace = true
+uuid.workspace = true
 zed_env_vars.workspace = true
 
 [dev-dependencies]

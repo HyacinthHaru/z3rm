@@ -1,13 +1,19 @@
+#[cfg(not(target_family = "wasm"))]
 use std::ffi::{CStr, CString, c_int};
 use std::marker::PhantomData;
+#[cfg(not(target_family = "wasm"))]
 use std::{ptr, slice, str};
 
-use anyhow::{Context as _, Result, bail};
+#[cfg(not(target_family = "wasm"))]
+use anyhow::bail;
+use anyhow::{Context as _, Result};
+#[cfg(not(target_family = "wasm"))]
 use libsqlite3_sys::*;
 
 use crate::bindable::{Bind, Column};
 use crate::connection::Connection;
 
+#[cfg(not(target_family = "wasm"))]
 pub struct Statement<'a> {
     /// vector of pointers to the raw SQLite statement objects.
     /// it holds the actual prepared statements that will be executed.
@@ -19,6 +25,14 @@ pub struct Statement<'a> {
     connection: &'a Connection,
     ///Indicates that the `Statement` struct is tied to the lifetime of the SQLite statement
     phantom: PhantomData<sqlite3_stmt>,
+}
+
+/// A statement over a connection that holds no rows: binding succeeds, and the
+/// first step is always the last, so `exec` is a no-op, `rows` comes back empty
+/// and `maybe_row` comes back `None`.
+#[cfg(target_family = "wasm")]
+pub struct Statement<'a> {
+    phantom: PhantomData<&'a Connection>,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -37,6 +51,14 @@ pub enum SqlType {
 }
 
 impl<'a> Statement<'a> {
+    #[cfg(target_family = "wasm")]
+    pub fn prepare<T: AsRef<str>>(_connection: &'a Connection, _query: T) -> Result<Self> {
+        Ok(Self {
+            phantom: PhantomData,
+        })
+    }
+
+    #[cfg(not(target_family = "wasm"))]
     pub fn prepare<T: AsRef<str>>(connection: &'a Connection, query: T) -> Result<Self> {
         let mut statement = Self {
             raw_statements: Default::default(),
@@ -85,10 +107,15 @@ impl<'a> Statement<'a> {
         Ok(statement)
     }
 
+    #[cfg(not(target_family = "wasm"))]
     fn current_statement(&self) -> *mut sqlite3_stmt {
         *self.raw_statements.get(self.current_statement).unwrap()
     }
 
+    #[cfg(target_family = "wasm")]
+    pub fn reset(&mut self) {}
+
+    #[cfg(not(target_family = "wasm"))]
     pub fn reset(&mut self) {
         unsafe {
             for raw_statement in self.raw_statements.iter() {
@@ -98,6 +125,12 @@ impl<'a> Statement<'a> {
         self.current_statement = 0;
     }
 
+    #[cfg(target_family = "wasm")]
+    pub fn parameter_count(&self) -> i32 {
+        0
+    }
+
+    #[cfg(not(target_family = "wasm"))]
     pub fn parameter_count(&self) -> i32 {
         unsafe {
             self.raw_statements
@@ -108,6 +141,7 @@ impl<'a> Statement<'a> {
         }
     }
 
+    #[cfg(not(target_family = "wasm"))]
     fn bind_index_with(&self, index: i32, bind: &dyn Fn(&*mut sqlite3_stmt)) -> Result<()> {
         let mut any_succeed = false;
         unsafe {
@@ -130,6 +164,12 @@ impl<'a> Statement<'a> {
         }
     }
 
+    #[cfg(target_family = "wasm")]
+    pub fn bind_blob(&self, _index: i32, _blob: &[u8]) -> Result<()> {
+        Ok(())
+    }
+
+    #[cfg(not(target_family = "wasm"))]
     pub fn bind_blob(&self, index: i32, blob: &[u8]) -> Result<()> {
         let index = index as c_int;
         let blob_pointer = blob.as_ptr() as *const _;
@@ -140,6 +180,12 @@ impl<'a> Statement<'a> {
         })
     }
 
+    #[cfg(target_family = "wasm")]
+    pub fn column_blob(&mut self, index: i32) -> Result<&[u8]> {
+        anyhow::bail!("no blob at index {index}")
+    }
+
+    #[cfg(not(target_family = "wasm"))]
     pub fn column_blob(&mut self, index: i32) -> Result<&[u8]> {
         let index = index as c_int;
         let pointer = unsafe { sqlite3_column_blob(self.current_statement(), index) };
@@ -158,6 +204,12 @@ impl<'a> Statement<'a> {
         unsafe { Ok(slice::from_raw_parts(pointer as *const u8, len)) }
     }
 
+    #[cfg(target_family = "wasm")]
+    pub fn bind_double(&self, _index: i32, _double: f64) -> Result<()> {
+        Ok(())
+    }
+
+    #[cfg(not(target_family = "wasm"))]
     pub fn bind_double(&self, index: i32, double: f64) -> Result<()> {
         let index = index as c_int;
 
@@ -166,6 +218,12 @@ impl<'a> Statement<'a> {
         })
     }
 
+    #[cfg(target_family = "wasm")]
+    pub fn column_double(&self, index: i32) -> Result<f64> {
+        anyhow::bail!("no double at index {index}")
+    }
+
+    #[cfg(not(target_family = "wasm"))]
     pub fn column_double(&self, index: i32) -> Result<f64> {
         let index = index as c_int;
         let result = unsafe { sqlite3_column_double(self.current_statement(), index) };
@@ -175,6 +233,12 @@ impl<'a> Statement<'a> {
         Ok(result)
     }
 
+    #[cfg(target_family = "wasm")]
+    pub fn bind_int(&self, _index: i32, _int: i32) -> Result<()> {
+        Ok(())
+    }
+
+    #[cfg(not(target_family = "wasm"))]
     pub fn bind_int(&self, index: i32, int: i32) -> Result<()> {
         let index = index as c_int;
         self.bind_index_with(index, &|raw_statement| unsafe {
@@ -182,6 +246,12 @@ impl<'a> Statement<'a> {
         })
     }
 
+    #[cfg(target_family = "wasm")]
+    pub fn column_int(&self, index: i32) -> Result<i32> {
+        anyhow::bail!("no int at index {index}")
+    }
+
+    #[cfg(not(target_family = "wasm"))]
     pub fn column_int(&self, index: i32) -> Result<i32> {
         let index = index as c_int;
         let result = unsafe { sqlite3_column_int(self.current_statement(), index) };
@@ -191,6 +261,12 @@ impl<'a> Statement<'a> {
         Ok(result)
     }
 
+    #[cfg(target_family = "wasm")]
+    pub fn bind_int64(&self, _index: i32, _int: i64) -> Result<()> {
+        Ok(())
+    }
+
+    #[cfg(not(target_family = "wasm"))]
     pub fn bind_int64(&self, index: i32, int: i64) -> Result<()> {
         let index = index as c_int;
         self.bind_index_with(index, &|raw_statement| unsafe {
@@ -198,6 +274,12 @@ impl<'a> Statement<'a> {
         })
     }
 
+    #[cfg(target_family = "wasm")]
+    pub fn column_int64(&self, index: i32) -> Result<i64> {
+        anyhow::bail!("no i64 at index {index}")
+    }
+
+    #[cfg(not(target_family = "wasm"))]
     pub fn column_int64(&self, index: i32) -> Result<i64> {
         let index = index as c_int;
         let result = unsafe { sqlite3_column_int64(self.current_statement(), index) };
@@ -207,6 +289,12 @@ impl<'a> Statement<'a> {
         Ok(result)
     }
 
+    #[cfg(target_family = "wasm")]
+    pub fn bind_null(&self, _index: i32) -> Result<()> {
+        Ok(())
+    }
+
+    #[cfg(not(target_family = "wasm"))]
     pub fn bind_null(&self, index: i32) -> Result<()> {
         let index = index as c_int;
         self.bind_index_with(index, &|raw_statement| unsafe {
@@ -214,6 +302,12 @@ impl<'a> Statement<'a> {
         })
     }
 
+    #[cfg(target_family = "wasm")]
+    pub fn bind_text(&self, _index: i32, _text: &str) -> Result<()> {
+        Ok(())
+    }
+
+    #[cfg(not(target_family = "wasm"))]
     pub fn bind_text(&self, index: i32, text: &str) -> Result<()> {
         let index = index as c_int;
         let text_pointer = text.as_ptr() as *const _;
@@ -224,6 +318,12 @@ impl<'a> Statement<'a> {
         })
     }
 
+    #[cfg(target_family = "wasm")]
+    pub fn column_text(&mut self, index: i32) -> Result<&str> {
+        anyhow::bail!("no text at index {index}")
+    }
+
+    #[cfg(not(target_family = "wasm"))]
     pub fn column_text(&mut self, index: i32) -> Result<&str> {
         let index = index as c_int;
         let pointer = unsafe { sqlite3_column_text(self.current_statement(), index) };
@@ -252,6 +352,12 @@ impl<'a> Statement<'a> {
         Ok(T::column(self, 0)?.0)
     }
 
+    #[cfg(target_family = "wasm")]
+    pub fn column_type(&mut self, _index: i32) -> Result<SqlType> {
+        Ok(SqlType::Null)
+    }
+
+    #[cfg(not(target_family = "wasm"))]
     pub fn column_type(&mut self, index: i32) -> Result<SqlType> {
         let result = unsafe { sqlite3_column_type(self.current_statement(), index) };
         self.connection.last_error()?;
@@ -270,6 +376,12 @@ impl<'a> Statement<'a> {
         Ok(self)
     }
 
+    #[cfg(target_family = "wasm")]
+    fn step(&mut self) -> Result<StepResult> {
+        Ok(StepResult::Done)
+    }
+
+    #[cfg(not(target_family = "wasm"))]
     fn step(&mut self) -> Result<StepResult> {
         match unsafe { sqlite3_step(self.current_statement()) } {
             SQLITE_ROW => Ok(StepResult::Row),
@@ -381,6 +493,7 @@ impl<'a> Statement<'a> {
     }
 }
 
+#[cfg(not(target_family = "wasm"))]
 impl Drop for Statement<'_> {
     fn drop(&mut self) {
         unsafe {
@@ -391,7 +504,7 @@ impl Drop for Statement<'_> {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, not(target_family = "wasm")))]
 mod test {
     use indoc::indoc;
 

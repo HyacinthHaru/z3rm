@@ -33,6 +33,7 @@ which = { workspace = true, optional = true }
 
 [target.'cfg(target_family = "wasm")'.dependencies]
 gloo-timers = { version = "0.3", features = ["futures"] }
+wasm-bindgen-futures = { workspace = true }
 getrandom = { version = "0.3.4", features = ["wasm_js"] }
 getrandom02 = { package = "getrandom", version = "0.2", features = ["js"] }
 
