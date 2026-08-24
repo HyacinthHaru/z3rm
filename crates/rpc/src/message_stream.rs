@@ -2,6 +2,7 @@
 
 pub use ::proto::*;
 
+#[cfg(not(target_family = "wasm"))]
 use anyhow::Context as _;
 use async_tungstenite::tungstenite::Message as WebSocketMessage;
 use futures::{SinkExt as _, StreamExt as _};
@@ -40,10 +41,10 @@ where
     S: futures::Sink<WebSocketMessage, Error = anyhow::Error> + Unpin,
 {
     pub async fn write(&mut self, message: Message) -> anyhow::Result<()> {
-        #[cfg(any(test, feature = "test-support"))]
+        #[cfg(all(any(test, feature = "test-support"), not(target_family = "wasm")))]
         const COMPRESSION_LEVEL: i32 = -7;
 
-        #[cfg(not(any(test, feature = "test-support")))]
+        #[cfg(all(not(any(test, feature = "test-support")), not(target_family = "wasm")))]
         const COMPRESSION_LEVEL: i32 = 4;
 
         match message {
