@@ -5,7 +5,9 @@ use remote::RemoteClient;
 use rpc::proto::{self, REMOTE_SERVER_PROJECT_ID};
 use std::{collections::VecDeque, path::Path, sync::Arc};
 use util::shell::Shell;
-use util::{ResultExt, command::new_command};
+use util::ResultExt;
+#[cfg(not(target_family = "wasm"))]
+use util::command::new_command;
 use worktree::Worktree;
 
 use collections::HashMap;
@@ -192,6 +194,7 @@ impl ProjectEnvironment {
     /// If the project was opened from the CLI, then the inherited CLI environment is returned.
     /// If it wasn't opened from the CLI, and an absolute path is given, then a shell is spawned in
     /// that directory, to get environment variables as if the user has `cd`'d there.
+    #[cfg(not(target_family = "wasm"))]
     pub fn local_directory_environment(
         &mut self,
         shell: &Shell,
@@ -247,6 +250,15 @@ impl ProjectEnvironment {
                 .shared()
             })
             .clone()
+    }
+    #[cfg(target_family = "wasm")]
+    pub fn local_directory_environment(
+        &mut self,
+        _shell: &Shell,
+        _abs_path: Arc<Path>,
+        _cx: &mut App,
+    ) -> Shared<Task<Option<HashMap<String, String>>>> {
+        Task::ready(None).shared()
     }
 
     pub fn remote_directory_environment(

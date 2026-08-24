@@ -1912,10 +1912,12 @@ pub struct ShellConfig {
     pub args: Vec<String>,
 }
 
+#[cfg(not(target_family = "wasm"))]
 pub struct ShellBuilder {
     inner: util::shell_builder::ShellBuilder,
 }
 
+#[cfg(not(target_family = "wasm"))]
 impl ShellBuilder {
     pub fn new(shell: &Shell, is_windows: bool) -> Self {
         let shell = match shell {

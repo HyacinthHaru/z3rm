@@ -12,8 +12,9 @@ use fs::Fs;
 
 use anyhow::{Context as _, Result, bail};
 use collections::{HashMap, HashSet, IndexSet};
+use db::kvp::KeyValueStore;
+#[cfg(not(target_family = "wasm"))]
 use db::{
-    kvp::KeyValueStore,
     query,
     sqlez::{connection::Connection, domain::Domain},
     sqlez_macros::sql,
@@ -29,6 +30,7 @@ use remote::{
     SshConnectionOptions, WslConnectionOptions, remote_connection_identity,
 };
 use serde::{Deserialize, Serialize};
+#[cfg(not(target_family = "wasm"))]
 use sqlez::{
     bindable::{Bind, Column, StaticColumnCount},
     statement::Statement,
@@ -36,7 +38,9 @@ use sqlez::{
 };
 
 use ui::{App, SharedString, px};
-use util::{ResultExt, maybe, rel_path::RelPath};
+use util::{rel_path::RelPath, ResultExt};
+#[cfg(not(target_family = "wasm"))]
+use util::maybe;
 use uuid::Uuid;
 
 use crate::{
@@ -73,7 +77,11 @@ fn contains_wsl_path(paths: &PathList) -> bool {
 
 #[derive(Copy, Clone, Debug, PartialEq)]
 pub(crate) struct SerializedAxis(pub(crate) gpui::Axis);
+
+#[cfg(not(target_family = "wasm"))]
 impl sqlez::bindable::StaticColumnCount for SerializedAxis {}
+
+#[cfg(not(target_family = "wasm"))]
 impl sqlez::bindable::Bind for SerializedAxis {
     fn bind(
         &self,
@@ -88,6 +96,7 @@ impl sqlez::bindable::Bind for SerializedAxis {
     }
 }
 
+#[cfg(not(target_family = "wasm"))]
 impl sqlez::bindable::Column for SerializedAxis {
     fn column(
         statement: &mut sqlez::statement::Statement,
@@ -109,12 +118,14 @@ impl sqlez::bindable::Column for SerializedAxis {
 #[derive(Copy, Clone, Debug, PartialEq, Default)]
 pub(crate) struct SerializedWindowBounds(pub(crate) WindowBounds);
 
+#[cfg(not(target_family = "wasm"))]
 impl StaticColumnCount for SerializedWindowBounds {
     fn column_count() -> usize {
         5
     }
 }
 
+#[cfg(not(target_family = "wasm"))]
 impl Bind for SerializedWindowBounds {
     fn bind(&self, statement: &Statement, start_index: i32) -> Result<i32> {
         match self.0 {
@@ -158,6 +169,7 @@ impl Bind for SerializedWindowBounds {
     }
 }
 
+#[cfg(not(target_family = "wasm"))]
 impl Column for SerializedWindowBounds {
     fn column(statement: &mut Statement, start_index: i32) -> Result<(Self, i32)> {
         let (window_state, next_index) = String::column(statement, start_index)?;
@@ -390,9 +402,11 @@ pub async fn write_default_dock_state(
 // 规范 §2.1 / §15.1：书签与断点随 project::bookmark_store / debugger 一起删除，
 // 相关的本地 Bookmark / Breakpoint 类型与数据库绑定实现一并移除。
 
+#[cfg(not(target_family = "wasm"))]
 struct SerializedPixels(gpui::Pixels);
+#[cfg(not(target_family = "wasm"))]
 impl sqlez::bindable::StaticColumnCount for SerializedPixels {}
-
+#[cfg(not(target_family = "wasm"))]
 impl sqlez::bindable::Bind for SerializedPixels {
     fn bind(
         &self,
@@ -404,8 +418,10 @@ impl sqlez::bindable::Bind for SerializedPixels {
     }
 }
 
+#[cfg(not(target_family = "wasm"))]
 pub struct WorkspaceDb(ThreadSafeConnection);
 
+#[cfg(not(target_family = "wasm"))]
 impl Domain for WorkspaceDb {
     const NAME: &str = stringify!(WorkspaceDb);
 
@@ -932,8 +948,10 @@ impl Domain for WorkspaceDb {
     }
 }
 
+#[cfg(not(target_family = "wasm"))]
 db::static_connection!(WorkspaceDb, []);
 
+#[cfg(not(target_family = "wasm"))]
 impl WorkspaceDb {
     /// Returns a serialized workspace for the given worktree_roots. If the passed array
     /// is empty, the most recent workspace is returned instead. If no workspace for the
@@ -2462,6 +2480,7 @@ fn dedupe_recent_workspaces(
     result
 }
 
+#[cfg(not(target_family = "wasm"))]
 pub fn delete_unloaded_items(
     alive_items: Vec<ItemId>,
     workspace_id: WorkspaceId,
@@ -2492,5 +2511,633 @@ pub fn delete_unloaded_items(
         .await
     })
 }
+
+// =============================================================================
+// WASM IN-MEMORY PERSISTENCE
+// =============================================================================
+//
+// On wasm32-unknown-unknown there is no SQLite. We provide in-memory shims
+// whose public signatures are byte-identical to the native versions. Semantics:
+//
+// * Writes are stored for the lifetime of the browser application. The web
+//   client owns one App, so process-local state has the same lifetime.
+// * Reads return what was written earlier in the session, or empty/None defaults
+//   if nothing has been persisted.
+// * `WorkspaceDb::next_id()` hands out monotonically increasing `WorkspaceId`s
+//   from an `AtomicI64` starting at 1.
+// * The KVP-backed free functions (`read_default_window_bounds`,
+//   `write_default_window_bounds`, `read_default_dock_state`,
+//   `write_default_dock_state`, `write_multi_workspace_state`) work transparently
+//   on wasm because `db::kvp::KeyValueStore` already has its own in-memory
+//   implementation. They are NOT cfg-gated.
+// * `delete_unloaded_items` cleans welcome-page state; editor and terminal
+//   persistence clean their own in-memory stores.
+
+#[cfg(target_family = "wasm")]
+mod wasm_persistence {
+    use collections::{HashMap, HashSet};
+    use std::path::PathBuf;
+    use std::sync::LazyLock;
+    use std::sync::atomic::{AtomicI64, AtomicU64, Ordering};
+
+    use super::RecentWorkspace;
+    use crate::WorkspaceId;
+    use crate::path_list::PathList;
+    use crate::persistence::model::{
+        DockStructure, RemoteConnectionId, SerializedWorkspace, SerializedWorkspaceLocation,
+        SessionWorkspace,
+    };
+    use anyhow::{Result, bail};
+    use chrono::{DateTime, Utc};
+    use db::kvp::KeyValueStore;
+    use fs::Fs;
+    use gpui::{App, WindowId};
+    use parking_lot::{Mutex, RwLock};
+    use project::trusted_worktrees::{DbTrustedPaths, RemoteHostLocation};
+    use remote::RemoteConnectionOptions;
+    use serde_json::{from_str, to_string};
+    use uuid::Uuid;
+
+    /// Browser-session workspace persistence. The web client owns one App, so
+    /// process-local storage has the same lifetime as the application.
+    #[derive(Default)]
+    struct WasmPersistence {
+        next_id: AtomicI64,
+        next_remote_id: AtomicU64,
+        /// workspace_id -> serialized workspace
+        workspaces: Mutex<HashMap<WorkspaceId, SerializedWorkspace>>,
+        /// For `recent_project_workspaces` and `last_session_workspace_locations`:
+        /// ordered list of workspace_ids in the order they were saved.
+        recent_order: Mutex<Vec<WorkspaceId>>,
+        /// workspace_id -> (session_id, window_id)
+        session_bindings: Mutex<HashMap<WorkspaceId, (Option<String>, Option<u64>)>>,
+        /// workspace_id -> (window_state, x, y, w, h, display_uuid)
+        window_state: Mutex<HashMap<WorkspaceId, (String, i32, i32, i32, i32, Option<Uuid>)>>,
+        /// workspace_id -> centered_layout
+        centered_layout: Mutex<HashMap<WorkspaceId, bool>>,
+        /// workspace_id -> (paths_str, paths_order_str) for workspace_for_roots lookup
+        workspaces_by_paths: Mutex<HashMap<(String, Option<u64>), WorkspaceId>>,
+        /// remote identity maps for round-tripping connection options.
+        remote_ids: Mutex<HashMap<RemoteConnectionOptions, RemoteConnectionId>>,
+        remote_options: Mutex<HashMap<RemoteConnectionId, RemoteConnectionOptions>>,
+        /// WorkspaceId -> timestamp for updates
+        workspace_timestamps: Mutex<HashMap<WorkspaceId, String>>,
+        /// workspace_id -> (remote_id, connection_options)
+        remote_connections: Mutex<HashMap<WorkspaceId, Option<RemoteConnectionId>>>,
+    }
+
+    static WASM_PERSISTENCE: LazyLock<WasmPersistence> =
+        LazyLock::new(WasmPersistence::default);
+
+    impl WasmPersistence {
+        fn global() -> &'static Self {
+            &WASM_PERSISTENCE
+        }
+
+        fn next_id(&self) -> i64 {
+            self.next_id.fetch_add(1, Ordering::SeqCst) + 1
+        }
+
+        fn remote_connection_id(
+            &self,
+            options: RemoteConnectionOptions,
+        ) -> RemoteConnectionId {
+            if let Some(id) = self.remote_ids.lock().get(&options).copied() {
+                return id;
+            }
+
+            let id = RemoteConnectionId(
+                self.next_remote_id.fetch_add(1, Ordering::SeqCst) + 1,
+            );
+            self.remote_ids.lock().insert(options.clone(), id);
+            self.remote_options.lock().insert(id, options);
+            id
+        }
+    }
+
+    // ---------------------------------------------------------------
+    // WorkspaceDb shim
+    // ---------------------------------------------------------------
+
+    pub struct WorkspaceDb;
+
+    impl std::ops::Deref for WorkspaceDb {
+        type Target = ();
+        fn deref(&self) -> &Self::Target {
+            &()
+        }
+    }
+
+    impl Clone for WorkspaceDb {
+        fn clone(&self) -> Self {
+            WorkspaceDb
+        }
+    }
+
+    impl Default for WorkspaceDb {
+        fn default() -> Self {
+            WorkspaceDb
+        }
+    }
+
+    impl WorkspaceDb {
+        /// Same signature as `db::static_connection!(WorkspaceDb, [])` on native.
+        pub fn global(_cx: &App) -> Self {
+            WorkspaceDb
+        }
+
+        /// wasm shim for `query! { pub async fn next_id() -> Result<WorkspaceId> }`
+        pub async fn next_id(&self) -> Result<WorkspaceId> {
+            let id = WasmPersistence::global()
+                .next_id();
+            Ok(WorkspaceId(id))
+        }
+
+        /// wasm shim for the native `next_id()` static (via static_connection!).
+        pub fn global_static(_cx: &App) -> Self {
+            WorkspaceDb
+        }
+
+        pub(crate) fn workspace_for_roots<P: AsRef<std::path::Path>>(
+            &self,
+            worktree_roots: &[P],
+        ) -> Option<SerializedWorkspace> {
+            self.workspace_for_roots_internal(worktree_roots, None)
+        }
+
+        pub(crate) fn remote_workspace_for_roots<P: AsRef<std::path::Path>>(
+            &self,
+            worktree_roots: &[P],
+            remote_connection_id: RemoteConnectionId,
+        ) -> Option<SerializedWorkspace> {
+            self.workspace_for_roots_internal(worktree_roots, Some(remote_connection_id))
+        }
+
+        pub(crate) fn workspace_for_roots_internal<P: AsRef<std::path::Path>>(
+            &self,
+            worktree_roots: &[P],
+            remote_connection_id: Option<RemoteConnectionId>,
+        ) -> Option<SerializedWorkspace> {
+            let paths_key = PathList::new(worktree_roots).serialize().paths;
+            let remote_key = remote_connection_id.map(|id| id.0);
+            let state = WasmPersistence::global();
+            let workspace_id = state
+                .workspaces_by_paths
+                .lock()
+                .get(&(paths_key, remote_key))
+                .copied()?;
+            state.workspaces.lock().get(&workspace_id).cloned()
+        }
+
+        pub(crate) fn workspace_for_id(&self, workspace_id: WorkspaceId) -> Option<SerializedWorkspace> {
+            WasmPersistence::global()
+                .workspaces
+                .lock()
+                .get(&workspace_id)
+                .cloned()
+        }
+
+        /// wasm shim for `save_workspace` — stores the serialized workspace in
+        /// process memory. `SerializedWorkspace` carries the pane_group / docks /
+        /// window_bounds / centered_layout we need to restore on the same
+        /// session. Data is not durable across page reloads.
+        pub(crate) async fn save_workspace(&self, workspace: SerializedWorkspace) {
+            let state = WasmPersistence::global();
+            {
+                let mut order = state.recent_order.lock();
+                if !order.contains(&workspace.id) {
+                    order.push(workspace.id);
+                }
+            }
+            state
+                .workspaces
+                .lock()
+                .insert(workspace.id, workspace.clone());
+            let ts = Utc::now()
+                .format("%Y-%m-%d %H:%M:%S")
+                .to_string();
+            state.workspace_timestamps.lock().insert(workspace.id, ts);
+            let paths = workspace.paths.serialize();
+            let remote_id = workspace
+                .remote_connection_options
+                .clone()
+                .map(|options| state.remote_connection_id(options));
+            let key = (paths.paths, remote_id.map(|id| id.0));
+            state
+                .workspaces_by_paths
+                .lock()
+                .insert(key, workspace.id);
+            if let Some(bounds) = workspace.window_bounds.map(|bounds| bounds.0) {
+                let b = match bounds {
+                    gpui::WindowBounds::Windowed(bounds)
+                    | gpui::WindowBounds::Maximized(bounds)
+                    | gpui::WindowBounds::Fullscreen(bounds) => bounds,
+                };
+                let tuple = (
+                    match bounds {
+                        gpui::WindowBounds::Windowed(_) => "Windowed".to_string(),
+                        gpui::WindowBounds::Maximized(_) => "Maximized".to_string(),
+                        gpui::WindowBounds::Fullscreen(_) => "FullScreen".to_string(),
+                    },
+                    f32::from(b.origin.x).round() as i32,
+                    f32::from(b.origin.y).round() as i32,
+                    f32::from(b.size.width).round() as i32,
+                    f32::from(b.size.height).round() as i32,
+                    workspace.display,
+                );
+                state.window_state.lock().insert(workspace.id, tuple);
+            }
+            state
+                .centered_layout
+                .lock()
+                .insert(workspace.id, workspace.centered_layout);
+            state
+                .remote_connections
+                .lock()
+                .insert(workspace.id, remote_id);
+        }
+
+        pub(crate) async fn update_timestamp(&self, workspace_id: WorkspaceId) -> Result<()> {
+            let state = WasmPersistence::global();
+            let ts = Utc::now()
+                .format("%Y-%m-%d %H:%M:%S")
+                .to_string();
+            state.workspace_timestamps.lock().insert(workspace_id, ts);
+            Ok(())
+        }
+
+        pub(crate) async fn set_window_open_status(
+            &self,
+            workspace_id: WorkspaceId,
+            bounds: super::SerializedWindowBounds,
+            display: Uuid,
+        ) -> Result<()> {
+            let state = WasmPersistence::global();
+            let b = match bounds.0 {
+                gpui::WindowBounds::Windowed(b) | gpui::WindowBounds::Maximized(b) | gpui::WindowBounds::Fullscreen(b) => b,
+            };
+            let tuple = (
+                match bounds.0 {
+                    gpui::WindowBounds::Windowed(_) => "Windowed".to_string(),
+                    gpui::WindowBounds::Maximized(_) => "Maximized".to_string(),
+                    gpui::WindowBounds::Fullscreen(_) => "FullScreen".to_string(),
+                },
+                f32::from(b.origin.x).round() as i32,
+                f32::from(b.origin.y).round() as i32,
+                f32::from(b.size.width).round() as i32,
+                f32::from(b.size.height).round() as i32,
+                Some(display),
+            );
+            state.window_state.lock().insert(workspace_id, tuple);
+            Ok(())
+        }
+
+        pub(crate) async fn set_centered_layout(
+            &self,
+            workspace_id: WorkspaceId,
+            centered_layout: bool,
+        ) -> Result<()> {
+            WasmPersistence::global()
+                .centered_layout
+                .lock()
+                .insert(workspace_id, centered_layout);
+            Ok(())
+        }
+
+        pub(crate) async fn set_session_id(
+            &self,
+            workspace_id: WorkspaceId,
+            session_id: Option<String>,
+        ) -> Result<()> {
+            let state = WasmPersistence::global();
+            let window_id = state
+                .session_bindings
+                .lock()
+                .get(&workspace_id)
+                .cloned()
+                .map(|(_, w)| w);
+            state.session_bindings.lock().insert(
+                workspace_id,
+                (session_id, window_id.unwrap_or(None)),
+            );
+            Ok(())
+        }
+
+        pub(crate) async fn set_session_binding(
+            &self,
+            workspace_id: WorkspaceId,
+            session_id: Option<String>,
+            window_id: Option<u64>,
+        ) -> Result<()> {
+            WasmPersistence::global()
+                .session_bindings
+                .lock()
+                .insert(workspace_id, (session_id, window_id));
+            Ok(())
+        }
+
+        pub async fn set_toolchain(
+            &self,
+            _workspace_id: WorkspaceId,
+            _worktree_root_path: std::sync::Arc<std::path::Path>,
+            _relative_worktree_path: std::sync::Arc<util::rel_path::RelPath>,
+            _toolchain: language::Toolchain,
+        ) -> Result<()> {
+            Ok(())
+        }
+
+        pub(crate) async fn save_trusted_worktrees(
+            &self,
+            _trusted_worktrees: HashMap<Option<RemoteHostLocation>, HashSet<PathBuf>>,
+        ) -> Result<()> {
+            Ok(())
+        }
+
+        pub fn fetch_trusted_worktrees(&self) -> Result<DbTrustedPaths> {
+            Ok(DbTrustedPaths::default())
+        }
+
+        pub async fn clear_trusted_worktrees(&self) -> Result<()> {
+            Ok(())
+        }
+
+        pub async fn delete_workspace_by_id(&self, id: WorkspaceId) -> Result<()> {
+            let state = WasmPersistence::global();
+            state.workspaces.lock().remove(&id);
+            state.recent_order.lock().retain(|&workspace_id| workspace_id != id);
+            state
+                .workspaces_by_paths
+                .lock()
+                .retain(|_, workspace_id| *workspace_id != id);
+            state.session_bindings.lock().remove(&id);
+            state.window_state.lock().remove(&id);
+            state.centered_layout.lock().remove(&id);
+            state.workspace_timestamps.lock().remove(&id);
+
+            let (remote_id, still_used) = {
+                let mut workspace_connections = state.remote_connections.lock();
+                let remote_id = workspace_connections.remove(&id).flatten();
+                let still_used = remote_id.is_some_and(|remote_id| {
+                    workspace_connections
+                        .values()
+                        .any(|candidate| *candidate == Some(remote_id))
+                });
+                (remote_id, still_used)
+            };
+            if let Some(remote_id) = remote_id.filter(|_| !still_used) {
+                if let Some(options) = state.remote_options.lock().remove(&remote_id) {
+                    state.remote_ids.lock().remove(&options);
+                }
+            }
+            Ok(())
+        }
+
+        fn recent_workspaces(
+            &self,
+        ) -> Result<Vec<(WorkspaceId, PathList, Option<RemoteConnectionOptions>, DateTime<Utc>)>> {
+            let state = WasmPersistence::global();
+            let order = state.recent_order.lock();
+            let workspaces = state.workspaces.lock();
+            let remote_ids = state.remote_connections.lock();
+            let remote_options = state.remote_options.lock();
+            let timestamps = state.workspace_timestamps.lock();
+            let mut recent = Vec::new();
+            for &id in order.iter().rev() {
+                if let Some(workspace) = workspaces.get(&id) {
+                    let remote_options = remote_ids
+                        .get(&id)
+                        .copied()
+                        .flatten()
+                        .and_then(|remote_id| remote_options.get(&remote_id).cloned());
+                    let timestamp = timestamps
+                        .get(&id)
+                        .map(|timestamp| super::parse_timestamp(timestamp))
+                        .unwrap_or_else(Utc::now);
+                    recent.push((id, workspace.paths.clone(), remote_options, timestamp));
+                }
+            }
+            Ok(recent)
+        }
+
+        pub async fn recent_project_workspaces_ungrouped(
+            &self,
+            _fs: &dyn Fs,
+        ) -> Result<Vec<RecentWorkspace>> {
+            let recent = self.recent_workspaces()?;
+            Ok(recent
+                .into_iter()
+                .map(
+                    |(id, paths, remote_connection_options, timestamp)| RecentWorkspace {
+                        workspace_id: id,
+                        location: match remote_connection_options.as_ref() {
+                            Some(options) => {
+                                SerializedWorkspaceLocation::Remote(options.display_name())
+                            }
+                            None => SerializedWorkspaceLocation::Local,
+                        },
+                        remote_connection_options,
+                        paths: paths.clone(),
+                        identity_paths: paths,
+                        timestamp,
+                    },
+                )
+                .collect())
+        }
+
+        pub async fn recent_project_workspaces(
+            &self,
+            fs: &dyn Fs,
+        ) -> Result<Vec<RecentWorkspace>> {
+            self.recent_project_workspaces_ungrouped(fs)
+                .await
+        }
+
+        pub async fn delete_recent_workspace_group(
+            &self,
+            _target: &RecentWorkspace,
+        ) -> Result<Vec<WorkspaceId>> {
+            Ok(Vec::new())
+        }
+
+        pub async fn garbage_collect_workspaces(
+            &self,
+            _fs: &dyn Fs,
+            _current_session_id: &str,
+            _last_session_id: Option<&str>,
+        ) -> Result<()> {
+            Ok(())
+        }
+
+        pub async fn last_workspace(
+            &self,
+            fs: &dyn Fs,
+        ) -> Result<Option<RecentWorkspace>> {
+            Ok(self
+                .recent_project_workspaces(fs)
+                .await?
+                .into_iter()
+                .next())
+        }
+
+        pub async fn last_session_workspace_locations(
+            &self,
+            last_session_id: &str,
+            last_session_window_stack: Option<Vec<WindowId>>,
+            _fs: &dyn Fs,
+        ) -> Result<Vec<SessionWorkspace>> {
+            let state = WasmPersistence::global();
+            let bindings = state.session_bindings.lock();
+            let workspaces = state.workspaces.lock();
+            let mut session_workspaces = bindings
+                .iter()
+                .filter_map(|(workspace_id, (session_id, window_id))| {
+                    (session_id.as_deref() == Some(last_session_id))
+                        .then(|| workspaces.get(workspace_id))
+                        .flatten()
+                        .map(|workspace| SessionWorkspace {
+                            workspace_id: *workspace_id,
+                            location: workspace.location.clone(),
+                            paths: workspace.paths.clone(),
+                            window_id: window_id.map(WindowId::from),
+                        })
+                })
+                .collect::<Vec<_>>();
+
+            if let Some(stack) = last_session_window_stack {
+                session_workspaces.sort_by_key(|workspace| {
+                    workspace
+                        .window_id
+                        .and_then(|id| stack.iter().position(|&stack_id| stack_id == id))
+                        .unwrap_or(usize::MAX)
+                });
+            }
+
+            Ok(session_workspaces)
+        }
+
+        pub fn workspace_location(&self, workspace_id: WorkspaceId) -> Option<SerializedWorkspaceLocation> {
+            let state = WasmPersistence::global();
+            state
+                .workspaces
+                .lock()
+                .get(&workspace_id)
+                .map(|ws| ws.location.clone())
+        }
+
+        pub async fn get_or_create_remote_connection(
+            &self,
+            options: RemoteConnectionOptions,
+        ) -> Result<RemoteConnectionId> {
+            Ok(WasmPersistence::global().remote_connection_id(options))
+        }
+
+        pub(crate) fn remote_connection(
+            &self,
+            id: RemoteConnectionId,
+        ) -> Result<RemoteConnectionOptions> {
+            WasmPersistence::global()
+                .remote_options
+                .lock()
+                .get(&id)
+                .cloned()
+                .ok_or_else(|| anyhow::anyhow!("unknown remote connection {}", id.0))
+        }
+    }
+    #[derive(Default)]
+    struct WasmWelcomePages(Mutex<HashMap<(u64, WorkspaceId), bool>>);
+    // WelcomePagesDb shim (declared in welcome.rs `mod persistence`)
+    // ---------------------------------------------------------------
+
+    static WASM_WELCOME_PAGES: LazyLock<WasmWelcomePages> =
+        LazyLock::new(WasmWelcomePages::default);
+
+    pub struct WelcomePagesDb;
+
+    impl Clone for WelcomePagesDb {
+        fn clone(&self) -> Self {
+            WelcomePagesDb
+        }
+    }
+
+    impl std::ops::Deref for WelcomePagesDb {
+        type Target = ();
+        fn deref(&self) -> &Self::Target {
+            &()
+        }
+    }
+
+    impl WelcomePagesDb {
+        pub fn global(_cx: &App) -> Self {
+            WelcomePagesDb
+        }
+
+        /// wasm shim for `query! { pub async fn save_welcome_page(...) }`.
+        /// Stores the (item_id, workspace_id) -> is_open mapping in memory.
+        pub async fn save_welcome_page(
+            &self,
+            item_id: crate::ItemId,
+            workspace_id: WorkspaceId,
+            is_open: bool,
+        ) -> Result<()> {
+            WASM_WELCOME_PAGES
+                .0
+                .lock()
+                .insert((item_id, workspace_id), is_open);
+            Ok(())
+        }
+
+        /// wasm shim for `query! { pub fn get_welcome_page(...) }`.
+        /// Returns `Ok(is_open)` if the item was saved this session, else `Err`.
+        pub fn get_welcome_page(
+            &self,
+            item_id: crate::ItemId,
+            workspace_id: WorkspaceId,
+        ) -> Result<bool> {
+            WASM_WELCOME_PAGES
+                .0
+                .lock()
+                .get(&(item_id, workspace_id))
+                .copied()
+                .ok_or_else(|| anyhow::anyhow!("welcome page not persisted"))
+        }
+    }
+
+    /// Remove serialized welcome pages that are no longer alive. Editor and
+    /// terminal persistence own their separate in-memory stores.
+    pub fn delete_unloaded_items(
+        alive_items: Vec<crate::ItemId>,
+        workspace_id: WorkspaceId,
+        table: &'static str,
+        _db: &(),
+        _cx: &mut App,
+    ) -> gpui::Task<Result<()>> {
+        if table == "welcome_pages" {
+            WASM_WELCOME_PAGES.0.lock().retain(|(item_id, saved_workspace_id), _| {
+                *saved_workspace_id != workspace_id || alive_items.contains(item_id)
+            });
+        }
+        gpui::Task::ready(Ok(()))
+    }
+
+
+    // ---------------------------------------------------------------
+    // Free-function shims for wasm. Signatures must match native free fns
+    // that persistence re-exports; the KVP-backed ones already work via the
+    // wasm KeyValueStore, so we only re-export here to keep the module
+    // self-contained in case native callers import through wasm_persistence.
+    // (Not actually called from the crate — provided for symmetry.)
+    // ---------------------------------------------------------------
+    pub use crate::persistence::{
+        read_default_dock_state, read_default_window_bounds,
+        write_default_dock_state, write_default_window_bounds,
+        write_multi_workspace_state,
+    };
+    pub use crate::persistence::{
+        WindowBoundsJson,
+    };
+}
+
+#[cfg(target_family = "wasm")]
+pub use wasm_persistence::*;
 
 // #[cfg(test)]

@@ -555,6 +555,7 @@ impl crate::SerializableItem for WelcomePage {
     }
 }
 
+#[cfg(not(target_family = "wasm"))]
 mod persistence {
     use crate::WorkspaceDb;
     use db::{
@@ -606,6 +607,10 @@ mod persistence {
             }
         }
     }
+}
+#[cfg(target_family = "wasm")]
+mod persistence {
+    pub use crate::persistence::WelcomePagesDb;
 }
 
 fn project_name(paths: &PathList) -> String {

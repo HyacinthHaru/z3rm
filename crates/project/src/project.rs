@@ -724,6 +724,7 @@ impl Project {
     }
 
     /// Create an interactive terminal using the configured shell.
+    #[cfg(not(target_family = "wasm"))]
     pub fn create_terminal_shell(
         &self,
         working_directory: Option<std::path::PathBuf>,
@@ -754,7 +755,20 @@ impl Project {
         })
     }
 
+    /// Return an explicit error because browser builds have no local PTY.
+    #[cfg(target_family = "wasm")]
+    pub fn create_terminal_shell(
+        &self,
+        _working_directory: Option<std::path::PathBuf>,
+        _cx: &mut Context<Self>,
+    ) -> Task<anyhow::Result<gpui::Entity<terminal::Terminal>>> {
+        Task::ready(Err(anyhow::anyhow!(
+            "local terminal shells are unavailable in the browser"
+        )))
+    }
+
     /// Clone an existing terminal, preserving its shell and terminal settings.
+    #[cfg(not(target_family = "wasm"))]
     pub fn clone_terminal(
         &self,
         terminal: &gpui::Entity<terminal::Terminal>,
@@ -766,6 +780,17 @@ impl Project {
             let builder = builder.await?;
             Ok(cx.new(|cx| builder.subscribe(cx)))
         })
+    }
+    #[cfg(target_family = "wasm")]
+    pub fn clone_terminal(
+        &self,
+        _terminal: &gpui::Entity<terminal::Terminal>,
+        _cx: &mut Context<Self>,
+        _working_directory: Option<std::path::PathBuf>,
+    ) -> Task<anyhow::Result<gpui::Entity<terminal::Terminal>>> {
+        Task::ready(Err(anyhow::anyhow!(
+            "cloning local terminals is unavailable in the browser"
+        )))
     }
 
     pub fn is_via_collab(&self) -> bool {
@@ -800,6 +825,7 @@ impl Project {
     }
 
     /// Create a terminal that runs a task and reports its exit status to the view.
+    #[cfg(not(target_family = "wasm"))]
     pub fn create_terminal_task(
         &mut self,
         task: SpawnInTerminal,
@@ -860,6 +886,16 @@ impl Project {
             let builder = builder.await?;
             Ok(cx.new(|cx| builder.subscribe(cx)))
         })
+    }
+    #[cfg(target_family = "wasm")]
+    pub fn create_terminal_task(
+        &mut self,
+        _task: SpawnInTerminal,
+        _cx: &mut Context<Self>,
+    ) -> Task<anyhow::Result<gpui::Entity<terminal::Terminal>>> {
+        Task::ready(Err(anyhow::anyhow!(
+            "local terminal tasks are unavailable in the browser"
+        )))
     }
 
     /// Local projects use the same configured shell as their regular terminal.
