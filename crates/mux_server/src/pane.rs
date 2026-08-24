@@ -94,6 +94,11 @@ pub struct Pane {
     pty_writer: Arc<Mutex<Box<dyn Write + Send>>>,
     /// §3.5 child 进程 handle (用于 kill/wait)。
     child: Arc<Mutex<Option<ChildBox>>>,
+    /// §3.1 What the native reader thread owns on its stack. There is no
+    /// reader thread in the browser: bytes arrive through
+    /// `push_guest_output`, so the same state lives here instead.
+    #[cfg(target_family = "wasm")]
+    guest_output_state: parking_lot::Mutex<(Dec2026Parser, AdaptiveCoalescer, ReadLoopState)>,
     /// §3.3 event 收集: alacritty 事件 → main loop。
     pub events: Arc<parking_lot::Mutex<Vec<AlacEvent>>>,
     /// §3.3 Pane notification subscribers keyed by attached client identity.
@@ -870,6 +875,12 @@ impl Pane {
             exit_hook: parking_lot::Mutex::new(None),
             clipboard_hook: parking_lot::Mutex::new(None),
             notification_hook: parking_lot::Mutex::new(None),
+            #[cfg(target_family = "wasm")]
+            guest_output_state: parking_lot::Mutex::new((
+                Dec2026Parser::new(),
+                AdaptiveCoalescer::new(),
+                ReadLoopState::default(),
+            )),
         });
 
         // §3.1 启动 PTY read loop — 后台线程持续读取 PTY 输出, 喂给 alacritty,
@@ -3258,4 +3269,35 @@ fn poll_fd_readable(fd: i32, timeout_ms: i32) -> bool {
 #[cfg(not(unix))]
 fn poll_fd_readable(_fd: i32, _timeout_ms: i32) -> bool {
     true
+}
+
+#[cfg(target_family = "wasm")]
+impl Pane {
+    /// §3.1 Feed bytes the guest produced into the emulator.
+    ///
+    /// This is the browser's equivalent of one `read()` returning in the
+    /// native reader thread, and it runs the identical path: same parser, same
+    /// coalescer, same dirty-row accounting, so a pane's generation advances
+    /// and `PaneDirty` fires exactly as it does on a real pty.
+    pub fn push_guest_output(self: &Arc<Self>, bytes: &[u8]) {
+        if bytes.is_empty() {
+            return;
+        }
+        // The lock is per pane and only this entry point takes it, so a guest
+        // callback re-entering while a batch is in flight would be a bug in the
+        // bridge rather than contention to wait on.
+        let Some(mut state) = self.guest_output_state.try_lock() else {
+            tracing::warn!(pane_id = %self.id, "guest output arrived while a batch was still being processed; dropped");
+            return;
+        };
+        let (dec, coalescer, read_loop) = &mut *state;
+        self.process_pty_bytes(bytes, dec, coalescer, read_loop);
+    }
+
+    /// §3.1 The sink carrying this pane's writes toward the guest.
+    ///
+    /// Installed by the JS bridge once the emulator's serial input is ready.
+    pub fn set_guest_input_handler(&self, handler: Box<dyn Fn(&[u8])>) {
+        self.pty_master.lock().set_input_handler(handler);
+    }
 }

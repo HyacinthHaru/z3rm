@@ -467,7 +467,7 @@ async fn read_envelope(
 }
 
 /// §9 分发 Envelope 到请求/通知处理器
-async fn dispatch_envelope(
+pub(crate) async fn dispatch_envelope(
     envelope: &Envelope,
     sessions: &Arc<parking_lot::RwLock<Vec<crate::session::Session>>>,
     outbound_tx: &mpsc::UnboundedSender<Envelope>,

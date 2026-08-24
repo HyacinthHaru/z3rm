@@ -228,6 +228,15 @@ pub mod mpsc {
             use futures::StreamExt as _;
             self.0.next().await
         }
+
+        /// Takes a value only if one is already queued.
+        pub fn try_recv(&mut self) -> Option<T> {
+            match self.0.try_next() {
+                Ok(value) => value,
+                // Empty, or closed with nothing left: both mean "nothing now".
+                Err(_) => None,
+            }
+        }
     }
 
     pub fn unbounded_channel<T>() -> (UnboundedSender<T>, UnboundedReceiver<T>) {

@@ -23,6 +23,8 @@ pub mod pty;
 pub mod rt;
 #[cfg(target_family = "wasm")]
 mod wasm_stubs;
+#[cfg(target_family = "wasm")]
+pub mod wasm_server;
 mod server_settings;
 
 pub mod clipboard;
