@@ -172,6 +172,7 @@ impl WgpuContext {
         } else {
             wgpu::Instance::new(descriptor)
         };
+
         let surface = instance
             .create_surface(wgpu::SurfaceTarget::Canvas(canvas.clone()))
             .map_err(|error| {

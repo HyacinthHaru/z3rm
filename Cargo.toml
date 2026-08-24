@@ -440,6 +440,9 @@ path = "crates/mux"
 [workspace.dependencies.mux_protocol]
 path = "crates/mux_protocol"
 
+[workspace.dependencies.mux_server]
+path = "crates/mux_server"
+
 [workspace.dependencies.net]
 path = "crates/net"
 

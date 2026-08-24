@@ -391,3 +391,213 @@ impl TryFrom<mux_protocol::LayoutNode> for LayoutNode {
 }
 
 // #[cfg(test)]
+
+// ============================================================================
+// §15.4 / §15.12 Client-side projection of one authoritative attach snapshot
+// ============================================================================
+
+/// §15.4 / §15.12 Client-side projection of one authoritative attach snapshot.
+#[derive(Clone, Default)]
+pub struct MuxSnapshot {
+    /// The layout tree the server handed back, if this session has one.
+    pub layout: Option<LayoutTree>,
+    /// Which pane the server considers focused.
+    pub focused_pane: Option<String>,
+    /// Per-pane zoom state, seeded without a second round trip.
+    pub zoomed: HashMap<String, bool>,
+    /// Every pane in the snapshot, in layout order when there is a layout.
+    pub pane_ids: Vec<String>,
+    /// Kept verbatim because the sidebar needs the tab dimension, which the
+    /// layout tree does not model.
+    pub session: Option<mux_protocol::SessionSnapshot>,
+}
+
+impl MuxSnapshot {
+    /// Project the snapshot carried by an attach response.
+    pub fn from_attach(response: &mux_protocol::AttachResponse) -> Self {
+        let Some(snapshot) = response.snapshot.as_ref() else {
+            return Self::default();
+        };
+        let layout = snapshot.layout.as_ref().map(LayoutTree::from_proto);
+        let pane_ids = match &layout {
+            Some(layout) => layout.pane_ids(),
+            None => snapshot
+                .tabs
+                .iter()
+                .flat_map(|tab| tab.panes.iter().map(|pane| pane.id.clone()))
+                .collect(),
+        };
+        Self {
+            layout,
+            focused_pane: (!snapshot.focused_pane_id.is_empty())
+                .then(|| snapshot.focused_pane_id.clone()),
+            zoomed: snapshot
+                .tabs
+                .iter()
+                .flat_map(|tab| tab.panes.iter().map(|pane| (pane.id.clone(), pane.zoomed)))
+                .collect(),
+            pane_ids,
+            session: Some(snapshot.clone()),
+        }
+    }
+}
+
+/// §15.4 / §15.12 Project the authoritative server layout into a workspace:
+/// one GPUI pane per server pane.
+///
+/// Both clients project the same snapshot the same way; they differ only in
+/// what a pane view is, so that is the one thing they pass in. `build_pane_item`
+/// is handed the pane id the server minted and returns the item to add.
+///
+/// Must run inside the `cx.new(|cx| Workspace::new(..))` closure — items added
+/// after the workspace is constructed never reach the render tree.
+pub fn install_snapshot_panes(
+    workspace: &mut crate::Workspace,
+    snapshot: &MuxSnapshot,
+    mut build_pane_item: impl FnMut(
+        &mut crate::Workspace,
+        String,
+        &mut gpui::Window,
+        &mut gpui::Context<crate::Workspace>,
+    ) -> Box<dyn crate::ItemHandle>,
+    window: &mut gpui::Window,
+    cx: &mut gpui::Context<crate::Workspace>,
+) {
+    match &snapshot.layout {
+        Some(layout) => {
+            // The zoom pass below needs to know which pane holds which id, and
+            // the layout walk is the only place that pairing exists.
+            let mut panes_by_id: Vec<(String, gpui::Entity<crate::Pane>)> = Vec::new();
+            workspace.apply_initial_layout(
+                layout,
+                snapshot.focused_pane.as_deref(),
+                |workspace, window, cx| workspace.add_pane_for_layout(window, cx),
+                |workspace, pane, pane_id, window, cx| {
+                    panes_by_id.push((pane_id.clone(), pane.clone()));
+                    let item = build_pane_item(workspace, pane_id, window, cx);
+                    workspace.add_item(pane.clone(), item, None, true, true, window, cx);
+                },
+                window,
+                cx,
+            );
+
+            // §15.4 seed zoom from PaneInfo without re-RPC.
+            for (pane_id, pane) in panes_by_id {
+                if snapshot.zoomed.get(&pane_id) == Some(&true) {
+                    workspace.set_pane_zoomed(pane, true, window, cx);
+                }
+            }
+        }
+        None => {
+            // No layout tree: single default pane with all views as tabs.
+            let pane = workspace.active_pane().clone();
+            pane.update(cx, |pane, _| {
+                pane.set_should_display_welcome_page(false);
+            });
+            let pane_ids = if snapshot.pane_ids.is_empty() {
+                vec!["default".to_string()]
+            } else {
+                snapshot.pane_ids.clone()
+            };
+            for (index, pane_id) in pane_ids.into_iter().enumerate() {
+                let item = build_pane_item(workspace, pane_id, window, cx);
+                workspace.add_item(pane.clone(), item, None, index == 0, true, window, cx);
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod mux_snapshot_tests {
+    use super::MuxSnapshot;
+
+    fn pane(id: &str, zoomed: bool) -> mux_protocol::PaneInfo {
+        mux_protocol::PaneInfo {
+            id: id.to_string(),
+            zoomed,
+            ..Default::default()
+        }
+    }
+
+    fn snapshot(tabs: Vec<mux_protocol::TabInfo>) -> mux_protocol::AttachResponse {
+        mux_protocol::AttachResponse {
+            snapshot: Some(mux_protocol::SessionSnapshot {
+                tabs,
+                ..Default::default()
+            }),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn a_response_without_a_snapshot_projects_to_nothing() {
+        let projected = MuxSnapshot::from_attach(&mux_protocol::AttachResponse::default());
+        assert!(projected.pane_ids.is_empty());
+        assert!(projected.layout.is_none());
+        assert!(projected.session.is_none());
+    }
+
+    #[test]
+    fn without_a_layout_the_panes_come_from_the_tabs_in_order() {
+        // The tab dimension is the only place pane ids appear when the server
+        // has not built a layout tree yet.
+        let response = snapshot(vec![
+            mux_protocol::TabInfo {
+                id: "tab-0".into(),
+                panes: vec![pane("a", false), pane("b", true)],
+                ..Default::default()
+            },
+            mux_protocol::TabInfo {
+                id: "tab-1".into(),
+                panes: vec![pane("c", false)],
+                ..Default::default()
+            },
+        ]);
+
+        let projected = MuxSnapshot::from_attach(&response);
+
+        assert_eq!(projected.pane_ids, vec!["a", "b", "c"]);
+        assert_eq!(projected.zoomed.get("b"), Some(&true));
+        assert_eq!(projected.zoomed.get("a"), Some(&false));
+    }
+
+    #[test]
+    fn with_a_layout_the_panes_come_from_the_tree() {
+        // Panes the layout does not place are not rendered, so a tab-only pane
+        // must not reach `pane_ids`.
+        let mut response = snapshot(vec![mux_protocol::TabInfo {
+            id: "tab-0".into(),
+            panes: vec![pane("placed", false), pane("unplaced", false)],
+            ..Default::default()
+        }]);
+        response.snapshot.as_mut().unwrap().layout = Some(mux_protocol::LayoutTree {
+            root: Some(mux_protocol::LayoutNode {
+                id: "node-0".into(),
+                node: Some(mux_protocol::layout_node::Node::Pane(
+                    mux_protocol::PaneLeaf {
+                        pane_id: "placed".into(),
+                    },
+                )),
+            }),
+            ..Default::default()
+        });
+
+        let projected = MuxSnapshot::from_attach(&response);
+
+        assert_eq!(projected.pane_ids, vec!["placed"]);
+        assert!(projected.layout.is_some());
+    }
+
+    #[test]
+    fn an_empty_focused_pane_id_is_no_focus() {
+        let mut response = snapshot(vec![]);
+        response.snapshot.as_mut().unwrap().focused_pane_id = String::new();
+        assert!(MuxSnapshot::from_attach(&response).focused_pane.is_none());
+
+        response.snapshot.as_mut().unwrap().focused_pane_id = "a".into();
+        assert_eq!(
+            MuxSnapshot::from_attach(&response).focused_pane.as_deref(),
+            Some("a")
+        );
+    }
+}

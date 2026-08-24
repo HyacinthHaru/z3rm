@@ -24,6 +24,7 @@
       canvas { position: fixed; inset: 0; z-index: 2; display: block; width: 100%; height: 100%; touch-action: none; outline: none; user-select: none; }
       html:not(.gpui-ready) canvas { visibility: hidden; }
       html.gpui-ready #boot-terminal { display: none; }
+      #v86-screen { display: none; }
     </style>
   </head>
   <body>
@@ -31,5 +32,6 @@
       <pre id="boot-terminal-output">Booting z3rm Linux…&#10;</pre>
       <span id="boot-terminal-status" aria-live="polite">initializing</span>
     </main>
+    <div id="v86-screen" aria-hidden="true"></div>
   </body>
 </html>

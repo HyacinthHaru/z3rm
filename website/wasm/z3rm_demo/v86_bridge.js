@@ -108,6 +108,30 @@
     (0, eval)(source);
   };
 
+  const welcomeScript = [
+    "#!/bin/sh",
+    "clear",
+    "printf '\\033[1;36m'",
+    "echo '     _____ _____                 '",
+    "echo '    |__  /|___ / _ __ _ __ ___  '",
+    "echo '      / /   |_ \\| .__| ._ \\` _ \\\\ '",
+    "echo '     / /_ ___) | |  | | | | | |'",
+    "echo '    /____|____/|_|  |_| |_| |_|'",
+    "echo",
+    "printf '\\033[0m'",
+    "printf '\\033[1mYour shells outlive the window.\\033[0m\\n\\n'",
+    "echo 'This is a real Linux VM running in your browser.'",
+    "echo 'The terminal is rendered by Z3rm GPUI through the'",
+    "echo 'same mux protocol used in production.'",
+    "echo",
+    "printf '\\033[90m── try it ──────────────────────────────────\\033[0m\\n\\n'",
+    "printf '  \\033[33muname -a\\033[0m          kernel info\\n'",
+    "printf '  \\033[33mcat /proc/cpuinfo\\033[0m CPU details\\n'",
+    "printf '  \\033[33mfree -h\\033[0m           memory usage\\n'",
+    "printf '  \\033[33mls /mnt/\\033[0m          9p shared filesystem\\n\\n'",
+    "printf '\\033[90m───────────────────────────────────────────\\033[0m\\n\\n'",
+  ].join("\n");
+
   const boot = async () => {
     await ensureRuntime();
     if (typeof window.V86 !== "function") {
@@ -127,9 +151,31 @@
       disable_mouse: true,
       disable_speaker: true,
       serial_console: { type: "none" },
+      screen: { container: document.getElementById("v86-screen") || undefined },
       filesystem: {},
     });
-    emulator.add_listener("serial0-output-byte", onSerialByte);
+    let shellReady = false;
+    const promptPattern = /[#$%>] $/;
+    const detectPrompt = (byte) => {
+      onSerialByte(byte);
+      if (shellReady) return;
+      const node = terminal();
+      if (!node) return;
+      const tail = node.textContent.slice(-80);
+      if (promptPattern.test(tail)) {
+        shellReady = true;
+        emulator.create_file(
+          "welcome.sh",
+          new TextEncoder().encode(welcomeScript),
+        ).then(() => {
+          const cmd = "sh /mnt/welcome.sh\r";
+          emulator.serial_send_bytes(0, new TextEncoder().encode(cmd));
+        }).catch((error) => {
+          console.warn("welcome inject failed:", error);
+        });
+      }
+    };
+    emulator.add_listener("serial0-output-byte", detectPrompt);
     emulator.add_listener("emulator-ready", () => setStatus("ready"));
     emulator.add_listener("emulator-started", () => {
       flushInput();
@@ -172,7 +218,24 @@
   });
   readyObserver.observe(document.documentElement, { attributes: true });
 
-  boot().catch((error) => {
+  const waitForGpuiCanvas = () => new Promise((resolve) => {
+    const started = performance.now();
+    const poll = () => {
+      const gpuiCanvas = document.querySelector("body > canvas");
+      if (gpuiCanvas || performance.now() - started >= 3000) {
+        resolve();
+      } else {
+        requestAnimationFrame(poll);
+      }
+    };
+    if (document.readyState === "loading") {
+      addEventListener("DOMContentLoaded", poll, { once: true });
+    } else {
+      poll();
+    }
+  });
+
+  waitForGpuiCanvas().then(boot).catch((error) => {
     const message = error instanceof Error ? error.message : String(error);
     setStatus(`failed: ${message}`);
     console.error("failed to boot v86", error);
