@@ -29,9 +29,16 @@ postage.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 schemars.workspace = true
-smol.workspace = true
 util.workspace = true
 release_channel.workspace = true
+
+async-channel.workspace = true
+futures-lite.workspace = true
+
+# smol drags in async-io -> polling/rustix, which do not build for
+# wasm32-unknown-unknown. The browser never spawns a language server anyway.
+[target.'cfg(not(target_family = "wasm"))'.dependencies]
+smol.workspace = true
 
 [dev-dependencies]
 async-pipe.workspace = true
