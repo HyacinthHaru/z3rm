@@ -20,13 +20,15 @@ use alacritty_terminal::vte::ansi::{
 use anyhow::Context as _;
 use mux_protocol::Notification as MuxNotification;
 use parking_lot::Mutex;
-use portable_pty::{CommandBuilder, MasterPty, PtyPair, PtySize, PtySystem};
+#[cfg(not(target_family = "wasm"))]
+use portable_pty::{CommandBuilder, MasterPty, PtyPair, PtySystem};
+use crate::pty::{ChildBox, MasterPtyBox, PtySize};
 use std::collections::{HashMap, VecDeque};
 use std::io::{Read, Write};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::Instant;
-use tokio::sync::mpsc;
+use crate::rt::mpsc;
 
 /// §3.1 真正拥有 alacritty Term + PTY pair 的 Pane (server-canonical)。
 pub struct Pane {
@@ -87,11 +89,16 @@ pub struct Pane {
     scrollback_capacity: AtomicU64,
     history_version: AtomicU64,
     /// §3.1 PTY master (用于 resize / reader clone)。
-    pty_master: Arc<Mutex<Box<dyn MasterPty + Send>>>,
+    pty_master: Arc<Mutex<MasterPtyBox>>,
     /// §3.1 PTY writer (单一 writer)。
     pty_writer: Arc<Mutex<Box<dyn Write + Send>>>,
     /// §3.5 child 进程 handle (用于 kill/wait)。
-    child: Arc<Mutex<Option<Box<dyn portable_pty::Child + Send + Sync>>>>,
+    child: Arc<Mutex<Option<ChildBox>>>,
+    /// §3.1 What the native reader thread owns on its stack. There is no
+    /// reader thread in the browser: bytes arrive through
+    /// `push_guest_output`, so the same state lives here instead.
+    #[cfg(target_family = "wasm")]
+    guest_output_state: parking_lot::Mutex<(Dec2026Parser, AdaptiveCoalescer, ReadLoopState)>,
     /// §3.3 event 收集: alacritty 事件 → main loop。
     pub events: Arc<parking_lot::Mutex<Vec<AlacEvent>>>,
     /// §3.3 Pane notification subscribers keyed by attached client identity.
@@ -735,59 +742,91 @@ impl Pane {
         let size = TermSize::new(cols_usize, rows_usize);
         let term = Term::new(term_config, &size, listener);
 
-        // §3.1 打开 PTY pair
-        let pty_system: Box<dyn PtySystem + Send> = portable_pty::native_pty_system();
-        let pair: PtyPair = pty_system.openpty(PtySize {
-            rows: rows as u16,
-            cols: cols as u16,
-            pixel_width: 0,
-            pixel_height: 0,
-        })?;
+        #[cfg(not(target_family = "wasm"))]
+        let (pty_master, writer, child, master_raw_fd, reader) = {
+            // §3.1 打开 PTY pair
+            let pty_system: Box<dyn PtySystem + Send> = portable_pty::native_pty_system();
+            let pair: PtyPair = pty_system.openpty(PtySize {
+                rows: rows as u16,
+                cols: cols as u16,
+                pixel_width: 0,
+                pixel_height: 0,
+            })?;
 
-        // §3.10 构建 shell 命令 (默认用 user shell 或 /bin/sh)
-        let mut cmd = if let Some(ref c) = command {
-            let mut builder = CommandBuilder::new(&c.program);
-            for arg in &c.args {
-                builder.arg(arg);
+            // §3.10 构建 shell 命令 (默认用 user shell 或 /bin/sh)
+            let mut cmd = if let Some(ref c) = command {
+                let mut builder = CommandBuilder::new(&c.program);
+                for arg in &c.args {
+                    builder.arg(arg);
+                }
+                for (k, v) in &c.env {
+                    builder.env(k, v);
+                }
+                builder
+            } else {
+                // 默认: $SHELL, 若未设置则 /bin/sh
+                let shell = std::env::var("SHELL").unwrap_or_else(|_| "/bin/sh".to_string());
+                crate::shell_integration::default_shell_command(&shell)
+            };
+
+            // §3.1 设置 cwd
+            let cwd_path = if cwd.is_empty() {
+                dirs::home_dir().unwrap_or_else(|| std::path::PathBuf::from("/"))
+            } else {
+                std::path::PathBuf::from(&cwd)
+            };
+            cmd.cwd(cwd_path);
+
+            // §3.1 标准终端环境变量
+            cmd.env("TERM", "xterm-256color");
+            cmd.env("COLORTERM", "truecolor");
+            cmd.env("Z3RM_PANE_ID", &id);
+            cmd.env("Z3RM_PANE", &id);
+            if !session_id.is_empty() {
+                cmd.env("Z3RM_SESSION", &session_id);
             }
-            for (k, v) in &c.env {
-                builder.env(k, v);
-            }
-            builder
-        } else {
-            // 默认: $SHELL, 若未设置则 /bin/sh
-            let shell = std::env::var("SHELL").unwrap_or_else(|_| "/bin/sh".to_string());
-            crate::shell_integration::default_shell_command(&shell)
+
+            // §3.1 spawn 子进程
+            let child = pair.slave.spawn_command(cmd)?;
+
+            // §3.1 获取 reader / writer
+            let reader = pair.master.try_clone_reader()?;
+            let writer = pair.master.take_writer()?;
+            // §3.3 raw fd for poll-based BSU timeout (None on platforms without it).
+            let master_raw_fd = pair.master.as_raw_fd().map(|fd| fd as i32);
+
+            // slave 端已经不需要了 (drop 让 child 持有)
+            drop(pair.slave);
+            (
+                pair.master as crate::pty::MasterPtyBox,
+                writer,
+                Some(child as crate::pty::ChildBox),
+                master_raw_fd,
+                reader,
+            )
         };
 
-        // §3.1 设置 cwd
-        let cwd_path = if cwd.is_empty() {
-            dirs::home_dir().unwrap_or_else(|| std::path::PathBuf::from("/"))
-        } else {
-            std::path::PathBuf::from(&cwd)
+        // §3.1 The browser has no pty and no child: the guest's bytes are
+        // pushed in from JS (#56) and pane writes go back out the same way.
+        // `command` and `cwd` are the guest's business, not this side's.
+        #[cfg(target_family = "wasm")]
+        let (pty_master, writer, child, master_raw_fd) = {
+            let _ = (&command, &cwd);
+            let pty = crate::pty::WasmPty::new();
+            pty.resize(PtySize {
+                rows: rows as u16,
+                cols: cols as u16,
+                pixel_width: 0,
+                pixel_height: 0,
+            })?;
+            let writer = pty.writer();
+            (
+                Box::new(pty) as crate::pty::MasterPtyBox,
+                writer,
+                None::<crate::pty::ChildBox>,
+                None::<i32>,
+            )
         };
-        cmd.cwd(cwd_path);
-
-        // §3.1 标准终端环境变量
-        cmd.env("TERM", "xterm-256color");
-        cmd.env("COLORTERM", "truecolor");
-        cmd.env("Z3RM_PANE_ID", &id);
-        cmd.env("Z3RM_PANE", &id);
-        if !session_id.is_empty() {
-            cmd.env("Z3RM_SESSION", &session_id);
-        }
-
-        // §3.1 spawn 子进程
-        let child = pair.slave.spawn_command(cmd)?;
-
-        // §3.1 获取 reader / writer
-        let reader = pair.master.try_clone_reader()?;
-        let writer = pair.master.take_writer()?;
-        // §3.3 raw fd for poll-based BSU timeout (None on platforms without it).
-        let master_raw_fd = pair.master.as_raw_fd().map(|fd| fd as i32);
-
-        // slave 端已经不需要了 (drop 让 child 持有)
-        drop(pair.slave);
 
         let command_str = command
             .as_ref()
@@ -821,9 +860,9 @@ impl Pane {
             // A random non-zero authority epoch prevents a client from reusing
             // cached history after the daemon reconstructs this pane.
             history_version: AtomicU64::new(initial_history_version()),
-            pty_master: Arc::new(Mutex::new(pair.master)),
+            pty_master: Arc::new(Mutex::new(pty_master)),
             pty_writer: Arc::new(Mutex::new(writer)),
-            child: Arc::new(Mutex::new(Some(child))),
+            child: Arc::new(Mutex::new(child)),
             events,
             subscribers: Arc::new(parking_lot::RwLock::new(HashMap::new())),
             // §3.4 spawn_with_session 携带的 session_id 让 PTY read loop 在自然退出
@@ -836,11 +875,20 @@ impl Pane {
             exit_hook: parking_lot::Mutex::new(None),
             clipboard_hook: parking_lot::Mutex::new(None),
             notification_hook: parking_lot::Mutex::new(None),
+            #[cfg(target_family = "wasm")]
+            guest_output_state: parking_lot::Mutex::new((
+                Dec2026Parser::new(),
+                AdaptiveCoalescer::new(),
+                ReadLoopState::default(),
+            )),
         });
 
         // §3.1 启动 PTY read loop — 后台线程持续读取 PTY 输出, 喂给 alacritty,
         // 计算 dirty diff, bump generation。线程持有弱引用, pane drop 时自动结束。
+        #[cfg(not(target_family = "wasm"))]
         pane.clone().start_pty_read_loop(reader, master_raw_fd);
+        #[cfg(target_family = "wasm")]
+        let _ = master_raw_fd;
         Ok(pane)
     }
 
@@ -849,6 +897,7 @@ impl Pane {
     /// 该线程持续从 PTY 读取字节, 喂给 alacritty Term, 然后从 dirty_lines
     /// 提取变更行, 生成 GridDiff, push 到 ring 并 bump generation。
     /// Bump generation 后由 connection 层 fan-out PaneDirty 通知到所有 client。
+#[cfg(not(target_family = "wasm"))]
     fn start_pty_read_loop(
         self: Arc<Self>,
         mut reader: Box<dyn Read + Send>,
@@ -3220,4 +3269,35 @@ fn poll_fd_readable(fd: i32, timeout_ms: i32) -> bool {
 #[cfg(not(unix))]
 fn poll_fd_readable(_fd: i32, _timeout_ms: i32) -> bool {
     true
+}
+
+#[cfg(target_family = "wasm")]
+impl Pane {
+    /// §3.1 Feed bytes the guest produced into the emulator.
+    ///
+    /// This is the browser's equivalent of one `read()` returning in the
+    /// native reader thread, and it runs the identical path: same parser, same
+    /// coalescer, same dirty-row accounting, so a pane's generation advances
+    /// and `PaneDirty` fires exactly as it does on a real pty.
+    pub fn push_guest_output(self: &Arc<Self>, bytes: &[u8]) {
+        if bytes.is_empty() {
+            return;
+        }
+        // The lock is per pane and only this entry point takes it, so a guest
+        // callback re-entering while a batch is in flight would be a bug in the
+        // bridge rather than contention to wait on.
+        let Some(mut state) = self.guest_output_state.try_lock() else {
+            tracing::warn!(pane_id = %self.id, "guest output arrived while a batch was still being processed; dropped");
+            return;
+        };
+        let (dec, coalescer, read_loop) = &mut *state;
+        self.process_pty_bytes(bytes, dec, coalescer, read_loop);
+    }
+
+    /// §3.1 The sink carrying this pane's writes toward the guest.
+    ///
+    /// Installed by the JS bridge once the emulator's serial input is ready.
+    pub fn set_guest_input_handler(&self, handler: Box<dyn Fn(&[u8])>) {
+        self.pty_master.lock().set_input_handler(handler);
+    }
 }

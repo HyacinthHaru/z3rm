@@ -7553,6 +7553,7 @@ dependencies = [
  "dirs",
  "flate2",
  "futures",
+ "gloo-timers",
  "http_client",
  "interprocess",
  "libc",
@@ -7577,6 +7578,7 @@ dependencies = [
  "tokio",
  "tracing",
  "walkdir",
+ "wasm-bindgen-futures",
  "zlog",
  "zlog_settings",
 ]
