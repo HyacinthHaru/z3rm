@@ -1,17 +1,28 @@
+#[cfg(not(target_family = "wasm"))]
 use crate::{
     RemoteArch, RemoteClientDelegate, RemoteOs, RemotePlatform,
     remote_client::{CommandTemplate, Interactive, RemoteConnection, RemoteConnectionOptions},
     transport::{parse_platform, parse_shell},
 };
+#[cfg(not(target_family = "wasm"))]
 use anyhow::{Context, Result, anyhow, bail};
+#[cfg(not(target_family = "wasm"))]
 use async_trait::async_trait;
+#[cfg(not(target_family = "wasm"))]
 use collections::HashMap;
+#[cfg(not(target_family = "wasm"))]
 use futures::channel::mpsc::{Sender, UnboundedReceiver, UnboundedSender};
+#[cfg(not(target_family = "wasm"))]
 use gpui::{App, AppContext as _, AsyncApp, Task};
+#[cfg(not(target_family = "wasm"))]
 use release_channel::{AppVersion, ReleaseChannel};
+#[cfg(not(target_family = "wasm"))]
 use rpc::proto::Envelope;
+#[cfg(not(target_family = "wasm"))]
 use semver::Version;
+#[cfg(not(target_family = "wasm"))]
 use smol::fs;
+#[cfg(not(target_family = "wasm"))]
 use std::{
     ffi::OsStr,
     fmt::Write as _,
@@ -20,6 +31,7 @@ use std::{
     time::Instant,
 };
 
+#[cfg(not(target_family = "wasm"))]
 use util::{
     command::Stdio,
     paths::{PathStyle, RemotePathBuf},
@@ -45,6 +57,7 @@ impl From<settings::WslConnection> for WslConnectionOptions {
     }
 }
 
+#[cfg(not(target_family = "wasm"))]
 #[derive(Debug)]
 pub(crate) struct WslRemoteConnection {
     remote_binary_path: Option<Arc<RelPath>>,
@@ -57,6 +70,7 @@ pub(crate) struct WslRemoteConnection {
     connection_options: WslConnectionOptions,
 }
 
+#[cfg(not(target_family = "wasm"))]
 impl WslRemoteConnection {
     pub(crate) async fn new(
         connection_options: WslConnectionOptions,
@@ -352,6 +366,7 @@ impl WslRemoteConnection {
 }
 
 #[async_trait(?Send)]
+#[cfg(not(target_family = "wasm"))]
 impl RemoteConnection for WslRemoteConnection {
     fn start_proxy(
         &self,
@@ -564,6 +579,7 @@ impl RemoteConnection for WslRemoteConnection {
 
 /// `wslpath` is a executable available in WSL, it's a linux binary.
 /// So it doesn't support Windows style paths.
+#[cfg(not(target_family = "wasm"))]
 async fn sanitize_path(path: &Path) -> Result<String> {
     let path = smol::fs::canonicalize(path)
         .await
@@ -574,6 +590,7 @@ async fn sanitize_path(path: &Path) -> Result<String> {
     Ok(sanitized.replace('\\', "/"))
 }
 
+#[cfg(not(target_family = "wasm"))]
 fn run_wsl_command_with_output_impl(
     options: &WslConnectionOptions,
     program: &str,
@@ -592,6 +609,7 @@ fn run_wsl_command_with_output_impl(
     }
 }
 
+#[cfg(not(target_family = "wasm"))]
 impl WslConnectionOptions {
     pub fn abs_windows_path_to_wsl_path(
         &self,
@@ -605,6 +623,7 @@ impl WslConnectionOptions {
     }
 }
 
+#[cfg(not(target_family = "wasm"))]
 async fn windows_path_to_wsl_path_impl(
     options: &WslConnectionOptions,
     source: &Path,
@@ -629,6 +648,7 @@ pub fn wsl_path_to_windows_path(
     }
 }
 
+#[cfg(not(target_family = "wasm"))]
 fn run_wsl_command_impl(
     mut command: util::command::Command,
 ) -> impl Future<Output = Result<String>> {
@@ -653,6 +673,7 @@ fn run_wsl_command_impl(
 /// Creates a new `wsl.exe` command that runs the given program with the given arguments.
 ///
 /// If `exec` is true, the command will be executed in the WSL environment without spawning a new shell.
+#[cfg(not(target_family = "wasm"))]
 fn wsl_command_impl(
     options: &WslConnectionOptions,
     program: &str,

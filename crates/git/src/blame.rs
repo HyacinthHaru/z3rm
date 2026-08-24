@@ -1,16 +1,24 @@
 use crate::Oid;
+#[cfg(not(target_family = "wasm"))]
 use crate::commit::{get_messages, get_tag_names};
+#[cfg(not(target_family = "wasm"))]
 use crate::repository::{GitBinary, RepoPath};
 use anyhow::{Context as _, Result};
-use collections::{HashMap, HashSet};
+use collections::HashMap;
+#[cfg(not(target_family = "wasm"))]
+use collections::HashSet;
+#[cfg(not(target_family = "wasm"))]
+use futures::io::{AsyncBufReadExt, AsyncReadExt, BufReader};
+#[cfg(not(target_family = "wasm"))]
 use futures::{AsyncWriteExt, TryFutureExt, try_join};
 use serde::{Deserialize, Serialize};
-use smol::io::{AsyncBufReadExt, AsyncReadExt, BufReader};
 use std::ops::Range;
+#[cfg(not(target_family = "wasm"))]
 use text::{LineEnding, Rope};
 use time::OffsetDateTime;
 use time::UtcOffset;
 use time::macros::format_description;
+#[cfg(not(target_family = "wasm"))]
 use util::command::Stdio;
 
 #[derive(Debug, Clone, Default)]
@@ -20,6 +28,7 @@ pub struct Blame {
     pub tag_names: HashMap<Oid, Vec<String>>,
 }
 
+#[cfg(not(target_family = "wasm"))]
 impl Blame {
     pub(crate) async fn for_path(
         git: &GitBinary,
@@ -63,6 +72,7 @@ const GIT_BLAME_NO_COMMIT_ERROR: &str = "fatal: no such ref: HEAD";
 const GIT_BLAME_NO_PATH: &str = "fatal: no such path";
 const BLAME_PARSE_YIELD_INTERVAL: usize = 512;
 
+#[cfg(not(target_family = "wasm"))]
 async fn run_git_blame(
     git: &GitBinary,
     path: &RepoPath,
@@ -123,7 +133,7 @@ async fn run_git_blame(
             lines_read += 1;
 
             if lines_read % BLAME_PARSE_YIELD_INTERVAL == 0 {
-                smol::future::yield_now().await;
+                futures_lite::future::yield_now().await;
             }
         }
 
@@ -283,12 +293,14 @@ impl BlameEntry {
 //    filename index.js
 //
 // More about `--incremental` output: https://mirrors.edge.kernel.org/pub/software/scm/git/docs/git-blame.html
+#[cfg(not(target_family = "wasm"))]
 struct GitBlameParser {
     entries: Vec<BlameEntry>,
     index: HashMap<Oid, usize>,
     current_entry: Option<BlameEntry>,
 }
 
+#[cfg(not(target_family = "wasm"))]
 impl GitBlameParser {
     fn new() -> Self {
         Self {

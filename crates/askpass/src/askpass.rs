@@ -2,29 +2,39 @@ mod encrypted_password;
 
 pub use encrypted_password::{EncryptedPassword, IKnowWhatIAmDoingAndIHaveReadTheDocs};
 
+#[cfg(not(target_family = "wasm"))]
 use net::async_net::UnixListener;
+#[cfg(not(target_family = "wasm"))]
 use smol::lock::Mutex;
-#[cfg(not(target_os = "windows"))]
+#[cfg(all(not(target_os = "windows"), not(target_family = "wasm")))]
 use util::fs::make_file_executable;
 
+#[cfg(not(target_family = "wasm"))]
 use std::ffi::OsStr;
+#[cfg(not(target_family = "wasm"))]
 use std::ops::ControlFlow;
+#[cfg(not(target_family = "wasm"))]
 use std::sync::Arc;
+#[cfg(not(target_family = "wasm"))]
 use std::sync::OnceLock;
+#[cfg(not(target_family = "wasm"))]
 use std::time::Duration;
 
+#[cfg(not(target_family = "wasm"))]
 use anyhow::{Context as _, Result};
 use futures::channel::{mpsc, oneshot};
+#[cfg(not(target_family = "wasm"))]
 use futures::{
-    AsyncBufReadExt as _, AsyncWriteExt as _, FutureExt as _, SinkExt, StreamExt, io::BufReader,
-    select_biased,
+    AsyncBufReadExt as _, AsyncWriteExt as _, FutureExt as _, io::BufReader, select_biased,
 };
+use futures::{SinkExt, StreamExt};
 use gpui::{AsyncApp, BackgroundExecutor, Task};
-#[cfg(not(target_os = "windows"))]
+#[cfg(all(not(target_os = "windows"), not(target_family = "wasm")))]
 use smol::fs;
+#[cfg(not(target_family = "wasm"))]
 use util::{ResultExt as _, debug_panic, maybe};
 
-#[cfg(not(target_os = "windows"))]
+#[cfg(all(not(target_os = "windows"), not(target_family = "wasm")))]
 use util::{paths::PathExt, shell::ShellKind};
 
 /// Path to the program used for askpass
@@ -34,6 +44,7 @@ use util::{paths::PathExt, shell::ShellKind};
 /// because SSH_ASKPASS must point to a directly executable binary. The CLI binary
 /// handles the ZED_ASKPASS_SOCKET env var to communicate with Zed over a Unix socket
 /// without needing a wrapper script.
+#[cfg(not(target_family = "wasm"))]
 static ASKPASS_PROGRAM: OnceLock<std::path::PathBuf> = OnceLock::new();
 
 #[derive(PartialEq, Eq)]
@@ -79,6 +90,7 @@ impl AskPassDelegate {
     }
 }
 
+#[cfg(not(target_family = "wasm"))]
 pub struct AskPassSession {
     #[cfg(target_os = "windows")]
     secret: std::sync::Arc<std::sync::Mutex<Option<EncryptedPassword>>>,
@@ -88,9 +100,10 @@ pub struct AskPassSession {
     executor: BackgroundExecutor,
 }
 
-#[cfg(not(target_os = "windows"))]
+#[cfg(all(not(target_os = "windows"), not(target_family = "wasm")))]
 const ASKPASS_SCRIPT_NAME: &str = "askpass.sh";
 
+#[cfg(not(target_family = "wasm"))]
 impl AskPassSession {
     /// This will create a new AskPassSession.
     /// You must retain this session until the master process exits.
@@ -201,6 +214,7 @@ impl AskPassSession {
     }
 }
 
+#[cfg(not(target_family = "wasm"))]
 pub struct PasswordProxy {
     _task: Task<()>,
     /// On Unix: path to the generated .sh askpass script (set as SSH_ASKPASS).
@@ -212,6 +226,7 @@ pub struct PasswordProxy {
     askpass_socket_path: std::path::PathBuf,
 }
 
+#[cfg(not(target_family = "wasm"))]
 impl PasswordProxy {
     pub async fn new(
         mut get_password: Box<
@@ -309,6 +324,7 @@ impl PasswordProxy {
     }
 }
 
+#[cfg(not(target_family = "wasm"))]
 /// Runs Zed in netcat mode for use in askpass.
 pub fn main(socket: &str) {
     use std::io::{self, Read};
@@ -323,12 +339,14 @@ pub fn main(socket: &str) {
     connect_and_write_prompt(socket, buffer)
 }
 
+#[cfg(not(target_family = "wasm"))]
 /// Runs Zed in askpass mode using prompts passed as arguments.
 pub fn main_from_args(socket: &str, args: impl IntoIterator<Item = String>) {
     let prompt = args.into_iter().collect::<Vec<_>>().join("\0");
     connect_and_write_prompt(socket, prompt.into_bytes())
 }
 
+#[cfg(not(target_family = "wasm"))]
 fn connect_and_write_prompt(socket: &str, mut buffer: Vec<u8>) {
     use net::UnixStream;
     use std::io::{self, Read, Write};
@@ -367,6 +385,7 @@ fn connect_and_write_prompt(socket: &str, mut buffer: Vec<u8>) {
     }
 }
 
+#[cfg(not(target_family = "wasm"))]
 pub fn set_askpass_program(path: std::path::PathBuf) {
     if ASKPASS_PROGRAM.set(path).is_err() {
         debug_panic!("askpass program has already been set");
@@ -375,7 +394,7 @@ pub fn set_askpass_program(path: std::path::PathBuf) {
 
 /// Generates the Unix shell askpass script.
 /// Not used on Windows — cli.exe is invoked directly as SSH_ASKPASS.
-#[cfg(not(target_os = "windows"))]
+#[cfg(all(not(target_os = "windows"), not(target_family = "wasm")))]
 fn generate_askpass_script(
     askpass_program: &std::path::Path,
     askpass_socket: &std::path::Path,

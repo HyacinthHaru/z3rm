@@ -1,11 +1,16 @@
 use crate::{
-    BuildCommitPermalinkParams, GitHostingProviderRegistry, GitRemote, Oid, parse_git_remote_url,
-    repository::GitBinary, status::StatusCode,
+    BuildCommitPermalinkParams, GitHostingProviderRegistry, GitRemote, parse_git_remote_url,
+    status::StatusCode,
 };
+#[cfg(not(target_family = "wasm"))]
+use crate::{Oid, repository::GitBinary};
 use anyhow::{Context as _, Result};
+#[cfg(not(target_family = "wasm"))]
 use collections::{HashMap, HashSet};
 use gpui::SharedString;
-use std::{str::FromStr, sync::Arc};
+#[cfg(not(target_family = "wasm"))]
+use std::str::FromStr;
+use std::sync::Arc;
 
 #[derive(Clone, Debug, Default)]
 pub struct ParsedCommitMessage {
@@ -48,6 +53,7 @@ impl ParsedCommitMessage {
     }
 }
 
+#[cfg(not(target_family = "wasm"))]
 pub(crate) async fn get_messages(git: &GitBinary, shas: &[Oid]) -> Result<HashMap<Oid, String>> {
     if shas.is_empty() {
         return Ok(HashMap::default());
@@ -78,6 +84,7 @@ pub(crate) async fn get_messages(git: &GitBinary, shas: &[Oid]) -> Result<HashMa
         .collect::<HashMap<Oid, String>>())
 }
 
+#[cfg(not(target_family = "wasm"))]
 pub(crate) async fn get_tag_names(
     git: &GitBinary,
     shas: &[Oid],
@@ -108,6 +115,7 @@ pub(crate) async fn get_tag_names(
     ))
 }
 
+#[cfg(not(target_family = "wasm"))]
 fn parse_tag_names(output: &str, shas: &[Oid]) -> HashMap<Oid, Vec<String>> {
     let shas = shas.iter().copied().collect::<HashSet<_>>();
     let mut result = HashMap::<Oid, Vec<String>>::default();
@@ -132,6 +140,7 @@ fn parse_tag_names(output: &str, shas: &[Oid]) -> HashMap<Oid, Vec<String>> {
     result
 }
 
+#[cfg(not(target_family = "wasm"))]
 async fn get_messages_impl(git: &GitBinary, shas: &[Oid]) -> Result<Vec<String>> {
     const MARKER: &str = "<MARKER>";
     let output = git

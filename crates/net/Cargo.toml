@@ -12,7 +12,7 @@ workspace = true
 path = "src/net.rs"
 doctest = false
 
-[dependencies]
+[target.'cfg(not(target_family = "wasm"))'.dependencies]
 smol.workspace = true
 
 [target.'cfg(target_os = "windows")'.dependencies]
@@ -20,5 +20,5 @@ anyhow.workspace = true
 async-io = "2.4"
 windows.workspace = true
 
-[dev-dependencies]
+[target.'cfg(not(target_family = "wasm"))'.dev-dependencies]
 tempfile.workspace = true

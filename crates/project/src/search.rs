@@ -2,11 +2,11 @@ use aho_corasick::{AhoCorasick, AhoCorasickBuilder};
 use anyhow::{Ok, Result};
 // use client::proto;  // removed-crate: client
 use fancy_regex::{Captures, Regex, RegexBuilder};
+use futures_lite::future::yield_now;
 use gpui::Entity;
 use itertools::Itertools as _;
 use language::{Buffer, BufferSnapshot, CharKind};
 use rpc::proto;
-use smol::future::yield_now;
 use std::{
     borrow::Cow,
     io::{BufRead, BufReader, Read},
@@ -424,7 +424,7 @@ impl SearchQuery {
                         bytes_read += text.len();
                         if bytes_read >= YIELD_THRESHOLD {
                             bytes_read = 0;
-                            smol::future::yield_now().await;
+                            yield_now().await;
                         }
                         text.clear();
                         line_number += 1;
@@ -454,7 +454,7 @@ impl SearchQuery {
                         bytes_read += text.len();
                         if bytes_read >= YIELD_THRESHOLD {
                             bytes_read = 0;
-                            smol::future::yield_now().await;
+                            yield_now().await;
                         }
                         text.clear();
                         line_number += 1;

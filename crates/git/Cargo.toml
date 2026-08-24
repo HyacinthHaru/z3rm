@@ -32,7 +32,7 @@ schemars.workspace = true
 serde.workspace = true
 smallvec.workspace = true
 async-channel.workspace = true
-smol.workspace = true
+futures-lite.workspace = true
 sum_tree.workspace = true
 text.workspace = true
 thiserror.workspace = true
@@ -43,6 +43,9 @@ util.workspace = true
 uuid.workspace = true
 futures.workspace = true
 ztracing.workspace = true
+
+[target.'cfg(not(target_family = "wasm"))'.dependencies]
+smol.workspace = true
 
 [dev-dependencies]
 pretty_assertions.workspace = true

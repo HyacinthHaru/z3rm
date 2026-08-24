@@ -1,3 +1,7 @@
+// The git CLI wrapper is gated out on wasm, leaving the format strings and
+// output parsers it drives without a caller.
+#![cfg_attr(target_family = "wasm", allow(dead_code))]
+
 pub mod blame;
 pub mod commit;
 mod hosting_provider;

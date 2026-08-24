@@ -1,26 +1,42 @@
+#[cfg(not(target_family = "wasm"))]
+use crate::remote_client::{CommandTemplate, Interactive};
+#[cfg(not(target_family = "wasm"))]
 use crate::{
     RemoteArch, RemoteClientDelegate, RemoteOs, RemotePlatform,
-    remote_client::{CommandTemplate, Interactive, RemoteConnection, RemoteConnectionOptions},
+    remote_client::{RemoteConnection, RemoteConnectionOptions},
     transport::{parse_platform, parse_shell},
 };
-use anyhow::{Context as _, Result, anyhow};
+#[cfg(not(target_family = "wasm"))]
+use anyhow::anyhow;
+use anyhow::{Context as _, Result};
+#[cfg(not(target_family = "wasm"))]
 use async_trait::async_trait;
+#[cfg(not(target_family = "wasm"))]
 use collections::HashMap;
+#[cfg(not(target_family = "wasm"))]
 use futures::{
     AsyncReadExt as _, FutureExt as _,
     channel::mpsc::{Sender, UnboundedReceiver, UnboundedSender},
     select_biased,
 };
+#[cfg(not(target_family = "wasm"))]
 use gpui::{App, AppContext as _, AsyncApp, Task};
+#[cfg(not(target_family = "wasm"))]
 use parking_lot::Mutex;
+#[cfg(not(target_family = "wasm"))]
 use paths::remote_server_dir_relative;
+#[cfg(not(target_family = "wasm"))]
 use release_channel::{AppVersion, ReleaseChannel};
+#[cfg(not(target_family = "wasm"))]
 use rpc::proto::Envelope;
+#[cfg(not(target_family = "wasm"))]
 use semver::Version;
 pub use settings::SshPortForwardOption;
+#[cfg(not(target_family = "wasm"))]
 use smol::fs;
+use std::net::IpAddr;
+#[cfg(not(target_family = "wasm"))]
 use std::{
-    net::IpAddr,
     path::{Path, PathBuf},
     sync::{
         Arc,
@@ -28,14 +44,17 @@ use std::{
     },
     time::Instant,
 };
+#[cfg(not(target_family = "wasm"))]
 use tempfile::TempDir;
+#[cfg(not(target_family = "wasm"))]
 use util::command::{Child, Stdio};
-use util::{
-    paths::{PathStyle, RemotePathBuf},
-    rel_path::RelPath,
-    shell::ShellKind,
-};
+#[cfg(not(target_family = "wasm"))]
+use util::paths::{PathStyle, RemotePathBuf};
+#[cfg(not(target_family = "wasm"))]
+use util::rel_path::RelPath;
+use util::shell::ShellKind;
 
+#[cfg(not(target_family = "wasm"))]
 pub(crate) struct SshRemoteConnection {
     socket: SshSocket,
     master_process: Mutex<Option<MasterProcess>>,
@@ -139,6 +158,7 @@ impl From<settings::SshConnection> for SshConnectionOptions {
     }
 }
 
+#[cfg(not(target_family = "wasm"))]
 struct SshSocket {
     connection_options: SshConnectionOptions,
     #[cfg(not(windows))]
@@ -149,10 +169,12 @@ struct SshSocket {
     _proxy: askpass::PasswordProxy,
 }
 
+#[cfg(not(target_family = "wasm"))]
 struct MasterProcess {
     process: Child,
 }
 
+#[cfg(not(target_family = "wasm"))]
 #[cfg(not(windows))]
 impl MasterProcess {
     pub fn new(
@@ -199,6 +221,7 @@ impl MasterProcess {
     }
 }
 
+#[cfg(not(target_family = "wasm"))]
 #[cfg(windows)]
 impl MasterProcess {
     const CONNECTION_ESTABLISHED_MAGIC: &str = "Z3RM_SSH_CONNECTION_ESTABLISHED";
@@ -239,13 +262,13 @@ impl MasterProcess {
     }
 
     pub async fn wait_connected(&mut self) -> Result<()> {
-        use smol::io::AsyncBufReadExt;
+        use futures::io::AsyncBufReadExt;
 
         let Some(stdout) = self.process.stdout.take() else {
             anyhow::bail!("ssh process stdout capture failed");
         };
 
-        let mut reader = smol::io::BufReader::new(stdout);
+        let mut reader = futures::io::BufReader::new(stdout);
 
         let mut line = String::new();
 
@@ -262,12 +285,14 @@ impl MasterProcess {
     }
 }
 
+#[cfg(not(target_family = "wasm"))]
 impl AsRef<Child> for MasterProcess {
     fn as_ref(&self) -> &Child {
         &self.process
     }
 }
 
+#[cfg(not(target_family = "wasm"))]
 impl AsMut<Child> for MasterProcess {
     fn as_mut(&mut self) -> &mut Child {
         &mut self.process
@@ -275,6 +300,7 @@ impl AsMut<Child> for MasterProcess {
 }
 
 #[async_trait(?Send)]
+#[cfg(not(target_family = "wasm"))]
 impl RemoteConnection for SshRemoteConnection {
     async fn kill(&self) -> Result<()> {
         self.killed.store(true, Ordering::Release);
@@ -530,6 +556,7 @@ impl RemoteConnection for SshRemoteConnection {
 
 /// Check if the user already has an active SSH ControlMaster session for the
 /// given destination. See: https://github.com/zed-industries/zed/issues/45271
+#[cfg(not(target_family = "wasm"))]
 #[cfg(not(windows))]
 async fn find_existing_control_master(
     destination: &str,
@@ -604,6 +631,7 @@ async fn find_existing_control_master(
     }
 }
 
+#[cfg(not(target_family = "wasm"))]
 impl SshRemoteConnection {
     pub(crate) async fn new(
         connection_options: SshConnectionOptions,
@@ -1262,6 +1290,7 @@ impl SshRemoteConnection {
     }
 }
 
+#[cfg(not(target_family = "wasm"))]
 impl SshSocket {
     #[cfg(not(windows))]
     async fn new(options: SshConnectionOptions, socket_path: PathBuf) -> Result<Self> {
@@ -1772,6 +1801,7 @@ impl SshConnectionOptions {
         args
     }
 
+    #[cfg(not(target_family = "wasm"))]
     fn scp_destination(&self) -> String {
         if let Some(username) = &self.username {
             format!("{}@{}", username, self.host.to_bracketed_string())
@@ -1795,6 +1825,7 @@ impl SshConnectionOptions {
     }
 }
 
+#[cfg(not(target_family = "wasm"))]
 fn build_command_posix(
     input_program: Option<String>,
     input_args: &[String],
@@ -1913,6 +1944,7 @@ fn build_command_posix(
     })
 }
 
+#[cfg(not(target_family = "wasm"))]
 fn build_command_windows(
     input_program: Option<String>,
     input_args: &[String],

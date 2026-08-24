@@ -325,6 +325,7 @@ fn shell_to_proto(shell: Shell) -> proto::Shell {
     }
 }
 
+#[cfg(not(target_family = "wasm"))]
 async fn load_directory_shell_environment(
     shell: Shell,
     abs_path: Arc<Path>,
@@ -402,6 +403,7 @@ async fn load_directory_shell_environment(
     Ok(envs)
 }
 
+#[cfg(not(target_family = "wasm"))]
 async fn load_direnv_environment(
     env: &HashMap<String, String>,
     dir: &Path,
