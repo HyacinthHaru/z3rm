@@ -16,7 +16,15 @@ use std::sync::Arc;
 ///
 /// Dropping this closes the client's transport, so the caller has to hold it.
 pub struct LocalMuxServer {
-    _server: Arc<WasmMuxServer>,
+    server: Arc<WasmMuxServer>,
+}
+
+impl LocalMuxServer {
+    /// The server itself, for the parts of the tab that reach past the
+    /// protocol — the v86 bridge has to hold a pane, not a request.
+    pub fn server(&self) -> &Arc<WasmMuxServer> {
+        &self.server
+    }
 }
 
 /// Start the in-tab server and return a domain already connected to it.
@@ -31,7 +39,7 @@ pub fn start() -> Result<(LocalMuxServer, Arc<MuxDomain>)> {
     let domain =
         MuxDomain::connect_in_memory(client_end).context("connecting to the in-tab mux server")?;
 
-    Ok((LocalMuxServer { _server: server }, Arc::new(domain)))
+    Ok((LocalMuxServer { server }, Arc::new(domain)))
 }
 
 /// Create the session this tab opens into and attach a window to it.

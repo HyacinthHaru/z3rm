@@ -5,11 +5,14 @@
     <meta name="viewport" content="width=device-width,height=device-height,initial-scale=1,user-scalable=0" />
     <title>Z3rm GPUI session projection</title>
     <link data-trunk rel="rust" data-bin="z3rm_web_demo" data-bindgen-target="web" data-wasm-opt="z" />
+    <link data-trunk rel="copy-file" href="v86_bridge.js" />
     <style>
       * { box-sizing: border-box; margin: 0; padding: 0; }
       html, body { width: 100%; height: 100%; overflow: hidden; background: #101215; }
       canvas { display: block; width: 100%; height: 100%; touch-action: none; outline: none; user-select: none; }
     </style>
   </head>
-  <body></body>
+  <body>
+    <script type="module" src="./v86_bridge.js"></script>
+  </body>
 </html>
