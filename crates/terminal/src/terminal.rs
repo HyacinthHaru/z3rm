@@ -1163,7 +1163,7 @@ impl TerminalBuilder {
             vi_mode_enabled: false,
             search_state: None,
             is_remote_terminal: false,
-            last_mouse_move_time: Instant::now(),
+            last_mouse_move_time: None,
             last_hyperlink_search_position: None,
             mouse_down_hyperlink: None,
             #[cfg(windows)]
@@ -1444,7 +1444,7 @@ impl TerminalBuilder {
                 vi_mode_enabled: false,
                 search_state: None,
                 is_remote_terminal,
-                last_mouse_move_time: Instant::now(),
+                last_mouse_move_time: Some(Instant::now()),
                 last_hyperlink_search_position: None,
                 mouse_down_hyperlink: None,
                 #[cfg(windows)]
@@ -1636,7 +1636,7 @@ pub struct Terminal {
     /// §12 Plan 31 — copy-mode search query, `None` until one is confirmed.
     search_state: Option<SearchState>,
     is_remote_terminal: bool,
-    last_mouse_move_time: Instant,
+    last_mouse_move_time: Option<Instant>,
     last_hyperlink_search_position: Option<GpuiPoint<Pixels>>,
     mouse_down_hyperlink: Option<HyperlinkMatch>,
     #[cfg(windows)]
@@ -2861,11 +2861,14 @@ impl Terminal {
                 let distance_moved = ((position.x - last_pos.x).abs()
                     + (position.y - last_pos.y).abs())
                     > FIND_HYPERLINK_THROTTLE_PX;
-                let time_elapsed = now.duration_since(self.last_mouse_move_time).as_millis() > 100;
+                let time_elapsed = self
+                    .last_mouse_move_time
+                    .map(|last| now.duration_since(last).as_millis() > 100)
+                    .unwrap_or(false);
                 distance_moved || time_elapsed
             })
         {
-            self.last_mouse_move_time = now;
+            self.last_mouse_move_time = Some(now);
             self.last_hyperlink_search_position = Some(position);
             self.events.push_back(InternalEvent::FindHyperlink(
                 position - self.last_content.terminal_bounds.bounds.origin,

@@ -17092,16 +17092,36 @@ dependencies = [
 name = "z3rm_web"
 version = "0.1.0"
 dependencies = [
- "alacritty_terminal",
  "anyhow",
+ "assets",
+ "db",
+ "editor",
+ "fs",
  "gpui",
- "js-sys",
+ "language",
  "log",
+ "mux",
  "mux_protocol",
- "parking_lot",
- "serde",
+ "mux_server",
+ "project",
+ "session",
+ "settings",
+ "terminal_view",
+ "theme",
+ "theme_settings",
+ "uuid",
  "wasm-bindgen",
- "web-sys",
+ "workspace",
+]
+
+[[package]]
+name = "z3rm_web_demo"
+version = "0.1.0"
+dependencies = [
+ "console_error_panic_hook",
+ "gpui",
+ "gpui_web",
+ "z3rm_web",
 ]
 
 [[package]]

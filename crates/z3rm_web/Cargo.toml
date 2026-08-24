@@ -13,25 +13,26 @@ path = "src/z3rm_web.rs"
 test = false
 doctest = false
 
-[features]
-default = ["demo-shell"]
-demo-shell = []
-
 [dependencies]
-gpui.workspace = true
-serde.workspace = true
-alacritty_terminal = { path = "alacritty_web", default-features = false }
 anyhow.workspace = true
+assets.workspace = true
+db.workspace = true
+editor.workspace = true
+fs.workspace = true
+gpui.workspace = true
+language.workspace = true
 log.workspace = true
+mux.workspace = true
 mux_protocol.workspace = true
-parking_lot.workspace = true
+mux_server = { path = "../mux_server" }
+project.workspace = true
+session.workspace = true
+settings.workspace = true
+terminal_view.workspace = true
+theme.workspace = true
+theme_settings.workspace = true
+uuid.workspace = true
+workspace.workspace = true
+
+[target.'cfg(target_family = "wasm")'.dependencies]
 wasm-bindgen.workspace = true
-web-sys = { version = "0.3", features = [
-    "BinaryType",
-    "console",
-    "Location",
-    "MessageEvent",
-    "WebSocket",
-    "Window",
-] }
-js-sys.workspace = true

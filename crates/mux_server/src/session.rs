@@ -119,14 +119,19 @@ pub struct SyncScrollbackState {
 impl Session {
     /// 创建新 session (§3.2)
     pub fn new(id: String, name: String, cwd: String) -> Self {
+        #[cfg(not(target_family = "wasm"))]
+        let created_timestamp = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis() as u64;
+        #[cfg(target_family = "wasm")]
+        let created_timestamp = 0;
+
         Self {
             id,
             name,
             cwd,
-            created_timestamp: std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap_or_default()
-                .as_millis() as u64,
+            created_timestamp,
             tabs: HashMap::new(),
             layout: LayoutTree::empty(),
             focused_pane: None,

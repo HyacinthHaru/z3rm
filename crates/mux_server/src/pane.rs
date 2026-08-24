@@ -673,12 +673,23 @@ impl Default for ReadLoopState {
     }
 }
 
-fn initial_history_version() -> u64 {
-    use std::hash::{DefaultHasher, Hash, Hasher};
+#[cfg(target_family = "wasm")]
+static NEXT_WASM_HISTORY_VERSION: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(1);
 
-    let mut hasher = DefaultHasher::new();
-    nanoid::nanoid!().hash(&mut hasher);
-    hasher.finish().max(1)
+fn initial_history_version() -> u64 {
+    #[cfg(not(target_family = "wasm"))]
+    {
+        use std::hash::{DefaultHasher, Hash, Hasher};
+
+        let mut hasher = DefaultHasher::new();
+        nanoid::nanoid!().hash(&mut hasher);
+        hasher.finish().max(1)
+    }
+    #[cfg(target_family = "wasm")]
+    {
+        NEXT_WASM_HISTORY_VERSION.fetch_add(1, std::sync::atomic::Ordering::SeqCst)
+    }
 }
 
 impl Pane {
