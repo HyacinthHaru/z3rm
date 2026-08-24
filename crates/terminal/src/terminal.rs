@@ -84,19 +84,23 @@ use gpui::{
 };
 
 #[cfg(not(windows))]
+#[cfg(not(target_family = "wasm"))]
 use crate::alacritty::current_child_signal_mask;
 use crate::alacritty::{
     AlacrittyCell, AlacrittyGridIterator, AlacrittyHyperlink, AlacrittySearch, AlacrittyTerm,
-    AlacrittyTermConfig, AlacrittyTermLock, HyperlinkMatch, PtySender, RegexSearches,
+    AlacrittyTermConfig, AlacrittyTermLock, HyperlinkMatch, RegexSearches,
     append_text_to_term, apply_config, apply_structured_snapshot, clear_saved_screen, content_text,
     cursor_anchor, display_offset, display_only_term_config, find_from_terminal_point,
-    full_content_range, last_non_empty_lines, make_content, new_term, open_pty, pty_options,
-    pty_term_config, resize, screen_lines, scroll_display, scroll_to_point, search_matches,
+    full_content_range, last_non_empty_lines, make_content, new_term,
+    resize, screen_lines, scroll_display, scroll_to_point, search_matches,
     selection_text, set_default_cursor_style, set_selection as set_term_selection, shrink_to_used,
-    spawn_event_loop, toggle_vi_mode as toggle_term_vi_mode, total_lines,
+    toggle_vi_mode as toggle_term_vi_mode, total_lines,
     update_selection as update_term_selection, update_selection_to_vi_cursor,
     update_vi_cursor_for_scroll, vi_goto_point, vi_motion,
 };
+// Only the pty-backed terminal needs these; the browser build is DisplayOnly.
+#[cfg(not(target_family = "wasm"))]
+use crate::alacritty::{PtySender, open_pty, pty_options, pty_term_config, spawn_event_loop};
 use crate::mappings::colors::to_vte_rgb;
 use crate::mappings::keys::to_esc_str;
 
@@ -1133,6 +1137,7 @@ impl TerminalBuilder {
             task: None,
             terminal_type: TerminalType::DisplayOnly,
             input_sink: None,
+            #[cfg(not(target_family = "wasm"))]
             subprocess: None,
             completion_tx: None,
             term,
@@ -1196,6 +1201,7 @@ impl TerminalBuilder {
         }
     }
 
+    #[cfg(not(target_family = "wasm"))]
     pub fn new(
         working_directory: Option<PathBuf>,
         task: Option<TaskState>,
@@ -1399,6 +1405,7 @@ impl TerminalBuilder {
                     spawn_event_loop(term.clone(), events_tx, pty, pty_options.drain_on_exit)?;
 
                 (
+                    #[cfg(not(target_family = "wasm"))]
                     TerminalType::Pty {
                         pty_tx,
                         info: Arc::new(pty_info),
@@ -1583,6 +1590,7 @@ impl TerminalBuilder {
 }
 
 enum TerminalType {
+    #[cfg(not(target_family = "wasm"))]
     Pty {
         pty_tx: PtySender,
         info: Arc<PtyProcessInfo>,
@@ -1598,6 +1606,7 @@ pub struct Terminal {
     input_sink: Option<std::sync::Arc<dyn Fn(Vec<u8>) + Send + Sync>>,
     /// Set for non-PTY terminals (see [`HeadlessTerminal`]); owns the spawned
     /// subprocess and the task pumping its output into the grid.
+    #[cfg(not(target_family = "wasm"))]
     subprocess: Option<SubprocessHandle>,
     completion_tx: Option<Sender<Option<ExitStatus>>>,
     term: Arc<AlacrittyTermLock>,
@@ -1769,6 +1778,7 @@ impl Terminal {
                 self.detect_init_command_startup_marker();
                 cx.emit(Event::Wakeup);
 
+                #[cfg(not(target_family = "wasm"))]
                 if let TerminalType::Pty { info, .. } = &self.terminal_type {
                     info.emit_title_changed_if_changed(cx);
                 }
@@ -1811,6 +1821,7 @@ impl Terminal {
 
                 self.last_content.terminal_bounds = new_bounds;
 
+                #[cfg(not(target_family = "wasm"))]
                 if let TerminalType::Pty { pty_tx, .. } = &self.terminal_type {
                     pty_tx.resize(new_bounds);
                 }
@@ -2332,6 +2343,7 @@ impl Terminal {
         let input = input.into();
         #[cfg(any(test, feature = "test-support"))]
         self.pty_write_log.borrow_mut().push(input.to_vec());
+        #[cfg(not(target_family = "wasm"))]
         if let TerminalType::Pty { pty_tx, .. } = &self.terminal_type {
             if log::log_enabled!(log::Level::Debug) {
                 if let Ok(str) = str::from_utf8(&input) {
@@ -2432,6 +2444,10 @@ impl Terminal {
     }
 
     pub fn is_pty(&self) -> bool {
+        // The browser build only ever has a DisplayOnly terminal.
+        #[cfg(target_family = "wasm")]
+        return false;
+        #[cfg(not(target_family = "wasm"))]
         matches!(self.terminal_type, TerminalType::Pty { .. })
     }
 
@@ -3185,6 +3201,7 @@ impl Terminal {
     /// Normalizes the command name of the foreground process, if one is known.
     pub fn foreground_process_command_name(&self) -> Option<String> {
         match &self.terminal_type {
+            #[cfg(not(target_family = "wasm"))]
             TerminalType::Pty { info, .. } => info
                 .current
                 .read()
@@ -3202,6 +3219,7 @@ impl Terminal {
     /// remote host, in case Zed is connected to a remote host.
     fn client_side_working_directory(&self) -> Option<PathBuf> {
         match &self.terminal_type {
+            #[cfg(not(target_family = "wasm"))]
             TerminalType::Pty { info, .. } => info
                 .current
                 .read()
@@ -3234,6 +3252,7 @@ impl Terminal {
                 .as_ref()
                 .map(|title_override| title_override.to_string())
                 .unwrap_or_else(|| match &self.terminal_type {
+                    #[cfg(not(target_family = "wasm"))]
                     TerminalType::Pty { info, .. } => info
                         .current
                         .read()
@@ -3276,6 +3295,7 @@ impl Terminal {
             && task.status == TaskStatus::Running
         {
             match &self.terminal_type {
+                #[cfg(not(target_family = "wasm"))]
                 TerminalType::Pty { info, .. } => {
                     // First kill the foreground process group (the command running in the shell)
                     info.kill_current_process();
@@ -3285,6 +3305,7 @@ impl Terminal {
                 }
                 TerminalType::DisplayOnly => {
                     // Non-PTY task terminals own their subprocess directly.
+                    #[cfg(not(target_family = "wasm"))]
                     if let Some(subprocess) = &self.subprocess {
                         subprocess.kill();
                     }
@@ -3295,6 +3316,7 @@ impl Terminal {
 
     pub fn pid(&self) -> Option<sysinfo::Pid> {
         match &self.terminal_type {
+            #[cfg(not(target_family = "wasm"))]
             TerminalType::Pty { info, .. } => info.pid(),
             TerminalType::DisplayOnly => None,
         }
@@ -3302,6 +3324,7 @@ impl Terminal {
 
     pub fn pid_getter(&self) -> Option<&ProcessIdGetter> {
         match &self.terminal_type {
+            #[cfg(not(target_family = "wasm"))]
             TerminalType::Pty { info, .. } => Some(info.pid_getter()),
             TerminalType::DisplayOnly => None,
         }
@@ -3401,6 +3424,7 @@ impl Terminal {
         self.vi_mode_enabled
     }
 
+    #[cfg(not(target_family = "wasm"))]
     pub fn clone_builder(&self, cx: &App, cwd: Option<PathBuf>) -> Task<Result<TerminalBuilder>> {
         let working_directory = self.working_directory().or_else(|| cwd);
         TerminalBuilder::new(
@@ -3675,11 +3699,13 @@ fn convert_lf_to_crlf(bytes: &[u8], previous_byte_was_cr: &mut bool) -> Vec<u8> 
 /// Owns a non-PTY task subprocess and the background task pumping its output
 /// into the terminal emulator. Used by headless hosts (e.g. the eval CLI) where
 /// PTY allocation fails with `ENOTTY`. Dropping this kills the child.
+#[cfg(not(target_family = "wasm"))]
 struct SubprocessHandle {
     child: Arc<parking_lot::Mutex<Option<util::process::Child>>>,
     _reader: Task<()>,
 }
 
+#[cfg(not(target_family = "wasm"))]
 impl SubprocessHandle {
     fn kill(&self) {
         if let Some(child) = self.child.lock().as_mut() {
@@ -3688,6 +3714,7 @@ impl SubprocessHandle {
     }
 }
 
+#[cfg(not(target_family = "wasm"))]
 /// Spawns `program`/`args` as a plain subprocess with piped stdout/stderr and
 /// drives its output into `term`, mirroring what the Alacritty event loop does
 /// for a PTY but without one. Used when [`HeadlessTerminal`] is enabled.
@@ -3799,9 +3826,11 @@ fn spawn_task_subprocess(
 
 impl Drop for Terminal {
     fn drop(&mut self) {
+        #[cfg(not(target_family = "wasm"))]
         if let Some(subprocess) = self.subprocess.take() {
             subprocess.kill();
         }
+        #[cfg(not(target_family = "wasm"))]
         if let TerminalType::Pty { pty_tx, info } =
             std::mem::replace(&mut self.terminal_type, TerminalType::DisplayOnly)
         {
@@ -6437,6 +6466,7 @@ mod tests {
         let mut command_name = None;
         for _ in 0..100 {
             terminal.update(cx, |terminal, _| {
+                #[cfg(not(target_family = "wasm"))]
                 if let TerminalType::Pty { info, .. } = &terminal.terminal_type {
                     info.load_for_test();
                 }
@@ -6451,6 +6481,7 @@ mod tests {
                 .await;
         }
         let process_info = terminal.update(cx, |terminal, _| match &terminal.terminal_type {
+            #[cfg(not(target_family = "wasm"))]
             TerminalType::Pty { info, .. } => format!(
                 "pid={:?}, fallback_pid={:?}, has_current_info={}",
                 info.pid(),

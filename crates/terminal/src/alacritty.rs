@@ -1,6 +1,7 @@
 #[cfg(target_os = "windows")]
 use std::num::NonZeroU32;
 #[cfg(unix)]
+#[cfg(not(target_family = "wasm"))]
 use std::os::fd::AsRawFd;
 use std::{borrow::Cow, io, ops::RangeInclusive, path::PathBuf, sync::Arc};
 
@@ -8,7 +9,6 @@ mod hyperlinks;
 
 use alacritty_terminal::{
     event::{Event as AlacTermEvent, EventListener, Notify, OnResize, WindowSize},
-    event_loop::{EventLoop, Msg, Notifier},
     grid::{Dimensions, Grid, GridIterator, Row, Scroll as AlacScroll},
     index::{Boundary, Column, Direction as AlacDirection, Line, Point as AlacPoint},
     selection::{
@@ -21,12 +21,17 @@ use alacritty_terminal::{
         cell::{Cell as AlacCell, Flags, Hyperlink as AlacHyperlink},
         search::{Match, RegexIter, RegexSearch},
     },
-    tty,
     vi_mode::{ViModeCursor, ViMotion as AlacViMotion},
     vte::ansi::{
         ClearMode, CursorShape as AlacCursorShape, CursorStyle as AlacCursorStyle, NamedMode,
         NamedPrivateMode, PrivateMode,
     },
+};
+// The PTY event loop and tty layer only exist where there is a pty to drive.
+#[cfg(not(target_family = "wasm"))]
+use alacritty_terminal::{
+    event_loop::{EventLoop, Msg, Notifier},
+    tty,
 };
 use anyhow::{Context as _, Result};
 use futures::channel::mpsc::UnboundedSender;
@@ -47,6 +52,7 @@ use crate::{
 
 pub(super) use hyperlinks::{HyperlinkMatch, RegexSearches};
 
+#[cfg(not(target_family = "wasm"))]
 pub(super) type AlacrittyPty = tty::Pty;
 pub(super) type AlacrittyTerm = Term<ZedListener>;
 pub(super) type AlacrittyTermConfig = Config;
@@ -83,10 +89,12 @@ impl From<&AlacrittyPty> for ProcessIdGetter {
     }
 }
 
+#[cfg(not(target_family = "wasm"))]
 pub(super) struct PtySender {
     notifier: Notifier,
 }
 
+#[cfg(not(target_family = "wasm"))]
 impl PtySender {
     pub(super) fn notify(&self, input: impl Into<Cow<'static, [u8]>>) {
         self.notifier.notify(input);
@@ -131,6 +139,7 @@ pub(super) fn display_only_term_config(
     }
 }
 
+#[cfg(not(target_family = "wasm"))]
 pub(super) fn pty_term_config(
     scrolling_history: usize,
     cursor_shape: SettingsCursorShape,
@@ -154,11 +163,13 @@ pub(super) fn apply_config(term: &AlacrittyTermLock, config: &AlacrittyTermConfi
     term.lock().set_options(config.clone());
 }
 
+#[cfg(not(target_family = "wasm"))]
 #[cfg(not(windows))]
 pub(super) fn current_child_signal_mask() -> io::Result<tty::SignalMask> {
     tty::SignalMask::current()
 }
 
+#[cfg(not(target_family = "wasm"))]
 pub(super) fn pty_options(
     shell: Option<(String, Vec<String>)>,
     working_directory: Option<PathBuf>,
@@ -178,6 +189,7 @@ pub(super) fn pty_options(
     }
 }
 
+#[cfg(not(target_family = "wasm"))]
 pub(super) fn open_pty(
     options: &tty::Options,
     bounds: TerminalBounds,
@@ -201,6 +213,7 @@ pub(super) fn new_term(
     Arc::new(FairMutex::new(term))
 }
 
+#[cfg(not(target_family = "wasm"))]
 /// Reader wrapper that scans PTY output for terminal graphics sequences on its
 /// way into the emulator.
 ///
@@ -215,6 +228,7 @@ pub(super) struct GraphicsTapReader<P: tty::EventedReadWrite> {
     events_tx: UnboundedSender<PtyEvent>,
 }
 
+#[cfg(not(target_family = "wasm"))]
 impl<P: tty::EventedReadWrite> io::Read for GraphicsTapReader<P> {
     fn read(&mut self, buffer: &mut [u8]) -> io::Result<usize> {
         let count = self.pty.reader().read(buffer)?;
@@ -232,6 +246,7 @@ impl<P: tty::EventedReadWrite> io::Read for GraphicsTapReader<P> {
     }
 }
 
+#[cfg(not(target_family = "wasm"))]
 /// PTY wrapper whose reader is a [`GraphicsTapReader`].
 ///
 /// `EventedReadWrite::reader` hands out `&mut Self::Reader`, so the tapping
@@ -240,6 +255,7 @@ pub(super) struct GraphicsTapPty<P: tty::EventedReadWrite> {
     reader: GraphicsTapReader<P>,
 }
 
+#[cfg(not(target_family = "wasm"))]
 impl<P: tty::EventedReadWrite> GraphicsTapPty<P> {
     fn new(pty: P, events_tx: UnboundedSender<PtyEvent>) -> Self {
         Self {
@@ -252,6 +268,7 @@ impl<P: tty::EventedReadWrite> GraphicsTapPty<P> {
     }
 }
 
+#[cfg(not(target_family = "wasm"))]
 impl<P: tty::EventedReadWrite> tty::EventedReadWrite for GraphicsTapPty<P> {
     type Reader = GraphicsTapReader<P>;
     type Writer = P::Writer;
@@ -287,18 +304,21 @@ impl<P: tty::EventedReadWrite> tty::EventedReadWrite for GraphicsTapPty<P> {
     }
 }
 
+#[cfg(not(target_family = "wasm"))]
 impl<P: tty::EventedPty> tty::EventedPty for GraphicsTapPty<P> {
     fn next_child_event(&mut self) -> Option<tty::ChildEvent> {
         self.reader.pty.next_child_event()
     }
 }
 
+#[cfg(not(target_family = "wasm"))]
 impl<P: tty::EventedReadWrite + OnResize> OnResize for GraphicsTapPty<P> {
     fn on_resize(&mut self, window_size: WindowSize) {
         self.reader.pty.on_resize(window_size)
     }
 }
 
+#[cfg(not(target_family = "wasm"))]
 pub(super) fn spawn_event_loop(
     term: Arc<AlacrittyTermLock>,
     events_tx: UnboundedSender<PtyEvent>,

@@ -47,6 +47,15 @@ impl ProcessIdGetter {
     }
 }
 
+/// A browser tab has no processes, so there is never a foreground pid to
+/// report. `None` is what every caller already handles for "not known yet".
+#[cfg(target_family = "wasm")]
+impl ProcessIdGetter {
+    fn pid(&self) -> Option<Pid> {
+        None
+    }
+}
+
 #[cfg(windows)]
 impl ProcessIdGetter {
     fn pid(&self) -> Option<Pid> {

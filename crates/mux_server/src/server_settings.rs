@@ -128,10 +128,16 @@ fn resolve_settings_path() -> Option<PathBuf> {
     if let Ok(p) = std::env::var("Z3RM_SERVER_SETTINGS") {
         return Some(PathBuf::from(p));
     }
+    // A browser tab has no home directory to fall back to; only an explicit
+    // env override can name a settings path there.
+    #[cfg(not(target_family = "wasm"))]
+    let home_config = dirs::home_dir().map(|home| home.join(".config"));
+    #[cfg(target_family = "wasm")]
+    let home_config: Option<PathBuf> = None;
     let config = std::env::var("XDG_CONFIG_HOME")
         .map(PathBuf::from)
         .ok()
-        .or_else(|| dirs::home_dir().map(|h| h.join(".config")));
+        .or(home_config);
     let path = config?.join("z3rm").join("server.json");
     if path.exists() {
         Some(path)
@@ -153,10 +159,10 @@ pub fn spawn_hot_reload(
     sessions: Arc<parking_lot::RwLock<Vec<crate::session::Session>>>,
 ) {
     let interval = Duration::from_secs(2);
-    tokio::spawn(async move {
+    crate::rt::spawn(async move {
         let mut last_mtime = None::<std::time::SystemTime>;
         loop {
-            tokio::time::sleep(interval).await;
+            crate::rt::sleep(interval).await;
             let Some(path) = settings.settings_path() else {
                 continue;
             };

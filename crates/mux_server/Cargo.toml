@@ -16,35 +16,44 @@ path = "src/main.rs"
 mux_protocol = { workspace = true }
 mux = { workspace = true }
 alacritty_terminal = { workspace = true }
-portable-pty = { workspace = true }
-sqlez = { workspace = true }
-interprocess = { version = "2", features = ["tokio"] }
-tokio = { workspace = true, features = ["full"] }
 prost = { workspace = true }
 anyhow = { workspace = true }
 parking_lot = { workspace = true }
-quickjs_runtime = { workspace = true }
 paths = { workspace = true }
 http_client = { workspace = true }
-reqwest_client = { workspace = true }
 futures = { workspace = true }
-smol = { workspace = true }
-tar = "0.4"
 flate2 = { workspace = true }
 tracing = { workspace = true }
 zlog = { workspace = true }
 zlog_settings = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
-dirs = "6.0"
-shadow_snapshot = { workspace = true }
 blake3 = "1"
-walkdir = { workspace = true }
-libc = { workspace = true }
 nanoid = "0.4"
-sysinfo = "0.37"
 base64 = "0.22"
 regex = { workspace = true }
+
+# The browser build has no PTY, no sockets, no SQLite and no extension
+# runtime. The wasm server is driven by a cooperative pump over an
+# in-memory stream instead; see `rt` and `wasm_server`.
+[target.'cfg(not(target_family = "wasm"))'.dependencies]
+portable-pty = { workspace = true }
+sqlez = { workspace = true }
+interprocess = { version = "2", features = ["tokio"] }
+tokio = { workspace = true, features = ["full"] }
+quickjs_runtime = { workspace = true }
+reqwest_client = { workspace = true }
+smol = { workspace = true }
+tar = "0.4"
+dirs = "6.0"
+shadow_snapshot = { workspace = true }
+walkdir = { workspace = true }
+libc = { workspace = true }
+sysinfo = "0.37"
+
+[target.'cfg(target_family = "wasm")'.dependencies]
+wasm-bindgen-futures = { workspace = true }
+gloo-timers = { version = "0.3", features = ["futures"] }
 
 [dev-dependencies]
 tempfile = { workspace = true }

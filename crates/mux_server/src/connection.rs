@@ -2,6 +2,7 @@
 // 每个客户端连接一个 tokio task, 处理请求并推送通知。
 
 use anyhow::Context as _;
+#[cfg(not(target_family = "wasm"))]
 use interprocess::local_socket::tokio::Stream as LocalSocketStream;
 use mux_protocol::proto::envelope::Payload as EnvelopePayload;
 use mux_protocol::proto::fetch_grid_update_response::Update as FetchGridUpdateResponseUpdate;
@@ -12,12 +13,16 @@ use mux_protocol::{
     proto::*,
 };
 use prost::Message;
+#[cfg(not(target_family = "wasm"))]
 use sqlez::connection::Connection;
+#[cfg(target_family = "wasm")]
+use crate::persistence::Connection;
 use std::collections::HashSet;
 use std::io::Read as _;
 use std::sync::Arc;
+#[cfg(not(target_family = "wasm"))]
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::sync::mpsc;
+use crate::rt::mpsc;
 
 // §3.3 客户端角色 (Plan 33)
 use crate::pane::{ShellMarker, ShellMarkerKind};
@@ -117,6 +122,7 @@ pub fn effective_attach_role(role: ClientRole, mode: crate::session::AttachMode)
 /// 单一 outbound mpsc channel 同时承载 Response 和 Notification:
 /// 写循环 (write_handle) 消费 channel, 把 Envelope framed 写回 socket。
 /// 这样所有写操作都在同一个 tokio task 内串行化, 避免并发 write 冲突。
+#[cfg(not(target_family = "wasm"))]
 pub async fn handle_connection(
     stream: LocalSocketStream,
     sessions: Arc<parking_lot::RwLock<Vec<crate::session::Session>>>,
@@ -145,7 +151,7 @@ pub async fn handle_connection(
     // Per-connection forward task handles spawned in handle_attach.
     // Tracked so they can be aborted on detach/EOF to prevent the
     // outbound channel from never closing (P0 connection hang).
-    let forward_tasks: Arc<parking_lot::Mutex<Vec<tokio::task::JoinHandle<()>>>> =
+    let forward_tasks: Arc<parking_lot::Mutex<Vec<crate::rt::JoinHandle<()>>>> =
         Arc::new(parking_lot::Mutex::new(Vec::new()));
     let read_handle = {
         let outbound_tx = outbound_tx.clone();
@@ -158,7 +164,7 @@ pub async fn handle_connection(
         let shutdown_state = shutdown_state.clone();
         let extension_host = extension_host.clone();
         let forward_tasks = forward_tasks.clone();
-        tokio::spawn(async move {
+        crate::rt::spawn(async move {
             let mut reader = reader;
             let mut first = true;
             loop {
@@ -209,7 +215,7 @@ pub async fn handle_connection(
     // §9 写循环: 消费 outbound channel, framed 写回客户端.
     // §3.5 After a Shutdown ack response is flushed, notify the accept loop so
     // the process exits only once the client has the acknowledgment on the wire.
-    let write_handle = tokio::spawn(async move {
+    let write_handle = crate::rt::spawn(async move {
         let mut writer = writer;
         while let Some(envelope) = outbound_rx.recv().await {
             let is_shutdown_ack = match &envelope.payload {
@@ -258,9 +264,10 @@ pub async fn handle_connection(
     Ok(())
 }
 
+#[cfg(not(target_family = "wasm"))]
 async fn wait_for_connection_tasks<Cleanup, CleanupFuture>(
-    mut read_handle: tokio::task::JoinHandle<anyhow::Result<()>>,
-    mut write_handle: tokio::task::JoinHandle<anyhow::Result<()>>,
+    mut read_handle: crate::rt::JoinHandle<anyhow::Result<()>>,
+    mut write_handle: crate::rt::JoinHandle<anyhow::Result<()>>,
     cleanup: Cleanup,
 ) where
     Cleanup: FnOnce() -> CleanupFuture,
@@ -269,7 +276,7 @@ async fn wait_for_connection_tasks<Cleanup, CleanupFuture>(
     tokio::select! {
         result = &mut read_handle => {
             cleanup().await;
-            match tokio::time::timeout(std::time::Duration::from_secs(1), &mut write_handle).await {
+            match crate::rt::timeout(std::time::Duration::from_secs(1), &mut write_handle).await {
                 Ok(Ok(Err(error))) => tracing::debug!(%error, "mux writer stopped"),
                 Ok(Err(error)) => tracing::warn!(%error, "mux writer task failed"),
                 Ok(Ok(Ok(()))) => {}
@@ -308,7 +315,7 @@ async fn wait_for_connection_tasks<Cleanup, CleanupFuture>(
 async fn cleanup_connection_state(
     sessions: &Arc<parking_lot::RwLock<Vec<crate::session::Session>>>,
     connection_client_id: &Arc<parking_lot::Mutex<Option<String>>>,
-    forward_tasks: &Arc<parking_lot::Mutex<Vec<tokio::task::JoinHandle<()>>>>,
+    forward_tasks: &Arc<parking_lot::Mutex<Vec<crate::rt::JoinHandle<()>>>>,
 ) {
     if let Some(client_id) = connection_client_id.lock().clone() {
         let mut sessions = sessions.write();
@@ -432,6 +439,7 @@ fn version_compatible(version: &Option<ProtocolVersion>) -> bool {
 }
 
 /// §9 从 socket 读取长度前缀帧, 解码 Envelope
+#[cfg(not(target_family = "wasm"))]
 async fn read_envelope(
     reader: &mut tokio::io::ReadHalf<LocalSocketStream>,
 ) -> anyhow::Result<Envelope> {
@@ -459,7 +467,7 @@ async fn read_envelope(
 }
 
 /// §9 分发 Envelope 到请求/通知处理器
-async fn dispatch_envelope(
+pub(crate) async fn dispatch_envelope(
     envelope: &Envelope,
     sessions: &Arc<parking_lot::RwLock<Vec<crate::session::Session>>>,
     outbound_tx: &mpsc::UnboundedSender<Envelope>,
@@ -470,7 +478,7 @@ async fn dispatch_envelope(
     connection_client_id: &Arc<parking_lot::Mutex<Option<String>>>,
     shutdown_state: &Arc<crate::ShutdownState>,
     extension_host: &Arc<crate::extension_host::ServerExtensionHost>,
-    forward_tasks: &Arc<parking_lot::Mutex<Vec<tokio::task::JoinHandle<()>>>>,
+    forward_tasks: &Arc<parking_lot::Mutex<Vec<crate::rt::JoinHandle<()>>>>,
     trust: ConnectionTrust,
 ) -> anyhow::Result<()> {
     let payload = match &envelope.payload {
@@ -523,7 +531,7 @@ async fn dispatch_request(
     connection_client_id: &Arc<parking_lot::Mutex<Option<String>>>,
     shutdown_state: &Arc<crate::ShutdownState>,
     extension_host: &Arc<crate::extension_host::ServerExtensionHost>,
-    forward_tasks: &Arc<parking_lot::Mutex<Vec<tokio::task::JoinHandle<()>>>>,
+    forward_tasks: &Arc<parking_lot::Mutex<Vec<crate::rt::JoinHandle<()>>>>,
     trust: ConnectionTrust,
 ) -> anyhow::Result<()> {
     let request_id = req.request_id;
@@ -863,10 +871,10 @@ fn start_session_snapshot_watch(
     cwd: String,
     sessions: Arc<parking_lot::RwLock<Vec<crate::session::Session>>>,
 ) {
-    tokio::spawn(async move {
+    crate::rt::spawn(async move {
         let session_id_for_start = session_id.clone();
         let cwd_for_start = cwd.clone();
-        let result = tokio::task::spawn_blocking(move || {
+        let result = crate::rt::spawn_blocking(move || {
             crate::snapshot::start(&session_id_for_start, &cwd_for_start)
         })
         .await;
@@ -1194,7 +1202,7 @@ async fn handle_attach(
     client_role: &Arc<parking_lot::Mutex<Option<ClientRole>>>,
     connection_client_id: &Arc<parking_lot::Mutex<Option<String>>>,
     outbound_tx: &mpsc::UnboundedSender<Envelope>,
-    forward_tasks: &Arc<parking_lot::Mutex<Vec<tokio::task::JoinHandle<()>>>>,
+    forward_tasks: &Arc<parking_lot::Mutex<Vec<crate::rt::JoinHandle<()>>>>,
     trust: ConnectionTrust,
     extension_host: &Arc<crate::extension_host::ServerExtensionHost>,
 ) -> anyhow::Result<ResponseBody> {
@@ -1343,7 +1351,7 @@ async fn handle_attach(
         pane.add_subscriber(client_id.clone(), inner_tx);
         // forward task: 把 inner Notification 包成 Envelope 发到 outbound
         let forward_tx = notification_forward_tx.clone();
-        let handle = tokio::spawn(async move {
+        let handle = crate::rt::spawn(async move {
             while let Some(notif) = inner_rx.recv().await {
                 let envelope = Envelope {
                     version: Some(mux_protocol::PROTOCOL_VERSION.clone()),
@@ -1398,7 +1406,7 @@ fn session_snapshot(session: &crate::session::Session) -> SessionSnapshot {
 async fn handle_detach(
     sessions: &Arc<parking_lot::RwLock<Vec<crate::session::Session>>>,
     connection_client_id: &Arc<parking_lot::Mutex<Option<String>>>,
-    forward_tasks: &Arc<parking_lot::Mutex<Vec<tokio::task::JoinHandle<()>>>>,
+    forward_tasks: &Arc<parking_lot::Mutex<Vec<crate::rt::JoinHandle<()>>>>,
 ) -> anyhow::Result<ResponseBody> {
     let mut sessions_w = sessions.write();
     if let Some(client_id) = connection_client_id.lock().take() {
@@ -1459,7 +1467,7 @@ fn register_pane_with_session_subscribers(
         let (inner_tx, mut inner_rx) = mpsc::unbounded_channel::<Notification>();
         pane.add_subscriber(client_id, inner_tx);
         let forward_tx = outbound_tx;
-        tokio::spawn(async move {
+        crate::rt::spawn(async move {
             while let Some(notif) = inner_rx.recv().await {
                 let envelope = Envelope {
                     version: Some(mux_protocol::PROTOCOL_VERSION.clone()),
@@ -2872,7 +2880,7 @@ async fn handle_list_changed_files(
     sessions: &Arc<parking_lot::RwLock<Vec<crate::session::Session>>>,
 ) -> anyhow::Result<ResponseBody> {
     let (watch, _root) = snapshot_context_for_session(sessions, &request.session_id)?;
-    let changed = tokio::task::spawn_blocking(move || watch.list_changed_files())
+    let changed = crate::rt::spawn_blocking(move || watch.list_changed_files())
         .await
         .context("joining shadow list-changed-files request")??;
     Ok(ResponseBody::ChangedFiles(
@@ -2895,7 +2903,7 @@ async fn handle_list_file_versions(
 ) -> anyhow::Result<ResponseBody> {
     let (watch, root) = snapshot_context_for_session(sessions, &request.session_id)?;
     let path = resolve_path_within_root(&root, &request.path)?;
-    let versions = tokio::task::spawn_blocking(move || watch.list_versions(path))
+    let versions = crate::rt::spawn_blocking(move || watch.list_versions(path))
         .await
         .context("joining shadow list-versions request")??;
     Ok(ResponseBody::FileVersions(
@@ -2919,7 +2927,7 @@ async fn handle_get_file_version(
     let (watch, root) = snapshot_context_for_session(sessions, &request.session_id)?;
     let path = resolve_path_within_root(&root, &request.path)?;
     let version_id = request.version_id;
-    let content = tokio::task::spawn_blocking(move || watch.get_version(path, version_id))
+    let content = crate::rt::spawn_blocking(move || watch.get_version(path, version_id))
         .await
         .context("joining shadow get-version request")??
         .with_context(|| format!("shadow version not found: {version_id}"))?;
@@ -2939,7 +2947,7 @@ async fn handle_decline_file_version(
     let (watch, root) = snapshot_context_for_session(sessions, &request.session_id)?;
     let path = resolve_path_within_root(&root, &request.path)?;
     let version_id = request.version_id;
-    let declined = tokio::task::spawn_blocking(move || watch.decline(path, version_id))
+    let declined = crate::rt::spawn_blocking(move || watch.decline(path, version_id))
         .await
         .context("joining shadow decline request")?;
     match declined {
@@ -3198,7 +3206,7 @@ async fn handle_list_dir(
         };
     // §4.3 list_versions 要和单写 recorder 线程做一次同步 round-trip,
     // 目录里每个文件一次, 不能压在 async worker 上。
-    let listing = tokio::task::spawn_blocking(move || {
+    let listing = crate::rt::spawn_blocking(move || {
         let has_shadow_versions = |file: &std::path::Path| match snapshot_watch.as_ref() {
             Some(watch) => match watch.list_versions(file.to_path_buf()) {
                 Ok(versions) => !versions.is_empty(),
@@ -4106,7 +4114,7 @@ mod connection_unit_tests {
         session.panes.write().insert(pane.id.clone(), pane);
         let sessions = Arc::new(parking_lot::RwLock::new(vec![session]));
         let client_id = Arc::new(parking_lot::Mutex::new(Some("client-1".to_string())));
-        let forward_tasks = Arc::new(parking_lot::Mutex::new(vec![tokio::spawn(
+        let forward_tasks = Arc::new(parking_lot::Mutex::new(vec![crate::rt::spawn(
             std::future::pending::<()>(),
         )]));
 
@@ -4346,7 +4354,7 @@ mod connection_unit_tests {
             response => panic!("expected pane id, got {response:?}"),
         };
 
-        let first = tokio::time::timeout(std::time::Duration::from_secs(2), lifecycle_rx.recv())
+        let first = crate::rt::timeout(std::time::Duration::from_secs(2), lifecycle_rx.recv())
             .await
             .expect("PaneAdded timeout")
             .expect("PaneAdded channel closed");
@@ -4359,7 +4367,7 @@ mod connection_unit_tests {
             Some(mux_protocol::notification::Event::PaneAdded(ref added))
                 if added.pane_id == pane_id
         ));
-        let removed = tokio::time::timeout(std::time::Duration::from_secs(2), async {
+        let removed = crate::rt::timeout(std::time::Duration::from_secs(2), async {
             loop {
                 let envelope = lifecycle_rx.recv().await.expect("lifecycle channel closed");
                 let event = match envelope.payload {
@@ -4460,7 +4468,7 @@ mod connection_unit_tests {
     #[tokio::test]
     async fn writer_exit_cancels_reader_task() {
         let reader_dropped = Arc::new(std::sync::atomic::AtomicBool::new(false));
-        let reader = tokio::spawn({
+        let reader = crate::rt::spawn({
             let guard = DropSignal(reader_dropped.clone());
             async move {
                 let _guard = guard;
@@ -4468,7 +4476,7 @@ mod connection_unit_tests {
                 Ok(())
             }
         });
-        let writer = tokio::spawn(async { Ok(()) });
+        let writer = crate::rt::spawn(async { Ok(()) });
 
         wait_for_connection_tasks(reader, writer, || async {}).await;
 
@@ -4478,17 +4486,17 @@ mod connection_unit_tests {
     #[tokio::test]
     async fn reader_exit_drains_queued_writer_response() {
         let response_written = Arc::new(std::sync::atomic::AtomicBool::new(false));
-        let (response_sender, response_receiver) = tokio::sync::oneshot::channel();
-        let reader = tokio::spawn(async move {
+        let (response_sender, response_receiver) = crate::rt::oneshot::channel();
+        let reader = crate::rt::spawn(async move {
             response_sender
                 .send(())
                 .map_err(|_| anyhow::anyhow!("writer dropped queued response"))?;
             Ok(())
         });
-        let writer = tokio::spawn({
+        let writer = crate::rt::spawn({
             let response_written = response_written.clone();
             async move {
-                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+                crate::rt::sleep(std::time::Duration::from_millis(10)).await;
                 response_receiver.await?;
                 response_written.store(true, std::sync::atomic::Ordering::SeqCst);
                 Ok(())
@@ -4503,8 +4511,8 @@ mod connection_unit_tests {
     #[tokio::test]
     async fn reader_exit_bounds_stalled_writer_drain() {
         let writer_dropped = Arc::new(std::sync::atomic::AtomicBool::new(false));
-        let reader = tokio::spawn(async { Ok(()) });
-        let writer = tokio::spawn({
+        let reader = crate::rt::spawn(async { Ok(()) });
+        let writer = crate::rt::spawn({
             let guard = DropSignal(writer_dropped.clone());
             async move {
                 let _guard = guard;
