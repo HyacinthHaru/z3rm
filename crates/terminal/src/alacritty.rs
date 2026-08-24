@@ -3,12 +3,14 @@ use std::num::NonZeroU32;
 #[cfg(unix)]
 #[cfg(not(target_family = "wasm"))]
 use std::os::fd::AsRawFd;
-use std::{borrow::Cow, io, ops::RangeInclusive, path::PathBuf, sync::Arc};
+#[cfg(not(target_family = "wasm"))]
+use std::{borrow::Cow, io, path::PathBuf};
+use std::{ops::RangeInclusive, sync::Arc};
 
 mod hyperlinks;
 
 use alacritty_terminal::{
-    event::{Event as AlacTermEvent, EventListener, Notify, OnResize, WindowSize},
+    event::{Event as AlacTermEvent, EventListener, WindowSize},
     grid::{Dimensions, Grid, GridIterator, Row, Scroll as AlacScroll},
     index::{Boundary, Column, Direction as AlacDirection, Line, Point as AlacPoint},
     selection::{
@@ -30,9 +32,11 @@ use alacritty_terminal::{
 // The PTY event loop and tty layer only exist where there is a pty to drive.
 #[cfg(not(target_family = "wasm"))]
 use alacritty_terminal::{
+    event::{Notify, OnResize},
     event_loop::{EventLoop, Msg, Notifier},
     tty,
 };
+#[cfg(not(target_family = "wasm"))]
 use anyhow::{Context as _, Result};
 use futures::channel::mpsc::UnboundedSender;
 use util::paths::PathStyle;
@@ -45,10 +49,10 @@ use crate::{
     PtyEvent, Range, RenderableCells, Scroll, Search, Selection, SelectionRange, SelectionSide,
     SelectionType, StructuredTerminalSnapshot, StructuredUnderlineStyle, TerminalBackendEvent,
     TerminalBounds, ViMotion,
-    kitty_graphics::GraphicsScanner,
-    pty_info::ProcessIdGetter,
     terminal_settings::{AlternateScroll, CursorShape as SettingsCursorShape},
 };
+#[cfg(not(target_family = "wasm"))]
+use crate::{kitty_graphics::GraphicsScanner, pty_info::ProcessIdGetter};
 
 pub(super) use hyperlinks::{HyperlinkMatch, RegexSearches};
 

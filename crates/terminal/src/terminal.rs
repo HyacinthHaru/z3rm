@@ -1,3 +1,7 @@
+// The pty layer is gated out on wasm, which leaves the process bookkeeping and
+// the task plumbing it drives without a caller.
+#![cfg_attr(target_family = "wasm", allow(dead_code))]
+
 mod mappings;
 
 mod alacritty;
@@ -5,7 +9,7 @@ pub mod kitty_graphics;
 mod pty_info;
 pub mod terminal_settings;
 
-#[cfg(not(windows))]
+#[cfg(all(not(windows), not(target_family = "wasm")))]
 use anyhow::Context as _;
 use anyhow::{Result, bail};
 use futures_lite::future::yield_now;
@@ -25,14 +29,18 @@ use mappings::mouse::{
 use async_channel::{Receiver, Sender};
 use collections::{HashMap, VecDeque};
 use futures::StreamExt;
-use pty_info::{ProcessIdGetter, PtyProcessInfo};
+use pty_info::ProcessIdGetter;
+#[cfg(not(target_family = "wasm"))]
+use pty_info::PtyProcessInfo;
 use serde::{Deserialize, Serialize};
 use settings::Settings;
 use terminal_settings::{AlternateScroll, CursorShape as SettingsCursorShape, TerminalSettings};
 use theme::{ActiveTheme, Theme};
 use urlencoding;
+#[cfg(not(target_family = "wasm"))]
+use util::ResultExt as _;
 use util::shell::{Shell, ShellKind};
-use util::{ResultExt as _, paths::PathStyle, truncate_and_trailoff};
+use util::{paths::PathStyle, truncate_and_trailoff};
 
 /// 终端任务隐藏策略 (stub: replaced deleted task::HideStrategy)
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Deserialize, serde::Serialize)]
@@ -60,6 +68,8 @@ pub struct SpawnInTerminal {
 
 #[cfg(unix)]
 use std::os::unix::process::ExitStatusExt;
+#[cfg(not(target_family = "wasm"))]
+use std::time::Duration;
 use std::{
     borrow::Cow,
     cmp::{self, min},
@@ -71,7 +81,7 @@ use std::{
         Arc,
         atomic::{AtomicU64, Ordering},
     },
-    time::{Duration, Instant},
+    time::Instant,
 };
 use thiserror::Error;
 use vte::ansi::{Attr, Handler, Processor, StdSyncHandler};
@@ -88,14 +98,13 @@ use gpui::{
 use crate::alacritty::current_child_signal_mask;
 use crate::alacritty::{
     AlacrittyCell, AlacrittyGridIterator, AlacrittyHyperlink, AlacrittySearch, AlacrittyTerm,
-    AlacrittyTermConfig, AlacrittyTermLock, HyperlinkMatch, RegexSearches,
-    append_text_to_term, apply_config, apply_structured_snapshot, clear_saved_screen, content_text,
-    cursor_anchor, display_offset, display_only_term_config, find_from_terminal_point,
-    full_content_range, last_non_empty_lines, make_content, new_term,
-    resize, screen_lines, scroll_display, scroll_to_point, search_matches,
-    selection_text, set_default_cursor_style, set_selection as set_term_selection, shrink_to_used,
-    toggle_vi_mode as toggle_term_vi_mode, total_lines,
-    update_selection as update_term_selection, update_selection_to_vi_cursor,
+    AlacrittyTermConfig, AlacrittyTermLock, HyperlinkMatch, RegexSearches, append_text_to_term,
+    apply_config, apply_structured_snapshot, clear_saved_screen, content_text, cursor_anchor,
+    display_offset, display_only_term_config, find_from_terminal_point, full_content_range,
+    last_non_empty_lines, make_content, new_term, resize, screen_lines, scroll_display,
+    scroll_to_point, search_matches, selection_text, set_default_cursor_style,
+    set_selection as set_term_selection, shrink_to_used, toggle_vi_mode as toggle_term_vi_mode,
+    total_lines, update_selection as update_term_selection, update_selection_to_vi_cursor,
     update_vi_cursor_for_scroll, vi_goto_point, vi_motion,
 };
 // Only the pty-backed terminal needs these; the browser build is DisplayOnly.
@@ -1199,6 +1208,28 @@ impl TerminalBuilder {
             terminal,
             events_rx,
         }
+    }
+
+    /// A web build has no pty to open; it reaches its terminals through the mux.
+    #[cfg(target_family = "wasm")]
+    pub fn new(
+        _working_directory: Option<PathBuf>,
+        _task: Option<TaskState>,
+        _shell: Shell,
+        _env: HashMap<String, String>,
+        _cursor_shape: SettingsCursorShape,
+        _alternate_scroll: AlternateScroll,
+        _max_scroll_history_lines: Option<usize>,
+        _path_hyperlink_regexes: Vec<String>,
+        _path_hyperlink_timeout_ms: u64,
+        _is_remote_terminal: bool,
+        _window_id: u64,
+        _completion_tx: Option<Sender<Option<ExitStatus>>>,
+        _cx: &App,
+        _activation_script: Vec<String>,
+        _path_style: PathStyle,
+    ) -> Task<Result<TerminalBuilder>> {
+        Task::ready(Err(anyhow::anyhow!("cannot open a pty")))
     }
 
     #[cfg(not(target_family = "wasm"))]
@@ -3422,6 +3453,11 @@ impl Terminal {
 
     pub fn vi_mode_enabled(&self) -> bool {
         self.vi_mode_enabled
+    }
+
+    #[cfg(target_family = "wasm")]
+    pub fn clone_builder(&self, _cx: &App, _cwd: Option<PathBuf>) -> Task<Result<TerminalBuilder>> {
+        Task::ready(Err(anyhow::anyhow!("cannot open a pty")))
     }
 
     #[cfg(not(target_family = "wasm"))]

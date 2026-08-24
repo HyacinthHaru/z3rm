@@ -14,7 +14,6 @@ pub mod rel_path;
 pub mod schemars;
 pub mod serde;
 pub mod shell;
-#[cfg(not(target_arch = "wasm32"))]
 pub mod shell_builder;
 #[cfg(not(target_arch = "wasm32"))]
 pub mod shell_env;

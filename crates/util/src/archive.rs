@@ -1,9 +1,13 @@
+#[cfg(any(unix, windows))]
 use std::path::Path;
 
+#[cfg(any(unix, windows))]
 use anyhow::{Context as _, Result};
+#[cfg(any(unix, windows))]
 use async_zip::base::read;
-#[cfg(not(windows))]
+#[cfg(unix)]
 use futures::AsyncSeek;
+#[cfg(any(unix, windows))]
 use futures::{AsyncRead, io::BufReader};
 
 #[cfg(any(unix, windows))]

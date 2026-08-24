@@ -7,16 +7,28 @@ pub mod fs_watcher;
 #[cfg(not(target_family = "wasm"))]
 pub use fs_watcher::requires_poll_watcher;
 
+/// There is no native watcher to fall back from on wasm.
+#[cfg(target_family = "wasm")]
+pub fn requires_poll_watcher(_path: &std::path::Path) -> bool {
+    false
+}
+
+#[cfg(not(target_family = "wasm"))]
 use parking_lot::Mutex;
 use std::ffi::OsString;
+#[cfg(not(target_family = "wasm"))]
 use std::sync::atomic::{AtomicU8, AtomicUsize, Ordering};
 use std::time::Instant;
 #[cfg(not(target_family = "wasm"))]
 use util::maybe;
 
-use anyhow::{Context as _, Result, anyhow};
+#[cfg(not(target_family = "wasm"))]
+use anyhow::anyhow;
+use anyhow::{Context as _, Result};
+#[cfg(not(target_family = "wasm"))]
 use futures::stream::iter;
 use gpui::App;
+#[cfg(not(target_family = "wasm"))]
 use gpui::BackgroundExecutor;
 use gpui::Global;
 use gpui::ReadGlobal as _;
@@ -40,18 +52,21 @@ use std::mem::MaybeUninit;
 #[cfg(not(target_family = "wasm"))]
 use async_tar::Archive;
 use futures::{AsyncRead, Stream, StreamExt, future::BoxFuture};
+use git::repository::GitRepository;
 #[cfg(not(target_family = "wasm"))]
-use git::repository::{GitRepository, RealGitRepository};
+use git::repository::RealGitRepository;
 #[cfg(not(target_family = "wasm"))]
 use is_executable::IsExecutable;
 use rope::Rope;
 use serde::{Deserialize, Serialize};
 #[cfg(not(target_family = "wasm"))]
 use smol::io::AsyncWriteExt;
+#[cfg(not(target_family = "wasm"))]
+use std::io::Write;
 #[cfg(feature = "test-support")]
 use std::path::Component;
 use std::{
-    io::{self, Write},
+    io,
     path::{Path, PathBuf},
     pin::Pin,
     sync::Arc,
@@ -167,21 +182,14 @@ pub trait Fs: Send + Sync {
         Arc<dyn Watcher>,
     );
 
-    // git shells out to a binary and reads a work tree; neither exists in the
-    // browser, so these leave the trait entirely rather than becoming stubs
-    // that fail at run time.
-    #[cfg(not(target_family = "wasm"))]
     fn open_repo(
         &self,
         abs_dot_git: &Path,
         system_git_binary_path: Option<&Path>,
     ) -> Result<Arc<dyn GitRepository>>;
-    #[cfg(not(target_family = "wasm"))]
     async fn git_init(&self, abs_work_directory: &Path, fallback_branch_name: String)
     -> Result<()>;
-    #[cfg(not(target_family = "wasm"))]
     async fn git_clone(&self, abs_work_directory: &Path, repo_url: &str) -> Result<()>;
-    #[cfg(not(target_family = "wasm"))]
     async fn git_config(&self, abs_work_directory: &Path, args: Vec<String>) -> Result<String>;
     fn is_fake(&self) -> bool;
     async fn is_case_sensitive(&self) -> bool;
@@ -349,11 +357,13 @@ pub enum JobEvent {
 pub type JobEventSender = futures::channel::mpsc::UnboundedSender<JobEvent>;
 pub type JobEventReceiver = futures::channel::mpsc::UnboundedReceiver<JobEvent>;
 
+#[cfg(not(target_family = "wasm"))]
 struct JobTracker {
     id: JobId,
     subscribers: Arc<Mutex<Vec<JobEventSender>>>,
 }
 
+#[cfg(not(target_family = "wasm"))]
 impl JobTracker {
     fn new(info: JobInfo, subscribers: Arc<Mutex<Vec<JobEventSender>>>) -> Self {
         let id = info.id;
@@ -369,6 +379,7 @@ impl JobTracker {
     }
 }
 
+#[cfg(not(target_family = "wasm"))]
 impl Drop for JobTracker {
     fn drop(&mut self) {
         let mut subs = self.subscribers.lock();
@@ -3498,9 +3509,9 @@ fn atomic_replace<P: AsRef<Path>>(replaced_file: P, replacement_file: P) -> Resu
 #[cfg(target_family = "wasm")]
 mod wasm_fs {
     use super::{
-        CopyOptions, CreateOptions, Fs, FileHandle, JobEventReceiver, LineEnding, Metadata, MTime,
-        PathEvent, RemoveOptions, RenameOptions, RenameOptions as _RenameOptions, Rope,
-        TrashRestoreError, TrashedEntry, Watcher,
+        CopyOptions, CreateOptions, FileHandle, Fs, GitRepository, JobEventReceiver, LineEnding,
+        MTime, Metadata, PathEvent, RemoveOptions, RenameOptions, Rope, TrashRestoreError,
+        TrashedEntry, Watcher,
     };
     use anyhow::{Context as _, Result, anyhow};
     use collections::BTreeMap;
@@ -3615,7 +3626,12 @@ mod wasm_fs {
             Ok(())
         }
 
-        async fn copy_file(&self, source: &Path, target: &Path, options: CopyOptions) -> Result<()> {
+        async fn copy_file(
+            &self,
+            source: &Path,
+            target: &Path,
+            options: CopyOptions,
+        ) -> Result<()> {
             if !options.overwrite && self.state.lock().entries.contains_key(target) {
                 if options.ignore_if_exists {
                     return Ok(());
@@ -3668,7 +3684,10 @@ mod wasm_fs {
             // cannot be restored. Saying so is better than reporting success
             // on an entry the caller may later try to restore.
             self.remove_file(path, options).await?;
-            Err(anyhow!("the browser has no trash to move {} to", path.display()))
+            Err(anyhow!(
+                "the browser has no trash to move {} to",
+                path.display()
+            ))
         }
 
         async fn remove_file(&self, path: &Path, options: RemoveOptions) -> Result<()> {
@@ -3717,7 +3736,10 @@ mod wasm_fs {
         }
 
         async fn is_file(&self, path: &Path) -> bool {
-            matches!(self.state.lock().entries.get(path), Some(Entry::File { .. }))
+            matches!(
+                self.state.lock().entries.get(path),
+                Some(Entry::File { .. })
+            )
         }
 
         async fn is_dir(&self, path: &Path) -> bool {
@@ -3778,6 +3800,40 @@ mod wasm_fs {
             (Box::pin(futures::stream::empty()), Arc::new(WasmWatcher))
         }
 
+        // git shells out to a binary and reads a work tree; neither exists in
+        // the browser.
+        fn open_repo(
+            &self,
+            abs_dot_git: &Path,
+            _system_git_binary_path: Option<&Path>,
+        ) -> Result<Arc<dyn GitRepository>> {
+            Err(anyhow!("cannot open the repository at {abs_dot_git:?}"))
+        }
+
+        async fn git_init(
+            &self,
+            abs_work_directory: &Path,
+            _fallback_branch_name: String,
+        ) -> Result<()> {
+            Err(anyhow!(
+                "cannot initialize a repository at {abs_work_directory:?}"
+            ))
+        }
+
+        async fn git_clone(&self, abs_work_directory: &Path, _repo_url: &str) -> Result<()> {
+            Err(anyhow!("cannot clone into {abs_work_directory:?}"))
+        }
+
+        async fn git_config(
+            &self,
+            abs_work_directory: &Path,
+            _args: Vec<String>,
+        ) -> Result<String> {
+            Err(anyhow!(
+                "cannot read the git config at {abs_work_directory:?}"
+            ))
+        }
+
         fn is_fake(&self) -> bool {
             false
         }
@@ -3813,7 +3869,6 @@ mod wasm_fs {
             Ok(())
         }
     }
-
 }
 
 #[cfg(target_family = "wasm")]
