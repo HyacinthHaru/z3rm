@@ -8,7 +8,11 @@ publish = false
 name = "z3rm_web_demo"
 path = "main.rs"
 
-[dependencies]
+# The whole binary is the browser client, so nothing it needs exists off wasm.
+# Keeping the dependencies target-scoped is what lets a native `cargo check
+# --workspace` walk over this member instead of failing on it.
+[target.'cfg(target_family = "wasm")'.dependencies]
+assets.workspace = true
 console_error_panic_hook.workspace = true
 gpui.workspace = true
 gpui_web = { path = "../../../crates/gpui_web", default-features = false }

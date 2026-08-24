@@ -36,6 +36,7 @@ use release_channel::{AppCommitSha, AppVersion, ReleaseChannel};
 use theme::ThemeRegistry;
 use theme_settings::load_user_theme;
 use util::ResultExt as _;
+use workspace::layout_projection::MuxSnapshot;
 
 use crate::zed::{init as zed_init, watch_settings_files};
 
@@ -704,55 +705,8 @@ fn mux_binding_for_window(
         .map(|mux_window| (mux_window.domain.clone(), mux_window.session_id.clone()))
 }
 
-/// §15.4 / §15.12 Client-side projection of one authoritative attach snapshot.
-#[derive(Clone, Default)]
-struct MuxSnapshot {
-    layout: Option<workspace::layout_projection::LayoutTree>,
-    focused_pane: Option<String>,
-    zoomed: std::collections::HashMap<String, bool>,
-    pane_ids: Vec<String>,
-    /// Kept verbatim because the sidebar needs the tab dimension, which the
-    /// layout tree does not model.
-    session: Option<mux_protocol::SessionSnapshot>,
-}
-
-impl MuxSnapshot {
-    fn from_attach(response: &mux_protocol::AttachResponse) -> Self {
-        let Some(snapshot) = response.snapshot.as_ref() else {
-            return Self::default();
-        };
-        let layout = snapshot
-            .layout
-            .as_ref()
-            .map(workspace::layout_projection::LayoutTree::from_proto);
-        let pane_ids = match &layout {
-            Some(layout) => layout.pane_ids(),
-            None => snapshot
-                .tabs
-                .iter()
-                .flat_map(|tab| tab.panes.iter().map(|pane| pane.id.clone()))
-                .collect(),
-        };
-        Self {
-            layout,
-            focused_pane: (!snapshot.focused_pane_id.is_empty())
-                .then(|| snapshot.focused_pane_id.clone()),
-            zoomed: snapshot
-                .tabs
-                .iter()
-                .flat_map(|tab| tab.panes.iter().map(|pane| (pane.id.clone(), pane.zoomed)))
-                .collect(),
-            pane_ids,
-            session: Some(snapshot.clone()),
-        }
-    }
-}
-
-/// §15.4 / §15.12 Project the authoritative server layout into a workspace:
-/// one GPUI pane per server pane.
-///
-/// Must run inside the `cx.new(|cx| Workspace::new(..))` closure — items added
-/// after the workspace is constructed never reach the render tree.
+/// §15.4 Project a snapshot into this window, with panes the desktop knows how
+/// to build: mux pane views wired to the QuickJS extension host.
 fn install_snapshot_panes(
     workspace: &mut workspace::Workspace,
     snapshot: &MuxSnapshot,
@@ -760,79 +714,26 @@ fn install_snapshot_panes(
     window: &mut Window,
     cx: &mut Context<workspace::Workspace>,
 ) {
-    match &snapshot.layout {
-        Some(layout) => {
-            workspace.apply_initial_layout(
-                layout,
-                snapshot.focused_pane.as_deref(),
-                |workspace, window, cx| workspace.add_pane_for_layout(window, cx),
-                |workspace, pane, pane_id, window, cx| {
-                    let view = cx.new(|cx| {
-                        new_mux_pane_view(
-                            pane_id,
-                            domain.clone(),
-                            workspace.weak_handle(),
-                            workspace.project().downgrade(),
-                            window,
-                            cx,
-                        )
-                    });
-                    subscribe_mux_pane_extension_actions(&view, cx);
-                    let item: Box<dyn workspace::ItemHandle> = Box::new(view);
-                    workspace.add_item(pane.clone(), item, None, true, true, window, cx);
-                },
-                window,
-                cx,
-            );
-
-            // §15.4 seed zoom from PaneInfo without re-RPC.
-            // Two-pass: collect then mutate to avoid borrow conflicts.
-            let mut panes_to_zoom: Vec<Entity<workspace::Pane>> = Vec::new();
-            for pane in workspace.panes() {
-                for item in pane.read(cx).items() {
-                    if let Ok(view) = item
-                        .to_any_view()
-                        .downcast::<terminal_view::mux_pane::MuxPaneView>()
-                    {
-                        let pane_id = view.read(cx).pane_id.clone();
-                        if snapshot.zoomed.get(&pane_id) == Some(&true) {
-                            panes_to_zoom.push(pane.clone());
-                        }
-                    }
-                }
-            }
-            for pane in panes_to_zoom {
-                workspace.set_pane_zoomed(pane, true, window, cx);
-            }
-        }
-        None => {
-            // No layout tree: single default pane with all views as tabs.
-            let pane = workspace.active_pane().clone();
-            pane.update(cx, |pane, _| {
-                pane.set_should_display_welcome_page(false);
+    workspace::layout_projection::install_snapshot_panes(
+        workspace,
+        snapshot,
+        |workspace, pane_id, window, cx| {
+            let view = cx.new(|cx| {
+                new_mux_pane_view(
+                    pane_id,
+                    domain.clone(),
+                    workspace.weak_handle(),
+                    workspace.project().downgrade(),
+                    window,
+                    cx,
+                )
             });
-            let pane_ids = if snapshot.pane_ids.is_empty() {
-                vec!["default".to_string()]
-            } else {
-                snapshot.pane_ids.clone()
-            };
-            for (index, pane_id) in pane_ids.into_iter().enumerate() {
-                let view = cx.new(|cx| {
-                    new_mux_pane_view(
-                        pane_id,
-                        domain.clone(),
-                        workspace.weak_handle(),
-                        workspace.project().downgrade(),
-                        window,
-                        cx,
-                    )
-                });
-                subscribe_mux_pane_extension_actions(&view, cx);
-                let item: Box<dyn workspace::ItemHandle> = Box::new(view);
-                workspace.add_item(pane.clone(), item, None, index == 0, true, window, cx);
-            }
-        }
-    }
+            subscribe_mux_pane_extension_actions(&view, cx);
+            Box::new(view)
+        },
+        window,
+        cx,
+    );
 }
 
 /// §3.3 Open one GPUI window bound to its own mux connection (Plan 32).

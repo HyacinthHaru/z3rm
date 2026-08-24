@@ -17096,9 +17096,13 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "assets",
+ "command_palette",
  "db",
  "editor",
  "fs",
+ "git",
+ "git_hosting_providers",
+ "git_ui",
  "gpui",
  "language",
  "log",
@@ -17106,11 +17110,16 @@ dependencies = [
  "mux_protocol",
  "mux_server",
  "project",
+ "recent_projects",
+ "release_channel",
+ "search",
  "session",
  "settings",
  "terminal_view",
  "theme",
  "theme_settings",
+ "title_bar",
+ "util",
  "uuid",
  "wasm-bindgen",
  "workspace",
@@ -17120,6 +17129,7 @@ dependencies = [
 name = "z3rm_web_demo"
 version = "0.1.0"
 dependencies = [
+ "assets",
  "console_error_panic_hook",
  "gpui",
  "gpui_web",
