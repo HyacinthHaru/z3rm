@@ -8,15 +8,8 @@ publish = false
 name = "z3rm_web_demo"
 path = "main.rs"
 
-[workspace]
-
 [dependencies]
-serde = "1"
-anyhow = "1"
-console_error_panic_hook = "0.1"
-gpui = { path = "../../../crates/gpui" }
+console_error_panic_hook.workspace = true
+gpui.workspace = true
 gpui_web = { path = "../../../crates/gpui_web", default-features = false }
-log = "0.4"
-mux_protocol = { path = "../../../crates/mux_protocol" }
-z3rm_web = { path = "../../../crates/z3rm_web", default-features = false }
-web-sys = { version = "0.3", features = ["Location", "Window"] }
+z3rm_web = { path = "../../../crates/z3rm_web" }

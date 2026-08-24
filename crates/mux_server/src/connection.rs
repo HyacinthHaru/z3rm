@@ -910,11 +910,26 @@ fn start_session_snapshot_watch(
         }
     });
 }
+#[cfg(target_family = "wasm")]
+static NEXT_WASM_RUNTIME_ID: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(1);
+
+#[cfg(target_family = "wasm")]
+fn wasm_runtime_id(prefix: &str) -> String {
+    format!(
+        "{prefix}-{}",
+        NEXT_WASM_RUNTIME_ID.fetch_add(1, std::sync::atomic::Ordering::SeqCst)
+    )
+}
+
 async fn handle_create_session(
     req: &CreateSessionRequest,
     sessions: &Arc<parking_lot::RwLock<Vec<crate::session::Session>>>,
 ) -> anyhow::Result<ResponseBody> {
+    #[cfg(not(target_family = "wasm"))]
     let id = nanoid::nanoid!();
+    #[cfg(target_family = "wasm")]
+    let id = wasm_runtime_id("session");
     let mut session = crate::session::Session::new(id.clone(), req.name.clone(), req.cwd.clone());
 
     // §16.6 spec 要求:每个新 session 自动创建一个 default tab,
@@ -1225,6 +1240,7 @@ async fn handle_attach(
         if let Some(existing) = stored.as_ref() {
             existing.clone()
         } else {
+            #[cfg(not(target_family = "wasm"))]
             let minted = if let Some(identity) = &req.identity {
                 if !identity.client_id.is_empty() {
                     format!("{}-{}", identity.client_id, nanoid::nanoid!(8))
@@ -1234,6 +1250,15 @@ async fn handle_attach(
             } else {
                 format!("client-{}-{}", std::process::id(), nanoid::nanoid!(8))
             };
+            #[cfg(target_family = "wasm")]
+            let minted = req
+                .identity
+                .as_ref()
+                .filter(|identity| !identity.client_id.is_empty())
+                .map(|identity| {
+                    format!("{}-{}", identity.client_id, wasm_runtime_id("client"))
+                })
+                .unwrap_or_else(|| wasm_runtime_id("client"));
             *stored = Some(minted.clone());
             minted
         }
@@ -1494,7 +1519,10 @@ async fn handle_new_window(
     if let Err(message) = ensure_mutation_allowed(sessions, connection_client_id) {
         return Ok(ResponseBody::Error(message));
     }
+    #[cfg(not(target_family = "wasm"))]
     let window_id = format!("win-{}-{}", std::process::id(), nanoid::nanoid!());
+    #[cfg(target_family = "wasm")]
+    let window_id = wasm_runtime_id("window");
 
     let sessions_r = sessions.read();
     let session = sessions_r
@@ -1529,7 +1557,10 @@ async fn handle_spawn_pane(
     if let Err(message) = ensure_mutation_allowed(sessions, connection_client_id) {
         return Ok(ResponseBody::Error(message));
     }
+    #[cfg(not(target_family = "wasm"))]
     let pane_id = nanoid::nanoid!();
+    #[cfg(target_family = "wasm")]
+    let pane_id = wasm_runtime_id("pane");
 
     // §3.1 转换 ShellCommand → pane::ShellCommand
     let shell_cmd = req.command.as_ref().map(|c| crate::pane::ShellCommand {
@@ -1688,7 +1719,10 @@ async fn handle_split_pane(
         2 => crate::layout::SplitDirection::TopBottom,
         _ => crate::layout::SplitDirection::LeftRight,
     };
+    #[cfg(not(target_family = "wasm"))]
     let new_pane_id = nanoid::nanoid!();
+    #[cfg(target_family = "wasm")]
+    let new_pane_id = wasm_runtime_id("pane");
 
     let mut sessions_w = sessions.write();
     for session in sessions_w.iter_mut() {
