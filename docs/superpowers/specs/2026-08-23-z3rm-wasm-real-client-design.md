@@ -105,3 +105,15 @@ hatch keeps CI fast.
 - M3: native unit tests of pane lifecycle against WasmPtySystem.
 - M4: e2e types `ls` into the demo, asserts output appears in the real grid.
 - M5: Pages deploy + Axe suite unchanged.
+
+## References and inspiration
+
+- Mayx, [在浏览器中运行 Linux 的各种方法](https://mabbs.github.io/2025/12/01/linux.html) —
+  survey and implementation notes for browser-hosted Linux approaches.
+- Mayx, [WASM Linux Terminal](https://mabbs.github.io/linux/) — terminal-first
+  browser experience that inspired z3rm's v86-backed web demo and full-viewport
+  terminal presentation.
+
+These are design references rather than copied implementations; z3rm keeps its
+own server-authoritative mux protocol, GPUI renderer, WasmPty seam, and v86
+serial/9p bridge.

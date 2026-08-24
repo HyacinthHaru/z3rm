@@ -4,12 +4,32 @@
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width,height=device-height,initial-scale=1,user-scalable=0" />
     <title>Z3rm GPUI session projection</title>
+    <link data-trunk rel="copy-dir" href="../../public/v86" />
+    <link data-trunk rel="copy-file" href="v86_bridge.js" />
+    <script type="module">import "./v86_bridge.js";</script>
     <link data-trunk rel="rust" data-bin="z3rm_web_demo" data-bindgen-target="web" data-wasm-opt="z" />
     <style>
       * { box-sizing: border-box; margin: 0; padding: 0; }
       html, body { width: 100%; height: 100%; overflow: hidden; background: #101215; }
-      canvas { display: block; width: 100%; height: 100%; touch-action: none; outline: none; user-select: none; }
+      body { color: #d7dadf; font: 14px/1.4 "IBM Plex Mono", "SFMono-Regular", Consolas, monospace; }
+      #boot-terminal {
+        position: fixed; inset: 0; z-index: 1; overflow: auto; padding: 18px 20px 36px;
+        background: #101215; outline: none; white-space: pre-wrap; cursor: text;
+      }
+      #boot-terminal-output { min-height: calc(100vh - 54px); }
+      #boot-terminal-status {
+        position: fixed; right: 12px; bottom: 8px; padding: 2px 8px;
+        color: #9ca3af; background: #171a20; border: 1px solid #2b3038;
+      }
+      canvas { position: fixed; inset: 0; z-index: 2; display: block; width: 100%; height: 100%; touch-action: none; outline: none; user-select: none; }
+      html:not(.gpui-ready) canvas { visibility: hidden; }
+      html.gpui-ready #boot-terminal { display: none; }
     </style>
   </head>
-  <body></body>
+  <body>
+    <main id="boot-terminal" tabindex="0" role="application" aria-label="z3rm Linux terminal">
+      <pre id="boot-terminal-output">Booting z3rm Linux…&#10;</pre>
+      <span id="boot-terminal-status" aria-live="polite">initializing</span>
+    </main>
+  </body>
 </html>

@@ -4,9 +4,11 @@
 use std::{path::Path, sync::Arc};
 
 #[cfg(target_family = "wasm")]
-use anyhow::Result;
+use anyhow::{Context as _, Result};
 #[cfg(target_family = "wasm")]
 use gpui::{App, AppContext as _, Global, TaskExt as _};
+#[cfg(target_family = "wasm")]
+mod v86_bridge;
 
 /// Keep the in-process server alive for as long as the browser application.
 #[cfg(target_family = "wasm")]
@@ -43,9 +45,10 @@ pub fn open_real_workspace(cx: &mut App) {
             return;
         }
     };
-    cx.set_global(WebMuxRuntime { _server: server });
+    cx.set_global(WebMuxRuntime { _server: server.clone() });
 
     cx.spawn(async move |cx| -> Result<()> {
+        let _server = server.clone();
         let session = session::Session::new(uuid::Uuid::new_v4().to_string(), key_value_store).await;
         let session_id = domain.create_session("web", Path::new("/")).await?;
         domain.create_and_attach_window(&session_id).await?;
@@ -61,6 +64,18 @@ pub fn open_real_workspace(cx: &mut App) {
                 Some(Path::new("/")),
             )
             .await?;
+        // §v86 Bind the spawned pane to the emulator bridge once the guest's
+        // serial port is ready; JS delivers guest output to this pane and pane
+        // writes are routed back to the guest's serial input.
+        let pane = {
+            let sessions = _server.sessions().read();
+            sessions
+                .iter()
+                .filter_map(|session| session.panes.read().get(&pane_id).cloned())
+                .next()
+                .context("spawned pane was not registered in the server session")?
+        };
+        v86_bridge::install(&pane, &pane_id);
 
         let app_state = cx.update(|cx| {
             let app_session = cx.new(|cx| session::AppSession::new(session, cx));
@@ -130,6 +145,12 @@ pub fn open_real_workspace(cx: &mut App) {
                 root
             })
         })?;
+        if let Some(root) = web_sys::window()
+            .and_then(|window| window.document())
+            .and_then(|document| document.document_element())
+        {
+            let _ = root.set_attribute("data-gpui-ready", "true");
+        }
         Ok(())
     })
     .detach_and_log_err(cx);

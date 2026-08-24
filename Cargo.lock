@@ -17100,6 +17100,7 @@ dependencies = [
  "editor",
  "fs",
  "gpui",
+ "js-sys",
  "language",
  "log",
  "mux",
@@ -17113,6 +17114,7 @@ dependencies = [
  "theme_settings",
  "uuid",
  "wasm-bindgen",
+ "web-sys",
  "workspace",
 ]
 
