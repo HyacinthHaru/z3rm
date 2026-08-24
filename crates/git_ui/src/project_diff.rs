@@ -622,16 +622,24 @@ impl SerializableItem for ProjectDiff {
 
 pub(crate) mod persistence {
 
+    #[cfg(not(target_family = "wasm"))]
     use anyhow::Context as _;
+    #[cfg(not(target_family = "wasm"))]
     use db::{
         sqlez::{domain::Domain, thread_safe_connection::ThreadSafeConnection},
         sqlez_macros::sql,
     };
+    #[cfg(not(target_family = "wasm"))]
     use project::git_store::diff_buffer_list::DiffBase;
-    use workspace::{ItemId, WorkspaceDb, WorkspaceId};
+    #[cfg(not(target_family = "wasm"))]
+    use workspace::WorkspaceDb;
+    #[cfg(not(target_family = "wasm"))]
+    use workspace::{ItemId, WorkspaceId};
 
+    #[cfg(not(target_family = "wasm"))]
     pub struct ProjectDiffDb(ThreadSafeConnection);
 
+    #[cfg(not(target_family = "wasm"))]
     impl Domain for ProjectDiffDb {
         const NAME: &str = stringify!(ProjectDiffDb);
 
@@ -663,8 +671,10 @@ pub(crate) mod persistence {
         ];
     }
 
+    #[cfg(not(target_family = "wasm"))]
     db::static_connection!(ProjectDiffDb, [WorkspaceDb]);
 
+    #[cfg(not(target_family = "wasm"))]
     impl ProjectDiffDb {
         pub async fn save_project_diff_base(
             &self,

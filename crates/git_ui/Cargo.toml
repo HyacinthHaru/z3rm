@@ -40,6 +40,7 @@ menu.workspace = true
 multi_buffer.workspace = true
 notifications.workspace = true
 panel.workspace = true
+parking_lot.workspace = true
 picker.workspace = true
 project.workspace = true
 proto.workspace = true

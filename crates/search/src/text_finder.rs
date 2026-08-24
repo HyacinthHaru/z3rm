@@ -1,5 +1,6 @@
 use std::{ops::Range, sync::atomic::Ordering};
 
+#[cfg(not(target_family = "wasm"))]
 use db::{
     query,
     sqlez::{domain::Domain, thread_safe_connection::ThreadSafeConnection},
@@ -16,10 +17,11 @@ use picker::Picker;
 use project::ProjectPath;
 use text::Anchor;
 use ui::Window;
+#[cfg(not(target_family = "wasm"))]
+use workspace::WorkspaceDb;
 use workspace::settings_stubs::SeedQuerySetting;
 use workspace::{
-    DismissDecision, ModalView, Workspace, WorkspaceDb, WorkspaceId,
-    searchable::SearchableItemHandle,
+    DismissDecision, ModalView, Workspace, WorkspaceId, searchable::SearchableItemHandle,
 };
 
 mod delegate;
@@ -43,8 +45,10 @@ pub struct TextFinder {
 /// (mirrors JetBrains' per-project find history). The row is removed automatically when its
 /// workspace is deleted, via the `ON DELETE CASCADE` foreign key. Workspaces without a database
 /// id (not yet persisted) don't participate.
+#[cfg(not(target_family = "wasm"))]
 pub struct TextFinderDb(ThreadSafeConnection);
 
+#[cfg(not(target_family = "wasm"))]
 impl Domain for TextFinderDb {
     const NAME: &str = stringify!(TextFinderDb);
 
@@ -59,8 +63,10 @@ impl Domain for TextFinderDb {
     )];
 }
 
+#[cfg(not(target_family = "wasm"))]
 db::static_connection!(TextFinderDb, [WorkspaceDb]);
 
+#[cfg(not(target_family = "wasm"))]
 impl TextFinderDb {
     query! {
         pub async fn set_last_search(workspace_id: WorkspaceId, query: String, search_options: i64) -> Result<()> {
@@ -78,6 +84,52 @@ impl TextFinderDb {
         }
     }
 }
+
+#[cfg(target_family = "wasm")]
+mod wasm_text_finder_persistence {
+    use std::collections::HashMap;
+    use std::sync::LazyLock;
+
+    use anyhow::Result;
+    use gpui::App;
+    use parking_lot::Mutex;
+    use workspace::WorkspaceId;
+
+    /// Per-App text finder history, mirroring the per-App SQLite table used on
+    /// native. Reads and writes stay in process memory.
+    static WASM_LAST_SEARCHES: LazyLock<Mutex<HashMap<WorkspaceId, (String, i64)>>> =
+        LazyLock::new(Mutex::default);
+
+    #[derive(Clone)]
+    pub struct TextFinderDb;
+
+    impl TextFinderDb {
+        pub fn global(_cx: &App) -> Self {
+            Self
+        }
+
+        /// wasm shim for `query! { pub async fn set_last_search(...) }`.
+        pub async fn set_last_search(
+            &self,
+            workspace_id: WorkspaceId,
+            query: String,
+            search_options: i64,
+        ) -> Result<()> {
+            WASM_LAST_SEARCHES
+                .lock()
+                .insert(workspace_id, (query, search_options));
+            Ok(())
+        }
+
+        /// wasm shim for `query! { pub fn last_search(...) }`.
+        pub fn last_search(&self, workspace_id: WorkspaceId) -> Result<Option<(String, i64)>> {
+            Ok(WASM_LAST_SEARCHES.lock().get(&workspace_id).cloned())
+        }
+    }
+}
+
+#[cfg(target_family = "wasm")]
+use wasm_text_finder_persistence::TextFinderDb;
 
 /// A query to pre-populate the Text Finder with, plus the search filters to restore alongside
 /// it. `options` carries the workspace's last-used filters when there are any persisted; it is

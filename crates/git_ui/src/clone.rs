@@ -39,7 +39,19 @@ pub fn clone_and_open(
                     let destination_dir = destination_dir.clone();
                     let repo_url = repo_url.clone();
                     cx.spawn(async move |_workspace, _cx| {
-                        fs.git_clone(destination_dir.as_path(), &repo_url).await
+                        // `Fs::git_clone` shells out to a git binary, which the
+                        // browser build does not carry.
+                        #[cfg(not(target_family = "wasm"))]
+                        {
+                            fs.git_clone(destination_dir.as_path(), &repo_url).await
+                        }
+                        #[cfg(target_family = "wasm")]
+                        {
+                            drop((fs, destination_dir, repo_url));
+                            anyhow::Result::<()>::Err(anyhow::anyhow!(
+                                "cannot clone a repository from the web"
+                            ))
+                        }
                     })
                 })
                 .ok()?;

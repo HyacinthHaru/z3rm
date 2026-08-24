@@ -1,33 +1,47 @@
-use anyhow::{Context as _, Result};
+// The updater replaces the running binary, which a browser tab has no way
+// to do, so its download and install paths leave the build entirely.
+#![cfg_attr(target_family = "wasm", allow(dead_code))]
+
+#[cfg(not(target_family = "wasm"))]
+use anyhow::Context as _;
+use anyhow::Result;
 use db::kvp::KeyValueStore;
+#[cfg(not(target_family = "wasm"))]
+use futures::io::{AsyncReadExt, AsyncWriteExt};
+#[cfg(not(target_family = "wasm"))]
 use futures_lite::StreamExt;
+#[cfg(not(target_family = "wasm"))]
+use gpui::TaskExt;
 use gpui::{
-    App, AppContext as _, AsyncApp, BackgroundExecutor, Context, Entity, Global, Task, TaskExt,
-    Window, actions,
+    App, AppContext as _, AsyncApp, BackgroundExecutor, Context, Entity, Global, Task, Window,
+    actions,
 };
-use http_client::{HttpClient, HttpClientWithUrl};
+#[cfg(not(target_family = "wasm"))]
+use http_client::HttpClient;
+use http_client::HttpClientWithUrl;
+#[cfg(not(target_family = "wasm"))]
 use paths::remote_servers_dir;
-use release_channel::{AppCommitSha, ReleaseChannel};
+#[cfg(not(target_family = "wasm"))]
+use release_channel::AppCommitSha;
+use release_channel::ReleaseChannel;
 use semver::Version;
 use serde::{Deserialize, Serialize};
 use settings::{RegisterSetting, Settings, SettingsStore};
+#[cfg(not(target_family = "wasm"))]
+use smol::fs;
+#[cfg(not(target_family = "wasm"))]
 use smol::fs::File;
-use smol::{
-    fs,
-    io::{AsyncReadExt, AsyncWriteExt},
-};
+#[cfg(not(target_family = "wasm"))]
 use std::mem;
+use std::{env, path::PathBuf, sync::Arc, time::Duration};
+#[cfg(not(target_family = "wasm"))]
 use std::{
-    env::{
-        self,
-        consts::{ARCH, OS},
-    },
-    ffi::OsStr,
-    ffi::OsString,
-    path::{Path, PathBuf},
-    sync::Arc,
-    time::{Duration, SystemTime},
+    env::consts::{ARCH, OS},
+    ffi::{OsStr, OsString},
+    path::Path,
+    time::SystemTime,
 };
+#[cfg(not(target_family = "wasm"))]
 use util::command::new_command;
 use workspace::Workspace;
 
@@ -48,6 +62,7 @@ const NIGHTLY_POLL_INTERVAL: Duration = Duration::from_secs(15 * 60);
 const REMOTE_SERVER_CACHE_LIMIT: usize = 5;
 
 #[cfg(target_os = "linux")]
+#[cfg(not(target_family = "wasm"))]
 fn linux_rsync_install_hint() -> &'static str {
     let os_release = match std::fs::read_to_string("/etc/os-release") {
         Ok(os_release) => os_release,
@@ -193,6 +208,7 @@ struct MacOsUnmounter<'a> {
     background_executor: &'a BackgroundExecutor,
 }
 
+#[cfg(not(target_family = "wasm"))]
 impl MacOsUnmounter<'_> {
     /// Unmounts the disk image and waits for completion. This must happen
     /// before the `InstallerDir` is dropped: deleting the temp dir while the
@@ -204,6 +220,7 @@ impl MacOsUnmounter<'_> {
     }
 }
 
+#[cfg(not(target_family = "wasm"))]
 impl Drop for MacOsUnmounter<'_> {
     fn drop(&mut self) {
         let mount_path = mem::take(&mut self.mount_path);
@@ -218,6 +235,7 @@ impl Drop for MacOsUnmounter<'_> {
     }
 }
 
+#[cfg(not(target_family = "wasm"))]
 async fn unmount_disk_image(mount_path: &Path) {
     let unmount_output = new_command("hdiutil")
         .args(["detach", "-force"])
@@ -364,13 +382,13 @@ pub fn view_release_notes(_: &ViewReleaseNotes, cx: &mut App) -> Option<()> {
     None
 }
 
-#[cfg(not(target_os = "windows"))]
+#[cfg(all(not(target_os = "windows"), not(target_family = "wasm")))]
 const INSTALLER_DIR_PREFIX: &str = "z3rm-auto-update";
 
-#[cfg(not(target_os = "windows"))]
+#[cfg(all(not(target_os = "windows"), not(target_family = "wasm")))]
 struct InstallerDir(tempfile::TempDir);
 
-#[cfg(not(target_os = "windows"))]
+#[cfg(all(not(target_os = "windows"), not(target_family = "wasm")))]
 impl InstallerDir {
     async fn new() -> Result<Self> {
         Ok(Self(
@@ -450,6 +468,12 @@ impl AutoUpdater {
         }
     }
 
+    #[cfg(target_family = "wasm")]
+    pub fn start_polling(&self, _cx: &mut Context<Self>) -> Task<Result<()>> {
+        Task::ready(Ok(()))
+    }
+
+    #[cfg(not(target_family = "wasm"))]
     pub fn start_polling(&self, cx: &mut Context<Self>) -> Task<Result<()>> {
         let poll_interval =
             ReleaseChannel::try_global(cx).map_or(POLL_INTERVAL, |channel| match channel {
@@ -481,6 +505,10 @@ impl AutoUpdater {
         self.update_check_type
     }
 
+    #[cfg(target_family = "wasm")]
+    pub fn poll(&mut self, _check_type: UpdateCheckType, _cx: &mut Context<Self>) {}
+
+    #[cfg(not(target_family = "wasm"))]
     pub fn poll(&mut self, check_type: UpdateCheckType, cx: &mut Context<Self>) {
         if check_type.is_manual() {
             self.dismissed_status = None;
@@ -559,6 +587,30 @@ impl AutoUpdater {
     // If you are packaging Zed and need to override the place it downloads SSH remotes from,
     // you can override this function. You should also update get_remote_server_release_url to return
     // Ok(None).
+    #[cfg(target_family = "wasm")]
+    pub async fn download_remote_server_release(
+        _release_channel: ReleaseChannel,
+        _version: Option<Version>,
+        _os: &str,
+        _arch: &str,
+        _set_status: impl Fn(&str, &mut AsyncApp) + Send + 'static,
+        _cx: &mut AsyncApp,
+    ) -> Result<PathBuf> {
+        anyhow::bail!("cannot download a remote server binary from the web")
+    }
+
+    #[cfg(target_family = "wasm")]
+    pub async fn get_remote_server_release_url(
+        _channel: ReleaseChannel,
+        _version: Option<Version>,
+        _os: &str,
+        _arch: &str,
+        _cx: &mut AsyncApp,
+    ) -> Result<Option<String>> {
+        Ok(None)
+    }
+
+    #[cfg(not(target_family = "wasm"))]
     pub async fn download_remote_server_release(
         release_channel: ReleaseChannel,
         version: Option<Version>,
@@ -616,6 +668,7 @@ impl AutoUpdater {
         Ok(version_path)
     }
 
+    #[cfg(not(target_family = "wasm"))]
     pub async fn get_remote_server_release_url(
         channel: ReleaseChannel,
         version: Option<Version>,
@@ -637,6 +690,7 @@ impl AutoUpdater {
         Ok(Some(release.url))
     }
 
+    #[cfg(not(target_family = "wasm"))]
     async fn get_release_asset(
         this: &Entity<Self>,
         release_channel: ReleaseChannel,
@@ -692,6 +746,7 @@ impl AutoUpdater {
         })
     }
 
+    #[cfg(not(target_family = "wasm"))]
     async fn update(this: Entity<Self>, cx: &mut AsyncApp) -> Result<()> {
         let (client, installed_version, previous_status, release_channel) =
             this.read_with(cx, |this, cx| {
@@ -816,6 +871,7 @@ impl AutoUpdater {
         Ok(())
     }
 
+    #[cfg(not(target_family = "wasm"))]
     fn check_if_fetched_version_is_newer(
         release_channel: ReleaseChannel,
         app_commit_sha: Result<Option<String>>,
@@ -852,6 +908,7 @@ impl AutoUpdater {
         }
     }
 
+    #[cfg(not(target_family = "wasm"))]
     fn check_dependencies() -> Result<()> {
         #[cfg(target_os = "linux")]
         if which::which("rsync").is_err() {
@@ -871,6 +928,7 @@ impl AutoUpdater {
         Ok(())
     }
 
+    #[cfg(not(target_family = "wasm"))]
     async fn target_path(installer_dir: &InstallerDir) -> Result<PathBuf> {
         let filename = match OS {
             "macos" => anyhow::Ok("Zed.dmg"),
@@ -883,6 +941,7 @@ impl AutoUpdater {
     }
 
     #[cfg_attr(test, allow(dead_code))]
+    #[cfg(not(target_family = "wasm"))]
     async fn install_release(
         installer_dir: InstallerDir,
         target_path: PathBuf,
@@ -908,6 +967,7 @@ impl AutoUpdater {
         }
     }
 
+    #[cfg(not(target_family = "wasm"))]
     fn check_if_fetched_version_is_newer_non_nightly(
         mut installed_version: Version,
         fetched_version: Version,
@@ -947,6 +1007,7 @@ impl AutoUpdater {
     }
 }
 
+#[cfg(not(target_family = "wasm"))]
 async fn download_remote_server_binary(
     target_path: &PathBuf,
     release: ReleaseAsset,
@@ -967,6 +1028,7 @@ async fn download_remote_server_binary(
     Ok(())
 }
 
+#[cfg(not(target_family = "wasm"))]
 async fn cleanup_remote_server_cache(
     platform_dir: &Path,
     keep_path: &Path,
@@ -1024,6 +1086,7 @@ async fn cleanup_remote_server_cache(
     Ok(())
 }
 
+#[cfg(not(target_family = "wasm"))]
 async fn download_release(
     target_path: &Path,
     release: ReleaseAsset,
@@ -1077,6 +1140,7 @@ async fn download_release(
     Ok(())
 }
 
+#[cfg(not(target_family = "wasm"))]
 async fn install_release_linux(
     temp_dir: &InstallerDir,
     downloaded_tar_gz: &Path,
@@ -1145,6 +1209,7 @@ async fn install_release_linux(
     Ok(Some(to.join(expected_suffix)))
 }
 
+#[cfg(not(target_family = "wasm"))]
 async fn install_release_macos(
     temp_dir: &InstallerDir,
     downloaded_dmg: &Path,
@@ -1205,6 +1270,7 @@ async fn install_release_macos(
 /// leaked one per update by deleting the dir while the downloaded disk image
 /// was still mounted inside it, which made the deletion fail silently.
 #[cfg(any(rust_analyzer, all(not(target_os = "windows"), not(test))))]
+#[cfg(not(target_family = "wasm"))]
 async fn cleanup_stale_installer_dirs() {
     const STALE_INSTALLER_DIR_AGE: Duration = Duration::from_secs(24 * 60 * 60);
 
@@ -1247,6 +1313,7 @@ async fn cleanup_stale_installer_dirs() {
     }
 }
 
+#[cfg(not(target_family = "wasm"))]
 async fn cleanup_windows() -> Result<()> {
     let parent = std::env::current_exe()?
         .parent()
@@ -1261,6 +1328,7 @@ async fn cleanup_windows() -> Result<()> {
     Ok(())
 }
 
+#[cfg(not(target_family = "wasm"))]
 async fn install_release_windows(downloaded_installer: &Path) -> Result<Option<PathBuf>> {
     let mut cmd = new_command(downloaded_installer);
     cmd.arg("/verysilent")
@@ -1283,6 +1351,7 @@ async fn install_release_windows(downloaded_installer: &Path) -> Result<Option<P
     Ok(Some(helper_path))
 }
 
+#[cfg(not(target_family = "wasm"))]
 pub async fn finalize_auto_update_on_quit() {
     let Some(installer_path) = std::env::current_exe()
         .ok()
@@ -1307,7 +1376,7 @@ pub async fn finalize_auto_update_on_quit() {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, not(target_family = "wasm")))]
 mod tests {
     // use client::Client;  // removed-crate: client
     use clock::FakeSystemClock;
