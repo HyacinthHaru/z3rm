@@ -46,6 +46,7 @@ use objc::{
 use parking_lot::Mutex;
 use ptr::null_mut;
 use semver::Version;
+use std::ffi::OsString;
 use std::{
     cell::Cell,
     ffi::{CStr, OsStr, c_void},
@@ -534,7 +535,7 @@ impl Platform for MacPlatform {
         }
     }
 
-    fn restart(&self, binary_path: Option<PathBuf>) {
+    fn restart(&self, binary_path: Option<PathBuf>, arguments: Vec<OsString>) {
         use std::os::unix::process::CommandExt as _;
 
         let app_pid = std::process::id().to_string();
@@ -550,11 +551,20 @@ impl Platform for MacPlatform {
             .unwrap_or_else(|| std::env::current_exe().unwrap());
 
         // Wait until this process has exited and then re-open this path.
+        // Positional parameters rather than interpolation, so a path or
+        // argument containing spaces or quotes survives the shell.
         let script = r#"
-            while kill -0 $0 2> /dev/null; do
+            while kill -0 "$0" 2> /dev/null; do
                 sleep 0.1
             done
-            open "$1"
+
+            app_path="$1"
+            shift
+            if (($# > 0)); then
+                open "$app_path" --args "$@"
+            else
+                open "$app_path"
+            fi
         "#;
 
         #[allow(
@@ -566,6 +576,7 @@ impl Platform for MacPlatform {
             .arg(script)
             .arg(app_pid)
             .arg(app_path)
+            .args(arguments)
             .process_group(0)
             .spawn();
 

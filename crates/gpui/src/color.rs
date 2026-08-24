@@ -740,9 +740,14 @@ impl<'de> Deserialize<'de> for Hsla {
     }
 }
 
+/// Which of the [`Background`] variants a value holds.
+///
+/// Public so renderers outside this crate — the software renderer in
+/// `gpui_platform`, for one — can dispatch on it the same way the GPU
+/// backends do.
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize, JsonSchema)]
 #[repr(C)]
-pub(crate) enum BackgroundTag {
+pub enum BackgroundTag {
     Solid = 0,
     LinearGradient = 1,
     PatternSlash = 2,
@@ -908,6 +913,28 @@ impl LinearColorStop {
 }
 
 impl Background {
+    /// Which variant this background holds.
+    pub fn tag(&self) -> BackgroundTag {
+        self.tag
+    }
+
+    /// The solid colour, meaningful for [`BackgroundTag::Solid`] and as the
+    /// pattern colour for the pattern variants.
+    pub fn solid_color(&self) -> Hsla {
+        self.solid
+    }
+
+    /// The two stops of a linear gradient.
+    pub fn gradient_stops(&self) -> [LinearColorStop; 2] {
+        self.colors
+    }
+
+    /// The gradient angle in degrees, or the pattern height, depending on
+    /// [`Self::tag`].
+    pub fn gradient_angle_or_pattern_height(&self) -> f32 {
+        self.gradient_angle_or_pattern_height
+    }
+
     /// Returns the solid color if this is a solid background, None otherwise.
     pub fn as_solid(&self) -> Option<Hsla> {
         if self.tag == BackgroundTag::Solid {

@@ -1,11 +1,17 @@
+// notify has no browser backend, so the watcher module — and the poll-watcher
+// question it answers — only exist off wasm. `Fs::watch` still exists on wasm;
+// it hands back a stream that never yields.
+#[cfg(not(target_family = "wasm"))]
 pub mod fs_watcher;
 
+#[cfg(not(target_family = "wasm"))]
 pub use fs_watcher::requires_poll_watcher;
 
 use parking_lot::Mutex;
 use std::ffi::OsString;
 use std::sync::atomic::{AtomicU8, AtomicUsize, Ordering};
 use std::time::Instant;
+#[cfg(not(target_family = "wasm"))]
 use util::maybe;
 
 use anyhow::{Context as _, Result, anyhow};
@@ -17,6 +23,7 @@ use gpui::ReadGlobal as _;
 use gpui::SharedString;
 #[cfg(unix)]
 use std::ffi::CString;
+#[cfg(not(target_family = "wasm"))]
 use util::command::new_command;
 
 #[cfg(unix)]
@@ -30,12 +37,16 @@ use std::os::unix::fs::{FileTypeExt, MetadataExt};
 #[cfg(any(target_os = "macos", target_os = "freebsd"))]
 use std::mem::MaybeUninit;
 
+#[cfg(not(target_family = "wasm"))]
 use async_tar::Archive;
 use futures::{AsyncRead, Stream, StreamExt, future::BoxFuture};
+#[cfg(not(target_family = "wasm"))]
 use git::repository::{GitRepository, RealGitRepository};
+#[cfg(not(target_family = "wasm"))]
 use is_executable::IsExecutable;
 use rope::Rope;
 use serde::{Deserialize, Serialize};
+#[cfg(not(target_family = "wasm"))]
 use smol::io::AsyncWriteExt;
 #[cfg(feature = "test-support")]
 use std::path::Component;
@@ -46,6 +57,7 @@ use std::{
     sync::Arc,
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
+#[cfg(not(target_family = "wasm"))]
 use tempfile::TempDir;
 use text::LineEnding;
 
@@ -103,6 +115,7 @@ pub trait Fs: Send + Sync {
         path: &Path,
         content: Pin<&mut (dyn AsyncRead + Send)>,
     ) -> Result<()>;
+    #[cfg(not(target_family = "wasm"))]
     async fn extract_tar_file(
         &self,
         path: &Path,
@@ -154,14 +167,21 @@ pub trait Fs: Send + Sync {
         Arc<dyn Watcher>,
     );
 
+    // git shells out to a binary and reads a work tree; neither exists in the
+    // browser, so these leave the trait entirely rather than becoming stubs
+    // that fail at run time.
+    #[cfg(not(target_family = "wasm"))]
     fn open_repo(
         &self,
         abs_dot_git: &Path,
         system_git_binary_path: Option<&Path>,
     ) -> Result<Arc<dyn GitRepository>>;
+    #[cfg(not(target_family = "wasm"))]
     async fn git_init(&self, abs_work_directory: &Path, fallback_branch_name: String)
     -> Result<()>;
+    #[cfg(not(target_family = "wasm"))]
     async fn git_clone(&self, abs_work_directory: &Path, repo_url: &str) -> Result<()>;
+    #[cfg(not(target_family = "wasm"))]
     async fn git_config(&self, abs_work_directory: &Path, args: Vec<String>) -> Result<String>;
     fn is_fake(&self) -> bool;
     async fn is_case_sensitive(&self) -> bool;
@@ -199,6 +219,7 @@ pub struct TrashedEntry {
     pub original_parent: PathBuf,
 }
 
+#[cfg(not(target_family = "wasm"))]
 impl From<trash::TrashItem> for TrashedEntry {
     fn from(item: trash::TrashItem) -> Self {
         Self {
@@ -209,6 +230,7 @@ impl From<trash::TrashItem> for TrashedEntry {
     }
 }
 
+#[cfg(not(target_family = "wasm"))]
 impl TrashedEntry {
     fn into_trash_item(self) -> trash::TrashItem {
         trash::TrashItem {
@@ -232,6 +254,7 @@ pub enum TrashRestoreError {
     Unknown { description: String },
 }
 
+#[cfg(not(target_family = "wasm"))]
 impl From<trash::Error> for TrashRestoreError {
     fn from(err: trash::Error) -> Self {
         match err {
@@ -396,6 +419,8 @@ impl From<MTime> for proto::Timestamp {
     }
 }
 
+// RealFs talks to a host filesystem; the browser build uses WasmFs below.
+#[cfg(not(target_family = "wasm"))]
 pub struct RealFs {
     bundled_git_binary_path: Option<PathBuf>,
     executor: BackgroundExecutor,
@@ -408,6 +433,7 @@ pub trait FileHandle: Send + Sync + std::fmt::Debug {
     fn current_path(&self, fs: &Arc<dyn Fs>) -> Result<PathBuf>;
 }
 
+#[cfg(not(target_family = "wasm"))]
 impl FileHandle for std::fs::File {
     #[cfg(target_os = "macos")]
     fn current_path(&self, _: &Arc<dyn Fs>) -> Result<PathBuf> {
@@ -500,8 +526,10 @@ impl FileHandle for std::fs::File {
     }
 }
 
+#[cfg(not(target_family = "wasm"))]
 pub struct RealWatcher {}
 
+#[cfg(not(target_family = "wasm"))]
 impl RealFs {
     pub fn new(git_binary_path: Option<PathBuf>, executor: BackgroundExecutor) -> Self {
         Self {
@@ -612,6 +640,7 @@ fn path_to_c_string(path: &Path) -> io::Result<CString> {
     })
 }
 
+#[cfg(not(target_family = "wasm"))]
 #[async_trait::async_trait]
 impl Fs for RealFs {
     async fn create_dir(&self, path: &Path) -> Result<()> {
@@ -1319,6 +1348,7 @@ impl Fs for RealFs {
     }
 }
 
+#[cfg(not(target_family = "wasm"))]
 #[cfg(not(any(target_os = "linux", target_os = "freebsd")))]
 impl Watcher for RealWatcher {
     fn add(&self, _: &Path) -> Result<()> {
@@ -3456,3 +3486,335 @@ fn atomic_replace<P: AsRef<Path>>(replaced_file: P, replacement_file: P) -> Resu
     .map_err(anyhow::Error::from)
     .with_context(|| format!("failed to atomically replace {:?}", replaced_file.as_ref()))
 }
+
+/// The browser's filesystem: everything lives in memory for the life of the
+/// page.
+///
+/// A tab has no host filesystem, no `notify` backend, no system trash and no
+/// git binary, so `RealFs` cannot exist there. This serves the same `Fs` trait
+/// (minus the git and tar methods, which are gated out of the trait itself)
+/// over a map of paths, which is what the settings and worktree layers need to
+/// come up.
+#[cfg(target_family = "wasm")]
+mod wasm_fs {
+    use super::{
+        CopyOptions, CreateOptions, Fs, FileHandle, JobEventReceiver, LineEnding, Metadata, MTime,
+        PathEvent, RemoveOptions, RenameOptions, RenameOptions as _RenameOptions, Rope,
+        TrashRestoreError, TrashedEntry, Watcher,
+    };
+    use anyhow::{Context as _, Result, anyhow};
+    use collections::BTreeMap;
+    use futures::{AsyncRead, Stream};
+    use parking_lot::Mutex;
+    use std::{
+        io,
+        path::{Path, PathBuf},
+        pin::Pin,
+        sync::Arc,
+        time::{Duration, SystemTime},
+    };
+
+    #[derive(Clone)]
+    enum Entry {
+        Dir,
+        File { content: Vec<u8>, mtime: SystemTime },
+    }
+
+    #[derive(Default)]
+    struct State {
+        entries: BTreeMap<PathBuf, Entry>,
+    }
+
+    pub struct WasmFs {
+        state: Mutex<State>,
+        job_event_subscribers: Arc<Mutex<Vec<super::JobEventSender>>>,
+    }
+
+    impl Default for WasmFs {
+        fn default() -> Self {
+            Self::new()
+        }
+    }
+
+    impl WasmFs {
+        pub fn new() -> Self {
+            let mut state = State::default();
+            state.entries.insert(PathBuf::from("/"), Entry::Dir);
+            Self {
+                state: Mutex::new(state),
+                job_event_subscribers: Arc::default(),
+            }
+        }
+
+        fn ensure_parents(state: &mut State, path: &Path) {
+            let mut ancestor = path.parent();
+            while let Some(dir) = ancestor {
+                state.entries.entry(dir.to_path_buf()).or_insert(Entry::Dir);
+                ancestor = dir.parent();
+            }
+        }
+
+        fn read(&self, path: &Path) -> Result<Vec<u8>> {
+            match self.state.lock().entries.get(path) {
+                Some(Entry::File { content, .. }) => Ok(content.clone()),
+                Some(Entry::Dir) => Err(anyhow!("{} is a directory", path.display())),
+                None => Err(anyhow!("{} does not exist", path.display())),
+            }
+        }
+
+        fn put(&self, path: &Path, content: Vec<u8>) {
+            let mut state = self.state.lock();
+            Self::ensure_parents(&mut state, path);
+            state.entries.insert(
+                path.to_path_buf(),
+                Entry::File {
+                    content,
+                    mtime: SystemTime::UNIX_EPOCH,
+                },
+            );
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl Fs for WasmFs {
+        async fn create_dir(&self, path: &Path) -> Result<()> {
+            let mut state = self.state.lock();
+            Self::ensure_parents(&mut state, path);
+            state.entries.insert(path.to_path_buf(), Entry::Dir);
+            Ok(())
+        }
+
+        async fn create_symlink(&self, _path: &Path, _target: PathBuf) -> Result<()> {
+            Err(anyhow!("symlinks are not available in the browser"))
+        }
+
+        async fn create_file(&self, path: &Path, options: CreateOptions) -> Result<()> {
+            if !options.overwrite && self.state.lock().entries.contains_key(path) {
+                if options.ignore_if_exists {
+                    return Ok(());
+                }
+                return Err(anyhow!("{} already exists", path.display()));
+            }
+            self.put(path, Vec::new());
+            Ok(())
+        }
+
+        async fn create_file_with(
+            &self,
+            path: &Path,
+            content: Pin<&mut (dyn AsyncRead + Send)>,
+        ) -> Result<()> {
+            use futures::AsyncReadExt as _;
+            let mut bytes = Vec::new();
+            let mut content = content;
+            content
+                .read_to_end(&mut bytes)
+                .await
+                .context("reading the source stream")?;
+            self.put(path, bytes);
+            Ok(())
+        }
+
+        async fn copy_file(&self, source: &Path, target: &Path, options: CopyOptions) -> Result<()> {
+            if !options.overwrite && self.state.lock().entries.contains_key(target) {
+                if options.ignore_if_exists {
+                    return Ok(());
+                }
+                return Err(anyhow!("{} already exists", target.display()));
+            }
+            let content = self.read(source)?;
+            self.put(target, content);
+            Ok(())
+        }
+
+        async fn rename(&self, source: &Path, target: &Path, options: RenameOptions) -> Result<()> {
+            if !options.overwrite && self.state.lock().entries.contains_key(target) {
+                if options.ignore_if_exists {
+                    return Ok(());
+                }
+                return Err(anyhow!("{} already exists", target.display()));
+            }
+            let entry = self
+                .state
+                .lock()
+                .entries
+                .remove(source)
+                .with_context(|| format!("{} does not exist", source.display()))?;
+            let mut state = self.state.lock();
+            Self::ensure_parents(&mut state, target);
+            state.entries.insert(target.to_path_buf(), entry);
+            Ok(())
+        }
+
+        async fn remove_dir(&self, path: &Path, options: RemoveOptions) -> Result<()> {
+            let mut state = self.state.lock();
+            let present = state.entries.contains_key(path);
+            if !present {
+                if options.ignore_if_not_exists {
+                    return Ok(());
+                }
+                return Err(anyhow!("{} does not exist", path.display()));
+            }
+            if options.recursive {
+                state.entries.retain(|entry, _| !entry.starts_with(path));
+            } else {
+                state.entries.remove(path);
+            }
+            Ok(())
+        }
+
+        async fn trash(&self, path: &Path, options: RemoveOptions) -> Result<TrashedEntry> {
+            // The browser has no system trash, so a "trash" is a delete that
+            // cannot be restored. Saying so is better than reporting success
+            // on an entry the caller may later try to restore.
+            self.remove_file(path, options).await?;
+            Err(anyhow!("the browser has no trash to move {} to", path.display()))
+        }
+
+        async fn remove_file(&self, path: &Path, options: RemoveOptions) -> Result<()> {
+            if self.state.lock().entries.remove(path).is_none() && !options.ignore_if_not_exists {
+                return Err(anyhow!("{} does not exist", path.display()));
+            }
+            Ok(())
+        }
+
+        async fn open_handle(&self, path: &Path) -> Result<Arc<dyn FileHandle>> {
+            Err(anyhow!(
+                "file handles are not available in the browser: {}",
+                path.display()
+            ))
+        }
+
+        async fn open_sync(&self, path: &Path) -> Result<Box<dyn io::Read + Send + Sync>> {
+            Ok(Box::new(io::Cursor::new(self.read(path)?)))
+        }
+
+        async fn load_bytes(&self, path: &Path) -> Result<Vec<u8>> {
+            self.read(path)
+        }
+
+        async fn atomic_write(&self, path: PathBuf, text: String) -> Result<()> {
+            self.put(&path, text.into_bytes());
+            Ok(())
+        }
+
+        async fn save(&self, path: &Path, text: &Rope, line_ending: LineEnding) -> Result<()> {
+            let mut content = text.to_string();
+            if line_ending == LineEnding::Windows {
+                content = content.replace('\n', "\r\n");
+            }
+            self.put(path, content.into_bytes());
+            Ok(())
+        }
+
+        async fn write(&self, path: &Path, content: &[u8]) -> Result<()> {
+            self.put(path, content.to_vec());
+            Ok(())
+        }
+
+        async fn canonicalize(&self, path: &Path) -> Result<PathBuf> {
+            Ok(path.to_path_buf())
+        }
+
+        async fn is_file(&self, path: &Path) -> bool {
+            matches!(self.state.lock().entries.get(path), Some(Entry::File { .. }))
+        }
+
+        async fn is_dir(&self, path: &Path) -> bool {
+            matches!(self.state.lock().entries.get(path), Some(Entry::Dir))
+        }
+
+        async fn metadata(&self, path: &Path) -> Result<Option<Metadata>> {
+            let state = self.state.lock();
+            let Some(entry) = state.entries.get(path) else {
+                return Ok(None);
+            };
+            let (is_dir, len, mtime) = match entry {
+                Entry::Dir => (true, 0, SystemTime::UNIX_EPOCH),
+                Entry::File { content, mtime } => (false, content.len() as u64, *mtime),
+            };
+            Ok(Some(Metadata {
+                inode: 0,
+                mtime: MTime(mtime),
+                len,
+                is_symlink: false,
+                is_dir,
+                is_fifo: false,
+                is_executable: false,
+                is_writable: true,
+            }))
+        }
+
+        async fn read_link(&self, path: &Path) -> Result<PathBuf> {
+            Err(anyhow!("{} is not a symlink", path.display()))
+        }
+
+        async fn read_dir(
+            &self,
+            path: &Path,
+        ) -> Result<Pin<Box<dyn Send + Stream<Item = Result<PathBuf>>>>> {
+            let children: Vec<Result<PathBuf>> = self
+                .state
+                .lock()
+                .entries
+                .keys()
+                .filter(|entry| entry.parent() == Some(path))
+                .map(|entry| Ok(entry.clone()))
+                .collect();
+            Ok(Box::pin(futures::stream::iter(children)))
+        }
+
+        async fn watch(
+            &self,
+            _path: &Path,
+            _latency: Duration,
+        ) -> (
+            Pin<Box<dyn Send + Stream<Item = Vec<PathEvent>>>>,
+            Arc<dyn Watcher>,
+        ) {
+            // Nothing outside this process can change the map, so a watcher has
+            // nothing to report. An empty stream keeps every caller's loop
+            // parked rather than spinning.
+            (Box::pin(futures::stream::empty()), Arc::new(WasmWatcher))
+        }
+
+        fn is_fake(&self) -> bool {
+            false
+        }
+
+        async fn is_case_sensitive(&self) -> bool {
+            true
+        }
+
+        fn subscribe_to_jobs(&self) -> JobEventReceiver {
+            let (sender, receiver) = futures::channel::mpsc::unbounded();
+            self.job_event_subscribers.lock().push(sender);
+            receiver
+        }
+
+        async fn restore(
+            &self,
+            trashed_entry: TrashedEntry,
+        ) -> std::result::Result<PathBuf, TrashRestoreError> {
+            Err(TrashRestoreError::NotFound {
+                path: trashed_entry.original_parent.join(trashed_entry.name),
+            })
+        }
+    }
+
+    pub struct WasmWatcher;
+
+    impl Watcher for WasmWatcher {
+        fn add(&self, _path: &Path) -> Result<()> {
+            Ok(())
+        }
+
+        fn remove(&self, _path: &Path) -> Result<()> {
+            Ok(())
+        }
+    }
+
+}
+
+#[cfg(target_family = "wasm")]
+pub use wasm_fs::{WasmFs as RealFs, WasmWatcher as RealWatcher};
