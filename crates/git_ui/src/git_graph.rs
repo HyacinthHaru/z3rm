@@ -4645,8 +4645,11 @@ impl workspace::SerializableItem for GitGraph {
 }
 
 mod persistence {
-    use std::{path::PathBuf, str::FromStr};
+    #[cfg(not(target_family = "wasm"))]
+    use std::path::PathBuf;
+    use std::str::FromStr;
 
+    #[cfg(not(target_family = "wasm"))]
     use db::{
         query,
         sqlez::{domain::Domain, thread_safe_connection::ThreadSafeConnection},
@@ -4656,10 +4659,13 @@ mod persistence {
         Oid,
         repository::{LogOrder, LogSource, RepoPath},
     };
+    #[cfg(not(target_family = "wasm"))]
     use workspace::WorkspaceDb;
 
+    #[cfg(not(target_family = "wasm"))]
     pub struct GitGraphsDb(ThreadSafeConnection);
 
+    #[cfg(not(target_family = "wasm"))]
     impl Domain for GitGraphsDb {
         const NAME: &str = stringify!(GitGraphsDb);
 
@@ -4692,6 +4698,7 @@ mod persistence {
         ];
     }
 
+    #[cfg(not(target_family = "wasm"))]
     db::static_connection!(GitGraphsDb, [WorkspaceDb]);
 
     pub const LOG_SOURCE_ALL: i32 = 0;
@@ -4793,6 +4800,7 @@ mod persistence {
         pub hidden_columns: Option<i32>,
     }
 
+    #[cfg(not(target_family = "wasm"))]
     impl GitGraphsDb {
         query! {
             pub async fn save_git_graph(
@@ -4845,6 +4853,97 @@ mod persistence {
             }
         }
     }
+
+    /// Per-App git graph state, mirroring the per-App SQLite table used on
+    /// native. Reads and writes stay in process memory.
+    #[cfg(target_family = "wasm")]
+    mod wasm_git_graph_persistence {
+        use std::collections::HashMap;
+        use std::path::PathBuf;
+        use std::sync::LazyLock;
+
+        use gpui::App;
+        use parking_lot::Mutex;
+        use workspace::{ItemId, WorkspaceId};
+
+        type SerializedRow = (
+            PathBuf,
+            Option<i32>,
+            Option<String>,
+            Option<i32>,
+            Option<String>,
+            Option<String>,
+            Option<bool>,
+            Option<i32>,
+        );
+
+        static WASM_GIT_GRAPHS: LazyLock<Mutex<HashMap<(ItemId, WorkspaceId), SerializedRow>>> =
+            LazyLock::new(Mutex::default);
+
+        #[derive(Clone)]
+        pub struct GitGraphsDb;
+
+        /// Lets `workspace::delete_unloaded_items` take this the same way it
+        /// takes a `ThreadSafeConnection` on native.
+        impl std::ops::Deref for GitGraphsDb {
+            type Target = ();
+            fn deref(&self) -> &Self::Target {
+                &()
+            }
+        }
+
+        impl GitGraphsDb {
+            pub fn global(_cx: &App) -> Self {
+                Self
+            }
+
+            /// wasm shim for `query! { pub async fn save_git_graph(...) }`.
+            #[allow(clippy::too_many_arguments)]
+            pub async fn save_git_graph(
+                &self,
+                item_id: ItemId,
+                workspace_id: WorkspaceId,
+                repo_working_path: String,
+                log_source_type: Option<i32>,
+                log_source_value: Option<String>,
+                log_order: Option<i32>,
+                selected_sha: Option<String>,
+                search_query: Option<String>,
+                search_case_sensitive: Option<bool>,
+                hidden_columns: Option<i32>,
+            ) -> anyhow::Result<()> {
+                WASM_GIT_GRAPHS.lock().insert(
+                    (item_id, workspace_id),
+                    (
+                        PathBuf::from(repo_working_path),
+                        log_source_type,
+                        log_source_value,
+                        log_order,
+                        selected_sha,
+                        search_query,
+                        search_case_sensitive,
+                        hidden_columns,
+                    ),
+                );
+                Ok(())
+            }
+
+            /// wasm shim for `query! { pub fn get_git_graph(...) }`.
+            pub fn get_git_graph(
+                &self,
+                item_id: ItemId,
+                workspace_id: WorkspaceId,
+            ) -> anyhow::Result<Option<SerializedRow>> {
+                Ok(WASM_GIT_GRAPHS
+                    .lock()
+                    .get(&(item_id, workspace_id))
+                    .cloned())
+            }
+        }
+    }
+
+    #[cfg(target_family = "wasm")]
+    pub use wasm_git_graph_persistence::GitGraphsDb;
 }
 
 #[cfg(any(test, feature = "test-support"))]

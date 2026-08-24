@@ -1,4 +1,6 @@
+#[cfg(not(target_family = "wasm"))]
 use anyhow::Result;
+#[cfg(not(target_family = "wasm"))]
 use db::{
     query,
     sqlez::{
@@ -25,6 +27,7 @@ pub(crate) struct SerializedCommandUsage {
     pub(crate) last_invoked: OffsetDateTime,
 }
 
+#[cfg(not(target_family = "wasm"))]
 impl Column for SerializedCommandUsage {
     fn column(statement: &mut Statement, start_index: i32) -> Result<(Self, i32)> {
         let (command_name, next_index): (String, i32) = Column::column(statement, start_index)?;
@@ -40,7 +43,7 @@ impl Column for SerializedCommandUsage {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, not(target_family = "wasm")))]
 impl Column for SerializedCommandInvocation {
     fn column(statement: &mut Statement, start_index: i32) -> Result<(Self, i32)> {
         let (command_name, next_index): (String, i32) = Column::column(statement, start_index)?;
@@ -55,8 +58,10 @@ impl Column for SerializedCommandInvocation {
     }
 }
 
+#[cfg(not(target_family = "wasm"))]
 pub struct CommandPaletteDB(ThreadSafeConnection);
 
+#[cfg(not(target_family = "wasm"))]
 impl Domain for CommandPaletteDB {
     const NAME: &str = stringify!(CommandPaletteDB);
     const MIGRATIONS: &[&str] = &[sql!(
@@ -69,8 +74,10 @@ impl Domain for CommandPaletteDB {
     )];
 }
 
+#[cfg(not(target_family = "wasm"))]
 db::static_connection!(CommandPaletteDB, []);
 
+#[cfg(not(target_family = "wasm"))]
 impl CommandPaletteDB {
     pub async fn write_command_invocation(
         &self,
@@ -142,7 +149,94 @@ impl CommandPaletteDB {
     }
 }
 
-#[cfg(test)]
+#[cfg(target_family = "wasm")]
+mod wasm_command_palette_persistence {
+    use std::collections::HashMap;
+    use std::sync::LazyLock;
+
+    use anyhow::Result;
+    use gpui::App;
+    use parking_lot::Mutex;
+    use time::OffsetDateTime;
+
+    use super::SerializedCommandUsage;
+
+    /// Per-App command history, mirroring the per-App SQLite table used on
+    /// native. Reads and writes stay in process memory.
+    #[derive(Default)]
+    struct Invocations {
+        /// command name -> (invocation count, most recent invocation)
+        usage: Mutex<HashMap<String, (u16, OffsetDateTime)>>,
+        /// most recent non-empty queries, oldest first
+        queries: Mutex<Vec<String>>,
+    }
+
+    static WASM_INVOCATIONS: LazyLock<Invocations> = LazyLock::new(Invocations::default);
+
+    #[derive(Clone)]
+    pub struct CommandPaletteDB;
+
+    impl CommandPaletteDB {
+        pub fn global(_cx: &App) -> Self {
+            Self
+        }
+
+        pub async fn write_command_invocation(
+            &self,
+            command_name: impl Into<String>,
+            user_query: impl Into<String>,
+        ) -> Result<()> {
+            let command_name = command_name.into();
+            let user_query = user_query.into();
+            log::debug!(
+                "Writing command invocation: command_name={command_name}, user_query={user_query}"
+            );
+            let now = OffsetDateTime::now_utc();
+            {
+                let mut usage = WASM_INVOCATIONS.usage.lock();
+                let entry = usage.entry(command_name).or_insert((0, now));
+                entry.0 = entry.0.saturating_add(1);
+                entry.1 = now;
+            }
+            if !user_query.is_empty() {
+                let mut queries = WASM_INVOCATIONS.queries.lock();
+                queries.retain(|query| query != &user_query);
+                queries.push(user_query);
+            }
+            Ok(())
+        }
+
+        /// wasm shim for `query! { pub fn list_commands_used(...) }`, which
+        /// orders by invocation count, most used first.
+        pub fn list_commands_used(&self) -> Result<Vec<SerializedCommandUsage>> {
+            let mut used = WASM_INVOCATIONS
+                .usage
+                .lock()
+                .iter()
+                .map(
+                    |(command_name, &(invocations, last_invoked))| SerializedCommandUsage {
+                        command_name: command_name.clone(),
+                        invocations,
+                        last_invoked,
+                    },
+                )
+                .collect::<Vec<_>>();
+            used.sort_by(|left, right| right.invocations.cmp(&left.invocations));
+            Ok(used)
+        }
+
+        /// wasm shim for `query! { pub fn list_recent_queries(...) }`, which
+        /// orders by last use, oldest first.
+        pub fn list_recent_queries(&self) -> Result<Vec<String>> {
+            Ok(WASM_INVOCATIONS.queries.lock().clone())
+        }
+    }
+}
+
+#[cfg(target_family = "wasm")]
+pub use wasm_command_palette_persistence::CommandPaletteDB;
+
+#[cfg(all(test, not(target_family = "wasm")))]
 mod tests {
 
     use crate::persistence::{CommandPaletteDB, SerializedCommandUsage};

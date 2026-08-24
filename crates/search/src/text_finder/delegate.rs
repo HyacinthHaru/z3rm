@@ -30,6 +30,7 @@ use std::{ops::Range, time::Duration};
 use collections::{HashMap, HashSet};
 use editor::{MultiBufferSnapshot, PathKey, multibuffer_context_lines};
 use file_icons::FileIcons;
+use futures_lite::future::yield_now;
 use gpui::{
     AnyElement, AppContext, AsyncApp, ClickEvent, DismissEvent, EntityId, HighlightStyle,
     Modifiers, StyledText, Task, TextStyle, prelude::*,
@@ -40,7 +41,6 @@ use picker::{Picker, PickerDelegate};
 use project::{Project, ProjectPath};
 use project::{SearchResults, search::SearchQuery, search::SearchResult};
 use settings::Settings;
-use smol::future::yield_now;
 use text::Anchor;
 use theme_settings::ThemeSettings;
 use ui::{
@@ -1316,7 +1316,7 @@ async fn stream_results_to_picker(
             return Some(SearchResults { rx });
         }
 
-        smol::future::yield_now().await;
+        yield_now().await;
     }
     None
 }
