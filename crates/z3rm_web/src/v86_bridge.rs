@@ -1,77 +1,96 @@
-//! §3.1 v86 serial ↔ authoritative mux pane bridge.
+//! §3.1 The guest end of a pane's pty: a v86 machine's serial port.
 //!
-//! `Application::run_embedded` owns the browser run loop and does not return,
-//! so the JS bootstrap cannot wait for wasm-bindgen exports. The bridge uses two
-//! globals installed from opposite sides instead:
+//! Natively a pane owns a pty master and the kernel carries bytes to a child
+//! process. In the browser the "child" is a Linux running inside v86, reached
+//! over its emulated serial port, and JS owns the emulator. So this is the only
+//! place the two directions cross the language boundary:
 //!
-//! - JS installs `window.z3rmV86SerialInput(Uint8Array)` before wasm starts.
-//! - Rust installs `window.z3rmPushSerialOutput(Uint8Array)` after the pane exists.
+//! * pane → guest: `WasmPty`'s input handler calls the JS `send`.
+//! * guest → pane: JS calls [`z3rm_v86_serial_bytes`], which feeds
+//!   `Pane::push_guest_output` — the same entry point the native read loop uses.
 //!
-//! Pane writes therefore reach the guest serial input, and guest serial output
-//! runs through `Pane::push_guest_output`, preserving the server-owned VT parser,
-//! generation accounting, dirty rows, and notifications.
+//! Nothing about the emulator is modelled here. JS decides when the machine is
+//! up and how to batch what it prints; this only has to be told.
 
-#[cfg(target_family = "wasm")]
-use std::{cell::RefCell, sync::Arc};
+use mux_server::pane::Pane;
+use mux_server::wasm_server::WasmMuxServer;
+use std::cell::RefCell;
+use std::sync::Arc;
+use wasm_bindgen::prelude::*;
 
-#[cfg(target_family = "wasm")]
-use js_sys::{Function, Reflect, Uint8Array};
-#[cfg(target_family = "wasm")]
-use wasm_bindgen::{JsCast as _, JsValue, closure::Closure};
-
-#[cfg(target_family = "wasm")]
-thread_local! {
-    /// Keep the JS callback alive for the lifetime of the browser application.
-    static OUTPUT_CALLBACK: RefCell<Option<Closure<dyn FnMut(Uint8Array)>>> = const {
-        RefCell::new(None)
-    };
+#[wasm_bindgen]
+unsafe extern "C" {
+    /// Hand bytes to the guest's serial input.
+    ///
+    /// Defined by the page as `window.__z3rm_v86.send`. Missing until the
+    /// emulator has been constructed, which is why this is fallible.
+    #[wasm_bindgen(js_namespace = ["window", "__z3rm_v86"], js_name = send, catch)]
+    fn v86_send(bytes: &[u8]) -> Result<(), JsValue>;
 }
 
-/// Bind a server-owned pane to v86's serial port.
-#[cfg(target_family = "wasm")]
-pub fn install(pane: &Arc<mux_server::pane::Pane>, pane_id: &str) {
-    let global = js_sys::global();
+thread_local! {
+    /// The pane the guest's serial output is routed to.
+    ///
+    /// One machine, one console, so one pane: a second v86 would be a second
+    /// bridge, not another entry in a table.
+    static BRIDGED_PANE: RefCell<Option<Arc<Pane>>> = const { RefCell::new(None) };
+}
 
-    match Reflect::get(&global, &JsValue::from_str("z3rmV86SerialInput"))
-        .ok()
-        .and_then(|value| value.dyn_into::<Function>().ok())
-    {
-        Some(input) => {
-            pane.set_guest_input_handler(Box::new(move |bytes: &[u8]| {
-                let bytes = Uint8Array::from(bytes);
-                if let Err(error) = input.call1(&JsValue::UNDEFINED, &bytes) {
-                    log::error!("v86 serial input callback failed: {error:?}");
-                }
-            }));
-        }
-        None => {
-            log::warn!("window.z3rmV86SerialInput is unavailable; pane input will be dropped");
-        }
-    }
+/// Point a pane's pty at the guest's serial port, in both directions.
+///
+/// Returns whether the pane was found. It will not be until the server has
+/// finished spawning it, so the caller decides whether that is worth retrying.
+pub fn attach(server: &Arc<WasmMuxServer>, pane_id: &str) -> bool {
+    let Some(pane) = find_pane(server, pane_id) else {
+        return false;
+    };
 
-    let weak_pane = Arc::downgrade(pane);
-    let output = Closure::wrap(Box::new(move |bytes: Uint8Array| {
-        let Some(pane) = weak_pane.upgrade() else {
+    pane.set_guest_input_handler(Box::new(|bytes| {
+        // A write that cannot reach the guest is a dropped keystroke, not a
+        // reason to tear the pane down: the machine may still be booting.
+        if let Err(error) = v86_send(bytes) {
+            log::warn!("v86 serial input rejected {} bytes: {error:?}", bytes.len());
+        }
+    }));
+
+    BRIDGED_PANE.with(|bridged| bridged.replace(Some(pane)));
+    true
+}
+
+fn find_pane(server: &Arc<WasmMuxServer>, pane_id: &str) -> Option<Arc<Pane>> {
+    server
+        .sessions()
+        .read()
+        .iter()
+        .find_map(|session| session.panes.read().get(pane_id).cloned())
+}
+
+/// Feed one batch of the guest's serial output into its pane.
+///
+/// Called from JS, ideally once per animation frame rather than once per byte:
+/// a booting kernel prints faster than a frame, and every call here runs the
+/// emulator parser and wakes the client.
+#[wasm_bindgen]
+pub fn z3rm_v86_serial_bytes(bytes: &[u8]) {
+    BRIDGED_PANE.with(|bridged| {
+        let Some(pane) = bridged.borrow().clone() else {
+            // Output before the pane exists is boot noise from a machine the
+            // page started early; there is nowhere to put it.
             return;
         };
-        pane.push_guest_output(&bytes.to_vec());
-    }) as Box<dyn FnMut(Uint8Array)>);
+        pane.push_guest_output(bytes);
+    });
+}
 
-    if let Err(error) = Reflect::set(
-        &global,
-        &JsValue::from_str("z3rmPushSerialOutput"),
-        output.as_ref(),
-    ) {
-        log::error!("failed to install v86 serial output callback: {error:?}");
-        return;
-    }
-    if let Err(error) = Reflect::set(
-        &global,
-        &JsValue::from_str("z3rmPaneId"),
-        &JsValue::from_str(pane_id),
-    ) {
-        log::warn!("failed to publish bridged pane id: {error:?}");
-    }
-
-    OUTPUT_CALLBACK.with(|slot| slot.replace(Some(output)));
+/// The size the pane last asked its pty for, as `rows` and `cols`.
+///
+/// The guest cannot be told its window size over a serial line, so the page
+/// reads this and types `stty` into the shell instead.
+#[wasm_bindgen]
+pub fn z3rm_v86_pane_size() -> Option<Vec<u16>> {
+    BRIDGED_PANE.with(|bridged| {
+        let pane = bridged.borrow().clone()?;
+        let size = pane.guest_pty_size();
+        Some(vec![size.rows, size.cols])
+    })
 }

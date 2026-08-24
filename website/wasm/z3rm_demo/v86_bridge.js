@@ -1,243 +1,116 @@
-(() => {
-  const MAX_BOOT_BUFFER = 1024 * 1024;
-  const MAX_TERMINAL_TEXT = 200_000;
-  const pendingInput = [];
-  const outputBatch = [];
-  const bridgeBacklog = [];
-  let outputBatchBytes = 0;
-  let bridgeBacklogBytes = 0;
-  let emulator = null;
-  let flushScheduled = false;
-  const decoder = new TextDecoder();
+// §3.1 The guest behind the terminal: a Linux running in v86, reached over its
+// emulated serial port.
+//
+// The Rust side owns the pane and its pty; this owns the emulator. The two meet
+// at exactly two calls:
+//
+//   window.__z3rm_v86.send(bytes)          pane -> guest  (called from Rust)
+//   wasmBindings.z3rm_v86_serial_bytes(b)  guest -> pane  (called from here)
+//
+// `window.wasmBindings` is what Trunk publishes for a `web` bindgen target, so
+// the module's hashed filename never has to be known here.
 
-  const terminal = () => document.getElementById("boot-terminal-output");
-  const shell = () => document.getElementById("boot-terminal");
+const V86_ASSETS = new URL("../v86/", document.baseURI);
+const BOOT_CMDLINE = "console=ttyS0 tsc=reliable mitigations=off random.trust_cpu=on";
+const MEMORY_BYTES = 128 * 1024 * 1024;
 
-  const setStatus = (status) => {
-    document.documentElement.dataset.v86Status = status;
-    const node = document.getElementById("boot-terminal-status");
-    if (node) node.textContent = status;
-  };
+/// Serial output arrives a byte at a time and a booting kernel prints far
+/// faster than a frame. Batching per frame turns thousands of tiny calls into
+/// one, and one repaint instead of thousands.
+class SerialBatch {
+  constructor(deliver) {
+    this.deliver = deliver;
+    this.pending = [];
+    this.scheduled = false;
+  }
 
-  const renderSerial = (bytes) => {
-    const node = terminal();
-    if (!node) return;
-    node.textContent += decoder.decode(bytes, { stream: true });
-    if (node.textContent.length > MAX_TERMINAL_TEXT) {
-      node.textContent = node.textContent.slice(-MAX_TERMINAL_TEXT);
+  push(byte) {
+    this.pending.push(byte);
+    if (this.scheduled) {
+      return;
     }
-    shell()?.scrollTo(0, shell().scrollHeight);
-  };
-
-  const flushInput = () => {
-    if (!emulator) return;
-    for (const bytes of pendingInput.splice(0)) {
-      emulator.serial_send_bytes(0, bytes);
-    }
-  };
-
-  window.z3rmV86SerialInput = (bytes) => {
-    const copy = Uint8Array.from(bytes);
-    if (emulator) emulator.serial_send_bytes(0, copy);
-    else pendingInput.push(copy);
-  };
-
-  const sendBacklog = () => {
-    const sink = window.z3rmPushSerialOutput;
-    if (typeof sink !== "function" || bridgeBacklogBytes === 0) return false;
-    const chunk = new Uint8Array(bridgeBacklogBytes);
-    let offset = 0;
-    for (const bytes of bridgeBacklog.splice(0)) {
-      chunk.set(bytes, offset);
-      offset += bytes.length;
-    }
-    bridgeBacklogBytes = 0;
-    sink(chunk);
-    return true;
-  };
-
-  const retryBridge = () => {
-    if (!sendBacklog()) setTimeout(retryBridge, 25);
-  };
-
-  const flushOutput = () => {
-    flushScheduled = false;
-    if (outputBatchBytes === 0) return;
-    const chunk = new Uint8Array(outputBatchBytes);
-    let offset = 0;
-    for (const bytes of outputBatch.splice(0)) {
-      chunk.set(bytes, offset);
-      offset += bytes.length;
-    }
-    outputBatchBytes = 0;
-    renderSerial(chunk);
-
-    const sink = window.z3rmPushSerialOutput;
-    if (typeof sink === "function") {
-      sendBacklog();
-      sink(chunk);
-    } else {
-      bridgeBacklog.push(chunk);
-      bridgeBacklogBytes += chunk.length;
-      while (bridgeBacklogBytes > MAX_BOOT_BUFFER && bridgeBacklog.length > 0) {
-        bridgeBacklogBytes -= bridgeBacklog.shift().length;
-      }
-      setTimeout(retryBridge, 25);
-    }
-  };
-
-  const scheduleOutputFlush = () => {
-    if (flushScheduled) return;
-    flushScheduled = true;
-    queueMicrotask(flushOutput);
-  };
-
-  const onSerialByte = (byte) => {
-    outputBatch.push(Uint8Array.of(byte & 0xff));
-    outputBatchBytes += 1;
-    scheduleOutputFlush();
-  };
-
-  const ensureRuntime = async () => {
-    if (typeof window.V86 === "function") return;
-    const source = await fetch("./v86/libv86.js").then((response) => {
-      if (!response.ok) throw new Error(`v86 runtime HTTP ${response.status}`);
-      return response.text();
+    this.scheduled = true;
+    requestAnimationFrame(() => {
+      this.scheduled = false;
+      const batch = Uint8Array.from(this.pending);
+      this.pending.length = 0;
+      this.deliver(batch);
     });
-    // Self-hosted, version-locked asset verified by public/v86/SHA256SUMS.txt.
-    (0, eval)(source);
-  };
+  }
+}
 
-  const welcomeScript = [
-    "#!/bin/sh",
-    "clear",
-    "printf '\\033[1;36m'",
-    "echo '     _____ _____                 '",
-    "echo '    |__  /|___ / _ __ _ __ ___  '",
-    "echo '      / /   |_ \\| .__| ._ \\` _ \\\\ '",
-    "echo '     / /_ ___) | |  | | | | | |'",
-    "echo '    /____|____/|_|  |_| |_| |_|'",
-    "echo",
-    "printf '\\033[0m'",
-    "printf '\\033[1mYour shells outlive the window.\\033[0m\\n\\n'",
-    "echo 'This is a real Linux VM running in your browser.'",
-    "echo 'The terminal is rendered by Z3rm GPUI through the'",
-    "echo 'same mux protocol used in production.'",
-    "echo",
-    "printf '\\033[90m── try it ──────────────────────────────────\\033[0m\\n\\n'",
-    "printf '  \\033[33muname -a\\033[0m          kernel info\\n'",
-    "printf '  \\033[33mcat /proc/cpuinfo\\033[0m CPU details\\n'",
-    "printf '  \\033[33mfree -h\\033[0m           memory usage\\n'",
-    "printf '  \\033[33mls /mnt/\\033[0m          9p shared filesystem\\n\\n'",
-    "printf '\\033[90m───────────────────────────────────────────\\033[0m\\n\\n'",
-  ].join("\n");
-
-  const boot = async () => {
-    await ensureRuntime();
-    if (typeof window.V86 !== "function") {
-      throw new Error("v86 runtime did not register window.V86");
-    }
-
-    setStatus("loading");
-    emulator = new window.V86({
-      wasm_path: "./v86/v86.wasm",
-      memory_size: 64 * 1024 * 1024,
-      vga_memory_size: 4 * 1024 * 1024,
-      bios: { url: "./v86/seabios.bin" },
-      bzimage: { url: "./v86/buildroot-bzimage.bin" },
-      cmdline: "console=ttyS0 root=/dev/ram0 rw",
-      autostart: true,
-      disable_keyboard: true,
-      disable_mouse: true,
-      disable_speaker: true,
-      serial_console: { type: "none" },
-      screen: { container: document.getElementById("v86-screen") || undefined },
-      filesystem: {},
-    });
-    let shellReady = false;
-    const promptPattern = /[#$%>] $/;
-    const detectPrompt = (byte) => {
-      onSerialByte(byte);
-      if (shellReady) return;
-      const node = terminal();
-      if (!node) return;
-      const tail = node.textContent.slice(-80);
-      if (promptPattern.test(tail)) {
-        shellReady = true;
-        emulator.create_file(
-          "welcome.sh",
-          new TextEncoder().encode(welcomeScript),
-        ).then(() => {
-          const cmd = "sh /mnt/welcome.sh\r";
-          emulator.serial_send_bytes(0, new TextEncoder().encode(cmd));
-        }).catch((error) => {
-          console.warn("welcome inject failed:", error);
-        });
-      }
-    };
-    emulator.add_listener("serial0-output-byte", detectPrompt);
-    emulator.add_listener("emulator-ready", () => setStatus("ready"));
-    emulator.add_listener("emulator-started", () => {
-      flushInput();
-      setStatus("running");
-    });
-    window.z3rmV86 = emulator;
-  };
-
-  const keyBytes = (event) => {
-    if (event.ctrlKey && event.key.length === 1) {
-      const code = event.key.toUpperCase().charCodeAt(0) - 64;
-      if (code > 0 && code < 32) return Uint8Array.of(code);
-    }
-    const named = {
-      Enter: "\r", Backspace: "\x7f", Tab: "\t", Escape: "\x1b",
-      ArrowUp: "\x1b[A", ArrowDown: "\x1b[B", ArrowRight: "\x1b[C", ArrowLeft: "\x1b[D",
-      Home: "\x1b[H", End: "\x1b[F", Delete: "\x1b[3~",
-    };
-    const text = named[event.key] ?? (event.key.length === 1 ? event.key : "");
-    return new TextEncoder().encode(text);
-  };
-
-  addEventListener("DOMContentLoaded", () => {
-    const host = shell();
-    host?.addEventListener("keydown", (event) => {
-      const bytes = keyBytes(event);
-      if (bytes.length > 0) {
-        event.preventDefault();
-        window.z3rmV86SerialInput(bytes);
-      }
-    });
-    host?.addEventListener("pointerdown", () => host.focus());
-    host?.focus();
+function loadV86Library() {
+  return new Promise((resolve, reject) => {
+    const script = document.createElement("script");
+    script.src = new URL("libv86.js", V86_ASSETS).href;
+    script.onload = () => resolve();
+    script.onerror = () => reject(new Error(`could not load ${script.src}`));
+    document.head.append(script);
   });
+}
 
-  const readyObserver = new MutationObserver(() => {
-    if (document.documentElement.dataset.gpuiReady === "true") {
-      document.documentElement.classList.add("gpui-ready");
-    }
-  });
-  readyObserver.observe(document.documentElement, { attributes: true });
-
-  const waitForGpuiCanvas = () => new Promise((resolve) => {
-    const started = performance.now();
+/// The Rust side installs its exports on `window.wasmBindings` once the module
+/// has initialised, which happens on its own schedule relative to this file.
+function waitForWasmBindings() {
+  return new Promise((resolve) => {
     const poll = () => {
-      const gpuiCanvas = document.querySelector("body > canvas");
-      if (gpuiCanvas || performance.now() - started >= 3000) {
-        resolve();
-      } else {
-        requestAnimationFrame(poll);
+      const bindings = window.wasmBindings;
+      if (bindings && typeof bindings.z3rm_v86_serial_bytes === "function") {
+        resolve(bindings);
+        return;
       }
+      requestAnimationFrame(poll);
     };
-    if (document.readyState === "loading") {
-      addEventListener("DOMContentLoaded", poll, { once: true });
-    } else {
-      poll();
-    }
+    poll();
+  });
+}
+
+async function boot() {
+  await loadV86Library();
+
+  const emulator = new window.V86({
+    wasm_path: new URL("v86.wasm", V86_ASSETS).href,
+    memory_size: MEMORY_BYTES,
+    bios: { url: new URL("seabios.bin", V86_ASSETS).href },
+    bzimage: { url: new URL("buildroot-bzimage.bin", V86_ASSETS).href, async: false },
+    cmdline: BOOT_CMDLINE,
+    autostart: true,
+    // No screen, no input devices: the terminal is the only interface, and the
+    // pane owns the keyboard.
+    disable_keyboard: true,
+    disable_mouse: true,
+    disable_speaker: true,
   });
 
-  waitForGpuiCanvas().then(boot).catch((error) => {
-    const message = error instanceof Error ? error.message : String(error);
-    setStatus(`failed: ${message}`);
-    console.error("failed to boot v86", error);
+  // Attach before anything else. The kernel starts printing during the
+  // constructor, and a listener added a tick later loses the whole boot.
+  const batch = new SerialBatch((bytes) => {
+    const bindings = window.wasmBindings;
+    if (bindings) {
+      bindings.z3rm_v86_serial_bytes(bytes);
+    }
   });
-})();
+  emulator.add_listener("serial0-output-byte", (byte) => batch.push(byte));
+
+  window.__z3rm_v86 = {
+    emulator,
+    send(bytes) {
+      for (const byte of bytes) {
+        emulator.bus.send("serial0-input", byte);
+      }
+    },
+  };
+
+  // A serial line carries no window size, so the guest is told once the shell
+  // is up. Rust knows the size the pane settled on.
+  const bindings = await waitForWasmBindings();
+  const size = bindings.z3rm_v86_pane_size?.();
+  if (size) {
+    const [rows, cols] = size;
+    emulator.serial0_send(`stty rows ${rows} cols ${cols}\n`);
+  }
+}
+
+boot().catch((error) => {
+  console.error("v86 bridge failed to start:", error);
+});

@@ -30,7 +30,7 @@ pub fn version() -> &'static str {
 ///
 /// Dropping the server closes the client's end of the pipe, so it has to
 /// outlive the window rather than the function that started it.
-struct GlobalLocalServer(#[allow(dead_code)] LocalMuxServer);
+struct GlobalLocalServer(#[expect(dead_code)] LocalMuxServer);
 
 impl gpui::Global for GlobalLocalServer {}
 
@@ -60,6 +60,7 @@ pub fn boot(cx: &mut App) {
             return;
         }
     };
+    let mux_server = server.server().clone();
     cx.set_global(GlobalLocalServer(server));
 
     let app_state = build_app_state(fs, domain.clone(), cx);
@@ -79,7 +80,7 @@ pub fn boot(cx: &mut App) {
     recent_projects::init(cx);
 
     cx.spawn(async move |cx| {
-        if let Err(error) = open_window(app_state, domain, cx).await {
+        if let Err(error) = open_window(app_state, domain, mux_server, cx).await {
             log::error!("could not open the z3rm window: {error:#}");
         }
     })
@@ -119,29 +120,18 @@ fn build_app_state(
 async fn open_window(
     app_state: Arc<workspace::AppState>,
     domain: Arc<mux::MuxDomain>,
+    mux_server: Arc<mux_server::wasm_server::WasmMuxServer>,
     cx: &mut gpui::AsyncApp,
 ) -> Result<WindowHandle<workspace::MultiWorkspace>> {
     let (_session_id, attach) = local_server::open_session(&domain).await?;
     let snapshot = workspace::layout_projection::MuxSnapshot::from_attach(&attach);
 
-    // §v86 Bind the first server pane to the emulator bridge. JS delivers
-    // guest output to this pane and pane writes are routed back to the
-    // guest serial input.
-    if let Some(pane_id) = snapshot.focused_pane.as_deref() {
-        let server = cx.update(|cx| {
-            cx.try_global::<GlobalLocalServer>()
-                .map(|g| g.0.server.clone())
-        });
-        if let Some(server) = server {
-            let pane = server
-                .sessions()
-                .read()
-                .iter()
-                .filter_map(|session| session.panes.read().get(pane_id).cloned())
-                .next();
-            if let Some(pane) = pane {
-                v86_bridge::install(&pane, pane_id);
-            }
+    // §3.1 The pane has a pty but nothing on the far end of it until the page's
+    // emulator is bridged in. A page that never boots one leaves the pane empty,
+    // which is the honest rendering of a terminal with no guest.
+    if let Some(pane_id) = snapshot.pane_ids.first() {
+        if !v86_bridge::attach(&mux_server, pane_id) {
+            log::warn!("pane {pane_id} is not on the server; the guest bridge is not connected");
         }
     }
 

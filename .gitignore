@@ -6,6 +6,9 @@
 **/venv
 **/.direnv
 *.wasm
+# The v86 runtime is vendored on purpose so the Pages deploy needs no
+# build-time fetch; the blanket rule above was silently dropping it.
+!website/public/v86/*.wasm
 *.xcodeproj
 .DS_Store
 .blob_store

@@ -3311,4 +3311,12 @@ impl Pane {
     pub fn set_guest_input_handler(&self, handler: Box<dyn Fn(&[u8])>) {
         self.pty_master.lock().set_input_handler(handler);
     }
+
+    /// §3.1 The size this pane last resized its pty to.
+    ///
+    /// A serial line carries no window size, so the bridge reads this and tells
+    /// the guest itself.
+    pub fn guest_pty_size(&self) -> crate::pty::PtySize {
+        self.pty_master.lock().size()
+    }
 }
