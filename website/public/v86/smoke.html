@@ -1,0 +1,57 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <title>v86 boot smoke</title>
+  </head>
+  <body>
+    <!--
+      A headless boot of the same machine the terminal runs, with the serial
+      output written to the page instead of into a pane. It exists so the boot
+      itself can be tested apart from the wasm client: when the terminal shows
+      nothing, this says whether the guest or the bridge is at fault.
+    -->
+    <pre id="serial" aria-label="guest serial output"></pre>
+    <script src="./libv86.js"></script>
+    <script>
+      const serial = document.getElementById("serial");
+      const decoder = new TextDecoder();
+      let pending = [];
+
+      // A booting kernel prints faster than a frame; appending per byte makes
+      // the DOM the bottleneck rather than the emulator.
+      function flush() {
+        if (pending.length === 0) {
+          return;
+        }
+        serial.textContent += decoder.decode(Uint8Array.from(pending));
+        pending = [];
+      }
+      setInterval(flush, 50);
+
+      const emulator = new V86({
+        wasm_path: "./v86.wasm",
+        memory_size: 128 * 1024 * 1024,
+        bios: { url: "./seabios.bin" },
+        bzimage: { url: "./buildroot-bzimage.bin", async: false },
+        cmdline: "console=ttyS0 tsc=reliable mitigations=off random.trust_cpu=on",
+        autostart: true,
+        disable_keyboard: true,
+        disable_mouse: true,
+        disable_speaker: true,
+      });
+
+      // Attached in the same tick as the constructor: a listener added later
+      // loses the start of the boot.
+      emulator.add_listener("serial0-output-byte", (byte) => pending.push(byte));
+
+      // The test types through this rather than reaching into the emulator, so
+      // it exercises the same serial input path the pane uses.
+      window.__z3rm_smoke = {
+        send(text) {
+          emulator.serial0_send(text);
+        },
+      };
+    </script>
+  </body>
+</html>
