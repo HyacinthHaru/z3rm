@@ -57,7 +57,6 @@ serde_json.workspace = true
 session.workspace = true
 settings.workspace = true
 smallvec.workspace = true
-sqlez.workspace = true
 strum.workspace = true
 telemetry.workspace = true
 theme.workspace = true
@@ -68,6 +67,9 @@ url.workspace = true
 util.workspace = true
 uuid.workspace = true
 zed_actions.workspace = true
+
+[target.'cfg(not(target_family = "wasm"))'.dependencies]
+sqlez.workspace = true
 
 [target.'cfg(target_os = "windows")'.dependencies]
 windows.workspace = true

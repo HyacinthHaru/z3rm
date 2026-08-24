@@ -12900,6 +12900,7 @@ dependencies = [
  "tracing",
  "ui",
  "util",
+ "wasm-bindgen-futures",
  "workspace",
  "zed_actions",
 ]

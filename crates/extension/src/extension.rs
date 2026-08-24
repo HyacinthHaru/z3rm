@@ -1,4 +1,7 @@
 mod capabilities;
+/// Native-only: spawns `cargo`/`clang`/`git`/`rustc`/`rustup`/`tar` via
+/// `util::command`; unavailable on wasm. No stub provided.
+#[cfg(not(target_family = "wasm"))]
 pub mod extension_builder;
 mod extension_events;
 mod extension_host_proxy;

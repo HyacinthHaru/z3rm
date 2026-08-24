@@ -1243,6 +1243,7 @@ impl LocalWorktree {
         let next_entry_id = self.next_entry_id.clone();
         let fs = self.fs.clone();
         let scanning_enabled = self.scanning_enabled;
+        #[cfg(not(target_family = "wasm"))]
         let force_defer_watch = self.force_defer_watch;
         let track_git_repositories = self.visible;
         let settings = self.settings.clone();
@@ -1251,8 +1252,11 @@ impl LocalWorktree {
             let abs_path = snapshot.abs_path.as_path().to_path_buf();
             let background = cx.background_executor().clone();
             async move {
+                #[cfg(not(target_family = "wasm"))]
                 let defer_watch =
                     force_defer_watch || (scanning_enabled && fs::requires_poll_watcher(&abs_path));
+                #[cfg(target_family = "wasm")]
+                let defer_watch = true;
 
                 let (events, watcher) = if scanning_enabled && !defer_watch {
                     fs.watch(&abs_path, FS_WATCH_LATENCY).await
@@ -5656,14 +5660,18 @@ impl BackgroundScanner {
         let (ignore_queue_tx, ignore_queue_rx) = async_channel::unbounded();
         {
             for (parent_abs_path, ignore_stack) in ignores_to_update {
-                ignore_queue_tx
-                    .send_blocking(UpdateIgnoreStatusJob {
+                if let Err(error) = ignore_queue_tx
+                    .send(UpdateIgnoreStatusJob {
                         abs_path: parent_abs_path,
                         ignore_stack,
                         ignore_queue: ignore_queue_tx.clone(),
                         scan_queue: scan_job_tx.clone(),
                     })
-                    .unwrap();
+                    .await
+                {
+                    log::error!("failed to queue ignore status update: {error}");
+                    return;
+                }
             }
         }
         drop(ignore_queue_tx);

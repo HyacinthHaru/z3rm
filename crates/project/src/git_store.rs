@@ -520,6 +520,7 @@ pub struct LocalRepositoryState {
 }
 
 impl LocalRepositoryState {
+    #[cfg(not(target_family = "wasm"))]
     async fn new(
         work_directory_abs_path: Arc<Path>,
         dot_git_abs_path: Arc<Path>,
@@ -559,6 +560,17 @@ impl LocalRepositoryState {
             environment: Arc::new(environment),
             fs,
         })
+    }
+    #[cfg(target_family = "wasm")]
+    async fn new(
+        _work_directory_abs_path: Arc<Path>,
+        _dot_git_abs_path: Arc<Path>,
+        _project_environment: WeakEntity<ProjectEnvironment>,
+        _fs: Arc<dyn Fs>,
+        _is_trusted: bool,
+        _cx: &mut AsyncApp,
+    ) -> anyhow::Result<Self> {
+        Err(anyhow!("local Git repositories are unavailable in the browser"))
     }
 }
 
@@ -635,6 +647,9 @@ impl GitStore {
         fs: Arc<dyn Fs>,
         cx: &mut Context<Self>,
     ) -> Self {
+        #[cfg(target_family = "wasm")]
+        let _fs_watches: Box<[Task<()>]> = Box::new([]);
+        #[cfg(not(target_family = "wasm"))]
         let _fs_watches = if fs.is_fake() {
             Box::new([])
         } else {
@@ -2616,9 +2631,17 @@ impl GitStore {
     ) -> Task<Result<()>> {
         match &self.state {
             GitStoreState::Local { fs, .. } => {
-                let fs = fs.clone();
-                cx.background_executor()
-                    .spawn(async move { fs.git_init(&path, fallback_branch_name).await })
+                #[cfg(not(target_family = "wasm"))]
+                {
+                    let fs = fs.clone();
+                    cx.background_executor()
+                        .spawn(async move { fs.git_init(&path, fallback_branch_name).await })
+                }
+                #[cfg(target_family = "wasm")]
+                {
+                    let _ = (fs, path, fallback_branch_name, cx);
+                    Task::ready(Err(anyhow!("Git init is unavailable in the browser")))
+                }
             }
             GitStoreState::Remote {
                 upstream_client,
@@ -2650,9 +2673,17 @@ impl GitStore {
         let path = path.into();
         match &self.state {
             GitStoreState::Local { fs, .. } => {
-                let fs = fs.clone();
-                cx.background_executor()
-                    .spawn(async move { fs.git_clone(&path, &repo).await })
+                #[cfg(not(target_family = "wasm"))]
+                {
+                    let fs = fs.clone();
+                    cx.background_executor()
+                        .spawn(async move { fs.git_clone(&path, &repo).await })
+                }
+                #[cfg(target_family = "wasm")]
+                {
+                    let _ = (fs, repo, path, cx);
+                    Task::ready(Err(anyhow!("Git clone is unavailable in the browser")))
+                }
             }
             GitStoreState::Remote {
                 upstream_client,
@@ -2685,9 +2716,17 @@ impl GitStore {
     pub fn git_config(&self, path: Arc<Path>, args: Vec<String>, cx: &App) -> Task<Result<String>> {
         match &self.state {
             GitStoreState::Local { fs, .. } => {
-                let fs = fs.clone();
-                cx.background_executor()
-                    .spawn(async move { fs.git_config(&path, args).await })
+                #[cfg(not(target_family = "wasm"))]
+                {
+                    let fs = fs.clone();
+                    cx.background_executor()
+                        .spawn(async move { fs.git_config(&path, args).await })
+                }
+                #[cfg(target_family = "wasm")]
+                {
+                    let _ = (fs, path, args, cx);
+                    Task::ready(Err(anyhow!("Git config is unavailable in the browser")))
+                }
             }
             GitStoreState::Remote {
                 upstream_client, ..

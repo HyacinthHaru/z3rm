@@ -128,6 +128,7 @@ use serde::Deserialize;
 use session::AppSession;
 use settings::{Settings, SettingsLocation, SettingsStore, update_settings_file};
 
+#[cfg(not(target_family = "wasm"))]
 use sqlez::{
     bindable::{Bind, Column, StaticColumnCount},
     statement::Statement,
@@ -632,12 +633,15 @@ impl WorkspaceId {
     }
 }
 
+#[cfg(not(target_family = "wasm"))]
 impl StaticColumnCount for WorkspaceId {}
+#[cfg(not(target_family = "wasm"))]
 impl Bind for WorkspaceId {
     fn bind(&self, statement: &Statement, start_index: i32) -> Result<i32> {
         self.0.bind(statement, start_index)
     }
 }
+#[cfg(not(target_family = "wasm"))]
 impl Column for WorkspaceId {
     fn column(statement: &mut Statement, start_index: i32) -> Result<(Self, i32)> {
         i64::column(statement, start_index)

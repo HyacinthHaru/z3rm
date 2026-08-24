@@ -6,6 +6,7 @@ use crate::{
 use anyhow::{Context, Result};
 use async_recursion::async_recursion;
 use collections::IndexSet;
+#[cfg(not(target_family = "wasm"))]
 use db::sqlez::{
     bindable::{Bind, Column, StaticColumnCount},
     statement::Statement,
@@ -141,7 +142,7 @@ impl RemoteConnectionKind {
         }
     }
 }
-
+#[cfg(not(target_family = "wasm"))]
 impl Column for DockStructure {
     fn column(statement: &mut Statement, start_index: i32) -> Result<(Self, i32)> {
         let (left, next_index) = DockData::column(statement, start_index)?;
@@ -158,6 +159,7 @@ impl Column for DockStructure {
     }
 }
 
+#[cfg(not(target_family = "wasm"))]
 impl Bind for DockStructure {
     fn bind(&self, statement: &Statement, start_index: i32) -> Result<i32> {
         let next_index = statement.bind(&self.left, start_index)?;
@@ -173,6 +175,7 @@ pub struct DockData {
     pub zoom: bool,
 }
 
+#[cfg(not(target_family = "wasm"))]
 impl Column for DockData {
     fn column(statement: &mut Statement, start_index: i32) -> Result<(Self, i32)> {
         let (visible, next_index) = Option::<bool>::column(statement, start_index)?;
@@ -189,6 +192,7 @@ impl Column for DockData {
     }
 }
 
+#[cfg(not(target_family = "wasm"))]
 impl Bind for DockData {
     fn bind(&self, statement: &Statement, start_index: i32) -> Result<i32> {
         let next_index = statement.bind(&self.visible, start_index)?;
@@ -418,11 +422,14 @@ impl Default for SerializedItem {
     }
 }
 
+#[cfg(not(target_family = "wasm"))]
 impl StaticColumnCount for SerializedItem {
     fn column_count() -> usize {
         4
     }
 }
+
+#[cfg(not(target_family = "wasm"))]
 impl Bind for &SerializedItem {
     fn bind(&self, statement: &Statement, start_index: i32) -> Result<i32> {
         let next_index = statement.bind(&self.kind, start_index)?;
@@ -432,6 +439,7 @@ impl Bind for &SerializedItem {
     }
 }
 
+#[cfg(not(target_family = "wasm"))]
 impl Column for SerializedItem {
     fn column(statement: &mut Statement, start_index: i32) -> Result<(Self, i32)> {
         let (kind, next_index) = Arc::<str>::column(statement, start_index)?;

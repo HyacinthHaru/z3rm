@@ -258,6 +258,7 @@ impl MuxPaneView {
         {
             let domain = domain.clone();
             let pane_id = pane_id.clone();
+            #[cfg(not(target_family = "wasm"))]
             let executor = cx.background_executor().clone();
             let errors = pending_input_errors.clone();
             let read_only = read_only.clone();
@@ -271,20 +272,22 @@ impl MuxPaneView {
                     let domain = domain.clone();
                     let pane_id = pane_id.clone();
                     let errors = errors.clone();
-                    executor
-                        .spawn(async move {
-                            if let Err(error) = domain.send_input(&pane_id, &bytes).await {
-                                tracing::error!(
-                                    pane_id = %pane_id,
-                                    error = %error,
-                                    "mouse send_input failed"
-                                );
-                                if let Ok(mut buf) = errors.lock() {
-                                    buf.push(SharedString::from(format!("{error}")));
-                                }
+                    let send = async move {
+                        if let Err(error) = domain.send_input(&pane_id, &bytes).await {
+                            tracing::error!(
+                                pane_id = %pane_id,
+                                error = %error,
+                                "mouse send_input failed"
+                            );
+                            if let Ok(mut buf) = errors.lock() {
+                                buf.push(SharedString::from(format!("{error}")));
                             }
-                        })
-                        .detach();
+                        }
+                    };
+                    #[cfg(not(target_family = "wasm"))]
+                    executor.spawn(send).detach();
+                    #[cfg(target_family = "wasm")]
+                    wasm_bindgen_futures::spawn_local(send);
                 });
             terminal.update(cx, |terminal, _cx| {
                 terminal.set_input_sink(Some(sink));
@@ -817,16 +820,18 @@ impl MuxPaneView {
     }
 
     /// §3.10 resize — notify server of new dimensions.
-    pub fn resize(&mut self, cols: u32, rows: u32, cx: &mut Context<Self>) {
+    pub fn resize(&mut self, cols: u32, rows: u32, _cx: &mut Context<Self>) {
         let domain = self.domain.clone();
         let pane_id = self.pane_id.clone();
-        cx.background_executor()
-            .spawn(async move {
-                if let Err(e) = domain.resize_pane(&pane_id, cols, rows).await {
-                    tracing::error!(error = %e, "resize_pane failed");
-                }
-            })
-            .detach();
+        let resize = async move {
+            if let Err(e) = domain.resize_pane(&pane_id, cols, rows).await {
+                tracing::error!(error = %e, "resize_pane failed");
+            }
+        };
+        #[cfg(not(target_family = "wasm"))]
+        _cx.background_executor().spawn(resize).detach();
+        #[cfg(target_family = "wasm")]
+        wasm_bindgen_futures::spawn_local(resize);
     }
 
     /// §15.7 Whether this pane is currently zoomed.
@@ -835,17 +840,19 @@ impl MuxPaneView {
     }
 
     /// §15.7 Set zoom state and notify server.
-    pub fn set_zoomed(&mut self, zoomed: bool, cx: &mut Context<Self>) {
+    pub fn set_zoomed(&mut self, zoomed: bool, _cx: &mut Context<Self>) {
         self.zoomed = zoomed;
         let domain = self.domain.clone();
         let pane_id = self.pane_id.clone();
-        cx.background_executor()
-            .spawn(async move {
-                if let Err(e) = domain.zoom_pane(&pane_id, zoomed).await {
-                    tracing::error!(error = %e, "zoom_pane failed");
-                }
-            })
-            .detach();
+        let zoom = async move {
+            if let Err(e) = domain.zoom_pane(&pane_id, zoomed).await {
+                tracing::error!(error = %e, "zoom_pane failed");
+            }
+        };
+        #[cfg(not(target_family = "wasm"))]
+        _cx.background_executor().spawn(zoom).detach();
+        #[cfg(target_family = "wasm")]
+        wasm_bindgen_futures::spawn_local(zoom);
     }
 
     /// §15.4 Seed zoom from an authoritative snapshot without re-issuing the

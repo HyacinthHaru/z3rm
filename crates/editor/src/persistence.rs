@@ -1,4 +1,5 @@
 use anyhow::Result;
+#[cfg(not(target_family = "wasm"))]
 use db::{
     query,
     sqlez::{
@@ -9,6 +10,7 @@ use db::{
     sqlez_macros::sql,
 };
 use fs::MTime;
+#[cfg(not(target_family = "wasm"))]
 use itertools::Itertools as _;
 use std::{
     path::{Path, PathBuf},
@@ -25,12 +27,14 @@ pub(crate) struct SerializedEditor {
     pub(crate) mtime: Option<MTime>,
 }
 
+#[cfg(not(target_family = "wasm"))]
 impl StaticColumnCount for SerializedEditor {
     fn column_count() -> usize {
         6
     }
 }
 
+#[cfg(not(target_family = "wasm"))]
 impl Bind for SerializedEditor {
     fn bind(&self, statement: &Statement, start_index: i32) -> Result<i32> {
         let start_index = statement.bind(&self.abs_path, start_index)?;
@@ -61,6 +65,7 @@ impl Bind for SerializedEditor {
     }
 }
 
+#[cfg(not(target_family = "wasm"))]
 impl Column for SerializedEditor {
     fn column(statement: &mut Statement, start_index: i32) -> Result<(Self, i32)> {
         let (abs_path, start_index): (Option<PathBuf>, i32) =
@@ -90,8 +95,10 @@ impl Column for SerializedEditor {
     }
 }
 
+#[cfg(not(target_family = "wasm"))]
 pub struct EditorDb(db::sqlez::thread_safe_connection::ThreadSafeConnection);
 
+#[cfg(not(target_family = "wasm"))]
 impl Domain for EditorDb {
     const NAME: &str = stringify!(EditorDb);
 
@@ -226,13 +233,16 @@ impl Domain for EditorDb {
     ];
 }
 
+#[cfg(not(target_family = "wasm"))]
 db::static_connection!(EditorDb, [WorkspaceDb]);
 
 // https://www.sqlite.org/limits.html
 // > <..> the maximum value of a host parameter number is SQLITE_MAX_VARIABLE_NUMBER,
 // > which defaults to <..> 32766 for SQLite versions after 3.32.0.
+#[cfg(not(target_family = "wasm"))]
 const MAX_QUERY_PLACEHOLDERS: usize = 32000;
 
+#[cfg(not(target_family = "wasm"))]
 impl EditorDb {
     query! {
         pub fn get_serialized_editor(item_id: ItemId, workspace_id: WorkspaceId) -> Result<Option<SerializedEditor>> {
@@ -615,3 +625,220 @@ mod tests {
         assert_eq!(retrieved_b[0].0, 30); // file_b's fold
     }
 }
+
+// =============================================================================
+// WASM IN-MEMORY PERSISTENCE
+// =============================================================================
+//
+// On wasm32-unknown-unknown there is no SQLite. This module provides an
+// in-memory `EditorDb` whose public signatures are byte-identical to the
+// native SQLite-backed version. Semantics:
+//
+// * Writes are accepted and stored in process memory for the lifetime of the
+//   browser session (a `LazyLock` static; the web client owns a single App, so
+//   process-local storage has the same lifetime as the per-App SQLite database
+//   used on native).
+// * Reads return what was written earlier in the session, or `None`/empty
+//   defaults if nothing has been persisted for that key.
+// * `SerializedEditor` (the data type) is cross-platform: only the sqlez
+//   `Bind`/`Column`/`StaticColumnCount` impls are gated away.
+
+#[cfg(target_family = "wasm")]
+mod wasm_editor_persistence {
+    use std::collections::HashMap;
+    use std::path::{Path, PathBuf};
+    use std::sync::{Arc, LazyLock};
+
+    use parking_lot::Mutex;
+
+    use super::SerializedEditor;
+    use anyhow::Result;
+    use gpui::App;
+    use workspace::{ItemId, WorkspaceId};
+
+    /// Per-App editor persistence state, mirroring the per-App SQLite database
+    /// used on native. All reads and writes stay in process memory.
+    #[derive(Default)]
+    struct WasmEditorPersistence {
+        /// (item_id, workspace_id) -> serialized editor
+        editors: Mutex<HashMap<(ItemId, WorkspaceId), SerializedEditor>>,
+        /// (item_id, workspace_id) -> (top_row, horizontal_offset, vertical_offset)
+        scroll_positions: Mutex<HashMap<(ItemId, WorkspaceId), (u32, f64, f64)>>,
+        /// (item_id, workspace_id) -> list of (start, end) selections
+        selections: Mutex<HashMap<(ItemId, WorkspaceId), Vec<(usize, usize)>>>,
+        /// (item_id, workspace_id) -> list of (start, end, start_fingerprint, end_fingerprint)
+        folds: Mutex<HashMap<(ItemId, WorkspaceId), Vec<(usize, usize, Option<String>, Option<String>)>>>,
+        /// (workspace_id, path) -> list of file folds
+        file_folds: Mutex<HashMap<(WorkspaceId, PathBuf), Vec<(usize, usize, Option<String>, Option<String>)>>>,
+    }
+
+    static WASM_EDITOR_PERSISTENCE: LazyLock<WasmEditorPersistence> =
+        LazyLock::new(WasmEditorPersistence::default);
+
+    /// In-memory `EditorDb` for wasm.
+    #[derive(Clone, Default)]
+    pub struct EditorDb;
+
+    impl std::ops::Deref for EditorDb {
+        type Target = ();
+        fn deref(&self) -> &Self::Target {
+            &()
+        }
+    }
+
+    impl EditorDb {
+        /// Same signature as `db::static_connection!(EditorDb, [WorkspaceDb])`
+        /// on native.
+        pub fn global(_cx: &App) -> Self {
+            EditorDb
+        }
+
+        /// wasm shim for `query! { pub fn get_serialized_editor(...) }`.
+        pub fn get_serialized_editor(
+            &self,
+            item_id: ItemId,
+            workspace_id: WorkspaceId,
+        ) -> Result<Option<SerializedEditor>> {
+            Ok(WASM_EDITOR_PERSISTENCE
+                .editors
+                .lock()
+                .get(&(item_id, workspace_id))
+                .cloned())
+        }
+
+        /// wasm shim for `query! { pub async fn save_serialized_editor(...) }`.
+        pub async fn save_serialized_editor(
+            &self,
+            item_id: ItemId,
+            workspace_id: WorkspaceId,
+            serialized_editor: SerializedEditor,
+        ) -> Result<()> {
+            WASM_EDITOR_PERSISTENCE
+                .editors
+                .lock()
+                .insert((item_id, workspace_id), serialized_editor);
+            Ok(())
+        }
+
+        /// wasm shim for `query! { pub fn get_scroll_position(...) }`.
+        pub fn get_scroll_position(
+            &self,
+            item_id: ItemId,
+            workspace_id: WorkspaceId,
+        ) -> Result<Option<(u32, f64, f64)>> {
+            Ok(WASM_EDITOR_PERSISTENCE
+                .scroll_positions
+                .lock()
+                .get(&(item_id, workspace_id))
+                .copied())
+        }
+
+        /// wasm shim for `query! { pub async fn save_scroll_position(...) }`.
+        pub async fn save_scroll_position(
+            &self,
+            item_id: ItemId,
+            workspace_id: WorkspaceId,
+            top_row: u32,
+            vertical_offset: f64,
+            horizontal_offset: f64,
+        ) -> Result<()> {
+            WASM_EDITOR_PERSISTENCE
+                .scroll_positions
+                .lock()
+                .insert((item_id, workspace_id), (top_row, vertical_offset, horizontal_offset));
+            Ok(())
+        }
+
+        /// wasm shim for `query! { pub fn get_editor_selections(...) }`.
+        pub fn get_editor_selections(
+            &self,
+            editor_id: ItemId,
+            workspace_id: WorkspaceId,
+        ) -> Result<Vec<(usize, usize)>> {
+            Ok(WASM_EDITOR_PERSISTENCE
+                .selections
+                .lock()
+                .get(&(editor_id, workspace_id))
+                .cloned()
+                .unwrap_or_default())
+        }
+
+        /// wasm shim for `save_editor_selections`.
+        pub async fn save_editor_selections(
+            &self,
+            editor_id: ItemId,
+            workspace_id: WorkspaceId,
+            selections: Vec<(usize, usize)>,
+        ) -> Result<()> {
+            log::debug!("Saving selections for editor {editor_id} in workspace {workspace_id:?}");
+            WASM_EDITOR_PERSISTENCE
+                .selections
+                .lock()
+                .insert((editor_id, workspace_id), selections);
+            Ok(())
+        }
+
+        /// wasm shim for `query! { pub fn get_editor_folds(...) }`.
+        pub fn get_editor_folds(
+            &self,
+            editor_id: ItemId,
+            workspace_id: WorkspaceId,
+        ) -> Result<Vec<(usize, usize, Option<String>, Option<String>)>> {
+            Ok(WASM_EDITOR_PERSISTENCE
+                .folds
+                .lock()
+                .get(&(editor_id, workspace_id))
+                .cloned()
+                .unwrap_or_default())
+        }
+
+        /// wasm shim for `query! { pub fn get_file_folds(...) }`.
+        pub fn get_file_folds(
+            &self,
+            workspace_id: WorkspaceId,
+            path: &Path,
+        ) -> Result<Vec<(usize, usize, Option<String>, Option<String>)>> {
+            Ok(WASM_EDITOR_PERSISTENCE
+                .file_folds
+                .lock()
+                .get(&(workspace_id, path.to_path_buf()))
+                .cloned()
+                .unwrap_or_default())
+        }
+
+        /// wasm shim for `save_file_folds`.
+        pub async fn save_file_folds(
+            &self,
+            workspace_id: WorkspaceId,
+            path: Arc<Path>,
+            folds: Vec<(usize, usize, String, String)>,
+        ) -> Result<()> {
+            log::debug!("Saving folds for file {path:?} in workspace {workspace_id:?}");
+            let folds = folds
+                .into_iter()
+                .map(|(start, end, start_fp, end_fp)| (start, end, Some(start_fp), Some(end_fp)))
+                .collect();
+            WASM_EDITOR_PERSISTENCE
+                .file_folds
+                .lock()
+                .insert((workspace_id, path.to_path_buf()), folds);
+            Ok(())
+        }
+
+        /// wasm shim for `delete_file_folds`.
+        pub async fn delete_file_folds(
+            &self,
+            workspace_id: WorkspaceId,
+            path: Arc<Path>,
+        ) -> Result<()> {
+            WASM_EDITOR_PERSISTENCE
+                .file_folds
+                .lock()
+                .remove(&(workspace_id, path.to_path_buf()));
+            Ok(())
+        }
+    }
+}
+
+#[cfg(target_family = "wasm")]
+pub(crate) use wasm_editor_persistence::EditorDb;
