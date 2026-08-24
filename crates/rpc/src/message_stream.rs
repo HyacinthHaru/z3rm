@@ -2,6 +2,7 @@
 
 pub use ::proto::*;
 
+use anyhow::Context as _;
 use async_tungstenite::tungstenite::Message as WebSocketMessage;
 use futures::{SinkExt as _, StreamExt as _};
 use proto::Message as _;
@@ -51,9 +52,15 @@ where
                 message
                     .encode(&mut self.encoding_buffer)
                     .map_err(io::Error::from)?;
+                // zstd is a C build with no wasm32-unknown-unknown target. The
+                // browser never opens a collab websocket, so the frame goes out
+                // uncompressed there rather than the crate failing to build.
+                #[cfg(not(target_family = "wasm"))]
                 let buffer =
                     zstd::stream::encode_all(self.encoding_buffer.as_slice(), COMPRESSION_LEVEL)
-                        .unwrap();
+                        .context("compressing an rpc envelope")?;
+                #[cfg(target_family = "wasm")]
+                let buffer = self.encoding_buffer.clone();
 
                 self.encoding_buffer.clear();
                 self.encoding_buffer.shrink_to(MAX_BUFFER_LEN);
@@ -86,10 +93,13 @@ where
             let received_at = Instant::now();
             match bytes? {
                 WebSocketMessage::Binary(bytes) => {
+                    #[cfg(not(target_family = "wasm"))]
                     zstd::stream::copy_decode(
                         zstd::zstd_safe::WriteBuf::as_slice(&*bytes),
                         &mut self.encoding_buffer,
                     )?;
+                    #[cfg(target_family = "wasm")]
+                    self.encoding_buffer.extend_from_slice(&bytes);
                     let envelope = Envelope::decode(self.encoding_buffer.as_slice())
                         .map_err(io::Error::from)?;
 
