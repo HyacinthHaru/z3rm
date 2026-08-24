@@ -5,7 +5,7 @@
 use base64::Engine;
 use mux_protocol::proto::ClipboardEntry as ProtoClipboardEntry;
 use mux_protocol::proto::clipboard_entry::ClipboardContentType as ProtoContentType;
-use tokio::sync::mpsc;
+use crate::rt::mpsc;
 
 /// §16.6 剪贴板内容类型
 #[derive(Clone, Copy, Debug, PartialEq)]

@@ -47,7 +47,7 @@ pub struct Session {
     /// §3.4 Session-level lifecycle notification subscribers: client_id → that
     /// connection's outbound channel.
     pub lifecycle_subscribers:
-        Arc<parking_lot::RwLock<HashMap<String, tokio::sync::mpsc::UnboundedSender<Envelope>>>>,
+        Arc<parking_lot::RwLock<HashMap<String, crate::rt::mpsc::UnboundedSender<Envelope>>>>,
     /// §4 Shadow snapshot watcher handle: cwd file changes → snapshot engine.
     /// `None` means this session has no live watcher (cwd unusable / recovered /
     /// test session). Arc so it survives Session derive(Clone) clones; the last
@@ -246,7 +246,7 @@ impl Session {
     pub fn add_lifecycle_subscriber(
         &self,
         client_id: String,
-        outbound_tx: tokio::sync::mpsc::UnboundedSender<Envelope>,
+        outbound_tx: crate::rt::mpsc::UnboundedSender<Envelope>,
     ) {
         self.lifecycle_subscribers
             .write()
