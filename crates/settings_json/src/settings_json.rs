@@ -1,7 +1,10 @@
 use anyhow::Result;
 use serde::{Serialize, de::DeserializeOwned};
 use serde_json::Value;
-use std::{ops::Range, sync::LazyLock};
+use std::ops::Range;
+#[cfg(not(target_family = "wasm"))]
+use std::sync::LazyLock;
+#[cfg(not(target_family = "wasm"))]
 use tree_sitter::{Query, StreamingIterator as _};
 use util::RangeExt;
 
@@ -65,6 +68,7 @@ pub fn update_value_in_json_text<'a>(
 }
 
 /// * `replace_key` - When an exact key match according to `key_path` is found, replace the key with `replace_key` if `Some`.
+#[cfg(not(target_family = "wasm"))]
 pub fn replace_value_in_json_text<T: AsRef<str>>(
     text: &str,
     key_path: &[T],
@@ -304,6 +308,7 @@ fn parse_index_key(index_key: &str) -> Option<usize> {
     index_key.strip_prefix('#')?.parse().ok()
 }
 
+#[cfg(not(target_family = "wasm"))]
 fn handle_possible_array_value(
     key_node: &tree_sitter::Node,
     value_node: &tree_sitter::Node,
@@ -375,6 +380,7 @@ const TS_DOCUMENT_KIND: &str = "document";
 const TS_ARRAY_KIND: &str = "array";
 const TS_COMMENT_KIND: &str = "comment";
 
+#[cfg(not(target_family = "wasm"))]
 pub fn replace_top_level_array_value_in_json_text(
     text: &str,
     key_path: &[impl AsRef<str>],
@@ -497,6 +503,7 @@ pub fn replace_top_level_array_value_in_json_text(
     }
 }
 
+#[cfg(not(target_family = "wasm"))]
 pub fn append_top_level_array_value_in_json_text(
     text: &str,
     new_value: &Value,
@@ -621,6 +628,7 @@ pub fn append_top_level_array_value_in_json_text(
 
 /// Infers the indentation size used in JSON text by analyzing the tree structure.
 /// Returns the detected indent size, or a default of 2 if no indentation is found.
+#[cfg(not(target_family = "wasm"))]
 pub fn infer_json_indent_size(text: &str) -> usize {
     const MAX_INDENT_SIZE: usize = 64;
 
@@ -745,7 +753,7 @@ pub fn parse_json_with_comments<T: DeserializeOwned>(content: &str) -> Result<T>
     Ok(serde_path_to_error::deserialize(&mut deserializer)?)
 }
 
-#[cfg(test)]
+#[cfg(all(test, not(target_family = "wasm")))]
 mod tests {
     use super::*;
     use serde_json::{Value, json};
@@ -2633,3 +2641,169 @@ mod tests {
         assert_eq!(infer_json_indent_size(json_mixed), 2);
     }
 }
+
+/// The browser build's JSONC editing, without tree-sitter.
+///
+/// tree-sitter and its JSON grammar are C builds, so neither can target
+/// wasm32-unknown-unknown. The native functions above edit a document in place
+/// and hand back the one range they touched, which is what preserves the
+/// comments and formatting around it. Without a parser there is no way to find
+/// that range, so these rewrite the whole document and report the whole range:
+/// the resulting text is correct, but comments and hand-formatting are lost.
+///
+/// Settings written from the browser are the only thing that flows through
+/// here, and the browser has no settings file to preserve — the store is
+/// in-memory (see `db::kvp`).
+#[cfg(target_family = "wasm")]
+mod wasm_json_edit {
+    use super::{parse_json_with_comments, to_pretty_json};
+    use serde_json::Value;
+    use std::ops::Range;
+
+    /// The document as a mutable tree, or an empty object when it cannot be
+    /// read. An unparseable document has no edit that could preserve it, and
+    /// refusing to write would lose the caller's change silently.
+    fn document(text: &str) -> Value {
+        if text.trim().is_empty() {
+            return Value::Object(serde_json::Map::new());
+        }
+        parse_json_with_comments::<Value>(text).unwrap_or(Value::Object(serde_json::Map::new()))
+    }
+
+    fn whole(text: &str, value: &Value, tab_size: usize) -> (Range<usize>, String) {
+        (0..text.len(), to_pretty_json(value, tab_size, 0))
+    }
+
+    /// Walk `key_path`, creating objects as needed, and apply `edit` to the
+    /// final container under the last key.
+    fn at_path<T: AsRef<str>>(
+        root: &mut Value,
+        key_path: &[T],
+        edit: impl FnOnce(&mut serde_json::Map<String, Value>, &str),
+    ) {
+        let Some((last, parents)) = key_path.split_last() else {
+            return;
+        };
+        let mut node = root;
+        for key in parents {
+            if !node.is_object() {
+                *node = Value::Object(serde_json::Map::new());
+            }
+            let Some(object) = node.as_object_mut() else {
+                return;
+            };
+            node = object
+                .entry(key.as_ref().to_owned())
+                .or_insert_with(|| Value::Object(serde_json::Map::new()));
+        }
+        if !node.is_object() {
+            *node = Value::Object(serde_json::Map::new());
+        }
+        if let Some(object) = node.as_object_mut() {
+            edit(object, last.as_ref());
+        }
+    }
+
+    pub fn replace_value_in_json_text<T: AsRef<str>>(
+        text: &str,
+        key_path: &[T],
+        tab_size: usize,
+        new_value: Option<&Value>,
+        replace_key: Option<&str>,
+    ) -> (Range<usize>, String) {
+        let mut root = document(text);
+        at_path(&mut root, key_path, |object, last| {
+            let existing = object.remove(last);
+            let key = replace_key.unwrap_or(last).to_owned();
+            match new_value {
+                Some(value) => {
+                    object.insert(key, value.clone());
+                }
+                // No replacement value means "rename in place" when a new key
+                // was given, and "delete" otherwise.
+                None => {
+                    if let (Some(existing), true) = (existing, replace_key.is_some()) {
+                        object.insert(key, existing);
+                    }
+                }
+            }
+        });
+        whole(text, &root, tab_size)
+    }
+
+    pub fn replace_top_level_array_value_in_json_text(
+        text: &str,
+        key_path: &[impl AsRef<str>],
+        new_value: Option<&Value>,
+        replace_key: Option<&str>,
+        array_index: usize,
+        tab_size: usize,
+    ) -> (Range<usize>, String) {
+        let mut root = document(text);
+        if let Some(element) = root
+            .as_array_mut()
+            .and_then(|array| array.get_mut(array_index))
+        {
+            if key_path.is_empty() {
+                if let Some(value) = new_value {
+                    *element = value.clone();
+                }
+            } else {
+                at_path(element, key_path, |object, last| {
+                    let existing = object.remove(last);
+                    let key = replace_key.unwrap_or(last).to_owned();
+                    match new_value {
+                        Some(value) => {
+                            object.insert(key, value.clone());
+                        }
+                        None => {
+                            if let (Some(existing), true) = (existing, replace_key.is_some()) {
+                                object.insert(key, existing);
+                            }
+                        }
+                    }
+                });
+            }
+        }
+        whole(text, &root, tab_size)
+    }
+
+    pub fn append_top_level_array_value_in_json_text(
+        text: &str,
+        new_value: &Value,
+        tab_size: usize,
+    ) -> (Range<usize>, String) {
+        let mut root = match document(text) {
+            Value::Array(elements) => Value::Array(elements),
+            // The callers only ever append to a top-level array; anything else
+            // is a document this build cannot meaningfully extend.
+            _ => Value::Array(Vec::new()),
+        };
+        if let Some(array) = root.as_array_mut() {
+            array.push(new_value.clone());
+        }
+        whole(text, &root, tab_size)
+    }
+
+    /// The first indentation actually used in the document.
+    ///
+    /// The native version asks the parse tree; counting the leading spaces of
+    /// the first indented line reaches the same answer for the documents this
+    /// crate writes, and needs no parser.
+    pub fn infer_json_indent_size(text: &str) -> usize {
+        const DEFAULT_INDENT_SIZE: usize = 4;
+        text.lines()
+            .filter_map(|line| {
+                let indent = line.len() - line.trim_start_matches(' ').len();
+                (indent > 0 && !line.trim().is_empty()).then_some(indent)
+            })
+            .next()
+            .unwrap_or(DEFAULT_INDENT_SIZE)
+    }
+}
+
+#[cfg(target_family = "wasm")]
+pub use wasm_json_edit::{
+    append_top_level_array_value_in_json_text, infer_json_indent_size,
+    replace_top_level_array_value_in_json_text, replace_value_in_json_text,
+};

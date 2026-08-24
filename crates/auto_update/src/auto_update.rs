@@ -1456,7 +1456,10 @@ mod tests {
         );
         let will_restart = cx.expect_restart();
         cx.update(|cx| cx.restart());
-        let path = will_restart.await.unwrap().unwrap();
+        // `restart` now also carries the arguments to relaunch with; this test
+        // only asserts which binary is started.
+        let (path, _arguments) = will_restart.await.unwrap();
+        let path = path.unwrap();
         assert_eq!(path, tmp_dir.path().join("z3rm"));
         assert_eq!(std::fs::read_to_string(path).unwrap(), "<fake-z3rm-update>");
     }
