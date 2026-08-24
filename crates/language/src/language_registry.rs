@@ -985,6 +985,7 @@ impl LanguageRegistry {
                 AvailableGrammar::Loading(_, txs) => {
                     txs.push(tx);
                 }
+                #[cfg(not(target_family = "wasm"))]
                 AvailableGrammar::Unloaded(wasm_path) => {
                     log::trace!("start loading grammar {name:?}");
                     let this = self.clone();
@@ -1021,6 +1022,14 @@ impl LanguageRegistry {
                             }
                         })
                         .detach();
+                }
+                #[cfg(target_family = "wasm")]
+                AvailableGrammar::Unloaded(_) => {
+                    let error = Arc::new(anyhow!(
+                        "loading filesystem-backed WASM grammars is unavailable in the browser"
+                    ));
+                    *grammar = AvailableGrammar::LoadFailed(error.clone());
+                    tx.send(Err(error)).ok();
                 }
             }
         } else {
