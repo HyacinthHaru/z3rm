@@ -1,5 +1,6 @@
+use std::cell::RefCell;
+#[cfg(not(target_family = "wasm"))]
 use std::{
-    cell::RefCell,
     ffi::{CStr, CString},
     marker::PhantomData,
     path::Path,
@@ -7,15 +8,74 @@ use std::{
 };
 
 use anyhow::Result;
+#[cfg(not(target_family = "wasm"))]
 use libsqlite3_sys::*;
 
+#[cfg(not(target_family = "wasm"))]
 pub struct Connection {
     pub(crate) sqlite3: *mut sqlite3,
     persistent: bool,
     pub(crate) write: RefCell<bool>,
     _sqlite: PhantomData<sqlite3>,
 }
+#[cfg(not(target_family = "wasm"))]
 unsafe impl Send for Connection {}
+
+// There is no sqlite in the browser. The connection still exists so that every
+// caller compiles unchanged; it holds no rows, so reads come back empty and
+// writes go nowhere.
+#[cfg(target_family = "wasm")]
+pub struct Connection {
+    persistent: bool,
+    pub(crate) write: RefCell<bool>,
+}
+
+#[cfg(target_family = "wasm")]
+impl Connection {
+    pub(crate) fn open(_uri: &str, persistent: bool) -> Result<Self> {
+        Ok(Self {
+            persistent,
+            write: RefCell::new(true),
+        })
+    }
+
+    pub fn open_file(uri: &str) -> Self {
+        Self::open(uri, true).expect("opening a connection cannot fail")
+    }
+
+    pub fn open_memory(_uri: Option<&str>) -> Self {
+        Self::open(":memory:", false).expect("opening a connection cannot fail")
+    }
+
+    pub fn persistent(&self) -> bool {
+        self.persistent
+    }
+
+    pub fn can_write(&self) -> bool {
+        *self.write.borrow()
+    }
+
+    pub fn backup_main(&self, _destination: &Connection) -> Result<()> {
+        anyhow::bail!("there is no database to back up")
+    }
+
+    pub fn backup_main_to(&self, _destination: impl AsRef<std::path::Path>) -> Result<()> {
+        anyhow::bail!("there is no database to back up")
+    }
+
+    pub fn sql_has_syntax_error(&self, _sql: &str) -> Option<(String, usize)> {
+        None
+    }
+
+    pub(crate) fn with_write<T>(&self, callback: impl FnOnce(&Connection) -> T) -> T {
+        *self.write.borrow_mut() = true;
+        let result = callback(self);
+        *self.write.borrow_mut() = false;
+        result
+    }
+}
+
+#[cfg(not(target_family = "wasm"))]
 
 impl Connection {
     fn open_with_flags(uri: &str, persistent: bool, flags: i32) -> Result<Self> {
@@ -228,6 +288,7 @@ impl Connection {
     }
 }
 
+#[cfg(not(target_family = "wasm"))]
 fn parse_alter_table(remaining_sql_str: &str) -> Option<(String, String)> {
     let remaining_sql_str = remaining_sql_str.to_lowercase();
     if remaining_sql_str.starts_with("alter")
@@ -266,13 +327,14 @@ fn parse_alter_table(remaining_sql_str: &str) -> Option<(String, String)> {
     None
 }
 
+#[cfg(not(target_family = "wasm"))]
 impl Drop for Connection {
     fn drop(&mut self) {
         unsafe { sqlite3_close(self.sqlite3) };
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, not(target_family = "wasm")))]
 mod test {
     use anyhow::Result;
     use indoc::indoc;

@@ -445,13 +445,21 @@ async fn race_recv_with_timeout(
     use std::future::poll_fn;
     use std::task::Poll;
     let millis = u32::try_from(timeout.as_millis()).unwrap_or(u32::MAX);
+    // `TimeoutFuture` owns a JS closure and so is not `Send`, while callers hand
+    // this future to the background executor. Keep the timer in a task of its
+    // own and wait on a channel, which is.
+    let (expired_tx, expired_rx) = async_channel::bounded::<()>(1);
+    wasm_bindgen_futures::spawn_local(async move {
+        gloo_timers::future::TimeoutFuture::new(millis).await;
+        expired_tx.send(()).await.ok();
+    });
     let mut receive = std::pin::pin!(rx.recv());
-    let mut timer = std::pin::pin!(gloo_timers::future::TimeoutFuture::new(millis));
+    let mut expired = std::pin::pin!(expired_rx.recv());
     poll_fn(|cx| {
         if let Poll::Ready(value) = receive.as_mut().poll(cx) {
             return Poll::Ready(Some(value));
         }
-        if timer.as_mut().poll(cx).is_ready() {
+        if expired.as_mut().poll(cx).is_ready() {
             return Poll::Ready(None);
         }
         Poll::Pending

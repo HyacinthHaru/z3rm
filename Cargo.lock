@@ -7531,6 +7531,7 @@ dependencies = [
  "terminal_view",
  "tokio",
  "tracing",
+ "wasm-bindgen-futures",
  "which 6.0.3",
 ]
 
