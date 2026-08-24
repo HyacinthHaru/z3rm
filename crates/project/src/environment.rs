@@ -1,11 +1,14 @@
+#[cfg(not(target_family = "wasm"))]
 use anyhow::{Context as _, bail};
 use futures::{FutureExt, StreamExt as _, channel::mpsc, future::Shared};
 use language::Buffer;
 use remote::RemoteClient;
 use rpc::proto::{self, REMOTE_SERVER_PROJECT_ID};
 use std::{collections::VecDeque, path::Path, sync::Arc};
+use util::ResultExt;
+#[cfg(not(target_family = "wasm"))]
+use util::command::new_command;
 use util::shell::Shell;
-use util::{ResultExt, command::new_command};
 use worktree::Worktree;
 
 use collections::HashMap;
@@ -323,6 +326,17 @@ fn shell_to_proto(shell: Shell) -> proto::Shell {
             }
         }),
     }
+}
+
+/// Nothing can be launched to ask, so the directory contributes no environment.
+#[cfg(target_family = "wasm")]
+async fn load_directory_shell_environment(
+    _shell: Shell,
+    _abs_path: Arc<Path>,
+    _load_direnv: DirenvSettings,
+    _tx: mpsc::UnboundedSender<String>,
+) -> anyhow::Result<HashMap<String, String>> {
+    Ok(HashMap::default())
 }
 
 #[cfg(not(target_family = "wasm"))]

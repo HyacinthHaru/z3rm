@@ -125,6 +125,7 @@ where
     F: FnOnce(&mut Parser) -> R,
 {
     let mut parser = PARSERS.lock().pop().unwrap_or_else(|| {
+        #[cfg_attr(target_arch = "wasm32", allow(unused_mut))]
         let mut parser = Parser::new();
         #[cfg(not(target_arch = "wasm32"))]
         parser

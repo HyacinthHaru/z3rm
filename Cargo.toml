@@ -931,6 +931,7 @@ features = [ "display", "parse", "serde",]
 [workspace.dependencies.tree-sitter]
 version = "0.26.9"
 default-features = false
+features = [ "std",]
 
 [workspace.dependencies.tree-sitter-cpp]
 git = "https://github.com/tree-sitter/tree-sitter-cpp"

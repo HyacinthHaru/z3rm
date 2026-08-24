@@ -512,6 +512,27 @@ impl std::ops::Deref for Repository {
     }
 }
 
+#[cfg(not(target_family = "wasm"))]
+fn system_git_binary_path(
+    search_paths: Option<String>,
+    work_directory_abs_path: &Path,
+) -> Option<PathBuf> {
+    search_paths
+        .and_then(|search_paths| {
+            which::which_in("git", Some(search_paths), work_directory_abs_path).ok()
+        })
+        .or_else(|| which::which("git").ok())
+}
+
+/// There is no `PATH` to search on wasm, and nothing to run if there were.
+#[cfg(target_family = "wasm")]
+fn system_git_binary_path(
+    _search_paths: Option<String>,
+    _work_directory_abs_path: &Path,
+) -> Option<PathBuf> {
+    None
+}
+
 #[derive(Clone)]
 pub struct LocalRepositoryState {
     pub fs: Arc<dyn Fs>,
@@ -542,12 +563,8 @@ impl LocalRepositoryState {
             .background_spawn({
                 let fs = fs.clone();
                 async move {
-                    let system_git_binary_path = search_paths
-                        .and_then(|search_paths| {
-                            which::which_in("git", Some(search_paths), &work_directory_abs_path)
-                                .ok()
-                        })
-                        .or_else(|| which::which("git").ok());
+                    let system_git_binary_path =
+                        system_git_binary_path(search_paths, &work_directory_abs_path);
                     fs.open_repo(&dot_git_abs_path, system_git_binary_path.as_deref())
                         .with_context(|| format!("opening repository at {dot_git_abs_path:?}"))
                 }

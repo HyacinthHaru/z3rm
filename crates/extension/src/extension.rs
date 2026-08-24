@@ -1,4 +1,6 @@
 mod capabilities;
+// Compiling an extension shells out to cargo, npm and wasm-opt.
+#[cfg(not(target_family = "wasm"))]
 pub mod extension_builder;
 mod extension_events;
 mod extension_host_proxy;

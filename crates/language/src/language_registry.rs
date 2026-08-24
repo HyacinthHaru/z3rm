@@ -1,9 +1,13 @@
+#[cfg(not(target_family = "wasm"))]
+use crate::with_parser;
 use crate::{
     CachedLspAdapter, File, Language, LanguageConfig, LanguageId, LanguageMatcher,
     LanguageServerName, LspAdapter, ManifestName, PLAIN_TEXT, ToolchainLister,
-    language_settings::all_language_settings, with_parser,
+    language_settings::all_language_settings,
 };
-use anyhow::{Context as _, Result, anyhow};
+#[cfg(not(target_family = "wasm"))]
+use anyhow::Context as _;
+use anyhow::{Result, anyhow};
 use collections::{FxHashMap, HashMap, HashSet, hash_map};
 pub use language_core::{
     BinaryStatus, LanguageName, LanguageQueries, LanguageServerStatusUpdate,
@@ -22,9 +26,10 @@ use parking_lot::{Mutex, RwLock};
 use postage::watch;
 
 use smallvec::SmallVec;
+#[cfg(not(target_family = "wasm"))]
+use std::ffi::OsStr;
 use std::{
     cell::LazyCell,
-    ffi::OsStr,
     ops::Not,
     path::{Path, PathBuf},
     sync::Arc,
@@ -33,7 +38,9 @@ use sum_tree::Bias;
 use text::{Point, Rope};
 use theme::Theme;
 use unicase::UniCase;
-use util::{maybe, post_inc};
+#[cfg(not(target_family = "wasm"))]
+use util::maybe;
+use util::post_inc;
 
 pub struct LanguageRegistry {
     state: RwLock<LanguageRegistryState>,
@@ -992,6 +999,7 @@ impl LanguageRegistry {
                     *grammar = AvailableGrammar::Loading(wasm_path.clone(), vec![tx]);
                     self.executor
                         .spawn(async move {
+                            #[cfg(not(target_family = "wasm"))]
                             let grammar_result = maybe!({
                                 let wasm_bytes = std::fs::read(&wasm_path)?;
                                 let grammar_name = wasm_path
@@ -1006,6 +1014,15 @@ impl LanguageRegistry {
                                 })?)
                             })
                             .map_err(Arc::new);
+                            // A grammar shipped as wasm needs an engine to run it in,
+                            // and there is none inside a wasm build.
+                            #[cfg(target_family = "wasm")]
+                            let grammar_result: Result<
+                                tree_sitter::Language,
+                                Arc<anyhow::Error>,
+                            > = Err(Arc::new(anyhow!(
+                                "cannot load the grammar at {wasm_path:?}"
+                            )));
 
                             let value = match &grammar_result {
                                 Ok(grammar) => AvailableGrammar::Loaded(wasm_path, grammar.clone()),

@@ -5657,12 +5657,13 @@ impl BackgroundScanner {
         {
             for (parent_abs_path, ignore_stack) in ignores_to_update {
                 ignore_queue_tx
-                    .send_blocking(UpdateIgnoreStatusJob {
+                    .send(UpdateIgnoreStatusJob {
                         abs_path: parent_abs_path,
                         ignore_stack,
                         ignore_queue: ignore_queue_tx.clone(),
                         scan_queue: scan_job_tx.clone(),
                     })
+                    .await
                     .unwrap();
             }
         }
