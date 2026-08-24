@@ -19,10 +19,9 @@ use postage::{barrier, prelude::Stream};
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use serde_json::{Value, json, value::RawValue};
-use smol::{
-    channel,
-    io::{AsyncBufReadExt, AsyncWriteExt, BufReader},
-};
+use async_channel as channel;
+use futures::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+#[cfg(not(target_family = "wasm"))]
 use util::command::{Child, Stdio};
 
 use std::path::Path;
@@ -75,7 +74,8 @@ pub enum IoKind {
 
 /// Represents a launchable language server. This can either be a standalone binary or the path
 /// to a runtime with arguments to instruct it to launch the actual language server file.
-#[derive(Clone, Serialize)]
+#[cfg_attr(not(target_family = "wasm"), derive(Serialize))]
+#[derive(Clone)]
 pub struct LanguageServerBinary {
     pub path: PathBuf,
     pub arguments: Vec<OsString>,
@@ -121,6 +121,7 @@ pub struct LanguageServer {
     #[allow(clippy::type_complexity)]
     io_tasks: Mutex<Option<(Task<Option<()>>, Task<Option<()>>)>>,
     output_done_rx: Mutex<Option<barrier::Receiver>>,
+    #[cfg(not(target_family = "wasm"))]
     server: Arc<Mutex<Option<Child>>>,
     workspace_folders: Option<Arc<Mutex<BTreeSet<Uri>>>>,
     root_uri: Uri,
@@ -392,6 +393,7 @@ pub const SEMANTIC_TOKEN_MODIFIERS: &[SemanticTokenModifier] = &[
 ];
 
 impl LanguageServer {
+    #[cfg(not(target_family = "wasm"))]
     /// Starts a language server process.
     /// A request_timeout of zero or Duration::MAX indicates an indefinite timeout.
     pub fn new(
@@ -462,6 +464,7 @@ impl LanguageServer {
         Ok(server)
     }
 
+    #[cfg(not(target_family = "wasm"))]
     fn new_internal<Stdin, Stdout, Stderr, F>(
         server_id: LanguageServerId,
         server_name: LanguageServerName,
@@ -623,7 +626,7 @@ impl LanguageServer {
     where
         Stdout: AsyncRead + Unpin + Send + 'static,
     {
-        use smol::stream::StreamExt;
+        use futures::StreamExt as _;
         let stdout = BufReader::new(stdout);
         let _clear_response_handlers = util::defer({
             let response_handlers = response_handlers.clone();
@@ -667,7 +670,7 @@ impl LanguageServer {
             }
 
             // Don't starve the main thread when receiving lots of notifications at once.
-            smol::future::yield_now().await;
+            futures_lite::future::yield_now().await;
         }
         input_handler.loop_handle.await
     }
@@ -703,7 +706,7 @@ impl LanguageServer {
             }
 
             // Don't starve the main thread when receiving lots of messages at once.
-            smol::future::yield_now().await;
+            futures_lite::future::yield_now().await;
         }
     }
 
@@ -1103,6 +1106,9 @@ impl LanguageServer {
             (),
         );
 
+        // No child process exists in the browser; the shutdown request still
+        // goes out, there is simply nothing left to reap afterwards.
+        #[cfg(not(target_family = "wasm"))]
         let server = self.server.clone();
         let name = self.name.clone();
         let server_id = self.server_id;
@@ -1135,6 +1141,7 @@ impl LanguageServer {
             Self::notify_internal::<notification::Exit>(&notification_serializers, ()).ok();
             notification_serializers.close();
             output_done.recv().await;
+            #[cfg(not(target_family = "wasm"))]
             server.lock().take().map(|mut child| child.kill());
             drop(tasks);
             log::debug!("language server shutdown finished");
@@ -1368,6 +1375,7 @@ impl LanguageServer {
         self.server_id
     }
 
+    #[cfg(not(target_family = "wasm"))]
     /// Get the process ID of the running language server, if available.
     pub fn process_id(&self) -> Option<u32> {
         self.server.lock().as_ref().map(|child| child.id())
@@ -1600,7 +1608,16 @@ impl LanguageServer {
             .unwrap()
         }));
 
+        // `send_blocking` parks the thread, which is not available (or
+        // meaningful) in the browser's single thread. The channel is unbounded
+        // in practice, so a try-send that only fails on a closed channel is the
+        // same outcome.
+        #[cfg(not(target_family = "wasm"))]
         outbound_tx.send_blocking(serializer)?;
+        #[cfg(target_family = "wasm")]
+        outbound_tx
+            .try_send(serializer)
+            .map_err(|error| anyhow::anyhow!("language server outbound channel: {error}"))?;
         Ok(())
     }
 
