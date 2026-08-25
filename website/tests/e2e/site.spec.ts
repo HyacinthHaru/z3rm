@@ -67,12 +67,13 @@ test("implementation status renders verified evidence rows", async ({ page }) =>
 });
 
 test("GPUI WASM demo and Proto UI controls work together", async ({ page }) => {
+  test.setTimeout(180_000);
   await page.goto("en/");
   const demo = page.locator("[data-z3rm-wasm-demo]");
   await expect(demo).toContainText("One mux snapshot");
 
   const frame = page.frameLocator('iframe[title="Z3rm GPUI WebAssembly session projection"]');
-  await expect(frame.locator("canvas")).toBeVisible({ timeout: 120_000 }).catch(async () => {
+  await expect(frame.locator("canvas")).toBeVisible({ timeout: 15_000 }).catch(async () => {
     // GPUI may not start in headless CI (no GPU). The boot terminal
     // fallback is the expected behavior in that case.
     await expect(frame.locator("#boot-terminal")).toBeVisible({ timeout: 5000 });
@@ -89,7 +90,7 @@ test("GPUI WASM demo and Proto UI controls work together", async ({ page }) => {
   await demo.locator("proto-ui-base-select-trigger").evaluate((element: HTMLElement) => element.click());
   await page.locator("proto-ui-base-select-item").filter({ hasText: "observe" }).evaluate((element: HTMLElement) => element.click());
   await expect(demo.locator("iframe")).toHaveAttribute("src", /window=window-1/);
-  await expect(frame.locator("canvas")).toBeVisible({ timeout: 120_000 }).catch(async () => {
+  await expect(frame.locator("canvas")).toBeVisible({ timeout: 15_000 }).catch(async () => {
     // GPUI may not start in headless CI (no GPU). The boot terminal
     // fallback is the expected behavior in that case.
     await expect(frame.locator("#boot-terminal")).toBeVisible({ timeout: 5000 });
@@ -97,9 +98,10 @@ test("GPUI WASM demo and Proto UI controls work together", async ({ page }) => {
 });
 
 test("GPUI WASM panes render a real terminal grid", async ({ page }) => {
+  test.setTimeout(60_000);
   await page.goto("en/");
   const frame = page.frameLocator('iframe[title="Z3rm GPUI WebAssembly session projection"]');
-  await expect(frame.locator("canvas")).toBeVisible({ timeout: 120_000 }).catch(async () => {
+  await expect(frame.locator("canvas")).toBeVisible({ timeout: 15_000 }).catch(async () => {
     // GPUI may not start in headless CI (no GPU). The boot terminal
     // fallback is the expected behavior in that case.
     await expect(frame.locator("#boot-terminal")).toBeVisible({ timeout: 5000 });
