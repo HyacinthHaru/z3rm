@@ -15,17 +15,9 @@ use futures::{
 use parking_lot::{Mutex, RwLock};
 use proto::{ErrorCode, ErrorCodeExt, ErrorExt, RpcError};
 use serde::{Serialize, ser::SerializeStruct};
-use std::{
-    fmt, future,
-    future::Future,
-    sync::atomic::Ordering::SeqCst,
-    sync::{
-        Arc,
-        atomic::{self, AtomicU32},
-    },
-    time::Duration,
-    time::Instant,
-};
+use std::{fmt, future, future::Future, sync::atomic::Ordering::SeqCst, sync::{Arc, atomic::{self, AtomicU32}}, time::Duration};
+use web_time::Instant;
+
 
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Debug, Serialize)]
 pub struct ConnectionId {
@@ -75,7 +67,7 @@ pub struct ConnectionState {
             Option<
                 HashMap<
                     u32,
-                    oneshot::Sender<(proto::Envelope, std::time::Instant, oneshot::Sender<()>)>,
+                    oneshot::Sender<(proto::Envelope, web_time::Instant, oneshot::Sender<()>)>,
                 >,
             >,
         >,

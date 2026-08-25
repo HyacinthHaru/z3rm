@@ -203,7 +203,7 @@ mod tests {
     use super::*;
     use crate::RunnableVariant;
     use scheduler::BackgroundExecutor;
-    use std::time::Instant as StdInstant;
+    use web_time::Instant as StdInstant;
 
     // `spawn_dedicated` shouldn't touch the platform dispatcher at all;
     // panicking on every method ensures the test catches it if it does.

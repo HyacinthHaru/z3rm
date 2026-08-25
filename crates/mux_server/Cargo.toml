@@ -13,6 +13,7 @@ name = "z3rm-server"
 path = "src/main.rs"
 
 [dependencies]
+web-time.workspace = true
 mux_protocol = { workspace = true }
 mux = { workspace = true }
 alacritty_terminal = { workspace = true }

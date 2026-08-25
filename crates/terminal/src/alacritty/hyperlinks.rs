@@ -10,10 +10,9 @@ use alacritty_terminal::{
 };
 use log::{info, warn};
 use regex::Regex;
-use std::{
-    ops::{Index, Range as StdRange},
-    time::{Duration, Instant},
-};
+use std::{ops::{Index, Range as StdRange}, time::{Duration}};
+use web_time::Instant;
+
 use url::Url;
 use util::paths::{PathStyle, UrlExt};
 

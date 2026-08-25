@@ -18,6 +18,7 @@ doctest = true
 test-support = ["rand", "util_macros"]
 
 [dependencies]
+web-time.workspace = true
 anyhow.workspace = true
 async_zip.workspace = true
 collections.workspace = true

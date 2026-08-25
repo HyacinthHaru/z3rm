@@ -60,19 +60,9 @@ pub struct SpawnInTerminal {
 
 #[cfg(unix)]
 use std::os::unix::process::ExitStatusExt;
-use std::{
-    borrow::Cow,
-    cmp::{self, min},
-    fmt::{self, Display, Formatter},
-    ops::{BitOr, BitOrAssign, Deref, Range as StdRange},
-    path::{Path, PathBuf},
-    process::ExitStatus,
-    sync::{
-        Arc,
-        atomic::{AtomicU64, Ordering},
-    },
-    time::{Duration, Instant},
-};
+use std::{borrow::Cow, cmp::{self, min}, fmt::{self, Display, Formatter}, ops::{BitOr, BitOrAssign, Deref, Range as StdRange}, path::{Path, PathBuf}, process::ExitStatus, sync::{Arc, atomic::{AtomicU64, Ordering}}, time::{Duration}};
+use web_time::Instant;
+
 use thiserror::Error;
 use vte::ansi::{Attr, Handler, Processor, StdSyncHandler};
 pub use vte::ansi::{Color, NamedColor, Rgb};

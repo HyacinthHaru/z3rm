@@ -10,7 +10,7 @@ pub use fs_watcher::requires_poll_watcher;
 use parking_lot::Mutex;
 use std::ffi::OsString;
 use std::sync::atomic::{AtomicU8, AtomicUsize, Ordering};
-use std::time::Instant;
+use web_time::Instant;
 #[cfg(not(target_family = "wasm"))]
 use util::maybe;
 
@@ -50,13 +50,8 @@ use serde::{Deserialize, Serialize};
 use smol::io::AsyncWriteExt;
 #[cfg(feature = "test-support")]
 use std::path::Component;
-use std::{
-    io::{self, Write},
-    path::{Path, PathBuf},
-    pin::Pin,
-    sync::Arc,
-    time::{Duration, SystemTime, UNIX_EPOCH},
-};
+use std::{io::{self, Write}, path::{Path, PathBuf}, pin::Pin, sync::Arc, time::{Duration, SystemTime, UNIX_EPOCH}};
+
 #[cfg(not(target_family = "wasm"))]
 use tempfile::TempDir;
 use text::LineEnding;
@@ -3506,13 +3501,8 @@ mod wasm_fs {
     use collections::BTreeMap;
     use futures::{AsyncRead, Stream};
     use parking_lot::Mutex;
-    use std::{
-        io,
-        path::{Path, PathBuf},
-        pin::Pin,
-        sync::Arc,
-        time::{Duration, SystemTime},
-    };
+    use std::{io, path::{Path, PathBuf}, pin::Pin, sync::Arc, time::{Duration, SystemTime}};
+
 
     #[derive(Clone)]
     enum Entry {

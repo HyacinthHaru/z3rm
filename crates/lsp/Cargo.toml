@@ -16,6 +16,7 @@ doctest = false
 test-support = ["async-pipe", "gpui_util"]
 
 [dependencies]
+web-time.workspace = true
 anyhow.workspace = true
 async-pipe = { workspace = true, optional = true }
 collections.workspace = true

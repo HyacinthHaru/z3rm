@@ -20,6 +20,7 @@ path = "src/terminal.rs"
 doctest = false
 
 [dependencies]
+web-time.workspace = true
 async-channel.workspace = true
 alacritty_terminal.workspace = true
 anyhow.workspace = true

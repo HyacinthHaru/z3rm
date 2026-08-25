@@ -25,22 +25,9 @@ use futures::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use util::command::{Child, Stdio};
 
 use std::path::Path;
-use std::{
-    any::TypeId,
-    collections::BTreeSet,
-    ffi::{OsStr, OsString},
-    fmt,
-    io::Write,
-    ops::DerefMut,
-    path::PathBuf,
-    pin::Pin,
-    sync::{
-        Arc, Weak,
-        atomic::{AtomicI32, Ordering::SeqCst},
-    },
-    task::Poll,
-    time::{Duration, Instant},
-};
+use std::{any::TypeId, collections::BTreeSet, ffi::{OsStr, OsString}, fmt, io::Write, ops::DerefMut, path::PathBuf, pin::Pin, sync::{Arc, Weak, atomic::{AtomicI32, Ordering::SeqCst}}, task::Poll, time::{Duration}};
+use web_time::Instant;
+
 use util::{ConnectionResult, ResultExt, TryFutureExt, redact};
 
 const JSON_RPC_VERSION: &str = "2.0";

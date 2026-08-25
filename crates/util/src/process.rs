@@ -204,7 +204,9 @@ mod windows_job {
 #[cfg(all(test, windows))]
 mod windows_tests {
     use super::*;
-    use std::time::{Duration, Instant};
+    use std::time::{Duration};
+use web_time::Instant;
+
 
     /// Spawns a process tree `powershell -> ping` via `Child::spawn` and
     /// returns the `Child` along with the pid of the grandchild (`ping`).

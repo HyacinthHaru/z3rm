@@ -18,6 +18,7 @@ gpui = ["dep:gpui"]
 test-support = ["collections/test-support", "gpui/test-support", "proto/test-support"]
 
 [dependencies]
+web-time.workspace = true
 anyhow.workspace = true
 async-tungstenite.workspace = true
 base64.workspace = true

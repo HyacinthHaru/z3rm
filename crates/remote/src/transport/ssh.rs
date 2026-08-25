@@ -36,14 +36,9 @@ pub use settings::SshPortForwardOption;
 use smol::fs;
 use std::net::IpAddr;
 #[cfg(not(target_family = "wasm"))]
-use std::{
-    path::{Path, PathBuf},
-    sync::{
-        Arc,
-        atomic::{AtomicBool, Ordering},
-    },
-    time::Instant,
-};
+use std::{path::{Path, PathBuf}, sync::{Arc, atomic::{AtomicBool, Ordering}}};
+use web_time::Instant;
+
 #[cfg(not(target_family = "wasm"))]
 use tempfile::TempDir;
 #[cfg(not(target_family = "wasm"))]

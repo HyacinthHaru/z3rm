@@ -16,7 +16,7 @@ use release_channel::{AppCommitSha, AppVersion, ReleaseChannel};
 use semver::Version as SemanticVersion;
 use std::collections::BTreeMap;
 #[cfg(not(target_family = "wasm"))]
-use std::time::Instant;
+use web_time::Instant;
 #[cfg(not(target_family = "wasm"))]
 use std::{
     path::{Path, PathBuf},

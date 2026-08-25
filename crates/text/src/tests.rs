@@ -1,12 +1,9 @@
 use super::{network::Network, *};
 use clock::ReplicaId;
 use rand::prelude::*;
-use std::{
-    cmp::Ordering,
-    env,
-    iter::Iterator,
-    time::{Duration, Instant},
-};
+use std::{cmp::Ordering, env, iter::Iterator, time::{Duration}};
+use web_time::Instant;
+
 
 #[cfg(test)]
 #[ctor::ctor(unsafe)]

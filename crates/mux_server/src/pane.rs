@@ -27,7 +27,7 @@ use std::collections::{HashMap, VecDeque};
 use std::io::{Read, Write};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::time::Instant;
+use web_time::Instant;
 use crate::rt::mpsc;
 
 /// §3.1 真正拥有 alacritty Term + PTY pair 的 Pane (server-canonical)。

@@ -174,7 +174,7 @@ impl BackgroundExecutor {
 
     /// Get the current time.
     ///
-    /// Calling this instead of `std::time::Instant::now` allows the use
+    /// Calling this instead of `web_time::Instant::now` allows the use
     /// of fake timers in tests.
     pub fn now(&self) -> Instant {
         self.inner.scheduler().clock().now()

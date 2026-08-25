@@ -72,8 +72,8 @@ pub struct Delegate {
     pub(crate) selected_index: usize,
     pub(crate) cancel_flag: Arc<AtomicBool>,
     pub(crate) text_finder_turning_into_project_search: Arc<AtomicBool>,
-    pub(crate) last_selection_change_time: Option<std::time::Instant>,
-    pub(crate) last_click: Option<(usize, std::time::Instant)>,
+    pub(crate) last_selection_change_time: Option<web_time::Instant>,
+    pub(crate) last_click: Option<(usize, web_time::Instant)>,
     pub(crate) search_options: SearchOptions,
     /// Kept around for switching to project search
     pub(crate) active_query: Option<SearchQuery>,
@@ -831,7 +831,7 @@ impl PickerDelegate for Delegate {
         _cx: &mut Context<Picker<Self>>,
     ) {
         self.selected_index = ix;
-        self.last_selection_change_time = Some(std::time::Instant::now());
+        self.last_selection_change_time = Some(web_time::Instant::now());
     }
 
     fn update_matches(
@@ -920,7 +920,7 @@ impl PickerDelegate for Delegate {
     fn confirm(&mut self, _: bool, window: &mut Window, cx: &mut Context<Picker<Self>>) {
         // Clicks (set_selected_index called immediately before confirm) require double-click.
         // Enter key proceeds immediately.
-        let now = std::time::Instant::now();
+        let now = web_time::Instant::now();
         let is_click = self
             .last_selection_change_time
             .map(|t| now.duration_since(t).as_millis() < CLICK_THRESHOLD_MS)

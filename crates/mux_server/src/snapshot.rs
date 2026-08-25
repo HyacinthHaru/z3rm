@@ -662,11 +662,11 @@ pub fn start_with_config(
             );
             let mut path_disconnected = false;
             loop {
-                let now = std::time::Instant::now();
+                let now = web_time::Instant::now();
                 suppressed_writes.retain(|_path_hash, (_content_hash, deadline)| *deadline > now);
                 match path_rx.recv_timeout(poll) {
                     Ok((path, trigger)) => {
-                        debouncer.note(path, trigger, std::time::Instant::now());
+                        debouncer.note(path, trigger, web_time::Instant::now());
                     }
                     Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
                     Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
@@ -682,7 +682,7 @@ pub fn start_with_config(
                     }
                 }
 
-                for (path, trigger) in debouncer.flush_due(std::time::Instant::now()) {
+                for (path, trigger) in debouncer.flush_due(web_time::Instant::now()) {
                     route_record_event(
                         &engine,
                         &path,
@@ -998,7 +998,7 @@ fn route_record_event(
     trigger: shadow_snapshot::SnapshotTrigger,
     suppressed_writes: &mut std::collections::HashMap<
         shadow_snapshot::PathHash,
-        (shadow_snapshot::ContentHash, std::time::Instant),
+        (shadow_snapshot::ContentHash, web_time::Instant),
     >,
     path_index: &mut std::collections::HashMap<shadow_snapshot::PathHash, PathBuf>,
 ) {
@@ -1358,7 +1358,7 @@ mod tests {
 
         // Wall-clock deadline: a real watcher plus a real debounce window, so
         // every wait has to poll rather than assume a single pump is enough.
-        let deadline = std::time::Instant::now() + Duration::from_secs(20);
+        let deadline = web_time::Instant::now() + Duration::from_secs(20);
         let mut debouncer = DebounceQueue::new(config.debounce);
         let mut suppressed_writes = std::collections::HashMap::new();
         let mut path_index = std::collections::HashMap::new();
@@ -1371,14 +1371,14 @@ mod tests {
                     observed_triggers: &mut Vec<(PathBuf, SnapshotTrigger)>| {
             while let Ok((path, trigger)) = path_rx.try_recv() {
                 observed_triggers.push((path.clone(), trigger));
-                debouncer.note(path, trigger, std::time::Instant::now());
+                debouncer.note(path, trigger, web_time::Instant::now());
             }
-            for (path, trigger) in debouncer.flush_due(std::time::Instant::now()) {
+            for (path, trigger) in debouncer.flush_due(web_time::Instant::now()) {
                 route_record_event(&engine, &path, trigger, suppressed_writes, path_index);
             }
         };
 
-        while std::time::Instant::now() < deadline
+        while web_time::Instant::now() < deadline
             && engine.list_versions(&target).unwrap_or_default().is_empty()
         {
             pump(
@@ -1396,7 +1396,7 @@ mod tests {
 
         std::fs::remove_file(&target).expect("delete the watched file");
 
-        let deadline = std::time::Instant::now() + Duration::from_secs(20);
+        let deadline = web_time::Instant::now() + Duration::from_secs(20);
         let tombstoned = |engine: &shadow_snapshot::ShadowSnapshotEngine| {
             engine
                 .list_versions(&target)
@@ -1404,7 +1404,7 @@ mod tests {
                 .last()
                 .is_some_and(|version| version.2 == SnapshotTrigger::Delete)
         };
-        while std::time::Instant::now() < deadline && !tombstoned(&engine) {
+        while web_time::Instant::now() < deadline && !tombstoned(&engine) {
             pump(
                 &mut debouncer,
                 &mut suppressed_writes,
@@ -1442,7 +1442,7 @@ mod tests {
         std::fs::write(&path, b"restored").unwrap();
         let path_hash = shadow_snapshot::compute_path_hash(&path);
         let content_hash = shadow_snapshot::BlobStore::compute_hash(b"restored");
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        let deadline = web_time::Instant::now() + std::time::Duration::from_secs(5);
         let mut suppressed_writes =
             std::collections::HashMap::from([(path_hash, (content_hash, deadline))]);
         let mut path_index = std::collections::HashMap::new();
@@ -1480,7 +1480,7 @@ mod tests {
         std::fs::write(&path, b"user edit").unwrap();
         let path_hash = shadow_snapshot::compute_path_hash(&path);
         let declined_hash = shadow_snapshot::BlobStore::compute_hash(b"restored");
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        let deadline = web_time::Instant::now() + std::time::Duration::from_secs(5);
         let mut suppressed_writes =
             std::collections::HashMap::from([(path_hash, (declined_hash, deadline))]);
         let mut path_index = std::collections::HashMap::new();

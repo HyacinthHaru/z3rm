@@ -11,7 +11,9 @@
 
 use std::collections::HashMap;
 use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::time::{Duration};
+use web_time::Instant;
+
 
 /// §16.3 合并档位。
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]

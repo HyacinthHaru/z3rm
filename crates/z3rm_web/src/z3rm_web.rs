@@ -63,23 +63,28 @@ pub fn boot(cx: &mut App) {
     let mux_server = server.server().clone();
     cx.set_global(GlobalLocalServer(server));
 
-    let app_state = build_app_state(fs, domain.clone(), cx);
-    workspace::AppState::set_global(app_state.clone(), cx);
-
-    // §2.1 The chrome the window renders. Everything here is the same crate the
-    // desktop registers; the browser simply has fewer of them, because the ones
-    // left out drive a filesystem or a subprocess it does not have.
-    workspace::init(app_state.clone(), cx);
-    editor::init(cx);
-    command_palette::init(cx);
-    search::init(cx);
-    title_bar::init(cx);
-    terminal_view::init(cx);
-    git_hosting_providers::init(cx);
-    git_ui::init(cx);
-    recent_projects::init(cx);
-
+    // §wasm-boot The scheduler cannot block on wasm, so the session (which the
+    // desktop `block_on`s against SQLite) is awaited inside this boot task; the
+    // app state and the chrome `init`s then run in the same order the desktop
+    // uses once it resolves.
     cx.spawn(async move |cx| {
+        let app_state = build_app_state(fs, domain.clone(), cx).await;
+        cx.update(|cx| {
+            workspace::AppState::set_global(app_state.clone(), cx);
+            // §2.1 The chrome the window renders. Everything here is the same
+            // crate the desktop registers; the browser simply has fewer of
+            // them, because the ones left out drive a filesystem or a
+            // subprocess it does not have.
+            workspace::init(app_state.clone(), cx);
+            editor::init(cx);
+            command_palette::init(cx);
+            search::init(cx);
+            title_bar::init(cx);
+            terminal_view::init(cx);
+            git_hosting_providers::init(cx);
+            git_ui::init(cx);
+            recent_projects::init(cx);
+        });
         if let Err(error) = open_window(app_state, domain, mux_server, cx).await {
             log::error!("could not open the z3rm window: {error:#}");
         }
@@ -87,32 +92,30 @@ pub fn boot(cx: &mut App) {
     .detach();
 }
 
-fn build_app_state(
+async fn build_app_state(
     fs: Arc<dyn fs::Fs>,
     domain: Arc<mux::MuxDomain>,
-    cx: &mut App,
+    cx: &mut gpui::AsyncApp,
 ) -> Arc<workspace::AppState> {
-    let key_value_store = db::kvp::KeyValueStore::global(cx);
+    let key_value_store = cx.update(|cx| db::kvp::KeyValueStore::global(cx));
     let session_id = uuid::Uuid::new_v4().to_string();
-    // The browser key-value store is in memory, so this future is already
-    // resolved; the desktop blocks on the same call against SQLite.
-    let session = cx
-        .foreground_executor()
-        .block_on(session::Session::new(session_id, key_value_store));
-    let session = cx.new(|cx| session::AppSession::new(session, cx));
-    let languages = Arc::new(language::LanguageRegistry::new(
-        cx.background_executor().clone(),
-    ));
+    let session = session::Session::new(session_id, key_value_store).await;
+    cx.update(|cx| {
+        let session = cx.new(|cx| session::AppSession::new(session, cx));
+        let languages = Arc::new(language::LanguageRegistry::new(
+            cx.background_executor().clone(),
+        ));
 
-    Arc::new(workspace::AppState {
-        languages,
-        fs,
-        build_window_options: |_, _| Default::default(),
-        session,
-        client: Arc::new(()),
-        node_runtime: (),
-        user_store: (),
-        mux_domain: Some(domain),
+        Arc::new(workspace::AppState {
+            languages,
+            fs,
+            build_window_options: |_, _| Default::default(),
+            session,
+            client: Arc::new(()),
+            node_runtime: (),
+            user_store: (),
+            mux_domain: Some(domain),
+        })
     })
 }
 

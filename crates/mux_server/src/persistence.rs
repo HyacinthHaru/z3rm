@@ -156,7 +156,7 @@ pub(crate) fn snapshot_sessions(
     let conn = db.lock();
     let sessions_r = sessions.read();
 
-    let now = std::time::SystemTime::now()
+    let now = web_time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default()
         .as_millis() as i64;

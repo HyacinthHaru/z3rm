@@ -40,13 +40,9 @@ use search::{
     ToggleCaseSensitive, buffer_search,
 };
 use smallvec::{SmallVec, smallvec};
-use std::{
-    cell::Cell,
-    ops::Range,
-    rc::Rc,
-    sync::{Arc, OnceLock},
-    time::{Duration, Instant},
-};
+use std::{cell::Cell, ops::Range, rc::Rc, sync::{Arc, OnceLock}, time::{Duration}};
+use web_time::Instant;
+
 // use task::{ResolvedTask, TaskContext, TaskVariables, VariableName};  // removed-crate: task
 use theme::AccentColors;
 use time::{OffsetDateTime, UtcOffset, format_description::BorrowedFormatItem};

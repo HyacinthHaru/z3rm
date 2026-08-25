@@ -181,9 +181,16 @@ impl WgpuContext {
 
         let adapter = instance
             .request_adapter(&wgpu::RequestAdapterOptions {
-                power_preference: wgpu::PowerPreference::HighPerformance,
+                // §web-gpu-fallback A headless / software-rendered browser (CI, a
+                // compute-only GPU, a blocklisted driver) exposes only a fallback
+                // adapter. HighPerformance + refusing fallbacks finds nothing, so
+                // ask for whatever the browser can actually drive.
+                power_preference: wgpu::PowerPreference::LowPower,
                 compatible_surface: Some(&surface),
-                force_fallback_adapter: false,
+                // wgpu-hal GL has no fallback-adapter concept: requesting one
+                // filters out every GL adapter ("gl had no fallback adapters").
+                // Only the BrowserWebGpu backend understands the bit.
+                force_fallback_adapter: preference == WebBackendPreference::WebGpu,
             })
             .await
             .map_err(|error| {

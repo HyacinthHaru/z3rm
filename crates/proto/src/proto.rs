@@ -6,12 +6,8 @@ mod typed_envelope;
 
 pub use error::*;
 pub use prost::{DecodeError, Message};
-use std::{
-    cmp,
-    fmt::Debug,
-    iter, mem,
-    time::{Duration, SystemTime, UNIX_EPOCH},
-};
+use std::{cmp, fmt::Debug, iter, mem, time::{Duration, SystemTime, UNIX_EPOCH}};
+
 pub use typed_envelope::*;
 
 include!(concat!(env!("OUT_DIR"), "/zed.messages.rs"));

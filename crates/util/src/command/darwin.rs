@@ -617,14 +617,14 @@ mod tests {
     }
 
     fn wait_until_gone(pid: u32) {
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        let deadline = web_time::Instant::now() + std::time::Duration::from_secs(10);
         loop {
             let result = unsafe { libc::kill(pid as libc::pid_t, 0) };
             if result == -1 && io::Error::last_os_error().raw_os_error() == Some(libc::ESRCH) {
                 return;
             }
             assert!(
-                std::time::Instant::now() < deadline,
+                web_time::Instant::now() < deadline,
                 "process {pid} was not reaped"
             );
             std::thread::sleep(std::time::Duration::from_millis(10));

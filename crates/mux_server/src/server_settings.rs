@@ -15,6 +15,7 @@
 //! cycle via the shared AtomicU64.
 
 use std::path::{Path, PathBuf};
+use std::time::SystemTime;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
@@ -160,7 +161,7 @@ pub fn spawn_hot_reload(
 ) {
     let interval = Duration::from_secs(2);
     crate::rt::spawn(async move {
-        let mut last_mtime = None::<std::time::SystemTime>;
+        let mut last_mtime = None::<SystemTime>;
         loop {
             crate::rt::sleep(interval).await;
             let Some(path) = settings.settings_path() else {

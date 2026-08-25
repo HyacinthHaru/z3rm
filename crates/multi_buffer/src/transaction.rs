@@ -1,10 +1,8 @@
 use gpui::{App, Context, Entity};
 use language::{self, Buffer, BufferEditSource, TransactionId};
-use std::{
-    collections::HashMap,
-    ops::Range,
-    time::{Duration, Instant},
-};
+use std::{collections::HashMap, ops::Range, time::{Duration}};
+use web_time::Instant;
+
 use sum_tree::Bias;
 use text::BufferId;
 

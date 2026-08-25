@@ -36,17 +36,9 @@ use rpc::{
     proto::{self, Envelope, EnvelopedMessage, PeerId, RequestMessage, build_typed_envelope},
 };
 use semver::Version;
-use std::{
-    collections::VecDeque,
-    fmt,
-    ops::ControlFlow,
-    path::PathBuf,
-    sync::{
-        Arc, Weak,
-        atomic::{AtomicU32, AtomicU64, Ordering::SeqCst},
-    },
-    time::{Duration, Instant},
-};
+use std::{collections::VecDeque, fmt, ops::ControlFlow, path::PathBuf, sync::{Arc, Weak, atomic::{AtomicU32, AtomicU64, Ordering::SeqCst}}, time::{Duration}};
+use web_time::Instant;
+
 use util::{
     ResultExt,
     paths::{PathStyle, RemotePathBuf},

@@ -1,16 +1,9 @@
 // FluentBuilder
 // pub use gpui_util::{FutureExt, Timeout, arc_cow::ArcCow};
 
-use std::{
-    env,
-    ffi::OsStr,
-    ops::AddAssign,
-    panic::Location,
-    pin::Pin,
-    sync::OnceLock,
-    task::{Context, Poll},
-    time::Instant,
-};
+use std::{env, ffi::OsStr, ops::AddAssign, panic::Location, pin::Pin, sync::OnceLock, task::{Context, Poll}};
+use web_time::Instant;
+
 
 pub mod arc_cow;
 

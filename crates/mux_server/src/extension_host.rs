@@ -25,7 +25,9 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::future::Future;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, mpsc};
-use std::time::{Duration, Instant};
+use std::time::{Duration};
+use web_time::Instant;
+
 
 use anyhow::{Context as _, Result, bail};
 use futures::AsyncReadExt as _;
@@ -2177,7 +2179,7 @@ fn install_on_host_thread(
     let unique = format!(
         "{id}-{}-{}",
         std::process::id(),
-        std::time::SystemTime::now()
+        web_time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .map(|duration| duration.as_nanos())
             .unwrap_or(0),

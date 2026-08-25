@@ -17,11 +17,8 @@
 //! connecting to the same remote host) are treated as manually created and
 //! never archived. That is intentional: when in doubt, don't delete.
 
-use std::{
-    future::Future,
-    path::Path,
-    time::{Duration, SystemTime, UNIX_EPOCH},
-};
+use std::{future::Future, path::Path, time::{Duration, SystemTime, UNIX_EPOCH}};
+
 
 use anyhow::{Context as _, Result};
 use db::kvp::KeyValueStore;

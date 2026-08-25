@@ -49,24 +49,9 @@ use rpc::{
 pub use settings::WorktreeId;
 use settings::{Settings, SettingsLocation, SettingsStore};
 use smallvec::{SmallVec, smallvec};
-use std::{
-    any::Any,
-    cmp::Ordering,
-    collections::hash_map,
-    convert::TryFrom,
-    ffi::OsStr,
-    fmt,
-    future::Future,
-    mem::{self},
-    ops::{Deref, DerefMut, Range},
-    path::{Path, PathBuf},
-    pin::Pin,
-    sync::{
-        Arc,
-        atomic::{AtomicUsize, Ordering::SeqCst},
-    },
-    time::{Duration, Instant},
-};
+use std::{any::Any, cmp::Ordering, collections::hash_map, convert::TryFrom, ffi::OsStr, fmt, future::Future, mem::{self}, ops::{Deref, DerefMut, Range}, path::{Path, PathBuf}, pin::Pin, sync::{Arc, atomic::{AtomicUsize, Ordering::SeqCst}}, time::{Duration}};
+use web_time::Instant;
+
 use sum_tree::{Bias, Dimensions, Edit, KeyedItem, SeekTarget, SumTree, Summary, TreeMap, TreeSet};
 use text::{LineEnding, Rope};
 use util::{

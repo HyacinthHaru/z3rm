@@ -27,6 +27,7 @@ test-support = [
 ]
 
 [dependencies]
+web-time.workspace = true
 anyhow.workspace = true
 async-trait.workspace = true
 clock.workspace = true

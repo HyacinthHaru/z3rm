@@ -6,7 +6,7 @@ use anyhow::Context as _;
 use async_tungstenite::tungstenite::Message as WebSocketMessage;
 use futures::{SinkExt as _, StreamExt as _};
 use proto::Message as _;
-use std::time::Instant;
+use web_time::Instant;
 use std::{fmt::Debug, io};
 
 const KIB: usize = 1024;

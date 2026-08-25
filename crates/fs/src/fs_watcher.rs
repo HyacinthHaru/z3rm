@@ -1,14 +1,9 @@
 use gpui::{BackgroundExecutor, Task};
 use notify::{Event, EventKind};
 use parking_lot::Mutex;
-use std::{
-    collections::HashMap,
-    fs,
-    ops::DerefMut,
-    path::Path,
-    sync::{Arc, LazyLock, OnceLock},
-    time::{Duration, Instant},
-};
+use std::{collections::HashMap, fs, ops::DerefMut, path::Path, sync::{Arc, LazyLock, OnceLock}, time::{Duration}};
+use web_time::Instant;
+
 use util::{ResultExt, paths::SanitizedPath};
 
 use crate::{PathEvent, PathEventKind, Watcher};

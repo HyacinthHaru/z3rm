@@ -23,13 +23,9 @@ use semver::Version;
 #[cfg(not(target_family = "wasm"))]
 use smol::fs;
 #[cfg(not(target_family = "wasm"))]
-use std::{
-    ffi::OsStr,
-    fmt::Write as _,
-    path::{Path, PathBuf},
-    sync::Arc,
-    time::Instant,
-};
+use std::{ffi::OsStr, fmt::Write as _, path::{Path, PathBuf}, sync::Arc};
+use web_time::Instant;
+
 
 #[cfg(not(target_family = "wasm"))]
 use util::{

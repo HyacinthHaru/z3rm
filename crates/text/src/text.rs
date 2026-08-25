@@ -24,18 +24,9 @@ use regex::Regex;
 pub use rope::*;
 pub use selection::*;
 use smallvec::SmallVec;
-use std::{
-    borrow::Cow,
-    cmp::{self, Ordering, Reverse},
-    fmt::Display,
-    future::Future,
-    iter::Iterator,
-    num::NonZeroU64,
-    ops::{self, Deref, Range, Sub},
-    str,
-    sync::{Arc, LazyLock},
-    time::{Duration, Instant},
-};
+use std::{borrow::Cow, cmp::{self, Ordering, Reverse}, fmt::Display, future::Future, iter::Iterator, num::NonZeroU64, ops::{self, Deref, Range, Sub}, str, sync::{Arc, LazyLock}, time::{Duration}};
+use web_time::Instant;
+
 pub use subscription::*;
 pub use sum_tree::Bias;
 use sum_tree::{Dimensions, FilterCursor, SumTree, Summary, TreeMap, TreeSet};

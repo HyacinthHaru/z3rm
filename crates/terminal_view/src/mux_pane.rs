@@ -3069,14 +3069,14 @@ mod tests {
                 cx,
             )
         });
-        let first_fetch_deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        let first_fetch_deadline = web_time::Instant::now() + std::time::Duration::from_secs(5);
         loop {
             while cx.executor().tick() {}
             if first_fetch.try_recv().is_ok() {
                 break;
             }
             assert!(
-                std::time::Instant::now() < first_fetch_deadline,
+                web_time::Instant::now() < first_fetch_deadline,
                 "mock server did not receive the initial grid fetch"
             );
             std::thread::sleep(std::time::Duration::from_millis(1));
@@ -3097,13 +3097,13 @@ mod tests {
         release_first_response
             .send_blocking(())
             .unwrap_or_else(|error| panic!("release first grid response: {error}"));
-        let catch_up_deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        let catch_up_deadline = web_time::Instant::now() + std::time::Duration::from_secs(5);
         let catch_up_state = loop {
             while cx.executor().tick() {}
             let state = view.read_with(cx, |view, _cx| {
                 (view.generation, view.fetch_in_flight, view.fetch_pending)
             });
-            if state == (8, false, false) || std::time::Instant::now() >= catch_up_deadline {
+            if state == (8, false, false) || web_time::Instant::now() >= catch_up_deadline {
                 break state;
             }
             std::thread::sleep(std::time::Duration::from_millis(1));

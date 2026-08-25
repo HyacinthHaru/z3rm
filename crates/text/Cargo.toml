@@ -16,6 +16,7 @@ doctest = false
 test-support = ["rand", "util/test-support"]
 
 [dependencies]
+web-time.workspace = true
 anyhow.workspace = true
 clock.workspace = true
 collections.workspace = true

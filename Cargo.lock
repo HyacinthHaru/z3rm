@@ -901,6 +901,7 @@ dependencies = [
  "smol 2.0.2",
  "tempfile",
  "util",
+ "web-time",
  "which 6.0.3",
  "workspace",
  "zlog",
@@ -1921,6 +1922,7 @@ dependencies = [
  "parking_lot",
  "serde",
  "smallvec",
+ "web-time",
 ]
 
 [[package]]
@@ -3407,6 +3409,7 @@ dependencies = [
  "urlencoding",
  "util",
  "uuid",
+ "web-time",
  "workspace",
  "zed_actions",
  "zlog",
@@ -3799,6 +3802,7 @@ dependencies = [
  "util",
  "wasm-encoder 0.252.0",
  "wasmparser 0.252.0",
+ "web-time",
  "ztracing",
 ]
 
@@ -4339,6 +4343,7 @@ dependencies = [
  "trash",
  "unicode-normalization",
  "util",
+ "web-time",
  "windows 0.61.3",
 ]
 
@@ -4694,6 +4699,7 @@ dependencies = [
  "urlencoding",
  "util",
  "uuid",
+ "web-time",
  "ztracing",
 ]
 
@@ -4776,6 +4782,7 @@ dependencies = [
  "ui_input",
  "unindent",
  "util",
+ "web-time",
  "windows 0.61.3",
  "workspace",
  "zed_actions",
@@ -5140,6 +5147,7 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "log",
+ "web-time",
  "which 6.0.3",
 ]
 
@@ -6561,6 +6569,7 @@ dependencies = [
  "unindent",
  "util",
  "watch",
+ "web-time",
  "zlog",
  "ztracing",
 ]
@@ -6962,6 +6971,7 @@ dependencies = [
  "serde_json",
  "smol 2.0.2",
  "util",
+ "web-time",
  "zlog",
 ]
 
@@ -7497,6 +7507,7 @@ dependencies = [
  "tree-sitter",
  "unicode-segmentation",
  "util",
+ "web-time",
  "zlog",
  "ztracing",
 ]
@@ -7582,6 +7593,7 @@ dependencies = [
  "tracing",
  "walkdir",
  "wasm-bindgen-futures",
+ "web-time",
  "zlog",
  "zlog_settings",
 ]
@@ -9848,6 +9860,7 @@ dependencies = [
  "url",
  "util",
  "wax",
+ "web-time",
  "which 6.0.3",
  "worktree",
  "zed_credentials_provider",
@@ -10026,6 +10039,7 @@ dependencies = [
  "prost",
  "prost-build",
  "serde",
+ "web-time",
 ]
 
 [[package]]
@@ -10659,6 +10673,7 @@ dependencies = [
  "thiserror 2.0.17",
  "urlencoding",
  "util",
+ "web-time",
  "which 6.0.3",
 ]
 
@@ -10856,6 +10871,7 @@ dependencies = [
  "strum",
  "tracing",
  "util",
+ "web-time",
  "zlog",
  "zstd 0.11.2+zstd.1.5.2",
 ]
@@ -11351,6 +11367,7 @@ dependencies = [
  "unindent",
  "util",
  "util_macros",
+ "web-time",
  "workspace",
  "zed_actions",
  "ztracing",
@@ -12849,6 +12866,7 @@ dependencies = [
  "util",
  "util_macros",
  "vte",
+ "web-time",
  "windows 0.61.3",
 ]
 
@@ -12903,6 +12921,7 @@ dependencies = [
  "ui",
  "util",
  "wasm-bindgen-futures",
+ "web-time",
  "workspace",
  "zed_actions",
 ]
@@ -12925,6 +12944,7 @@ dependencies = [
  "smallvec",
  "sum_tree",
  "util",
+ "web-time",
  "zlog",
 ]
 
@@ -12946,6 +12966,7 @@ dependencies = [
  "syntax_theme",
  "thiserror 2.0.17",
  "uuid",
+ "web-time",
 ]
 
 [[package]]
@@ -13951,6 +13972,7 @@ dependencies = [
  "theme",
  "theme_settings",
  "ui_macros",
+ "web-time",
  "windows 0.61.3",
 ]
 
@@ -14231,6 +14253,7 @@ dependencies = [
  "url",
  "util_macros",
  "walkdir",
+ "web-time",
  "which 6.0.3",
  "windows 0.61.3",
 ]
@@ -16674,6 +16697,7 @@ dependencies = [
  "url",
  "util",
  "uuid",
+ "web-time",
  "windows 0.61.3",
  "zed_actions",
  "zlog",
@@ -16712,6 +16736,7 @@ dependencies = [
  "text",
  "tracing",
  "util",
+ "web-time",
  "worktree",
  "zlog",
  "ztracing",
@@ -17552,6 +17577,7 @@ dependencies = [
  "collections",
  "log",
  "tempfile",
+ "web-time",
 ]
 
 [[package]]

@@ -16,7 +16,9 @@ use std::pin::Pin;
 #[cfg(not(target_family = "wasm"))]
 use std::sync::atomic::{AtomicUsize, Ordering};
 #[cfg(not(target_family = "wasm"))]
-use std::time::{Duration, SystemTime};
+use std::time::{Duration};
+use web_time::SystemTime;
+
 
 pub mod connection;
 pub mod pty;

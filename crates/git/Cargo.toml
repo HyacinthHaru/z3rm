@@ -15,6 +15,7 @@ path = "src/git.rs"
 test-support = ["rand"]
 
 [dependencies]
+web-time.workspace = true
 anyhow.workspace = true
 askpass.workspace = true
 async-trait.workspace = true

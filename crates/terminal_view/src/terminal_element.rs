@@ -13,7 +13,7 @@ use gpui::{
 use itertools::Itertools;
 use language::CursorShape as EditorCursorShape;
 use settings::Settings;
-use std::time::Instant;
+use web_time::Instant;
 use terminal::{
     Cell, Color, Content, CursorShape, IndexedCell, Modes, NamedColor, Point, Range,
     ScrollLineDown, ScrollLineUp, Terminal, TerminalBounds, VisibleImage,

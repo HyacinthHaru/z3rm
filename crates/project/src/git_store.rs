@@ -75,20 +75,10 @@ use rpc::{
 use serde::Deserialize;
 use settings::{Settings, WorktreeId};
 use smallvec::SmallVec;
-use std::{
-    cmp::Ordering,
-    collections::{BTreeSet, HashSet, VecDeque, hash_map::Entry},
-    future::Future,
-    mem,
-    ops::Range,
-    path::{Path, PathBuf},
-    str::FromStr,
-    sync::{
-        Arc,
-        atomic::{self, AtomicU64},
-    },
-    time::{Duration, Instant, SystemTime},
-};
+use std::{cmp::Ordering, collections::{BTreeSet, HashSet, VecDeque, hash_map::Entry}, future::Future, mem, ops::Range, path::{Path, PathBuf}, str::FromStr, sync::{Arc, atomic::{self, AtomicU64}}, time::{Duration}};
+use web_time::Instant;
+use std::time::SystemTime;
+
 use sum_tree::{Edit, SumTree, TreeMap};
 use text::{Bias, BufferId, OffsetRangeExt, Rope, ToOffset};
 use util::shell::Shell;

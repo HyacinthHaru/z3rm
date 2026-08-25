@@ -7,15 +7,9 @@ use crate::{
 use collections::HashMap;
 use futures::FutureExt;
 use gpui::SharedString;
-use std::{
-    borrow::Cow,
-    cmp::{self, Ordering, Reverse},
-    collections::BinaryHeap,
-    fmt, iter,
-    ops::{ControlFlow, Deref, DerefMut, Range},
-    sync::{Arc, LazyLock},
-    time::{Duration, Instant},
-};
+use std::{borrow::Cow, cmp::{self, Ordering, Reverse}, collections::BinaryHeap, fmt, iter, ops::{ControlFlow, Deref, DerefMut, Range}, sync::{Arc, LazyLock}, time::{Duration}};
+use web_time::Instant;
+
 use streaming_iterator::StreamingIterator;
 use sum_tree::{Bias, Dimensions, SeekTarget, SumTree};
 use text::{Anchor, BufferId, BufferSnapshot, OffsetRangeExt, Point, Rope, ToOffset, ToPoint};

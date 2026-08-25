@@ -219,21 +219,9 @@ use serde::{Deserialize, Serialize};
 use settings::{Settings, SettingsLocation, SettingsStore, update_settings_file};
 use smallvec::{SmallVec, smallvec};
 // use snippet::Snippet;  // removed-crate: snippet
-use std::{
-    any::{Any, TypeId},
-    borrow::Cow,
-    cell::{OnceCell, RefCell},
-    cmp::{self, Ordering, Reverse},
-    collections::hash_map,
-    iter::{self, Peekable},
-    mem,
-    num::NonZeroU32,
-    ops::{Deref, DerefMut, Not, Range, RangeInclusive},
-    path::{Path, PathBuf},
-    rc::Rc,
-    sync::Arc,
-    time::{Duration, Instant},
-};
+use std::{any::{Any, TypeId}, borrow::Cow, cell::{OnceCell, RefCell}, cmp::{self, Ordering, Reverse}, collections::hash_map, iter::{self, Peekable}, mem, num::NonZeroU32, ops::{Deref, DerefMut, Not, Range, RangeInclusive}, path::{Path, PathBuf}, rc::Rc, sync::Arc, time::{Duration}};
+use web_time::Instant;
+
 // use task::TaskVariables;  // removed-crate: task
 use text::{BufferId, FromAnchor, Rope, ToOffset as _, ToPoint as _};
 use theme::{

@@ -536,7 +536,9 @@ fn markdown_style(window: &Window, cx: &App) -> MarkdownStyle {
 
 pub mod simple_message_notification {
     use std::sync::Arc;
-    use std::time::{Duration, Instant};
+    use std::time::{Duration};
+use web_time::Instant;
+
 
     use gpui::{
         AnyElement, DismissEvent, EventEmitter, FocusHandle, Focusable, ParentElement, Render,

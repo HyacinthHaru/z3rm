@@ -27,7 +27,9 @@ use gpui::{AsyncApp, BackgroundExecutor, SharedString, Task};
 use ignore::gitignore::GitignoreBuilder;
 use parking_lot::Mutex;
 use rope::Rope;
-use std::{path::PathBuf, sync::Arc, sync::atomic::AtomicBool, time::SystemTime};
+use std::{path::PathBuf, sync::Arc, sync::atomic::AtomicBool};
+use web_time::SystemTime;
+
 use text::LineEnding;
 use util::{paths::PathStyle, rel_path::RelPath};
 

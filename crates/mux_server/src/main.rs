@@ -100,7 +100,7 @@ mod daemon {
                 .ok()
                 .and_then(|m| {
                     m.modified().ok().map(|t| {
-                        let elapsed = std::time::SystemTime::now()
+                        let elapsed = web_time::SystemTime::now()
                             .duration_since(t)
                             .unwrap_or_default();
                         let hours = elapsed.as_secs() / 3600;

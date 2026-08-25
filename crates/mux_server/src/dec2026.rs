@@ -1,6 +1,8 @@
 //! Incremental recognizer for DEC synchronized-output private mode 2026.
 
-use std::time::{Duration, Instant};
+use std::time::{Duration};
+use web_time::Instant;
+
 
 const SYNC_TIMEOUT: Duration = Duration::from_millis(100);
 const SYNC_PREFIX: &[u8] = b"\x1b[?2026";

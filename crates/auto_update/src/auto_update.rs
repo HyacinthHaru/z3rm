@@ -35,12 +35,9 @@ use smol::fs::File;
 use std::mem;
 use std::{env, path::PathBuf, sync::Arc, time::Duration};
 #[cfg(not(target_family = "wasm"))]
-use std::{
-    env::consts::{ARCH, OS},
-    ffi::{OsStr, OsString},
-    path::Path,
-    time::SystemTime,
-};
+use std::{env::consts::{ARCH, OS}, ffi::{OsStr, OsString}, path::Path};
+use web_time::SystemTime;
+
 #[cfg(not(target_family = "wasm"))]
 use util::command::new_command;
 use workspace::Workspace;

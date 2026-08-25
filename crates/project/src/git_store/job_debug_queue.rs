@@ -1,4 +1,6 @@
-use std::{collections::VecDeque, time::Instant};
+use std::{collections::VecDeque};
+use web_time::Instant;
+
 
 use gpui::SharedString;
 

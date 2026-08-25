@@ -38,24 +38,9 @@ use lsp::LanguageServerId;
 use parking_lot::Mutex;
 use settings::WorktreeId;
 use smallvec::SmallVec;
-use std::{
-    any::Any,
-    borrow::Cow,
-    cell::Cell,
-    cmp::{self, Ordering, Reverse},
-    collections::{BTreeMap, BTreeSet},
-    fmt::Write as _,
-    future::Future,
-    iter::{self, Iterator, Peekable},
-    mem,
-    num::NonZeroU32,
-    ops::{Deref, Range},
-    path::PathBuf,
-    rc,
-    sync::Arc,
-    time::{Duration, Instant},
-    vec,
-};
+use std::{any::Any, borrow::Cow, cell::Cell, cmp::{self, Ordering, Reverse}, collections::{BTreeMap, BTreeSet}, fmt::Write as _, future::Future, iter::{self, Iterator, Peekable}, mem, num::NonZeroU32, ops::{Deref, Range}, path::PathBuf, rc, sync::Arc, time::{Duration}, vec};
+use web_time::Instant;
+
 use sum_tree::TreeMap;
 use text::operation_queue::OperationQueue;
 use text::*;
