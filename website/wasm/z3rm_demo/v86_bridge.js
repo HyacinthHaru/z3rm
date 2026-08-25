@@ -1,4 +1,3 @@
-console.log("[v86] module loaded");
 // §3.1 The guest behind the terminal: a Linux running in v86, reached over its
 // emulated serial port.
 //
@@ -48,7 +47,7 @@ function loadV86Library() {
   return new Promise((resolve, reject) => {
     const script = document.createElement("script");
     script.src = new URL("libv86.js", V86_ASSETS).href;
-    script.onload = () => { console.log("[v86] libv86.js loaded"); resolve(); };
+    script.onload = () => resolve();
     script.onerror = () => reject(new Error(`could not load ${script.src}`));
     document.head.append(script);
   });
@@ -117,11 +116,9 @@ async function boot() {
       bindings.z3rm_v86_serial_bytes(bytes);
     }
   });
-  console.log("[v86] emulator created, attaching listeners");
-emulator.add_listener("serial0-output-byte", (byte) => batch.push(byte));
+  emulator.add_listener("serial0-output-byte", (byte) => batch.push(byte));
 
-  console.log("[v86] setting window.__z3rm_v86");
-window.__z3rm_v86 = {
+  window.__z3rm_v86 = {
     emulator,
     send(bytes) {
       for (const byte of bytes) {
@@ -142,8 +139,6 @@ window.__z3rm_v86 = {
   }
 }
 
-console.log("[v86] boot() starting");
 boot().catch((error) => {
   console.error("v86 bridge failed to start:", error);
-  renderSerial(new TextEncoder().encode(`\n\x1b[31mFailed to start v86: ${error.message}\x1b[0m\n`));
 });
