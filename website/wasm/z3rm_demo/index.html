@@ -6,7 +6,7 @@
     <title>Z3rm GPUI session projection</title>
     <link data-trunk rel="copy-dir" href="../../public/v86" />
     <link data-trunk rel="copy-file" href="v86_bridge.js" />
-    <script type="module">import "./v86_bridge.js";</script>
+    <script type="module">import("./v86_bridge.js").catch(e => console.error("[v86] import failed:", e));</script>
     <link data-trunk rel="rust" data-bin="z3rm_web_demo" data-bindgen-target="web" data-wasm-opt="z" />
     <link data-trunk rel="copy-file" href="v86_bridge.js" />
     <style>
