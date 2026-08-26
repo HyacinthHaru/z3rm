@@ -17156,7 +17156,6 @@ dependencies = [
  "log",
  "mux",
  "mux_protocol",
- "mux_server",
  "mux_window",
  "project",
  "recent_projects",

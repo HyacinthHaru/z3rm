@@ -1,46 +1,13 @@
-//! §3.1 The tab's own mux server, on the other end of an in-memory pipe.
+//! Session bootstrap requests for the mux server running in the v86 guest.
 //!
-//! A desktop client connects to a daemon over a socket. A tab has no socket and
-//! no second process, so the same `mux_server` runs in this one and the two
-//! ends of `mem_transport::pair()` stand in for the socket. Everything above
-//! the transport — the framed protocol, the session state, the notifications —
-//! is the code the daemon runs.
+//! Transport setup lives in `serial_link`; this module only performs the
+//! protocol-level create-session, spawn-pane and attach sequence once the
+//! guest server is ready.
 
 use anyhow::{Context as _, Result};
 use mux::MuxDomain;
-use mux_server::wasm_server::WasmMuxServer;
 use std::path::Path;
 use std::sync::Arc;
-
-/// The server end of the pipe, kept alive for as long as the tab is.
-///
-/// Dropping this closes the client's transport, so the caller has to hold it.
-pub struct LocalMuxServer {
-    server: Arc<WasmMuxServer>,
-}
-
-impl LocalMuxServer {
-    /// The server itself, for the parts of the tab that reach past the
-    /// protocol — the v86 bridge has to hold a pane, not a request.
-    pub fn server(&self) -> &Arc<WasmMuxServer> {
-        &self.server
-    }
-}
-
-/// Start the in-tab server and return a domain already connected to it.
-pub fn start() -> Result<(LocalMuxServer, Arc<MuxDomain>)> {
-    let (server_end, client_end) = mux_protocol::mem_transport::pair();
-
-    let server = WasmMuxServer::new(server_end);
-    // The client's writes land in the server's buffer synchronously, so this is
-    // what stands in for the daemon's accept loop noticing a readable socket.
-    server.attach_notify();
-
-    let domain =
-        MuxDomain::connect_in_memory(client_end).context("connecting to the in-tab mux server")?;
-
-    Ok((LocalMuxServer { server }, Arc::new(domain)))
-}
 
 /// Create the session this tab opens into and attach a window to it.
 ///

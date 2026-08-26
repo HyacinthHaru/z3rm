@@ -9,12 +9,18 @@
 //! Both sides are named through these aliases so `pane.rs` holds one set of
 //! fields rather than two.
 
-#[cfg(all(not(target_family = "wasm"), feature = "desktop"))]
+#[cfg(all(
+    not(target_family = "wasm"),
+    any(feature = "desktop", feature = "guest")
+))]
 pub use native::*;
-#[cfg(any(target_family = "wasm", not(feature = "desktop")))]
+#[cfg(target_family = "wasm")]
 pub use wasm::*;
 
-#[cfg(all(not(target_family = "wasm"), feature = "desktop"))]
+#[cfg(all(
+    not(target_family = "wasm"),
+    any(feature = "desktop", feature = "guest")
+))]
 mod native {
     pub use portable_pty::PtySize;
 
@@ -22,7 +28,7 @@ mod native {
     pub type ChildBox = Box<dyn portable_pty::Child + Send + Sync>;
 }
 
-#[cfg(any(target_family = "wasm", not(feature = "desktop")))]
+#[cfg(target_family = "wasm")]
 mod wasm {
     use parking_lot::Mutex;
     use std::io::{self, Write};

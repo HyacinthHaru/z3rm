@@ -1,5 +1,8 @@
 use anyhow::{Context as _, Result};
-#[cfg(all(not(target_family = "wasm"), feature = "desktop"))]
+#[cfg(all(
+    not(target_family = "wasm"),
+    any(feature = "desktop", feature = "guest")
+))]
 use portable_pty::CommandBuilder;
 use std::ffi::OsStr;
 use std::fs::{self, File, OpenOptions};
@@ -129,7 +132,10 @@ else
 fi
 "#;
 
-#[cfg(all(not(target_family = "wasm"), feature = "desktop"))]
+#[cfg(all(
+    not(target_family = "wasm"),
+    any(feature = "desktop", feature = "guest")
+))]
 pub(crate) fn default_shell_command(shell: &str) -> CommandBuilder {
     let mut command = CommandBuilder::new(shell);
     if !is_supported_shell(shell) {
@@ -153,7 +159,10 @@ fn is_supported_shell(shell: &str) -> bool {
         .is_some_and(|name| name == OsStr::new("zsh") || name == OsStr::new("bash"))
 }
 
-#[cfg(all(not(target_family = "wasm"), feature = "desktop"))]
+#[cfg(all(
+    not(target_family = "wasm"),
+    any(feature = "desktop", feature = "guest")
+))]
 fn install_root() -> Result<PathBuf> {
     if let Some(root) = std::env::var_os(INSTALL_ROOT_ENV) {
         return Ok(PathBuf::from(root));
@@ -168,7 +177,10 @@ fn install_root() -> Result<PathBuf> {
         })
 }
 
-#[cfg(all(not(target_family = "wasm"), feature = "desktop"))]
+#[cfg(all(
+    not(target_family = "wasm"),
+    any(feature = "desktop", feature = "guest")
+))]
 fn configure_shell(command: &mut CommandBuilder, shell: &str, root: &Path) -> Result<()> {
     let Some(shell_name) = Path::new(shell).file_name() else {
         return Ok(());
@@ -189,7 +201,10 @@ fn configure_shell(command: &mut CommandBuilder, shell: &str, root: &Path) -> Re
     }
 }
 
-#[cfg(all(not(target_family = "wasm"), feature = "desktop"))]
+#[cfg(all(
+    not(target_family = "wasm"),
+    any(feature = "desktop", feature = "guest")
+))]
 fn configure_zsh(command: &mut CommandBuilder, root: &Path) -> Result<()> {
     let zsh_directory = root.join("zsh");
     secure_directory(&zsh_directory)?;
@@ -216,7 +231,10 @@ fn configure_zsh(command: &mut CommandBuilder, root: &Path) -> Result<()> {
     Ok(())
 }
 
-#[cfg(all(not(target_family = "wasm"), feature = "desktop"))]
+#[cfg(all(
+    not(target_family = "wasm"),
+    any(feature = "desktop", feature = "guest")
+))]
 fn configure_bash(command: &mut CommandBuilder, root: &Path) -> Result<()> {
     let bash_rc = root.join("bashrc");
     atomic_write(&bash_rc, BASH_RC.as_bytes())?;

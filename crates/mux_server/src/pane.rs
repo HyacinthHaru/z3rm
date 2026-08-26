@@ -10,6 +10,8 @@ use crate::grid_sync::{
     self, FullGridSnapshot, GridDiff, GridDiffRing, diff_from_dirty, modes_from_alacritty,
     snapshot_from_term,
 };
+use crate::pty::{ChildBox, MasterPtyBox, PtySize};
+use crate::rt::mpsc;
 use alacritty_terminal::event::{Event as AlacEvent, EventListener};
 use alacritty_terminal::grid::Dimensions as _;
 use alacritty_terminal::term::test::TermSize;
@@ -20,15 +22,16 @@ use alacritty_terminal::vte::ansi::{
 use anyhow::Context as _;
 use mux_protocol::Notification as MuxNotification;
 use parking_lot::Mutex;
-#[cfg(all(not(target_family = "wasm"), feature = "desktop"))]
+#[cfg(all(
+    not(target_family = "wasm"),
+    any(feature = "desktop", feature = "guest")
+))]
 use portable_pty::{CommandBuilder, MasterPty, PtyPair, PtySystem};
-use crate::pty::{ChildBox, MasterPtyBox, PtySize};
 use std::collections::{HashMap, VecDeque};
 use std::io::{Read, Write};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use web_time::Instant;
-use crate::rt::mpsc;
 
 /// §3.1 真正拥有 alacritty Term + PTY pair 的 Pane (server-canonical)。
 pub struct Pane {
@@ -97,7 +100,7 @@ pub struct Pane {
     /// §3.1 What the native reader thread owns on its stack. There is no
     /// reader thread in the browser: bytes arrive through
     /// `push_guest_output`, so the same state lives here instead.
-    #[cfg(any(target_family = "wasm", not(feature = "desktop")))]
+    #[cfg(target_family = "wasm")]
     guest_output_state: parking_lot::Mutex<(Dec2026Parser, AdaptiveCoalescer, ReadLoopState)>,
     /// §3.3 event 收集: alacritty 事件 → main loop。
     pub events: Arc<parking_lot::Mutex<Vec<AlacEvent>>>,
@@ -673,12 +676,15 @@ impl Default for ReadLoopState {
     }
 }
 
-#[cfg(any(target_family = "wasm", not(feature = "desktop")))]
+#[cfg(target_family = "wasm")]
 static NEXT_WASM_HISTORY_VERSION: std::sync::atomic::AtomicU64 =
     std::sync::atomic::AtomicU64::new(1);
 
 fn initial_history_version() -> u64 {
-    #[cfg(all(not(target_family = "wasm"), feature = "desktop"))]
+    #[cfg(all(
+        not(target_family = "wasm"),
+        any(feature = "desktop", feature = "guest")
+    ))]
     {
         use std::hash::{DefaultHasher, Hash, Hasher};
 
@@ -686,7 +692,7 @@ fn initial_history_version() -> u64 {
         nanoid::nanoid!().hash(&mut hasher);
         hasher.finish().max(1)
     }
-    #[cfg(any(target_family = "wasm", not(feature = "desktop")))]
+    #[cfg(target_family = "wasm")]
     {
         NEXT_WASM_HISTORY_VERSION.fetch_add(1, std::sync::atomic::Ordering::SeqCst)
     }
@@ -753,7 +759,10 @@ impl Pane {
         let size = TermSize::new(cols_usize, rows_usize);
         let term = Term::new(term_config, &size, listener);
 
-        #[cfg(all(not(target_family = "wasm"), feature = "desktop"))]
+        #[cfg(all(
+            not(target_family = "wasm"),
+            any(feature = "desktop", feature = "guest")
+        ))]
         let (pty_master, writer, child, master_raw_fd, reader) = {
             // §3.1 打开 PTY pair
             let pty_system: Box<dyn PtySystem + Send> = portable_pty::native_pty_system();
@@ -820,7 +829,7 @@ impl Pane {
         // §3.1 The browser has no pty and no child: the guest's bytes are
         // pushed in from JS (#56) and pane writes go back out the same way.
         // `command` and `cwd` are the guest's business, not this side's.
-        #[cfg(any(target_family = "wasm", not(feature = "desktop")))]
+        #[cfg(target_family = "wasm")]
         let (pty_master, writer, child, master_raw_fd) = {
             let _ = (&command, &cwd);
             let pty = crate::pty::WasmPty::new();
@@ -886,7 +895,7 @@ impl Pane {
             exit_hook: parking_lot::Mutex::new(None),
             clipboard_hook: parking_lot::Mutex::new(None),
             notification_hook: parking_lot::Mutex::new(None),
-            #[cfg(any(target_family = "wasm", not(feature = "desktop")))]
+            #[cfg(target_family = "wasm")]
             guest_output_state: parking_lot::Mutex::new((
                 Dec2026Parser::new(),
                 AdaptiveCoalescer::new(),
@@ -896,9 +905,12 @@ impl Pane {
 
         // §3.1 启动 PTY read loop — 后台线程持续读取 PTY 输出, 喂给 alacritty,
         // 计算 dirty diff, bump generation。线程持有弱引用, pane drop 时自动结束。
-        #[cfg(all(not(target_family = "wasm"), feature = "desktop"))]
+        #[cfg(all(
+            not(target_family = "wasm"),
+            any(feature = "desktop", feature = "guest")
+        ))]
         pane.clone().start_pty_read_loop(reader, master_raw_fd);
-        #[cfg(any(target_family = "wasm", not(feature = "desktop")))]
+        #[cfg(target_family = "wasm")]
         let _ = master_raw_fd;
         Ok(pane)
     }
@@ -908,7 +920,10 @@ impl Pane {
     /// 该线程持续从 PTY 读取字节, 喂给 alacritty Term, 然后从 dirty_lines
     /// 提取变更行, 生成 GridDiff, push 到 ring 并 bump generation。
     /// Bump generation 后由 connection 层 fan-out PaneDirty 通知到所有 client。
-#[cfg(all(not(target_family = "wasm"), feature = "desktop"))]
+    #[cfg(all(
+        not(target_family = "wasm"),
+        any(feature = "desktop", feature = "guest")
+    ))]
     fn start_pty_read_loop(
         self: Arc<Self>,
         mut reader: Box<dyn Read + Send>,
@@ -1771,11 +1786,7 @@ impl Pane {
     ) -> (Vec<grid_sync::RowChange>, u32, u64) {
         match self.fetch_scrollback_checked(from_line, direction, count) {
             Ok(result) => result,
-            Err(_) => (
-                Vec::new(),
-                0,
-                self.history_version.load(Ordering::Acquire),
-            ),
+            Err(_) => (Vec::new(), 0, self.history_version.load(Ordering::Acquire)),
         }
     }
 
@@ -2413,7 +2424,10 @@ mod tests {
         let (after_rows, after_total, after_version) = pane.fetch_scrollback(0, 1, 10);
 
         assert_eq!(after_total, before_total, "history size must not change");
-        assert_ne!(after_version, before_version, "rotated contents must bump version");
+        assert_ne!(
+            after_version, before_version,
+            "rotated contents must bump version"
+        );
         assert_eq!(after_rows.len(), 2);
         assert_eq!(after_rows[0].cells[0].character, "B");
         assert_eq!(after_rows[1].cells[0].character, "C");
@@ -3282,7 +3296,7 @@ fn poll_fd_readable(_fd: i32, _timeout_ms: i32) -> bool {
     true
 }
 
-#[cfg(any(target_family = "wasm", not(feature = "desktop")))]
+#[cfg(target_family = "wasm")]
 impl Pane {
     /// §3.1 Feed bytes the guest produced into the emulator.
     ///

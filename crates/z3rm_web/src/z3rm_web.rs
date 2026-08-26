@@ -1,11 +1,10 @@
 //! The z3rm client, in a browser tab.
 //!
-//! The desktop binary starts a daemon, connects to it over a socket, and opens
-//! a `MultiWorkspace` whose panes render the session that daemon owns. This
-//! does the same thing with the daemon in the same process (see
-//! [`local_server`]) and over the in-memory transport instead of a socket.
-//! Everything above that — the workspace, the pane views, the projection of the
-//! attach snapshot — is the desktop code, reached through the same entry points.
+//! The desktop binary connects to a daemon over a socket. The browser client
+//! speaks the same framed mux protocol across a serial bridge to a real
+//! mux_server process running inside the v86 Linux guest.
+//! Everything above that transport — workspace, pane views and authoritative
+//! layout projection — is the desktop code reached through the same crates.
 //!
 //! The crate exists only for the browser: on any other target it is empty, so
 //! that a workspace build does not have to carry a second set of stubs for a
@@ -21,7 +20,7 @@ mod local_server;
 mod serial_link;
 mod v86_bridge;
 
-pub use local_server::LocalMuxServer;
+// The transport is kept alive by GlobalSerialLink; no in-process server exists.
 
 pub fn version() -> &'static str {
     env!("CARGO_PKG_VERSION")

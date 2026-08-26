@@ -57,10 +57,10 @@ jobs:
           node-version: 24
           cache: pnpm
           cache-dependency-path: website/pnpm-lock.yaml
-      - name: Install WebAssembly build tools
+      - name: Install WebAssembly and guest build tools
         shell: bash
         run: |
-          rustup target add wasm32-unknown-unknown
+          rustup target add wasm32-unknown-unknown i686-unknown-linux-musl
           curl --fail --location --output /tmp/trunk.tar.gz \
             https://github.com/trunk-rs/trunk/releases/download/v0.21.14/trunk-x86_64-unknown-linux-gnu.tar.gz
           echo "f2b4680cd239693a646a2795e4633c625328d7b2a044fbe749fa3a2fe9e7036b  /tmp/trunk.tar.gz" | sha256sum --check

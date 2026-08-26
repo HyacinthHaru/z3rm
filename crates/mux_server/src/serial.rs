@@ -1,111 +1,145 @@
 //! §3.1-in-guest Serial transport for the in-guest mux_server.
 //!
-//! The browser tab owns the other end of this wire: v86 bridges the guest's
-//! `ttyS0` to the page, and the client speaks the same length-prefixed
-//! protobuf framing the unix socket uses. Exactly one client exists (the
-//! page), so the "listener" is the tty itself.
+//! v86's emulated tty is not a reliable epoll/AsyncFd source. The serial
+//! transport therefore uses two blocking OS threads (one read, one write) and
+//! presents their byte queues as a normal tokio AsyncRead/AsyncWrite stream.
+//! The mux protocol and connection handler remain identical to the socket path.
 
+use std::collections::VecDeque;
+use std::io::{Read as _, Write as _};
+use std::os::fd::{FromRawFd, IntoRawFd};
 use std::path::{Path, PathBuf};
 use std::pin::Pin;
-use std::sync::Arc;
 use std::task::{Context, Poll};
+use std::thread;
 
 use anyhow::Result;
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 
-/// Open `device` as a raw (termios raw, no echo) duplex stream for the mux
-/// protocol. The caller replaces whatever console process held the tty, so
-/// no line discipline competes with the framing.
+/// Open `device` as a raw duplex stream. Blocking reader/writer threads avoid
+/// relying on epoll readiness for v86's emulated UART.
 pub fn open_raw(device: &Path) -> Result<SerialStream> {
-    use std::os::fd::IntoRawFd;
+    use std::os::unix::fs::OpenOptionsExt;
 
     let file = std::fs::OpenOptions::new()
         .read(true)
         .write(true)
+        .custom_flags(libc::O_NOCTTY)
         .open(device)?;
     let fd = file.into_raw_fd();
 
-    // raw mode: no echo, no line discipline, no signal chars — the mux
-    // framing is binary and must not be touched.
-    // SAFETY: fd is a valid open file descriptor we just created.
+    // SAFETY: fd is an open tty descriptor owned by this function.
     unsafe {
         let mut termios: libc::termios = std::mem::zeroed();
         if libc::tcgetattr(fd, &mut termios) != 0 {
             anyhow::bail!("tcgetattr failed on {}", device.display());
         }
         libc::cfmakeraw(&mut termios);
+        termios.c_cc[libc::VMIN] = 1;
+        termios.c_cc[libc::VTIME] = 0;
+        termios.c_cflag |= libc::CLOCAL | libc::CREAD;
         if libc::tcsetattr(fd, libc::TCSANOW, &termios) != 0 {
             anyhow::bail!("tcsetattr failed on {}", device.display());
         }
     }
 
-    // Verify the fd is valid before taking ownership of it as a File.
-    // SAFETY: querying the validity of an fd we just created.
-    if unsafe { libc::fcntl(fd, libc::F_GETFD) } == -1 {
-        anyhow::bail!("serial fd invalid after termios setup");
+    // Separate descriptors let a blocking reader and writer run concurrently.
+    // SAFETY: dup returns independent descriptors referring to the configured
+    // tty; ownership is transferred to the File values below.
+    let read_fd = unsafe { libc::dup(fd) };
+    let write_fd = unsafe { libc::dup(fd) };
+    if read_fd < 0 || write_fd < 0 {
+        unsafe {
+            libc::close(fd);
+            if read_fd >= 0 {
+                libc::close(read_fd);
+            }
+            if write_fd >= 0 {
+                libc::close(write_fd);
+            }
+        }
+        anyhow::bail!("dup failed for serial tty {}", device.display());
     }
-    let file = unsafe { std::os::fd::FromRawFd::from_raw_fd(fd) };
-    let async_fd = tokio::io::unix::AsyncFd::new(file)?;
-    Ok(SerialStream { fd, async_fd })
+    // The two duplicated descriptors now own the tty; close the original raw fd.
+    unsafe {
+        libc::close(fd);
+    }
+
+    let reader = unsafe { std::fs::File::from_raw_fd(read_fd) };
+    let writer = unsafe { std::fs::File::from_raw_fd(write_fd) };
+    let (incoming_tx, incoming_rx) = tokio::sync::mpsc::unbounded_channel();
+    let (outgoing_tx, mut outgoing_rx) = tokio::sync::mpsc::unbounded_channel::<Vec<u8>>();
+
+    thread::Builder::new()
+        .name("z3rm-serial-reader".into())
+        .spawn(move || {
+            let mut reader = reader;
+            let mut buffer = [0u8; 4096];
+            loop {
+                match reader.read(&mut buffer) {
+                    Ok(0) => thread::yield_now(),
+                    Ok(count) => {
+                        if incoming_tx.send(buffer[..count].to_vec()).is_err() {
+                            break;
+                        }
+                    }
+                    Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
+                    Err(error) => {
+                        tracing::debug!(%error, "serial reader stopped");
+                        break;
+                    }
+                }
+            }
+        })?;
+
+    thread::Builder::new()
+        .name("z3rm-serial-writer".into())
+        .spawn(move || {
+            let mut writer = writer;
+            while let Some(buffer) = outgoing_rx.blocking_recv() {
+                if let Err(error) = writer.write_all(&buffer) {
+                    tracing::debug!(%error, "serial writer stopped");
+                    break;
+                }
+                if let Err(error) = writer.flush() {
+                    tracing::debug!(%error, "serial writer flush stopped");
+                    break;
+                }
+            }
+        })?;
+
+    Ok(SerialStream {
+        incoming: incoming_rx,
+        outgoing: outgoing_tx,
+        pending_read: VecDeque::new(),
+    })
 }
 
-/// A raw serial port as a tokio duplex stream.
+/// Tokio stream backed by blocking serial reader/writer threads.
 pub struct SerialStream {
-    fd: std::os::fd::RawFd,
-    async_fd: tokio::io::unix::AsyncFd<std::fs::File>,
-}
-
-fn read_direct(fd: std::os::fd::RawFd, buf: &mut [u8]) -> std::io::Result<usize> {
-    // SAFETY: buf is a valid slice for read(2).
-    let n = unsafe { libc::read(fd, buf.as_mut_ptr().cast(), buf.len()) };
-    if n < 0 {
-        Err(std::io::Error::last_os_error())
-    } else {
-        Ok(n as usize)
-    }
-}
-
-fn write_direct(fd: std::os::fd::RawFd, buf: &[u8]) -> std::io::Result<usize> {
-    // SAFETY: buf is a valid slice for write(2).
-    let n = unsafe { libc::write(fd, buf.as_ptr().cast(), buf.len()) };
-    if n < 0 {
-        Err(std::io::Error::last_os_error())
-    } else {
-        Ok(n as usize)
-    }
+    incoming: tokio::sync::mpsc::UnboundedReceiver<Vec<u8>>,
+    outgoing: tokio::sync::mpsc::UnboundedSender<Vec<u8>>,
+    pending_read: VecDeque<u8>,
 }
 
 impl AsyncRead for SerialStream {
     fn poll_read(
-        self: Pin<&mut Self>,
+        mut self: Pin<&mut Self>,
         cx: &mut Context<'_>,
         buf: &mut ReadBuf<'_>,
     ) -> Poll<std::io::Result<()>> {
-        let this = self.get_mut();
         loop {
-            let mut guard = match this.async_fd.poll_read_ready_mut(cx) {
-                Poll::Ready(Ok(guard)) => guard,
-                Poll::Ready(Err(e)) => return Poll::Ready(Err(e)),
-                Poll::Pending => {
-                    cx.waker().wake_by_ref();
-                    return Poll::Pending;
-                }
-            };
-            let unfilled = buf.initialize_unfilled();
-            let fd = this.fd;
-            match guard.try_io(|_| read_direct(fd, unfilled)) {
-                Ok(Ok(0)) => return Poll::Ready(Ok(())),
-                Ok(Ok(n)) => {
-                    buf.advance(n);
-                    return Poll::Ready(Ok(()));
-                }
-                Ok(Err(e)) if e.kind() == std::io::ErrorKind::Interrupted => continue,
-                Ok(Err(e)) => return Poll::Ready(Err(e)),
-                Err(_would_block) => {}
+            if !self.pending_read.is_empty() {
+                let count = self.pending_read.len().min(buf.remaining());
+                let bytes: Vec<u8> = self.pending_read.drain(..count).collect();
+                buf.put_slice(&bytes);
+                return Poll::Ready(Ok(()));
             }
-            guard.clear_ready_matching(tokio::io::Ready::READABLE);
-            cx.waker().wake_by_ref();
-            return Poll::Pending;
+            match Pin::new(&mut self.incoming).poll_recv(cx) {
+                Poll::Ready(Some(bytes)) => self.pending_read.extend(bytes),
+                Poll::Ready(None) => return Poll::Ready(Ok(())),
+                Poll::Pending => return Poll::Pending,
+            }
         }
     }
 }
@@ -113,30 +147,16 @@ impl AsyncRead for SerialStream {
 impl AsyncWrite for SerialStream {
     fn poll_write(
         self: Pin<&mut Self>,
-        cx: &mut Context<'_>,
-        buf: &[u8],
+        _cx: &mut Context<'_>,
+        buffer: &[u8],
     ) -> Poll<std::io::Result<usize>> {
-        let this = self.get_mut();
-        loop {
-            let mut guard = match this.async_fd.poll_write_ready_mut(cx) {
-                Poll::Ready(Ok(guard)) => guard,
-                Poll::Ready(Err(e)) => return Poll::Ready(Err(e)),
-                Poll::Pending => {
-                    cx.waker().wake_by_ref();
-                    return Poll::Pending;
-                }
-            };
-            let fd = this.fd;
-            match guard.try_io(|_| write_direct(fd, buf)) {
-                Ok(Ok(n)) => return Poll::Ready(Ok(n)),
-                Ok(Err(e)) if e.kind() == std::io::ErrorKind::Interrupted => continue,
-                Ok(Err(e)) => return Poll::Ready(Err(e)),
-                Err(_would_block) => {}
-            }
-            guard.clear_ready_matching(tokio::io::Ready::WRITABLE);
-            cx.waker().wake_by_ref();
-            return Poll::Pending;
+        if self.outgoing.send(buffer.to_vec()).is_err() {
+            return Poll::Ready(Err(std::io::Error::new(
+                std::io::ErrorKind::BrokenPipe,
+                "serial writer stopped",
+            )));
         }
+        Poll::Ready(Ok(buffer.len()))
     }
 
     fn poll_flush(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
@@ -148,51 +168,38 @@ impl AsyncWrite for SerialStream {
     }
 }
 
-/// Run the mux server over a serial device. Single client (the browser tab):
-/// the "accept loop" is one connection that lives as long as the tty does.
+/// Run the mux server over a serial device. One client (the browser tab) owns
+/// the tty for the lifetime of the process.
 pub fn run_serial(device: PathBuf) -> Result<()> {
     crate::setup_logging()?;
-
-    let rt = tokio::runtime::Builder::new_current_thread()
+    let runtime = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()?;
-
-    rt.block_on(async move {
-        let sessions = Arc::new(parking_lot::RwLock::new(Vec::new()));
-        let database = Arc::new(parking_lot::Mutex::new(crate::persistence::Connection));
-        let clipboard = Arc::new(crate::clipboard::ServerClipboard::new());
+    runtime.block_on(async move {
+        let sessions = std::sync::Arc::new(parking_lot::RwLock::new(Vec::new()));
+        let database = std::sync::Arc::new(parking_lot::Mutex::new(crate::persistence::Connection));
+        let clipboard = std::sync::Arc::new(crate::clipboard::ServerClipboard::new());
         let server_settings = crate::server_settings::ServerSettings::load();
-        let extension_host = Arc::new(crate::extension_host::ServerExtensionHost::new());
-        let shutdown_state = Arc::new(crate::ShutdownState {
-            requested: Arc::new(std::sync::atomic::AtomicBool::new(false)),
-            ack_request_id: Arc::new(std::sync::atomic::AtomicU64::new(0)),
-            acked: Arc::new(tokio::sync::Notify::new()),
+        let extension_host = std::sync::Arc::new(crate::extension_host::ServerExtensionHost::new());
+        let shutdown_state = std::sync::Arc::new(crate::ShutdownState {
+            requested: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            ack_request_id: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            acked: std::sync::Arc::new(tokio::sync::Notify::new()),
         });
-
         let stream = open_raw(&device)?;
-        eprintln!("mux_server: serial transport ready on {}", device.display());
-
-        // One client for the life of the tty. If the connection ends (the tab
-        // closed), exit — the guest has nothing else to serve.
-        if let Err(error) =
-            crate::connection::handle_connection(
-                stream,
-                sessions,
-                database,
-                clipboard,
-                server_settings,
-                shutdown_state,
-                extension_host,
-            )
-            .await
-        {
-            eprintln!("mux_server: serial connection ended: {error:#}");
-        }
-        Ok(())
+        crate::connection::handle_connection(
+            stream,
+            sessions,
+            database,
+            clipboard,
+            server_settings,
+            shutdown_state,
+            extension_host,
+        )
+        .await
     })
 }
 
-/// Default serial device inside the guest.
 pub fn default_serial_device() -> PathBuf {
     std::env::var("Z3RM_MUX_SERIAL")
         .map(PathBuf::from)

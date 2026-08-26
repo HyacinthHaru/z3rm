@@ -31,7 +31,6 @@ language.workspace = true
 log.workspace = true
 mux.workspace = true
 mux_protocol.workspace = true
-mux_server = { path = "../mux_server", default-features = false }
 project.workspace = true
 recent_projects.workspace = true
 release_channel.workspace = true

@@ -6,8 +6,20 @@
 // server there is driven by a pump from JS (see `mux_server::rt`).
 #![cfg_attr(target_family = "wasm", allow(unused))]
 
-#[cfg(any(target_family = "wasm", not(feature = "desktop")))]
+#[cfg(target_family = "wasm")]
 fn main() {}
+
+#[cfg(all(not(target_family = "wasm"), feature = "guest"))]
+fn main() -> anyhow::Result<()> {
+    let args: Vec<String> = std::env::args().collect();
+    let device = args
+        .iter()
+        .position(|argument| argument == "--serial")
+        .and_then(|index| args.get(index + 1))
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(mux_server::serial::default_serial_device);
+    mux_server::serial::run_serial(device)
+}
 
 #[cfg(all(not(target_family = "wasm"), feature = "desktop"))]
 mod daemon {
@@ -188,7 +200,6 @@ mod daemon {
         }
         None
     }
-
 }
 
 #[cfg(all(not(target_family = "wasm"), feature = "desktop"))]

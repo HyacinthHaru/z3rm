@@ -8,7 +8,7 @@
     "dev": "astro dev",
     "check": "astro check && node --test tests/*.test.mjs",
     "build": "pnpm build:wasm && astro build",
-    "build:wasm": "cd wasm/z3rm_demo && NO_COLOR=false trunk build --release",
+    "build:wasm": "cd wasm/z3rm_demo && ./build-guest-fs.sh && NO_COLOR=false trunk build --release",
     "preview": "astro preview",
     "test": "node --test tests/*.test.mjs",
     "test:e2e": "playwright test",
