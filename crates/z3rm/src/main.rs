@@ -12,6 +12,25 @@ mod open_remote;
 mod quickjs_extensions;
 mod zed;
 
+/// The desktop surfaces the shared mux window layer through the daemon error
+/// toast and the QuickJS extension host's shortcut resolver.
+fn desktop_mux_window_hooks() -> MuxWindowHooks {
+    MuxWindowHooks {
+        show_error: |cx, message| daemon::show_daemon_error(cx, message),
+        extension_shortcut_resolver: |cx| {
+            cx.try_global::<quickjs_extensions::GlobalHostController>()
+                .map(|host| host.0.read(cx).extension_shortcut_resolver())
+        },
+        route_extension_action: |cx, action_id| {
+            let Some(host) = cx.try_global::<quickjs_extensions::GlobalHostController>() else {
+                tracing::debug!(action_id, "extension host absent; extension action dropped");
+                return;
+            };
+            host.0.read(cx).execute_command(action_id, "");
+        },
+    }
+}
+
 use std::{
     path::Path,
     rc::Rc,
@@ -33,6 +52,15 @@ use gpui::{
 use gpui_platform;
 use parking_lot::Mutex;
 use release_channel::{AppCommitSha, AppVersion, ReleaseChannel};
+use mux_window::{
+    apply_mux_layout_to_workspace, focus_mux_pane_by_id, install_session_sidebar,
+    install_snapshot_panes, mark_remote_mux_window_disconnected, mux_binding_for_window,
+    mux_domain_for_window, mux_session_for_window, new_mux_pane_view, begin_mux_reconnect,
+    finish_mux_reconnect, publish_mux_connection_state, register_core_mux_actions,
+    register_mux_window, subscribe_mux_pane_extension_actions, take_mux_window,
+    watch_mux_session_notifications, MuxReconnectUnavailable,
+    MuxWindowHooks, MuxWindows, MuxConnectionStatusItem, OpenFileRoute, MAX_OPEN_FILE_BYTES,
+};
 use theme::ThemeRegistry;
 use theme_settings::load_user_theme;
 use util::ResultExt as _;
@@ -61,112 +89,6 @@ fn build_application() -> Application {
 
 gpui::actions!(z3rm_debug, [DumpAccessibilityTree]);
 
-fn focus_mux_workspace_pane(
-    pane: Entity<workspace::Pane>,
-    window: &mut Window,
-    cx: &mut Context<workspace::Workspace>,
-) {
-    let Some(item) = pane.read(cx).active_item() else {
-        return;
-    };
-    let Ok(mux_view) = item
-        .to_any_view()
-        .downcast::<terminal_view::mux_pane::MuxPaneView>()
-    else {
-        return;
-    };
-    let pane_id = mux_view.read(cx).pane_id.clone();
-    let focus_handle = item.item_focus_handle(cx);
-    window.focus(&focus_handle, cx);
-
-    let Some(domain) = mux_domain_for_window(window, cx) else {
-        return;
-    };
-    cx.spawn(async move |_, cx| {
-        if let Err(error) = domain.focus_pane(&pane_id).await {
-            tracing::error!(pane_id, %error, "focus_pane RPC failed");
-            cx.update(|cx| {
-                daemon::show_daemon_error(
-                    cx,
-                    format!("Failed to focus mux pane {pane_id}: {error}"),
-                );
-            });
-        }
-    })
-    .detach();
-}
-
-fn focus_mux_pane_index(
-    workspace: &mut workspace::Workspace,
-    index: u8,
-    window: &mut Window,
-    cx: &mut Context<workspace::Workspace>,
-) {
-    if let Some(pane) = workspace.panes().get(index as usize).cloned() {
-        focus_mux_workspace_pane(pane, window, cx);
-    }
-}
-
-/// §15.7 Focus the GPUI pane projecting `pane_id`, for callers that only know
-/// the server-side pane id (the session sidebar).
-fn focus_mux_pane_by_id(
-    workspace: &mut workspace::Workspace,
-    pane_id: &str,
-    window: &mut Window,
-    cx: &mut Context<workspace::Workspace>,
-) {
-    let located = workspace.panes().iter().find_map(|pane| {
-        let item_index = pane.read(cx).items().position(|item| {
-            item.to_any_view()
-                .downcast::<terminal_view::mux_pane::MuxPaneView>()
-                .is_ok_and(|view| view.read(cx).pane_id == pane_id)
-        })?;
-        Some((pane.clone(), item_index))
-    });
-    let Some((pane, item_index)) = located else {
-        // The pane belongs to a tab this window does not project; the server
-        // stays authoritative and there is nothing local to focus.
-        return;
-    };
-    // Activating first makes the pane's active item the one we mean, so the
-    // shared focus helper sends `focus_pane` for the requested id.
-    pane.update(cx, |pane, cx| {
-        pane.activate_item(item_index, true, true, window, cx);
-    });
-    focus_mux_workspace_pane(pane, window, cx);
-}
-
-fn cyclic_pane_index(current: usize, pane_count: usize, forward: bool) -> Option<usize> {
-    if pane_count == 0 || current >= pane_count {
-        return None;
-    }
-    Some(if forward {
-        (current + 1) % pane_count
-    } else if current == 0 {
-        pane_count - 1
-    } else {
-        current - 1
-    })
-}
-
-fn focus_adjacent_mux_pane(
-    workspace: &mut workspace::Workspace,
-    forward: bool,
-    window: &mut Window,
-    cx: &mut Context<workspace::Workspace>,
-) {
-    let panes = workspace.panes();
-    let Some(current) = panes
-        .iter()
-        .position(|pane| pane == workspace.active_pane())
-    else {
-        return;
-    };
-    let Some(index) = cyclic_pane_index(current, panes.len(), forward) else {
-        return;
-    };
-    focus_mux_workspace_pane(panes[index].clone(), window, cx);
-}
 
 // ============================================================================
 // §16.7 Extension shortcuts: MuxPaneView resolver installation + event routing
@@ -175,426 +97,12 @@ fn focus_adjacent_mux_pane(
 /// §16.7 Build a pane view with the extension shortcut resolver installed so
 /// declared extension keybindings can match in the pane's priority chain.
 /// Without a host (or before any keymap report lands) the resolver is
-/// absent and the pane behaves exactly as it did before — native core
-/// commands never depend on the extension host.
-fn new_mux_pane_view(
-    pane_id: String,
-    domain: Arc<mux::MuxDomain>,
-    workspace: WeakEntity<workspace::Workspace>,
-    project: WeakEntity<project::Project>,
-    window: &mut Window,
-    cx: &mut Context<terminal_view::mux_pane::MuxPaneView>,
-) -> terminal_view::mux_pane::MuxPaneView {
-    let mut view = terminal_view::mux_pane::MuxPaneView::new(
-        pane_id,
-        domain,
-        workspace,
-        project,
-        window,
-        cx,
-    );
-    if let Some(host) = cx.try_global::<quickjs_extensions::GlobalHostController>() {
-        view.set_extension_shortcut_resolver(Some(host.0.read(cx).extension_shortcut_resolver()));
-    }
-    view
-}
-
-/// §16.7 Route every `MuxPaneEvent::ExtensionAction` the pane emits to the
-/// extension host, which dispatches it to the owning extension through the
-/// command registry. A pane that never matches an extension shortcut emits
-/// nothing; without a host the route is a logged no-op.
-fn subscribe_mux_pane_extension_actions(
-    view: &Entity<terminal_view::mux_pane::MuxPaneView>,
-    cx: &mut App,
-) {
-    cx.subscribe(view, |_, event, cx| {
-        if let terminal_view::mux_pane::MuxPaneEvent::ExtensionAction { action_id } = event {
-            route_extension_action(action_id.as_ref(), cx);
-        }
-    })
-    .detach();
-}
-
-/// §16.7 Dispatch one extension action id through the host's command
-/// registry; owner resolution happens inside `execute_command`. A missing
-/// host is a no-op — the id comes from an extension keymap, so there is
-/// nothing to do natively (and native core commands never arrive here).
-fn route_extension_action(action_id: &str, cx: &mut App) {
-    let Some(host) = cx.try_global::<quickjs_extensions::GlobalHostController>() else {
-        tracing::debug!(action_id, "extension host absent; extension action dropped");
-        return;
-    };
-    host.0.read(cx).execute_command(action_id, "");
-}
-
-fn apply_mux_layout_to_workspace(
-    workspace: &mut workspace::Workspace,
-    layout: &workspace::layout_projection::LayoutTree,
-    focused_pane_id: Option<&str>,
-    domain: Arc<mux::MuxDomain>,
-    window: &mut Window,
-    cx: &mut Context<workspace::Workspace>,
-) {
-    let mut existing: std::collections::HashMap<String, Entity<workspace::Pane>> =
-        std::collections::HashMap::default();
-    for pane in workspace.panes() {
-        for item in pane.read(cx).items() {
-            if let Ok(view) = item
-                .to_any_view()
-                .downcast::<terminal_view::mux_pane::MuxPaneView>()
-            {
-                let pane_id = view.read(cx).pane_id.clone();
-                existing.entry(pane_id).or_insert_with(|| pane.clone());
-            }
-        }
-    }
-    workspace.apply_layout_snapshot(
-        layout,
-        focused_pane_id,
-        existing,
-        |workspace, window, cx| workspace.add_pane_for_layout(window, cx),
-        |workspace, pane, pane_id, window, cx| {
-            let view = cx.new(|cx| {
-                new_mux_pane_view(
-                    pane_id,
-                    domain.clone(),
-                    workspace.weak_handle(),
-                    workspace.project().downgrade(),
-                    window,
-                    cx,
-                )
-            });
-            subscribe_mux_pane_extension_actions(&view, cx);
-            let item: Box<dyn workspace::ItemHandle> = Box::new(view);
-            workspace.add_item(pane.clone(), item, None, true, true, window, cx);
-        },
-        window,
-        cx,
-    );
-}
 
 // ============================================================================
 // §3.3 Multiple windows per session (Plan 32)
 // ============================================================================
 
-#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
-enum MuxConnectionState {
-    #[default]
-    Connected,
-    Disconnected,
-    Reconnecting,
-}
-
-impl MuxConnectionState {
-    fn begin_reconnect(&mut self) -> bool {
-        if *self == Self::Reconnecting {
-            return false;
-        }
-        *self = Self::Reconnecting;
-        true
-    }
-
-    fn finish_reconnect(&mut self, succeeded: bool) {
-        *self = if succeeded {
-            Self::Connected
-        } else {
-            Self::Disconnected
-        };
-    }
-
-    fn mark_disconnected(&mut self) -> bool {
-        if *self == Self::Disconnected {
-            return false;
-        }
-        *self = Self::Disconnected;
-        true
-    }
-}
-
-/// §3.3 One GPUI window's mux binding.
-///
-/// A window owns its own `MuxDomain`, i.e. its own socket, client identity and
-/// server-minted window id. That is what makes window teardown precise: closing
-/// the window closes exactly one connection, and the server releases exactly
-/// that window's session membership — including when the process crashes.
-///
-/// §16.6 For a remote (`attach --ssh`) window, `ssh_session` additionally
-/// owns the SSH ControlMaster + socket forward: it must stay alive as long as
-/// the window renders, so it lives here and dies only when the binding is
-/// removed. The type parameter exists so the carry-over contract (rebinding a
-/// window must not drop the session) is testable without a live tunnel.
-struct MuxWindow<T = mux::SshSession> {
-    domain: Arc<mux::MuxDomain>,
-    session_id: String,
-    ssh_session: Option<Arc<futures::lock::Mutex<T>>>,
-    connection_state: MuxConnectionState,
-}
-
-/// §15.4 The window's persistent connection indicator.
-///
-/// A toast is the wrong surface for this: it tells the user once and then the
-/// window looks identical to a healthy one. An offline remote window has to
-/// keep saying so until it is reconnected.
-struct MuxConnectionStatusItem {
-    state: MuxConnectionState,
-}
-
-impl MuxConnectionStatusItem {
-    fn new() -> Self {
-        Self {
-            state: MuxConnectionState::Connected,
-        }
-    }
-
-    fn set_state(&mut self, state: MuxConnectionState, cx: &mut Context<Self>) {
-        if self.state == state {
-            return;
-        }
-        self.state = state;
-        cx.notify();
-    }
-}
-
-impl Render for MuxConnectionStatusItem {
-    fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
-        use ui::prelude::*;
-
-        // Recovery is announced but not drawn. The status bar goes back to
-        // showing nothing once the connection returns, which is right for a
-        // user who can see the pane responding again and wrong for one who was
-        // told the connection dropped and is never told otherwise — clearing
-        // the announcement leaves them believing they are still detached.
-        let (state_text, visible_color) = match self.state {
-            MuxConnectionState::Connected => ("Connected", None),
-            MuxConnectionState::Disconnected => ("Disconnected", Some(ui::Color::Error)),
-            MuxConnectionState::Reconnecting => ("Reconnecting…", Some(ui::Color::Warning)),
-        };
-        // Losing the connection is conveyed only by this text and its color, and
-        // it happens while the user is working somewhere else entirely. A polite
-        // live region is what tells a screen reader to announce the change
-        // without the user having to go looking for it; assertive would cut off
-        // whatever they were reading for something they cannot act on instantly.
-        gpui::div()
-            .id("mux-connection-status")
-            .role(gpui::Role::Status)
-            .aria_live(gpui::accesskit::Live::Polite)
-            .aria_announcement(format!("Mux connection: {state_text}"))
-            .when_some(visible_color, |element, color| {
-                element.child(
-                    ui::Label::new(state_text)
-                        .size(ui::LabelSize::Small)
-                        .color(color),
-                )
-            })
-    }
-}
-
-impl workspace::StatusItemView for MuxConnectionStatusItem {
-    fn set_active_pane_item(
-        &mut self,
-        _active_pane_item: Option<&dyn workspace::ItemHandle>,
-        _window: &mut Window,
-        _cx: &mut Context<Self>,
-    ) {
-    }
-
-    fn hide_setting(&self, _cx: &App) -> Option<workspace::HideStatusItem> {
-        None
-    }
-}
-
-/// §3.3 Client-side view of which windows share which session (Plan 32).
-///
-/// `windows` holds the windows this process owns; `roster` is the server's
-/// authoritative membership, rebuilt from the at-least-once `WindowAdded` /
-/// `WindowRemoved` lifecycle stream.
-#[derive(Default)]
-struct MuxWindows {
-    windows: std::collections::HashMap<gpui::WindowId, MuxWindow>,
-    roster: std::collections::HashMap<String, std::collections::BTreeSet<String>>,
-    status_items: std::collections::HashMap<gpui::WindowId, WeakEntity<MuxConnectionStatusItem>>,
-}
-
-impl Global for MuxWindows {}
-
-impl MuxWindows {
-    fn apply_window_event(&mut self, event: &mux_protocol::notification::Event) -> bool {
-        match event {
-            mux_protocol::notification::Event::WindowAdded(added) => {
-                self.roster
-                    .entry(added.session_id.clone())
-                    .or_default()
-                    .insert(added.window_id.clone());
-                true
-            }
-            mux_protocol::notification::Event::WindowRemoved(removed) => {
-                if let Some(windows) = self.roster.get_mut(&removed.session_id) {
-                    windows.remove(&removed.window_id);
-                    if windows.is_empty() {
-                        self.roster.remove(&removed.session_id);
-                    }
-                }
-                true
-            }
-            _ => false,
-        }
-    }
-
-    fn session_window_ids(&self, session_id: &str) -> Vec<String> {
-        self.roster
-            .get(session_id)
-            .map(|windows| windows.iter().cloned().collect())
-            .unwrap_or_default()
-    }
-}
-
-/// §3.3 Rebind `window_id` to a new (domain, session) binding.
-///
-/// Any SSH session held for the window is carried across the swap: switching
-/// sessions must not tear down the tunnel, which dies only when the window
-/// binding is removed (`take_mux_window`). Generic over the held resource so
-/// the carry-over contract is unit-testable without a live SSH tunnel.
-fn rebind_mux_window<T>(
-    windows: &mut std::collections::HashMap<gpui::WindowId, MuxWindow<T>>,
-    window_id: gpui::WindowId,
-    domain: Arc<mux::MuxDomain>,
-    session_id: String,
-    ssh_session: Option<T>,
-) {
-    let previous = windows.remove(&window_id);
-    let (held, connection_state) = previous
-        .map(|existing| (existing.ssh_session, existing.connection_state))
-        .unwrap_or_default();
-    windows.insert(
-        window_id,
-        MuxWindow {
-            domain,
-            session_id,
-            ssh_session: held.or_else(|| {
-                ssh_session.map(|ssh_session| Arc::new(futures::lock::Mutex::new(ssh_session)))
-            }),
-            connection_state,
-        },
-    );
-}
-
-fn register_mux_window(
-    window_id: gpui::WindowId,
-    domain: Arc<mux::MuxDomain>,
-    session_id: String,
-    ssh_session: Option<mux::SshSession>,
-    cx: &mut App,
-) {
-    if cx.try_global::<MuxWindows>().is_none() {
-        cx.set_global(MuxWindows::default());
-    }
-    cx.update_global::<MuxWindows, ()>(|windows, _| {
-        rebind_mux_window(
-            &mut windows.windows,
-            window_id,
-            domain,
-            session_id,
-            ssh_session,
-        );
-    });
-}
-
-fn take_mux_window(window_id: gpui::WindowId, cx: &mut App) -> Option<MuxWindow> {
-    if cx.try_global::<MuxWindows>().is_none() {
-        return None;
-    }
-    cx.update_global::<MuxWindows, Option<MuxWindow>>(|windows, _| {
-        windows.status_items.remove(&window_id);
-        windows.windows.remove(&window_id)
-    })
-}
-struct MuxReconnectRequest<T> {
-    domain: Arc<mux::MuxDomain>,
-    session_id: String,
-    ssh_session: Arc<futures::lock::Mutex<T>>,
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum MuxReconnectUnavailable {
-    WindowNotBound,
-    LocalWindow,
-    InProgress,
-}
-
-fn begin_mux_reconnect<T>(
-    windows: &mut std::collections::HashMap<gpui::WindowId, MuxWindow<T>>,
-    window_id: gpui::WindowId,
-) -> Result<MuxReconnectRequest<T>, MuxReconnectUnavailable> {
-    let binding = windows
-        .get_mut(&window_id)
-        .ok_or(MuxReconnectUnavailable::WindowNotBound)?;
-    let ssh_session = binding
-        .ssh_session
-        .clone()
-        .ok_or(MuxReconnectUnavailable::LocalWindow)?;
-    if !binding.connection_state.begin_reconnect() {
-        return Err(MuxReconnectUnavailable::InProgress);
-    }
-    Ok(MuxReconnectRequest {
-        domain: binding.domain.clone(),
-        session_id: binding.session_id.clone(),
-        ssh_session,
-    })
-}
-
-fn finish_mux_reconnect<T>(
-    windows: &mut std::collections::HashMap<gpui::WindowId, MuxWindow<T>>,
-    window_id: gpui::WindowId,
-    domain: &Arc<mux::MuxDomain>,
-    succeeded: bool,
-) -> bool {
-    let Some(binding) = windows.get_mut(&window_id) else {
-        return false;
-    };
-    if !Arc::ptr_eq(&binding.domain, domain) {
-        return false;
-    }
-    binding.connection_state.finish_reconnect(succeeded);
-    true
-}
-
-fn mark_remote_mux_window_disconnected<T>(
-    windows: &mut std::collections::HashMap<gpui::WindowId, MuxWindow<T>>,
-    window_id: gpui::WindowId,
-    domain: &Arc<mux::MuxDomain>,
-) -> bool {
-    let Some(binding) = windows.get_mut(&window_id) else {
-        return false;
-    };
-    if binding.ssh_session.is_none() || !Arc::ptr_eq(&binding.domain, domain) {
-        return false;
-    }
-    binding.connection_state.mark_disconnected()
-}
-
 /// §15.4 Mirror `window_id`'s connection state into its status bar item.
-fn publish_mux_connection_state(window_id: gpui::WindowId, cx: &mut App) {
-    let Some(windows) = cx.try_global::<MuxWindows>() else {
-        return;
-    };
-    let Some(state) = windows
-        .windows
-        .get(&window_id)
-        .map(|binding| binding.connection_state)
-    else {
-        return;
-    };
-    let Some(item) = windows.status_items.get(&window_id).cloned() else {
-        return;
-    };
-    item.update(cx, |item, cx| item.set_state(state, cx)).ok();
-}
-
-/// §15.4 Watch a remote window's tunnel and surface the outage.
-///
-/// The lifecycle notification stream cannot carry this: its subscriber channel
-/// stays open when the transport dies (only a dropped domain closes it), so a
-/// dead tunnel is indistinguishable from an idle one. `check_connection` issues
 /// a real RPC, which is the same probe the local daemon watcher uses.
 fn watch_remote_mux_connection(
     domain: Arc<mux::MuxDomain>,
@@ -637,33 +145,6 @@ fn watch_remote_mux_connection(
 }
 
 /// §3.3 The mux connection that drives `window`.
-///
-/// Falls back to the process-wide `AppState` domain so windows opened outside
-/// the multi-window path (and every pre-Plan-32 caller) keep working.
-fn mux_domain_for_window(window: &Window, cx: &App) -> Option<Arc<mux::MuxDomain>> {
-    let window_id = window.window_handle().window_id();
-    cx.try_global::<MuxWindows>()
-        .and_then(|windows| windows.windows.get(&window_id))
-        .map(|mux_window| mux_window.domain.clone())
-        .or_else(|| workspace::AppState::try_global(cx).and_then(|state| state.mux_domain.clone()))
-}
-
-/// §3.3 The session `window` renders, preferring this window's own binding.
-fn mux_session_for_window(window: &Window, cx: &App) -> Option<String> {
-    let window_id = window.window_handle().window_id();
-    cx.try_global::<MuxWindows>()
-        .and_then(|windows| windows.windows.get(&window_id))
-        .map(|mux_window| mux_window.session_id.clone())
-}
-
-const MAX_OPEN_FILE_BYTES: u64 = 2 * 1024 * 1024;
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum OpenFileRoute {
-    Matched,
-    Unbound,
-    WrongSession,
-}
 
 fn open_file_route(requested_session_id: &str, bound_session_id: Option<&str>) -> OpenFileRoute {
     match bound_session_id {
@@ -695,51 +176,6 @@ fn validate_open_file_metadata(exists: bool, is_dir: bool, size: u64) -> OpenFil
     }
 }
 
-fn mux_binding_for_window(
-    window: &Window,
-    cx: &App,
-) -> Option<(Arc<mux::MuxDomain>, String)> {
-    let window_id = window.window_handle().window_id();
-    cx.try_global::<MuxWindows>()
-        .and_then(|windows| windows.windows.get(&window_id))
-        .map(|mux_window| (mux_window.domain.clone(), mux_window.session_id.clone()))
-}
-
-/// §15.4 Project a snapshot into this window, with panes the desktop knows how
-/// to build: mux pane views wired to the QuickJS extension host.
-fn install_snapshot_panes(
-    workspace: &mut workspace::Workspace,
-    snapshot: &MuxSnapshot,
-    domain: Arc<mux::MuxDomain>,
-    window: &mut Window,
-    cx: &mut Context<workspace::Workspace>,
-) {
-    workspace::layout_projection::install_snapshot_panes(
-        workspace,
-        snapshot,
-        |workspace, pane_id, window, cx| {
-            let view = cx.new(|cx| {
-                new_mux_pane_view(
-                    pane_id,
-                    domain.clone(),
-                    workspace.weak_handle(),
-                    workspace.project().downgrade(),
-                    window,
-                    cx,
-                )
-            });
-            subscribe_mux_pane_extension_actions(&view, cx);
-            Box::new(view)
-        },
-        window,
-        cx,
-    );
-}
-
-/// §3.3 Open one GPUI window bound to its own mux connection (Plan 32).
-///
-/// The window attaches with a server-minted window id before it is opened, so
-/// the layout it renders is the authoritative snapshot the server handed back
 /// for this very window rather than a snapshot borrowed from another window.
 async fn open_mux_window(
     domain: Arc<mux::MuxDomain>,
@@ -811,6 +247,7 @@ async fn open_mux_window_with_snapshot(
                 None,
                 window,
                 cx,
+                Rc::new(handle_sidebar_request),
             );
         })
         .log_err();
@@ -820,38 +257,6 @@ async fn open_mux_window_with_snapshot(
 
 /// §15.7 Give this window the native mux session tree.
 ///
-/// Session switching and pane focusing must be reachable without the QuickJS
-/// extension host, so the sidebar is registered unconditionally alongside the
-/// window's mux binding rather than by an extension.
-fn install_session_sidebar(
-    multi_workspace: &mut workspace::MultiWorkspace,
-    domain: Arc<mux::MuxDomain>,
-    session_id: String,
-    snapshot: Option<&mux_protocol::SessionSnapshot>,
-    restore_width: Option<gpui::Pixels>,
-    window: &mut Window,
-    cx: &mut Context<workspace::MultiWorkspace>,
-) {
-    let workspace = multi_workspace.workspace().downgrade();
-    let handler_domain = domain.clone();
-    let sidebar = cx.new(|cx| {
-        sidebar::Sidebar::new(
-            domain,
-            session_id,
-            snapshot,
-            Rc::new(move |request, window: &mut Window, cx: &mut App| {
-                handle_sidebar_request(&workspace, &handler_domain, request, window, cx);
-            }),
-            window,
-            cx,
-        )
-    });
-    multi_workspace.register_sidebar(sidebar, cx);
-    if let (Some(width), Some(sidebar)) = (restore_width, multi_workspace.sidebar()) {
-        sidebar.set_width(Some(width), cx);
-    }
-}
-
 fn handle_sidebar_request(
     workspace: &gpui::WeakEntity<workspace::Workspace>,
     domain: &Arc<mux::MuxDomain>,
@@ -1261,6 +666,7 @@ fn activate_mux_session(
                             previous_width,
                             window,
                             cx,
+                            Rc::new(handle_sidebar_request),
                         );
                     });
                 })?;
@@ -1284,138 +690,6 @@ fn activate_mux_session(
 /// §15.4 The authoritative focus that rides along with a layout change.
 ///
 /// The snapshot travels with the layout, so a reconnect that rebuilt panes and
-/// tabs but left focus wherever it happened to be is not the state the server
-/// holds. An empty id means the server has no focused pane, not pane "".
-fn focused_pane_from_layout_change(
-    layout_change: &mux_protocol::SessionLayoutChanged,
-) -> Option<String> {
-    layout_change
-        .snapshot
-        .as_ref()
-        .map(|snapshot| snapshot.focused_pane_id.clone())
-        .filter(|pane_id| !pane_id.is_empty())
-}
-
-/// §15.4 / §15.12 Reconcile a window from the server's lifecycle stream.
-///
-/// `SessionLayoutChanged` carries the authoritative layout tree, which is
-/// projected into this window's workspace. `WindowAdded` / `WindowRemoved`
-/// maintain the client's view of which windows share the session (§3.4
-/// at-least-once), and a `WindowRemoved` naming *this* window means the server
-/// dropped it — surfaced to the user rather than silently ignored.
-fn watch_mux_session_notifications(
-    domain: Arc<mux::MuxDomain>,
-    session_id: String,
-    window_handle: gpui::WindowHandle<workspace::MultiWorkspace>,
-    cx: &mut gpui::AsyncApp,
-) {
-    let notifications = domain.subscribe();
-    let mux_window_id = domain.window_id();
-    // Weak, so a closed window's connection is not pinned open by this task:
-    // the socket closes with the last strong handle, and the notification
-    // stream then ends, which is what stops this loop.
-    let domain = Arc::downgrade(&domain);
-    cx.spawn(async move |cx| {
-        while let Ok(notification) = notifications.recv().await {
-            let Some(event) = notification.event else {
-                continue;
-            };
-            match &event {
-                mux_protocol::notification::Event::SessionLayoutChanged(layout_change) => {
-                    let Some(proto_layout) = layout_change.layout.as_ref() else {
-                        continue;
-                    };
-                    let layout =
-                        workspace::layout_projection::LayoutTree::from_proto(proto_layout);
-                    let focused_pane = focused_pane_from_layout_change(layout_change);
-                    let Some(domain) = domain.upgrade() else {
-                        break;
-                    };
-                    if let Err(error) = cx.update_window(window_handle.into(), move |_, window, cx| {
-                        let Some(multi_workspace) =
-                            window.root::<workspace::MultiWorkspace>().flatten()
-                        else {
-                            return;
-                        };
-                        let Some(workspace) =
-                            multi_workspace.read(cx).workspaces().next().cloned()
-                        else {
-                            return;
-                        };
-                        workspace.update(cx, |workspace, cx| {
-                            apply_mux_layout_to_workspace(
-                                workspace,
-                                &layout,
-                                focused_pane.as_deref(),
-                                domain,
-                                window,
-                                cx,
-                            );
-                        });
-                    }) {
-                        tracing::debug!(error = %error, "app context closed during SessionLayoutChanged reconcile");
-                        break;
-                    }
-                }
-                mux_protocol::notification::Event::WindowAdded(_)
-                | mux_protocol::notification::Event::WindowRemoved(_) => {
-                    let dropped_this_window = matches!(
-                        &event,
-                        mux_protocol::notification::Event::WindowRemoved(removed)
-                            if removed.window_id == mux_window_id
-                    );
-                    let session_id = session_id.clone();
-                    cx.update(|cx| {
-                        if cx.try_global::<MuxWindows>().is_none() {
-                            cx.set_global(MuxWindows::default());
-                        }
-                        let windows = cx.update_global::<MuxWindows, Vec<String>>(|windows, _| {
-                            windows.apply_window_event(&event);
-                            windows.session_window_ids(&session_id)
-                        });
-                        tracing::info!(
-                            session_id = %session_id,
-                            windows = windows.len(),
-                            "mux session window membership changed"
-                        );
-                        if dropped_this_window {
-                            daemon::show_daemon_error(
-                                cx,
-                                "This window was removed from the mux session",
-                            );
-                        }
-                    });
-                }
-                _ => {}
-            }
-        }
-        // Reaching here means the domain was dropped, i.e. the window is going
-        // away. A live tunnel that dies never ends this loop — the subscriber
-        // channel outlives the transport — which is why outage detection lives
-        // in `watch_remote_mux_connection` instead.
-    })
-    .detach();
-}
-
-/// §16.9 Forward a layout ratio resize to the server.
-fn forward_layout_resize(
-    window: &Window,
-    cx: &mut gpui::App,
-    pane_id: String,
-    direction: mux_protocol::split_node::SplitDirection,
-    delta: f32,
-) {
-    let Some(domain) = mux_domain_for_window(window, cx) else {
-        return;
-    };
-    cx.background_executor()
-        .spawn(async move {
-            if let Err(error) = domain.resize_layout(&pane_id, direction, delta).await {
-                tracing::warn!(error = %error, "resize_layout RPC failed");
-            }
-        })
-        .detach();
-}
 
 // ============================================================================
 // §16.1 Font 加载
@@ -2339,275 +1613,11 @@ fn main() {
                         check_pending_consent_prompt(host, window, cx);
                     }
 
-                    // §15.7 Register mux_pane action handlers on every workspace.
+                    // §15.7 Register the shared mux pane action handlers, then the
+                    // desktop-only ones (attach/detach/reconnect/kill/new window)
+                    // that drive the daemon.
+                    mux_window::register_core_mux_actions(workspace, window, cx);
                     workspace
-                        .register_action(|workspace, _: &settings::mux_actions::SplitRight, window, cx| {
-                            let Some(domain) = mux_domain_for_window(window, cx) else { return };
-                            let Some(mux_view) = workspace.active_item_as::<terminal_view::mux_pane::MuxPaneView>(cx) else { return };
-                            let pane_id = mux_view.read(cx).pane_id.clone();
-                            let weak_workspace = workspace.weak_handle();
-                            let window_handle = window.window_handle();
-                            window.spawn(cx, async move |cx| {
-                                match domain.split_pane(&pane_id, mux_protocol::split_node::SplitDirection::LeftRight).await {
-                                    Ok(new_pane_id) => {
-                                        if let Err(e) = window_handle.update(cx, |_, window, cx| {
-                                            if let Err(e) = weak_workspace.update(cx, |workspace, cx| {
-                                                let view = cx.new(|cx| {
-                                                    new_mux_pane_view(new_pane_id, domain, workspace.weak_handle(), workspace.project().downgrade(), window, cx)
-                                                });
-                                                subscribe_mux_pane_extension_actions(&view, cx);
-                                                let item: Box<dyn workspace::ItemHandle> = Box::new(view);
-                                                workspace.split_item(workspace::SplitDirection::Right, item, window, cx);
-                                            }) {
-                                                tracing::debug!(error = %e, "workspace dropped during mux_pane::SplitRight handler");
-                                            }
-                                        }) {
-                                            tracing::debug!(error = %e, "window dropped during mux_pane::SplitRight handler");
-                                        }
-                                    }
-                                    Err(error) => {
-                                        tracing::error!(pane_id, %error, "mux_pane::SplitRight failed");
-                                        cx.update(|_, cx| daemon::show_daemon_error(
-                                            cx,
-                                            format!("Failed to split mux pane {pane_id}: {error}"),
-                                        ))?;
-                                    }
-                                }
-                                anyhow::Ok(())
-                            }).detach();
-                        })
-                        .register_action(|workspace, _: &settings::mux_actions::SplitDown, window, cx| {
-                            let Some(domain) = mux_domain_for_window(window, cx) else { return };
-                            let Some(mux_view) = workspace.active_item_as::<terminal_view::mux_pane::MuxPaneView>(cx) else { return };
-                            let pane_id = mux_view.read(cx).pane_id.clone();
-                            let weak_workspace = workspace.weak_handle();
-                            let window_handle = window.window_handle();
-                            window.spawn(cx, async move |cx| {
-                                match domain.split_pane(&pane_id, mux_protocol::split_node::SplitDirection::TopBottom).await {
-                                    Ok(new_pane_id) => {
-                                        if let Err(e) = window_handle.update(cx, |_, window, cx| {
-                                            if let Err(e) = weak_workspace.update(cx, |workspace, cx| {
-                                                let view = cx.new(|cx| {
-                                                    new_mux_pane_view(new_pane_id, domain, workspace.weak_handle(), workspace.project().downgrade(), window, cx)
-                                                });
-                                                subscribe_mux_pane_extension_actions(&view, cx);
-                                                let item: Box<dyn workspace::ItemHandle> = Box::new(view);
-                                                workspace.split_item(workspace::SplitDirection::Down, item, window, cx);
-                                            }) {
-                                                tracing::debug!(error = %e, "workspace dropped during mux_pane::SplitDown handler");
-                                            }
-                                        }) {
-                                            tracing::debug!(error = %e, "window dropped during mux_pane::SplitDown handler");
-                                        }
-                                    }
-                                    Err(error) => {
-                                        tracing::error!(pane_id, %error, "mux_pane::SplitDown failed");
-                                        cx.update(|_, cx| daemon::show_daemon_error(
-                                            cx,
-                                            format!("Failed to split mux pane {pane_id}: {error}"),
-                                        ))?;
-                                    }
-                                }
-                                anyhow::Ok(())
-                            }).detach();
-                        })
-                        .register_action(|workspace, _: &settings::mux_actions::FocusLeft, window, cx| {
-                            if let Some(pane) = workspace.find_pane_in_direction(workspace::SplitDirection::Left, cx) {
-                                focus_mux_workspace_pane(pane, window, cx);
-                            }
-                        })
-                        .register_action(|workspace, _: &settings::mux_actions::FocusRight, window, cx| {
-                            if let Some(pane) = workspace.find_pane_in_direction(workspace::SplitDirection::Right, cx) {
-                                focus_mux_workspace_pane(pane, window, cx);
-                            }
-                        })
-                        .register_action(|workspace, _: &settings::mux_actions::FocusUp, window, cx| {
-                            if let Some(pane) = workspace.find_pane_in_direction(workspace::SplitDirection::Up, cx) {
-                                focus_mux_workspace_pane(pane, window, cx);
-                            }
-                        })
-                        .register_action(|workspace, _: &settings::mux_actions::FocusDown, window, cx| {
-                            if let Some(pane) = workspace.find_pane_in_direction(workspace::SplitDirection::Down, cx) {
-                                focus_mux_workspace_pane(pane, window, cx);
-                            }
-                        })
-                        .register_action(|workspace, _: &settings::mux_actions::FocusNextPane, window, cx| {
-                            focus_adjacent_mux_pane(workspace, true, window, cx);
-                        })
-                        .register_action(|workspace, _: &settings::mux_actions::FocusPrevPane, window, cx| {
-                            focus_adjacent_mux_pane(workspace, false, window, cx);
-                        })
-                        .register_action(|workspace, _: &settings::mux_actions::NextTab, window, cx| {
-                            workspace.active_pane().update(cx, |pane, cx| {
-                                pane.activate_next_item(&workspace::pane::ActivateNextItem::default(), window, cx);
-                            });
-                        })
-                        .register_action(|workspace, _: &settings::mux_actions::PrevTab, window, cx| {
-                            workspace.active_pane().update(cx, |pane, cx| {
-                                pane.activate_previous_item(&workspace::pane::ActivatePreviousItem::default(), window, cx);
-                            });
-                        })
-                        .register_action(|workspace, action: &settings::mux_actions::FocusPaneIndex, window, cx| {
-                            focus_mux_pane_index(workspace, action.index, window, cx);
-                        })
-                        .register_action(|workspace, _: &settings::mux_actions::FocusPane0, window, cx| {
-                            focus_mux_pane_index(workspace, 0, window, cx);
-                        })
-                        .register_action(|workspace, _: &settings::mux_actions::FocusPane1, window, cx| {
-                            focus_mux_pane_index(workspace, 1, window, cx);
-                        })
-                        .register_action(|workspace, _: &settings::mux_actions::FocusPane2, window, cx| {
-                            focus_mux_pane_index(workspace, 2, window, cx);
-                        })
-                        .register_action(|workspace, _: &settings::mux_actions::FocusPane3, window, cx| {
-                            focus_mux_pane_index(workspace, 3, window, cx);
-                        })
-                        .register_action(|workspace, _: &settings::mux_actions::FocusPane4, window, cx| {
-                            focus_mux_pane_index(workspace, 4, window, cx);
-                        })
-                        .register_action(|workspace, _: &settings::mux_actions::FocusPane5, window, cx| {
-                            focus_mux_pane_index(workspace, 5, window, cx);
-                        })
-                        .register_action(|workspace, _: &settings::mux_actions::FocusPane6, window, cx| {
-                            focus_mux_pane_index(workspace, 6, window, cx);
-                        })
-                        .register_action(|workspace, _: &settings::mux_actions::FocusPane7, window, cx| {
-                            focus_mux_pane_index(workspace, 7, window, cx);
-                        })
-                        .register_action(|workspace, _: &settings::mux_actions::FocusPane8, window, cx| {
-                            focus_mux_pane_index(workspace, 8, window, cx);
-                        })
-                        .register_action(|workspace, action: &settings::mux_actions::EnterPrefixMode, _window, cx| {
-                            let Some(mux_view) = workspace.active_item_as::<terminal_view::mux_pane::MuxPaneView>(cx) else { return };
-                            mux_view.update(cx, |view, cx| view.enter_prefix_mode(action.timeout_ms, cx));
-                        })
-                        .register_action(|workspace, action: &settings::mux_actions::SendLiteral, _window, cx| {
-                            let Some(mux_view) = workspace.active_item_as::<terminal_view::mux_pane::MuxPaneView>(cx) else { return };
-                            mux_view.update(cx, |view, cx| view.send_literal(&action.keystroke, cx));
-                        })
-                        .register_action(|workspace, _: &settings::mux_actions::ResizeLeft, window, cx| {
-                            workspace.resize_pane(gpui::Axis::Horizontal, gpui::px(-50.0), window, cx);
-                            let pane_id = workspace.active_item_as::<terminal_view::mux_pane::MuxPaneView>(cx).map(|v| v.read(cx).pane_id.clone());
-                            if let Some(id) = pane_id { forward_layout_resize(window, cx, id, mux_protocol::split_node::SplitDirection::LeftRight, -0.05); }
-                        })
-                        .register_action(|workspace, _: &settings::mux_actions::ResizeRight, window, cx| {
-                            workspace.resize_pane(gpui::Axis::Horizontal, gpui::px(50.0), window, cx);
-                            let pane_id = workspace.active_item_as::<terminal_view::mux_pane::MuxPaneView>(cx).map(|v| v.read(cx).pane_id.clone());
-                            if let Some(id) = pane_id { forward_layout_resize(window, cx, id, mux_protocol::split_node::SplitDirection::LeftRight, 0.05); }
-                        })
-                        .register_action(|workspace, _: &settings::mux_actions::ResizeUp, window, cx| {
-                            workspace.resize_pane(gpui::Axis::Vertical, gpui::px(-50.0), window, cx);
-                            let pane_id = workspace.active_item_as::<terminal_view::mux_pane::MuxPaneView>(cx).map(|v| v.read(cx).pane_id.clone());
-                            if let Some(id) = pane_id { forward_layout_resize(window, cx, id, mux_protocol::split_node::SplitDirection::TopBottom, -0.05); }
-                        })
-                        .register_action(|workspace, _: &settings::mux_actions::ResizeDown, window, cx| {
-                            workspace.resize_pane(gpui::Axis::Vertical, gpui::px(50.0), window, cx);
-                            let pane_id = workspace.active_item_as::<terminal_view::mux_pane::MuxPaneView>(cx).map(|v| v.read(cx).pane_id.clone());
-                            if let Some(id) = pane_id { forward_layout_resize(window, cx, id, mux_protocol::split_node::SplitDirection::TopBottom, 0.05); }
-                        })
-                        .register_action(|workspace, _: &settings::mux_actions::ResizeEqual, _window, cx| {
-                            workspace.reset_pane_sizes(cx);
-                        })
-                        .register_action(|workspace, _: &settings::mux_actions::CloseTab, window, cx| {
-                            let Some(domain) = mux_domain_for_window(window, cx) else { return };
-                            let Some(mux_view) = workspace.active_item_as::<terminal_view::mux_pane::MuxPaneView>(cx) else { return };
-                            let pane_id = mux_view.read(cx).pane_id.clone();
-                            let weak_workspace = workspace.weak_handle();
-                            let window_handle = window.window_handle();
-                            window.spawn(cx, async move |cx| {
-                                match domain.close_pane(&pane_id).await {
-                                    Ok(()) => {
-                                        window_handle.update(cx, |_, window, cx| {
-                                            weak_workspace.update(cx, |workspace, cx| {
-                                                workspace.active_pane().update(cx, |pane, cx| {
-                                                    pane.close_active_item(&workspace::CloseActiveItem::default(), window, cx)
-                                                        .detach_and_log_err(cx);
-                                                });
-                                            })
-                                        })??;
-                                    }
-                                    Err(error) => {
-                                        tracing::error!(pane_id, %error, "mux_pane::CloseTab failed");
-                                        cx.update(|_, cx| daemon::show_daemon_error(
-                                            cx,
-                                            format!("Failed to close mux pane {pane_id}: {error}"),
-                                        ))?;
-                                    }
-                                }
-                                anyhow::Ok(())
-                            }).detach();
-                        })
-                        .register_action(|workspace, _: &settings::mux_actions::ZoomToggle, window, cx| {
-                            let Some(mux_view) = workspace.active_item_as::<terminal_view::mux_pane::MuxPaneView>(cx) else { return };
-                            let new_zoom = !mux_view.read(cx).is_zoomed();
-                            // Updates the view's zoom state and notifies the server
-                            // (zoom_pane RPC is fire-and-forget; errors logged in set_zoomed).
-                            mux_view.update(cx, |view, cx| view.set_zoomed(new_zoom, cx));
-                            // Reflect the zoom into the workspace's zoomed view.
-                            let pane = workspace.active_pane().clone();
-                            workspace.set_pane_zoomed(pane, new_zoom, window, cx);
-                        })
-                        .register_action(|workspace, _: &settings::mux_actions::NewTab, window, cx| {
-                            let Some(domain) = mux_domain_for_window(window, cx) else { return };
-                            let known_session = mux_session_for_window(window, cx);
-                            let weak_workspace = workspace.weak_handle();
-                            let window_handle = window.window_handle();
-                            window.spawn(cx, async move |cx| {
-                                let session_id = if let Some(session_id) =
-                                    known_session.or_else(|| domain.last_attached_session_id())
-                                {
-                                    Some(session_id)
-                                } else {
-                                    match domain.list_sessions().await {
-                                        Ok(sessions) => sessions.first().map(|session| session.id.clone()),
-                                        Err(error) => {
-                                            tracing::error!(%error, "mux_pane::NewTab list_sessions failed");
-                                            cx.update(|_, cx| daemon::show_daemon_error(
-                                                cx,
-                                                format!("Failed to find a mux session for the new tab: {error}"),
-                                            ))?;
-                                            None
-                                        }
-                                    }
-                                };
-                                let Some(session_id) = session_id else {
-                                    cx.update(|_, cx| daemon::show_daemon_error(
-                                        cx,
-                                        "No mux session is available for the new tab",
-                                    ))?;
-                                    return anyhow::Ok(());
-                                };
-                                let size = mux_protocol::TerminalSize { cols: 80, rows: 24 };
-                                let tab_id = format!("tab-{}", nanoid::nanoid!());
-                                match domain.spawn_pane(&session_id, &tab_id, size, None, None).await {
-                                    Ok(new_pane_id) => {
-                                        if let Err(error) = window_handle.update(cx, |_, window, cx| {
-                                            if let Err(error) = weak_workspace.update(cx, |workspace, cx| {
-                                                let pane = workspace.active_pane().clone();
-                                                let view = cx.new(|cx| {
-                                                    new_mux_pane_view(new_pane_id, domain, workspace.weak_handle(), workspace.project().downgrade(), window, cx)
-                                                });
-                                                subscribe_mux_pane_extension_actions(&view, cx);
-                                                let item: Box<dyn workspace::ItemHandle> = Box::new(view);
-                                                workspace.add_item(pane, item, None, true, true, window, cx);
-                                            }) {
-                                                tracing::debug!(%error, "workspace dropped during mux_pane::NewTab handler");
-                                            }
-                                        }) {
-                                            tracing::debug!(%error, "window dropped during mux_pane::NewTab handler");
-                                        }
-                                    }
-                                    Err(error) => {
-                                        tracing::error!(session_id, %error, "mux_pane::NewTab spawn failed");
-                                        cx.update(|_, cx| daemon::show_daemon_error(
-                                            cx,
-                                            format!("Failed to create mux tab in session {session_id}: {error}"),
-                                        ))?;
-                                    }
-                                }
-                                anyhow::Ok(())
-                            }).detach();
-                        })
                         .register_action(|workspace, _: &settings::mux_actions::Attach, window, cx| {
                             let Some(domain) = mux_domain_for_window(window, cx) else { return };
                             let known_session = mux_session_for_window(window, cx);

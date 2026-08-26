@@ -7599,6 +7599,26 @@ dependencies = [
 ]
 
 [[package]]
+name = "mux_window"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "futures",
+ "gpui",
+ "mux",
+ "mux_protocol",
+ "nanoid",
+ "project",
+ "settings",
+ "sidebar",
+ "terminal_view",
+ "tracing",
+ "ui",
+ "util",
+ "workspace",
+]
+
+[[package]]
 name = "naga"
 version = "29.0.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -17037,6 +17057,7 @@ dependencies = [
  "menu",
  "mux",
  "mux_protocol",
+ "mux_window",
  "nanoid",
  "notifications",
  "parking_lot",
@@ -17136,6 +17157,7 @@ dependencies = [
  "mux",
  "mux_protocol",
  "mux_server",
+ "mux_window",
  "project",
  "recent_projects",
  "release_channel",

@@ -447,6 +447,7 @@ workspace = true
 [dependencies]
 z3rm_macros = { workspace = true }
 inventory = "0.3"
+mux_window = { path = "../mux_window", features = ["ssh", "quickjs"] }
 
 # --- UI screenshot / a11y regression + mux stress harness (docs/development/ui-regression-testing.md) ---
 

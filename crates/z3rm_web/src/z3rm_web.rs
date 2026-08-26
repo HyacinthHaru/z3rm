@@ -40,6 +40,19 @@ impl gpui::Global for GlobalLocalServer {}
 /// theme first so every `init` below can read them, then the app state every
 /// `init` needs, then the chrome, then the window.
 pub fn boot(cx: &mut App) {
+    // The browser surface has no extension host: extension actions are a no-op
+    // and infrastructure errors land in the log.
+    mux_window::install_hooks(
+        cx,
+        mux_window::MuxWindowHooks {
+            show_error: |cx, message| {
+                log::error!("{message}");
+                let _ = cx;
+            },
+            extension_shortcut_resolver: |_| None,
+            route_extension_action: |_, _| {},
+        },
+    );
     let app_version = release_channel::AppVersion::load(env!("CARGO_PKG_VERSION"), None, None);
     release_channel::init(app_version, cx);
     settings::init(cx);
@@ -166,6 +179,9 @@ async fn open_window(
                         window,
                         cx,
                     );
+                    // §15.7 The same pane action handlers the desktop registers:
+                    // split, focus, tabs, resize, zoom, prefix mode.
+                    mux_window::register_core_mux_actions(workspace, window, cx);
                 }
             })),
             workspace::OpenMode::NewWindow,

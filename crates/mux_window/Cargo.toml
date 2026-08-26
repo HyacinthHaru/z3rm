@@ -1,0 +1,42 @@
+[package]
+name = "mux_window"
+version = "0.1.0"
+edition = "2024"
+publish = false
+license = "GPL-3.0-or-later"
+
+[lints]
+workspace = true
+
+[lib]
+path = "src/mux_window.rs"
+
+[features]
+# The desktop binary routes pane extension actions into the QuickJS host; the
+# browser build has no extension host and leaves the hook off.
+quickjs = []
+# The desktop carries per-window SSH tunnels in its window bindings; the
+# browser build has no SSH and stores nothing.
+ssh = ["mux/ssh"]
+
+[dependencies]
+anyhow.workspace = true
+futures.workspace = true
+gpui.workspace = true
+nanoid.workspace = true
+project.workspace = true
+settings.workspace = true
+sidebar.workspace = true
+terminal_view.workspace = true
+tracing.workspace = true
+ui.workspace = true
+util.workspace = true
+
+[dependencies.mux]
+workspace = true
+
+[dependencies.mux_protocol]
+workspace = true
+
+[dependencies.workspace]
+workspace = true
