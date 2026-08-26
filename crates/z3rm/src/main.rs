@@ -1417,96 +1417,6 @@ fn forward_layout_resize(
         .detach();
 }
 
-#[derive(Clone, Debug, settings::RegisterSetting)]
-struct MuxSettings {
-    keymap_profile: String,
-}
-
-impl settings::Settings for MuxSettings {
-    fn from_settings(content: &settings::SettingsContent) -> Self {
-        let mux = content.mux.clone().unwrap_or_default();
-        Self {
-            keymap_profile: mux.keymap_profile.unwrap_or_else(|| "default".to_string()),
-        }
-    }
-}
-
-/// Tracks the currently-active mux keymap profile plus its bindings so a
-/// profile switch can emit `Unbind` entries for the prior keystrokes before
-/// binding the new profile. Without this, switching profiles left the old
-/// profile's bindings live alongside the new ones (§16.7).
-struct ActiveMuxKeymapProfile {
-    profile: String,
-    bindings: Vec<gpui::KeyBinding>,
-}
-
-impl Global for ActiveMuxKeymapProfile {}
-
-fn bind_startup_keymaps(cx: &mut App) {
-    match settings::KeymapFile::load_asset_allow_partial_failure(settings::DEFAULT_KEYMAP_PATH, cx)
-    {
-        Ok(key_bindings) => cx.bind_keys(key_bindings),
-        Err(error) => tracing::error!(error = %error, "failed to load default keymap"),
-    }
-    bind_configured_mux_keymap_profile(cx);
-    cx.observe_global::<settings::SettingsStore>(|cx| {
-        bind_configured_mux_keymap_profile(cx);
-    })
-    .detach();
-}
-
-fn bind_configured_mux_keymap_profile(cx: &mut App) {
-    let profile = <MuxSettings as settings::Settings>::get_global(cx)
-        .keymap_profile
-        .clone();
-    if cx
-        .try_global::<ActiveMuxKeymapProfile>()
-        .is_some_and(|active| active.profile == profile)
-    {
-        return;
-    }
-    let path = settings::mux_keymap_profile_path(&profile);
-    // Built-in mux profiles reject partial failures (see settings::load_mux_keymap_profile),
-    // so a broken profile never leaves half-applied bindings.
-    match settings::load_mux_keymap_profile(&profile, cx) {
-        Ok(key_bindings) => {
-            // §16.7 Profile switching must not stack bindings. Before binding
-            // the new profile, emit `Unbind` entries at the previous profile's
-            // keystrokes (naming the previous action) so the keymap drops them.
-            if let Some(prev) = cx.try_global::<ActiveMuxKeymapProfile>() {
-                let unbinds: Vec<gpui::KeyBinding> = prev
-                    .bindings
-                    .iter()
-                    .filter_map(|binding| {
-                        // No-action and Unbind markers have no action name to clear.
-                        if gpui::is_unbind(binding.action()) || gpui::is_no_action(binding.action())
-                        {
-                            return None;
-                        }
-                        if binding.keystrokes().is_empty() {
-                            return None;
-                        }
-                        Some(binding.unbind())
-                    })
-                    .collect();
-                if !unbinds.is_empty() {
-                    cx.bind_keys(unbinds);
-                }
-            }
-            // Clone before consuming — `cx.bind_keys` needs an owned iterator.
-            let stored = key_bindings.clone();
-            cx.bind_keys(key_bindings);
-            cx.set_global(ActiveMuxKeymapProfile {
-                profile,
-                bindings: stored,
-            });
-        }
-        Err(error) => {
-            tracing::error!(profile, path, error = %error, "failed to load mux keymap profile")
-        }
-    }
-}
-
 // ============================================================================
 // §16.1 Font 加载
 // ============================================================================
@@ -2172,7 +2082,7 @@ fn main() {
         settings::init(cx);
         theme_settings::init(theme::LoadThemes::All(Box::new(Assets)), cx);
         zed_init(cx);
-        bind_startup_keymaps(cx);
+        settings::bind_startup_keymaps(cx);
         watch_settings_files(fs.clone(), cx);
 
         load_embedded_fonts(cx);
@@ -3503,9 +3413,9 @@ mod tests {
     #[gpui::test]
     fn startup_keymaps_bind_default_and_mux_profile(cx: &mut App) {
         settings::init(cx);
-        super::bind_startup_keymaps(cx);
+        settings::bind_startup_keymaps(cx);
         assert_eq!(
-            cx.try_global::<super::ActiveMuxKeymapProfile>()
+            cx.try_global::<settings::ActiveMuxKeymapProfile>()
                 .map(|profile| profile.profile.as_str()),
             Some("default")
         );
@@ -3756,7 +3666,7 @@ mod tests {
     #[gpui::test]
     fn mux_profile_switch_unbinds_previous_keystrokes(cx: &mut App) {
         settings::init(cx);
-        super::bind_startup_keymaps(cx);
+        settings::bind_startup_keymaps(cx);
 
         // Use bindings_for_input with a Terminal context so disabled
         // (NoAction/Unbind) bindings are honored by the keymap's resolution
@@ -3776,15 +3686,15 @@ mod tests {
         );
 
         // Switch profile to tmux (which does not bind ctrl-shift-d).
-        super::MuxSettings::override_global(
-            super::MuxSettings {
+        settings::MuxSettings::override_global(
+            settings::MuxSettings {
                 keymap_profile: "tmux".to_string(),
             },
             cx,
         );
         // override_global does not notify SettingsStore on its own; drive the
         // rebind function directly so the test exercises the unbind path.
-        super::bind_configured_mux_keymap_profile(cx);
+        settings::bind_configured_mux_keymap_profile(cx);
 
         let (after, _) = cx
             .key_bindings()

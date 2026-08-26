@@ -36,6 +36,7 @@ settings_json.workspace = true
 settings_macros.workspace = true
 smallvec.workspace = true
 util.workspace = true
+tracing.workspace = true
 zlog.workspace = true
 
 [dev-dependencies]

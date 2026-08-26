@@ -1,3 +1,7 @@
+// The derive(RegisterSetting) macro emits paths through the `settings` crate
+// name; inside the crate itself that only resolves via a self-extern.
+extern crate self as settings;
+
 mod base_keymap_setting;
 mod content_into_gpui;
 mod editable_setting_control;
@@ -219,6 +223,100 @@ pub fn load_mux_keymap_profile(
     // Built-in assets are not user-editable, so any per-binding failure is a bug
     // in the bundled profile rather than a user typo and must surface as an error.
     KeymapFile::load_asset(path, None, cx)
+}
+
+/// The mux keymap settings: which named keymap profile (default/tmux/
+/// zellij/screen) the mux pane action chords come from.
+#[derive(Clone, Debug, RegisterSetting)]
+pub struct MuxSettings {
+    pub keymap_profile: String,
+}
+
+impl Settings for MuxSettings {
+    fn from_settings(content: &SettingsContent) -> Self {
+        let mux = content.mux.clone().unwrap_or_default();
+        Self {
+            keymap_profile: mux.keymap_profile.unwrap_or_else(|| "default".to_string()),
+        }
+    }
+}
+
+/// Tracks the currently-active mux keymap profile plus its bindings so a
+/// profile switch can emit `Unbind` entries for the prior keystrokes before
+/// binding the new profile. Without this, switching profiles left the old
+/// profile's bindings live alongside the new ones (§16.7).
+pub struct ActiveMuxKeymapProfile {
+    profile: String,
+    bindings: Vec<gpui::KeyBinding>,
+}
+
+impl Global for ActiveMuxKeymapProfile {}
+
+/// Load the platform default keymap plus the configured mux keymap profile,
+/// and re-bind both whenever the settings change. Both the desktop binary and
+/// the WebAssembly client call this so the two surfaces share one keymap.
+pub fn bind_startup_keymaps(cx: &mut App) {
+    match KeymapFile::load_asset_allow_partial_failure(DEFAULT_KEYMAP_PATH, cx) {
+        Ok(key_bindings) => cx.bind_keys(key_bindings),
+        Err(error) => tracing::error!(error = %error, "failed to load default keymap"),
+    }
+    bind_configured_mux_keymap_profile(cx);
+    cx.observe_global::<SettingsStore>(|cx| {
+        bind_configured_mux_keymap_profile(cx);
+    })
+    .detach();
+}
+
+pub fn bind_configured_mux_keymap_profile(cx: &mut App) {
+    let profile = <MuxSettings as Settings>::get_global(cx)
+        .keymap_profile
+        .clone();
+    if cx
+        .try_global::<ActiveMuxKeymapProfile>()
+        .is_some_and(|active| active.profile == profile)
+    {
+        return;
+    }
+    let path = mux_keymap_profile_path(&profile);
+    // Built-in mux profiles reject partial failures (see load_mux_keymap_profile),
+    // so a broken profile never leaves half-applied bindings.
+    match load_mux_keymap_profile(&profile, cx) {
+        Ok(key_bindings) => {
+            // §16.7 Profile switching must not stack bindings. Before binding
+            // the new profile, emit `Unbind` entries at the previous profile's
+            // keystrokes (naming the previous action) so the keymap drops them.
+            if let Some(prev) = cx.try_global::<ActiveMuxKeymapProfile>() {
+                let unbinds: Vec<gpui::KeyBinding> = prev
+                    .bindings
+                    .iter()
+                    .filter_map(|binding| {
+                        // No-action and Unbind markers have no action name to clear.
+                        if gpui::is_unbind(binding.action()) || gpui::is_no_action(binding.action())
+                        {
+                            return None;
+                        }
+                        if binding.keystrokes().is_empty() {
+                            return None;
+                        }
+                        Some(binding.unbind())
+                    })
+                    .collect();
+                if !unbinds.is_empty() {
+                    cx.bind_keys(unbinds);
+                }
+            }
+            // Clone before consuming — `cx.bind_keys` needs an owned iterator.
+            let stored = key_bindings.clone();
+            cx.bind_keys(key_bindings);
+            cx.set_global(ActiveMuxKeymapProfile {
+                profile,
+                bindings: stored,
+            });
+        }
+        Err(error) => {
+            tracing::error!(profile, path, error = %error, "failed to load mux keymap profile")
+        }
+    }
 }
 
 /// Specific keybinding overrides. Loaded after the base keymap so they win over

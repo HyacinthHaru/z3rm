@@ -43,6 +43,9 @@ pub fn boot(cx: &mut App) {
     let app_version = release_channel::AppVersion::load(env!("CARGO_PKG_VERSION"), None, None);
     release_channel::init(app_version, cx);
     settings::init(cx);
+    // §16.7 Bind the same default + mux keymap profiles the desktop binary
+    // loads, so the browser surface shares one keymap with the desktop.
+    settings::bind_startup_keymaps(cx);
     theme_settings::init(theme::LoadThemes::All(Box::new(assets::Assets)), cx);
     load_embedded_fonts(cx);
 
