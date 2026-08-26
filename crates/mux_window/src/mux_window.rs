@@ -6,6 +6,8 @@
 //! extension host and the file-transfer flows stay in the desktop binary and
 //! reach this layer through [`MuxWindowHooks`].
 
+gpui::actions!(z3rm_debug, [DumpAccessibilityTree]);
+
 use std::collections::BTreeSet;
 use std::collections::HashMap;
 use std::rc::Rc;

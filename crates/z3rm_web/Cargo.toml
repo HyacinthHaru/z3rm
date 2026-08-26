@@ -15,6 +15,7 @@ doctest = false
 
 [dependencies]
 gloo-timers = { version = "0.3", features = ["futures"] }
+web-time.workspace = true
 mux_window = { path = "../mux_window" }
 anyhow.workspace = true
 assets.workspace = true

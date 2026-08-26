@@ -52,6 +52,7 @@ use gpui::{
 use gpui_platform;
 use parking_lot::Mutex;
 use release_channel::{AppCommitSha, AppVersion, ReleaseChannel};
+use mux_window::DumpAccessibilityTree;
 use mux_window::{
     apply_mux_layout_to_workspace, focus_mux_pane_by_id, install_session_sidebar,
     install_snapshot_panes, mark_remote_mux_window_disconnected, mux_binding_for_window,
@@ -87,7 +88,8 @@ fn build_application() -> Application {
     }
 }
 
-gpui::actions!(z3rm_debug, [DumpAccessibilityTree]);
+// The z3rm_debug actions live in the shared mux_window layer so the browser
+// surface registers the same names the bundled keymap references.
 
 
 // ============================================================================

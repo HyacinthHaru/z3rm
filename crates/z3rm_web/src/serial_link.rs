@@ -125,13 +125,13 @@ pub fn on_guest_bytes(bytes: &[u8]) {
 
 /// Wait until the in-guest mux server is answering on the serial line.
 pub async fn wait_ready(ready: &AtomicBool) -> anyhow::Result<()> {
-    const TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
-    let deadline = std::time::Instant::now() + TIMEOUT;
+    const TIMEOUT: web_time::Duration = web_time::Duration::from_secs(60);
+    let deadline = web_time::Instant::now() + TIMEOUT;
     loop {
         if ready.load(Ordering::SeqCst) {
             return Ok(());
         }
-        if std::time::Instant::now() > deadline {
+        if web_time::Instant::now() > deadline {
             anyhow::bail!(
                 "the mux server inside the v86 guest never signalled ready on the serial line"
             );
