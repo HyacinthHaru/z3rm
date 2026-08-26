@@ -77,6 +77,7 @@ function waitForWasmBindings() {
 /// Render serial output to the boot terminal as a fallback when GPUI is not
 /// yet or never available.
 const decoder = new TextDecoder();
+let muxBootText = [];
 function renderSerial(bytes) {
   const node = document.getElementById("boot-terminal-output");
   if (!node) return;
@@ -97,6 +98,12 @@ async function boot() {
     bios: { url: new URL("seabios.bin", V86_ASSETS).href },
     bzimage: { url: new URL("buildroot-bzimage.bin", V86_ASSETS).href, async: false },
     cmdline: BOOT_CMDLINE,
+    // The guest's mux_server binary and start script, served over the 9p
+    // filesystem v86 exposes to the guest as tag "host9p".
+    filesystem: {
+      baseurl: new URL("./fs/", V86_ASSETS).href,
+      basefs: new URL("./fs/fs.json", V86_ASSETS).href,
+    },
     autostart: true,
     // No screen, no input devices: the terminal is the only interface, and the
     // pane owns the keyboard.
@@ -107,16 +114,48 @@ async function boot() {
 
   // Attach before anything else. The kernel starts printing during the
   // constructor, and a listener added a tick later loses the whole boot.
+  let muxReady = false;
   const batch = new SerialBatch((bytes) => {
-    // Render to the boot terminal as a fallback.
-    renderSerial(bytes);
-    // Also forward to the wasm bridge when available.
+    // Forward everything to the Rust serial link: it renders boot text via
+    // this same path until the in-guest mux server signals ready, then
+    // switches to protocol framing.
     const bindings = window.wasmBindings;
     if (bindings && typeof bindings.z3rm_v86_serial_bytes === "function") {
       bindings.z3rm_v86_serial_bytes(bytes);
     }
+    if (!muxReady) {
+      muxBootText.push(...bytes);
+      const text = decoder.decode(Uint8Array.from(muxBootText));
+      if (text.includes("Z3RM_MUX_READY")) {
+        muxReady = true;
+        muxBootText = [];
+      } else if (muxBootText.length > 8192) {
+        muxBootText = muxBootText.slice(-4096);
+      } else {
+        renderSerial(bytes);
+      }
+    }
   });
   emulator.add_listener("serial0-output-byte", (byte) => batch.push(byte));
+
+  // Once the guest shell answers, replace it with the mux server: serial0
+  // becomes the mux protocol transport the client speaks across.
+  let muxStartTyped = false;
+  emulator.add_listener("serial0-output-byte", (byte) => {
+    if (muxStartTyped) return;
+    muxBootText.push(byte);
+    if (muxBootText.length > 4096) muxBootText = muxBootText.slice(-2048);
+    const text = decoder.decode(Uint8Array.from(muxBootText), { stream: false });
+    if (text.includes("~%")) {
+      muxStartTyped = true;
+      setTimeout(() => {
+        const cmd = "/mnt/start-mux.sh\n";
+        for (const ch of cmd) {
+          emulator.bus.send("serial0-input", ch.charCodeAt(0));
+        }
+      }, 300);
+    }
+  });
 
   window.__z3rm_v86 = {
     emulator,
@@ -127,16 +166,6 @@ async function boot() {
     },
   };
 
-  // Wait for GPUI to be ready (or timeout). The boot terminal is already
-  // rendering output either way.
-  const bindings = await waitForWasmBindings();
-  if (bindings) {
-    const size = bindings.z3rm_v86_pane_size?.();
-    if (size) {
-      const [rows, cols] = size;
-      emulator.serial0_send(`stty rows ${rows} cols ${cols}\n`);
-    }
-  }
 }
 
 boot().catch((error) => {

@@ -2,7 +2,7 @@
 // 每个客户端连接一个 tokio task, 处理请求并推送通知。
 
 use anyhow::Context as _;
-#[cfg(not(target_family = "wasm"))]
+#[cfg(all(not(target_family = "wasm"), feature = "desktop"))]
 use interprocess::local_socket::tokio::Stream as LocalSocketStream;
 use mux_protocol::proto::envelope::Payload as EnvelopePayload;
 use mux_protocol::proto::fetch_grid_update_response::Update as FetchGridUpdateResponseUpdate;
@@ -13,15 +13,17 @@ use mux_protocol::{
     proto::*,
 };
 use prost::Message;
-#[cfg(not(target_family = "wasm"))]
+#[cfg(all(not(target_family = "wasm"), feature = "desktop"))]
 use sqlez::connection::Connection;
-#[cfg(target_family = "wasm")]
+#[cfg(any(target_family = "wasm", not(feature = "desktop")))]
 use crate::persistence::Connection;
 use std::collections::HashSet;
 use std::io::Read as _;
 use std::sync::Arc;
-#[cfg(not(target_family = "wasm"))]
+#[cfg(all(not(target_family = "wasm"), feature = "desktop"))]
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
+#[cfg(all(not(target_family = "wasm"), not(feature = "desktop")))]
+use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
 use crate::rt::mpsc;
 
 // §3.3 客户端角色 (Plan 33)
@@ -122,9 +124,9 @@ pub fn effective_attach_role(role: ClientRole, mode: crate::session::AttachMode)
 /// 单一 outbound mpsc channel 同时承载 Response 和 Notification:
 /// 写循环 (write_handle) 消费 channel, 把 Envelope framed 写回 socket。
 /// 这样所有写操作都在同一个 tokio task 内串行化, 避免并发 write 冲突。
-#[cfg(not(target_family = "wasm"))]
-pub async fn handle_connection(
-    stream: LocalSocketStream,
+#[cfg(all(not(target_family = "wasm")))]
+pub async fn handle_connection<S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static>(
+    stream: S,
     sessions: Arc<parking_lot::RwLock<Vec<crate::session::Session>>>,
     db: Arc<parking_lot::Mutex<Connection>>,
     clipboard: Arc<crate::clipboard::ServerClipboard>,
@@ -264,7 +266,7 @@ pub async fn handle_connection(
     Ok(())
 }
 
-#[cfg(not(target_family = "wasm"))]
+#[cfg(all(not(target_family = "wasm")))]
 async fn wait_for_connection_tasks<Cleanup, CleanupFuture>(
     mut read_handle: crate::rt::JoinHandle<anyhow::Result<()>>,
     mut write_handle: crate::rt::JoinHandle<anyhow::Result<()>>,
@@ -439,9 +441,9 @@ fn version_compatible(version: &Option<ProtocolVersion>) -> bool {
 }
 
 /// §9 从 socket 读取长度前缀帧, 解码 Envelope
-#[cfg(not(target_family = "wasm"))]
-async fn read_envelope(
-    reader: &mut tokio::io::ReadHalf<LocalSocketStream>,
+#[cfg(all(not(target_family = "wasm")))]
+async fn read_envelope<R: tokio::io::AsyncRead + Unpin>(
+    reader: &mut R,
 ) -> anyhow::Result<Envelope> {
     let mut len: u64 = 0;
     let mut shift: u32 = 0;
@@ -910,11 +912,11 @@ fn start_session_snapshot_watch(
         }
     });
 }
-#[cfg(target_family = "wasm")]
+#[cfg(any(target_family = "wasm", not(feature = "desktop")))]
 static NEXT_WASM_RUNTIME_ID: std::sync::atomic::AtomicU64 =
     std::sync::atomic::AtomicU64::new(1);
 
-#[cfg(target_family = "wasm")]
+#[cfg(any(target_family = "wasm", not(feature = "desktop")))]
 fn wasm_runtime_id(prefix: &str) -> String {
     format!(
         "{prefix}-{}",
@@ -926,9 +928,9 @@ async fn handle_create_session(
     req: &CreateSessionRequest,
     sessions: &Arc<parking_lot::RwLock<Vec<crate::session::Session>>>,
 ) -> anyhow::Result<ResponseBody> {
-    #[cfg(not(target_family = "wasm"))]
+    #[cfg(all(not(target_family = "wasm"), feature = "desktop"))]
     let id = nanoid::nanoid!();
-    #[cfg(target_family = "wasm")]
+    #[cfg(any(target_family = "wasm", not(feature = "desktop")))]
     let id = wasm_runtime_id("session");
     let mut session = crate::session::Session::new(id.clone(), req.name.clone(), req.cwd.clone());
 
@@ -1240,7 +1242,7 @@ async fn handle_attach(
         if let Some(existing) = stored.as_ref() {
             existing.clone()
         } else {
-            #[cfg(not(target_family = "wasm"))]
+            #[cfg(all(not(target_family = "wasm"), feature = "desktop"))]
             let minted = if let Some(identity) = &req.identity {
                 if !identity.client_id.is_empty() {
                     format!("{}-{}", identity.client_id, nanoid::nanoid!(8))
@@ -1250,7 +1252,7 @@ async fn handle_attach(
             } else {
                 format!("client-{}-{}", std::process::id(), nanoid::nanoid!(8))
             };
-            #[cfg(target_family = "wasm")]
+            #[cfg(any(target_family = "wasm", not(feature = "desktop")))]
             let minted = req
                 .identity
                 .as_ref()
@@ -1519,9 +1521,9 @@ async fn handle_new_window(
     if let Err(message) = ensure_mutation_allowed(sessions, connection_client_id) {
         return Ok(ResponseBody::Error(message));
     }
-    #[cfg(not(target_family = "wasm"))]
+    #[cfg(all(not(target_family = "wasm"), feature = "desktop"))]
     let window_id = format!("win-{}-{}", std::process::id(), nanoid::nanoid!());
-    #[cfg(target_family = "wasm")]
+    #[cfg(any(target_family = "wasm", not(feature = "desktop")))]
     let window_id = wasm_runtime_id("window");
 
     let sessions_r = sessions.read();
@@ -1557,9 +1559,9 @@ async fn handle_spawn_pane(
     if let Err(message) = ensure_mutation_allowed(sessions, connection_client_id) {
         return Ok(ResponseBody::Error(message));
     }
-    #[cfg(not(target_family = "wasm"))]
+    #[cfg(all(not(target_family = "wasm"), feature = "desktop"))]
     let pane_id = nanoid::nanoid!();
-    #[cfg(target_family = "wasm")]
+    #[cfg(any(target_family = "wasm", not(feature = "desktop")))]
     let pane_id = wasm_runtime_id("pane");
 
     // §3.1 转换 ShellCommand → pane::ShellCommand
@@ -1719,9 +1721,9 @@ async fn handle_split_pane(
         2 => crate::layout::SplitDirection::TopBottom,
         _ => crate::layout::SplitDirection::LeftRight,
     };
-    #[cfg(not(target_family = "wasm"))]
+    #[cfg(all(not(target_family = "wasm"), feature = "desktop"))]
     let new_pane_id = nanoid::nanoid!();
-    #[cfg(target_family = "wasm")]
+    #[cfg(any(target_family = "wasm", not(feature = "desktop")))]
     let new_pane_id = wasm_runtime_id("pane");
 
     let mut sessions_w = sessions.write();

@@ -1,0 +1,5 @@
+#!/bin/sh
+dmesg -n 1 2>/dev/null
+stty -F /dev/ttyS0 raw -echo 2>/dev/null
+echo Z3RM_MUX_READY
+exec /mnt/mux_server --serial /dev/ttyS0

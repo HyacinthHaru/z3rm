@@ -6,10 +6,10 @@
 // server there is driven by a pump from JS (see `mux_server::rt`).
 #![cfg_attr(target_family = "wasm", allow(unused))]
 
-#[cfg(target_family = "wasm")]
+#[cfg(any(target_family = "wasm", not(feature = "desktop")))]
 fn main() {}
 
-#[cfg(not(target_family = "wasm"))]
+#[cfg(all(not(target_family = "wasm"), feature = "desktop"))]
 mod daemon {
 
     use anyhow::Result;
@@ -191,7 +191,7 @@ mod daemon {
 
 }
 
-#[cfg(not(target_family = "wasm"))]
+#[cfg(all(not(target_family = "wasm"), feature = "desktop"))]
 fn main() -> anyhow::Result<()> {
     daemon::main()
 }

@@ -1,21 +1,25 @@
 // §3.1 mux_server — mux_server 守护进程库。
 // 管理 PTY、alacritty 终端模拟、layout 引擎、session 持久化。
 
-#[cfg(not(target_family = "wasm"))]
+#[cfg(all(not(target_family = "wasm"), feature = "desktop"))]
 use anyhow::{Context as _, Result};
-#[cfg(not(target_family = "wasm"))]
+#[cfg(all(not(target_family = "wasm"), not(feature = "desktop")))]
+use anyhow::Result;
+#[cfg(all(not(target_family = "wasm"), feature = "desktop"))]
 use interprocess::local_socket::tokio::Listener as LocalSocketListener;
-#[cfg(not(target_family = "wasm"))]
+#[cfg(all(not(target_family = "wasm"), feature = "desktop"))]
 use sqlez::connection::Connection;
-#[cfg(not(target_family = "wasm"))]
+#[cfg(all(not(target_family = "wasm"), feature = "desktop"))]
 use std::future::Future;
-#[cfg(not(target_family = "wasm"))]
+#[cfg(all(not(target_family = "wasm"), feature = "desktop"))]
 use std::path::{Path, PathBuf};
-#[cfg(not(target_family = "wasm"))]
+#[cfg(all(not(target_family = "wasm"), not(feature = "desktop")))]
+use std::path::PathBuf;
+#[cfg(all(not(target_family = "wasm"), feature = "desktop"))]
 use std::pin::Pin;
-#[cfg(not(target_family = "wasm"))]
+#[cfg(all(not(target_family = "wasm"), feature = "desktop"))]
 use std::sync::atomic::{AtomicUsize, Ordering};
-#[cfg(not(target_family = "wasm"))]
+#[cfg(all(not(target_family = "wasm"), feature = "desktop"))]
 use std::time::{Duration};
 use web_time::SystemTime;
 
@@ -23,7 +27,9 @@ use web_time::SystemTime;
 pub mod connection;
 pub mod pty;
 pub mod rt;
-#[cfg(target_family = "wasm")]
+#[cfg(all(not(target_family = "wasm"), feature = "guest"))]
+pub mod serial;
+#[cfg(any(target_family = "wasm", not(feature = "desktop")))]
 mod wasm_stubs;
 #[cfg(target_family = "wasm")]
 pub mod wasm_server;
@@ -32,21 +38,21 @@ mod server_settings;
 pub mod clipboard;
 pub mod coalescing;
 pub mod dec2026;
-#[cfg(not(target_family = "wasm"))]
+#[cfg(all(not(target_family = "wasm"), feature = "desktop"))]
 pub mod extension_host;
-#[cfg(target_family = "wasm")]
+#[cfg(any(target_family = "wasm", not(feature = "desktop")))]
 pub use wasm_stubs::extension_host;
 pub mod grid_sync;
 pub mod layout;
 pub mod pane;
-#[cfg(not(target_family = "wasm"))]
+#[cfg(all(not(target_family = "wasm"), feature = "desktop"))]
 pub mod persistence;
-#[cfg(target_family = "wasm")]
+#[cfg(any(target_family = "wasm", not(feature = "desktop")))]
 pub use wasm_stubs::persistence;
 mod shell_integration;
-#[cfg(not(target_family = "wasm"))]
+#[cfg(all(not(target_family = "wasm"), feature = "desktop"))]
 pub mod snapshot;
-#[cfg(target_family = "wasm")]
+#[cfg(any(target_family = "wasm", not(feature = "desktop")))]
 pub use wasm_stubs::snapshot;
 
 pub mod session;
@@ -58,7 +64,7 @@ mod tests;
 // ============================================================================
 
 /// 获取日志目录路径 (§16.12)
-#[cfg(not(target_family = "wasm"))]
+#[cfg(all(not(target_family = "wasm")))]
 pub(crate) fn get_log_dir() -> PathBuf {
     if cfg!(target_os = "macos") {
         dirs::home_dir()
@@ -74,12 +80,12 @@ pub(crate) fn get_log_dir() -> PathBuf {
 }
 
 /// §16.12 日志文件路径 (主文件)
-#[cfg(not(target_family = "wasm"))]
+#[cfg(all(not(target_family = "wasm")))]
 static LOG_FILE_PATH: std::sync::LazyLock<PathBuf> =
     std::sync::LazyLock::new(|| get_log_dir().join("mux-server.log"));
 
 /// §16.12 日志轮转路径 (旧文件)
-#[cfg(not(target_family = "wasm"))]
+#[cfg(all(not(target_family = "wasm")))]
 static LOG_FILE_ROTATE: std::sync::LazyLock<PathBuf> =
     std::sync::LazyLock::new(|| get_log_dir().join("mux-server.log.old"));
 
@@ -89,7 +95,7 @@ static LOG_FILE_ROTATE: std::sync::LazyLock<PathBuf> =
 /// 继承 stderr 会把日志喷到 GUI 启动终端 (spec §16.14)。
 /// 调试时用 `tail -f ~/.local/share/z3rm/logs/mux-server.log`。
 /// 显式调试可用 `--verbose` flag 开启 stderr。
-#[cfg(not(target_family = "wasm"))]
+#[cfg(all(not(target_family = "wasm")))]
 pub fn setup_logging() -> Result<()> {
     // §16.14 初始化 zlog 框架
     zlog::init();
@@ -115,7 +121,7 @@ pub fn setup_logging() -> Result<()> {
 
 /// 默认 socket 路径: $XDG_RUNTIME_DIR/z3rm/mux.sock (Unix §16.1)
 /// 或 \\.\pipe\z3rm-mux (Windows)
-#[cfg(not(target_family = "wasm"))]
+#[cfg(all(not(target_family = "wasm"), feature = "desktop"))]
 fn default_socket_name() -> Result<interprocess::local_socket::Name<'static>> {
     use interprocess::local_socket::{GenericFilePath, GenericNamespaced, prelude::*};
     if let Ok(path) = std::env::var("Z3RM_MUX_SOCKET") {
@@ -149,7 +155,7 @@ fn default_socket_name() -> Result<interprocess::local_socket::Name<'static>> {
 /// §16.1 Unix socket 文件系统路径 (绑定后设置 0600 权限用)。
 /// 与 default_socket_name 同源: 优先 $Z3RM_MUX_SOCKET, 否则 $XDG_RUNTIME_DIR/z3rm/mux.sock。
 #[cfg(unix)]
-#[cfg(not(target_family = "wasm"))]
+#[cfg(all(not(target_family = "wasm"), feature = "desktop"))]
 fn unix_socket_path() -> Option<std::path::PathBuf> {
     if let Ok(p) = std::env::var("Z3RM_MUX_SOCKET") {
         return Some(std::path::PathBuf::from(p));
@@ -162,7 +168,7 @@ fn unix_socket_path() -> Option<std::path::PathBuf> {
     )
 }
 
-#[cfg(not(target_family = "wasm"))]
+#[cfg(all(not(target_family = "wasm"), feature = "desktop"))]
 async fn bind_socket(name: &interprocess::local_socket::Name<'_>) -> Result<LocalSocketListener> {
     use interprocess::local_socket::tokio::prelude::*;
     let listener = LocalSocketListener::from_options(
@@ -198,14 +204,14 @@ async fn bind_socket(name: &interprocess::local_socket::Name<'_>) -> Result<Loca
 /// marker the live owner holds; a starter that cannot place it knows another
 /// daemon already owns the socket and must not reclaim it.
 #[cfg(unix)]
-#[cfg(not(target_family = "wasm"))]
+#[cfg(all(not(target_family = "wasm"), feature = "desktop"))]
 struct SocketSidecars {
     pid: PathBuf,
     lock: PathBuf,
 }
 
 #[cfg(unix)]
-#[cfg(not(target_family = "wasm"))]
+#[cfg(all(not(target_family = "wasm"), feature = "desktop"))]
 fn socket_sidecars(socket_path: &Path) -> SocketSidecars {
     let mut pid = socket_path.as_os_str().to_owned();
     pid.push(".pid");
@@ -225,7 +231,7 @@ fn socket_sidecars(socket_path: &Path) -> SocketSidecars {
 /// prior daemon died without cleanup" answer is `ESRCH`, which we read as
 /// "owner gone, safe to reclaim".
 #[cfg(unix)]
-#[cfg(not(target_family = "wasm"))]
+#[cfg(all(not(target_family = "wasm"), feature = "desktop"))]
 fn owner_process_alive(pid: u32) -> bool {
     let Ok(pid) = libc::pid_t::try_from(pid) else {
         return false;
@@ -244,7 +250,7 @@ fn owner_process_alive(pid: u32) -> bool {
 ///parses. A missing or malformed file means "no recorded owner", which the
 /// caller treats as "stale" only together with a failed connect probe.
 #[cfg(unix)]
-#[cfg(not(target_family = "wasm"))]
+#[cfg(all(not(target_family = "wasm"), feature = "desktop"))]
 fn read_owner_metadata(socket_path: &Path) -> Option<OwnerMetadata> {
     let sidecars = socket_sidecars(socket_path);
     let contents = std::fs::read_to_string(&sidecars.pid).ok()?;
@@ -255,7 +261,7 @@ fn read_owner_metadata(socket_path: &Path) -> Option<OwnerMetadata> {
 }
 
 #[cfg(unix)]
-#[cfg(not(target_family = "wasm"))]
+#[cfg(all(not(target_family = "wasm"), feature = "desktop"))]
 struct OwnerMetadata {
     pid: u32,
     boot_secs: u64,
@@ -267,7 +273,7 @@ struct OwnerMetadata {
 /// because `bind` would follow it and leave the real target owned by an
 /// attacker. `stat` would defeat that check.
 #[cfg(unix)]
-#[cfg(not(target_family = "wasm"))]
+#[cfg(all(not(target_family = "wasm"), feature = "desktop"))]
 enum SocketInodeState {
     /// No inode at the path — clean bind target.
     Missing,
@@ -280,7 +286,7 @@ enum SocketInodeState {
 }
 
 #[cfg(unix)]
-#[cfg(not(target_family = "wasm"))]
+#[cfg(all(not(target_family = "wasm"), feature = "desktop"))]
 fn classify_socket_inode(socket_path: &Path) -> SocketInodeState {
     use std::os::unix::fs::{FileTypeExt as _, MetadataExt as _};
     let metadata = match std::fs::symlink_metadata(socket_path) {
@@ -322,7 +328,7 @@ fn classify_socket_inode(socket_path: &Path) -> SocketInodeState {
 }
 
 #[cfg(unix)]
-#[cfg(not(target_family = "wasm"))]
+#[cfg(all(not(target_family = "wasm"), feature = "desktop"))]
 fn nix_uid() -> u32 {
     // Safety: getuid takes no arguments and returns the calling process' uid.
     unsafe { libc::getuid() }
@@ -333,7 +339,7 @@ fn nix_uid() -> u32 {
 /// refused connect alone is not enough — a slow-to-start daemon or a kernel
 /// backlog stalling the connect would let a second starter steal the socket.
 #[cfg(unix)]
-#[cfg(not(target_family = "wasm"))]
+#[cfg(all(not(target_family = "wasm"), feature = "desktop"))]
 fn socket_accepts_connection(socket_path: &Path) -> bool {
     use std::os::unix::net::UnixStream;
     UnixStream::connect(socket_path).is_ok()
@@ -344,7 +350,7 @@ fn socket_accepts_connection(socket_path: &Path) -> bool {
 /// The pidfile is the startup claim `z3rm-server status` and the next startup
 /// read to decide whether the recorded owner is still alive.
 #[cfg(unix)]
-#[cfg(not(target_family = "wasm"))]
+#[cfg(all(not(target_family = "wasm"), feature = "desktop"))]
 fn write_pidfile(socket_path: &Path, boot: SystemTime) -> Result<()> {
     let sidecars = socket_sidecars(socket_path);
     let parent = sidecars.pid.parent().ok_or_else(|| {
@@ -381,7 +387,7 @@ fn write_pidfile(socket_path: &Path, boot: SystemTime) -> Result<()> {
 /// durable across a crash. Best-effort: a failure here must not block start,
 /// because some tmpfs setups (and CI sandboxes) reject directory fsync.
 #[cfg(unix)]
-#[cfg(not(target_family = "wasm"))]
+#[cfg(all(not(target_family = "wasm"), feature = "desktop"))]
 fn fsync_parent(path: &Path) {
     let Some(parent) = path.parent() else { return };
     match std::fs::File::open(parent) {
@@ -403,7 +409,7 @@ fn fsync_parent(path: &Path) {
 /// Called on graceful shutdown and after reclaiming a stale socket, so the
 /// next startup sees a clean dir and does not misread a dead owner's record.
 #[cfg(unix)]
-#[cfg(not(target_family = "wasm"))]
+#[cfg(all(not(target_family = "wasm"), feature = "desktop"))]
 fn remove_sidecars(socket_path: &Path) {
     let sidecars = socket_sidecars(socket_path);
     for file in [sidecars.pid.as_path(), sidecars.lock.as_path()] {
@@ -426,7 +432,7 @@ fn remove_sidecars(socket_path: &Path) {
 /// and boot timestamp so `z3rm-server status` and the next startup agree on
 /// ownership. On Windows named pipes are ephemeral, so the trust check is a
 /// no-op and stale cleanup is unnecessary.
-#[cfg(not(target_family = "wasm"))]
+#[cfg(all(not(target_family = "wasm"), feature = "desktop"))]
 pub async fn bind_or_cleanup(
     name: &interprocess::local_socket::Name<'_>,
 ) -> Result<LocalSocketListener> {
@@ -451,7 +457,7 @@ pub async fn bind_or_cleanup(
 }
 
 #[cfg(unix)]
-#[cfg(not(target_family = "wasm"))]
+#[cfg(all(not(target_family = "wasm"), feature = "desktop"))]
 async fn reclaim_or_refuse(
     socket_path: &Path,
     name: &interprocess::local_socket::Name<'_>,
@@ -498,7 +504,7 @@ async fn reclaim_or_refuse(
         }
     }
 }
-#[cfg(not(target_family = "wasm"))]
+#[cfg(all(not(target_family = "wasm"), feature = "desktop"))]
 fn init_database(db_path: &Path) -> Result<Connection> {
     let db = Connection::open_file(db_path.to_str().unwrap_or("file::memory:?mode=memory"));
     // §3.6 初始化持久化表
@@ -516,7 +522,7 @@ pub struct ShutdownState {
     pub acked: std::sync::Arc<crate::rt::Notify>,
 }
 
-#[cfg(not(target_family = "wasm"))]
+#[cfg(all(not(target_family = "wasm"), feature = "desktop"))]
 pub fn run() -> Result<()> {
     // §16.12 初始化日志系统
     setup_logging()?;
@@ -631,7 +637,7 @@ pub fn run() -> Result<()> {
 }
 
 /// 服务器主结构 (§3.1)
-#[cfg(not(target_family = "wasm"))]
+#[cfg(all(not(target_family = "wasm"), feature = "desktop"))]
 pub struct Server {
     // §3.2 session 注册表
     sessions: std::sync::Arc<parking_lot::RwLock<Vec<session::Session>>>,
@@ -650,7 +656,7 @@ pub struct Server {
     // §3.5 active connection counter — drives the idle-shutdown timer
     active_connections: std::sync::Arc<AtomicUsize>,
 }
-#[cfg(not(target_family = "wasm"))]
+#[cfg(all(not(target_family = "wasm"), feature = "desktop"))]
 impl Server {
     async fn run(self, listener: LocalSocketListener) -> Result<()> {
         // §16.11 Hot-reload server.json → scrollback capacity on live panes.
@@ -766,7 +772,7 @@ impl Server {
 /// so it stays dormant inside `tokio::select!` until a connection event
 /// wins the race. This avoids the need for conditional branching inside
 /// the select! — the branch is always present but inert when disabled.
-#[cfg(not(target_family = "wasm"))]
+#[cfg(all(not(target_family = "wasm"), feature = "desktop"))]
 fn idle_sleep(deadline: Option<tokio::time::Instant>) -> Pin<Box<dyn Future<Output = ()> + Send>> {
     match deadline {
         // Never resolves — far-future deadline keeps the select! branch inert.

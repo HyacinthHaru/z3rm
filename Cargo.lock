@@ -7595,7 +7595,6 @@ dependencies = [
  "wasm-bindgen-futures",
  "web-time",
  "zlog",
- "zlog_settings",
 ]
 
 [[package]]
@@ -17150,6 +17149,7 @@ dependencies = [
  "git",
  "git_hosting_providers",
  "git_ui",
+ "gloo-timers",
  "gpui",
  "js-sys",
  "language",

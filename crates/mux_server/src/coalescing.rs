@@ -535,16 +535,16 @@ mod tests {
 /// to release paths that have been quiet for `DEBOUNCE_WINDOW`. While a path
 /// is being debounced, `note` updates the latest trigger/content hint, so the
 /// released event always reflects the most recent fs state.
-#[cfg(not(target_family = "wasm"))]
+#[cfg(all(not(target_family = "wasm"), feature = "desktop"))]
 pub struct PathDebouncer {
     pending: HashMap<std::path::PathBuf, (shadow_snapshot::SnapshotTrigger, Instant)>,
 }
 
 /// §4.7 debounce window for filesystem snapshotting.
-#[cfg(not(target_family = "wasm"))]
+#[cfg(all(not(target_family = "wasm"), feature = "desktop"))]
 const DEBOUNCE_WINDOW: Duration = Duration::from_millis(500);
 
-#[cfg(not(target_family = "wasm"))]
+#[cfg(all(not(target_family = "wasm"), feature = "desktop"))]
 impl PathDebouncer {
     pub fn new() -> Self {
         Self {

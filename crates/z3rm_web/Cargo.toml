@@ -14,6 +14,7 @@ test = false
 doctest = false
 
 [dependencies]
+gloo-timers = { version = "0.3", features = ["futures"] }
 mux_window = { path = "../mux_window" }
 anyhow.workspace = true
 assets.workspace = true
@@ -29,7 +30,7 @@ language.workspace = true
 log.workspace = true
 mux.workspace = true
 mux_protocol.workspace = true
-mux_server.workspace = true
+mux_server = { path = "../mux_server", default-features = false }
 project.workspace = true
 recent_projects.workspace = true
 release_channel.workspace = true

@@ -131,9 +131,9 @@ fn resolve_settings_path() -> Option<PathBuf> {
     }
     // A browser tab has no home directory to fall back to; only an explicit
     // env override can name a settings path there.
-    #[cfg(not(target_family = "wasm"))]
+    #[cfg(all(not(target_family = "wasm"), feature = "desktop"))]
     let home_config = dirs::home_dir().map(|home| home.join(".config"));
-    #[cfg(target_family = "wasm")]
+    #[cfg(any(target_family = "wasm", not(feature = "desktop")))]
     let home_config: Option<PathBuf> = None;
     let config = std::env::var("XDG_CONFIG_HOME")
         .map(PathBuf::from)

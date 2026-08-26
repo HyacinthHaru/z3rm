@@ -119,12 +119,12 @@ pub struct SyncScrollbackState {
 impl Session {
     /// 创建新 session (§3.2)
     pub fn new(id: String, name: String, cwd: String) -> Self {
-        #[cfg(not(target_family = "wasm"))]
+        #[cfg(all(not(target_family = "wasm"), feature = "desktop"))]
         let created_timestamp = web_time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap_or_default()
             .as_millis() as u64;
-        #[cfg(target_family = "wasm")]
+        #[cfg(any(target_family = "wasm", not(feature = "desktop")))]
         let created_timestamp = 0;
 
         Self {

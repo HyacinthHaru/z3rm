@@ -18,6 +18,7 @@ use std::sync::Arc;
 use util::ResultExt as _;
 
 mod local_server;
+mod serial_link;
 mod v86_bridge;
 
 pub use local_server::LocalMuxServer;
@@ -30,9 +31,9 @@ pub fn version() -> &'static str {
 ///
 /// Dropping the server closes the client's end of the pipe, so it has to
 /// outlive the window rather than the function that started it.
-struct GlobalLocalServer(#[expect(dead_code)] LocalMuxServer);
+struct GlobalSerialLink(#[expect(dead_code)] Arc<std::sync::atomic::AtomicBool>);
 
-impl gpui::Global for GlobalLocalServer {}
+impl gpui::Global for GlobalSerialLink {}
 
 /// Bring the application up and open the window.
 ///
@@ -69,15 +70,16 @@ pub fn boot(cx: &mut App) {
         cx,
     );
 
-    let (server, domain) = match local_server::start() {
-        Ok(started) => started,
+    // The mux server runs inside the v86 guest; the domain speaks the same
+    // framed protocol across the serial link.
+    let (domain, link_ready) = match serial_link::install() {
+        Ok(installed) => installed,
         Err(error) => {
-            log::error!("could not start the in-tab mux server: {error:#}");
+            log::error!("could not install the serial link to the guest: {error:#}");
             return;
         }
     };
-    let mux_server = server.server().clone();
-    cx.set_global(GlobalLocalServer(server));
+    cx.set_global(GlobalSerialLink(link_ready.clone()));
 
     // §wasm-boot The scheduler cannot block on wasm, so the session (which the
     // desktop `block_on`s against SQLite) is awaited inside this boot task; the
@@ -101,7 +103,12 @@ pub fn boot(cx: &mut App) {
             git_ui::init(cx);
             recent_projects::init(cx);
         });
-        if let Err(error) = open_window(app_state, domain, mux_server, cx).await {
+        // Nothing to attach to until the guest's mux server answers.
+        if let Err(error) = serial_link::wait_ready(&link_ready).await {
+            log::error!("{error:#}");
+            return;
+        }
+        if let Err(error) = open_window(app_state, domain, cx).await {
             log::error!("could not open the z3rm window: {error:#}");
         }
     })
@@ -139,20 +146,10 @@ async fn build_app_state(
 async fn open_window(
     app_state: Arc<workspace::AppState>,
     domain: Arc<mux::MuxDomain>,
-    mux_server: Arc<mux_server::wasm_server::WasmMuxServer>,
     cx: &mut gpui::AsyncApp,
 ) -> Result<WindowHandle<workspace::MultiWorkspace>> {
     let (_session_id, attach) = local_server::open_session(&domain).await?;
     let snapshot = workspace::layout_projection::MuxSnapshot::from_attach(&attach);
-
-    // §3.1 The pane has a pty but nothing on the far end of it until the page's
-    // emulator is bridged in. A page that never boots one leaves the pane empty,
-    // which is the honest rendering of a terminal with no guest.
-    if let Some(pane_id) = snapshot.pane_ids.first() {
-        if !v86_bridge::attach(&mux_server, pane_id) {
-            log::warn!("pane {pane_id} is not on the server; the guest bridge is not connected");
-        }
-    }
 
     let open_window = cx.update(|cx| {
         workspace::Workspace::new_local(
