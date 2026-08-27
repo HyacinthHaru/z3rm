@@ -274,6 +274,93 @@ fn test_pane_bell_notification() {
     ));
 }
 
+// §9 验证 PaneMedia 通知 round-trip: 媒体字节、尺寸与时间戳必须逐字段回归。
+#[test]
+fn test_pane_media_notification_round_trip() {
+    let media = PaneMedia {
+        pane_id: "v86-1".into(),
+        media_type: "image/png".into(),
+        data: [0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A].to_vec(), // PNG magic prefix
+        width: 800,
+        height: 600,
+        timestamp_ms: 1_724_702_400_000,
+    };
+
+    let env = Envelope {
+        version: Some(PROTOCOL_VERSION),
+        payload: Some(proto::envelope::Payload::Notification(Notification {
+            event: Some(proto::notification::Event::PaneMedia(media.clone())),
+        })),
+    };
+
+    let framed = frame(&env).unwrap();
+    let (decoded, consumed) = unframe(&framed).unwrap();
+    assert_eq!(consumed, framed.len());
+
+    let payload = decoded.payload.expect("payload missing");
+    let Notification { event } = match payload {
+        proto::envelope::Payload::Notification(n) => n,
+        _ => panic!("expected Notification"),
+    };
+    let proto::notification::Event::PaneMedia(decoded_media) = event.expect("event missing")
+    else {
+        panic!("expected PaneMedia event")
+    };
+    assert_eq!(decoded_media.pane_id, "v86-1");
+    assert_eq!(decoded_media.media_type, "image/png");
+    assert_eq!(decoded_media.data, [0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A]);
+    assert_eq!(decoded_media.width, 800);
+    assert_eq!(decoded_media.height, 600);
+    assert_eq!(decoded_media.timestamp_ms, 1_724_702_400_000);
+}
+
+// §9 验证 PaneAction 通知 round-trip: action_name 与 JSON payload 字节必须回归。
+#[test]
+fn test_pane_action_notification_round_trip() {
+    let payload_bytes = r#"{"key":"ControlLeft","event":"keydown"}"#.as_bytes().to_vec();
+
+    let env = Envelope {
+        version: Some(PROTOCOL_VERSION),
+        payload: Some(proto::envelope::Payload::Notification(Notification {
+            event: Some(proto::notification::Event::PaneAction(PaneAction {
+                pane_id: "v86-1".into(),
+                action_name: "guest_key_event".into(),
+                payload: payload_bytes.clone(),
+                timestamp_ms: 42_001,
+            })),
+        })),
+    };
+
+    let framed = frame(&env).unwrap();
+    let (decoded, consumed) = unframe(&framed).unwrap();
+    assert_eq!(consumed, framed.len());
+
+    let payload = decoded.payload.expect("payload missing");
+    let Notification { event } = match payload {
+        proto::envelope::Payload::Notification(n) => n,
+        _ => panic!("expected Notification"),
+    };
+    let proto::notification::Event::PaneAction(decoded_action) =
+        event.expect("event missing")
+    else {
+        panic!("expected PaneAction event")
+    };
+    assert_eq!(decoded_action.pane_id, "v86-1");
+    assert_eq!(decoded_action.action_name, "guest_key_event");
+    assert_eq!(decoded_action.payload, payload_bytes);
+    assert_eq!(decoded_action.timestamp_ms, 42_001);
+}
+
+// §9 验证 ProtocolVersion 增量字段 (minor) 已被 bump, 反映新增 PaneMedia/PaneAction 通知。
+#[test]
+fn test_protocol_version_minor_bumped_for_media_and_action() {
+    assert_eq!(PROTOCOL_VERSION.major, 1);
+    assert!(
+        PROTOCOL_VERSION.minor >= 6,
+        "minor version should reflect additive PaneMedia/PaneAction notifications"
+    );
+}
+
 // §4 验证 FileVersion 消息直接编码/解码（version_id / seq_no / trigger）。
 #[test]
 fn test_file_version_round_trip() {

@@ -675,6 +675,8 @@ message Notification {
         PaneOutputChunk pane_output = 14;
         PaneTitleChanged pane_title_changed = 15;
         PaneBell pane_bell = 16;
+        PaneMedia pane_media = 17;
+        PaneAction pane_action = 18;
     }
 }
 
@@ -748,6 +750,34 @@ message PaneTitleChanged {
 // §9 / §15.13 Pane 终端铃声通知 (终端 BEL 字符, §15.13 BSU timeout 100ms)。
 message PaneBell {
     string pane_id = 1;
+}
+
+// §9 / §3.3 Pane 多媒体通知：用于承载 v86 之类 guest 终端从 canvas / framebuffer
+// 发出的二进制媒体片段 (通常是 PNG 截图)。字段与 v86 runtime 的
+// screen_make_screenshot 语义对齐: media_type 是 MIME 标签 (如 "image/png"),
+// data 是原始字节, width/height 是画面像素尺寸, timestamp_ms 是服务端生成
+// 该媒体的单调时钟 (毫秒), 用于客户端排序与去重。客户端不解析 data 内容;
+// 它把数据透传给本地渲染器。
+message PaneMedia {
+    string pane_id = 1;
+    string media_type = 2;
+    bytes data = 3;
+    uint32 width = 4;
+    uint32 height = 5;
+    uint64 timestamp_ms = 6;
+}
+
+// §9 / §3.3 Pane 动作通知：用于承载 v86 之类 guest 终端发出的结构化动作
+// (例如键盘按键映射、截图请求、鼠标手势)。action_name 是稳定的 action
+// 字符串键 (例如 "guest_screenshot_requested"、"guest_key_event");
+// payload 是服务端签名、客户端透传的 JSON 字节负载 —— 客户端只负责把
+// (pane_id, action_name, payload) 三元组转发给本地 guest 宿主, 服务端
+// 决定语义与校验。timestamp_ms 同样用于客户端排序与去重。
+message PaneAction {
+    string pane_id = 1;
+    string action_name = 2;
+    bytes payload = 3;
+    uint64 timestamp_ms = 4;
 }
 
 
