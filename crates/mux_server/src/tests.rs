@@ -718,6 +718,7 @@ fn test_pane_creation() {
 }
 
 /// §3.10 Pane: resize
+#[test]
 fn test_pane_resize() {
     let pane = crate::pane::Pane::spawn(
         "pane-1".to_string(),
