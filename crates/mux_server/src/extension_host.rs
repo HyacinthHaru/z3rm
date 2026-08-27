@@ -1201,7 +1201,10 @@ impl ServerExtensionHost {
                 }),
             ),
             Event::ClipboardChanged(_) => ("clipboard", serde_json::Value::Null),
-            Event::SyncScrollback(_) | Event::ExtensionChrome(_) => return,
+            Event::SyncScrollback(_)
+            | Event::ExtensionChrome(_)
+            | Event::PaneMedia(_)
+            | Event::PaneAction(_) => return,
         };
         self.emit_event(name, payload);
     }
