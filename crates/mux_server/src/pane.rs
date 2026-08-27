@@ -34,6 +34,19 @@ use std::io::{Read, Write};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use web_time::Instant;
+/// §16.13 A slow connection setup must not lose typed events, but a pane
+/// without a session must not accumulate an unbounded queue while unobserved.
+const MAX_PENDING_TYPED_EVENTS: usize = 256;
+
+enum PendingTypedEvent {
+    Media(PaneMedia),
+    Action(PaneAction),
+}
+
+struct PendingTypedEvents {
+    queue: VecDeque<PendingTypedEvent>,
+    draining: bool,
+}
 
 /// §3.1 真正拥有 alacritty Term + PTY pair 的 Pane (server-canonical)。
 pub struct Pane {
@@ -129,6 +142,9 @@ pub struct Pane {
     media_hook: parking_lot::Mutex<Option<Arc<dyn Fn(Vec<PaneMedia>) + Send + Sync>>>,
     /// §16.13 Observer for each `PaneAction`, in sequence order.
     action_hook: parking_lot::Mutex<Option<Arc<dyn Fn(Vec<PaneAction>) + Send + Sync>>>,
+    /// §16.13 Typed events buffered while a session-scoped hook is being
+    /// installed. The queue is bounded and only used for panes with a session.
+    pending_typed_events: parking_lot::Mutex<PendingTypedEvents>,
 }
 /// §3.3 Pane 事件收集器 — alacritty `EventListener` 的实现。
 ///
@@ -649,6 +665,13 @@ fn parse_osc133_payload(payload: &[u8]) -> Option<(ShellMarkerKind, Option<i32>)
     Some((kind, exit_code))
 }
 
+#[derive(Clone, Copy)]
+struct PendingMediaCursor {
+    image_id: u32,
+    row: i32,
+    column: u32,
+}
+
 /// §3.3 PTY read-loop 本地状态: DEC-2026 同步延迟 + coalescing 通知节流。
 /// 仅在单一 PTY read 线程内顺序访问, 无需同步原语。
 pub(crate) struct ReadLoopState {
@@ -678,6 +701,9 @@ pub(crate) struct ReadLoopState {
     media: Vec<PaneMedia>,
     /// §16.13 Completed actions from the last batch, indexed by `scan_events`.
     actions: Vec<PaneAction>,
+    /// Cursor captured at the initial `m=1,a=T` chunk, retained until the
+    /// matching final media event arrives (which may be a later PTY feed).
+    pending_media_cursor: Option<PendingMediaCursor>,
 }
 
 impl Default for ReadLoopState {
@@ -693,6 +719,7 @@ impl Default for ReadLoopState {
             pending_full_snapshot: false,
             pending_notify: false,
             terminal_scanner: TerminalMediaScanner::new(),
+            pending_media_cursor: None,
             scan_events: Vec::new(),
             media: Vec::new(),
             actions: Vec::new(),
@@ -922,6 +949,10 @@ impl Pane {
             media_sequence: AtomicU64::new(0),
             media_hook: parking_lot::Mutex::new(None),
             action_hook: parking_lot::Mutex::new(None),
+            pending_typed_events: parking_lot::Mutex::new(PendingTypedEvents {
+                queue: VecDeque::new(),
+                draining: false,
+            }),
             #[cfg(target_family = "wasm")]
             guest_output_state: parking_lot::Mutex::new((
                 Dec2026Parser::new(),
@@ -1093,6 +1124,7 @@ impl Pane {
                 &state.osc_events,
                 &state.scan_events,
                 &mut state.terminal_processor,
+                &mut state.pending_media_cursor,
             );
             let after = (
                 term.grid().cursor.point,
@@ -1219,6 +1251,7 @@ impl Pane {
         events: &[OscEvent],
         media_events: &[ScanEvent],
         processor: &mut Processor<StdSyncHandler>,
+        pending_media_cursor: &mut Option<PendingMediaCursor>,
     ) -> (RowAddressing, Vec<(usize, i32, u32)>) {
         let mut addressing = RowAddressing {
             viewport_top: self.viewport_top_absolute.load(Ordering::Acquire),
@@ -1232,17 +1265,23 @@ impl Pane {
         let epoch = self.row_addressing_epoch.load(Ordering::Acquire);
 
         // §16.13 Merge OSC 133 marker boundaries with Kitty event offsets into
-        // one sorted walk so the cursor is read at each event's exact grid
-        // position instead of at the batch end. The two offsets come from the
-        // same grid-safe stream, so they compare directly.
+        // one sorted walk. A continuation's final media event is retained as
+        // a boundary even though its cursor was captured by an earlier event;
+        // this lets pending cursor state be consumed in exact event order.
         enum Boundary {
             Marker {
                 kind: ShellMarkerKind,
                 exit_code: Option<i32>,
             },
+            Placement {
+                image_id: u32,
+                action: Option<u8>,
+            },
             Media {
                 index: usize,
+                image_id: u32,
                 action: Option<u8>,
+                placement_from_pending: bool,
             },
         }
         let mut boundaries: Vec<(usize, Boundary)> = Vec::new();
@@ -1263,19 +1302,34 @@ impl Pane {
             }
         }
         for event in media_events {
-            if let ScanEvent::Media {
-                index,
-                grid_offset,
-                action,
-            } = event
-            {
-                boundaries.push((
+            match event {
+                ScanEvent::Placement {
+                    image_id,
+                    grid_offset,
+                    action,
+                } => boundaries.push((
+                    *grid_offset,
+                    Boundary::Placement {
+                        image_id: *image_id,
+                        action: *action,
+                    },
+                )),
+                ScanEvent::Media {
+                    index,
+                    image_id,
+                    grid_offset,
+                    action,
+                    placement_from_pending,
+                } => boundaries.push((
                     *grid_offset,
                     Boundary::Media {
                         index: *index,
+                        image_id: *image_id,
                         action: *action,
+                        placement_from_pending: *placement_from_pending,
                     },
-                ));
+                )),
+                ScanEvent::Action { .. } => {}
             }
         }
         boundaries.sort_by_key(|(offset, _)| *offset);
@@ -1287,12 +1341,49 @@ impl Pane {
                 Boundary::Marker { kind, exit_code } => {
                     self.record_shell_marker(term, kind, exit_code, addressing.viewport_top, epoch);
                 }
-                Boundary::Media { index, action } => {
+                Boundary::Placement { image_id, action } => {
                     if action == Some(b'T') {
                         let cursor = term.grid().cursor.point;
-                        let row = cursor.line.0;
-                        let column = u32::try_from(cursor.column.0).unwrap_or(u32::MAX);
-                        media_cursor.push((index, row, column));
+                        *pending_media_cursor = Some(PendingMediaCursor {
+                            image_id,
+                            row: cursor.line.0,
+                            column: u32::try_from(cursor.column.0).unwrap_or(u32::MAX),
+                        });
+                    }
+                }
+                Boundary::Media {
+                    index,
+                    image_id,
+                    action,
+                    placement_from_pending,
+                } => {
+                    if action != Some(b'T') {
+                        continue;
+                    }
+                    if placement_from_pending {
+                        if let Some(cursor) = pending_media_cursor.take() {
+                            if cursor.image_id == image_id {
+                                media_cursor.push((index, cursor.row, cursor.column));
+                            } else {
+                                tracing::warn!(
+                                    "terminal media: pending cursor image {} did not match final image {}",
+                                    cursor.image_id,
+                                    image_id
+                                );
+                                *pending_media_cursor = Some(cursor);
+                            }
+                        } else {
+                            tracing::warn!(
+                                "terminal media: missing pending cursor for image {image_id}"
+                            );
+                        }
+                    } else {
+                        let cursor = term.grid().cursor.point;
+                        media_cursor.push((
+                            index,
+                            cursor.line.0,
+                            u32::try_from(cursor.column.0).unwrap_or(u32::MAX),
+                        ));
                     }
                 }
             }
@@ -1460,11 +1551,12 @@ impl Pane {
             )),
         });
     }
-    /// §16.13 Deliver completed media/actions to the pane's observers in
-    /// cross-type arrival order, each stamped with a per-pane monotonic
-    /// sequence shared by media and actions. Runs after the batch's
-    /// emulator/generation state is committed and without holding `commit`.
+    /// §16.13 Queue completed media/actions in cross-type arrival order, each
+    /// stamped with the one per-pane monotonic sequence shared by both types.
+    /// The queue drains only through hooks that are currently installed; a
+    /// session-scoped pane retains a bounded queue across late registration.
     fn dispatch_media_events(&self, state: &ReadLoopState) {
+        let mut events = Vec::with_capacity(state.scan_events.len());
         for event in &state.scan_events {
             match event {
                 ScanEvent::Media { index, .. } => {
@@ -1477,10 +1569,7 @@ impl Pane {
                         .media_sequence
                         .fetch_add(1, Ordering::AcqRel)
                         .saturating_add(1);
-                    let hook = self.media_hook.lock().clone();
-                    if let Some(hook) = hook {
-                        hook(vec![media]);
-                    }
+                    events.push(PendingTypedEvent::Media(media));
                 }
                 ScanEvent::Action { index, .. } => {
                     let Some(action) = state.actions.get(*index) else {
@@ -1492,9 +1581,82 @@ impl Pane {
                         .media_sequence
                         .fetch_add(1, Ordering::AcqRel)
                         .saturating_add(1);
+                    events.push(PendingTypedEvent::Action(action));
+                }
+                ScanEvent::Placement { .. } => {}
+            }
+        }
+        self.enqueue_typed_events(events);
+    }
+
+    fn enqueue_typed_events(&self, events: Vec<PendingTypedEvent>) {
+        let has_session = self.session_id.lock().is_some();
+        let media_hook_present = self.media_hook.lock().is_some();
+        let action_hook_present = self.action_hook.lock().is_some();
+        let mut pending = self.pending_typed_events.lock();
+        for event in events {
+            let retain = has_session
+                || match &event {
+                    PendingTypedEvent::Media(_) => media_hook_present,
+                    PendingTypedEvent::Action(_) => action_hook_present,
+                };
+            if !retain {
+                continue;
+            }
+            if pending.queue.len() >= MAX_PENDING_TYPED_EVENTS {
+                tracing::warn!(
+                    pane_id = %self.id,
+                    "pending terminal media/action queue is full; dropping newest event"
+                );
+                continue;
+            }
+            pending.queue.push_back(event);
+        }
+        drop(pending);
+        self.drain_pending_typed_events();
+    }
+
+    /// Drain without holding either the queue or hook lock while invoking a
+    /// callback. `draining` also makes re-entrant hook registration safe: the
+    /// active drainer observes newly queued events after the callback returns.
+    fn drain_pending_typed_events(&self) {
+        {
+            let mut pending = self.pending_typed_events.lock();
+            if pending.draining {
+                return;
+            }
+            pending.draining = true;
+        }
+        loop {
+            let event = {
+                let mut pending = self.pending_typed_events.lock();
+                let Some(event) = pending.queue.pop_front() else {
+                    pending.draining = false;
+                    return;
+                };
+                event
+            };
+            match event {
+                PendingTypedEvent::Media(media) => {
+                    let hook = self.media_hook.lock().clone();
+                    if let Some(hook) = hook {
+                        hook(vec![media]);
+                    } else {
+                        let mut pending = self.pending_typed_events.lock();
+                        pending.queue.push_front(PendingTypedEvent::Media(media));
+                        pending.draining = false;
+                        return;
+                    }
+                }
+                PendingTypedEvent::Action(action) => {
                     let hook = self.action_hook.lock().clone();
                     if let Some(hook) = hook {
                         hook(vec![action]);
+                    } else {
+                        let mut pending = self.pending_typed_events.lock();
+                        pending.queue.push_front(PendingTypedEvent::Action(action));
+                        pending.draining = false;
+                        return;
                     }
                 }
             }
@@ -1864,12 +2026,14 @@ impl Pane {
     /// sequence order. Replaces any previous hook.
     pub fn set_media_hook(&self, hook: Box<dyn Fn(Vec<PaneMedia>) + Send + Sync>) {
         *self.media_hook.lock() = Some(Arc::from(hook));
+        self.drain_pending_typed_events();
     }
 
     /// §16.13 Install an observer invoked for each `PaneAction` in sequence
     /// order. Replaces any previous hook.
     pub fn set_action_hook(&self, hook: Box<dyn Fn(Vec<PaneAction>) + Send + Sync>) {
         *self.action_hook.lock() = Some(Arc::from(hook));
+        self.drain_pending_typed_events();
     }
 
     /// §3.4 获取 pane 所属 session id (可能为 None 表示未关联会话)。
@@ -2427,6 +2591,54 @@ mod tests {
         drop(pane);
         assert!(weak.upgrade().is_none());
     }
+    #[test]
+    fn media_event_waits_for_late_hook_registration() {
+        let pane = match Pane::spawn_with_session(
+            "media-late-hook".to_string(),
+            "session".to_string(),
+            std::env::temp_dir().to_string_lossy().to_string(),
+            20,
+            6,
+            Some(ShellCommand {
+                program: "/bin/cat".to_string(),
+                ..Default::default()
+            }),
+            100,
+        ) {
+            Ok(pane) => pane,
+            Err(error) => panic!("spawn media late-hook pane: {error}"),
+        };
+        let mut feed = PtyFeed::new();
+        feed.feed(&pane, b"\x1b_Ga=T,f=100,i=12;SGVsbG8=\x1b\\");
+
+        let received = Arc::new(Mutex::new(Vec::<PaneMedia>::new()));
+        let captured = received.clone();
+        pane.set_media_hook(Box::new(move |media| captured.lock().extend(media)));
+
+        assert_eq!(received.lock().len(), 1);
+    }
+
+    #[test]
+    fn kitty_continuation_preserves_initial_display_cursor_across_feeds() {
+        let pane = spawn_media_pane("media-cross-feed-cursor");
+        let mut feed = PtyFeed::new();
+        let notifications = typed_notifications(&pane);
+
+        feed.feed(
+            &pane,
+            b"abcdefghijkl\x1b[5;7H\x1b_Ga=T,m=1,f=100,i=13;SGVsbG8=\x1b\\after",
+        );
+        feed.feed(&pane, b"\x1b_Gm=0,i=13;V29ybGQ=\x1b\\");
+
+        let typed = notifications.lock();
+        match typed.first().and_then(|notification| notification.event.as_ref()) {
+            Some(mux_protocol::notification::Event::PaneMedia(media)) => {
+                assert_eq!((media.row, media.column), (4, 6));
+            }
+            event => panic!("expected PaneMedia, got {event:?}"),
+        }
+    }
+
 
     #[test]
     fn mode_only_output_publishes_full_generation() {

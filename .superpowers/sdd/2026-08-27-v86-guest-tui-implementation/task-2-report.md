@@ -200,3 +200,61 @@ Concerns: the existing workspace emits unrelated warnings (dependency patch
 and unused/dead-code warnings). The cursor-specific test was not rerun after
 the final source edit; the parser, grid-strip, media-order/generation, native
 check, and i686 guest check above all completed successfully.
+
+## Fix round 3 — late hooks and split-feed placement
+
+The scoped re-review exposed two wiring issues. Completed typed events are now
+kept in one bounded per-pane queue until their matching media/action hook is
+installed. Queue draining is serialized without retaining the queue or hook
+lock during callbacks; media and actions therefore retain one cross-type order
+through sequential connection registration. Panes without a session do not
+retain unobserved events, and queue overflow drops only the newest event with a
+warning.
+
+Kitty continuation placement now emits an internal `Placement` boundary for
+the initial `m=1,a=T` chunk. `ReadLoopState` retains that single cursor cell
+across reads, and the final media event consumes it by image id. Final event
+offsets remain local to the completing feed; no prior-feed offset is reused for
+terminal advancement. The regression feeds ordinary bytes after the initial
+chunk and completes the transfer in a shorter later feed.
+
+The first run reproduced both failures:
+
+```text
+$ cargo test -p mux_server --lib -- media_event_waits_for_late_hook_registration
+test result: FAILED; 0 passed; 1 failed
+assertion `left == right` failed: left: 0, right: 1
+
+$ cargo test -p mux_server --lib -- kitty_continuation_preserves_initial_display_cursor_across_feeds
+test result: FAILED; 0 passed; 1 failed
+assertion `left == right` failed: left: (4, 11), right: (4, 6)
+```
+
+After the fixes, bounded verification completed as follows (shared target
+directory `/run/media/ezra/13D010B6FDBC1A06/projects/z3rm-target-verify`):
+
+```text
+$ cargo test -p mux_server --lib -- media_
+test result: ok. 6 passed; 0 failed; 0 ignored
+
+$ cargo test -p mux_server --lib -- kitty_continuation_preserves_initial_display_cursor_across_feeds
+test result: ok. 1 passed; 0 failed; 0 ignored
+
+$ cargo test -p mux_server --lib -- kitty_delete
+test result: ok. 2 passed; 0 failed; 0 ignored
+
+$ cargo test -p mux_server terminal_media
+test result: ok. 23 passed; 0 failed; 0 ignored
+```
+
+The native and i686 guest checks are rerun below after the final source edit.
+Existing dependency-patch and unrelated unused/dead-code warnings remain.
+
+```text
+$ cargo check -p mux_server
+Finished successfully (warnings only; exit 0).
+
+$ RUSTFLAGS="-C linker=rust-lld" cargo check -p mux_server \
+    --target i686-unknown-linux-musl --no-default-features --features guest
+Finished successfully (warnings only; exit 0).
+```

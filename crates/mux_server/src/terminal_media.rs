@@ -60,8 +60,19 @@ pub struct ScanOutput {
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum ScanEvent {
+    /// A complete media payload. `placement_from_pending` means the cursor
+    /// was captured when an earlier `m=1,a=T` chunk started this transfer.
     Media {
         index: usize,
+        image_id: u32,
+        grid_offset: usize,
+        action: Option<u8>,
+        placement_from_pending: bool,
+    },
+    /// Internal cursor boundary for the first `m=1,a=T` chunk. No media is
+    /// emitted until the matching final chunk arrives.
+    Placement {
+        image_id: u32,
         grid_offset: usize,
         action: Option<u8>,
     },
@@ -70,7 +81,6 @@ pub(crate) enum ScanEvent {
         grid_offset: usize,
     },
 }
-
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum ScanState {
@@ -126,10 +136,8 @@ struct PendingMedia {
     rows: u32,
     data: Vec<u8>,
     /// Placement metadata belongs to the first chunk. A final continuation
-    /// may omit `a`, but `a=T` still names the cursor location where the
-    /// transfer started.
+    /// may omit `a`, but `a=T` still names the cursor event to reuse.
     placement_action: Option<u8>,
-    placement_grid_offset: usize,
 }
 
 
@@ -177,18 +185,6 @@ impl TerminalMediaScanner {
     /// Scan one PTY byte batch, returning the grid-safe bytes and any
     /// complete media/actions. State persists for the next batch.
     pub fn feed(&mut self, bytes: &[u8]) -> ScanOutput {
-        if self.pending.is_some() {
-            if let Some((_, pending)) = self.pending.as_mut() {
-                // A continuation transfer may have started in an earlier
-                // feed; its original cursor is the beginning of this feed.
-                pending.placement_grid_offset = 0;
-            }
-        }
-        if !matches!(self.state, ScanState::Ground | ScanState::Discard | ScanState::DiscardEsc) {
-            // A control sequence split across feeds has no grid bytes before
-            // its completion in this feed, so its local boundary is zero.
-            self.sequence_grid_offset = 0;
-        }
         let mut output = ScanOutput {
             grid_bytes: Vec::with_capacity(bytes.len()),
             ..ScanOutput::default()
@@ -508,8 +504,10 @@ impl TerminalMediaScanner {
             });
             output.events.push(ScanEvent::Media {
                 index,
+                image_id,
                 grid_offset: event_offset,
                 action: parsed.action,
+                placement_from_pending: false,
             });
             self.pending = None;
             return;
@@ -531,15 +529,17 @@ impl TerminalMediaScanner {
             // Accumulate; publish only on the final chunk (m=0/absent).
             // Only one active transfer is tracked (protocol chunks do not
             // interleave); if a new image id arrives, replace the pending.
+            let new_transfer = match self.pending.as_ref() {
+                Some((pending_id, _)) => *pending_id != image_id,
+                None => true,
+            };
             let entry = self.pending.get_or_insert_with(|| (image_id, PendingMedia {
                 format: parsed.format.unwrap_or(0),
                 columns: parsed.columns.unwrap_or(0),
                 rows: parsed.rows.unwrap_or(0),
                 data: Vec::new(),
                 placement_action: parsed.action,
-                placement_grid_offset: event_offset,
             }));
-            // If the image id changed, reset the pending transfer.
             if entry.0 != image_id {
                 *entry = (image_id, PendingMedia {
                     format: parsed.format.unwrap_or(0),
@@ -547,27 +547,42 @@ impl TerminalMediaScanner {
                     rows: parsed.rows.unwrap_or(0),
                     data: Vec::new(),
                     placement_action: parsed.action,
-                    placement_grid_offset: event_offset,
                 });
             }
+            // A later continuation may carry the placement action if the
+            // initial chunk omitted it; preserve the first `a=T` boundary.
+            let new_placement = entry.1.placement_action != Some(b'T')
+                && parsed.action == Some(b'T');
+            if new_placement {
+                entry.1.placement_action = parsed.action;
+            }
             // Preflight data size with checked_add.
-            match entry.1.data.len().checked_add(payload.len()) {
+            let accepted = match entry.1.data.len().checked_add(payload.len()) {
                 Some(new_len) if new_len <= MAX_REASSEMBLED_MEDIA_BYTES => {
                     entry.1.data.extend_from_slice(&payload);
+                    true
                 }
                 _ => {
                     tracing::warn!(
                         "terminal media: image {image_id} exceeded {MAX_REASSEMBLED_MEDIA_BYTES} bytes; dropped"
                     );
                     self.pending = None;
+                    false
                 }
+            };
+            if accepted && (new_transfer || new_placement) && parsed.action == Some(b'T') {
+                output.events.push(ScanEvent::Placement {
+                    image_id,
+                    grid_offset: event_offset,
+                    action: Some(b'T'),
+                });
             }
             return;
         }
 
         // Final chunk: complete a pending image or publish a single chunk.
         let mut placement_action = parsed.action;
-        let mut placement_grid_offset = event_offset;
+        let mut placement_from_pending = false;
         let mut media = if let Some((pid, entry)) = self.pending.take() {
             if pid != image_id {
                 // Image id mismatch — start fresh with this chunk.
@@ -586,9 +601,7 @@ impl TerminalMediaScanner {
                 }
             } else {
                 placement_action = entry.placement_action.or(parsed.action);
-                if entry.placement_action.is_some() {
-                    placement_grid_offset = entry.placement_grid_offset;
-                }
+                placement_from_pending = entry.placement_action == Some(b'T');
                 PaneMedia {
                     pane_id: String::new(),
                     sequence: 0,
@@ -634,8 +647,10 @@ impl TerminalMediaScanner {
         output.media.push(media);
         output.events.push(ScanEvent::Media {
             index,
-            grid_offset: placement_grid_offset,
+            image_id,
+            grid_offset: event_offset,
             action: placement_action,
+            placement_from_pending,
         });
     }
 
