@@ -29,8 +29,9 @@ the server. The program:
 - switches to the alternate screen and enables SGR mouse reporting;
 - maps wheel events to page scrolling and button regions to actions;
 - emits Kitty Graphics Protocol transmit/display sequences for bundled PNGs;
-- emits OSC 8 hyperlinks with the `z3rm-download:` scheme for downloadable
-  artifacts;
+- wraps the visible download button in OSC 8 with a `z3rm-download:` URI;
+- after a download click, emits `OSC 9;z3rm-download;<uri>BEL`;
+- after a copy click, emits `OSC 9;z3rm-copy;<base64-text>BEL`;
 - emits OSC 52 for explicit copy actions;
 - exits cleanly on the configured quit key and restores terminal modes.
 
@@ -39,12 +40,17 @@ client supplies terminal chrome and renders the guest's authoritative grid.
 
 ## Media and action protocol
 
-Extend `mux_protocol` notifications with a `PaneMedia` event. It contains the
-pane id, monotonically increasing media sequence, Kitty image id, image format,
-cell row/column placement, chunk bytes, and a final-chunk flag. The server
-parser recognizes complete Kitty APC sequences before passing ordinary bytes
-to alacritty. It reassembles Kitty continuation chunks per pane and publishes
-media notifications in the same order as the corresponding PTY output.
+Extend `mux_protocol` notifications with `PaneMedia` and `PaneAction` events.
+`PaneMedia` contains the pane id, monotonically increasing media sequence,
+Kitty image id, image format, cell row/column placement, chunk bytes, and a
+final-chunk/delete flag. `PaneAction` contains the pane id, action sequence,
+an enum (`DOWNLOAD` or `COPY`), and the decoded value.
+
+The server parser recognizes complete Kitty APC sequences before passing
+ordinary bytes to alacritty. It reassembles Kitty continuation chunks per pane
+and publishes media notifications in the same order as the corresponding PTY
+output. It recognizes BEL-terminated `OSC 9;z3rm-download;<uri>` and
+`OSC 9;z3rm-copy;<base64-text>` and emits typed action notifications.
 
 Ordinary text and OSC 8 hyperlinks continue through alacritty and the existing
 `Cell.hyperlink` field. The client treats only `z3rm-download:` links as local
