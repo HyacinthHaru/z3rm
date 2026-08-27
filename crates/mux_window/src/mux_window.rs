@@ -1097,3 +1097,316 @@ pub fn register_core_mux_actions(workspace: &mut workspace::Workspace, window: &
                             }).detach();
                         });
 }
+
+#[cfg(test)]
+mod tests {
+    use gpui::AppContext as _;
+
+    #[test]
+    fn cyclic_pane_navigation_wraps_both_directions() {
+        assert_eq!(super::cyclic_pane_index(0, 0, true), None);
+        assert_eq!(super::cyclic_pane_index(2, 2, true), None);
+        assert_eq!(super::cyclic_pane_index(0, 3, true), Some(1));
+        assert_eq!(super::cyclic_pane_index(2, 3, true), Some(0));
+        assert_eq!(super::cyclic_pane_index(0, 3, false), Some(2));
+        assert_eq!(super::cyclic_pane_index(2, 3, false), Some(1));
+    }
+
+    #[test]
+    fn reconnect_state_serializes_attempts_and_records_outcomes() {
+        let mut state = super::MuxConnectionState::Disconnected;
+
+        assert!(state.begin_reconnect());
+        assert_eq!(state, super::MuxConnectionState::Reconnecting);
+        assert!(
+            !state.begin_reconnect(),
+            "a second reconnect must not start while one is in flight"
+        );
+
+        state.finish_reconnect(false);
+        assert_eq!(state, super::MuxConnectionState::Disconnected);
+        assert!(state.begin_reconnect());
+        state.finish_reconnect(true);
+        assert_eq!(state, super::MuxConnectionState::Connected);
+    }
+
+    fn window_added(session_id: &str, window_id: &str) -> mux_protocol::notification::Event {
+        mux_protocol::notification::Event::WindowAdded(mux_protocol::WindowAdded {
+            window_id: window_id.to_string(),
+            session_id: session_id.to_string(),
+        })
+    }
+
+    fn window_removed(session_id: &str, window_id: &str) -> mux_protocol::notification::Event {
+        mux_protocol::notification::Event::WindowRemoved(mux_protocol::WindowRemoved {
+            window_id: window_id.to_string(),
+            session_id: session_id.to_string(),
+        })
+    }
+
+    /// §3.3 / §3.4 The client's view of session membership is rebuilt purely
+    /// from the at-least-once `WindowAdded` / `WindowRemoved` stream (Plan 32).
+    #[test]
+    fn window_events_maintain_the_session_roster() {
+        let mut windows = super::MuxWindows::default();
+
+        assert!(windows.apply_window_event(&window_added("session-1", "win-1")));
+        assert!(windows.apply_window_event(&window_added("session-1", "win-2")));
+        assert_eq!(
+            windows.session_window_ids("session-1"),
+            vec!["win-1".to_string(), "win-2".to_string()]
+        );
+
+        // Duplicates are expected: lifecycle delivery is at-least-once.
+        windows.apply_window_event(&window_added("session-1", "win-2"));
+        assert_eq!(windows.session_window_ids("session-1").len(), 2);
+
+        assert!(windows.apply_window_event(&window_removed("session-1", "win-1")));
+        assert_eq!(
+            windows.session_window_ids("session-1"),
+            vec!["win-2".to_string()]
+        );
+
+        windows.apply_window_event(&window_removed("session-1", "win-2"));
+        assert!(windows.session_window_ids("session-1").is_empty());
+
+        assert!(
+            !windows.apply_window_event(&mux_protocol::notification::Event::PaneDirty(
+                mux_protocol::PaneDirty {
+                    pane_id: "pane-1".to_string(),
+                }
+            )),
+            "non-window events must not be treated as membership changes"
+        );
+    }
+
+    /// §3.3 A window that never joined must not corrupt another session's roster.
+    #[test]
+    fn removing_an_unknown_window_is_a_no_op() {
+        let mut windows = super::MuxWindows::default();
+        windows.apply_window_event(&window_added("session-1", "win-1"));
+
+        windows.apply_window_event(&window_removed("session-2", "win-9"));
+
+        assert_eq!(
+            windows.session_window_ids("session-1"),
+            vec!["win-1".to_string()]
+        );
+        assert!(windows.session_window_ids("session-2").is_empty());
+    }
+
+    /// §3.3 / §16.6 Swapping a window's binding (sidebar session switch) must
+    /// carry any held SSH session across the swap: the tunnel keeps the
+    /// window's remote connection alive and is released only when the window
+    /// owner itself is removed (window close -> `take_mux_window`).
+    #[test]
+    fn rebinding_a_window_preserves_the_held_ssh_session_until_removed() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::sync::Arc;
+
+        /// Stand-in for `mux::SshSession`: counts drops so the carry-over
+        /// contract is observable without a live SSH tunnel.
+        struct SessionProbe(Arc<AtomicUsize>);
+
+        impl Drop for SessionProbe {
+            fn drop(&mut self) {
+                self.0.fetch_add(1, Ordering::SeqCst);
+            }
+        }
+
+        /// A domain over an EOF-only stream: the mux I/O thread exits
+        /// immediately and the domain is never used for requests here.
+        fn dummy_domain() -> Arc<mux::MuxDomain> {
+            Arc::new(
+                mux::MuxDomain::connect_with_blocking_stream(std::io::Cursor::new(Vec::new()))
+                    .expect("dummy domain"),
+            )
+        }
+
+        let drops = Arc::new(AtomicUsize::new(0));
+        let window_id = gpui::WindowId::from(1u64);
+        let mut windows: std::collections::HashMap<gpui::WindowId, super::MuxWindow<SessionProbe>> =
+            std::collections::HashMap::new();
+
+        super::rebind_mux_window(
+            &mut windows,
+            window_id,
+            dummy_domain(),
+            "session-1".to_string(),
+            Some(SessionProbe(drops.clone())),
+        );
+
+        // Session switch in the same window: the held session must survive.
+        super::rebind_mux_window(
+            &mut windows,
+            window_id,
+            dummy_domain(),
+            "session-2".to_string(),
+            None,
+        );
+        assert_eq!(
+            drops.load(Ordering::SeqCst),
+            0,
+            "a session switch must not drop the held SSH session"
+        );
+        assert_eq!(
+            windows.get(&window_id).map(|binding| binding.session_id.as_str()),
+            Some("session-2"),
+            "the new binding must win"
+        );
+        assert_eq!(windows.len(), 1, "rebinding must not leak window slots");
+
+        // Removing the window owner (what take_mux_window does on close)
+        // releases the session.
+        windows.remove(&window_id);
+        assert_eq!(
+            drops.load(Ordering::SeqCst),
+            1,
+            "removing the window owner must drop the SSH session"
+        );
+    }
+
+    /// §15.4 Reconnect broadcasts a synthetic `SessionLayoutChanged` carrying
+    /// the whole snapshot. Reading only `.layout` out of it silently drops the
+    /// focused pane, which is part of the state the reconnect has to restore.
+    #[test]
+    fn layout_change_carries_the_authoritative_focus() {
+        let with_focus = mux_protocol::SessionLayoutChanged {
+            layout: None,
+            snapshot: Some(mux_protocol::SessionSnapshot {
+                focused_pane_id: "pane-7".to_string(),
+                ..Default::default()
+            }),
+        };
+        assert_eq!(
+            super::focused_pane_from_layout_change(&with_focus),
+            Some("pane-7".to_string())
+        );
+
+        let unfocused = mux_protocol::SessionLayoutChanged {
+            layout: None,
+            snapshot: Some(mux_protocol::SessionSnapshot::default()),
+        };
+        assert_eq!(super::focused_pane_from_layout_change(&unfocused), None);
+
+        let no_snapshot = mux_protocol::SessionLayoutChanged {
+            layout: None,
+            snapshot: None,
+        };
+        assert_eq!(super::focused_pane_from_layout_change(&no_snapshot), None);
+    }
+
+    /// Losing the mux connection is shown as small coloured text in the status
+    /// bar, while the user is working inside a pane. Without a live region the
+    /// change is never announced, so a screen-reader user keeps typing into a
+    /// session that is no longer attached.
+    #[gpui::test]
+    async fn mux_connection_state_is_announced_when_it_changes(cx: &mut gpui::TestAppContext) {
+        cx.update(|cx| {
+            let settings_store = settings::SettingsStore::test(cx);
+            cx.set_global(settings_store);
+            theme_settings::init(theme::LoadThemes::JustBase, cx);
+        });
+        let window = cx.add_window(|_, _| super::MuxConnectionStatusItem {
+            state: super::MuxConnectionState::Disconnected,
+        });
+        cx.activate_a11y(window.into());
+
+        let json = cx
+            .update_window(window.into(), |_, window, cx| {
+                window.draw(cx).clear(cx);
+                window.debug_a11y_tree_json()
+            })
+            .expect("the status window is still open")
+            .expect("activation makes the debug tree available");
+        let tree: serde_json::Value = serde_json::from_str(&json).expect("the dump is valid JSON");
+        gpui::a11y_checks::assert_interactive_nodes_are_named(&tree, "mux connection status");
+        gpui::a11y_checks::assert_names_are_distinguishable(&tree, "mux connection status");
+        gpui::a11y_checks::assert_focusable_names_are_distinguishable(&tree, "mux connection status");
+        gpui::a11y_checks::assert_clickable_elements_are_reachable(&tree, "mux connection status");
+        gpui::a11y_checks::assert_click_targets_are_reachable(&tree, "mux connection status");
+        gpui::a11y_checks::assert_controls_have_area(&tree, "mux connection status");
+        gpui::a11y_checks::assert_landmarks_are_distinguishable(&tree, "mux connection status");
+        gpui::a11y_checks::assert_active_descendant_is_honoured(&tree, "mux connection status");
+        gpui::a11y_checks::assert_no_role_was_discarded(&tree, "mux connection status");
+        gpui::a11y_checks::assert_no_aria_was_discarded(&tree, "mux connection status");
+        gpui::a11y_checks::assert_roles_are_contained(&tree, "mux connection status");
+        gpui::a11y_checks::assert_live_regions_can_speak(&tree, "mux connection status");
+
+        let status = tree["nodes"]
+            .as_object()
+            .expect("the dump lists nodes")
+            .values()
+            .find(|node| node["aria"]["role"] == "Status")
+            .expect("the connection indicator must be reported as a status");
+        assert_eq!(
+            status["aria"]["live"].as_str(),
+            Some("Polite"),
+            "a status that changes on its own has to be a live region"
+        );
+        // The value, not the label: macOS speaks `node.value()` and raises no
+        // announcement at all without one.
+        assert_eq!(
+            status["aria"]["value"].as_str(),
+            Some("Mux connection: Disconnected"),
+            "the announcement has to say what changed, not just \"Disconnected\""
+        );
+    }
+
+    /// The all-clear, not the alarm. Nothing is drawn once the connection is
+    /// back, and if the announcement is dropped along with the text then a
+    /// reader who was told the session detached is never told it returned.
+    #[gpui::test]
+    async fn mux_reconnection_is_announced_even_though_nothing_is_drawn(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        cx.update(|cx| {
+            let settings_store = settings::SettingsStore::test(cx);
+            cx.set_global(settings_store);
+            theme_settings::init(theme::LoadThemes::JustBase, cx);
+        });
+        let window = cx.add_window(|_, _| super::MuxConnectionStatusItem {
+            state: super::MuxConnectionState::Disconnected,
+        });
+        cx.activate_a11y(window.into());
+
+        let announcement = |cx: &mut gpui::TestAppContext| -> Option<String> {
+            let json = cx
+                .update_window(window.into(), |_, window, cx| {
+                    window.draw(cx).clear(cx);
+                    window.debug_a11y_tree_json()
+                })
+                .expect("the status window is still open")
+                .expect("activation makes the debug tree available");
+            let tree: serde_json::Value =
+                serde_json::from_str(&json).expect("the dump is valid JSON");
+            gpui::a11y_checks::assert_live_regions_can_speak(&tree, "mux reconnection");
+            tree["nodes"]
+                .as_object()
+                .expect("the dump lists nodes")
+                .values()
+                .find(|node| node["aria"]["role"] == "Status")
+                .and_then(|node| node["aria"]["value"].as_str())
+                .map(str::to_owned)
+        };
+
+        assert_eq!(
+            announcement(cx).as_deref(),
+            Some("Mux connection: Disconnected"),
+            "the drop is the precondition: without it the recovery says nothing"
+        );
+
+        window
+            .update(cx, |item, _, cx| {
+                item.state = super::MuxConnectionState::Connected;
+                cx.notify();
+            })
+            .expect("the status window is still open");
+
+        assert_eq!(
+            announcement(cx).as_deref(),
+            Some("Mux connection: Connected"),
+            "coming back is the half a reader cannot see for themselves"
+        );
+    }
+}

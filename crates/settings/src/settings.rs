@@ -250,6 +250,12 @@ pub struct ActiveMuxKeymapProfile {
     bindings: Vec<gpui::KeyBinding>,
 }
 
+impl ActiveMuxKeymapProfile {
+    pub fn profile(&self) -> &str {
+        &self.profile
+    }
+}
+
 impl Global for ActiveMuxKeymapProfile {}
 
 /// Load the platform default keymap plus the configured mux keymap profile,
