@@ -141,3 +141,11 @@ test result: ok. 22 passed; 0 failed; 0 ignored
 
 Status: fix commit `6d8382b4a1` pushed to `origin/main` (base `63b04cafc7`, no
 force).
+
+## Fix round 2 (scoped re-review)
+
+The re-review found one malformed-OSC recovery gap: `OscPayloadEscape` retained a non-ST byte and swallowed subsequent CSI/text. The arm now clears the typed OSC buffer and re-dispatches that byte from `Escape`, with regression coverage in `malformed_osc_payload_aborts_on_non_st_esc_and_resumes`.
+
+Verification: `cargo test -p mux_server terminal_media` — 23 passed; 0 failed.
+
+Follow-up commit: pending push after this report update.

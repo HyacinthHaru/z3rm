@@ -302,7 +302,15 @@ impl TerminalMediaScanner {
                         b'\\' => self.finish_osc(&mut output),
                         0x07 => self.finish_osc(&mut output),
                         0x1b => self.state = ScanState::OscPayloadEscape,
-                        _ => self.state = ScanState::OscPayload,
+                        _ => {
+                            // Not ST: the typed OSC was aborted by its ESC.
+                            // Drop the partial payload and re-dispatch this
+                            // byte from escape state so a new sequence (CSI,
+                            // APC, OSC) can begin.
+                            self.state = ScanState::Escape;
+                            self.buffer.clear();
+                            index -= 1;
+                        }
                     }
                 }
                 ScanState::OscPassthrough => {
@@ -1039,5 +1047,16 @@ mod tests {
         assert_eq!(output.grid_bytes, b"a\x1b_Xhello\x1bXworld\x1b\\b");
         assert!(output.media.is_empty());
         assert!(output.actions.is_empty());
+    }
+
+    #[test]
+    fn malformed_osc_payload_aborts_on_non_st_esc_and_resumes() {
+        // A truncated OSC 9 followed by a normal CSI must not swallow the
+        // CSI or subsequent text. The malformed OSC is dropped, and the new
+        // escape sequence resumes from its ESC.
+        let mut scanner = TerminalMediaScanner::new();
+        let output = scanner.feed(b"\x1b]9;z3rm-copy;AAAA\x1b[31mhello");
+        assert!(output.actions.is_empty());
+        assert_eq!(output.grid_bytes, b"\x1b[31mhello");
     }
 }
