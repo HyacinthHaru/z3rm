@@ -373,41 +373,38 @@ impl MuxPaneView {
             let mut pending_dirty = false;
 
             loop {
-                let notif = if !pending_dirty {
-                    match rx.recv().await {
-                        Ok(n) => n,
-                        Err(_) => break,
-                    }
-                } else {
-                    match rx.try_recv() {
-                        Ok(n) => n,
-                        Err(err)
-                            if err.to_string().contains("empty")
-                                || format!("{err:?}").contains("Empty") =>
-                        {
-                            cx.background_executor()
-                                .timer(std::time::Duration::from_millis(8))
-                                .await;
-                            while let Ok(n) = rx.try_recv() {
-                                if !Self::accumulate_notification(
-                                    &pane_id,
-                                    n,
-                                    &mut pending_dirty,
-                                    &weak,
-                                    cx,
-                                ) {
-                                    return;
-                                }
-                            }
-                            Self::flush_pending(&weak, &mut pending_dirty, cx).await;
-                            continue;
-                        }
-                        Err(_) => break,
-                    }
+                let notif = match rx.recv().await {
+                    Ok(notif) => notif,
+                    Err(_) => break,
                 };
 
                 if !Self::accumulate_notification(&pane_id, notif, &mut pending_dirty, &weak, cx) {
                     break;
+                }
+
+                if pending_dirty {
+                    // A dirty signal means visible output may already have
+                    // landed, so flush on the next executor tick — not after a
+                    // quiet-window timer. The server's AdaptiveCoalescer
+                    // (§16.3) already bounds PaneDirty cadence and
+                    // schedule_fetch's in-flight/pending pair coalesces a burst
+                    // into at most one catch-up pull, so the 8ms client-side
+                    // sleep that previously gated every flush was a pure
+                    // latency tax on repaints, including interactive echo
+                    // (§15.5 p95 < 16ms). Drain what is already queued so a
+                    // tight burst still produces a single fetch.
+                    while let Ok(queued) = rx.try_recv() {
+                        if !Self::accumulate_notification(
+                            &pane_id,
+                            queued,
+                            &mut pending_dirty,
+                            &weak,
+                            cx,
+                        ) {
+                            return;
+                        }
+                    }
+                    Self::flush_pending(&weak, &mut pending_dirty, cx).await;
                 }
             }
         });
@@ -2427,6 +2424,321 @@ mod tests {
     }
 
     #[cfg(unix)]
+    /// Read one request frame; `Ok(None)` when the mock client has gone quiet
+    /// (read timeout or hangup) instead of treating quiet as a failure.
+    fn read_request_or_quiet(
+        stream: &mut std::os::unix::net::UnixStream,
+        context: &str,
+    ) -> Result<Option<Envelope>, String> {
+        use std::io::Read;
+
+        let mut prefix = Vec::with_capacity(mux_protocol::MAX_VARINT_LEN);
+        loop {
+            let mut byte = [0u8; 1];
+            match stream.read_exact(&mut byte) {
+                Ok(()) => {}
+                Err(error)
+                    if matches!(
+                        error.kind(),
+                        std::io::ErrorKind::WouldBlock
+                            | std::io::ErrorKind::TimedOut
+                            | std::io::ErrorKind::UnexpectedEof
+                    ) =>
+                {
+                    return Ok(None);
+                }
+                Err(error) => {
+                    return Err(format!("read {context} prefix: {error}"));
+                }
+            }
+            prefix.push(byte[0]);
+            if byte[0] & 0x80 == 0 {
+                break;
+            }
+            if prefix.len() == mux_protocol::MAX_VARINT_LEN {
+                return Err(format!("{context} used an overlong frame prefix"));
+            }
+        }
+        let (raw_len, prefix_len) = mux_protocol::parse_len_prefix(&prefix)
+            .map_err(|error| format!("parse {context} prefix: {error}"))?
+            .ok_or_else(|| format!("{context} prefix was incomplete"))?;
+        let payload_len = mux_protocol::check_frame_len(raw_len)
+            .map_err(|error| format!("validate {context} length: {error}"))?;
+        let mut framed = prefix;
+        framed.resize(prefix_len + payload_len, 0);
+        stream
+            .read_exact(&mut framed[prefix_len..])
+            .map_err(|error| format!("read {context} payload: {error}"))?;
+        let (envelope, consumed) =
+            mux_protocol::unframe(&framed).map_err(|error| format!("decode {context}: {error}"))?;
+        if consumed != framed.len() {
+            return Err(format!("{context} left {} trailing bytes", framed.len() - consumed));
+        }
+        Ok(Some(envelope))
+    }
+
+    #[cfg(unix)]
+    /// Serve an initial 0→1 grid, then hold the post-dirty 1→2 response until
+    /// the test has asserted the refetch was triggered promptly.
+    fn serve_prompt_refresh(
+        mut stream: std::os::unix::net::UnixStream,
+        initial_fetch_served: async_channel::Sender<()>,
+        post_dirty_fetch_received: async_channel::Sender<()>,
+        release_post_dirty_response: async_channel::Receiver<()>,
+    ) -> Result<(), String> {
+        stream
+            .set_read_timeout(Some(std::time::Duration::from_secs(5)))
+            .map_err(|error| format!("set prompt-refresh server read timeout: {error}"))?;
+
+        let (first_request_id, first_fetch) = loop {
+            let envelope = read_test_envelope(&mut stream, "initial grid request")?;
+            let request = match envelope.payload {
+                Some(EnvelopePayload::Request(request)) => request,
+                payload => return Err(format!("expected initial request, got {payload:?}")),
+            };
+            match request.body {
+                Some(RequestBody::FetchGridUpdate(fetch)) => break (request.request_id, fetch),
+                Some(RequestBody::ResizePane(_)) => continue,
+                body => return Err(format!("expected initial grid fetch, got {body:?}")),
+            }
+        };
+        if first_fetch.pane_id != "refresh-pane" || first_fetch.since_generation != 0 {
+            return Err(format!(
+                "unexpected initial fetch: {}@{}",
+                first_fetch.pane_id, first_fetch.since_generation
+            ));
+        }
+        write_test_envelope(
+            &mut stream,
+            &grid_response(first_request_id, 0, 1, 0),
+            "initial grid response",
+        )?;
+        initial_fetch_served
+            .send_blocking(())
+            .map_err(|error| format!("signal initial fetch: {error}"))?;
+
+        let (second_request_id, second_fetch) = loop {
+            let envelope = read_test_envelope(&mut stream, "post-dirty grid request")?;
+            let request = match envelope.payload {
+                Some(EnvelopePayload::Request(request)) => request,
+                payload => return Err(format!("expected post-dirty request, got {payload:?}")),
+            };
+            match request.body {
+                Some(RequestBody::FetchGridUpdate(fetch)) => break (request.request_id, fetch),
+                Some(RequestBody::ResizePane(_)) => continue,
+                body => return Err(format!("expected post-dirty grid fetch, got {body:?}")),
+            }
+        };
+        if second_fetch.pane_id != "refresh-pane" || second_fetch.since_generation != 1 {
+            return Err(format!(
+                "unexpected post-dirty fetch: {}@{}",
+                second_fetch.pane_id, second_fetch.since_generation
+            ));
+        }
+        post_dirty_fetch_received
+            .send_blocking(())
+            .map_err(|error| format!("signal post-dirty fetch: {error}"))?;
+        release_post_dirty_response
+            .recv_blocking()
+            .map_err(|error| format!("wait to release post-dirty response: {error}"))?;
+
+        let response = Envelope {
+            version: Some(mux_protocol::PROTOCOL_VERSION),
+            payload: Some(EnvelopePayload::Response(Response {
+                request_id: second_request_id,
+                body: Some(ResponseBody::GridUpdate(FetchGridUpdateResponse {
+                    from_generation: 1,
+                    to_generation: 2,
+                    output_sequence: 0,
+                    update: Some(FetchUpdate::FullSnapshot(FullGridSnapshot {
+                        cols: 2,
+                        rows: 2,
+                        cells: vec![
+                            Cell {
+                                char: "h".to_string(),
+                                ..Cell::default()
+                            },
+                            Cell {
+                                char: "i".to_string(),
+                                ..Cell::default()
+                            },
+                            Cell {
+                                char: " ".to_string(),
+                                ..Cell::default()
+                            },
+                            Cell {
+                                char: " ".to_string(),
+                                ..Cell::default()
+                            },
+                        ],
+                        cursor: Some(mux_protocol::CursorState {
+                            col: 1,
+                            row: 0,
+                            style: 1,
+                            visible: true,
+                            blinking: false,
+                        }),
+                        alternate_screen: false,
+                        display_offset: 0,
+                        history_size: 0,
+                        history_version: 0,
+                        modes: None,
+                    })),
+                })),
+            })),
+        };
+        write_test_envelope(&mut stream, &response, "post-dirty grid response")
+    }
+
+    #[cfg(unix)]
+    /// Serve an initial 0→1 grid, then count every post-dirty fetch. A burst of
+    /// notifications must produce exactly one fetch; the trailing short-timeout
+    /// drain catches a per-notification fetch storm.
+    fn serve_dirty_burst(mut stream: std::os::unix::net::UnixStream) -> Result<usize, String> {
+        stream
+            .set_read_timeout(Some(std::time::Duration::from_secs(5)))
+            .map_err(|error| format!("set dirty-burst server read timeout: {error}"))?;
+
+        let (first_request_id, first_fetch) = loop {
+            let envelope = read_test_envelope(&mut stream, "initial grid request")?;
+            let request = match envelope.payload {
+                Some(EnvelopePayload::Request(request)) => request,
+                payload => return Err(format!("expected initial request, got {payload:?}")),
+            };
+            match request.body {
+                Some(RequestBody::FetchGridUpdate(fetch)) => break (request.request_id, fetch),
+                Some(RequestBody::ResizePane(_)) => continue,
+                body => return Err(format!("expected initial grid fetch, got {body:?}")),
+            }
+        };
+        if first_fetch.pane_id != "burst-pane" || first_fetch.since_generation != 0 {
+            return Err(format!(
+                "unexpected initial fetch: {}@{}",
+                first_fetch.pane_id, first_fetch.since_generation
+            ));
+        }
+        write_test_envelope(
+            &mut stream,
+            &grid_response(first_request_id, 0, 1, 0),
+            "initial grid response",
+        )?;
+
+        // The first post-dirty fetch must arrive promptly: the 5s read below
+        // turns a missed (never-sent) fetch into a timeout failure. Everything
+        // after that one is a storm unless it is the single catch-up.
+        let mut post_dirty_fetches = 0usize;
+        let mut request = loop {
+            match read_request_or_quiet(&mut stream, "first post-dirty request")? {
+                Some(envelope) => {
+                    let request = match envelope.payload {
+                        Some(EnvelopePayload::Request(request)) => request,
+                        payload => {
+                            return Err(format!("expected post-dirty request, got {payload:?}"))
+                        }
+                    };
+                    match request.body {
+                        Some(RequestBody::FetchGridUpdate(fetch)) => break (request.request_id, fetch),
+                        Some(RequestBody::ResizePane(_)) => {
+                            write_test_envelope(
+                                &mut stream,
+                                &Envelope {
+                                    version: Some(mux_protocol::PROTOCOL_VERSION),
+                                    payload: Some(EnvelopePayload::Response(Response {
+                                        request_id: request.request_id,
+                                        body: None,
+                                    })),
+                                },
+                                "resize response",
+                            )?;
+                            continue;
+                        }
+                        body => return Err(format!("expected post-dirty grid fetch, got {body:?}")),
+                    }
+                }
+                None => {
+                    return Err(
+                        "client never fetched after the dirty burst; refresh was not prompt"
+                            .to_string(),
+                    );
+                }
+            }
+        };
+        let (request_id, fetch) = request;
+        if fetch.pane_id != "burst-pane" || fetch.since_generation != 1 {
+            return Err(format!(
+                "unexpected post-dirty fetch: {}@{}",
+                fetch.pane_id, fetch.since_generation
+            ));
+        }
+        post_dirty_fetches += 1;
+        write_test_envelope(
+            &mut stream,
+            &Envelope {
+                version: Some(mux_protocol::PROTOCOL_VERSION),
+                payload: Some(EnvelopePayload::Response(Response {
+                    request_id,
+                    body: Some(ResponseBody::GridUpdate(FetchGridUpdateResponse {
+                        from_generation: 1,
+                        to_generation: 1,
+                        output_sequence: 0,
+                        update: None,
+                    })),
+                })),
+            },
+            "post-dirty no-change response",
+        )?;
+
+        stream
+            .set_read_timeout(Some(std::time::Duration::from_millis(300)))
+            .map_err(|error| format!("set dirty-burst drain timeout: {error}"))?;
+        while let Some(envelope) = read_request_or_quiet(&mut stream, "post-dirty drain")? {
+            let request = match envelope.payload {
+                Some(EnvelopePayload::Request(request)) => request,
+                payload => return Err(format!("expected drain request, got {payload:?}")),
+            };
+            match request.body {
+                Some(RequestBody::FetchGridUpdate(fetch)) => {
+                    if fetch.pane_id != "burst-pane" {
+                        return Err(format!("unexpected drain fetch: {fetch:?}"));
+                    }
+                    post_dirty_fetches += 1;
+                    write_test_envelope(
+                        &mut stream,
+                        &Envelope {
+                            version: Some(mux_protocol::PROTOCOL_VERSION),
+                            payload: Some(EnvelopePayload::Response(Response {
+                                request_id: request.request_id,
+                                body: Some(ResponseBody::GridUpdate(FetchGridUpdateResponse {
+                                    from_generation: 1,
+                                    to_generation: 1,
+                                    output_sequence: 0,
+                                    update: None,
+                                })),
+                            })),
+                        },
+                        "drain no-change response",
+                    )?;
+                }
+                Some(RequestBody::ResizePane(_)) => {
+                    write_test_envelope(
+                        &mut stream,
+                        &Envelope {
+                            version: Some(mux_protocol::PROTOCOL_VERSION),
+                            payload: Some(EnvelopePayload::Response(Response {
+                                request_id: request.request_id,
+                                body: None,
+                            })),
+                        },
+                        "drain resize response",
+                    )?;
+                }
+                body => return Err(format!("expected drain grid fetch, got {body:?}")),
+            }
+        }
+        Ok(post_dirty_fetches)
+    }
+
+    #[cfg(unix)]
     #[test]
     fn prepare_fetch_pages_history_and_reuses_matching_checkpoint() {
         let (client, server) = std::os::unix::net::UnixStream::pair()
@@ -3131,6 +3443,210 @@ mod tests {
                 terminal::Point::new(1, 0)
             );
         });
+    }
+
+    /// A lone PaneDirty must put a refetch on the wire on the next executor
+    /// tick. The notification listener used to park on an 8ms quiet-window
+    /// timer before flushing, so a single notification did not repaint
+    /// promptly; this test never advances the executor clock past that window.
+    #[cfg(unix)]
+    #[gpui::test]
+    async fn pane_dirty_triggers_prompt_refetch_without_a_coalescing_delay(
+        cx: &mut TestAppContext,
+    ) {
+        cx.executor().allow_parking();
+        cx.update(|cx| {
+            let settings_store = SettingsStore::test(cx);
+            cx.set_global(settings_store);
+            theme_settings::init(theme::LoadThemes::JustBase, cx);
+        });
+
+        let (client, server) = match std::os::unix::net::UnixStream::pair() {
+            Ok(pair) => pair,
+            Err(error) => panic!("create prompt-refresh socket pair: {error}"),
+        };
+        if let Err(error) = client.set_nonblocking(true) {
+            panic!("set prompt-refresh client nonblocking: {error}");
+        }
+        let domain = match MuxDomain::connect_with_blocking_stream(client) {
+            Ok(domain) => Arc::new(domain),
+            Err(error) => panic!("connect prompt-refresh mux domain: {error}"),
+        };
+        let (initial_fetch_served, initial_served) = async_channel::bounded(1);
+        let (post_dirty_fetch_received, post_dirty_fetch) = async_channel::bounded(1);
+        let (release_post_dirty_response, release_response) = async_channel::bounded(1);
+        let server_thread = std::thread::spawn(move || {
+            serve_prompt_refresh(
+                server,
+                initial_fetch_served,
+                post_dirty_fetch_received,
+                release_response,
+            )
+        });
+
+        let (view, cx) = cx.add_window_view(|window, cx| {
+            MuxPaneView::new(
+                "refresh-pane".to_string(),
+                domain.clone(),
+                WeakEntity::new_invalid(),
+                WeakEntity::new_invalid(),
+                window,
+                cx,
+            )
+        });
+        let initial_deadline = web_time::Instant::now() + std::time::Duration::from_secs(5);
+        loop {
+            while cx.executor().tick() {}
+            if initial_served.try_recv().is_ok() {
+                break;
+            }
+            assert!(
+                web_time::Instant::now() < initial_deadline,
+                "mock server did not receive the initial grid fetch"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+        let settled =
+            view.condition::<MuxPaneEvent>(cx, |view, _cx| view.generation == 1 && !view.fetch_in_flight);
+        settled.await;
+
+        domain.broadcast_notification(mux_protocol::Notification {
+            event: Some(NotifEvent::PaneDirty(mux_protocol::PaneDirty {
+                pane_id: "refresh-pane".to_string(),
+            })),
+        });
+        cx.run_until_parked();
+
+        // The post-dirty fetch must already be on the wire — no clock
+        // advancement past a coalescing window. The server holds its response
+        // until this assertion, so fetch_in_flight is guaranteed still set.
+        let post_dirty_deadline = web_time::Instant::now() + std::time::Duration::from_secs(5);
+        loop {
+            while cx.executor().tick() {}
+            if post_dirty_fetch.try_recv().is_ok() {
+                break;
+            }
+            assert!(
+                web_time::Instant::now() < post_dirty_deadline,
+                "pane did not refetch promptly after PaneDirty"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+        view.read_with(cx, |view, _cx| {
+            assert!(view.fetch_in_flight, "post-dirty fetch must be in flight");
+        });
+        release_post_dirty_response
+            .send_blocking(())
+            .unwrap_or_else(|error| panic!("release post-dirty response: {error}"));
+
+        let refresh_deadline = web_time::Instant::now() + std::time::Duration::from_secs(5);
+        let refresh_state = loop {
+            while cx.executor().tick() {}
+            let state =
+                view.read_with(cx, |view, _cx| (view.generation, view.fetch_in_flight, view.fetch_pending));
+            if state == (2, false, false) || web_time::Instant::now() >= refresh_deadline {
+                break state;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        };
+        match server_thread.join() {
+            Ok(Ok(())) => {}
+            Ok(Err(error)) => panic!("prompt-refresh server failed at {refresh_state:?}: {error}"),
+            Err(_) => panic!("prompt-refresh server panicked"),
+        }
+        assert_eq!(
+            refresh_state,
+            (2, false, false),
+            "pane did not refresh to generation 2 after PaneDirty"
+        );
+
+        view.read_with(cx, |view, cx| {
+            assert_eq!(view.generation, 2);
+            let content = view.terminal.read(cx).last_content();
+            let first_row: String = content
+                .cells
+                .iter()
+                .take(2)
+                .map(|cell| cell.character())
+                .collect();
+            assert_eq!(first_row, "hi", "post-dirty grid did not reach the terminal");
+        });
+    }
+
+    /// A tight burst of dirty signals is one refresh: the first triggers the
+    /// pull and the rest coalesce into the same fetch (at most one catch-up),
+    /// never one fetch per notification.
+    #[cfg(unix)]
+    #[gpui::test]
+    async fn repeated_dirty_notifications_coalesce_into_one_fetch(cx: &mut TestAppContext) {
+        cx.executor().allow_parking();
+        cx.update(|cx| {
+            let settings_store = SettingsStore::test(cx);
+            cx.set_global(settings_store);
+            theme_settings::init(theme::LoadThemes::JustBase, cx);
+        });
+
+        let (client, server) = match std::os::unix::net::UnixStream::pair() {
+            Ok(pair) => pair,
+            Err(error) => panic!("create dirty-burst socket pair: {error}"),
+        };
+        if let Err(error) = client.set_nonblocking(true) {
+            panic!("set dirty-burst client nonblocking: {error}");
+        }
+        let domain = match MuxDomain::connect_with_blocking_stream(client) {
+            Ok(domain) => Arc::new(domain),
+            Err(error) => panic!("connect dirty-burst mux domain: {error}"),
+        };
+        let server_thread = std::thread::spawn(move || serve_dirty_burst(server));
+
+        let (view, cx) = cx.add_window_view(|window, cx| {
+            MuxPaneView::new(
+                "burst-pane".to_string(),
+                domain.clone(),
+                WeakEntity::new_invalid(),
+                WeakEntity::new_invalid(),
+                window,
+                cx,
+            )
+        });
+        let settled =
+            view.condition::<MuxPaneEvent>(cx, |view, _cx| view.generation == 1 && !view.fetch_in_flight);
+        settled.await;
+
+        for _ in 0..8 {
+            domain.broadcast_notification(mux_protocol::Notification {
+                event: Some(NotifEvent::PaneDirty(mux_protocol::PaneDirty {
+                    pane_id: "burst-pane".to_string(),
+                })),
+            });
+        }
+        cx.run_until_parked();
+
+        let burst_deadline = web_time::Instant::now() + std::time::Duration::from_secs(5);
+        let burst_state = loop {
+            while cx.executor().tick() {}
+            let state =
+                view.read_with(cx, |view, _cx| (view.generation, view.fetch_in_flight, view.fetch_pending));
+            if (!state.1 && !state.2) || web_time::Instant::now() >= burst_deadline {
+                break state;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        };
+        match server_thread.join() {
+            Ok(Ok(post_dirty_fetches)) => {
+                assert_eq!(
+                    post_dirty_fetches, 1,
+                    "a burst of dirty notifications must coalesce into one fetch (state {burst_state:?})"
+                );
+            }
+            Ok(Err(error)) => panic!("dirty-burst server failed at {burst_state:?}: {error}"),
+            Err(_) => panic!("dirty-burst server panicked"),
+        }
+        assert_eq!(
+            burst_state,
+            (1, false, false),
+            "burst must settle at generation 1 without a stranded fetch"
+        );
     }
 
     #[test]
