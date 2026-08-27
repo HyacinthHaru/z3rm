@@ -44,6 +44,7 @@ pub mod extension_host;
 pub use wasm_stubs::extension_host;
 pub mod grid_sync;
 pub mod layout;
+pub mod terminal_media;
 pub mod pane;
 #[cfg(all(not(target_family = "wasm"), feature = "desktop"))]
 pub mod persistence;
