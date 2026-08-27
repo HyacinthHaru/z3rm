@@ -12,6 +12,7 @@ use crate::grid_sync::{
 };
 use crate::pty::{ChildBox, MasterPtyBox, PtySize};
 use crate::rt::mpsc;
+use crate::terminal_media::{ScanEvent, ScanOutput, TerminalMediaScanner};
 use alacritty_terminal::event::{Event as AlacEvent, EventListener};
 use alacritty_terminal::grid::Dimensions as _;
 use alacritty_terminal::term::test::TermSize;
@@ -21,6 +22,7 @@ use alacritty_terminal::vte::ansi::{
 };
 use anyhow::Context as _;
 use mux_protocol::Notification as MuxNotification;
+use mux_protocol::proto::{PaneAction, PaneMedia};
 use parking_lot::Mutex;
 #[cfg(all(
     not(target_family = "wasm"),
@@ -120,6 +122,13 @@ pub struct Pane {
     notification_hook: parking_lot::Mutex<Option<Arc<dyn Fn(MuxNotification) + Send + Sync>>>,
     /// §16.6 Optional hook for ClipboardStore events from the emulator.
     clipboard_hook: parking_lot::Mutex<Option<Box<dyn Fn(String) + Send>>>,
+    /// §16.13 Per-pane monotonic sequence shared by media and actions, in
+    /// cross-type arrival order. Read/written under `commit`.
+    media_sequence: AtomicU64,
+    /// §16.13 Observer for each completed `PaneMedia`, in sequence order.
+    media_hook: parking_lot::Mutex<Option<Arc<dyn Fn(Vec<PaneMedia>) + Send + Sync>>>,
+    /// §16.13 Observer for each `PaneAction`, in sequence order.
+    action_hook: parking_lot::Mutex<Option<Arc<dyn Fn(Vec<PaneAction>) + Send + Sync>>>,
 }
 /// §3.3 Pane 事件收集器 — alacritty `EventListener` 的实现。
 ///
@@ -642,7 +651,7 @@ fn parse_osc133_payload(payload: &[u8]) -> Option<(ShellMarkerKind, Option<i32>)
 
 /// §3.3 PTY read-loop 本地状态: DEC-2026 同步延迟 + coalescing 通知节流。
 /// 仅在单一 PTY read 线程内顺序访问, 无需同步原语。
-struct ReadLoopState {
+pub(crate) struct ReadLoopState {
     /// Persistent parsers preserve escape sequences split across PTY reads.
     terminal_processor: Processor<StdSyncHandler>,
     history_processor: Processor<StdSyncHandler>,
@@ -658,6 +667,17 @@ struct ReadLoopState {
     pending_full_snapshot: bool,
     /// 有被 coalescing 推迟、待窗口到期补发的 PaneDirty
     pending_notify: bool,
+    /// §16.13 Server-side Kitty / OSC 9 scanner for this pane's byte stream.
+    /// State persists across feeds (sequences split at PTY read boundaries).
+    terminal_scanner: TerminalMediaScanner,
+    /// §16.13 Event ledger from the last batch: media/action arrival order
+    /// plus each event's grid-byte offset, so cursor placement and dispatch
+    /// can be merged with the OSC 133 marker walk without guessing.
+    scan_events: Vec<ScanEvent>,
+    /// §16.13 Completed media from the last batch, indexed by `scan_events`.
+    media: Vec<PaneMedia>,
+    /// §16.13 Completed actions from the last batch, indexed by `scan_events`.
+    actions: Vec<PaneAction>,
 }
 
 impl Default for ReadLoopState {
@@ -672,6 +692,10 @@ impl Default for ReadLoopState {
             pending_dirty_rows: Vec::new(),
             pending_full_snapshot: false,
             pending_notify: false,
+            terminal_scanner: TerminalMediaScanner::new(),
+            scan_events: Vec::new(),
+            media: Vec::new(),
+            actions: Vec::new(),
         }
     }
 }
@@ -895,6 +919,9 @@ impl Pane {
             exit_hook: parking_lot::Mutex::new(None),
             clipboard_hook: parking_lot::Mutex::new(None),
             notification_hook: parking_lot::Mutex::new(None),
+            media_sequence: AtomicU64::new(0),
+            media_hook: parking_lot::Mutex::new(None),
+            action_hook: parking_lot::Mutex::new(None),
             #[cfg(target_family = "wasm")]
             guest_output_state: parking_lot::Mutex::new((
                 Dec2026Parser::new(),
@@ -1000,31 +1027,47 @@ impl Pane {
 
     /// Feed one PTY byte batch into the server-owned emulator and publish one
     /// coherent grid generation outside DEC-2026 synchronized-update windows.
-    fn process_pty_bytes(
+    pub(crate) fn process_pty_bytes(
         self: &Arc<Self>,
         bytes: &[u8],
         dec: &mut Dec2026Parser,
         coalescer: &mut AdaptiveCoalescer,
         state: &mut ReadLoopState,
     ) {
-        let transitions = dec.parse(bytes);
+        // §16.13 Strip Kitty APC and consumed OSC 9 actions before any
+        // DEC-2026, OSC, history, or alacritty processor sees a byte.
+        // `grid_bytes` is the only stream advanced below; media/actions travel
+        // through the event ledger and are dispatched after the batch commits.
+        let ScanOutput {
+            grid_bytes,
+            media,
+            actions,
+            events,
+        } = state.terminal_scanner.feed(bytes);
+        state.scan_events = events;
+        state.media = media;
+        state.actions = actions;
+
+        let transitions = dec.parse(&grid_bytes);
         let in_sync = dec.is_in_sync();
-        // §16.3 Re-classify on the byte volume of this batch before any
+        // §16.3 Re-classify on the grid-byte volume of this batch before any
         // notification decision uses the resulting window.
-        coalescer.on_output(bytes.len());
+        coalescer.on_output(grid_bytes.len());
         self.flush_pending_notify(state, coalescer);
 
-        // §3.3 OSC 7 / OSC 133 are scanned before the emulator consumes the
-        // batch: a marker belongs to the cursor row at its own byte offset, and
-        // one batch routinely spans a prompt, a command line and its output.
+        // §3.3 OSC 7 / OSC 133 are scanned on the grid-safe stream so their
+        // offsets stay grid-relative: a marker belongs to the cursor row at its
+        // own byte offset, and one batch routinely spans a prompt, a command
+        // line and its output. Kitty / OSC 9 bytes are absent from `grid_bytes`,
+        // so offsets here address the same stream the emulator consumes.
         state.osc_events.clear();
-        state.osc_scanner.scan(bytes, &mut state.osc_events);
+        state.osc_scanner.scan(&grid_bytes, &mut state.osc_events);
 
         let commit = self.commit.lock();
         state.history_observer.reset();
         state
             .history_processor
-            .advance(&mut state.history_observer, bytes);
+            .advance(&mut state.history_observer, &grid_bytes);
         let (
             render_state_changed,
             history_size_before,
@@ -1033,6 +1076,7 @@ impl Pane {
             modes_after,
             alt_screen_changed,
             addressing,
+            media_cursor,
         ) = {
             let mut term = self.term.lock();
             let before = (
@@ -1043,10 +1087,11 @@ impl Pane {
             );
             let history_size_before = term.grid().history_size();
             let alt_screen_before = term.mode().contains(TermMode::ALT_SCREEN);
-            let addressing = self.advance_recording_markers(
+            let (addressing, media_cursor) = self.advance_recording_markers(
                 &mut term,
-                bytes,
+                &grid_bytes,
                 &state.osc_events,
+                &state.scan_events,
                 &mut state.terminal_processor,
             );
             let after = (
@@ -1063,11 +1108,21 @@ impl Pane {
                 after.3,
                 alt_screen_before != term.mode().contains(TermMode::ALT_SCREEN),
                 addressing,
+                media_cursor,
             )
         };
         self.set_bracketed_paste_mode(
             modes_after & mux_protocol::terminal_mode::BRACKETED_PASTE != 0,
         );
+        // §16.13 Apply cursor-cell placement captured at each Kitty event's
+        // exact grid-byte offset. Only `a=T` places at the cursor; other
+        // actions keep row/column at their protocol default (0).
+        for (index, row, column) in media_cursor {
+            if let Some(media) = state.media.get_mut(index) {
+                media.row = row;
+                media.column = column;
+            }
+        }
         let (dirty_rows, _fully_damaged) = self.collect_dirty_rows();
         // A VTE scroll can rotate a full history ring without changing its
         // length. Ordinary input and color changes do not invalidate the
@@ -1092,14 +1147,21 @@ impl Pane {
         );
 
         let grid_changed = !dirty_rows.is_empty() || render_state_changed || history_changed;
+        // §16.13 A media add/delete is render-affecting even when it leaves
+        // the grid untouched (Kitty bytes are stripped), so it advances the
+        // pane generation under the same commit fence as PTY output.
+        let has_media = state
+            .scan_events
+            .iter()
+            .any(|event| matches!(event, ScanEvent::Media { .. }));
         let should_broadcast_dirty = if in_sync && !transitions.ended() {
-            if grid_changed {
+            if grid_changed || has_media {
                 state.pending_sync = true;
                 state.pending_dirty_rows.extend(dirty_rows);
                 state.pending_full_snapshot |= render_state_changed || history_changed;
             }
             false
-        } else if grid_changed || state.pending_sync {
+        } else if grid_changed || has_media || state.pending_sync {
             let mut all_dirty_rows = std::mem::take(&mut state.pending_dirty_rows);
             all_dirty_rows.extend(dirty_rows);
             all_dirty_rows.sort_unstable();
@@ -1125,6 +1187,10 @@ impl Pane {
         let output_sequence = self.advance_output_sequence();
         drop(commit);
 
+        // §16.13 Deliver completed media/actions in cross-type arrival order,
+        // after the batch's emulator/generation state is committed and with
+        // no lock held.
+        self.dispatch_media_events(state);
         self.broadcast_pane_output(bytes, output_sequence);
         self.handle_pending_events();
         for event in &state.osc_events {
@@ -1139,7 +1205,8 @@ impl Pane {
 
     /// Feed one batch to the emulator, pausing at every OSC 133 marker so the
     /// marker's row is read at the byte offset it arrived on, and return the
-    /// batch's row-addressing bookkeeping.
+    /// batch's row-addressing bookkeeping plus the cursor cell captured at each
+    /// `a=T` Kitty event's grid-byte offset.
     ///
     /// Rows pushed above the viewport are counted as scrollback growth. The
     /// emulator would stop growing once scrollback reaches capacity, so the
@@ -1150,8 +1217,9 @@ impl Pane {
         term: &mut Term<PaneEventListener>,
         bytes: &[u8],
         events: &[OscEvent],
+        media_events: &[ScanEvent],
         processor: &mut Processor<StdSyncHandler>,
-    ) -> RowAddressing {
+    ) -> (RowAddressing, Vec<(usize, i32, u32)>) {
         let mut addressing = RowAddressing {
             viewport_top: self.viewport_top_absolute.load(Ordering::Acquire),
             history_size: term.grid().history_size(),
@@ -1163,21 +1231,75 @@ impl Pane {
         };
         let epoch = self.row_addressing_epoch.load(Ordering::Acquire);
 
+        // §16.13 Merge OSC 133 marker boundaries with Kitty event offsets into
+        // one sorted walk so the cursor is read at each event's exact grid
+        // position instead of at the batch end. The two offsets come from the
+        // same grid-safe stream, so they compare directly.
+        enum Boundary {
+            Marker {
+                kind: ShellMarkerKind,
+                exit_code: Option<i32>,
+            },
+            Media {
+                index: usize,
+                action: Option<u8>,
+            },
+        }
+        let mut boundaries: Vec<(usize, Boundary)> = Vec::new();
         for event in events {
-            let OscEvent::ShellMarker {
+            if let OscEvent::ShellMarker {
                 kind,
                 exit_code,
                 end_offset,
             } = event
-            else {
-                continue;
-            };
-            addressing.advance_to(term, processor, bytes, *end_offset);
-            self.record_shell_marker(term, *kind, *exit_code, addressing.viewport_top, epoch);
+            {
+                boundaries.push((
+                    *end_offset,
+                    Boundary::Marker {
+                        kind: *kind,
+                        exit_code: *exit_code,
+                    },
+                ));
+            }
+        }
+        for event in media_events {
+            if let ScanEvent::Media {
+                index,
+                grid_offset,
+                action,
+            } = event
+            {
+                boundaries.push((
+                    *grid_offset,
+                    Boundary::Media {
+                        index: *index,
+                        action: *action,
+                    },
+                ));
+            }
+        }
+        boundaries.sort_by_key(|(offset, _)| *offset);
+
+        let mut media_cursor: Vec<(usize, i32, u32)> = Vec::new();
+        for (offset, boundary) in boundaries {
+            addressing.advance_to(term, processor, bytes, offset);
+            match boundary {
+                Boundary::Marker { kind, exit_code } => {
+                    self.record_shell_marker(term, kind, exit_code, addressing.viewport_top, epoch);
+                }
+                Boundary::Media { index, action } => {
+                    if action == Some(b'T') {
+                        let cursor = term.grid().cursor.point;
+                        let row = cursor.line.0;
+                        let column = u32::try_from(cursor.column.0).unwrap_or(u32::MAX);
+                        media_cursor.push((index, row, column));
+                    }
+                }
+            }
         }
         addressing.advance_to(term, processor, bytes, bytes.len());
         addressing.finish(term);
-        addressing
+        (addressing, media_cursor)
     }
 
     /// Publish the batch's absolute row base, retiring the numbering when the
@@ -1338,6 +1460,46 @@ impl Pane {
             )),
         });
     }
+    /// §16.13 Deliver completed media/actions to the pane's observers in
+    /// cross-type arrival order, each stamped with a per-pane monotonic
+    /// sequence shared by media and actions. Runs after the batch's
+    /// emulator/generation state is committed and without holding `commit`.
+    fn dispatch_media_events(&self, state: &ReadLoopState) {
+        for event in &state.scan_events {
+            match event {
+                ScanEvent::Media { index, .. } => {
+                    let Some(media) = state.media.get(*index) else {
+                        continue;
+                    };
+                    let mut media = media.clone();
+                    media.pane_id = self.id.clone();
+                    media.sequence = self
+                        .media_sequence
+                        .fetch_add(1, Ordering::AcqRel)
+                        .saturating_add(1);
+                    let hook = self.media_hook.lock().clone();
+                    if let Some(hook) = hook {
+                        hook(vec![media]);
+                    }
+                }
+                ScanEvent::Action { index, .. } => {
+                    let Some(action) = state.actions.get(*index) else {
+                        continue;
+                    };
+                    let mut action = action.clone();
+                    action.pane_id = self.id.clone();
+                    action.sequence = self
+                        .media_sequence
+                        .fetch_add(1, Ordering::AcqRel)
+                        .saturating_add(1);
+                    let hook = self.action_hook.lock().clone();
+                    if let Some(hook) = hook {
+                        hook(vec![action]);
+                    }
+                }
+            }
+        }
+    }
 
     /// §3.3 从 alacritty Term 收集 dirty 行号和整屏损伤标志。
     fn collect_dirty_rows(&self) -> (Vec<usize>, bool) {
@@ -1360,7 +1522,6 @@ impl Pane {
         term.reset_damage();
         (rows, fully_damaged)
     }
-
     fn broadcast_pane_title(&self, title: String) {
         self.broadcast_notification(MuxNotification {
             event: Some(mux_protocol::notification::Event::PaneTitleChanged(
@@ -1380,7 +1541,6 @@ impl Pane {
             .write()
             .retain(|_client_id, subscriber| subscriber.send(notification.clone()).is_ok());
     }
-
     pub fn add_subscriber(
         &self,
         client_id: String,
@@ -1699,6 +1859,17 @@ impl Pane {
     /// (OSC 52 / ClipboardStore). Replaces any previous hook.
     pub fn set_clipboard_hook(&self, hook: Box<dyn Fn(String) + Send>) {
         *self.clipboard_hook.lock() = Some(hook);
+    }
+    /// §16.13 Install an observer invoked for each completed `PaneMedia` in
+    /// sequence order. Replaces any previous hook.
+    pub fn set_media_hook(&self, hook: Box<dyn Fn(Vec<PaneMedia>) + Send + Sync>) {
+        *self.media_hook.lock() = Some(Arc::from(hook));
+    }
+
+    /// §16.13 Install an observer invoked for each `PaneAction` in sequence
+    /// order. Replaces any previous hook.
+    pub fn set_action_hook(&self, hook: Box<dyn Fn(Vec<PaneAction>) + Send + Sync>) {
+        *self.action_hook.lock() = Some(Arc::from(hook));
     }
 
     /// §3.4 获取 pane 所属 session id (可能为 None 表示未关联会话)。
@@ -2135,6 +2306,126 @@ mod tests {
             replacement_receiver.try_recv(),
             Err(mpsc::error::TryRecvError::Disconnected)
         ));
+    }
+
+    fn spawn_media_pane(id: &str) -> Arc<Pane> {
+        spawn_marker_pane(id, 20, 6, 100)
+    }
+
+    fn typed_notifications(pane: &Arc<Pane>) -> Arc<Mutex<Vec<MuxNotification>>> {
+        let notifications = Arc::new(Mutex::new(Vec::new()));
+        let captured_media = notifications.clone();
+        pane.set_media_hook(Box::new(move |media| {
+            let mut notifications = captured_media.lock();
+            notifications.extend(media.into_iter().map(|media| MuxNotification {
+                event: Some(mux_protocol::notification::Event::PaneMedia(media)),
+            }));
+        }));
+        let captured_actions = notifications.clone();
+        pane.set_action_hook(Box::new(move |actions| {
+            let mut notifications = captured_actions.lock();
+            notifications.extend(actions.into_iter().map(|action| MuxNotification {
+                event: Some(mux_protocol::notification::Event::PaneAction(action)),
+            }));
+        }));
+        notifications
+    }
+
+    #[test]
+    fn kitty_media_is_stripped_but_surrounding_text_reaches_grid() {
+        let pane = spawn_media_pane("media-grid");
+        let mut feed = PtyFeed::new();
+        let notifications = typed_notifications(&pane);
+
+        feed.feed(
+            &pane,
+            b"before\x1b_Ga=T,f=100,i=7,c=2,r=1;SGVsbG8=\x1b\\after",
+        );
+
+        let snapshot = pane.get_full_snapshot();
+        let text: String = snapshot
+            .cells
+            .iter()
+            .take("beforeafter".len())
+            .map(|cell| cell.character.as_str())
+            .collect();
+        assert_eq!(text, "beforeafter");
+        assert_eq!(notifications.lock().len(), 1);
+    }
+
+    #[test]
+    fn kitty_display_captures_cursor_at_control_offset() {
+        let pane = spawn_media_pane("media-cursor");
+        let mut feed = PtyFeed::new();
+        let notifications = typed_notifications(&pane);
+
+        feed.feed(
+            &pane,
+            b"\x1b[3;5H\x1b_Ga=T,f=100,i=8,c=2,r=1;SGVsbG8=\x1b\\tail",
+        );
+
+        let typed = notifications.lock();
+        assert_eq!(typed.len(), 1);
+        match typed.first().and_then(|notification| notification.event.as_ref()) {
+            Some(mux_protocol::notification::Event::PaneMedia(media)) => {
+                assert_eq!((media.row, media.column), (2, 4));
+            }
+            event => panic!("expected PaneMedia, got {event:?}"),
+        }
+    }
+
+    #[test]
+    fn media_and_actions_share_ordered_pane_sequence_across_batches() {
+        let pane = spawn_media_pane("media-action-order");
+        let mut feed = PtyFeed::new();
+        let notifications = typed_notifications(&pane);
+
+        feed.feed(
+            &pane,
+            b"left\x1b_Ga=T,f=100,i=9;SGVsbG8=\x1b\\right",
+        );
+        feed.feed(&pane, b"\x1b]9;z3rm-download;https://example.test/a\x07after");
+
+        let typed = notifications.lock();
+        assert_eq!(typed.len(), 2);
+        let events: Vec<(u64, &'static str)> = typed
+            .iter()
+            .filter_map(|notification| match notification.event.as_ref() {
+                Some(mux_protocol::notification::Event::PaneMedia(media)) => {
+                    Some((media.sequence, "media"))
+                }
+                Some(mux_protocol::notification::Event::PaneAction(action)) => {
+                    Some((action.sequence, "action"))
+                }
+                _ => None,
+            })
+            .collect();
+        assert_eq!(events, vec![(1, "media"), (2, "action")]);
+    }
+    #[test]
+    fn media_advances_generation_and_osc52_remains_one_clipboard_effect() {
+        let pane = spawn_media_pane("media-generation-clipboard");
+        let mut feed = PtyFeed::new();
+        let clipboard = Arc::new(Mutex::new(Vec::<String>::new()));
+        let captured = clipboard.clone();
+        pane.set_clipboard_hook(Box::new(move |value| captured.lock().push(value)));
+        let baseline = pane.get_generation();
+
+        feed.feed(
+            &pane,
+            b"\x1b_Ga=T,f=100,i=10;SGVsbG8=\x1b\\\x1b]52;c;SGVsbG8=\x07",
+        );
+
+        assert!(pane.get_generation() > baseline);
+        assert_eq!(&*clipboard.lock(), &["Hello".to_string()]);
+    }
+
+    #[test]
+    fn pane_drop_releases_media_hook_without_arc_cycle() {
+        let pane = spawn_media_pane("media-hook-drop");
+        let weak = Arc::downgrade(&pane);
+        drop(pane);
+        assert!(weak.upgrade().is_none());
     }
 
     #[test]

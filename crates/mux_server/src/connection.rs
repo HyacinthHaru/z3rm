@@ -1147,6 +1147,7 @@ fn handle_confirm_recovery(
         register_pane_with_session_subscribers(session, pane);
         drop(live);
         install_pane_clipboard_hook(pane, sessions, clipboard);
+        install_pane_media_hooks(pane, sessions, &candidate.id);
         install_pane_exit_hook(pane, sessions, candidate.id.clone(), pane.id.clone());
     }
     // §16.8 The recovered session and its panes were created inside this
@@ -1495,6 +1496,60 @@ fn install_pane_clipboard_hook(
         clipboard.set_clipboard(entry, &txs);
     }));
 }
+/// §16.13 Install daemon-side observers for a pane's completed media/actions.
+///
+/// Each completed `PaneMedia` / `PaneAction` is fanned out to every attached
+/// client of the pane's session through the existing session lifecycle
+/// notification path (length-delimited Envelope framing) — the same channel
+/// the clipboard hook uses — so there is exactly one transport and one
+/// delivery per client. The closures hold only a `Weak` to the sessions list,
+/// so a dropped pane releases the hook state and no Arc cycle forms.
+fn install_pane_media_hooks(
+    pane: &std::sync::Arc<crate::pane::Pane>,
+    sessions: &Arc<parking_lot::RwLock<Vec<crate::session::Session>>>,
+    session_id: &str,
+) {
+    let session_id = session_id.to_string();
+    let weak_media = Arc::downgrade(sessions);
+    let weak_action = Arc::downgrade(sessions);
+    let session_id_action = session_id.clone();
+    pane.set_media_hook(Box::new(move |media| {
+        let Some(sessions) = weak_media.upgrade() else {
+            return;
+        };
+        for media in media {
+            let notification = Notification {
+                event: Some(mux_protocol::notification::Event::PaneMedia(media)),
+            };
+            let session = sessions
+                .read()
+                .iter()
+                .find(|session| session.id == session_id)
+                .cloned();
+            if let Some(session) = session {
+                session.broadcast_lifecycle(notification);
+            }
+        }
+    }));
+    pane.set_action_hook(Box::new(move |actions| {
+        let Some(sessions) = weak_action.upgrade() else {
+            return;
+        };
+        for action in actions {
+            let notification = Notification {
+                event: Some(mux_protocol::notification::Event::PaneAction(action)),
+            };
+            let session = sessions
+                .read()
+                .iter()
+                .find(|session| session.id == session_id_action)
+                .cloned();
+            if let Some(session) = session {
+                session.broadcast_lifecycle(notification);
+            }
+        }
+    }));
+}
 
 fn register_pane_with_session_subscribers(
     session: &crate::session::Session,
@@ -1693,6 +1748,7 @@ async fn handle_spawn_pane(
             if let Some(pane) = session.panes.read().get(&pane_id) {
                 register_pane_with_session_subscribers(session, pane);
                 install_pane_clipboard_hook(pane, sessions, clipboard);
+                install_pane_media_hooks(pane, sessions, &req.session_id);
             }
         }
     }
@@ -1881,6 +1937,7 @@ async fn handle_split_pane(
                 pane.set_session_id(session.id.clone());
                 register_pane_with_session_subscribers(session, &pane);
                 install_pane_clipboard_hook(&pane, sessions, clipboard);
+                install_pane_media_hooks(&pane, sessions, &session.id);
             }
             // §3.4 fan-out PaneAdded + 更新后 layout 到所有 attached 客户端。
             // 写入 session 在 scopes 结束 (sessions_w 被 drop) 后释放,

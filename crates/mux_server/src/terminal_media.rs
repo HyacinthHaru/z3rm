@@ -52,7 +52,25 @@ pub struct ScanOutput {
     pub media: Vec<PaneMedia>,
     /// Typed DOWNLOAD/COPY actions, in arrival order.
     pub actions: Vec<PaneAction>,
+    /// Control events in their original arrival order. The public vectors are
+    /// retained for API compatibility; Pane uses this index/offset ledger to
+    /// merge media/actions with OSC 133 boundaries without guessing.
+    pub(crate) events: Vec<ScanEvent>,
 }
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum ScanEvent {
+    Media {
+        index: usize,
+        grid_offset: usize,
+        action: Option<u8>,
+    },
+    Action {
+        index: usize,
+        grid_offset: usize,
+    },
+}
+
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum ScanState {
@@ -107,7 +125,13 @@ struct PendingMedia {
     columns: u32,
     rows: u32,
     data: Vec<u8>,
+    /// Placement metadata belongs to the first chunk. A final continuation
+    /// may omit `a`, but `a=T` still names the cursor location where the
+    /// transfer started.
+    placement_action: Option<u8>,
+    placement_grid_offset: usize,
 }
+
 
 /// Incremental, bounded scanner for the control sequences above.
 ///
@@ -125,7 +149,12 @@ pub struct TerminalMediaScanner {
     osc_digits: u32,
     /// Active Kitty transfer, if any (protocol chunks do not interleave).
     pending: Option<(u32, PendingMedia)>,
+    /// Grid-byte offset at which the currently buffered control sequence
+    /// began. Offsets are relative to the current `feed`; a sequence spanning
+    /// feeds is therefore anchored at offset zero in the completing feed.
+    sequence_grid_offset: usize,
 }
+
 
 impl Default for TerminalMediaScanner {
     fn default() -> Self {
@@ -135,6 +164,7 @@ impl Default for TerminalMediaScanner {
             osc_number: 0,
             osc_digits: 0,
             pending: None,
+            sequence_grid_offset: 0,
         }
     }
 }
@@ -147,6 +177,18 @@ impl TerminalMediaScanner {
     /// Scan one PTY byte batch, returning the grid-safe bytes and any
     /// complete media/actions. State persists for the next batch.
     pub fn feed(&mut self, bytes: &[u8]) -> ScanOutput {
+        if self.pending.is_some() {
+            if let Some((_, pending)) = self.pending.as_mut() {
+                // A continuation transfer may have started in an earlier
+                // feed; its original cursor is the beginning of this feed.
+                pending.placement_grid_offset = 0;
+            }
+        }
+        if !matches!(self.state, ScanState::Ground | ScanState::Discard | ScanState::DiscardEsc) {
+            // A control sequence split across feeds has no grid bytes before
+            // its completion in this feed, so its local boundary is zero.
+            self.sequence_grid_offset = 0;
+        }
         let mut output = ScanOutput {
             grid_bytes: Vec::with_capacity(bytes.len()),
             ..ScanOutput::default()
@@ -171,11 +213,11 @@ impl TerminalMediaScanner {
                         self.state = ScanState::Escape;
                     }
                     b'_' => {
-                        self.start_sequence(b'_');
+                        self.start_sequence(b'_', output.grid_bytes.len());
                         self.state = ScanState::ApcIntro;
                     }
                     b']' => {
-                        self.start_sequence(b']');
+                        self.start_sequence(b']', output.grid_bytes.len());
                         self.osc_number = 0;
                         self.osc_digits = 0;
                         self.state = ScanState::OscNumber;
@@ -344,12 +386,12 @@ impl TerminalMediaScanner {
 
     /// Begin buffering a control sequence introduced by `_` or `]`. The ESC
     /// was already consumed by the caller and is replayed here.
-    fn start_sequence(&mut self, introducer: u8) {
+    fn start_sequence(&mut self, introducer: u8, grid_offset: usize) {
         self.buffer.clear();
         self.buffer.push(0x1b);
         self.buffer.push(introducer);
+        self.sequence_grid_offset = grid_offset;
     }
-
     /// Append a control byte without ever growing the buffer beyond the cap.
     /// If the cap is already full, the current byte is consumed as part of
     /// discard recovery so a terminator on this byte still resumes parsing.
@@ -420,6 +462,7 @@ impl TerminalMediaScanner {
     /// A complete Kitty APC is buffered: `ESC _ G params ; data`.
     fn finish_kitty(&mut self, output: &mut ScanOutput) {
         // Buffer layout: ESC _ G <params> ; <data> (ST/BEL already consumed).
+        let event_offset = self.sequence_grid_offset;
         let body = std::mem::take(&mut self.buffer);
         self.state = ScanState::Ground;
         let params = &body[3..];
@@ -449,6 +492,7 @@ impl TerminalMediaScanner {
         let delete = parsed.action == Some(b'd')
             || (parsed.action == Some(b'q') && parsed.delete_mode == Some(b'i'));
         if delete {
+            let index = output.media.len();
             output.media.push(PaneMedia {
                 pane_id: String::new(),
                 sequence: 0,
@@ -461,6 +505,11 @@ impl TerminalMediaScanner {
                 data: Vec::new(),
                 final_chunk: false,
                 delete: true,
+            });
+            output.events.push(ScanEvent::Media {
+                index,
+                grid_offset: event_offset,
+                action: parsed.action,
             });
             self.pending = None;
             return;
@@ -487,6 +536,8 @@ impl TerminalMediaScanner {
                 columns: parsed.columns.unwrap_or(0),
                 rows: parsed.rows.unwrap_or(0),
                 data: Vec::new(),
+                placement_action: parsed.action,
+                placement_grid_offset: event_offset,
             }));
             // If the image id changed, reset the pending transfer.
             if entry.0 != image_id {
@@ -495,9 +546,11 @@ impl TerminalMediaScanner {
                     columns: parsed.columns.unwrap_or(0),
                     rows: parsed.rows.unwrap_or(0),
                     data: Vec::new(),
+                    placement_action: parsed.action,
+                    placement_grid_offset: event_offset,
                 });
             }
-            // Preflight data size with checked_add before extending.
+            // Preflight data size with checked_add.
             match entry.1.data.len().checked_add(payload.len()) {
                 Some(new_len) if new_len <= MAX_REASSEMBLED_MEDIA_BYTES => {
                     entry.1.data.extend_from_slice(&payload);
@@ -513,6 +566,8 @@ impl TerminalMediaScanner {
         }
 
         // Final chunk: complete a pending image or publish a single chunk.
+        let mut placement_action = parsed.action;
+        let mut placement_grid_offset = event_offset;
         let mut media = if let Some((pid, entry)) = self.pending.take() {
             if pid != image_id {
                 // Image id mismatch — start fresh with this chunk.
@@ -530,6 +585,10 @@ impl TerminalMediaScanner {
                     delete: false,
                 }
             } else {
+                placement_action = entry.placement_action.or(parsed.action);
+                if entry.placement_action.is_some() {
+                    placement_grid_offset = entry.placement_grid_offset;
+                }
                 PaneMedia {
                     pane_id: String::new(),
                     sequence: 0,
@@ -571,7 +630,13 @@ impl TerminalMediaScanner {
                 return;
             }
         }
+        let index = output.media.len();
         output.media.push(media);
+        output.events.push(ScanEvent::Media {
+            index,
+            grid_offset: placement_grid_offset,
+            action: placement_action,
+        });
     }
 
     /// A complete OSC payload is buffered: `ESC ] <number> ; <payload>`.
@@ -622,11 +687,16 @@ impl TerminalMediaScanner {
         match kind {
             Some(PaneActionKind::Download) => {
                 if let Some(value) = value {
+                    let index = output.actions.len();
                     output.actions.push(PaneAction {
                         pane_id: String::new(),
                         sequence: 0,
                         kind: PaneActionKind::Download as i32,
                         value,
+                    });
+                    output.events.push(ScanEvent::Action {
+                        index,
+                        grid_offset: self.sequence_grid_offset,
                     });
                 } else {
                     tracing::warn!("terminal media: OSC 9 z3rm-download value is not valid UTF-8");
@@ -636,12 +706,19 @@ impl TerminalMediaScanner {
                 if let Some(value) = value {
                     match base64::engine::general_purpose::STANDARD.decode(value.as_bytes()) {
                         Ok(text) => match String::from_utf8(text) {
-                            Ok(text) => output.actions.push(PaneAction {
-                                pane_id: String::new(),
-                                sequence: 0,
-                                kind: PaneActionKind::Copy as i32,
-                                value: text,
-                            }),
+                            Ok(text) => {
+                                let index = output.actions.len();
+                                output.actions.push(PaneAction {
+                                    pane_id: String::new(),
+                                    sequence: 0,
+                                    kind: PaneActionKind::Copy as i32,
+                                    value: text,
+                                });
+                                output.events.push(ScanEvent::Action {
+                                    index,
+                                    grid_offset: self.sequence_grid_offset,
+                                });
+                            }
                             Err(_) => {
                                 tracing::warn!(
                                     "terminal media: OSC 9 z3rm-copy decoded text is not valid UTF-8"

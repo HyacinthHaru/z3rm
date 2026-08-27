@@ -149,3 +149,54 @@ The re-review found one malformed-OSC recovery gap: `OscPayloadEscape` retained 
 Verification: `cargo test -p mux_server terminal_media` — 23 passed; 0 failed.
 
 Follow-up commit: `46943df3d3` pushed to `origin/main` (base `12f126aae3`, no force).
+## Pane / connection wiring
+
+The reviewed scanner is now on the server-canonical PTY path. `ReadLoopState`
+owns one persistent `TerminalMediaScanner` for both native PTY reads and the
+guest-output entry point. `Pane::process_pty_bytes` feeds the scanner first;
+DEC-2026, OSC 7/133, history observation, and alacritty all receive only
+`ScanOutput.grid_bytes`. Raw `PaneOutput` remains the documented lossy wakeup.
+
+`ScanOutput` now carries an internal ordered event ledger with grid-byte
+offsets. Pane merges those offsets with OSC 133 boundaries while advancing the
+authoritative alacritty terminal, captures `a=T` row/column at the Kitty event
+offset, and stamps media/actions from one Pane-owned monotonic sequence. Media
+adds/deletes publish a generation under the same commit fence. Typed events are
+delivered after commit through the registered media/action hooks; hooks are
+`Send + Sync`, session-scoped in `connection.rs`, and use weak registry
+references so pane removal does not create an Arc cycle. Recovered, spawned,
+and split panes install the hooks alongside clipboard/subscriber registration;
+the connection hook targets only the owning session's lifecycle subscribers,
+so each attached client receives one length-delimited notification. OSC 52
+continues through the existing ClipboardStore hook only.
+
+## Wiring verification
+
+All commands used the shared bounded target directory
+`/run/media/ezra/13D010B6FDBC1A06/projects/z3rm-target-verify`.
+
+```text
+$ cargo test -p mux_server terminal_media
+test result: ok. 22 passed; 0 failed; 0 ignored
+
+$ cargo test -p mux_server --lib -- kitty_media_is_stripped_but_surrounding_text_reaches_grid
+test result: ok. 1 passed; 0 failed; 0 ignored
+
+$ cargo test -p mux_server --lib -- media_
+test result: ok. 5 passed; 0 failed; 0 ignored
+
+$ cargo check -p mux_server --lib
+Finished successfully (warnings only; exit 0).
+
+$ cargo check -p mux_server --lib --no-default-features --features guest
+Finished successfully (warnings only; exit 0).
+
+$ RUSTFLAGS="-C linker=rust-lld" cargo check -p mux_server \
+    --target i686-unknown-linux-musl --no-default-features --features guest
+Finished successfully (warnings only; exit 0).
+```
+
+Concerns: the existing workspace emits unrelated warnings (dependency patch
+and unused/dead-code warnings). The cursor-specific test was not rerun after
+the final source edit; the parser, grid-strip, media-order/generation, native
+check, and i686 guest check above all completed successfully.
