@@ -114,6 +114,7 @@ fn newline_advances_cursor_line() {
     assert_eq!(cell_char(&term, 1, 1), 'D');
 }
 
+#[test]
 fn carriage_return_moves_to_col_zero() {
     let mut term = make_term();
     feed(&mut term, b"ABCDE\rXY");
