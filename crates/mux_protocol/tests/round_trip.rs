@@ -274,90 +274,168 @@ fn test_pane_bell_notification() {
     ));
 }
 
-// §9 验证 PaneMedia 通知 round-trip: 媒体字节、尺寸与时间戳必须逐字段回归。
+// §9 验证 PaneMedia 通知 round-trip: 全部字段逐项回归, 并覆盖空 data 的
+// delete 清除、非 final 的分块与 final_chunk 收尾三种形态。
 #[test]
 fn test_pane_media_notification_round_trip() {
+    // 完整单块帧: 所有字段均非缺省。
     let media = PaneMedia {
         pane_id: "v86-1".into(),
-        media_type: "image/png".into(),
-        data: [0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A].to_vec(), // PNG magic prefix
-        width: 800,
-        height: 600,
-        timestamp_ms: 1_724_702_400_000,
+        sequence: 9_999,
+        image_id: 7,
+        format: 1, // image/png
+        row: 0,
+        column: 0,
+        columns: 800,
+        rows: 600,
+        data: [0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A].to_vec(), // PNG magic
+        final_chunk: true,
+        delete: false,
     };
+    let decoded_media = round_trip_pane_media(media);
+    assert_eq!(decoded_media.pane_id, "v86-1");
+    assert_eq!(decoded_media.sequence, 9_999);
+    assert_eq!(decoded_media.image_id, 7);
+    assert_eq!(decoded_media.format, 1);
+    assert_eq!(decoded_media.row, 0);
+    assert_eq!(decoded_media.column, 0);
+    assert_eq!(decoded_media.columns, 800);
+    assert_eq!(decoded_media.rows, 600);
+    assert_eq!(
+        decoded_media.data,
+        [0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A]
+    );
+    assert!(decoded_media.final_chunk);
+    assert!(!decoded_media.delete);
 
+    // 分块帧的中间块: 非空 data、非 final, row 指向块起始行。
+    let chunk = PaneMedia {
+        pane_id: "v86-1".into(),
+        sequence: 10_001,
+        image_id: 7,
+        format: 1,
+        row: 200,
+        column: 0,
+        columns: 800,
+        rows: 600,
+        data: vec![0xDE, 0xAD, 0xBE, 0xEF],
+        final_chunk: false,
+        delete: false,
+    };
+    let decoded_chunk = round_trip_pane_media(chunk);
+    assert_eq!(decoded_chunk.sequence, 10_001);
+    assert_eq!(decoded_chunk.image_id, 7);
+    assert_eq!(decoded_chunk.row, 200);
+    assert_eq!(decoded_chunk.data, [0xDE, 0xAD, 0xBE, 0xEF]);
+    assert!(!decoded_chunk.final_chunk);
+    assert!(!decoded_chunk.delete);
+
+    // delete 清除消息: 空 data、delete=true。
+    let deleted = PaneMedia {
+        pane_id: "v86-1".into(),
+        sequence: 10_002,
+        image_id: 7,
+        format: 0,
+        row: 0,
+        column: 0,
+        columns: 0,
+        rows: 0,
+        data: Vec::new(),
+        final_chunk: false,
+        delete: true,
+    };
+    let decoded_deleted = round_trip_pane_media(deleted);
+    assert!(decoded_deleted.data.is_empty());
+    assert!(decoded_deleted.delete);
+    assert!(!decoded_deleted.final_chunk);
+    assert_eq!(decoded_deleted.image_id, 7);
+}
+
+// §9 PaneMedia frame → unframe 辅助: 逐字段解码并返回。
+fn round_trip_pane_media(media: PaneMedia) -> PaneMedia {
     let env = Envelope {
         version: Some(PROTOCOL_VERSION),
         payload: Some(proto::envelope::Payload::Notification(Notification {
-            event: Some(proto::notification::Event::PaneMedia(media.clone())),
+            event: Some(proto::notification::Event::PaneMedia(media)),
         })),
     };
-
     let framed = frame(&env).unwrap();
     let (decoded, consumed) = unframe(&framed).unwrap();
     assert_eq!(consumed, framed.len());
-
     let payload = decoded.payload.expect("payload missing");
     let Notification { event } = match payload {
         proto::envelope::Payload::Notification(n) => n,
         _ => panic!("expected Notification"),
     };
-    let proto::notification::Event::PaneMedia(decoded_media) = event.expect("event missing")
-    else {
-        panic!("expected PaneMedia event")
-    };
-    assert_eq!(decoded_media.pane_id, "v86-1");
-    assert_eq!(decoded_media.media_type, "image/png");
-    assert_eq!(decoded_media.data, [0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A]);
-    assert_eq!(decoded_media.width, 800);
-    assert_eq!(decoded_media.height, 600);
-    assert_eq!(decoded_media.timestamp_ms, 1_724_702_400_000);
+    match event.expect("event missing") {
+        proto::notification::Event::PaneMedia(m) => m,
+        _ => panic!("expected PaneMedia event"),
+    }
 }
 
-// §9 验证 PaneAction 通知 round-trip: action_name 与 JSON payload 字节必须回归。
+// §9 验证 PaneAction 通知 round-trip: kind 的 DOWNLOAD 与 COPY 两个取值及
+// value 字符串必须逐字段回归。
 #[test]
 fn test_pane_action_notification_round_trip() {
-    let payload_bytes = r#"{"key":"ControlLeft","event":"keydown"}"#.as_bytes().to_vec();
+    // DOWNLOAD 动作。
+    let download = PaneAction {
+        pane_id: "v86-1".into(),
+        sequence: 20_001,
+        kind: PaneActionKind::Download as i32,
+        value: "https://example.com/guest-image.png".into(),
+    };
+    let decoded_download = round_trip_pane_action(download);
+    assert_eq!(decoded_download.pane_id, "v86-1");
+    assert_eq!(decoded_download.sequence, 20_001);
+    assert_eq!(decoded_download.kind, PaneActionKind::Download as i32);
+    assert_eq!(
+        decoded_download.value,
+        "https://example.com/guest-image.png"
+    );
 
+    // COPY 动作。
+    let copy = PaneAction {
+        pane_id: "v86-2".into(),
+        sequence: 20_002,
+        kind: PaneActionKind::Copy as i32,
+        value: "guest text to copy".into(),
+    };
+    let decoded_copy = round_trip_pane_action(copy);
+    assert_eq!(decoded_copy.pane_id, "v86-2");
+    assert_eq!(decoded_copy.sequence, 20_002);
+    assert_eq!(decoded_copy.kind, PaneActionKind::Copy as i32);
+    assert_eq!(decoded_copy.value, "guest text to copy");
+}
+
+// §9 PaneAction frame → unframe 辅助: 逐字段解码并返回。
+fn round_trip_pane_action(action: PaneAction) -> PaneAction {
     let env = Envelope {
         version: Some(PROTOCOL_VERSION),
         payload: Some(proto::envelope::Payload::Notification(Notification {
-            event: Some(proto::notification::Event::PaneAction(PaneAction {
-                pane_id: "v86-1".into(),
-                action_name: "guest_key_event".into(),
-                payload: payload_bytes.clone(),
-                timestamp_ms: 42_001,
-            })),
+            event: Some(proto::notification::Event::PaneAction(action)),
         })),
     };
-
     let framed = frame(&env).unwrap();
     let (decoded, consumed) = unframe(&framed).unwrap();
     assert_eq!(consumed, framed.len());
-
     let payload = decoded.payload.expect("payload missing");
     let Notification { event } = match payload {
         proto::envelope::Payload::Notification(n) => n,
         _ => panic!("expected Notification"),
     };
-    let proto::notification::Event::PaneAction(decoded_action) =
-        event.expect("event missing")
-    else {
-        panic!("expected PaneAction event")
-    };
-    assert_eq!(decoded_action.pane_id, "v86-1");
-    assert_eq!(decoded_action.action_name, "guest_key_event");
-    assert_eq!(decoded_action.payload, payload_bytes);
-    assert_eq!(decoded_action.timestamp_ms, 42_001);
+    match event.expect("event missing") {
+        proto::notification::Event::PaneAction(a) => a,
+        _ => panic!("expected PaneAction event"),
+    }
 }
 
-// §9 验证 ProtocolVersion 增量字段 (minor) 已被 bump, 反映新增 PaneMedia/PaneAction 通知。
+// §9 验证 ProtocolVersion minor 精确等于 6, 反映新增 PaneMedia/PaneAction 通知。
 #[test]
 fn test_protocol_version_minor_bumped_for_media_and_action() {
     assert_eq!(PROTOCOL_VERSION.major, 1);
-    assert!(
-        PROTOCOL_VERSION.minor >= 6,
-        "minor version should reflect additive PaneMedia/PaneAction notifications"
+    assert_eq!(
+        PROTOCOL_VERSION.minor, 6,
+        "minor version must be exactly 6 for additive PaneMedia/PaneAction notifications"
     );
 }
 

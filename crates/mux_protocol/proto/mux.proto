@@ -753,31 +753,43 @@ message PaneBell {
 }
 
 // §9 / §3.3 Pane 多媒体通知：用于承载 v86 之类 guest 终端从 canvas / framebuffer
-// 发出的二进制媒体片段 (通常是 PNG 截图)。字段与 v86 runtime 的
-// screen_make_screenshot 语义对齐: media_type 是 MIME 标签 (如 "image/png"),
-// data 是原始字节, width/height 是画面像素尺寸, timestamp_ms 是服务端生成
-// 该媒体的单调时钟 (毫秒), 用于客户端排序与去重。客户端不解析 data 内容;
-// 它把数据透传给本地渲染器。
+// 发出的二进制媒体片段 (通常是 PNG 截图)。v86 runtime 通过
+// screen_make_screenshot / screen_write_image 把 framebuffer 切成多块, 每块
+// 一条 PaneMedia: 同一帧的所有块共享 image_id 与 sequence (全局单调序号,
+// 用于客户端排序与去重), format 是帧格式标签 (如 "image/png"), row/column
+// 是当前块在整帧中的起始位置, columns/rows 是整帧尺寸, final_chunk 标记
+// 整帧的最后一块, delete 表示撤销/清除之前发布的 image_id。客户端不解析
+// data 内容, 它把数据透传给本地渲染器。
 message PaneMedia {
     string pane_id = 1;
-    string media_type = 2;
-    bytes data = 3;
-    uint32 width = 4;
-    uint32 height = 5;
-    uint64 timestamp_ms = 6;
+    uint64 sequence = 2;
+    uint32 image_id = 3;
+    uint32 format = 4;
+    int32 row = 5;
+    uint32 column = 6;
+    uint32 columns = 7;
+    uint32 rows = 8;
+    bytes data = 9;
+    bool final_chunk = 10;
+    bool delete = 11;
 }
 
-// §9 / §3.3 Pane 动作通知：用于承载 v86 之类 guest 终端发出的结构化动作
-// (例如键盘按键映射、截图请求、鼠标手势)。action_name 是稳定的 action
-// 字符串键 (例如 "guest_screenshot_requested"、"guest_key_event");
-// payload 是服务端签名、客户端透传的 JSON 字节负载 —— 客户端只负责把
-// (pane_id, action_name, payload) 三元组转发给本地 guest 宿主, 服务端
-// 决定语义与校验。timestamp_ms 同样用于客户端排序与去重。
+// §9 / §3.3 Pane 动作通知：承载 guest 终端的结构化动作。kind 是稳定类型
+// 标签 (DOWNLOAD 下载动作 / COPY 复制动作), value 是动作负载字符串
+// (例如下载 URL 或要复制的文本)。sequence 与 PaneMedia 共用同一个单调
+// 序号空间, 用于客户端按序消费。
 message PaneAction {
     string pane_id = 1;
-    string action_name = 2;
-    bytes payload = 3;
-    uint64 timestamp_ms = 4;
+    uint64 sequence = 2;
+    PaneActionKind kind = 3;
+    string value = 4;
+}
+
+// §9 / §3.3 Pane 动作类型。
+enum PaneActionKind {
+    PANE_ACTION_KIND_UNSPECIFIED = 0;
+    DOWNLOAD = 1;
+    COPY = 2;
 }
 
 
