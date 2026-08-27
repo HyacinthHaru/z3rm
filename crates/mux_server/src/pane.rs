@@ -34,9 +34,9 @@ use std::io::{Read, Write};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use web_time::Instant;
-/// §16.13 A slow connection setup must not lose typed events, but a pane
-/// without a session must not accumulate an unbounded queue while unobserved.
-const MAX_PENDING_TYPED_EVENTS: usize = 256;
+/// §16.13 A slow connection setup must not lose typed events. Session-scoped
+/// panes retain pending events until both matching hooks are installed; panes
+/// without a session retain only events that already have a matching hook.
 
 enum PendingTypedEvent {
     Media(PaneMedia),
@@ -142,8 +142,9 @@ pub struct Pane {
     media_hook: parking_lot::Mutex<Option<Arc<dyn Fn(Vec<PaneMedia>) + Send + Sync>>>,
     /// §16.13 Observer for each `PaneAction`, in sequence order.
     action_hook: parking_lot::Mutex<Option<Arc<dyn Fn(Vec<PaneAction>) + Send + Sync>>>,
-    /// §16.13 Typed events buffered while a session-scoped hook is being
-    /// installed. The queue is bounded and only used for panes with a session.
+    /// §16.13 Typed events buffered while session-scoped hooks are being
+    /// installed. The queue is dropped with the pane and never used as an
+    /// unobserved queue for panes without a session.
     pending_typed_events: parking_lot::Mutex<PendingTypedEvents>,
 }
 /// §3.3 Pane 事件收集器 — alacritty `EventListener` 的实现。
@@ -1553,8 +1554,8 @@ impl Pane {
     }
     /// §16.13 Queue completed media/actions in cross-type arrival order, each
     /// stamped with the one per-pane monotonic sequence shared by both types.
-    /// The queue drains only through hooks that are currently installed; a
-    /// session-scoped pane retains a bounded queue across late registration.
+    /// The queue drains only through matching hooks; a session-scoped pane
+    /// retains every event across late registration.
     fn dispatch_media_events(&self, state: &ReadLoopState) {
         let mut events = Vec::with_capacity(state.scan_events.len());
         for event in &state.scan_events {
@@ -1601,13 +1602,6 @@ impl Pane {
                     PendingTypedEvent::Action(_) => action_hook_present,
                 };
             if !retain {
-                continue;
-            }
-            if pending.queue.len() >= MAX_PENDING_TYPED_EVENTS {
-                tracing::warn!(
-                    pane_id = %self.id,
-                    "pending terminal media/action queue is full; dropping newest event"
-                );
                 continue;
             }
             pending.queue.push_back(event);

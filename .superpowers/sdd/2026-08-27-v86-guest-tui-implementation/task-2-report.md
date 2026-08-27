@@ -258,3 +258,37 @@ $ RUSTFLAGS="-C linker=rust-lld" cargo check -p mux_server \
     --target i686-unknown-linux-musl --no-default-features --features guest
 Finished successfully (warnings only; exit 0).
 ```
+
+## Fix round 4 — lossless session hook queue and feed-local offsets
+
+The follow-up review correctly rejected the bounded pending-event cap: a
+session-scoped pane must not silently lose media/actions while connection hooks
+are installed sequentially. The Pane queue now retains every pending typed
+event for the pane lifetime, drains only from the front when the matching hook
+exists, and invokes callbacks without queue or hook locks. Panes without a
+session still retain no unobserved events unless a matching hook is already
+installed.
+
+The scanner now resets only the transient control-sequence offset when a
+control sequence itself crosses a feed boundary. The pending continuation's
+initial `a=T` cursor is carried by the internal `Placement` event and persistent
+Pane cursor state; final media offsets remain local to the completing feed.
+Delete media returns immediately after its single typed event, preventing a
+second fall-through media notification.
+
+```text
+$ cargo test -p mux_server terminal_media
+test result: ok. 23 passed; 0 failed; 0 ignored
+
+$ cargo test -p mux_server --lib -- media_
+test result: ok. 6 passed; 0 failed; 0 ignored
+```
+
+```text
+$ cargo check -p mux_server
+Finished successfully (warnings only; exit 0).
+
+$ RUSTFLAGS="-C linker=rust-lld" cargo check -p mux_server \
+    --target i686-unknown-linux-musl --no-default-features --features guest
+Finished successfully (warnings only; exit 0).
+```

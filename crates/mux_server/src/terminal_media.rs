@@ -185,6 +185,11 @@ impl TerminalMediaScanner {
     /// Scan one PTY byte batch, returning the grid-safe bytes and any
     /// complete media/actions. State persists for the next batch.
     pub fn feed(&mut self, bytes: &[u8]) -> ScanOutput {
+        if !matches!(self.state, ScanState::Ground | ScanState::Discard | ScanState::DiscardEsc) {
+            // A control sequence split across feeds has no grid bytes before
+            // its completion in this feed, so its local event offset is zero.
+            self.sequence_grid_offset = 0;
+        }
         let mut output = ScanOutput {
             grid_bytes: Vec::with_capacity(bytes.len()),
             ..ScanOutput::default()
@@ -1043,6 +1048,10 @@ mod tests {
         assert_eq!(second.grid_bytes, b"post");
         assert_eq!(second.media.len(), 1);
         assert_eq!(second.media[0].data, b"Hello");
+        assert!(matches!(
+            second.events.as_slice(),
+            [ScanEvent::Media { grid_offset: 0, .. }]
+        ));
     }
 
     #[test]
