@@ -48,6 +48,13 @@ pub struct Session {
     /// connection's outbound channel.
     pub lifecycle_subscribers:
         Arc<parking_lot::RwLock<HashMap<String, crate::rt::mpsc::UnboundedSender<Envelope>>>>,
+    /// §3.10 Panes created under a client-supplied idempotency key.
+    ///
+    /// A retried spawn or split must not leave a second shell behind, so the
+    /// key the first request carried maps to the pane it produced and a repeat
+    /// answers with that pane. Entries whose pane has since closed are pruned
+    /// on the next insert, which bounds this by the live pane count.
+    pub created_panes_by_key: Arc<parking_lot::RwLock<HashMap<String, String>>>,
     /// §4 Shadow snapshot watcher handle: cwd file changes → snapshot engine.
     /// `None` means this session has no live watcher (cwd unusable / recovered /
     /// test session). Arc so it survives Session derive(Clone) clones; the last
@@ -142,8 +149,26 @@ impl Session {
             connected_windows: Arc::new(parking_lot::RwLock::new(Vec::new())),
             lifecycle_hook: None,
             lifecycle_subscribers: Arc::new(parking_lot::RwLock::new(HashMap::new())),
+            created_panes_by_key: Arc::new(parking_lot::RwLock::new(HashMap::new())),
             snapshot_watch: None,
         }
+    }
+
+    /// §3.10 The pane a previous request with this key created, if it is still
+    /// open. A key whose pane has closed is not a hit: the caller asked for a
+    /// pane and there is none, so it should get a fresh one.
+    pub fn pane_for_idempotency_key(&self, key: &str) -> Option<String> {
+        let pane_id = self.created_panes_by_key.read().get(key).cloned()?;
+        self.panes.read().contains_key(&pane_id).then_some(pane_id)
+    }
+
+    /// §3.10 Remember which pane a key produced, dropping keys whose panes are
+    /// gone so the map stays bounded by the panes that actually exist.
+    pub fn record_idempotency_key(&self, key: String, pane_id: String) {
+        let live = self.panes.read();
+        let mut keys = self.created_panes_by_key.write();
+        keys.retain(|_, existing| live.contains_key(existing));
+        keys.insert(key, pane_id);
     }
 
     pub fn add_tab(&mut self, id: String, title: String) {
@@ -160,9 +185,13 @@ impl Session {
         self.focused_pane.as_deref()
     }
 
-    /// 设置焦点 pane (§3.10 FocusPaneRequest)
-    pub fn set_focused_pane(&mut self, pane_id: String) {
-        self.focused_pane = Some(pane_id);
+    /// 设置焦点 pane (§3.10 FocusPaneRequest)。
+    ///
+    /// 返回焦点是否真的动了。焦点广播会让每个已连接的客户端跟着移焦点, 所以
+    /// "本来就在那儿"和"从别处挪过来"必须能区分, 否则两个客户端会互相把
+    /// 焦点推来推去。
+    pub fn set_focused_pane(&mut self, pane_id: String) -> bool {
+        self.focused_pane.replace(pane_id) != self.focused_pane
     }
 
     /// Remove a pane from every server-authoritative session index.

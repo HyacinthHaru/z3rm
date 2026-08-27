@@ -1831,12 +1831,19 @@ impl Pane {
     }
 
     /// §3.3 Atomically set pane zoom state and publish its generation.
-    pub fn set_zoomed(&self, zoomed: bool) {
+    ///
+    /// Returns whether the state actually changed. Zoom moves the layout, so a
+    /// zoom that changes nothing must not bump the generation or wake clients
+    /// into reprojecting a layout that is already what they render.
+    pub fn set_zoomed(&self, zoomed: bool) -> bool {
         let commit = self.commit.lock();
-        self.zoomed.store(zoomed, Ordering::SeqCst);
+        if self.zoomed.swap(zoomed, Ordering::SeqCst) == zoomed {
+            return false;
+        }
         self.bump_generation_locked();
         drop(commit);
         self.broadcast_pane_dirty();
+        true
     }
 
     /// §3.3 获取 pane zoom 状态。

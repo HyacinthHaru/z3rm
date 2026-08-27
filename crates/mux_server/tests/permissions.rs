@@ -221,6 +221,7 @@ fn spawn_pane() -> RequestBody {
         size: None,
         command: None,
         cwd: None,
+        idempotency_key: None,
     })
 }
 

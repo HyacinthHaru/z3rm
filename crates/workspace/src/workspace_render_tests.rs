@@ -2064,3 +2064,304 @@ async fn closing_the_focused_item_leaves_focus_somewhere(cx: &mut TestAppContext
         "focus must not stay on the item that was closed"
     );
 }
+
+/// §16.9 The server owns the layout ratios, so a divider the user drags here
+/// has to travel back. `mux_layout_ratio_drift` is the inverse of the
+/// projection that put the ratios on screen: it names the server node and
+/// reports where the divider actually landed, absolute so that re-sending it
+/// moves nothing.
+#[gpui::test]
+async fn dragging_a_divider_reports_absolute_ratios_for_the_server_node(
+    cx: &mut TestAppContext,
+) {
+    use crate::layout_projection::{LayoutNode, LayoutTree, SplitDirection as LayoutSplit};
+
+    init_test(cx);
+    let fs = FakeFs::new(cx.executor());
+    fs.insert_tree("/root", json!({ "a.txt": "" })).await;
+    let project = Project::test(fs, [path!("/root").as_ref()], cx).await;
+
+    let (multi_workspace, cx) =
+        cx.add_window_view(|window, cx| MultiWorkspace::test_new(project, window, cx));
+    let workspace = multi_workspace.read_with(cx, |mw, _| mw.workspace().clone());
+
+    let server_layout = LayoutTree {
+        root: LayoutNode::Split {
+            id: "split-1".to_string(),
+            direction: LayoutSplit::LeftRight,
+            children: vec![
+                LayoutNode::Pane {
+                    id: "leaf-1".to_string(),
+                    pane_id: "pane-1".to_string(),
+                },
+                LayoutNode::Pane {
+                    id: "leaf-2".to_string(),
+                    pane_id: "pane-2".to_string(),
+                },
+            ],
+            ratios: vec![0.5, 0.5],
+        },
+    };
+    workspace.update_in(cx, |workspace, window, cx| {
+        workspace.apply_layout_snapshot(
+            &server_layout,
+            None,
+            Default::default(),
+            |workspace, window, cx| workspace.add_pane_for_layout(window, cx),
+            |workspace, pane, pane_id, window, cx| {
+                let item = Box::new(cx.new(|cx| TestItem::new(cx).with_label(&pane_id)));
+                workspace.add_item(pane.clone(), item, None, true, true, window, cx);
+            },
+            window,
+            cx,
+        );
+    });
+    cx.run_until_parked();
+
+    // Nothing has been dragged, so nothing is owed to the server. Without this
+    // the test below would pass on a function that always reports every split.
+    workspace.read_with(cx, |workspace, _| {
+        assert!(
+            workspace.mux_layout_ratio_drift().is_empty(),
+            "a layout that matches the server owes it nothing"
+        );
+    });
+
+    // What a divider drag leaves behind: GPUI flexes summing to the child
+    // count, not to one.
+    workspace.read_with(cx, |workspace, _| {
+        let crate::pane_group::Member::Axis(axis) = &workspace.center.root else {
+            panic!("expected the projected layout to be an axis");
+        };
+        *axis.flexes.lock() = vec![1.4, 0.6];
+    });
+
+    let drift = workspace.read_with(cx, |workspace, _| workspace.mux_layout_ratio_drift());
+    assert_eq!(drift.len(), 1, "one divider moved, so one node is owed: {drift:?}");
+    assert_eq!(drift[0].0, "split-1", "the report must name the server's node");
+    assert!(
+        (drift[0].1[0] - 0.7).abs() < 1e-4 && (drift[0].1[1] - 0.3).abs() < 1e-4,
+        "flexes must be normalised into ratios, got {:?}",
+        drift[0].1
+    );
+}
+
+/// §16.9 Two mux panes stacked in one GPUI pane — what dropping a tab into
+/// another pane's strip leaves behind — still projects to two leaves. Reusing
+/// the one pane for both would put the same entity in the tree twice, which
+/// renders one and loses the other.
+#[gpui::test]
+async fn two_leaves_never_share_one_pane(cx: &mut TestAppContext) {
+    use crate::layout_projection::{LayoutNode, LayoutTree, SplitDirection as LayoutSplit};
+
+    init_test(cx);
+    let fs = FakeFs::new(cx.executor());
+    fs.insert_tree("/root", json!({ "a.txt": "" })).await;
+    let project = Project::test(fs, [path!("/root").as_ref()], cx).await;
+
+    let (multi_workspace, cx) =
+        cx.add_window_view(|window, cx| MultiWorkspace::test_new(project, window, cx));
+    let workspace = multi_workspace.read_with(cx, |mw, _| mw.workspace().clone());
+    let stacked = workspace.read_with(cx, |workspace, _| workspace.active_pane().clone());
+
+    let server_layout = LayoutTree {
+        root: LayoutNode::Split {
+            id: "split-1".to_string(),
+            direction: LayoutSplit::LeftRight,
+            children: vec![
+                LayoutNode::Pane {
+                    id: "leaf-1".to_string(),
+                    pane_id: "pane-1".to_string(),
+                },
+                LayoutNode::Pane {
+                    id: "leaf-2".to_string(),
+                    pane_id: "pane-2".to_string(),
+                },
+            ],
+            ratios: vec![0.5, 0.5],
+        },
+    };
+    // Both leaves already resolve to the same pane: the state a strip drop
+    // leaves behind, before the server's answer arrives.
+    let mut existing = std::collections::HashMap::default();
+    existing.insert("pane-1".to_string(), stacked.clone());
+    existing.insert("pane-2".to_string(), stacked.clone());
+
+    workspace.update_in(cx, |workspace, window, cx| {
+        workspace.apply_layout_snapshot(
+            &server_layout,
+            None,
+            existing,
+            |workspace, window, cx| workspace.add_pane_for_layout(window, cx),
+            |workspace, pane, pane_id, window, cx| {
+                let item = Box::new(cx.new(|cx| TestItem::new(cx).with_label(&pane_id)));
+                workspace.add_item(pane.clone(), item, None, true, true, window, cx);
+            },
+            window,
+            cx,
+        );
+    });
+    cx.run_until_parked();
+
+    workspace.read_with(cx, |workspace, _| {
+        let crate::pane_group::Member::Axis(axis) = &workspace.center.root else {
+            panic!("expected the projected layout to be an axis");
+        };
+        let ids: Vec<_> = axis
+            .members
+            .iter()
+            .map(|member| match member {
+                crate::pane_group::Member::Pane(pane) => pane.entity_id(),
+                crate::pane_group::Member::Axis(_) => panic!("expected two leaves"),
+            })
+            .collect();
+        assert_eq!(ids.len(), 2);
+        assert_ne!(ids[0], ids[1], "the same pane must not stand for both leaves");
+    });
+}
+
+/// §16.9 Both layout-sync events are raised by `workspace` and consumed by the
+/// surface that owns the mux socket, which subscribes to the same workspace it
+/// is registering handlers on. Nothing reaches the server if GPUI does not
+/// deliver an entity's own events back to it.
+#[gpui::test]
+async fn a_workspace_receives_the_layout_events_it_emits(cx: &mut TestAppContext) {
+    use std::cell::RefCell;
+    use std::rc::Rc;
+
+    init_test(cx);
+    let fs = FakeFs::new(cx.executor());
+    fs.insert_tree("/root", json!({ "a.txt": "" })).await;
+    let project = Project::test(fs, [path!("/root").as_ref()], cx).await;
+
+    let (multi_workspace, cx) =
+        cx.add_window_view(|window, cx| MultiWorkspace::test_new(project, window, cx));
+    let workspace = multi_workspace.read_with(cx, |mw, _| mw.workspace().clone());
+
+    let seen: Rc<RefCell<Vec<&'static str>>> = Rc::new(RefCell::new(Vec::new()));
+    workspace.update_in(cx, |_, window, cx| {
+        let this = cx.entity();
+        cx.subscribe_in(&this, window, {
+            let seen = seen.clone();
+            move |_, _, event, _, _| match event {
+                crate::Event::LayoutRatiosChanged => seen.borrow_mut().push("ratios"),
+                crate::Event::TabDropped { .. } => seen.borrow_mut().push("drop"),
+                _ => {}
+            }
+        })
+        .detach();
+    });
+
+    workspace.update(cx, |_, cx| {
+        cx.emit(crate::Event::LayoutRatiosChanged);
+        cx.emit(crate::Event::TabDropped {
+            item_id: cx.entity_id(),
+            target_item_id: None,
+            split_direction: Some(crate::SplitDirection::Right),
+            before: false,
+        });
+    });
+    cx.run_until_parked();
+
+    assert_eq!(*seen.borrow(), vec!["ratios", "drop"]);
+}
+
+/// §16.9 The report has to wait for the drag to finish. Sending it per frame
+/// would have the server broadcast the layout back mid-gesture, and every
+/// client rebuilds its pane tree from that broadcast — including the `flexes`
+/// the drag is still holding a handle to.
+#[gpui::test]
+async fn a_divider_drag_reports_once_when_it_lands(cx: &mut TestAppContext) {
+    use std::cell::RefCell;
+    use std::rc::Rc;
+
+    init_test(cx);
+    let fs = FakeFs::new(cx.executor());
+    fs.insert_tree("/root", json!({ "a.txt": "" })).await;
+    let project = Project::test(fs, [path!("/root").as_ref()], cx).await;
+
+    let (multi_workspace, cx) =
+        cx.add_window_view(|window, cx| MultiWorkspace::test_new(project, window, cx));
+    let workspace = multi_workspace.read_with(cx, |mw, _| mw.workspace().clone());
+
+    let pane = workspace.read_with(cx, |workspace, _| workspace.active_pane().clone());
+    pane.update_in(cx, |pane, window, cx| {
+        pane.add_item(
+            Box::new(cx.new(|cx| TestItem::new(cx).with_label("left"))),
+            true,
+            true,
+            None,
+            window,
+            cx,
+        );
+    });
+    workspace.update_in(cx, |workspace, window, cx| {
+        workspace.split_pane(pane.clone(), crate::SplitDirection::Right, window, cx);
+    });
+    cx.run_until_parked();
+
+    let reports = Rc::new(RefCell::new(0usize));
+    workspace.update_in(cx, |_, window, cx| {
+        let this = cx.entity();
+        cx.subscribe_in(&this, window, {
+            let reports = reports.clone();
+            move |_, _, event, _, _| {
+                if matches!(event, crate::Event::LayoutRatiosChanged) {
+                    *reports.borrow_mut() += 1;
+                }
+            }
+        })
+        .detach();
+    });
+
+    // The divider sits between two evenly split panes, so it is on the
+    // window's vertical midline. `HANDLE_HITBOX_SIZE` is only a few pixels
+    // wide, so try either side of it rather than betting on one coordinate.
+    let bounds = cx.update(|window, _| window.bounds());
+    let middle_x = bounds.size.width / 2.;
+    let middle_y = bounds.size.height / 2.;
+    let mut engaged = false;
+    for offset in [0., -1., 1., -2., 2.] {
+        let handle = gpui::point(middle_x + gpui::px(offset), middle_y);
+        cx.simulate_mouse_down(handle, gpui::MouseButton::Left, gpui::Modifiers::none());
+        cx.simulate_mouse_move(
+            gpui::point(handle.x + gpui::px(60.), middle_y),
+            gpui::MouseButton::Left,
+            gpui::Modifiers::none(),
+        );
+        cx.run_until_parked();
+        // The drag engaged if the flexes moved off the even split.
+        engaged = workspace.read_with(cx, |workspace, _| {
+            let crate::pane_group::Member::Axis(axis) = &workspace.center.root else {
+                panic!("expected a split layout");
+            };
+            axis.flexes
+                .lock()
+                .iter()
+                .any(|flex| (flex - 1.).abs() > 1e-3)
+        });
+        if engaged {
+            assert_eq!(
+                *reports.borrow(),
+                0,
+                "a drag in flight must not have been reported yet"
+            );
+            cx.simulate_mouse_up(
+                gpui::point(handle.x + gpui::px(60.), middle_y),
+                gpui::MouseButton::Left,
+                gpui::Modifiers::none(),
+            );
+            cx.run_until_parked();
+            break;
+        }
+        cx.simulate_mouse_up(handle, gpui::MouseButton::Left, gpui::Modifiers::none());
+        cx.run_until_parked();
+    }
+
+    assert!(engaged, "the test never grabbed the divider");
+    assert_eq!(
+        *reports.borrow(),
+        1,
+        "the landing is reported exactly once, however many frames the drag took"
+    );
+}

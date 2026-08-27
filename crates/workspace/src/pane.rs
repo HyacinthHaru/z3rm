@@ -3823,8 +3823,26 @@ impl Pane {
 
         let from_pane = dragged_tab.pane.clone();
 
+        // §16.9 Raised before the move so the target still names what the user
+        // dropped onto. The server owns the layout, so this is a request, not
+        // a report: what actually reshapes the tree is the broadcast that
+        // comes back.
+        let (target_item_id, before) = match self.items.get(ix) {
+            Some(item) => (Some(item.item_id()), true),
+            // Dropped past the last tab, so the target is that last tab and
+            // the drop lands after it. Reading index `ix` here would name
+            // nothing and the drop would go unreported.
+            None => (self.items.last().map(|item| item.item_id()), false),
+        };
+
         self.workspace
             .update(cx, |_, cx| {
+                cx.emit(crate::Event::TabDropped {
+                    item_id,
+                    target_item_id,
+                    split_direction,
+                    before,
+                });
                 cx.defer_in(window, move |workspace, window, cx| {
                     if let Some(split_direction) = split_direction {
                         to_pane = workspace.split_pane(to_pane, split_direction, window, cx);

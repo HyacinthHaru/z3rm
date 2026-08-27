@@ -1378,8 +1378,12 @@ mod element {
                                 if e.click_count >= 2 {
                                     let mut borrow = flexes.lock();
                                     *borrow = vec![1.; borrow.len()];
+                                    drop(borrow);
                                     workspace
-                                        .update(cx, |this, cx| this.serialize_workspace(window, cx))
+                                        .update(cx, |this, cx| {
+                                            this.serialize_workspace(window, cx);
+                                            cx.emit(crate::Event::LayoutRatiosChanged);
+                                        })
                                         .log_err();
 
                                     window.refresh();
@@ -1416,9 +1420,17 @@ mod element {
 
             window.on_mouse_event({
                 let dragged_handle = layout.dragged_handle.clone();
-                move |_: &MouseUpEvent, phase, _window, _cx| {
-                    if phase.bubble() {
-                        dragged_handle.replace(None);
+                let workspace = self.workspace.clone();
+                move |_: &MouseUpEvent, phase, _window, cx| {
+                    // §16.9 Report where the divider landed, once, when it
+                    // lands. Reporting each frame would have the server
+                    // broadcast the layout back mid-gesture, and every client
+                    // rebuilds its pane tree from that — including the flexes
+                    // this drag is still holding.
+                    if phase.bubble() && dragged_handle.replace(None).is_some() {
+                        workspace
+                            .update(cx, |_, cx| cx.emit(crate::Event::LayoutRatiosChanged))
+                            .log_err();
                     }
                 }
             });

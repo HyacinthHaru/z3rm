@@ -430,6 +430,216 @@ impl LayoutTree {
         }
     }
 
+    /// 树中是否存在这个 node id (split 或叶子都算)。
+    pub fn contains_node(&self, node_id: &str) -> bool {
+        let mut ids = HashSet::new();
+        Self::collect_node_ids(&self.root, &mut ids);
+        ids.contains(node_id)
+    }
+
+    /// §16.9 设置某个 split 节点的比例 (绝对值, 幂等)。
+    ///
+    /// `resize_pane` 收的是增量, 重放一次就会把分隔条挪两次。GUI 拖动分隔条
+    /// 拿到的是落点而不是位移, 所以它报告的是最终比例; 同样的比例发几次,
+    /// 树都一样。比例会被归一化, 因此任何等比例的写法都是同一个请求。
+    pub fn set_ratios(&mut self, node_id: &str, ratios: &[f32]) -> anyhow::Result<()> {
+        let total: f32 = ratios.iter().sum();
+        let mut candidate = self.root.clone();
+        anyhow::ensure!(
+            Self::set_ratios_in_node(&mut candidate, node_id, ratios, total),
+            "layout split not found: {node_id}"
+        );
+        // 比例可能出的错 —— 个数对不上、非正、非有限、和为零 (于是除出 NaN)
+        // —— 正是 validate_structure 拒绝的那些。它验的是克隆出来的候选树,
+        // 所以坏请求根本到不了 self.root, 不需要在前面再拦一道。
+        Self::validate_structure(&candidate)?;
+        self.root = candidate;
+        Ok(())
+    }
+
+    fn set_ratios_in_node(
+        node: &mut LayoutNode,
+        node_id: &str,
+        ratios: &[f32],
+        total: f32,
+    ) -> bool {
+        let LayoutNode::Split {
+            id,
+            children,
+            ratios: current,
+            ..
+        } = node
+        else {
+            return false;
+        };
+        if id == node_id {
+            *current = ratios.iter().map(|ratio| ratio / total).collect();
+            return true;
+        }
+        children
+            .iter_mut()
+            .any(|child| Self::set_ratios_in_node(child, node_id, ratios, total))
+    }
+
+    /// §16.9 把一个 pane 移到 `target_pane_id` 旁边 (幂等)。
+    ///
+    /// 这是"拖动 tab"对服务端的含义: 叶子从原处离开, 在目标旁边重新进入。
+    /// 移动前先问它现在在哪 —— 已经就位时最短的移动是不移动, 而绕一圈会把
+    /// split 折叠再重建, 把没人动过的节点重新命名一遍。
+    ///
+    /// 找不到 pane、找不到目标、把 pane 移到它自己旁边, 都由移除和插入这两
+    /// 步自己报告: 它们操作的是克隆出来的候选树, 失败时原树原封不动。
+    pub fn move_pane(
+        &mut self,
+        pane_id: &str,
+        target_pane_id: &str,
+        direction: SplitDirection,
+        before: bool,
+    ) -> anyhow::Result<()> {
+        if Self::placement(&self.root, pane_id, target_pane_id) == Some((direction, before)) {
+            return Ok(());
+        }
+
+        let mut candidate = self.root.clone();
+        anyhow::ensure!(
+            Self::remove_from_node(&mut candidate, pane_id)?,
+            "pane not found in layout: {pane_id}"
+        );
+        let moved = LayoutNode::Pane {
+            id: Self::fresh_node_id(&candidate, pane_id),
+            pane_id: pane_id.to_string(),
+        };
+        anyhow::ensure!(
+            Self::insert_beside(&mut candidate, target_pane_id, moved, direction, before),
+            "target pane not found in layout: {target_pane_id}"
+        );
+        Self::validate_structure(&candidate)?;
+        self.root = candidate;
+        Ok(())
+    }
+
+    /// 一个 pane 相对另一个 pane 的落位: 两者是同一个 split 的相邻叶子时,
+    /// 返回该 split 的方向, 以及前者是否排在后者之前。其余情形没有落位可言。
+    fn placement(
+        node: &LayoutNode,
+        pane_id: &str,
+        target_pane_id: &str,
+    ) -> Option<(SplitDirection, bool)> {
+        let LayoutNode::Split {
+            direction,
+            children,
+            ..
+        } = node
+        else {
+            return None;
+        };
+        let leaf_index = |wanted: &str| {
+            children.iter().position(
+                |child| matches!(child, LayoutNode::Pane { pane_id, .. } if pane_id == wanted),
+            )
+        };
+        match (leaf_index(pane_id), leaf_index(target_pane_id)) {
+            (Some(moved), Some(target)) if moved + 1 == target => Some((*direction, true)),
+            (Some(moved), Some(target)) if moved == target + 1 => Some((*direction, false)),
+            _ => children
+                .iter()
+                .find_map(|child| Self::placement(child, pane_id, target_pane_id)),
+        }
+    }
+
+    /// 在 `target_pane_id` 旁边插入一个节点。目标的父节点方向一致时直接
+    /// 并入该 split (与目标平分它原本的比例), 否则把目标叶子换成新的 split。
+    fn insert_beside(
+        node: &mut LayoutNode,
+        target_pane_id: &str,
+        inserted: LayoutNode,
+        direction: SplitDirection,
+        before: bool,
+    ) -> bool {
+        if let LayoutNode::Pane { id, pane_id } = node
+            && pane_id == target_pane_id
+        {
+            let target = LayoutNode::Pane {
+                id: format!("{id}-kept"),
+                pane_id: pane_id.clone(),
+            };
+            let children = if before {
+                vec![inserted, target]
+            } else {
+                vec![target, inserted]
+            };
+            *node = LayoutNode::Split {
+                id: id.clone(),
+                direction,
+                children,
+                ratios: vec![0.5, 0.5],
+            };
+            return true;
+        }
+
+        let LayoutNode::Split {
+            direction: split_direction,
+            children,
+            ratios,
+            ..
+        } = node
+        else {
+            return false;
+        };
+
+        // 目标是这个 split 的直接叶子, 且方向一致: 并进来, 和目标平分它原本
+        // 的比例。`get` 而不是索引 —— children 与 ratios 长度不一致是坏树,
+        // 由 validate_structure 判定, 这里不该 panic 也不该抢先下结论。
+        let direct = children.iter().position(
+            |child| matches!(child, LayoutNode::Pane { pane_id, .. } if pane_id == target_pane_id),
+        );
+        if let Some(index) = direct
+            && *split_direction == direction
+            && let Some(share) = ratios.get(index).map(|ratio| ratio / 2.0)
+        {
+            let at = if before { index } else { index + 1 };
+            ratios[index] = share;
+            children.insert(at, inserted);
+            ratios.insert(at, share);
+            return true;
+        }
+
+        // 方向不一致, 或目标埋在更深处: 走到含着它的那棵子树里去。目标是叶子
+        // 时递归会落到上面第一个分支, 把它换成新的 split。
+        children
+            .iter_mut()
+            .find(|child| Self::contains_pane(child, target_pane_id))
+            .is_some_and(|child| {
+                Self::insert_beside(child, target_pane_id, inserted, direction, before)
+            })
+    }
+
+    /// 取一个树中尚未使用的 node id。确定性的, 这样服务端重放同一串操作
+    /// 得到的树逐字节相同, TUI 与 GUI 也就看到同一个 id。
+    fn fresh_node_id(root: &LayoutNode, pane_id: &str) -> String {
+        let mut used = HashSet::new();
+        Self::collect_node_ids(root, &mut used);
+        let base = format!("node-{pane_id}");
+        if !used.contains(&base) {
+            return base;
+        }
+        (1..).map(|n| format!("{base}-{n}")).find(|candidate| !used.contains(candidate)).unwrap_or(base)
+    }
+
+    fn collect_node_ids(node: &LayoutNode, ids: &mut HashSet<String>) {
+        match node {
+            LayoutNode::Pane { id, .. } => {
+                ids.insert(id.clone());
+            }
+            LayoutNode::Split { id, children, .. } => {
+                ids.insert(id.clone());
+                for child in children {
+                    Self::collect_node_ids(child, ids);
+                }
+            }
+        }
+    }
+
     /// 检查节点是否包含指定 pane
     fn contains_pane(node: &LayoutNode, pane_id: &str) -> bool {
         match node {

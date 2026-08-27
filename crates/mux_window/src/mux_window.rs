@@ -823,6 +823,115 @@ pub fn forward_layout_resize(
     .detach();
 }
 
+/// §16.9 Report the split ratios this window has moved away from the server's.
+///
+/// A drag moves one divider, so this usually sends one request; the ratios are
+/// absolute, so re-sending one changes nothing. Each split is its own request
+/// because each is its own node — there is no "set the whole tree" call, and
+/// there should not be: the server owns the layout.
+pub fn forward_layout_ratios(
+    workspace: &workspace::Workspace,
+    window: &Window,
+    cx: &mut gpui::App,
+) {
+    let drift = workspace.mux_layout_ratio_drift();
+    let Some(domain) = mux_domain_for_window(window, cx) else {
+        return;
+    };
+    cx.spawn(async move |_| {
+        for (node_id, ratios) in drift {
+            if let Err(error) = domain.set_layout_ratios(&node_id, ratios).await {
+                tracing::warn!(error = %error, node_id, "set_layout_ratios RPC failed");
+            }
+        }
+    })
+    .detach();
+}
+
+/// §16.9 Forward a dropped tab as a pane move.
+///
+/// The drop already happened locally; this asks the server for the same thing
+/// so the two agree. The authoritative `SessionLayoutChanged` that comes back
+/// is what the window ends up rendering, which is also what corrects a drop
+/// the server would not accept.
+pub fn forward_tab_drop(
+    workspace: &workspace::Workspace,
+    item_id: gpui::EntityId,
+    target_item_id: Option<gpui::EntityId>,
+    split_direction: Option<workspace::SplitDirection>,
+    before: bool,
+    window: &Window,
+    cx: &mut gpui::App,
+) {
+    use mux_protocol::split_node::SplitDirection as WireDirection;
+
+    // Which two mux panes the drop involves. An item that renders no mux pane,
+    // a drop with nothing under it, or a pane dropped onto itself all mean the
+    // same thing here: there is nothing to ask the server for.
+    let Some((pane_id, target_pane_id)) = mux_pane_id_for_item(workspace, item_id, cx)
+        .zip(target_item_id.and_then(|target| mux_pane_id_for_item(workspace, target, cx)))
+        .filter(|(pane_id, target_pane_id)| pane_id != target_pane_id)
+    else {
+        return;
+    };
+
+    let (direction, before) = match split_direction {
+        Some(workspace::SplitDirection::Left) => (WireDirection::LeftRight, true),
+        Some(workspace::SplitDirection::Right) => (WireDirection::LeftRight, false),
+        Some(workspace::SplitDirection::Up) => (WireDirection::TopBottom, true),
+        Some(workspace::SplitDirection::Down) => (WireDirection::TopBottom, false),
+        // Dropped into a tab strip. The server has no stacking, so the closest
+        // placement it can hold is beside the target on the axis already there.
+        None => {
+            let direction = workspace
+                .get_server_layout()
+                .and_then(|layout| layout.parent_direction(&target_pane_id))
+                .map(|direction| match direction {
+                    workspace::layout_projection::SplitDirection::LeftRight => {
+                        WireDirection::LeftRight
+                    }
+                    workspace::layout_projection::SplitDirection::TopBottom => {
+                        WireDirection::TopBottom
+                    }
+                })
+                .unwrap_or(WireDirection::LeftRight);
+            (direction, before)
+        }
+    };
+
+    let Some(domain) = mux_domain_for_window(window, cx) else {
+        return;
+    };
+    cx.spawn(async move |_| {
+        if let Err(error) = domain
+            .move_pane(&pane_id, &target_pane_id, direction, before)
+            .await
+        {
+            tracing::warn!(error = %error, pane_id, target_pane_id, "move_pane RPC failed");
+        }
+    })
+    .detach();
+}
+
+/// The mux pane an item renders, if it renders one at all.
+fn mux_pane_id_for_item(
+    workspace: &workspace::Workspace,
+    item_id: gpui::EntityId,
+    cx: &gpui::App,
+) -> Option<String> {
+    workspace.panes().iter().find_map(|pane| {
+        pane.read(cx)
+            .items()
+            .find(|item| item.item_id() == item_id)
+            .and_then(|item| {
+                item.to_any_view()
+                    .downcast::<terminal_view::mux_pane::MuxPaneView>()
+                    .ok()
+            })
+            .map(|view| view.read(cx).pane_id.clone())
+    })
+}
+
 /// §15.7 Register the mux pane action handlers both surfaces share: split,
 /// focus, tabs, resize, zoom, prefix mode. Desktop-only handlers (attach,
 /// detach, reconnect, kill, new window) stay in the desktop binary because
@@ -1096,6 +1205,29 @@ pub fn register_core_mux_actions(workspace: &mut workspace::Workspace, window: &
                                 anyhow::Ok(())
                             }).detach();
                         });
+
+    // §16.9 The divider drag lives in `workspace`, which has the ratios but
+    // not the socket, so it raises an event and the forwarding happens here.
+    let this = cx.entity();
+    cx.subscribe_in(&this, window, |workspace, _, event, window, cx| match event {
+        workspace::Event::LayoutRatiosChanged => forward_layout_ratios(workspace, window, cx),
+        workspace::Event::TabDropped {
+            item_id,
+            target_item_id,
+            split_direction,
+            before,
+        } => forward_tab_drop(
+            workspace,
+            *item_id,
+            *target_item_id,
+            *split_direction,
+            *before,
+            window,
+            cx,
+        ),
+        _ => {}
+    })
+    .detach();
 }
 
 #[cfg(test)]

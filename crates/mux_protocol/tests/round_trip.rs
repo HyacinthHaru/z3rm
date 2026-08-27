@@ -432,11 +432,141 @@ fn round_trip_pane_action(action: PaneAction) -> PaneAction {
 // §9 验证 ProtocolVersion minor 精确等于 6, 反映新增 PaneMedia/PaneAction 通知。
 #[test]
 fn test_protocol_version_minor_bumped_for_media_and_action() {
+    // minor 是所有追加式改动共用的一个计数器, 不属于某一个功能。钉死成某个
+    // 数字的话, 下一个不相干的追加就会让这里失败, 而它想说的其实是: 加
+    // PaneMedia/PaneAction 没有破坏兼容 —— major 没动, minor 越过了 5。
     assert_eq!(PROTOCOL_VERSION.major, 1);
-    assert_eq!(
-        PROTOCOL_VERSION.minor, 6,
-        "minor version must be exactly 6 for additive PaneMedia/PaneAction notifications"
+    assert!(
+        PROTOCOL_VERSION.minor >= 6,
+        "minor version must have moved past 5 for additive PaneMedia/PaneAction notifications"
     );
+}
+
+// §16.9 验证 SetLayoutRatios 请求 round-trip: 拖动分隔条报告的绝对比例必须
+// 逐个原样回归, 少一个或错位一个都会把分隔条放到别处。
+#[test]
+fn set_layout_ratios_request_round_trip() {
+    let env = Envelope {
+        version: Some(PROTOCOL_VERSION),
+        payload: Some(proto::envelope::Payload::Request(Request {
+            request_id: 7,
+            body: Some(proto::request::Body::SetLayoutRatios(SetLayoutRatiosRequest {
+                node_id: "split-1".into(),
+                ratios: vec![0.25, 0.5, 0.25],
+            })),
+        })),
+    };
+
+    let framed = frame(&env).unwrap();
+    let (decoded, consumed) = unframe(&framed).unwrap();
+    assert_eq!(consumed, framed.len());
+
+    let proto::envelope::Payload::Request(request) = decoded.payload.expect("payload missing")
+    else {
+        panic!("expected Request")
+    };
+    assert_eq!(request.request_id, 7);
+    let Some(proto::request::Body::SetLayoutRatios(decoded_request)) = request.body else {
+        panic!("expected SetLayoutRatios request")
+    };
+    assert_eq!(decoded_request.node_id, "split-1");
+    assert_eq!(decoded_request.ratios, vec![0.25, 0.5, 0.25]);
+}
+
+// §16.9 验证 MovePane 请求 round-trip: before 决定拖到目标左半边还是右半边,
+// 丢掉它两种落点就变成同一个请求。
+#[test]
+fn move_pane_request_round_trip() {
+    for before in [true, false] {
+        let env = Envelope {
+            version: Some(PROTOCOL_VERSION),
+            payload: Some(proto::envelope::Payload::Request(Request {
+                request_id: 9,
+                body: Some(proto::request::Body::MovePane(MovePaneRequest {
+                    pane_id: "pane-3".into(),
+                    target_pane_id: "pane-1".into(),
+                    direction: proto::split_node::SplitDirection::TopBottom as i32,
+                    before,
+                })),
+            })),
+        };
+
+        let framed = frame(&env).unwrap();
+        let (decoded, consumed) = unframe(&framed).unwrap();
+        assert_eq!(consumed, framed.len());
+
+        let proto::envelope::Payload::Request(request) =
+            decoded.payload.expect("payload missing")
+        else {
+            panic!("expected Request")
+        };
+        let Some(proto::request::Body::MovePane(decoded_request)) = request.body else {
+            panic!("expected MovePane request")
+        };
+        assert_eq!(decoded_request.pane_id, "pane-3");
+        assert_eq!(decoded_request.target_pane_id, "pane-1");
+        assert_eq!(
+            decoded_request.direction,
+            proto::split_node::SplitDirection::TopBottom as i32
+        );
+        assert_eq!(decoded_request.before, before);
+    }
+}
+
+// §3.10 验证幂等键 round-trip: 键丢了, 重试就是第二个 shell。
+#[test]
+fn create_requests_carry_an_idempotency_key() {
+    let env = Envelope {
+        version: Some(PROTOCOL_VERSION),
+        payload: Some(proto::envelope::Payload::Request(Request {
+            request_id: 11,
+            body: Some(proto::request::Body::SpawnPane(SpawnPaneRequest {
+                session_id: "session-1".into(),
+                tab_id: "tab-1".into(),
+                size: None,
+                command: None,
+                cwd: None,
+                idempotency_key: Some("spawn-42".into()),
+            })),
+        })),
+    };
+
+    let framed = frame(&env).unwrap();
+    let (decoded, _) = unframe(&framed).unwrap();
+    let proto::envelope::Payload::Request(request) = decoded.payload.expect("payload missing")
+    else {
+        panic!("expected Request")
+    };
+    let Some(proto::request::Body::SpawnPane(decoded_request)) = request.body else {
+        panic!("expected SpawnPane request")
+    };
+    assert_eq!(decoded_request.idempotency_key.as_deref(), Some("spawn-42"));
+
+    // An absent key must stay absent: a server that saw `Some("")` would treat
+    // every keyless spawn as the same request.
+    let env = Envelope {
+        version: Some(PROTOCOL_VERSION),
+        payload: Some(proto::envelope::Payload::Request(Request {
+            request_id: 12,
+            body: Some(proto::request::Body::SplitPane(SplitPaneRequest {
+                pane_id: "pane-1".into(),
+                direction: proto::split_node::SplitDirection::LeftRight as i32,
+                command: None,
+                cwd: None,
+                idempotency_key: None,
+            })),
+        })),
+    };
+    let framed = frame(&env).unwrap();
+    let (decoded, _) = unframe(&framed).unwrap();
+    let proto::envelope::Payload::Request(request) = decoded.payload.expect("payload missing")
+    else {
+        panic!("expected Request")
+    };
+    let Some(proto::request::Body::SplitPane(decoded_request)) = request.body else {
+        panic!("expected SplitPane request")
+    };
+    assert_eq!(decoded_request.idempotency_key, None);
 }
 
 // §4 验证 FileVersion 消息直接编码/解码（version_id / seq_no / trigger）。
