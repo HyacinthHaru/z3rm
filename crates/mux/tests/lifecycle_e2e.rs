@@ -281,6 +281,22 @@ async fn pane_natural_exit_broadcasts_removed() -> Result<()> {
         .and_then(|s| s.tabs.first().map(|t| t.id.clone()))
         .unwrap_or_else(|| "tab-0".to_string());
 
+    // 一个不退出的 pane, 这样"退出的那个不在快照里"是个有内容的断言:
+    // 只有一个 pane 时快照本来就是空的, 断言等于没写。
+    let survivor_id = client
+        .spawn_pane(
+            &session_id,
+            &tab_id,
+            mux_protocol::TerminalSize { cols: 80, rows: 24 },
+            Some(ShellCommand {
+                program: "/bin/cat".to_string(),
+                args: Vec::new(),
+                env: HashMap::new(),
+            }),
+            None,
+        )
+        .await?;
+
     // 启动一个立刻退出的命令。
     let pane_id = client
         .spawn_pane(
@@ -305,11 +321,30 @@ async fn pane_natural_exit_broadcasts_removed() -> Result<()> {
     .context("server must fan out PaneRemoved when the shell exits")?;
     assert!(matches!(event, NotifEvent::PaneRemoved(_)));
 
-    // pane 移除后 close 应报 not found (不残留 zombie)。
-    let close_result = client.close_pane(&pane_id).await;
+    // §3.10 close 是幂等的: 已经关掉的 pane 正是调用方要的状态, 所以第二次
+    // 关闭仍然成功。用返回错误来代表"不残留 zombie"会让两个客户端同时关同一个
+    // pane 时有一个收到失败, 而实际上什么都没出错。
+    client
+        .close_pane(&pane_id)
+        .await
+        .context("closing an already-exited pane must succeed")?;
+
+    // 真正的不变量在这里: 重新 attach 拿到的权威快照里不能再有它。
+    let attach = client.attach(&session_id, AttachMode::Shared).await?;
+    let surviving: Vec<String> = attach
+        .snapshot
+        .iter()
+        .flat_map(|snapshot| snapshot.tabs.iter())
+        .flat_map(|tab| tab.panes.iter())
+        .map(|pane| pane.id.clone())
+        .collect();
     assert!(
-        close_result.is_err(),
-        "closing an exited pane must report not found"
+        surviving.contains(&survivor_id),
+        "the live pane must still be there: {surviving:?}"
+    );
+    assert!(
+        !surviving.contains(&pane_id),
+        "an exited pane must not survive in the snapshot: {surviving:?}"
     );
 
     Ok(())

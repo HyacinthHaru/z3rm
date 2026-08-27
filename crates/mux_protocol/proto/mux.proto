@@ -179,6 +179,9 @@ message SpawnPaneRequest {
     TerminalSize size = 3;
     optional ShellCommand command = 4;
     optional string cwd = 5;
+    // §3.10 Replaying a spawn must not create a second pane. When set, the
+    // server returns the pane the first request with this key produced.
+    optional string idempotency_key = 6;
 }
 
 // §3.10 Shell 命令结构。
@@ -196,6 +199,8 @@ message SplitPaneRequest {
     optional ShellCommand command = 3;
     // Optional working directory for the new pane (inherits parent when unset).
     optional string cwd = 4;
+    // §3.10 See SpawnPaneRequest.idempotency_key.
+    optional string idempotency_key = 5;
 }
 
 // §3.10 关闭 Pane。
@@ -221,10 +226,38 @@ message SetPaneTitleRequest {
 }
 
 // §16.9 Adjust the server-authoritative layout ratio of a pane.
+//
+// The delta is relative, so replaying it moves the divider twice. A GUI
+// dragging a divider reports where it landed instead: see SetLayoutRatios.
 message ResizeLayoutRequest {
     string pane_id = 1;
     SplitNode.SplitDirection direction = 2;
     float delta = 3;  // ratio delta (e.g. 0.05 = 5%)
+}
+
+// §16.9 Set one split node's ratios outright.
+//
+// Absolute, so it is idempotent and expresses a mouse drag directly: the
+// client reports the ratios it settled on rather than a sequence of nudges.
+// The server normalises them, so any positive scale of the same proportions
+// is the same request.
+message SetLayoutRatiosRequest {
+    string node_id = 1;
+    repeated float ratios = 2;
+}
+
+// §16.9 Move a pane elsewhere in the layout tree.
+//
+// This is what a tab drag means to the server: the leaf leaves wherever it
+// was and re-enters beside `target_pane_id`. Moving a pane to where it
+// already sits is a no-op, so a redelivered drag does not shuffle the tree.
+message MovePaneRequest {
+    string pane_id = 1;
+    string target_pane_id = 2;
+    SplitNode.SplitDirection direction = 3;
+    // Insert before the target rather than after it: dropping on the left
+    // half of a pane and dropping on the right half are different requests.
+    bool before = 4;
 }
 
 // §3.10 调整 Pane 尺寸。
@@ -895,6 +928,8 @@ message Request {
         ListChangedFilesRequest list_changed_files = 36;  // §4 shadow snapshot
         ListCommandsRequest list_commands = 37;  // §3.3 OSC 133 shell commands
         ExtensionChromeActionRequest extension_chrome_action = 38;  // §16.9
+        SetLayoutRatiosRequest set_layout_ratios = 39;  // §16.9 absolute ratios
+        MovePaneRequest move_pane = 40;  // §16.9 tab drag
     }
 }
 

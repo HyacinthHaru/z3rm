@@ -91,6 +91,8 @@ pub fn pre_attach_role(trust: ConnectionTrust, body: &RequestBody) -> ClientRole
         | RequestBody::FocusPane(_)
         | RequestBody::ResizePane(_)
         | RequestBody::ResizeLayout(_)
+        | RequestBody::SetLayoutRatios(_)
+        | RequestBody::MovePane(_)
         | RequestBody::SendInput(_)
         | RequestBody::Paste(_)
         | RequestBody::SetClipboard(_)
@@ -754,6 +756,20 @@ async fn dispatch_request(
         RequestBody::ResizeLayout(r) => {
             if check_permission(role, ClientRole::ReadWrite) {
                 handle_resize_layout(r, sessions, outbound_tx, connection_client_id).await?
+            } else {
+                ResponseBody::Error("permission denied: read-write required".to_string())
+            }
+        }
+        RequestBody::SetLayoutRatios(r) => {
+            if check_permission(role, ClientRole::ReadWrite) {
+                handle_set_layout_ratios(r, sessions, connection_client_id).await?
+            } else {
+                ResponseBody::Error("permission denied: read-write required".to_string())
+            }
+        }
+        RequestBody::MovePane(r) => {
+            if check_permission(role, ClientRole::ReadWrite) {
+                handle_move_pane(r, sessions, connection_client_id).await?
             } else {
                 ResponseBody::Error("permission denied: read-write required".to_string())
             }
@@ -1559,10 +1575,18 @@ async fn handle_spawn_pane(
     if let Err(message) = ensure_mutation_allowed(sessions, connection_client_id) {
         return Ok(ResponseBody::Error(message));
     }
-    #[cfg(all(not(target_family = "wasm"), feature = "desktop"))]
-    let pane_id = nanoid::nanoid!();
-    #[cfg(any(target_family = "wasm", not(feature = "desktop")))]
-    let pane_id = wasm_runtime_id("pane");
+    // §3.10 Which pane this request names: the one an earlier request with the
+    // same key already created, or a fresh id. Answering from the key first is
+    // the point — spawning is the half that costs a process, and a dropped
+    // response would otherwise buy a second shell nobody asked for.
+    let pane_id = match req
+        .idempotency_key
+        .as_deref()
+        .and_then(|key| idempotent_pane(sessions, &req.session_id, key))
+    {
+        Some(existing) => return Ok(ResponseBody::PaneId(existing)),
+        None => new_pane_id(),
+    };
 
     // §3.1 转换 ShellCommand → pane::ShellCommand
     let shell_cmd = req.command.as_ref().map(|c| crate::pane::ShellCommand {
@@ -1700,7 +1724,52 @@ async fn handle_spawn_pane(
     }
     broadcast_layout_changed(sessions, &req.session_id);
 
+    if let Some(key) = req.idempotency_key.as_deref() {
+        record_idempotent_pane(sessions, &req.session_id, key, &pane_id);
+    }
+
     Ok(ResponseBody::PaneId(pane_id))
+}
+
+/// A fresh pane id. The browser build has no `nanoid` entropy source, so it
+/// mints ids from its own runtime counter instead.
+fn new_pane_id() -> String {
+    #[cfg(all(not(target_family = "wasm"), feature = "desktop"))]
+    {
+        nanoid::nanoid!()
+    }
+    #[cfg(any(target_family = "wasm", not(feature = "desktop")))]
+    {
+        wasm_runtime_id("pane")
+    }
+}
+
+/// §3.10 The pane an earlier request with this key produced, if it is still open.
+fn idempotent_pane(
+    sessions: &Arc<parking_lot::RwLock<Vec<crate::session::Session>>>,
+    session_id: &str,
+    key: &str,
+) -> Option<String> {
+    sessions
+        .read()
+        .iter()
+        .find(|session| session.id == session_id)
+        .and_then(|session| session.pane_for_idempotency_key(key))
+}
+
+fn record_idempotent_pane(
+    sessions: &Arc<parking_lot::RwLock<Vec<crate::session::Session>>>,
+    session_id: &str,
+    key: &str,
+    pane_id: &str,
+) {
+    if let Some(session) = sessions
+        .read()
+        .iter()
+        .find(|session| session.id == session_id)
+    {
+        session.record_idempotency_key(key.to_string(), pane_id.to_string());
+    }
 }
 
 /// §3.10 Split an existing pane and optionally run a command in the new pane.
@@ -1721,10 +1790,21 @@ async fn handle_split_pane(
         2 => crate::layout::SplitDirection::TopBottom,
         _ => crate::layout::SplitDirection::LeftRight,
     };
-    #[cfg(all(not(target_family = "wasm"), feature = "desktop"))]
-    let new_pane_id = nanoid::nanoid!();
-    #[cfg(any(target_family = "wasm", not(feature = "desktop")))]
-    let new_pane_id = wasm_runtime_id("pane");
+    // §3.10 See handle_spawn_pane. The session to ask is the one holding the
+    // pane being split.
+    let new_pane_id = match req
+        .idempotency_key
+        .as_deref()
+        .and_then(|key| {
+            sessions
+                .read()
+                .iter()
+                .find(|session| session.layout.root.find_pane(&req.pane_id).is_some())
+                .and_then(|session| session.pane_for_idempotency_key(key))
+        }) {
+        Some(existing) => return Ok(ResponseBody::PaneId(existing)),
+        None => new_pane_id(),
+    };
 
     let mut sessions_w = sessions.write();
     for session in sessions_w.iter_mut() {
@@ -1833,6 +1913,14 @@ async fn handle_split_pane(
                 );
             }
             broadcast_layout_changed(sessions, &session_id_for_broadcast);
+            if let Some(key) = req.idempotency_key.as_deref() {
+                record_idempotent_pane(
+                    sessions,
+                    &session_id_for_broadcast,
+                    key,
+                    &new_pane_id,
+                );
+            }
             return Ok(ResponseBody::PaneId(new_pane_id));
         }
     }
@@ -1851,30 +1939,27 @@ async fn handle_close_pane(
         return Ok(ResponseBody::Error(message));
     }
 
-    let mut removed = false;
-    let mut session_id = None;
-    {
+    // §3.4 The session this call actually took a pane out of, if any. Two
+    // clients can close the same pane and lifecycle delivery is at-least-once,
+    // so "already gone" is the state the caller asked for rather than a
+    // failure — there is simply nothing left to announce.
+    let closed_in = {
         let mut sessions_w = sessions.write();
-        for session in sessions_w.iter_mut() {
-            if session.panes.read().contains_key(&req.pane_id) {
-                removed = session.remove_pane(&req.pane_id)?;
-                session_id = Some(session.id.clone());
-                if removed {
-                    zlog::info!("pane closed: id={}", req.pane_id);
-                }
-                break;
-            }
+        match sessions_w
+            .iter_mut()
+            .find(|session| session.panes.read().contains_key(&req.pane_id))
+        {
+            Some(session) => session
+                .remove_pane(&req.pane_id)?
+                .then(|| session.id.clone()),
+            None => None,
         }
-    }
-    if !removed {
-        return Ok(ResponseBody::Error(format!(
-            "pane not found: {}",
-            req.pane_id
-        )));
-    }
-    if let Some(sid) = session_id {
-        broadcast_pane_removed(sessions, &sid, &req.pane_id, 0);
-        broadcast_layout_changed(sessions, &sid);
+    };
+
+    if let Some(session_id) = closed_in {
+        zlog::info!("pane closed: id={}", req.pane_id);
+        broadcast_pane_removed(sessions, &session_id, &req.pane_id, 0);
+        broadcast_layout_changed(sessions, &session_id);
     }
     Ok(ResponseBody::Error(String::new()))
 }
@@ -1889,7 +1974,10 @@ async fn handle_focus_pane(
     if let Err(message) = ensure_mutation_allowed(sessions, connection_client_id) {
         return Ok(ResponseBody::Error(message));
     }
-    let session_id = {
+    // The session whose focus this call actually moved. Focus that did not
+    // move is not news: announcing it makes every attached client move focus
+    // again, which is how two clients end up trading it back and forth.
+    let moved_in = {
         let mut sessions = sessions.write();
         let Some(session) = sessions
             .iter_mut()
@@ -1900,21 +1988,25 @@ async fn handle_focus_pane(
                 req.pane_id
             )));
         };
-        session.set_focused_pane(req.pane_id.clone());
-        session.id.clone()
+        session
+            .set_focused_pane(req.pane_id.clone())
+            .then(|| session.id.clone())
     };
-    broadcast_lifecycle_in_session(
-        sessions,
-        &session_id,
-        Notification {
-            event: Some(mux_protocol::notification::Event::PaneFocused(
-                mux_protocol::PaneFocused {
-                    pane_id: req.pane_id.clone(),
-                },
-            )),
-        },
-    );
-    broadcast_layout_changed(sessions, &session_id);
+
+    if let Some(session_id) = moved_in {
+        broadcast_lifecycle_in_session(
+            sessions,
+            &session_id,
+            Notification {
+                event: Some(mux_protocol::notification::Event::PaneFocused(
+                    mux_protocol::PaneFocused {
+                        pane_id: req.pane_id.clone(),
+                    },
+                )),
+            },
+        );
+        broadcast_layout_changed(sessions, &session_id);
+    }
     Ok(ResponseBody::Error(String::new()))
 }
 /// §3.10 调整 pane 尺寸 — 真正调用 pane.resize (PTY TIOCSWINSZ + alacritty)
@@ -1994,6 +2086,97 @@ async fn handle_resize_layout(
     );
     Ok(ResponseBody::Error(String::new()))
 }
+/// §16.9 Set one split node's ratios outright.
+///
+/// The absolute counterpart of `handle_resize_layout`: a GUI dragging a
+/// divider knows where it landed, not how far it travelled, and reporting the
+/// landing point means a redelivered drag lands in the same place.
+async fn handle_set_layout_ratios(
+    req: &mux_protocol::SetLayoutRatiosRequest,
+    sessions: &Arc<parking_lot::RwLock<Vec<crate::session::Session>>>,
+    connection_client_id: &Arc<parking_lot::Mutex<Option<String>>>,
+) -> anyhow::Result<ResponseBody> {
+    if let Err(message) = ensure_mutation_allowed(sessions, connection_client_id) {
+        return Ok(ResponseBody::Error(message));
+    }
+    let session_id = {
+        let mut sessions_w = sessions.write();
+        let Some(session) = sessions_w
+            .iter_mut()
+            .find(|session| session.layout.contains_node(&req.node_id))
+        else {
+            return Ok(ResponseBody::Error(format!(
+                "layout split not found: {}",
+                req.node_id
+            )));
+        };
+        if let Err(error) = session.layout.set_ratios(&req.node_id, &req.ratios) {
+            tracing::warn!(error = %error, node_id = %req.node_id, "layout set_ratios failed");
+            return Ok(ResponseBody::Error(format!("{error}")));
+        }
+        session.id.clone()
+    };
+    broadcast_layout_changed(sessions, &session_id);
+    zlog::info!(
+        "layout ratios set: node={} ratios={:?}",
+        req.node_id,
+        req.ratios
+    );
+    Ok(ResponseBody::Error(String::new()))
+}
+
+/// §16.9 Move a pane beside another one — what a dragged tab means here.
+async fn handle_move_pane(
+    req: &mux_protocol::MovePaneRequest,
+    sessions: &Arc<parking_lot::RwLock<Vec<crate::session::Session>>>,
+    connection_client_id: &Arc<parking_lot::Mutex<Option<String>>>,
+) -> anyhow::Result<ResponseBody> {
+    if let Err(message) = ensure_mutation_allowed(sessions, connection_client_id) {
+        return Ok(ResponseBody::Error(message));
+    }
+    let direction = match req.direction {
+        1 => crate::layout::SplitDirection::LeftRight,
+        2 => crate::layout::SplitDirection::TopBottom,
+        _ => {
+            return Ok(ResponseBody::Error(format!(
+                "invalid split direction: {}",
+                req.direction
+            )));
+        }
+    };
+    let session_id = {
+        let mut sessions_w = sessions.write();
+        let Some(session) = sessions_w
+            .iter_mut()
+            .find(|session| session.layout.root.find_pane(&req.pane_id).is_some())
+        else {
+            return Ok(ResponseBody::Error(format!(
+                "pane not found: {}",
+                req.pane_id
+            )));
+        };
+        if let Err(error) = session.layout.move_pane(
+            &req.pane_id,
+            &req.target_pane_id,
+            direction,
+            req.before,
+        ) {
+            tracing::warn!(error = %error, pane_id = %req.pane_id, "layout move_pane failed");
+            return Ok(ResponseBody::Error(format!("{error}")));
+        }
+        session.id.clone()
+    };
+    broadcast_layout_changed(sessions, &session_id);
+    zlog::info!(
+        "pane moved: pane={} target={} direction={:?} before={}",
+        req.pane_id,
+        req.target_pane_id,
+        direction,
+        req.before
+    );
+    Ok(ResponseBody::Error(String::new()))
+}
+
 fn find_pane(
     sessions: &Arc<parking_lot::RwLock<Vec<crate::session::Session>>>,
     pane_id: &str,
@@ -3525,47 +3708,42 @@ async fn handle_zoom_pane(
     if let Err(message) = ensure_mutation_allowed(sessions, connection_client_id) {
         return Ok(ResponseBody::Error(message));
     }
-    let mut matched_session_id: Option<String> = None;
-    let mut pane_found = false;
-
-    {
+    // The session whose zoom this call actually flipped. A zoom that changes
+    // nothing still reached every attached client as a layout change, which
+    // re-runs their projection and moves focus with it.
+    let zoomed_in = {
         let sessions_r = sessions.read();
-        for session in sessions_r.iter() {
-            if let Some(pane) = session.panes.read().get(&req.pane_id) {
-                pane.set_zoomed(req.zoom);
-                matched_session_id = Some(session.id.clone());
-                pane_found = true;
-                break;
-            }
-        }
-    }
-
-    if !pane_found {
-        return Ok(ResponseBody::Error(format!(
-            "zoom_pane: pane {} not found",
-            req.pane_id
-        )));
-    }
+        let Some((session_id, pane)) = sessions_r.iter().find_map(|session| {
+            let pane = session.panes.read().get(&req.pane_id).cloned()?;
+            Some((session.id.clone(), pane))
+        }) else {
+            return Ok(ResponseBody::Error(format!(
+                "zoom_pane: pane {} not found",
+                req.pane_id
+            )));
+        };
+        pane.set_zoomed(req.zoom).then_some(session_id)
+    };
 
     // §3.4 zoom 影响 layout 可见性; PaneZoomed + SessionLayoutChanged 都属于
     // lifecycle 事件范畴, 走会话级 lifecycle fan-out 路径送达所有 attached 客户端。
-    let session_id = matched_session_id.expect("pane_found implies matched session");
-    {
-        let sessions_r = sessions.read();
-        if let Some(session) = sessions_r.iter().find(|s| s.id == session_id) {
-            session.broadcast_lifecycle(Notification {
-                event: Some(mux_protocol::notification::Event::PaneZoomed(
-                    mux_protocol::PaneZoomed {
-                        pane_id: req.pane_id.clone(),
-                        zoomed: req.zoom,
-                    },
-                )),
-            });
+    if let Some(session_id) = zoomed_in {
+        {
+            let sessions_r = sessions.read();
+            if let Some(session) = sessions_r.iter().find(|s| s.id == session_id) {
+                session.broadcast_lifecycle(Notification {
+                    event: Some(mux_protocol::notification::Event::PaneZoomed(
+                        mux_protocol::PaneZoomed {
+                            pane_id: req.pane_id.clone(),
+                            zoomed: req.zoom,
+                        },
+                    )),
+                });
+            }
         }
+        broadcast_layout_changed(sessions, &session_id);
+        zlog::info!("pane zoom: pane={} zoomed={}", req.pane_id, req.zoom);
     }
-    broadcast_layout_changed(sessions, &session_id);
-
-    zlog::info!("pane zoom: pane={} zoomed={}", req.pane_id, req.zoom);
     Ok(ResponseBody::ZoomPane(mux_protocol::ZoomPaneResponse {}))
 }
 
@@ -4249,6 +4427,7 @@ mod connection_unit_tests {
             tab_id: "tab".to_string(),
             size: Some(mux_protocol::TerminalSize { cols: 80, rows: 24 }),
             cwd: None,
+            idempotency_key: None,
             command: Some(mux_protocol::ShellCommand {
                 program: "/definitely/must/not/spawn".to_string(),
                 args: Vec::new(),
@@ -4318,6 +4497,7 @@ mod connection_unit_tests {
                     env: Default::default(),
                 }),
                 cwd: None,
+                idempotency_key: None,
             },
             &sessions,
             &outbound,
@@ -4364,6 +4544,7 @@ mod connection_unit_tests {
                 tab_id: "tab-1".to_string(),
                 size: Some(mux_protocol::TerminalSize { cols: 20, rows: 5 }),
                 cwd: None,
+                idempotency_key: None,
                 command: Some(mux_protocol::ShellCommand {
                     // macOS ships `true` only under /usr/bin; hardcoding /bin
                     // makes this fail as ENOENT instead of testing the fast
@@ -4461,6 +4642,7 @@ mod connection_unit_tests {
                     tab_id: tab_id.to_string(),
                     size: Some(mux_protocol::TerminalSize { cols: 20, rows: 5 }),
                     cwd: None,
+                    idempotency_key: None,
                     command: Some(mux_protocol::ShellCommand {
                         program: "/bin/cat".to_string(),
                         args: Vec::new(),
@@ -4493,6 +4675,452 @@ mod connection_unit_tests {
         assert_eq!(session.focused_tab.as_deref(), Some("tab-2"));
         assert_eq!(session.focused_pane.as_deref(), Some(pane_ids[1].as_str()));
     }
+    /// §3.10 A dropped response makes the client retry. Without a key that
+    /// retry is a second shell the user never asked for and cannot see.
+    #[tokio::test]
+    async fn a_replayed_spawn_with_a_key_returns_the_first_pane() {
+        let mut session = crate::session::Session::new(
+            "key-session".to_string(),
+            "key-session".to_string(),
+            "/tmp".to_string(),
+        );
+        session.add_tab("tab-1".to_string(), "one".to_string());
+        let sessions = Arc::new(parking_lot::RwLock::new(vec![session]));
+        let settings = crate::server_settings::ServerSettings::load();
+        let clipboard = Arc::new(crate::clipboard::ServerClipboard::new());
+        let (_extensions_dir, extension_host, unattached) = handler_fixture(&sessions);
+
+        let spawn = || async {
+            let response = handle_spawn_pane(
+                &SpawnPaneRequest {
+                    session_id: "key-session".to_string(),
+                    tab_id: "tab-1".to_string(),
+                    size: Some(mux_protocol::TerminalSize { cols: 20, rows: 5 }),
+                    cwd: None,
+                    idempotency_key: Some("spawn-1".to_string()),
+                    command: Some(mux_protocol::ShellCommand {
+                        program: "/bin/cat".to_string(),
+                        args: Vec::new(),
+                        env: Default::default(),
+                    }),
+                },
+                &sessions,
+                &settings,
+                &clipboard,
+                &extension_host,
+                &unattached,
+            )
+            .await
+            .expect("spawn returns a response");
+            match response {
+                ResponseBody::PaneId(id) => id,
+                response => panic!("expected pane id, got {response:?}"),
+            }
+        };
+
+        let first = spawn().await;
+        let second = spawn().await;
+
+        assert_eq!(first, second, "a replayed spawn must name the same pane");
+        assert_eq!(
+            sessions.read()[0].panes.read().len(),
+            1,
+            "a replayed spawn must not leave a second shell running"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_replayed_split_with_a_key_returns_the_first_pane() {
+        let mut session = crate::session::Session::new(
+            "split-key-session".to_string(),
+            "split-key-session".to_string(),
+            "/tmp".to_string(),
+        );
+        session.add_tab("tab-1".to_string(), "one".to_string());
+        let sessions = Arc::new(parking_lot::RwLock::new(vec![session]));
+        let settings = crate::server_settings::ServerSettings::load();
+        let clipboard = Arc::new(crate::clipboard::ServerClipboard::new());
+        let (_extensions_dir, extension_host, unattached) = handler_fixture(&sessions);
+        let (outbound, _notifications) = mpsc::unbounded_channel();
+
+        let root = match handle_spawn_pane(
+            &SpawnPaneRequest {
+                session_id: "split-key-session".to_string(),
+                tab_id: "tab-1".to_string(),
+                size: Some(mux_protocol::TerminalSize { cols: 20, rows: 5 }),
+                cwd: None,
+                idempotency_key: None,
+                command: Some(mux_protocol::ShellCommand {
+                    program: "/bin/cat".to_string(),
+                    args: Vec::new(),
+                    env: Default::default(),
+                }),
+            },
+            &sessions,
+            &settings,
+            &clipboard,
+            &extension_host,
+            &unattached,
+        )
+        .await
+        .expect("spawn returns a response")
+        {
+            ResponseBody::PaneId(id) => id,
+            response => panic!("expected pane id, got {response:?}"),
+        };
+
+        let split = || async {
+            let response = handle_split_pane(
+                &SplitPaneRequest {
+                    pane_id: root.clone(),
+                    direction: 1,
+                    cwd: None,
+                    idempotency_key: Some("split-1".to_string()),
+                    command: Some(mux_protocol::ShellCommand {
+                        program: "/bin/cat".to_string(),
+                        args: Vec::new(),
+                        env: Default::default(),
+                    }),
+                },
+                &sessions,
+                &outbound,
+                &settings,
+                &clipboard,
+                &extension_host,
+                &unattached,
+            )
+            .await
+            .expect("split returns a response");
+            match response {
+                ResponseBody::PaneId(id) => id,
+                response => panic!("expected pane id, got {response:?}"),
+            }
+        };
+
+        let first = split().await;
+        let second = split().await;
+
+        assert_eq!(first, second, "a replayed split must name the same pane");
+        assert_eq!(
+            sessions.read()[0].panes.read().len(),
+            2,
+            "a replayed split must not leave a third shell running"
+        );
+    }
+
+    /// §3.4 Two clients can close the same pane, and lifecycle delivery is
+    /// at-least-once. The pane is gone either way, which is what the caller
+    /// asked for — but it must only be announced gone once.
+    #[tokio::test]
+    async fn closing_a_pane_twice_succeeds_and_announces_it_once() {
+        let mut session = crate::session::Session::new(
+            "close-session".to_string(),
+            "close-session".to_string(),
+            "/tmp".to_string(),
+        );
+        session.add_tab("tab-1".to_string(), "one".to_string());
+        let sessions = Arc::new(parking_lot::RwLock::new(vec![session]));
+        let settings = crate::server_settings::ServerSettings::load();
+        let clipboard = Arc::new(crate::clipboard::ServerClipboard::new());
+        let (_extensions_dir, extension_host, unattached) = handler_fixture(&sessions);
+        let (outbound, _notifications) = mpsc::unbounded_channel();
+
+        let mut panes = Vec::new();
+        for _ in 0..2 {
+            let response = handle_spawn_pane(
+                &SpawnPaneRequest {
+                    session_id: "close-session".to_string(),
+                    tab_id: "tab-1".to_string(),
+                    size: Some(mux_protocol::TerminalSize { cols: 20, rows: 5 }),
+                    cwd: None,
+                    idempotency_key: None,
+                    command: Some(mux_protocol::ShellCommand {
+                        program: "/bin/cat".to_string(),
+                        args: Vec::new(),
+                        env: Default::default(),
+                    }),
+                },
+                &sessions,
+                &settings,
+                &clipboard,
+                &extension_host,
+                &unattached,
+            )
+            .await
+            .expect("spawn returns a response");
+            match response {
+                ResponseBody::PaneId(id) => panes.push(id),
+                response => panic!("expected pane id, got {response:?}"),
+            }
+        }
+
+        let (subscriber, mut announcements) = mpsc::unbounded_channel();
+        sessions.read()[0].add_lifecycle_subscriber("watcher".to_string(), subscriber);
+
+        for attempt in 0..2 {
+            let response = handle_close_pane(
+                &ClosePaneRequest {
+                    pane_id: panes[1].clone(),
+                },
+                &sessions,
+                &outbound,
+                &unattached,
+            )
+            .await
+            .expect("close returns a response");
+            assert!(
+                matches!(&response, ResponseBody::Error(message) if message.is_empty()),
+                "close attempt {attempt} must succeed, got {response:?}"
+            );
+        }
+
+        assert_eq!(
+            sessions.read()[0].panes.read().len(),
+            1,
+            "the pane must be gone after either attempt"
+        );
+        let removals = drain_pane_removals(&mut announcements, &panes[1]);
+        assert_eq!(removals, 1, "the pane must be announced gone exactly once");
+    }
+
+    fn drain_pane_removals(
+        announcements: &mut mpsc::UnboundedReceiver<Envelope>,
+        pane_id: &str,
+    ) -> usize {
+        let mut removals = 0;
+        while let Ok(envelope) = announcements.try_recv() {
+            if let Some(mux_protocol::envelope::Payload::Notification(notification)) =
+                envelope.payload
+                && let Some(mux_protocol::notification::Event::PaneRemoved(removed)) =
+                    notification.event
+                && removed.pane_id == pane_id
+            {
+                removals += 1;
+            }
+        }
+        removals
+    }
+
+    /// §3.4 A zoom that changes nothing still reached every attached client as
+    /// a layout change, and their projection moves focus with it.
+    #[tokio::test]
+    async fn rezooming_a_zoomed_pane_announces_nothing() {
+        let mut session = crate::session::Session::new(
+            "zoom-session".to_string(),
+            "zoom-session".to_string(),
+            "/tmp".to_string(),
+        );
+        session.add_tab("tab-1".to_string(), "one".to_string());
+        let sessions = Arc::new(parking_lot::RwLock::new(vec![session]));
+        let settings = crate::server_settings::ServerSettings::load();
+        let clipboard = Arc::new(crate::clipboard::ServerClipboard::new());
+        let (_extensions_dir, extension_host, unattached) = handler_fixture(&sessions);
+        let (outbound, _notifications) = mpsc::unbounded_channel();
+
+        let pane = match handle_spawn_pane(
+            &SpawnPaneRequest {
+                session_id: "zoom-session".to_string(),
+                tab_id: "tab-1".to_string(),
+                size: Some(mux_protocol::TerminalSize { cols: 20, rows: 5 }),
+                cwd: None,
+                idempotency_key: None,
+                command: Some(mux_protocol::ShellCommand {
+                    program: "/bin/cat".to_string(),
+                    args: Vec::new(),
+                    env: Default::default(),
+                }),
+            },
+            &sessions,
+            &settings,
+            &clipboard,
+            &extension_host,
+            &unattached,
+        )
+        .await
+        .expect("spawn returns a response")
+        {
+            ResponseBody::PaneId(id) => id,
+            response => panic!("expected pane id, got {response:?}"),
+        };
+
+        let zoom = || async {
+            handle_zoom_pane(
+                &mux_protocol::ZoomPaneRequest {
+                    pane_id: pane.clone(),
+                    zoom: true,
+                },
+                &sessions,
+                &outbound,
+                &unattached,
+            )
+            .await
+            .expect("zoom returns a response")
+        };
+
+        let (subscriber, mut announcements) = mpsc::unbounded_channel();
+        sessions.read()[0].add_lifecycle_subscriber("watcher".to_string(), subscriber);
+
+        // The half that must keep working: a zoom that flips the state is
+        // announced, or no client would ever learn the pane zoomed.
+        zoom().await;
+        assert_eq!(
+            drain_zoom_announcements(&mut announcements, &pane),
+            1,
+            "a zoom that changes the state must be announced"
+        );
+
+        let response = zoom().await;
+
+        assert!(
+            matches!(response, ResponseBody::ZoomPane(_)),
+            "re-zooming must succeed, got {response:?}"
+        );
+        assert!(
+            announcements.try_recv().is_err(),
+            "a zoom that changes nothing must not be announced"
+        );
+        assert!(
+            sessions.read()[0]
+                .panes
+                .read()
+                .get(&pane)
+                .is_some_and(|pane| pane.is_zoomed()),
+            "the pane must stay zoomed"
+        );
+    }
+
+    /// §3.4 Focus is broadcast to every attached client, so re-announcing the
+    /// focus a client already holds moves everyone's focus again — which is
+    /// how two clients end up trading it back and forth.
+    #[tokio::test]
+    async fn refocusing_the_focused_pane_announces_nothing() {
+        let mut session = crate::session::Session::new(
+            "focus-session".to_string(),
+            "focus-session".to_string(),
+            "/tmp".to_string(),
+        );
+        session.add_tab("tab-1".to_string(), "one".to_string());
+        let sessions = Arc::new(parking_lot::RwLock::new(vec![session]));
+        let settings = crate::server_settings::ServerSettings::load();
+        let clipboard = Arc::new(crate::clipboard::ServerClipboard::new());
+        let (_extensions_dir, extension_host, unattached) = handler_fixture(&sessions);
+        let (outbound, _notifications) = mpsc::unbounded_channel();
+
+        let mut panes = Vec::new();
+        for _ in 0..2 {
+            let response = handle_spawn_pane(
+                &SpawnPaneRequest {
+                    session_id: "focus-session".to_string(),
+                    tab_id: "tab-1".to_string(),
+                    size: Some(mux_protocol::TerminalSize { cols: 20, rows: 5 }),
+                    cwd: None,
+                    idempotency_key: None,
+                    command: Some(mux_protocol::ShellCommand {
+                        program: "/bin/cat".to_string(),
+                        args: Vec::new(),
+                        env: Default::default(),
+                    }),
+                },
+                &sessions,
+                &settings,
+                &clipboard,
+                &extension_host,
+                &unattached,
+            )
+            .await
+            .expect("spawn returns a response");
+            match response {
+                ResponseBody::PaneId(id) => panes.push(id),
+                response => panic!("expected pane id, got {response:?}"),
+            }
+        }
+        let other = panes[0].clone();
+        // The second spawn took the focus, so focusing the first is a real
+        // move — which is the precondition for the repeat being a no-op.
+        assert_eq!(
+            sessions.read()[0].focused_pane.as_deref(),
+            Some(panes[1].as_str())
+        );
+
+        let (subscriber, mut announcements) = mpsc::unbounded_channel();
+        sessions.read()[0].add_lifecycle_subscriber("watcher".to_string(), subscriber);
+
+        let focus = |pane_id: String| async {
+            handle_focus_pane(
+                &FocusPaneRequest { pane_id },
+                &sessions,
+                &outbound,
+                &unattached,
+            )
+            .await
+            .expect("focus returns a response")
+        };
+
+        // The half that must keep working: focus that moves is announced, or
+        // no client would ever learn where it went.
+        let response = focus(other.clone()).await;
+        assert!(
+            matches!(&response, ResponseBody::Error(message) if message.is_empty()),
+            "focusing another pane must succeed, got {response:?}"
+        );
+        assert_eq!(
+            drain_focus_announcements(&mut announcements, &other),
+            1,
+            "a focus that moves must be announced"
+        );
+
+        let response = focus(other.clone()).await;
+        assert!(
+            matches!(&response, ResponseBody::Error(message) if message.is_empty()),
+            "refocusing must succeed, got {response:?}"
+        );
+        assert!(
+            announcements.try_recv().is_err(),
+            "a focus that changes nothing must not be announced"
+        );
+        assert_eq!(
+            sessions.read()[0].focused_pane.as_deref(),
+            Some(other.as_str()),
+            "the focus itself must not move"
+        );
+    }
+
+    fn drain_zoom_announcements(
+        announcements: &mut mpsc::UnboundedReceiver<Envelope>,
+        pane_id: &str,
+    ) -> usize {
+        let mut zooms = 0;
+        while let Ok(envelope) = announcements.try_recv() {
+            if let Some(mux_protocol::envelope::Payload::Notification(notification)) =
+                envelope.payload
+                && let Some(mux_protocol::notification::Event::PaneZoomed(event)) =
+                    notification.event
+                && event.pane_id == pane_id
+            {
+                zooms += 1;
+            }
+        }
+        zooms
+    }
+
+    fn drain_focus_announcements(
+        announcements: &mut mpsc::UnboundedReceiver<Envelope>,
+        pane_id: &str,
+    ) -> usize {
+        let mut focused = 0;
+        while let Ok(envelope) = announcements.try_recv() {
+            if let Some(mux_protocol::envelope::Payload::Notification(notification)) =
+                envelope.payload
+                && let Some(mux_protocol::notification::Event::PaneFocused(event)) =
+                    notification.event
+                && event.pane_id == pane_id
+            {
+                focused += 1;
+            }
+        }
+        focused
+    }
+
     struct DropSignal(Arc<std::sync::atomic::AtomicBool>);
 
     impl Drop for DropSignal {

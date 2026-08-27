@@ -1048,12 +1048,29 @@ impl MuxDomain {
         command: Option<ShellCommand>,
         cwd: Option<&Path>,
     ) -> Result<String> {
+        self.spawn_pane_idempotent(session, tab, size, command, cwd, None)
+            .await
+    }
+
+    /// §3.10 As `spawn_pane`, but a caller that may retry supplies a key: the
+    /// server answers a repeat with the pane the first request created rather
+    /// than spawning a second shell.
+    pub async fn spawn_pane_idempotent(
+        &self,
+        session: &str,
+        tab: &str,
+        size: TerminalSize,
+        command: Option<ShellCommand>,
+        cwd: Option<&Path>,
+        idempotency_key: Option<String>,
+    ) -> Result<String> {
         let req = RequestBody::SpawnPane(mux_protocol::SpawnPaneRequest {
             session_id: session.to_string(),
             tab_id: tab.to_string(),
             size: Some(size),
             command,
             cwd: cwd.map(|p| p.to_string_lossy().to_string()),
+            idempotency_key,
         });
         let resp = self.send_request(req).await?;
         match resp.body {
@@ -1075,11 +1092,25 @@ impl MuxDomain {
         direction: SplitDirection,
         command: Option<ShellCommand>,
     ) -> Result<String> {
+        self.split_pane_idempotent(pane, direction, command, None)
+            .await
+    }
+
+    /// §3.10 As `split_pane_with_command`, with the retry key described on
+    /// [`MuxDomain::spawn_pane_idempotent`].
+    pub async fn split_pane_idempotent(
+        &self,
+        pane: &str,
+        direction: SplitDirection,
+        command: Option<ShellCommand>,
+        idempotency_key: Option<String>,
+    ) -> Result<String> {
         let req = RequestBody::SplitPane(mux_protocol::SplitPaneRequest {
             pane_id: pane.to_string(),
             direction: direction as i32,
             command,
             cwd: None,
+            idempotency_key,
         });
         let resp = self.send_request(req).await?;
         match resp.body {
@@ -1126,6 +1157,36 @@ impl MuxDomain {
             pane_id: pane.to_string(),
             direction: direction as i32,
             delta,
+        });
+        Self::empty_or_error_response(self.send_request(req).await?)
+    }
+
+    /// §16.9 Set one split node's ratios outright.
+    ///
+    /// What a divider drag reports: the ratios the client settled on, not the
+    /// nudges that got it there. Absolute, so a repeat is a no-op.
+    pub async fn set_layout_ratios(&self, node: &str, ratios: Vec<f32>) -> Result<()> {
+        let req = RequestBody::SetLayoutRatios(mux_protocol::SetLayoutRatiosRequest {
+            node_id: node.to_string(),
+            ratios,
+        });
+        Self::empty_or_error_response(self.send_request(req).await?)
+    }
+
+    /// §16.9 Move a pane beside another one — what a tab drag means to the
+    /// server. Moving a pane to where it already sits is a no-op.
+    pub async fn move_pane(
+        &self,
+        pane: &str,
+        target: &str,
+        direction: SplitDirection,
+        before: bool,
+    ) -> Result<()> {
+        let req = RequestBody::MovePane(mux_protocol::MovePaneRequest {
+            pane_id: pane.to_string(),
+            target_pane_id: target.to_string(),
+            direction: direction as i32,
+            before,
         });
         Self::empty_or_error_response(self.send_request(req).await?)
     }

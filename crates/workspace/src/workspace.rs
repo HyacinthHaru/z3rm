@@ -63,9 +63,6 @@ use anyhow::{Context as _, Result, anyhow};
 use collections::{BTreeMap, HashMap, HashSet, TypeIdHashMap, hash_map};
 use dock::{Dock, DockPosition, PanelButtons, PanelHandle, RESIZE_HANDLE_SIZE};
 use fs::Fs;
-// §15.1 导入 mux_protocol 用于 LayoutTree 类型转换
-use mux_protocol;
-// §15.1 导入 mux client 用于 RPC 转发
 use futures::{
     Future, FutureExt, StreamExt,
     channel::{
@@ -1181,6 +1178,23 @@ pub enum Event {
     Activate,
     PanelAdded(AnyView),
     WorktreeCreationChanged,
+    /// §16.9 A divider was dragged, so this window's split ratios no longer
+    /// match the server's. The surface that owns the mux connection forwards
+    /// them; `workspace` has the ratios but not the socket.
+    LayoutRatiosChanged,
+    /// §16.9 A tab was dropped somewhere. Reported by item id rather than by
+    /// pane id because `workspace` cannot tell a mux pane from any other item;
+    /// the surface that can resolves these and forwards the move.
+    ///
+    /// Raised before the local move so `target_item_id` still names the item
+    /// the user dropped onto rather than the one that just landed there.
+    TabDropped {
+        item_id: EntityId,
+        target_item_id: Option<EntityId>,
+        split_direction: Option<SplitDirection>,
+        /// The drop landed above/left of the target rather than below/right.
+        before: bool,
+    },
 }
 
 /// Controls which types of items should be made visible in the project panel
@@ -6567,6 +6581,72 @@ impl Workspace {
     }
 
     /// §15.1 获取服务端布局树
+    /// §16.9 Below this a reported ratio is the one the server already holds:
+    /// float round-trips through the projection, and re-sending an unchanged
+    /// split would broadcast a layout change to every attached client.
+    const RATIO_DRIFT: f32 = 1e-4;
+
+    /// §16.9 Which split ratios this window has moved away from the server's.
+    ///
+    /// The inverse of `apply_layout_snapshot`: that projects the server's
+    /// ratios into GPUI flexes, this reads the flexes back out and names the
+    /// server node each one belongs to. Absolute, so what comes back is a
+    /// request that can be sent twice without moving anything twice.
+    ///
+    /// Only splits that actually drifted are reported: a drag moves one
+    /// divider, and re-sending the rest would be a broadcast per untouched
+    /// node. A shape mismatch means the projection has not caught up with the
+    /// server yet, so that subtree is skipped rather than guessed at.
+    pub fn mux_layout_ratio_drift(&self) -> Vec<(String, Vec<f32>)> {
+        let Some(server_layout) = self.server_layout.as_ref() else {
+            return Vec::new();
+        };
+        let mut drift = Vec::new();
+        Self::collect_ratio_drift(&self.center.root, &server_layout.root, &mut drift);
+        drift
+    }
+
+    fn collect_ratio_drift(
+        member: &Member,
+        node: &crate::layout_projection::LayoutNode,
+        drift: &mut Vec<(String, Vec<f32>)>,
+    ) {
+        use crate::layout_projection::LayoutNode;
+
+        let (Member::Axis(axis), LayoutNode::Split { id, children, ratios, .. }) = (member, node)
+        else {
+            return;
+        };
+
+        // One flex per child per ratio, every one of them a positive finite
+        // number. Anything else means the projection has not caught up with
+        // the server, and a report built from a half-applied tree would move
+        // dividers nobody touched. Recursion still descends: it is this split
+        // that is unreadable, not the ones below it, and `zip` stops at
+        // whichever side ran out.
+        let flexes = axis.flexes.lock().clone();
+        let total: f32 = flexes.iter().sum();
+        let readable = flexes.len() == children.len()
+            && ratios.len() == children.len()
+            && total.is_finite()
+            && total > 0.0
+            && flexes.iter().all(|flex| flex.is_finite() && *flex > 0.0);
+        if readable {
+            let normalised: Vec<f32> = flexes.iter().map(|flex| flex / total).collect();
+            let moved = ratios
+                .iter()
+                .zip(&normalised)
+                .any(|(server, local)| (server - local).abs() >= Self::RATIO_DRIFT);
+            if moved {
+                drift.push((id.clone(), normalised));
+            }
+        }
+
+        for (child_member, child_node) in axis.members.iter().zip(children) {
+            Self::collect_ratio_drift(child_member, child_node, drift);
+        }
+    }
+
     pub fn get_server_layout(&self) -> Option<&crate::layout_projection::LayoutTree> {
         self.server_layout.as_ref()
     }
@@ -6760,7 +6840,14 @@ impl Workspace {
 
         match node {
             LayoutNode::Pane { pane_id, .. } => {
-                let pane = if let Some(pane) = existing.remove(pane_id) {
+                // A pane holding two mux items — which is what dropping a tab
+                // into another pane's strip leaves behind — maps to two leaves.
+                // Reusing it for both would put the same entity in the tree
+                // twice, so the second leaf gets a pane of its own.
+                let reusable = existing
+                    .remove(pane_id)
+                    .filter(|pane| !used.contains(&pane.entity_id()));
+                let pane = if let Some(pane) = reusable {
                     pane
                 } else {
                     let pane = create_pane(self, window, cx);
@@ -6824,49 +6911,6 @@ impl Workspace {
                 (Member::Axis(PaneAxis::load(axis, members, flexes)), focus)
             }
         }
-    }
-
-    // ========================================================================
-    // §15.1 / §16.9 布局交互 RPC 转发 — 将用户操作转发到 mux_server
-    // ========================================================================
-
-    /// §16.9 转发分割请求到 server — 调用 domain.split_pane() RPC
-    pub async fn rpc_split_pane(
-        &self,
-        domain: &mux::MuxDomain,
-        pane_id: &str,
-        direction: mux_protocol::split_node::SplitDirection,
-    ) -> anyhow::Result<String> {
-        domain.split_pane(pane_id, direction).await
-    }
-
-    /// §16.9 转发关闭请求到 server
-    pub async fn rpc_close_pane(
-        &self,
-        domain: &mux::MuxDomain,
-        pane_id: &str,
-    ) -> anyhow::Result<()> {
-        domain.close_pane(pane_id).await
-    }
-
-    /// §16.9 转发聚焦请求到 server
-    pub async fn rpc_focus_pane(
-        &self,
-        domain: &mux::MuxDomain,
-        pane_id: &str,
-    ) -> anyhow::Result<()> {
-        domain.focus_pane(pane_id).await
-    }
-
-    /// §16.9 转发调整大小请求到 server
-    pub async fn rpc_resize_pane(
-        &self,
-        domain: &mux::MuxDomain,
-        pane_id: &str,
-        cols: u32,
-        rows: u32,
-    ) -> anyhow::Result<()> {
-        domain.resize_pane(pane_id, cols, rows).await
     }
 
     #[cfg(any(test, feature = "test-support"))]

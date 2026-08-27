@@ -103,6 +103,31 @@ impl LayoutTree {
     }
 
     /// 收集所有 pane IDs
+    /// §16.9 The direction of the split a pane sits directly inside.
+    ///
+    /// A tab dropped into another pane's tab strip carries no direction of its
+    /// own — the server has no stacking, so the nearest thing it can hold is
+    /// "beside the target, along the axis already there".
+    pub fn parent_direction(&self, pane_id: &str) -> Option<SplitDirection> {
+        fn visit(node: &LayoutNode, pane_id: &str) -> Option<SplitDirection> {
+            let LayoutNode::Split {
+                direction,
+                children,
+                ..
+            } = node
+            else {
+                return None;
+            };
+            if children.iter().any(
+                |child| matches!(child, LayoutNode::Pane { pane_id: id, .. } if id == pane_id),
+            ) {
+                return Some(*direction);
+            }
+            children.iter().find_map(|child| visit(child, pane_id))
+        }
+        visit(&self.root, pane_id)
+    }
+
     pub fn pane_ids(&self) -> Vec<String> {
         let mut ids = Vec::new();
         self.collect_pane_ids(&self.root, &mut ids);
@@ -504,6 +529,60 @@ pub fn install_snapshot_panes(
                 workspace.add_item(pane.clone(), item, None, index == 0, true, window, cx);
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod layout_tree_tests {
+    use super::{LayoutNode, LayoutTree, SplitDirection};
+
+    fn leaf(id: &str, pane_id: &str) -> LayoutNode {
+        LayoutNode::Pane {
+            id: id.to_string(),
+            pane_id: pane_id.to_string(),
+        }
+    }
+
+    /// A tab dropped into another pane's strip carries no direction, so the
+    /// axis already around the target is the only honest answer.
+    #[test]
+    fn parent_direction_reports_the_split_a_pane_sits_in() {
+        let tree = LayoutTree {
+            root: LayoutNode::Split {
+                id: "root".to_string(),
+                direction: SplitDirection::LeftRight,
+                children: vec![
+                    leaf("a", "pane-1"),
+                    LayoutNode::Split {
+                        id: "inner".to_string(),
+                        direction: SplitDirection::TopBottom,
+                        children: vec![leaf("b", "pane-2"), leaf("c", "pane-3")],
+                        ratios: vec![0.5, 0.5],
+                    },
+                ],
+                ratios: vec![0.5, 0.5],
+            },
+        };
+
+        assert_eq!(
+            tree.parent_direction("pane-1"),
+            Some(SplitDirection::LeftRight)
+        );
+        assert_eq!(
+            tree.parent_direction("pane-3"),
+            Some(SplitDirection::TopBottom),
+            "the nearest split wins, not the root"
+        );
+        assert_eq!(tree.parent_direction("pane-9"), None);
+    }
+
+    /// A lone pane has no split around it, so there is no axis to drop along.
+    #[test]
+    fn a_root_pane_has_no_parent_direction() {
+        let tree = LayoutTree {
+            root: leaf("root", "pane-1"),
+        };
+        assert_eq!(tree.parent_direction("pane-1"), None);
     }
 }
 

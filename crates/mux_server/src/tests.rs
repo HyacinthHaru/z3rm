@@ -230,6 +230,193 @@ fn test_layout_resize_pane() {
     }
 }
 
+/// §16.9 拖动分隔条报告的是落点。同一个落点报告两次, 树必须一模一样 ——
+/// `resize_pane` 收增量, 重放会把分隔条挪两次, 这正是它替代不了的地方。
+#[test]
+fn setting_layout_ratios_is_absolute_and_repeatable() {
+    let mut tree = LayoutTree::with_pane("node-1".to_string(), "pane-1".to_string());
+    tree.split("pane-1", "pane-2".to_string(), SplitDirection::LeftRight)
+        .expect("split failed");
+
+    tree.set_ratios("node-1", &[0.7, 0.3])
+        .expect("set ratios failed");
+    let once = tree.root.clone();
+    tree.set_ratios("node-1", &[0.7, 0.3])
+        .expect("replaying the same drag must succeed");
+
+    assert_eq!(tree.root, once, "an absolute ratio must not accumulate");
+    match &tree.root {
+        LayoutNode::Split { ratios, .. } => {
+            assert!((ratios[0] - 0.7).abs() < 1e-6);
+            assert!((ratios[1] - 0.3).abs() < 1e-6);
+        }
+        _ => panic!("expected Split node"),
+    }
+}
+
+/// 比例被归一化, 所以客户端按像素报告 (300/700) 和按比例报告 (0.3/0.7)
+/// 是同一个请求。
+#[test]
+fn layout_ratios_are_normalised() {
+    let mut tree = LayoutTree::with_pane("node-1".to_string(), "pane-1".to_string());
+    tree.split("pane-1", "pane-2".to_string(), SplitDirection::LeftRight)
+        .expect("split failed");
+
+    tree.set_ratios("node-1", &[300.0, 700.0])
+        .expect("set ratios failed");
+
+    match &tree.root {
+        LayoutNode::Split { ratios, .. } => {
+            assert!((ratios[0] - 0.3).abs() < 1e-6);
+            assert!((ratios[1] - 0.7).abs() < 1e-6);
+        }
+        _ => panic!("expected Split node"),
+    }
+}
+
+#[test]
+fn layout_ratios_reject_a_mismatched_count() {
+    let mut tree = LayoutTree::with_pane("node-1".to_string(), "pane-1".to_string());
+    tree.split("pane-1", "pane-2".to_string(), SplitDirection::LeftRight)
+        .expect("split failed");
+    let before = tree.root.clone();
+
+    tree.set_ratios("node-1", &[0.5, 0.3, 0.2])
+        .expect_err("three ratios for two children must be rejected");
+    tree.set_ratios("node-1", &[0.0, 1.0])
+        .expect_err("a zero-width pane is not a layout");
+    tree.set_ratios("node-1", &[f32::NAN, 1.0])
+        .expect_err("NaN must not reach the tree");
+
+    assert_eq!(tree.root, before, "a rejected resize must not touch the tree");
+}
+
+/// §16.9 拖动 tab: 叶子离开原处, 在目标旁边重新进入。
+#[test]
+fn moving_a_pane_places_it_beside_the_target() {
+    let mut tree = LayoutTree::with_pane("node-1".to_string(), "pane-1".to_string());
+    tree.split("pane-1", "pane-2".to_string(), SplitDirection::LeftRight)
+        .expect("split failed");
+    tree.split("pane-2", "pane-3".to_string(), SplitDirection::TopBottom)
+        .expect("split failed");
+
+    tree.move_pane("pane-3", "pane-1", SplitDirection::LeftRight, true)
+        .expect("move failed");
+
+    // pane-3 现在在 pane-1 左边, 而它原来所在的上下 split 只剩 pane-2, 已折叠。
+    match &tree.root {
+        LayoutNode::Split {
+            direction, children, ..
+        } => {
+            assert_eq!(*direction, SplitDirection::LeftRight);
+            assert_eq!(children.len(), 3, "the collapsed split must not leave a stub");
+            let panes: Vec<&str> = children
+                .iter()
+                .map(|child| match child {
+                    LayoutNode::Pane { pane_id, .. } => pane_id.as_str(),
+                    LayoutNode::Split { .. } => "split",
+                })
+                .collect();
+            assert_eq!(panes, vec!["pane-3", "pane-1", "pane-2"]);
+        }
+        _ => panic!("expected Split node"),
+    }
+}
+
+/// 同一次拖动被重复投递 —— 至少一次的通知语义下这是常态 —— 不能让树接着动。
+#[test]
+fn moving_a_pane_where_it_already_sits_changes_nothing() {
+    let mut tree = LayoutTree::with_pane("node-1".to_string(), "pane-1".to_string());
+    tree.split("pane-1", "pane-2".to_string(), SplitDirection::LeftRight)
+        .expect("split failed");
+    tree.split("pane-2", "pane-3".to_string(), SplitDirection::TopBottom)
+        .expect("split failed");
+
+    tree.move_pane("pane-3", "pane-1", SplitDirection::LeftRight, true)
+        .expect("move failed");
+    let once = tree.root.clone();
+    tree.move_pane("pane-3", "pane-1", SplitDirection::LeftRight, true)
+        .expect("replaying the same drag must succeed");
+
+    assert_eq!(tree.root, once, "a replayed move must be a no-op");
+}
+
+/// 落在目标左半边和落在右半边是两个不同的请求。
+#[test]
+fn moving_before_and_after_a_target_differ() {
+    let build = |before: bool| {
+        let mut tree = LayoutTree::with_pane("node-1".to_string(), "pane-1".to_string());
+        tree.split("pane-1", "pane-2".to_string(), SplitDirection::LeftRight)
+            .expect("split failed");
+        tree.split("pane-2", "pane-3".to_string(), SplitDirection::TopBottom)
+            .expect("split failed");
+        tree.move_pane("pane-3", "pane-1", SplitDirection::LeftRight, before)
+            .expect("move failed");
+        match tree.root {
+            LayoutNode::Split { children, .. } => children
+                .iter()
+                .map(|child| match child {
+                    LayoutNode::Pane { pane_id, .. } => pane_id.clone(),
+                    LayoutNode::Split { .. } => "split".to_string(),
+                })
+                .collect::<Vec<_>>(),
+            _ => panic!("expected Split node"),
+        }
+    };
+
+    assert_eq!(build(true), vec!["pane-3", "pane-1", "pane-2"]);
+    assert_eq!(build(false), vec!["pane-1", "pane-3", "pane-2"]);
+}
+
+#[test]
+fn moving_a_pane_rejects_unknown_and_self_targets() {
+    let mut tree = LayoutTree::with_pane("node-1".to_string(), "pane-1".to_string());
+    tree.split("pane-1", "pane-2".to_string(), SplitDirection::LeftRight)
+        .expect("split failed");
+    let before = tree.root.clone();
+
+    tree.move_pane("pane-1", "pane-1", SplitDirection::LeftRight, true)
+        .expect_err("a pane cannot be moved next to itself");
+    tree.move_pane("pane-9", "pane-1", SplitDirection::LeftRight, true)
+        .expect_err("an unknown pane cannot be moved");
+    tree.move_pane("pane-1", "pane-9", SplitDirection::LeftRight, true)
+        .expect_err("a pane cannot be moved next to an unknown target");
+
+    assert_eq!(tree.root, before, "a rejected move must not touch the tree");
+}
+
+/// 移动跨越轴向时目标叶子会变成新的 split; 新节点的 id 不能撞上已有的。
+#[test]
+fn moving_a_pane_across_axes_mints_a_unique_node_id() {
+    let mut tree = LayoutTree::with_pane("node-1".to_string(), "pane-1".to_string());
+    tree.split("pane-1", "pane-2".to_string(), SplitDirection::LeftRight)
+        .expect("split failed");
+    tree.split("pane-2", "pane-3".to_string(), SplitDirection::LeftRight)
+        .expect("split failed");
+
+    tree.move_pane("pane-3", "pane-1", SplitDirection::TopBottom, false)
+        .expect("move failed");
+
+    let mut ids = Vec::new();
+    collect_ids(&tree.root, &mut ids);
+    let mut sorted = ids.clone();
+    sorted.sort();
+    sorted.dedup();
+    assert_eq!(sorted.len(), ids.len(), "node ids must stay unique: {ids:?}");
+}
+
+fn collect_ids(node: &LayoutNode, ids: &mut Vec<String>) {
+    match node {
+        LayoutNode::Pane { id, .. } => ids.push(id.clone()),
+        LayoutNode::Split { id, children, .. } => {
+            ids.push(id.clone());
+            for child in children {
+                collect_ids(child, ids);
+            }
+        }
+    }
+}
+
 /// §3.7 类型化 layout 持久化: 多层混合轴向树精确 round-trip (节点 ID、比例、方向)。
 #[test]
 fn persisted_layout_round_trips_exact_mixed_axis_tree() {
