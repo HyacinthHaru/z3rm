@@ -148,4 +148,4 @@ The re-review found one malformed-OSC recovery gap: `OscPayloadEscape` retained 
 
 Verification: `cargo test -p mux_server terminal_media` — 23 passed; 0 failed.
 
-Follow-up commit: pending push after this report update.
+Follow-up commit: `46943df3d3` pushed to `origin/main` (base `12f126aae3`, no force).
