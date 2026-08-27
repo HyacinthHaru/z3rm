@@ -13,21 +13,21 @@
 //     grid content and stay in `grid_bytes` untouched — a visible link never
 //     triggers a download merely by being rendered (the client decides on
 //     click). No action is emitted.
-//   - OSC 9 `z3rm-download:` / `z3rm-copy:`: BEL/ST-terminated typed action
+//   - OSC 9 `z3rm-download;` / `z3rm-copy;`: BEL/ST-terminated typed action
 //     sequences. Emitted as a `PaneAction` (DOWNLOAD / COPY) and consumed
 //     (removed from the grid stream). Ordinary OSC 9 stays in the grid.
-//   - OSC 52 clipboard: emitted as a typed COPY `PaneAction` after base64
-//     decoding AND left in `grid_bytes`, so alacritty's existing
-//     `ClipboardStore` path (→ clipboard hook → ServerClipboard) keeps
-//     working unchanged and grid semantics are preserved.
+//   - OSC 52 clipboard: preserved byte-for-byte in `grid_bytes` for
+//     alacritty's existing `ClipboardStore` path (→ clipboard hook →
+//     ServerClipboard) which keeps working unchanged. No PaneAction is
+//     emitted — the clipboard hook is the sole copy path.
 //
 // The scanner is bounded and incremental: a real PTY splits sequences at
 // arbitrary byte boundaries, so state lives across `feed` calls, and every
 // control-sequence buffer is capped by `MAX_CONTROL_SEQUENCE_BYTES`. On
-// overflow the sequence is dropped, the parse error is logged, and scanning
-// resumes at the next ground-state byte without dropping the text after it.
+// overflow the sequence is dropped, the parse error is logged, and the
+// scanner enters a discard-until-terminator state that persists across feeds
+// so that residue of the oversized sequence is not emitted as text.
 
-use std::collections::HashMap;
 
 use base64::Engine;
 use mux_protocol::proto::{PaneAction, PaneActionKind, PaneMedia};
@@ -81,6 +81,11 @@ enum ScanState {
     OscPassthrough,
     /// Pass-through OSC after an `ESC`.
     OscPassthroughEscape,
+    /// Discarding bytes until a BEL or ST (ESC \) terminator after an
+    /// overflow. Persists across feed boundaries.
+    Discard,
+    /// In Discard, after an ESC — waiting for `\` to confirm ST.
+    DiscardEsc,
 }
 
 /// A parsed Kitty chunk's parameter list. Optional fields let a continuation
@@ -92,18 +97,13 @@ struct KittyParams {
     image_id: Option<u32>,
     columns: Option<u32>,
     rows: Option<u32>,
-    row: Option<i32>,
-    column: Option<u32>,
     mode: Option<u32>,
-    encoding: Option<u32>,
-    delete: Option<u32>,
+    delete_mode: Option<u8>,
 }
 
 /// Reassembled Kitty image awaiting its final chunk.
 struct PendingMedia {
     format: u32,
-    row: i32,
-    column: u32,
     columns: u32,
     rows: u32,
     data: Vec<u8>,
@@ -123,8 +123,8 @@ pub struct TerminalMediaScanner {
     osc_number: u32,
     /// Digits consumed so far for `osc_number`.
     osc_digits: u32,
-    /// Kitty continuation state per image id.
-    pending: HashMap<u32, PendingMedia>,
+    /// Active Kitty transfer, if any (protocol chunks do not interleave).
+    pending: Option<(u32, PendingMedia)>,
 }
 
 impl Default for TerminalMediaScanner {
@@ -134,7 +134,7 @@ impl Default for TerminalMediaScanner {
             buffer: Vec::new(),
             osc_number: 0,
             osc_digits: 0,
-            pending: HashMap::new(),
+            pending: None,
         }
     }
 }
@@ -164,7 +164,12 @@ impl TerminalMediaScanner {
                     }
                 }
                 ScanState::Escape => match byte {
-                    0x1b => {} // double ESC: still escaping
+                    0x1b => {
+                        // Preserve the first ESC immediately and keep the
+                        // second one pending in case it starts a sequence.
+                        output.grid_bytes.push(0x1b);
+                        self.state = ScanState::Escape;
+                    }
                     b'_' => {
                         self.start_sequence(b'_');
                         self.state = ScanState::ApcIntro;
@@ -181,78 +186,85 @@ impl TerminalMediaScanner {
                         self.state = ScanState::Ground;
                     }
                 },
+                ScanState::Discard | ScanState::DiscardEsc => {
+                    self.consume_discard_byte(byte);
+                }
                 ScanState::ApcIntro => {
-                    self.buffer.push(byte);
-                    if byte == b'G' {
-                        self.state = ScanState::ApcParams;
-                    } else {
-                        self.state = ScanState::ApcPassthrough;
+                    if !self.buffer_byte(byte, "APC") {
+                        continue;
+                    }
+                    match byte {
+                        b'G' => self.state = ScanState::ApcParams,
+                        0x1b => self.state = ScanState::ApcPassthroughEscape,
+                        0x07 => self.flush_passthrough(&mut output),
+                        _ => self.state = ScanState::ApcPassthrough,
                     }
                 }
                 ScanState::ApcParams => {
-                    self.buffer.push(byte);
-                    if byte == b';' {
-                        self.state = ScanState::ApcData;
-                    } else if byte == 0x1b {
-                        // Possible ST start; do not push ESC into buffer yet.
-                        self.buffer.pop();
+                    if byte == 0x1b {
+                        // Possible ST start; keep the ESC out of Kitty data.
                         self.state = ScanState::ApcEscape;
                     } else if byte == 0x07 {
-                        // BEL terminates a Kitty APC too.
+                        // BEL terminates the APC, but is not payload.
                         self.finish_kitty(&mut output);
-                    }
-                    if self.buffer.len() > MAX_CONTROL_SEQUENCE_BYTES {
-                        self.drop_overflow("Kitty APC");
-                        break;
+                    } else if self.buffer_byte(byte, "Kitty APC") {
+                        if byte == b';' {
+                            self.state = ScanState::ApcData;
+                        }
                     }
                 }
                 ScanState::ApcData => {
-                    self.buffer.push(byte);
                     if byte == 0x1b {
-                        self.buffer.pop();
                         self.state = ScanState::ApcEscape;
                     } else if byte == 0x07 {
+                        // BEL terminates the APC, but is not payload.
                         self.finish_kitty(&mut output);
-                    }
-                    if self.buffer.len() > MAX_CONTROL_SEQUENCE_BYTES {
-                        self.drop_overflow("Kitty APC");
-                        break;
+                    } else {
+                        let _ = self.buffer_byte(byte, "Kitty APC");
                     }
                 }
                 ScanState::ApcEscape => {
                     if byte == b'\\' {
                         self.finish_kitty(&mut output);
                     } else {
-                        // An ESC that is not ST aborts the APC; re-dispatch
-                        // this byte from ground state.
+                        // A malformed Kitty APC is dropped. Re-dispatch the
+                        // byte after its ESC so a new sequence can begin.
                         self.state = ScanState::Ground;
                         self.buffer.clear();
                         index -= 1;
                     }
                 }
                 ScanState::ApcPassthrough => {
-                    self.buffer.push(byte);
-                    if byte == 0x1b {
-                        self.state = ScanState::ApcPassthroughEscape;
-                    } else if byte == 0x07 {
-                        self.flush_passthrough(&mut output);
+                    if !self.buffer_byte(byte, "APC") {
+                        continue;
                     }
-                    if self.buffer.len() > MAX_CONTROL_SEQUENCE_BYTES {
-                        self.drop_overflow("APC");
-                        break;
+                    match byte {
+                        0x1b => self.state = ScanState::ApcPassthroughEscape,
+                        0x07 => self.flush_passthrough(&mut output),
+                        _ => {}
                     }
                 }
                 ScanState::ApcPassthroughEscape => {
-                    if byte == b'\\' {
-                        self.buffer.push(byte);
-                        self.flush_passthrough(&mut output);
-                    } else {
-                        // Not ST: the ESC is data in the pass-through text.
-                        self.state = ScanState::ApcPassthrough;
+                    if !self.buffer_byte_after_escape(byte, "APC") {
+                        continue;
+                    }
+                    match byte {
+                        b'\\' | 0x07 => {
+                            // Both ST and BEL terminate a pass-through APC.
+                            self.flush_passthrough(&mut output);
+                        }
+                        0x1b => {
+                            // The newest ESC is now the possible ST start;
+                            // retain both consecutive ESC bytes.
+                            self.state = ScanState::ApcPassthroughEscape;
+                        }
+                        _ => self.state = ScanState::ApcPassthrough,
                     }
                 }
                 ScanState::OscNumber => {
-                    self.buffer.push(byte);
+                    if !self.buffer_byte(byte, "OSC") {
+                        continue;
+                    }
                     match byte {
                         b'0'..=b'9' if self.osc_digits < 5 => {
                             self.osc_number =
@@ -260,75 +272,61 @@ impl TerminalMediaScanner {
                             self.osc_digits += 1;
                         }
                         b';' => {
-                            if self.osc_number == 8 {
-                                // OSC 8 hyperlink: ordinary grid content.
-                                self.state = ScanState::OscPassthrough;
-                            } else if self.osc_number == 9 || self.osc_number == 52 {
+                            if self.osc_number == 9 || self.osc_number == 52 {
                                 self.state = ScanState::OscPayload;
                             } else {
+                                // OSC 8 and all other OSCs are passed through.
                                 self.state = ScanState::OscPassthrough;
                             }
                         }
-                        0x1b => {
-                            self.state = ScanState::Escape;
-                            index -= 1;
-                        }
+                        0x1b => self.state = ScanState::OscPassthroughEscape,
+                        0x07 => self.flush_passthrough(&mut output),
                         _ => self.state = ScanState::OscPassthrough,
-                    }
-                    if self.buffer.len() > MAX_CONTROL_SEQUENCE_BYTES {
-                        self.drop_overflow("OSC");
-                        break;
                     }
                 }
                 ScanState::OscPayload => {
-                    self.buffer.push(byte);
-                    if byte == 0x1b {
-                        self.state = ScanState::OscPayloadEscape;
-                    } else if byte == 0x07 {
-                        self.finish_osc(&mut output);
+                    if !self.buffer_byte(byte, "OSC") {
+                        continue;
                     }
-                    if self.buffer.len() > MAX_CONTROL_SEQUENCE_BYTES {
-                        self.drop_overflow("OSC");
-                        break;
+                    match byte {
+                        0x1b => self.state = ScanState::OscPayloadEscape,
+                        0x07 => self.finish_osc(&mut output),
+                        _ => {}
                     }
                 }
                 ScanState::OscPayloadEscape => {
-                    if byte == b'\\' {
-                        // ST terminates the OSC; keep the backslash so
-                        // preserved sequences round-trip unchanged.
-                        self.buffer.push(byte);
-                        self.finish_osc(&mut output);
-                    } else {
-                        // Not ST: the OSC was aborted by its ESC; drop the
-                        // partial payload and re-dispatch this byte from
-                        // escape state.
-                        self.state = ScanState::Escape;
-                        self.buffer.clear();
-                        index -= 1;
+                    if !self.buffer_byte_after_escape(byte, "OSC") {
+                        continue;
+                    }
+                    match byte {
+                        b'\\' => self.finish_osc(&mut output),
+                        0x07 => self.finish_osc(&mut output),
+                        0x1b => self.state = ScanState::OscPayloadEscape,
+                        _ => self.state = ScanState::OscPayload,
                     }
                 }
                 ScanState::OscPassthrough => {
-                    self.buffer.push(byte);
-                    if byte == 0x1b {
-                        self.state = ScanState::OscPassthroughEscape;
-                    } else if byte == 0x07 {
-                        self.flush_passthrough(&mut output);
+                    if !self.buffer_byte(byte, "OSC") {
+                        continue;
                     }
-                    if self.buffer.len() > MAX_CONTROL_SEQUENCE_BYTES {
-                        self.drop_overflow("OSC");
-                        break;
+                    match byte {
+                        0x1b => self.state = ScanState::OscPassthroughEscape,
+                        0x07 => self.flush_passthrough(&mut output),
+                        _ => {}
                     }
                 }
                 ScanState::OscPassthroughEscape => {
-                    if byte == b'\\' {
-                        self.buffer.push(byte);
-                        self.flush_passthrough(&mut output);
-                    } else {
-                        // Not ST: the OSC was aborted by its ESC; emit its
-                        // buffer and re-dispatch this byte from escape state.
-                        self.state = ScanState::Escape;
-                        self.buffer.clear();
-                        index -= 1;
+                    if !self.buffer_byte_after_escape(byte, "OSC") {
+                        continue;
+                    }
+                    match byte {
+                        b'\\' | 0x07 => {
+                            self.flush_passthrough(&mut output);
+                        }
+                        0x1b => {
+                            self.state = ScanState::OscPassthroughEscape;
+                        }
+                        _ => self.state = ScanState::OscPassthrough,
                     }
                 }
             }
@@ -344,12 +342,66 @@ impl TerminalMediaScanner {
         self.buffer.push(introducer);
     }
 
+    /// Append a control byte without ever growing the buffer beyond the cap.
+    /// If the cap is already full, the current byte is consumed as part of
+    /// discard recovery so a terminator on this byte still resumes parsing.
+    fn buffer_byte(&mut self, byte: u8, what: &str) -> bool {
+        if self.buffer.len() >= MAX_CONTROL_SEQUENCE_BYTES {
+            self.drop_overflow(what);
+            self.consume_discard_byte(byte);
+            false
+        } else {
+            self.buffer.push(byte);
+            true
+        }
+    }
+
+    /// As [`buffer_byte`], but the existing buffer ends in an ESC that was
+    /// already stored. If the current byte is `\\`, it must still close ST
+    /// even though the overflowing sequence itself is discarded.
+    fn buffer_byte_after_escape(&mut self, byte: u8, what: &str) -> bool {
+        if self.buffer.len() >= MAX_CONTROL_SEQUENCE_BYTES {
+            self.drop_overflow(what);
+            self.state = ScanState::DiscardEsc;
+            self.consume_discard_byte(byte);
+            false
+        } else {
+            self.buffer.push(byte);
+            true
+        }
+    }
+
     fn drop_overflow(&mut self, what: &str) {
         tracing::warn!(
             "{what} control sequence exceeded {MAX_CONTROL_SEQUENCE_BYTES} bytes; dropped"
         );
         self.buffer.clear();
-        self.state = ScanState::Ground;
+        self.state = ScanState::Discard;
+    }
+
+    /// Consume bytes after an overflow until BEL or ST. This state is
+    /// intentionally independent of the original APC/OSC kind and persists
+    /// across calls to `feed`.
+    fn consume_discard_byte(&mut self, byte: u8) {
+        match self.state {
+            ScanState::Discard => {
+                if byte == 0x07 {
+                    self.state = ScanState::Ground;
+                } else if byte == 0x1b {
+                    self.state = ScanState::DiscardEsc;
+                }
+            }
+            ScanState::DiscardEsc => {
+                if byte == b'\\' || byte == 0x07 {
+                    self.state = ScanState::Ground;
+                } else if byte == 0x1b {
+                    self.state = ScanState::DiscardEsc;
+                } else {
+                    self.state = ScanState::Discard;
+                }
+            }
+            _ => {}
+        }
     }
 
     fn flush_passthrough(&mut self, output: &mut ScanOutput) {
@@ -369,39 +421,50 @@ impl TerminalMediaScanner {
         };
         let mut parsed = KittyParams::default();
         if let Err(message) = parse_kitty_params(params, &mut parsed) {
+            // The `d=i` delete mode encodes a character, not a u32; the
+            // parser accepts either.
             tracing::warn!("terminal media: malformed Kitty params: {message}");
             return;
         }
-        let Some(image_id) = parsed.image_id else {
+
+        // `a=d` (or `d=1`) deletes a previously published image.
+        // If `image_id` is omitted but a pending transfer exists, inherit
+        // its image id.
+        let image_id = parsed.image_id.or_else(|| {
+            self.pending.as_ref().map(|(id, _)| *id)
+        });
+        let Some(image_id) = image_id else {
             tracing::warn!("terminal media: Kitty APC without image id; dropped");
             return;
         };
 
-        // `a=d` (or `d=1`) deletes a previously published image.
-        let delete = parsed.action == Some(b'd') || parsed.delete == Some(1);
+        let delete = parsed.action == Some(b'd')
+            || (parsed.action == Some(b'q') && parsed.delete_mode == Some(b'i'));
         if delete {
             output.media.push(PaneMedia {
                 pane_id: String::new(),
                 sequence: 0,
                 image_id,
                 format: parsed.format.unwrap_or(0),
-                row: parsed.row.unwrap_or(0),
-                column: parsed.column.unwrap_or(0),
+                row: 0,
+                column: 0,
                 columns: parsed.columns.unwrap_or(0),
                 rows: parsed.rows.unwrap_or(0),
                 data: Vec::new(),
-                final_chunk: true,
+                final_chunk: false,
                 delete: true,
             });
-            self.pending.remove(&image_id);
+            self.pending = None;
             return;
         }
 
-        let payload = match decode_kitty_data(data, parsed.encoding) {
-            Some(payload) => payload,
-            None => {
+        // The payload is always base64-encoded (Kitty `q` is response
+        // suppression, not encoding).
+        let payload = match base64::engine::general_purpose::STANDARD.decode(data) {
+            Ok(payload) => payload,
+            Err(_) => {
                 tracing::warn!("terminal media: Kitty data is not valid base64; dropped");
-                self.pending.remove(&image_id);
+                self.pending = None;
                 return;
             }
         };
@@ -409,38 +472,69 @@ impl TerminalMediaScanner {
         let is_continuation = parsed.mode == Some(1);
         if is_continuation {
             // Accumulate; publish only on the final chunk (m=0/absent).
-            let entry = self.pending.entry(image_id).or_insert_with(|| PendingMedia {
+            // Only one active transfer is tracked (protocol chunks do not
+            // interleave); if a new image id arrives, replace the pending.
+            let entry = self.pending.get_or_insert_with(|| (image_id, PendingMedia {
                 format: parsed.format.unwrap_or(0),
-                row: parsed.row.unwrap_or(0),
-                column: parsed.column.unwrap_or(0),
                 columns: parsed.columns.unwrap_or(0),
                 rows: parsed.rows.unwrap_or(0),
                 data: Vec::new(),
-            });
-            entry.data.extend_from_slice(&payload);
-            if entry.data.len() > MAX_REASSEMBLED_MEDIA_BYTES {
-                tracing::warn!(
-                    "terminal media: image {image_id} exceeded {MAX_REASSEMBLED_MEDIA_BYTES} bytes; dropped"
-                );
-                self.pending.remove(&image_id);
+            }));
+            // If the image id changed, reset the pending transfer.
+            if entry.0 != image_id {
+                *entry = (image_id, PendingMedia {
+                    format: parsed.format.unwrap_or(0),
+                    columns: parsed.columns.unwrap_or(0),
+                    rows: parsed.rows.unwrap_or(0),
+                    data: Vec::new(),
+                });
+            }
+            // Preflight data size with checked_add before extending.
+            match entry.1.data.len().checked_add(payload.len()) {
+                Some(new_len) if new_len <= MAX_REASSEMBLED_MEDIA_BYTES => {
+                    entry.1.data.extend_from_slice(&payload);
+                }
+                _ => {
+                    tracing::warn!(
+                        "terminal media: image {image_id} exceeded {MAX_REASSEMBLED_MEDIA_BYTES} bytes; dropped"
+                    );
+                    self.pending = None;
+                }
             }
             return;
         }
 
         // Final chunk: complete a pending image or publish a single chunk.
-        let mut media = if let Some(entry) = self.pending.remove(&image_id) {
-            PaneMedia {
-                pane_id: String::new(),
-                sequence: 0,
-                image_id,
-                format: entry.format,
-                row: entry.row,
-                column: entry.column,
-                columns: entry.columns,
-                rows: entry.rows,
-                data: entry.data,
-                final_chunk: true,
-                delete: false,
+        let mut media = if let Some((pid, entry)) = self.pending.take() {
+            if pid != image_id {
+                // Image id mismatch — start fresh with this chunk.
+                PaneMedia {
+                    pane_id: String::new(),
+                    sequence: 0,
+                    image_id,
+                    format: parsed.format.unwrap_or(0),
+                    row: 0,
+                    column: 0,
+                    columns: parsed.columns.unwrap_or(0),
+                    rows: parsed.rows.unwrap_or(0),
+                    data: Vec::new(),
+                    final_chunk: true,
+                    delete: false,
+                }
+            } else {
+                PaneMedia {
+                    pane_id: String::new(),
+                    sequence: 0,
+                    image_id,
+                    format: entry.format,
+                    row: 0,
+                    column: 0,
+                    columns: entry.columns,
+                    rows: entry.rows,
+                    data: entry.data,
+                    final_chunk: true,
+                    delete: false,
+                }
             }
         } else {
             PaneMedia {
@@ -448,8 +542,8 @@ impl TerminalMediaScanner {
                 sequence: 0,
                 image_id,
                 format: parsed.format.unwrap_or(0),
-                row: parsed.row.unwrap_or(0),
-                column: parsed.column.unwrap_or(0),
+                row: 0,
+                column: 0,
                 columns: parsed.columns.unwrap_or(0),
                 rows: parsed.rows.unwrap_or(0),
                 data: Vec::new(),
@@ -457,7 +551,18 @@ impl TerminalMediaScanner {
                 delete: false,
             }
         };
-        media.data.extend_from_slice(&payload);
+        // Preflight final append.
+        match media.data.len().checked_add(payload.len()) {
+            Some(new_len) if new_len <= MAX_REASSEMBLED_MEDIA_BYTES => {
+                media.data.extend_from_slice(&payload);
+            }
+            _ => {
+                tracing::warn!(
+                    "terminal media: image {image_id} exceeded {MAX_REASSEMBLED_MEDIA_BYTES} bytes; dropped"
+                );
+                return;
+            }
+        }
         output.media.push(media);
     }
 
@@ -478,26 +583,10 @@ impl TerminalMediaScanner {
             }
         }
         if number == 52 {
-            // OSC 52 stays in the grid so alacritty's ClipboardStore path
-            // (clipboard hook → ServerClipboard) keeps working; the typed
-            // COPY action is an additive signal for the guest TUI client.
-            let payload = &self.buffer[payload_start..payload_end];
-            let action = match decode_osc52(payload) {
-                Some(text) => Some(PaneAction {
-                    pane_id: String::new(),
-                    sequence: 0,
-                    kind: PaneActionKind::Copy as i32,
-                    value: text,
-                }),
-                None => {
-                    tracing::warn!("terminal media: OSC 52 payload is not valid base64; dropped");
-                    None
-                }
-            };
+            // OSC 52 stays in the grid for alacritty's clipboard hook.
+            // No PaneAction is emitted — the clipboard hook is the sole
+            // copy path (per design/ledger ruling).
             output.grid_bytes.append(&mut self.buffer);
-            if let Some(action) = action {
-                output.actions.push(action);
-            }
             self.state = ScanState::Ground;
             return;
         }
@@ -509,36 +598,54 @@ impl TerminalMediaScanner {
         }
         let payload = &self.buffer[payload_start..payload_end];
         // OSC 9: only the z3rm action prefixes are consumed.
+        // Wire format: `OSC 9;z3rm-download;<uri>` and
+        // `OSC 9;z3rm-copy;<base64>` (semicolon-delimited).
         let (kind, value) = match payload {
-            p if p.starts_with(b"z3rm-download:") => (
+            p if p.starts_with(b"z3rm-download;") => (
                 Some(PaneActionKind::Download),
-                String::from_utf8_lossy(&p[b"z3rm-download:".len()..]).into_owned(),
+                String::from_utf8(p[b"z3rm-download;".len()..].to_vec()).ok(),
             ),
-            p if p.starts_with(b"z3rm-copy:") => (
+            p if p.starts_with(b"z3rm-copy;") => (
                 Some(PaneActionKind::Copy),
-                String::from_utf8_lossy(&p[b"z3rm-copy:".len()..]).into_owned(),
+                String::from_utf8(p[b"z3rm-copy;".len()..].to_vec()).ok(),
             ),
-            _ => (None, String::new()),
+            _ => (None, None),
         };
         match kind {
-            Some(PaneActionKind::Download) => output.actions.push(PaneAction {
-                pane_id: String::new(),
-                sequence: 0,
-                kind: PaneActionKind::Download as i32,
-                value,
-            }),
-            Some(PaneActionKind::Copy) => {
-                let decoded = base64::engine::general_purpose::STANDARD.decode(value.as_bytes());
-                match decoded {
-                    Ok(text) => output.actions.push(PaneAction {
+            Some(PaneActionKind::Download) => {
+                if let Some(value) = value {
+                    output.actions.push(PaneAction {
                         pane_id: String::new(),
                         sequence: 0,
-                        kind: PaneActionKind::Copy as i32,
-                        value: String::from_utf8_lossy(&text).into_owned(),
-                    }),
-                    Err(_) => {
-                        tracing::warn!("terminal media: OSC 9 z3rm-copy is not valid base64");
+                        kind: PaneActionKind::Download as i32,
+                        value,
+                    });
+                } else {
+                    tracing::warn!("terminal media: OSC 9 z3rm-download value is not valid UTF-8");
+                }
+            }
+            Some(PaneActionKind::Copy) => {
+                if let Some(value) = value {
+                    match base64::engine::general_purpose::STANDARD.decode(value.as_bytes()) {
+                        Ok(text) => match String::from_utf8(text) {
+                            Ok(text) => output.actions.push(PaneAction {
+                                pane_id: String::new(),
+                                sequence: 0,
+                                kind: PaneActionKind::Copy as i32,
+                                value: text,
+                            }),
+                            Err(_) => {
+                                tracing::warn!(
+                                    "terminal media: OSC 9 z3rm-copy decoded text is not valid UTF-8"
+                                );
+                            }
+                        },
+                        Err(_) => {
+                            tracing::warn!("terminal media: OSC 9 z3rm-copy is not valid base64");
+                        }
                     }
+                } else {
+                    tracing::warn!("terminal media: OSC 9 z3rm-copy value is not valid UTF-8");
                 }
             }
             Some(PaneActionKind::Unspecified) | None => {
@@ -549,32 +656,13 @@ impl TerminalMediaScanner {
         self.state = ScanState::Ground;
     }
 }
-
-/// Decode a Kitty chunk's payload per its `q` encoding: `2` = base64,
-/// absent = base64, `0` = raw bytes.
-fn decode_kitty_data(data: &[u8], encoding: Option<u32>) -> Option<Vec<u8>> {
-    match encoding {
-        Some(2) | None => base64::engine::general_purpose::STANDARD.decode(data).ok(),
-        Some(0) => Some(data.to_vec()),
-        Some(other) => {
-            tracing::warn!("terminal media: unsupported Kitty encoding q={other}");
-            None
-        }
-    }
-}
-
-/// OSC 52 payload is `[selection;]base64`. Return the decoded text.
-fn decode_osc52(payload: &[u8]) -> Option<String> {
-    let base64_part = payload
-        .iter()
-        .position(|&b| b == b';')
-        .map(|split| &payload[split + 1..])
-        .unwrap_or(payload);
-    let decoded = base64::engine::general_purpose::STANDARD.decode(base64_part).ok()?;
-    Some(String::from_utf8_lossy(&decoded).into_owned())
-}
-
 /// Parse the comma-separated `key=value` parameter list of a Kitty chunk.
+///
+/// `q` is response suppression (not encoding); the payload is always
+/// base64. `x` and `y` are crop offsets, not terminal cell coordinates;
+/// they are ignored here (Pane wiring supplies cursor-cell placement).
+/// `d` is a character deletion selector (e.g. `d=i` for delete by image
+/// id), not a numeric value.
 fn parse_kitty_params(params: &[u8], out: &mut KittyParams) -> Result<(), String> {
     for field in params.split(|&b| b == b',') {
         if field.is_empty() {
@@ -595,11 +683,16 @@ fn parse_kitty_params(params: &[u8], out: &mut KittyParams) -> Result<(), String
             "c" => out.columns = Some(parse_u32(key, value)?),
             "r" => out.rows = Some(parse_u32(key, value)?),
             "m" => out.mode = Some(parse_u32(key, value)?),
-            "q" => out.encoding = Some(parse_u32(key, value)?),
-            "d" => out.delete = Some(parse_u32(key, value)?),
-            // `y` is the placement row, `x` the placement column.
-            "y" => out.row = Some(parse_i32(key, value)?),
-            "x" => out.column = Some(parse_u32(key, value)?),
+            // `q` is response suppression; the payload is always base64.
+            // Parsed for completeness but not used for encoding.
+            "q" => {}
+            // `d` is a character deletion selector, not numeric.
+            "d" => {
+                out.delete_mode = value.as_bytes().first().copied();
+            }
+            // `x` and `y` are crop offsets, not terminal cell coordinates.
+            // Ignored here; Pane wiring supplies cursor-cell placement.
+            "x" | "y" => {}
             _ => {} // unsupported keys are ignored
         }
     }
@@ -609,12 +702,6 @@ fn parse_kitty_params(params: &[u8], out: &mut KittyParams) -> Result<(), String
 fn parse_u32(key: &str, value: &str) -> Result<u32, String> {
     value
         .parse::<u32>()
-        .map_err(|_| format!("parameter `{key}` has non-numeric value `{value}`"))
-}
-
-fn parse_i32(key: &str, value: &str) -> Result<i32, String> {
-    value
-        .parse::<i32>()
         .map_err(|_| format!("parameter `{key}` has non-numeric value `{value}`"))
 }
 
@@ -661,6 +748,18 @@ mod tests {
     }
 
     #[test]
+    fn kitty_continuation_without_image_id_uses_pending() {
+        // Final chunk omits `i`; inherits image_id from the pending transfer.
+        let mut scanner = TerminalMediaScanner::new();
+        let first = scanner.feed(b"\x1b_Ga=T,f=100,i=7,c=2,r=1,m=1;SGVsbG8=\x1b\\");
+        assert!(first.media.is_empty());
+        let second = scanner.feed(b"\x1b_Ga=T,m=0;IQ==\x1b\\");
+        assert_eq!(second.media.len(), 1);
+        assert_eq!(second.media[0].image_id, 7);
+        assert_eq!(second.media[0].data, b"Hello!");
+    }
+
+    #[test]
     fn kitty_delete_emits_delete_media() {
         let mut scanner = TerminalMediaScanner::new();
         let output = scanner.feed(b"\x1b_Ga=d,i=9\x1b\\");
@@ -670,21 +769,59 @@ mod tests {
         assert_eq!(media.image_id, 9);
         assert!(media.delete);
         assert!(media.data.is_empty());
+        assert!(!media.final_chunk);
+    }
+
+    #[test]
+    fn kitty_delete_with_d_i_selector() {
+        // The `d` parameter is a character deletion selector; `d=i` means
+        // delete by image id.
+        let mut scanner = TerminalMediaScanner::new();
+        let output = scanner.feed(b"\x1b_Ga=d,d=i,i=9\x1b\\");
+        assert!(output.grid_bytes.is_empty());
+        assert_eq!(output.media.len(), 1);
+        let media = &output.media[0];
+        assert_eq!(media.image_id, 9);
+        assert!(media.delete);
+        assert!(media.data.is_empty());
+        assert!(!media.final_chunk);
+    }
+
+    #[test]
+    fn kitty_q_is_response_suppression_not_encoding() {
+        // `q=0` and `q=1` are response suppression modes; the payload is
+        // always base64 regardless of `q`. All three values decode.
+        for q in [b"0", b"1", b"2"] {
+            let mut scanner = TerminalMediaScanner::new();
+            let q_s = std::str::from_utf8(q).unwrap();
+            let input = format!(
+                "\x1b_Ga=T,f=100,i=7,q={};SGVsbG8=\x1b\\",
+                q_s
+            );
+            let output = scanner.feed(input.as_bytes());
+            assert_eq!(output.media.len(), 1, "q={}", q_s);
+            assert_eq!(
+                output.media[0].data,
+                b"Hello",
+                "q={}",
+                q_s
+            );
+        }
     }
 
     #[test]
     fn download_and_copy_actions_are_bounded_and_decoded() {
         let mut scanner = TerminalMediaScanner::new();
-        // OSC 9 z3rm-download: consumed, typed DOWNLOAD, no grid residue.
-        let output = scanner.feed(b"a\x1b]9;z3rm-download:https://example.com/f.bin\x07b");
+        // OSC 9 z3rm-download; consumed, typed DOWNLOAD, no grid residue.
+        let output = scanner.feed(b"a\x1b]9;z3rm-download;https://example.com/f.bin\x07b");
         assert_eq!(output.grid_bytes, b"ab");
         assert_eq!(output.actions.len(), 1);
         assert_eq!(output.actions[0].kind, PaneActionKind::Download as i32);
         assert_eq!(output.actions[0].value, "https://example.com/f.bin");
 
-        // OSC 9 z3rm-copy: base64-decoded typed COPY.
+        // OSC 9 z3rm-copy; base64-decoded typed COPY.
         let mut scanner = TerminalMediaScanner::new();
-        let output = scanner.feed(b"\x1b]9;z3rm-copy:Y2FyZ28gaW5zdGFsbCB6M3Jt\x1b\\");
+        let output = scanner.feed(b"\x1b]9;z3rm-copy;Y2FyZ28gaW5zdGFsbCB6M3Jt\x1b\\");
         assert!(output.grid_bytes.is_empty());
         assert_eq!(output.actions.len(), 1);
         assert_eq!(output.actions[0].kind, PaneActionKind::Copy as i32);
@@ -717,14 +854,13 @@ mod tests {
     }
 
     #[test]
-    fn osc52_emits_copy_and_preserves_grid_semantics() {
+    fn osc52_preserves_grid_and_emits_no_action() {
+        // OSC 52 is preserved byte-for-byte for the alacritty clipboard
+        // hook. No PaneAction is emitted (per design/ledger ruling).
         let mut scanner = TerminalMediaScanner::new();
         let output = scanner.feed(b"\x1b]52;c;SGVsbG8=\x1b\\");
-        // OSC 52 stays in the grid so the emulator clipboard hook still fires.
         assert_eq!(output.grid_bytes, b"\x1b]52;c;SGVsbG8=\x1b\\");
-        assert_eq!(output.actions.len(), 1);
-        assert_eq!(output.actions[0].kind, PaneActionKind::Copy as i32);
-        assert_eq!(output.actions[0].value, "Hello");
+        assert!(output.actions.is_empty());
     }
 
     #[test]
@@ -737,18 +873,64 @@ mod tests {
     }
 
     #[test]
-    fn unterminated_control_sequence_is_bounded_and_does_not_drop_future_text() {
+    fn overflow_discards_until_terminator_then_resumes() {
+        // Overflow: enter discard-until-terminator state. The sequence
+        // is dropped; text after the terminator in the same feed is
+        // preserved.
         let mut scanner = TerminalMediaScanner::new();
-        let mut huge = Vec::new();
-        huge.extend_from_slice(b"\x1b_Ga=T,i=1,q=2;");
-        huge.resize(MAX_CONTROL_SEQUENCE_BYTES + 64, b'A');
-        let output = scanner.feed(&huge);
+        let mut buf = Vec::new();
+        buf.extend_from_slice(b"\x1b_Ga=T,i=1,q=2;");
+        buf.resize(MAX_CONTROL_SEQUENCE_BYTES + 64, b'A');
+        // ST terminates the discarded sequence, followed by ordinary text.
+        buf.extend_from_slice(b"\x1b\\after");
+        let output = scanner.feed(&buf);
+        assert!(output.media.is_empty());
+        assert_eq!(
+            output.grid_bytes,
+            b"after",
+            "text after ST terminator is preserved"
+        );
+
+        // Next feed continues normally.
+        let output = scanner.feed(b" more");
+        assert_eq!(output.grid_bytes, b" more");
+        assert!(output.media.is_empty());
+    }
+
+    #[test]
+    fn overflow_cross_feed_discard_then_resume() {
+        // Overflow spans multiple feeds; the discard state persists until
+        // a terminator arrives.
+        let mut scanner = TerminalMediaScanner::new();
+        let mut buf = Vec::new();
+        buf.extend_from_slice(b"\x1b_Ga=T,i=1,q=2;");
+        buf.resize(MAX_CONTROL_SEQUENCE_BYTES + 64, b'A');
+        // No terminator in this feed — overflow leads to Discard state.
+        let output = scanner.feed(&buf);
         assert!(output.media.is_empty());
         assert!(output.grid_bytes.is_empty());
-        // Future text after the overflow resumes at ground state.
-        let output = scanner.feed(b"after");
+
+        // Next feed still has no terminator; still discarding.
+        let output = scanner.feed(b"still no terminator here");
+        assert!(output.grid_bytes.is_empty());
+
+        // Terminator arrives in this feed; resume after it.
+        let output = scanner.feed(b"\x1b\\after");
         assert_eq!(output.grid_bytes, b"after");
         assert!(output.media.is_empty());
+    }
+
+    #[test]
+    fn overflow_bel_terminator_resumes() {
+        // BEL can also terminate a discarded sequence.
+        let mut scanner = TerminalMediaScanner::new();
+        let mut buf = Vec::new();
+        buf.extend_from_slice(b"\x1b_Ga=T,i=1,q=2;");
+        buf.resize(MAX_CONTROL_SEQUENCE_BYTES + 64, b'A');
+        buf.extend_from_slice(b"\x07after");
+        let output = scanner.feed(&buf);
+        assert!(output.media.is_empty());
+        assert_eq!(output.grid_bytes, b"after");
     }
 
     #[test]
@@ -761,5 +943,101 @@ mod tests {
         assert_eq!(second.grid_bytes, b"post");
         assert_eq!(second.media.len(), 1);
         assert_eq!(second.media[0].data, b"Hello");
+    }
+
+    #[test]
+    fn consecutive_esc_bytes_are_preserved() {
+        // The second ESC must not be collapsed into the first. The trailing
+        // ordinary byte resolves the second ESC as an unrecognized sequence,
+        // so both input ESC bytes reach the grid parser.
+        let mut scanner = TerminalMediaScanner::new();
+        let output = scanner.feed(b"\x1b\x1btext");
+        assert_eq!(output.grid_bytes, b"\x1b\x1btext");
+        assert!(output.media.is_empty());
+        assert!(output.actions.is_empty());
+    }
+
+    #[test]
+    fn kitty_pending_payload_budget_is_checked_before_final_append() {
+        let mut scanner = TerminalMediaScanner::new();
+        let first_data = vec![b'A'; MAX_REASSEMBLED_MEDIA_BYTES / 2];
+        let first_encoded = base64::engine::general_purpose::STANDARD.encode(&first_data);
+        let first = format!("\x1b_Ga=T,i=1,m=1;{first_encoded}\x1b\\");
+        assert!(first.len() <= MAX_CONTROL_SEQUENCE_BYTES);
+        let output = scanner.feed(first.as_bytes());
+        assert!(output.media.is_empty());
+
+        // The decoded aggregate would exceed the scanner-wide 4 MiB budget;
+        // the final append is rejected rather than growing the pending Vec.
+        let second_data = vec![b'B'; MAX_REASSEMBLED_MEDIA_BYTES / 2 + 1];
+        let second_encoded = base64::engine::general_purpose::STANDARD.encode(&second_data);
+        let second = format!("\x1b_Ga=T,m=0;{second_encoded}\x1b\\");
+        assert!(second.len() <= MAX_CONTROL_SEQUENCE_BYTES);
+        let output = scanner.feed(second.as_bytes());
+        assert!(output.media.is_empty());
+        assert!(output.grid_bytes.is_empty());
+    }
+
+    #[test]
+    fn apc_passthrough_bel_after_non_st_esc_terminates() {
+        let mut scanner = TerminalMediaScanner::new();
+        let output = scanner.feed(b"a\x1b_Xhello\x1b\x07after");
+        assert_eq!(output.grid_bytes, b"a\x1b_Xhello\x1b\x07after");
+        assert!(output.media.is_empty());
+        assert!(output.actions.is_empty());
+    }
+
+    #[test]
+    fn overflow_osc_cross_feed_discards_until_terminator() {
+        let mut scanner = TerminalMediaScanner::new();
+        let mut prefix = Vec::new();
+        prefix.extend_from_slice(b"\x1b]9;z3rm-copy;");
+        prefix.resize(MAX_CONTROL_SEQUENCE_BYTES + 1, b'A');
+        let output = scanner.feed(&prefix);
+        assert!(output.grid_bytes.is_empty());
+        assert!(output.actions.is_empty());
+
+        let output = scanner.feed(b"residue");
+        assert!(output.grid_bytes.is_empty());
+        assert!(output.actions.is_empty());
+
+        let output = scanner.feed(b"\x07after");
+        assert_eq!(output.grid_bytes, b"after");
+        assert!(output.media.is_empty());
+        assert!(output.actions.is_empty());
+    }
+
+    #[test]
+    fn kitty_ignores_x_y_crop_offsets() {
+        // `x` and `y` are crop offsets, not terminal cell coordinates.
+        // They are ignored; row/column default to 0.
+        let mut scanner = TerminalMediaScanner::new();
+        let output = scanner.feed(
+            b"\x1b_Ga=T,f=100,i=7,c=2,r=1,x=10,y=20;SGVsbG8=\x1b\\",
+        );
+        assert_eq!(output.media.len(), 1);
+        assert_eq!(output.media[0].row, 0);
+        assert_eq!(output.media[0].column, 0);
+        assert_eq!(output.media[0].data, b"Hello");
+    }
+
+    #[test]
+    fn kitty_bel_terminated_does_not_include_bel_in_data() {
+        // BEL termination must not enter the base64 data.
+        let mut scanner = TerminalMediaScanner::new();
+        let output = scanner.feed(b"\x1b_Ga=T,f=100,i=7,c=2,r=1,q=2;SGVsbG8=\x07");
+        assert_eq!(output.media.len(), 1);
+        assert_eq!(output.media[0].data, b"Hello");
+    }
+
+    #[test]
+    fn apc_passthrough_non_st_preserves_byte() {
+        // APC passthrough with ESC followed by non-`\` preserves the
+        // byte and stays in passthrough.
+        let mut scanner = TerminalMediaScanner::new();
+        let output = scanner.feed(b"a\x1b_Xhello\x1bXworld\x1b\\b");
+        assert_eq!(output.grid_bytes, b"a\x1b_Xhello\x1bXworld\x1b\\b");
+        assert!(output.media.is_empty());
+        assert!(output.actions.is_empty());
     }
 }
