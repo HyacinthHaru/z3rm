@@ -15,6 +15,7 @@ use anyhow::{Context as _, Result};
 use gpui::{App, AppContext as _, Entity, Window, WindowHandle};
 use std::sync::Arc;
 use util::ResultExt as _;
+use wasm_bindgen::{prelude::wasm_bindgen, JsValue};
 
 mod local_server;
 mod serial_link;
@@ -75,6 +76,7 @@ pub fn boot(cx: &mut App) {
         Ok(installed) => installed,
         Err(error) => {
             log::error!("could not install the serial link to the guest: {error:#}");
+            report_progress_error("GPUI serial link", &error);
             return;
         }
     };
@@ -105,10 +107,12 @@ pub fn boot(cx: &mut App) {
         // Nothing to attach to until the guest's mux server answers.
         if let Err(error) = serial_link::wait_ready(&link_ready).await {
             log::error!("{error:#}");
+            report_progress_error("v86 guest", &error);
             return;
         }
         if let Err(error) = open_window(app_state, domain, cx).await {
             log::error!("could not open the z3rm window: {error:#}");
+            report_progress_error("GPUI window", &error);
         }
     })
     .detach();
@@ -178,6 +182,9 @@ async fn open_window(
                     // §15.7 The same pane action handlers the desktop registers:
                     // split, focus, tabs, resize, zoom, prefix mode.
                     mux_window::register_core_mux_actions(workspace, window, cx);
+                    // This is the first authoritative attach snapshot and its
+                    // pane layout is now installed in the GPUI workspace.
+                    signal_first_pane_snapshot_ready();
                 }
             })),
             workspace::OpenMode::NewWindow,
@@ -186,12 +193,16 @@ async fn open_window(
     });
     let open_result = open_window.await.context("opening the workspace window")?;
 
-    // Signal the JS bootstrap that the GPUI canvas is rendering.
+    // Keep the existing GPUI marker, but let the loading surface hide only
+    // after both it and the first pane snapshot signal have arrived.
     if let Some(root) = web_sys::window()
         .and_then(|window| window.document())
         .and_then(|document| document.document_element())
     {
         let _ = root.set_attribute("data-gpui-ready", "true");
+    }
+    if let Err(error) = progress_ready() {
+        log::warn!("could not signal GPUI readiness to the loading surface: {error:?}");
     }
 
     Ok(open_result.window)
@@ -238,4 +249,46 @@ fn load_embedded_fonts(cx: &App) {
         }
     }
     cx.text_system().add_fonts(fonts).log_err();
+}
+
+fn signal_first_pane_snapshot_ready() {
+    if let Err(error) = progress_first_pane_snapshot_ready() {
+        log::warn!("could not signal first pane snapshot readiness: {error:?}");
+        return;
+    }
+    if let Some(root) = web_sys::window()
+        .and_then(|window| window.document())
+        .and_then(|document| document.document_element())
+    {
+        let _ = root.set_attribute("data-first-pane-snapshot-ready", "true");
+    }
+}
+
+fn report_progress_error(stage: &str, error: &anyhow::Error) {
+    let message = format!("{error:#}");
+    let _ = progress_error(stage, &message);
+}
+
+#[wasm_bindgen]
+unsafe extern "C" {
+    #[wasm_bindgen(
+        js_namespace = ["window", "__z3rm_progress"],
+        js_name = firstPaneSnapshotReady,
+        catch
+    )]
+    fn progress_first_pane_snapshot_ready() -> Result<(), JsValue>;
+
+    #[wasm_bindgen(
+        js_namespace = ["window", "__z3rm_progress"],
+        js_name = ready,
+        catch
+    )]
+    fn progress_ready() -> Result<(), JsValue>;
+
+    #[wasm_bindgen(
+        js_namespace = ["window", "__z3rm_progress"],
+        js_name = error,
+        catch
+    )]
+    fn progress_error(stage: &str, message: &str) -> Result<(), JsValue>;
 }

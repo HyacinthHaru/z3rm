@@ -6,13 +6,53 @@
     <title>Z3rm GPUI session projection</title>
     <link data-trunk rel="copy-dir" href="../../public/v86" />
     <link data-trunk rel="copy-file" href="v86_bridge.js" />
-    <script type="module">import("./v86_bridge.js").catch(e => console.error("[v86] import failed:", e));</script>
+    <!-- A classic script runs synchronously before Trunk's generated module. -->
+    <script src="v86_bridge.js"></script>
     <link data-trunk rel="rust" data-bin="z3rm_web_demo" data-bindgen-target="web" data-wasm-opt="z" />
-    <link data-trunk rel="copy-file" href="v86_bridge.js" />
     <style>
       * { box-sizing: border-box; margin: 0; padding: 0; }
       html, body { width: 100%; height: 100%; overflow: hidden; background: #101215; }
       body { color: #d7dadf; font: 14px/1.4 "IBM Plex Mono", "SFMono-Regular", Consolas, monospace; }
+      #loading-progress {
+        position: fixed; inset: 0; z-index: 4; display: grid; place-items: center;
+        padding: 24px; color: var(--text-primary, #d7dadf);
+        background: rgb(16 18 21 / 94%); font: 14px/1.4 var(--font-mono, "IBM Plex Mono", monospace);
+        pointer-events: none; transition: opacity 180ms ease, visibility 180ms ease;
+      }
+      #loading-progress-panel {
+        width: min(100%, 36rem); padding: 24px; border: 1px solid var(--border-strong, #2b3038);
+        background: var(--surface-panel, #171a20); box-shadow: 0 18px 55px rgb(0 0 0 / 30%);
+        pointer-events: auto;
+      }
+      #loading-progress-label { color: var(--text-primary, #d7dadf); font-weight: 600; }
+      #loading-progress-bar {
+        position: relative; height: 6px; margin: 16px 0 10px; overflow: hidden;
+        background: var(--border-muted, #2b3038);
+      }
+      #loading-progress-bar > span {
+        display: block; height: 100%; width: var(--loading-progress-width, 0%);
+        background: var(--accent-blue, #3f6c9f); transition: width 120ms ease;
+      }
+      #loading-progress-bar[data-indeterminate="true"] > span {
+        width: 34%; animation: loading-progress-slide 1.2s ease-in-out infinite;
+      }
+      #loading-progress-detail { min-height: 1.4em; color: var(--text-muted, #9ca3af); overflow-wrap: anywhere; }
+      #loading-progress-retry {
+        margin-top: 18px; padding: 8px 12px; border: 1px solid var(--border-strong, #2b3038);
+        color: var(--text-primary, #d7dadf); background: var(--surface-app, #101215);
+        cursor: pointer; font: inherit; pointer-events: auto;
+      }
+      #loading-progress-retry:hover { background: var(--surface-hover, #252a32); }
+      #loading-progress[data-state="error"] #loading-progress-label { color: var(--accent-coral, #d4766b); }
+      #loading-progress-retry[hidden] { display: none; }
+      @keyframes loading-progress-slide {
+        0% { transform: translateX(-120%); }
+        100% { transform: translateX(330%); }
+      }
+      @media (prefers-reduced-motion: reduce) {
+        #loading-progress { transition: none; }
+        #loading-progress-bar > span { transition: none; animation: none; }
+      }
       #boot-terminal {
         position: fixed; inset: 0; z-index: 1; overflow: auto; padding: 18px 20px 36px;
         background: #101215; outline: none; white-space: pre-wrap; cursor: text;
@@ -23,12 +63,23 @@
         color: #9ca3af; background: #171a20; border: 1px solid #2b3038;
       }
       canvas { position: fixed; inset: 0; z-index: 2; display: block; width: 100%; height: 100%; touch-action: none; outline: none; user-select: none; }
-      html:not([data-gpui-ready]) canvas { visibility: hidden; }
-      html[data-gpui-ready] #boot-terminal { display: none; }
+      html:not([data-gpui-ready][data-first-pane-snapshot-ready]) canvas { visibility: hidden; }
+      html[data-gpui-ready][data-first-pane-snapshot-ready] #boot-terminal { display: none; }
+      html[data-gpui-ready][data-first-pane-snapshot-ready] #loading-progress[data-state="ready"] { opacity: 0; visibility: hidden; }
       #v86-screen { display: none; }
     </style>
   </head>
   <body>
+    <section id="loading-progress" role="status" aria-live="polite" aria-atomic="true" aria-busy="true">
+      <div id="loading-progress-panel">
+        <p id="loading-progress-label">Loading z3rm</p>
+        <div id="loading-progress-bar" role="progressbar" aria-label="Loading z3rm" aria-valuemin="0" aria-valuemax="100" data-indeterminate="true">
+          <span aria-hidden="true"></span>
+        </div>
+        <p id="loading-progress-detail">Preparing the browser guest…</p>
+        <button id="loading-progress-retry" type="button" hidden>Reload to retry</button>
+      </div>
+    </section>
     <main id="boot-terminal" tabindex="0" role="region" aria-label="z3rm Linux terminal">
       <pre id="boot-terminal-output">Booting z3rm Linux…&#10;</pre>
       <span id="boot-terminal-status" aria-live="polite">initializing</span>
