@@ -228,7 +228,7 @@ fn apply_mouse(
         0 if event.pressed => {
             if let Some(action) = layout.action_at(event.x, event.y, result.offset) {
                 result.action = Some(action);
-                result.output = action_output(action, download_root);
+                result.output.push_str(&action_output(action, download_root));
                 result.redraw = true;
             }
         }
@@ -314,10 +314,12 @@ fn action_output(action: Action, download_root: &str) -> String {
             output.push_str("\x1b\\Download server\x1b]8;;\x1b\\");
             output.push_str("\x1b]9;z3rm-download;");
             output.push_str(download_root);
-            output.push_str("\x1b\\");
+            output.push('\x07');
             output
         }
-        Action::Copy => format!("\x1b]52;c;{COPY_BASE64}\x1b\\"),
+        Action::Copy => format!(
+            "\x1b]9;z3rm-copy;{COPY_BASE64}\x07\x1b]52;c;{COPY_BASE64}\x1b\\",
+        ),
     }
 }
 
@@ -418,7 +420,9 @@ impl Drop for TerminalGuard {
     }
 }
 
-fn terminal_size() -> (usize, usize) {
+/// Query the controlling tty. An ioctl failure is a real error; only a
+/// successful query with zero dimensions receives the deterministic fallback.
+fn terminal_size() -> io::Result<(usize, usize)> {
     let mut window = libc::winsize {
         ws_row: 0,
         ws_col: 0,
@@ -426,10 +430,17 @@ fn terminal_size() -> (usize, usize) {
         ws_ypixel: 0,
     };
     let status = unsafe { libc::ioctl(STDIN_FD, libc::TIOCGWINSZ, &mut window) };
-    if status == -1 || window.ws_col == 0 || window.ws_row == 0 {
+    if status == -1 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(terminal_size_from_winsize(window.ws_col, window.ws_row))
+}
+
+fn terminal_size_from_winsize(columns: u16, rows: u16) -> (usize, usize) {
+    if columns == 0 || rows == 0 {
         (120, 32)
     } else {
-        (window.ws_col as usize, window.ws_row as usize)
+        (columns as usize, rows as usize)
     }
 }
 
@@ -650,7 +661,7 @@ fn run() -> io::Result<()> {
     let content_root = std::env::args().nth(1).unwrap_or_else(|| String::from(DOWNLOAD_ROOT));
     let png = read_file(IMAGE_PATH)?;
     let image_command = kitty_image_command(&png);
-    let (columns, rows) = terminal_size();
+    let (columns, rows) = terminal_size()?;
     let terminal = TerminalGuard::enter()?;
     let mut app = App::new(Layout::new(columns, rows), content_root, image_command);
     draw(&app)?;
@@ -678,7 +689,7 @@ const STDERR_FD: libc::c_int = 2;
 
 #[cfg(test)]
 mod tests {
-    use super::{Action, Layout, Rect, apply_input};
+    use super::{Action, Layout, Rect, apply_input, terminal_size_from_winsize};
 
     #[test]
     fn terminal_layout_has_stable_controls() {
@@ -713,7 +724,7 @@ mod tests {
 
         assert_eq!(result.action, Some(Action::Download));
         assert!(result.output.contains("z3rm-download:"));
-        assert!(result.output.contains("\x1b]"));
+        assert!(result.output.contains("\x1b]9;z3rm-download;/\x07"));
     }
 
     #[test]
@@ -723,5 +734,41 @@ mod tests {
 
         assert_eq!(result.action, None);
         assert!(result.output.is_empty());
+    }
+
+    #[test]
+    fn copy_click_emits_typed_action_and_clipboard_sequence() {
+        let layout = Layout::new(120, 32);
+        let result = apply_input(b"\x1b[<0;48;16M", &layout, 0);
+
+        assert_eq!(result.action, Some(Action::Copy));
+        assert!(result.output.contains("\x1b]9;z3rm-copy;Y2FyZ28gaW5zdGFsbCB6M3Jt\x07"));
+        assert!(result.output.contains("\x1b]52;c;Y2FyZ28gaW5zdGFsbCB6M3Jt\x1b\\"));
+    }
+
+    #[test]
+    fn multiple_clicks_emit_actions_in_input_order() {
+        let layout = Layout::new(120, 32);
+        let result = apply_input(
+            b"\x1b[<0;18;16M\x1b[<0;48;16M",
+            &layout,
+            0,
+        );
+
+        assert_eq!(result.action, Some(Action::Copy));
+        let download = result.output.find("\x1b]9;z3rm-download;/\x07");
+        let copy_action = result.output.find("\x1b]9;z3rm-copy;");
+        let copy_clipboard = result.output.find("\x1b]52;c;");
+        assert!(download.is_some());
+        assert!(copy_action.is_some());
+        assert!(copy_clipboard.is_some());
+        assert!(download < copy_action);
+        assert!(copy_action < copy_clipboard);
+    }
+
+    #[test]
+    fn zero_winsize_uses_documented_default() {
+        assert_eq!(terminal_size_from_winsize(0, 0), (120, 32));
+        assert_eq!(terminal_size_from_winsize(120, 32), (120, 32));
     }
 }
