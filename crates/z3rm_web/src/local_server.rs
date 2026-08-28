@@ -57,7 +57,11 @@ async fn ensure_pane_in_session(domain: &Arc<MuxDomain>, session_id: &str) -> Re
                 cols: 120,
                 rows: 32,
             },
-            None,
+            Some(mux_protocol::ShellCommand {
+                program: "/mnt/z3rm-tui".to_string(),
+                args: Vec::new(),
+                env: Default::default(),
+            }),
             Some(Path::new("/")),
         )
         .await

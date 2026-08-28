@@ -1,0 +1,16 @@
+[package]
+name = "z3rm_guest_tui"
+version = "0.1.0"
+edition.workspace = true
+publish.workspace = true
+license = "Apache-2.0"
+
+[[bin]]
+name = "z3rm-tui"
+path = "src/main.rs"
+
+[dependencies]
+libc.workspace = true
+
+[lints]
+workspace = true

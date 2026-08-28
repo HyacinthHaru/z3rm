@@ -1,15 +1,30 @@
 #!/bin/sh
-# Rebuild the 9p filesystem served to the v86 guest: the mux_server binary
-# (static i686-musl) plus its start script, indexed in v86's fs.json format.
+# Rebuild the 9p filesystem served to the v86 guest: the static i686-musl
+# mux_server, the no-dependency landing TUI, and their startup wrapper.
 set -e
 cd "$(dirname "$0")"
 OUT=../../public/v86/fs
 mkdir -p "$OUT"
 : "${RUSTFLAGS:=-C linker=rust-lld -C strip=symbols -C panic=abort}"
 export RUSTFLAGS
+cargo build -p z3rm_guest_tui --target i686-unknown-linux-musl --release
 cargo build -p mux_server --manifest-path ../../../crates/mux_server/Cargo.toml \
   --target i686-unknown-linux-musl --no-default-features --features guest --release
 STAGE=$(mktemp -d)
+cp ../../../target/i686-unknown-linux-musl/release/z3rm-tui "$STAGE/z3rm-tui"
+cp ../../public/media/z3rm-terminal-grid.png "$STAGE/z3rm-terminal-grid.png"
+cat > "$STAGE/z3rm" <<'SCRIPT'
+#!/bin/sh
+case "${1-}" in
+  a|attach|landing)
+    exec /mnt/z3rm-tui
+    ;;
+  *)
+    printf '%s\n' 'usage: /mnt/z3rm {a|attach|landing}' >&2
+    exit 2
+    ;;
+esac
+SCRIPT
 cp ../../../target/i686-unknown-linux-musl/release/z3rm-server "$STAGE/mux_server"
 cat > "$STAGE/start-mux.sh" <<'SCRIPT'
 #!/bin/sh
@@ -18,9 +33,10 @@ mount -t devpts devpts /dev/pts 2>/dev/null || true
 dmesg -n 1 2>/dev/null
 stty -F /dev/ttyS0 raw -echo 2>/dev/null
 printf 'Z3RM_MUX_READY'
+export PATH=/mnt:$PATH
 exec /mnt/mux_server --serial /dev/ttyS0
 SCRIPT
-chmod +x "$STAGE/start-mux.sh" "$STAGE/mux_server"
+chmod +x "$STAGE/start-mux.sh" "$STAGE/mux_server" "$STAGE/z3rm-tui" "$STAGE/z3rm"
 python3 - "$OUT" <<'PY'
 import os, sys
 for filename in os.listdir(sys.argv[1]):

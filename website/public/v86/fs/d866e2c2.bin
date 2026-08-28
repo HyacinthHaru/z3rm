@@ -1,0 +1,10 @@
+#!/bin/sh
+case "${1-}" in
+  a|attach|landing)
+    exec /mnt/z3rm-tui
+    ;;
+  *)
+    printf '%s\n' 'usage: /mnt/z3rm {a|attach|landing}' >&2
+    exit 2
+    ;;
+esac

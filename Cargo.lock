@@ -17122,6 +17122,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "z3rm_guest_tui"
+version = "0.1.0"
+dependencies = [
+ "libc",
+]
+
+[[package]]
 name = "z3rm_macros"
 version = "0.1.0"
 dependencies = [
