@@ -27,6 +27,8 @@ use project::Project;
 use settings::Settings;
 use std::collections::BTreeMap;
 use std::sync::Arc;
+#[cfg(target_family = "wasm")]
+use wasm_bindgen::{JsCast, JsValue};
 use terminal::{
     CursorShape as TerminalCursorShape, Hyperlink as TerminalHyperlink, MAX_SCROLL_HISTORY_LINES,
     Modes, Rgb, StructuredTerminalCell, StructuredTerminalCursor, StructuredTerminalSnapshot,
@@ -41,8 +43,9 @@ pub use crate::terminal_element::{
     BrowserClipboardCallback, BrowserDownloadCallback, DownloadClickState, TerminalElement,
     TerminalMedia,
 };
-use crate::terminal_element::download_target_from_uri;
-pub(crate) use crate::terminal_element::download_click_target;
+use crate::terminal_element::download_filename;
+#[cfg(test)]
+use crate::terminal_element::{download_click_target, download_target_from_uri};
 use crate::{TerminalMode, TerminalView};
 
 use workspace::{
@@ -84,7 +87,15 @@ const MAX_SCROLLBACK_CELLS: usize = mux_protocol::MAX_GRID_CELLS * 16;
 
 /// Kitty's encoded PNG format tag used by the server-side media scanner.
 const PNG_MEDIA_FORMAT: u32 = 100;
-
+const PNG_SIGNATURE: &[u8; 8] = b"\x89PNG\r\n\x1a\n";
+/// Keep decoded media bounded per pane. A single decoded frame is already
+/// capped by the terminal decoder; this aggregate limit prevents a stream of
+/// otherwise-valid frames from exhausting the browser process.
+const MAX_MEDIA_RESIDENT_BYTES: usize = 256 * 1024 * 1024;
+const MAX_MEDIA_IMAGES: usize = 256;
+const MAX_MEDIA_COLUMNS: u32 = 4096;
+const MAX_MEDIA_ROWS: u32 = 4096;
+const MAX_MEDIA_CELLS: u64 = (MAX_MEDIA_COLUMNS as u64) * (MAX_MEDIA_ROWS as u64);
 
 #[derive(Clone)]
 struct PaneMediaEntry {
@@ -95,6 +106,7 @@ struct PaneMediaEntry {
     format: u32,
     encoded: Vec<u8>,
     render_image: Option<Arc<gpui::RenderImage>>,
+    resident_bytes: usize,
 }
 
 /// Client-side cache for media notifications. The protocol's sequence is
@@ -103,6 +115,7 @@ struct PaneMediaEntry {
 #[derive(Default)]
 struct PaneMediaStore {
     images: BTreeMap<(u32, u64), PaneMediaEntry>,
+    resident_bytes: usize,
 }
 
 impl PaneMediaStore {
@@ -115,30 +128,36 @@ impl PaneMediaStore {
         }
 
         let key = (media.image_id, media.sequence);
-        let entry = self.images.entry(key).or_insert_with(|| PaneMediaEntry {
-            row: media.row,
-            column: media.column as usize,
-            columns: media.columns as usize,
-            rows: media.rows as usize,
-            format: media.format,
-            encoded: Vec::new(),
-            render_image: None,
-        });
+        let is_new = !self.images.contains_key(&key);
+        if is_new {
+            anyhow::ensure!(
+                self.images.len() < MAX_MEDIA_IMAGES,
+                "pane media image count exceeds the {MAX_MEDIA_IMAGES} image limit"
+            );
+            Self::validate_metadata(media)?;
+        }
 
         // A duplicate final notification is harmless and must not append the
         // same encoded bytes a second time.
-        if entry.render_image.is_some() {
+        if self
+            .images
+            .get(&key)
+            .is_some_and(|entry| entry.render_image.is_some())
+        {
             return Ok(Vec::new());
         }
 
-        entry.row = media.row;
-        entry.column = usize::try_from(media.column).unwrap_or(usize::MAX);
-        entry.columns = usize::try_from(media.columns).unwrap_or(usize::MAX);
-        entry.rows = usize::try_from(media.rows).unwrap_or(usize::MAX);
-        entry.format = media.format;
-        let encoded_len = entry
-            .encoded
-            .len()
+        let previous_bytes = self
+            .images
+            .get(&key)
+            .map(|entry| entry.resident_bytes)
+            .unwrap_or(0);
+        let previous_encoded_len = self
+            .images
+            .get(&key)
+            .map(|entry| entry.encoded.len())
+            .unwrap_or(0);
+        let encoded_len = previous_encoded_len
             .checked_add(media.data.len())
             .ok_or_else(|| anyhow::anyhow!("pane media payload length overflow"))?;
         anyhow::ensure!(
@@ -146,37 +165,105 @@ impl PaneMediaStore {
             "pane media payload exceeds the {} byte limit",
             terminal::kitty_graphics::MAX_IMAGE_BYTES
         );
+        let encoded_total = self
+            .resident_bytes
+            .checked_sub(previous_bytes)
+            .and_then(|bytes| bytes.checked_add(encoded_len))
+            .ok_or_else(|| anyhow::anyhow!("pane media resident-byte accounting overflow"))?;
+        anyhow::ensure!(
+            encoded_total <= MAX_MEDIA_RESIDENT_BYTES,
+            "pane media cache exceeds the {MAX_MEDIA_RESIDENT_BYTES} byte limit"
+        );
+
+        if is_new {
+            self.images.insert(
+                key,
+                PaneMediaEntry {
+                    row: media.row,
+                    column: media.column as usize,
+                    columns: media.columns as usize,
+                    rows: media.rows as usize,
+                    format: media.format,
+                    encoded: Vec::new(),
+                    render_image: None,
+                    resident_bytes: 0,
+                },
+            );
+        }
+        let entry = self
+            .images
+            .get_mut(&key)
+            .ok_or_else(|| anyhow::anyhow!("pane media cache entry disappeared"))?;
+        // Continuation chunks inherit all metadata from the first chunk. This
+        // also handles protobuf messages that omit scalar metadata by sending
+        // their default zero values on the final chunk.
         entry.encoded.extend_from_slice(&media.data);
+        entry.resident_bytes = encoded_len;
+        self.resident_bytes = encoded_total;
 
         if media.final_chunk {
-            // Format zero is the scanner's backwards-compatible default; the
-            // decoder still validates that its bytes are an encoded image.
             anyhow::ensure!(
                 entry.format == 0 || entry.format == PNG_MEDIA_FORMAT,
                 "unsupported pane media format {}",
                 entry.format
             );
+            if entry.format == PNG_MEDIA_FORMAT {
+                anyhow::ensure!(
+                    entry.encoded.starts_with(PNG_SIGNATURE),
+                    "pane media tagged as PNG does not have a PNG signature"
+                );
+            }
             let decoded = decode_encoded_image(&entry.encoded)
                 .map_err(|error| anyhow::anyhow!("decode pane media image: {error}"))?;
+            let decoded_total = self
+                .resident_bytes
+                .checked_sub(encoded_len)
+                .and_then(|bytes| bytes.checked_add(decoded.byte_size))
+                .ok_or_else(|| anyhow::anyhow!("pane media resident-byte accounting overflow"))?;
+            anyhow::ensure!(
+                decoded_total <= MAX_MEDIA_RESIDENT_BYTES,
+                "decoded pane media cache exceeds the {MAX_MEDIA_RESIDENT_BYTES} byte limit"
+            );
             entry.render_image = Some(decoded.render_image);
-            entry.encoded.clear();
+            entry.encoded = Vec::new();
+            entry.resident_bytes = decoded.byte_size;
+            self.resident_bytes = decoded_total;
         }
+        Ok(Vec::new())
+    }
 
-        // Keep the cache bounded even if a guest repeatedly publishes unique
-        // image ids. Sequence ordering makes the oldest entry deterministic.
-        const MAX_MEDIA_IMAGES: usize = 256;
-        let mut dropped = Vec::new();
-        while self.images.len() > MAX_MEDIA_IMAGES {
-            let Some(oldest_key) = self.images.keys().next().copied() else {
-                break;
-            };
-            if let Some(oldest) = self.images.remove(&oldest_key)
-                && let Some(image) = oldest.render_image
-            {
-                dropped.push(image);
-            }
-        }
-        Ok(dropped)
+    fn validate_metadata(media: &PaneMedia) -> anyhow::Result<()> {
+        anyhow::ensure!(
+            media.column <= MAX_MEDIA_COLUMNS
+                && media.columns <= MAX_MEDIA_COLUMNS
+                && media.rows <= MAX_MEDIA_ROWS,
+            "pane media placement exceeds cell limits"
+        );
+        anyhow::ensure!(
+            u64::from(media.column)
+                .checked_add(u64::from(media.columns))
+                .is_some_and(|end| end <= u64::from(MAX_MEDIA_COLUMNS))
+                && i64::from(media.row)
+                    .checked_add(i64::from(media.rows))
+                    .is_some_and(|end| {
+                        end >= -i64::from(MAX_MEDIA_ROWS)
+                            && end <= i64::from(MAX_MEDIA_ROWS)
+                    }),
+            "pane media placement is outside cell limits"
+        );
+        anyhow::ensure!(
+            u64::from(media.columns)
+                .checked_mul(u64::from(media.rows))
+                .is_some_and(|cells| cells <= MAX_MEDIA_CELLS),
+            "pane media rectangle is too large"
+        );
+        Ok(())
+    }
+
+    fn remove_key(&mut self, key: (u32, u64)) -> Option<PaneMediaEntry> {
+        let entry = self.images.remove(&key)?;
+        self.resident_bytes = self.resident_bytes.saturating_sub(entry.resident_bytes);
+        Some(entry)
     }
 
     fn remove_image_id(&mut self, image_id: u32) -> Vec<Arc<gpui::RenderImage>> {
@@ -188,7 +275,7 @@ impl PaneMediaStore {
             .collect();
         let mut dropped = Vec::new();
         for key in keys {
-            if let Some(entry) = self.images.remove(&key)
+            if let Some(entry) = self.remove_key(key)
                 && let Some(image) = entry.render_image
             {
                 dropped.push(image);
@@ -198,14 +285,17 @@ impl PaneMediaStore {
     }
 
     fn clear(&mut self) -> Vec<Arc<gpui::RenderImage>> {
-        std::mem::take(&mut self.images)
+        let images = std::mem::take(&mut self.images);
+        self.resident_bytes = 0;
+        images
             .into_iter()
             .filter_map(|(_, entry)| entry.render_image)
             .collect()
     }
 
     fn visible_images(&self) -> Vec<TerminalMedia> {
-        self.images
+        let mut visible: Vec<_> = self
+            .images
             .iter()
             .filter_map(|(key, entry)| {
                 Some(TerminalMedia {
@@ -217,7 +307,9 @@ impl PaneMediaStore {
                     render_image: entry.render_image.clone()?,
                 })
             })
-            .collect()
+            .collect();
+        visible.sort_by_key(|media| media.key.1);
+        visible
     }
 }
 fn invoke_browser_action(
@@ -378,6 +470,130 @@ pub struct MuxPaneView {
     /// has no GPUI context) and drained into InputFailed events at render.
     pending_input_errors: std::sync::Arc<std::sync::Mutex<Vec<SharedString>>>,
 }
+#[cfg(target_family = "wasm")]
+fn default_browser_download_callback() -> BrowserDownloadCallback {
+    Arc::new(|uri, filename| {
+        let Some(window) = web_sys::window() else {
+            log::warn!("download requested without a browser window");
+            return;
+        };
+        let Some(document) = window.document() else {
+            log::warn!("download requested without a browser document");
+            return;
+        };
+        let base_uri = match document.base_uri() {
+            Ok(Some(base_uri)) => base_uri,
+            Ok(None) => String::from("./"),
+            Err(error) => {
+                log::warn!("could not read the document base URI: {error:?}");
+                String::from("./")
+            }
+        };
+        let url = match web_sys::Url::new(&uri) {
+            Ok(url) => url,
+            Err(_) if uri == "/z3rm-server" => {
+                match web_sys::Url::new_with_base("v86/z3rm-server.bin", &base_uri) {
+                    Ok(url) => url,
+                    Err(error) => {
+                        log::warn!("could not resolve the guest server artifact: {error:?}");
+                        return;
+                    }
+                }
+            }
+            Err(_) => {
+                log::warn!("refusing malformed download URI: {uri}");
+                return;
+            }
+        };
+        let protocol = url.protocol();
+        if protocol != "http:" && protocol != "https:" {
+            log::warn!("refusing unsupported download URI scheme {protocol}: {uri}");
+            return;
+        }
+        let Ok(element) = document.create_element("a") else {
+            log::warn!("could not create browser download anchor");
+            return;
+        };
+        let Ok(anchor) = element.dyn_into::<web_sys::HtmlAnchorElement>() else {
+            log::warn!("browser download anchor had an unexpected type");
+            return;
+        };
+        anchor.set_href(&url.href());
+        anchor.set_download(&filename);
+        anchor.set_rel("noopener noreferrer");
+        let Some(body) = document.body() else {
+            log::warn!("download requested without a document body");
+            return;
+        };
+        if let Err(error) = body.append_child(&anchor) {
+            log::warn!("could not attach browser download anchor: {error:?}");
+            return;
+        }
+        anchor.click();
+        if let Some(parent) = anchor.parent_node()
+            && let Err(error) = parent.remove_child(&anchor)
+        {
+            log::debug!("could not remove browser download anchor: {error:?}");
+        }
+    })
+}
+
+#[cfg(target_family = "wasm")]
+fn default_browser_clipboard_callback() -> BrowserClipboardCallback {
+    Arc::new(|text| {
+        let Some(window) = web_sys::window() else {
+            log::warn!("copy requested without a browser window");
+            return;
+        };
+        let navigator = window.navigator();
+        let clipboard_available = js_sys::Reflect::get(
+            navigator.as_ref(),
+            &JsValue::from_str("clipboard"),
+        )
+        .is_ok_and(|value| !value.is_undefined() && !value.is_null());
+        if !clipboard_available {
+            log::warn!("browser clipboard API is unavailable");
+            return;
+        }
+        let write = navigator.clipboard().write_text(&text);
+        wasm_bindgen_futures::spawn_local(async move {
+            if let Err(error) = wasm_bindgen_futures::JsFuture::from(write).await {
+                log::warn!("browser clipboard write failed: {error:?}");
+            }
+        });
+    })
+}
+#[cfg(target_family = "wasm")]
+static FIRST_PANE_SNAPSHOT_SIGNALLED: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+#[cfg(target_family = "wasm")]
+fn signal_first_pane_snapshot_ready() {
+    if FIRST_PANE_SNAPSHOT_SIGNALLED.swap(true, std::sync::atomic::Ordering::SeqCst) {
+        return;
+    }
+    if let Err(error) = progress_first_pane_snapshot_ready() {
+        log::debug!("could not signal first pane snapshot readiness: {error:?}");
+    }
+    if let Some(root) = web_sys::window()
+        .and_then(|window| window.document())
+        .and_then(|document| document.document_element())
+        && let Err(error) = root.set_attribute("data-first-pane-snapshot-ready", "true")
+    {
+        log::debug!("could not set first pane readiness attribute: {error:?}");
+    }
+}
+
+#[cfg(target_family = "wasm")]
+#[wasm_bindgen::prelude::wasm_bindgen]
+unsafe extern "C" {
+    #[wasm_bindgen::prelude::wasm_bindgen(
+        js_namespace = ["window", "__z3rm_progress"],
+        js_name = firstPaneSnapshotReady,
+        catch
+    )]
+    fn progress_first_pane_snapshot_ready() -> Result<(), JsValue>;
+}
 
 impl MuxPaneView {
     /// §3.3 Create view with DisplayOnly Terminal + TerminalView.
@@ -510,6 +726,14 @@ impl MuxPaneView {
             cells: Arc::new(Vec::new()),
         };
 
+        #[cfg(target_family = "wasm")]
+        let download_callback = Some(default_browser_download_callback());
+        #[cfg(not(target_family = "wasm"))]
+        let download_callback: Option<BrowserDownloadCallback> = None;
+        #[cfg(target_family = "wasm")]
+        let copy_callback = Some(default_browser_clipboard_callback());
+        #[cfg(not(target_family = "wasm"))]
+        let copy_callback: Option<BrowserClipboardCallback> = None;
         let mut view = Self {
             pane_id: pane_id.clone(),
             domain: domain.clone(),
@@ -519,14 +743,14 @@ impl MuxPaneView {
             focus_handle,
             notification_task: None,
             generation: 0,
+            download_callback,
+            copy_callback,
             fetch_in_flight: false,
             fetch_pending: false,
             fetch_retry_task: None,
             snapshot,
             history_cache,
             media: PaneMediaStore::default(),
-            download_callback: None,
-            copy_callback: None,
             download_click_state: Arc::new(std::sync::Mutex::new(None)),
             zoomed: false,
             last_sent_size: (80, 24),
@@ -679,7 +903,7 @@ impl MuxPaneView {
             Err(error) => {
                 // Do not retain an incomplete or undecodable entry. A later
                 // sequence can still publish the same image id cleanly.
-                self.media.images.remove(&key);
+                self.media.remove_key(key);
                 tracing::warn!(
                     pane_id = %self.pane_id,
                     image_id = media.image_id,
@@ -769,13 +993,7 @@ impl MuxPaneView {
             .strip_prefix("z3rm-download:")
             .unwrap_or(value)
             .to_string();
-        let filename = uri
-            .rsplit('/')
-            .find(|part| !part.is_empty() && *part != "." && *part != "..")
-            .and_then(|part| part.split(['?', '#']).next())
-            .filter(|part| !part.is_empty())
-            .unwrap_or("download")
-            .to_string();
+        let filename = download_filename(&uri);
         (uri, filename)
     }
 
@@ -922,6 +1140,15 @@ impl MuxPaneView {
                         cx,
                     );
                 });
+                #[cfg(target_family = "wasm")]
+                if generation > 0
+                    && structured
+                        .cells
+                        .iter()
+                        .any(|cell| !cell.character.is_whitespace())
+                {
+                    signal_first_pane_snapshot_ready();
+                }
             }
         }
         cx.notify();
@@ -2080,6 +2307,7 @@ impl Render for MuxPaneView {
             .bg(colors.editor_background)
             .child(
                 div()
+                    .size_full()
                     .child(TerminalElement::new_with_media(
                         terminal_handle,
                         terminal_view_handle,
@@ -4846,6 +5074,14 @@ mod tests {
         store
             .apply_notification(&media)
             .expect("valid PNG media should decode");
+        assert_eq!(
+            store
+                .images
+                .get(&(42, 7))
+                .map(|entry| entry.encoded.capacity()),
+            Some(0),
+            "decoded media must release its encoded buffer allocation"
+        );
         let visible = store.visible_images();
         assert_eq!(visible.len(), 1);
         assert_eq!(visible[0].key, (42, 7));
@@ -4874,6 +5110,79 @@ mod tests {
     }
 
     #[test]
+    fn pane_media_store_preserves_first_chunk_metadata() {
+        let png = tiny_png();
+        let split = png.len() / 2;
+        let first = mux_protocol::proto::PaneMedia {
+            pane_id: "media-pane".to_string(),
+            sequence: 19,
+            image_id: 43,
+            format: PNG_MEDIA_FORMAT,
+            row: 3,
+            column: 4,
+            columns: 2,
+            rows: 1,
+            data: png[..split].to_vec(),
+            final_chunk: false,
+            delete: false,
+        };
+        let second = mux_protocol::proto::PaneMedia {
+            pane_id: "media-pane".to_string(),
+            sequence: 19,
+            image_id: 43,
+            data: png[split..].to_vec(),
+            final_chunk: true,
+            delete: false,
+            ..Default::default()
+        };
+        let mut store = PaneMediaStore::default();
+        store
+            .apply_notification(&first)
+            .expect("first media chunk should be retained");
+        store
+            .apply_notification(&second)
+            .expect("continuation media chunk should decode");
+        let visible = store.visible_images();
+        assert_eq!(visible.len(), 1);
+        assert_eq!(visible[0].key, (43, 19));
+        assert_eq!((visible[0].row, visible[0].column), (3, 4));
+        assert_eq!((visible[0].columns, visible[0].rows), (2, 1));
+    }
+    #[test]
+    fn pane_media_store_rejects_new_frames_without_evicting_existing() {
+        let mut store = PaneMediaStore::default();
+        for sequence in 0..MAX_MEDIA_IMAGES as u64 {
+            let media = mux_protocol::proto::PaneMedia {
+                sequence,
+                image_id: sequence as u32 + 1,
+                format: PNG_MEDIA_FORMAT,
+                columns: 1,
+                rows: 1,
+                data: tiny_png().to_vec(),
+                final_chunk: true,
+                ..Default::default()
+            };
+            store
+                .apply_notification(&media)
+                .expect("media within the cache entry limit should decode");
+        }
+        let overflow = mux_protocol::proto::PaneMedia {
+            sequence: MAX_MEDIA_IMAGES as u64,
+            image_id: MAX_MEDIA_IMAGES as u32 + 1,
+            format: PNG_MEDIA_FORMAT,
+            columns: 1,
+            rows: 1,
+            data: tiny_png().to_vec(),
+            final_chunk: true,
+            ..Default::default()
+        };
+        assert!(store.apply_notification(&overflow).is_err());
+        assert!(store.images.contains_key(&(1, 0)));
+        assert_eq!(store.visible_images().len(), MAX_MEDIA_IMAGES);
+    }
+
+
+    #[test]
     fn z3rm_download_links_are_actionable_only_when_parsed_as_click_targets() {
         assert_eq!(
             download_target_from_uri("z3rm-download:/z3rm-server"),
@@ -4885,7 +5194,22 @@ mod tests {
         let target = download_target_from_uri("z3rm-download:/z3rm-server");
         assert!(download_click_target(target.clone(), false, false).is_some());
         assert!(download_click_target(target.clone(), true, false).is_none());
-        assert!(download_click_target(target, false, true).is_none());
+        assert!(download_click_target(target, false, true).is_some());
+        assert_eq!(
+            download_target_from_uri("z3rm-download:/foo/..?x"),
+            Some(("/foo/..?x".to_string(), "download".to_string()))
+        );
+        assert_eq!(
+            download_target_from_uri("z3rm-download:/foo\\bar/file.bin#fragment"),
+            Some((
+                "/foo\\bar/file.bin#fragment".to_string(),
+                "file.bin".to_string()
+            ))
+        );
+        assert_eq!(
+            download_target_from_uri("z3rm-download:/foo/bad\u{0000}name"),
+            Some(("/foo/bad\u{0000}name".to_string(), "download".to_string()))
+        );
     }
 
     #[test]

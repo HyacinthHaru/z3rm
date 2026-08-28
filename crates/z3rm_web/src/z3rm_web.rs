@@ -105,11 +105,13 @@ pub fn boot(cx: &mut App) {
             recent_projects::init(cx);
         });
         // Nothing to attach to until the guest's mux server answers.
+        report_progress_stage("mux: connecting");
         if let Err(error) = serial_link::wait_ready(&link_ready).await {
             log::error!("{error:#}");
             report_progress_error("v86 guest", &error);
             return;
         }
+        report_progress_stage("mux: connected");
         if let Err(error) = open_window(app_state, domain, cx).await {
             log::error!("could not open the z3rm window: {error:#}");
             report_progress_error("GPUI window", &error);
@@ -182,9 +184,6 @@ async fn open_window(
                     // §15.7 The same pane action handlers the desktop registers:
                     // split, focus, tabs, resize, zoom, prefix mode.
                     mux_window::register_core_mux_actions(workspace, window, cx);
-                    // This is the first authoritative attach snapshot and its
-                    // pane layout is now installed in the GPUI workspace.
-                    signal_first_pane_snapshot_ready();
                 }
             })),
             workspace::OpenMode::NewWindow,
@@ -199,7 +198,9 @@ async fn open_window(
         .and_then(|window| window.document())
         .and_then(|document| document.document_element())
     {
-        let _ = root.set_attribute("data-gpui-ready", "true");
+        if let Err(error) = root.set_attribute("data-gpui-ready", "true") {
+            log::debug!("could not set GPUI readiness attribute: {error:?}");
+        }
     }
     if let Err(error) = progress_ready() {
         log::warn!("could not signal GPUI readiness to the loading surface: {error:?}");
@@ -217,7 +218,7 @@ fn new_mux_pane_view(
 ) -> Entity<terminal_view::mux_pane::MuxPaneView> {
     let workspace_handle = workspace.weak_handle();
     let project = workspace.project().downgrade();
-    cx.new(|cx| {
+    let pane = cx.new(|cx| {
         terminal_view::mux_pane::MuxPaneView::new(
             pane_id,
             domain,
@@ -226,7 +227,15 @@ fn new_mux_pane_view(
             window,
             cx,
         )
-    })
+    });
+    pane
+}
+
+
+fn report_progress_stage(stage: &str) {
+    if let Err(error) = progress_stage(stage, 0.0, 0.0) {
+        log::debug!("could not report loading stage {stage}: {error:?}");
+    }
 }
 
 /// Load the fonts bundled into the wasm module.
@@ -251,32 +260,23 @@ fn load_embedded_fonts(cx: &App) {
     cx.text_system().add_fonts(fonts).log_err();
 }
 
-fn signal_first_pane_snapshot_ready() {
-    if let Err(error) = progress_first_pane_snapshot_ready() {
-        log::warn!("could not signal first pane snapshot readiness: {error:?}");
-        return;
-    }
-    if let Some(root) = web_sys::window()
-        .and_then(|window| window.document())
-        .and_then(|document| document.document_element())
-    {
-        let _ = root.set_attribute("data-first-pane-snapshot-ready", "true");
-    }
-}
 
 fn report_progress_error(stage: &str, error: &anyhow::Error) {
     let message = format!("{error:#}");
-    let _ = progress_error(stage, &message);
+    if let Err(error) = progress_error(stage, &message) {
+        log::debug!("could not report loading error for {stage}: {error:?}");
+    }
 }
 
 #[wasm_bindgen]
 unsafe extern "C" {
     #[wasm_bindgen(
         js_namespace = ["window", "__z3rm_progress"],
-        js_name = firstPaneSnapshotReady,
+        js_name = stage,
         catch
     )]
-    fn progress_first_pane_snapshot_ready() -> Result<(), JsValue>;
+    fn progress_stage(stage: &str, loaded: f64, total: f64) -> Result<(), JsValue>;
+
 
     #[wasm_bindgen(
         js_namespace = ["window", "__z3rm_progress"],

@@ -8,7 +8,7 @@ export default defineConfig({
   retries: process.env.CI ? 2 : 0,
   reporter: process.env.CI ? "github" : "line",
   use: {
-    baseURL: "http://127.0.0.1:4331/z3rm/",
+    baseURL: process.env.PLAYWRIGHT_TEST_BASE_URL ?? "http://127.0.0.1:4331/z3rm/",
     trace: "retain-on-failure",
   },
   projects: [

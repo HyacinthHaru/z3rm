@@ -56,27 +56,31 @@ pub struct TerminalMedia {
     pub render_image: Arc<gpui::RenderImage>,
 }
 
-/// Parse the private hyperlink scheme used by the guest landing TUI. Ordinary
-/// URLs return `None` and therefore continue through Terminal's normal URL
-/// handling path.
+/// Return a browser-safe basename for a private download target. Query and
+/// fragment suffixes are not part of the filename, and path/control values
+/// fall back to a deterministic neutral name.
+pub(crate) fn download_filename(target: &str) -> String {
+    let path = target.split(['?', '#']).next().unwrap_or_default();
+    path
+        .rsplit(['/', '\\'])
+        .find(|part| !part.is_empty())
+        .filter(|part| *part != "." && *part != "..")
+        .filter(|part| !part.chars().any(char::is_control))
+        .unwrap_or("download")
+        .to_string()
+}
+
 pub(crate) fn download_target_from_uri(uri: &str) -> Option<(String, String)> {
     let target = uri.strip_prefix("z3rm-download:")?;
-    let filename = target
-        .rsplit('/')
-        .find(|part| !part.is_empty() && *part != "." && *part != "..")
-        .and_then(|part| part.split(['?', '#']).next())
-        .filter(|part| !part.is_empty())
-        .unwrap_or("download")
-        .to_string();
-    Some((target.to_string(), filename))
+    Some((target.to_string(), download_filename(target)))
 }
 
 pub(crate) fn download_click_target(
     target: Option<(String, String)>,
     mouse_mode: bool,
-    secondary: bool,
+    _secondary: bool,
 ) -> Option<(String, String)> {
-    (!mouse_mode && !secondary).then_some(target).flatten()
+    (!mouse_mode).then_some(target).flatten()
 }
 fn download_target_at_position(
     terminal: &Terminal,
@@ -94,8 +98,8 @@ fn download_target_at_position(
     if columns == 0 || rows == 0 {
         return None;
     }
-    let column = ((position.x / bounds.cell_width()).round() as usize).min(columns - 1);
-    let row = ((position.y / bounds.line_height()).round() as usize).min(rows - 1);
+    let column = ((position.x / bounds.cell_width()) as usize).min(columns - 1);
+    let row = ((position.y / bounds.line_height()) as usize).min(rows - 1);
     let cell = content.cells.get(row.checked_mul(columns)?.checked_add(column)?)?;
     download_target_from_uri(cell.cell.hyperlink()?.uri())
 }
@@ -927,18 +931,26 @@ impl TerminalElement {
                 })
             }
         });
-
         window.on_mouse_event({
             let terminal = self.terminal.clone();
             let hitbox = hitbox.clone();
             let focus = focus.clone();
             let terminal_view = terminal_view.clone();
+            let download_click_state = download_click_state.clone();
             move |e: &MouseMoveEvent, phase, window, cx| {
                 if phase != DispatchPhase::Bubble {
                     return;
                 }
 
-                if e.pressed_button.is_some() && !cx.has_active_drag() && focus.is_focused(window) {
+                let download_pending = download_click_state
+                    .lock()
+                    .ok()
+                    .is_some_and(|pending| pending.is_some());
+                if e.pressed_button.is_some()
+                    && !download_pending
+                    && !cx.has_active_drag()
+                    && focus.is_focused(window)
+                {
                     let hovered = hitbox.is_hovered(window);
 
                     let scroll_top = terminal_view.read(cx).scroll_top;
@@ -1663,7 +1675,14 @@ impl Element for TerminalElement {
                     base_text_style: text_style,
                     content_mode,
                     images: resolve_terminal_images(&self.terminal, cx),
-                    media: self.media.clone(),
+                    // External media is anchored to the live viewport. It is
+                    // not part of the server's scrollback snapshot, so never
+                    // paint it over historical rows while the user scrolls.
+                    media: if display_offset == 0 {
+                        self.media.clone()
+                    } else {
+                        Vec::new()
+                    },
                     // Uncut: the tab strip's 25-character budget is not this
                     // surface's problem, and this is the name a reader is given
                     // when focus lands here.

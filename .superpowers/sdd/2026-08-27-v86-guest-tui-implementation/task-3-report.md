@@ -27,19 +27,21 @@ by the packaging script as `/mnt/z3rm-terminal-grid.png`.
   and 65 move a clamped page offset; left-clicks map to download/copy rectangles.
 - The landing page includes a colored z3rm/product header, guest/GPUI/mux/serial
   architecture explanation, a scrollable page, a visible OSC 8
-  `z3rm-download:/` `Download server` link, and a `Copy install command` button.
+  `z3rm-download:/z3rm-server` `Download server` link, and a side-by-side
+  `Copy install command` button.
 - The Kitty image command is generated from the bytes loaded at
   `/mnt/z3rm-terminal-grid.png` and uses exactly
   `a=T,f=100,i=1,c=56,r=12,q=2`.
 - Download clicks emit the OSC 8 hyperlink and BEL-terminated OSC 9
-  `z3rm-download;/` action consumed by the mux terminal-media scanner. Copy
-  clicks emit BEL-terminated OSC 9 `z3rm-copy;<base64>` plus OSC 52 `c;<base64>`
+  `z3rm-download;/z3rm-server` action consumed by the mux terminal-media scanner.
+  Copy clicks emit BEL-terminated OSC 9 `z3rm-copy;<base64>` plus OSC 52 `c;<base64>`
   with ST termination; the typed action and clipboard paths remain distinct.
 - Added the `/mnt/z3rm` wrapper: `a`, `attach`, and `landing` exec
   `/mnt/z3rm-tui`; any other command prints usage and exits 2.
 - The first web session pane now requests `/mnt/z3rm-tui` with empty args/env.
 - Packaging builds both static i686-musl binaries, stages the TUI, mux server,
   wrapper, start script, and PNG, exports `PATH=/mnt:$PATH` from `start-mux.sh`,
+  publishes the mux server as the static `v86/z3rm-server.bin` download artifact,
   removes stale `.bin` chunks, regenerates `fs.json`, and writes current hashes.
 
 ## TDD and verification
@@ -97,8 +99,18 @@ sum_entry_sizes 3577944 index_size 3577944 matches True
 The mux chunk is `1be1d510.bin` (3,091,140 bytes); the TUI chunk is
 `3d5df8dd.bin` (441,308 bytes). The wrapper, PNG, and start-script chunks
 remain unchanged. Both target binaries and packaged ELF chunks were rechecked
-as static i386 stripped ELFs, and the packaged PNG remains a valid 45,100-byte
-PNG.
+as static i386 stripped ELFs, and the packaged PNG remains a valid 45,100-byte PNG.
+
+## Current repackage
+
+After changing the landing download target to the named static artifact
+`/z3rm-server` and rendering the side-by-side copy control, the packaging script
+was rerun successfully. The current five-entry index is 3,579,480 bytes and
+references `0de4018e.bin` (442,844 bytes) for `z3rm-tui`; the mux server remains
+`1be1d510.bin` (3,091,140 bytes). The script also emits the ignored static
+artifact `website/public/v86/z3rm-server.bin` (3,091,140 bytes), which Trunk
+copies to `gpui-demo/v86/z3rm-server.bin` for browser downloads.
+
 
 Running the packaged wrapper with an unknown command returned the required
 status and usage text:
@@ -111,7 +123,7 @@ status=2 stderr=usage: /mnt/z3rm {a|attach|landing}
 target/i686-unknown-linux-musl/release/z3rm-tui:    ELF 32-bit LSB executable, Intel i386, version 1 (GNU/Linux), statically linked, stripped
 target/i686-unknown-linux-musl/release/z3rm-server: ELF 32-bit LSB executable, Intel i386, version 1 (GNU/Linux), statically linked, stripped
 website/public/v86/fs/1be1d510.bin:                ELF 32-bit LSB executable, Intel i386, version 1 (GNU/Linux), statically linked, stripped
-website/public/v86/fs/3d5df8dd.bin:                 ELF 32-bit LSB executable, Intel i386, version 1 (GNU/Linux), statically linked, stripped
+website/public/v86/fs/0de4018e.bin:                 ELF 32-bit LSB executable, Intel i386, version 1 (GNU/Linux), statically linked, stripped
 website/public/v86/fs/c19922ad.bin:                 PNG image data, 1440 x 640, 8-bit/color RGBA, non-interlaced
 ```
 

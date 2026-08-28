@@ -7,9 +7,9 @@ Implemented the client-side half of the mux media/action protocol in:
 - `crates/terminal_view/src/mux_pane.rs`
 - `crates/terminal_view/src/terminal_element.rs`
 
-No additional source file was required. `crates/terminal_view/Cargo.toml`,
-`crates/gpui_web/src/platform.rs`, website files, and
-`crates/fs/src/wasm_fs.rs` were not modified. The pre-existing untracked
+Follow-up hardening and browser integration also touched
+`crates/mux/src/mux.rs`, `crates/terminal_view/Cargo.toml`, and the wasm host
+path in `crates/z3rm_web`. The unrelated untracked
 `crates/fs/src/wasm_fs.rs` was left untouched.
 
 ## Implementation
@@ -24,21 +24,37 @@ No additional source file was required. `crates/terminal_view/Cargo.toml`,
 - Delete notifications remove every cached frame for the image id and release
   decoded images. `PaneRemoved` clears the entire media cache and emits the
   existing `CloseRequested` event.
-- Added `BrowserDownloadCallback` and `BrowserClipboardCallback` injection
-  APIs on `MuxPaneView`. Typed DOWNLOAD actions pass the URI and a safe
-  basename (root paths use `download`); typed COPY actions preserve the exact
-  decoded Unicode string. COPY falls back to the existing GPUI clipboard
-  abstraction when no browser callback is installed.
+- Added `BrowserDownloadCallback` and `BrowserClipboardCallback` injection APIs
+  on `MuxPaneView`. Typed DOWNLOAD actions pass the URI and a sanitized
+  basename (including query/fragment, separator, dot-name, and control-byte
+  handling); typed COPY actions preserve the exact decoded Unicode string.
+  COPY falls back to the existing GPUI clipboard abstraction when no callback
+  is installed.
 - Added safe `z3rm-download:` hyperlink handling in `TerminalElement`: a
   left-click in a non-mouse-mode pane is captured on press and invokes the
   download callback only when release remains on the same target. Private
-  links never fall through to URL navigation when no callback is installed;
-  ordinary URLs retain the existing `Terminal::mouse_up` path. Mouse-mode
-  panes retain the SGR input path, allowing the guest to produce typed actions.
-- Existing authoritative `Terminal::last_content().mode` and DisplayOnly
-  input sink continue to govern mouse tracking. Focused coverage verifies
-  SGR wheel reports use button 64/65 and are delivered through the input sink
-  used by `MuxPaneView`'s `MuxDomain::send_input` path.
+  links are consumed for all modifiers and never fall through to URL
+  navigation; ordinary URLs retain the existing `Terminal::mouse_up` path.
+  Mouse-mode panes retain the SGR input path, allowing the guest to produce
+  typed actions.
+- Existing authoritative `Terminal::last_content().mode` and DisplayOnly input
+  sink continue to govern mouse tracking. Focused coverage verifies SGR wheel
+  reports use button 64/65 and are delivered through the input sink used by
+  `MuxPaneView`'s `MuxDomain::send_input` path.
+
+## Follow-up hardening
+
+- Media metadata is inherited from the first chunk for a `(image_id, sequence)`
+  key, format 100 requires a PNG signature, and placement dimensions are
+  bounded before painting.
+- The client accounts decoded and in-flight media bytes under a 256 MiB
+  per-pane limit, releases encoded allocations after decode, rejects new frames
+  instead of evicting live entries when its 256-frame cap is reached, orders
+  visible frames by sequence, releases entries on delete/pane removal, and
+  suppresses live media while viewing scrollback.
+- `PaneMedia` and `PaneAction` are reliable notification classes in `MuxDomain`,
+  so saturated subscribers backpressure (or use the wasm overflow queue)
+  instead of silently dropping typed events.
 
 ## Focused tests and checks
 
@@ -62,20 +78,17 @@ cargo test -p terminal_view pane_media_notifications_create_and_delete_visible_i
 1 passed
 ```
 
-The final required focused command was also run:
+The final required focused command was rerun after the hardening and browser
+host integration:
 
 ```text
 cargo test -p terminal_view mux_pane
-33 passed; 2 failed
+37 passed; 0 failed
 ```
 
-The two failures are existing tests unrelated to this change:
-
-- `mux_pane::tests::a_terminal_selection_is_reported_as_a_text_range`
-- `mux_pane::tests::dirty_during_fetch_triggers_cursor_catch_up`
-
-Both failures were present in the initial focused run before the new client
-behavior was added; the new media/action/mouse tests pass in the same suite.
+The focused suite covers media add/decode/position/delete and pane removal,
+metadata inheritance, cache-limit retention, typed DOWNLOAD/COPY dispatch
+including Unicode, private-link gating, and SGR wheel buttons 64/65.
 
 Wasm checks completed with exit status 0 (warnings only):
 
@@ -86,16 +99,10 @@ cargo check -p z3rm_web --target wasm32-unknown-unknown
 
 No formatter, linter, or project-wide test suite was run.
 
-## Concerns
+## Remaining risk
 
-- The host must install the two callback types with
-  `MuxPaneView::set_browser_action_callbacks` (or the separate setters). This
-  keeps DOM/browser code out of `terminal_view`; no website bridge was changed
-  in Task 4.
-- `MuxDomain` currently classifies `PaneMedia` and `PaneAction` as lossy in
-  its notification fan-out policy. The client consumes them correctly when
-  delivered, but a saturated subscriber can still lose a typed event; fixing
-  that policy belongs outside the Task 4 file ownership.
-- Browser permission rejection is necessarily handled by the injected host
-  callback (the callback is intentionally browser-runtime agnostic). The
-  existing GPUI clipboard fallback remains available for non-browser hosts.
+- The wasm host now installs default browser download/clipboard callbacks in
+  every `MuxPaneView` construction path, including split panes. Unsupported
+  download schemes and rejected clipboard promises are logged by that host
+  seam; native hosts can still inject their own callbacks or use the GPUI
+  clipboard fallback.

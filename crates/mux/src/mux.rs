@@ -209,12 +209,10 @@ pub(crate) fn prune_closed_subscribers(subscribers: &mut Vec<SubscriberSender>) 
 
 /// Fan one notification out to every live subscriber.
 ///
-/// Reliable notifications (§3.4 lifecycle events) block the dedicated I/O
-/// thread rather than drop — the bounded subscriber queue applies backpressure.
-/// Everything else is a supplemental dirty signal and never blocks the router:
-/// `PaneOutputChunk` drops outright on a full queue, while a full-queue
-/// `PaneDirty` records the pane in the subscriber's latch for the receiver to
-/// synthesize once the queue drains.
+/// Reliable lifecycle and typed media/action notifications block the native
+/// I/O thread rather than drop; on wasm they move to the subscriber's FIFO
+/// overflow queue. Supplemental `PaneOutputChunk` drops on a full queue, and
+/// `PaneDirty` records a per-pane latch for later synthesis.
 pub(crate) fn fan_out_notification(subscribers: &[SubscriberSender], notification: &Notification) {
     let reliable = notification_requires_reliable_delivery(notification);
     for subscriber in subscribers {
@@ -273,17 +271,11 @@ pub(crate) fn fan_out_notification(subscribers: &[SubscriberSender], notificatio
 }
 /// Notifications that must never be dropped by the router fan-out.
 ///
-/// Lifecycle events are at-least-once by contract (§3.4): losing PaneRemoved
-/// leaves a zombie pane, so they briefly block the dedicated I/O thread rather
-/// than drop. Every other notification is a supplemental dirty signal, not a
-/// data path: `PaneOutputChunk` is the §3.1 render-path byte stream and
-/// `PaneDirty` is the push half of push/pull sync. Neither carries
-/// authoritative state, so losing either only defers the next
-/// `fetch_grid_update` pull and the router never blocks on a slow renderer —
-/// recovery comes from the authoritative pull, not from the notification
-/// stream itself. A full queue drops `PaneOutputChunk` outright and records a
-/// dropped `PaneDirty` in the subscriber's per-pane latch, which the receiver
-/// synthesizes exactly once when the queue drains.
+/// Lifecycle events (§3.4) and typed media/actions are at-least-once: losing a
+/// `PaneRemoved` leaves a zombie pane, while losing a download/copy or media
+/// event changes user-visible behavior. Native transports apply backpressure;
+/// wasm uses the subscriber's reliable overflow queue because blocking the
+/// browser's only thread would deadlock it.
 fn notification_requires_reliable_delivery(notification: &Notification) -> bool {
     matches!(
         notification.event,
@@ -293,6 +285,8 @@ fn notification_requires_reliable_delivery(notification: &Notification) -> bool 
             | Some(NotifEvent::PaneZoomed(_))
             | Some(NotifEvent::PaneTitleChanged(_))
             | Some(NotifEvent::PaneBell(_))
+            | Some(NotifEvent::PaneMedia(_))
+            | Some(NotifEvent::PaneAction(_))
             | Some(NotifEvent::ExtensionChrome(_))
             | Some(NotifEvent::WindowAdded(_))
             | Some(NotifEvent::WindowRemoved(_))
@@ -2069,6 +2063,14 @@ mod tests {
         assert!(!notification_requires_reliable_delivery(&dirty));
         // Lifecycle events remain at-least-once and block the router.
         assert!(notification_requires_reliable_delivery(&removed));
+        let media = Notification {
+            event: Some(NotifEvent::PaneMedia(mux_protocol::PaneMedia::default())),
+        };
+        let action = Notification {
+            event: Some(NotifEvent::PaneAction(mux_protocol::PaneAction::default())),
+        };
+        assert!(notification_requires_reliable_delivery(&media));
+        assert!(notification_requires_reliable_delivery(&action));
     }
 
     /// §3.4 Deterministic regression: a subscriber saturated with lossy

@@ -58,6 +58,25 @@
     }
   }
 
+  function resourceKind(transport, url) {
+    let pathname = "";
+    try {
+      pathname = new URL(url, document.baseURI).pathname;
+    } catch {
+      // The full URL is still shown by the tracker when parsing fails.
+    }
+    if (/\/fs\/[^/]+\.bin$/i.test(pathname)) {
+      return `${transport} system bin`;
+    }
+    if (/\.wasm$/i.test(pathname)) {
+      return `${transport} wasm`;
+    }
+    if (pathname.includes("/v86/")) {
+      return `${transport} guest resource`;
+    }
+    return transport;
+  }
+
   function resourceStage(kind, url) {
     requestNumber += 1;
     return `${kind} ${url} (${requestNumber})`;
@@ -245,7 +264,7 @@
     const originalFetch = window.fetch;
     window.fetch = function trackedFetch(input, init) {
       const url = resourceUrl(input);
-      const stage = resourceStage("fetch", url);
+      const stage = resourceStage(resourceKind("fetch", url), url);
       recordStage(stage, 0, 0);
       let request;
       try {
@@ -330,7 +349,7 @@
       if (!request || typeof xhr.addEventListener !== "function") {
         return originalSend.call(this, body);
       }
-      request.stage = resourceStage(`xhr ${request.method}`, request.url);
+      request.stage = resourceStage(resourceKind(`xhr ${request.method}`, request.url), request.url);
       let loaded = 0;
       let total = 0;
       const headerTotal = () => {

@@ -11,7 +11,7 @@ const PAGE_HEIGHT: usize = 46;
 const SCROLL_STEP: usize = 3;
 const IMAGE_PAGE_ROW: usize = 17;
 const IMAGE_PATH: &str = "/mnt/z3rm-terminal-grid.png";
-const DOWNLOAD_ROOT: &str = "/";
+const DOWNLOAD_ROOT: &str = "/z3rm-server";
 const COPY_TEXT: &str = "cargo install z3rm";
 const COPY_BASE64: &str = "Y2FyZ28gaW5zdGFsbCB6M3Jt";
 
@@ -624,14 +624,35 @@ fn draw(app: &App) -> io::Result<()> {
             write_fd(STDOUT_FD, app.image_command.as_bytes())?;
         }
 
-        if page_row == app.layout.download.y + 1 {
-            write_fd(STDOUT_FD, b"    \x1b[48;5;24;38;5;255m  ")?;
+        if page_row == app.layout.download.y + 1
+            && page_row == app.layout.copy.y + 1
+        {
+            let download_column = format!("\x1b[{}G", app.layout.download.x + 1);
+            write_fd(STDOUT_FD, download_column.as_bytes())?;
+            write_fd(STDOUT_FD, b"\x1b[48;5;24;38;5;255m  ")?;
             write_fd(STDOUT_FD, b"\x1b]8;;z3rm-download:")?;
             write_fd(STDOUT_FD, app.content_root.as_bytes())?;
-            write_fd(STDOUT_FD, b"\x1b\\Download server\x1b]8;;\x1b\\")?;
-            write_fd(STDOUT_FD, b"  \x1b[0m")?;
+            write_fd(STDOUT_FD, b"\x1b\\Download server\x1b]8;;\x1b\\  \x1b[0m")?;
+            let copy_column = format!("\x1b[{}G", app.layout.copy.x + 1);
+            write_fd(STDOUT_FD, copy_column.as_bytes())?;
+            write_fd(
+                STDOUT_FD,
+                b"\x1b[48;5;238;38;5;255m  Copy install command  \x1b[0m",
+            )?;
+        } else if page_row == app.layout.download.y + 1 {
+            let download_column = format!("\x1b[{}G", app.layout.download.x + 1);
+            write_fd(STDOUT_FD, download_column.as_bytes())?;
+            write_fd(STDOUT_FD, b"\x1b[48;5;24;38;5;255m  ")?;
+            write_fd(STDOUT_FD, b"\x1b]8;;z3rm-download:")?;
+            write_fd(STDOUT_FD, app.content_root.as_bytes())?;
+            write_fd(STDOUT_FD, b"\x1b\\Download server\x1b]8;;\x1b\\  \x1b[0m")?;
         } else if page_row == app.layout.copy.y + 1 {
-            write_fd(STDOUT_FD, b"                                 \x1b[48;5;238;38;5;255m  Copy install command  \x1b[0m")?;
+            let copy_column = format!("\x1b[{}G", app.layout.copy.x + 1);
+            write_fd(STDOUT_FD, copy_column.as_bytes())?;
+            write_fd(
+                STDOUT_FD,
+                b"\x1b[48;5;238;38;5;255m  Copy install command  \x1b[0m",
+            )?;
         } else {
             let line = lines.get(page_row).copied().unwrap_or("");
             let mut visible = line.as_bytes().to_vec();
@@ -724,7 +745,7 @@ mod tests {
 
         assert_eq!(result.action, Some(Action::Download));
         assert!(result.output.contains("z3rm-download:"));
-        assert!(result.output.contains("\x1b]9;z3rm-download;/\x07"));
+        assert!(result.output.contains("\x1b]9;z3rm-download;/z3rm-server\x07"));
     }
 
     #[test]
@@ -756,7 +777,7 @@ mod tests {
         );
 
         assert_eq!(result.action, Some(Action::Copy));
-        let download = result.output.find("\x1b]9;z3rm-download;/\x07");
+        let download = result.output.find("\x1b]9;z3rm-download;/z3rm-server\x07");
         let copy_action = result.output.find("\x1b]9;z3rm-copy;");
         let copy_clipboard = result.output.find("\x1b]52;c;");
         assert!(download.is_some());

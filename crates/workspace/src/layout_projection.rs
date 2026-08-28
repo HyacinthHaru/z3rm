@@ -499,6 +499,9 @@ pub fn install_snapshot_panes(
                 |workspace, window, cx| workspace.add_pane_for_layout(window, cx),
                 |workspace, pane, pane_id, window, cx| {
                     panes_by_id.push((pane_id.clone(), pane.clone()));
+                    pane.update(cx, |pane, _| {
+                        pane.set_should_display_welcome_page(false);
+                    });
                     let item = build_pane_item(workspace, pane_id, window, cx);
                     workspace.add_item(pane.clone(), item, None, true, true, window, cx);
                 },

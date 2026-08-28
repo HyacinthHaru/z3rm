@@ -57,6 +57,9 @@ zed_actions.workspace = true
 
 [target.'cfg(target_family = "wasm")'.dependencies]
 wasm-bindgen-futures.workspace = true
+wasm-bindgen.workspace = true
+js-sys.workspace = true
+web-sys = { version = "0.3", features = ["Document", "Element", "Window", "HtmlAnchorElement", "HtmlElement", "Navigator", "Clipboard", "Url"] }
 
 [dev-dependencies]
 editor = { workspace = true, features = ["test-support"] }

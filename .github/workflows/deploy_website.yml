@@ -19,6 +19,7 @@ on:
       - "crates/editor/**"
       - "crates/mux/**"
       - "crates/mux_server/**"
+      - "crates/z3rm_guest_tui/**"
       - "crates/db/**"
       - "crates/session/**"
       - "crates/theme/**"

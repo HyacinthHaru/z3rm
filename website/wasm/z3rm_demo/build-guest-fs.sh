@@ -26,6 +26,8 @@ case "${1-}" in
 esac
 SCRIPT
 cp ../../../target/i686-unknown-linux-musl/release/z3rm-server "$STAGE/mux_server"
+rm -f ../../public/v86/z3rm-server ../../public/v86/z3rm-server.bin
+cp "$STAGE/mux_server" ../../public/v86/z3rm-server.bin
 cat > "$STAGE/start-mux.sh" <<'SCRIPT'
 #!/bin/sh
 mkdir -p /dev/pts
