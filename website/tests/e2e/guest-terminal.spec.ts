@@ -45,18 +45,22 @@ test("real guest renders Kitty media and handles terminal actions", async ({ pag
 
   let download = null;
   let downloadY = 0;
+  const downloadEvent = page
+    .waitForEvent("download", { timeout: 60_000 })
+    .catch(() => null);
   for (const candidateY of Array.from({ length: 34 }, (_, index) => 80 + index * 10)) {
-    const downloadEvent = page
-      .waitForEvent("download", { timeout: 300 })
-      .catch(() => null);
     await page.mouse.click(canvasBox.x + 120, canvasBox.y + candidateY);
-    const candidate = await downloadEvent;
+    const candidate = await Promise.race([
+      downloadEvent,
+      page.waitForTimeout(300).then(() => null),
+    ]);
     if (candidate) {
       download = candidate;
       downloadY = candidateY;
       break;
     }
   }
+  if (!download) download = await downloadEvent;
   expect(download).not.toBeNull();
   expect(download!.suggestedFilename()).toBe("z3rm-server");
   expect(download!.url()).toMatch(/\/v86\/z3rm-server\.bin$/);
