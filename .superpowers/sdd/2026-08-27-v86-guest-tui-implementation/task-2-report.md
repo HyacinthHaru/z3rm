@@ -292,3 +292,39 @@ $ RUSTFLAGS="-C linker=rust-lld" cargo check -p mux_server \
     --target i686-unknown-linux-musl --no-default-features --features guest
 Finished successfully (warnings only; exit 0).
 ```
+
+## Fix round 5 — drain handoff race
+
+The final review identified a registration race in the lossless pending-event
+drainer: a hook setter could observe an active drainer while the drainer was
+about to requeue an event with no matching hook, leaving that event stuck. A
+`retry_requested` handoff flag now causes the drainer to restart after the
+requeue, while still invoking callbacks without queue or hook locks. The pane
+drop regression was also made deterministic by using an exiting child and a
+bounded wait for the reader's strong reference to release.
+
+Final focused verification:
+
+```text
+$ cargo test -p mux_server --lib -- media_
+cargo test: 6 passed (1 suite, 283 filtered, 0.00s)
+
+$ cargo test -p mux_server --lib -- hook_registration_during_drain_releases_pending_action
+cargo test: 1 passed (1 suite, 288 filtered, 0.00s)
+
+$ cargo test -p mux_server --lib -- pane_drop_releases_media_hook_without_arc_cycle
+cargo test: 1 passed (1 suite, 288 filtered, 0.00s)
+
+$ cargo test -p mux_server terminal_media
+cargo test: 23 passed (5 suites, 312 filtered, 0.00s)
+
+$ cargo check -p mux_server
+Finished successfully (warnings only; exit 0).
+
+$ RUSTFLAGS="-C linker=rust-lld" cargo check -p mux_server \
+    --target i686-unknown-linux-musl --no-default-features --features guest
+Finished successfully (warnings only; exit 0).
+```
+
+The `media_` filter includes six matching tests; all six pass. Existing
+workspace dependency-patch and unused/dead-code warnings remain unrelated.

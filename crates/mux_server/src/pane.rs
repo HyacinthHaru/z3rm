@@ -46,6 +46,7 @@ enum PendingTypedEvent {
 struct PendingTypedEvents {
     queue: VecDeque<PendingTypedEvent>,
     draining: bool,
+    retry_requested: bool,
 }
 
 /// §3.1 真正拥有 alacritty Term + PTY pair 的 Pane (server-canonical)。
@@ -953,6 +954,7 @@ impl Pane {
             pending_typed_events: parking_lot::Mutex::new(PendingTypedEvents {
                 queue: VecDeque::new(),
                 draining: false,
+                retry_requested: false,
             }),
             #[cfg(target_family = "wasm")]
             guest_output_state: parking_lot::Mutex::new((
@@ -1613,10 +1615,15 @@ impl Pane {
     /// Drain without holding either the queue or hook lock while invoking a
     /// callback. `draining` also makes re-entrant hook registration safe: the
     /// active drainer observes newly queued events after the callback returns.
+    /// Drain without holding either the queue or hook lock while invoking a
+    /// callback. `draining` serializes concurrent drains, while
+    /// `retry_requested` hands off a hook registration that races a missing
+    /// hook at the front of the queue.
     fn drain_pending_typed_events(&self) {
         {
             let mut pending = self.pending_typed_events.lock();
             if pending.draining {
+                pending.retry_requested = true;
                 return;
             }
             pending.draining = true;
@@ -1626,6 +1633,7 @@ impl Pane {
                 let mut pending = self.pending_typed_events.lock();
                 let Some(event) = pending.queue.pop_front() else {
                     pending.draining = false;
+                    pending.retry_requested = false;
                     return;
                 };
                 event
@@ -1636,9 +1644,17 @@ impl Pane {
                     if let Some(hook) = hook {
                         hook(vec![media]);
                     } else {
-                        let mut pending = self.pending_typed_events.lock();
-                        pending.queue.push_front(PendingTypedEvent::Media(media));
-                        pending.draining = false;
+                        let retry = {
+                            let mut pending = self.pending_typed_events.lock();
+                            pending.queue.push_front(PendingTypedEvent::Media(media));
+                            let retry = pending.retry_requested;
+                            pending.retry_requested = false;
+                            pending.draining = false;
+                            retry
+                        };
+                        if retry {
+                            self.drain_pending_typed_events();
+                        }
                         return;
                     }
                 }
@@ -1647,9 +1663,17 @@ impl Pane {
                     if let Some(hook) = hook {
                         hook(vec![action]);
                     } else {
-                        let mut pending = self.pending_typed_events.lock();
-                        pending.queue.push_front(PendingTypedEvent::Action(action));
-                        pending.draining = false;
+                        let retry = {
+                            let mut pending = self.pending_typed_events.lock();
+                            pending.queue.push_front(PendingTypedEvent::Action(action));
+                            let retry = pending.retry_requested;
+                            pending.retry_requested = false;
+                            pending.draining = false;
+                            retry
+                        };
+                        if retry {
+                            self.drain_pending_typed_events();
+                        }
                         return;
                     }
                 }
@@ -2580,10 +2604,82 @@ mod tests {
 
     #[test]
     fn pane_drop_releases_media_hook_without_arc_cycle() {
-        let pane = spawn_media_pane("media-hook-drop");
+        let pane = Pane::spawn(
+            "media-hook-drop".to_string(),
+            std::env::temp_dir().to_string_lossy().to_string(),
+            20,
+            6,
+            Some(ShellCommand {
+                program: "/bin/false".to_string(),
+                ..Default::default()
+            }),
+        )
+        .expect("spawn media hook drop pane");
         let weak = Arc::downgrade(&pane);
         drop(pane);
-        assert!(weak.upgrade().is_none());
+        for _ in 0..100 {
+            if weak.upgrade().is_none() {
+                return;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+        panic!("pane reader retained a strong reference after drop");
+    }
+
+    #[test]
+    fn hook_registration_during_drain_releases_pending_action() {
+        let pane = Pane::spawn_with_session(
+            "media-hook-drain-race".to_string(),
+            "session".to_string(),
+            std::env::temp_dir().to_string_lossy().to_string(),
+            20,
+            6,
+            Some(ShellCommand {
+                program: "/bin/cat".to_string(),
+                ..Default::default()
+            }),
+            100,
+        )
+        .expect("spawn media hook drain pane");
+        let received = Arc::new(Mutex::new(Vec::<PaneAction>::new()));
+        let started = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let release = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        {
+            let mut pending = pane.pending_typed_events.lock();
+            pending
+                .queue
+                .push_back(PendingTypedEvent::Media(PaneMedia::default()));
+            pending
+                .queue
+                .push_back(PendingTypedEvent::Action(PaneAction::default()));
+        }
+
+        let pane_for_drain = pane.clone();
+        let started_for_hook = started.clone();
+        let release_for_hook = release.clone();
+        let drain_thread = std::thread::spawn(move || {
+            pane_for_drain.set_media_hook(Box::new(move |_media| {
+                started_for_hook.store(true, std::sync::atomic::Ordering::SeqCst);
+                while !release_for_hook.load(std::sync::atomic::Ordering::SeqCst) {
+                    std::thread::yield_now();
+                }
+            }));
+        });
+        for _ in 0..1000 {
+            if started.load(std::sync::atomic::Ordering::SeqCst) {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+        assert!(started.load(std::sync::atomic::Ordering::SeqCst));
+
+        let captured = received.clone();
+        pane.set_action_hook(Box::new(move |actions| {
+            captured.lock().extend(actions);
+        }));
+        release.store(true, std::sync::atomic::Ordering::SeqCst);
+        drain_thread.join().expect("media hook drain thread");
+        assert_eq!(received.lock().len(), 1);
     }
     #[test]
     fn media_event_waits_for_late_hook_registration() {
