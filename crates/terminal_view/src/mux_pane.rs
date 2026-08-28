@@ -21,20 +21,28 @@ use mux_protocol::input::{
 use mux_protocol::{
     FetchScrollbackResponse, FullGridSnapshot, GridDiff,
     fetch_grid_update_response::Update as FetchUpdate, notification::Event as NotifEvent,
+    proto::{PaneAction, PaneActionKind, PaneMedia},
 };
 use project::Project;
 use settings::Settings;
+use std::collections::BTreeMap;
 use std::sync::Arc;
 use terminal::{
     CursorShape as TerminalCursorShape, Hyperlink as TerminalHyperlink, MAX_SCROLL_HISTORY_LINES,
     Modes, Rgb, StructuredTerminalCell, StructuredTerminalCursor, StructuredTerminalSnapshot,
     StructuredUnderlineStyle, Terminal, TerminalBounds, TerminalBuilder,
+    kitty_graphics::decode_encoded_image,
     terminal_settings::TerminalSettings,
 };
 use theme::ActiveTheme;
 use util::paths::PathStyle;
 
-use crate::terminal_element::TerminalElement;
+pub use crate::terminal_element::{
+    BrowserClipboardCallback, BrowserDownloadCallback, DownloadClickState, TerminalElement,
+    TerminalMedia,
+};
+use crate::terminal_element::download_target_from_uri;
+pub(crate) use crate::terminal_element::download_click_target;
 use crate::{TerminalMode, TerminalView};
 
 use workspace::{
@@ -73,6 +81,169 @@ const HISTORY_PAGE_ROWS: u32 = 512;
 /// per-page wire bound. This prevents a malicious snapshot from reserving a
 /// huge `cols * history_size` vector before the first RPC.
 const MAX_SCROLLBACK_CELLS: usize = mux_protocol::MAX_GRID_CELLS * 16;
+
+/// Kitty's encoded PNG format tag used by the server-side media scanner.
+const PNG_MEDIA_FORMAT: u32 = 100;
+
+
+#[derive(Clone)]
+struct PaneMediaEntry {
+    row: i32,
+    column: usize,
+    columns: usize,
+    rows: usize,
+    format: u32,
+    encoded: Vec<u8>,
+    render_image: Option<Arc<gpui::RenderImage>>,
+}
+
+/// Client-side cache for media notifications. The protocol's sequence is
+/// part of the key because an image id can be reused for a later frame; delete
+/// notifications remove every frame carrying the image id.
+#[derive(Default)]
+struct PaneMediaStore {
+    images: BTreeMap<(u32, u64), PaneMediaEntry>,
+}
+
+impl PaneMediaStore {
+    fn apply_notification(
+        &mut self,
+        media: &PaneMedia,
+    ) -> anyhow::Result<Vec<Arc<gpui::RenderImage>>> {
+        if media.delete {
+            return Ok(self.remove_image_id(media.image_id));
+        }
+
+        let key = (media.image_id, media.sequence);
+        let entry = self.images.entry(key).or_insert_with(|| PaneMediaEntry {
+            row: media.row,
+            column: media.column as usize,
+            columns: media.columns as usize,
+            rows: media.rows as usize,
+            format: media.format,
+            encoded: Vec::new(),
+            render_image: None,
+        });
+
+        // A duplicate final notification is harmless and must not append the
+        // same encoded bytes a second time.
+        if entry.render_image.is_some() {
+            return Ok(Vec::new());
+        }
+
+        entry.row = media.row;
+        entry.column = usize::try_from(media.column).unwrap_or(usize::MAX);
+        entry.columns = usize::try_from(media.columns).unwrap_or(usize::MAX);
+        entry.rows = usize::try_from(media.rows).unwrap_or(usize::MAX);
+        entry.format = media.format;
+        let encoded_len = entry
+            .encoded
+            .len()
+            .checked_add(media.data.len())
+            .ok_or_else(|| anyhow::anyhow!("pane media payload length overflow"))?;
+        anyhow::ensure!(
+            encoded_len <= terminal::kitty_graphics::MAX_IMAGE_BYTES,
+            "pane media payload exceeds the {} byte limit",
+            terminal::kitty_graphics::MAX_IMAGE_BYTES
+        );
+        entry.encoded.extend_from_slice(&media.data);
+
+        if media.final_chunk {
+            // Format zero is the scanner's backwards-compatible default; the
+            // decoder still validates that its bytes are an encoded image.
+            anyhow::ensure!(
+                entry.format == 0 || entry.format == PNG_MEDIA_FORMAT,
+                "unsupported pane media format {}",
+                entry.format
+            );
+            let decoded = decode_encoded_image(&entry.encoded)
+                .map_err(|error| anyhow::anyhow!("decode pane media image: {error}"))?;
+            entry.render_image = Some(decoded.render_image);
+            entry.encoded.clear();
+        }
+
+        // Keep the cache bounded even if a guest repeatedly publishes unique
+        // image ids. Sequence ordering makes the oldest entry deterministic.
+        const MAX_MEDIA_IMAGES: usize = 256;
+        let mut dropped = Vec::new();
+        while self.images.len() > MAX_MEDIA_IMAGES {
+            let Some(oldest_key) = self.images.keys().next().copied() else {
+                break;
+            };
+            if let Some(oldest) = self.images.remove(&oldest_key)
+                && let Some(image) = oldest.render_image
+            {
+                dropped.push(image);
+            }
+        }
+        Ok(dropped)
+    }
+
+    fn remove_image_id(&mut self, image_id: u32) -> Vec<Arc<gpui::RenderImage>> {
+        let keys: Vec<_> = self
+            .images
+            .keys()
+            .copied()
+            .filter(|(id, _)| *id == image_id)
+            .collect();
+        let mut dropped = Vec::new();
+        for key in keys {
+            if let Some(entry) = self.images.remove(&key)
+                && let Some(image) = entry.render_image
+            {
+                dropped.push(image);
+            }
+        }
+        dropped
+    }
+
+    fn clear(&mut self) -> Vec<Arc<gpui::RenderImage>> {
+        std::mem::take(&mut self.images)
+            .into_iter()
+            .filter_map(|(_, entry)| entry.render_image)
+            .collect()
+    }
+
+    fn visible_images(&self) -> Vec<TerminalMedia> {
+        self.images
+            .iter()
+            .filter_map(|(key, entry)| {
+                Some(TerminalMedia {
+                    key: *key,
+                    row: entry.row,
+                    column: entry.column,
+                    columns: entry.columns,
+                    rows: entry.rows,
+                    render_image: entry.render_image.clone()?,
+                })
+            })
+            .collect()
+    }
+}
+fn invoke_browser_action(
+    action: &PaneAction,
+    download: Option<&BrowserDownloadCallback>,
+    copy: Option<&BrowserClipboardCallback>,
+) -> bool {
+    match PaneActionKind::from_i32(action.kind) {
+        Some(PaneActionKind::Download) => {
+            let Some(callback) = download else {
+                return false;
+            };
+            let (uri, filename) = MuxPaneView::download_action_target(&action.value);
+            callback(uri, filename);
+            true
+        }
+        Some(PaneActionKind::Copy) => {
+            let Some(callback) = copy else {
+                return false;
+            };
+            callback(action.value.clone());
+            true
+        }
+        Some(PaneActionKind::Unspecified) | None => false,
+    }
+}
 
 #[derive(Clone, Debug)]
 struct HistoryCache {
@@ -179,6 +350,15 @@ pub struct MuxPaneView {
     snapshot: FullGridSnapshot,
     /// Oldest-to-newest authoritative history for `snapshot`.
     history_cache: HistoryCache,
+    /// §16.13 Client-side media keyed by the server's image id and sequence.
+    media: PaneMediaStore,
+    /// Browser bridge callbacks are injected by the wasm host. Desktop hosts
+    /// can leave them unset and continue using ordinary terminal behavior.
+    download_callback: Option<BrowserDownloadCallback>,
+    copy_callback: Option<BrowserClipboardCallback>,
+    /// Shared press state lets TerminalElement intercept a z3rm download link
+    /// without mutating the terminal's selection state before mouse-up.
+    download_click_state: DownloadClickState,
     /// §15.7 zoom state
     zoomed: bool,
     /// §3.10 last resize dimensions sent to server (cols, rows)
@@ -344,6 +524,10 @@ impl MuxPaneView {
             fetch_retry_task: None,
             snapshot,
             history_cache,
+            media: PaneMediaStore::default(),
+            download_callback: None,
+            copy_callback: None,
+            download_click_state: Arc::new(std::sync::Mutex::new(None)),
             zoomed: false,
             last_sent_size: (80, 24),
             prefix_machine: PrefixModeMachine::new(PrefixModeConfig::default()),
@@ -433,9 +617,31 @@ impl MuxPaneView {
                 *pending_dirty = true;
                 true
             }
+            NotifEvent::PaneMedia(media) if media.pane_id == pane_id => {
+                if let Err(error) = weak.update(cx, |view, cx| {
+                    view.apply_media_notification(media, cx);
+                }) {
+                    tracing::debug!(error = %error, "MuxPaneView dropped after pane media update");
+                }
+                true
+            }
+            NotifEvent::PaneAction(action) if action.pane_id == pane_id => {
+                if let Err(error) = weak.update(cx, |view, cx| {
+                    view.apply_action_notification(action, cx);
+                }) {
+                    tracing::debug!(error = %error, "MuxPaneView dropped after pane action update");
+                }
+                true
+            }
             NotifEvent::PaneRemoved(removed) if removed.pane_id == pane_id => {
                 if let Err(error) = weak.update(cx, |view, cx| {
                     view.notification_task = None;
+                    for image in view.media.clear() {
+                        cx.drop_image(image, None);
+                    }
+                    if let Ok(mut pending) = view.download_click_state.lock() {
+                        pending.take();
+                    }
                     cx.emit(MuxPaneEvent::CloseRequested);
                 }) {
                     tracing::debug!(error = %error, "MuxPaneView dropped after pane removal");
@@ -459,6 +665,118 @@ impl MuxPaneView {
             }
             _ => true,
         }
+    }
+
+    fn apply_media_notification(&mut self, media: PaneMedia, cx: &mut Context<Self>) {
+        let key = (media.image_id, media.sequence);
+        match self.media.apply_notification(&media) {
+            Ok(dropped) => {
+                for image in dropped {
+                    cx.drop_image(image, None);
+                }
+                cx.notify();
+            }
+            Err(error) => {
+                // Do not retain an incomplete or undecodable entry. A later
+                // sequence can still publish the same image id cleanly.
+                self.media.images.remove(&key);
+                tracing::warn!(
+                    pane_id = %self.pane_id,
+                    image_id = media.image_id,
+                    sequence = media.sequence,
+                    error = %error,
+                    "discarding invalid pane media"
+                );
+                cx.emit(MuxPaneEvent::InputFailed {
+                    message: SharedString::from(format!(
+                        "failed to decode media for mux pane {}: {error}",
+                        self.pane_id
+                    )),
+                });
+            }
+        }
+    }
+
+    fn apply_action_notification(&mut self, action: PaneAction, cx: &mut Context<Self>) {
+        match PaneActionKind::from_i32(action.kind) {
+            Some(PaneActionKind::Download) => {
+                if !invoke_browser_action(
+                    &action,
+                    self.download_callback.as_ref(),
+                    self.copy_callback.as_ref(),
+                ) {
+                    cx.emit(MuxPaneEvent::InputFailed {
+                        message: SharedString::from(format!(
+                            "browser download bridge is unavailable for mux pane {}",
+                            self.pane_id
+                        )),
+                    });
+                }
+            }
+            Some(PaneActionKind::Copy) => {
+                if !invoke_browser_action(
+                    &action,
+                    self.download_callback.as_ref(),
+                    self.copy_callback.as_ref(),
+                ) {
+                    cx.write_to_clipboard(gpui::ClipboardItem::new_string(action.value));
+                }
+            }
+            Some(PaneActionKind::Unspecified) | None => {
+                tracing::warn!(
+                    pane_id = %self.pane_id,
+                    kind = action.kind,
+                    "ignoring unknown mux pane action"
+                );
+            }
+        }
+        cx.notify();
+    }
+
+    /// Install the browser-side callbacks used by typed DOWNLOAD/COPY
+    /// notifications and z3rm-download hyperlink clicks.
+    pub fn set_browser_action_callbacks(
+        &mut self,
+        download: Option<BrowserDownloadCallback>,
+        copy: Option<BrowserClipboardCallback>,
+        cx: &mut Context<Self>,
+    ) {
+        self.download_callback = download;
+        self.copy_callback = copy;
+        cx.notify();
+    }
+
+    pub fn set_browser_download_callback(
+        &mut self,
+        callback: Option<BrowserDownloadCallback>,
+        cx: &mut Context<Self>,
+    ) {
+        self.download_callback = callback;
+        cx.notify();
+    }
+
+    pub fn set_browser_clipboard_callback(
+        &mut self,
+        callback: Option<BrowserClipboardCallback>,
+        cx: &mut Context<Self>,
+    ) {
+        self.copy_callback = callback;
+        cx.notify();
+    }
+
+    fn download_action_target(value: &str) -> (String, String) {
+        let uri = value
+            .strip_prefix("z3rm-download:")
+            .unwrap_or(value)
+            .to_string();
+        let filename = uri
+            .rsplit('/')
+            .find(|part| !part.is_empty() && *part != "." && *part != "..")
+            .and_then(|part| part.split(['?', '#']).next())
+            .filter(|part| !part.is_empty())
+            .unwrap_or("download")
+            .to_string();
+        (uri, filename)
     }
 
     async fn flush_pending(weak: &WeakEntity<Self>, pending_dirty: &mut bool, cx: &mut AsyncApp) {
@@ -1707,6 +2025,9 @@ impl Render for MuxPaneView {
         let focused = self.focus_handle.is_focused(window);
         let terminal_handle = self.terminal.clone();
         let terminal_view_handle = self.terminal_view.clone();
+        let media = self.media.visible_images();
+        let download_callback = self.download_callback.clone();
+        let download_click_state = self.download_click_state.clone();
 
         let mut dispatch_context = gpui::KeyContext::new_with_defaults();
         dispatch_context.add("Terminal");
@@ -1759,10 +2080,7 @@ impl Render for MuxPaneView {
             .bg(colors.editor_background)
             .child(
                 div()
-                    .size_full()
-                    .id("mux-terminal-container")
-                    .bg(colors.editor_background)
-                    .child(TerminalElement::new(
+                    .child(TerminalElement::new_with_media(
                         terminal_handle,
                         terminal_view_handle,
                         self.workspace.clone(),
@@ -1771,6 +2089,9 @@ impl Render for MuxPaneView {
                         true, // cursor_visible
                         None, // block_below_cursor
                         TerminalMode::Standalone,
+                        media,
+                        download_callback,
+                        download_click_state,
                     )),
             )
             // §16.7 keyboard → shared input router → MuxDomain::send_input
@@ -1905,7 +2226,10 @@ impl Item for MuxPaneView {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use gpui::{TestAppContext, VisualContext as _};
+    use gpui::{
+        ScrollDelta, ScrollWheelEvent, TestAppContext, TouchPhase, VisualContext as _, point, px,
+        size,
+    };
     use mux_protocol::{
         Cell, CellStyle, Envelope, FetchGridUpdateResponse, FetchScrollbackResponse, Request,
         Response, RowChange, envelope::Payload as EnvelopePayload, request::Body as RequestBody,
@@ -2903,6 +3227,179 @@ mod tests {
             assert!(content.mode.contains(Modes::APP_CURSOR));
             assert!(content.mode.contains(Modes::BRACKETED_PASTE));
         });
+    }
+
+    #[cfg(unix)]
+    #[gpui::test]
+    async fn mux_notifications_apply_media_delete_and_browser_actions(
+        cx: &mut TestAppContext,
+    ) {
+        cx.executor().allow_parking();
+        cx.update(|cx| {
+            let settings_store = SettingsStore::test(cx);
+            cx.set_global(settings_store);
+            theme_settings::init(theme::LoadThemes::JustBase, cx);
+        });
+
+        let (client, server) =
+            std::os::unix::net::UnixStream::pair().expect("create notification socket pair");
+        client
+            .set_nonblocking(true)
+            .expect("set notification client nonblocking");
+        let domain = Arc::new(
+            MuxDomain::connect_with_blocking_stream(client).expect("connect notification mux domain"),
+        );
+        let server_thread = std::thread::spawn(move || serve_initial_grid(server, "notify-pane"));
+        let domain_for_view = domain.clone();
+        let (view, cx) = cx.add_window_view(|window, cx| {
+            MuxPaneView::new(
+                "notify-pane".to_string(),
+                domain_for_view,
+                WeakEntity::new_invalid(),
+                WeakEntity::new_invalid(),
+                window,
+                cx,
+            )
+        });
+        view.condition::<MuxPaneEvent>(cx, |view, _cx| {
+            view.generation == 7 && !view.fetch_in_flight
+        })
+        .await;
+        match server_thread.join() {
+            Ok(Ok(())) => {}
+            Ok(Err(error)) => panic!("notification mock server failed: {error}"),
+            Err(_) => panic!("notification mock server panicked"),
+        }
+
+        let downloads = Arc::new(std::sync::Mutex::new(Vec::<(String, String)>::new()));
+        let captured_downloads = downloads.clone();
+        let copies = Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+        let captured_copies = copies.clone();
+        view.update(cx, |view, cx| {
+            view.set_browser_action_callbacks(
+                Some(Arc::new(move |uri, filename| {
+                    captured_downloads.lock().unwrap().push((uri, filename));
+                })),
+                Some(Arc::new(move |text| {
+                    captured_copies.lock().unwrap().push(text);
+                })),
+                cx,
+            );
+        });
+
+        domain.broadcast_notification(mux_protocol::Notification {
+            event: Some(NotifEvent::PaneMedia(PaneMedia {
+                pane_id: "notify-pane".to_string(),
+                sequence: 1,
+                image_id: 7,
+                format: PNG_MEDIA_FORMAT,
+                row: 2,
+                column: 3,
+                columns: 1,
+                rows: 1,
+                data: tiny_png().to_vec(),
+                final_chunk: true,
+                delete: false,
+            })),
+        });
+        let media_deadline = web_time::Instant::now() + std::time::Duration::from_secs(5);
+        loop {
+            while cx.executor().tick() {}
+            if view.read_with(cx, |view, _cx| view.media.visible_images().len()) == 1 {
+                break;
+            }
+            assert!(web_time::Instant::now() < media_deadline, "media notification was not applied");
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+
+        domain.broadcast_notification(mux_protocol::Notification {
+            event: Some(NotifEvent::PaneAction(PaneAction {
+                pane_id: "notify-pane".to_string(),
+                sequence: 2,
+                kind: PaneActionKind::Download as i32,
+                value: "/z3rm-server".to_string(),
+            })),
+        });
+        domain.broadcast_notification(mux_protocol::Notification {
+            event: Some(NotifEvent::PaneAction(PaneAction {
+                pane_id: "notify-pane".to_string(),
+                sequence: 3,
+                kind: PaneActionKind::Copy as i32,
+                value: "安装 z3rm 🚀".to_string(),
+            })),
+        });
+        let action_deadline = web_time::Instant::now() + std::time::Duration::from_secs(5);
+        loop {
+            while cx.executor().tick() {}
+            if downloads.lock().unwrap().len() == 1 && copies.lock().unwrap().len() == 1 {
+                break;
+            }
+            assert!(
+                web_time::Instant::now() < action_deadline,
+                "browser action notification was not dispatched"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+        assert_eq!(
+            &*downloads.lock().unwrap(),
+            &[("/z3rm-server".to_string(), "z3rm-server".to_string())]
+        );
+        assert_eq!(&*copies.lock().unwrap(), &["安装 z3rm 🚀".to_string()]);
+
+        domain.broadcast_notification(mux_protocol::Notification {
+            event: Some(NotifEvent::PaneMedia(PaneMedia {
+                pane_id: "notify-pane".to_string(),
+                sequence: 4,
+                image_id: 7,
+                delete: true,
+                ..Default::default()
+            })),
+        });
+        let delete_deadline = web_time::Instant::now() + std::time::Duration::from_secs(5);
+        loop {
+            while cx.executor().tick() {}
+            if view.read_with(cx, |view, _cx| view.media.visible_images().is_empty()) {
+                break;
+            }
+            assert!(web_time::Instant::now() < delete_deadline, "media delete was not applied");
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+        domain.broadcast_notification(mux_protocol::Notification {
+            event: Some(NotifEvent::PaneMedia(PaneMedia {
+                pane_id: "notify-pane".to_string(),
+                sequence: 5,
+                image_id: 8,
+                format: PNG_MEDIA_FORMAT,
+                row: 1,
+                column: 1,
+                columns: 1,
+                rows: 1,
+                data: tiny_png().to_vec(),
+                final_chunk: true,
+                delete: false,
+            })),
+        });
+        let restored_deadline = web_time::Instant::now() + std::time::Duration::from_secs(5);
+        loop {
+            while cx.executor().tick() {}
+            if view.read_with(cx, |view, _cx| view.media.visible_images().len()) == 1 {
+                break;
+            }
+            assert!(
+                web_time::Instant::now() < restored_deadline,
+                "second media notification was not applied"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+        let close_requested = view.next_event::<MuxPaneEvent>(cx);
+        domain.broadcast_notification(mux_protocol::Notification {
+            event: Some(NotifEvent::PaneRemoved(mux_protocol::PaneRemoved {
+                pane_id: "notify-pane".to_string(),
+                exit_code: 0,
+            })),
+        });
+        assert_eq!(close_requested.await, MuxPaneEvent::CloseRequested);
+        assert!(view.read_with(cx, |view, _cx| view.media.visible_images().is_empty()));
     }
 
     /// Prefix and copy mode change what every key does. A sighted user sees the
@@ -4250,5 +4747,187 @@ mod tests {
                 "the grid stopped reaching the tree on redraw {frame}"
             );
         }
+    }
+    #[gpui::test]
+    async fn authoritative_mouse_mode_wheel_uses_sgr_button_64_and_65(
+        cx: &mut TestAppContext,
+    ) {
+        cx.executor().allow_parking();
+        cx.update(|cx| {
+            let settings_store = SettingsStore::test(cx);
+            cx.set_global(settings_store);
+            theme_settings::init(theme::LoadThemes::JustBase, cx);
+        });
+
+        let reports = Arc::new(std::sync::Mutex::new(Vec::<Vec<u8>>::new()));
+        let captured = reports.clone();
+        let terminal = cx.new(|cx| {
+            TerminalBuilder::new_display_only_with_bounds(
+                terminal::terminal_settings::CursorShape::Block,
+                settings::AlternateScroll::On,
+                None,
+                0,
+                cx.background_executor(),
+                PathStyle::local(),
+                TerminalBounds::new(
+                    px(18.),
+                    px(8.),
+                    gpui::Bounds {
+                        origin: point(px(0.), px(0.)),
+                        size: size(px(80.), px(90.)),
+                    },
+                ),
+            )
+            .subscribe(cx)
+        });
+        terminal.update(cx, |terminal, _cx| {
+            terminal.set_input_sink(Some(Arc::new(move |bytes| {
+                captured.lock().unwrap().push(bytes);
+            })));
+        });
+
+        let snapshot = StructuredTerminalSnapshot {
+            cols: 10,
+            rows: 5,
+            cells: vec![StructuredTerminalCell::default(); 50],
+            history: Vec::new(),
+            display_offset: 0,
+            cursor: Some(StructuredTerminalCursor {
+                point: terminal::Point::new(0, 0),
+                shape: TerminalCursorShape::Block,
+                visible: true,
+                blinking: false,
+            }),
+            alternate_screen: true,
+            modes: Modes::ALT_SCREEN | Modes::MOUSE_MODE | Modes::SGR_MOUSE,
+        };
+        terminal
+            .update(cx, |terminal, cx| terminal.apply_structured_snapshot(&snapshot, cx))
+            .expect("apply authoritative mouse-mode snapshot");
+
+        let positive = ScrollWheelEvent {
+            delta: ScrollDelta::Lines(point(0., 1.)),
+            touch_phase: TouchPhase::Moved,
+            position: point(px(2. * 8. + 1.), px(1. * 18. + 1.)),
+            ..Default::default()
+        };
+        let negative = ScrollWheelEvent {
+            delta: ScrollDelta::Lines(point(0., -1.)),
+            touch_phase: TouchPhase::Moved,
+            position: positive.position,
+            ..Default::default()
+        };
+        terminal.update(cx, |terminal, _cx| {
+            terminal.scroll_wheel(&positive, 1.0);
+            terminal.scroll_wheel(&negative, 1.0);
+        });
+
+        let reports = reports.lock().unwrap().clone();
+        assert_eq!(reports, vec![b"\x1b[<64;3;2M".to_vec(), b"\x1b[<65;3;2M".to_vec()]);
+    }
+
+    #[test]
+    fn pane_media_notifications_create_and_delete_visible_images() {
+        let mut store = PaneMediaStore::default();
+        let media = mux_protocol::proto::PaneMedia {
+            pane_id: "media-pane".to_string(),
+            sequence: 7,
+            image_id: 42,
+            format: PNG_MEDIA_FORMAT,
+            row: 3,
+            column: 4,
+            columns: 2,
+            rows: 1,
+            data: tiny_png().to_vec(),
+            final_chunk: true,
+            delete: false,
+        };
+
+        store
+            .apply_notification(&media)
+            .expect("valid PNG media should decode");
+        let visible = store.visible_images();
+        assert_eq!(visible.len(), 1);
+        assert_eq!(visible[0].key, (42, 7));
+        assert_eq!((visible[0].row, visible[0].column), (3, 4));
+        assert_eq!((visible[0].columns, visible[0].rows), (2, 1));
+        let mut newer = media.clone();
+        newer.sequence = 8;
+        newer.row = 5;
+        store
+            .apply_notification(&newer)
+            .expect("a reused image id may carry a new sequence");
+        assert_eq!(store.visible_images().len(), 2);
+
+
+        let delete = mux_protocol::proto::PaneMedia {
+            pane_id: "media-pane".to_string(),
+            sequence: 8,
+            image_id: 42,
+            delete: true,
+            ..Default::default()
+        };
+        store
+            .apply_notification(&delete)
+            .expect("delete media should be accepted");
+        assert!(store.visible_images().is_empty());
+    }
+
+    #[test]
+    fn z3rm_download_links_are_actionable_only_when_parsed_as_click_targets() {
+        assert_eq!(
+            download_target_from_uri("z3rm-download:/z3rm-server"),
+            Some(("/z3rm-server".to_string(), "z3rm-server".to_string()))
+        );
+        assert_eq!(download_target_from_uri("https://example.test/file"), None);
+        assert_eq!(download_target_from_uri("z3rm-download:/"),
+            Some(("/".to_string(), "download".to_string())));
+        let target = download_target_from_uri("z3rm-download:/z3rm-server");
+        assert!(download_click_target(target.clone(), false, false).is_some());
+        assert!(download_click_target(target.clone(), true, false).is_none());
+        assert!(download_click_target(target, false, true).is_none());
+    }
+
+    #[test]
+    fn pane_action_download_callback_receives_uri_and_filename() {
+        let received = Arc::new(std::sync::Mutex::new(Vec::<(String, String)>::new()));
+        let captured = received.clone();
+        let callback: BrowserDownloadCallback = Arc::new(move |uri, filename| {
+            captured.lock().unwrap().push((uri, filename));
+        });
+        let action = mux_protocol::proto::PaneAction {
+            pane_id: "download-pane".to_string(),
+            sequence: 11,
+            kind: mux_protocol::proto::PaneActionKind::Download as i32,
+            value: "/z3rm-server".to_string(),
+        };
+
+        assert!(invoke_browser_action(&action, Some(&callback), None));
+        assert_eq!(
+            &*received.lock().unwrap(),
+            &[("/z3rm-server".to_string(), "z3rm-server".to_string())]
+        );
+    }
+
+    #[test]
+    fn pane_action_copy_preserves_unicode_text() {
+        let received = Arc::new(std::sync::Mutex::new(String::new()));
+        let captured = received.clone();
+        let callback: BrowserClipboardCallback = Arc::new(move |text| {
+            *captured.lock().unwrap() = text;
+        });
+        let action = mux_protocol::proto::PaneAction {
+            pane_id: "copy-pane".to_string(),
+            sequence: 12,
+            kind: mux_protocol::proto::PaneActionKind::Copy as i32,
+            value: "安装 z3rm 🚀".to_string(),
+        };
+
+        assert!(invoke_browser_action(&action, None, Some(&callback)));
+        assert_eq!(&*received.lock().unwrap(), "安装 z3rm 🚀");
+    }
+
+    const fn tiny_png() -> &'static [u8] {
+        b"\x89PNG\r\n\x1a\n\x00\x00\x00\rIHDR\x00\x00\x00\x01\x00\x00\x00\x01\x08\x04\x00\x00\x00\xb5\x1c\x0c\x02\x00\x00\x00\x0bIDATx\xda\x63\x64\xf8\x0f\x00\x01\x05\x01\x01\x27\x18\xe3\x66\x00\x00\x00\x00IEND\xaeB`\x82"
     }
 }

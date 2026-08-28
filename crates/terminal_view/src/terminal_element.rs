@@ -28,9 +28,77 @@ use util::ResultExt;
 use workspace::Workspace;
 
 use std::mem;
+use std::sync::Arc;
 use std::{fmt::Debug, rc::Rc};
 
 use crate::{BlockContext, BlockProperties, ContentMode, TerminalMode, TerminalView};
+
+/// Callback used by a browser host to turn a `z3rm-download:` target into a
+/// safe download. The URI is passed without the private hyperlink scheme.
+pub type BrowserDownloadCallback = Arc<dyn Fn(String, String) + Send + Sync>;
+/// Callback used by a browser host to write a typed COPY action.
+pub type BrowserClipboardCallback = Arc<dyn Fn(String) + Send + Sync>;
+
+/// Shared state for the one left-button gesture currently being considered as
+/// a download link. It deliberately lives outside the short-lived element so
+/// a redraw between mouse-down and mouse-up cannot lose the target.
+pub type DownloadClickState = Arc<std::sync::Mutex<Option<(String, String)>>>;
+
+/// A decoded media frame supplied by a mux pane. Positions are terminal cell
+/// coordinates and are painted after text but before the cursor.
+#[derive(Clone)]
+pub struct TerminalMedia {
+    pub key: (u32, u64),
+    pub row: i32,
+    pub column: usize,
+    pub columns: usize,
+    pub rows: usize,
+    pub render_image: Arc<gpui::RenderImage>,
+}
+
+/// Parse the private hyperlink scheme used by the guest landing TUI. Ordinary
+/// URLs return `None` and therefore continue through Terminal's normal URL
+/// handling path.
+pub(crate) fn download_target_from_uri(uri: &str) -> Option<(String, String)> {
+    let target = uri.strip_prefix("z3rm-download:")?;
+    let filename = target
+        .rsplit('/')
+        .find(|part| !part.is_empty() && *part != "." && *part != "..")
+        .and_then(|part| part.split(['?', '#']).next())
+        .filter(|part| !part.is_empty())
+        .unwrap_or("download")
+        .to_string();
+    Some((target.to_string(), filename))
+}
+
+pub(crate) fn download_click_target(
+    target: Option<(String, String)>,
+    mouse_mode: bool,
+    secondary: bool,
+) -> Option<(String, String)> {
+    (!mouse_mode && !secondary).then_some(target).flatten()
+}
+fn download_target_at_position(
+    terminal: &Terminal,
+    position: GpuiPoint<Pixels>,
+) -> Option<(String, String)> {
+    let content = terminal.last_content();
+    let bounds = content.terminal_bounds;
+    let position = position - bounds.bounds.origin;
+    if position.x < Pixels::ZERO || position.y < Pixels::ZERO {
+        return None;
+    }
+
+    let columns = bounds.num_columns();
+    let rows = bounds.num_lines();
+    if columns == 0 || rows == 0 {
+        return None;
+    }
+    let column = ((position.x / bounds.cell_width()).round() as usize).min(columns - 1);
+    let row = ((position.y / bounds.line_height()).round() as usize).min(rows - 1);
+    let cell = content.cells.get(row.checked_mul(columns)?.checked_add(column)?)?;
+    download_target_from_uri(cell.cell.hyperlink()?.uri())
+}
 
 /// The information generated during layout that is necessary for painting.
 pub struct LayoutState {
@@ -55,6 +123,9 @@ pub struct LayoutState {
     block_below_cursor_element: Option<AnyElement>,
     base_text_style: TextStyle,
     content_mode: ContentMode,
+    /// Media frames supplied directly by a mux pane, after text and before the
+    /// cursor. Kitty images remain in `images` and keep their existing cache.
+    media: Vec<TerminalMedia>,
     /// kitty graphics / OSC 1337 图像叠加层, 已按 z-index 排好绘制顺序。
     images: Vec<(VisibleImage, std::sync::Arc<gpui::RenderImage>)>,
     /// What this surface is called, captured here because the accessibility
@@ -402,6 +473,9 @@ pub struct TerminalElement {
     interactivity: Interactivity,
     mode: TerminalMode,
     block_below_cursor: Option<Rc<BlockProperties>>,
+    media: Vec<TerminalMedia>,
+    download_callback: Option<BrowserDownloadCallback>,
+    download_click_state: DownloadClickState,
 }
 
 impl InteractiveElement for TerminalElement {
@@ -423,10 +497,37 @@ impl TerminalElement {
         block_below_cursor: Option<Rc<BlockProperties>>,
         mode: TerminalMode,
     ) -> Stateful<TerminalElement> {
+        Self::new_with_media(
+            terminal,
+            terminal_view,
+            workspace,
+            focus,
+            focused,
+            cursor_visible,
+            block_below_cursor,
+            mode,
+            Vec::new(),
+            None,
+            Arc::new(std::sync::Mutex::new(None)),
+        )
+    }
+
+    pub fn new_with_media(
+        terminal: Entity<Terminal>,
+        terminal_view: Entity<TerminalView>,
+        workspace: WeakEntity<Workspace>,
+        focus: FocusHandle,
+        focused: bool,
+        cursor_visible: bool,
+        block_below_cursor: Option<Rc<BlockProperties>>,
+        mode: TerminalMode,
+        media: Vec<TerminalMedia>,
+        download_callback: Option<BrowserDownloadCallback>,
+        download_click_state: DownloadClickState,
+    ) -> Stateful<TerminalElement> {
         // A stable id is required for the element to participate in the
         // accessibility tree (Element::a11y_role / a11y_synthetic_children
-        // are only consulted for elements with an id). The id is unique within
-        // its parent wrapper (mux_pane / terminal_view render one element each).
+        // are only consulted for elements with an id).
         TerminalElement {
             terminal,
             terminal_view,
@@ -436,6 +537,9 @@ impl TerminalElement {
             cursor_visible,
             block_below_cursor,
             mode,
+            media,
+            download_callback,
+            download_click_state,
             interactivity: Default::default(),
         }
         .id("terminal-element")
@@ -786,21 +890,38 @@ impl TerminalElement {
         let focus = self.focus.clone();
         let terminal = self.terminal.clone();
         let terminal_view = self.terminal_view.clone();
+        let download_callback = self.download_callback.clone();
+        let download_click_state = self.download_click_state.clone();
 
         self.interactivity.on_mouse_down(MouseButton::Left, {
             let terminal = terminal.clone();
             let focus = focus.clone();
             let terminal_view = terminal_view.clone();
+            let download_click_state = download_click_state.clone();
 
             move |e, window, cx| {
                 window.focus(&focus, cx);
 
                 let scroll_top = terminal_view.read(cx).scroll_top;
-                terminal.update(cx, |terminal, cx| {
-                    let mut adjusted_event = e.clone();
-                    if scroll_top > Pixels::ZERO {
-                        adjusted_event.position.y += scroll_top;
+                let mut adjusted_event = e.clone();
+                if scroll_top > Pixels::ZERO {
+                    adjusted_event.position.y += scroll_top;
+                }
+                let mouse_mode = terminal.read(cx).mouse_mode(e.modifiers.shift);
+                if let Some(target) = download_click_target(
+                    download_target_at_position(&terminal.read(cx), adjusted_event.position),
+                    mouse_mode,
+                    e.modifiers.secondary(),
+                ) {
+                    if let Ok(mut pending) = download_click_state.lock() {
+                        *pending = Some(target);
                     }
+                    return;
+                }
+                if let Ok(mut pending) = download_click_state.lock() {
+                    pending.take();
+                }
+                terminal.update(cx, |terminal, cx| {
                     terminal.mouse_down(&adjusted_event, cx);
                     cx.notify();
                 })
@@ -811,7 +932,7 @@ impl TerminalElement {
             let terminal = self.terminal.clone();
             let hitbox = hitbox.clone();
             let focus = focus.clone();
-            let terminal_view = terminal_view;
+            let terminal_view = terminal_view.clone();
             move |e: &MouseMoveEvent, phase, window, cx| {
                 if phase != DispatchPhase::Bubble {
                     return;
@@ -841,17 +962,42 @@ impl TerminalElement {
             }
         });
 
-        self.interactivity.on_mouse_up(
-            MouseButton::Left,
-            TerminalElement::generic_button_handler(
-                terminal.clone(),
-                focus.clone(),
-                false,
-                move |terminal, e, cx| {
+        self.interactivity.on_mouse_up(MouseButton::Left, {
+            let terminal = terminal.clone();
+            let focus = focus.clone();
+            let terminal_view = terminal_view.clone();
+            let download_callback = download_callback.clone();
+            let download_click_state = download_click_state.clone();
+
+            move |e, window, cx| {
+                if !focus.is_focused(window) {
+                    return;
+                }
+
+                let pending = download_click_state
+                    .lock()
+                    .ok()
+                    .and_then(|mut pending| pending.take());
+                if let Some((uri, filename)) = pending {
+                    let scroll_top = terminal_view.read(cx).scroll_top;
+                    let mut position = e.position;
+                    if scroll_top > Pixels::ZERO {
+                        position.y += scroll_top;
+                    }
+                    let same_target = download_target_at_position(&terminal.read(cx), position)
+                        .is_some_and(|(target, _)| target == uri);
+                    if same_target && let Some(callback) = download_callback.as_ref() {
+                        callback(uri, filename);
+                    }
+                    return;
+                }
+
+                terminal.update(cx, |terminal, cx| {
                     terminal.mouse_up(e, cx);
-                },
-            ),
-        );
+                    cx.notify();
+                });
+            }
+        });
         self.interactivity.on_mouse_down(
             MouseButton::Middle,
             TerminalElement::generic_button_handler(
@@ -1517,6 +1663,7 @@ impl Element for TerminalElement {
                     base_text_style: text_style,
                     content_mode,
                     images: resolve_terminal_images(&self.terminal, cx),
+                    media: self.media.clone(),
                     // Uncut: the tab strip's 25-character budget is not this
                     // surface's problem, and this is the name a reader is given
                     // when focus lands here.
@@ -1662,6 +1809,38 @@ impl Element for TerminalElement {
                                 image_bounds,
                                 gpui::Corners::all(px(0.)),
                                 render_image.clone(),
+                                0,
+                                false,
+                            )
+                            .log_err();
+                    }
+
+                    // §16.13 MuxPane media is projected from the server's
+                    // reported cell coordinates. It intentionally paints
+                    // after text and before the cursor/IME layers.
+                    for media in &layout.media {
+                        if media.columns == 0 || media.rows == 0 {
+                            continue;
+                        }
+                        let image_bounds = Bounds {
+                            origin: snapped_cell_point(
+                                origin,
+                                media.row,
+                                media.column,
+                                &layout.dimensions,
+                                scale_factor,
+                            ),
+                            size: size(
+                                media.columns as f32 * layout.dimensions.cell_width,
+                                media.rows as f32 * layout.dimensions.line_height,
+                            ),
+                        };
+                        window
+                            .paint_image(
+                                image_bounds,
+                                image_bounds,
+                                gpui::Corners::all(px(0.)),
+                                media.render_image.clone(),
                                 0,
                                 false,
                             )
