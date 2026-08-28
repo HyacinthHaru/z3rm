@@ -37,9 +37,10 @@ resources, guest filesystem binaries, and mux connection:
 - `guest-terminal.spec.ts`: real Chromium boot, scroll, guest download, browser
   clipboard action, and loading-error assertions passed in focused runs.
 
-- Deployment run `33200337771` for `39efb9154e` completed successfully:
-  Verify and build passed all 22 hosted browser checks, and GitHub Pages deployed
+- Deployment run `33207869817` for `f6a4f7a9e5` completed successfully:
+  Verify and build passed all 22 hosted Chromium checks, and GitHub Pages deployed
   the site.
 - Direct Chromium verification against
-  `https://cyjin-yl.github.io/z3rm/gpui-demo/index.html` passed the real-guest
-  interaction and loading-error tests (`2 passed`, 55.2s).
+  `https://cyjin-yl.github.io/z3rm/gpui-demo/index.html` passed the complete
+  hosted Chromium project (`22 passed`, 51.5s), including real guest boot,
+  Kitty/media actions, download, clipboard, progress, and protocol checks.
