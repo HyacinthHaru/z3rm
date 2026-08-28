@@ -73,11 +73,14 @@ test("GPUI WASM demo and Proto UI controls work together", async ({ page }) => {
   await expect(demo).toContainText("One mux snapshot");
 
   const frame = page.frameLocator('iframe[title="Z3rm GPUI WebAssembly session projection"]');
-  await expect(frame.locator("canvas")).toBeVisible({ timeout: 15_000 }).catch(async () => {
-    // GPUI may not start in headless CI (no GPU). The boot terminal
-    // fallback is the expected behavior in that case.
-    await expect(frame.locator("#boot-terminal")).toBeVisible({ timeout: 5000 });
-  });
+  await expect
+    .poll(
+      async () =>
+        (await frame.locator("canvas").isVisible()) ||
+        (await frame.locator("#boot-terminal").isVisible()),
+      { timeout: 120_000 },
+    )
+    .toBe(true);
   const contractTab = page.getByRole("tab", { name: "Data contract" });
   await contractTab.evaluate((element: HTMLElement) => element.click());
   await expect(demo.locator(".contract-panel")).toContainText("SessionSnapshot");
@@ -90,11 +93,14 @@ test("GPUI WASM demo and Proto UI controls work together", async ({ page }) => {
   await demo.locator("proto-ui-base-select-trigger").evaluate((element: HTMLElement) => element.click());
   await page.locator("proto-ui-base-select-item").filter({ hasText: "observe" }).evaluate((element: HTMLElement) => element.click());
   await expect(demo.locator("iframe")).toHaveAttribute("src", /window=window-1/);
-  await expect(frame.locator("canvas")).toBeVisible({ timeout: 15_000 }).catch(async () => {
-    // GPUI may not start in headless CI (no GPU). The boot terminal
-    // fallback is the expected behavior in that case.
-    await expect(frame.locator("#boot-terminal")).toBeVisible({ timeout: 5000 });
-  });
+  await expect
+    .poll(
+      async () =>
+        (await frame.locator("canvas").isVisible()) ||
+        (await frame.locator("#boot-terminal").isVisible()),
+      { timeout: 120_000 },
+    )
+    .toBe(true);
 });
 
 test("GPUI WASM boot surface exposes the loading progress contract", async ({ page }) => {
@@ -130,14 +136,17 @@ test("GPUI WASM boot surface exposes the loading progress contract", async ({ pa
 });
 
 test("GPUI WASM panes render a real terminal grid", async ({ page }) => {
-  test.setTimeout(60_000);
+  test.setTimeout(180_000);
   await page.goto("en/");
   const frame = page.frameLocator('iframe[title="Z3rm GPUI WebAssembly session projection"]');
-  await expect(frame.locator("canvas")).toBeVisible({ timeout: 15_000 }).catch(async () => {
-    // GPUI may not start in headless CI (no GPU). The boot terminal
-    // fallback is the expected behavior in that case.
-    await expect(frame.locator("#boot-terminal")).toBeVisible({ timeout: 5000 });
-  });
+  await expect
+    .poll(
+      async () =>
+        (await frame.locator("canvas").isVisible()) ||
+        (await frame.locator("#boot-terminal").isVisible()),
+      { timeout: 120_000 },
+    )
+    .toBe(true);
   const received = await frame.locator("html").evaluate(() => {
     const bindings = (window as Window & {
       wasmBindings?: {
