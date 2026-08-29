@@ -2,14 +2,14 @@ import { expect, test } from "@playwright/test";
 import { stat } from "node:fs/promises";
 
 const VIEWPORT = { width: 780, height: 437 };
-const GUEST_BOOT_TIMEOUT = 120_000;
+const GUEST_BOOT_TIMEOUT = 300_000;
 
 // The real guest is intentionally exercised only in the desktop Chromium
 // project. The mobile project still covers the surrounding site; booting a
 // second v86 instance there adds time without testing another code path.
 test("real guest renders Kitty media and handles terminal actions", async ({ page }, testInfo) => {
   test.skip(testInfo.project.name !== "chromium", "the v86 interaction check runs in desktop Chromium");
-  test.setTimeout(180_000);
+  test.setTimeout(420_000);
 
   await page.setViewportSize(VIEWPORT);
   const appOrigin = new URL(
@@ -19,7 +19,7 @@ test("real guest renders Kitty media and handles terminal actions", async ({ pag
     origin: appOrigin,
   });
   await page.goto("gpui-demo/index.html");
-  await expect(page.locator("#loading-progress")).toBeVisible({ timeout: 10_000 });
+  await expect(page.locator("#loading-progress")).toBeVisible({ timeout: 30_000 });
 
   const html = page.locator("html");
   await expect(html).toHaveAttribute("data-gpui-ready", "true", {

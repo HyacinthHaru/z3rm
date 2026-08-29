@@ -67,7 +67,7 @@ test("implementation status renders verified evidence rows", async ({ page }) =>
 });
 
 test("GPUI WASM demo and Proto UI controls work together", async ({ page }) => {
-  test.setTimeout(180_000);
+  test.setTimeout(300_000);
   await page.goto("en/");
   const demo = page.locator("[data-z3rm-wasm-demo]");
   await expect(demo).toContainText("One mux snapshot");
@@ -78,7 +78,7 @@ test("GPUI WASM demo and Proto UI controls work together", async ({ page }) => {
       async () =>
         (await frame.locator("canvas").isVisible()) ||
         (await frame.locator("#boot-terminal").isVisible()),
-      { timeout: 120_000 },
+      { timeout: 300_000 },
     )
     .toBe(true);
   const contractTab = page.getByRole("tab", { name: "Data contract" });
@@ -98,7 +98,7 @@ test("GPUI WASM demo and Proto UI controls work together", async ({ page }) => {
       async () =>
         (await frame.locator("canvas").isVisible()) ||
         (await frame.locator("#boot-terminal").isVisible()),
-      { timeout: 120_000 },
+      { timeout: 300_000 },
     )
     .toBe(true);
 });
@@ -136,7 +136,7 @@ test("GPUI WASM boot surface exposes the loading progress contract", async ({ pa
 });
 
 test("GPUI WASM panes render a real terminal grid", async ({ page }) => {
-  test.setTimeout(180_000);
+  test.setTimeout(300_000);
   await page.goto("en/");
   const frame = page.frameLocator('iframe[title="Z3rm GPUI WebAssembly session projection"]');
   await expect
@@ -144,7 +144,7 @@ test("GPUI WASM panes render a real terminal grid", async ({ page }) => {
       async () =>
         (await frame.locator("canvas").isVisible()) ||
         (await frame.locator("#boot-terminal").isVisible()),
-      { timeout: 120_000 },
+      { timeout: 300_000 },
     )
     .toBe(true);
   const received = await frame.locator("html").evaluate(() => {

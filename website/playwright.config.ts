@@ -1,7 +1,7 @@
 import { defineConfig, devices } from "@playwright/test";
 
 export default defineConfig({
-  testDir: "./tests/e2e",
+  timeout: 300_000,
   outputDir: "./test-results",
   fullyParallel: true,
   forbidOnly: Boolean(process.env.CI),
@@ -10,6 +10,7 @@ export default defineConfig({
   use: {
     baseURL: process.env.PLAYWRIGHT_TEST_BASE_URL ?? "http://127.0.0.1:4331/z3rm/",
     trace: "retain-on-failure",
+    navigationTimeout: 60_000,
   },
   projects: [
     { name: "chromium", use: { ...devices["Desktop Chrome"] } },

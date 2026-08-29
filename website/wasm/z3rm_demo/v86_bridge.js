@@ -85,16 +85,18 @@
   function aggregate() {
     let loaded = 0;
     let total = 0;
-    let indeterminate = stages.size === 0;
+    let hasKnownTotal = false;
     for (const stage of stages.values()) {
       loaded += stage.loaded;
       if (stage.total > 0) {
         total += stage.total;
-      } else {
-        indeterminate = true;
+        hasKnownTotal = true;
       }
     }
-    return { loaded, total, indeterminate };
+    // Indeterminate only when no stage has a known total. As soon as the
+    // main wasm/guest-resource download reports Content-Length, show a real
+    // percentage even if minor stages (mux connect) lack a total.
+    return { loaded, total, indeterminate: !hasKnownTotal && stages.size > 0 };
   }
 
   function rollingRate(now) {
@@ -160,10 +162,12 @@
       label.textContent = "z3rm is ready";
       detail.textContent = "The first authoritative pane snapshot is rendering.";
     } else {
+      const percent = total > 0 ? Math.min(100, (loaded / total) * 100) : null;
+      const percentText = percent !== null ? `${Math.round(percent)}% · ` : "";
       label.textContent = `Loading ${state.currentStage}`;
       detail.textContent = indeterminate
         ? `${formatBytes(loaded)} loaded · ${formatRate(rollingRate(now))}`
-        : `${formatBytes(loaded)} of ${formatBytes(total)} · ${formatRate(rollingRate(now))}`;
+        : `${percentText}${formatBytes(loaded)} of ${formatBytes(total)} · ${formatRate(rollingRate(now))}`;
     }
 
     if (indeterminate || total <= 0) {
