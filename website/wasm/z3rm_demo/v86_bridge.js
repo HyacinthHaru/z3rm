@@ -93,9 +93,7 @@
         hasKnownTotal = true;
       }
     }
-    // Indeterminate only when no stage has a known total. As soon as the
-    // main wasm/guest-resource download reports Content-Length, show a real
-    // percentage even if minor stages (mux connect) lack a total.
+    // A known total keeps the bar determinate even if another stage has no total.
     return { loaded, total, indeterminate: !hasKnownTotal && stages.size > 0 };
   }
 

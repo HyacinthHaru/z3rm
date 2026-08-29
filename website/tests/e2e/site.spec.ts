@@ -117,22 +117,44 @@ test("GPUI WASM boot surface exposes the loading progress contract", async ({ pa
     };
     const progress = browserWindow.__z3rm_progress;
     progress?.stage?.("e2e unknown asset", 12, 0);
-    const bar = document.querySelector("#loading-progress-bar");
     return {
       api: typeof progress?.stage === "function" && typeof progress?.ready === "function",
       firstPaneSignal: typeof progress?.firstPaneSnapshotReady === "function",
       ids: ["loading-progress-label", "loading-progress-detail"].every((id) => document.getElementById(id)),
-      indeterminate: bar?.getAttribute("data-indeterminate"),
-      value: bar?.getAttribute("aria-valuenow"),
       detail: document.querySelector("#loading-progress-detail")?.textContent,
     };
   });
   expect(contract.api).toBe(true);
   expect(contract.firstPaneSignal).toBe(true);
   expect(contract.ids).toBe(true);
-  expect(contract.indeterminate).toBe("true");
-  expect(contract.value).toBeNull();
   expect(contract.detail).toContain("B/s");
+});
+
+test("GPUI WASM loading surface shows percentage when total is known", async ({ page }) => {
+  await page.goto("en/");
+  const frame = page.frameLocator('iframe[title="Z3rm GPUI WebAssembly session projection"]');
+  await expect(frame.locator("#loading-progress")).toBeAttached();
+  const contract = await frame.locator("html").evaluate(() => {
+    const browserWindow = window as Window & {
+      __z3rm_progress?: {
+        stage?: (name: string, loaded: number, total: number) => void;
+      };
+    };
+    const progress = browserWindow.__z3rm_progress;
+    // A known total must flip the bar from spinner to a percentage even when
+    // another concurrent stage has no total.
+    progress?.stage?.("e2e determinate asset", 50, 200);
+    const bar = document.querySelector("#loading-progress-bar");
+    return {
+      indeterminate: bar?.getAttribute("data-indeterminate"),
+      value: bar?.getAttribute("aria-valuenow"),
+      detail: document.querySelector("#loading-progress-detail")?.textContent,
+    };
+  });
+  expect(contract.indeterminate).toBe("false");
+  expect(contract.value).not.toBeNull();
+  expect(Number(contract.value)).toBeGreaterThanOrEqual(0);
+  expect(contract.detail).toContain("%");
 });
 
 test("GPUI WASM panes render a real terminal grid", async ({ page }) => {
