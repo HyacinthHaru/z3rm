@@ -434,6 +434,7 @@
 
 const V86_ASSETS = new URL("./v86/", document.baseURI);
 const BOOT_CMDLINE = "console=ttyS0 tsc=reliable mitigations=off random.trust_cpu=on";
+const WASM_BINDINGS_TIMEOUT_MS = 300_000;
 const MEMORY_BYTES = 128 * 1024 * 1024;
 const MAX_TERMINAL_TEXT = 200_000;
 
@@ -488,7 +489,7 @@ function waitForWasmBindings() {
         resolve(bindings);
         return;
       }
-      if (Date.now() - start >= 15000) {
+      if (Date.now() - start >= WASM_BINDINGS_TIMEOUT_MS) {
         resolve(null);
         return;
       }
@@ -526,7 +527,10 @@ async function boot() {
   // boot output, but it must remain visible rather than silently hanging.
   void waitForWasmBindings().then((bindings) => {
     if (!bindings) {
-      progress.error("GPUI WebAssembly", "bindings did not initialize within 15 seconds");
+      progress.error(
+        "GPUI WebAssembly",
+        `bindings did not initialize within ${WASM_BINDINGS_TIMEOUT_MS / 1000} seconds`,
+      );
     }
   });
 
