@@ -7535,6 +7535,7 @@ dependencies = [
  "nanoid",
  "parking_lot",
  "prost",
+ "regex",
  "serde",
  "serde_json",
  "sha2",

@@ -45,6 +45,10 @@
       "ctrl-shift-t": "mux_pane::NewTab",
       "ctrl-shift-x": "mux_pane::CloseTab",
       "ctrl-shift-z": "mux_pane::ZoomToggle",
+
+      // §3.3 Jump between OSC 133 command prompts
+      "ctrl-shift-[": "mux_pane::JumpToPreviousPrompt",
+      "ctrl-shift-]": "mux_pane::JumpToNextPrompt",
     },
   },
   {

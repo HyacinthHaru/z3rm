@@ -12,6 +12,7 @@ use mux_protocol::proto::{
 };
 
 use super::capture::{CaptureLine, CaptureOptions, CommandSelector};
+use mux::command_history::{CommandSpan, command_output_span};
 use super::format::{FormatScope, expand as expand_format};
 use super::keys::parse_keys;
 use super::target::Target;
@@ -800,16 +801,16 @@ pub async fn run_cli_command(cmd: CliCommand) -> Result<()> {
             } else {
                 let mut unaddressable = 0usize;
                 for command in &listed.commands {
-                    let (start, end) = match super::capture::command_output_span(command) {
-                        super::capture::CommandSpan::Located { start, end } => (
+                    let (start, end) = match command_output_span(command) {
+                        CommandSpan::Located { start, end } => (
                             start.to_string(),
                             end.map_or_else(|| "-".to_string(), |end| end.to_string()),
                         ),
-                        super::capture::CommandSpan::Unaddressable => {
+                        CommandSpan::Unaddressable => {
                             unaddressable += 1;
                             ("?".to_string(), "?".to_string())
                         }
-                        super::capture::CommandSpan::Unmarked => ("?".to_string(), "?".to_string()),
+                        CommandSpan::Unmarked => ("?".to_string(), "?".to_string()),
                     };
                     let status = match (&command.command_end, command.exit_code) {
                         (Some(_), Some(code)) => format!("exit={code}"),
@@ -1002,12 +1003,16 @@ pub async fn run_cli_command(cmd: CliCommand) -> Result<()> {
         } => {
             let target = super::target::parse_target(&target)?;
             let pane_id = resolve_pane_id(&domain, &target, ResolveAccess::ReadOnly).await?;
-            let hits = super::search::search_scrollback(
+            let hits = mux::scrollback_search::search_scrollback(
                 &domain,
                 &pane_id,
                 &pattern,
-                super::search::SearchOptions {
-                    start,
+                mux::scrollback_search::SearchOptions {
+                    // `-` 是"这一侧的极端边界", 也就是缺省覆盖整个 pane。
+                    start: start.and_then(|line| match line {
+                        super::capture::CaptureLine::Edge => None,
+                        super::capture::CaptureLine::Line(line) => Some(line),
+                    }),
                     forward,
                     max_results,
                 },

@@ -1,19 +1,26 @@
-// search-scrollback 实现: 在 pane 的历史 + 可见区里做正则搜索
-// 来源: spec §12 — scrollback search 是 Day 0 终端能力
+//! §12 Scrollback search: a regex over a pane's history *and* its viewport.
+//!
+//! The server's `SearchScrollback` only covers history, so a match still on
+//! screen would not be found — which is nothing but a surprise to the caller.
+//! The viewport half is added here, over the grid snapshot that has to be
+//! fetched anyway to convert line numbers, so it costs no extra round trip.
+//!
+//! Both surfaces search the same way. The CLI's `search-scrollback` and the
+//! GUI's in-pane search are the same call with different presentation; a
+//! second implementation would be a second set of off-by-ones.
 
+use crate::MuxDomain;
 use anyhow::{Context, Result};
-use mux::MuxDomain;
 use mux_protocol::proto::{
     Cell, FullGridSnapshot, fetch_grid_update_response::Update as GridUpdateKind,
 };
 
-use super::capture::{CaptureLine, render_cells};
-
 /// 搜索方向与结果上限。
 #[derive(Debug, Clone, Copy, Default)]
 pub struct SearchOptions {
-    /// `-S`，起始行 (tmux 行号)。缺省时覆盖整个 pane。
-    pub start: Option<CaptureLine>,
+    /// 起始行 (tmux 行号: 可见区第一行是 0, 负数进入历史)。缺省时覆盖整个
+    /// pane —— 也是"从最开头"这个边界的含义, 两者落在同一个分支。
+    pub start: Option<i32>,
     /// `--forward`：朝更新的方向搜，取最旧的 N 条；缺省朝更旧搜，取最新的 N 条。
     pub forward: bool,
     /// `-n`，结果上限。
@@ -67,7 +74,7 @@ pub async fn search_scrollback(
             .context("failed to search scrollback")?;
         hits.extend(response.matches.into_iter().map(|found| SearchHit {
             line: found.line_number as i32 - clamp_to_i32(snapshot.history_size),
-            text: render_cells(found.context.iter(), false),
+            text: plain_text(found.context.iter()),
         }));
     }
     if let Some((first, last)) = span.visible {
@@ -94,7 +101,7 @@ struct SearchSpan {
 fn search_span(
     history_size: u32,
     rows: u32,
-    start: Option<CaptureLine>,
+    start: Option<i32>,
     forward: bool,
 ) -> SearchSpan {
     let oldest = -clamp_to_i32(history_size);
@@ -105,14 +112,14 @@ fn search_span(
 
     // 缺省起点取搜索方向的"上游"端点，于是整个 pane 都在范围内。
     let start = match start {
-        Some(CaptureLine::Edge) | None => {
+        None => {
             if forward {
                 oldest
             } else {
                 newest
             }
         }
-        Some(CaptureLine::Line(line)) => line.clamp(oldest, newest),
+        Some(line) => line.clamp(oldest, newest),
     };
 
     let history = if history_size == 0 {
@@ -142,6 +149,27 @@ fn search_span(
     SearchSpan { history, visible }
 }
 
+/// A row of cells as the text a regex sees.
+///
+/// A wide character occupies two cells; the second carries no text of its own,
+/// so including it would put a stray column between the halves of every CJK
+/// glyph and break any pattern spanning one.
+pub fn plain_text<'a>(cells: impl IntoIterator<Item = &'a Cell>) -> String {
+    cells
+        .into_iter()
+        .filter(|cell| {
+            !cell.style.as_ref().is_some_and(|style| {
+                style.wide_char_spacer || style.leading_wide_char_spacer
+            })
+        })
+        .map(|cell| {
+            let mut text = cell.char.clone();
+            text.push_str(&cell.zerowidth);
+            text
+        })
+        .collect()
+}
+
 fn clamp_to_i32(value: u32) -> i32 {
     i32::try_from(value).unwrap_or(i32::MAX)
 }
@@ -159,7 +187,7 @@ fn visible_hits(
             let cells: Vec<&Cell> = (0..columns)
                 .filter_map(|column| snapshot.cells.get(offset + column))
                 .collect();
-            let text = render_cells(cells, false);
+            let text = plain_text(cells);
             regex.is_match(&text).then(|| SearchHit {
                 line: row as i32,
                 text,
@@ -238,7 +266,7 @@ mod tests {
     fn a_start_inside_the_viewport_splits_the_two_segments() {
         // 向更旧: 可见区只到起点为止，历史全在范围内。
         assert_eq!(
-            search_span(50, 24, Some(CaptureLine::Line(5)), false),
+            search_span(50, 24, Some(5), false),
             SearchSpan {
                 history: Some((49, 0)),
                 visible: Some((0, 5)),
@@ -246,7 +274,7 @@ mod tests {
         );
         // 向更新: 历史全在起点之前，不参与。
         assert_eq!(
-            search_span(50, 24, Some(CaptureLine::Line(5)), true),
+            search_span(50, 24, Some(5), true),
             SearchSpan {
                 history: None,
                 visible: Some((5, 23)),
@@ -258,7 +286,7 @@ mod tests {
     fn a_start_inside_history_splits_the_two_segments() {
         // 向更旧: 只搜起点及更旧的历史，可见区不参与。
         assert_eq!(
-            search_span(50, 24, Some(CaptureLine::Line(-10)), false),
+            search_span(50, 24, Some(-10), false),
             SearchSpan {
                 history: Some((40, 0)),
                 visible: None,
@@ -266,7 +294,7 @@ mod tests {
         );
         // 向更新: 从起点开始的历史 + 整个可见区。
         assert_eq!(
-            search_span(50, 24, Some(CaptureLine::Line(-10)), true),
+            search_span(50, 24, Some(-10), true),
             SearchSpan {
                 history: Some((40, 1)),
                 visible: Some((0, 23)),
@@ -277,14 +305,14 @@ mod tests {
     #[test]
     fn a_start_beyond_the_pane_is_clamped_not_sent_out_of_range() {
         assert_eq!(
-            search_span(3, 24, Some(CaptureLine::Line(-999)), false),
+            search_span(3, 24, Some(-999), false),
             SearchSpan {
                 history: Some((0, 0)),
                 visible: None,
             }
         );
         assert_eq!(
-            search_span(3, 24, Some(CaptureLine::Line(999)), true),
+            search_span(3, 24, Some(999), true),
             SearchSpan {
                 history: None,
                 visible: Some((23, 23)),

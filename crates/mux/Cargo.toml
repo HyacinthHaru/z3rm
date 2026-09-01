@@ -9,6 +9,7 @@ license = "Apache-2.0"
 path = "src/mux.rs"
 
 [dependencies]
+regex.workspace = true
 mux_protocol = { workspace = true }
 nanoid = { workspace = true }
 prost = { workspace = true }

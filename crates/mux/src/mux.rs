@@ -34,6 +34,8 @@ use mux_protocol::{
 // §16.6 SSH 远程连接模块（Plan 19）。
 #[cfg(all(feature = "ssh", not(target_family = "wasm")))]
 mod remote_install;
+pub mod command_history;
+pub mod scrollback_search;
 #[cfg(all(feature = "ssh", not(target_family = "wasm")))]
 mod ssh;
 mod sync;

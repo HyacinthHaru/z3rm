@@ -55,6 +55,10 @@
       // Pane zoom
       "ctrl-shift-z": "mux_pane::ZoomToggle",
 
+      // §3.3 Jump between OSC 133 command prompts
+      "ctrl-shift-[": "mux_pane::JumpToPreviousPrompt",
+      "ctrl-shift-]": "mux_pane::JumpToNextPrompt",
+
       // Debug accessibility tree
       "ctrl-shift-a": "z3rm_debug::DumpAccessibilityTree",
 

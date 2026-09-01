@@ -6,7 +6,6 @@ pub mod dispatch;
 pub mod format;
 pub mod keys;
 pub mod marketplace;
-pub mod search;
 pub mod target;
 
 pub use capture::{CaptureLine, CommandSelector};
@@ -1159,6 +1158,7 @@ fn parse_cli_args_lossy(args: &[String]) -> Result<Option<CliCommand>, String> {
     }
 }
 
+#[cfg(test)]
 mod tests {
     use super::*;
 

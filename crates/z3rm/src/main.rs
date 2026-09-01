@@ -2354,6 +2354,11 @@ mod tests {
             "mux::KillServer",
             "mux::NewWindow",
             "mux::Reconnect",
+            // §3.3 `bind_startup_keymaps` drops bindings whose action does not
+            // resolve, so a renamed or mistyped action here is silent: the
+            // keystroke simply stops doing anything.
+            "mux_pane::JumpToPreviousPrompt",
+            "mux_pane::JumpToNextPrompt",
         ] {
             assert!(
                 action_names.contains(required),

@@ -110,6 +110,10 @@ actions!(
         ResizeDown,
         /// §16.7 等分所有 pane 大小。
         ResizeEqual,
+        /// §3.3 跳到上一条命令的提示符 (OSC 133)。
+        JumpToPreviousPrompt,
+        /// §3.3 跳到下一条命令的提示符 (OSC 133)。
+        JumpToNextPrompt,
     ]
 );
 

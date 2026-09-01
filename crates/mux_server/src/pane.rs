@@ -2609,8 +2609,12 @@ mod tests {
             std::env::temp_dir().to_string_lossy().to_string(),
             20,
             6,
+            // A process that exits at once, spelled the way that works on every
+            // platform: macOS has no /bin/false, so naming it directly made this
+            // test unrunnable there.
             Some(ShellCommand {
-                program: "/bin/false".to_string(),
+                program: "/bin/sh".to_string(),
+                args: vec!["-c".to_string(), "exit 0".to_string()],
                 ..Default::default()
             }),
         )

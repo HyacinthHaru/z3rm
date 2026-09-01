@@ -4,6 +4,7 @@
 use anyhow::{Context, Result};
 use mux_protocol::{MAX_GRID_CELLS, checked_grid_cell_count};
 use mux::MuxDomain;
+use mux::command_history::{CommandSpan, command_output_span};
 use mux_protocol::proto::{
     Cell, FetchGridUpdateResponse, FullGridSnapshot, fetch_grid_update_response::Update as GridUpdateKind,
 CommandRange,
@@ -72,50 +73,6 @@ pub fn select_command(
                 .context("recorded command index out of range")
         }
     }
-}
-
-/// 一条命令的输出落在哪些行，用 tmux 行号表示。
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum CommandSpan {
-    /// 起点可用。`end` 为 `None` 表示命令还在跑，取到可见区末尾。
-    Located { start: i64, end: Option<i64> },
-    /// marker 记下来了，但那些行已经不可寻址。
-    Unaddressable,
-    /// shell 根本没报告过这条命令从哪儿开始。
-    Unmarked,
-}
-
-/// 求一条命令的输出区间。
-///
-/// 缺 marker 时退到更靠前的那个 (`C` → `B` → `A`)：多带上命令行甚至提示符，
-/// 总好过漏掉真正的输出。行号本身不可用时返回 `Unaddressable`，绝不猜一个。
-pub fn command_output_span(command: &CommandRange) -> CommandSpan {
-    let starts = [&command.output_start, &command.command, &command.prompt];
-    let Some(start) = starts
-        .iter()
-        .find_map(|marker| marker.as_ref().and_then(|marker| marker.line))
-    else {
-        return if starts.iter().any(|marker| marker.is_some()) {
-            CommandSpan::Unaddressable
-        } else {
-            CommandSpan::Unmarked
-        };
-    };
-
-    let end = match &command.command_end {
-        // D 落在第 0 列意味着 shell 已经换到新的一行才报告结束，那一行不属于
-        // 输出；落在行中间则说明它还在输出的最后一行上。
-        Some(marker) => match marker.line {
-            Some(line) if marker.column == 0 => Some(line.saturating_sub(1)),
-            Some(line) => Some(line),
-            // 起点找得到而终点找不到，说明这一对配不上了；capture 到可见区末尾
-            // 会把后面无关的输出一起带上。
-            None => return CommandSpan::Unaddressable,
-        },
-        None => None,
-    };
-
-    CommandSpan::Located { start, end }
 }
 
 /// 把一条命令的输出区间变成 `-S` / `-E`，行号不可用时给出说清原因的报错。

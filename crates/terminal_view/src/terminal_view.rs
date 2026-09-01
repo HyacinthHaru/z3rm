@@ -959,6 +959,30 @@ impl TerminalView {
         cx.notify();
     }
 
+    /// §3.3 Scroll so `line` becomes the viewport's top row.
+    ///
+    /// tmux line numbering: row 0 is the first visible row and negative values
+    /// go back into history, which is what the server's OSC 133 markers carry.
+    /// A line already at or below the viewport top scrolls to the bottom rather
+    /// than forward past the live output.
+    pub fn scroll_to_tmux_line(&mut self, line: i64, cx: &mut Context<Self>) {
+        let current = self.terminal.read(cx).last_content().display_offset as i64;
+        let target = (-line).max(0);
+        let delta = target - current;
+        self.terminal.update(cx, |terminal, _| {
+            match delta.cmp(&0) {
+                std::cmp::Ordering::Greater => terminal.scroll_up_by(delta as usize),
+                std::cmp::Ordering::Less => terminal.scroll_down_by(delta.unsigned_abs() as usize),
+                std::cmp::Ordering::Equal => {}
+            }
+        });
+        // A jump is a deliberate destination, so it holds against the output
+        // still arriving underneath it — the same lock a manual scroll takes.
+        self.scroll_locked = true;
+        self.sync_scrollback_offset_from_terminal(cx);
+        cx.notify();
+    }
+
     /// §16.9 获取回滚偏移量
     pub fn get_scrollback_offset(&self) -> Option<usize> {
         self.scrollback_offset

@@ -451,6 +451,9 @@ pub struct MuxPaneView {
     /// Shared press state lets TerminalElement intercept a z3rm download link
     /// without mutating the terminal's selection state before mouse-up.
     download_click_state: DownloadClickState,
+    /// §3.3 What the last prompt jump landed on, announced to a reader and
+    /// shown as a badge. `None` until the user jumps.
+    prompt_jump: Option<SharedString>,
     /// §15.7 zoom state
     zoomed: bool,
     /// §3.10 last resize dimensions sent to server (cols, rows)
@@ -752,6 +755,7 @@ impl MuxPaneView {
             history_cache,
             media: PaneMediaStore::default(),
             download_click_state: Arc::new(std::sync::Mutex::new(None)),
+            prompt_jump: None,
             zoomed: false,
             last_sent_size: (80, 24),
             prefix_machine: PrefixModeMachine::new(PrefixModeConfig::default()),
@@ -1289,6 +1293,74 @@ impl MuxPaneView {
     /// extension step of the priority chain can never match.
     pub fn set_extension_shortcut_resolver(&mut self, resolver: Option<ExtensionShortcutResolver>) {
         self.extension_shortcuts = resolver;
+    }
+
+    /// §3.3 Jump to the prompt of the previous or next command (OSC 133).
+    ///
+    /// The shell reports command boundaries and the server keeps them; nothing
+    /// in the GUI reached them before, so a user scrolling back for "what did
+    /// that command print" had to hunt by eye. The markers are the server's, so
+    /// this asks rather than guessing from the local grid.
+    pub fn jump_to_adjacent_prompt(&mut self, backward: bool, cx: &mut Context<Self>) {
+        let domain = self.domain.clone();
+        let pane_id = self.pane_id.clone();
+        // The viewport's top row in the same numbering the markers use.
+        let from_line = -(self.terminal.read(cx).last_content().display_offset as i64);
+        cx.spawn(async move |this, cx| {
+            let listed = match domain.list_commands(&pane_id, 0).await {
+                Ok(listed) => listed,
+                Err(error) => {
+                    tracing::warn!(error = %error, pane_id, "list_commands failed");
+                    if let Err(error) = this.update(cx, |this, cx| {
+                        this.announce_prompt_jump("Command history unavailable", cx);
+                    }) {
+                        tracing::debug!(%error, "pane dropped before the jump was reported");
+                    }
+                    return;
+                }
+            };
+            if let Err(error) = this.update(cx, |this, cx| {
+                let target = mux::command_history::adjacent_prompt_line(
+                    &listed.commands,
+                    from_line,
+                    backward,
+                );
+                match target {
+                    Some(line) => {
+                        this.terminal_view.update(cx, |terminal_view, cx| {
+                            terminal_view.scroll_to_tmux_line(line, cx);
+                        });
+                        this.announce_prompt_jump(
+                            prompt_jump_label(&listed.commands, line),
+                            cx,
+                        );
+                    }
+                    // Saying nothing would be indistinguishable from a jump
+                    // that silently failed, and the viewport does not move
+                    // either way.
+                    None if listed.commands.is_empty() => this.announce_prompt_jump(
+                        "No commands recorded in this pane",
+                        cx,
+                    ),
+                    None => this.announce_prompt_jump(
+                        if backward {
+                            "At the oldest recorded command"
+                        } else {
+                            "At the newest recorded command"
+                        },
+                        cx,
+                    ),
+                }
+            }) {
+                tracing::debug!(%error, "pane dropped before the jump was applied");
+            }
+        })
+        .detach();
+    }
+
+    fn announce_prompt_jump(&mut self, label: impl Into<SharedString>, cx: &mut Context<Self>) {
+        self.prompt_jump = Some(label.into());
+        cx.notify();
     }
 
     /// §16.7 Agent CLI passthrough state.
@@ -2229,6 +2301,36 @@ impl Focusable for MuxPaneView {
 
 impl EventEmitter<MuxPaneEvent> for MuxPaneView {}
 
+/// §3.3 What a jump landed on, in the words a reader needs: which command of
+/// how many, and how it ended. The line number alone says nothing about
+/// whether the command succeeded, which is usually why one goes looking.
+fn prompt_jump_label(commands: &[mux_protocol::proto::CommandRange], line: i64) -> String {
+    let mut lines: Vec<i64> = commands
+        .iter()
+        .filter_map(mux::command_history::command_prompt_line)
+        .collect();
+    lines.sort_unstable();
+    let position = lines.iter().position(|candidate| *candidate == line);
+
+    let outcome = commands
+        .iter()
+        .find(|command| mux::command_history::command_prompt_line(command) == Some(line))
+        .map(|command| match command.exit_code {
+            Some(0) => "succeeded".to_string(),
+            Some(code) => format!("exited {code}"),
+            // OSC 133 D carries the status; a shell that only reports the
+            // boundary leaves it unknown, and "still running" would be a guess.
+            None if command.command_end.is_some() => "exit status not reported".to_string(),
+            None => "still running".to_string(),
+        })
+        .unwrap_or_else(|| "exit status not reported".to_string());
+
+    match position {
+        Some(index) => format!("Command {} of {}, {outcome}", index + 1, lines.len()),
+        None => format!("Command at line {line}, {outcome}"),
+    }
+}
+
 impl Render for MuxPaneView {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl gpui::IntoElement {
         // §3.1 drain mouse-input transport errors buffered by the input sink
@@ -2367,6 +2469,45 @@ impl Render for MuxPaneView {
                     )
                 },
             )
+            // §3.3 A pane-local operation, so the pane handles it: the jump
+            // navigates this pane's own scrollback wherever it is rendered.
+            .on_action(cx.listener(
+                |this, _: &settings::mux_actions::JumpToPreviousPrompt, _window, cx| {
+                    this.jump_to_adjacent_prompt(true, cx);
+                },
+            ))
+            .on_action(cx.listener(
+                |this, _: &settings::mux_actions::JumpToNextPrompt, _window, cx| {
+                    this.jump_to_adjacent_prompt(false, cx);
+                },
+            ))
+            // §3.3 Where the last prompt jump landed. The viewport moves,
+            // which a sighted user reads at a glance and a reader cannot; a
+            // polite live region says it once without cutting anything off.
+            .when_some(self.prompt_jump.clone(), |this, label| {
+                this.child(
+                    gpui::deferred(
+                        div()
+                            .id("mux-prompt-jump")
+                            .role(gpui::Role::Status)
+                            .aria_live(gpui::accesskit::Live::Polite)
+                            .aria_announcement(label.to_string())
+                            .absolute()
+                            .bottom_0()
+                            .right_0()
+                            .p(gpui::Rems(0.25))
+                            .bg(colors.editor_background)
+                            .rounded_sm()
+                            .child(
+                                div()
+                                    .text_size(gpui::Rems(0.875))
+                                    .text_color(colors.text_muted)
+                                    .child(label),
+                            ),
+                    )
+                    .with_priority(1),
+                )
+            })
             // §3.3 只读指示器 (Plan 33)
             .when(self.is_read_only(), |this| {
                 this.child(

@@ -575,6 +575,19 @@ fn mock_response(
                 scrollback_version: snapshot.history_version,
             }))
         }
+        // §3.3 The OSC 133 markers the jump navigates by. Two commands, both
+        // in history, so a jump has somewhere to land and a second one has a
+        // boundary to stop at.
+        Some(RequestBody::ListCommands(_)) => Some(ResponseBody::Commands(
+            mux_protocol::ListCommandsResponse {
+                commands: vec![
+                    mock_command(1, -4, Some(0)),
+                    mock_command(2, -2, Some(1)),
+                ],
+                history_size: u32::try_from(history.len()).unwrap_or(u32::MAX),
+                recorded_markers: 2,
+            },
+        )),
         // Empty body = success. Anything the view issues during startup that is
         // not answered would leave a task waiting forever.
         _ => None,
@@ -582,6 +595,23 @@ fn mock_response(
     Response {
         request_id: request.request_id,
         body,
+    }
+}
+
+/// One OSC 133 command: a prompt at `prompt_line` and an exit status.
+fn mock_command(id: u64, prompt_line: i64, exit_code: Option<i32>) -> mux_protocol::CommandRange {
+    mux_protocol::CommandRange {
+        id,
+        prompt: Some(mux_protocol::CommandMarker {
+            line: Some(prompt_line),
+            column: 0,
+        }),
+        command_end: Some(mux_protocol::CommandMarker {
+            line: Some(prompt_line + 1),
+            column: 0,
+        }),
+        exit_code,
+        ..Default::default()
     }
 }
 
@@ -1487,6 +1517,113 @@ fn terminal_semantic_scroll_actions_move_viewport() -> Result<()> {
     Ok(())
 }
 
+/// §3.3 The shell reports where each command started and how it ended, and the
+/// server keeps those markers — but nothing in the GUI reached them, so
+/// scrolling back for "what did that command print" meant hunting by eye.
+///
+/// The jump moves the viewport, which a sighted user reads at a glance and a
+/// screen-reader user cannot: without a live region saying where it landed, the
+/// two keystrokes are silent and indistinguishable from doing nothing.
+fn prompt_jump_moves_the_viewport_and_says_where_it_landed() -> Result<()> {
+    let mut cx = headless_app()?;
+    let (domain, _server) = MockMuxServer::start(terminal_grid_with_history())?;
+    cx.allow_parking();
+
+    let window = open_mux_pane(&mut cx, domain)?;
+    let (_, tree) = draw_until(&mut cx, window.into(), |tree| {
+        a11y_text_run_values(tree)
+            .iter()
+            .any(|value| value.contains(TERMINAL_MARKER))
+    })?;
+    // The precondition: history is off-screen, so a jump that does nothing
+    // cannot be mistaken for a jump that worked.
+    assert!(
+        !a11y_text_run_values(&tree)
+            .iter()
+            .any(|value| value.contains("HIST-")),
+        "history must start above the viewport"
+    );
+    assert!(
+        a11y_nodes_with_role(&tree, "Status").is_empty(),
+        "nothing has been jumped to yet, so there is nothing to announce"
+    );
+
+    // The action is dispatched from whatever holds focus, and a headless window
+    // focuses nothing on its own.
+    cx.update_window(window.into(), |view, window, cx| {
+        let handle = view
+            .downcast::<MuxPaneView>()
+            .ok()
+            .map(|view| gpui::Focusable::focus_handle(view.read(cx), cx));
+        if let Some(handle) = handle {
+            window.focus(&handle, cx);
+        }
+        window.dispatch_action(
+            Box::new(settings::mux_actions::JumpToPreviousPrompt),
+            cx,
+        );
+    })?;
+    cx.run_until_parked();
+
+    // The newest command's prompt sits two rows into history, so the jump has
+    // to bring history into view.
+    let (_, tree) = draw_until(&mut cx, window.into(), |tree| {
+        !a11y_nodes_with_role(tree, "Status").is_empty()
+    })?;
+    check_a11y(&tree, "mux prompt jump");
+    let (frame, _) = draw_frame(&mut cx, window.into())?;
+    save_frame("mux_prompt_jump", &frame, &tree)?;
+
+    let announced: Vec<String> = a11y_nodes_with_role(&tree, "Status")
+        .into_iter()
+        .filter_map(|node| a11y_string_field(node, "value"))
+        .collect();
+    assert!(
+        announced
+            .iter()
+            .any(|value| value.starts_with("Command 2 of 2")),
+        "the jump must say which command it landed on: {announced:?}"
+    );
+    assert!(
+        announced.iter().any(|value| value.contains("exited 1")),
+        "a reader goes looking for a command because of how it ended: {announced:?}"
+    );
+
+    let runs = a11y_text_run_values(&tree);
+    assert!(
+        runs.iter().any(|value| value.contains("HIST-")),
+        "the jump must move the viewport into history: {runs:?}"
+    );
+
+    // A second jump backwards lands on the older command; a third has nowhere
+    // left to go and must say so rather than silently leaving the view alone.
+    for expected in ["Command 1 of 2", "At the oldest recorded command"] {
+        cx.update_window(window.into(), |_, window, cx| {
+            window.dispatch_action(
+                Box::new(settings::mux_actions::JumpToPreviousPrompt),
+                cx,
+            );
+        })?;
+        cx.run_until_parked();
+        let (_, tree) = draw_until(&mut cx, window.into(), |tree| {
+            a11y_nodes_with_role(tree, "Status")
+                .into_iter()
+                .filter_map(|node| a11y_string_field(node, "value"))
+                .any(|value| value.starts_with(expected))
+        })?;
+        let announced: Vec<String> = a11y_nodes_with_role(&tree, "Status")
+            .into_iter()
+            .filter_map(|node| a11y_string_field(node, "value"))
+            .collect();
+        assert!(
+            announced.iter().any(|value| value.starts_with(expected)),
+            "expected {expected:?}, got {announced:?}"
+        );
+    }
+
+    Ok(())
+}
+
 /// A failure and a piece of news arrive through the same component, told apart
 /// on screen by a red warning icon. An icon is not a node and carries no text,
 /// so the screenshot and the a11y dump beside it are the two halves of the
@@ -1686,6 +1823,10 @@ fn main() {
         (
             "notification_severity_reaches_the_reader",
             notification_severity_reaches_the_reader,
+        ),
+        (
+            "prompt_jump_moves_the_viewport_and_says_where_it_landed",
+            prompt_jump_moves_the_viewport_and_says_where_it_landed,
         ),
     ];
 
