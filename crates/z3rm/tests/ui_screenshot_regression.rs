@@ -250,6 +250,19 @@ fn a11y_text_run_values(tree: &serde_json::Value) -> Vec<String> {
 }
 
 /// Roles present in the frame, sorted, for diagnostics in failure messages.
+/// The values every live region is currently announcing.
+///
+/// A region with no value is one that has been rendered so it has something to
+/// diff against later; it is not an announcement, and asking whether the node
+/// exists would count it as one.
+fn announced_status_values(tree: &serde_json::Value) -> Vec<String> {
+    a11y_nodes_with_role(tree, "Status")
+        .into_iter()
+        .filter_map(|node| a11y_string_field(node, "value"))
+        .filter(|value| !value.is_empty())
+        .collect()
+}
+
 fn a11y_role_summary(tree: &serde_json::Value) -> Vec<String> {
     let mut roles: Vec<String> = a11y_nodes(tree)
         .into_iter()
@@ -1572,8 +1585,8 @@ fn prompt_jump_moves_the_viewport_and_says_where_it_landed() -> Result<()> {
         "history must start above the viewport"
     );
     assert!(
-        a11y_nodes_with_role(&tree, "Status").is_empty(),
-        "nothing has been jumped to yet, so there is nothing to announce"
+        announced_status_values(&tree).is_empty(),
+        "the region is there from the first frame, but with nothing to say yet"
     );
 
     // The action is dispatched from whatever holds focus, and a headless window
@@ -1596,16 +1609,15 @@ fn prompt_jump_moves_the_viewport_and_says_where_it_landed() -> Result<()> {
     // The newest command's prompt sits two rows into history, so the jump has
     // to bring history into view.
     let (_, tree) = draw_until(&mut cx, window.into(), |tree| {
-        !a11y_nodes_with_role(tree, "Status").is_empty()
+        announced_status_values(tree)
+            .iter()
+            .any(|value| value.starts_with("Command "))
     })?;
     check_a11y(&tree, "mux prompt jump");
     let (frame, _) = draw_frame(&mut cx, window.into())?;
     save_frame("mux_prompt_jump", &frame, &tree)?;
 
-    let announced: Vec<String> = a11y_nodes_with_role(&tree, "Status")
-        .into_iter()
-        .filter_map(|node| a11y_string_field(node, "value"))
-        .collect();
+    let announced = announced_status_values(&tree);
     assert!(
         announced
             .iter()
@@ -1634,15 +1646,11 @@ fn prompt_jump_moves_the_viewport_and_says_where_it_landed() -> Result<()> {
         })?;
         cx.run_until_parked();
         let (_, tree) = draw_until(&mut cx, window.into(), |tree| {
-            a11y_nodes_with_role(tree, "Status")
-                .into_iter()
-                .filter_map(|node| a11y_string_field(node, "value"))
+            announced_status_values(tree)
+                .iter()
                 .any(|value| value.starts_with(expected))
         })?;
-        let announced: Vec<String> = a11y_nodes_with_role(&tree, "Status")
-            .into_iter()
-            .filter_map(|node| a11y_string_field(node, "value"))
-            .collect();
+        let announced = announced_status_values(&tree);
         assert!(
             announced.iter().any(|value| value.starts_with(expected)),
             "expected {expected:?}, got {announced:?}"
@@ -1693,13 +1701,12 @@ fn session_clipboard_copy_and_paste_report_what_happened() -> Result<()> {
         Box::new(settings::mux_actions::CopyToSession),
     )?;
     let (_, tree) = draw_until(&mut cx, window.into(), |tree| {
-        !a11y_nodes_with_role(tree, "Status").is_empty()
+        announced_status_values(tree)
+            .iter()
+            .any(|value| value.contains("Nothing selected"))
     })?;
     check_a11y(&tree, "mux session clipboard");
-    let announced: Vec<String> = a11y_nodes_with_role(&tree, "Status")
-        .into_iter()
-        .filter_map(|node| a11y_string_field(node, "value"))
-        .collect();
+    let announced = announced_status_values(&tree);
     assert!(
         announced
             .iter()
@@ -1714,15 +1721,11 @@ fn session_clipboard_copy_and_paste_report_what_happened() -> Result<()> {
         Box::new(settings::mux_actions::PasteFromSession),
     )?;
     let (_, tree) = draw_until(&mut cx, window.into(), |tree| {
-        a11y_nodes_with_role(tree, "Status")
-            .into_iter()
-            .filter_map(|node| a11y_string_field(node, "value"))
+        announced_status_values(tree)
+            .iter()
             .any(|value| value.contains("empty"))
     })?;
-    let announced: Vec<String> = a11y_nodes_with_role(&tree, "Status")
-        .into_iter()
-        .filter_map(|node| a11y_string_field(node, "value"))
-        .collect();
+    let announced = announced_status_values(&tree);
     assert!(
         announced
             .iter()
@@ -1743,15 +1746,11 @@ fn session_clipboard_copy_and_paste_report_what_happened() -> Result<()> {
 
     dispatch(&mut cx, Box::new(settings::mux_actions::PasteFromSession))?;
     let (_, tree) = draw_until(&mut cx, window.into(), |tree| {
-        a11y_nodes_with_role(tree, "Status")
-            .into_iter()
-            .filter_map(|node| a11y_string_field(node, "value"))
+        announced_status_values(tree)
+            .iter()
             .any(|value| value.contains("Pasted"))
     })?;
-    let announced: Vec<String> = a11y_nodes_with_role(&tree, "Status")
-        .into_iter()
-        .filter_map(|node| a11y_string_field(node, "value"))
-        .collect();
+    let announced = announced_status_values(&tree);
     assert!(
         announced
             .iter()
@@ -1791,6 +1790,10 @@ fn rename_session_modal_names_its_field_and_speaks_its_refusal() -> Result<()> {
         !a11y_nodes_with_role(tree, "TextInput").is_empty()
     })?;
     check_a11y(&tree, "rename session modal");
+    assert!(
+        announced_status_values(&tree).is_empty(),
+        "the field's error region is there from the first frame with nothing to say"
+    );
     let (frame, _) = draw_frame(&mut cx, window.into())?;
     save_frame("rename_session_modal", &frame, &tree)?;
 
@@ -1822,20 +1825,75 @@ fn rename_session_modal_names_its_field_and_speaks_its_refusal() -> Result<()> {
     cx.run_until_parked();
 
     let (_, tree) = draw_until(&mut cx, window.into(), |tree| {
-        a11y_nodes_with_role(tree, "Status")
-            .into_iter()
-            .filter_map(|node| a11y_string_field(node, "value"))
+        announced_status_values(tree)
+            .iter()
             .any(|value| value.contains("needs a name"))
     })?;
-    let announced: Vec<String> = a11y_nodes_with_role(&tree, "Status")
-        .into_iter()
-        .filter_map(|node| a11y_string_field(node, "value"))
-        .collect();
+    let announced = announced_status_values(&tree);
     assert!(
         announced.iter().any(|value| value.contains("needs a name")),
         "an empty name must be refused out loud: {announced:?}"
     );
 
+    Ok(())
+}
+
+/// §12 A search reports how many matches it found, and that count is the whole
+/// answer to "did that find anything". It was a plain label: no node, no role,
+/// nothing said — a reader typing a query got silence either way.
+fn copy_mode_search_announces_its_match_count() -> Result<()> {
+    let mut cx = headless_app()?;
+    let (domain, _server) = MockMuxServer::start(terminal_grid_with_history())?;
+    cx.allow_parking();
+
+    let window = open_mux_pane(&mut cx, domain)?;
+    let (_, tree) = draw_until(&mut cx, window.into(), |tree| {
+        a11y_text_run_values(tree)
+            .iter()
+            .any(|value| value.contains(TERMINAL_MARKER))
+    })?;
+    assert!(
+        announced_status_values(&tree).is_empty(),
+        "nothing has been searched for yet"
+    );
+
+    let view = window.root(&mut cx)?;
+    cx.update(|cx| {
+        view.update(cx, |pane, cx| {
+            let terminal_view = pane.terminal_view_for_test().clone();
+            terminal_view.update(cx, |terminal_view, cx| {
+                terminal_view.enter_copy_mode_for_test(cx);
+                // The keys a user presses: `/`, the query, then enter.
+                for key in ["/", "r", "o", "w", "enter"] {
+                    let keystroke =
+                        gpui::Keystroke::parse(key).expect("well-formed test keystroke");
+                    terminal_view.dispatch_copy_mode_keystroke(&keystroke, cx);
+                }
+            });
+        });
+    });
+    cx.run_until_parked();
+
+    let (_, tree) = draw_until(&mut cx, window.into(), |tree| {
+        announced_status_values(tree)
+            .iter()
+            .any(|value| value.contains("match"))
+    })?;
+    check_a11y(&tree, "copy mode search");
+    let (frame, _) = draw_frame(&mut cx, window.into())?;
+    save_frame("mux_copy_mode_search", &frame, &tree)?;
+
+    let announced = announced_status_values(&tree);
+    assert!(
+        announced.iter().any(|value| value.starts_with("/row")),
+        "the indicator must name the query it searched for: {announced:?}"
+    );
+    assert!(
+        announced
+            .iter()
+            .any(|value| value.contains("matches") && !value.contains("no matches")),
+        "the grid has rows to match, so a count is what proves the search ran: {announced:?}"
+    );
     Ok(())
 }
 
@@ -2050,6 +2108,10 @@ fn main() {
         (
             "rename_session_modal_names_its_field_and_speaks_its_refusal",
             rename_session_modal_names_its_field_and_speaks_its_refusal,
+        ),
+        (
+            "copy_mode_search_announces_its_match_count",
+            copy_mode_search_announces_its_match_count,
         ),
     ];
 

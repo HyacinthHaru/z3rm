@@ -1591,6 +1591,15 @@ impl MuxPaneView {
 
     /// §16.5 Send a literal keystroke to the PTY (double-tap escape).
     /// `keystroke` is a tmux-style name (`C-b`, `Enter`, …) from the keymap.
+    /// §12 The pane's display-only terminal view.
+    ///
+    /// Exposed for tests that drive copy mode the way the key router does,
+    /// without standing up a real key event to get there.
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn terminal_view_for_test(&self) -> &Entity<TerminalView> {
+        &self.terminal_view
+    }
+
     pub fn send_literal(&mut self, keystroke: &str, cx: &mut Context<Self>) {
         let bytes = mux_protocol::parse_key(keystroke);
         if bytes.is_empty() {
@@ -2555,32 +2564,41 @@ impl Render for MuxPaneView {
                 }
             }))
             // §12 复制模式搜索指示器 (Plan 31)
-            .when_some(
-                self.terminal_view
-                    .read(cx)
-                    .copy_mode_state()
-                    .search_indicator(),
-                |this, label| {
-                    this.child(
-                        gpui::deferred(
-                            div()
-                                .id("mux-copy-mode-search")
-                                .absolute()
-                                .bottom_0()
-                                .left_0()
-                                .p(gpui::Rems(0.25))
-                                .bg(colors.editor_background)
-                                .rounded_sm()
-                                .child(
-                                    div()
-                                        .text_size(gpui::Rems(0.875))
-                                        .text_color(colors.text)
-                                        .child(label),
-                                ),
-                        )
-                        .with_priority(1),
-                    )
-                },
+            //
+            // The match count is the whole answer to "did that find anything",
+            // and it was a plain label: no node, no role, nothing said. It is a
+            // live region now, and rendered whether or not there is a search —
+            // one that appears together with its text has nothing to diff
+            // against, so it announces nothing. Same shape `InputField` uses.
+            .child(
+                gpui::deferred(
+                    div()
+                        .id("mux-copy-mode-search")
+                        .role(gpui::Role::Status)
+                        .aria_live(gpui::accesskit::Live::Polite)
+                        .absolute()
+                        .bottom_0()
+                        .left_0()
+                        .when_some(
+                            self.terminal_view
+                                .read(cx)
+                                .copy_mode_state()
+                                .search_indicator(),
+                            |this, label| {
+                                this.aria_announcement(label.clone())
+                                    .p(gpui::Rems(0.25))
+                                    .bg(colors.editor_background)
+                                    .rounded_sm()
+                                    .child(
+                                        div()
+                                            .text_size(gpui::Rems(0.875))
+                                            .text_color(colors.text)
+                                            .child(label),
+                                    )
+                            },
+                        ),
+                )
+                .with_priority(1),
             )
             // §3.3 A pane-local operation, so the pane handles it: the jump
             // navigates this pane's own scrollback wherever it is rendered.
@@ -2609,32 +2627,33 @@ impl Render for MuxPaneView {
             // §3.3 / §16.6 What the last operation did. A jump moves the
             // viewport and a copy reaches a clipboard on another machine —
             // both are things a sighted user reads at a glance or infers, and
-            // a reader cannot. A polite live region says it once without
-            // cutting off whatever they were reading.
-            .when_some(self.last_operation.clone(), |this, label| {
-                this.child(
-                    gpui::deferred(
-                        div()
-                            .id("mux-pane-operation-status")
-                            .role(gpui::Role::Status)
-                            .aria_live(gpui::accesskit::Live::Polite)
-                            .aria_announcement(label.to_string())
-                            .absolute()
-                            .bottom_0()
-                            .right_0()
-                            .p(gpui::Rems(0.25))
-                            .bg(colors.editor_background)
-                            .rounded_sm()
-                            .child(
-                                div()
-                                    .text_size(gpui::Rems(0.875))
-                                    .text_color(colors.text_muted)
-                                    .child(label),
-                            ),
-                    )
-                    .with_priority(1),
+            // a reader cannot. Rendered whether or not there is anything to
+            // say: a live region that appears together with its message has
+            // nothing to diff against and announces nothing.
+            .child(
+                gpui::deferred(
+                    div()
+                        .id("mux-pane-operation-status")
+                        .role(gpui::Role::Status)
+                        .aria_live(gpui::accesskit::Live::Polite)
+                        .absolute()
+                        .bottom_0()
+                        .right_0()
+                        .when_some(self.last_operation.clone(), |this, label| {
+                            this.aria_announcement(label.to_string())
+                                .p(gpui::Rems(0.25))
+                                .bg(colors.editor_background)
+                                .rounded_sm()
+                                .child(
+                                    div()
+                                        .text_size(gpui::Rems(0.875))
+                                        .text_color(colors.text_muted)
+                                        .child(label),
+                                )
+                        }),
                 )
-            })
+                .with_priority(1),
+            )
             // §3.3 只读指示器 (Plan 33)
             .when(self.is_read_only(), |this| {
                 this.child(
