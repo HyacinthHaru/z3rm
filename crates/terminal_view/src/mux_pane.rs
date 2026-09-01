@@ -451,9 +451,10 @@ pub struct MuxPaneView {
     /// Shared press state lets TerminalElement intercept a z3rm download link
     /// without mutating the terminal's selection state before mouse-up.
     download_click_state: DownloadClickState,
-    /// §3.3 What the last prompt jump landed on, announced to a reader and
-    /// shown as a badge. `None` until the user jumps.
-    prompt_jump: Option<SharedString>,
+    /// §3.3 / §16.6 The result of the last pane operation whose only effect is
+    /// somewhere the pane does not show — a prompt jump, a session clipboard
+    /// copy. Announced to a reader and shown as a badge; `None` until one runs.
+    last_operation: Option<SharedString>,
     /// §15.7 zoom state
     zoomed: bool,
     /// §3.10 last resize dimensions sent to server (cols, rows)
@@ -755,7 +756,7 @@ impl MuxPaneView {
             history_cache,
             media: PaneMediaStore::default(),
             download_click_state: Arc::new(std::sync::Mutex::new(None)),
-            prompt_jump: None,
+            last_operation: None,
             zoomed: false,
             last_sent_size: (80, 24),
             prefix_machine: PrefixModeMachine::new(PrefixModeConfig::default()),
@@ -1301,66 +1302,132 @@ impl MuxPaneView {
     /// in the GUI reached them before, so a user scrolling back for "what did
     /// that command print" had to hunt by eye. The markers are the server's, so
     /// this asks rather than guessing from the local grid.
-    pub fn jump_to_adjacent_prompt(&mut self, backward: bool, cx: &mut Context<Self>) {
+    /// §3.3 / §16.6 Run a server operation on the user's behalf and say what
+    /// it did.
+    ///
+    /// `failure` phrases the case where the server never answered; the error
+    /// itself is logged rather than being the whole of what the user reads.
+    fn run_announced<Fut>(
+        &self,
+        failure: &'static str,
+        cx: &mut Context<Self>,
+        operation: impl FnOnce(Arc<MuxDomain>, String) -> Fut + 'static,
+    ) where
+        Fut: std::future::Future<Output = anyhow::Result<PaneOutcome>> + 'static,
+    {
         let domain = self.domain.clone();
         let pane_id = self.pane_id.clone();
-        // The viewport's top row in the same numbering the markers use.
-        let from_line = -(self.terminal.read(cx).last_content().display_offset as i64);
         cx.spawn(async move |this, cx| {
-            let listed = match domain.list_commands(&pane_id, 0).await {
-                Ok(listed) => listed,
+            let outcome = match operation(domain, pane_id).await {
+                Ok(outcome) => outcome,
                 Err(error) => {
-                    tracing::warn!(error = %error, pane_id, "list_commands failed");
-                    if let Err(error) = this.update(cx, |this, cx| {
-                        this.announce_prompt_jump("Command history unavailable", cx);
-                    }) {
-                        tracing::debug!(%error, "pane dropped before the jump was reported");
-                    }
-                    return;
+                    tracing::warn!(error = %error, failure);
+                    PaneOutcome::said(format!("{failure}: {error}"))
                 }
             };
             if let Err(error) = this.update(cx, |this, cx| {
-                let target = mux::command_history::adjacent_prompt_line(
-                    &listed.commands,
-                    from_line,
-                    backward,
-                );
-                match target {
-                    Some(line) => {
-                        this.terminal_view.update(cx, |terminal_view, cx| {
-                            terminal_view.scroll_to_tmux_line(line, cx);
-                        });
-                        this.announce_prompt_jump(
-                            prompt_jump_label(&listed.commands, line),
-                            cx,
-                        );
-                    }
-                    // Saying nothing would be indistinguishable from a jump
-                    // that silently failed, and the viewport does not move
-                    // either way.
-                    None if listed.commands.is_empty() => this.announce_prompt_jump(
-                        "No commands recorded in this pane",
-                        cx,
-                    ),
-                    None => this.announce_prompt_jump(
-                        if backward {
-                            "At the oldest recorded command"
-                        } else {
-                            "At the newest recorded command"
-                        },
-                        cx,
-                    ),
+                // The sentence describes the state after the operation, so
+                // whatever makes it true has to happen before it is said.
+                if let Some(apply) = outcome.apply {
+                    apply(this, cx);
                 }
+                this.announce_operation(outcome.said, cx);
             }) {
-                tracing::debug!(%error, "pane dropped before the jump was applied");
+                tracing::debug!(%error, failure, "pane closed before the outcome was reported");
             }
         })
         .detach();
     }
 
-    fn announce_prompt_jump(&mut self, label: impl Into<SharedString>, cx: &mut Context<Self>) {
-        self.prompt_jump = Some(label.into());
+    fn announce_operation(&mut self, label: impl Into<SharedString>, cx: &mut Context<Self>) {
+        self.last_operation = Some(label.into());
         cx.notify();
+    }
+
+    /// §3.3 Jump to the prompt of the previous or next command (OSC 133).
+    ///
+    /// The shell reports command boundaries and the server keeps them; nothing
+    /// in the GUI reached them before, so a user scrolling back for "what did
+    /// that command print" had to hunt by eye. The markers are the server's, so
+    /// this asks rather than guessing from the local grid.
+    pub fn jump_to_adjacent_prompt(&mut self, backward: bool, cx: &mut Context<Self>) {
+        // The viewport's top row in the same numbering the markers use.
+        let from_line = -(self.terminal.read(cx).last_content().display_offset as i64);
+        self.run_announced(
+            "Command history unavailable",
+            cx,
+            move |domain, pane_id| async move {
+                let listed = domain.list_commands(&pane_id, 0).await?;
+                let target =
+                    mux::command_history::adjacent_prompt_line(&listed.commands, from_line, backward);
+                Ok(match target {
+                    Some(line) => PaneOutcome::said(prompt_jump_label(&listed.commands, line))
+                        .applying(move |this, cx| {
+                            this.terminal_view.update(cx, |terminal_view, cx| {
+                                terminal_view.scroll_to_tmux_line(line, cx);
+                            });
+                        }),
+                    // Saying nothing would be indistinguishable from a jump
+                    // that silently failed, and the viewport does not move
+                    // either way.
+                    None if listed.commands.is_empty() => {
+                        PaneOutcome::said("No commands recorded in this pane")
+                    }
+                    None if backward => PaneOutcome::said("At the oldest recorded command"),
+                    None => PaneOutcome::said("At the newest recorded command"),
+                })
+            },
+        );
+    }
+
+    /// §16.6 Copy the pane's selection to the session clipboard.
+    ///
+    /// The ordinary copy writes to this machine's clipboard, which is exactly
+    /// what a local user wants and exactly what a second client attached to
+    /// the same session cannot see. The server's clipboard is the one both
+    /// windows share, and it outlives a detach.
+    pub fn copy_to_session_clipboard(&mut self, cx: &mut Context<Self>) {
+        let Some(text) = self.terminal.read(cx).last_content().selection_text.clone() else {
+            self.announce_operation("Nothing selected to copy", cx);
+            return;
+        };
+        let characters = text.chars().count();
+        self.run_announced(
+            "Could not reach the session clipboard",
+            cx,
+            move |domain, _| async move {
+                domain
+                    .set_clipboard(mux_protocol::ClipboardEntry {
+                        content_type: mux_protocol::clipboard_entry::ClipboardContentType::Text
+                            as i32,
+                        data: text.into_bytes(),
+                        origin_host: String::new(),
+                    })
+                    .await?;
+                Ok(PaneOutcome::said(format!(
+                    "Copied {characters} characters to the session clipboard"
+                )))
+            },
+        );
+    }
+
+    /// §16.6 Paste whatever the session clipboard holds into this pane.
+    pub fn paste_from_session_clipboard(&mut self, cx: &mut Context<Self>) {
+        self.run_announced(
+            "Could not paste from the session clipboard",
+            cx,
+            |domain, pane_id| async move {
+                let text = session_clipboard_text(&domain).await?;
+                if text.is_empty() {
+                    return Ok(PaneOutcome::said("The session clipboard is empty"));
+                }
+                let characters = text.chars().count();
+                domain.paste(&pane_id, &text).await?;
+                Ok(PaneOutcome::said(format!(
+                    "Pasted {characters} characters from the session clipboard"
+                )))
+            },
+        );
     }
 
     /// §16.7 Agent CLI passthrough state.
@@ -2301,6 +2368,52 @@ impl Focusable for MuxPaneView {
 
 impl EventEmitter<MuxPaneEvent> for MuxPaneView {}
 
+/// §3.3 / §16.6 What a pane operation did, in the words the user is told.
+///
+/// These operations have one thing in common that matters more than what each
+/// of them does: none changes anything the pane renders. A copy lands on
+/// another machine, a paste arrives as bytes the shell may not echo, a jump
+/// moves a viewport a reader cannot see move. The sentence is not decoration
+/// on top of the operation — it is the only evidence the operation happened,
+/// which is why it is the return type rather than something every call site
+/// has to remember.
+struct PaneOutcome {
+    said: String,
+    /// Some outcomes are only true once the pane has acted on them: a jump's
+    /// sentence names a line the viewport has not reached yet.
+    apply: Option<Box<dyn FnOnce(&mut MuxPaneView, &mut Context<MuxPaneView>)>>,
+}
+
+impl PaneOutcome {
+    fn said(said: impl Into<String>) -> Self {
+        Self {
+            said: said.into(),
+            apply: None,
+        }
+    }
+
+    fn applying(
+        mut self,
+        apply: impl FnOnce(&mut MuxPaneView, &mut Context<MuxPaneView>) + 'static,
+    ) -> Self {
+        self.apply = Some(Box::new(apply));
+        self
+    }
+}
+
+/// §16.6 The session clipboard's contents as text.
+///
+/// The clipboard also carries images and file paths; a terminal can only be
+/// sent bytes, so anything else is reported as empty rather than pasted as
+/// whatever its encoding happens to look like.
+async fn session_clipboard_text(domain: &MuxDomain) -> anyhow::Result<String> {
+    let entry = domain.get_clipboard().await?;
+    if entry.content_type != mux_protocol::clipboard_entry::ClipboardContentType::Text as i32 {
+        return Ok(String::new());
+    }
+    Ok(String::from_utf8_lossy(&entry.data).into_owned())
+}
+
 /// §3.3 What a jump landed on, in the words a reader needs: which command of
 /// how many, and how it ended. The line number alone says nothing about
 /// whether the command succeeded, which is usually why one goes looking.
@@ -2481,14 +2594,28 @@ impl Render for MuxPaneView {
                     this.jump_to_adjacent_prompt(false, cx);
                 },
             ))
-            // §3.3 Where the last prompt jump landed. The viewport moves,
-            // which a sighted user reads at a glance and a reader cannot; a
-            // polite live region says it once without cutting anything off.
-            .when_some(self.prompt_jump.clone(), |this, label| {
+            // §16.6 The session clipboard, which every client attached to this
+            // session shares — unlike the machine's own.
+            .on_action(cx.listener(
+                |this, _: &settings::mux_actions::CopyToSession, _window, cx| {
+                    this.copy_to_session_clipboard(cx);
+                },
+            ))
+            .on_action(cx.listener(
+                |this, _: &settings::mux_actions::PasteFromSession, _window, cx| {
+                    this.paste_from_session_clipboard(cx);
+                },
+            ))
+            // §3.3 / §16.6 What the last operation did. A jump moves the
+            // viewport and a copy reaches a clipboard on another machine —
+            // both are things a sighted user reads at a glance or infers, and
+            // a reader cannot. A polite live region says it once without
+            // cutting off whatever they were reading.
+            .when_some(self.last_operation.clone(), |this, label| {
                 this.child(
                     gpui::deferred(
                         div()
-                            .id("mux-prompt-jump")
+                            .id("mux-pane-operation-status")
                             .role(gpui::Role::Status)
                             .aria_live(gpui::accesskit::Live::Polite)
                             .aria_announcement(label.to_string())

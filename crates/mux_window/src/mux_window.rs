@@ -8,6 +8,9 @@
 
 gpui::actions!(z3rm_debug, [DumpAccessibilityTree]);
 
+mod rename_session_modal;
+pub use rename_session_modal::RenameSessionModal;
+
 use std::collections::BTreeSet;
 use std::collections::HashMap;
 use std::rc::Rc;
@@ -1205,6 +1208,20 @@ pub fn register_core_mux_actions(workspace: &mut workspace::Workspace, window: &
                                 anyhow::Ok(())
                             }).detach();
                         });
+
+    workspace.register_action(
+        |workspace, _: &settings::mux_actions::RenameSession, window, cx| {
+            let Some(domain) = mux_domain_for_window(window, cx) else {
+                return;
+            };
+            let Some(session_id) = mux_session_for_window(window, cx) else {
+                return;
+            };
+            workspace.toggle_modal(window, cx, move |window, cx| {
+                RenameSessionModal::new(domain, session_id, window, cx)
+            });
+        },
+    );
 
     // §16.9 The divider drag lives in `workspace`, which has the ratios but
     // not the socket, so it raises an event and the forwarding happens here.

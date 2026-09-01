@@ -59,6 +59,13 @@
       "ctrl-shift-[": "mux_pane::JumpToPreviousPrompt",
       "ctrl-shift-]": "mux_pane::JumpToNextPrompt",
 
+      // §16.6 Session clipboard, shared by every attached client
+      "ctrl-alt-c": "mux_pane::CopyToSession",
+      "ctrl-alt-v": "mux_pane::PasteFromSession",
+
+      // §3.10 Rename the current session
+      "ctrl-alt-comma": "mux::RenameSession",
+
       // Debug accessibility tree
       "ctrl-shift-a": "z3rm_debug::DumpAccessibilityTree",
 

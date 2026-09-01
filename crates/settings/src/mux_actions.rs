@@ -46,6 +46,11 @@ pub struct KillSession;
 #[action(namespace = mux)]
 pub struct KillServer;
 
+/// §3.10 重命名当前 mux session。
+#[derive(Clone, Debug, Default, Deserialize, JsonSchema, PartialEq, Action)]
+#[action(namespace = mux)]
+pub struct RenameSession;
+
 /// §16.7 进入 prefix 模式，等待下一个按键。
 /// timeout_ms 控制 prefix 模式超时时间（默认 500ms）。
 #[derive(Clone, Debug, Deserialize, JsonSchema, PartialEq, Action)]
@@ -114,6 +119,10 @@ actions!(
         JumpToPreviousPrompt,
         /// §3.3 跳到下一条命令的提示符 (OSC 133)。
         JumpToNextPrompt,
+        /// §16.6 把选区复制到会话剪贴板 (所有已连接的客户端共享)。
+        CopyToSession,
+        /// §16.6 从会话剪贴板粘贴到本 pane。
+        PasteFromSession,
     ]
 );
 

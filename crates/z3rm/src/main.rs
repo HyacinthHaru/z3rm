@@ -2359,6 +2359,9 @@ mod tests {
             // keystroke simply stops doing anything.
             "mux_pane::JumpToPreviousPrompt",
             "mux_pane::JumpToNextPrompt",
+            "mux_pane::CopyToSession",
+            "mux_pane::PasteFromSession",
+            "mux::RenameSession",
         ] {
             assert!(
                 action_names.contains(required),
