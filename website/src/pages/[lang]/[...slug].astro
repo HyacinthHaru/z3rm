@@ -1,8 +1,7 @@
 ---
 import { getCollection, render, type CollectionEntry } from "astro:content";
-import HomeLanding from "../../components/HomeLanding.astro";
+import TerminalApp from "../../components/TerminalApp.astro";
 import DocsLayout from "../../layouts/DocsLayout.astro";
-import SiteLayout from "../../layouts/SiteLayout.astro";
 import StatusMatrix from "../../components/StatusMatrix.astro";
 
 type Props = { entry: CollectionEntry<"docs">; lang: "en" | "zh"; pairedPath: string };
@@ -35,9 +34,7 @@ const isHome = entry.data.section === "home";
 const isImplementationStatus = entry.data.translationKey === "implementation-status";
 ---
 {isHome ? (
-  <SiteLayout title={entry.data.title} description={entry.data.description} {lang} {pairedPath} {canonical} {alternate}>
-    <HomeLanding {lang} />
-  </SiteLayout>
+  <TerminalApp {lang} />
 ) : (
   <DocsLayout {entry} {entries} {headings} {lang} {pairedPath} {canonical} {alternate}>
     <Content />

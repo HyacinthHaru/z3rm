@@ -1,0 +1,29 @@
+---
+// §15.1 The site is the desktop app compiled to WebAssembly, connected to a
+// live v86 Linux guest — so a route that used to be a page *about* the
+// terminal is now the terminal.
+//
+// Every such route lands on the one boot page Trunk builds. The overlay, the
+// progress reporting and the hashed module filenames live there; a copy of
+// them here would be a second thing to keep in step, and Astro cannot see the
+// hashes anyway.
+type Props = { lang?: "en" | "zh" };
+const { lang = "en" } = Astro.props;
+const base = import.meta.env.BASE_URL.replace(/\/$/, "");
+const target = `${base}/gpui-demo/index.html`;
+---
+<!doctype html>
+<html lang={lang}>
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, height=device-height, initial-scale=1, user-scalable=0" />
+    <title>Z3rm</title>
+    <link rel="canonical" href={target} />
+    <noscript><meta http-equiv="refresh" content={`0; url=${target}`} /></noscript>
+  </head>
+  <body>
+    <script is:inline define:vars={{ target }}>
+      location.replace(target);
+    </script>
+  </body>
+</html>
