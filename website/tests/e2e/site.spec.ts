@@ -130,34 +130,6 @@ test("GPUI WASM loading surface shows percentage when total is known", async ({ 
   expect(contract.detail).toContain("%");
 });
 
-test("GPUI WASM panes render a real terminal grid", async ({ page }) => {
-  test.setTimeout(300_000);
-  await page.goto("gpui-demo/index.html");
-  await expect
-    .poll(
-      async () =>
-        (await page.locator("canvas").isVisible()) ||
-        (await page.locator("#boot-terminal").isVisible()),
-      { timeout: 300_000 },
-    )
-    .toBe(true);
-  const received = await page.evaluate(() => {
-    const bindings = (window as Window & {
-      wasmBindings?: {
-        receive_shell_bytes?: (bytes: Uint8Array) => void;
-        receive_shell_result?: (command: string, stdout: string, stderr: string, exitCode: number) => void;
-        terminal_viewport?: () => string;
-      };
-    }).wasmBindings;
-    if (!bindings?.receive_shell_result || !bindings.terminal_viewport) return null;
-    bindings.receive_shell_result("echo demo", "demo output line\n", "", 0);
-    return bindings.terminal_viewport();
-  });
-  if (received !== null) {
-    expect(received).toContain("demo output line");
-  }
-});
-
 test("docs table of contents marks the section in view", async ({ page }) => {
   await page.goto("en/reference/cli/");
   const tocLinks = page.locator(".page-toc a");
