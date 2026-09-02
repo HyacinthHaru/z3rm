@@ -5149,6 +5149,35 @@ mod tests {
         assert_eq!((visible[0].columns, visible[0].rows), (2, 1));
     }
     #[test]
+    /// The reference page states the limits a program is held to. Numbers in
+    /// prose drift away from the constants they describe unless something
+    /// fails when they do.
+    #[test]
+    fn the_documented_media_limits_are_the_enforced_ones() {
+        const REFERENCE: &str =
+            include_str!("../../../website/src/content/docs/en/reference/terminal-images.md");
+
+        for (value, what) in [
+            (MAX_MEDIA_IMAGES.to_string(), "image count"),
+            ((MAX_MEDIA_RESIDENT_BYTES / (1024 * 1024)).to_string(), "resident megabytes"),
+            (MAX_MEDIA_COLUMNS.to_string(), "cells per side"),
+        ] {
+            assert!(
+                REFERENCE.contains(&value),
+                "the {what} limit is {value}, which the reference page does not say"
+            );
+        }
+        assert_eq!(
+            MAX_MEDIA_COLUMNS, MAX_MEDIA_ROWS,
+            "the page says `on a side`, which assumes one number for both"
+        );
+        assert!(
+            REFERENCE.contains(&PNG_MEDIA_FORMAT.to_string()),
+            "the page must name the format tag the client decodes"
+        );
+    }
+
+    #[test]
     fn pane_media_store_rejects_new_frames_without_evicting_existing() {
         let mut store = PaneMediaStore::default();
         for sequence in 0..MAX_MEDIA_IMAGES as u64 {
