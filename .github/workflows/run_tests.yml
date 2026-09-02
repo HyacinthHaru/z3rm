@@ -18,7 +18,7 @@ permissions:
   contents: read
 jobs:
   orchestrate:
-    if: (github.repository_owner == 'zed-industries' || github.repository_owner == 'zed-extensions')
+    if: (github.repository_owner == 'cyjin-yl')
     runs-on: namespace-profile-2x4-ubuntu-2404
     steps:
     - name: steps::harden_runner
@@ -140,7 +140,7 @@ jobs:
       run_tests: ${{ steps.filter.outputs.run_tests }}
       changed_extensions: ${{ steps.filter.outputs.changed_extensions }}
   check_style:
-    if: (github.repository_owner == 'zed-industries' || github.repository_owner == 'zed-extensions')
+    if: (github.repository_owner == 'cyjin-yl')
     runs-on: namespace-profile-4x8-ubuntu-2204
     steps:
     - name: steps::harden_runner
@@ -931,13 +931,14 @@ jobs:
     - doctests
     - check_workspace_binaries
     - run_ui_regression_suite
+    - run_ui_regression_suite_linux
     - check_wasm
     - check_dependencies
     - check_docs
     - check_licenses
     - check_scripts
     - extension_tests
-    if: (github.repository_owner == 'zed-industries' || github.repository_owner == 'zed-extensions') && always()
+    if: (github.repository_owner == 'cyjin-yl') && always()
     runs-on: namespace-profile-2x4-ubuntu-2404
     steps:
     - name: run_tests::tests_pass
@@ -963,6 +964,7 @@ jobs:
         check_result "doctests" "$RESULT_DOCTESTS"
         check_result "check_workspace_binaries" "$RESULT_CHECK_WORKSPACE_BINARIES"
         check_result "run_ui_regression_suite" "$RESULT_RUN_UI_REGRESSION_SUITE"
+        check_result "run_ui_regression_suite_linux" "$RESULT_RUN_UI_REGRESSION_SUITE_LINUX"
         check_result "check_wasm" "$RESULT_CHECK_WASM"
         check_result "check_dependencies" "$RESULT_CHECK_DEPENDENCIES"
         check_result "check_docs" "$RESULT_CHECK_DOCS"
@@ -985,6 +987,7 @@ jobs:
         RESULT_DOCTESTS: ${{ needs.doctests.result }}
         RESULT_CHECK_WORKSPACE_BINARIES: ${{ needs.check_workspace_binaries.result }}
         RESULT_RUN_UI_REGRESSION_SUITE: ${{ needs.run_ui_regression_suite.result }}
+        RESULT_RUN_UI_REGRESSION_SUITE_LINUX: ${{ needs.run_ui_regression_suite_linux.result }}
         RESULT_CHECK_WASM: ${{ needs.check_wasm.result }}
         RESULT_CHECK_DEPENDENCIES: ${{ needs.check_dependencies.result }}
         RESULT_CHECK_DOCS: ${{ needs.check_docs.result }}

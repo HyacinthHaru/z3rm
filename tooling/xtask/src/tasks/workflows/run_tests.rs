@@ -9,7 +9,8 @@ use serde_json::json;
 use crate::tasks::workflows::{
     steps::{
         CommonJobConditions, CommonPermissionSets, cache_rust_dependencies_namespace,
-        repository_owner_guard_expression, use_clang,
+        project_repository_owner_guard_expression, repository_owner_guard_expression,
+        use_clang,
     },
     vars::{self, PathCondition},
 };
@@ -98,7 +99,11 @@ pub(crate) fn run_tests() -> Workflow {
         should_check_scripts.and_always().then(check_scripts(true)),
     ];
     let ext_tests = extension_tests();
-    let tests_pass = tests_pass(&jobs, &[&ext_tests.name]);
+    let tests_pass = tests_pass(
+        &jobs,
+        &[&ext_tests.name],
+        project_repository_owner_guard_expression(true),
+    );
 
     // TODO: For merge queues, this should fail in the merge queue context
     jobs.push(
@@ -304,7 +309,11 @@ fn orchestrate_impl(rules: &[&PathCondition], target: OrchestrateTarget) -> Name
 
     let job = Job::default()
         .runs_on(runners::LINUX_SMALL)
-        .with_repository_owner_guard()
+        .when_else(
+            target == OrchestrateTarget::ZedRepo,
+            |this| this.with_project_repository_owner_guard(),
+            |this| this.with_repository_owner_guard(),
+        )
         .outputs(outputs)
         .when(target == OrchestrateTarget::ZedRepo, |this| {
             this.add_step(steps::harden_runner())
@@ -315,7 +324,10 @@ fn orchestrate_impl(rules: &[&PathCondition], target: OrchestrateTarget) -> Name
     NamedJob { name, job }
 }
 
-pub fn tests_pass(jobs: &[NamedJob], extra_job_names: &[&str]) -> NamedJob {
+/// The aggregate check, guarded by whichever owner the calling workflow
+/// answers to: this project's own suite and the extension registry's are
+/// generated from the same code but run in different repositories.
+pub fn tests_pass(jobs: &[NamedJob], extra_job_names: &[&str], guard: Expression) -> NamedJob {
     let mut script = String::from(indoc::indoc! {r#"
         set +x
         EXIT_CODE=0
@@ -361,7 +373,7 @@ pub fn tests_pass(jobs: &[NamedJob], extra_job_names: &[&str]) -> NamedJob {
                 .map(|name| name.to_string())
                 .collect::<Vec<String>>(),
         )
-        .cond(repository_owner_guard_expression(true))
+        .cond(guard)
         .add_step(
             env_entries
                 .into_iter()
@@ -441,6 +453,7 @@ fn check_style() -> NamedJob {
 
     named::job(
         release_job(&[])
+            .cond(project_repository_owner_guard_expression(false))
             .runs_on(runners::LINUX_MEDIUM)
             .add_step(steps::harden_runner())
             .add_step(steps::checkout_repo())
@@ -676,6 +689,9 @@ fn run_ui_regression_suite_linux() -> NamedJob {
     named::job(
         Job::default()
             .runs_on(runners::LINUX_LARGE)
+            // The suite draws frames and waits for them to converge; a frame
+            // that never does would otherwise hold a runner for six hours.
+            .timeout_minutes(30u32)
             .add_step(steps::harden_runner())
             .add_step(steps::checkout_repo())
             .add_step(steps::setup_cargo_config(Platform::Linux))

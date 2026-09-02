@@ -34,8 +34,6 @@ on:
 
 permissions:
   contents: read
-  pages: write
-  id-token: write
 
 concurrency:
   group: pages
@@ -108,6 +106,12 @@ jobs:
 
   deploy:
     name: Deploy
+    # Only this job publishes, so only this job needs to. Granting it at the
+    # top of the file hands the write to `build` too, which runs the site's
+    # own build scripts.
+    permissions:
+      pages: write
+      id-token: write
     environment:
       name: github-pages
       url: ${{ steps.deployment.outputs.page_url }}

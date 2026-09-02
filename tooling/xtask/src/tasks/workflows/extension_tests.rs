@@ -9,7 +9,7 @@ use crate::tasks::workflows::{
     runners,
     steps::{
         self, BASH_SHELL, CommonJobConditions, CommonPermissionSets, FluentBuilder, NamedJob,
-        cache_rust_dependencies_namespace, named,
+        cache_rust_dependencies_namespace, named, repository_owner_guard_expression,
     },
     vars::{PathCondition, StepOutput, WorkflowInput, one_workflow_per_non_main_branch_and_token},
 };
@@ -36,7 +36,7 @@ pub(crate) fn extension_tests() -> Workflow {
         should_check_extension.and_always().then(check_extension()),
     ];
 
-    let tests_pass = tests_pass(&jobs, &[]);
+    let tests_pass = tests_pass(&jobs, &[], repository_owner_guard_expression(true));
 
     let working_directory = WorkflowInput::string("working-directory", Some(".".to_owned()));
 

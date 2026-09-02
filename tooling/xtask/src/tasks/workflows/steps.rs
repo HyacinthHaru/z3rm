@@ -355,24 +355,47 @@ pub struct NamedJob<J: JobType = RunJob> {
 //     }
 // }
 
+/// Workflows that only make sense in Zed's own repositories: releases, the
+/// extension registry, the Slack notifiers. They stay off here.
 pub(crate) const DEFAULT_REPOSITORY_OWNER_GUARD: &str =
     "(github.repository_owner == 'zed-industries' || github.repository_owner == 'zed-extensions')";
 
+/// This project's own test suite.
+///
+/// It arrived from the fork wearing the guard above, which is false in this
+/// repository — so `orchestrate` never ran, every job that waits on its
+/// `run_tests` output stayed skipped, and no test has ever run in CI here.
+pub(crate) const PROJECT_REPOSITORY_OWNER_GUARD: &str =
+    "(github.repository_owner == 'cyjin-yl')";
+
 pub fn repository_owner_guard_expression(trigger_always: bool) -> Expression {
+    guard_expression(DEFAULT_REPOSITORY_OWNER_GUARD, trigger_always)
+}
+
+pub fn project_repository_owner_guard_expression(trigger_always: bool) -> Expression {
+    guard_expression(PROJECT_REPOSITORY_OWNER_GUARD, trigger_always)
+}
+
+fn guard_expression(guard: &str, trigger_always: bool) -> Expression {
     Expression::new(format!(
         "{}{}",
-        DEFAULT_REPOSITORY_OWNER_GUARD,
+        guard,
         trigger_always.then_some(" && always()").unwrap_or_default()
     ))
 }
 
 pub trait CommonJobConditions: Sized {
     fn with_repository_owner_guard(self) -> Self;
+    fn with_project_repository_owner_guard(self) -> Self;
 }
 
 impl CommonJobConditions for Job {
     fn with_repository_owner_guard(self) -> Self {
         self.cond(repository_owner_guard_expression(false))
+    }
+
+    fn with_project_repository_owner_guard(self) -> Self {
+        self.cond(project_repository_owner_guard_expression(false))
     }
 }
 

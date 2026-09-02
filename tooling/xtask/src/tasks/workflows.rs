@@ -212,7 +212,10 @@ impl WorkflowType {
 }
 
 pub fn run_workflows(args: GenerateWorkflowArgs) -> Result<()> {
-    if !Path::new("crates/zed/").is_dir() {
+    // The binary crate is the marker for "this is the project root". It was
+    // `crates/zed/` before the fork renamed it, which made this bail wherever
+    // it was run from — so nothing has regenerated a workflow since.
+    if !Path::new("crates/z3rm/").is_dir() {
         anyhow::bail!("xtask workflows must be ran from the project root");
     }
 
