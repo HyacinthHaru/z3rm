@@ -26,6 +26,59 @@ case "${1-}" in
 esac
 SCRIPT
 cp ../../../target/i686-unknown-linux-musl/release/z3rm-server "$STAGE/mux_server"
+
+# §16.9 The site's own markdown, mounted for the in-guest reader. The docs the
+# browser renders and the docs the terminal renders are the same files, so
+# publishing a change to one publishes it to the other; nothing is rebuilt into
+# the disk image.
+python3 - ../../src/content/docs/en "$STAGE/docs" <<'PY'
+import os, pathlib, shutil, sys
+
+source, destination = pathlib.Path(sys.argv[1]), pathlib.Path(sys.argv[2])
+destination.mkdir(parents=True, exist_ok=True)
+
+
+def frontmatter(text):
+    if not text.startswith("---\n"):
+        return {}
+    end = text.find("\n---", 4)
+    if end == -1:
+        return {}
+    fields = {}
+    for line in text[4:end].splitlines():
+        key, separator, value = line.partition(":")
+        if separator:
+            fields[key.strip()] = value.strip().strip('"')
+    return fields
+
+
+documents = []
+for path in sorted(source.rglob("*.md")):
+    text = path.read_text(encoding="utf-8")
+    fields = frontmatter(text)
+    # The home entry is the landing route, which is the app itself.
+    if fields.get("section") == "home":
+        continue
+    relative = path.relative_to(source)
+    target = destination / relative
+    target.parent.mkdir(parents=True, exist_ok=True)
+    shutil.copyfile(path, target)
+    try:
+        order = int(fields.get("order", "999"))
+    except ValueError:
+        order = 999
+    documents.append((fields.get("section", "zzz"), order, fields.get("title", relative.stem), relative.as_posix()))
+
+# The sidebar's order: by section, then by the order each document declares.
+# A reader who knows the site should find the list in the same shape.
+documents.sort()
+index = destination / "index.txt"
+index.write_text(
+    "".join(f"{path}\t{title}\n" for _, _, title, path in documents),
+    encoding="utf-8",
+)
+print(f"packaged {len(documents)} docs")
+PY
 rm -f ../../public/v86/z3rm-server ../../public/v86/z3rm-server.bin
 cp "$STAGE/mux_server" ../../public/v86/z3rm-server.bin
 cat > "$STAGE/start-mux.sh" <<'SCRIPT'
@@ -49,13 +102,19 @@ python3 tools/fs2json.py --out "$OUT/fs.json" "$STAGE"
 python3 - "$STAGE" "$OUT" <<'PY'
 import hashlib, os, sys
 stage, out = sys.argv[1], sys.argv[2]
-for f in os.listdir(stage):
-    h = hashlib.sha256()
-    with open(os.path.join(stage, f), "rb", buffering=0) as fh:
-        for b in iter(lambda: fh.read(128*1024), b""):
-            h.update(b)
-    data = open(os.path.join(stage, f), "rb").read()
-    open(os.path.join(out, h.hexdigest()[:8] + ".bin"), "wb").write(data)
+# Walk: the stage grew a docs/ tree, and listdir would hand back a directory
+# to open as a file.
+for root, _, files in os.walk(stage):
+    for name in files:
+        path = os.path.join(root, name)
+        h = hashlib.sha256()
+        with open(path, "rb", buffering=0) as fh:
+            for b in iter(lambda: fh.read(128*1024), b""):
+                h.update(b)
+        with open(path, "rb") as fh:
+            data = fh.read()
+        with open(os.path.join(out, h.hexdigest()[:8] + ".bin"), "wb") as fh:
+            fh.write(data)
 PY
 rm -rf "$STAGE"
 echo "guest fs packaged into $OUT"

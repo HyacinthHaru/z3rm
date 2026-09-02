@@ -1,0 +1,16 @@
+concepts/sessions-and-panes.md	Sessions, windows, and panes
+concepts/server-canonical-model.md	Server-canonical terminal state
+concepts/local-and-remote.md	Local and remote sessions
+concepts/shadow-snapshots.md	Shadow snapshots
+features.md	Features
+quick-start.md	Quick start
+guide/cli.md	Use the CLI
+guide/gui.md	Use the GUI
+guide/for-humans.md	Z3rm for humans
+guide/for-agents.md	Z3rm for agents
+reference/cli.md	CLI reference
+reference/keybindings.md	Keybindings
+reference/configuration.md	Configuration
+reference/extension-runtime.md	Extension runtime
+implementation-status.md	Implementation status
+troubleshooting.md	Troubleshooting
